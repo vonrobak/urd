@@ -1,6 +1,7 @@
 use std::collections::HashSet;
-#[allow(unused_imports)]
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 
 use chrono::NaiveDateTime;
 
@@ -105,6 +106,9 @@ pub fn plan(
         let pinned = fs.pinned_snapshots(&local_dir, &drive_labels);
 
         // ── Local operations ────────────────────────────────────────
+        // LOAD-BEARING ORDER: Operations are emitted as create → send → delete.
+        // The executor relies on this ordering within each subvolume.
+        // Do not reorder without updating the executor contract in PLAN.md.
         if !filters.external_only {
             plan_local_snapshot(subvol, &local_dir, &local_snaps, now, force, &mut operations, &mut skipped);
             plan_local_retention(
