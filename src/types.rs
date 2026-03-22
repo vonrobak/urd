@@ -325,19 +325,22 @@ pub enum PlannedOperation {
         snapshot: PathBuf,
         dest_dir: PathBuf,
         drive_label: String,
+        subvolume_name: String,
+        /// Pin file to write on successful send: (pin_file_path, snapshot_name_to_write)
+        pin_on_success: Option<(PathBuf, SnapshotName)>,
     },
     SendFull {
         snapshot: PathBuf,
         dest_dir: PathBuf,
         drive_label: String,
+        subvolume_name: String,
+        /// Pin file to write on successful send: (pin_file_path, snapshot_name_to_write)
+        pin_on_success: Option<(PathBuf, SnapshotName)>,
     },
     DeleteSnapshot {
         path: PathBuf,
         reason: String,
-    },
-    PinParent {
-        pin_file: PathBuf,
-        snapshot_name: SnapshotName,
+        subvolume_name: String,
     },
 }
 
@@ -351,11 +354,13 @@ impl fmt::Display for PlannedOperation {
                 snapshot,
                 drive_label,
                 parent,
+                pin_on_success,
                 ..
             } => {
+                let pin_suffix = if pin_on_success.is_some() { " + pin" } else { "" };
                 write!(
                     f,
-                    "SEND    {} -> {} (incremental, parent: {})",
+                    "SEND    {} -> {} (incremental, parent: {}){pin_suffix}",
                     snapshot.display(),
                     drive_label,
                     parent.file_name().unwrap_or_default().to_string_lossy()
@@ -364,29 +369,19 @@ impl fmt::Display for PlannedOperation {
             Self::SendFull {
                 snapshot,
                 drive_label,
+                pin_on_success,
                 ..
             } => {
+                let pin_suffix = if pin_on_success.is_some() { " + pin" } else { "" };
                 write!(
                     f,
-                    "SEND    {} -> {} (full)",
+                    "SEND    {} -> {} (full){pin_suffix}",
                     snapshot.display(),
                     drive_label
                 )
             }
-            Self::DeleteSnapshot { path, reason } => {
+            Self::DeleteSnapshot { path, reason, .. } => {
                 write!(f, "DELETE  {} ({})", path.display(), reason)
-            }
-            Self::PinParent {
-                snapshot_name,
-                pin_file,
-                ..
-            } => {
-                write!(
-                    f,
-                    "PIN     {} = {}",
-                    pin_file.file_name().unwrap_or_default().to_string_lossy(),
-                    snapshot_name
-                )
             }
         }
     }
@@ -416,10 +411,10 @@ impl BackupPlan {
         for op in &self.operations {
             match op {
                 PlannedOperation::CreateSnapshot { .. } => s.snapshots += 1,
-                PlannedOperation::SendIncremental { .. } => s.sends += 1,
-                PlannedOperation::SendFull { .. } => s.sends += 1,
+                PlannedOperation::SendIncremental { .. } | PlannedOperation::SendFull { .. } => {
+                    s.sends += 1;
+                }
                 PlannedOperation::DeleteSnapshot { .. } => s.deletions += 1,
-                PlannedOperation::PinParent { .. } => s.pins += 1,
             }
         }
         s.skipped = self.skipped.len();
@@ -432,7 +427,6 @@ pub struct PlanSummary {
     pub snapshots: usize,
     pub sends: usize,
     pub deletions: usize,
-    pub pins: usize,
     pub skipped: usize,
 }
 
@@ -747,10 +741,12 @@ mod tests {
                 PlannedOperation::DeleteSnapshot {
                     path: PathBuf::from("/snap/old"),
                     reason: "expired".to_string(),
+                    subvolume_name: "htpc-home".to_string(),
                 },
                 PlannedOperation::DeleteSnapshot {
                     path: PathBuf::from("/snap/old2"),
                     reason: "expired".to_string(),
+                    subvolume_name: "htpc-home".to_string(),
                 },
             ],
             timestamp: NaiveDate::from_ymd_opt(2026, 3, 22)
