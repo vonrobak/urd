@@ -21,6 +21,12 @@ pub enum UrdError {
     #[error("Retention error: {0}")]
     #[allow(dead_code)]
     Retention(String),
+
+    #[error("Btrfs command failed: {0}")]
+    Btrfs(String),
+
+    #[error("State database error: {0}")]
+    State(String),
 }
 
 pub type Result<T> = std::result::Result<T, UrdError>;
