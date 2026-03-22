@@ -1,11 +1,15 @@
+mod btrfs;
 mod chain;
 mod cli;
 mod commands;
 mod config;
 mod drives;
 mod error;
+mod executor;
+mod metrics;
 mod plan;
 mod retention;
+mod state;
 mod types;
 
 use clap::Parser;
@@ -18,10 +22,8 @@ fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Commands::Plan(args) => commands::plan_cmd::run(config, args),
-        Commands::Backup(_) => {
-            eprintln!("Not implemented yet — coming in Phase 2");
-            Ok(())
-        }
+        Commands::Backup(args) => commands::backup::run(config, args),
+        Commands::Init => commands::init::run(config),
         Commands::Status => {
             eprintln!("Not implemented yet — coming in Phase 3");
             Ok(())
@@ -32,10 +34,6 @@ fn main() -> anyhow::Result<()> {
         }
         Commands::Verify => {
             eprintln!("Not implemented yet — coming in Phase 3");
-            Ok(())
-        }
-        Commands::Init => {
-            eprintln!("Not implemented yet — coming in Phase 2");
             Ok(())
         }
     }

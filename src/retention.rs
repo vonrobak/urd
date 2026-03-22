@@ -398,8 +398,8 @@ mod tests {
         );
 
         // Should keep at least 1 (newest), delete the rest
-        assert!(result.keep.len() >= 1);
-        assert!(result.delete.len() >= 1);
+        assert!(!result.keep.is_empty());
+        assert!(!result.delete.is_empty());
         assert!(result.keep.iter().any(|s| s.as_str() == "20260322-home"));
     }
 

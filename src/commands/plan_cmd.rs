@@ -17,10 +17,19 @@ pub fn run(config: Config, args: PlanArgs) -> anyhow::Result<()> {
     let fs_state = RealFileSystemState;
     let backup_plan = plan::plan(&config, now, &filters, &fs_state)?;
 
+    run_with_plan(&config, &backup_plan)
+}
+
+/// Print a backup plan. Shared by `urd plan` and `urd backup --dry-run`.
+pub fn run_with_plan(config: &Config, backup_plan: &crate::types::BackupPlan) -> anyhow::Result<()> {
     // Print header
     println!(
         "{}",
-        format!("Urd backup plan for {}", now.format("%Y-%m-%d %H:%M")).bold()
+        format!(
+            "Urd backup plan for {}",
+            backup_plan.timestamp.format("%Y-%m-%d %H:%M")
+        )
+        .bold()
     );
     println!();
 
