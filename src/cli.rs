@@ -26,9 +26,9 @@ pub enum Commands {
     /// Show system status
     Status,
     /// Show backup history
-    History,
+    History(HistoryArgs),
     /// Verify chain integrity
-    Verify,
+    Verify(VerifyArgs),
     /// Initialize state from existing snapshots
     Init,
 }
@@ -73,4 +73,30 @@ pub struct BackupArgs {
     /// Only run external operations
     #[arg(long)]
     pub external_only: bool,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct HistoryArgs {
+    /// Number of recent runs to show
+    #[arg(long, default_value = "10")]
+    pub last: usize,
+
+    /// Filter by subvolume name
+    #[arg(long)]
+    pub subvolume: Option<String>,
+
+    /// Show only failed operations
+    #[arg(long)]
+    pub failures: bool,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct VerifyArgs {
+    /// Only verify this subvolume
+    #[arg(long)]
+    pub subvolume: Option<String>,
+
+    /// Only verify against this drive
+    #[arg(long)]
+    pub drive: Option<String>,
 }

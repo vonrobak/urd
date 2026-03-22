@@ -43,36 +43,33 @@ impl RealBtrfs {
         }
     }
 
-    fn run_btrfs(&self, args: &[&str]) -> crate::error::Result<()> {
-        log::debug!("Running: sudo {} {}", self.btrfs_path, args.join(" "));
+}
+
+impl BtrfsOps for RealBtrfs {
+    fn create_readonly_snapshot(&self, source: &Path, dest: &Path) -> crate::error::Result<()> {
+        log::debug!(
+            "Running: sudo {} subvolume snapshot -r {} {}",
+            self.btrfs_path,
+            source.display(),
+            dest.display()
+        );
         let output = Command::new("sudo")
             .arg(&self.btrfs_path)
-            .args(args)
+            .args(["subvolume", "snapshot", "-r"])
+            .arg(source)
+            .arg(dest)
             .output()
             .map_err(|e| UrdError::Btrfs(format!("failed to spawn btrfs: {e}")))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(UrdError::Btrfs(format!(
-                "btrfs {} failed (exit {}): {}",
-                args.first().unwrap_or(&""),
+                "snapshot failed (exit {}): {}",
                 output.status.code().unwrap_or(-1),
                 stderr.trim()
             )));
         }
         Ok(())
-    }
-}
-
-impl BtrfsOps for RealBtrfs {
-    fn create_readonly_snapshot(&self, source: &Path, dest: &Path) -> crate::error::Result<()> {
-        self.run_btrfs(&[
-            "subvolume",
-            "snapshot",
-            "-r",
-            &source.to_string_lossy(),
-            &dest.to_string_lossy(),
-        ])
     }
 
     fn send_receive(
@@ -197,7 +194,27 @@ impl BtrfsOps for RealBtrfs {
     }
 
     fn delete_subvolume(&self, path: &Path) -> crate::error::Result<()> {
-        self.run_btrfs(&["subvolume", "delete", &path.to_string_lossy()])
+        log::debug!(
+            "Running: sudo {} subvolume delete {}",
+            self.btrfs_path,
+            path.display()
+        );
+        let output = Command::new("sudo")
+            .arg(&self.btrfs_path)
+            .args(["subvolume", "delete"])
+            .arg(path)
+            .output()
+            .map_err(|e| UrdError::Btrfs(format!("failed to spawn btrfs: {e}")))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(UrdError::Btrfs(format!(
+                "delete failed (exit {}): {}",
+                output.status.code().unwrap_or(-1),
+                stderr.trim()
+            )));
+        }
+        Ok(())
     }
 
     fn subvolume_exists(&self, path: &Path) -> bool {

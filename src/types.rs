@@ -557,6 +557,27 @@ impl Serialize for ByteSize {
     }
 }
 
+// ── Display helpers ─────────────────────────────────────────────────────
+
+/// Format a number of seconds as a human-readable duration string (e.g., "2m 15s", "45s").
+#[must_use]
+pub fn format_duration_secs(secs: i64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else {
+        format!("{}m {}s", secs / 60, secs % 60)
+    }
+}
+
+/// Parse two ISO timestamps and return a formatted duration string.
+/// Returns `None` if either timestamp fails to parse.
+#[must_use]
+pub fn format_run_duration(started: &str, finished: &str) -> Option<String> {
+    let start = NaiveDateTime::parse_from_str(started, "%Y-%m-%dT%H:%M:%S").ok()?;
+    let end = NaiveDateTime::parse_from_str(finished, "%Y-%m-%dT%H:%M:%S").ok()?;
+    Some(format_duration_secs((end - start).num_seconds()))
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]
