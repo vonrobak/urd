@@ -2,6 +2,7 @@ use std::io::Write as _;
 
 use colored::Colorize;
 
+use crate::btrfs::{BtrfsOps, RealBtrfs};
 use crate::chain;
 use crate::config::Config;
 use crate::drives;
@@ -14,10 +15,61 @@ pub fn run(config: Config) -> anyhow::Result<()> {
     println!();
 
     // 1. Create state database
-    print!("Creating state database... ");
+    let db_exists = config.general.state_db.exists();
+    print!(
+        "{} state database... ",
+        if db_exists { "Verifying" } else { "Creating" }
+    );
     match StateDb::open(&config.general.state_db) {
-        Ok(_) => println!("{}", "OK".green()),
+        Ok(_) => {
+            if db_exists {
+                println!("{} (already exists)", "OK".green());
+            } else {
+                println!("{}", "OK".green());
+            }
+        }
         Err(e) => println!("{}: {e}", "FAILED".red()),
+    }
+
+    // 1b. Verify metrics directory is writable
+    if let Some(parent) = config.general.metrics_file.parent() {
+        match std::fs::create_dir_all(parent).and_then(|_| {
+            let test = parent.join(".urd-write-test");
+            std::fs::write(&test, b"").and_then(|_| std::fs::remove_file(&test))
+        }) {
+            Ok(()) => println!(
+                "{} Metrics directory writable: {}",
+                "OK".green(),
+                parent.display()
+            ),
+            Err(e) => println!(
+                "{} Metrics directory not writable: {} ({})",
+                "ERROR".red(),
+                parent.display(),
+                e
+            ),
+        }
+    }
+
+    // 1c. Verify lock file directory is writable
+    let lock_path = config.general.state_db.with_extension("lock");
+    if let Some(parent) = lock_path.parent() {
+        match std::fs::create_dir_all(parent).and_then(|_| {
+            let test = parent.join(".urd-lock-write-test");
+            std::fs::write(&test, b"").and_then(|_| std::fs::remove_file(&test))
+        }) {
+            Ok(()) => println!(
+                "{} Lock file directory writable: {}",
+                "OK".green(),
+                parent.display()
+            ),
+            Err(e) => println!(
+                "{} Lock file directory not writable: {} ({})",
+                "ERROR".red(),
+                parent.display(),
+                e
+            ),
+        }
     }
 
     // 2. Verify config paths exist
@@ -175,8 +227,19 @@ pub fn run(config: Config) -> anyhow::Result<()> {
                     let mut input = String::new();
                     std::io::stdin().read_line(&mut input)?;
                     if input.trim().eq_ignore_ascii_case("y") {
-                        println!("  Deletion of incomplete snapshots requires sudo btrfs subvolume delete.");
-                        println!("  Run: sudo btrfs subvolume delete {}", partial_path.display());
+                        let btrfs = RealBtrfs::new(&config.general.btrfs_path);
+                        match btrfs.delete_subvolume(&partial_path) {
+                            Ok(()) => println!(
+                                "  {} Deleted {}",
+                                "OK".green(),
+                                partial_path.display()
+                            ),
+                            Err(e) => println!(
+                                "  {} Failed to delete {}: {e}",
+                                "ERROR".red(),
+                                partial_path.display()
+                            ),
+                        }
                     }
                 }
             }

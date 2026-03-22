@@ -27,6 +27,7 @@ anyhow = "1"
 # System
 nix = { version = "0.29", features = ["fs"] }
 dirs = "6"
+ctrlc = "3"
 
 # Output formatting
 colored = "2"
