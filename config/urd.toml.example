@@ -1,0 +1,155 @@
+# Urd configuration
+# Copy to ~/.config/urd/urd.toml and adjust paths for your system.
+
+[general]
+# SQLite database for run history and state
+state_db = "~/.local/share/urd/urd.db"
+# Prometheus metrics output (atomic write via tmp+rename)
+metrics_file = "~/containers/data/backup-metrics/backup.prom"
+# Log directory
+log_dir = "~/containers/data/backup-logs"
+# Path to btrfs binary (sudoers entries reference this)
+btrfs_path = "/usr/sbin/btrfs"
+
+[local_snapshots]
+# Each root maps to a directory where snapshot subdirectories are created.
+# The subvolumes list determines which subvolumes store snapshots under this root.
+roots = [
+  { path = "~/.snapshots", subvolumes = ["htpc-home", "htpc-root"] },
+  { path = "/mnt/btrfs-pool/.snapshots", subvolumes = [
+    "subvol1-docs", "subvol2-pics", "subvol3-opptak",
+    "subvol4-multimedia", "subvol5-music", "subvol6-tmp", "subvol7-containers"
+  ]}
+]
+
+# ─── External Drives ────────────────────────────────────────────────
+
+[[drives]]
+label = "WD-18TB"
+mount_path = "/run/media/<user>/WD-18TB"
+snapshot_root = ".snapshots"       # Relative to mount_path
+role = "primary"                   # primary | offsite | test
+
+[[drives]]
+label = "WD-18TB1"
+mount_path = "/run/media/<user>/WD-18TB1"
+snapshot_root = ".snapshots"
+role = "offsite"
+
+[[drives]]
+label = "2TB-backup"
+mount_path = "/run/media/<user>/2TB-backup"
+snapshot_root = ".snapshots"
+role = "test"
+
+# ─── Tier 1: Critical (daily local + daily external) ────────────────
+
+[[subvolumes]]
+name = "htpc-home"
+short_name = "htpc-home"           # Used in snapshot naming: YYYYMMDD-<short_name>
+source = "/home"
+tier = 1
+enabled = true
+local_schedule = "daily"           # daily | weekly | monthly
+external_schedule = "daily"        # daily | weekly | monthly | first-saturday | never
+external_retention = 14
+
+[[subvolumes]]
+name = "subvol3-opptak"
+short_name = "opptak"
+source = "/mnt/btrfs-pool/subvol3-opptak"
+tier = 1
+enabled = true
+local_schedule = "daily"
+external_schedule = "daily"
+external_retention = 14
+# NOTE: Irreplaceable recordings — highest backup priority
+
+[[subvolumes]]
+name = "subvol7-containers"
+short_name = "containers"
+source = "/mnt/btrfs-pool/subvol7-containers"
+tier = 1
+enabled = true
+local_schedule = "daily"
+external_schedule = "daily"
+external_retention = 14
+
+# ─── Tier 2: Important (daily local, daily or monthly external) ─────
+
+[[subvolumes]]
+name = "subvol1-docs"
+short_name = "docs"
+source = "/mnt/btrfs-pool/subvol1-docs"
+tier = 2
+enabled = true
+local_schedule = "daily"
+external_schedule = "daily"
+external_retention = 14
+
+[[subvolumes]]
+name = "htpc-root"
+short_name = "htpc-root"
+source = "/"
+tier = 2
+enabled = true
+local_schedule = "monthly"
+external_schedule = "monthly"
+local_retention = 1                # Override: only 1 local snapshot for root
+external_retention = 6
+
+# ─── Tier 3: Standard (weekly local, monthly or never external) ─────
+
+[[subvolumes]]
+name = "subvol2-pics"
+short_name = "pics"
+source = "/mnt/btrfs-pool/subvol2-pics"
+tier = 3
+enabled = true
+local_schedule = "weekly"
+external_schedule = "first-saturday"
+local_retention = 8
+external_retention = 6
+
+[[subvolumes]]
+name = "subvol4-multimedia"
+short_name = "multimedia"
+source = "/mnt/btrfs-pool/subvol4-multimedia"
+tier = 3
+enabled = true
+local_schedule = "weekly"
+external_schedule = "first-saturday"
+external_enabled = false           # Disabled until initial manual full send
+local_retention = 4
+external_retention = 3
+
+[[subvolumes]]
+name = "subvol5-music"
+short_name = "music"
+source = "/mnt/btrfs-pool/subvol5-music"
+tier = 3
+enabled = true
+local_schedule = "weekly"
+external_schedule = "first-saturday"
+local_retention = 8
+external_retention = 6
+
+[[subvolumes]]
+name = "subvol6-tmp"
+short_name = "tmp"
+source = "/mnt/btrfs-pool/subvol6-tmp"
+tier = 3
+enabled = true
+local_schedule = "weekly"
+external_schedule = "never"        # Cache data — fully replaceable
+local_retention = 4
+
+# ─── Retention Policy ───────────────────────────────────────────────
+
+[retention.graduated]
+# Applied automatically to subvolumes with daily local_schedule.
+# Subvolumes with weekly/monthly schedules use their local_retention count instead.
+daily_keep = 14                    # Keep all snapshots from last 14 days
+weekly_keep = 6                    # Keep 1 per ISO week for next ~6 weeks (days 15-56)
+monthly_keep = 3                   # Keep 1 per month for next ~3 months (days 57-149)
+# Total coverage: ~149 days (~5 months)
