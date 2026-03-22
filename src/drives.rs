@@ -1,0 +1,82 @@
+use std::path::{Path, PathBuf};
+
+use crate::config::DriveConfig;
+use crate::error::UrdError;
+
+/// Check if a drive is mounted by looking for its mount_path in /proc/mounts.
+#[must_use]
+pub fn is_drive_mounted(drive: &DriveConfig) -> bool {
+    is_path_mounted(&drive.mount_path)
+}
+
+/// Check if a path appears as a mount point in /proc/mounts.
+#[must_use]
+pub fn is_path_mounted(mount_path: &str) -> bool {
+    let Ok(mounts) = std::fs::read_to_string("/proc/mounts") else {
+        return false;
+    };
+    for line in mounts.lines() {
+        let parts: Vec<&str> = line.splitn(3, ' ').collect();
+        if parts.len() >= 2 && parts[1] == mount_path {
+            return true;
+        }
+    }
+    false
+}
+
+/// Get free bytes on the filesystem containing the given path.
+pub fn filesystem_free_bytes(path: &Path) -> crate::error::Result<u64> {
+    let stat = nix::sys::statvfs::statvfs(path).map_err(|e| UrdError::Io {
+        path: path.to_path_buf(),
+        source: std::io::Error::other(e.to_string()),
+    })?;
+    Ok(stat.blocks_available() * stat.fragment_size())
+}
+
+/// Get the external snapshot directory for a subvolume on a drive.
+/// Returns `{mount_path}/{snapshot_root}/{subvol_name}`.
+#[must_use]
+pub fn external_snapshot_dir(drive: &DriveConfig, subvol_name: &str) -> PathBuf {
+    PathBuf::from(&drive.mount_path)
+        .join(&drive.snapshot_root)
+        .join(subvol_name)
+}
+
+// ── Tests ───────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::DriveRole;
+
+    fn test_drive() -> DriveConfig {
+        DriveConfig {
+            label: "WD-18TB".to_string(),
+            mount_path: "/run/media/user/WD-18TB".to_string(),
+            snapshot_root: ".snapshots".to_string(),
+            role: DriveRole::Primary,
+            max_usage_percent: Some(90),
+            min_free_bytes: None,
+        }
+    }
+
+    #[test]
+    fn external_snapshot_dir_construction() {
+        let drive = test_drive();
+        let dir = external_snapshot_dir(&drive, "htpc-home");
+        assert_eq!(
+            dir,
+            PathBuf::from("/run/media/user/WD-18TB/.snapshots/htpc-home")
+        );
+    }
+
+    #[test]
+    fn external_snapshot_dir_with_subvol_name() {
+        let drive = test_drive();
+        let dir = external_snapshot_dir(&drive, "subvol3-opptak");
+        assert_eq!(
+            dir,
+            PathBuf::from("/run/media/user/WD-18TB/.snapshots/subvol3-opptak")
+        );
+    }
+}
