@@ -72,6 +72,35 @@ pub fn run(config: Config) -> anyhow::Result<()> {
         }
     }
 
+    // 1d. Verify sudo btrfs is available (uses `filesystem show /` which is
+    // already in sudoers NOPASSWD — `btrfs --version` is not covered)
+    print!("Checking sudo btrfs... ");
+    std::io::stdout().flush()?;
+    match std::process::Command::new("sudo")
+        .arg("-n") // non-interactive: fail immediately if password required
+        .arg(&config.general.btrfs_path)
+        .args(["filesystem", "show", "/"])
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            println!("{}", "OK".green());
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            println!(
+                "{} exit {}: {}",
+                "FAILED".red(),
+                output.status.code().unwrap_or(-1),
+                stderr.trim()
+            );
+            println!(
+                "        {}",
+                "Check sudoers config — see /etc/sudoers.d/btrfs-backup".dimmed()
+            );
+        }
+        Err(e) => println!("{}: {e}", "FAILED".red()),
+    }
+
     // 2. Verify config paths exist
     println!();
     println!("{}", "Checking subvolume sources:".bold());
