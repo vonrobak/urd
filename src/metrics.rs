@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::Path;
 
@@ -54,6 +55,51 @@ pub fn write_metrics(path: &Path, data: &MetricsData) -> crate::error::Result<()
     })?;
 
     Ok(())
+}
+
+/// Read `backup_last_success_timestamp` values from an existing .prom file.
+/// Returns a map of subvolume name to unix timestamp.
+/// Missing or malformed files return an empty map (safe fallback).
+#[must_use]
+pub fn read_existing_timestamps(path: &Path) -> HashMap<String, i64> {
+    let mut map = HashMap::new();
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return map,
+    };
+
+    for line in content.lines() {
+        let line = line.trim();
+        // Match: backup_last_success_timestamp{subvolume="NAME"} VALUE
+        let Some(rest) = line.strip_prefix("backup_last_success_timestamp{subvolume=\"") else {
+            continue;
+        };
+        let Some(close_idx) = rest.find("\"}") else {
+            continue;
+        };
+        let name = &rest[..close_idx];
+        let value_str = rest[close_idx + 2..].trim();
+        if let Ok(ts) = value_str.parse::<i64>() {
+            map.insert(name.to_string(), ts);
+        }
+    }
+
+    map
+}
+
+/// Fill in `last_success_timestamp` from carried-forward values for subvolumes
+/// that didn't get a fresh timestamp in this run.
+pub fn apply_carried_forward_timestamps(
+    subvolumes: &mut [SubvolumeMetrics],
+    carried: &HashMap<String, i64>,
+) {
+    for sv in subvolumes.iter_mut() {
+        if sv.last_success_timestamp.is_none()
+            && let Some(&ts) = carried.get(&sv.name)
+        {
+            sv.last_success_timestamp = Some(ts);
+        }
+    }
 }
 
 fn format_metrics(data: &MetricsData) -> String {
@@ -265,5 +311,125 @@ mod tests {
         let output = format_metrics(&data);
         assert!(output.contains("backup_external_drive_mounted 0"));
         assert!(output.contains("backup_external_free_bytes 0"));
+    }
+
+    // ── Carryforward tests ─────────────────────────────────────────────
+
+    #[test]
+    fn read_existing_timestamps_valid_prom() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("backup.prom");
+        let data = sample_data();
+        write_metrics(&path, &data).unwrap();
+
+        let ts = read_existing_timestamps(&path);
+        assert_eq!(ts.get("subvol3-opptak"), Some(&1_711_100_000));
+        assert!(ts.get("htpc-home").is_none()); // was not emitted (no success)
+    }
+
+    #[test]
+    fn read_existing_timestamps_missing_file() {
+        let ts = read_existing_timestamps(Path::new("/nonexistent/backup.prom"));
+        assert!(ts.is_empty());
+    }
+
+    #[test]
+    fn read_existing_timestamps_malformed_lines() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("backup.prom");
+        std::fs::write(
+            &path,
+            "backup_last_success_timestamp{subvolume=\"good\"} 12345\n\
+             backup_last_success_timestamp{subvolume=\"bad\"} notanumber\n\
+             this is not a metric line\n\
+             backup_last_success_timestamp{subvolume=\"also-good\"} 67890\n",
+        )
+        .unwrap();
+
+        let ts = read_existing_timestamps(&path);
+        assert_eq!(ts.get("good"), Some(&12345));
+        assert_eq!(ts.get("also-good"), Some(&67890));
+        assert!(ts.get("bad").is_none());
+    }
+
+    #[test]
+    fn apply_carried_forward_fills_none() {
+        let mut svs = vec![
+            SubvolumeMetrics {
+                name: "sv-a".to_string(),
+                success: 1,
+                last_success_timestamp: Some(9999),
+                duration_seconds: 10,
+                local_snapshot_count: 5,
+                external_snapshot_count: 3,
+                send_type: 1,
+            },
+            SubvolumeMetrics {
+                name: "sv-b".to_string(),
+                success: 2,
+                last_success_timestamp: None,
+                duration_seconds: 0,
+                local_snapshot_count: 5,
+                external_snapshot_count: 3,
+                send_type: 2,
+            },
+            SubvolumeMetrics {
+                name: "sv-c".to_string(),
+                success: 2,
+                last_success_timestamp: None,
+                duration_seconds: 0,
+                local_snapshot_count: 5,
+                external_snapshot_count: 3,
+                send_type: 2,
+            },
+        ];
+
+        let mut carried = HashMap::new();
+        carried.insert("sv-b".to_string(), 5555);
+        // sv-c not in carried — stays None
+
+        apply_carried_forward_timestamps(&mut svs, &carried);
+
+        assert_eq!(svs[0].last_success_timestamp, Some(9999)); // not overwritten
+        assert_eq!(svs[1].last_success_timestamp, Some(5555)); // carried forward
+        assert_eq!(svs[2].last_success_timestamp, None); // no carry available
+    }
+
+    #[test]
+    fn carryforward_roundtrip() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("backup.prom");
+
+        // First run: success for sv-a
+        let data = MetricsData {
+            subvolumes: vec![SubvolumeMetrics {
+                name: "sv-a".to_string(),
+                success: 1,
+                last_success_timestamp: Some(12345),
+                duration_seconds: 10,
+                local_snapshot_count: 5,
+                external_snapshot_count: 3,
+                send_type: 1,
+            }],
+            external_drive_mounted: true,
+            external_free_bytes: 1_000_000,
+            script_last_run_timestamp: 12345,
+        };
+        write_metrics(&path, &data).unwrap();
+
+        // Second run: sv-a skipped
+        let carried = read_existing_timestamps(&path);
+        let mut svs = vec![SubvolumeMetrics {
+            name: "sv-a".to_string(),
+            success: 2,
+            last_success_timestamp: None,
+            duration_seconds: 0,
+            local_snapshot_count: 5,
+            external_snapshot_count: 3,
+            send_type: 2,
+        }];
+        apply_carried_forward_timestamps(&mut svs, &carried);
+
+        assert_eq!(svs[0].last_success_timestamp, Some(12345));
     }
 }

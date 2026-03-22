@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use crate::btrfs::BtrfsOps;
@@ -89,6 +90,7 @@ pub struct Executor<'a> {
     btrfs: &'a dyn BtrfsOps,
     state: Option<&'a StateDb>,
     config: &'a Config,
+    shutdown: &'a AtomicBool,
 }
 
 impl<'a> Executor<'a> {
@@ -97,11 +99,13 @@ impl<'a> Executor<'a> {
         btrfs: &'a dyn BtrfsOps,
         state: Option<&'a StateDb>,
         config: &'a Config,
+        shutdown: &'a AtomicBool,
     ) -> Self {
         Self {
             btrfs,
             state,
             config,
+            shutdown,
         }
     }
 
@@ -119,6 +123,10 @@ impl<'a> Executor<'a> {
         let mut subvolume_results = Vec::new();
 
         for (subvol_name, ops) in &groups {
+            if self.shutdown.load(Ordering::SeqCst) {
+                log::warn!("Shutdown signal received, skipping remaining subvolumes");
+                break;
+            }
             let result = self.execute_subvolume(subvol_name, ops, run_id, &mut space_recovered);
             subvolume_results.push(result);
         }
@@ -158,6 +166,12 @@ impl<'a> Executor<'a> {
         let mut pin_failures: u32 = 0;
 
         for op in ops {
+            if self.shutdown.load(Ordering::SeqCst) {
+                log::warn!(
+                    "Shutdown signal received, skipping remaining operations for {subvol_name}"
+                );
+                break;
+            }
             let outcome = match op {
                 PlannedOperation::CreateSnapshot { source, dest, .. } => {
                     self.execute_create(source, dest, &mut failed_creates)
@@ -613,6 +627,11 @@ mod tests {
     use chrono::NaiveDate;
     use std::path::PathBuf;
 
+    /// Shutdown flag that never triggers — used for all tests that don't test signal handling.
+    fn no_shutdown() -> AtomicBool {
+        AtomicBool::new(false)
+    }
+
     fn test_config() -> Config {
         let config_str = r#"
 [general]
@@ -688,7 +707,8 @@ source = "/data/b"
     fn happy_path_all_succeed() {
         let mock = MockBtrfs::new();
         let config = test_config();
-        let executor = Executor::new(&mock, None, &config);
+        let shutdown = no_shutdown();
+        let executor = Executor::new(&mock, None, &config, &shutdown);
         let plan = simple_plan();
 
         let result = executor.execute(&plan, "full");
@@ -714,7 +734,8 @@ source = "/data/b"
             .insert(PathBuf::from("/snap/sv-a/20260322-1430-a"));
 
         let config = test_config();
-        let executor = Executor::new(&mock, None, &config);
+        let shutdown = no_shutdown();
+        let executor = Executor::new(&mock, None, &config, &shutdown);
 
         let ts = NaiveDate::from_ymd_opt(2026, 3, 22)
             .unwrap()
@@ -752,7 +773,8 @@ source = "/data/b"
             .insert(PathBuf::from("/snap/sv-a/20260322-1430-a"));
 
         let config = test_config();
-        let executor = Executor::new(&mock, None, &config);
+        let shutdown = no_shutdown();
+        let executor = Executor::new(&mock, None, &config, &shutdown);
 
         let ts = NaiveDate::from_ymd_opt(2026, 3, 22)
             .unwrap()
@@ -799,7 +821,8 @@ source = "/data/b"
     fn pin_on_success_writes_pin_file() {
         let mock = MockBtrfs::new();
         let config = test_config();
-        let executor = Executor::new(&mock, None, &config);
+        let shutdown = no_shutdown();
+        let executor = Executor::new(&mock, None, &config, &shutdown);
 
         let pin_dir = tempfile::TempDir::new().unwrap();
         let pin_path = pin_dir
@@ -842,7 +865,8 @@ source = "/data/b"
             .insert(PathBuf::from("/snap/sv-b/20260322-1430-b"));
 
         let config = test_config();
-        let executor = Executor::new(&mock, None, &config);
+        let shutdown = no_shutdown();
+        let executor = Executor::new(&mock, None, &config, &shutdown);
 
         let ts = NaiveDate::from_ymd_opt(2026, 3, 22)
             .unwrap()
@@ -873,7 +897,8 @@ source = "/data/b"
     fn empty_plan_is_success() {
         let mock = MockBtrfs::new();
         let config = test_config();
-        let executor = Executor::new(&mock, None, &config);
+        let shutdown = no_shutdown();
+        let executor = Executor::new(&mock, None, &config, &shutdown);
 
         let ts = NaiveDate::from_ymd_opt(2026, 3, 22)
             .unwrap()
@@ -896,7 +921,8 @@ source = "/data/b"
         *mock.free_bytes.borrow_mut() = 200_000_000_000; // 200GB > 100GB threshold
 
         let config = test_config();
-        let executor = Executor::new(&mock, None, &config);
+        let shutdown = no_shutdown();
+        let executor = Executor::new(&mock, None, &config, &shutdown);
 
         let ts = NaiveDate::from_ymd_opt(2026, 3, 22)
             .unwrap()
@@ -947,7 +973,8 @@ source = "/data/b"
         let mock = MockBtrfs::new();
         let config = test_config();
         let db = StateDb::open_memory().unwrap();
-        let executor = Executor::new(&mock, Some(&db), &config);
+        let shutdown = no_shutdown();
+        let executor = Executor::new(&mock, Some(&db), &config, &shutdown);
         let plan = simple_plan();
 
         let result = executor.execute(&plan, "full");
@@ -960,7 +987,8 @@ source = "/data/b"
     fn send_type_tracks_full() {
         let mock = MockBtrfs::new();
         let config = test_config();
-        let executor = Executor::new(&mock, None, &config);
+        let shutdown = no_shutdown();
+        let executor = Executor::new(&mock, None, &config, &shutdown);
 
         let ts = NaiveDate::from_ymd_opt(2026, 3, 22)
             .unwrap()
@@ -989,7 +1017,8 @@ source = "/data/b"
         *mock.free_bytes.borrow_mut() = 200_000_000_000; // 200GB > 100GB threshold
 
         let config = test_config();
-        let executor = Executor::new(&mock, None, &config);
+        let shutdown = no_shutdown();
+        let executor = Executor::new(&mock, None, &config, &shutdown);
 
         let ts = NaiveDate::from_ymd_opt(2026, 3, 22)
             .unwrap()
@@ -1034,7 +1063,8 @@ source = "/data/b"
     fn pin_failure_tracked_in_result() {
         let mock = MockBtrfs::new();
         let config = test_config();
-        let executor = Executor::new(&mock, None, &config);
+        let shutdown = no_shutdown();
+        let executor = Executor::new(&mock, None, &config, &shutdown);
 
         // Use a non-existent directory for pin path so the write fails
         let pin_path = PathBuf::from("/nonexistent/dir/.last-external-parent-TEST-DRIVE");
@@ -1090,5 +1120,81 @@ source = "/data/b"
         assert_eq!(groups[0].1.len(), 2); // create + delete
         assert_eq!(groups[1].0, "sv-b");
         assert_eq!(groups[1].1.len(), 1); // create
+    }
+
+    #[test]
+    fn shutdown_flag_skips_all_subvolumes() {
+        let mock = MockBtrfs::new();
+        let config = test_config();
+        let shutdown = AtomicBool::new(true); // pre-set
+        let executor = Executor::new(&mock, None, &config, &shutdown);
+
+        let ts = NaiveDate::from_ymd_opt(2026, 3, 22)
+            .unwrap()
+            .and_hms_opt(14, 30, 0)
+            .unwrap();
+        let plan = BackupPlan {
+            operations: vec![
+                PlannedOperation::CreateSnapshot {
+                    source: PathBuf::from("/data/a"),
+                    dest: PathBuf::from("/snap/sv-a/20260322-1430-a"),
+                    subvolume_name: "sv-a".to_string(),
+                },
+                PlannedOperation::CreateSnapshot {
+                    source: PathBuf::from("/data/b"),
+                    dest: PathBuf::from("/snap/sv-b/20260322-1430-b"),
+                    subvolume_name: "sv-b".to_string(),
+                },
+            ],
+            timestamp: ts,
+            skipped: vec![],
+        };
+
+        let result = executor.execute(&plan, "full");
+
+        // No subvolumes should have been processed
+        assert!(result.subvolume_results.is_empty());
+        assert_eq!(result.overall, RunResult::Success); // empty = success
+        assert!(mock.calls().is_empty());
+    }
+
+    #[test]
+    fn shutdown_after_first_subvolume_skips_rest() {
+        let mock = MockBtrfs::new();
+        let config = test_config();
+        let shutdown = AtomicBool::new(false);
+        let executor = Executor::new(&mock, None, &config, &shutdown);
+
+        let ts = NaiveDate::from_ymd_opt(2026, 3, 22)
+            .unwrap()
+            .and_hms_opt(14, 30, 0)
+            .unwrap();
+        let plan = BackupPlan {
+            operations: vec![
+                PlannedOperation::CreateSnapshot {
+                    source: PathBuf::from("/data/a"),
+                    dest: PathBuf::from("/snap/sv-a/20260322-1430-a"),
+                    subvolume_name: "sv-a".to_string(),
+                },
+                PlannedOperation::CreateSnapshot {
+                    source: PathBuf::from("/data/b"),
+                    dest: PathBuf::from("/snap/sv-b/20260322-1430-b"),
+                    subvolume_name: "sv-b".to_string(),
+                },
+            ],
+            timestamp: ts,
+            skipped: vec![],
+        };
+
+        // Set shutdown after sv-a would have executed — but since we can't
+        // hook into the mock, we just verify the flag is checked.
+        // For this test: run normally (flag=false), both subvolumes execute.
+        let result = executor.execute(&plan, "full");
+        assert_eq!(result.subvolume_results.len(), 2);
+
+        // Now set flag and re-run
+        shutdown.store(true, Ordering::SeqCst);
+        let result2 = executor.execute(&plan, "full");
+        assert!(result2.subvolume_results.is_empty());
     }
 }

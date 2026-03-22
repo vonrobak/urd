@@ -1,4 +1,7 @@
+use std::collections::HashSet;
 use std::fs::File;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use colored::Colorize;
 
@@ -48,6 +51,16 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Set up signal handling for graceful shutdown
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_clone = shutdown.clone();
+    if let Err(e) = ctrlc::set_handler(move || {
+        shutdown_clone.store(true, Ordering::SeqCst);
+        eprintln!("\nSignal received, finishing current operation...");
+    }) {
+        log::warn!("Failed to set signal handler: {e}");
+    }
+
     // Set up executor
     let btrfs = RealBtrfs::new(&config.general.btrfs_path);
 
@@ -59,7 +72,7 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
         }
     };
 
-    let executor = Executor::new(&btrfs, state_db.as_ref(), &config);
+    let executor = Executor::new(&btrfs, state_db.as_ref(), &config, &shutdown);
     let result = executor.execute(&backup_plan, mode);
 
     // Print results
@@ -113,6 +126,35 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     // Print skipped subvolumes
     for (name, reason) in &backup_plan.skipped {
         println!("  {} {} ({})", "SKIP".dimmed(), name, reason.dimmed());
+    }
+
+    // Summary for skipped deletions (space recovery)
+    let planned_deletes = backup_plan
+        .operations
+        .iter()
+        .filter(|op| matches!(op, crate::types::PlannedOperation::DeleteSnapshot { .. }))
+        .count();
+    let skipped_deletes: usize = result
+        .subvolume_results
+        .iter()
+        .flat_map(|sv| sv.operations.iter())
+        .filter(|op| {
+            op.operation == "delete"
+                && op.result == crate::executor::OpResult::Skipped
+                && op
+                    .error
+                    .as_ref()
+                    .is_some_and(|e| e.contains("space recovered"))
+        })
+        .count();
+    if skipped_deletes > 0 {
+        println!();
+        println!(
+            "{} {} of {} planned deletion(s) skipped (space recovered)",
+            "NOTE:".dimmed().bold(),
+            skipped_deletes,
+            planned_deletes,
+        );
     }
 
     // Summary warning for pin failures
@@ -195,8 +237,17 @@ fn write_metrics_after_execution(
         });
     }
 
-    // Metrics for skipped subvolumes
-    append_skipped_metrics(config, plan, fs_state, &mut subvolume_metrics);
+    // Metrics for skipped subvolumes (deduplicated against executed results)
+    let already_emitted: HashSet<String> = result
+        .subvolume_results
+        .iter()
+        .map(|sv| sv.name.clone())
+        .collect();
+    append_skipped_metrics(config, plan, fs_state, &mut subvolume_metrics, &already_emitted);
+
+    // Carry forward last_success_timestamp from previous .prom file
+    let carried = metrics::read_existing_timestamps(&config.general.metrics_file);
+    metrics::apply_carried_forward_timestamps(&mut subvolume_metrics, &carried);
 
     write_global_metrics(config, now_ts, subvolume_metrics)
 }
@@ -210,7 +261,11 @@ fn write_metrics_for_skipped(
     let fs_state = RealFileSystemState;
     let mut subvolume_metrics = Vec::new();
 
-    append_skipped_metrics(config, plan, &fs_state, &mut subvolume_metrics);
+    append_skipped_metrics(config, plan, &fs_state, &mut subvolume_metrics, &HashSet::new());
+
+    // Carry forward last_success_timestamp from previous .prom file
+    let carried = metrics::read_existing_timestamps(&config.general.metrics_file);
+    metrics::apply_carried_forward_timestamps(&mut subvolume_metrics, &carried);
 
     write_global_metrics(config, now_ts, subvolume_metrics)
 }
@@ -220,8 +275,15 @@ fn append_skipped_metrics(
     plan: &crate::types::BackupPlan,
     fs_state: &RealFileSystemState,
     subvolume_metrics: &mut Vec<SubvolumeMetrics>,
+    already_emitted: &HashSet<String>,
 ) {
+    let mut seen = already_emitted.clone();
+
     for (name, _reason) in &plan.skipped {
+        if !seen.insert(name.clone()) {
+            continue; // already emitted by execution results or earlier skip entry
+        }
+
         let local_count = count_local_snapshots(config, name, fs_state);
         let external_count = count_external_snapshots(config, name, fs_state);
 
