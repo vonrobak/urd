@@ -10,8 +10,33 @@ pub struct StateDb {
     conn: Connection,
 }
 
-/// A record of a single operation within a backup run.
+/// Input record for writing a single operation to the database.
 pub struct OperationRecord {
+    pub run_id: i64,
+    pub subvolume: String,
+    pub operation: String,
+    pub drive_label: Option<String>,
+    pub duration_secs: Option<f64>,
+    pub result: String,
+    pub error_message: Option<String>,
+    pub bytes_transferred: Option<i64>,
+}
+
+/// A run record returned from database queries.
+#[derive(Debug)]
+pub struct RunRecord {
+    pub id: i64,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+    pub mode: String,
+    pub result: String,
+}
+
+/// An operation record returned from database queries.
+#[derive(Debug)]
+#[allow(dead_code)]
+pub struct OperationRow {
+    pub id: i64,
     pub run_id: i64,
     pub subvolume: String,
     pub operation: String,
@@ -124,6 +149,130 @@ impl StateDb {
             )
             .map_err(|e| UrdError::State(format!("failed to finish run: {e}")))?;
         Ok(())
+    }
+
+    // ── Query methods ──────────────────────────────────────────────────
+
+    /// Get the most recent run, if any.
+    pub fn last_run(&self) -> crate::error::Result<Option<RunRecord>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, started_at, finished_at, mode, result FROM runs ORDER BY id DESC LIMIT 1")
+            .map_err(|e| UrdError::State(format!("query failed: {e}")))?;
+
+        let mut rows = stmt
+            .query_map([], |row| {
+                Ok(RunRecord {
+                    id: row.get(0)?,
+                    started_at: row.get(1)?,
+                    finished_at: row.get(2)?,
+                    mode: row.get(3)?,
+                    result: row.get(4)?,
+                })
+            })
+            .map_err(|e| UrdError::State(format!("query failed: {e}")))?;
+
+        match rows.next() {
+            Some(Ok(record)) => Ok(Some(record)),
+            Some(Err(e)) => Err(UrdError::State(format!("failed to read run: {e}"))),
+            None => Ok(None),
+        }
+    }
+
+    /// Get the N most recent runs.
+    pub fn recent_runs(&self, limit: usize) -> crate::error::Result<Vec<RunRecord>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, started_at, finished_at, mode, result FROM runs ORDER BY id DESC LIMIT ?1")
+            .map_err(|e| UrdError::State(format!("query failed: {e}")))?;
+
+        let rows = stmt
+            .query_map([limit as i64], |row| {
+                Ok(RunRecord {
+                    id: row.get(0)?,
+                    started_at: row.get(1)?,
+                    finished_at: row.get(2)?,
+                    mode: row.get(3)?,
+                    result: row.get(4)?,
+                })
+            })
+            .map_err(|e| UrdError::State(format!("query failed: {e}")))?;
+
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| UrdError::State(format!("failed to read runs: {e}")))
+    }
+
+    /// Get all operations for a specific run.
+    #[allow(dead_code)]
+    pub fn run_operations(&self, run_id: i64) -> crate::error::Result<Vec<OperationRow>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, run_id, subvolume, operation, drive_label, duration_secs, result, error_message, bytes_transferred
+                 FROM operations WHERE run_id = ?1 ORDER BY id",
+            )
+            .map_err(|e| UrdError::State(format!("query failed: {e}")))?;
+
+        let rows = stmt
+            .query_map([run_id], Self::map_operation_row)
+            .map_err(|e| UrdError::State(format!("query failed: {e}")))?;
+
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| UrdError::State(format!("failed to read operations: {e}")))
+    }
+
+    /// Get recent operations for a specific subvolume.
+    pub fn subvolume_history(
+        &self,
+        name: &str,
+        limit: usize,
+    ) -> crate::error::Result<Vec<OperationRow>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, run_id, subvolume, operation, drive_label, duration_secs, result, error_message, bytes_transferred
+                 FROM operations WHERE subvolume = ?1 ORDER BY id DESC LIMIT ?2",
+            )
+            .map_err(|e| UrdError::State(format!("query failed: {e}")))?;
+
+        let rows = stmt
+            .query_map(rusqlite::params![name, limit as i64], Self::map_operation_row)
+            .map_err(|e| UrdError::State(format!("query failed: {e}")))?;
+
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| UrdError::State(format!("failed to read operations: {e}")))
+    }
+
+    /// Get recent failed operations across all subvolumes.
+    pub fn recent_failures(&self, limit: usize) -> crate::error::Result<Vec<OperationRow>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, run_id, subvolume, operation, drive_label, duration_secs, result, error_message, bytes_transferred
+                 FROM operations WHERE result = 'failure' ORDER BY id DESC LIMIT ?1",
+            )
+            .map_err(|e| UrdError::State(format!("query failed: {e}")))?;
+
+        let rows = stmt
+            .query_map([limit as i64], Self::map_operation_row)
+            .map_err(|e| UrdError::State(format!("query failed: {e}")))?;
+
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| UrdError::State(format!("failed to read operations: {e}")))
+    }
+
+    fn map_operation_row(row: &rusqlite::Row) -> rusqlite::Result<OperationRow> {
+        Ok(OperationRow {
+            id: row.get(0)?,
+            run_id: row.get(1)?,
+            subvolume: row.get(2)?,
+            operation: row.get(3)?,
+            drive_label: row.get(4)?,
+            duration_secs: row.get(5)?,
+            result: row.get(6)?,
+            error_message: row.get(7)?,
+            bytes_transferred: row.get(8)?,
+        })
     }
 }
 
@@ -262,5 +411,115 @@ mod tests {
         db.finish_run(run_id, "success").unwrap();
 
         assert!(db_path.exists());
+    }
+
+    // ── Query method tests ─────────────────────────────────────────────
+
+    fn seed_db(db: &StateDb) -> (i64, i64) {
+        let r1 = db.begin_run("full").unwrap();
+        db.record_operation(&OperationRecord {
+            run_id: r1,
+            subvolume: "htpc-home".to_string(),
+            operation: "snapshot".to_string(),
+            drive_label: None,
+            duration_secs: Some(0.5),
+            result: "success".to_string(),
+            error_message: None,
+            bytes_transferred: None,
+        })
+        .unwrap();
+        db.record_operation(&OperationRecord {
+            run_id: r1,
+            subvolume: "htpc-home".to_string(),
+            operation: "send_incremental".to_string(),
+            drive_label: Some("WD-18TB".to_string()),
+            duration_secs: Some(120.0),
+            result: "success".to_string(),
+            error_message: None,
+            bytes_transferred: Some(1_000_000),
+        })
+        .unwrap();
+        db.finish_run(r1, "success").unwrap();
+
+        let r2 = db.begin_run("full").unwrap();
+        db.record_operation(&OperationRecord {
+            run_id: r2,
+            subvolume: "subvol3-opptak".to_string(),
+            operation: "send_full".to_string(),
+            drive_label: Some("WD-18TB".to_string()),
+            duration_secs: Some(300.0),
+            result: "failure".to_string(),
+            error_message: Some("No space left".to_string()),
+            bytes_transferred: None,
+        })
+        .unwrap();
+        db.finish_run(r2, "partial").unwrap();
+
+        (r1, r2)
+    }
+
+    #[test]
+    fn last_run_returns_most_recent() {
+        let db = StateDb::open_memory().unwrap();
+        assert!(db.last_run().unwrap().is_none());
+
+        let (_r1, r2) = seed_db(&db);
+        let last = db.last_run().unwrap().unwrap();
+        assert_eq!(last.id, r2);
+        assert_eq!(last.result, "partial");
+        assert_eq!(last.mode, "full");
+    }
+
+    #[test]
+    fn recent_runs_respects_limit() {
+        let db = StateDb::open_memory().unwrap();
+        seed_db(&db);
+
+        let all = db.recent_runs(10).unwrap();
+        assert_eq!(all.len(), 2);
+        assert!(all[0].id > all[1].id); // newest first
+
+        let one = db.recent_runs(1).unwrap();
+        assert_eq!(one.len(), 1);
+    }
+
+    #[test]
+    fn run_operations_returns_ops_for_run() {
+        let db = StateDb::open_memory().unwrap();
+        let (r1, r2) = seed_db(&db);
+
+        let ops1 = db.run_operations(r1).unwrap();
+        assert_eq!(ops1.len(), 2);
+        assert_eq!(ops1[0].operation, "snapshot");
+        assert_eq!(ops1[1].operation, "send_incremental");
+
+        let ops2 = db.run_operations(r2).unwrap();
+        assert_eq!(ops2.len(), 1);
+        assert_eq!(ops2[0].result, "failure");
+    }
+
+    #[test]
+    fn subvolume_history_filters_by_name() {
+        let db = StateDb::open_memory().unwrap();
+        seed_db(&db);
+
+        let home_ops = db.subvolume_history("htpc-home", 10).unwrap();
+        assert_eq!(home_ops.len(), 2);
+        assert!(home_ops.iter().all(|o| o.subvolume == "htpc-home"));
+
+        let opptak_ops = db.subvolume_history("subvol3-opptak", 10).unwrap();
+        assert_eq!(opptak_ops.len(), 1);
+        assert_eq!(opptak_ops[0].result, "failure");
+    }
+
+    #[test]
+    fn recent_failures_returns_only_failures() {
+        let db = StateDb::open_memory().unwrap();
+        seed_db(&db);
+
+        let failures = db.recent_failures(10).unwrap();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].subvolume, "subvol3-opptak");
+        assert_eq!(failures[0].error_message.as_deref(), Some("No space left"));
     }
 }

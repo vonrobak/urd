@@ -43,6 +43,19 @@ pub fn external_snapshot_dir(drive: &DriveConfig, subvol_name: &str) -> PathBuf 
     drive.mount_path.join(&drive.snapshot_root).join(subvol_name)
 }
 
+/// Get the mount status and free bytes of the first mounted drive in the config.
+/// Returns (any_mounted, free_bytes). For bash-compatible metrics (single drive assumption).
+#[must_use]
+pub fn first_mounted_drive_status(config: &crate::config::Config) -> (bool, u64) {
+    for drive in &config.drives {
+        if is_drive_mounted(drive) {
+            let free = filesystem_free_bytes(&drive.mount_path).unwrap_or(0);
+            return (true, free);
+        }
+    }
+    (false, 0)
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]

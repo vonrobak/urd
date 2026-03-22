@@ -24,17 +24,8 @@ fn main() -> anyhow::Result<()> {
         Commands::Plan(args) => commands::plan_cmd::run(config, args),
         Commands::Backup(args) => commands::backup::run(config, args),
         Commands::Init => commands::init::run(config),
-        Commands::Status => {
-            eprintln!("Not implemented yet — coming in Phase 3");
-            Ok(())
-        }
-        Commands::History => {
-            eprintln!("Not implemented yet — coming in Phase 3");
-            Ok(())
-        }
-        Commands::Verify => {
-            eprintln!("Not implemented yet — coming in Phase 3");
-            Ok(())
-        }
+        Commands::Status => commands::status::run(config),
+        Commands::History(args) => commands::history::run(config, args),
+        Commands::Verify(args) => commands::verify::run(config, args),
     }
 }
