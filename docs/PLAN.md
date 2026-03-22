@@ -376,17 +376,37 @@ The executor takes a `BackupPlan` and executes each operation sequentially. Its 
 
 **Operation ordering:** Within a subvolume, operations execute in plan order: create → send → delete. This ensures new snapshots exist before sends reference them, and deletions happen after sends complete. This ordering is load-bearing — the planner emits operations in this order (see comment in `plan()`) and the executor relies on it.
 
-### Phase 3: CLI + Parallel Run (Sessions 5-6)
+### Phase 3: CLI + Parallel Run (Sessions 5-6) ✅
 
 **Goal:** Full CLI, parallel running with bash script for validation.
 
-- `commands/status.rs` — mounted drives, chain health, snapshot counts, last run
-- `commands/history.rs` — SQLite queries, formatted table
-- `commands/verify.rs` — chain integrity, pin file validation
-- Create systemd units (urd-backup.service + timer)
-- Parallel run: Urd at 02:00, bash at 03:00
-- Compare Prometheus metrics between both systems
-- Fix behavioral differences
+**New commands:**
+- `commands/status.rs` — per-subvolume table (local/external counts, chain health), drive summary, last run from SQLite
+- `commands/history.rs` — recent runs, `--subvolume` filter, `--failures`, `--last N`
+- `commands/verify.rs` — pin file validation, pinned snapshot existence (local + external), orphan detection, stale pin detection
+
+**New CLI args:**
+- `HistoryArgs`: `--last N` (default 10), `--subvolume NAME`, `--failures`
+- `VerifyArgs`: `--subvolume NAME`, `--drive LABEL`
+
+**StateDb query methods added:**
+- `last_run()`, `recent_runs(limit)`, `run_operations(run_id)`, `subvolume_history(name, limit)`, `recent_failures(limit)`
+- New types: `RunRecord`, `OperationRow` (query result types separate from write type `OperationRecord`)
+
+**Adversary review fixes applied:**
+- Fixed `to_string_lossy()` in `RealBtrfs` — `create_readonly_snapshot` and `delete_subvolume` now use `.arg(path)` directly on `Command` instead of `run_btrfs(&[&str])`. The `run_btrfs` helper was removed entirely.
+- Extracted `first_mounted_drive_status()` to `drives.rs` for reuse by `status.rs`
+- Consolidated duplicate metrics helpers in `backup.rs` (`append_skipped_metrics`, `write_global_metrics`)
+
+**Systemd units:**
+- `systemd/urd-backup.service` — oneshot service, `ExecStart=%h/.cargo/bin/urd backup`
+- `systemd/urd-backup.timer` — 02:00 daily, `Persistent=true`, `RandomizedDelaySec=300`
+
+**Parallel run strategy:**
+- Pin file contention: no separate namespaces needed. Atomic writes + 1-hour separation sufficient. Last writer wins (correct behavior — pin should reflect most recent successful send).
+- Timing: Urd at 02:00, bash at 03:00. Separate lock files (can technically overlap, but btrfs ops on different subvolumes are safe concurrently).
+- Install: `cp systemd/*.{service,timer} ~/.config/systemd/user/ && systemctl --user daemon-reload && systemctl --user enable --now urd-backup.timer`
+- Change bash timer: `systemctl --user edit btrfs-backup-daily.timer` → set `OnCalendar=*-*-* 03:00:00`
 
 **Deliverable:** Both systems running nightly with equivalent results.
 

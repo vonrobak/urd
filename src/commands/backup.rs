@@ -181,7 +181,6 @@ fn write_metrics_after_execution(
             None
         };
 
-        // Re-scan snapshot directories for accurate counts
         let local_count = count_local_snapshots(config, &sv_result.name, fs_state);
         let external_count = count_external_snapshots(config, &sv_result.name, fs_state);
 
@@ -197,33 +196,9 @@ fn write_metrics_after_execution(
     }
 
     // Metrics for skipped subvolumes
-    for (name, _reason) in &plan.skipped {
-        let local_count = count_local_snapshots(config, name, fs_state);
-        let external_count = count_external_snapshots(config, name, fs_state);
+    append_skipped_metrics(config, plan, fs_state, &mut subvolume_metrics);
 
-        subvolume_metrics.push(SubvolumeMetrics {
-            name: name.clone(),
-            success: 2, // schedule-skipped
-            last_success_timestamp: None,
-            duration_seconds: 0,
-            local_snapshot_count: local_count,
-            external_snapshot_count: external_count,
-            send_type: 2, // no send
-        });
-    }
-
-    // Global metrics
-    let (drive_mounted, free_bytes) = get_drive_status(config);
-
-    let data = MetricsData {
-        subvolumes: subvolume_metrics,
-        external_drive_mounted: drive_mounted,
-        external_free_bytes: free_bytes,
-        script_last_run_timestamp: now_ts,
-    };
-
-    metrics::write_metrics(&config.general.metrics_file, &data)?;
-    Ok(())
+    write_global_metrics(config, now_ts, subvolume_metrics)
 }
 
 fn write_metrics_for_skipped(
@@ -235,9 +210,20 @@ fn write_metrics_for_skipped(
     let fs_state = RealFileSystemState;
     let mut subvolume_metrics = Vec::new();
 
+    append_skipped_metrics(config, plan, &fs_state, &mut subvolume_metrics);
+
+    write_global_metrics(config, now_ts, subvolume_metrics)
+}
+
+fn append_skipped_metrics(
+    config: &Config,
+    plan: &crate::types::BackupPlan,
+    fs_state: &RealFileSystemState,
+    subvolume_metrics: &mut Vec<SubvolumeMetrics>,
+) {
     for (name, _reason) in &plan.skipped {
-        let local_count = count_local_snapshots(config, name, &fs_state);
-        let external_count = count_external_snapshots(config, name, &fs_state);
+        let local_count = count_local_snapshots(config, name, fs_state);
+        let external_count = count_external_snapshots(config, name, fs_state);
 
         subvolume_metrics.push(SubvolumeMetrics {
             name: name.clone(),
@@ -249,8 +235,14 @@ fn write_metrics_for_skipped(
             send_type: 2,
         });
     }
+}
 
-    let (drive_mounted, free_bytes) = get_drive_status(config);
+fn write_global_metrics(
+    config: &Config,
+    now_ts: i64,
+    subvolume_metrics: Vec<SubvolumeMetrics>,
+) -> anyhow::Result<()> {
+    let (drive_mounted, free_bytes) = drives::first_mounted_drive_status(config);
 
     let data = MetricsData {
         subvolumes: subvolume_metrics,
@@ -293,14 +285,4 @@ fn count_external_snapshots(
         }
     }
     0
-}
-
-fn get_drive_status(config: &Config) -> (bool, u64) {
-    for drive in &config.drives {
-        if drives::is_drive_mounted(drive) {
-            let free = drives::filesystem_free_bytes(&drive.mount_path).unwrap_or(0);
-            return (true, free);
-        }
-    }
-    (false, 0)
 }
