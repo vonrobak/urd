@@ -71,9 +71,13 @@ This separation is the most important architectural property of Urd. Do not bypa
 
 These formats MUST be preserved exactly (the existing bash backup system and monitoring depend on them):
 
-1. **Snapshot naming:** `YYYYMMDD-<short_name>` (e.g., `20260322-opptak`)
+1. **Snapshot naming:**
+   - **Legacy (read-only):** `YYYYMMDD-<short_name>` (e.g., `20260322-opptak`) — parsed as midnight. Existing snapshots in this format are recognized and handled correctly by `SnapshotName::parse()`.
+   - **Current (write):** `YYYYMMDD-HHMM-<short_name>` (e.g., `20260322-1430-opptak`) — all new snapshots use this format to support sub-daily snapshot intervals (e.g., 15-minute intervals on htpc-home).
+   - **Coexistence:** Both formats may exist in the same snapshot directory. Retention, send, and display logic handle both transparently. Ordering is by datetime, not string comparison.
+   - **Phase 3 note:** During parallel running, the bash script may not recognize HHMM-format names. This is acceptable — the bash script only manages snapshots it created (matched by its own naming convention). Urd manages all snapshots in the directory regardless of format.
 2. **Snapshot directories:** `<snapshot_root>/<subvolume_name>/` (e.g., `.snapshots/subvol3-opptak/`)
-3. **Pin files:** `.last-external-parent-<DRIVE_LABEL>` in the subvolume's local snapshot directory
+3. **Pin files:** `.last-external-parent-<DRIVE_LABEL>` in the subvolume's local snapshot directory. May contain either legacy or current snapshot name format.
 4. **Prometheus metrics:** exact metric names, labels, and value semantics (see `docs/PLAN.md` for full list)
 
 ### BTRFS Commands

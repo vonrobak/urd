@@ -35,7 +35,7 @@ pub fn run(config: Config, args: PlanArgs) -> anyhow::Result<()> {
         let ops: Vec<_> = backup_plan
             .operations
             .iter()
-            .filter(|op| op_belongs_to(op, &subvol.name))
+            .filter(|op| op_subvolume_name(op) == subvol.name)
             .collect();
         let skips: Vec<_> = backup_plan
             .skipped
@@ -73,24 +73,12 @@ pub fn run(config: Config, args: PlanArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn op_belongs_to(op: &PlannedOperation, subvol_name: &str) -> bool {
+fn op_subvolume_name(op: &PlannedOperation) -> &str {
     match op {
-        PlannedOperation::CreateSnapshot {
-            subvolume_name, ..
-        } => subvolume_name == subvol_name,
-        PlannedOperation::SendIncremental { snapshot, .. }
-        | PlannedOperation::SendFull { snapshot, .. } => snapshot
-            .parent()
-            .and_then(|p| p.file_name())
-            .is_some_and(|dir| dir.to_string_lossy() == subvol_name),
-        PlannedOperation::DeleteSnapshot { path, .. } => path
-            .parent()
-            .and_then(|p| p.file_name())
-            .is_some_and(|dir| dir.to_string_lossy() == subvol_name),
-        PlannedOperation::PinParent { pin_file, .. } => pin_file
-            .parent()
-            .and_then(|p| p.file_name())
-            .is_some_and(|dir| dir.to_string_lossy() == subvol_name),
+        PlannedOperation::CreateSnapshot { subvolume_name, .. }
+        | PlannedOperation::SendIncremental { subvolume_name, .. }
+        | PlannedOperation::SendFull { subvolume_name, .. }
+        | PlannedOperation::DeleteSnapshot { subvolume_name, .. } => subvolume_name,
     }
 }
 
@@ -108,14 +96,16 @@ fn print_operation(op: &PlannedOperation) {
             snapshot,
             drive_label,
             parent,
+            pin_on_success,
             ..
         } => {
             let parent_name = parent
                 .file_name()
                 .unwrap_or_default()
                 .to_string_lossy();
+            let pin_suffix = if pin_on_success.is_some() { " + pin" } else { "" };
             println!(
-                "  {}   {} -> {} (incremental, parent: {})",
+                "  {}   {} -> {} (incremental, parent: {}){pin_suffix}",
                 "[SEND]".blue(),
                 snapshot.file_name().unwrap_or_default().to_string_lossy(),
                 drive_label,
@@ -125,32 +115,23 @@ fn print_operation(op: &PlannedOperation) {
         PlannedOperation::SendFull {
             snapshot,
             drive_label,
+            pin_on_success,
             ..
         } => {
+            let pin_suffix = if pin_on_success.is_some() { " + pin" } else { "" };
             println!(
-                "  {}   {} -> {} (full)",
+                "  {}   {} -> {} (full){pin_suffix}",
                 "[SEND]".blue(),
                 snapshot.file_name().unwrap_or_default().to_string_lossy(),
                 drive_label,
             );
         }
-        PlannedOperation::DeleteSnapshot { path, reason } => {
+        PlannedOperation::DeleteSnapshot { path, reason, .. } => {
             println!(
                 "  {} {} ({})",
                 "[DELETE]".yellow(),
                 path.file_name().unwrap_or_default().to_string_lossy(),
                 reason
-            );
-        }
-        PlannedOperation::PinParent {
-            pin_file,
-            snapshot_name,
-        } => {
-            println!(
-                "  {}    {} = {}",
-                "[PIN]".dimmed(),
-                pin_file.file_name().unwrap_or_default().to_string_lossy(),
-                snapshot_name
             );
         }
     }

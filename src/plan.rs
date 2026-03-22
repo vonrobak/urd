@@ -175,6 +175,20 @@ fn plan_local_snapshot(
 ) {
     // Check if interval has elapsed since newest snapshot
     let newest = local_snaps.iter().max();
+
+    // Warn if the newest snapshot is dated in the future (clock skew)
+    if let Some(newest) = newest
+        && newest.datetime() > now
+    {
+        log::warn!(
+            "Subvolume {}: newest snapshot {} is dated in the future ({}); \
+             automatic snapshots will be suppressed until clock catches up",
+            subvol.name,
+            newest,
+            newest.datetime().format("%Y-%m-%d %H:%M"),
+        );
+    }
+
     let should_create = if force {
         true
     } else if let Some(newest) = newest {
@@ -221,6 +235,34 @@ fn plan_local_retention(
         return;
     }
 
+    // Protect unsent snapshots from retention deletion.
+    // If send is enabled, snapshots newer than the oldest pin may not have been
+    // sent to all drives yet. Deleting them would lose the only local copy before
+    // it reaches external storage — one step from silent data loss.
+    let protected = if subvol.send_enabled {
+        let oldest_pin = pinned.iter().min();
+        let mut expanded = pinned.clone();
+        match oldest_pin {
+            Some(oldest) => {
+                for snap in local_snaps {
+                    if snap > oldest {
+                        expanded.insert(snap.clone());
+                    }
+                }
+            }
+            None => {
+                // No pins at all — nothing has ever been sent externally.
+                // Protect all local snapshots until the first send succeeds.
+                for snap in local_snaps {
+                    expanded.insert(snap.clone());
+                }
+            }
+        }
+        expanded
+    } else {
+        pinned.clone()
+    };
+
     // Check space pressure
     let min_free = config.root_min_free_bytes(&subvol.name).unwrap_or(0);
     let free_bytes = fs.filesystem_free_bytes(local_dir).unwrap_or(u64::MAX);
@@ -230,7 +272,7 @@ fn plan_local_retention(
         local_snaps,
         now,
         &subvol.local_retention,
-        pinned,
+        &protected,
         space_pressure,
     );
 
@@ -238,6 +280,7 @@ fn plan_local_retention(
         operations.push(PlannedOperation::DeleteSnapshot {
             path: local_dir.join(snap.as_str()),
             reason,
+            subvolume_name: subvol.name.clone(),
         });
     }
 }
@@ -309,6 +352,11 @@ fn plan_external_send(
         false
     };
 
+    let pin_info = Some((
+        local_dir.join(format!(".last-external-parent-{}", drive.label)),
+        snap_to_send.clone(),
+    ));
+
     if is_incremental {
         let parent_name = pin.unwrap();
         let parent_path = local_dir.join(parent_name.as_str());
@@ -317,21 +365,18 @@ fn plan_external_send(
             snapshot: snap_path,
             dest_dir: ext_dir,
             drive_label: drive.label.clone(),
+            subvolume_name: subvol.name.clone(),
+            pin_on_success: pin_info,
         });
     } else {
         operations.push(PlannedOperation::SendFull {
             snapshot: snap_path,
             dest_dir: ext_dir,
             drive_label: drive.label.clone(),
+            subvolume_name: subvol.name.clone(),
+            pin_on_success: pin_info,
         });
     }
-
-    // Pin the sent snapshot
-    let pin_file = local_dir.join(format!(".last-external-parent-{}", drive.label));
-    operations.push(PlannedOperation::PinParent {
-        pin_file,
-        snapshot_name: snap_to_send.clone(),
-    });
 }
 
 fn plan_external_retention(
@@ -365,6 +410,7 @@ fn plan_external_retention(
         operations.push(PlannedOperation::DeleteSnapshot {
             path: ext_dir.join(snap.as_str()),
             reason,
+            subvolume_name: subvol.name.clone(),
         });
     }
 }
@@ -884,7 +930,7 @@ send_enabled = false
     }
 
     #[test]
-    fn pin_parent_emitted_after_send() {
+    fn send_includes_pin_info() {
         let config = test_config();
         let mut fs = MockFileSystemState::new();
         fs.local_snapshots.insert(
@@ -898,11 +944,167 @@ send_enabled = false
             ..PlanFilters::default()
         };
         let result = plan(&config, now(), &filters, &fs).unwrap();
-        let pins: Vec<_> = result
+        let sends_with_pin: Vec<_> = result
             .operations
             .iter()
-            .filter(|op| matches!(op, PlannedOperation::PinParent { .. }))
+            .filter(|op| matches!(op,
+                PlannedOperation::SendFull { pin_on_success: Some(_), .. }
+                | PlannedOperation::SendIncremental { pin_on_success: Some(_), .. }
+            ))
             .collect();
-        assert_eq!(pins.len(), 1);
+        assert_eq!(sends_with_pin.len(), 1);
+    }
+
+    #[test]
+    fn unsent_snapshots_protected_from_retention() {
+        // sv1 has send_enabled=true (via defaults). Pin points to an older snapshot.
+        // Snapshots newer than the pin should be protected from retention.
+        let config = test_config();
+        let mut fs = MockFileSystemState::new();
+        let pin_snap = snap("20260320-1000-one");
+        // Create snapshots: the pinned one, plus two newer ones in the daily window
+        // (outside hourly window so they'd normally be thinned to 1/day)
+        fs.local_snapshots.insert(
+            "sv1".to_string(),
+            vec![
+                pin_snap.clone(),
+                snap("20260320-1400-one"), // same day as pin, normally would be thinned
+                snap("20260321-1000-one"),
+                snap("20260322-1500-one"), // newest
+            ],
+        );
+        fs.pin_files.insert(
+            (PathBuf::from("/snap/sv1"), "D1".to_string()),
+            pin_snap,
+        );
+
+        let filters = PlanFilters {
+            subvolume: Some("sv1".to_string()),
+            local_only: true,
+            ..PlanFilters::default()
+        };
+        let result = plan(&config, now(), &filters, &fs).unwrap();
+        // All snapshots newer than the pin should be protected (not deleted)
+        let deletes: Vec<_> = result
+            .operations
+            .iter()
+            .filter(|op| matches!(op, PlannedOperation::DeleteSnapshot { .. }))
+            .collect();
+        // The 20260320-1400-one snapshot is newer than pin and should be protected
+        assert!(
+            !deletes.iter().any(|op| matches!(op,
+                PlannedOperation::DeleteSnapshot { path, .. } if path.to_string_lossy().contains("20260320-1400")
+            )),
+            "Unsent snapshot newer than pin should not be deleted"
+        );
+    }
+
+    #[test]
+    fn all_snapshots_protected_when_no_pin() {
+        // send_enabled=true but no pin files — nothing has ever been sent.
+        // All snapshots should be protected from retention deletion.
+        let config = test_config();
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots.insert(
+            "sv1".to_string(),
+            vec![
+                snap("20260318-1000-one"), // 4 days old, outside hourly, in daily window
+                snap("20260319-1000-one"),
+                snap("20260320-1000-one"),
+                snap("20260322-1500-one"),
+            ],
+        );
+
+        let filters = PlanFilters {
+            subvolume: Some("sv1".to_string()),
+            local_only: true,
+            ..PlanFilters::default()
+        };
+        let result = plan(&config, now(), &filters, &fs).unwrap();
+        let deletes: Vec<_> = result
+            .operations
+            .iter()
+            .filter(|op| matches!(op, PlannedOperation::DeleteSnapshot { .. }))
+            .collect();
+        assert_eq!(deletes.len(), 0, "No snapshots should be deleted when nothing has been sent externally");
+    }
+
+    #[test]
+    fn send_disabled_no_unsent_protection() {
+        // Subvolume with send_enabled=false — retention should work normally
+        let toml_str = r#"
+[general]
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp"
+
+[local_snapshots]
+roots = [{ path = "/snap", subvolumes = ["sv"] }]
+
+[defaults]
+snapshot_interval = "1h"
+send_interval = "4h"
+[defaults.local_retention]
+hourly = 24
+daily = 30
+[defaults.external_retention]
+daily = 30
+
+[[drives]]
+label = "D1"
+mount_path = "/mnt/d1"
+snapshot_root = ".snapshots"
+role = "test"
+
+[[subvolumes]]
+name = "sv"
+short_name = "sv"
+source = "/data/sv"
+send_enabled = false
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let mut fs = MockFileSystemState::new();
+        // Multiple snapshots on the same day outside hourly window — should be thinned
+        fs.local_snapshots.insert(
+            "sv".to_string(),
+            vec![
+                snap("20260320-0800-sv"),
+                snap("20260320-1000-sv"),
+                snap("20260320-1400-sv"),
+                snap("20260322-1500-sv"),
+            ],
+        );
+
+        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let deletes: Vec<_> = result
+            .operations
+            .iter()
+            .filter(|op| matches!(op, PlannedOperation::DeleteSnapshot { .. }))
+            .collect();
+        // With send_enabled=false, daily thinning should delete the 0800 and 1000 snapshots
+        assert!(deletes.len() >= 2, "Retention should thin normally when send is disabled");
+    }
+
+    #[test]
+    fn future_dated_snapshot_suppresses_creation() {
+        let config = test_config();
+        let mut fs = MockFileSystemState::new();
+        // Snapshot dated 1 hour in the future
+        fs.local_snapshots.insert(
+            "sv1".to_string(),
+            vec![snap("20260322-1600-one")], // now() is 15:00, this is 16:00
+        );
+
+        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let creates: Vec<_> = result
+            .operations
+            .iter()
+            .filter(|op| matches!(op, PlannedOperation::CreateSnapshot { subvolume_name, .. } if subvolume_name == "sv1"))
+            .collect();
+        assert_eq!(creates.len(), 0, "No snapshot should be created when newest is in the future");
+        assert!(
+            result.skipped.iter().any(|(name, reason)| name == "sv1" && reason.contains("interval")),
+            "Should report interval not elapsed for future-dated snapshot"
+        );
     }
 }
