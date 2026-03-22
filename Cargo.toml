@@ -31,8 +31,6 @@ ctrlc = "3"
 
 # Output formatting
 colored = "2"
-tabled = "0.17"
-
 # Logging
 log = "0.4"
 env_logger = "0.11"

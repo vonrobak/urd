@@ -123,37 +123,6 @@ pub fn graduated_retention(
     RetentionResult { keep, delete }
 }
 
-/// Simple count-based retention: keep the newest `count` snapshots.
-/// Pinned snapshots are never deleted.
-#[must_use]
-#[allow(dead_code)]
-pub fn count_retention(
-    snapshots: &[SnapshotName],
-    count: u32,
-    pinned: &HashSet<SnapshotName>,
-) -> RetentionResult {
-    let mut sorted: Vec<SnapshotName> = snapshots.to_vec();
-    sorted.sort();
-    sorted.reverse(); // newest first
-
-    let mut keep = Vec::new();
-    let mut delete = Vec::new();
-    let mut kept = 0u32;
-
-    for snap in sorted {
-        if kept < count {
-            keep.push(snap);
-            kept += 1;
-        } else if pinned.contains(&snap) {
-            keep.push(snap);
-        } else {
-            delete.push((snap, format!("count retention: exceeds limit of {count}")));
-        }
-    }
-
-    RetentionResult { keep, delete }
-}
-
 /// Space-governed retention with graduated thinning.
 ///
 /// First applies graduated thinning, then if the estimated remaining space
@@ -327,54 +296,6 @@ mod tests {
         // Hour 12: keep 1245
         assert_eq!(result.keep.len(), 3);
         assert_eq!(result.delete.len(), 2);
-    }
-
-    #[test]
-    fn count_retention_basic() {
-        let snaps = vec![
-            make_daily_snap("20260322", "home"),
-            make_daily_snap("20260321", "home"),
-            make_daily_snap("20260320", "home"),
-            make_daily_snap("20260319", "home"),
-            make_daily_snap("20260318", "home"),
-        ];
-        let result = count_retention(&snaps, 3, &HashSet::new());
-        assert_eq!(result.keep.len(), 3);
-        assert_eq!(result.delete.len(), 2);
-        // Newest 3 kept
-        assert_eq!(result.keep[0].as_str(), "20260322-home");
-        assert_eq!(result.keep[1].as_str(), "20260321-home");
-        assert_eq!(result.keep[2].as_str(), "20260320-home");
-    }
-
-    #[test]
-    fn count_retention_fewer_than_limit() {
-        let snaps = vec![
-            make_daily_snap("20260322", "home"),
-            make_daily_snap("20260321", "home"),
-        ];
-        let result = count_retention(&snaps, 5, &HashSet::new());
-        assert_eq!(result.keep.len(), 2);
-        assert!(result.delete.is_empty());
-    }
-
-    #[test]
-    fn count_retention_pinned_protection() {
-        let old = make_daily_snap("20260318", "home");
-        let snaps = vec![
-            make_daily_snap("20260322", "home"),
-            make_daily_snap("20260321", "home"),
-            make_daily_snap("20260320", "home"),
-            old.clone(),
-        ];
-        let mut pinned = HashSet::new();
-        pinned.insert(old.clone());
-
-        let result = count_retention(&snaps, 2, &pinned);
-        assert_eq!(result.keep.len(), 3); // 2 newest + 1 pinned
-        assert!(result.keep.contains(&old));
-        assert_eq!(result.delete.len(), 1);
-        assert_eq!(result.delete[0].0.as_str(), "20260320-home");
     }
 
     #[test]

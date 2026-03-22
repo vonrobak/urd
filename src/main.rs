@@ -16,8 +16,16 @@ use clap::Parser;
 use cli::{Cli, Commands};
 
 fn main() -> anyhow::Result<()> {
-    env_logger::init();
     let cli = Cli::parse();
+
+    env_logger::Builder::new()
+        .filter_level(if cli.verbose {
+            log::LevelFilter::Debug
+        } else {
+            log::LevelFilter::Warn
+        })
+        .parse_default_env() // RUST_LOG still overrides if set
+        .init();
     let config = config::Config::load(cli.config.as_deref())?;
 
     match cli.command {

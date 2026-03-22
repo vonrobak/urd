@@ -293,6 +293,10 @@ impl Config {
         validate_path_safe(&self.general.state_db, "general.state_db")?;
         validate_path_safe(&self.general.metrics_file, "general.metrics_file")?;
         validate_path_safe(&self.general.log_dir, "general.log_dir")?;
+        validate_path_safe(
+            std::path::Path::new(&self.general.btrfs_path),
+            "general.btrfs_path",
+        )?;
 
         for root in &self.local_snapshots.roots {
             validate_path_safe(&root.path, "snapshot root path")?;

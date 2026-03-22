@@ -21,15 +21,15 @@ pub struct Cli {
 pub enum Commands {
     /// Show planned backup operations without executing
     Plan(PlanArgs),
-    /// Run backup
+    /// Create snapshots, send to external drives, run retention
     Backup(BackupArgs),
-    /// Show system status
+    /// Show snapshot counts, drive status, chain health
     Status,
     /// Show backup history
     History(HistoryArgs),
-    /// Verify chain integrity
+    /// Verify incremental chain integrity and pin file health
     Verify(VerifyArgs),
-    /// Initialize state from existing snapshots
+    /// Initialize state database and validate system readiness
     Init,
 }
 
