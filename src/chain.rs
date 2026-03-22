@@ -65,6 +65,32 @@ pub fn find_pinned_snapshots(
     pinned
 }
 
+/// Write the pin file for a specific drive in a local snapshot directory.
+/// Records the last successfully sent snapshot name.
+/// Uses atomic write (temp file + rename) to prevent corruption.
+pub fn write_pin_file(
+    local_snapshot_dir: &Path,
+    drive_label: &str,
+    snapshot_name: &SnapshotName,
+) -> crate::error::Result<()> {
+    let final_path = local_snapshot_dir.join(format!(".last-external-parent-{drive_label}"));
+    let tmp_path = local_snapshot_dir.join(format!(".last-external-parent-{drive_label}.tmp"));
+
+    std::fs::write(&tmp_path, format!("{}\n", snapshot_name.as_str())).map_err(|e| {
+        UrdError::Io {
+            path: tmp_path.clone(),
+            source: e,
+        }
+    })?;
+
+    std::fs::rename(&tmp_path, &final_path).map_err(|e| UrdError::Io {
+        path: final_path,
+        source: e,
+    })?;
+
+    Ok(())
+}
+
 fn try_read_pin(path: &Path) -> crate::error::Result<Option<SnapshotName>> {
     match std::fs::read_to_string(path) {
         Ok(content) => {
@@ -193,6 +219,41 @@ mod tests {
         assert_eq!(pinned.len(), 2);
         assert!(pinned.iter().any(|s| s.as_str() == "20260322-opptak"));
         assert!(pinned.iter().any(|s| s.as_str() == "20260321-opptak"));
+    }
+
+    #[test]
+    fn write_and_read_pin_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let name = SnapshotName::parse("20260322-1430-opptak").unwrap();
+
+        write_pin_file(dir.path(), "WD-18TB", &name).unwrap();
+
+        let result = read_pin_file(dir.path(), "WD-18TB").unwrap();
+        assert_eq!(result.unwrap().as_str(), "20260322-1430-opptak");
+    }
+
+    #[test]
+    fn write_pin_overwrites_existing() {
+        let dir = TempDir::new().unwrap();
+        let old = SnapshotName::parse("20260321-opptak").unwrap();
+        let new = SnapshotName::parse("20260322-1430-opptak").unwrap();
+
+        write_pin_file(dir.path(), "WD-18TB", &old).unwrap();
+        write_pin_file(dir.path(), "WD-18TB", &new).unwrap();
+
+        let result = read_pin_file(dir.path(), "WD-18TB").unwrap();
+        assert_eq!(result.unwrap().as_str(), "20260322-1430-opptak");
+    }
+
+    #[test]
+    fn write_pin_no_tmp_file_remains() {
+        let dir = TempDir::new().unwrap();
+        let name = SnapshotName::parse("20260322-1430-opptak").unwrap();
+
+        write_pin_file(dir.path(), "WD-18TB", &name).unwrap();
+
+        let tmp = dir.path().join(".last-external-parent-WD-18TB.tmp");
+        assert!(!tmp.exists());
     }
 
     #[test]
