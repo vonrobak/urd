@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use chrono::{Datelike, NaiveDateTime, Timelike};
+use chrono::{Datelike, Months, NaiveDateTime, Timelike};
 
 use crate::types::{ResolvedGraduatedRetention, SnapshotName};
 
@@ -50,7 +50,15 @@ pub fn graduated_retention(
     let monthly_cutoff = if config.monthly == 0 {
         None // unlimited
     } else {
-        Some(weekly_cutoff - chrono::Duration::days(i64::from(config.monthly) * 30))
+        // Use calendar month subtraction for accurate window boundaries.
+        // Duration::days(n * 30) drifts ~5 days/year vs real calendar months.
+        // On overflow (unreachable for realistic configs), treat as unlimited
+        // rather than silently changing behavior.
+        Some(
+            weekly_cutoff
+                .checked_sub_months(Months::new(config.monthly))
+                .unwrap_or(NaiveDateTime::MIN),
+        )
     };
 
     // Track which day/week/month slots are already filled
@@ -416,5 +424,50 @@ mod tests {
         // All within daily window, all kept
         assert_eq!(result.keep.len(), 3);
         assert!(result.delete.is_empty());
+    }
+
+    #[test]
+    fn monthly_window_uses_calendar_months() {
+        // Regression: Duration::days(monthly * 30) drifts vs calendar months.
+        //
+        // With 6 months of monthly retention and now = 2026-03-22:
+        //   Calendar months: weekly_cutoff - 6 months ≈ 2025-09-22
+        //   Old days*30:     weekly_cutoff - 180 days ≈ 2025-09-23
+        //
+        // The divergence grows with larger values. With 12 months:
+        //   Calendar months: weekly_cutoff - 12 months ≈ 2025-03-22
+        //   Old days*30:     weekly_cutoff - 360 days ≈ 2025-03-28
+        //
+        // A snapshot between the two cutoffs would be deleted by days*30
+        // but kept by calendar months. This test targets that boundary.
+        let config = ResolvedGraduatedRetention {
+            hourly: 0,  // no hourly/daily/weekly windows — all snapshots land in monthly
+            daily: 0,
+            weekly: 0,
+            monthly: 12,
+        };
+        // now = 2026-03-22 15:00
+        // monthly_cutoff with calendar months ≈ 2025-03-22
+        // monthly_cutoff with days*30 = 2025-03-28
+        // A snapshot at 2025-03-25 falls between: kept by calendar, deleted by days*30
+        let boundary_snap = make_daily_snap("20250325", "home");
+        // A snapshot clearly beyond both cutoffs
+        let old_snap = make_daily_snap("20250101", "home");
+
+        let snaps = vec![
+            make_snap("20260322", "1400", "home"),
+            boundary_snap.clone(),
+            old_snap.clone(),
+        ];
+
+        let result = graduated_retention(&snaps, now(), &config, &HashSet::new(), false);
+        assert!(
+            result.keep.contains(&boundary_snap),
+            "Snapshot at calendar-month boundary (2025-03-25) should be kept with 12-month retention"
+        );
+        assert!(
+            result.delete.iter().any(|(s, _)| s == &old_snap),
+            "Snapshot from 14+ months ago should be beyond retention window"
+        );
     }
 }

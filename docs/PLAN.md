@@ -99,30 +99,40 @@ mount_path = "/run/media/patriark/2TB-backup"
 snapshot_root = ".snapshots"
 role = "test"
 
+[defaults]
+snapshot_interval = "1h"
+send_interval = "4h"
+send_enabled = true
+enabled = true
+
+[defaults.local_retention]
+hourly = 24
+daily = 30
+weekly = 26
+monthly = 12
+
+[defaults.external_retention]
+daily = 30
+weekly = 26
+monthly = 0                    # 0 = unlimited
+
 [[subvolumes]]
 name = "htpc-home"
 short_name = "htpc-home"
 source = "/home"
-tier = 1
-local_schedule = "daily"
-external_schedule = "daily"
-external_retention = 14
+priority = 1
+snapshot_interval = "15m"
+send_interval = "1h"
 
 [[subvolumes]]
 name = "subvol3-opptak"
 short_name = "opptak"
 source = "/mnt/btrfs-pool/subvol3-opptak"
-tier = 1
-local_schedule = "daily"
-external_schedule = "daily"
-external_retention = 14
+priority = 1
+snapshot_interval = "1h"
+send_interval = "2h"
 
-# ... (all 9 subvolumes, see full config in urd.toml.example)
-
-[retention.graduated]
-daily_keep = 14
-weekly_keep = 6
-monthly_keep = 3
+# ... (all 9 subvolumes, see config/urd.toml.example for full reference)
 ```
 
 ## Architecture: Key Design Principles
@@ -133,13 +143,14 @@ The planner is a **pure function**: `fn plan(config, state, now, filters) -> Bac
 
 ```rust
 enum PlannedOperation {
-    CreateSnapshot { source, dest },
-    SendIncremental { parent, snapshot, dest_dir, drive },
-    SendFull { snapshot, dest_dir, drive },
-    DeleteSnapshot { path, reason },
-    PinParent { local_dir, snapshot_name, drive },
+    CreateSnapshot { source, dest, subvolume_name },
+    SendIncremental { parent, snapshot, dest_dir, drive_label, subvolume_name, pin_on_success },
+    SendFull { snapshot, dest_dir, drive_label, subvolume_name, pin_on_success },
+    DeleteSnapshot { path, reason, subvolume_name },
 }
 ```
+
+Every variant carries `subvolume_name` so operations are self-describing — no path heuristics needed to determine ownership. Send variants carry `pin_on_success: Option<(PathBuf, SnapshotName)>` — the pin file is written by the executor only on successful send, making the send/pin dependency structural rather than implicit.
 
 `urd plan` prints the plan. `urd backup --dry-run` prints it. `urd backup` executes it. The planner is fully unit-testable without touching any filesystem.
 
@@ -160,14 +171,69 @@ pub trait BtrfsOps {
 
 Individual subvolume failures do NOT abort the run. Failed sends trigger partial cleanup. Pin files are only updated on success. Exit code 1 if any subvolume failed, 0 if all succeeded/skipped.
 
-### 4. Backward Compatibility
+### 4. Incremental Chain Integrity
 
-- Snapshot naming: `YYYYMMDD-shortname` preserved exactly
+The incremental send/receive chain is the most performance-critical property of the system. A broken chain forces a full send (potentially hundreds of GB) instead of a small incremental diff.
+
+**Invariant:** Retention (local or external) must never delete a snapshot that is the current pin parent for any drive. The system enforces this through:
+- Pin file targets are always in the `pinned` set and are never deleted by retention
+- Unsent snapshot protection: when `send_enabled` is true, snapshots newer than the oldest pin are protected from local retention (they may not have been sent to all drives yet)
+- The planner verifies the parent exists on both local and external before planning an incremental send; if not, it falls back to a full send
+
+**Corollary:** The executor must re-check space between deletions on external drives rather than batch-deleting everything the planner proposed, because the planner cannot know exact snapshot sizes.
+
+### 5. Backward Compatibility
+
+- Snapshot naming:
+  - **Current (write):** `YYYYMMDD-HHMM-shortname` (e.g., `20260322-1430-opptak`)
+  - **Legacy (read-only):** `YYYYMMDD-shortname` (e.g., `20260322-opptak`) — parsed as midnight
+  - Both formats coexist transparently in snapshot directories
 - Directory structure: same locations as bash script
-- Pin files: `.last-external-parent-{DRIVE_LABEL}` format preserved (read+write)
-- Prometheus metrics: identical names, labels, value semantics
+- Pin files: `.last-external-parent-{DRIVE_LABEL}` format preserved (read+write), with legacy `.last-external-parent` fallback for reading
+- Prometheus metrics: identical names, labels, value semantics (see Prometheus Metrics below)
+
+## Prometheus Metrics
+
+File: `~/containers/data/backup-metrics/backup.prom` (configurable via `metrics_file`).
+Written atomically (temp file + rename) to prevent partial reads by the Prometheus node exporter.
+
+The metrics format must match the bash script's output exactly. Grafana dashboards and alerting depend on these names and labels.
+
+### Per-subvolume metrics
+
+| Metric | Type | Labels | Values |
+|--------|------|--------|--------|
+| `backup_last_success_timestamp` | gauge | `subvolume` | Unix timestamp; only set when `backup_success=1` |
+| `backup_success` | gauge | `subvolume` | `1`=success, `0`=failure, `2`=schedule-skipped |
+| `backup_duration_seconds` | gauge | `subvolume` | Integer seconds for the subvolume's operations |
+| `backup_snapshot_count` | gauge | `subvolume`, `location` | Count of snapshots; `location` is `"local"` or `"external"` (external = first mounted drive by config order, for bash compat) |
+| `backup_send_type` | gauge | `subvolume` | `0`=full, `1`=incremental, `2`=no send this run |
+
+### Global metrics
+
+| Metric | Type | Labels | Values |
+|--------|------|--------|--------|
+| `backup_external_drive_mounted` | gauge | none | `1`=any external drive mounted, `0`=none |
+| `backup_external_free_bytes` | gauge | none | Free bytes on mounted external drive; `0` when unmounted |
+| `backup_script_last_run_timestamp` | gauge | none | Unix timestamp when the backup ran |
+
+**Multi-drive note:** The bash script assumes a single external drive. These three global metrics maintain that assumption for backward compatibility: `backup_external_drive_mounted` is `1` if *any* configured drive is mounted, and `backup_external_free_bytes` reports the free space of the first mounted drive (by config order). Phase 4 may add per-drive metrics with a `drive` label, but the global metrics must remain for Grafana compatibility.
+
+### File format
+
+Each metric group has `# HELP`, `# TYPE gauge`, then one or more value lines. Groups separated by blank lines. `backup_send_type` must emit an entry for every subvolume that has a `backup_success` entry (never omit a series).
+
+Example:
+```
+# HELP backup_success Backup result: 1=success, 0=failure, 2=schedule-skipped
+# TYPE backup_success gauge
+backup_success{subvolume="subvol3-opptak"} 1
+backup_success{subvolume="htpc-home"} 2
+```
 
 ## SQLite Schema
+
+The SQLite database records backup history. It is **not** the source of truth for current filesystem state — the filesystem (snapshot directories, pin files) is authoritative. SQLite answers "what happened" (runs, operations); the filesystem answers "what exists now" (snapshots, chain state).
 
 ```sql
 CREATE TABLE runs (
@@ -182,25 +248,16 @@ CREATE TABLE operations (
     id INTEGER PRIMARY KEY,
     run_id INTEGER REFERENCES runs(id),
     subvolume TEXT NOT NULL,
-    operation TEXT NOT NULL,   -- "snapshot", "send_incremental", "send_full", "delete", "pin"
+    operation TEXT NOT NULL,   -- "snapshot", "send_incremental", "send_full", "delete"
     drive_label TEXT,
     duration_secs REAL,
     result TEXT NOT NULL,      -- "success", "failure", "skipped"
     error_message TEXT,
     bytes_transferred INTEGER
 );
-
-CREATE TABLE snapshots (
-    id INTEGER PRIMARY KEY,
-    subvolume TEXT NOT NULL,
-    name TEXT NOT NULL,        -- "20260322-opptak"
-    location TEXT NOT NULL,    -- "local" or drive label
-    path TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    is_pinned INTEGER DEFAULT 0,
-    UNIQUE(subvolume, name, location)
-);
 ```
+
+The `snapshots` table from the original plan has been removed. Pin files remain the source of truth for chain state, and snapshot directories are the source of truth for what exists. Duplicating this in SQLite creates a sync problem with no clear benefit — `urd status` and `urd history` can query the filesystem directly for current state and SQLite for historical data.
 
 ## CLI Commands
 
@@ -244,38 +301,80 @@ Next scheduled: subvol2-pics in 5d (Saturday)
 
 ## Implementation Phases
 
-### Phase 1: Skeleton + Config + Plan (Sessions 1-2)
+### Phase 1: Skeleton + Config + Plan ✅
 
 **Goal:** `urd plan` reads config, discovers real snapshots, prints correct planned operations.
 
-- Install Rust toolchain
-- `cargo init`, add dependencies
-- `config.rs` — TOML parsing, validation, tilde expansion
-- `types.rs` — All domain types (Tier, Schedule, SnapshotName, PlannedOperation)
-- `cli.rs` — clap setup
-- `plan.rs` — planner logic (schedule checking, snapshot discovery, parent resolution)
-- `chain.rs` — pin file reading
-- `retention.rs` — graduated + count-based retention (pure functions)
-- `commands/plan_cmd.rs` — wire up `urd plan`
-- Unit tests for config, retention, plan
+**Completed:**
+- `config.rs` — TOML parsing, validation, tilde expansion, PathBuf throughout
+- `types.rs` — All domain types (Interval, SnapshotName with dual-format, PlannedOperation, ByteSize)
+- `cli.rs` — clap setup for all commands
+- `plan.rs` — planner logic (schedule, snapshot discovery, parent resolution, unsent protection)
+- `chain.rs` — pin file reading (drive-specific + legacy fallback)
+- `retention.rs` — graduated + count-based + space-governed retention
+- `drives.rs` — drive detection, space checks via statvfs, external snapshot dir construction
+- `error.rs` — thiserror error types
+- `commands/plan_cmd.rs` — `urd plan` with colored grouped output
+- 67 unit tests across all modules
 
-**Deliverable:** `urd plan` on live system matches what bash script would do.
+**Hardening (Phase 1.5):**
+- Unsent snapshot protection (prevents retention from deleting snapshots not yet sent externally)
+- `PinParent` removed — pin is now `pin_on_success` field on Send variants
+- `subvolume_name` added to all `PlannedOperation` variants
+- PathBuf migration (no more `to_string_lossy()` roundtrips)
+- Path validation (`validate_path_safe`, `validate_name_safe`)
+- Future-date snapshot warning
+- Monthly retention uses calendar month subtraction (not `days * 30`)
 
 ### Phase 2: Execute + State + Metrics (Sessions 3-4)
 
 **Goal:** `urd backup` creates snapshots, sends to 2TB-backup, manages retention, writes metrics.
 
-- `btrfs.rs` — RealBtrfs + MockBtrfs implementations
-- `executor.rs` — sequential operation execution with error handling + partial cleanup
+**New modules:**
+- `btrfs.rs` — BtrfsOps trait + RealBtrfs + MockBtrfs
+- `executor.rs` — sequential operation execution (see Executor Contract below)
 - `state.rs` — SQLite schema, run/operation recording
 - `metrics.rs` — Prometheus .prom writer (exact format match)
-- `drives.rs` — drive detection, space checks via statvfs
-- `chain.rs` — pin file writing
-- `commands/init.rs` — `urd init` (import existing snapshots/pin files)
-- `commands/backup.rs` — `urd backup` (planner + executor)
-- Integration tests on 2TB-backup drive
+
+**Additions to existing modules:**
+- `chain.rs` — pin file writing (reading already done in Phase 1)
+- `error.rs` — executor error variants (BtrfsError, ExecutorError)
+
+**New commands:**
+- `commands/backup.rs` — `urd backup` (planner + executor), `--dry-run` prints plan
+- `commands/init.rs` — `urd init` (first-run setup: create SQLite DB, verify config paths exist, verify pin files are readable, detect and flag incomplete snapshots on external drives from interrupted bash script runs — offer cleanup with user confirmation, never silently delete, report system state summary)
+
+**Testing:**
+- Unit tests with MockBtrfs for executor logic
+- Integration tests on 2TB-backup drive (`#[ignore]`)
 
 **Deliverable:** Successful backup cycle to test drive. `urd backup --dry-run` on production matches bash.
+
+#### Executor Contract
+
+The executor takes a `BackupPlan` and executes each operation sequentially. Its behavior is governed by these rules:
+
+**Error isolation:** A failure in one subvolume must NOT abort operations for other subvolumes. The executor groups operations by `subvolume_name` and tracks per-subvolume success/failure. The overall result is `success` (all OK), `partial` (some failed), or `failure` (all failed).
+
+**Send execution:** The `btrfs send | btrfs receive` pipeline must:
+- Capture stderr from both the send and receive sides
+- Check exit codes from both processes
+- On failure, clean up any partial snapshot at the destination (`btrfs subvolume delete` on the incomplete receive)
+- Log both stderr streams for diagnostics
+
+**Pin-on-success:** After a successful send, the executor writes the pin file specified in `pin_on_success`. If the pin file write fails, the executor logs a warning and continues — the send itself succeeded and the snapshot is valid on the destination. The pin can be recovered on the next successful send to that drive. Note: repeated pin failures (e.g., due to a read-only mount) degrade performance by forcing full sends. Phase 3's `urd verify` / `urd status` should surface stale pins so the operator can investigate.
+
+**Retention execution on external drives:** The planner proposes deletions based on a point-in-time space check, but it cannot know exact snapshot sizes. The executor must:
+- Execute external deletions oldest-first
+- Re-check free space after each deletion
+- Stop deleting once the `min_free_bytes` threshold is satisfied, logging skipped deletions with reason ("space recovered, N planned deletions skipped") so `urd plan` vs `urd backup` divergence is visible to the operator
+- Never delete a snapshot that is the current pin parent for that drive (defense-in-depth — the planner already excludes these, but the executor double-checks)
+
+**Cascading failure handling:** When an operation fails, the executor must skip dependent operations within the same subvolume rather than letting them fail naturally. Specifically: if a `CreateSnapshot` fails, skip any subsequent `Send` that references the snapshot that was not created. The executor checks that source paths exist before attempting operations. This prevents confusing cascading errors in logs and ensures error messages reflect the root cause.
+
+**Crash recovery:** The executor does not assume clean state from prior runs. Before sending a snapshot to a drive, it checks whether a subvolume with that name already exists at the destination. If it exists but is not the result of a completed send (i.e., the pin file does not point to it), it deletes the partial and proceeds with a fresh send. This handles the case where a prior run was interrupted mid-transfer (power loss, drive disconnect, OOM kill). The pin file is the source of truth for "last successful send" — if the pin doesn't reference a snapshot, that snapshot's presence at the destination is not trusted for incremental chain purposes.
+
+**Operation ordering:** Within a subvolume, operations execute in plan order: create → send → delete. This ensures new snapshots exist before sends reference them, and deletions happen after sends complete. This ordering is load-bearing — the planner emits operations in this order (see comment in `plan()`) and the executor relies on it.
 
 ### Phase 3: CLI + Parallel Run (Sessions 5-6)
 
@@ -313,7 +412,7 @@ Next scheduled: subvol2-pics in 5d (Saturday)
 
 ## Migration Strategy
 
-1. **`urd init`** scans existing snapshot directories, reads pin files, populates SQLite
+1. **`urd init`** creates SQLite DB, verifies config paths, validates pin files, detects incomplete snapshots on external drives
 2. **Parallel running** (2 weeks): Urd at 02:00, bash at 03:00, compare metrics
 3. **Cutover:** disable bash timer, enable Urd timer, monitor 1 week
 4. Pin file format maintained throughout — both systems can coexist
