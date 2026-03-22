@@ -101,7 +101,7 @@ impl BtrfsOps for RealBtrfs {
             .map_err(|e| UrdError::Btrfs(format!("failed to spawn btrfs send: {e}")))?;
 
         // Take send's stdout to pipe into receive's stdin
-        let send_stdout = send_child.stdout.take().ok_or_else(|| {
+        let mut send_stdout = send_child.stdout.take().ok_or_else(|| {
             UrdError::Btrfs("failed to capture btrfs send stdout".to_string())
         })?;
 
@@ -118,25 +118,44 @@ impl BtrfsOps for RealBtrfs {
             buf
         });
 
-        // Build receive command
+        // Build receive command with piped stdin so we can count bytes
         log::debug!(
             "Running: sudo {} receive {}",
             self.btrfs_path,
             dest_dir.display()
         );
 
-        let recv_output = Command::new("sudo")
+        let mut recv_child = Command::new("sudo")
             .arg(&self.btrfs_path)
             .arg("receive")
             .arg(dest_dir)
-            .stdin(send_stdout)
+            .stdin(Stdio::piped())
             .stderr(Stdio::piped())
-            .output()
+            .spawn()
             .map_err(|e| UrdError::Btrfs(format!("failed to spawn btrfs receive: {e}")))?;
 
+        let mut recv_stdin = recv_child.stdin.take().ok_or_else(|| {
+            UrdError::Btrfs("failed to capture btrfs receive stdin".to_string())
+        })?;
+
+        // Copy send stdout → receive stdin in a thread, counting bytes
+        let copy_thread = std::thread::spawn(move || {
+            let bytes = std::io::copy(&mut send_stdout, &mut recv_stdin);
+            drop(recv_stdin); // close pipe to signal EOF to receive
+            bytes
+        });
+
+        // Wait for receive to finish
+        let recv_output = recv_child
+            .wait_with_output()
+            .map_err(|e| UrdError::Btrfs(format!("failed to wait for btrfs receive: {e}")))?;
+
+        // Wait for send to finish
         let send_status = send_child
             .wait()
             .map_err(|e| UrdError::Btrfs(format!("failed to wait for btrfs send: {e}")))?;
+
+        let bytes_copied = copy_thread.join().unwrap_or(Ok(0)).ok();
 
         let send_stderr_str = send_stderr_thread.join().unwrap_or_default();
         let recv_stderr_str = String::from_utf8_lossy(&recv_output.stderr);
@@ -189,7 +208,7 @@ impl BtrfsOps for RealBtrfs {
         }
 
         Ok(SendResult {
-            bytes_transferred: None,
+            bytes_transferred: bytes_copied,
         })
     }
 
@@ -255,6 +274,7 @@ pub struct MockBtrfs {
     pub fail_deletes: RefCell<HashSet<PathBuf>>,
     pub existing_subvolumes: RefCell<HashSet<PathBuf>>,
     pub free_bytes: RefCell<u64>,
+    pub mock_bytes_transferred: RefCell<Option<u64>>,
 }
 
 #[allow(dead_code)]
@@ -268,6 +288,7 @@ impl MockBtrfs {
             fail_deletes: RefCell::new(HashSet::new()),
             existing_subvolumes: RefCell::new(HashSet::new()),
             free_bytes: RefCell::new(1_000_000_000_000), // 1TB default
+            mock_bytes_transferred: RefCell::new(None),
         }
     }
 
@@ -316,7 +337,7 @@ impl BtrfsOps for MockBtrfs {
             )));
         }
         Ok(SendResult {
-            bytes_transferred: None,
+            bytes_transferred: *self.mock_bytes_transferred.borrow(),
         })
     }
 
