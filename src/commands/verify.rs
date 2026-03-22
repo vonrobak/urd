@@ -25,6 +25,27 @@ pub fn run(config: Config, args: VerifyArgs) -> anyhow::Result<()> {
         }
 
         if !subvol.send_enabled {
+            // Check for stale pin files — suggests send_enabled was previously true
+            if let Some(root) = config.snapshot_root_for(&subvol.name) {
+                let local_dir = root.join(&subvol.name);
+                let drive_labels: Vec<String> =
+                    config.drives.iter().map(|d| d.label.clone()).collect();
+                let pinned = chain::find_pinned_snapshots(&local_dir, &drive_labels);
+                if !pinned.is_empty() {
+                    println!("Verifying {}...", subvol.name.bold());
+                    println!(
+                        "  {}  send_enabled=false but {} pin file(s) exist — was this previously enabled?",
+                        "WARN".yellow(),
+                        pinned.len(),
+                    );
+                    println!(
+                        "        {}",
+                        "Unsent snapshot protection is disabled — retention may delete snapshots not yet on all drives".dimmed(),
+                    );
+                    println!();
+                    total_warn += 1;
+                }
+            }
             continue;
         }
 
