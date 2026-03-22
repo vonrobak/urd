@@ -1197,4 +1197,52 @@ source = "/data/b"
         let result2 = executor.execute(&plan, "full");
         assert!(result2.subvolume_results.is_empty());
     }
+
+    #[test]
+    fn crash_recovery_cleans_up_partial_and_resends() {
+        let mock = MockBtrfs::new();
+        // Simulate a partial snapshot at destination from an interrupted prior run
+        let dest_snap = PathBuf::from("/mnt/test/.snapshots/sv-a/20260322-1430-a");
+        mock.existing_subvolumes
+            .borrow_mut()
+            .insert(dest_snap.clone());
+
+        let config = test_config();
+        let shutdown = no_shutdown();
+        let executor = Executor::new(&mock, None, &config, &shutdown);
+
+        let ts = NaiveDate::from_ymd_opt(2026, 3, 22)
+            .unwrap()
+            .and_hms_opt(14, 30, 0)
+            .unwrap();
+        let plan = BackupPlan {
+            operations: vec![PlannedOperation::SendFull {
+                snapshot: PathBuf::from("/snap/sv-a/20260322-1430-a"),
+                dest_dir: PathBuf::from("/mnt/test/.snapshots/sv-a"),
+                drive_label: "TEST-DRIVE".to_string(),
+                subvolume_name: "sv-a".to_string(),
+                pin_on_success: None,
+            }],
+            timestamp: ts,
+            skipped: vec![],
+        };
+
+        let result = executor.execute(&plan, "full");
+
+        // Should succeed: delete partial, then re-send
+        assert_eq!(result.overall, RunResult::Success);
+        assert!(result.subvolume_results[0].success);
+
+        // Verify: first call is DeleteSubvolume (cleanup), second is SendReceive
+        let calls = mock.calls();
+        assert_eq!(calls.len(), 2);
+        assert!(
+            matches!(&calls[0], MockBtrfsCall::DeleteSubvolume { path } if path == &dest_snap),
+            "First call should delete partial at dest"
+        );
+        assert!(
+            matches!(&calls[1], MockBtrfsCall::SendReceive { .. }),
+            "Second call should be the send"
+        );
+    }
 }
