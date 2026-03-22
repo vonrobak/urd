@@ -41,7 +41,7 @@ pub fn run(config: Config) -> anyhow::Result<()> {
         let mut row = vec![sv.name.clone(), local_count.to_string()];
 
         // Per-drive: external snapshot count + chain health (worst case)
-        let mut chain_status = String::new();
+        let mut worst_health: Option<ChainHealth> = None;
         let mut any_ext = false;
         for drive in &mounted_drives {
             let ext_count = fs_state
@@ -55,22 +55,22 @@ pub fn run(config: Config) -> anyhow::Result<()> {
                 "\u{2014}".to_string() // em dash
             });
 
-            // Chain health: show worst case across all drives
+            // Chain health: track worst case across all drives
             let ext_dir = drives::external_snapshot_dir(drive, &sv.name);
             let health = chain_health(&local_dir, &drive.label, ext_count, &ext_dir);
-            if chain_status.is_empty() {
-                chain_status = health;
-            } else if health.starts_with("full") && chain_status.starts_with("incremental") {
-                // Downgrade to worst case
-                chain_status = health;
-            }
+            worst_health = Some(match worst_health {
+                Some(current) => current.min(health),
+                None => health,
+            });
         }
 
-        if mounted_drives.is_empty() || (!any_ext && chain_status.is_empty()) {
-            chain_status = "\u{2014}".to_string();
-        }
+        let chain_display = if mounted_drives.is_empty() || (!any_ext && worst_health.is_none()) {
+            "\u{2014}".to_string()
+        } else {
+            worst_health.map_or("\u{2014}".to_string(), |h| h.to_string())
+        };
 
-        row.push(chain_status);
+        row.push(chain_display);
         rows.push(row);
     }
 
@@ -167,32 +167,73 @@ pub fn run(config: Config) -> anyhow::Result<()> {
     Ok(())
 }
 
+// ── ChainHealth ─────────────────────────────────────────────────────
+
+/// Chain health status for a subvolume/drive pair, ordered worst-to-best.
+/// `min()` across drives yields the worst health.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ChainHealth {
+    NoDriveData,
+    Full(String),
+    Incremental(String),
+}
+
+impl ChainHealth {
+    fn severity(&self) -> u8 {
+        match self {
+            Self::NoDriveData => 0,
+            Self::Full(_) => 1,
+            Self::Incremental(_) => 2,
+        }
+    }
+}
+
+impl Ord for ChainHealth {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.severity().cmp(&other.severity())
+    }
+}
+
+impl PartialOrd for ChainHealth {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl std::fmt::Display for ChainHealth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoDriveData => write!(f, "none"),
+            Self::Full(reason) => write!(f, "full ({reason})"),
+            Self::Incremental(pin) => write!(f, "incremental ({pin})"),
+        }
+    }
+}
+
 fn chain_health(
     local_dir: &std::path::Path,
     drive_label: &str,
     ext_count: usize,
     ext_dir: &std::path::Path,
-) -> String {
+) -> ChainHealth {
     if ext_count == 0 {
-        return "none".to_string();
+        return ChainHealth::NoDriveData;
     }
 
     match chain::read_pin_file(local_dir, drive_label) {
         Ok(Some(pin)) => {
-            // Check if pinned snapshot exists locally
             let local_exists = local_dir.join(pin.as_str()).exists();
             if !local_exists {
-                return "full (pin missing locally)".to_string();
+                return ChainHealth::Full("pin missing locally".to_string());
             }
-            // Check if pinned snapshot exists on external drive
             let ext_exists = ext_dir.join(pin.as_str()).exists();
             if !ext_exists {
-                return "full (pin missing on drive)".to_string();
+                return ChainHealth::Full("pin missing on drive".to_string());
             }
-            format!("incremental ({})", pin)
+            ChainHealth::Incremental(pin.to_string())
         }
-        Ok(None) => "full (no pin)".to_string(),
-        Err(_) => "full (pin error)".to_string(),
+        Ok(None) => ChainHealth::Full("no pin".to_string()),
+        Err(_) => ChainHealth::Full("pin error".to_string()),
     }
 }
 
@@ -232,6 +273,57 @@ fn print_table(headers: &[String], rows: &[Vec<String>]) {
             })
             .collect();
         println!("{}", line.join("  "));
+    }
+}
+
+// ── Tests ───────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chain_health_ordering() {
+        let none = ChainHealth::NoDriveData;
+        let full = ChainHealth::Full("no pin".to_string());
+        let inc = ChainHealth::Incremental("20260322-1430-opptak".to_string());
+
+        assert!(none < full);
+        assert!(full < inc);
+        assert!(none < inc);
+    }
+
+    #[test]
+    fn chain_health_min_finds_worst() {
+        let inc = ChainHealth::Incremental("snap".to_string());
+        let full = ChainHealth::Full("no pin".to_string());
+        let none = ChainHealth::NoDriveData;
+
+        assert_eq!(inc.clone().min(full.clone()), full);
+        assert_eq!(full.min(none.clone()), none);
+        assert_eq!(inc.min(none.clone()), none);
+    }
+
+    #[test]
+    fn chain_health_display() {
+        assert_eq!(ChainHealth::NoDriveData.to_string(), "none");
+        assert_eq!(
+            ChainHealth::Full("no pin".to_string()).to_string(),
+            "full (no pin)"
+        );
+        assert_eq!(
+            ChainHealth::Incremental("20260322-snap".to_string()).to_string(),
+            "incremental (20260322-snap)"
+        );
+    }
+
+    #[test]
+    fn chain_health_min_two_fulls_keeps_first() {
+        let full_a = ChainHealth::Full("pin missing locally".to_string());
+        let full_b = ChainHealth::Full("pin missing on drive".to_string());
+        // Both are Full — min returns self (first), which is fine
+        let result = full_a.clone().min(full_b);
+        assert!(matches!(result, ChainHealth::Full(_)));
     }
 }
 
