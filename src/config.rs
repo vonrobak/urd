@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use serde::Deserialize;
 
@@ -21,9 +21,9 @@ pub struct Config {
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 pub struct GeneralConfig {
-    pub state_db: String,
-    pub metrics_file: String,
-    pub log_dir: String,
+    pub state_db: PathBuf,
+    pub metrics_file: PathBuf,
+    pub log_dir: PathBuf,
     #[serde(default = "default_btrfs_path")]
     pub btrfs_path: String,
 }
@@ -39,7 +39,7 @@ pub struct LocalSnapshotsConfig {
 
 #[derive(Debug, Deserialize)]
 pub struct SnapshotRoot {
-    pub path: String,
+    pub path: PathBuf,
     pub subvolumes: Vec<String>,
     #[serde(default)]
     pub min_free_bytes: Option<ByteSize>,
@@ -49,7 +49,7 @@ pub struct SnapshotRoot {
 #[allow(dead_code)]
 pub struct DriveConfig {
     pub label: String,
-    pub mount_path: String,
+    pub mount_path: PathBuf,
     pub snapshot_root: String,
     pub role: DriveRole,
     #[serde(default)]
@@ -78,7 +78,7 @@ fn default_true() -> bool {
 pub struct SubvolumeConfig {
     pub name: String,
     pub short_name: String,
-    pub source: String,
+    pub source: PathBuf,
     #[serde(default = "default_priority")]
     pub priority: u8,
     pub enabled: Option<bool>,
@@ -125,7 +125,7 @@ impl SubvolumeConfig {
         ResolvedSubvolume {
             name: self.name.clone(),
             short_name: self.short_name.clone(),
-            source: PathBuf::from(&self.source),
+            source: self.source.clone(),
             priority: self.priority,
             enabled: self.enabled.unwrap_or(defaults.enabled),
             snapshot_interval: self.snapshot_interval.unwrap_or(defaults.snapshot_interval),
@@ -165,7 +165,7 @@ impl Config {
     pub fn snapshot_root_for(&self, subvol_name: &str) -> Option<PathBuf> {
         for root in &self.local_snapshots.roots {
             if root.subvolumes.iter().any(|s| s == subvol_name) {
-                return Some(expand_tilde(&root.path));
+                return Some(root.path.clone());
             }
         }
         None
@@ -203,16 +203,20 @@ impl Config {
     }
 
     fn expand_paths(&mut self) {
-        self.general.state_db = expand_tilde(&self.general.state_db).to_string_lossy().into();
-        self.general.metrics_file = expand_tilde(&self.general.metrics_file).to_string_lossy().into();
-        self.general.log_dir = expand_tilde(&self.general.log_dir).to_string_lossy().into();
+        self.general.state_db = expand_tilde(&self.general.state_db);
+        self.general.metrics_file = expand_tilde(&self.general.metrics_file);
+        self.general.log_dir = expand_tilde(&self.general.log_dir);
 
         for root in &mut self.local_snapshots.roots {
-            root.path = expand_tilde(&root.path).to_string_lossy().into();
+            root.path = expand_tilde(&root.path);
         }
 
         for drive in &mut self.drives {
-            drive.mount_path = expand_tilde(&drive.mount_path).to_string_lossy().into();
+            drive.mount_path = expand_tilde(&drive.mount_path);
+        }
+
+        for sv in &mut self.subvolumes {
+            sv.source = expand_tilde(&sv.source);
         }
     }
 
@@ -285,6 +289,27 @@ impl Config {
             }
         }
 
+        // Path safety: all paths must be absolute with no ".." components
+        validate_path_safe(&self.general.state_db, "general.state_db")?;
+        validate_path_safe(&self.general.metrics_file, "general.metrics_file")?;
+        validate_path_safe(&self.general.log_dir, "general.log_dir")?;
+
+        for root in &self.local_snapshots.roots {
+            validate_path_safe(&root.path, "snapshot root path")?;
+        }
+
+        for drive in &self.drives {
+            validate_path_safe(&drive.mount_path, &format!("drive {:?} mount_path", drive.label))?;
+            validate_name_safe(&drive.label, "drive label")?;
+            validate_name_safe(&drive.snapshot_root, "drive snapshot_root")?;
+        }
+
+        for sv in &self.subvolumes {
+            validate_path_safe(&sv.source, &format!("subvolume {:?} source", sv.name))?;
+            validate_name_safe(&sv.name, "subvolume name")?;
+            validate_name_safe(&sv.short_name, "subvolume short_name")?;
+        }
+
         Ok(())
     }
 }
@@ -293,17 +318,53 @@ impl Config {
 
 /// Expand `~` at the start of a path to the user's home directory.
 #[must_use]
-pub fn expand_tilde(path: &str) -> PathBuf {
-    if let Some(rest) = path.strip_prefix("~/") {
+pub fn expand_tilde(path: &Path) -> PathBuf {
+    let Some(s) = path.to_str() else {
+        // Non-UTF-8 path cannot contain a tilde prefix meaningfully
+        return path.to_path_buf();
+    };
+    if let Some(rest) = s.strip_prefix("~/") {
         if let Some(home) = dirs::home_dir() {
             return home.join(rest);
         }
-    } else if path == "~"
+    } else if s == "~"
         && let Some(home) = dirs::home_dir()
     {
         return home;
     }
-    PathBuf::from(path)
+    path.to_path_buf()
+}
+
+/// Validate that a path is absolute and contains no `..` components.
+fn validate_path_safe(path: &Path, label: &str) -> crate::error::Result<()> {
+    if !path.is_absolute() {
+        return Err(UrdError::Config(format!(
+            "{label} must be an absolute path, got: {}",
+            path.display()
+        )));
+    }
+    for component in path.components() {
+        if matches!(component, Component::ParentDir) {
+            return Err(UrdError::Config(format!(
+                "{label} must not contain '..': {}",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Validate that a name is safe for use in filesystem paths.
+fn validate_name_safe(name: &str, label: &str) -> crate::error::Result<()> {
+    if name.is_empty() {
+        return Err(UrdError::Config(format!("{label} must not be empty")));
+    }
+    if name.contains('/') || name.contains('\\') || name.contains("..") || name.contains('\0') {
+        return Err(UrdError::Config(format!(
+            "{label} contains forbidden characters: {name:?}"
+        )));
+    }
+    Ok(())
 }
 
 fn default_config_path() -> crate::error::Result<PathBuf> {
@@ -321,20 +382,20 @@ mod tests {
 
     #[test]
     fn expand_tilde_with_home() {
-        let expanded = expand_tilde("~/projects/urd");
+        let expanded = expand_tilde(Path::new("~/projects/urd"));
         assert!(expanded.to_string_lossy().contains("projects/urd"));
         assert!(!expanded.to_string_lossy().starts_with('~'));
     }
 
     #[test]
     fn expand_tilde_absolute() {
-        let expanded = expand_tilde("/usr/bin/btrfs");
+        let expanded = expand_tilde(Path::new("/usr/bin/btrfs"));
         assert_eq!(expanded, PathBuf::from("/usr/bin/btrfs"));
     }
 
     #[test]
     fn expand_tilde_bare() {
-        let expanded = expand_tilde("~");
+        let expanded = expand_tilde(Path::new("~"));
         assert!(!expanded.to_string_lossy().contains('~'));
     }
 
@@ -633,5 +694,113 @@ local_retention = { daily = 7, weekly = 4 }
         assert_eq!(resolved.local_retention.hourly, 24); // from defaults (not overridden)
         assert_eq!(resolved.local_retention.monthly, 12); // from defaults (not overridden)
         assert_eq!(resolved.external_retention.daily, 30);
+    }
+
+    #[test]
+    fn validate_relative_path_rejected() {
+        let config_str = r#"
+[general]
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp"
+
+[local_snapshots]
+roots = [{ path = "/snap", subvolumes = ["a"] }]
+
+[defaults]
+snapshot_interval = "1h"
+send_interval = "4h"
+[defaults.local_retention]
+hourly = 24
+[defaults.external_retention]
+daily = 30
+
+[[drives]]
+label = "D1"
+mount_path = "/mnt/d1"
+snapshot_root = ".snapshots"
+role = "test"
+
+[[subvolumes]]
+name = "a"
+short_name = "a"
+source = "relative/path"
+"#;
+        let mut config: Config = toml::from_str(config_str).unwrap();
+        config.expand_paths();
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("absolute path"));
+    }
+
+    #[test]
+    fn validate_path_traversal_rejected() {
+        let config_str = r#"
+[general]
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp"
+
+[local_snapshots]
+roots = [{ path = "/snap", subvolumes = ["a"] }]
+
+[defaults]
+snapshot_interval = "1h"
+send_interval = "4h"
+[defaults.local_retention]
+hourly = 24
+[defaults.external_retention]
+daily = 30
+
+[[drives]]
+label = "D1"
+mount_path = "/mnt/d1"
+snapshot_root = ".snapshots"
+role = "test"
+
+[[subvolumes]]
+name = "a"
+short_name = "a"
+source = "/data/../etc/shadow"
+"#;
+        let mut config: Config = toml::from_str(config_str).unwrap();
+        config.expand_paths();
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains(".."));
+    }
+
+    #[test]
+    fn validate_name_with_slash_rejected() {
+        let config_str = r#"
+[general]
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp"
+
+[local_snapshots]
+roots = [{ path = "/snap", subvolumes = ["foo/bar"] }]
+
+[defaults]
+snapshot_interval = "1h"
+send_interval = "4h"
+[defaults.local_retention]
+hourly = 24
+[defaults.external_retention]
+daily = 30
+
+[[drives]]
+label = "D1"
+mount_path = "/mnt/d1"
+snapshot_root = ".snapshots"
+role = "test"
+
+[[subvolumes]]
+name = "foo/bar"
+short_name = "fb"
+source = "/data"
+"#;
+        let mut config: Config = toml::from_str(config_str).unwrap();
+        config.expand_paths();
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("forbidden characters"));
     }
 }
