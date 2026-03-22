@@ -11,13 +11,16 @@ pub fn is_drive_mounted(drive: &DriveConfig) -> bool {
 
 /// Check if a path appears as a mount point in /proc/mounts.
 #[must_use]
-pub fn is_path_mounted(mount_path: &str) -> bool {
+pub fn is_path_mounted(mount_path: &Path) -> bool {
+    let Some(mount_str) = mount_path.to_str() else {
+        return false;
+    };
     let Ok(mounts) = std::fs::read_to_string("/proc/mounts") else {
         return false;
     };
     for line in mounts.lines() {
         let parts: Vec<&str> = line.splitn(3, ' ').collect();
-        if parts.len() >= 2 && parts[1] == mount_path {
+        if parts.len() >= 2 && parts[1] == mount_str {
             return true;
         }
     }
@@ -37,9 +40,7 @@ pub fn filesystem_free_bytes(path: &Path) -> crate::error::Result<u64> {
 /// Returns `{mount_path}/{snapshot_root}/{subvol_name}`.
 #[must_use]
 pub fn external_snapshot_dir(drive: &DriveConfig, subvol_name: &str) -> PathBuf {
-    PathBuf::from(&drive.mount_path)
-        .join(&drive.snapshot_root)
-        .join(subvol_name)
+    drive.mount_path.join(&drive.snapshot_root).join(subvol_name)
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
@@ -52,7 +53,7 @@ mod tests {
     fn test_drive() -> DriveConfig {
         DriveConfig {
             label: "WD-18TB".to_string(),
-            mount_path: "/run/media/user/WD-18TB".to_string(),
+            mount_path: PathBuf::from("/run/media/user/WD-18TB"),
             snapshot_root: ".snapshots".to_string(),
             role: DriveRole::Primary,
             max_usage_percent: Some(90),
