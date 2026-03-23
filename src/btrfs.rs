@@ -1,8 +1,10 @@
 use std::cell::RefCell;
 use std::collections::HashSet;
-use std::io::Read as _;
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use crate::error::UrdError;
 
@@ -33,16 +35,20 @@ pub trait BtrfsOps {
 
 pub struct RealBtrfs {
     btrfs_path: String,
+    /// Live byte counter updated during send/receive. The executor can poll
+    /// this to display transfer progress. Not part of the `BtrfsOps` trait —
+    /// progress display is a presentation concern, not a correctness contract.
+    bytes_counter: Arc<AtomicU64>,
 }
 
 impl RealBtrfs {
     #[must_use]
-    pub fn new(btrfs_path: &str) -> Self {
+    pub fn new(btrfs_path: &str, bytes_counter: Arc<AtomicU64>) -> Self {
         Self {
             btrfs_path: btrfs_path.to_string(),
+            bytes_counter,
         }
     }
-
 }
 
 impl BtrfsOps for RealBtrfs {
@@ -59,15 +65,21 @@ impl BtrfsOps for RealBtrfs {
             .arg(source)
             .arg(dest)
             .output()
-            .map_err(|e| UrdError::Btrfs(format!("failed to spawn btrfs: {e}")))?;
+            .map_err(|e| UrdError::Btrfs {
+                msg: format!("failed to spawn btrfs: {e}"),
+                bytes_transferred: None,
+            })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(UrdError::Btrfs(format!(
-                "snapshot failed (exit {}): {}",
-                output.status.code().unwrap_or(-1),
-                stderr.trim()
-            )));
+            return Err(UrdError::Btrfs {
+                msg: format!(
+                    "snapshot failed (exit {}): {}",
+                    output.status.code().unwrap_or(-1),
+                    stderr.trim()
+                ),
+                bytes_transferred: None,
+            });
         }
         Ok(())
     }
@@ -98,16 +110,25 @@ impl BtrfsOps for RealBtrfs {
 
         let mut send_child = send_cmd
             .spawn()
-            .map_err(|e| UrdError::Btrfs(format!("failed to spawn btrfs send: {e}")))?;
+            .map_err(|e| UrdError::Btrfs {
+                msg: format!("failed to spawn btrfs send: {e}"),
+                bytes_transferred: None,
+            })?;
 
         // Take send's stdout to pipe into receive's stdin
         let mut send_stdout = send_child.stdout.take().ok_or_else(|| {
-            UrdError::Btrfs("failed to capture btrfs send stdout".to_string())
+            UrdError::Btrfs {
+                msg: "failed to capture btrfs send stdout".to_string(),
+                bytes_transferred: None,
+            }
         })?;
 
         // Take send's stderr to drain in a thread
         let send_stderr = send_child.stderr.take().ok_or_else(|| {
-            UrdError::Btrfs("failed to capture btrfs send stderr".to_string())
+            UrdError::Btrfs {
+                msg: "failed to capture btrfs send stderr".to_string(),
+                bytes_transferred: None,
+            }
         })?;
 
         // Drain send stderr in a background thread to prevent deadlock
@@ -132,28 +153,54 @@ impl BtrfsOps for RealBtrfs {
             .stdin(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|e| UrdError::Btrfs(format!("failed to spawn btrfs receive: {e}")))?;
+            .map_err(|e| UrdError::Btrfs {
+                msg: format!("failed to spawn btrfs receive: {e}"),
+                bytes_transferred: None,
+            })?;
 
         let mut recv_stdin = recv_child.stdin.take().ok_or_else(|| {
-            UrdError::Btrfs("failed to capture btrfs receive stdin".to_string())
+            UrdError::Btrfs {
+                msg: "failed to capture btrfs receive stdin".to_string(),
+                bytes_transferred: None,
+            }
         })?;
 
-        // Copy send stdout → receive stdin in a thread, counting bytes
-        let copy_thread = std::thread::spawn(move || {
-            let bytes = std::io::copy(&mut send_stdout, &mut recv_stdin);
+        // Copy send stdout → receive stdin in a thread, counting bytes.
+        // Uses a chunked loop instead of std::io::copy so the bytes_counter
+        // is updated live for progress display.
+        let counter = self.bytes_counter.clone();
+        counter.store(0, Ordering::Relaxed);
+        let copy_thread = std::thread::spawn(move || -> std::io::Result<u64> {
+            let mut buf = [0u8; 128 * 1024]; // 128KB chunks
+            let mut total: u64 = 0;
+            loop {
+                let n = send_stdout.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                recv_stdin.write_all(&buf[..n])?;
+                total += n as u64;
+                counter.store(total, Ordering::Relaxed);
+            }
             drop(recv_stdin); // close pipe to signal EOF to receive
-            bytes
+            Ok(total)
         });
 
         // Wait for receive to finish
         let recv_output = recv_child
             .wait_with_output()
-            .map_err(|e| UrdError::Btrfs(format!("failed to wait for btrfs receive: {e}")))?;
+            .map_err(|e| UrdError::Btrfs {
+                msg: format!("failed to wait for btrfs receive: {e}"),
+                bytes_transferred: None,
+            })?;
 
         // Wait for send to finish
         let send_status = send_child
             .wait()
-            .map_err(|e| UrdError::Btrfs(format!("failed to wait for btrfs send: {e}")))?;
+            .map_err(|e| UrdError::Btrfs {
+                msg: format!("failed to wait for btrfs send: {e}"),
+                bytes_transferred: None,
+            })?;
 
         let bytes_copied = copy_thread.join().unwrap_or(Ok(0)).ok();
 
@@ -197,7 +244,10 @@ impl BtrfsOps for RealBtrfs {
                     recv_stderr_str.trim()
                 ));
             }
-            return Err(UrdError::Btrfs(msg));
+            return Err(UrdError::Btrfs {
+                msg,
+                bytes_transferred: bytes_copied,
+            });
         }
 
         if !send_stderr_str.is_empty() {
@@ -223,15 +273,21 @@ impl BtrfsOps for RealBtrfs {
             .args(["subvolume", "delete"])
             .arg(path)
             .output()
-            .map_err(|e| UrdError::Btrfs(format!("failed to spawn btrfs: {e}")))?;
+            .map_err(|e| UrdError::Btrfs {
+                msg: format!("failed to spawn btrfs: {e}"),
+                bytes_transferred: None,
+            })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(UrdError::Btrfs(format!(
-                "delete failed (exit {}): {}",
-                output.status.code().unwrap_or(-1),
-                stderr.trim()
-            )));
+            return Err(UrdError::Btrfs {
+                msg: format!(
+                    "delete failed (exit {}): {}",
+                    output.status.code().unwrap_or(-1),
+                    stderr.trim()
+                ),
+                bytes_transferred: None,
+            });
         }
         Ok(())
     }
@@ -275,6 +331,8 @@ pub struct MockBtrfs {
     pub existing_subvolumes: RefCell<HashSet<PathBuf>>,
     pub free_bytes: RefCell<u64>,
     pub mock_bytes_transferred: RefCell<Option<u64>>,
+    /// Partial bytes to report when a send fails (simulates partial transfer)
+    pub mock_fail_send_bytes: RefCell<Option<u64>>,
 }
 
 #[allow(dead_code)]
@@ -289,6 +347,7 @@ impl MockBtrfs {
             existing_subvolumes: RefCell::new(HashSet::new()),
             free_bytes: RefCell::new(1_000_000_000_000), // 1TB default
             mock_bytes_transferred: RefCell::new(None),
+            mock_fail_send_bytes: RefCell::new(None),
         }
     }
 
@@ -311,10 +370,10 @@ impl BtrfsOps for MockBtrfs {
             dest: dest.to_path_buf(),
         });
         if self.fail_creates.borrow().contains(dest) {
-            return Err(UrdError::Btrfs(format!(
-                "mock: create snapshot failed for {}",
-                dest.display()
-            )));
+            return Err(UrdError::Btrfs {
+                msg: format!("mock: create snapshot failed for {}", dest.display()),
+                bytes_transferred: None,
+            });
         }
         Ok(())
     }
@@ -331,10 +390,10 @@ impl BtrfsOps for MockBtrfs {
             dest_dir: dest_dir.to_path_buf(),
         });
         if self.fail_sends.borrow().contains(snapshot) {
-            return Err(UrdError::Btrfs(format!(
-                "mock: send failed for {}",
-                snapshot.display()
-            )));
+            return Err(UrdError::Btrfs {
+                msg: format!("mock: send failed for {}", snapshot.display()),
+                bytes_transferred: *self.mock_fail_send_bytes.borrow(),
+            });
         }
         Ok(SendResult {
             bytes_transferred: *self.mock_bytes_transferred.borrow(),
@@ -348,10 +407,10 @@ impl BtrfsOps for MockBtrfs {
                 path: path.to_path_buf(),
             });
         if self.fail_deletes.borrow().contains(path) {
-            return Err(UrdError::Btrfs(format!(
-                "mock: delete failed for {}",
-                path.display()
-            )));
+            return Err(UrdError::Btrfs {
+                msg: format!("mock: delete failed for {}", path.display()),
+                bytes_transferred: None,
+            });
         }
         Ok(())
     }
@@ -454,6 +513,23 @@ mod tests {
 
         let result = mock.send_receive(&snap, None, Path::new("/dest"));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn mock_send_failure_with_partial_bytes() {
+        let mock = MockBtrfs::new();
+        let snap = PathBuf::from("/snap/fail");
+        mock.fail_sends.borrow_mut().insert(snap.clone());
+        *mock.mock_fail_send_bytes.borrow_mut() = Some(500_000);
+
+        let result = mock.send_receive(&snap, None, Path::new("/dest"));
+        let err = result.unwrap_err();
+        match err {
+            UrdError::Btrfs { bytes_transferred, .. } => {
+                assert_eq!(bytes_transferred, Some(500_000));
+            }
+            _ => panic!("expected UrdError::Btrfs"),
+        }
     }
 
     #[test]

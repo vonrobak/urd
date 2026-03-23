@@ -32,6 +32,7 @@ fn main() -> anyhow::Result<()> {
         Commands::Plan(args) => commands::plan_cmd::run(config, args),
         Commands::Backup(args) => commands::backup::run(config, args),
         Commands::Init => commands::init::run(config),
+        Commands::Calibrate(args) => commands::calibrate::run(config, args),
         Commands::Status => commands::status::run(config),
         Commands::History(args) => commands::history::run(config, args),
         Commands::Verify(args) => commands::verify::run(config, args),

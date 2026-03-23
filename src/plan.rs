@@ -52,6 +52,10 @@ pub trait FileSystemState {
         drive_label: &str,
         send_type: &str,
     ) -> Option<u64>;
+
+    /// Get a calibrated size estimate for a subvolume (from `urd calibrate`).
+    /// Returns `(estimated_bytes, measured_at)` or None if not calibrated.
+    fn calibrated_size(&self, subvol_name: &str) -> Option<(u64, String)>;
 }
 
 // ── PlanFilters ─────────────────────────────────────────────────────────
@@ -365,15 +369,14 @@ fn plan_external_send(
         false
     };
 
-    // Space estimation: skip if historical send size exceeds available space
+    // Space estimation: skip if estimated send size exceeds available space.
+    // Tier 1: Historical send data (most accurate). Tier 3: Calibrated sizes (fallback for full sends).
     let send_type_str = if is_incremental { "send_incremental" } else { "send_full" };
     if let Some(last_size) = fs.last_send_size(&subvol.name, &drive.label, send_type_str) {
-        let estimated = (last_size as f64 * 1.2) as u64; // 20% safety margin
-        let free = fs.filesystem_free_bytes(&ext_dir).unwrap_or(u64::MAX);
-        let min_free = drive.min_free_bytes.map(|b| b.bytes()).unwrap_or(0);
-        let available = free.saturating_sub(min_free);
-
-        if estimated > available {
+        // Tier 1: historical data from previous sends (successful or failed)
+        if let Some((estimated, available, free, min_free)) =
+            exceeds_available_space(last_size, &ext_dir, drive, fs)
+        {
             use crate::types::ByteSize;
             skipped.push((
                 subvol.name.clone(),
@@ -387,6 +390,33 @@ fn plan_external_send(
                 ),
             ));
             return;
+        }
+    } else if !is_incremental {
+        // Tier 3: Calibrated size from `urd calibrate` (only for full sends)
+        if let Some((cal_bytes, measured_at)) = fs.calibrated_size(&subvol.name) {
+            let age_days = calibration_age_days(&measured_at);
+            let staleness = if age_days > 30 {
+                format!(" (calibrated {} days ago — run `urd calibrate` to refresh)", age_days)
+            } else {
+                String::new()
+            };
+
+            if let Some((estimated, available, _, _)) =
+                exceeds_available_space(cal_bytes, &ext_dir, drive, fs)
+            {
+                use crate::types::ByteSize;
+                skipped.push((
+                    subvol.name.clone(),
+                    format!(
+                        "send to {} skipped: calibrated size ~{} exceeds {} available{}",
+                        drive.label,
+                        ByteSize(estimated),
+                        ByteSize(available),
+                        staleness,
+                    ),
+                ));
+                return;
+            }
         }
     }
 
@@ -463,6 +493,32 @@ fn format_duration_short(minutes: i64) -> String {
     }
 }
 
+/// Check if estimated send size (with 1.2x margin) exceeds available space on the drive.
+/// Returns `Some((estimated, available, free, min_free))` if space is insufficient, `None` if OK.
+fn exceeds_available_space(
+    raw_bytes: u64,
+    ext_dir: &Path,
+    drive: &DriveConfig,
+    fs: &dyn FileSystemState,
+) -> Option<(u64, u64, u64, u64)> {
+    let estimated = (raw_bytes as f64 * 1.2) as u64; // 20% safety margin
+    let free = fs.filesystem_free_bytes(ext_dir).unwrap_or(u64::MAX);
+    let min_free = drive.min_free_bytes.map(|b| b.bytes()).unwrap_or(0);
+    let available = free.saturating_sub(min_free);
+    if estimated > available {
+        Some((estimated, available, free, min_free))
+    } else {
+        None
+    }
+}
+
+fn calibration_age_days(measured_at: &str) -> i64 {
+    let now = chrono::Local::now().naive_local();
+    chrono::NaiveDateTime::parse_from_str(measured_at, "%Y-%m-%dT%H:%M:%S")
+        .map(|ts| (now - ts).num_days())
+        .unwrap_or(365) // corrupt timestamp → treat as stale, not fresh
+}
+
 // ── RealFileSystemState ─────────────────────────────────────────────────
 
 /// Real filesystem state — reads actual directories, pin files, and mounts.
@@ -516,9 +572,22 @@ impl FileSystemState for RealFileSystemState<'_> {
         send_type: &str,
     ) -> Option<u64> {
         self.state.and_then(|db| {
-            db.last_successful_send_size(subvol_name, drive_label, send_type)
+            let successful = db.last_successful_send_size(subvol_name, drive_label, send_type)
                 .ok()
-                .flatten()
+                .flatten();
+            let failed = db.last_failed_send_size(subvol_name, drive_label, send_type)
+                .ok()
+                .flatten();
+            match (successful, failed) {
+                (Some(s), Some(f)) => Some(s.max(f)),
+                (s, f) => s.or(f),
+            }
+        })
+    }
+
+    fn calibrated_size(&self, subvol_name: &str) -> Option<(u64, String)> {
+        self.state.and_then(|db| {
+            db.calibrated_size(subvol_name).ok().flatten()
         })
     }
 }
@@ -564,6 +633,7 @@ pub struct MockFileSystemState {
     pub free_bytes: std::collections::HashMap<PathBuf, u64>,
     pub pin_files: std::collections::HashMap<(PathBuf, String), SnapshotName>,
     pub send_sizes: std::collections::HashMap<(String, String, String), u64>,
+    pub calibrated_sizes: std::collections::HashMap<String, (u64, String)>,
 }
 
 #[cfg(test)]
@@ -576,6 +646,7 @@ impl MockFileSystemState {
             free_bytes: std::collections::HashMap::new(),
             pin_files: std::collections::HashMap::new(),
             send_sizes: std::collections::HashMap::new(),
+            calibrated_sizes: std::collections::HashMap::new(),
         }
     }
 }
@@ -641,6 +712,10 @@ impl FileSystemState for MockFileSystemState {
                 send_type.to_string(),
             ))
             .copied()
+    }
+
+    fn calibrated_size(&self, subvol_name: &str) -> Option<(u64, String)> {
+        self.calibrated_sizes.get(subvol_name).cloned()
     }
 }
 
@@ -1234,6 +1309,88 @@ send_enabled = false
             .filter(|op| matches!(op, PlannedOperation::SendFull { subvolume_name, .. } if subvolume_name == "sv1"))
             .collect();
         assert_eq!(sends.len(), 1, "First-ever send should proceed without history");
+    }
+
+    #[test]
+    fn calibrated_size_skips_send_when_too_large() {
+        let config = test_config();
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots.insert("sv1".to_string(), vec![snap("20260322-1300-one")]);
+        fs.mounted_drives.insert("D1".to_string());
+        // No send history (Tier 1), but calibrated size says 1TB
+        fs.calibrated_sizes.insert(
+            "sv1".to_string(),
+            (1_000_000_000_000, "2026-03-22T12:00:00".to_string()),
+        );
+        // Drive has only 500GB free
+        fs.free_bytes.insert(
+            PathBuf::from("/mnt/d1/.snapshots/sv1"),
+            500_000_000_000,
+        );
+
+        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let sends: Vec<_> = result
+            .operations
+            .iter()
+            .filter(|op| matches!(op, PlannedOperation::SendFull { subvolume_name, .. } if subvolume_name == "sv1"))
+            .collect();
+        assert_eq!(sends.len(), 0, "Send should be skipped when calibrated size exceeds available space");
+        assert!(
+            result.skipped.iter().any(|(name, reason)| name == "sv1" && reason.contains("calibrated size")),
+            "Skip reason should mention calibrated size"
+        );
+    }
+
+    #[test]
+    fn tier1_overrides_calibrated_size() {
+        let config = test_config();
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots.insert("sv1".to_string(), vec![snap("20260322-1300-one")]);
+        fs.mounted_drives.insert("D1".to_string());
+        // Tier 1 says 100KB (small send)
+        fs.send_sizes.insert(
+            ("sv1".to_string(), "D1".to_string(), "send_full".to_string()),
+            100_000,
+        );
+        // Calibrated says 1TB (would block if used)
+        fs.calibrated_sizes.insert(
+            "sv1".to_string(),
+            (1_000_000_000_000, "2026-03-22T12:00:00".to_string()),
+        );
+        // Drive has 500GB free — enough for Tier 1 estimate, not for calibrated
+        fs.free_bytes.insert(
+            PathBuf::from("/mnt/d1/.snapshots/sv1"),
+            500_000_000_000,
+        );
+
+        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let sends: Vec<_> = result
+            .operations
+            .iter()
+            .filter(|op| matches!(op, PlannedOperation::SendFull { subvolume_name, .. } if subvolume_name == "sv1"))
+            .collect();
+        assert_eq!(sends.len(), 1, "Tier 1 history should override calibrated size");
+    }
+
+    #[test]
+    fn send_proceeds_without_history_or_calibration() {
+        let config = test_config();
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots.insert("sv1".to_string(), vec![snap("20260322-1300-one")]);
+        fs.mounted_drives.insert("D1".to_string());
+        // No send_sizes, no calibrated_sizes — fail open
+        fs.free_bytes.insert(
+            PathBuf::from("/mnt/d1/.snapshots/sv1"),
+            1_000_000,
+        );
+
+        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let sends: Vec<_> = result
+            .operations
+            .iter()
+            .filter(|op| matches!(op, PlannedOperation::SendFull { subvolume_name, .. } if subvolume_name == "sv1"))
+            .collect();
+        assert_eq!(sends.len(), 1, "First-ever send should proceed without history or calibration");
     }
 
     #[test]
