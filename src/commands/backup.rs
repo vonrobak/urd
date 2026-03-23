@@ -1,7 +1,9 @@
 use std::collections::HashSet;
 use std::fs::File;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::io::IsTerminal;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use colored::Colorize;
 
@@ -13,6 +15,7 @@ use crate::executor::{Executor, RunResult, SendType};
 use crate::metrics::{self, MetricsData, SubvolumeMetrics};
 use crate::plan::{self, FileSystemState, PlanFilters, RealFileSystemState};
 use crate::state::StateDb;
+use crate::types::ByteSize;
 
 pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     let now = chrono::Local::now().naive_local();
@@ -69,11 +72,30 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
         log::warn!("Failed to set signal handler: {e}");
     }
 
-    // Set up executor
-    let btrfs = RealBtrfs::new(&config.general.btrfs_path);
+    // Set up executor with live byte counter for progress display
+    let bytes_counter = Arc::new(AtomicU64::new(0));
+    let btrfs = RealBtrfs::new(&config.general.btrfs_path, bytes_counter.clone());
+
+    // Spawn progress display thread if running on a TTY
+    let progress_shutdown = Arc::new(AtomicBool::new(false));
+    let progress_handle = if std::io::stderr().is_terminal() {
+        let counter = bytes_counter.clone();
+        let shutdown_flag = progress_shutdown.clone();
+        Some(std::thread::spawn(move || {
+            progress_display_loop(&counter, &shutdown_flag);
+        }))
+    } else {
+        None
+    };
 
     let executor = Executor::new(&btrfs, state_db.as_ref(), &config, &shutdown);
     let result = executor.execute(&backup_plan, mode);
+
+    // Stop progress display
+    progress_shutdown.store(true, Ordering::SeqCst);
+    if let Some(h) = progress_handle {
+        h.join().ok();
+    }
 
     // Print results
     println!(
@@ -347,4 +369,68 @@ fn count_external_snapshots(
         }
     }
     0
+}
+
+/// Polls the byte counter and displays a live progress line on stderr.
+/// Only runs when stderr is a TTY. Cleans up the line on exit.
+fn progress_display_loop(counter: &AtomicU64, shutdown: &AtomicBool) {
+    let mut send_start = Instant::now();
+    let mut last_display_bytes = 0u64;
+
+    while !shutdown.load(Ordering::SeqCst) {
+        std::thread::sleep(Duration::from_millis(250));
+
+        let current = counter.load(Ordering::Relaxed);
+        if current == 0 {
+            // Counter reset to 0 — between sends or before first send.
+            // Reset tracking so next non-zero read starts a fresh timer.
+            last_display_bytes = 0;
+            continue;
+        }
+        if current == last_display_bytes {
+            continue;
+        }
+
+        // Detect new send start (counter went from 0 to non-zero)
+        if last_display_bytes == 0 {
+            send_start = Instant::now();
+        }
+        last_display_bytes = current;
+
+        let elapsed = send_start.elapsed();
+        let rate = if elapsed.as_secs_f64() > 0.5 {
+            current as f64 / elapsed.as_secs_f64()
+        } else {
+            0.0
+        };
+
+        let elapsed_str = format_elapsed(elapsed);
+
+        if rate > 0.0 {
+            eprint!(
+                "\r  {} @ {}/s  [{}]    ",
+                ByteSize(current),
+                ByteSize(rate as u64),
+                elapsed_str,
+            );
+        } else {
+            eprint!("\r  {}  [{}]    ", ByteSize(current), elapsed_str);
+        }
+    }
+
+    // Clear the progress line
+    eprint!("\r\x1b[2K");
+}
+
+fn format_elapsed(d: Duration) -> String {
+    let total_secs = d.as_secs();
+    let hours = total_secs / 3600;
+    let mins = (total_secs % 3600) / 60;
+    let secs = total_secs % 60;
+
+    if hours > 0 {
+        format!("{hours}:{mins:02}:{secs:02}")
+    } else {
+        format!("{mins}:{secs:02}")
+    }
 }

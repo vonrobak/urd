@@ -100,6 +100,13 @@ impl StateDb {
                     result TEXT NOT NULL,
                     error_message TEXT,
                     bytes_transferred INTEGER
+                );
+
+                CREATE TABLE IF NOT EXISTS subvolume_sizes (
+                    subvolume TEXT PRIMARY KEY,
+                    estimated_bytes INTEGER NOT NULL,
+                    measured_at TEXT NOT NULL,
+                    method TEXT NOT NULL
                 );",
             )
             .map_err(|e| UrdError::State(format!("failed to create schema: {e}")))?;
@@ -275,6 +282,89 @@ impl StateDb {
                 "SELECT bytes_transferred FROM operations
                  WHERE subvolume = ?1 AND drive_label = ?2 AND operation = ?3
                    AND result = 'success' AND bytes_transferred IS NOT NULL
+                 ORDER BY id DESC LIMIT 1",
+            )
+            .map_err(|e| UrdError::State(format!("query failed: {e}")))?;
+
+        let mut rows = stmt
+            .query_map(rusqlite::params![subvol, drive, send_type], |row| {
+                let bytes: i64 = row.get(0)?;
+                Ok(bytes as u64)
+            })
+            .map_err(|e| UrdError::State(format!("query failed: {e}")))?;
+
+        match rows.next() {
+            Some(Ok(size)) => Ok(Some(size)),
+            Some(Err(e)) => Err(UrdError::State(format!("failed to read send size: {e}"))),
+            None => Ok(None),
+        }
+    }
+
+    // ── Calibration methods ─────────────────────────────────────────
+
+    /// Store (or update) a calibrated size for a subvolume.
+    pub fn upsert_subvolume_size(
+        &self,
+        subvolume: &str,
+        estimated_bytes: u64,
+        method: &str,
+    ) -> crate::error::Result<()> {
+        let now = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+        self.conn
+            .execute(
+                "INSERT INTO subvolume_sizes (subvolume, estimated_bytes, measured_at, method)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(subvolume) DO UPDATE SET
+                   estimated_bytes = ?2, measured_at = ?3, method = ?4",
+                rusqlite::params![subvolume, estimated_bytes as i64, now, method],
+            )
+            .map_err(|e| UrdError::State(format!("failed to upsert subvolume size: {e}")))?;
+        Ok(())
+    }
+
+    /// Get the calibrated size for a subvolume, if any.
+    /// Returns `(estimated_bytes, measured_at)`.
+    pub fn calibrated_size(
+        &self,
+        subvolume: &str,
+    ) -> crate::error::Result<Option<(u64, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT estimated_bytes, measured_at FROM subvolume_sizes WHERE subvolume = ?1",
+            )
+            .map_err(|e| UrdError::State(format!("query failed: {e}")))?;
+
+        let mut rows = stmt
+            .query_map(rusqlite::params![subvolume], |row| {
+                let bytes: i64 = row.get(0)?;
+                let measured_at: String = row.get(1)?;
+                Ok((bytes as u64, measured_at))
+            })
+            .map_err(|e| UrdError::State(format!("query failed: {e}")))?;
+
+        match rows.next() {
+            Some(Ok(result)) => Ok(Some(result)),
+            Some(Err(e)) => Err(UrdError::State(format!("failed to read calibrated size: {e}"))),
+            None => Ok(None),
+        }
+    }
+
+    /// Get the bytes_transferred from the most recent failed send of a given type
+    /// for a subvolume to a specific drive, where partial bytes were recorded.
+    /// This serves as a lower bound: the actual size is at least this large.
+    pub fn last_failed_send_size(
+        &self,
+        subvol: &str,
+        drive: &str,
+        send_type: &str,
+    ) -> crate::error::Result<Option<u64>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT bytes_transferred FROM operations
+                 WHERE subvolume = ?1 AND drive_label = ?2 AND operation = ?3
+                   AND result = 'failure' AND bytes_transferred IS NOT NULL
                  ORDER BY id DESC LIMIT 1",
             )
             .map_err(|e| UrdError::State(format!("query failed: {e}")))?;
@@ -666,5 +756,108 @@ mod tests {
             db.last_successful_send_size("sv1", "D", "send_full").unwrap(),
             Some(999)
         );
+    }
+
+    // ── last_failed_send_size tests ───────────────────────────────────
+
+    #[test]
+    fn last_failed_send_size_returns_partial_bytes() {
+        let db = StateDb::open_memory().unwrap();
+        let run_id = db.begin_run("full").unwrap();
+
+        db.record_operation(&OperationRecord {
+            run_id,
+            subvolume: "subvol5-music".to_string(),
+            operation: "send_full".to_string(),
+            drive_label: Some("2TB-backup".to_string()),
+            duration_secs: Some(600.0),
+            result: "failure".to_string(),
+            error_message: Some("No space left".to_string()),
+            bytes_transferred: Some(1_100_000_000_000),
+        })
+        .unwrap();
+
+        assert_eq!(
+            db.last_failed_send_size("subvol5-music", "2TB-backup", "send_full").unwrap(),
+            Some(1_100_000_000_000)
+        );
+    }
+
+    #[test]
+    fn last_failed_send_size_ignores_null_bytes() {
+        let db = StateDb::open_memory().unwrap();
+        let run_id = db.begin_run("full").unwrap();
+
+        // Failed send without bytes_transferred (old-style failure)
+        db.record_operation(&OperationRecord {
+            run_id,
+            subvolume: "sv1".to_string(),
+            operation: "send_full".to_string(),
+            drive_label: Some("D".to_string()),
+            duration_secs: Some(5.0),
+            result: "failure".to_string(),
+            error_message: Some("error".to_string()),
+            bytes_transferred: None,
+        })
+        .unwrap();
+
+        assert_eq!(
+            db.last_failed_send_size("sv1", "D", "send_full").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn last_failed_send_size_ignores_successes() {
+        let db = StateDb::open_memory().unwrap();
+        let run_id = db.begin_run("full").unwrap();
+
+        db.record_operation(&OperationRecord {
+            run_id,
+            subvolume: "sv1".to_string(),
+            operation: "send_full".to_string(),
+            drive_label: Some("D".to_string()),
+            duration_secs: Some(10.0),
+            result: "success".to_string(),
+            error_message: None,
+            bytes_transferred: Some(500_000),
+        })
+        .unwrap();
+
+        assert_eq!(
+            db.last_failed_send_size("sv1", "D", "send_full").unwrap(),
+            None
+        );
+    }
+
+    // ── calibration tests ─────────────────────────────────────────────
+
+    #[test]
+    fn upsert_and_query_calibrated_size() {
+        let db = StateDb::open_memory().unwrap();
+
+        db.upsert_subvolume_size("htpc-home", 77_640_000_000, "du -sb").unwrap();
+        let result = db.calibrated_size("htpc-home").unwrap();
+        assert!(result.is_some());
+        let (bytes, measured_at) = result.unwrap();
+        assert_eq!(bytes, 77_640_000_000);
+        assert!(!measured_at.is_empty());
+    }
+
+    #[test]
+    fn upsert_overwrites_calibrated_size() {
+        let db = StateDb::open_memory().unwrap();
+
+        db.upsert_subvolume_size("sv1", 100, "du -sb").unwrap();
+        db.upsert_subvolume_size("sv1", 200, "du -sb").unwrap();
+
+        let (bytes, _) = db.calibrated_size("sv1").unwrap().unwrap();
+        assert_eq!(bytes, 200);
+    }
+
+    #[test]
+    fn calibrated_size_returns_none_for_unknown() {
+        let db = StateDb::open_memory().unwrap();
+        assert_eq!(db.calibrated_size("nonexistent").unwrap(), None);
     }
 }

@@ -31,6 +31,8 @@ pub enum Commands {
     Verify(VerifyArgs),
     /// Initialize state database and validate system readiness
     Init,
+    /// Measure snapshot sizes for space estimation (run before first external send)
+    Calibrate(CalibrateArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -88,6 +90,13 @@ pub struct HistoryArgs {
     /// Show only failed operations
     #[arg(long)]
     pub failures: bool,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct CalibrateArgs {
+    /// Only calibrate this subvolume
+    #[arg(long)]
+    pub subvolume: Option<String>,
 }
 
 #[derive(clap::Args, Debug)]

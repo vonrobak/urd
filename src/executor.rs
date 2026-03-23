@@ -412,7 +412,19 @@ impl<'a> Executor<'a> {
                 )
             }
             Err(e) => {
+                // Extract partial byte count from btrfs errors (e.g., failed sends
+                // that transferred some data before the pipe broke)
+                let partial_bytes = match &e {
+                    crate::error::UrdError::Btrfs { bytes_transferred, .. } => *bytes_transferred,
+                    _ => None,
+                };
                 log::error!("{op_name} failed for {subvol_name} -> {drive_label}: {e}");
+                if let Some(bytes) = partial_bytes {
+                    log::info!(
+                        "Partial transfer: {} bytes copied before failure",
+                        bytes,
+                    );
+                }
                 (
                     OperationOutcome {
                         operation: op_name.to_string(),
@@ -420,7 +432,7 @@ impl<'a> Executor<'a> {
                         result: OpResult::Failure,
                         duration: start.elapsed(),
                         error: Some(e.to_string()),
-                        bytes_transferred: None,
+                        bytes_transferred: partial_bytes,
                     },
                     false,
                 )

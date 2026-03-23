@@ -256,7 +256,10 @@ pub fn run(config: Config) -> anyhow::Result<()> {
                     let mut input = String::new();
                     std::io::stdin().read_line(&mut input)?;
                     if input.trim().eq_ignore_ascii_case("y") {
-                        let btrfs = RealBtrfs::new(&config.general.btrfs_path);
+                        let btrfs = RealBtrfs::new(
+                            &config.general.btrfs_path,
+                            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                        );
                         match btrfs.delete_subvolume(&partial_path) {
                             Ok(()) => println!(
                                 "  {} Deleted {}",

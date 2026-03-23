@@ -22,8 +22,11 @@ pub enum UrdError {
     #[allow(dead_code)]
     Retention(String),
 
-    #[error("Btrfs command failed: {0}")]
-    Btrfs(String),
+    #[error("Btrfs command failed: {msg}")]
+    Btrfs {
+        msg: String,
+        bytes_transferred: Option<u64>,
+    },
 
     #[error("State database error: {0}")]
     State(String),
