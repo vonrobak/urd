@@ -1,7 +1,7 @@
 ---
 name: commit-push-pr
-description: Stage changes, commit with GPG signature, push to remote, and create PR with gh CLI
-argument-hint: Optional commit message prefix (e.g., "feat", "fix", "refactor", "test")
+description: Stage changes, commit with GPG signature, push to remote, and create PR with gh CLI. Includes PII scrubbing, quality gates, and Urd project conventions.
+argument-hint: Optional commit message prefix (e.g., "feat", "fix", "refactor", "docs")
 allowed-tools:
   - Bash
   - Read
@@ -11,134 +11,130 @@ allowed-tools:
 
 # Commit, Push, and Create PR
 
-Automated git workflow for the Urd project.
+Automated git workflow for the Urd project. This command handles the full cycle from
+uncommitted changes to a merged-ready PR, with PII protection and quality gates.
 
-## Workflow
+## Phase 1: Gather State (Parallel)
 
-### Phase 1: Pre-Compute Git Status (Parallel)
-
-Run these commands in PARALLEL for speed:
+Run all of these in parallel — they're independent and this cuts wall time significantly:
 
 ```bash
 git status --porcelain
 git diff --stat
+git diff HEAD               # full diff for PII scan
 git log --oneline -5
 git branch --show-current
 ```
 
-### Phase 2: Analyze Changes
+## Phase 2: PII Scan (BLOCKING — do this before staging anything)
 
-Parse the pre-computed status to understand what's changing:
+This repo is public. Personal information must not reach GitHub. Scan the full diff
+output from Phase 1 for these patterns:
 
-1. **Identify changed files** and categorize:
-   - Core logic: `src/plan.rs`, `src/retention.rs`, `src/chain.rs`, `src/types.rs`
-   - BTRFS integration: `src/btrfs.rs`, `src/executor.rs`, `src/drives.rs`
-   - CLI/UX: `src/cli.rs`, `src/commands/*.rs`
-   - Infrastructure: `src/state.rs`, `src/metrics.rs`, `src/config.rs`
-   - Tests: `tests/**`, `#[cfg(test)]` modules
-   - Config/docs: `config/`, `docs/`, `systemd/`, `udev/`
-2. **Detect change type**:
-   - `feat`: New module, new CLI command, new capability
-   - `fix`: Bug fix, error handling improvement
-   - `refactor`: Restructuring without behavior change
-   - `test`: New or modified tests
-   - `docs`: Documentation only
-   - `chore`: Dependencies, CI, tooling
-3. **Check current branch**: Feature branch vs master
+| Pattern | What it catches | Replacement |
+|---------|----------------|-------------|
+| The system username (from `$USER` or `whoami`) | Home paths, mount paths, sudoers entries | `<username>` |
+| `/home/<username>/` | Absolute home directory references | `~/` or `$HOME/` |
+| `/run/media/<username>/` | Mount paths with username | `/run/media/$USER/` |
+| Email addresses | Personal emails in configs or docs | `<email>` |
+| Hostnames from `/etc/hostname` | Machine-identifying names in examples | `<hostname>` |
 
-### Phase 3: Quality Gate
+**How to scan:**
 
-Before committing, run cargo checks:
+1. Get the username: `whoami`
+2. Search the diff for that username and the other patterns above
+3. If found in **source code or config examples** (`src/`, `config/`): these are bugs — fix
+   the files before committing. Replace with generic placeholders or environment variables.
+4. If found in **documentation** (`docs/`): evaluate context. Mount paths and sudoers
+   examples in docs are acceptable when they serve as real-world operational reference in
+   journals and reports (the reader needs to see actual paths to understand the system).
+   But gratuitous username exposure should be cleaned up. Use judgment.
+5. If PII is found and needs fixing, stop and fix the files first. Do not proceed to
+   staging until the diff is clean or the user has explicitly approved the remaining
+   instances.
+
+**Report findings to the user** before proceeding: "Found N instances of username in diff.
+M are in docs (operational context, acceptable). K are in source/config (should fix)."
+
+## Phase 3: Analyze Changes
+
+Categorize changed files to determine commit type and message structure:
+
+**File categories:**
+- Core logic: `plan.rs`, `retention.rs`, `chain.rs`, `types.rs`
+- BTRFS integration: `btrfs.rs`, `executor.rs`, `drives.rs`
+- CLI/UX: `cli.rs`, `commands/*.rs`
+- Infrastructure: `state.rs`, `metrics.rs`, `config.rs`, `error.rs`
+- Tests: `tests/**`, inline `#[cfg(test)]` modules
+- Documentation: `docs/`, `CLAUDE.md`, `CONTRIBUTING.md`
+- Deployment: `systemd/`, `udev/`, `config/`
+
+**Change type detection:**
+- `feat`: New capability, new module, new CLI command
+- `fix`: Bug fix, error handling improvement
+- `refactor`: Restructuring without behavior change
+- `test`: New or modified tests only
+- `docs`: Documentation changes only
+- `chore`: Dependencies, CI, tooling
+
+If the user provided a prefix argument, use that instead of auto-detecting.
+
+## Phase 4: Quality Gate
+
+For changes touching Rust code (`src/`, `tests/`), run cargo checks before committing:
 
 ```bash
 cargo clippy -- -D warnings 2>&1
 cargo test 2>&1
 ```
 
-If clippy or tests fail:
-- Show the errors clearly
-- Ask user whether to commit anyway or fix first
-- Default recommendation: fix first
+If either fails, show the errors and ask the user whether to fix first (recommended) or
+proceed anyway. For documentation-only changes, skip this phase.
 
-### Phase 4: Generate Commit Message
+## Phase 5: Stage and Commit
 
-Based on change type, generate a structured commit message:
+**Staging rules:**
+- Stage files by name — never use `git add -A` or `git add .`
+- Never stage: `.env`, credentials, files matching `.gitignore` patterns
+- Review what you're staging against the PII scan results from Phase 2
 
-**For feature/implementation work:**
+**Branch check:**
+If on `master`, warn the user and suggest creating a feature branch. The existing branch
+naming convention from git history is `feat/<slug>`, `fix/<slug>`, `docs/<slug>`,
+`refactor/<slug>`. Suggest an appropriate name based on the change type.
+
+**Commit message format:**
+
 ```
-<prefix>: <concise description>
+<type>: <concise description of what changed>
 
-<What changed and why, focusing on the architectural impact>
+<Body: what changed and why, focusing on architectural impact.
+For features, describe what was built. For fixes, describe root cause.
+Keep it informative but concise — the diff tells the details.>
 
-Modules: <list of changed modules>
-Phase: <current implementation phase from docs/PLAN.md>
+Modules: <list of changed src modules, e.g., plan, state, executor>
 
 Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
 ```
 
-**For bug fixes:**
-```
-fix: <what was broken>
+The `Modules:` line helps reviewers understand scope at a glance. Omit it for
+documentation-only or chore changes where it adds no value.
 
-<Root cause and how it was fixed>
-
-Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
-```
-
-**For tests:**
-```
-test: <what is being tested>
-
-<Coverage added, edge cases caught>
-
-Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
-```
-
-**For refactoring:**
-```
-refactor: <what was restructured>
-
-<Why the old structure was insufficient, what the new structure enables>
-
-Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
-```
-
-### Phase 5: Execute Git Operations
-
+Use a heredoc for the commit message to preserve formatting:
 ```bash
-# 1. Check we're in git repo
-if ! git rev-parse --git-dir > /dev/null 2>&1; then
-  echo "ERROR: Not a git repository"
-  exit 1
-fi
-
-# 2. Check for changes
-if [[ -z "$(git status --porcelain)" ]]; then
-  echo "No changes to commit"
-  exit 0
-fi
-
-# 3. Check current branch
-CURRENT_BRANCH=$(git branch --show-current)
-if [[ "$CURRENT_BRANCH" == "master" ]]; then
-  echo "WARNING: On master branch. Consider creating feature branch first."
-  echo "Suggestion: git checkout -b feature/<description>"
-  # Ask user if they want to continue or create branch
-fi
-
-# 4. Stage changes
-git add <relevant files>
-# Never stage files that might contain secrets
-
-# 5. Commit with message (using heredoc)
 git commit -m "$(cat <<'EOF'
-<generated commit message>
+<message here>
 EOF
 )"
+```
 
-# Note: GPG signing happens automatically if configured in git
+GPG signing is configured in git — it happens automatically.
 
-# 6. Push to remote
+## Phase 6: Push and Create PR
+
+**Push:**
+```bash
+CURRENT_BRANCH=$(git branch --show-current)
 if [[ "$CURRENT_BRANCH" == "master" ]]; then
   git push origin master
 else
@@ -146,59 +142,47 @@ else
 fi
 ```
 
-### Phase 6: Create PR (if on feature branch)
+**PR creation** (skip if committing directly to master):
 
-Skip PR creation if committing directly to master.
+Check `gh auth status` first. Then analyze all commits since divergence from master
+to build the PR description:
 
 ```bash
-# Check gh authentication
-if ! gh auth status > /dev/null 2>&1; then
-  echo "ERROR: gh CLI not authenticated. Run: gh auth login"
-  exit 1
-fi
-
-# Analyze all commits since divergence from master
-COMMITS=$(git log master..HEAD --oneline)
-
-gh pr create --title "<type>: <summary>" --body "$(cat <<'EOF'
+gh pr create --title "<type>: <summary under 70 chars>" --body "$(cat <<'EOF'
 ## Summary
 
-<Bullet points summarizing all commits since branch point>
-
-## Changes
-
-<List of modules changed and what each change does>
+<2-4 bullet points covering what changed and why>
 
 ## Testing
 
-<What was tested, how to verify>
-- `cargo test` results
-- `cargo clippy` status
-- Integration test status (if applicable)
+- cargo clippy: <pass/fail>
+- cargo test: <N tests, pass/fail>
+- Integration tests: <status or "not applicable">
 
-## Plan Phase
-
-<Which phase of docs/PLAN.md this implements>
-
-Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
 EOF
 )"
 ```
 
-### Error Handling
+Keep the PR body focused. The commit messages carry the detail — the PR summarizes
+across commits.
 
-1. **Not in git repo**: Clear error message
-2. **No changes**: Exit gracefully
-3. **On master**: Warn, suggest feature branch, ask user
-4. **Clippy/test failures**: Show errors, recommend fixing before commit
-5. **gh not authenticated**: Clear remediation
-6. **Commit/push/PR failure**: Show error, don't proceed to next step
+## Error Handling
+
+Each phase is a gate — if it fails, do not proceed to the next:
+
+1. **No git repo**: Exit with clear message
+2. **No changes**: Exit gracefully, tell the user
+3. **PII found in source/config**: Stop, fix files, restart
+4. **Quality gate failure**: Show errors, recommend fixing, ask user
+5. **On master without intent**: Suggest feature branch, ask user
+6. **gh not authenticated**: Show `gh auth login` remediation
+7. **Push/PR failure**: Show error output, do not continue
 
 ## Usage
 
 ```
 /commit-push-pr           # Auto-detect change type
-/commit-push-pr feat      # Use "feat" prefix
-/commit-push-pr fix       # Use "fix" prefix
-/commit-push-pr refactor  # Use "refactor" prefix
+/commit-push-pr feat      # Force "feat" prefix
+/commit-push-pr docs      # Force "docs" prefix (skips quality gate)
 ```

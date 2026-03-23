@@ -10,7 +10,8 @@ The name comes from the Norse norn who tends the Well of Urðr and knows all tha
 
 ## Architecture
 
-The implementation plan is at `docs/PLAN.md`. Read it before making architectural decisions.
+For current project state, read `docs/96-project-supervisor/status.md` first. The original
+roadmap and architectural vision is at `docs/96-project-supervisor/roadmap.md`.
 
 ### Core Design Principle: Planner/Executor Separation
 
@@ -52,6 +53,7 @@ This separation is the most important architectural property of Urd. Do not bypa
 - Follow standard Rust conventions: `snake_case` for functions/variables, `CamelCase` for types
 - Use `clippy` — all warnings are errors: `cargo clippy -- -D warnings`
 - Format with `rustfmt` before committing
+- Documentation filenames are lowercase kebab-case (exceptions: CLAUDE.md, README.md, CONTRIBUTING.md)
 - Prefer strong types over primitives: `SnapshotName` not `String`, `Tier` not `u8`
 - Use `#[must_use]` on functions that return values that should not be ignored
 - Derive `Debug` on all types. Derive `Clone`, `PartialEq`, `Eq` where it makes sense
@@ -128,8 +130,10 @@ src/
   commands/          # CLI subcommand implementations
 config/
   urd.toml.example   # Reference config
-docs/
-  PLAN.md            # Implementation plan
+docs/                # See CONTRIBUTING.md for full documentation structure
+  96-project-supervisor/
+    status.md        # Start here: current state, links to details
+    roadmap.md       # Original project roadmap (founding artifact)
 systemd/             # Service/timer units (Phase 3+)
 udev/                # udev rules (Phase 5)
 tests/
@@ -144,4 +148,5 @@ Example config: `config/urd.toml.example`
 
 ## Current Phase
 
-Check `docs/PLAN.md` for the current implementation phase and what to build next.
+Check `docs/96-project-supervisor/status.md` for current project state and what to build next.
+See `CONTRIBUTING.md` for documentation standards and organization.
