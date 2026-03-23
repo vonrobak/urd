@@ -5,18 +5,24 @@
 
 ## Current State
 
-**Phase 4 code is complete. Post-cutover features (Priorities 2-4) are built and reviewed.
-Operational cutover has not started.** The bash script (`btrfs-snapshot-backup.sh`) is still
-the sole production backup system, running nightly at 02:00 via `btrfs-backup-daily.timer`.
-Urd v0.1.0 is installed (`~/.cargo/bin/urd`) and has been tested manually on real subvolumes
-(2026-03-23), but is not deployed on a schedule.
+**Phase 5 has begun. The awareness model (Priority 3a) is built, double-reviewed, and
+passing 168 tests.** Operational cutover has not started — the bash script
+(`btrfs-snapshot-backup.sh`) is still the sole production backup system, running nightly at
+02:00 via `btrfs-backup-daily.timer`. Urd v0.1.0 is installed (`~/.cargo/bin/urd`) and has
+been tested manually on real subvolumes (2026-03-23), but is not deployed on a schedule.
 
-Post-Phase 4 work completed: pre-send space estimation (historical data-based), documentation
-system (CONTRIBUTING.md), first real-world backup testing (subvol6-tmp, htpc-root,
-subvol1-docs, htpc-home — all successful, chains now incremental for tested subvolumes),
-failed-send bytes recording, live progress display during sends, and `urd calibrate` command.
-All three post-cutover features passed adversary review (scores 4-5 across all dimensions)
-and review-identified fixes have been applied.
+Phase 5 work completed: awareness model (`awareness.rs`) — a pure function computing
+PROTECTED / AT RISK / UNPROTECTED per subvolume from config + filesystem state + history.
+Design-reviewed before implementation, implementation-reviewed after. Asymmetric thresholds
+(local 2x/5x, external 1.5x/3x), best-drive aggregation (max across drives), clock skew
+protection, per-subvolume error capture. 24 awareness tests.
+[Journal](../98-journals/2026-03-23-awareness-model.md) |
+[Design review](../99-reports/2026-03-23-awareness-model-design-review.md) |
+[Implementation review](../99-reports/2026-03-23-awareness-model-implementation-review.md)
+
+Prior work: pre-send space estimation, documentation system (CONTRIBUTING.md), first
+real-world backup testing, failed-send bytes recording, live progress display, `urd calibrate`.
+All post-cutover features passed adversary review and fixes have been applied.
 
 ## What to Build Next — Priority Order
 
@@ -49,15 +55,15 @@ These features define the abstractions everything else builds on. Getting them w
 cascades. Each has architectural gates from the
 [vision architecture review](../99-reports/2026-03-23-vision-architecture-review.md).
 
-**3a. Awareness model** (`awareness.rs`) — the architectural prerequisite for promises,
-heartbeat, Sentinel, and status output. A **pure function**: given config + filesystem
-state + history, compute promise states per subvolume. Must work without the Sentinel.
-Available to every command.
+**3a. Awareness model** (`awareness.rs`) — **COMPLETE.** Pure function computing promise
+states per subvolume. Asymmetric thresholds (local 2x/5x, external 1.5x/3x). Best-drive
+aggregation for overall status. Clock skew protection. Error capture per subvolume.
+Advisories for offsite cycling reminders. 24 tests. Double adversary-reviewed.
 
-- [ ] Module exists as standalone pure function, no I/O dependencies
-- [ ] Promise state enum: PROTECTED / AT RISK / UNPROTECTED
-- [ ] Computable from existing `FileSystemState` trait (extend if needed)
-- [ ] Testable with `MockFileSystemState`
+- [x] Module exists as standalone pure function, no I/O dependencies
+- [x] Promise state enum: PROTECTED / AT RISK / UNPROTECTED
+- [x] Computable from existing `FileSystemState` trait (extended with `last_successful_send_time`)
+- [x] Testable with `MockFileSystemState` (including error injection)
 
 **3b. Heartbeat file** — JSON at `~/.local/share/urd/heartbeat.json`. Written after every
 backup run. Versioned schema, atomic writes (temp + rename), staleness advisory timestamp.
@@ -116,7 +122,7 @@ The Sentinel is three independent systems that compose. Build and test them sepa
 | 5c | **Active mode** | Event reactor (5b) | Auto-trigger backups to meet promises. Circuit breaker (no cascade on error). Lock contention with manual `urd backup` resolved. |
 
 Architectural gates:
-- [ ] Awareness model works independently (tested, no Sentinel dependency)
+- [x] Awareness model works independently (tested, no Sentinel dependency)
 - [ ] Heartbeat works independently (written by `urd backup`, read by Sentinel)
 - [ ] Event/action types defined as enums (testable state machine)
 - [ ] Lock contention with manual `urd backup` designed
@@ -156,7 +162,7 @@ external integrations. Build these when the foundations are solid.
 | Pull mode / mesh | Indefinitely. |
 | Multi-user / library mode | No current need. |
 
-### Completed (Priorities 2-4)
+### Completed (Priorities 2-4 + Phase 5 partial)
 
 These features are built, adversary-reviewed, and ready to ship:
 
@@ -173,6 +179,11 @@ These features are built, adversary-reviewed, and ready to ship:
 Review fixes applied: progress timer reset between sends, reject 0-byte calibration, corrupt
 timestamp staleness handling, space check deduplication, ANSI line clearing.
 [Review](../99-reports/2026-03-23-post-cutover-features-review.md)
+- **Awareness model** (Phase 5, P3a) — `awareness.rs`: pure function `assess(config, now, fs)`
+  computing PROTECTED / AT RISK / UNPROTECTED per subvolume. Asymmetric thresholds, best-drive
+  aggregation, clock skew protection, error capture, offsite advisories. `FileSystemState`
+  extended with `last_successful_send_time()`. 24 tests. Not yet integrated into status command.
+  [Journal](../98-journals/2026-03-23-awareness-model.md)
 
 ### Not Building (dropped per adversary review)
 
@@ -193,7 +204,7 @@ timestamp staleness handling, space check deduplication, ANSI line clearing.
 - [x] **Phase 4 code** — Cutover polish + space estimation + real-world testing
 - [ ] **Phase 4 cutover** — Operational transition from bash to Urd (see below)
 - [x] **Post-cutover features** — failed-send bytes, progress, calibrate (Priorities 2-4)
-- [ ] **Phase 5** — Architectural foundation: awareness model, heartbeat, presentation layer, `urd get`
+- [ ] **Phase 5** — Architectural foundation: ~~awareness model~~, heartbeat, presentation layer, `urd get`
 - [ ] **Phase 5 gate** — ADR: protection promise design (retention mappings, config conflicts, migration)
 - [ ] **Phase 6** — Protection promises in config + planner + status
 - [ ] **Phase 7** — Sentinel: notification dispatcher → event reactor → active mode
@@ -238,6 +249,9 @@ for details.
 
 | Decision | Date | Reference |
 |----------|------|-----------|
+| Asymmetric multipliers: local 2x/5x, external 1.5x/3x | 2026-03-23 | [Awareness model design review](../99-reports/2026-03-23-awareness-model-design-review.md) |
+| Overall status = max() across drives (best drive wins), offsite as advisory | 2026-03-23 | [Awareness model design review](../99-reports/2026-03-23-awareness-model-design-review.md) |
+| Clock skew: clamp negative ages to zero, emit advisory | 2026-03-23 | [Awareness model impl review](../99-reports/2026-03-23-awareness-model-implementation-review.md) |
 | Awareness model as standalone pure function (not inside Sentinel) | 2026-03-23 | [Vision architecture review](../99-reports/2026-03-23-vision-architecture-review.md) §2 |
 | Sentinel decomposed: awareness + event reactor + notification dispatcher | 2026-03-23 | [Vision architecture review](../99-reports/2026-03-23-vision-architecture-review.md) §2 |
 | Protection promises need ADR before code (policy design problem) | 2026-03-23 | [Vision architecture review](../99-reports/2026-03-23-vision-architecture-review.md) §1 |
@@ -266,7 +280,7 @@ for details.
 | Future directions brainstorm | [Feature ideas](../95-ideas/2026-03-23-brainstorm-urd-future.md) |
 | UX design principles brainstorm | [Norman principles](../95-ideas/2026-03-23-brainstorm-ux-norman-principles.md) |
 | Vision architecture review | [2026-03-23 Architectural criteria for vision](../99-reports/2026-03-23-vision-architecture-review.md) |
-| Latest adversary review | [2026-03-23 Post-cutover features review](../99-reports/2026-03-23-post-cutover-features-review.md) |
+| Latest adversary review | [2026-03-23 Awareness model impl review](../99-reports/2026-03-23-awareness-model-implementation-review.md) |
 | Code conventions & architecture | [CLAUDE.md](../../CLAUDE.md) |
 | Documentation standards | [CONTRIBUTING.md](../../CONTRIBUTING.md) |
 
@@ -277,6 +291,7 @@ for details.
 - `du -sb` may follow symlinks in snapshots — consider `-P` flag (not yet tested on real snapshots with symlinks)
 - Stale failed send estimates persist indefinitely for (subvolume, drive, send_type) triples with no subsequent sends — consider TTL or clearing on successful calibration
 - Successful sends could update `subvolume_sizes` table to keep calibration fresh, but pipe bytes ≠ `du -sb` bytes (method mixing concern)
-- `sentinel.rs` stubbed but not implemented (Phase 5)
+- `FileSystemState` trait (9 methods) is outgrowing its name — consider renaming to `SystemState` if more history/state methods are added
+- Awareness model not yet integrated into `urd status` or backup post-run summary (follow-up task)
 - Per-drive pin protection for external retention — current all-drives-union is conservative but suboptimal for space
 - Idea: [systemd unit drift check](../95-ideas/2026-03-23-systemd-unit-drift-check.md) in `urd verify`
