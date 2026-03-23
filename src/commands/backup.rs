@@ -33,7 +33,15 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
         "full"
     };
 
-    let fs_state = RealFileSystemState;
+    let state_db = match StateDb::open(&config.general.state_db) {
+        Ok(db) => Some(db),
+        Err(e) => {
+            log::warn!("Failed to open state DB, continuing without history: {e}");
+            None
+        }
+    };
+
+    let fs_state = RealFileSystemState { state: state_db.as_ref() };
     let backup_plan = plan::plan(&config, now, &filters, &fs_state)?;
 
     // Dry run: print plan and exit (no lock needed)
@@ -63,14 +71,6 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
 
     // Set up executor
     let btrfs = RealBtrfs::new(&config.general.btrfs_path);
-
-    let state_db = match StateDb::open(&config.general.state_db) {
-        Ok(db) => Some(db),
-        Err(e) => {
-            log::warn!("Failed to open state DB, continuing without history: {e}");
-            None
-        }
-    };
 
     let executor = Executor::new(&btrfs, state_db.as_ref(), &config, &shutdown);
     let result = executor.execute(&backup_plan, mode);
@@ -209,7 +209,7 @@ fn write_metrics_after_execution(
     result: &crate::executor::ExecutionResult,
     plan: &crate::types::BackupPlan,
     now: chrono::NaiveDateTime,
-    fs_state: &RealFileSystemState,
+    fs_state: &dyn FileSystemState,
 ) -> anyhow::Result<()> {
     let now_ts = now.and_utc().timestamp();
     let mut subvolume_metrics = Vec::new();
@@ -258,7 +258,7 @@ fn write_metrics_for_skipped(
     now: chrono::NaiveDateTime,
 ) -> anyhow::Result<()> {
     let now_ts = now.and_utc().timestamp();
-    let fs_state = RealFileSystemState;
+    let fs_state = RealFileSystemState { state: None };
     let mut subvolume_metrics = Vec::new();
 
     append_skipped_metrics(config, plan, &fs_state, &mut subvolume_metrics, &HashSet::new());
@@ -273,7 +273,7 @@ fn write_metrics_for_skipped(
 fn append_skipped_metrics(
     config: &Config,
     plan: &crate::types::BackupPlan,
-    fs_state: &RealFileSystemState,
+    fs_state: &dyn FileSystemState,
     subvolume_metrics: &mut Vec<SubvolumeMetrics>,
     already_emitted: &HashSet<String>,
 ) {
@@ -320,7 +320,7 @@ fn write_global_metrics(
 fn count_local_snapshots(
     config: &Config,
     subvol_name: &str,
-    fs_state: &RealFileSystemState,
+    fs_state: &dyn FileSystemState,
 ) -> usize {
     if let Some(root) = config.snapshot_root_for(subvol_name) {
         fs_state
@@ -335,7 +335,7 @@ fn count_local_snapshots(
 fn count_external_snapshots(
     config: &Config,
     subvol_name: &str,
-    fs_state: &RealFileSystemState,
+    fs_state: &dyn FileSystemState,
 ) -> usize {
     // First mounted drive's count (for bash compat)
     for drive in &config.drives {

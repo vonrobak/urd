@@ -261,6 +261,38 @@ impl StateDb {
             .map_err(|e| UrdError::State(format!("failed to read operations: {e}")))
     }
 
+    /// Get the bytes_transferred from the most recent successful send of a given type
+    /// for a subvolume to a specific drive. Returns None if no matching history exists.
+    pub fn last_successful_send_size(
+        &self,
+        subvol: &str,
+        drive: &str,
+        send_type: &str,
+    ) -> crate::error::Result<Option<u64>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT bytes_transferred FROM operations
+                 WHERE subvolume = ?1 AND drive_label = ?2 AND operation = ?3
+                   AND result = 'success' AND bytes_transferred IS NOT NULL
+                 ORDER BY id DESC LIMIT 1",
+            )
+            .map_err(|e| UrdError::State(format!("query failed: {e}")))?;
+
+        let mut rows = stmt
+            .query_map(rusqlite::params![subvol, drive, send_type], |row| {
+                let bytes: i64 = row.get(0)?;
+                Ok(bytes as u64)
+            })
+            .map_err(|e| UrdError::State(format!("query failed: {e}")))?;
+
+        match rows.next() {
+            Some(Ok(size)) => Ok(Some(size)),
+            Some(Err(e)) => Err(UrdError::State(format!("failed to read send size: {e}"))),
+            None => Ok(None),
+        }
+    }
+
     fn map_operation_row(row: &rusqlite::Row) -> rusqlite::Result<OperationRow> {
         Ok(OperationRow {
             id: row.get(0)?,
@@ -521,5 +553,118 @@ mod tests {
         assert_eq!(failures.len(), 1);
         assert_eq!(failures[0].subvolume, "subvol3-opptak");
         assert_eq!(failures[0].error_message.as_deref(), Some("No space left"));
+    }
+
+    // ── last_successful_send_size tests ────────────────────────────────
+
+    #[test]
+    fn last_send_size_returns_bytes() {
+        let db = StateDb::open_memory().unwrap();
+        seed_db(&db); // htpc-home send_incremental to WD-18TB = 1_000_000 bytes
+
+        let size = db
+            .last_successful_send_size("htpc-home", "WD-18TB", "send_incremental")
+            .unwrap();
+        assert_eq!(size, Some(1_000_000));
+    }
+
+    #[test]
+    fn last_send_size_excludes_failures() {
+        let db = StateDb::open_memory().unwrap();
+        seed_db(&db); // subvol3-opptak send_full to WD-18TB failed
+
+        let size = db
+            .last_successful_send_size("subvol3-opptak", "WD-18TB", "send_full")
+            .unwrap();
+        assert_eq!(size, None);
+    }
+
+    #[test]
+    fn last_send_size_no_history() {
+        let db = StateDb::open_memory().unwrap();
+
+        let size = db
+            .last_successful_send_size("nonexistent", "WD-18TB", "send_full")
+            .unwrap();
+        assert_eq!(size, None);
+    }
+
+    #[test]
+    fn last_send_size_filters_by_drive() {
+        let db = StateDb::open_memory().unwrap();
+        let run_id = db.begin_run("full").unwrap();
+
+        db.record_operation(&OperationRecord {
+            run_id,
+            subvolume: "htpc-home".to_string(),
+            operation: "send_full".to_string(),
+            drive_label: Some("DRIVE-A".to_string()),
+            duration_secs: Some(10.0),
+            result: "success".to_string(),
+            error_message: None,
+            bytes_transferred: Some(500_000),
+        })
+        .unwrap();
+
+        db.record_operation(&OperationRecord {
+            run_id,
+            subvolume: "htpc-home".to_string(),
+            operation: "send_full".to_string(),
+            drive_label: Some("DRIVE-B".to_string()),
+            duration_secs: Some(20.0),
+            result: "success".to_string(),
+            error_message: None,
+            bytes_transferred: Some(600_000),
+        })
+        .unwrap();
+
+        assert_eq!(
+            db.last_successful_send_size("htpc-home", "DRIVE-A", "send_full").unwrap(),
+            Some(500_000)
+        );
+        assert_eq!(
+            db.last_successful_send_size("htpc-home", "DRIVE-B", "send_full").unwrap(),
+            Some(600_000)
+        );
+        assert_eq!(
+            db.last_successful_send_size("htpc-home", "DRIVE-C", "send_full").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn last_send_size_returns_most_recent() {
+        let db = StateDb::open_memory().unwrap();
+
+        let r1 = db.begin_run("full").unwrap();
+        db.record_operation(&OperationRecord {
+            run_id: r1,
+            subvolume: "sv1".to_string(),
+            operation: "send_full".to_string(),
+            drive_label: Some("D".to_string()),
+            duration_secs: Some(10.0),
+            result: "success".to_string(),
+            error_message: None,
+            bytes_transferred: Some(100),
+        })
+        .unwrap();
+
+        let r2 = db.begin_run("full").unwrap();
+        db.record_operation(&OperationRecord {
+            run_id: r2,
+            subvolume: "sv1".to_string(),
+            operation: "send_full".to_string(),
+            drive_label: Some("D".to_string()),
+            duration_secs: Some(10.0),
+            result: "success".to_string(),
+            error_message: None,
+            bytes_transferred: Some(999),
+        })
+        .unwrap();
+
+        assert_eq!(
+            db.last_successful_send_size("sv1", "D", "send_full").unwrap(),
+            Some(999)
+        );
     }
 }
