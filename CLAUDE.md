@@ -1,152 +1,158 @@
 # CLAUDE.md
 
-## Project
+## Vision
 
 **Urd** (Old Norse: Urðr) — a BTRFS Time Machine for Linux, written in Rust.
 
-Urd automates BTRFS snapshot creation, incremental send/receive to external drives, and graduated retention. It replaces a 1710-line bash script with a type-safe, testable, distributable tool.
+Urd is the norn who tends the Well of Urðr and knows all that has passed. She preserves your
+filesystem history silently and faithfully. When you invoke her, the encounter should be
+pleasant and clear. When she demands your attention, you should be glad she did.
 
-The name comes from the Norse norn who tends the Well of Urðr and knows all that has passed — fitting for a system that preserves filesystem history.
+**Design north star:** Every feature must pass two tests: (1) does it make the user's data
+safer? (2) does it reduce the attention the user needs to spend on backups? If a feature
+adds complexity the user must manage, it needs a very strong justification.
+
+**Two modes of existence:**
+- **The invisible worker.** Urd runs autonomously — systemd timer, Sentinel daemon, tray icon.
+  Silence is a good sign. The user should trust that if Urd is quiet, their data is safe.
+- **The invoked norn.** When the user calls `urd status`, `urd restore`, or any command, they
+  are consulting Urd. She speaks with authority and clarity, guiding decisions about their data.
+  When Urd surfaces a problem unbidden (notification, broken promise), it's because it matters.
+
+**The mythic voice.** Urd's text-based interactions carry the character of the norn — evocative,
+wise, grounding. Not cosplay or gimmick, but a consistent tone that makes the experience of
+managing backups feel considered and trustworthy. "Your recordings are woven into the well"
+rather than "backup completed: success." Apply this voice to status output, setup conversation,
+recovery contracts, and notifications. Technical details remain precise; the framing is mythic.
+
+**Protection promises.** Urd thinks in promises, not operations. The user declares what matters
+("protect my home directory," "keep my recordings resilient") and Urd derives the operations.
+Anchor promises to the user's actual data: documents, photos, recordings, projects — not
+subvolume IDs. Promise states (PROTECTED / AT RISK / UNPROTECTED) are the universal language
+of the app.
+
+## Orient Yourself
+
+Read `docs/96-project-supervisor/status.md` first — it has current state, priorities, and
+links to everything else. See `CONTRIBUTING.md` for documentation standards.
 
 ## Architecture
 
-For current project state, read `docs/96-project-supervisor/status.md` first. The original
-roadmap and architectural vision is at `docs/96-project-supervisor/roadmap.md`.
+### Core Invariant: Planner/Executor Separation
 
-### Core Design Principle: Planner/Executor Separation
+The planner (`plan.rs`) is a **pure function**: config + filesystem state in, `BackupPlan` out.
+It never modifies anything. The executor (`executor.rs`) takes a plan and runs it.
 
-The planner (`plan.rs`) is a **pure function** that produces a `BackupPlan` — a list of `PlannedOperation` variants. It reads config and filesystem state, but never modifies anything. The executor (`executor.rs`) takes a plan and executes it.
-
-This separation is the most important architectural property of Urd. Do not bypass it. All backup logic flows through: config -> plan -> execute.
+This is the most important architectural property. Do not bypass it. All backup logic flows
+through: config -> plan -> execute.
 
 ### BtrfsOps Trait
 
-`btrfs.rs` defines a `BtrfsOps` trait. `RealBtrfs` calls `sudo /usr/sbin/btrfs` via `std::process::Command`. `MockBtrfs` records calls for testing. This is the **only module that shells out to btrfs**. Every other module works through the trait.
+`btrfs.rs` defines `BtrfsOps`. `RealBtrfs` shells out to `sudo btrfs`; `MockBtrfs` records
+calls for testing. This is the **only module that calls btrfs**. Everything else uses the trait.
 
 ### Module Responsibilities
 
 | Module | Does | Does NOT |
 |--------|------|----------|
-| `config.rs` | Parse TOML, validate, expand paths | Touch filesystem beyond checking paths exist |
+| `config.rs` | Parse TOML, validate, expand paths | Touch filesystem beyond path checks |
 | `types.rs` | Define domain types, parsing, Display | Contain business logic |
-| `plan.rs` | Decide what operations to run | Execute operations, call btrfs |
-| `executor.rs` | Execute planned operations, handle errors | Decide what to do (that's the planner's job) |
+| `plan.rs` | Decide what operations to run | Execute anything or call btrfs |
+| `executor.rs` | Execute planned operations | Decide what to do (planner's job) |
 | `btrfs.rs` | Wrap btrfs subprocess calls | Know about retention, plans, config |
 | `retention.rs` | Compute which snapshots to keep/delete | Delete anything (returns lists) |
 | `chain.rs` | Track incremental chain parents (pin files) | Send snapshots |
 | `state.rs` | Record history in SQLite | Influence backup decisions |
 | `metrics.rs` | Write Prometheus .prom files | Read metrics |
 | `drives.rs` | Detect mounted drives, check space | Mount/unmount drives |
+| `commands/` | CLI subcommand handlers | Core logic (delegate to above) |
 
 ### Error Handling
 
-- Use `thiserror` for error type definitions in `error.rs`
-- Use `anyhow` in `main.rs` and CLI layer for error context
+- `thiserror` for types in `error.rs`; `anyhow` in `main.rs` / CLI layer
 - Individual subvolume failures must NOT abort the entire backup run
-- Failed btrfs sends must clean up partial snapshots at the destination
-- SQLite failures must NOT prevent backups from running (log warning, continue)
+- Failed sends must clean up partial snapshots at the destination
+- SQLite failures must NOT prevent backups (log warning, continue)
+
+### UX Principles
+
+These encode design decisions from the Norman UX analysis and user feedback:
+
+- **Invisible worker, invoked norn.** Two interaction modes (see Vision above). Autonomous
+  operation is silent; invoked interaction is rich, guided, and carries the mythic voice.
+  Failures and broken promises are always impossible to miss, regardless of mode.
+- **Answer "is my data safe?"** Every user-facing surface should answer this in human terms
+  — promise states, plain language, data types the user cares about (not subvolume IDs).
+- **Guide through affordances, not error messages.** The interface should lead users toward
+  correct choices so errors don't happen. Smart defaults, setup guidance, and promise-level
+  config are better than post-hoc warnings. The goal is fewer errors, not better errors.
+- **Flexibility only earns its keep if it's easy to operate.** A powerful feature behind a
+  confusing interface is a feature nobody uses. When in doubt, choose the simpler design.
+  Power users interact with config files directly — don't over-build the config UI for them.
+- **The Sentinel is the integration layer.** An event-driven state machine that holds the
+  awareness model, reacts to events (drive plug, timer, backup result), updates promise
+  states, and drives notifications. Other features subscribe to its event stream.
 
 ## Coding Conventions
 
-### Rust Style
+- Standard Rust: `snake_case` functions, `CamelCase` types
+- `cargo clippy -- -D warnings` (all warnings are errors)
+- `rustfmt` before committing
+- Strong types over primitives: `SnapshotName` not `String`, `Tier` not `u8`
+- `#[must_use]` on functions whose return values matter
+- Derive `Debug` on all types; `Clone`, `PartialEq`, `Eq` where sensible
+- No `unsafe` — no need for it in this project
+- No `unwrap()` / `expect()` in library code — only in tests and `main.rs`
+- Doc filenames: lowercase kebab-case (exceptions: CLAUDE.md, README.md, CONTRIBUTING.md)
 
-- Follow standard Rust conventions: `snake_case` for functions/variables, `CamelCase` for types
-- Use `clippy` — all warnings are errors: `cargo clippy -- -D warnings`
-- Format with `rustfmt` before committing
-- Documentation filenames are lowercase kebab-case (exceptions: CLAUDE.md, README.md, CONTRIBUTING.md)
-- Prefer strong types over primitives: `SnapshotName` not `String`, `Tier` not `u8`
-- Use `#[must_use]` on functions that return values that should not be ignored
-- Derive `Debug` on all types. Derive `Clone`, `PartialEq`, `Eq` where it makes sense
-- No `unsafe` code — there is no need for it in this project
-- No `unwrap()` or `expect()` in library code — only in tests and `main.rs` where panicking is acceptable
+## Testing
 
-### Testing
-
-- Unit tests live in the same file as the code (`#[cfg(test)] mod tests`)
-- Integration tests that need real btrfs/drives go in `tests/integration/` and are `#[ignore]` by default
-- Run unit tests: `cargo test`
-- Run integration tests: `cargo test -- --ignored` (requires 2TB-backup drive mounted)
-- Use `MockBtrfs` for unit testing anything that would call btrfs
+- Unit tests: `#[cfg(test)] mod tests` in same file. Run: `cargo test`
+- Integration tests: `tests/integration/`, `#[ignore]` by default. Run: `cargo test -- --ignored`
+- Use `MockBtrfs` for anything that would call btrfs
 - Test retention logic exhaustively — it protects against data loss
 
-### Backward Compatibility
+## Backward Compatibility
 
-These formats MUST be preserved exactly (the existing bash backup system and monitoring depend on them):
+These formats are **load-bearing** — existing snapshots, monitoring, and pin files depend on them:
 
-1. **Snapshot naming:**
-   - **Legacy (read-only):** `YYYYMMDD-<short_name>` (e.g., `20260322-opptak`) — parsed as midnight. Existing snapshots in this format are recognized and handled correctly by `SnapshotName::parse()`.
-   - **Current (write):** `YYYYMMDD-HHMM-<short_name>` (e.g., `20260322-1430-opptak`) — all new snapshots use this format to support sub-daily snapshot intervals (e.g., 15-minute intervals on htpc-home).
-   - **Coexistence:** Both formats may exist in the same snapshot directory. Retention, send, and display logic handle both transparently. Ordering is by datetime, not string comparison.
-   - **Phase 3 note:** During parallel running, the bash script may not recognize HHMM-format names. This is acceptable — the bash script only manages snapshots it created (matched by its own naming convention). Urd manages all snapshots in the directory regardless of format.
-2. **Snapshot directories:** `<snapshot_root>/<subvolume_name>/` (e.g., `.snapshots/subvol3-opptak/`)
-3. **Pin files:** `.last-external-parent-<DRIVE_LABEL>` in the subvolume's local snapshot directory. May contain either legacy or current snapshot name format.
-4. **Prometheus metrics:** exact metric names, labels, and value semantics (see `docs/PLAN.md` for full list)
+1. **Snapshot names:** Legacy `YYYYMMDD-<name>` (read-only, parsed as midnight) and current
+   `YYYYMMDD-HHMM-<name>` (all new snapshots). Both coexist; ordering by datetime, not string.
+2. **Snapshot dirs:** `<snapshot_root>/<subvolume_name>/`
+3. **Pin files:** `.last-external-parent-<DRIVE_LABEL>` in local snapshot dir
+4. **Prometheus metrics:** exact names, labels, and value semantics must be preserved
 
-### BTRFS Commands
+## BTRFS Commands
 
-All btrfs operations require `sudo`. The sudoers file scopes allowed commands to specific paths. Commands used:
+All operations require `sudo` (scoped via sudoers). The `BtrfsOps` trait wraps:
 
-```bash
-sudo btrfs subvolume snapshot -r <source> <dest>     # Create read-only snapshot
-sudo btrfs send [-p <parent>] <snapshot>              # Send (incremental with -p)
-sudo btrfs receive <dest_dir>                         # Receive snapshot stream
-sudo btrfs subvolume delete <path>                    # Delete snapshot
-sudo btrfs subvolume show <path>                      # Metadata (read-only)
-sudo btrfs filesystem show <path>                     # Filesystem info (read-only)
+```
+snapshot -r, send [-p parent], receive, subvolume delete, subvolume show, filesystem show
 ```
 
-The send|receive pipeline must capture stderr from both sides and check both exit codes. On failure, clean up any partial snapshot at the destination.
+The send|receive pipeline must capture stderr from both sides, check both exit codes, and
+clean up partial snapshots on failure.
 
 ## Build & Run
 
 ```bash
-cargo build                          # Debug build
-cargo build --release                # Release build
+cargo build                          # Debug
+cargo build --release                # Release
 cargo test                           # Unit tests
-cargo test -- --ignored              # Integration tests (needs 2TB-backup drive)
+cargo test -- --ignored              # Integration tests (needs drives)
 cargo clippy -- -D warnings          # Lint
-cargo run -- plan                    # Run: show backup plan
-cargo run -- backup --dry-run        # Run: dry-run backup
-cargo run -- status                  # Run: show system status
-```
-
-## Project Structure
-
-```
-src/
-  main.rs            # CLI entry, clap dispatch
-  cli.rs             # Clap definitions
-  config.rs          # TOML config
-  types.rs           # Domain types
-  plan.rs            # Backup planner (pure logic)
-  executor.rs        # Plan executor
-  btrfs.rs           # BtrfsOps trait + RealBtrfs + MockBtrfs
-  retention.rs       # Graduated + count-based retention
-  chain.rs           # Incremental chain / pin files
-  state.rs           # SQLite state DB
-  metrics.rs         # Prometheus writer
-  drives.rs          # Drive detection + space
-  error.rs           # Error types
-  commands/          # CLI subcommand implementations
-config/
-  urd.toml.example   # Reference config
-docs/                # See CONTRIBUTING.md for full documentation structure
-  96-project-supervisor/
-    status.md        # Start here: current state, links to details
-    roadmap.md       # Original project roadmap (founding artifact)
-systemd/             # Service/timer units (Phase 3+)
-udev/                # udev rules (Phase 5)
-tests/
-  integration/       # Tests requiring real drives
+cargo run -- plan                    # Preview backup plan
+cargo run -- backup --dry-run        # Dry-run
+cargo run -- status                  # Current state
 ```
 
 ## Configuration
 
-Config file: `~/.config/urd/urd.toml` (override with `--config`)
-State database: `~/.local/share/urd/urd.db`
-Example config: `config/urd.toml.example`
+- Config: `~/.config/urd/urd.toml` (override: `--config`)
+- State DB: `~/.local/share/urd/urd.db`
+- Example: `config/urd.toml.example`
 
-## Current Phase
+## Project State
 
-Check `docs/96-project-supervisor/status.md` for current project state and what to build next.
-See `CONTRIBUTING.md` for documentation standards and organization.
+See `docs/96-project-supervisor/status.md` for current priorities and what to build next.
+See `CONTRIBUTING.md` for documentation structure, conventions, and privacy rules.

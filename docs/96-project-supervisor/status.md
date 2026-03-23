@@ -20,27 +20,141 @@ and review-identified fixes have been applied.
 
 ## What to Build Next — Priority Order
 
-The operational cutover is the gate — nothing else matters until Urd is running production
-backups. All post-cutover code features (Priorities 2-4) are complete.
+Vision is guidance, but the app is built by excellent code and great architecture. Each
+priority below has architectural gates that must be met before building. If the architecture
+is right, the mythic voice follows naturally from well-structured presentation layers.
+[Vision architecture review](../99-reports/2026-03-23-vision-architecture-review.md) |
+[Vision brainstorm](../95-ideas/2026-03-23-brainstorm-realizing-the-vision.md) |
+[Synthesis](../99-reports/2026-03-23-brainstorm-synthesis.md)
 
-### Priority 1: Operational Cutover (Phase 4 ops)
+### Priority 1: Operational Cutover — THE GATE
 
-**Why first:** All code improvements are valueless until Urd is the production backup system.
-The code is tested and ready. This is purely operational — no code changes needed.
+No code changes. Just do it. See [cutover checklist](#active-work--operational-cutover).
 
-See [Step-by-step cutover checklist](#active-work--operational-cutover) below.
+### Priority 2: Safety Hardening (during/after cutover)
 
-**Blocking question:** The parallel run requires 1-2 weeks of monitoring. Starting the
-cutover now means Urd becomes sole backup system by mid-April 2026.
+Low-risk, high-value improvements to the existing architecture.
 
-### Priority 2: Phase 5 — Sentinel daemon + udev rules
+| # | Feature | Effort | Notes |
+|---|---------|--------|-------|
+| 2a | **UUID drive fingerprinting** | Low | Add UUID to `DriveConfig`, verify on mount in `drives.rs`. Config migration: UUID optional, warn if absent. |
+| 2b | **Surface skipped sends loudly** | Low | Prominent warning block in backup output. |
+| 2c | **Pre-flight checks** | Low | Extract `init.rs` validation into shared `preflight_checks()`. |
+| 2d | **Post-backup structured summary** | Medium | Answer "is my data safer now?" Format as structured data, render via presentation layer. |
+| 2e | **Structured error messages** | Medium | Pattern-match common btrfs stderr. Build as a translation layer in `error.rs`, not scattered across commands. |
 
-**Why deferred:** Requires Urd to be battle-tested as sole backup system first. The nightly
-timer provides reliable scheduled backups. Drive-plug-triggered backups add convenience but
-not safety.
+### Priority 3: Architectural Foundation (design before code)
 
-**Scope:** `sentinel.rs` (stubbed), udev rules, `urd-sentinel.service`. Desktop notification
-hooks.
+These features define the abstractions everything else builds on. Getting them wrong
+cascades. Each has architectural gates from the
+[vision architecture review](../99-reports/2026-03-23-vision-architecture-review.md).
+
+**3a. Awareness model** (`awareness.rs`) — the architectural prerequisite for promises,
+heartbeat, Sentinel, and status output. A **pure function**: given config + filesystem
+state + history, compute promise states per subvolume. Must work without the Sentinel.
+Available to every command.
+
+- [ ] Module exists as standalone pure function, no I/O dependencies
+- [ ] Promise state enum: PROTECTED / AT RISK / UNPROTECTED
+- [ ] Computable from existing `FileSystemState` trait (extend if needed)
+- [ ] Testable with `MockFileSystemState`
+
+**3b. Heartbeat file** — JSON at `~/.local/share/urd/heartbeat.json`. Written after every
+backup run. Versioned schema, atomic writes (temp + rename), staleness advisory timestamp.
+
+- [ ] Schema versioned from day one (`schema_version` field)
+- [ ] Atomic write via temp file + rename
+- [ ] Includes computation timestamp + `stale_after` advisory
+- [ ] Minimal first iteration — add fields later, don't guess what consumers need
+
+**3c. Presentation layer** (`voice.rs`) — commands produce structured output data;
+the presentation layer renders it as text. Two renderers: interactive (rich, colored,
+eventually mythic) and daemon (JSON/terse). TTY detection selects renderer.
+
+- [ ] Commands return structured types, not formatted strings
+- [ ] Renderer trait with interactive and daemon implementations
+- [ ] All user-facing text flows through this layer
+- [ ] Testable: given this state, assert output contains these facts
+
+**3d. `urd get file@date`** — restore via direct path construction. O(1) — no search,
+no indexing. Parse `@` date reference, resolve snapshot, copy file. ~100 lines. Ship this
+separately from `urd find` (which has unsolved performance problems).
+
+- [ ] Direct path construction: `<snapshot_root>/<subvol>/<snapshot>/relative/path`
+- [ ] Smart date matching: "yesterday", "last week", "2026-03-15"
+- [ ] Path validation (no `..` escapes from snapshot boundary)
+- [ ] Read-only operation, no sudo needed
+
+**Gate before Priority 4:** Write ADR for protection promises:
+- [ ] Exact retention/interval derivations for each promise level
+- [ ] Config conflict resolution: what if promise + manual intervals both set?
+- [ ] Migration path for existing configs (implicit `custom`)
+- [ ] Promise validation: "this promise is unachievable given your drive connection pattern"
+- [ ] `custom` designed as first-class, not afterthought
+
+### Priority 4: Protection Promises (score: 10 — build after ADR)
+
+Config extension: optional `protection_level` per subvolume. Planner derives intervals
+and retention from promise level. Existing operation-focused configs continue to work
+as implicit `custom`. The awareness model (3a) evaluates whether promises are being kept.
+
+| # | Feature | Effort | Notes |
+|---|---------|--------|-------|
+| 4a | **Promise config + planner derivation** | Medium-High | `guarded`/`protected`/`resilient`/`archival`/`custom`. Planner routes to promise-based or operation-based logic. Anchor to data types users recognize. |
+| 4b | **Promise-anchored status** | Low-Medium | `urd status` opens with awareness model output. Confidence statement in plain language. |
+| 4c | **Subvolume-to-drive mapping** | Medium | Per-subvolume `drives = [...]`. Required for promises — "resilient" needs to know which drives count toward min_copies. |
+
+### Priority 5: Sentinel (score: 10 — decompose into three components)
+
+The Sentinel is three independent systems that compose. Build and test them separately.
+[Architecture review §2](../99-reports/2026-03-23-vision-architecture-review.md)
+
+| # | Component | Depends On | Notes |
+|---|-----------|------------|-------|
+| 5a | **Notification dispatcher** | Awareness model (3a) | Subscribe to promise state changes, route to desktop/webhook. Works without event reactor. |
+| 5b | **Event reactor** | Awareness model (3a), heartbeat (3b) | udev drive events, timer management. Long-running daemon. Start passive (no auto-trigger). |
+| 5c | **Active mode** | Event reactor (5b) | Auto-trigger backups to meet promises. Circuit breaker (no cascade on error). Lock contention with manual `urd backup` resolved. |
+
+Architectural gates:
+- [ ] Awareness model works independently (tested, no Sentinel dependency)
+- [ ] Heartbeat works independently (written by `urd backup`, read by Sentinel)
+- [ ] Event/action types defined as enums (testable state machine)
+- [ ] Lock contention with manual `urd backup` designed
+- [ ] Circuit breaker designed (min interval between auto-triggers)
+- [ ] Passive mode ships and works before active mode is attempted
+- [ ] Sentinel can be killed without affecting promise state computation
+
+### Priority 6: Core Expansion
+
+| # | Feature | Effort | Notes |
+|---|---------|--------|-------|
+| 6a | **Shell completions** | Low | `clap_complete` for static; custom completer for subvolume/drive names. |
+| 6b | **Smart defaults** | Medium | Guess subvolume treatment from names/sizes. Needs good architecture — pattern matching rules should be data, not code. |
+| 6c | **Conversational setup** | Medium | `urd setup` as guided config generator. Opinionated recommendations. Uses presentation layer for voice. |
+| 6d | **Drive replacement workflow** | Medium | Guided migration with safety overlap. Old drive retires as archival copy. |
+| 6e | **`urd find` (cross-snapshot search)** | High | Unsolved performance problem on large subvolumes. Do not build until `urd get` has proven the restore UX and a performance strategy exists. |
+
+### Priority 7: Experience Polish
+
+These features emerge naturally from well-built architecture — the presentation layer
+enables the voice, the awareness model enables the attention budget, the heartbeat enables
+external integrations. Build these when the foundations are solid.
+
+| # | Feature | Effort | Notes |
+|---|---------|--------|-------|
+| 7a | **Recovery contract** | Low-Medium | Generated from config + awareness model state. Written to well-known path. |
+| 7b | **Deep verification** | Medium | `urd verify --deep`: random-sample checksums from external vs. local. |
+| 7c | **Attention budget** | Medium | Priority queue in awareness model. Filter what surfaces by urgency. |
+| 7d | **Config validation as simulation** | Medium | "Here's what your config means in practice." Uses awareness model + planner dry-run. |
+
+### Deferred
+
+| Feature | Rationale |
+|---------|-----------|
+| SSH remote targets | Keep the app simple for now. |
+| Cloud backup (S3/B2) | Indefinitely. |
+| Pull mode / mesh | Indefinitely. |
+| Multi-user / library mode | No current need. |
 
 ### Completed (Priorities 2-4)
 
@@ -79,8 +193,11 @@ timestamp staleness handling, space check deduplication, ANSI line clearing.
 - [x] **Phase 4 code** — Cutover polish + space estimation + real-world testing
 - [ ] **Phase 4 cutover** — Operational transition from bash to Urd (see below)
 - [x] **Post-cutover features** — failed-send bytes, progress, calibrate (Priorities 2-4)
-- [ ] **Phase 5** — Sentinel daemon + udev rules (deferred)
-- [ ] Notifications (desktop + Discord, deferred until core is battle-tested)
+- [ ] **Phase 5** — Architectural foundation: awareness model, heartbeat, presentation layer, `urd get`
+- [ ] **Phase 5 gate** — ADR: protection promise design (retention mappings, config conflicts, migration)
+- [ ] **Phase 6** — Protection promises in config + planner + status
+- [ ] **Phase 7** — Sentinel: notification dispatcher → event reactor → active mode
+- [ ] **Phase 8** — Expansion: completions, smart defaults, setup wizard, drive lifecycle
 
 ## Active Work — Operational Cutover
 
@@ -121,6 +238,16 @@ for details.
 
 | Decision | Date | Reference |
 |----------|------|-----------|
+| Awareness model as standalone pure function (not inside Sentinel) | 2026-03-23 | [Vision architecture review](../99-reports/2026-03-23-vision-architecture-review.md) §2 |
+| Sentinel decomposed: awareness + event reactor + notification dispatcher | 2026-03-23 | [Vision architecture review](../99-reports/2026-03-23-vision-architecture-review.md) §2 |
+| Protection promises need ADR before code (policy design problem) | 2026-03-23 | [Vision architecture review](../99-reports/2026-03-23-vision-architecture-review.md) §1 |
+| Presentation layer: commands produce data, voice module renders text | 2026-03-23 | [Vision architecture review](../99-reports/2026-03-23-vision-architecture-review.md) §4 |
+| `urd get` (O(1) path) ships before `urd find` (unsolved perf problem) | 2026-03-23 | [Vision architecture review](../99-reports/2026-03-23-vision-architecture-review.md) §5 |
+| Heartbeat schema versioned from day one, atomic writes, staleness advisory | 2026-03-23 | [Vision architecture review](../99-reports/2026-03-23-vision-architecture-review.md) §6 |
+| Protection promises as core abstraction (score 10/10) | 2026-03-23 | [Vision brainstorm](../95-ideas/2026-03-23-brainstorm-realizing-the-vision.md) |
+| Mythic voice emerges from presentation layer, not scattered string edits | 2026-03-23 | User + architecture review |
+| Two modes: invisible worker + invoked norn | 2026-03-23 | User feedback on vision brainstorm |
+| SSH remote targets deferred — keep app simple for now | 2026-03-23 | User ranking (score 4/10) |
 | Daily external sends for Tier 1/2 (RPO 7d → 1d) | 2026-03-21 | [ADR-020](../00-foundation/decisions/ADR-relating-to-bash-script/2026-03-21-ADR-020-daily-external-backups.md) |
 | Pre-send space estimation using historical data | 2026-03-23 | [Journal](../98-journals/2026-03-23-space-estimation-and-testing.md) |
 | Drop Tier 2 and qgroup option from size estimation | 2026-03-23 | [Adversary review](../99-reports/2026-03-23-arch-adversary-proposal-review.md) |
@@ -134,10 +261,12 @@ for details.
 | Purpose | Document |
 |---------|----------|
 | Original roadmap & architecture | [roadmap.md](roadmap.md) |
-| Latest journal entry | [2026-03-23 Post-implementation review fixes](../98-journals/2026-03-23-post-implementation-review-fixes.md) |
+| Feature priorities & user rankings | [Brainstorm synthesis](../99-reports/2026-03-23-brainstorm-synthesis.md) + [review](../99-reports/2026-03-23-brainstorm-synthesis-review.md) |
+| Vision brainstorm (promises, mythic voice, sentinel) | [Realizing the vision](../95-ideas/2026-03-23-brainstorm-realizing-the-vision.md) |
+| Future directions brainstorm | [Feature ideas](../95-ideas/2026-03-23-brainstorm-urd-future.md) |
+| UX design principles brainstorm | [Norman principles](../95-ideas/2026-03-23-brainstorm-ux-norman-principles.md) |
+| Vision architecture review | [2026-03-23 Architectural criteria for vision](../99-reports/2026-03-23-vision-architecture-review.md) |
 | Latest adversary review | [2026-03-23 Post-cutover features review](../99-reports/2026-03-23-post-cutover-features-review.md) |
-| Post-cutover features journal | [2026-03-23 Post-cutover features](../98-journals/2026-03-23-post-cutover-features.md) |
-| Progress & size estimation proposal | [2026-03-23 Proposal](../99-reports/2026-03-23-proposal-progress-and-size-estimation.md) |
 | Code conventions & architecture | [CLAUDE.md](../../CLAUDE.md) |
 | Documentation standards | [CONTRIBUTING.md](../../CONTRIBUTING.md) |
 
