@@ -43,6 +43,15 @@ pub trait FileSystemState {
         local_dir: &Path,
         drive_labels: &[String],
     ) -> HashSet<SnapshotName>;
+
+    /// Get the bytes_transferred from the most recent successful send of a given type.
+    /// Returns None if no history exists (e.g., first-ever send).
+    fn last_send_size(
+        &self,
+        subvol_name: &str,
+        drive_label: &str,
+        send_type: &str,
+    ) -> Option<u64>;
 }
 
 // ── PlanFilters ─────────────────────────────────────────────────────────
@@ -356,6 +365,31 @@ fn plan_external_send(
         false
     };
 
+    // Space estimation: skip if historical send size exceeds available space
+    let send_type_str = if is_incremental { "send_incremental" } else { "send_full" };
+    if let Some(last_size) = fs.last_send_size(&subvol.name, &drive.label, send_type_str) {
+        let estimated = (last_size as f64 * 1.2) as u64; // 20% safety margin
+        let free = fs.filesystem_free_bytes(&ext_dir).unwrap_or(u64::MAX);
+        let min_free = drive.min_free_bytes.map(|b| b.bytes()).unwrap_or(0);
+        let available = free.saturating_sub(min_free);
+
+        if estimated > available {
+            use crate::types::ByteSize;
+            skipped.push((
+                subvol.name.clone(),
+                format!(
+                    "send to {} skipped: estimated ~{} exceeds {} available (free: {}, min_free: {})",
+                    drive.label,
+                    ByteSize(estimated),
+                    ByteSize(available),
+                    ByteSize(free),
+                    ByteSize(min_free),
+                ),
+            ));
+            return;
+        }
+    }
+
     let pin_info = Some((
         local_dir.join(format!(".last-external-parent-{}", drive.label)),
         snap_to_send.clone(),
@@ -432,9 +466,12 @@ fn format_duration_short(minutes: i64) -> String {
 // ── RealFileSystemState ─────────────────────────────────────────────────
 
 /// Real filesystem state — reads actual directories, pin files, and mounts.
-pub struct RealFileSystemState;
+/// Optionally carries a StateDb reference for historical send size estimation.
+pub struct RealFileSystemState<'a> {
+    pub state: Option<&'a crate::state::StateDb>,
+}
 
-impl FileSystemState for RealFileSystemState {
+impl FileSystemState for RealFileSystemState<'_> {
     fn local_snapshots(&self, root: &Path, subvol_name: &str) -> crate::error::Result<Vec<SnapshotName>> {
         read_snapshot_dir(&root.join(subvol_name))
     }
@@ -470,6 +507,19 @@ impl FileSystemState for RealFileSystemState {
         drive_labels: &[String],
     ) -> HashSet<SnapshotName> {
         crate::chain::find_pinned_snapshots(local_dir, drive_labels)
+    }
+
+    fn last_send_size(
+        &self,
+        subvol_name: &str,
+        drive_label: &str,
+        send_type: &str,
+    ) -> Option<u64> {
+        self.state.and_then(|db| {
+            db.last_successful_send_size(subvol_name, drive_label, send_type)
+                .ok()
+                .flatten()
+        })
     }
 }
 
@@ -513,6 +563,7 @@ pub struct MockFileSystemState {
     pub mounted_drives: HashSet<String>,
     pub free_bytes: std::collections::HashMap<PathBuf, u64>,
     pub pin_files: std::collections::HashMap<(PathBuf, String), SnapshotName>,
+    pub send_sizes: std::collections::HashMap<(String, String, String), u64>,
 }
 
 #[cfg(test)]
@@ -524,6 +575,7 @@ impl MockFileSystemState {
             mounted_drives: HashSet::new(),
             free_bytes: std::collections::HashMap::new(),
             pin_files: std::collections::HashMap::new(),
+            send_sizes: std::collections::HashMap::new(),
         }
     }
 }
@@ -574,6 +626,21 @@ impl FileSystemState for MockFileSystemState {
             }
         }
         pinned
+    }
+
+    fn last_send_size(
+        &self,
+        subvol_name: &str,
+        drive_label: &str,
+        send_type: &str,
+    ) -> Option<u64> {
+        self.send_sizes
+            .get(&(
+                subvol_name.to_string(),
+                drive_label.to_string(),
+                send_type.to_string(),
+            ))
+            .copied()
     }
 }
 
@@ -1087,6 +1154,86 @@ send_enabled = false
             .collect();
         // With send_enabled=false, daily thinning should delete the 0800 and 1000 snapshots
         assert!(deletes.len() >= 2, "Retention should thin normally when send is disabled");
+    }
+
+    // ── Space estimation tests ──────────────────────────────────────────
+
+    #[test]
+    fn send_skipped_insufficient_space() {
+        let config = test_config();
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots.insert("sv1".to_string(), vec![snap("20260322-1300-one")]);
+        fs.mounted_drives.insert("D1".to_string());
+        // Historical full send was 200GB
+        fs.send_sizes.insert(
+            ("sv1".to_string(), "D1".to_string(), "send_full".to_string()),
+            200_000_000_000,
+        );
+        // Only 150GB free on external drive (min_free=100GB, so available=50GB)
+        fs.free_bytes.insert(
+            PathBuf::from("/mnt/d1/.snapshots/sv1"),
+            150_000_000_000,
+        );
+
+        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let sends: Vec<_> = result
+            .operations
+            .iter()
+            .filter(|op| matches!(op, PlannedOperation::SendFull { subvolume_name, .. } if subvolume_name == "sv1"))
+            .collect();
+        assert_eq!(sends.len(), 0, "Send should be skipped when space is insufficient");
+        assert!(
+            result.skipped.iter().any(|(name, reason)| name == "sv1" && reason.contains("estimated")),
+            "Should report space estimation skip"
+        );
+    }
+
+    #[test]
+    fn send_proceeds_with_sufficient_space() {
+        let config = test_config();
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots.insert("sv1".to_string(), vec![snap("20260322-1300-one")]);
+        fs.mounted_drives.insert("D1".to_string());
+        // Historical full send was 50GB
+        fs.send_sizes.insert(
+            ("sv1".to_string(), "D1".to_string(), "send_full".to_string()),
+            50_000_000_000,
+        );
+        // 500GB free on external drive (min_free=100GB, available=400GB, estimated=60GB)
+        fs.free_bytes.insert(
+            PathBuf::from("/mnt/d1/.snapshots/sv1"),
+            500_000_000_000,
+        );
+
+        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let sends: Vec<_> = result
+            .operations
+            .iter()
+            .filter(|op| matches!(op, PlannedOperation::SendFull { subvolume_name, .. } if subvolume_name == "sv1"))
+            .collect();
+        assert_eq!(sends.len(), 1, "Send should proceed when space is sufficient");
+    }
+
+    #[test]
+    fn send_proceeds_without_history() {
+        let config = test_config();
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots.insert("sv1".to_string(), vec![snap("20260322-1300-one")]);
+        fs.mounted_drives.insert("D1".to_string());
+        // No send_sizes entry — first-ever send
+        // Tiny free space — but no history means we can't estimate, so proceed
+        fs.free_bytes.insert(
+            PathBuf::from("/mnt/d1/.snapshots/sv1"),
+            1_000_000,
+        );
+
+        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let sends: Vec<_> = result
+            .operations
+            .iter()
+            .filter(|op| matches!(op, PlannedOperation::SendFull { subvolume_name, .. } if subvolume_name == "sv1"))
+            .collect();
+        assert_eq!(sends.len(), 1, "First-ever send should proceed without history");
     }
 
     #[test]
