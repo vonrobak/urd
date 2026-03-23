@@ -7,7 +7,7 @@ use crate::plan::{FileSystemState, RealFileSystemState};
 use crate::state::StateDb;
 
 pub fn run(config: Config) -> anyhow::Result<()> {
-    let fs_state = RealFileSystemState;
+    let fs_state = RealFileSystemState { state: None };
     let drive_labels: Vec<String> = config.drives.iter().map(|d| d.label.clone()).collect();
     let mounted_drives: Vec<_> = config
         .drives

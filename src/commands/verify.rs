@@ -9,7 +9,7 @@ use crate::drives;
 use crate::plan::{FileSystemState, RealFileSystemState};
 
 pub fn run(config: Config, args: VerifyArgs) -> anyhow::Result<()> {
-    let fs_state = RealFileSystemState;
+    let fs_state = RealFileSystemState { state: None };
     let mut total_ok: u32 = 0;
     let mut total_warn: u32 = 0;
     let mut total_fail: u32 = 0;
@@ -187,7 +187,7 @@ pub fn run(config: Config, args: VerifyArgs) -> anyhow::Result<()> {
 }
 
 fn check_orphans(
-    fs_state: &RealFileSystemState,
+    fs_state: &dyn FileSystemState,
     drive: &crate::config::DriveConfig,
     subvol_name: &str,
     pin: &crate::types::SnapshotName,

@@ -3,6 +3,7 @@ use colored::Colorize;
 use crate::cli::PlanArgs;
 use crate::config::Config;
 use crate::plan::{self, PlanFilters, RealFileSystemState};
+use crate::state::StateDb;
 use crate::types::PlannedOperation;
 
 pub fn run(config: Config, args: PlanArgs) -> anyhow::Result<()> {
@@ -14,7 +15,8 @@ pub fn run(config: Config, args: PlanArgs) -> anyhow::Result<()> {
         external_only: args.external_only,
     };
 
-    let fs_state = RealFileSystemState;
+    let state_db = StateDb::open(&config.general.state_db).ok();
+    let fs_state = RealFileSystemState { state: state_db.as_ref() };
     let backup_plan = plan::plan(&config, now, &filters, &fs_state)?;
 
     run_with_plan(&config, &backup_plan)

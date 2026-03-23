@@ -194,7 +194,7 @@ pub fn run(config: Config) -> anyhow::Result<()> {
     }
 
     // 6. Detect incomplete snapshots on external drives
-    let fs_state = RealFileSystemState;
+    let fs_state = RealFileSystemState { state: None };
     let mut incomplete_found = false;
 
     for drive in &config.drives {
