@@ -1,5 +1,12 @@
 # Urd: BTRFS Time Machine for Linux
 
+> **Provenance:** This is the original project roadmap, written during project inception
+> (2026-03-22). It serves as the founding architectural vision, phase plan, and technical
+> specification. As Urd matures, the living [status tracker](status.md) supersedes this
+> document for current project state. The roadmap remains as reference for original design
+> rationale and decisions. Once the status tracker fully covers the project's ongoing needs,
+> this document should be moved to `docs/90-archive/96-project-supervisor/roadmap.md`.
+
 ## Context
 
 The homelab's backup system is a 1710-line bash script (`scripts/btrfs-snapshot-backup.sh`) that has been patched through three major incidents. It works but has reached its maintainability limit. The 2026-03-22 journal entry documents a critical audit (15 issues found) and recommends Option C: a purpose-built tool replacing the bash script entirely.
@@ -410,16 +417,20 @@ The executor takes a `BackupPlan` and executes each operation sequentially. Its 
 
 **Deliverable:** Both systems running nightly with equivalent results.
 
-### Phase 4: Cutover + Polish (Session 7)
+### Phase 4: Cutover + Polish (Session 7) — code ✅, operations pending
 
 **Goal:** Urd is sole backup system.
 
-- Disable bash script timer, enable urd-backup.timer
-- Colored terminal output
-- Error message quality pass
-- `--help` polish
+**Code (complete):** CLI help polish, btrfs_path validation, crash-recovery test, --verbose
+flag, dead code removal, tabled dependency removed. See [Phase 4 journal](../98-journals/2026-03-22-urd-phase4.md).
+
+**Operations (not started):**
+- Install and enable urd-backup.timer, run parallel with bash for 1-2 weeks
+- Disable bash script timer after validation
 - Write ADR-021 for the migration
 - Archive bash script to `scripts/archive/`
+
+See [status.md](status.md) for the detailed cutover checklist.
 
 ### Phase 5: Sentinel + udev (Session 8, deferred)
 
