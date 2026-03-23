@@ -14,3 +14,7 @@ Thumbs.db
 
 # Test artifacts
 /tmp-test-*/
+
+# Private documentation (contains system-specific details)
+docs/98-journals/
+!docs/98-journals/README.md
