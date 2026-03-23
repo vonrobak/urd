@@ -1,3 +1,6 @@
+// TODO: Remove allow(dead_code) when commands/status.rs integrates the awareness model.
+#[allow(dead_code)]
+mod awareness;
 mod btrfs;
 mod chain;
 mod cli;

@@ -300,6 +300,46 @@ impl StateDb {
         }
     }
 
+    /// Get the timestamp of the most recent successful send (full or incremental)
+    /// for a subvolume to a specific drive. Returns the run's started_at timestamp.
+    #[allow(dead_code)]
+    pub fn last_successful_send_time(
+        &self,
+        subvol: &str,
+        drive: &str,
+    ) -> crate::error::Result<Option<chrono::NaiveDateTime>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT r.started_at FROM operations o
+                 JOIN runs r ON o.run_id = r.id
+                 WHERE o.subvolume = ?1 AND o.drive_label = ?2
+                   AND o.operation IN ('send_full', 'send_incremental')
+                   AND o.result = 'success'
+                 ORDER BY r.started_at DESC LIMIT 1",
+            )
+            .map_err(|e| UrdError::State(format!("query failed: {e}")))?;
+
+        let mut rows = stmt
+            .query_map(rusqlite::params![subvol, drive], |row| {
+                let ts: String = row.get(0)?;
+                Ok(ts)
+            })
+            .map_err(|e| UrdError::State(format!("query failed: {e}")))?;
+
+        match rows.next() {
+            Some(Ok(ts)) => {
+                let parsed = chrono::NaiveDateTime::parse_from_str(&ts, "%Y-%m-%dT%H:%M:%S")
+                    .map_err(|e| {
+                        UrdError::State(format!("failed to parse send timestamp {ts:?}: {e}"))
+                    })?;
+                Ok(Some(parsed))
+            }
+            Some(Err(e)) => Err(UrdError::State(format!("failed to read send time: {e}"))),
+            None => Ok(None),
+        }
+    }
+
     // ── Calibration methods ─────────────────────────────────────────
 
     /// Store (or update) a calibrated size for a subvolume.

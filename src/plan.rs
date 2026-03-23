@@ -56,6 +56,14 @@ pub trait FileSystemState {
     /// Get a calibrated size estimate for a subvolume (from `urd calibrate`).
     /// Returns `(estimated_bytes, measured_at)` or None if not calibrated.
     fn calibrated_size(&self, subvol_name: &str) -> Option<(u64, String)>;
+
+    /// Get the timestamp of the most recent successful send (full or incremental)
+    /// for a subvolume to a specific drive. Returns None if no send history exists.
+    fn last_successful_send_time(
+        &self,
+        subvol_name: &str,
+        drive_label: &str,
+    ) -> Option<NaiveDateTime>;
 }
 
 // ── PlanFilters ─────────────────────────────────────────────────────────
@@ -590,6 +598,18 @@ impl FileSystemState for RealFileSystemState<'_> {
             db.calibrated_size(subvol_name).ok().flatten()
         })
     }
+
+    fn last_successful_send_time(
+        &self,
+        subvol_name: &str,
+        drive_label: &str,
+    ) -> Option<NaiveDateTime> {
+        self.state.and_then(|db| {
+            db.last_successful_send_time(subvol_name, drive_label)
+                .ok()
+                .flatten()
+        })
+    }
 }
 
 fn read_snapshot_dir(dir: &Path) -> crate::error::Result<Vec<SnapshotName>> {
@@ -634,6 +654,9 @@ pub struct MockFileSystemState {
     pub pin_files: std::collections::HashMap<(PathBuf, String), SnapshotName>,
     pub send_sizes: std::collections::HashMap<(String, String, String), u64>,
     pub calibrated_sizes: std::collections::HashMap<String, (u64, String)>,
+    pub send_times: std::collections::HashMap<(String, String), NaiveDateTime>,
+    /// Subvolume names for which local_snapshots() should return an error.
+    pub fail_local_snapshots: HashSet<String>,
 }
 
 #[cfg(test)]
@@ -647,6 +670,8 @@ impl MockFileSystemState {
             pin_files: std::collections::HashMap::new(),
             send_sizes: std::collections::HashMap::new(),
             calibrated_sizes: std::collections::HashMap::new(),
+            send_times: std::collections::HashMap::new(),
+            fail_local_snapshots: HashSet::new(),
         }
     }
 }
@@ -654,6 +679,12 @@ impl MockFileSystemState {
 #[cfg(test)]
 impl FileSystemState for MockFileSystemState {
     fn local_snapshots(&self, _root: &Path, subvol_name: &str) -> crate::error::Result<Vec<SnapshotName>> {
+        if self.fail_local_snapshots.contains(subvol_name) {
+            return Err(crate::error::UrdError::Io {
+                path: std::path::PathBuf::from(format!("/snap/{subvol_name}")),
+                source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "permission denied"),
+            });
+        }
         Ok(self.local_snapshots.get(subvol_name).cloned().unwrap_or_default())
     }
 
@@ -716,6 +747,16 @@ impl FileSystemState for MockFileSystemState {
 
     fn calibrated_size(&self, subvol_name: &str) -> Option<(u64, String)> {
         self.calibrated_sizes.get(subvol_name).cloned()
+    }
+
+    fn last_successful_send_time(
+        &self,
+        subvol_name: &str,
+        drive_label: &str,
+    ) -> Option<NaiveDateTime> {
+        self.send_times
+            .get(&(subvol_name.to_string(), drive_label.to_string()))
+            .copied()
     }
 }
 
