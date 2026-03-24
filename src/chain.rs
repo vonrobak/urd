@@ -4,6 +4,22 @@ use std::path::Path;
 use crate::error::UrdError;
 use crate::types::SnapshotName;
 
+/// Source of a pin file read — drive-specific or legacy fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinSource {
+    /// Pin came from `.last-external-parent-{DRIVE_LABEL}`.
+    DriveSpecific,
+    /// Pin came from legacy `.last-external-parent` (not drive-scoped).
+    Legacy,
+}
+
+/// Pin file read result — the snapshot name and where it came from.
+#[derive(Debug, Clone)]
+pub struct PinResult {
+    pub name: SnapshotName,
+    pub source: PinSource,
+}
+
 /// Read the pin file for a specific drive from a local snapshot directory.
 ///
 /// Checks drive-specific file first (`.last-external-parent-{LABEL}`),
@@ -12,16 +28,26 @@ use crate::types::SnapshotName;
 pub fn read_pin_file(
     local_snapshot_dir: &Path,
     drive_label: &str,
-) -> crate::error::Result<Option<SnapshotName>> {
+) -> crate::error::Result<Option<PinResult>> {
     // Drive-specific pin file takes precedence
     let drive_specific = local_snapshot_dir.join(format!(".last-external-parent-{drive_label}"));
     if let Some(name) = try_read_pin(&drive_specific)? {
-        return Ok(Some(name));
+        return Ok(Some(PinResult {
+            name,
+            source: PinSource::DriveSpecific,
+        }));
     }
 
     // Legacy fallback
     let legacy = local_snapshot_dir.join(".last-external-parent");
-    try_read_pin(&legacy)
+    if let Some(name) = try_read_pin(&legacy)? {
+        return Ok(Some(PinResult {
+            name,
+            source: PinSource::Legacy,
+        }));
+    }
+
+    Ok(None)
 }
 
 /// Collect all pinned snapshot names across all drives.
@@ -35,8 +61,8 @@ pub fn find_pinned_snapshots(
 
     for label in drive_labels {
         match read_pin_file(local_snapshot_dir, label) {
-            Ok(Some(name)) => {
-                pinned.insert(name);
+            Ok(Some(result)) => {
+                pinned.insert(result.name);
             }
             Ok(None) => {}
             Err(e) => {
@@ -128,8 +154,9 @@ mod tests {
         )
         .unwrap();
 
-        let result = read_pin_file(dir.path(), "WD-18TB").unwrap();
-        assert_eq!(result.unwrap().as_str(), "20260322-opptak");
+        let result = read_pin_file(dir.path(), "WD-18TB").unwrap().unwrap();
+        assert_eq!(result.name.as_str(), "20260322-opptak");
+        assert_eq!(result.source, PinSource::DriveSpecific);
     }
 
     #[test]
@@ -138,8 +165,9 @@ mod tests {
         fs::write(dir.path().join(".last-external-parent"), "20260322-opptak").unwrap();
 
         // No drive-specific file, should fall back to legacy
-        let result = read_pin_file(dir.path(), "WD-18TB").unwrap();
-        assert_eq!(result.unwrap().as_str(), "20260322-opptak");
+        let result = read_pin_file(dir.path(), "WD-18TB").unwrap().unwrap();
+        assert_eq!(result.name.as_str(), "20260322-opptak");
+        assert_eq!(result.source, PinSource::Legacy);
     }
 
     #[test]
@@ -152,8 +180,9 @@ mod tests {
         .unwrap();
         fs::write(dir.path().join(".last-external-parent"), "20260321-opptak").unwrap();
 
-        let result = read_pin_file(dir.path(), "WD-18TB").unwrap();
-        assert_eq!(result.unwrap().as_str(), "20260322-1400-opptak");
+        let result = read_pin_file(dir.path(), "WD-18TB").unwrap().unwrap();
+        assert_eq!(result.name.as_str(), "20260322-1400-opptak");
+        assert_eq!(result.source, PinSource::DriveSpecific);
     }
 
     #[test]
@@ -213,8 +242,9 @@ mod tests {
 
         write_pin_file(dir.path(), "WD-18TB", &name).unwrap();
 
-        let result = read_pin_file(dir.path(), "WD-18TB").unwrap();
-        assert_eq!(result.unwrap().as_str(), "20260322-1430-opptak");
+        let result = read_pin_file(dir.path(), "WD-18TB").unwrap().unwrap();
+        assert_eq!(result.name.as_str(), "20260322-1430-opptak");
+        assert_eq!(result.source, PinSource::DriveSpecific);
     }
 
     #[test]
@@ -226,8 +256,8 @@ mod tests {
         write_pin_file(dir.path(), "WD-18TB", &old).unwrap();
         write_pin_file(dir.path(), "WD-18TB", &new).unwrap();
 
-        let result = read_pin_file(dir.path(), "WD-18TB").unwrap();
-        assert_eq!(result.unwrap().as_str(), "20260322-1430-opptak");
+        let result = read_pin_file(dir.path(), "WD-18TB").unwrap().unwrap();
+        assert_eq!(result.name.as_str(), "20260322-1430-opptak");
     }
 
     #[test]
@@ -250,7 +280,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = read_pin_file(dir.path(), "WD-18TB").unwrap();
-        assert_eq!(result.unwrap().as_str(), "20260322-opptak");
+        let result = read_pin_file(dir.path(), "WD-18TB").unwrap().unwrap();
+        assert_eq!(result.name.as_str(), "20260322-opptak");
     }
 }

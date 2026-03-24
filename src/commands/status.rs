@@ -147,7 +147,8 @@ fn compute_chain_health(
     }
 
     match chain::read_pin_file(local_dir, drive_label) {
-        Ok(Some(pin)) => {
+        Ok(Some(result)) => {
+            let pin = &result.name;
             let local_exists = local_dir.join(pin.as_str()).exists();
             if !local_exists {
                 return ChainHealth::Full("pin missing locally".to_string());

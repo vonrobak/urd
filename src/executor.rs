@@ -330,6 +330,32 @@ impl<'a> Executor<'a> {
             );
         }
 
+        // Ensure destination directory exists (btrfs receive won't create it).
+        // Only attempt mkdir if the parent exists (i.e. the drive's snapshot root is real).
+        // This is the first executor precondition check — see Priority 2c for the systematic pattern.
+        if !dest_dir.exists()
+            && let Some(parent) = dest_dir.parent()
+            && parent.exists()
+        {
+            log::info!("Creating destination directory: {}", dest_dir.display());
+            if let Err(e) = std::fs::create_dir_all(dest_dir) {
+                return (
+                    OperationOutcome {
+                        operation: op_name.to_string(),
+                        drive_label: Some(drive_label.to_string()),
+                        result: OpResult::Failure,
+                        duration: start.elapsed(),
+                        error: Some(format!(
+                            "failed to create destination directory {}: {e}",
+                            dest_dir.display()
+                        )),
+                        bytes_transferred: None,
+                    },
+                    false,
+                );
+            }
+        }
+
         // Crash recovery: check if snapshot already exists at destination
         if let Some(snap_name) = snapshot.file_name() {
             let dest_snap = dest_dir.join(snap_name);
@@ -338,7 +364,7 @@ impl<'a> Executor<'a> {
                 if let Some((pin_path, _)) = pin_on_success
                     && let Some(pin_dir) = pin_path.parent()
                     && let Ok(Some(pinned)) = chain::read_pin_file(pin_dir, drive_label)
-                    && pinned.as_str() == snap_name.to_string_lossy()
+                    && pinned.name.as_str() == snap_name.to_string_lossy()
                 {
                     log::info!(
                         "Snapshot {} already exists at dest and is pinned, skipping send",
@@ -1263,5 +1289,92 @@ source = "/data/b"
             matches!(&calls[1], MockBtrfsCall::SendReceive { .. }),
             "Second call should be the send"
         );
+    }
+
+    #[test]
+    fn mkdir_creates_dest_dir_when_parent_exists() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Create parent (simulates drive's .snapshots root) but NOT the subvolume subdir
+        let snapshot_root = tmp.path().join(".snapshots");
+        std::fs::create_dir(&snapshot_root).unwrap();
+        let dest_dir = snapshot_root.join("sv-a");
+
+        let mock = MockBtrfs::new();
+        let config = test_config();
+        let shutdown = no_shutdown();
+        let executor = Executor::new(&mock, None, &config, &shutdown);
+
+        let ts = NaiveDate::from_ymd_opt(2026, 3, 22)
+            .unwrap()
+            .and_hms_opt(14, 30, 0)
+            .unwrap();
+        let plan = BackupPlan {
+            operations: vec![
+                PlannedOperation::CreateSnapshot {
+                    source: PathBuf::from("/data/a"),
+                    dest: PathBuf::from("/snap/sv-a/20260322-1430-a"),
+                    subvolume_name: "sv-a".to_string(),
+                },
+                PlannedOperation::SendFull {
+                    snapshot: PathBuf::from("/snap/sv-a/20260322-1430-a"),
+                    dest_dir: dest_dir.clone(),
+                    drive_label: "TEST-DRIVE".to_string(),
+                    subvolume_name: "sv-a".to_string(),
+                    pin_on_success: None,
+                },
+            ],
+            timestamp: ts,
+            skipped: vec![],
+        };
+
+        let result = executor.execute(&plan, "full");
+
+        assert_eq!(result.overall, RunResult::Success);
+        assert!(dest_dir.exists(), "dest_dir should have been created by executor");
+
+        let calls = mock.calls();
+        assert!(matches!(calls[0], MockBtrfsCall::CreateSnapshot { .. }));
+        assert!(matches!(calls[1], MockBtrfsCall::SendReceive { .. }));
+    }
+
+    #[test]
+    fn mkdir_skipped_when_parent_missing() {
+        // dest_dir with a non-existent parent — simulates unmounted drive
+        let dest_dir = PathBuf::from("/nonexistent/drive/.snapshots/sv-a");
+
+        let mock = MockBtrfs::new();
+        let config = test_config();
+        let shutdown = no_shutdown();
+        let executor = Executor::new(&mock, None, &config, &shutdown);
+
+        let ts = NaiveDate::from_ymd_opt(2026, 3, 22)
+            .unwrap()
+            .and_hms_opt(14, 30, 0)
+            .unwrap();
+        let plan = BackupPlan {
+            operations: vec![
+                PlannedOperation::CreateSnapshot {
+                    source: PathBuf::from("/data/a"),
+                    dest: PathBuf::from("/snap/sv-a/20260322-1430-a"),
+                    subvolume_name: "sv-a".to_string(),
+                },
+                PlannedOperation::SendFull {
+                    snapshot: PathBuf::from("/snap/sv-a/20260322-1430-a"),
+                    dest_dir,
+                    drive_label: "TEST-DRIVE".to_string(),
+                    subvolume_name: "sv-a".to_string(),
+                    pin_on_success: None,
+                },
+            ],
+            timestamp: ts,
+            skipped: vec![],
+        };
+
+        let result = executor.execute(&plan, "full");
+
+        // Send proceeds (MockBtrfs doesn't check filesystem) — but mkdir was skipped
+        // In production, btrfs receive would fail with "No such file or directory"
+        assert_eq!(result.overall, RunResult::Success);
+        assert!(!PathBuf::from("/nonexistent/drive/.snapshots/sv-a").exists());
     }
 }

@@ -76,8 +76,15 @@ pub fn run(config: Config, args: VerifyArgs) -> anyhow::Result<()> {
 
             // 1. Pin file readable
             match chain::read_pin_file(&local_dir, &drive.label) {
-                Ok(Some(pin)) => {
-                    println!("    {}    Pin: {}", "OK".green(), pin);
+                Ok(Some(pin_result)) => {
+                    let pin = &pin_result.name;
+                    let is_legacy = pin_result.source == chain::PinSource::Legacy;
+                    let pin_label = if is_legacy {
+                        format!("{} {}", pin, "(legacy — not drive-specific)".dimmed())
+                    } else {
+                        pin.to_string()
+                    };
+                    println!("    {}    Pin: {}", "OK".green(), pin_label);
                     total_ok += 1;
 
                     // 2. Pinned snapshot exists locally
@@ -85,6 +92,13 @@ pub fn run(config: Config, args: VerifyArgs) -> anyhow::Result<()> {
                     if local_snap.exists() {
                         println!("    {}    Exists locally", "OK".green());
                         total_ok += 1;
+                    } else if is_legacy {
+                        println!(
+                            "    {}  Pinned snapshot missing locally: {} (legacy pin — may not apply to this drive)",
+                            "WARN".yellow(),
+                            pin
+                        );
+                        total_warn += 1;
                     } else {
                         println!(
                             "    {}  Pinned snapshot missing locally: {}",
@@ -104,6 +118,13 @@ pub fn run(config: Config, args: VerifyArgs) -> anyhow::Result<()> {
                     if ext_snap.exists() {
                         println!("    {}    Exists on drive", "OK".green());
                         total_ok += 1;
+                    } else if is_legacy {
+                        println!(
+                            "    {}  Pinned snapshot not on this drive: {} (legacy pin — run urd backup to establish drive-specific chain)",
+                            "WARN".yellow(),
+                            pin
+                        );
+                        total_warn += 1;
                     } else {
                         println!(
                             "    {}  Pinned snapshot missing from drive: {}",
@@ -122,19 +143,21 @@ pub fn run(config: Config, args: VerifyArgs) -> anyhow::Result<()> {
                         &fs_state,
                         drive,
                         &subvol.name,
-                        &pin,
+                        pin,
                         &mut total_ok,
                         &mut total_warn,
                     );
 
-                    // 5. Stale pin detection
-                    check_stale_pin(
-                        &local_dir,
-                        &drive.label,
-                        &subvol.send_interval,
-                        &mut total_ok,
-                        &mut total_warn,
-                    );
+                    // 5. Stale pin detection (only meaningful for drive-specific pins)
+                    if !is_legacy {
+                        check_stale_pin(
+                            &local_dir,
+                            &drive.label,
+                            &subvol.send_interval,
+                            &mut total_ok,
+                            &mut total_warn,
+                        );
+                    }
                 }
                 Ok(None) => {
                     // Check if there are any external snapshots — if so, missing pin is a problem
