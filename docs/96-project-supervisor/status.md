@@ -5,13 +5,14 @@
 
 ## Current State
 
-**Phase 5 continues. Awareness model (3a), heartbeat file (3b), and presentation layer (3c)
-are built, reviewed, and passing 186 tests.** Operational cutover has not started — the bash script
-(`btrfs-snapshot-backup.sh`) is still the sole production backup system, running nightly at
-02:00 via `btrfs-backup-daily.timer`. Urd v0.1.0 is installed (`~/.cargo/bin/urd`) and has
-been tested manually on real subvolumes (2026-03-23), but is not deployed on a schedule.
+**Phase 5 complete. Awareness model (3a), heartbeat file (3b), presentation layer (3c),
+and `urd get` (3d) are built, reviewed, and passing 205 tests.** Operational cutover has not
+started — the bash script (`btrfs-snapshot-backup.sh`) is still the sole production backup
+system, running nightly at 02:00 via `btrfs-backup-daily.timer`. Urd v0.1.0 is installed
+(`~/.cargo/bin/urd`) and has been tested manually on real subvolumes (2026-03-23), but is not
+deployed on a schedule.
 
-Phase 5 work completed so far:
+Phase 5 work completed:
 
 - **Awareness model** (`awareness.rs`) — pure function computing PROTECTED / AT RISK /
   UNPROTECTED per subvolume from config + filesystem state + history. Asymmetric thresholds
@@ -38,6 +39,17 @@ Phase 5 work completed so far:
   fully migrated; other commands migrate incrementally. 11 voice tests + 4 output tests.
   [Design review](../99-reports/2026-03-24-presentation-layer-design-review.md) |
   [Implementation review](../99-reports/2026-03-24-presentation-layer-implementation-review.md)
+
+- **`urd get`** (`commands/get.rs`) — file restore from snapshots via direct path construction.
+  O(1) — no search, no indexing. Automatic subvolume detection via longest-prefix matching on
+  source paths. Date parsing (YYYY-MM-DD, YYYYMMDD, "yesterday", "today"). Nearest-before
+  snapshot selection. Defense-in-depth path validation (normalize, traversal check, starts_with).
+  Content to stdout (pipe-friendly), metadata to stderr via voice layer. `--output` for file
+  copy with overwrite protection. 19 tests. Design-reviewed before implementation,
+  implementation-reviewed after.
+  [Journal](../98-journals/2026-03-24-urd-get.md) |
+  [Design review](../99-reports/2026-03-24-urd-get-design-review.md) |
+  [Implementation review](../99-reports/2026-03-24-urd-get-implementation-review.md)
 
 Prior work: pre-send space estimation, documentation system (CONTRIBUTING.md), first
 real-world backup testing, failed-send bytes recording, live progress display, `urd calibrate`.
@@ -110,14 +122,18 @@ migrate incrementally.
 - [x] Testable: 10 voice tests asserting output contains expected facts
 - [ ] Remaining commands migrate incrementally (not blocked on this)
 
-**3d. `urd get file@date`** — restore via direct path construction. O(1) — no search,
-no indexing. Parse `@` date reference, resolve snapshot, copy file. ~100 lines. Ship this
-separately from `urd find` (which has unsolved performance problems).
+**3d. `urd get file --at date`** — **COMPLETE.** Restore via direct path construction.
+O(1) — no search, no indexing. Automatic subvolume detection (longest-prefix match on
+source paths), `--subvolume` override. Five date formats (YYYY-MM-DD, YYYYMMDD,
+"YYYY-MM-DD HH:MM", "yesterday", "today"). Nearest-before snapshot selection. Content to
+stdout, metadata to stderr. `--output` for file copy with overwrite protection. 19 tests.
+Design-reviewed and implementation-reviewed. Review fixes: removed fragile `short_name`
+filter, added `--output` overwrite protection, removed dead_code allow on `local_snapshot_dir`.
 
-- [ ] Direct path construction: `<snapshot_root>/<subvol>/<snapshot>/relative/path`
-- [ ] Smart date matching: "yesterday", "last week", "2026-03-15"
-- [ ] Path validation (no `..` escapes from snapshot boundary)
-- [ ] Read-only operation, no sudo needed
+- [x] Direct path construction: `<snapshot_root>/<subvol>/<snapshot>/relative/path`
+- [x] Smart date matching: "yesterday", "today", "2026-03-15", "2026-03-15 14:30", "20260315"
+- [x] Path validation (normalize + no `..` + starts_with defense-in-depth)
+- [x] Read-only operation, no sudo needed
 
 **Gate before Priority 4:** Write ADR for protection promises:
 - [ ] Exact retention/interval derivations for each promise level
@@ -228,6 +244,16 @@ timestamp staleness handling, space check deduplication, ANSI line clearing.
   filtering, advisory rendering.
   [Design review](../99-reports/2026-03-24-presentation-layer-design-review.md) |
   [Implementation review](../99-reports/2026-03-24-presentation-layer-implementation-review.md)
+- **`urd get`** (Phase 5, P3d) — `commands/get.rs`: file restore from snapshots via direct path
+  construction. `urd get <path> --at <date>` streams file content to stdout. Automatic subvolume
+  detection (longest-prefix match), five date formats, nearest-before snapshot selection.
+  Defense-in-depth path validation (3 layers). `--output` for file copy with overwrite protection.
+  Metadata to stderr via presentation layer. `read_snapshot_dir` made `pub(crate)` for reuse.
+  19 tests. Review fixes: removed fragile `short_name` filter (directory structure already scopes),
+  added overwrite protection, removed dead_code allow.
+  [Journal](../98-journals/2026-03-24-urd-get.md) |
+  [Design review](../99-reports/2026-03-24-urd-get-design-review.md) |
+  [Implementation review](../99-reports/2026-03-24-urd-get-implementation-review.md)
 
 ### Not Building (dropped per adversary review)
 
@@ -248,7 +274,7 @@ timestamp staleness handling, space check deduplication, ANSI line clearing.
 - [x] **Phase 4 code** — Cutover polish + space estimation + real-world testing
 - [ ] **Phase 4 cutover** — Operational transition from bash to Urd (see below)
 - [x] **Post-cutover features** — failed-send bytes, progress, calibrate (Priorities 2-4)
-- [ ] **Phase 5** — Architectural foundation: ~~awareness model~~, ~~heartbeat~~, ~~presentation layer~~, `urd get`
+- [x] **Phase 5** — Architectural foundation: awareness model, heartbeat, presentation layer, `urd get`
 - [ ] **Phase 5 gate** — ADR: protection promise design (retention mappings, config conflicts, migration)
 - [ ] **Phase 6** — Protection promises in config + planner + status
 - [ ] **Phase 7** — Sentinel: notification dispatcher → event reactor → active mode
@@ -321,6 +347,13 @@ for details.
 | Calibrate on snapshots, not live sources | 2026-03-23 | [Adversary review](../99-reports/2026-03-23-arch-adversary-proposal-review.md) Finding 5 |
 | UrdError::Btrfs struct variant (not separate type) for partial bytes | 2026-03-23 | [Post-cutover journal](../98-journals/2026-03-23-post-cutover-features.md) |
 | MAX(successful, failed) for send size estimation | 2026-03-23 | [Post-cutover journal](../98-journals/2026-03-23-post-cutover-features.md) |
+| `urd get` uses `--at` flag not `@` syntax (avoids filename ambiguity) | 2026-03-24 | [urd get design review](../99-reports/2026-03-24-urd-get-design-review.md) Tension 1 |
+| Automatic subvolume detection via longest-prefix match on source paths | 2026-03-24 | [urd get design review](../99-reports/2026-03-24-urd-get-design-review.md) Tension 2 |
+| Nearest-before-or-equal snapshot selection (time-travel semantic) | 2026-03-24 | [urd get design review](../99-reports/2026-03-24-urd-get-design-review.md) Tension 3 |
+| stdout for content, stderr for metadata (Unix tool convention) | 2026-03-24 | [urd get design review](../99-reports/2026-03-24-urd-get-design-review.md) Tension 4 |
+| Minimal date parsing: 5 formats, no NLP (extend later if needed) | 2026-03-24 | [urd get design review](../99-reports/2026-03-24-urd-get-design-review.md) Finding 3 |
+| Remove short_name snapshot filter — directory structure already scopes | 2026-03-24 | [urd get impl review](../99-reports/2026-03-24-urd-get-implementation-review.md) Finding 1 |
+| `--output` overwrite protection (error if file exists) | 2026-03-24 | [urd get impl review](../99-reports/2026-03-24-urd-get-implementation-review.md) Finding 3 |
 
 ## Key Documents
 
@@ -332,7 +365,7 @@ for details.
 | Future directions brainstorm | [Feature ideas](../95-ideas/2026-03-23-brainstorm-urd-future.md) |
 | UX design principles brainstorm | [Norman principles](../95-ideas/2026-03-23-brainstorm-ux-norman-principles.md) |
 | Vision architecture review | [2026-03-23 Architectural criteria for vision](../99-reports/2026-03-23-vision-architecture-review.md) |
-| Latest adversary review | [2026-03-24 Presentation layer impl review](../99-reports/2026-03-24-presentation-layer-implementation-review.md) |
+| Latest adversary review | [2026-03-24 urd get impl review](../99-reports/2026-03-24-urd-get-implementation-review.md) |
 | Code conventions & architecture | [CLAUDE.md](../../CLAUDE.md) |
 | Documentation standards | [CONTRIBUTING.md](../../CONTRIBUTING.md) |
 
@@ -348,4 +381,6 @@ for details.
 - `heartbeat::read()` returns `Option` — cannot distinguish missing file from corrupt JSON (upgrade to `Result<Option>` when Sentinel is built)
 - Remaining commands (`plan`, `backup`, `history`, `verify`, `init`, `calibrate`) still use direct `println!` — migrate to voice layer incrementally
 - Per-drive pin protection for external retention — current all-drives-union is conservative but suboptimal for space
+- `urd get` normalizes paths without filesystem access (no `canonicalize`) — symlinked paths won't match subvolume sources. Documented limitation; correct behavior (use canonical paths)
+- `urd get` doesn't support directory restore — files only in v1. Error message guides user.
 - Idea: [systemd unit drift check](../95-ideas/2026-03-23-systemd-unit-drift-check.md) in `urd verify`

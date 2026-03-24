@@ -179,7 +179,6 @@ impl Config {
 
     /// Get the local snapshot directory for a subvolume: `{root}/{subvol_name}/`
     #[must_use]
-    #[allow(dead_code)]
     pub fn local_snapshot_dir(&self, subvol_name: &str) -> Option<PathBuf> {
         self.snapshot_root_for(subvol_name)
             .map(|root| root.join(subvol_name))

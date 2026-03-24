@@ -51,5 +51,6 @@ fn main() -> anyhow::Result<()> {
         Commands::Status => commands::status::run(config, output_mode),
         Commands::History(args) => commands::history::run(config, args),
         Commands::Verify(args) => commands::verify::run(config, args),
+        Commands::Get(args) => commands::get::run(config, args, output_mode),
     }
 }
