@@ -93,6 +93,21 @@ These encode design decisions from the Norman UX analysis and user feedback:
   awareness model, reacts to events (drive plug, timer, backup result), updates promise
   states, and drives notifications. Other features subscribe to its event stream.
 
+### Architectural Invariants
+
+These rules are load-bearing. Violating them causes architectural damage that compounds.
+Each references an ADR in `docs/00-foundation/decisions/` with full rationale.
+
+1. **The planner never modifies anything.** Pure function: config + state in, plan out. (ADR-100)
+2. **All btrfs calls go through `BtrfsOps`.** No other module spawns btrfs subprocesses. (ADR-101)
+3. **Filesystem is truth, SQLite is history.** Pin files and snapshot dirs are authoritative. SQLite failures never prevent backups. (ADR-102)
+4. **Individual subvolume failures never abort the run.** The executor isolates errors per subvolume. (ADR-100)
+5. **Retention never deletes pinned snapshots.** Three independent layers: unsent protection, planner exclusion, executor re-check. (ADR-106)
+6. **Backups fail open; deletions fail closed.** Missing data means proceed and clean up, never refuse to back up. But never delete a snapshot you can't confirm is safe to remove. (ADR-107)
+7. **Core logic modules are pure functions.** Planner, awareness, retention, voice — inputs in, outputs out, no I/O. (ADR-108)
+8. **Validate at config boundary, trust afterward.** Paths and names validated once at load; no re-validation in hot paths. (ADR-109)
+9. **Backward compatibility contracts are sacred.** Snapshot names, pin files, Prometheus metrics — changes require an ADR with migration plan. (ADR-105)
+
 ## Coding Conventions
 
 - Standard Rust: `snake_case` functions, `CamelCase` types
