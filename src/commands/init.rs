@@ -163,8 +163,8 @@ pub fn run(config: Config) -> anyhow::Result<()> {
             let local_dir = root.path.join(subvol_name);
             for label in &drive_labels {
                 match chain::read_pin_file(&local_dir, label) {
-                    Ok(Some(name)) => {
-                        println!("  {} {}/{}: {}", "OK".green(), subvol_name, label, name);
+                    Ok(Some(result)) => {
+                        println!("  {} {}/{}: {}", "OK".green(), subvol_name, label, result.name);
                     }
                     Ok(None) => {
                         println!("  {} {}/{}: no pin file", "—".dimmed(), subvol_name, label);
@@ -204,7 +204,8 @@ pub fn run(config: Config) -> anyhow::Result<()> {
             // Get the pinned snapshot for this drive
             let pinned = chain::read_pin_file(&local_dir, &drive.label)
                 .ok()
-                .flatten();
+                .flatten()
+                .map(|r| r.name);
 
             // The newest snapshot that is NOT pinned might be a partial
             let newest = external_snaps.iter().max();
