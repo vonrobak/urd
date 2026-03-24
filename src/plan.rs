@@ -557,14 +557,18 @@ fn format_duration_short(minutes: i64) -> String {
 
 /// Check if estimated send size (with 1.2x margin) exceeds available space on the drive.
 /// Returns `Some((estimated, available, free, min_free))` if space is insufficient, `None` if OK.
+///
+/// Uses the drive's mount path for the free space query — the per-subvolume directory
+/// (`ext_dir`) may not exist yet for first-ever sends, and `statvfs` on a non-existent
+/// path returns an error that the caller treats as infinite space.
 fn exceeds_available_space(
     raw_bytes: u64,
-    ext_dir: &Path,
+    _ext_dir: &Path,
     drive: &DriveConfig,
     fs: &dyn FileSystemState,
 ) -> Option<(u64, u64, u64, u64)> {
     let estimated = (raw_bytes as f64 * 1.2) as u64; // 20% safety margin
-    let free = fs.filesystem_free_bytes(ext_dir).unwrap_or(u64::MAX);
+    let free = fs.filesystem_free_bytes(&drive.mount_path).unwrap_or(u64::MAX);
     let min_free = drive.min_free_bytes.map(|b| b.bytes()).unwrap_or(0);
     let available = free.saturating_sub(min_free);
     if estimated > available {
@@ -1381,7 +1385,7 @@ send_enabled = false
         );
         // Only 150GB free on external drive (min_free=100GB, so available=50GB)
         fs.free_bytes
-            .insert(PathBuf::from("/mnt/d1/.snapshots/sv1"), 150_000_000_000);
+            .insert(PathBuf::from("/mnt/d1"), 150_000_000_000);
 
         let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
         let sends: Vec<_> = result
@@ -1417,7 +1421,7 @@ send_enabled = false
         );
         // 500GB free on external drive (min_free=100GB, available=400GB, estimated=60GB)
         fs.free_bytes
-            .insert(PathBuf::from("/mnt/d1/.snapshots/sv1"), 500_000_000_000);
+            .insert(PathBuf::from("/mnt/d1"), 500_000_000_000);
 
         let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
         let sends: Vec<_> = result
@@ -1442,7 +1446,7 @@ send_enabled = false
         // No send_sizes entry — first-ever send
         // Tiny free space — but no history means we can't estimate, so proceed
         fs.free_bytes
-            .insert(PathBuf::from("/mnt/d1/.snapshots/sv1"), 1_000_000);
+            .insert(PathBuf::from("/mnt/d1"), 1_000_000);
 
         let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
         let sends: Vec<_> = result
@@ -1471,7 +1475,7 @@ send_enabled = false
         );
         // Drive has only 500GB free
         fs.free_bytes
-            .insert(PathBuf::from("/mnt/d1/.snapshots/sv1"), 500_000_000_000);
+            .insert(PathBuf::from("/mnt/d1"), 500_000_000_000);
 
         let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
         let sends: Vec<_> = result
@@ -1512,7 +1516,7 @@ send_enabled = false
         );
         // Drive has 500GB free — enough for Tier 1 estimate, not for calibrated
         fs.free_bytes
-            .insert(PathBuf::from("/mnt/d1/.snapshots/sv1"), 500_000_000_000);
+            .insert(PathBuf::from("/mnt/d1"), 500_000_000_000);
 
         let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
         let sends: Vec<_> = result
@@ -1536,7 +1540,7 @@ send_enabled = false
         fs.mounted_drives.insert("D1".to_string());
         // No send_sizes, no calibrated_sizes — fail open
         fs.free_bytes
-            .insert(PathBuf::from("/mnt/d1/.snapshots/sv1"), 1_000_000);
+            .insert(PathBuf::from("/mnt/d1"), 1_000_000);
 
         let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
         let sends: Vec<_> = result
