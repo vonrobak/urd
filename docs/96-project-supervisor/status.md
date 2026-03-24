@@ -373,59 +373,51 @@ for details.
 - [ ] _(this repo)_ Write ADR-021: migration decision record
 - [ ] _(this repo)_ Clean up legacy `.last-external-parent` pin files (wait 30+ days after bash retirement)
 
+## Founding ADRs
+
+These architectural decisions were made at project inception and formalized as ADRs on
+2026-03-24. They constrain all future work. See `docs/00-foundation/decisions/` for full
+rationale.
+
+| ADR | Decision | Reference |
+|-----|----------|-----------|
+| [ADR-100](../00-foundation/decisions/2026-03-24-ADR-100-planner-executor-separation.md) | Planner is a pure function; executor runs the plan | Founding decision |
+| [ADR-101](../00-foundation/decisions/2026-03-24-ADR-101-btrfsops-trait.md) | All btrfs calls go through `BtrfsOps` trait | Founding decision |
+| [ADR-102](../00-foundation/decisions/2026-03-24-ADR-102-filesystem-truth-sqlite-history.md) | Filesystem is truth, SQLite is history | Founding decision |
+| [ADR-103](../00-foundation/decisions/2026-03-24-ADR-103-interval-scheduling.md) | Interval-based scheduling, not cron-like | Phase 1 redesign |
+| [ADR-104](../00-foundation/decisions/2026-03-24-ADR-104-graduated-retention.md) | Graduated retention (hourly/daily/weekly/monthly) | Phase 1 redesign |
+| [ADR-105](../00-foundation/decisions/2026-03-24-ADR-105-backward-compatibility-contracts.md) | Snapshot names, pin files, metrics are contracts | Founding decision |
+| [ADR-106](../00-foundation/decisions/2026-03-24-ADR-106-defense-in-depth-data-integrity.md) | Three-layer protection against silent data loss | Phase 1 hardening |
+| [ADR-107](../00-foundation/decisions/2026-03-24-ADR-107-fail-open-cleanup-on-failure.md) | Backups fail open; deletions fail closed | Phase 2 + space estimation |
+| [ADR-108](../00-foundation/decisions/2026-03-24-ADR-108-pure-function-module-pattern.md) | Core logic modules are pure functions | Planner → awareness → voice |
+| [ADR-109](../00-foundation/decisions/2026-03-24-ADR-109-config-boundary-validation.md) | Validate at config boundary, trust afterward | Phase 1 hardening |
+| [ADR-020](../00-foundation/decisions/ADR-relating-to-bash-script/2026-03-21-ADR-020-daily-external-backups.md) | Daily external sends, graduated local retention | Bash-era, still active |
+
 ## Recent Decisions
+
+Current-phase decisions. Older decisions have been graduated to ADRs or remain in their
+review/journal references. See the [design evolution analysis](../99-reports/2026-03-24-design-evolution-analysis.md)
+for the graduation rationale.
 
 | Decision | Date | Reference |
 |----------|------|-----------|
-| Asymmetric multipliers: local 2x/5x, external 1.5x/3x | 2026-03-23 | [Awareness model design review](../99-reports/2026-03-23-awareness-model-design-review.md) |
-| Overall status = max() across drives (best drive wins), offsite as advisory | 2026-03-23 | [Awareness model design review](../99-reports/2026-03-23-awareness-model-design-review.md) |
-| Clock skew: clamp negative ages to zero, emit advisory | 2026-03-23 | [Awareness model impl review](../99-reports/2026-03-23-awareness-model-implementation-review.md) |
 | Awareness model as standalone pure function (not inside Sentinel) | 2026-03-23 | [Vision architecture review](../99-reports/2026-03-23-vision-architecture-review.md) §2 |
 | Sentinel decomposed: awareness + event reactor + notification dispatcher | 2026-03-23 | [Vision architecture review](../99-reports/2026-03-23-vision-architecture-review.md) §2 |
 | Protection promises need ADR before code (policy design problem) | 2026-03-23 | [Vision architecture review](../99-reports/2026-03-23-vision-architecture-review.md) §1 |
 | Presentation layer: commands produce data, voice module renders text | 2026-03-23 | [Vision architecture review](../99-reports/2026-03-23-vision-architecture-review.md) §4 |
-| `urd get` (O(1) path) ships before `urd find` (unsolved perf problem) | 2026-03-23 | [Vision architecture review](../99-reports/2026-03-23-vision-architecture-review.md) §5 |
-| Heartbeat schema versioned from day one, atomic writes, staleness advisory | 2026-03-23 | [Vision architecture review](../99-reports/2026-03-23-vision-architecture-review.md) §6 |
-| Heartbeat includes per-subvolume promise status (not just timestamp) | 2026-03-24 | [Heartbeat design review](../99-reports/2026-03-24-heartbeat-design-review.md) Finding 1 |
-| Heartbeat written on empty/skipped runs too (prevents false staleness) | 2026-03-24 | [Heartbeat design review](../99-reports/2026-03-24-heartbeat-design-review.md) Finding 3 |
-| stale_after = now + min(configured_intervals) × 2, matching awareness AT_RISK | 2026-03-24 | [Heartbeat design review](../99-reports/2026-03-24-heartbeat-design-review.md) Tension 3 |
-| Heartbeat uses fresh timestamp at write time, not pre-execution `now` | 2026-03-24 | [Heartbeat impl review](../99-reports/2026-03-24-heartbeat-implementation-review.md) Finding 1 |
-| OutputMode enum + match, not Renderer trait (two impls don't justify dyn dispatch) | 2026-03-24 | [Presentation layer review](../99-reports/2026-03-24-presentation-layer-design-review.md) |
-| Status command migrated first; other commands migrate incrementally | 2026-03-24 | [Presentation layer review](../99-reports/2026-03-24-presentation-layer-design-review.md) |
-| Progress display stays in backup.rs (streaming I/O doesn't fit produce-data/render) | 2026-03-24 | [Presentation layer review](../99-reports/2026-03-24-presentation-layer-design-review.md) |
-| TTY color: force-off for non-TTY only, respect NO_COLOR/CLICOLOR on TTY | 2026-03-24 | [Presentation layer impl review](../99-reports/2026-03-24-presentation-layer-implementation-review.md) Finding 1 |
-| Protection promises as core abstraction (score 10/10) | 2026-03-23 | [Vision brainstorm](../95-ideas/2026-03-23-brainstorm-realizing-the-vision.md) |
-| Mythic voice emerges from presentation layer, not scattered string edits | 2026-03-23 | User + architecture review |
-| Two modes: invisible worker + invoked norn | 2026-03-23 | User feedback on vision brainstorm |
-| SSH remote targets deferred — keep app simple for now | 2026-03-23 | User ranking (score 4/10) |
-| Daily external sends for Tier 1/2 (RPO 7d → 1d) | 2026-03-21 | [ADR-020](../00-foundation/decisions/ADR-relating-to-bash-script/2026-03-21-ADR-020-daily-external-backups.md) |
-| Pre-send space estimation using historical data | 2026-03-23 | [Journal](../98-journals/2026-03-23-space-estimation-and-testing.md) |
-| Drop Tier 2 and qgroup option from size estimation | 2026-03-23 | [Adversary review](../99-reports/2026-03-23-arch-adversary-proposal-review.md) |
-| Keep progress counter out of BtrfsOps trait | 2026-03-23 | [Adversary review](../99-reports/2026-03-23-arch-adversary-proposal-review.md) Finding 4 |
-| Calibrate on snapshots, not live sources | 2026-03-23 | [Adversary review](../99-reports/2026-03-23-arch-adversary-proposal-review.md) Finding 5 |
-| UrdError::Btrfs struct variant (not separate type) for partial bytes | 2026-03-23 | [Post-cutover journal](../98-journals/2026-03-23-post-cutover-features.md) |
-| MAX(successful, failed) for send size estimation | 2026-03-23 | [Post-cutover journal](../98-journals/2026-03-23-post-cutover-features.md) |
-| `urd get` uses `--at` flag not `@` syntax (avoids filename ambiguity) | 2026-03-24 | [urd get design review](../99-reports/2026-03-24-urd-get-design-review.md) Tension 1 |
-| Automatic subvolume detection via longest-prefix match on source paths | 2026-03-24 | [urd get design review](../99-reports/2026-03-24-urd-get-design-review.md) Tension 2 |
-| Nearest-before-or-equal snapshot selection (time-travel semantic) | 2026-03-24 | [urd get design review](../99-reports/2026-03-24-urd-get-design-review.md) Tension 3 |
-| stdout for content, stderr for metadata (Unix tool convention) | 2026-03-24 | [urd get design review](../99-reports/2026-03-24-urd-get-design-review.md) Tension 4 |
-| Minimal date parsing: 5 formats, no NLP (extend later if needed) | 2026-03-24 | [urd get design review](../99-reports/2026-03-24-urd-get-design-review.md) Finding 3 |
-| Remove short_name snapshot filter — directory structure already scopes | 2026-03-24 | [urd get impl review](../99-reports/2026-03-24-urd-get-implementation-review.md) Finding 1 |
-| `--output` overwrite protection (error if file exists) | 2026-03-24 | [urd get impl review](../99-reports/2026-03-24-urd-get-implementation-review.md) Finding 3 |
+| OutputMode enum + match, not Renderer trait | 2026-03-24 | [Presentation layer review](../99-reports/2026-03-24-presentation-layer-design-review.md) |
 | `DriveAvailability` enum (not bool) — skip reasons are safety-critical | 2026-03-24 | [UUID design review](../99-reports/2026-03-24-uuid-fingerprinting-design-review.md) Tension 2 |
-| `findmnt -n -o UUID` for detection (no sudo, handles LUKS) | 2026-03-24 | [UUID design review](../99-reports/2026-03-24-uuid-fingerprinting-design-review.md) Tension 4 |
-| No auto-learn UUID — defeats threat model (wrong drive learns wrong UUID) | 2026-03-24 | [UUID design review](../99-reports/2026-03-24-uuid-fingerprinting-design-review.md) Finding 1 |
-| UUID optional with warning, not required — backward compat, gradual adoption | 2026-03-24 | [UUID design review](../99-reports/2026-03-24-uuid-fingerprinting-design-review.md) |
-| Default `is_drive_mounted()` on trait delegates to `drive_availability()` | 2026-03-24 | [UUID impl review](../99-reports/2026-03-24-uuid-fingerprinting-implementation-review.md) Tension 3 |
-| Case-insensitive UUID comparison and uniqueness validation | 2026-03-24 | [UUID impl review](../99-reports/2026-03-24-uuid-fingerprinting-implementation-review.md) Finding 1 |
-| Executor mkdir with parent-exists guard (skip for unmounted drives and tests) | 2026-03-24 | [Pre-cutover journal](../98-journals/2026-03-24-pre-cutover-hardening.md) |
-| `PinResult` with `PinSource` enum — legacy pins downgraded to WARN in verify | 2026-03-24 | [Pre-cutover journal](../98-journals/2026-03-24-pre-cutover-hardening.md) |
+| No auto-learn UUID — defeats threat model | 2026-03-24 | [UUID design review](../99-reports/2026-03-24-uuid-fingerprinting-design-review.md) Finding 1 |
+| Executor mkdir with parent-exists guard | 2026-03-24 | [Pre-cutover journal](../98-journals/2026-03-24-pre-cutover-hardening.md) |
+| `PinResult` with `PinSource` enum — legacy pins downgraded to WARN | 2026-03-24 | [Pre-cutover journal](../98-journals/2026-03-24-pre-cutover-hardening.md) |
 | Space estimation queries mount path, not per-subvolume dir | 2026-03-24 | [Pre-cutover journal](../98-journals/2026-03-24-pre-cutover-hardening.md) |
+| Founding ADRs formalized (ADR-100 through ADR-109) | 2026-03-24 | [Design evolution analysis](../99-reports/2026-03-24-design-evolution-analysis.md) |
 
 ## Key Documents
 
 | Purpose | Document |
 |---------|----------|
+| Founding ADRs (ADR-100–105) | [decisions/](../00-foundation/decisions/) |
 | Original roadmap & architecture | [roadmap.md](roadmap.md) |
 | Feature priorities & user rankings | [Brainstorm synthesis](../99-reports/2026-03-23-brainstorm-synthesis.md) + [review](../99-reports/2026-03-23-brainstorm-synthesis-review.md) |
 | Vision brainstorm (promises, mythic voice, sentinel) | [Realizing the vision](../95-ideas/2026-03-23-brainstorm-realizing-the-vision.md) |

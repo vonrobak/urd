@@ -167,6 +167,18 @@ write a new document. When in doubt, supersede.
 2. Move the superseded document to `90-archive/` (mirroring original directory structure)
 3. Add a header to the new document: `**Supersedes:** [original title](../90-archive/path/to/original.md)`
 
+### ADR Numbering
+
+ADRs use two number ranges:
+
+| Range | Era | Location |
+|-------|-----|----------|
+| ADR-001–099 | Bash script era | `decisions/ADR-relating-to-bash-script/` |
+| ADR-100+ | Urd era | `decisions/` (top level) |
+
+New Urd ADRs increment from the highest existing number. Bash-era ADRs retain their
+original numbers and subdirectory for historical reference.
+
 ### ADR Lifecycle
 
 ADRs use explicit status tracking:
@@ -264,6 +276,34 @@ type should have. Add sections as needed.
 ## Decision
 
 ## Consequences
+```
+
+#### Design Proposal
+
+Use for features that introduce a new module, change a public interface, or affect more
+than 3 existing files. Not needed for bug fixes, config tweaks, or self-contained additions.
+The adversary review reviews the proposal before implementation begins.
+
+```markdown
+# Design: {Feature Name}
+
+> **TL;DR:** {2-3 sentences: what, why, key constraint}
+
+**Date:** YYYY-MM-DD
+**Status:** proposed | reviewed | accepted | abandoned
+**Depends on:** {prior features or ADRs}
+
+## Problem
+
+## Proposed Design
+
+## Invariants
+
+## Integration Points
+
+## Rejected Alternatives
+
+## Open Questions
 ```
 
 #### Idea
