@@ -1,5 +1,6 @@
 pub mod backup;
 pub mod calibrate;
+pub mod get;
 pub mod history;
 pub mod init;
 pub mod plan_cmd;

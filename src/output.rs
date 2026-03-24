@@ -169,6 +169,18 @@ pub struct LastRunInfo {
     pub duration: Option<String>,
 }
 
+// ── GetOutput ──────────────────────────────────────────────────────────
+
+/// Structured output for the `urd get` command (metadata, not file content).
+#[derive(Debug, Serialize)]
+pub struct GetOutput {
+    pub subvolume: String,
+    pub snapshot: String,
+    pub snapshot_date: String,
+    pub file_path: String,
+    pub file_size: u64,
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]

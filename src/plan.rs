@@ -633,7 +633,7 @@ impl FileSystemState for RealFileSystemState<'_> {
     }
 }
 
-fn read_snapshot_dir(dir: &Path) -> crate::error::Result<Vec<SnapshotName>> {
+pub(crate) fn read_snapshot_dir(dir: &Path) -> crate::error::Result<Vec<SnapshotName>> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),

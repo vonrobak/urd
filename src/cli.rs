@@ -33,6 +33,8 @@ pub enum Commands {
     Init,
     /// Measure snapshot sizes for space estimation (run before first external send)
     Calibrate(CalibrateArgs),
+    /// Retrieve a file from a past snapshot
+    Get(GetArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -95,6 +97,24 @@ pub struct HistoryArgs {
 #[derive(clap::Args, Debug)]
 pub struct CalibrateArgs {
     /// Only calibrate this subvolume
+    #[arg(long)]
+    pub subvolume: Option<String>,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct GetArgs {
+    /// Path to the file to retrieve
+    pub path: PathBuf,
+
+    /// Date to retrieve from (YYYY-MM-DD, YYYYMMDD, "yesterday", "today")
+    #[arg(long)]
+    pub at: String,
+
+    /// Write output to file instead of stdout
+    #[arg(long, short)]
+    pub output: Option<PathBuf>,
+
+    /// Override automatic subvolume detection
     #[arg(long)]
     pub subvolume: Option<String>,
 }
