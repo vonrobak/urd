@@ -50,9 +50,13 @@ monthly = 0                    # Keep all monthly snapshots (0 = unlimited, spac
 
 # ─── External Drives ──────────────────────────────────────────────────
 # Space thresholds trigger aggressive retention when exceeded.
+# uuid: Optional filesystem UUID for identity verification. Prevents sending
+# snapshots to the wrong drive if a different disk mounts at the expected path.
+# Run `findmnt -o UUID <mount_path>` to get the UUID of a mounted drive.
 
 [[drives]]
 label = "WD-18TB"
+uuid = "647693ed-490e-4c09-8816-189ba2baf03f"   # findmnt -o UUID <mount_path>
 mount_path = "/run/media/<user>/WD-18TB"
 snapshot_root = ".snapshots"
 role = "primary"
@@ -61,6 +65,7 @@ min_free_bytes = "500GB"
 
 [[drives]]
 label = "WD-18TB1"
+# uuid = "..."                                   # Recommended: add UUID for safety
 mount_path = "/run/media/<user>/WD-18TB1"
 snapshot_root = ".snapshots"
 role = "offsite"
@@ -69,6 +74,7 @@ min_free_bytes = "500GB"
 
 [[drives]]
 label = "2TB-backup"
+# uuid = "..."                                   # Recommended: add UUID for safety
 mount_path = "/run/media/<user>/2TB-backup"
 snapshot_root = ".snapshots"
 role = "test"

@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use chrono::NaiveDateTime;
 
 use crate::config::{Config, DriveConfig, ResolvedSubvolume};
+use crate::drives::DriveAvailability;
 use crate::error::UrdError;
 use crate::retention;
 use crate::types::{BackupPlan, PlannedOperation, SnapshotName};
@@ -29,7 +30,12 @@ pub trait FileSystemState {
     ) -> crate::error::Result<Vec<SnapshotName>>;
 
     /// Check if a drive is currently mounted.
-    fn is_drive_mounted(&self, drive: &DriveConfig) -> bool;
+    fn is_drive_mounted(&self, drive: &DriveConfig) -> bool {
+        self.drive_availability(drive) == DriveAvailability::Available
+    }
+
+    /// Check if a drive is mounted and UUID-verified.
+    fn drive_availability(&self, drive: &DriveConfig) -> DriveAvailability;
 
     /// Get free bytes on the filesystem containing the given path.
     fn filesystem_free_bytes(&self, path: &Path) -> crate::error::Result<u64>;
@@ -155,12 +161,35 @@ pub fn plan(
         // ── External operations ─────────────────────────────────────
         if !filters.local_only && subvol.send_enabled {
             for drive in &config.drives {
-                if !fs.is_drive_mounted(drive) {
-                    skipped.push((
-                        subvol.name.clone(),
-                        format!("drive {} not mounted", drive.label),
-                    ));
-                    continue;
+                match fs.drive_availability(drive) {
+                    DriveAvailability::Available => {}
+                    DriveAvailability::NotMounted => {
+                        skipped.push((
+                            subvol.name.clone(),
+                            format!("drive {} not mounted", drive.label),
+                        ));
+                        continue;
+                    }
+                    DriveAvailability::UuidMismatch { expected, found } => {
+                        skipped.push((
+                            subvol.name.clone(),
+                            format!(
+                                "drive {} UUID mismatch (expected {}, found {})",
+                                drive.label, expected, found
+                            ),
+                        ));
+                        continue;
+                    }
+                    DriveAvailability::UuidCheckFailed(reason) => {
+                        skipped.push((
+                            subvol.name.clone(),
+                            format!(
+                                "drive {} UUID check failed: {}",
+                                drive.label, reason
+                            ),
+                        ));
+                        continue;
+                    }
                 }
 
                 plan_external_send(
@@ -578,8 +607,8 @@ impl FileSystemState for RealFileSystemState<'_> {
         read_snapshot_dir(&dir)
     }
 
-    fn is_drive_mounted(&self, drive: &DriveConfig) -> bool {
-        crate::drives::is_drive_mounted(drive)
+    fn drive_availability(&self, drive: &DriveConfig) -> DriveAvailability {
+        crate::drives::drive_availability(drive)
     }
 
     fn filesystem_free_bytes(&self, path: &Path) -> crate::error::Result<u64> {
@@ -671,6 +700,10 @@ pub struct MockFileSystemState {
     pub local_snapshots: std::collections::HashMap<String, Vec<SnapshotName>>,
     pub external_snapshots: std::collections::HashMap<(String, String), Vec<SnapshotName>>,
     pub mounted_drives: HashSet<String>,
+    /// Override drive_availability() for specific drives (by label).
+    /// When absent, falls back to mounted_drives check.
+    pub drive_availability_overrides:
+        std::collections::HashMap<String, crate::drives::DriveAvailability>,
     pub free_bytes: std::collections::HashMap<PathBuf, u64>,
     pub pin_files: std::collections::HashMap<(PathBuf, String), SnapshotName>,
     pub send_sizes: std::collections::HashMap<(String, String, String), u64>,
@@ -687,6 +720,7 @@ impl MockFileSystemState {
             local_snapshots: std::collections::HashMap::new(),
             external_snapshots: std::collections::HashMap::new(),
             mounted_drives: HashSet::new(),
+            drive_availability_overrides: std::collections::HashMap::new(),
             free_bytes: std::collections::HashMap::new(),
             pin_files: std::collections::HashMap::new(),
             send_sizes: std::collections::HashMap::new(),
@@ -733,8 +767,16 @@ impl FileSystemState for MockFileSystemState {
             .unwrap_or_default())
     }
 
-    fn is_drive_mounted(&self, drive: &DriveConfig) -> bool {
-        self.mounted_drives.contains(&drive.label)
+    fn drive_availability(&self, drive: &DriveConfig) -> DriveAvailability {
+        if let Some(status) = self.drive_availability_overrides.get(&drive.label) {
+            return status.clone();
+        }
+        // Backward compat: fall back to mounted_drives set
+        if self.mounted_drives.contains(&drive.label) {
+            DriveAvailability::Available
+        } else {
+            DriveAvailability::NotMounted
+        }
     }
 
     fn filesystem_free_bytes(&self, path: &Path) -> crate::error::Result<u64> {
@@ -1535,6 +1577,104 @@ send_enabled = false
                 .iter()
                 .any(|(name, reason)| name == "sv1" && reason.contains("interval")),
             "Should report interval not elapsed for future-dated snapshot"
+        );
+    }
+
+    // ── UUID drive fingerprinting tests ─────────────────────────────
+
+    #[test]
+    fn uuid_mismatch_skips_drive() {
+        let config = test_config();
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap("20260322-1300-one")]);
+        fs.drive_availability_overrides.insert(
+            "D1".to_string(),
+            DriveAvailability::UuidMismatch {
+                expected: "aaa".to_string(),
+                found: "bbb".to_string(),
+            },
+        );
+
+        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        assert!(
+            result
+                .skipped
+                .iter()
+                .any(|(_, reason)| reason.contains("UUID mismatch")),
+            "UUID mismatch should produce a skip reason: {:?}",
+            result.skipped
+        );
+        // No sends should be planned
+        let sends: Vec<_> = result
+            .operations
+            .iter()
+            .filter(|op| matches!(op, PlannedOperation::SendFull { .. } | PlannedOperation::SendIncremental { .. }))
+            .collect();
+        assert!(sends.is_empty(), "No sends should be planned on UUID mismatch");
+    }
+
+    #[test]
+    fn uuid_check_failed_skips_drive() {
+        let config = test_config();
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap("20260322-1300-one")]);
+        fs.drive_availability_overrides.insert(
+            "D1".to_string(),
+            DriveAvailability::UuidCheckFailed("findmnt not found".to_string()),
+        );
+
+        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        assert!(
+            result
+                .skipped
+                .iter()
+                .any(|(_, reason)| reason.contains("UUID check failed")),
+            "UUID check failure should produce a skip reason: {:?}",
+            result.skipped
+        );
+    }
+
+    #[test]
+    fn uuid_match_proceeds_with_send() {
+        let config = test_config();
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap("20260322-1300-one")]);
+        fs.drive_availability_overrides
+            .insert("D1".to_string(), DriveAvailability::Available);
+
+        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let sends: Vec<_> = result
+            .operations
+            .iter()
+            .filter(|op| matches!(op, PlannedOperation::SendFull { .. } | PlannedOperation::SendIncremental { .. }))
+            .collect();
+        assert!(
+            !sends.is_empty(),
+            "Sends should be planned when drive is Available"
+        );
+    }
+
+    #[test]
+    fn no_uuid_configured_still_sends() {
+        // Backward compat: mounted_drives without override still works
+        let config = test_config();
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap("20260322-1300-one")]);
+        fs.mounted_drives.insert("D1".to_string());
+
+        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let sends: Vec<_> = result
+            .operations
+            .iter()
+            .filter(|op| matches!(op, PlannedOperation::SendFull { .. } | PlannedOperation::SendIncremental { .. }))
+            .collect();
+        assert!(
+            !sends.is_empty(),
+            "Backward compat: mounted_drives should still trigger sends"
         );
     }
 }

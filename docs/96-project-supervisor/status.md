@@ -5,12 +5,27 @@
 
 ## Current State
 
-**Phase 5 complete. Awareness model (3a), heartbeat file (3b), presentation layer (3c),
-and `urd get` (3d) are built, reviewed, and passing 205 tests.** Operational cutover has not
-started — the bash script (`btrfs-snapshot-backup.sh`) is still the sole production backup
-system, running nightly at 02:00 via `btrfs-backup-daily.timer`. Urd v0.1.0 is installed
-(`~/.cargo/bin/urd`) and has been tested manually on real subvolumes (2026-03-23), but is not
-deployed on a schedule.
+**Phase 5 complete. Safety hardening in progress (2a done).** Awareness model (3a), heartbeat
+file (3b), presentation layer (3c), `urd get` (3d), and UUID drive fingerprinting (2a) are
+built, reviewed, and passing 214 tests. Operational cutover has not started — the bash script
+(`btrfs-snapshot-backup.sh`) is still the sole production backup system, running nightly at
+02:00 via `btrfs-backup-daily.timer`. Urd v0.1.0 is installed (`~/.cargo/bin/urd`) and has
+been tested manually on real subvolumes (2026-03-23), but is not deployed on a schedule.
+
+Safety hardening completed:
+
+- **UUID drive fingerprinting** (`drives.rs`) — `DriveAvailability` enum (Available / NotMounted
+  / UuidMismatch / UuidCheckFailed) replaces bare bool in planner drive loop. `findmnt -n -o UUID`
+  for detection — no sudo, handles LUKS transparently. Optional `uuid` field on `DriveConfig`
+  (`#[serde(default)]`). Case-insensitive comparison. Planner produces distinct skip reasons per
+  variant (exhaustive match). `FileSystemState` trait gains `drive_availability()` with default
+  `is_drive_mounted()` impl — all existing callers (awareness.rs, status, verify) unchanged.
+  `warn_missing_uuids()` shows detected UUID via `log::warn!` so users can copy-paste into config.
+  Config validation: UUID uniqueness (case-insensitive), empty UUID rejected. 10 new tests
+  (6 drives, 4 planner). Review fixes: case-insensitive UUID uniqueness check, `log::warn!`
+  instead of `eprintln!`.
+  [Design review](../99-reports/2026-03-24-uuid-fingerprinting-design-review.md) |
+  [Implementation review](../99-reports/2026-03-24-uuid-fingerprinting-implementation-review.md)
 
 Phase 5 work completed:
 
@@ -74,7 +89,7 @@ Low-risk, high-value improvements to the existing architecture.
 
 | # | Feature | Effort | Notes |
 |---|---------|--------|-------|
-| 2a | **UUID drive fingerprinting** | Low | Add UUID to `DriveConfig`, verify on mount in `drives.rs`. Config migration: UUID optional, warn if absent. |
+| 2a | ~~**UUID drive fingerprinting**~~ | ~~Low~~ | **COMPLETE.** `DriveAvailability` enum, `findmnt` UUID detection, planner integration, config validation. 10 tests. Adversary-reviewed. |
 | 2b | **Surface skipped sends loudly** | Low | Prominent warning block in backup output. |
 | 2c | **Pre-flight checks** | Low | Extract `init.rs` validation into shared `preflight_checks()`. |
 | 2d | **Post-backup structured summary** | Medium | Answer "is my data safer now?" Format as structured data, render via presentation layer. |
@@ -254,6 +269,15 @@ timestamp staleness handling, space check deduplication, ANSI line clearing.
   [Journal](../98-journals/2026-03-24-urd-get.md) |
   [Design review](../99-reports/2026-03-24-urd-get-design-review.md) |
   [Implementation review](../99-reports/2026-03-24-urd-get-implementation-review.md)
+- **UUID drive fingerprinting** (P2a) — `drives.rs`: `DriveAvailability` enum with 4 variants
+  replaces bool mount check in planner. `findmnt -n -o UUID` for filesystem UUID detection (no
+  sudo, LUKS-transparent). Optional `uuid` field on `DriveConfig`. Case-insensitive comparison
+  and uniqueness validation. Exhaustive match in planner produces distinct skip reasons. Default
+  `is_drive_mounted()` impl on trait preserves all existing callers. `warn_missing_uuids()` shows
+  detected UUID via `log::warn!` for copy-paste. 10 new tests. Review fixes: case-insensitive
+  uniqueness check, `log::warn!` over `eprintln!`.
+  [Design review](../99-reports/2026-03-24-uuid-fingerprinting-design-review.md) |
+  [Implementation review](../99-reports/2026-03-24-uuid-fingerprinting-implementation-review.md)
 
 ### Not Building (dropped per adversary review)
 
@@ -354,6 +378,12 @@ for details.
 | Minimal date parsing: 5 formats, no NLP (extend later if needed) | 2026-03-24 | [urd get design review](../99-reports/2026-03-24-urd-get-design-review.md) Finding 3 |
 | Remove short_name snapshot filter — directory structure already scopes | 2026-03-24 | [urd get impl review](../99-reports/2026-03-24-urd-get-implementation-review.md) Finding 1 |
 | `--output` overwrite protection (error if file exists) | 2026-03-24 | [urd get impl review](../99-reports/2026-03-24-urd-get-implementation-review.md) Finding 3 |
+| `DriveAvailability` enum (not bool) — skip reasons are safety-critical | 2026-03-24 | [UUID design review](../99-reports/2026-03-24-uuid-fingerprinting-design-review.md) Tension 2 |
+| `findmnt -n -o UUID` for detection (no sudo, handles LUKS) | 2026-03-24 | [UUID design review](../99-reports/2026-03-24-uuid-fingerprinting-design-review.md) Tension 4 |
+| No auto-learn UUID — defeats threat model (wrong drive learns wrong UUID) | 2026-03-24 | [UUID design review](../99-reports/2026-03-24-uuid-fingerprinting-design-review.md) Finding 1 |
+| UUID optional with warning, not required — backward compat, gradual adoption | 2026-03-24 | [UUID design review](../99-reports/2026-03-24-uuid-fingerprinting-design-review.md) |
+| Default `is_drive_mounted()` on trait delegates to `drive_availability()` | 2026-03-24 | [UUID impl review](../99-reports/2026-03-24-uuid-fingerprinting-implementation-review.md) Tension 3 |
+| Case-insensitive UUID comparison and uniqueness validation | 2026-03-24 | [UUID impl review](../99-reports/2026-03-24-uuid-fingerprinting-implementation-review.md) Finding 1 |
 
 ## Key Documents
 
@@ -365,7 +395,7 @@ for details.
 | Future directions brainstorm | [Feature ideas](../95-ideas/2026-03-23-brainstorm-urd-future.md) |
 | UX design principles brainstorm | [Norman principles](../95-ideas/2026-03-23-brainstorm-ux-norman-principles.md) |
 | Vision architecture review | [2026-03-23 Architectural criteria for vision](../99-reports/2026-03-23-vision-architecture-review.md) |
-| Latest adversary review | [2026-03-24 urd get impl review](../99-reports/2026-03-24-urd-get-implementation-review.md) |
+| Latest adversary review | [2026-03-24 UUID fingerprinting impl review](../99-reports/2026-03-24-uuid-fingerprinting-implementation-review.md) |
 | Code conventions & architecture | [CLAUDE.md](../../CLAUDE.md) |
 | Documentation standards | [CONTRIBUTING.md](../../CONTRIBUTING.md) |
 
@@ -376,11 +406,12 @@ for details.
 - `du -sb` may follow symlinks in snapshots — consider `-P` flag (not yet tested on real snapshots with symlinks)
 - Stale failed send estimates persist indefinitely for (subvolume, drive, send_type) triples with no subsequent sends — consider TTL or clearing on successful calibration
 - Successful sends could update `subvolume_sizes` table to keep calibration fresh, but pipe bytes ≠ `du -sb` bytes (method mixing concern)
-- `FileSystemState` trait (9 methods) is outgrowing its name — consider renaming to `SystemState` if more history/state methods are added
+- `FileSystemState` trait (10 methods, including `drive_availability`) is outgrowing its name — consider renaming to `SystemState` if more methods are added
 - Awareness model integrated into heartbeat and `urd status` but not yet into backup post-run summary
 - `heartbeat::read()` returns `Option` — cannot distinguish missing file from corrupt JSON (upgrade to `Result<Option>` when Sentinel is built)
 - Remaining commands (`plan`, `backup`, `history`, `verify`, `init`, `calibrate`) still use direct `println!` — migrate to voice layer incrementally
 - Per-drive pin protection for external retention — current all-drives-union is conservative but suboptimal for space
 - `urd get` normalizes paths without filesystem access (no `canonicalize`) — symlinked paths won't match subvolume sources. Documented limitation; correct behavior (use canonical paths)
 - `urd get` doesn't support directory restore — files only in v1. Error message guides user.
+- `warn_missing_uuids` spawns `findmnt` per mounted drive without UUID on every plan/backup run — acceptable during transition, consider moving to `urd verify` only once UUID adoption is complete
 - Idea: [systemd unit drift check](../95-ideas/2026-03-23-systemd-unit-drift-check.md) in `urd verify`

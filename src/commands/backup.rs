@@ -51,6 +51,9 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     };
     let backup_plan = plan::plan(&config, now, &filters, &fs_state)?;
 
+    // Warn about drives without UUID fingerprinting
+    drives::warn_missing_uuids(&config.drives);
+
     // Dry run: print plan and exit (no lock needed)
     if args.dry_run {
         crate::commands::plan_cmd::run_with_plan(&config, &backup_plan)?;
