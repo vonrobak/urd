@@ -5,20 +5,30 @@
 
 ## Current State
 
-**Phase 5 has begun. The awareness model (Priority 3a) is built, double-reviewed, and
-passing 168 tests.** Operational cutover has not started — the bash script
+**Phase 5 continues. Awareness model (3a) and heartbeat file (3b) are built, reviewed, and
+passing 175 tests.** Operational cutover has not started — the bash script
 (`btrfs-snapshot-backup.sh`) is still the sole production backup system, running nightly at
 02:00 via `btrfs-backup-daily.timer`. Urd v0.1.0 is installed (`~/.cargo/bin/urd`) and has
 been tested manually on real subvolumes (2026-03-23), but is not deployed on a schedule.
 
-Phase 5 work completed: awareness model (`awareness.rs`) — a pure function computing
-PROTECTED / AT RISK / UNPROTECTED per subvolume from config + filesystem state + history.
-Design-reviewed before implementation, implementation-reviewed after. Asymmetric thresholds
-(local 2x/5x, external 1.5x/3x), best-drive aggregation (max across drives), clock skew
-protection, per-subvolume error capture. 24 awareness tests.
-[Journal](../98-journals/2026-03-23-awareness-model.md) |
-[Design review](../99-reports/2026-03-23-awareness-model-design-review.md) |
-[Implementation review](../99-reports/2026-03-23-awareness-model-implementation-review.md)
+Phase 5 work completed so far:
+
+- **Awareness model** (`awareness.rs`) — pure function computing PROTECTED / AT RISK /
+  UNPROTECTED per subvolume from config + filesystem state + history. Asymmetric thresholds
+  (local 2x/5x, external 1.5x/3x), best-drive aggregation (max across drives), clock skew
+  protection, per-subvolume error capture. 24 awareness tests. Double adversary-reviewed.
+  [Journal](../98-journals/2026-03-23-awareness-model.md) |
+  [Design review](../99-reports/2026-03-23-awareness-model-design-review.md) |
+  [Implementation review](../99-reports/2026-03-23-awareness-model-implementation-review.md)
+
+- **Heartbeat file** (`heartbeat.rs`) — JSON health signal at `~/.local/share/urd/heartbeat.json`,
+  written after every backup run (including empty runs). Schema v1 with `schema_version`,
+  `timestamp`, `stale_after` (derived from min interval × 2), `run_result`, `run_id`, and
+  per-subvolume promise status from the awareness model. Atomic writes (temp + rename).
+  Non-fatal — write failures are logged but never block backups. First real consumer of the
+  awareness model. `heartbeat_file` configurable in `[general]` with sensible default. 7 tests.
+  [Design review](../99-reports/2026-03-24-heartbeat-design-review.md) |
+  [Implementation review](../99-reports/2026-03-24-heartbeat-implementation-review.md)
 
 Prior work: pre-send space estimation, documentation system (CONTRIBUTING.md), first
 real-world backup testing, failed-send bytes recording, live progress display, `urd calibrate`.
@@ -65,13 +75,17 @@ Advisories for offsite cycling reminders. 24 tests. Double adversary-reviewed.
 - [x] Computable from existing `FileSystemState` trait (extended with `last_successful_send_time`)
 - [x] Testable with `MockFileSystemState` (including error injection)
 
-**3b. Heartbeat file** — JSON at `~/.local/share/urd/heartbeat.json`. Written after every
-backup run. Versioned schema, atomic writes (temp + rename), staleness advisory timestamp.
+**3b. Heartbeat file** (`heartbeat.rs`) — **COMPLETE.** JSON at
+`~/.local/share/urd/heartbeat.json`. Written after every backup run (including empty runs).
+Schema v1 with per-subvolume promise status from awareness model. Atomic writes,
+configurable path, non-fatal errors. 7 tests. Design-reviewed before implementation,
+implementation-reviewed after. Review fix applied: fresh timestamp at write time (not
+pre-execution `now`).
 
-- [ ] Schema versioned from day one (`schema_version` field)
-- [ ] Atomic write via temp file + rename
-- [ ] Includes computation timestamp + `stale_after` advisory
-- [ ] Minimal first iteration — add fields later, don't guess what consumers need
+- [x] Schema versioned from day one (`schema_version` field)
+- [x] Atomic write via temp file + rename
+- [x] Includes computation timestamp + `stale_after` advisory
+- [x] Minimal first iteration — add fields later, don't guess what consumers need
 
 **3c. Presentation layer** (`voice.rs`) — commands produce structured output data;
 the presentation layer renders it as text. Two renderers: interactive (rich, colored,
@@ -123,7 +137,7 @@ The Sentinel is three independent systems that compose. Build and test them sepa
 
 Architectural gates:
 - [x] Awareness model works independently (tested, no Sentinel dependency)
-- [ ] Heartbeat works independently (written by `urd backup`, read by Sentinel)
+- [x] Heartbeat works independently (written by `urd backup`, read by Sentinel)
 - [ ] Event/action types defined as enums (testable state machine)
 - [ ] Lock contention with manual `urd backup` designed
 - [ ] Circuit breaker designed (min interval between auto-triggers)
@@ -182,8 +196,16 @@ timestamp staleness handling, space check deduplication, ANSI line clearing.
 - **Awareness model** (Phase 5, P3a) — `awareness.rs`: pure function `assess(config, now, fs)`
   computing PROTECTED / AT RISK / UNPROTECTED per subvolume. Asymmetric thresholds, best-drive
   aggregation, clock skew protection, error capture, offsite advisories. `FileSystemState`
-  extended with `last_successful_send_time()`. 24 tests. Not yet integrated into status command.
+  extended with `last_successful_send_time()`. 24 tests. Integrated into heartbeat; not yet
+  integrated into status command.
   [Journal](../98-journals/2026-03-23-awareness-model.md)
+- **Heartbeat file** (Phase 5, P3b) — `heartbeat.rs`: JSON health signal written after every
+  backup run. Schema v1 with per-subvolume promise status from awareness model. Atomic writes,
+  configurable path (`heartbeat_file` in `[general]`), `stale_after` derived from min interval
+  × 2. Non-fatal errors. Fresh timestamp at write time. 7 tests. First consumer of awareness
+  model.
+  [Design review](../99-reports/2026-03-24-heartbeat-design-review.md) |
+  [Implementation review](../99-reports/2026-03-24-heartbeat-implementation-review.md)
 
 ### Not Building (dropped per adversary review)
 
@@ -204,7 +226,7 @@ timestamp staleness handling, space check deduplication, ANSI line clearing.
 - [x] **Phase 4 code** — Cutover polish + space estimation + real-world testing
 - [ ] **Phase 4 cutover** — Operational transition from bash to Urd (see below)
 - [x] **Post-cutover features** — failed-send bytes, progress, calibrate (Priorities 2-4)
-- [ ] **Phase 5** — Architectural foundation: ~~awareness model~~, heartbeat, presentation layer, `urd get`
+- [ ] **Phase 5** — Architectural foundation: ~~awareness model~~, ~~heartbeat~~, presentation layer, `urd get`
 - [ ] **Phase 5 gate** — ADR: protection promise design (retention mappings, config conflicts, migration)
 - [ ] **Phase 6** — Protection promises in config + planner + status
 - [ ] **Phase 7** — Sentinel: notification dispatcher → event reactor → active mode
@@ -258,6 +280,10 @@ for details.
 | Presentation layer: commands produce data, voice module renders text | 2026-03-23 | [Vision architecture review](../99-reports/2026-03-23-vision-architecture-review.md) §4 |
 | `urd get` (O(1) path) ships before `urd find` (unsolved perf problem) | 2026-03-23 | [Vision architecture review](../99-reports/2026-03-23-vision-architecture-review.md) §5 |
 | Heartbeat schema versioned from day one, atomic writes, staleness advisory | 2026-03-23 | [Vision architecture review](../99-reports/2026-03-23-vision-architecture-review.md) §6 |
+| Heartbeat includes per-subvolume promise status (not just timestamp) | 2026-03-24 | [Heartbeat design review](../99-reports/2026-03-24-heartbeat-design-review.md) Finding 1 |
+| Heartbeat written on empty/skipped runs too (prevents false staleness) | 2026-03-24 | [Heartbeat design review](../99-reports/2026-03-24-heartbeat-design-review.md) Finding 3 |
+| stale_after = now + min(configured_intervals) × 2, matching awareness AT_RISK | 2026-03-24 | [Heartbeat design review](../99-reports/2026-03-24-heartbeat-design-review.md) Tension 3 |
+| Heartbeat uses fresh timestamp at write time, not pre-execution `now` | 2026-03-24 | [Heartbeat impl review](../99-reports/2026-03-24-heartbeat-implementation-review.md) Finding 1 |
 | Protection promises as core abstraction (score 10/10) | 2026-03-23 | [Vision brainstorm](../95-ideas/2026-03-23-brainstorm-realizing-the-vision.md) |
 | Mythic voice emerges from presentation layer, not scattered string edits | 2026-03-23 | User + architecture review |
 | Two modes: invisible worker + invoked norn | 2026-03-23 | User feedback on vision brainstorm |
@@ -280,7 +306,7 @@ for details.
 | Future directions brainstorm | [Feature ideas](../95-ideas/2026-03-23-brainstorm-urd-future.md) |
 | UX design principles brainstorm | [Norman principles](../95-ideas/2026-03-23-brainstorm-ux-norman-principles.md) |
 | Vision architecture review | [2026-03-23 Architectural criteria for vision](../99-reports/2026-03-23-vision-architecture-review.md) |
-| Latest adversary review | [2026-03-23 Awareness model impl review](../99-reports/2026-03-23-awareness-model-implementation-review.md) |
+| Latest adversary review | [2026-03-24 Heartbeat impl review](../99-reports/2026-03-24-heartbeat-implementation-review.md) |
 | Code conventions & architecture | [CLAUDE.md](../../CLAUDE.md) |
 | Documentation standards | [CONTRIBUTING.md](../../CONTRIBUTING.md) |
 
@@ -292,6 +318,8 @@ for details.
 - Stale failed send estimates persist indefinitely for (subvolume, drive, send_type) triples with no subsequent sends — consider TTL or clearing on successful calibration
 - Successful sends could update `subvolume_sizes` table to keep calibration fresh, but pipe bytes ≠ `du -sb` bytes (method mixing concern)
 - `FileSystemState` trait (9 methods) is outgrowing its name — consider renaming to `SystemState` if more history/state methods are added
-- Awareness model not yet integrated into `urd status` or backup post-run summary (follow-up task)
+- Awareness model integrated into heartbeat but not yet into `urd status` or backup post-run summary
+- `heartbeat::read()` returns `Option` — cannot distinguish missing file from corrupt JSON (upgrade to `Result<Option>` when Sentinel is built)
+- `#[allow(dead_code)]` on awareness structs (`SubvolAssessment`, `LocalAssessment`, `DriveAssessment`) — remove when status command integrates awareness
 - Per-drive pin protection for external retention — current all-drives-union is conservative but suboptimal for space
 - Idea: [systemd unit drift check](../95-ideas/2026-03-23-systemd-unit-drift-check.md) in `urd verify`

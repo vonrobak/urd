@@ -7,11 +7,13 @@ use std::time::{Duration, Instant};
 
 use colored::Colorize;
 
+use crate::awareness;
 use crate::btrfs::RealBtrfs;
 use crate::cli::BackupArgs;
 use crate::config::Config;
 use crate::drives;
 use crate::executor::{Executor, RunResult, SendType};
+use crate::heartbeat;
 use crate::metrics::{self, MetricsData, SubvolumeMetrics};
 use crate::plan::{self, FileSystemState, PlanFilters, RealFileSystemState};
 use crate::state::StateDb;
@@ -59,6 +61,12 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     if backup_plan.is_empty() && backup_plan.skipped.is_empty() {
         println!("{}", "Nothing to do.".dimmed());
         write_metrics_for_skipped(&config, &backup_plan, now)?;
+        let heartbeat_now = chrono::Local::now().naive_local();
+        let assessments = awareness::assess(&config, heartbeat_now, &fs_state);
+        let hb = heartbeat::build_empty(&config, heartbeat_now, &assessments);
+        if let Err(e) = heartbeat::write(&config.general.heartbeat_file, &hb) {
+            log::warn!("Failed to write heartbeat: {e}");
+        }
         return Ok(());
     }
 
@@ -192,6 +200,14 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
 
     // Write metrics
     write_metrics_after_execution(&config, &result, &backup_plan, now, &fs_state)?;
+
+    // Write heartbeat (fresh timestamp — `now` is from before execution)
+    let heartbeat_now = chrono::Local::now().naive_local();
+    let assessments = awareness::assess(&config, heartbeat_now, &fs_state);
+    let hb = heartbeat::build_from_run(&config, heartbeat_now, &result, &assessments);
+    if let Err(e) = heartbeat::write(&config.general.heartbeat_file, &hb) {
+        log::warn!("Failed to write heartbeat: {e}");
+    }
 
     // Exit with appropriate code
     if result.overall != RunResult::Success {
