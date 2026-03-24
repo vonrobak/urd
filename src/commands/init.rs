@@ -6,8 +6,8 @@ use crate::btrfs::{BtrfsOps, RealBtrfs};
 use crate::chain;
 use crate::config::Config;
 use crate::drives;
-use crate::plan::RealFileSystemState;
 use crate::plan::FileSystemState;
+use crate::plan::RealFileSystemState;
 use crate::state::StateDb;
 
 pub fn run(config: Config) -> anyhow::Result<()> {
@@ -164,29 +164,13 @@ pub fn run(config: Config) -> anyhow::Result<()> {
             for label in &drive_labels {
                 match chain::read_pin_file(&local_dir, label) {
                     Ok(Some(name)) => {
-                        println!(
-                            "  {} {}/{}: {}",
-                            "OK".green(),
-                            subvol_name,
-                            label,
-                            name
-                        );
+                        println!("  {} {}/{}: {}", "OK".green(), subvol_name, label, name);
                     }
                     Ok(None) => {
-                        println!(
-                            "  {} {}/{}: no pin file",
-                            "—".dimmed(),
-                            subvol_name,
-                            label
-                        );
+                        println!("  {} {}/{}: no pin file", "—".dimmed(), subvol_name, label);
                     }
                     Err(e) => {
-                        println!(
-                            "  {} {}/{}: {e}",
-                            "ERROR".red(),
-                            subvol_name,
-                            label
-                        );
+                        println!("  {} {}/{}: {e}", "ERROR".red(), subvol_name, label);
                     }
                 }
             }
@@ -261,11 +245,9 @@ pub fn run(config: Config) -> anyhow::Result<()> {
                             std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
                         );
                         match btrfs.delete_subvolume(&partial_path) {
-                            Ok(()) => println!(
-                                "  {} Deleted {}",
-                                "OK".green(),
-                                partial_path.display()
-                            ),
+                            Ok(()) => {
+                                println!("  {} Deleted {}", "OK".green(), partial_path.display())
+                            }
                             Err(e) => println!(
                                 "  {} Failed to delete {}: {e}",
                                 "ERROR".red(),

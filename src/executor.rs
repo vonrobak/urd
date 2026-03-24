@@ -261,7 +261,11 @@ impl<'a> Executor<'a> {
         failed_creates: &mut HashSet<&'b Path>,
     ) -> OperationOutcome {
         let start = Instant::now();
-        log::info!("Creating snapshot: {} -> {}", source.display(), dest.display());
+        log::info!(
+            "Creating snapshot: {} -> {}",
+            source.display(),
+            dest.display()
+        );
 
         match self.btrfs.create_readonly_snapshot(source, dest) {
             Ok(()) => OperationOutcome {
@@ -393,9 +397,7 @@ impl<'a> Executor<'a> {
                     && let Some(pin_dir) = pin_path.parent()
                     && let Err(e) = chain::write_pin_file(pin_dir, drive_label, pin_name)
                 {
-                    log::warn!(
-                        "Send succeeded but pin file write failed for {drive_label}: {e}"
-                    );
+                    log::warn!("Send succeeded but pin file write failed for {drive_label}: {e}");
                     pin_failed = true;
                 }
 
@@ -415,15 +417,14 @@ impl<'a> Executor<'a> {
                 // Extract partial byte count from btrfs errors (e.g., failed sends
                 // that transferred some data before the pipe broke)
                 let partial_bytes = match &e {
-                    crate::error::UrdError::Btrfs { bytes_transferred, .. } => *bytes_transferred,
+                    crate::error::UrdError::Btrfs {
+                        bytes_transferred, ..
+                    } => *bytes_transferred,
                     _ => None,
                 };
                 log::error!("{op_name} failed for {subvol_name} -> {drive_label}: {e}");
                 if let Some(bytes) = partial_bytes {
-                    log::info!(
-                        "Partial transfer: {} bytes copied before failure",
-                        bytes,
-                    );
+                    log::info!("Partial transfer: {} bytes copied before failure", bytes,);
                 }
                 (
                     OperationOutcome {
@@ -818,11 +819,13 @@ source = "/data/b"
         assert!(!sv.success);
         // The send should be skipped, not attempted
         assert_eq!(sv.operations[1].result, OpResult::Skipped);
-        assert!(sv.operations[1]
-            .error
-            .as_ref()
-            .unwrap()
-            .contains("snapshot creation failed"));
+        assert!(
+            sv.operations[1]
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("snapshot creation failed")
+        );
 
         // Verify send was NOT called on the mock
         let calls = mock.calls();
@@ -837,9 +840,7 @@ source = "/data/b"
         let executor = Executor::new(&mock, None, &config, &shutdown);
 
         let pin_dir = tempfile::TempDir::new().unwrap();
-        let pin_path = pin_dir
-            .path()
-            .join(".last-external-parent-TEST-DRIVE");
+        let pin_path = pin_dir.path().join(".last-external-parent-TEST-DRIVE");
         let snap_name = SnapshotName::parse("20260322-1430-a").unwrap();
 
         let ts = NaiveDate::from_ymd_opt(2026, 3, 22)
@@ -1058,9 +1059,15 @@ source = "/data/b"
         let result = executor.execute(&plan, "full");
 
         // sv-a's delete succeeds and triggers space_recovered for TEST-DRIVE
-        assert_eq!(result.subvolume_results[0].operations[0].result, OpResult::Success);
+        assert_eq!(
+            result.subvolume_results[0].operations[0].result,
+            OpResult::Success
+        );
         // sv-b's delete on the SAME drive should be skipped
-        assert_eq!(result.subvolume_results[1].operations[0].result, OpResult::Skipped);
+        assert_eq!(
+            result.subvolume_results[1].operations[0].result,
+            OpResult::Skipped
+        );
 
         // Only one delete should have been called
         let delete_count = mock

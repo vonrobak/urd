@@ -158,8 +158,8 @@ impl Config {
             source: e,
         })?;
 
-        let mut config: Config =
-            toml::from_str(&contents).map_err(|e| UrdError::Config(format!("{config_path:?}: {e}")))?;
+        let mut config: Config = toml::from_str(&contents)
+            .map_err(|e| UrdError::Config(format!("{config_path:?}: {e}")))?;
 
         config.expand_paths();
         config.validate()?;
@@ -251,7 +251,8 @@ impl Config {
         }
 
         // Every subvolume referenced in roots must exist in [[subvolumes]]
-        let subvol_names: HashSet<&str> = self.subvolumes.iter().map(|sv| sv.name.as_str()).collect();
+        let subvol_names: HashSet<&str> =
+            self.subvolumes.iter().map(|sv| sv.name.as_str()).collect();
         for root in &self.local_snapshots.roots {
             for name in &root.subvolumes {
                 if !subvol_names.contains(name.as_str()) {
@@ -310,7 +311,10 @@ impl Config {
         }
 
         for drive in &self.drives {
-            validate_path_safe(&drive.mount_path, &format!("drive {:?} mount_path", drive.label))?;
+            validate_path_safe(
+                &drive.mount_path,
+                &format!("drive {:?} mount_path", drive.label),
+            )?;
             validate_name_safe(&drive.label, "drive label")?;
             validate_name_safe(&drive.snapshot_root, "drive snapshot_root")?;
         }
@@ -379,9 +383,8 @@ fn validate_name_safe(name: &str, label: &str) -> crate::error::Result<()> {
 }
 
 fn default_config_path() -> crate::error::Result<PathBuf> {
-    let config_dir = dirs::config_dir().ok_or_else(|| {
-        UrdError::Config("could not determine XDG config directory".to_string())
-    })?;
+    let config_dir = dirs::config_dir()
+        .ok_or_else(|| UrdError::Config("could not determine XDG config directory".to_string()))?;
     Ok(config_dir.join("urd").join("urd.toml"))
 }
 
@@ -506,13 +509,21 @@ send_interval = "2h"
         assert_eq!(config.defaults.send_interval, Interval::hours(4));
 
         // Verify a subvolume with overrides
-        let htpc = config.subvolumes.iter().find(|s| s.name == "htpc-home").unwrap();
+        let htpc = config
+            .subvolumes
+            .iter()
+            .find(|s| s.name == "htpc-home")
+            .unwrap();
         assert_eq!(htpc.snapshot_interval, Some(Interval::minutes(15)));
         assert_eq!(htpc.send_interval, Some(Interval::hours(1)));
         assert_eq!(htpc.priority, 1);
 
         // Verify a subvolume with send_enabled=false
-        let tmp = config.subvolumes.iter().find(|s| s.name == "subvol6-tmp").unwrap();
+        let tmp = config
+            .subvolumes
+            .iter()
+            .find(|s| s.name == "subvol6-tmp")
+            .unwrap();
         assert_eq!(tmp.send_enabled, Some(false));
 
         // Verify validation passes
@@ -604,7 +615,10 @@ source = "/b"
         let mut config: Config = toml::from_str(config_str).unwrap();
         config.expand_paths();
         let err = config.validate().unwrap_err();
-        assert!(err.to_string().contains("not assigned to any snapshot root"));
+        assert!(
+            err.to_string()
+                .contains("not assigned to any snapshot root")
+        );
     }
 
     #[test]
@@ -646,8 +660,14 @@ short_name = "b"
 source = "/b"
 "#;
         let config: Config = toml::from_str(config_str).unwrap();
-        assert_eq!(config.snapshot_root_for("a"), Some(PathBuf::from("/snap-a")));
-        assert_eq!(config.snapshot_root_for("b"), Some(PathBuf::from("/snap-b")));
+        assert_eq!(
+            config.snapshot_root_for("a"),
+            Some(PathBuf::from("/snap-a"))
+        );
+        assert_eq!(
+            config.snapshot_root_for("b"),
+            Some(PathBuf::from("/snap-b"))
+        );
         assert_eq!(config.snapshot_root_for("c"), None);
     }
 

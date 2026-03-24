@@ -5,8 +5,8 @@
 
 ## Current State
 
-**Phase 5 continues. Awareness model (3a) and heartbeat file (3b) are built, reviewed, and
-passing 175 tests.** Operational cutover has not started — the bash script
+**Phase 5 continues. Awareness model (3a), heartbeat file (3b), and presentation layer (3c)
+are built, reviewed, and passing 186 tests.** Operational cutover has not started — the bash script
 (`btrfs-snapshot-backup.sh`) is still the sole production backup system, running nightly at
 02:00 via `btrfs-backup-daily.timer`. Urd v0.1.0 is installed (`~/.cargo/bin/urd`) and has
 been tested manually on real subvolumes (2026-03-23), but is not deployed on a schedule.
@@ -29,6 +29,15 @@ Phase 5 work completed so far:
   awareness model. `heartbeat_file` configurable in `[general]` with sensible default. 7 tests.
   [Design review](../99-reports/2026-03-24-heartbeat-design-review.md) |
   [Implementation review](../99-reports/2026-03-24-heartbeat-implementation-review.md)
+
+- **Presentation layer** (`output.rs` + `voice.rs`) — structured output types + rendering module.
+  `OutputMode` enum (Interactive/Daemon) with match-based dispatch (adversary review rejected
+  trait approach). `StatusOutput` struct rendered by `voice::render_status()`. Interactive mode
+  produces colored table with STATUS column from awareness model. Daemon mode outputs JSON.
+  Global TTY-aware color control (force-off for non-TTY, respects `NO_COLOR`). Status command
+  fully migrated; other commands migrate incrementally. 11 voice tests + 4 output tests.
+  [Design review](../99-reports/2026-03-24-presentation-layer-design-review.md) |
+  [Implementation review](../99-reports/2026-03-24-presentation-layer-implementation-review.md)
 
 Prior work: pre-send space estimation, documentation system (CONTRIBUTING.md), first
 real-world backup testing, failed-send bytes recording, live progress display, `urd calibrate`.
@@ -87,14 +96,19 @@ pre-execution `now`).
 - [x] Includes computation timestamp + `stale_after` advisory
 - [x] Minimal first iteration — add fields later, don't guess what consumers need
 
-**3c. Presentation layer** (`voice.rs`) — commands produce structured output data;
-the presentation layer renders it as text. Two renderers: interactive (rich, colored,
-eventually mythic) and daemon (JSON/terse). TTY detection selects renderer.
+**3c. Presentation layer** (`output.rs` + `voice.rs`) — commands produce structured output
+data; the presentation layer renders it as text. `OutputMode` enum (Interactive/Daemon) with
+match-based dispatch. TTY detection selects mode. Status command migrated first; other commands
+migrate incrementally.
 
-- [ ] Commands return structured types, not formatted strings
-- [ ] Renderer trait with interactive and daemon implementations
-- [ ] All user-facing text flows through this layer
-- [ ] Testable: given this state, assert output contains these facts
+- [x] `status` command returns structured `StatusOutput`, rendered by `voice::render_status()`
+- [x] `OutputMode` enum with `detect()` (not a trait — two impls don't justify dynamic dispatch)
+- [x] Awareness model integrated into status output (STATUS column with promise states)
+- [x] Interactive mode: colored table with STATUS, SUBVOLUME, LOCAL, drives, CHAIN
+- [x] Daemon mode: JSON serialization of `StatusOutput`
+- [x] Global TTY-aware color control (`colored::control::set_override` in main)
+- [x] Testable: 10 voice tests asserting output contains expected facts
+- [ ] Remaining commands migrate incrementally (not blocked on this)
 
 **3d. `urd get file@date`** — restore via direct path construction. O(1) — no search,
 no indexing. Parse `@` date reference, resolve snapshot, copy file. ~100 lines. Ship this
@@ -206,6 +220,14 @@ timestamp staleness handling, space check deduplication, ANSI line clearing.
   model.
   [Design review](../99-reports/2026-03-24-heartbeat-design-review.md) |
   [Implementation review](../99-reports/2026-03-24-heartbeat-implementation-review.md)
+- **Presentation layer** (Phase 5, P3c) — `output.rs` + `voice.rs`: structured output types
+  and rendering module. `OutputMode` enum (Interactive/Daemon), `StatusOutput` struct, status
+  command fully migrated with awareness model integration (STATUS column). Daemon mode = JSON.
+  Global TTY color control (respects `NO_COLOR`). Advisories and errors surfaced in interactive
+  mode. 11 voice tests + 4 output tests. Review fixes: `NO_COLOR` respect, disabled subvolume
+  filtering, advisory rendering.
+  [Design review](../99-reports/2026-03-24-presentation-layer-design-review.md) |
+  [Implementation review](../99-reports/2026-03-24-presentation-layer-implementation-review.md)
 
 ### Not Building (dropped per adversary review)
 
@@ -226,7 +248,7 @@ timestamp staleness handling, space check deduplication, ANSI line clearing.
 - [x] **Phase 4 code** — Cutover polish + space estimation + real-world testing
 - [ ] **Phase 4 cutover** — Operational transition from bash to Urd (see below)
 - [x] **Post-cutover features** — failed-send bytes, progress, calibrate (Priorities 2-4)
-- [ ] **Phase 5** — Architectural foundation: ~~awareness model~~, ~~heartbeat~~, presentation layer, `urd get`
+- [ ] **Phase 5** — Architectural foundation: ~~awareness model~~, ~~heartbeat~~, ~~presentation layer~~, `urd get`
 - [ ] **Phase 5 gate** — ADR: protection promise design (retention mappings, config conflicts, migration)
 - [ ] **Phase 6** — Protection promises in config + planner + status
 - [ ] **Phase 7** — Sentinel: notification dispatcher → event reactor → active mode
@@ -284,6 +306,10 @@ for details.
 | Heartbeat written on empty/skipped runs too (prevents false staleness) | 2026-03-24 | [Heartbeat design review](../99-reports/2026-03-24-heartbeat-design-review.md) Finding 3 |
 | stale_after = now + min(configured_intervals) × 2, matching awareness AT_RISK | 2026-03-24 | [Heartbeat design review](../99-reports/2026-03-24-heartbeat-design-review.md) Tension 3 |
 | Heartbeat uses fresh timestamp at write time, not pre-execution `now` | 2026-03-24 | [Heartbeat impl review](../99-reports/2026-03-24-heartbeat-implementation-review.md) Finding 1 |
+| OutputMode enum + match, not Renderer trait (two impls don't justify dyn dispatch) | 2026-03-24 | [Presentation layer review](../99-reports/2026-03-24-presentation-layer-design-review.md) |
+| Status command migrated first; other commands migrate incrementally | 2026-03-24 | [Presentation layer review](../99-reports/2026-03-24-presentation-layer-design-review.md) |
+| Progress display stays in backup.rs (streaming I/O doesn't fit produce-data/render) | 2026-03-24 | [Presentation layer review](../99-reports/2026-03-24-presentation-layer-design-review.md) |
+| TTY color: force-off for non-TTY only, respect NO_COLOR/CLICOLOR on TTY | 2026-03-24 | [Presentation layer impl review](../99-reports/2026-03-24-presentation-layer-implementation-review.md) Finding 1 |
 | Protection promises as core abstraction (score 10/10) | 2026-03-23 | [Vision brainstorm](../95-ideas/2026-03-23-brainstorm-realizing-the-vision.md) |
 | Mythic voice emerges from presentation layer, not scattered string edits | 2026-03-23 | User + architecture review |
 | Two modes: invisible worker + invoked norn | 2026-03-23 | User feedback on vision brainstorm |
@@ -306,7 +332,7 @@ for details.
 | Future directions brainstorm | [Feature ideas](../95-ideas/2026-03-23-brainstorm-urd-future.md) |
 | UX design principles brainstorm | [Norman principles](../95-ideas/2026-03-23-brainstorm-ux-norman-principles.md) |
 | Vision architecture review | [2026-03-23 Architectural criteria for vision](../99-reports/2026-03-23-vision-architecture-review.md) |
-| Latest adversary review | [2026-03-24 Heartbeat impl review](../99-reports/2026-03-24-heartbeat-implementation-review.md) |
+| Latest adversary review | [2026-03-24 Presentation layer impl review](../99-reports/2026-03-24-presentation-layer-implementation-review.md) |
 | Code conventions & architecture | [CLAUDE.md](../../CLAUDE.md) |
 | Documentation standards | [CONTRIBUTING.md](../../CONTRIBUTING.md) |
 
@@ -318,8 +344,8 @@ for details.
 - Stale failed send estimates persist indefinitely for (subvolume, drive, send_type) triples with no subsequent sends — consider TTL or clearing on successful calibration
 - Successful sends could update `subvolume_sizes` table to keep calibration fresh, but pipe bytes ≠ `du -sb` bytes (method mixing concern)
 - `FileSystemState` trait (9 methods) is outgrowing its name — consider renaming to `SystemState` if more history/state methods are added
-- Awareness model integrated into heartbeat but not yet into `urd status` or backup post-run summary
+- Awareness model integrated into heartbeat and `urd status` but not yet into backup post-run summary
 - `heartbeat::read()` returns `Option` — cannot distinguish missing file from corrupt JSON (upgrade to `Result<Option>` when Sentinel is built)
-- `#[allow(dead_code)]` on awareness structs (`SubvolAssessment`, `LocalAssessment`, `DriveAssessment`) — remove when status command integrates awareness
+- Remaining commands (`plan`, `backup`, `history`, `verify`, `init`, `calibrate`) still use direct `println!` — migrate to voice layer incrementally
 - Per-drive pin protection for external retention — current all-drives-union is conservative but suboptimal for space
 - Idea: [systemd unit drift check](../95-ideas/2026-03-23-systemd-unit-drift-check.md) in `urd verify`

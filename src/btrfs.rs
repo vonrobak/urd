@@ -3,8 +3,8 @@ use std::collections::HashSet;
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::UrdError;
 
@@ -108,27 +108,21 @@ impl BtrfsOps for RealBtrfs {
             snapshot.display()
         );
 
-        let mut send_child = send_cmd
-            .spawn()
-            .map_err(|e| UrdError::Btrfs {
-                msg: format!("failed to spawn btrfs send: {e}"),
-                bytes_transferred: None,
-            })?;
+        let mut send_child = send_cmd.spawn().map_err(|e| UrdError::Btrfs {
+            msg: format!("failed to spawn btrfs send: {e}"),
+            bytes_transferred: None,
+        })?;
 
         // Take send's stdout to pipe into receive's stdin
-        let mut send_stdout = send_child.stdout.take().ok_or_else(|| {
-            UrdError::Btrfs {
-                msg: "failed to capture btrfs send stdout".to_string(),
-                bytes_transferred: None,
-            }
+        let mut send_stdout = send_child.stdout.take().ok_or_else(|| UrdError::Btrfs {
+            msg: "failed to capture btrfs send stdout".to_string(),
+            bytes_transferred: None,
         })?;
 
         // Take send's stderr to drain in a thread
-        let send_stderr = send_child.stderr.take().ok_or_else(|| {
-            UrdError::Btrfs {
-                msg: "failed to capture btrfs send stderr".to_string(),
-                bytes_transferred: None,
-            }
+        let send_stderr = send_child.stderr.take().ok_or_else(|| UrdError::Btrfs {
+            msg: "failed to capture btrfs send stderr".to_string(),
+            bytes_transferred: None,
         })?;
 
         // Drain send stderr in a background thread to prevent deadlock
@@ -158,11 +152,9 @@ impl BtrfsOps for RealBtrfs {
                 bytes_transferred: None,
             })?;
 
-        let mut recv_stdin = recv_child.stdin.take().ok_or_else(|| {
-            UrdError::Btrfs {
-                msg: "failed to capture btrfs receive stdin".to_string(),
-                bytes_transferred: None,
-            }
+        let mut recv_stdin = recv_child.stdin.take().ok_or_else(|| UrdError::Btrfs {
+            msg: "failed to capture btrfs receive stdin".to_string(),
+            bytes_transferred: None,
         })?;
 
         // Copy send stdout → receive stdin in a thread, counting bytes.
@@ -187,20 +179,16 @@ impl BtrfsOps for RealBtrfs {
         });
 
         // Wait for receive to finish
-        let recv_output = recv_child
-            .wait_with_output()
-            .map_err(|e| UrdError::Btrfs {
-                msg: format!("failed to wait for btrfs receive: {e}"),
-                bytes_transferred: None,
-            })?;
+        let recv_output = recv_child.wait_with_output().map_err(|e| UrdError::Btrfs {
+            msg: format!("failed to wait for btrfs receive: {e}"),
+            bytes_transferred: None,
+        })?;
 
         // Wait for send to finish
-        let send_status = send_child
-            .wait()
-            .map_err(|e| UrdError::Btrfs {
-                msg: format!("failed to wait for btrfs send: {e}"),
-                bytes_transferred: None,
-            })?;
+        let send_status = send_child.wait().map_err(|e| UrdError::Btrfs {
+            msg: format!("failed to wait for btrfs send: {e}"),
+            bytes_transferred: None,
+        })?;
 
         let bytes_copied = copy_thread.join().unwrap_or(Ok(0)).ok();
 
@@ -216,10 +204,7 @@ impl BtrfsOps for RealBtrfs {
             if let Some(snap_name) = snapshot.file_name() {
                 let partial = dest_dir.join(snap_name);
                 if partial.exists() {
-                    log::warn!(
-                        "Cleaning up partial snapshot at {}",
-                        partial.display()
-                    );
+                    log::warn!("Cleaning up partial snapshot at {}", partial.display());
                     if let Err(e) = self.delete_subvolume(&partial) {
                         log::error!("Failed to clean up partial snapshot: {e}");
                     }
@@ -442,10 +427,7 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(
             calls[0],
-            MockBtrfsCall::CreateSnapshot {
-                source: src,
-                dest,
-            }
+            MockBtrfsCall::CreateSnapshot { source: src, dest }
         );
     }
 
@@ -457,7 +439,12 @@ mod tests {
 
         let result = mock.create_readonly_snapshot(Path::new("/home"), &dest);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("mock: create snapshot failed"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("mock: create snapshot failed")
+        );
     }
 
     #[test]
@@ -525,7 +512,9 @@ mod tests {
         let result = mock.send_receive(&snap, None, Path::new("/dest"));
         let err = result.unwrap_err();
         match err {
-            UrdError::Btrfs { bytes_transferred, .. } => {
+            UrdError::Btrfs {
+                bytes_transferred, ..
+            } => {
                 assert_eq!(bytes_transferred, Some(500_000));
             }
             _ => panic!("expected UrdError::Btrfs"),

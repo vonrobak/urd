@@ -4,8 +4,8 @@ use colored::Colorize;
 
 use crate::cli::CalibrateArgs;
 use crate::config::Config;
-use crate::plan::RealFileSystemState;
 use crate::plan::FileSystemState;
+use crate::plan::RealFileSystemState;
 use crate::state::StateDb;
 use crate::types::ByteSize;
 
@@ -16,7 +16,9 @@ pub fn run(config: Config, args: CalibrateArgs) -> anyhow::Result<()> {
     println!("{}", "Urd calibrate — measuring snapshot sizes".bold());
     println!();
 
-    let fs_state = RealFileSystemState { state: Some(&state_db) };
+    let fs_state = RealFileSystemState {
+        state: Some(&state_db),
+    };
     let mut calibrated = 0usize;
     let mut skipped = 0usize;
 
@@ -49,11 +51,7 @@ pub fn run(config: Config, args: CalibrateArgs) -> anyhow::Result<()> {
             .unwrap_or_default();
 
         let Some(newest) = local_snaps.iter().max() else {
-            println!(
-                "  {} {} (no local snapshots)",
-                "SKIP".dimmed(),
-                subvol.name,
-            );
+            println!("  {} {} (no local snapshots)", "SKIP".dimmed(), subvol.name,);
             skipped += 1;
             continue;
         };
@@ -113,9 +111,7 @@ pub fn run(config: Config, args: CalibrateArgs) -> anyhow::Result<()> {
         "Calibrated {} subvolume(s), skipped {}.",
         calibrated, skipped,
     );
-    println!(
-        "Sizes stored in state database. The planner will use these as fallback",
-    );
+    println!("Sizes stored in state database. The planner will use these as fallback",);
     println!("estimates when no send history exists.");
 
     Ok(())

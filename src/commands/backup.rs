@@ -1,8 +1,8 @@
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::IsTerminal;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use colored::Colorize;
@@ -46,7 +46,9 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
         }
     };
 
-    let fs_state = RealFileSystemState { state: state_db.as_ref() };
+    let fs_state = RealFileSystemState {
+        state: state_db.as_ref(),
+    };
     let backup_plan = plan::plan(&config, now, &filters, &fs_state)?;
 
     // Dry run: print plan and exit (no lock needed)
@@ -281,7 +283,13 @@ fn write_metrics_after_execution(
         .iter()
         .map(|sv| sv.name.clone())
         .collect();
-    append_skipped_metrics(config, plan, fs_state, &mut subvolume_metrics, &already_emitted);
+    append_skipped_metrics(
+        config,
+        plan,
+        fs_state,
+        &mut subvolume_metrics,
+        &already_emitted,
+    );
 
     // Carry forward last_success_timestamp from previous .prom file
     let carried = metrics::read_existing_timestamps(&config.general.metrics_file);
@@ -299,7 +307,13 @@ fn write_metrics_for_skipped(
     let fs_state = RealFileSystemState { state: None };
     let mut subvolume_metrics = Vec::new();
 
-    append_skipped_metrics(config, plan, &fs_state, &mut subvolume_metrics, &HashSet::new());
+    append_skipped_metrics(
+        config,
+        plan,
+        &fs_state,
+        &mut subvolume_metrics,
+        &HashSet::new(),
+    );
 
     // Carry forward last_success_timestamp from previous .prom file
     let carried = metrics::read_existing_timestamps(&config.general.metrics_file);

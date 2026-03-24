@@ -106,15 +106,28 @@ fn format_metrics(data: &MetricsData) -> String {
     let mut out = String::new();
 
     // backup_success
-    writeln!(out, "# HELP backup_success Backup result: 1=success, 0=failure, 2=schedule-skipped").unwrap();
+    writeln!(
+        out,
+        "# HELP backup_success Backup result: 1=success, 0=failure, 2=schedule-skipped"
+    )
+    .unwrap();
     writeln!(out, "# TYPE backup_success gauge").unwrap();
     for sv in &data.subvolumes {
-        writeln!(out, "backup_success{{subvolume=\"{}\"}} {}", sv.name, sv.success).unwrap();
+        writeln!(
+            out,
+            "backup_success{{subvolume=\"{}\"}} {}",
+            sv.name, sv.success
+        )
+        .unwrap();
     }
 
     // backup_last_success_timestamp
     writeln!(out).unwrap();
-    writeln!(out, "# HELP backup_last_success_timestamp Unix timestamp of last successful backup").unwrap();
+    writeln!(
+        out,
+        "# HELP backup_last_success_timestamp Unix timestamp of last successful backup"
+    )
+    .unwrap();
     writeln!(out, "# TYPE backup_last_success_timestamp gauge").unwrap();
     for sv in &data.subvolumes {
         if let Some(ts) = sv.last_success_timestamp {
@@ -129,7 +142,11 @@ fn format_metrics(data: &MetricsData) -> String {
 
     // backup_duration_seconds
     writeln!(out).unwrap();
-    writeln!(out, "# HELP backup_duration_seconds Duration of backup operations in seconds").unwrap();
+    writeln!(
+        out,
+        "# HELP backup_duration_seconds Duration of backup operations in seconds"
+    )
+    .unwrap();
     writeln!(out, "# TYPE backup_duration_seconds gauge").unwrap();
     for sv in &data.subvolumes {
         writeln!(
@@ -161,7 +178,11 @@ fn format_metrics(data: &MetricsData) -> String {
 
     // backup_send_type
     writeln!(out).unwrap();
-    writeln!(out, "# HELP backup_send_type Send type: 0=full, 1=incremental, 2=no send").unwrap();
+    writeln!(
+        out,
+        "# HELP backup_send_type Send type: 0=full, 1=incremental, 2=no send"
+    )
+    .unwrap();
     writeln!(out, "# TYPE backup_send_type gauge").unwrap();
     for sv in &data.subvolumes {
         writeln!(
@@ -174,7 +195,11 @@ fn format_metrics(data: &MetricsData) -> String {
 
     // backup_external_drive_mounted
     writeln!(out).unwrap();
-    writeln!(out, "# HELP backup_external_drive_mounted Whether an external backup drive is mounted").unwrap();
+    writeln!(
+        out,
+        "# HELP backup_external_drive_mounted Whether an external backup drive is mounted"
+    )
+    .unwrap();
     writeln!(out, "# TYPE backup_external_drive_mounted gauge").unwrap();
     writeln!(
         out,
@@ -185,13 +210,26 @@ fn format_metrics(data: &MetricsData) -> String {
 
     // backup_external_free_bytes
     writeln!(out).unwrap();
-    writeln!(out, "# HELP backup_external_free_bytes Free bytes on external backup drive").unwrap();
+    writeln!(
+        out,
+        "# HELP backup_external_free_bytes Free bytes on external backup drive"
+    )
+    .unwrap();
     writeln!(out, "# TYPE backup_external_free_bytes gauge").unwrap();
-    writeln!(out, "backup_external_free_bytes {}", data.external_free_bytes).unwrap();
+    writeln!(
+        out,
+        "backup_external_free_bytes {}",
+        data.external_free_bytes
+    )
+    .unwrap();
 
     // backup_script_last_run_timestamp
     writeln!(out).unwrap();
-    writeln!(out, "# HELP backup_script_last_run_timestamp Unix timestamp of last backup run").unwrap();
+    writeln!(
+        out,
+        "# HELP backup_script_last_run_timestamp Unix timestamp of last backup run"
+    )
+    .unwrap();
     writeln!(out, "# TYPE backup_script_last_run_timestamp gauge").unwrap();
     writeln!(
         out,
@@ -244,12 +282,21 @@ mod tests {
 
         assert!(output.contains("backup_success{subvolume=\"subvol3-opptak\"} 1"));
         assert!(output.contains("backup_success{subvolume=\"htpc-home\"} 2"));
-        assert!(output.contains("backup_last_success_timestamp{subvolume=\"subvol3-opptak\"} 1711100000"));
+        assert!(
+            output
+                .contains("backup_last_success_timestamp{subvolume=\"subvol3-opptak\"} 1711100000")
+        );
         // htpc-home has no last_success_timestamp (skipped)
         assert!(!output.contains("backup_last_success_timestamp{subvolume=\"htpc-home\"}"));
         assert!(output.contains("backup_duration_seconds{subvolume=\"subvol3-opptak\"} 120"));
-        assert!(output.contains("backup_snapshot_count{subvolume=\"subvol3-opptak\",location=\"local\"} 15"));
-        assert!(output.contains("backup_snapshot_count{subvolume=\"subvol3-opptak\",location=\"external\"} 14"));
+        assert!(
+            output.contains(
+                "backup_snapshot_count{subvolume=\"subvol3-opptak\",location=\"local\"} 15"
+            )
+        );
+        assert!(output.contains(
+            "backup_snapshot_count{subvolume=\"subvol3-opptak\",location=\"external\"} 14"
+        ));
         assert!(output.contains("backup_send_type{subvolume=\"subvol3-opptak\"} 1"));
         assert!(output.contains("backup_send_type{subvolume=\"htpc-home\"} 2"));
         assert!(output.contains("backup_external_drive_mounted 1"));

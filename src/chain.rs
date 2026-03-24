@@ -99,10 +99,7 @@ fn try_read_pin(path: &Path) -> crate::error::Result<Option<SnapshotName>> {
                 return Ok(None);
             }
             let name = SnapshotName::parse(trimmed).map_err(|e| {
-                UrdError::Chain(format!(
-                    "malformed pin file {}: {e}",
-                    path.display()
-                ))
+                UrdError::Chain(format!("malformed pin file {}: {e}", path.display()))
             })?;
             Ok(Some(name))
         }
@@ -138,11 +135,7 @@ mod tests {
     #[test]
     fn read_legacy_fallback() {
         let dir = TempDir::new().unwrap();
-        fs::write(
-            dir.path().join(".last-external-parent"),
-            "20260322-opptak",
-        )
-        .unwrap();
+        fs::write(dir.path().join(".last-external-parent"), "20260322-opptak").unwrap();
 
         // No drive-specific file, should fall back to legacy
         let result = read_pin_file(dir.path(), "WD-18TB").unwrap();
@@ -157,11 +150,7 @@ mod tests {
             "20260322-1400-opptak",
         )
         .unwrap();
-        fs::write(
-            dir.path().join(".last-external-parent"),
-            "20260321-opptak",
-        )
-        .unwrap();
+        fs::write(dir.path().join(".last-external-parent"), "20260321-opptak").unwrap();
 
         let result = read_pin_file(dir.path(), "WD-18TB").unwrap();
         assert_eq!(result.unwrap().as_str(), "20260322-1400-opptak");
@@ -190,11 +179,7 @@ mod tests {
     #[test]
     fn empty_pin_file() {
         let dir = TempDir::new().unwrap();
-        fs::write(
-            dir.path().join(".last-external-parent-WD-18TB"),
-            "  \n  ",
-        )
-        .unwrap();
+        fs::write(dir.path().join(".last-external-parent-WD-18TB"), "  \n  ").unwrap();
 
         let result = read_pin_file(dir.path(), "WD-18TB").unwrap();
         assert!(result.is_none());

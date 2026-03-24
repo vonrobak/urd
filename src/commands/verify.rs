@@ -155,7 +155,10 @@ pub fn run(config: Config, args: VerifyArgs) -> anyhow::Result<()> {
                         );
                         total_warn += 1;
                     } else {
-                        println!("    {}    No pin file (no snapshots on drive)", "OK".green());
+                        println!(
+                            "    {}    No pin file (no snapshots on drive)",
+                            "OK".green()
+                        );
                         total_ok += 1;
                     }
                 }

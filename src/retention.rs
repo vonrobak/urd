@@ -79,7 +79,12 @@ pub fn graduated_retention(
         } else if dt >= hourly_cutoff {
             // Hourly window
             if space_pressure {
-                let slot = (dt.date().year(), dt.date().month(), dt.date().day(), dt.time().hour());
+                let slot = (
+                    dt.date().year(),
+                    dt.date().month(),
+                    dt.date().day(),
+                    dt.time().hour(),
+                );
                 if hourly_slots.insert(slot) || is_pinned {
                     keep.push(snap.clone());
                 } else {
@@ -116,7 +121,10 @@ pub fn graduated_retention(
         } else if is_pinned {
             keep.push(snap.clone());
         } else {
-            delete.push((snap.clone(), "graduated: beyond retention window".to_string()));
+            delete.push((
+                snap.clone(),
+                "graduated: beyond retention window".to_string(),
+            ));
         }
     }
 
@@ -264,10 +272,7 @@ mod tests {
     fn graduated_pinned_never_deleted() {
         // Snapshot outside all windows but pinned
         let old_snap = make_daily_snap("20240101", "home");
-        let snaps = vec![
-            make_snap("20260322", "1400", "home"),
-            old_snap.clone(),
-        ];
+        let snaps = vec![make_snap("20260322", "1400", "home"), old_snap.clone()];
         let mut pinned = HashSet::new();
         pinned.insert(old_snap.clone());
 
@@ -362,7 +367,7 @@ mod tests {
         // A snapshot between the two cutoffs would be deleted by days*30
         // but kept by calendar months. This test targets that boundary.
         let config = ResolvedGraduatedRetention {
-            hourly: 0,  // no hourly/daily/weekly windows — all snapshots land in monthly
+            hourly: 0, // no hourly/daily/weekly windows — all snapshots land in monthly
             daily: 0,
             weekly: 0,
             monthly: 12,

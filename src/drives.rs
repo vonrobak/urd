@@ -40,7 +40,10 @@ pub fn filesystem_free_bytes(path: &Path) -> crate::error::Result<u64> {
 /// Returns `{mount_path}/{snapshot_root}/{subvol_name}`.
 #[must_use]
 pub fn external_snapshot_dir(drive: &DriveConfig, subvol_name: &str) -> PathBuf {
-    drive.mount_path.join(&drive.snapshot_root).join(subvol_name)
+    drive
+        .mount_path
+        .join(&drive.snapshot_root)
+        .join(subvol_name)
 }
 
 /// Get the mount status and free bytes of the first mounted drive in the config.

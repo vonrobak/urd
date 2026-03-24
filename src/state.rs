@@ -61,7 +61,10 @@ impl StateDb {
         }
 
         let conn = Connection::open(path).map_err(|e| {
-            UrdError::State(format!("failed to open state DB at {}: {e}", path.display()))
+            UrdError::State(format!(
+                "failed to open state DB at {}: {e}",
+                path.display()
+            ))
         })?;
 
         let db = Self { conn };
@@ -243,7 +246,10 @@ impl StateDb {
             .map_err(|e| UrdError::State(format!("query failed: {e}")))?;
 
         let rows = stmt
-            .query_map(rusqlite::params![name, limit as i64], Self::map_operation_row)
+            .query_map(
+                rusqlite::params![name, limit as i64],
+                Self::map_operation_row,
+            )
             .map_err(|e| UrdError::State(format!("query failed: {e}")))?;
 
         rows.collect::<Result<Vec<_>, _>>()
@@ -364,10 +370,7 @@ impl StateDb {
 
     /// Get the calibrated size for a subvolume, if any.
     /// Returns `(estimated_bytes, measured_at)`.
-    pub fn calibrated_size(
-        &self,
-        subvolume: &str,
-    ) -> crate::error::Result<Option<(u64, String)>> {
+    pub fn calibrated_size(&self, subvolume: &str) -> crate::error::Result<Option<(u64, String)>> {
         let mut stmt = self
             .conn
             .prepare(
@@ -385,7 +388,9 @@ impl StateDb {
 
         match rows.next() {
             Some(Ok(result)) => Ok(Some(result)),
-            Some(Err(e)) => Err(UrdError::State(format!("failed to read calibrated size: {e}"))),
+            Some(Err(e)) => Err(UrdError::State(format!(
+                "failed to read calibrated size: {e}"
+            ))),
             None => Ok(None),
         }
     }
@@ -472,11 +477,9 @@ mod tests {
         // Check run was created with 'running' result
         let result: String = db
             .conn
-            .query_row(
-                "SELECT result FROM runs WHERE id = ?1",
-                [run_id],
-                |row| row.get(0),
-            )
+            .query_row("SELECT result FROM runs WHERE id = ?1", [run_id], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(result, "running");
 
@@ -749,15 +752,18 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            db.last_successful_send_size("htpc-home", "DRIVE-A", "send_full").unwrap(),
+            db.last_successful_send_size("htpc-home", "DRIVE-A", "send_full")
+                .unwrap(),
             Some(500_000)
         );
         assert_eq!(
-            db.last_successful_send_size("htpc-home", "DRIVE-B", "send_full").unwrap(),
+            db.last_successful_send_size("htpc-home", "DRIVE-B", "send_full")
+                .unwrap(),
             Some(600_000)
         );
         assert_eq!(
-            db.last_successful_send_size("htpc-home", "DRIVE-C", "send_full").unwrap(),
+            db.last_successful_send_size("htpc-home", "DRIVE-C", "send_full")
+                .unwrap(),
             None
         );
     }
@@ -793,7 +799,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            db.last_successful_send_size("sv1", "D", "send_full").unwrap(),
+            db.last_successful_send_size("sv1", "D", "send_full")
+                .unwrap(),
             Some(999)
         );
     }
@@ -818,7 +825,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            db.last_failed_send_size("subvol5-music", "2TB-backup", "send_full").unwrap(),
+            db.last_failed_send_size("subvol5-music", "2TB-backup", "send_full")
+                .unwrap(),
             Some(1_100_000_000_000)
         );
     }
@@ -876,7 +884,8 @@ mod tests {
     fn upsert_and_query_calibrated_size() {
         let db = StateDb::open_memory().unwrap();
 
-        db.upsert_subvolume_size("htpc-home", 77_640_000_000, "du -sb").unwrap();
+        db.upsert_subvolume_size("htpc-home", 77_640_000_000, "du -sb")
+            .unwrap();
         let result = db.calibrated_size("htpc-home").unwrap();
         assert!(result.is_some());
         let (bytes, measured_at) = result.unwrap();

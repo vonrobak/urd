@@ -16,14 +16,19 @@ pub fn run(config: Config, args: PlanArgs) -> anyhow::Result<()> {
     };
 
     let state_db = StateDb::open(&config.general.state_db).ok();
-    let fs_state = RealFileSystemState { state: state_db.as_ref() };
+    let fs_state = RealFileSystemState {
+        state: state_db.as_ref(),
+    };
     let backup_plan = plan::plan(&config, now, &filters, &fs_state)?;
 
     run_with_plan(&config, &backup_plan)
 }
 
 /// Print a backup plan. Shared by `urd plan` and `urd backup --dry-run`.
-pub fn run_with_plan(config: &Config, backup_plan: &crate::types::BackupPlan) -> anyhow::Result<()> {
+pub fn run_with_plan(
+    config: &Config,
+    backup_plan: &crate::types::BackupPlan,
+) -> anyhow::Result<()> {
     // Print header
     println!(
         "{}",
@@ -76,10 +81,7 @@ pub fn run_with_plan(config: &Config, backup_plan: &crate::types::BackupPlan) ->
 
     // Summary
     let summary = backup_plan.summary();
-    println!(
-        "{}",
-        format!("Summary: {summary}").bold()
-    );
+    println!("{}", format!("Summary: {summary}").bold());
 
     Ok(())
 }
@@ -110,11 +112,12 @@ fn print_operation(op: &PlannedOperation) {
             pin_on_success,
             ..
         } => {
-            let parent_name = parent
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy();
-            let pin_suffix = if pin_on_success.is_some() { " + pin" } else { "" };
+            let parent_name = parent.file_name().unwrap_or_default().to_string_lossy();
+            let pin_suffix = if pin_on_success.is_some() {
+                " + pin"
+            } else {
+                ""
+            };
             println!(
                 "  {}   {} -> {} (incremental, parent: {}){pin_suffix}",
                 "[SEND]".blue(),
@@ -129,7 +132,11 @@ fn print_operation(op: &PlannedOperation) {
             pin_on_success,
             ..
         } => {
-            let pin_suffix = if pin_on_success.is_some() { " + pin" } else { "" };
+            let pin_suffix = if pin_on_success.is_some() {
+                " + pin"
+            } else {
+                ""
+            };
             println!(
                 "  {}   {} -> {} (full){pin_suffix}",
                 "[SEND]".blue(),
