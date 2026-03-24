@@ -55,6 +55,8 @@ pub struct SnapshotRoot {
 #[allow(dead_code)]
 pub struct DriveConfig {
     pub label: String,
+    #[serde(default)]
+    pub uuid: Option<String>,
     pub mount_path: PathBuf,
     pub snapshot_root: String,
     pub role: DriveRole,
@@ -281,6 +283,25 @@ impl Config {
                     "subvolume {:?} is not assigned to any snapshot root",
                     sv.name
                 )));
+            }
+        }
+
+        // Drive UUIDs must be unique (when present)
+        let mut seen_uuids = HashSet::new();
+        for drive in &self.drives {
+            if let Some(ref uuid) = drive.uuid {
+                if uuid.is_empty() {
+                    return Err(UrdError::Config(format!(
+                        "drive {:?} has empty uuid — remove the field or set a valid UUID",
+                        drive.label
+                    )));
+                }
+                if !seen_uuids.insert(uuid.to_lowercase()) {
+                    return Err(UrdError::Config(format!(
+                        "duplicate drive uuid: {:?}",
+                        uuid
+                    )));
+                }
             }
         }
 
