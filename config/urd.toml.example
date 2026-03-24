@@ -10,6 +10,8 @@ metrics_file = "~/containers/data/backup-metrics/backup.prom"
 log_dir = "~/containers/data/backup-logs"
 # Path to btrfs binary (sudoers entries reference this)
 btrfs_path = "/usr/sbin/btrfs"
+# Heartbeat file — JSON health signal written after each backup run
+# heartbeat_file = "~/.local/share/urd/heartbeat.json"
 
 # ─── Local Snapshot Roots ──────────────────────────────────────────────
 # Each root maps to a directory where snapshot subdirectories are created.

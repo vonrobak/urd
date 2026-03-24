@@ -50,6 +50,7 @@ impl std::fmt::Display for PromiseStatus {
 
 /// Complete assessment for a single subvolume.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct SubvolAssessment {
     pub name: String,
     pub status: PromiseStatus,
@@ -63,6 +64,7 @@ pub struct SubvolAssessment {
 
 /// Local snapshot freshness assessment.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct LocalAssessment {
     pub status: PromiseStatus,
     pub snapshot_count: usize,
@@ -72,6 +74,7 @@ pub struct LocalAssessment {
 
 /// External drive send freshness assessment.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct DriveAssessment {
     pub drive_label: String,
     pub status: PromiseStatus,

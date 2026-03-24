@@ -939,6 +939,7 @@ dependencies = [
  "nix 0.29.0",
  "rusqlite",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "toml",

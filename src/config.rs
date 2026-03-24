@@ -26,10 +26,16 @@ pub struct GeneralConfig {
     pub log_dir: PathBuf,
     #[serde(default = "default_btrfs_path")]
     pub btrfs_path: String,
+    #[serde(default = "default_heartbeat_path")]
+    pub heartbeat_file: PathBuf,
 }
 
 fn default_btrfs_path() -> String {
     "/usr/sbin/btrfs".to_string()
+}
+
+fn default_heartbeat_path() -> PathBuf {
+    PathBuf::from("~/.local/share/urd/heartbeat.json")
 }
 
 #[derive(Debug, Deserialize)]
@@ -206,6 +212,7 @@ impl Config {
         self.general.state_db = expand_tilde(&self.general.state_db);
         self.general.metrics_file = expand_tilde(&self.general.metrics_file);
         self.general.log_dir = expand_tilde(&self.general.log_dir);
+        self.general.heartbeat_file = expand_tilde(&self.general.heartbeat_file);
 
         for root in &mut self.local_snapshots.roots {
             root.path = expand_tilde(&root.path);
