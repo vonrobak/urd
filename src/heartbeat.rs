@@ -183,11 +183,10 @@ mod tests {
     use super::*;
     use crate::awareness::{DriveAssessment, LocalAssessment, PromiseStatus};
     use crate::config::{
-        Config, DefaultsConfig, DriveConfig, GeneralConfig, LocalSnapshotsConfig, SnapshotRoot,
-        SubvolumeConfig,
+        Config, DefaultsConfig, GeneralConfig, LocalSnapshotsConfig, SnapshotRoot, SubvolumeConfig,
     };
     use crate::executor::{ExecutionResult, RunResult, SendType, SubvolumeResult};
-    use crate::types::{DriveRole, GraduatedRetention, Interval};
+    use crate::types::{GraduatedRetention, Interval};
     use std::path::PathBuf;
 
     fn test_config(intervals: &[(&str, &str)]) -> Config {
@@ -313,8 +312,8 @@ mod tests {
     #[test]
     fn schema_roundtrip() {
         let config = test_config(&[("home", "1h"), ("docs", "1h")]);
-        let now = NaiveDateTime::parse_from_str("2026-03-24T02:05:00", "%Y-%m-%dT%H:%M:%S")
-            .unwrap();
+        let now =
+            NaiveDateTime::parse_from_str("2026-03-24T02:05:00", "%Y-%m-%dT%H:%M:%S").unwrap();
         let assessments = test_assessments();
         let result = test_execution_result();
 
@@ -340,8 +339,8 @@ mod tests {
     #[test]
     fn stale_after_picks_minimum_interval() {
         let config = test_config(&[("fast", "15m"), ("slow", "1d")]);
-        let now = NaiveDateTime::parse_from_str("2026-03-24T02:00:00", "%Y-%m-%dT%H:%M:%S")
-            .unwrap();
+        let now =
+            NaiveDateTime::parse_from_str("2026-03-24T02:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
 
         let stale = compute_stale_after(&config, now);
         // 15m * 2 = 30m
@@ -353,8 +352,8 @@ mod tests {
     fn stale_after_no_enabled_subvolumes_defaults_to_24h() {
         let mut config = test_config(&[("only", "1h")]);
         config.subvolumes[0].enabled = Some(false);
-        let now = NaiveDateTime::parse_from_str("2026-03-24T02:00:00", "%Y-%m-%dT%H:%M:%S")
-            .unwrap();
+        let now =
+            NaiveDateTime::parse_from_str("2026-03-24T02:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
 
         let stale = compute_stale_after(&config, now);
         let expected = now + chrono::Duration::hours(24);
@@ -366,8 +365,8 @@ mod tests {
     #[test]
     fn empty_run_heartbeat() {
         let config = test_config(&[("home", "1h")]);
-        let now = NaiveDateTime::parse_from_str("2026-03-24T02:00:00", "%Y-%m-%dT%H:%M:%S")
-            .unwrap();
+        let now =
+            NaiveDateTime::parse_from_str("2026-03-24T02:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
         let assessments = test_assessments();
 
         let heartbeat = build_empty(&config, now, &assessments);
@@ -391,8 +390,8 @@ mod tests {
         let path = dir.path().join("heartbeat.json");
 
         let config = test_config(&[("home", "1h")]);
-        let now = NaiveDateTime::parse_from_str("2026-03-24T02:00:00", "%Y-%m-%dT%H:%M:%S")
-            .unwrap();
+        let now =
+            NaiveDateTime::parse_from_str("2026-03-24T02:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
         let assessments = test_assessments();
 
         let heartbeat = build_empty(&config, now, &assessments);
@@ -412,8 +411,8 @@ mod tests {
         let path = dir.path().join("nested").join("dir").join("heartbeat.json");
 
         let config = test_config(&[("home", "1h")]);
-        let now = NaiveDateTime::parse_from_str("2026-03-24T02:00:00", "%Y-%m-%dT%H:%M:%S")
-            .unwrap();
+        let now =
+            NaiveDateTime::parse_from_str("2026-03-24T02:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
         let heartbeat = build_empty(&config, now, &test_assessments());
         write(&path, &heartbeat).unwrap();
 

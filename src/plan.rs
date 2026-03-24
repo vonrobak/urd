@@ -15,7 +15,11 @@ use crate::types::{BackupPlan, PlannedOperation, SnapshotName};
 /// Abstraction over filesystem state for testing.
 pub trait FileSystemState {
     /// List snapshot names in a local snapshot directory.
-    fn local_snapshots(&self, root: &Path, subvol_name: &str) -> crate::error::Result<Vec<SnapshotName>>;
+    fn local_snapshots(
+        &self,
+        root: &Path,
+        subvol_name: &str,
+    ) -> crate::error::Result<Vec<SnapshotName>>;
 
     /// List snapshot names on an external drive for a subvolume.
     fn external_snapshots(
@@ -38,20 +42,11 @@ pub trait FileSystemState {
     ) -> crate::error::Result<Option<SnapshotName>>;
 
     /// Collect all pinned snapshot names for a subvolume across all drives.
-    fn pinned_snapshots(
-        &self,
-        local_dir: &Path,
-        drive_labels: &[String],
-    ) -> HashSet<SnapshotName>;
+    fn pinned_snapshots(&self, local_dir: &Path, drive_labels: &[String]) -> HashSet<SnapshotName>;
 
     /// Get the bytes_transferred from the most recent successful send of a given type.
     /// Returns None if no history exists (e.g., first-ever send).
-    fn last_send_size(
-        &self,
-        subvol_name: &str,
-        drive_label: &str,
-        send_type: &str,
-    ) -> Option<u64>;
+    fn last_send_size(&self, subvol_name: &str, drive_label: &str, send_type: &str) -> Option<u64>;
 
     /// Get a calibrated size estimate for a subvolume (from `urd calibrate`).
     /// Returns `(estimated_bytes, measured_at)` or None if not calibrated.
@@ -106,7 +101,10 @@ pub fn plan(
         }
 
         // Filter: specific subvolume (overrides interval check)
-        let force = filters.subvolume.as_ref().is_some_and(|s| s == &subvol.name);
+        let force = filters
+            .subvolume
+            .as_ref()
+            .is_some_and(|s| s == &subvol.name);
         if filters.subvolume.is_some() && !force {
             continue;
         }
@@ -121,7 +119,9 @@ pub fn plan(
         let local_dir = snapshot_root.join(&subvol.name);
 
         // Get existing local snapshots
-        let local_snaps = fs.local_snapshots(&snapshot_root, &subvol.name).unwrap_or_default();
+        let local_snaps = fs
+            .local_snapshots(&snapshot_root, &subvol.name)
+            .unwrap_or_default();
 
         // Get pinned snapshots
         let pinned = fs.pinned_snapshots(&local_dir, &drive_labels);
@@ -131,7 +131,15 @@ pub fn plan(
         // The executor relies on this ordering within each subvolume.
         // Do not reorder without updating the executor contract in PLAN.md.
         if !filters.external_only {
-            plan_local_snapshot(subvol, &local_dir, &local_snaps, now, force, &mut operations, &mut skipped);
+            plan_local_snapshot(
+                subvol,
+                &local_dir,
+                &local_snaps,
+                now,
+                force,
+                &mut operations,
+                &mut skipped,
+            );
             plan_local_retention(
                 config,
                 subvol,
@@ -167,14 +175,7 @@ pub fn plan(
                     &mut skipped,
                 );
 
-                plan_external_retention(
-                    subvol,
-                    drive,
-                    now,
-                    fs,
-                    &pinned,
-                    &mut operations,
-                );
+                plan_external_retention(subvol, drive, now, fs, &pinned, &mut operations);
             }
         } else if !filters.local_only && !subvol.send_enabled {
             skipped.push((subvol.name.clone(), "send disabled".to_string()));
@@ -236,11 +237,15 @@ fn plan_local_snapshot(
             subvolume_name: subvol.name.clone(),
         });
     } else {
-        let next_in = subvol.snapshot_interval.as_chrono() - now.signed_duration_since(newest.unwrap().datetime());
+        let next_in = subvol.snapshot_interval.as_chrono()
+            - now.signed_duration_since(newest.unwrap().datetime());
         let mins = next_in.num_minutes();
         skipped.push((
             subvol.name.clone(),
-            format!("interval not elapsed (next in ~{})", format_duration_short(mins)),
+            format!(
+                "interval not elapsed (next in ~{})",
+                format_duration_short(mins)
+            ),
         ));
     }
 }
@@ -323,7 +328,9 @@ fn plan_external_send(
     skipped: &mut Vec<(String, String)>,
 ) {
     let ext_dir = crate::drives::external_snapshot_dir(drive, &subvol.name);
-    let ext_snaps = fs.external_snapshots(drive, &subvol.name).unwrap_or_default();
+    let ext_snaps = fs
+        .external_snapshots(drive, &subvol.name)
+        .unwrap_or_default();
 
     // Check send interval
     let newest_ext = ext_snaps.iter().max();
@@ -337,7 +344,8 @@ fn plan_external_send(
     };
 
     if !should_send {
-        let next_in = subvol.send_interval.as_chrono() - now.signed_duration_since(newest_ext.unwrap().datetime());
+        let next_in = subvol.send_interval.as_chrono()
+            - now.signed_duration_since(newest_ext.unwrap().datetime());
         skipped.push((
             subvol.name.clone(),
             format!(
@@ -351,12 +359,18 @@ fn plan_external_send(
 
     // Find the snapshot to send (newest local)
     let Some(snap_to_send) = local_snaps.iter().max() else {
-        skipped.push((subvol.name.clone(), "no local snapshots to send".to_string()));
+        skipped.push((
+            subvol.name.clone(),
+            "no local snapshots to send".to_string(),
+        ));
         return;
     };
 
     // Check if already on external
-    if ext_snaps.iter().any(|s| s.as_str() == snap_to_send.as_str()) {
+    if ext_snaps
+        .iter()
+        .any(|s| s.as_str() == snap_to_send.as_str())
+    {
         skipped.push((
             subvol.name.clone(),
             format!("{} already on {}", snap_to_send, drive.label),
@@ -370,7 +384,9 @@ fn plan_external_send(
     let pin = fs.read_pin_file(local_dir, &drive.label).unwrap_or(None);
     let is_incremental = if let Some(ref parent_name) = pin {
         // Parent must exist both locally and on the external drive
-        let parent_exists_local = local_snaps.iter().any(|s| s.as_str() == parent_name.as_str());
+        let parent_exists_local = local_snaps
+            .iter()
+            .any(|s| s.as_str() == parent_name.as_str());
         let parent_exists_ext = ext_snaps.iter().any(|s| s.as_str() == parent_name.as_str());
         parent_exists_local && parent_exists_ext
     } else {
@@ -379,7 +395,11 @@ fn plan_external_send(
 
     // Space estimation: skip if estimated send size exceeds available space.
     // Tier 1: Historical send data (most accurate). Tier 3: Calibrated sizes (fallback for full sends).
-    let send_type_str = if is_incremental { "send_incremental" } else { "send_full" };
+    let send_type_str = if is_incremental {
+        "send_incremental"
+    } else {
+        "send_full"
+    };
     if let Some(last_size) = fs.last_send_size(&subvol.name, &drive.label, send_type_str) {
         // Tier 1: historical data from previous sends (successful or failed)
         if let Some((estimated, available, free, min_free)) =
@@ -404,7 +424,10 @@ fn plan_external_send(
         if let Some((cal_bytes, measured_at)) = fs.calibrated_size(&subvol.name) {
             let age_days = calibration_age_days(&measured_at);
             let staleness = if age_days > 30 {
-                format!(" (calibrated {} days ago — run `urd calibrate` to refresh)", age_days)
+                format!(
+                    " (calibrated {} days ago — run `urd calibrate` to refresh)",
+                    age_days
+                )
             } else {
                 String::new()
             };
@@ -464,7 +487,9 @@ fn plan_external_retention(
     operations: &mut Vec<PlannedOperation>,
 ) {
     let ext_dir = crate::drives::external_snapshot_dir(drive, &subvol.name);
-    let ext_snaps = fs.external_snapshots(drive, &subvol.name).unwrap_or_default();
+    let ext_snaps = fs
+        .external_snapshots(drive, &subvol.name)
+        .unwrap_or_default();
 
     if ext_snaps.is_empty() {
         return;
@@ -536,7 +561,11 @@ pub struct RealFileSystemState<'a> {
 }
 
 impl FileSystemState for RealFileSystemState<'_> {
-    fn local_snapshots(&self, root: &Path, subvol_name: &str) -> crate::error::Result<Vec<SnapshotName>> {
+    fn local_snapshots(
+        &self,
+        root: &Path,
+        subvol_name: &str,
+    ) -> crate::error::Result<Vec<SnapshotName>> {
         read_snapshot_dir(&root.join(subvol_name))
     }
 
@@ -565,25 +594,18 @@ impl FileSystemState for RealFileSystemState<'_> {
         crate::chain::read_pin_file(local_dir, drive_label)
     }
 
-    fn pinned_snapshots(
-        &self,
-        local_dir: &Path,
-        drive_labels: &[String],
-    ) -> HashSet<SnapshotName> {
+    fn pinned_snapshots(&self, local_dir: &Path, drive_labels: &[String]) -> HashSet<SnapshotName> {
         crate::chain::find_pinned_snapshots(local_dir, drive_labels)
     }
 
-    fn last_send_size(
-        &self,
-        subvol_name: &str,
-        drive_label: &str,
-        send_type: &str,
-    ) -> Option<u64> {
+    fn last_send_size(&self, subvol_name: &str, drive_label: &str, send_type: &str) -> Option<u64> {
         self.state.and_then(|db| {
-            let successful = db.last_successful_send_size(subvol_name, drive_label, send_type)
+            let successful = db
+                .last_successful_send_size(subvol_name, drive_label, send_type)
                 .ok()
                 .flatten();
-            let failed = db.last_failed_send_size(subvol_name, drive_label, send_type)
+            let failed = db
+                .last_failed_send_size(subvol_name, drive_label, send_type)
                 .ok()
                 .flatten();
             match (successful, failed) {
@@ -594,9 +616,8 @@ impl FileSystemState for RealFileSystemState<'_> {
     }
 
     fn calibrated_size(&self, subvol_name: &str) -> Option<(u64, String)> {
-        self.state.and_then(|db| {
-            db.calibrated_size(subvol_name).ok().flatten()
-        })
+        self.state
+            .and_then(|db| db.calibrated_size(subvol_name).ok().flatten())
     }
 
     fn last_successful_send_time(
@@ -620,7 +641,7 @@ fn read_snapshot_dir(dir: &Path) -> crate::error::Result<Vec<SnapshotName>> {
             return Err(UrdError::Io {
                 path: dir.to_path_buf(),
                 source: e,
-            })
+            });
         }
     };
 
@@ -678,14 +699,25 @@ impl MockFileSystemState {
 
 #[cfg(test)]
 impl FileSystemState for MockFileSystemState {
-    fn local_snapshots(&self, _root: &Path, subvol_name: &str) -> crate::error::Result<Vec<SnapshotName>> {
+    fn local_snapshots(
+        &self,
+        _root: &Path,
+        subvol_name: &str,
+    ) -> crate::error::Result<Vec<SnapshotName>> {
         if self.fail_local_snapshots.contains(subvol_name) {
             return Err(crate::error::UrdError::Io {
                 path: std::path::PathBuf::from(format!("/snap/{subvol_name}")),
-                source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "permission denied"),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "permission denied",
+                ),
             });
         }
-        Ok(self.local_snapshots.get(subvol_name).cloned().unwrap_or_default())
+        Ok(self
+            .local_snapshots
+            .get(subvol_name)
+            .cloned()
+            .unwrap_or_default())
     }
 
     fn external_snapshots(
@@ -694,7 +726,11 @@ impl FileSystemState for MockFileSystemState {
         subvol_name: &str,
     ) -> crate::error::Result<Vec<SnapshotName>> {
         let key = (drive.label.clone(), subvol_name.to_string());
-        Ok(self.external_snapshots.get(&key).cloned().unwrap_or_default())
+        Ok(self
+            .external_snapshots
+            .get(&key)
+            .cloned()
+            .unwrap_or_default())
     }
 
     fn is_drive_mounted(&self, drive: &DriveConfig) -> bool {
@@ -716,26 +752,20 @@ impl FileSystemState for MockFileSystemState {
             .cloned())
     }
 
-    fn pinned_snapshots(
-        &self,
-        local_dir: &Path,
-        drive_labels: &[String],
-    ) -> HashSet<SnapshotName> {
+    fn pinned_snapshots(&self, local_dir: &Path, drive_labels: &[String]) -> HashSet<SnapshotName> {
         let mut pinned: HashSet<SnapshotName> = HashSet::new();
         for label in drive_labels {
-            if let Some(name) = self.pin_files.get(&(local_dir.to_path_buf(), label.clone())) {
+            if let Some(name) = self
+                .pin_files
+                .get(&(local_dir.to_path_buf(), label.clone()))
+            {
                 pinned.insert(name.clone());
             }
         }
         pinned
     }
 
-    fn last_send_size(
-        &self,
-        subvol_name: &str,
-        drive_label: &str,
-        send_type: &str,
-    ) -> Option<u64> {
+    fn last_send_size(&self, subvol_name: &str, drive_label: &str, send_type: &str) -> Option<u64> {
         self.send_sizes
             .get(&(
                 subvol_name.to_string(),
@@ -837,10 +867,8 @@ priority = 2
         let config = test_config();
         let mut fs = MockFileSystemState::new();
         // sv1 last snapshot was 20 minutes ago (interval is 15m)
-        fs.local_snapshots.insert(
-            "sv1".to_string(),
-            vec![snap("20260322-1440-one")],
-        );
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap("20260322-1440-one")]);
 
         let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
         let creates: Vec<_> = result
@@ -856,10 +884,8 @@ priority = 2
         let config = test_config();
         let mut fs = MockFileSystemState::new();
         // sv1 last snapshot was 10 minutes ago (interval is 15m)
-        fs.local_snapshots.insert(
-            "sv1".to_string(),
-            vec![snap("20260322-1455-one")],
-        );
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap("20260322-1455-one")]);
 
         let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
         let creates: Vec<_> = result
@@ -868,7 +894,12 @@ priority = 2
             .filter(|op| matches!(op, PlannedOperation::CreateSnapshot { subvolume_name, .. } if subvolume_name == "sv1"))
             .collect();
         assert_eq!(creates.len(), 0);
-        assert!(result.skipped.iter().any(|(name, reason)| name == "sv1" && reason.contains("interval")));
+        assert!(
+            result
+                .skipped
+                .iter()
+                .any(|(name, reason)| name == "sv1" && reason.contains("interval"))
+        );
     }
 
     #[test]
@@ -892,10 +923,8 @@ priority = 2
         let config = test_config();
         let mut fs = MockFileSystemState::new();
         // sv1 last snapshot was 5 minutes ago (interval is 15m — not elapsed)
-        fs.local_snapshots.insert(
-            "sv1".to_string(),
-            vec![snap("20260322-1458-one")],
-        );
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap("20260322-1458-one")]);
 
         let filters = PlanFilters {
             subvolume: Some("sv1".to_string()),
@@ -937,14 +966,10 @@ priority = 2
         let parent = snap("20260322-1400-one");
         let current = snap("20260322-1500-one");
 
-        fs.local_snapshots.insert(
-            "sv1".to_string(),
-            vec![parent.clone(), current.clone()],
-        );
-        fs.external_snapshots.insert(
-            ("D1".to_string(), "sv1".to_string()),
-            vec![parent.clone()],
-        );
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![parent.clone(), current.clone()]);
+        fs.external_snapshots
+            .insert(("D1".to_string(), "sv1".to_string()), vec![parent.clone()]);
         fs.mounted_drives.insert("D1".to_string());
         fs.pin_files.insert(
             (PathBuf::from("/snap/sv1"), "D1".to_string()),
@@ -968,10 +993,8 @@ priority = 2
     fn full_send_when_no_pin() {
         let config = test_config();
         let mut fs = MockFileSystemState::new();
-        fs.local_snapshots.insert(
-            "sv1".to_string(),
-            vec![snap("20260322-1500-one")],
-        );
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap("20260322-1500-one")]);
         fs.mounted_drives.insert("D1".to_string());
 
         let filters = PlanFilters {
@@ -999,10 +1022,8 @@ priority = 2
         );
         // Pin points to parent, but parent is NOT on external drive
         fs.mounted_drives.insert("D1".to_string());
-        fs.pin_files.insert(
-            (PathBuf::from("/snap/sv1"), "D1".to_string()),
-            parent,
-        );
+        fs.pin_files
+            .insert((PathBuf::from("/snap/sv1"), "D1".to_string()), parent);
 
         let filters = PlanFilters {
             subvolume: Some("sv1".to_string()),
@@ -1021,18 +1042,26 @@ priority = 2
     fn skips_send_when_drive_not_mounted() {
         let config = test_config();
         let mut fs = MockFileSystemState::new();
-        fs.local_snapshots.insert(
-            "sv1".to_string(),
-            vec![snap("20260322-1500-one")],
-        );
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap("20260322-1500-one")]);
         // Drive NOT mounted
 
         let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
-        assert!(result.skipped.iter().any(|(_, reason)| reason.contains("not mounted")));
+        assert!(
+            result
+                .skipped
+                .iter()
+                .any(|(_, reason)| reason.contains("not mounted"))
+        );
         let sends: Vec<_> = result
             .operations
             .iter()
-            .filter(|op| matches!(op, PlannedOperation::SendIncremental { .. } | PlannedOperation::SendFull { .. }))
+            .filter(|op| {
+                matches!(
+                    op,
+                    PlannedOperation::SendIncremental { .. } | PlannedOperation::SendFull { .. }
+                )
+            })
             .collect();
         assert_eq!(sends.len(), 0);
     }
@@ -1076,7 +1105,12 @@ send_enabled = false
         fs.mounted_drives.insert("D1".to_string());
 
         let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
-        assert!(result.skipped.iter().any(|(_, reason)| reason.contains("send disabled")));
+        assert!(
+            result
+                .skipped
+                .iter()
+                .any(|(_, reason)| reason.contains("send disabled"))
+        );
     }
 
     #[test]
@@ -1093,7 +1127,12 @@ send_enabled = false
         let sends: Vec<_> = result
             .operations
             .iter()
-            .filter(|op| matches!(op, PlannedOperation::SendIncremental { .. } | PlannedOperation::SendFull { .. }))
+            .filter(|op| {
+                matches!(
+                    op,
+                    PlannedOperation::SendIncremental { .. } | PlannedOperation::SendFull { .. }
+                )
+            })
             .collect();
         assert_eq!(sends.len(), 0);
     }
@@ -1120,10 +1159,8 @@ send_enabled = false
     fn send_includes_pin_info() {
         let config = test_config();
         let mut fs = MockFileSystemState::new();
-        fs.local_snapshots.insert(
-            "sv1".to_string(),
-            vec![snap("20260322-1500-one")],
-        );
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap("20260322-1500-one")]);
         fs.mounted_drives.insert("D1".to_string());
 
         let filters = PlanFilters {
@@ -1134,10 +1171,18 @@ send_enabled = false
         let sends_with_pin: Vec<_> = result
             .operations
             .iter()
-            .filter(|op| matches!(op,
-                PlannedOperation::SendFull { pin_on_success: Some(_), .. }
-                | PlannedOperation::SendIncremental { pin_on_success: Some(_), .. }
-            ))
+            .filter(|op| {
+                matches!(
+                    op,
+                    PlannedOperation::SendFull {
+                        pin_on_success: Some(_),
+                        ..
+                    } | PlannedOperation::SendIncremental {
+                        pin_on_success: Some(_),
+                        ..
+                    }
+                )
+            })
             .collect();
         assert_eq!(sends_with_pin.len(), 1);
     }
@@ -1160,10 +1205,8 @@ send_enabled = false
                 snap("20260322-1500-one"), // newest
             ],
         );
-        fs.pin_files.insert(
-            (PathBuf::from("/snap/sv1"), "D1".to_string()),
-            pin_snap,
-        );
+        fs.pin_files
+            .insert((PathBuf::from("/snap/sv1"), "D1".to_string()), pin_snap);
 
         let filters = PlanFilters {
             subvolume: Some("sv1".to_string()),
@@ -1213,7 +1256,11 @@ send_enabled = false
             .iter()
             .filter(|op| matches!(op, PlannedOperation::DeleteSnapshot { .. }))
             .collect();
-        assert_eq!(deletes.len(), 0, "No snapshots should be deleted when nothing has been sent externally");
+        assert_eq!(
+            deletes.len(),
+            0,
+            "No snapshots should be deleted when nothing has been sent externally"
+        );
     }
 
     #[test]
@@ -1269,7 +1316,10 @@ send_enabled = false
             .filter(|op| matches!(op, PlannedOperation::DeleteSnapshot { .. }))
             .collect();
         // With send_enabled=false, daily thinning should delete the 0800 and 1000 snapshots
-        assert!(deletes.len() >= 2, "Retention should thin normally when send is disabled");
+        assert!(
+            deletes.len() >= 2,
+            "Retention should thin normally when send is disabled"
+        );
     }
 
     // ── Space estimation tests ──────────────────────────────────────────
@@ -1278,7 +1328,8 @@ send_enabled = false
     fn send_skipped_insufficient_space() {
         let config = test_config();
         let mut fs = MockFileSystemState::new();
-        fs.local_snapshots.insert("sv1".to_string(), vec![snap("20260322-1300-one")]);
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap("20260322-1300-one")]);
         fs.mounted_drives.insert("D1".to_string());
         // Historical full send was 200GB
         fs.send_sizes.insert(
@@ -1286,10 +1337,8 @@ send_enabled = false
             200_000_000_000,
         );
         // Only 150GB free on external drive (min_free=100GB, so available=50GB)
-        fs.free_bytes.insert(
-            PathBuf::from("/mnt/d1/.snapshots/sv1"),
-            150_000_000_000,
-        );
+        fs.free_bytes
+            .insert(PathBuf::from("/mnt/d1/.snapshots/sv1"), 150_000_000_000);
 
         let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
         let sends: Vec<_> = result
@@ -1297,9 +1346,16 @@ send_enabled = false
             .iter()
             .filter(|op| matches!(op, PlannedOperation::SendFull { subvolume_name, .. } if subvolume_name == "sv1"))
             .collect();
-        assert_eq!(sends.len(), 0, "Send should be skipped when space is insufficient");
+        assert_eq!(
+            sends.len(),
+            0,
+            "Send should be skipped when space is insufficient"
+        );
         assert!(
-            result.skipped.iter().any(|(name, reason)| name == "sv1" && reason.contains("estimated")),
+            result
+                .skipped
+                .iter()
+                .any(|(name, reason)| name == "sv1" && reason.contains("estimated")),
             "Should report space estimation skip"
         );
     }
@@ -1308,7 +1364,8 @@ send_enabled = false
     fn send_proceeds_with_sufficient_space() {
         let config = test_config();
         let mut fs = MockFileSystemState::new();
-        fs.local_snapshots.insert("sv1".to_string(), vec![snap("20260322-1300-one")]);
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap("20260322-1300-one")]);
         fs.mounted_drives.insert("D1".to_string());
         // Historical full send was 50GB
         fs.send_sizes.insert(
@@ -1316,10 +1373,8 @@ send_enabled = false
             50_000_000_000,
         );
         // 500GB free on external drive (min_free=100GB, available=400GB, estimated=60GB)
-        fs.free_bytes.insert(
-            PathBuf::from("/mnt/d1/.snapshots/sv1"),
-            500_000_000_000,
-        );
+        fs.free_bytes
+            .insert(PathBuf::from("/mnt/d1/.snapshots/sv1"), 500_000_000_000);
 
         let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
         let sends: Vec<_> = result
@@ -1327,21 +1382,24 @@ send_enabled = false
             .iter()
             .filter(|op| matches!(op, PlannedOperation::SendFull { subvolume_name, .. } if subvolume_name == "sv1"))
             .collect();
-        assert_eq!(sends.len(), 1, "Send should proceed when space is sufficient");
+        assert_eq!(
+            sends.len(),
+            1,
+            "Send should proceed when space is sufficient"
+        );
     }
 
     #[test]
     fn send_proceeds_without_history() {
         let config = test_config();
         let mut fs = MockFileSystemState::new();
-        fs.local_snapshots.insert("sv1".to_string(), vec![snap("20260322-1300-one")]);
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap("20260322-1300-one")]);
         fs.mounted_drives.insert("D1".to_string());
         // No send_sizes entry — first-ever send
         // Tiny free space — but no history means we can't estimate, so proceed
-        fs.free_bytes.insert(
-            PathBuf::from("/mnt/d1/.snapshots/sv1"),
-            1_000_000,
-        );
+        fs.free_bytes
+            .insert(PathBuf::from("/mnt/d1/.snapshots/sv1"), 1_000_000);
 
         let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
         let sends: Vec<_> = result
@@ -1349,14 +1407,19 @@ send_enabled = false
             .iter()
             .filter(|op| matches!(op, PlannedOperation::SendFull { subvolume_name, .. } if subvolume_name == "sv1"))
             .collect();
-        assert_eq!(sends.len(), 1, "First-ever send should proceed without history");
+        assert_eq!(
+            sends.len(),
+            1,
+            "First-ever send should proceed without history"
+        );
     }
 
     #[test]
     fn calibrated_size_skips_send_when_too_large() {
         let config = test_config();
         let mut fs = MockFileSystemState::new();
-        fs.local_snapshots.insert("sv1".to_string(), vec![snap("20260322-1300-one")]);
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap("20260322-1300-one")]);
         fs.mounted_drives.insert("D1".to_string());
         // No send history (Tier 1), but calibrated size says 1TB
         fs.calibrated_sizes.insert(
@@ -1364,10 +1427,8 @@ send_enabled = false
             (1_000_000_000_000, "2026-03-22T12:00:00".to_string()),
         );
         // Drive has only 500GB free
-        fs.free_bytes.insert(
-            PathBuf::from("/mnt/d1/.snapshots/sv1"),
-            500_000_000_000,
-        );
+        fs.free_bytes
+            .insert(PathBuf::from("/mnt/d1/.snapshots/sv1"), 500_000_000_000);
 
         let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
         let sends: Vec<_> = result
@@ -1375,9 +1436,16 @@ send_enabled = false
             .iter()
             .filter(|op| matches!(op, PlannedOperation::SendFull { subvolume_name, .. } if subvolume_name == "sv1"))
             .collect();
-        assert_eq!(sends.len(), 0, "Send should be skipped when calibrated size exceeds available space");
+        assert_eq!(
+            sends.len(),
+            0,
+            "Send should be skipped when calibrated size exceeds available space"
+        );
         assert!(
-            result.skipped.iter().any(|(name, reason)| name == "sv1" && reason.contains("calibrated size")),
+            result
+                .skipped
+                .iter()
+                .any(|(name, reason)| name == "sv1" && reason.contains("calibrated size")),
             "Skip reason should mention calibrated size"
         );
     }
@@ -1386,7 +1454,8 @@ send_enabled = false
     fn tier1_overrides_calibrated_size() {
         let config = test_config();
         let mut fs = MockFileSystemState::new();
-        fs.local_snapshots.insert("sv1".to_string(), vec![snap("20260322-1300-one")]);
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap("20260322-1300-one")]);
         fs.mounted_drives.insert("D1".to_string());
         // Tier 1 says 100KB (small send)
         fs.send_sizes.insert(
@@ -1399,10 +1468,8 @@ send_enabled = false
             (1_000_000_000_000, "2026-03-22T12:00:00".to_string()),
         );
         // Drive has 500GB free — enough for Tier 1 estimate, not for calibrated
-        fs.free_bytes.insert(
-            PathBuf::from("/mnt/d1/.snapshots/sv1"),
-            500_000_000_000,
-        );
+        fs.free_bytes
+            .insert(PathBuf::from("/mnt/d1/.snapshots/sv1"), 500_000_000_000);
 
         let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
         let sends: Vec<_> = result
@@ -1410,20 +1477,23 @@ send_enabled = false
             .iter()
             .filter(|op| matches!(op, PlannedOperation::SendFull { subvolume_name, .. } if subvolume_name == "sv1"))
             .collect();
-        assert_eq!(sends.len(), 1, "Tier 1 history should override calibrated size");
+        assert_eq!(
+            sends.len(),
+            1,
+            "Tier 1 history should override calibrated size"
+        );
     }
 
     #[test]
     fn send_proceeds_without_history_or_calibration() {
         let config = test_config();
         let mut fs = MockFileSystemState::new();
-        fs.local_snapshots.insert("sv1".to_string(), vec![snap("20260322-1300-one")]);
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap("20260322-1300-one")]);
         fs.mounted_drives.insert("D1".to_string());
         // No send_sizes, no calibrated_sizes — fail open
-        fs.free_bytes.insert(
-            PathBuf::from("/mnt/d1/.snapshots/sv1"),
-            1_000_000,
-        );
+        fs.free_bytes
+            .insert(PathBuf::from("/mnt/d1/.snapshots/sv1"), 1_000_000);
 
         let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
         let sends: Vec<_> = result
@@ -1431,7 +1501,11 @@ send_enabled = false
             .iter()
             .filter(|op| matches!(op, PlannedOperation::SendFull { subvolume_name, .. } if subvolume_name == "sv1"))
             .collect();
-        assert_eq!(sends.len(), 1, "First-ever send should proceed without history or calibration");
+        assert_eq!(
+            sends.len(),
+            1,
+            "First-ever send should proceed without history or calibration"
+        );
     }
 
     #[test]
@@ -1450,9 +1524,16 @@ send_enabled = false
             .iter()
             .filter(|op| matches!(op, PlannedOperation::CreateSnapshot { subvolume_name, .. } if subvolume_name == "sv1"))
             .collect();
-        assert_eq!(creates.len(), 0, "No snapshot should be created when newest is in the future");
+        assert_eq!(
+            creates.len(),
+            0,
+            "No snapshot should be created when newest is in the future"
+        );
         assert!(
-            result.skipped.iter().any(|(name, reason)| name == "sv1" && reason.contains("interval")),
+            result
+                .skipped
+                .iter()
+                .any(|(name, reason)| name == "sv1" && reason.contains("interval")),
             "Should report interval not elapsed for future-dated snapshot"
         );
     }

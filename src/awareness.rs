@@ -50,7 +50,6 @@ impl std::fmt::Display for PromiseStatus {
 
 /// Complete assessment for a single subvolume.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct SubvolAssessment {
     pub name: String,
     pub status: PromiseStatus,
@@ -64,23 +63,25 @@ pub struct SubvolAssessment {
 
 /// Local snapshot freshness assessment.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct LocalAssessment {
     pub status: PromiseStatus,
     pub snapshot_count: usize,
+    #[allow(dead_code)] // consumed by verbose status display (future)
     pub newest_age: Option<Duration>,
+    #[allow(dead_code)] // consumed by verbose status display (future)
     pub configured_interval: Interval,
 }
 
 /// External drive send freshness assessment.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct DriveAssessment {
     pub drive_label: String,
     pub status: PromiseStatus,
     pub mounted: bool,
     pub snapshot_count: Option<usize>,
+    #[allow(dead_code)] // consumed by verbose status display (future)
     pub last_send_age: Option<Duration>,
+    #[allow(dead_code)] // consumed by verbose status display (future)
     pub configured_interval: Interval,
 }
 
@@ -130,8 +131,7 @@ pub fn assess(
         let mut advisories = Vec::new();
         let local = match fs.local_snapshots(&snapshot_root, &subvol.name) {
             Ok(snaps) => {
-                let (assessment, advisory) =
-                    assess_local(&snaps, now, subvol.snapshot_interval);
+                let (assessment, advisory) = assess_local(&snaps, now, subvol.snapshot_interval);
                 if let Some(adv) = advisory {
                     advisories.push(adv);
                 }
@@ -153,8 +153,7 @@ pub fn assess(
 
         if subvol.send_enabled {
             if config.drives.is_empty() {
-                advisories
-                    .push("send_enabled but no drives configured".to_string());
+                advisories.push("send_enabled but no drives configured".to_string());
             }
 
             for drive in &config.drives {
@@ -175,23 +174,21 @@ pub fn assess(
                     None
                 };
 
-                let last_send_time =
-                    fs.last_successful_send_time(&subvol.name, &drive.label);
+                let last_send_time = fs.last_successful_send_time(&subvol.name, &drive.label);
                 // Clamp negative ages to zero (clock skew protection, same as local)
                 let last_send_age = last_send_time.map(|t| {
                     let age = now - t;
-                    if age < Duration::zero() { Duration::zero() } else { age }
+                    if age < Duration::zero() {
+                        Duration::zero()
+                    } else {
+                        age
+                    }
                 });
 
-                let status = assess_external_status(
-                    last_send_age,
-                    subvol.send_interval,
-                );
+                let status = assess_external_status(last_send_age, subvol.send_interval);
 
                 // Advisory for stale offsite drives
-                if !mounted
-                    && let Some(age) = last_send_age
-                {
+                if !mounted && let Some(age) = last_send_age {
                     let days = age.num_days();
                     if days > 7 {
                         advisories.push(format!(
@@ -287,10 +284,7 @@ fn assess_local(
     )
 }
 
-fn assess_external_status(
-    last_send_age: Option<Duration>,
-    interval: Interval,
-) -> PromiseStatus {
+fn assess_external_status(last_send_age: Option<Duration>, interval: Interval) -> PromiseStatus {
     match last_send_age {
         None => PromiseStatus::Unprotected,
         Some(age) => freshness_status(
@@ -322,10 +316,7 @@ fn freshness_status(
 
 /// Overall status: min(local, best_external).
 /// External uses max() across drives (best connected drive wins).
-fn compute_overall_status(
-    local: &LocalAssessment,
-    drives: &[DriveAssessment],
-) -> PromiseStatus {
+fn compute_overall_status(local: &LocalAssessment, drives: &[DriveAssessment]) -> PromiseStatus {
     if drives.is_empty() {
         return local.status;
     }
@@ -451,10 +442,8 @@ source = "/data/sv2"
         let mut fs = MockFileSystemState::new();
 
         // Snapshot 3h ago: > 2× of 1h interval but < 5× → AT_RISK
-        fs.local_snapshots.insert(
-            "sv1".to_string(),
-            vec![snap(dt(2026, 3, 23, 11, 0), "sv1")],
-        );
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap(dt(2026, 3, 23, 11, 0), "sv1")]);
 
         // Fresh send so external doesn't drag status down
         fs.send_times.insert(
@@ -477,10 +466,8 @@ source = "/data/sv2"
         let mut fs = MockFileSystemState::new();
 
         // Snapshot 6h ago: > 5× of 1h interval → UNPROTECTED
-        fs.local_snapshots.insert(
-            "sv1".to_string(),
-            vec![snap(dt(2026, 3, 23, 8, 0), "sv1")],
-        );
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap(dt(2026, 3, 23, 8, 0), "sv1")]);
         fs.mounted_drives.insert("WD-18TB".to_string());
 
         let results = assess(&config, now, &fs);
@@ -708,11 +695,19 @@ source = "/data/sv1"
         let results = assess(&config, now, &fs);
 
         // Primary drive is PROTECTED
-        let primary = &results[0].external.iter().find(|d| d.drive_label == "primary").unwrap();
+        let primary = &results[0]
+            .external
+            .iter()
+            .find(|d| d.drive_label == "primary")
+            .unwrap();
         assert_eq!(primary.status, PromiseStatus::Protected);
 
         // Offsite is UNPROTECTED
-        let offsite = &results[0].external.iter().find(|d| d.drive_label == "offsite").unwrap();
+        let offsite = &results[0]
+            .external
+            .iter()
+            .find(|d| d.drive_label == "offsite")
+            .unwrap();
         assert_eq!(offsite.status, PromiseStatus::Unprotected);
 
         // Overall: max(PROTECTED, UNPROTECTED) = PROTECTED for external,
@@ -729,10 +724,8 @@ source = "/data/sv1"
         let mut fs = MockFileSystemState::new();
 
         // Stale local → AT_RISK (3h old, > 2× of 1h)
-        fs.local_snapshots.insert(
-            "sv1".to_string(),
-            vec![snap(dt(2026, 3, 23, 11, 0), "sv1")],
-        );
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap(dt(2026, 3, 23, 11, 0), "sv1")]);
 
         // Fresh external → PROTECTED
         fs.send_times.insert(
@@ -805,10 +798,8 @@ enabled = false
         let mut fs = MockFileSystemState::new();
 
         // Exactly 2h ago = exactly 2× of 1h interval → PROTECTED (≤)
-        fs.local_snapshots.insert(
-            "sv1".to_string(),
-            vec![snap(dt(2026, 3, 23, 12, 0), "sv1")],
-        );
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap(dt(2026, 3, 23, 12, 0), "sv1")]);
 
         let results = assess(&config, now, &fs);
         assert_eq!(results[0].local.status, PromiseStatus::Protected);
@@ -830,19 +821,15 @@ enabled = false
         let mut fs = MockFileSystemState::new();
 
         // Exactly 5h ago = exactly 5× of 1h interval → AT_RISK (≤)
-        fs.local_snapshots.insert(
-            "sv1".to_string(),
-            vec![snap(dt(2026, 3, 23, 9, 0), "sv1")],
-        );
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap(dt(2026, 3, 23, 9, 0), "sv1")]);
 
         let results = assess(&config, now, &fs);
         assert_eq!(results[0].local.status, PromiseStatus::AtRisk);
 
         // 5h + 1min ago → UNPROTECTED (> 5×)
-        fs.local_snapshots.insert(
-            "sv1".to_string(),
-            vec![snap(dt(2026, 3, 23, 8, 59), "sv1")],
-        );
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap(dt(2026, 3, 23, 8, 59), "sv1")]);
 
         let results = assess(&config, now, &fs);
         assert_eq!(results[0].local.status, PromiseStatus::Unprotected);
@@ -888,14 +875,10 @@ source = "/data/sv1"
 
         // 2 days ago: within 2× local (PROTECTED) but > 1.5× external (AT_RISK)
         let two_days_ago = dt(2026, 3, 21, 14, 0);
-        fs.local_snapshots.insert(
-            "sv1".to_string(),
-            vec![snap(two_days_ago, "sv1")],
-        );
-        fs.send_times.insert(
-            ("sv1".to_string(), "WD-18TB".to_string()),
-            two_days_ago,
-        );
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap(two_days_ago, "sv1")]);
+        fs.send_times
+            .insert(("sv1".to_string(), "WD-18TB".to_string()), two_days_ago);
         fs.mounted_drives.insert("WD-18TB".to_string());
 
         let results = assess(&config, now, &fs);
@@ -985,7 +968,12 @@ source = "/data/sv1"
         // Drive NOT mounted
 
         let results = assess(&config, now, &fs);
-        assert!(results[0].advisories.iter().any(|a| a.contains("consider cycling")));
+        assert!(
+            results[0]
+                .advisories
+                .iter()
+                .any(|a| a.contains("consider cycling"))
+        );
         assert!(results[0].advisories[0].contains("WD-18TB"));
     }
 
@@ -1006,7 +994,10 @@ source = "/data/sv1"
             newest_age: Some(Duration::minutes(30)),
             configured_interval: Interval::hours(1),
         };
-        assert_eq!(compute_overall_status(&local, &[]), PromiseStatus::Protected);
+        assert_eq!(
+            compute_overall_status(&local, &[]),
+            PromiseStatus::Protected
+        );
 
         let local_risk = LocalAssessment {
             status: PromiseStatus::AtRisk,
@@ -1014,7 +1005,10 @@ source = "/data/sv1"
             newest_age: Some(Duration::hours(3)),
             configured_interval: Interval::hours(1),
         };
-        assert_eq!(compute_overall_status(&local_risk, &[]), PromiseStatus::AtRisk);
+        assert_eq!(
+            compute_overall_status(&local_risk, &[]),
+            PromiseStatus::AtRisk
+        );
     }
 
     // ── PromiseStatus ordering ─────────────────────────────────────
@@ -1062,10 +1056,8 @@ source = "/data/sv1"
         let mut fs = MockFileSystemState::new();
 
         // Snapshot from 14:00, but clock says 12:00 → snapshot is "from the future"
-        fs.local_snapshots.insert(
-            "sv1".to_string(),
-            vec![snap(dt(2026, 3, 23, 14, 0), "sv1")],
-        );
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap(dt(2026, 3, 23, 14, 0), "sv1")]);
         fs.send_times.insert(
             ("sv1".to_string(), "WD-18TB".to_string()),
             dt(2026, 3, 23, 10, 0),
@@ -1077,7 +1069,12 @@ source = "/data/sv1"
         // (not falsely PROTECTED from negative duration)
         assert_eq!(results[0].local.status, PromiseStatus::Protected);
         // Clock skew advisory should be present
-        assert!(results[0].advisories.iter().any(|a| a.contains("clock skew")));
+        assert!(
+            results[0]
+                .advisories
+                .iter()
+                .any(|a| a.contains("clock skew"))
+        );
         // Age should be zero, not negative
         assert_eq!(results[0].local.newest_age, Some(Duration::zero()));
     }

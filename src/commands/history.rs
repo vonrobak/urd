@@ -194,4 +194,3 @@ mod tests {
         assert!(result.is_char_boundary(result.len()));
     }
 }
-

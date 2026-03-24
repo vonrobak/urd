@@ -139,15 +139,12 @@ impl SnapshotName {
     pub fn parse(s: &str) -> crate::error::Result<Self> {
         let s = s.trim();
         if s.len() < 10 {
-            return Err(UrdError::Parse(format!(
-                "snapshot name too short: {s:?}"
-            )));
+            return Err(UrdError::Parse(format!("snapshot name too short: {s:?}")));
         }
 
         let date_str = &s[..8];
-        let date = NaiveDate::parse_from_str(date_str, "%Y%m%d").map_err(|e| {
-            UrdError::Parse(format!("invalid date in snapshot name {s:?}: {e}"))
-        })?;
+        let date = NaiveDate::parse_from_str(date_str, "%Y%m%d")
+            .map_err(|e| UrdError::Parse(format!("invalid date in snapshot name {s:?}: {e}")))?;
 
         // After the date, expect a '-'
         if s.as_bytes().get(8) != Some(&b'-') {
@@ -161,8 +158,7 @@ impl SnapshotName {
         // Try new format: HHMM-shortname (rest starts with 4 digits then '-')
         if rest.len() >= 5
             && rest.as_bytes()[4] == b'-'
-            && let (Ok(hour), Ok(minute)) =
-                (rest[..2].parse::<u32>(), rest[2..4].parse::<u32>())
+            && let (Ok(hour), Ok(minute)) = (rest[..2].parse::<u32>(), rest[2..4].parse::<u32>())
             && hour < 24
             && minute < 60
         {
@@ -172,9 +168,8 @@ impl SnapshotName {
                     "empty short name in snapshot name: {s:?}"
                 )));
             }
-            let time = NaiveTime::from_hms_opt(hour, minute, 0).ok_or_else(|| {
-                UrdError::Parse(format!("invalid time in snapshot name: {s:?}"))
-            })?;
+            let time = NaiveTime::from_hms_opt(hour, minute, 0)
+                .ok_or_else(|| UrdError::Parse(format!("invalid time in snapshot name: {s:?}")))?;
             return Ok(Self {
                 raw: s.to_string(),
                 datetime: NaiveDateTime::new(date, time),
@@ -188,9 +183,8 @@ impl SnapshotName {
                 "empty short name in snapshot name: {s:?}"
             )));
         }
-        let time = NaiveTime::from_hms_opt(0, 0, 0).ok_or_else(|| {
-            UrdError::Parse("failed to create midnight time".to_string())
-        })?;
+        let time = NaiveTime::from_hms_opt(0, 0, 0)
+            .ok_or_else(|| UrdError::Parse("failed to create midnight time".to_string()))?;
         Ok(Self {
             raw: s.to_string(),
             datetime: NaiveDateTime::new(date, time),
@@ -357,7 +351,11 @@ impl fmt::Display for PlannedOperation {
                 pin_on_success,
                 ..
             } => {
-                let pin_suffix = if pin_on_success.is_some() { " + pin" } else { "" };
+                let pin_suffix = if pin_on_success.is_some() {
+                    " + pin"
+                } else {
+                    ""
+                };
                 write!(
                     f,
                     "SEND    {} -> {} (incremental, parent: {}){pin_suffix}",
@@ -372,7 +370,11 @@ impl fmt::Display for PlannedOperation {
                 pin_on_success,
                 ..
             } => {
-                let pin_suffix = if pin_on_success.is_some() { " + pin" } else { "" };
+                let pin_suffix = if pin_on_success.is_some() {
+                    " + pin"
+                } else {
+                    ""
+                };
                 write!(
                     f,
                     "SEND    {} -> {} (full){pin_suffix}",
@@ -477,11 +479,7 @@ impl FromStr for ByteSize {
             "MIB" => 1_048_576,
             "GIB" => 1_073_741_824,
             "TIB" => 1_099_511_627_776,
-            _ => {
-                return Err(UrdError::Parse(format!(
-                    "unknown byte size unit: {unit:?}"
-                )))
-            }
+            _ => return Err(UrdError::Parse(format!("unknown byte size unit: {unit:?}"))),
         };
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         Ok(Self((num * multiplier as f64) as u64))
@@ -712,7 +710,10 @@ mod tests {
     fn parse_byte_sizes() {
         assert_eq!("10GB".parse::<ByteSize>().unwrap().bytes(), 10_000_000_000);
         assert_eq!("500MB".parse::<ByteSize>().unwrap().bytes(), 500_000_000);
-        assert_eq!("1TB".parse::<ByteSize>().unwrap().bytes(), 1_000_000_000_000);
+        assert_eq!(
+            "1TB".parse::<ByteSize>().unwrap().bytes(),
+            1_000_000_000_000
+        );
         assert_eq!("1GiB".parse::<ByteSize>().unwrap().bytes(), 1_073_741_824);
         assert_eq!("100KB".parse::<ByteSize>().unwrap().bytes(), 100_000);
         assert_eq!("1024B".parse::<ByteSize>().unwrap().bytes(), 1024);
@@ -774,7 +775,10 @@ mod tests {
                 .unwrap()
                 .and_hms_opt(14, 30, 0)
                 .unwrap(),
-            skipped: vec![("subvol6-tmp".to_string(), "interval not elapsed".to_string())],
+            skipped: vec![(
+                "subvol6-tmp".to_string(),
+                "interval not elapsed".to_string(),
+            )],
         };
         let s = plan.summary();
         assert_eq!(s.snapshots, 1);
