@@ -5,12 +5,18 @@
 
 ## Current State
 
-**Phase 5 complete. Safety hardening in progress (2a done).** Awareness model (3a), heartbeat
-file (3b), presentation layer (3c), `urd get` (3d), and UUID drive fingerprinting (2a) are
-built, reviewed, and passing 214 tests. Operational cutover has not started — the bash script
-(`btrfs-snapshot-backup.sh`) is still the sole production backup system, running nightly at
-02:00 via `btrfs-backup-daily.timer`. Urd v0.1.0 is installed (`~/.cargo/bin/urd`) and has
-been tested manually on real subvolumes (2026-03-23), but is not deployed on a schedule.
+**Phase 5 complete. Safety hardening in progress (2a done). Pre-cutover hardening done.**
+Awareness model (3a), heartbeat file (3b), presentation layer (3c), `urd get` (3d), and UUID
+drive fingerprinting (2a) are built, reviewed, and passing 216 tests. Pre-cutover testing
+(2026-03-24) found and fixed two bugs: executor didn't mkdir before `btrfs receive` (every
+first-send to a new drive would fail), and verify reported false chain breaks from legacy
+pin files. A third bug — space estimation querying per-subvolume dir instead of mount path —
+was also found and fixed in the same session. UUID fingerprints configured for both mounted
+drives. Operational cutover has not started — the bash script (`btrfs-snapshot-backup.sh`)
+is still the sole production backup system, running nightly at 02:00 via
+`btrfs-backup-daily.timer`. Urd v0.2.2026-03-24 is installed (`~/.cargo/bin/urd`) and has
+been tested manually on real subvolumes (all read-only tests pass, one successful incremental
+send to 2TB-backup). Full backup run (Test 11) is the last gate before installing the timer.
 
 Safety hardening completed:
 
@@ -26,6 +32,24 @@ Safety hardening completed:
   instead of `eprintln!`.
   [Design review](../99-reports/2026-03-24-uuid-fingerprinting-design-review.md) |
   [Implementation review](../99-reports/2026-03-24-uuid-fingerprinting-implementation-review.md)
+
+Pre-cutover hardening (2026-03-24):
+
+- **mkdir before btrfs receive** (`executor.rs`) — `btrfs receive` requires the destination
+  directory to exist but won't create it. Added precondition check with `parent.exists()` guard
+  (skips mkdir for unmounted drives and test paths). Root cause of 2026-03-23 subvol5-music
+  failure. 2 new tests using `tempfile::TempDir`. Linked to Priority 2c (pre-flight checks).
+- **Legacy pin false positives** (`chain.rs`, `commands/verify.rs`) — `read_pin_file()` now
+  returns `PinResult { name, source }` where source is `DriveSpecific` or `Legacy`. Verify
+  downgrades legacy-pin mismatches from FAIL to WARN with actionable message. Skips stale-pin
+  checks for legacy pins. All callers updated (6 files). Verify went from 2 failures to 0.
+- **Space estimation mount path fix** (`plan.rs`) — `exceeds_available_space()` queried
+  per-subvolume `ext_dir` via `statvfs`, which doesn't exist for first-ever sends
+  (`unwrap_or(u64::MAX)` = infinite space). Changed to query `drive.mount_path`. Now correctly
+  blocks sends that would overflow the drive (1.1TB and 3.4TB subvolumes blocked from 1.1TB
+  available on 2TB-backup).
+  [Journal](../98-journals/2026-03-24-pre-cutover-hardening.md) |
+  [Review](../99-reports/2026-03-24-pre-cutover-testing-review.md)
 
 Phase 5 work completed:
 
@@ -278,6 +302,16 @@ timestamp staleness handling, space check deduplication, ANSI line clearing.
   uniqueness check, `log::warn!` over `eprintln!`.
   [Design review](../99-reports/2026-03-24-uuid-fingerprinting-design-review.md) |
   [Implementation review](../99-reports/2026-03-24-uuid-fingerprinting-implementation-review.md)
+- **Pre-cutover hardening** (2026-03-24) — Three bugs found and fixed during pre-cutover manual
+  testing. (1) `executor.rs`: mkdir before `btrfs receive` — first-ever sends to any drive would
+  fail without destination directory. Parent-exists guard preserves test behavior and unmounted-drive
+  safety. 2 tests. (2) `chain.rs` + `verify`: `PinResult` with `PinSource` enum distinguishes
+  drive-specific from legacy pins. Verify downgrades legacy mismatches from FAIL to WARN. 6 callers
+  updated. (3) `plan.rs`: space estimation queries `drive.mount_path` instead of per-subvolume
+  `ext_dir` — fixes infinite-space fallback on first sends. All three bugs shared the same root
+  cause: code assumed per-subvolume directories exist on external drives before first send.
+  [Journal](../98-journals/2026-03-24-pre-cutover-hardening.md) |
+  [Review](../99-reports/2026-03-24-pre-cutover-testing-review.md)
 
 ### Not Building (dropped per adversary review)
 
@@ -384,6 +418,9 @@ for details.
 | UUID optional with warning, not required — backward compat, gradual adoption | 2026-03-24 | [UUID design review](../99-reports/2026-03-24-uuid-fingerprinting-design-review.md) |
 | Default `is_drive_mounted()` on trait delegates to `drive_availability()` | 2026-03-24 | [UUID impl review](../99-reports/2026-03-24-uuid-fingerprinting-implementation-review.md) Tension 3 |
 | Case-insensitive UUID comparison and uniqueness validation | 2026-03-24 | [UUID impl review](../99-reports/2026-03-24-uuid-fingerprinting-implementation-review.md) Finding 1 |
+| Executor mkdir with parent-exists guard (skip for unmounted drives and tests) | 2026-03-24 | [Pre-cutover journal](../98-journals/2026-03-24-pre-cutover-hardening.md) |
+| `PinResult` with `PinSource` enum — legacy pins downgraded to WARN in verify | 2026-03-24 | [Pre-cutover journal](../98-journals/2026-03-24-pre-cutover-hardening.md) |
+| Space estimation queries mount path, not per-subvolume dir | 2026-03-24 | [Pre-cutover journal](../98-journals/2026-03-24-pre-cutover-hardening.md) |
 
 ## Key Documents
 
@@ -395,14 +432,13 @@ for details.
 | Future directions brainstorm | [Feature ideas](../95-ideas/2026-03-23-brainstorm-urd-future.md) |
 | UX design principles brainstorm | [Norman principles](../95-ideas/2026-03-23-brainstorm-ux-norman-principles.md) |
 | Vision architecture review | [2026-03-23 Architectural criteria for vision](../99-reports/2026-03-23-vision-architecture-review.md) |
-| Latest adversary review | [2026-03-24 UUID fingerprinting impl review](../99-reports/2026-03-24-uuid-fingerprinting-implementation-review.md) |
+| Latest adversary review | [2026-03-24 Pre-cutover testing review](../99-reports/2026-03-24-pre-cutover-testing-review.md) |
 | Code conventions & architecture | [CLAUDE.md](../../CLAUDE.md) |
 | Documentation standards | [CONTRIBUTING.md](../../CONTRIBUTING.md) |
 
 ## Known Issues & Tech Debt
 
 - Pipe bytes vs. on-disk size mismatch in space estimation (1.2x margin handles common case)
-- Space-skip visibility in plan output could be improved (`[SKIP:SPACE]` marker suggested)
 - `du -sb` may follow symlinks in snapshots — consider `-P` flag (not yet tested on real snapshots with symlinks)
 - Stale failed send estimates persist indefinitely for (subvolume, drive, send_type) triples with no subsequent sends — consider TTL or clearing on successful calibration
 - Successful sends could update `subvolume_sizes` table to keep calibration fresh, but pipe bytes ≠ `du -sb` bytes (method mixing concern)
@@ -414,4 +450,9 @@ for details.
 - `urd get` normalizes paths without filesystem access (no `canonicalize`) — symlinked paths won't match subvolume sources. Documented limitation; correct behavior (use canonical paths)
 - `urd get` doesn't support directory restore — files only in v1. Error message guides user.
 - `warn_missing_uuids` spawns `findmnt` per mounted drive without UUID on every plan/backup run — acceptable during transition, consider moving to `urd verify` only once UUID adoption is complete
+- Orphaned snapshot `20250422-multimedia` on WD-18TB1 (13 months old, found by `urd init`) — clean up before cutover or let crash recovery handle it
+- WD-18TB UUID still needs to be added to config when drive is next mounted
+- urd-backup.service has 6-hour timeout — may be insufficient for full send of largest subvolume (opptak ~3TB). March 23 failed send ran 2.3 hours
+- Bootstrap pattern — code that touches `external_snapshot_dir()` may assume per-subvolume dirs exist. Three instances found and fixed (mkdir, verify pins, space estimation). Watch for more
+- MockBtrfs tests don't exercise filesystem preconditions — `tempfile::TempDir` approach needed for code that touches real filesystem
 - Idea: [systemd unit drift check](../95-ideas/2026-03-23-systemd-unit-drift-check.md) in `urd verify`
