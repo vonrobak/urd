@@ -164,6 +164,13 @@ pub fn plan(
         // ── External operations ─────────────────────────────────────
         if !filters.local_only && subvol.send_enabled {
             for drive in &config.drives {
+                // Skip drives not in subvol.drives when specified
+                if let Some(ref allowed) = subvol.drives
+                    && !allowed.iter().any(|d| d == &drive.label)
+                {
+                    continue;
+                }
+
                 match fs.drive_availability(drive) {
                     DriveAvailability::Available => {}
                     DriveAvailability::NotMounted => {
@@ -1828,6 +1835,105 @@ send_enabled = false
             creates.len(),
             1,
             "Should create snapshot when free bytes unreadable (fail open)"
+        );
+    }
+
+    #[test]
+    fn drive_filtering_respects_subvol_drives() {
+        // Config with two drives, subvolume mapped to only D1
+        let toml_str = r#"
+[general]
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp"
+
+[local_snapshots]
+roots = [
+  { path = "/snap", subvolumes = ["sv1"], min_free_bytes = "10GB" }
+]
+
+[defaults]
+snapshot_interval = "1h"
+send_interval = "1h"
+send_enabled = true
+enabled = true
+
+[defaults.local_retention]
+hourly = 24
+daily = 7
+weekly = 4
+monthly = 0
+
+[defaults.external_retention]
+daily = 7
+weekly = 4
+monthly = 0
+
+[[drives]]
+label = "D1"
+mount_path = "/mnt/d1"
+snapshot_root = ".snapshots"
+role = "test"
+max_usage_percent = 90
+
+[[drives]]
+label = "D2"
+mount_path = "/mnt/d2"
+snapshot_root = ".snapshots"
+role = "test"
+max_usage_percent = 90
+
+[[subvolumes]]
+name = "sv1"
+short_name = "one"
+source = "/data/sv1"
+priority = 1
+drives = ["D1"]
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let mut fs = MockFileSystemState::new();
+        // Snapshot is old enough to trigger send
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap("20260322-1200-one")]);
+        // Both drives mounted
+        fs.mounted_drives.insert("D1".to_string());
+        fs.mounted_drives.insert("D2".to_string());
+
+        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+
+        // Should only have send operations for D1, not D2
+        let sends: Vec<_> = result
+            .operations
+            .iter()
+            .filter(|op| {
+                matches!(
+                    op,
+                    PlannedOperation::SendFull { drive_label, .. }
+                    | PlannedOperation::SendIncremental { drive_label, .. }
+                    if drive_label == "D2"
+                )
+            })
+            .collect();
+        assert!(
+            sends.is_empty(),
+            "D2 should be skipped — subvol.drives only allows D1"
+        );
+
+        let d1_sends: Vec<_> = result
+            .operations
+            .iter()
+            .filter(|op| {
+                matches!(
+                    op,
+                    PlannedOperation::SendFull { drive_label, .. }
+                    | PlannedOperation::SendIncremental { drive_label, .. }
+                    if drive_label == "D1"
+                )
+            })
+            .collect();
+        assert!(
+            !d1_sends.is_empty(),
+            "D1 should have send operations — it's in the allowed list"
         );
     }
 }

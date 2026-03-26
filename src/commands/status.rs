@@ -117,11 +117,20 @@ pub fn run(config: Config, output_mode: OutputMode) -> anyhow::Result<()> {
         .sum();
 
     // ── Assemble and render ─────────────────────────────────────────
+    // Thread protection_level from resolved config into status assessments
+    let assessments_with_promises: Vec<StatusAssessment> = assessments
+        .iter()
+        .map(|a| {
+            let mut sa = StatusAssessment::from_assessment(a);
+            if let Some(sv) = resolved.iter().find(|sv| sv.name == a.name) {
+                sa.promise_level = sv.protection_level.map(|l| l.to_string());
+            }
+            sa
+        })
+        .collect();
+
     let status_output = StatusOutput {
-        assessments: assessments
-            .iter()
-            .map(StatusAssessment::from_assessment)
-            .collect(),
+        assessments: assessments_with_promises,
         chain_health: chain_health_entries,
         drives: drive_infos,
         last_run,

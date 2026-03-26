@@ -9,6 +9,7 @@
 use serde::Serialize;
 
 use crate::config::Config;
+use crate::types::{ProtectionLevel, derive_policy};
 
 // ── Types ──────────────────────────────────────────────────────────────
 
@@ -40,6 +41,7 @@ pub fn preflight_checks(config: &Config) -> Vec<PreflightCheck> {
         }
 
         check_retention_send_compatibility(subvol, &mut checks);
+        check_promise_achievability(subvol, config, &mut checks);
     }
 
     checks
@@ -110,6 +112,109 @@ fn check_send_without_drives(
             message: format!(
                 "no drives configured but send is enabled for: {}",
                 send_enabled.join(", "),
+            ),
+        });
+    }
+}
+
+/// Check that a protection promise is achievable given the resolved config.
+///
+/// Three categories of problems:
+/// 1. **Drive count**: not enough drives for the promise level.
+/// 2. **Voiding overrides**: explicit settings that make the promise impossible
+///    (e.g., `send_enabled = false` on a `protected` subvolume).
+/// 3. **Weakening overrides**: explicit settings that degrade below the derived
+///    baseline (e.g., longer snapshot interval, tighter retention).
+fn check_promise_achievability(
+    subvol: &crate::config::ResolvedSubvolume,
+    config: &Config,
+    checks: &mut Vec<PreflightCheck>,
+) {
+    let level = match subvol.protection_level {
+        Some(l) if l != ProtectionLevel::Custom => l,
+        _ => return, // No promise or custom — nothing to check
+    };
+
+    let derived = match derive_policy(level, config.general.run_frequency) {
+        Some(d) => d,
+        None => return,
+    };
+
+    // ── Drive count vs promise ───────────────────────────────────────
+    if derived.min_external_drives > 0 {
+        let available_drives = match subvol.drives {
+            Some(ref drives) => drives.len(),
+            None => config.drives.len(),
+        };
+        if (available_drives as u8) < derived.min_external_drives {
+            checks.push(PreflightCheck {
+                name: "drive-count-vs-promise",
+                message: format!(
+                    "{}: {} promise requires {} external drive(s), but only {} configured",
+                    subvol.name, level, derived.min_external_drives, available_drives,
+                ),
+            });
+        }
+    }
+
+    // ── Voiding overrides ────────────────────────────────────────────
+    if derived.send_enabled && !subvol.send_enabled {
+        checks.push(PreflightCheck {
+            name: "voiding-override",
+            message: format!(
+                "{}: send_enabled=false voids the {} promise (external copies required)",
+                subvol.name, level,
+            ),
+        });
+    }
+
+    if derived.send_enabled
+        && let Some(ref drives) = subvol.drives
+        && drives.is_empty()
+    {
+        checks.push(PreflightCheck {
+            name: "voiding-override",
+            message: format!(
+                "{}: drives=[] voids the {} promise (external copies required)",
+                subvol.name, level,
+            ),
+        });
+    }
+
+    // ── Weakening overrides ──────────────────────────────────────────
+    if subvol.snapshot_interval.as_secs() > derived.snapshot_interval.as_secs() {
+        checks.push(PreflightCheck {
+            name: "weakening-override",
+            message: format!(
+                "{}: snapshot_interval is longer than {} baseline — promise may not be met",
+                subvol.name, level,
+            ),
+        });
+    }
+
+    if subvol.send_enabled && subvol.send_interval.as_secs() > derived.send_interval.as_secs() {
+        checks.push(PreflightCheck {
+            name: "weakening-override",
+            message: format!(
+                "{}: send_interval is longer than {} baseline — external copies may lag",
+                subvol.name, level,
+            ),
+        });
+    }
+
+    // Retention weakening: check if any bucket is tighter than derived
+    let local = &subvol.local_retention;
+    let derived_local = &derived.local_retention;
+    if local.hourly < derived_local.hourly
+        || local.daily < derived_local.daily
+        || local.weekly < derived_local.weekly
+        || (derived_local.monthly > 0 && local.monthly < derived_local.monthly)
+    {
+        checks.push(PreflightCheck {
+            name: "weakening-override",
+            message: format!(
+                "{}: local_retention is tighter than {} baseline — less history preserved",
+                subvol.name, level,
             ),
         });
     }
@@ -359,6 +464,163 @@ mod tests {
         let sv = test_subvolume("test-subvol");
         let config = test_config(vec![sv], vec![test_drive()]);
         let results = preflight_checks(&config);
+
+        assert!(results.is_empty());
+    }
+
+    // ── Promise achievability ────────────────────────────────────────
+
+    #[test]
+    fn resilient_needs_two_drives() {
+        let mut sv = test_subvolume("recordings");
+        sv.protection_level = Some(crate::types::ProtectionLevel::Resilient);
+        // Only one drive configured — resilient needs 2
+        let config = test_config(vec![sv], vec![test_drive()]);
+        let results: Vec<_> = preflight_checks(&config)
+            .into_iter()
+            .filter(|c| c.name == "drive-count-vs-promise")
+            .collect();
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].message.contains("2 external drive(s)"));
+    }
+
+    #[test]
+    fn protected_needs_one_drive() {
+        let mut sv = test_subvolume("documents");
+        sv.protection_level = Some(crate::types::ProtectionLevel::Protected);
+        // No drives at all
+        let config = test_config(vec![sv], vec![]);
+        let results: Vec<_> = preflight_checks(&config)
+            .into_iter()
+            .filter(|c| c.name == "drive-count-vs-promise")
+            .collect();
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].message.contains("1 external drive(s)"));
+    }
+
+    #[test]
+    fn guarded_no_drive_requirement() {
+        let mut sv = test_subvolume("logs");
+        sv.protection_level = Some(crate::types::ProtectionLevel::Guarded);
+        let config = test_config(vec![sv], vec![]);
+        let results: Vec<_> = preflight_checks(&config)
+            .into_iter()
+            .filter(|c| c.name == "drive-count-vs-promise")
+            .collect();
+
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn send_disabled_voids_protected_promise() {
+        let mut sv = test_subvolume("documents");
+        sv.protection_level = Some(crate::types::ProtectionLevel::Protected);
+        sv.send_enabled = Some(false);
+        let config = test_config(vec![sv], vec![test_drive()]);
+        let results: Vec<_> = preflight_checks(&config)
+            .into_iter()
+            .filter(|c| c.name == "voiding-override")
+            .collect();
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].message.contains("send_enabled=false"));
+        assert!(results[0].message.contains("voids"));
+    }
+
+    #[test]
+    fn empty_drives_list_voids_protected_promise() {
+        let mut sv = test_subvolume("documents");
+        sv.protection_level = Some(crate::types::ProtectionLevel::Protected);
+        sv.drives = Some(vec![]);
+        let config = test_config(vec![sv], vec![test_drive()]);
+        let results: Vec<_> = preflight_checks(&config)
+            .into_iter()
+            .filter(|c| c.name == "voiding-override")
+            .collect();
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].message.contains("drives=[]"));
+    }
+
+    #[test]
+    fn weakening_snapshot_interval_warns() {
+        let mut sv = test_subvolume("documents");
+        sv.protection_level = Some(crate::types::ProtectionLevel::Protected);
+        // Protected + daily timer derives 24h snapshot interval.
+        // Set a longer one to trigger the warning.
+        sv.snapshot_interval = Some("2d".parse().unwrap());
+        let config = test_config(vec![sv], vec![test_drive()]);
+        let results: Vec<_> = preflight_checks(&config)
+            .into_iter()
+            .filter(|c| c.name == "weakening-override")
+            .collect();
+
+        assert!(
+            results
+                .iter()
+                .any(|c| c.message.contains("snapshot_interval")),
+            "expected weakening warning for snapshot_interval"
+        );
+    }
+
+    #[test]
+    fn weakening_retention_warns() {
+        let mut sv = test_subvolume("documents");
+        sv.protection_level = Some(crate::types::ProtectionLevel::Protected);
+        // Protected derives hourly=24, daily=30. Set tighter retention.
+        sv.local_retention = Some(GraduatedRetention {
+            hourly: Some(6),
+            daily: Some(7),
+            weekly: Some(4),
+            monthly: Some(0),
+        });
+        let config = test_config(vec![sv], vec![test_drive()]);
+        let results: Vec<_> = preflight_checks(&config)
+            .into_iter()
+            .filter(|c| c.name == "weakening-override")
+            .collect();
+
+        assert!(
+            results
+                .iter()
+                .any(|c| c.message.contains("local_retention")),
+            "expected weakening warning for local_retention"
+        );
+    }
+
+    #[test]
+    fn custom_level_skips_all_promise_checks() {
+        let mut sv = test_subvolume("misc");
+        sv.protection_level = Some(crate::types::ProtectionLevel::Custom);
+        sv.send_enabled = Some(false);
+        let config = test_config(vec![sv], vec![]);
+        let results: Vec<_> = preflight_checks(&config)
+            .into_iter()
+            .filter(|c| {
+                c.name == "drive-count-vs-promise"
+                    || c.name == "voiding-override"
+                    || c.name == "weakening-override"
+            })
+            .collect();
+
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn no_promise_skips_all_promise_checks() {
+        let sv = test_subvolume("misc");
+        assert!(sv.protection_level.is_none());
+        let config = test_config(vec![sv], vec![test_drive()]);
+        let results: Vec<_> = preflight_checks(&config)
+            .into_iter()
+            .filter(|c| {
+                c.name == "drive-count-vs-promise"
+                    || c.name == "voiding-override"
+                    || c.name == "weakening-override"
+            })
+            .collect();
 
         assert!(results.is_empty());
     }
