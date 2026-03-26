@@ -66,6 +66,7 @@ pub fn get_filesystem_uuid(mount_path: &Path) -> crate::error::Result<Option<Str
     })?;
 
     let output = Command::new("findmnt")
+        .env("LC_ALL", "C")
         .args(["-n", "-o", "UUID", mount_str])
         .output()
         .map_err(|e| UrdError::Io {

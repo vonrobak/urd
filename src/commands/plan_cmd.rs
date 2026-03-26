@@ -1,13 +1,15 @@
-use colored::Colorize;
-
 use crate::cli::PlanArgs;
 use crate::config::Config;
 use crate::drives;
+use crate::output::{
+    OutputMode, PlanOperationEntry, PlanOutput, PlanSummaryOutput, SkippedSubvolume,
+};
 use crate::plan::{self, PlanFilters, RealFileSystemState};
 use crate::state::StateDb;
 use crate::types::PlannedOperation;
+use crate::voice;
 
-pub fn run(config: Config, args: PlanArgs) -> anyhow::Result<()> {
+pub fn run(config: Config, args: PlanArgs, mode: OutputMode) -> anyhow::Result<()> {
     let now = chrono::Local::now().naive_local();
     let filters = PlanFilters {
         priority: args.priority,
@@ -25,136 +27,109 @@ pub fn run(config: Config, args: PlanArgs) -> anyhow::Result<()> {
     // Warn about drives without UUID fingerprinting
     drives::warn_missing_uuids(&config.drives);
 
-    run_with_plan(&config, &backup_plan)
-}
-
-/// Print a backup plan. Shared by `urd plan` and `urd backup --dry-run`.
-pub fn run_with_plan(
-    config: &Config,
-    backup_plan: &crate::types::BackupPlan,
-) -> anyhow::Result<()> {
-    // Print header
-    println!(
-        "{}",
-        format!(
-            "Urd backup plan for {}",
-            backup_plan.timestamp.format("%Y-%m-%d %H:%M")
-        )
-        .bold()
-    );
-    println!();
-
-    if backup_plan.operations.is_empty() && backup_plan.skipped.is_empty() {
-        println!("{}", "Nothing to do.".dimmed());
-        return Ok(());
-    }
-
-    // Group operations by subvolume
-    let resolved = config.resolved_subvolumes();
-    for subvol in &resolved {
-        let ops: Vec<_> = backup_plan
-            .operations
-            .iter()
-            .filter(|op| op_subvolume_name(op) == subvol.name)
-            .collect();
-        let skips: Vec<_> = backup_plan
-            .skipped
-            .iter()
-            .filter(|(name, _)| name == &subvol.name)
-            .collect();
-
-        if ops.is_empty() && skips.is_empty() {
-            continue;
-        }
-
-        println!(
-            "{} (priority {}, every {}):",
-            subvol.name.bold(),
-            subvol.priority,
-            subvol.snapshot_interval
-        );
-
-        for op in &ops {
-            print_operation(op);
-        }
-        for (_, reason) in &skips {
-            println!("  {} {}", "[SKIP]".dimmed(), reason.dimmed());
-        }
-        println!();
-    }
-
-    // Summary
-    let summary = backup_plan.summary();
-    println!("{}", format!("Summary: {summary}").bold());
+    let output = build_plan_output(&backup_plan);
+    print!("{}", voice::render_plan(&output, mode));
 
     Ok(())
 }
 
-fn op_subvolume_name(op: &PlannedOperation) -> &str {
-    match op {
-        PlannedOperation::CreateSnapshot { subvolume_name, .. }
-        | PlannedOperation::SendIncremental { subvolume_name, .. }
-        | PlannedOperation::SendFull { subvolume_name, .. }
-        | PlannedOperation::DeleteSnapshot { subvolume_name, .. } => subvolume_name,
+/// Build PlanOutput from a BackupPlan. Shared by `urd plan` and `urd backup --dry-run`.
+#[must_use]
+pub fn build_plan_output(backup_plan: &crate::types::BackupPlan) -> PlanOutput {
+    let summary = backup_plan.summary();
+
+    let operations: Vec<PlanOperationEntry> = backup_plan
+        .operations
+        .iter()
+        .map(build_operation_entry)
+        .collect();
+
+    let skipped: Vec<SkippedSubvolume> = backup_plan
+        .skipped
+        .iter()
+        .map(|(name, reason)| SkippedSubvolume {
+            name: name.clone(),
+            reason: reason.clone(),
+        })
+        .collect();
+
+    PlanOutput {
+        timestamp: backup_plan.timestamp.format("%Y-%m-%d %H:%M").to_string(),
+        operations,
+        skipped,
+        summary: PlanSummaryOutput {
+            snapshots: summary.snapshots,
+            sends: summary.sends,
+            deletions: summary.deletions,
+            skipped: summary.skipped,
+        },
     }
 }
 
-fn print_operation(op: &PlannedOperation) {
+fn build_operation_entry(op: &PlannedOperation) -> PlanOperationEntry {
     match op {
-        PlannedOperation::CreateSnapshot { source, dest, .. } => {
-            println!(
-                "  {} {} -> {}",
-                "[CREATE]".green(),
-                source.display(),
-                dest.display()
-            );
-        }
+        PlannedOperation::CreateSnapshot {
+            source,
+            dest,
+            subvolume_name,
+        } => PlanOperationEntry {
+            subvolume: subvolume_name.clone(),
+            operation: "create".to_string(),
+            detail: format!("{} -> {}", source.display(), dest.display()),
+        },
         PlannedOperation::SendIncremental {
             snapshot,
             drive_label,
             parent,
             pin_on_success,
+            subvolume_name,
             ..
         } => {
+            let snap_name = snapshot.file_name().unwrap_or_default().to_string_lossy();
             let parent_name = parent.file_name().unwrap_or_default().to_string_lossy();
             let pin_suffix = if pin_on_success.is_some() {
                 " + pin"
             } else {
                 ""
             };
-            println!(
-                "  {}   {} -> {} (incremental, parent: {}){pin_suffix}",
-                "[SEND]".blue(),
-                snapshot.file_name().unwrap_or_default().to_string_lossy(),
-                drive_label,
-                parent_name
-            );
+            PlanOperationEntry {
+                subvolume: subvolume_name.clone(),
+                operation: "send".to_string(),
+                detail: format!(
+                    "{snap_name} -> {drive_label} (incremental, parent: {parent_name}){pin_suffix}"
+                ),
+            }
         }
         PlannedOperation::SendFull {
             snapshot,
             drive_label,
             pin_on_success,
+            subvolume_name,
             ..
         } => {
+            let snap_name = snapshot.file_name().unwrap_or_default().to_string_lossy();
             let pin_suffix = if pin_on_success.is_some() {
                 " + pin"
             } else {
                 ""
             };
-            println!(
-                "  {}   {} -> {} (full){pin_suffix}",
-                "[SEND]".blue(),
-                snapshot.file_name().unwrap_or_default().to_string_lossy(),
-                drive_label,
-            );
+            PlanOperationEntry {
+                subvolume: subvolume_name.clone(),
+                operation: "send".to_string(),
+                detail: format!("{snap_name} -> {drive_label} (full){pin_suffix}"),
+            }
         }
-        PlannedOperation::DeleteSnapshot { path, reason, .. } => {
-            println!(
-                "  {} {} ({})",
-                "[DELETE]".yellow(),
-                path.file_name().unwrap_or_default().to_string_lossy(),
-                reason
-            );
+        PlannedOperation::DeleteSnapshot {
+            path,
+            reason,
+            subvolume_name,
+        } => {
+            let snap_name = path.file_name().unwrap_or_default().to_string_lossy();
+            PlanOperationEntry {
+                subvolume: subvolume_name.clone(),
+                operation: "delete".to_string(),
+                detail: format!("{snap_name} ({reason})"),
+            }
         }
     }
 }

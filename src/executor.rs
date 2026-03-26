@@ -6,6 +6,7 @@ use std::time::Instant;
 use crate::btrfs::BtrfsOps;
 use crate::chain;
 use crate::config::Config;
+use crate::error::BtrfsOperation;
 use crate::state::{OperationRecord, StateDb};
 use crate::types::{BackupPlan, PlannedOperation};
 
@@ -63,6 +64,10 @@ pub struct OperationOutcome {
     pub duration: std::time::Duration,
     pub error: Option<String>,
     pub bytes_transferred: Option<u64>,
+    /// Typed btrfs operation for structured error translation.
+    pub btrfs_operation: Option<BtrfsOperation>,
+    /// Raw stderr from btrfs subprocess (when available).
+    pub btrfs_stderr: Option<String>,
 }
 
 #[derive(Debug)]
@@ -275,9 +280,13 @@ impl<'a> Executor<'a> {
                 duration: start.elapsed(),
                 error: None,
                 bytes_transferred: None,
+                btrfs_operation: None,
+                btrfs_stderr: None,
             },
             Err(e) => {
                 log::error!("Snapshot creation failed: {e}");
+                let btrfs_op = e.btrfs_operation();
+                let btrfs_stderr = e.btrfs_stderr().map(String::from);
                 failed_creates.insert(dest);
                 OperationOutcome {
                     operation: "snapshot".to_string(),
@@ -286,6 +295,8 @@ impl<'a> Executor<'a> {
                     duration: start.elapsed(),
                     error: Some(e.to_string()),
                     bytes_transferred: None,
+                    btrfs_operation: btrfs_op,
+                    btrfs_stderr,
                 }
             }
         }
@@ -325,6 +336,8 @@ impl<'a> Executor<'a> {
                     duration: start.elapsed(),
                     error: Some("snapshot creation failed".to_string()),
                     bytes_transferred: None,
+                btrfs_operation: None,
+                btrfs_stderr: None,
                 },
                 false,
             );
@@ -350,6 +363,8 @@ impl<'a> Executor<'a> {
                             dest_dir.display()
                         )),
                         bytes_transferred: None,
+                        btrfs_operation: None,
+                        btrfs_stderr: None,
                     },
                     false,
                 );
@@ -378,6 +393,8 @@ impl<'a> Executor<'a> {
                             duration: start.elapsed(),
                             error: None,
                             bytes_transferred: None,
+                            btrfs_operation: None,
+                            btrfs_stderr: None,
                         },
                         false,
                     );
@@ -401,6 +418,8 @@ impl<'a> Executor<'a> {
                                 dest_snap.display()
                             )),
                             bytes_transferred: None,
+                            btrfs_operation: None,
+                            btrfs_stderr: None,
                         },
                         false,
                     );
@@ -435,19 +454,16 @@ impl<'a> Executor<'a> {
                         duration: start.elapsed(),
                         error: None,
                         bytes_transferred: result.bytes_transferred,
+                        btrfs_operation: None,
+                        btrfs_stderr: None,
                     },
                     pin_failed,
                 )
             }
             Err(e) => {
-                // Extract partial byte count from btrfs errors (e.g., failed sends
-                // that transferred some data before the pipe broke)
-                let partial_bytes = match &e {
-                    crate::error::UrdError::Btrfs {
-                        bytes_transferred, ..
-                    } => *bytes_transferred,
-                    _ => None,
-                };
+                let partial_bytes = e.bytes_transferred();
+                let btrfs_op = e.btrfs_operation();
+                let btrfs_stderr = e.btrfs_stderr().map(String::from);
                 log::error!("{op_name} failed for {subvol_name} -> {drive_label}: {e}");
                 if let Some(bytes) = partial_bytes {
                     log::info!("Partial transfer: {} bytes copied before failure", bytes,);
@@ -460,6 +476,8 @@ impl<'a> Executor<'a> {
                         duration: start.elapsed(),
                         error: Some(e.to_string()),
                         bytes_transferred: partial_bytes,
+                        btrfs_operation: btrfs_op,
+                        btrfs_stderr,
                     },
                     false,
                 )
@@ -492,6 +510,8 @@ impl<'a> Executor<'a> {
                 duration: start.elapsed(),
                 error: Some("space recovered, deletion skipped".to_string()),
                 bytes_transferred: None,
+                btrfs_operation: None,
+                btrfs_stderr: None,
             };
         }
 
@@ -516,6 +536,8 @@ impl<'a> Executor<'a> {
                             duration: start.elapsed(),
                             error: Some("snapshot is pinned".to_string()),
                             bytes_transferred: None,
+                            btrfs_operation: None,
+                            btrfs_stderr: None,
                         };
                     }
                 }
@@ -550,10 +572,14 @@ impl<'a> Executor<'a> {
                     duration: start.elapsed(),
                     error: None,
                     bytes_transferred: None,
+                btrfs_operation: None,
+                btrfs_stderr: None,
                 }
             }
             Err(e) => {
                 log::error!("Delete failed for {}: {e}", path.display());
+                let btrfs_op = e.btrfs_operation();
+                let btrfs_stderr = e.btrfs_stderr().map(String::from);
                 OperationOutcome {
                     operation: "delete".to_string(),
                     drive_label: self.drive_label_for_path(path),
@@ -561,6 +587,8 @@ impl<'a> Executor<'a> {
                     duration: start.elapsed(),
                     error: Some(e.to_string()),
                     bytes_transferred: None,
+                    btrfs_operation: btrfs_op,
+                    btrfs_stderr,
                 }
             }
         }

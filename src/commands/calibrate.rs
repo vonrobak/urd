@@ -1,24 +1,19 @@
-use std::io::Write;
-
-use colored::Colorize;
-
 use crate::cli::CalibrateArgs;
 use crate::config::Config;
+use crate::output::{CalibrateEntry, CalibrateOutput, CalibrateResult, OutputMode};
 use crate::plan::FileSystemState;
 use crate::plan::RealFileSystemState;
 use crate::state::StateDb;
-use crate::types::ByteSize;
+use crate::voice;
 
-pub fn run(config: Config, args: CalibrateArgs) -> anyhow::Result<()> {
+pub fn run(config: Config, args: CalibrateArgs, mode: OutputMode) -> anyhow::Result<()> {
     let state_db = StateDb::open(&config.general.state_db)?;
     let resolved = config.resolved_subvolumes();
-
-    println!("{}", "Urd calibrate — measuring snapshot sizes".bold());
-    println!();
 
     let fs_state = RealFileSystemState {
         state: Some(&state_db),
     };
+    let mut entries = Vec::new();
     let mut calibrated = 0usize;
     let mut skipped = 0usize;
 
@@ -31,17 +26,23 @@ pub fn run(config: Config, args: CalibrateArgs) -> anyhow::Result<()> {
         }
 
         if !subvol.enabled {
-            println!("  {} {} (disabled)", "SKIP".dimmed(), subvol.name);
+            entries.push(CalibrateEntry {
+                name: subvol.name.clone(),
+                result: CalibrateResult::Skipped {
+                    reason: "disabled".to_string(),
+                },
+            });
             skipped += 1;
             continue;
         }
 
         let Some(snapshot_root) = config.snapshot_root_for(&subvol.name) else {
-            println!(
-                "  {} {} (no snapshot root configured)",
-                "SKIP".dimmed(),
-                subvol.name,
-            );
+            entries.push(CalibrateEntry {
+                name: subvol.name.clone(),
+                result: CalibrateResult::Skipped {
+                    reason: "no snapshot root configured".to_string(),
+                },
+            });
             skipped += 1;
             continue;
         };
@@ -51,18 +52,22 @@ pub fn run(config: Config, args: CalibrateArgs) -> anyhow::Result<()> {
             .unwrap_or_default();
 
         let Some(newest) = local_snaps.iter().max() else {
-            println!("  {} {} (no local snapshots)", "SKIP".dimmed(), subvol.name,);
+            entries.push(CalibrateEntry {
+                name: subvol.name.clone(),
+                result: CalibrateResult::Skipped {
+                    reason: "no local snapshots".to_string(),
+                },
+            });
             skipped += 1;
             continue;
         };
 
         let snap_path = snapshot_root.join(&subvol.name).join(newest.as_str());
-
-        print!("  {} ({})... ", subvol.name.bold(), newest);
-        std::io::stdout().flush()?;
+        let snapshot_name = newest.to_string();
 
         // Run du -sb on the snapshot (apparent size in bytes)
         let output = std::process::Command::new("du")
+            .env("LC_ALL", "C")
             .args(["-sb"])
             .arg(&snap_path)
             .output();
@@ -79,40 +84,60 @@ pub fn run(config: Config, args: CalibrateArgs) -> anyhow::Result<()> {
                 match bytes {
                     Some(bytes) => {
                         state_db.upsert_subvolume_size(&subvol.name, bytes, "du -sb")?;
-                        println!("{}", ByteSize(bytes));
+                        entries.push(CalibrateEntry {
+                            name: subvol.name.clone(),
+                            result: CalibrateResult::Ok {
+                                snapshot: snapshot_name,
+                                bytes,
+                            },
+                        });
                         calibrated += 1;
                     }
                     None => {
-                        println!("{}", "FAILED".red());
-                        eprintln!(
-                            "    du -sb returned no usable size (output: {:?})",
-                            stdout.trim(),
-                        );
+                        entries.push(CalibrateEntry {
+                            name: subvol.name.clone(),
+                            result: CalibrateResult::Failed {
+                                snapshot: snapshot_name,
+                                error: format!(
+                                    "du -sb returned no usable size (output: {:?})",
+                                    stdout.trim()
+                                ),
+                            },
+                        });
                         skipped += 1;
                     }
                 }
             }
             Ok(output) => {
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                println!("{}", "FAILED".red());
-                eprintln!("    du failed: {}", stderr.trim());
+                entries.push(CalibrateEntry {
+                    name: subvol.name.clone(),
+                    result: CalibrateResult::Failed {
+                        snapshot: snapshot_name,
+                        error: format!("du failed: {}", stderr.trim()),
+                    },
+                });
                 skipped += 1;
             }
             Err(e) => {
-                println!("{}", "FAILED".red());
-                eprintln!("    du error: {e}");
+                entries.push(CalibrateEntry {
+                    name: subvol.name.clone(),
+                    result: CalibrateResult::Failed {
+                        snapshot: snapshot_name,
+                        error: format!("du error: {e}"),
+                    },
+                });
                 skipped += 1;
             }
         }
     }
 
-    println!();
-    println!(
-        "Calibrated {} subvolume(s), skipped {}.",
-        calibrated, skipped,
-    );
-    println!("Sizes stored in state database. The planner will use these as fallback",);
-    println!("estimates when no send history exists.");
+    let data = CalibrateOutput {
+        entries,
+        calibrated,
+        skipped,
+    };
+    print!("{}", voice::render_calibrate(&data, mode));
 
     Ok(())
 }

@@ -45,13 +45,13 @@ fn main() -> anyhow::Result<()> {
     let output_mode = output::OutputMode::detect();
 
     match cli.command {
-        Commands::Plan(args) => commands::plan_cmd::run(config, args),
+        Commands::Plan(args) => commands::plan_cmd::run(config, args, output_mode),
         Commands::Backup(args) => commands::backup::run(config, args),
         Commands::Init => commands::init::run(config),
-        Commands::Calibrate(args) => commands::calibrate::run(config, args),
+        Commands::Calibrate(args) => commands::calibrate::run(config, args, output_mode),
         Commands::Status => commands::status::run(config, output_mode),
-        Commands::History(args) => commands::history::run(config, args),
-        Commands::Verify(args) => commands::verify::run(config, args),
+        Commands::History(args) => commands::history::run(config, args, output_mode),
+        Commands::Verify(args) => commands::verify::run(config, args, output_mode),
         Commands::Get(args) => commands::get::run(config, args, output_mode),
     }
 }
