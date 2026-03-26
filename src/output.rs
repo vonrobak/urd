@@ -214,6 +214,20 @@ pub struct SubvolumeSummary {
     /// Per-drive send results (zero or more per subvolume).
     pub sends: Vec<SendSummary>,
     pub errors: Vec<String>,
+    /// Structured error details (when btrfs errors have been translated).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub structured_errors: Vec<StructuredError>,
+}
+
+/// A translated btrfs error with layered detail.
+#[derive(Debug, Serialize)]
+pub struct StructuredError {
+    pub operation: String,
+    pub summary: String,
+    pub cause: String,
+    pub remediation: Vec<String>,
+    pub drive: Option<String>,
+    pub bytes_transferred: Option<u64>,
 }
 
 /// Result of a single send operation to one drive.
@@ -229,6 +243,157 @@ pub struct SendSummary {
 pub struct SkippedSubvolume {
     pub name: String,
     pub reason: String,
+}
+
+// ── PlanOutput ─────────────────────────────────────────────────────────
+
+/// Structured output for the `urd plan` and `urd backup --dry-run` commands.
+#[derive(Debug, Serialize)]
+pub struct PlanOutput {
+    pub timestamp: String,
+    pub operations: Vec<PlanOperationEntry>,
+    pub skipped: Vec<SkippedSubvolume>,
+    pub summary: PlanSummaryOutput,
+}
+
+/// A single planned operation for display.
+#[derive(Debug, Serialize)]
+pub struct PlanOperationEntry {
+    pub subvolume: String,
+    pub operation: String,
+    pub detail: String,
+}
+
+/// Summary counts for a backup plan.
+#[derive(Debug, Serialize)]
+pub struct PlanSummaryOutput {
+    pub snapshots: usize,
+    pub sends: usize,
+    pub deletions: usize,
+    pub skipped: usize,
+}
+
+// ── HistoryOutput ──────────────────────────────────────────────────────
+
+/// Structured output for the `urd history` command.
+#[derive(Debug, Serialize)]
+pub struct HistoryOutput {
+    pub runs: Vec<HistoryRun>,
+}
+
+/// A single backup run in history.
+#[derive(Debug, Serialize)]
+pub struct HistoryRun {
+    pub id: i64,
+    pub started_at: String,
+    pub mode: String,
+    pub result: String,
+    pub duration: Option<String>,
+}
+
+/// Structured output for `urd history --subvolume`.
+#[derive(Debug, Serialize)]
+pub struct SubvolumeHistoryOutput {
+    pub subvolume: String,
+    pub operations: Vec<HistoryOperation>,
+}
+
+/// A single operation in subvolume history.
+#[derive(Debug, Serialize)]
+pub struct HistoryOperation {
+    pub run_id: i64,
+    pub operation: String,
+    pub drive: Option<String>,
+    pub result: String,
+    pub duration: Option<String>,
+    pub error: Option<String>,
+}
+
+/// Structured output for `urd history --failures`.
+#[derive(Debug, Serialize)]
+pub struct FailuresOutput {
+    pub failures: Vec<FailureEntry>,
+}
+
+/// A single failure entry.
+#[derive(Debug, Serialize)]
+pub struct FailureEntry {
+    pub run_id: i64,
+    pub subvolume: String,
+    pub operation: String,
+    pub drive: Option<String>,
+    pub error: Option<String>,
+}
+
+// ── CalibrateOutput ───────────────────────────────────────────────────
+
+/// Structured output for the `urd calibrate` command.
+#[derive(Debug, Serialize)]
+pub struct CalibrateOutput {
+    pub entries: Vec<CalibrateEntry>,
+    pub calibrated: usize,
+    pub skipped: usize,
+}
+
+/// A single calibration entry.
+#[derive(Debug, Serialize)]
+pub struct CalibrateEntry {
+    pub name: String,
+    pub result: CalibrateResult,
+}
+
+/// Result of calibrating one subvolume.
+#[derive(Debug, Serialize)]
+#[serde(tag = "status")]
+pub enum CalibrateResult {
+    #[serde(rename = "ok")]
+    Ok {
+        snapshot: String,
+        bytes: u64,
+    },
+    #[serde(rename = "skipped")]
+    Skipped {
+        reason: String,
+    },
+    #[serde(rename = "failed")]
+    Failed {
+        snapshot: String,
+        error: String,
+    },
+}
+
+// ── VerifyOutput ──────────────────────────────────────────────────────
+
+/// Structured output for the `urd verify` command.
+#[derive(Debug, Serialize)]
+pub struct VerifyOutput {
+    pub subvolumes: Vec<VerifySubvolume>,
+    pub preflight_warnings: Vec<String>,
+    pub ok_count: u32,
+    pub warn_count: u32,
+    pub fail_count: u32,
+}
+
+/// Verification results for one subvolume.
+#[derive(Debug, Serialize)]
+pub struct VerifySubvolume {
+    pub name: String,
+    pub drives: Vec<VerifyDrive>,
+}
+
+/// Verification results for one subvolume/drive pair.
+#[derive(Debug, Serialize)]
+pub struct VerifyDrive {
+    pub label: String,
+    pub checks: Vec<VerifyCheck>,
+}
+
+/// A single verification check result.
+#[derive(Debug, Serialize)]
+pub struct VerifyCheck {
+    pub name: String,
+    pub status: String,
+    pub detail: Option<String>,
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────

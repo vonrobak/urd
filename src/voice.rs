@@ -11,7 +11,10 @@ use std::fmt::Write;
 
 use colored::Colorize;
 
-use crate::output::{BackupSummary, GetOutput, OutputMode, StatusOutput};
+use crate::output::{
+    BackupSummary, CalibrateOutput, CalibrateResult, FailuresOutput, GetOutput, HistoryOutput,
+    OutputMode, PlanOutput, StatusOutput, SubvolumeHistoryOutput, VerifyOutput,
+};
 use crate::types::ByteSize;
 
 // ── Status ──────────────────────────────────────────────────────────────
@@ -317,8 +320,30 @@ fn render_backup_interactive(data: &BackupSummary) -> String {
             )
             .ok();
 
-            for err in &sv.errors {
-                writeln!(out, "    {} {}", "ERROR".red(), err).ok();
+            if !sv.structured_errors.is_empty() {
+                // Render structured errors with layered detail
+                for se in &sv.structured_errors {
+                    writeln!(out, "    {} {}: {}", "ERROR".red(), se.operation, se.summary).ok();
+                    writeln!(out, "          Why: {}", se.cause).ok();
+                    if let Some(bytes) = se.bytes_transferred {
+                        writeln!(
+                            out,
+                            "          Transferred {} before failure",
+                            ByteSize(bytes)
+                        )
+                        .ok();
+                    }
+                    if !se.remediation.is_empty() {
+                        writeln!(out, "          What to do:").ok();
+                        for step in &se.remediation {
+                            writeln!(out, "            \u{2022} {step}").ok();
+                        }
+                    }
+                }
+            } else {
+                for err in &sv.errors {
+                    writeln!(out, "    {} {}", "ERROR".red(), err).ok();
+                }
             }
         }
     }
@@ -528,14 +553,424 @@ fn render_get_interactive(data: &GetOutput) -> String {
     )
 }
 
+// ── Plan ────────────────────────────────────────────────────────────────
+
+/// Render plan output according to the given mode.
+#[must_use]
+pub fn render_plan(data: &PlanOutput, mode: OutputMode) -> String {
+    match mode {
+        OutputMode::Interactive => render_plan_interactive(data),
+        OutputMode::Daemon => {
+            serde_json::to_string_pretty(data)
+                .unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
+        }
+    }
+}
+
+fn render_plan_interactive(data: &PlanOutput) -> String {
+    let mut out = String::new();
+
+    writeln!(out, "{}", format!("Urd backup plan for {}", data.timestamp).bold()).ok();
+    writeln!(out).ok();
+
+    if data.operations.is_empty() && data.skipped.is_empty() {
+        writeln!(out, "{}", "Nothing to do.".dimmed()).ok();
+        return out;
+    }
+
+    // Group operations by subvolume
+    let mut current_subvol: Option<&str> = None;
+    for entry in &data.operations {
+        if current_subvol != Some(&entry.subvolume) {
+            if current_subvol.is_some() {
+                writeln!(out).ok();
+            }
+            writeln!(out, "{}:", entry.subvolume.bold()).ok();
+            current_subvol = Some(&entry.subvolume);
+        }
+
+        let label = match entry.operation.as_str() {
+            "create" => "[CREATE]".green().to_string(),
+            "send" => "[SEND]".blue().to_string(),
+            "delete" => "[DELETE]".yellow().to_string(),
+            other => format!("[{other}]"),
+        };
+        writeln!(out, "  {:<10} {}", label, entry.detail).ok();
+    }
+
+    // Skipped entries
+    if !data.skipped.is_empty() {
+        if current_subvol.is_some() {
+            writeln!(out).ok();
+        }
+        for skip in &data.skipped {
+            writeln!(
+                out,
+                "  {} {}: {}",
+                "[SKIP]".dimmed(),
+                skip.name,
+                skip.reason.dimmed()
+            )
+            .ok();
+        }
+    }
+
+    writeln!(out).ok();
+    writeln!(
+        out,
+        "{}",
+        format!(
+            "Summary: {} snapshots, {} sends, {} deletions, {} skipped",
+            data.summary.snapshots, data.summary.sends, data.summary.deletions, data.summary.skipped
+        )
+        .bold()
+    )
+    .ok();
+
+    out
+}
+
+// ── History ─────────────────────────────────────────────────────────────
+
+/// Render history (recent runs) output.
+#[must_use]
+pub fn render_history(data: &HistoryOutput, mode: OutputMode) -> String {
+    match mode {
+        OutputMode::Interactive => render_history_interactive(data),
+        OutputMode::Daemon => {
+            serde_json::to_string_pretty(data)
+                .unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
+        }
+    }
+}
+
+fn render_history_interactive(data: &HistoryOutput) -> String {
+    let mut out = String::new();
+
+    if data.runs.is_empty() {
+        writeln!(out, "{}", "No backup runs recorded.".dimmed()).ok();
+        return out;
+    }
+
+    let headers = vec![
+        "RUN".to_string(),
+        "STARTED".to_string(),
+        "MODE".to_string(),
+        "RESULT".to_string(),
+        "DURATION".to_string(),
+    ];
+    let rows: Vec<Vec<String>> = data
+        .runs
+        .iter()
+        .map(|r| {
+            vec![
+                r.id.to_string(),
+                r.started_at.clone(),
+                r.mode.clone(),
+                r.result.clone(),
+                r.duration.clone().unwrap_or_else(|| "running".to_string()),
+            ]
+        })
+        .collect();
+    format_history_table(&headers, &rows, &mut out);
+
+    out
+}
+
+/// Render subvolume history output.
+#[must_use]
+pub fn render_subvolume_history(data: &SubvolumeHistoryOutput, mode: OutputMode) -> String {
+    match mode {
+        OutputMode::Interactive => render_subvolume_history_interactive(data),
+        OutputMode::Daemon => {
+            serde_json::to_string_pretty(data)
+                .unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
+        }
+    }
+}
+
+fn render_subvolume_history_interactive(data: &SubvolumeHistoryOutput) -> String {
+    let mut out = String::new();
+
+    if data.operations.is_empty() {
+        writeln!(out, "No operations recorded for subvolume {:?}.", data.subvolume).ok();
+        return out;
+    }
+
+    writeln!(out, "{}", format!("History for {}:", data.subvolume).bold()).ok();
+    writeln!(out).ok();
+
+    let headers = vec![
+        "RUN".to_string(),
+        "OPERATION".to_string(),
+        "DRIVE".to_string(),
+        "RESULT".to_string(),
+        "DURATION".to_string(),
+        "ERROR".to_string(),
+    ];
+    let rows: Vec<Vec<String>> = data
+        .operations
+        .iter()
+        .map(|op| {
+            vec![
+                op.run_id.to_string(),
+                op.operation.clone(),
+                op.drive.clone().unwrap_or_else(|| "\u{2014}".to_string()),
+                op.result.clone(),
+                op.duration.clone().unwrap_or_else(|| "\u{2014}".to_string()),
+                truncate_str(op.error.as_deref().unwrap_or(""), 30),
+            ]
+        })
+        .collect();
+    format_history_table(&headers, &rows, &mut out);
+
+    out
+}
+
+/// Render failures output.
+#[must_use]
+pub fn render_failures(data: &FailuresOutput, mode: OutputMode) -> String {
+    match mode {
+        OutputMode::Interactive => render_failures_interactive(data),
+        OutputMode::Daemon => {
+            serde_json::to_string_pretty(data)
+                .unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
+        }
+    }
+}
+
+fn render_failures_interactive(data: &FailuresOutput) -> String {
+    let mut out = String::new();
+
+    if data.failures.is_empty() {
+        writeln!(out, "{}", "No failures recorded.".green()).ok();
+        return out;
+    }
+
+    writeln!(
+        out,
+        "{}",
+        format!("{} failure(s):", data.failures.len()).red().bold()
+    )
+    .ok();
+    writeln!(out).ok();
+
+    let headers = vec![
+        "RUN".to_string(),
+        "SUBVOLUME".to_string(),
+        "OPERATION".to_string(),
+        "DRIVE".to_string(),
+        "ERROR".to_string(),
+    ];
+    let rows: Vec<Vec<String>> = data
+        .failures
+        .iter()
+        .map(|f| {
+            vec![
+                f.run_id.to_string(),
+                f.subvolume.clone(),
+                f.operation.clone(),
+                f.drive.clone().unwrap_or_else(|| "\u{2014}".to_string()),
+                truncate_str(f.error.as_deref().unwrap_or("unknown"), 40),
+            ]
+        })
+        .collect();
+    format_history_table(&headers, &rows, &mut out);
+
+    out
+}
+
+/// Format a table with result-colored RESULT column.
+fn format_history_table(headers: &[String], rows: &[Vec<String>], out: &mut String) {
+    let cols = headers.len();
+    let mut widths: Vec<usize> = headers.iter().map(|h| h.len()).collect();
+    for row in rows {
+        for (i, cell) in row.iter().enumerate() {
+            if i < cols {
+                widths[i] = widths[i].max(cell.len());
+            }
+        }
+    }
+
+    // Header
+    let header_line: Vec<String> = headers
+        .iter()
+        .enumerate()
+        .map(|(i, h)| format!("{:<width$}", h, width = widths[i]))
+        .collect();
+    writeln!(out, "{}", header_line.join("  ").bold()).ok();
+
+    // Rows — color the RESULT column
+    let result_col = headers.iter().position(|h| h == "RESULT");
+    for row in rows {
+        let line: Vec<String> = row
+            .iter()
+            .enumerate()
+            .map(|(i, cell)| {
+                let w = widths.get(i).copied().unwrap_or(cell.len());
+                if Some(i) == result_col {
+                    let colored = color_result(cell);
+                    let visible_len = cell.len();
+                    let padding = w.saturating_sub(visible_len);
+                    format!("{colored}{:padding$}", "", padding = padding)
+                } else {
+                    format!("{:<width$}", cell, width = w)
+                }
+            })
+            .collect();
+        writeln!(out, "{}", line.join("  ")).ok();
+    }
+}
+
+fn truncate_str(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        return s.to_string();
+    }
+    let end = s
+        .char_indices()
+        .take_while(|(i, _)| *i < max_len.saturating_sub(3))
+        .last()
+        .map(|(i, c)| i + c.len_utf8())
+        .unwrap_or(0);
+    format!("{}...", &s[..end])
+}
+
+// ── Calibrate ───────────────────────────────────────────────────────────
+
+/// Render calibrate output according to the given mode.
+#[must_use]
+pub fn render_calibrate(data: &CalibrateOutput, mode: OutputMode) -> String {
+    match mode {
+        OutputMode::Interactive => render_calibrate_interactive(data),
+        OutputMode::Daemon => {
+            serde_json::to_string_pretty(data)
+                .unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
+        }
+    }
+}
+
+fn render_calibrate_interactive(data: &CalibrateOutput) -> String {
+    let mut out = String::new();
+
+    writeln!(out, "{}", "Urd calibrate \u{2014} measuring snapshot sizes".bold()).ok();
+    writeln!(out).ok();
+
+    for entry in &data.entries {
+        match &entry.result {
+            CalibrateResult::Ok { snapshot, bytes } => {
+                writeln!(
+                    out,
+                    "  {} ({}) {}",
+                    entry.name.bold(),
+                    snapshot,
+                    ByteSize(*bytes),
+                )
+                .ok();
+            }
+            CalibrateResult::Skipped { reason } => {
+                writeln!(out, "  {} {} ({})", "SKIP".dimmed(), entry.name, reason).ok();
+            }
+            CalibrateResult::Failed { snapshot, error } => {
+                writeln!(
+                    out,
+                    "  {} ({}) {}",
+                    entry.name.bold(),
+                    snapshot,
+                    "FAILED".red(),
+                )
+                .ok();
+                writeln!(out, "    {error}").ok();
+            }
+        }
+    }
+
+    writeln!(out).ok();
+    writeln!(
+        out,
+        "Calibrated {} subvolume(s), skipped {}.",
+        data.calibrated, data.skipped
+    )
+    .ok();
+    writeln!(out, "Sizes stored in state database. The planner will use these as fallback").ok();
+    writeln!(out, "estimates when no send history exists.").ok();
+
+    out
+}
+
+// ── Verify ──────────────────────────────────────────────────────────────
+
+/// Render verify output according to the given mode.
+#[must_use]
+pub fn render_verify(data: &VerifyOutput, mode: OutputMode) -> String {
+    match mode {
+        OutputMode::Interactive => render_verify_interactive(data),
+        OutputMode::Daemon => {
+            serde_json::to_string_pretty(data)
+                .unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
+        }
+    }
+}
+
+fn render_verify_interactive(data: &VerifyOutput) -> String {
+    let mut out = String::new();
+
+    for sv in &data.subvolumes {
+        writeln!(out, "Verifying {}...", sv.name.bold()).ok();
+
+        for drive in &sv.drives {
+            writeln!(out, "  {}:", drive.label.bold()).ok();
+
+            for check in &drive.checks {
+                let status_str = match check.status.as_str() {
+                    "ok" => format!("{}   ", "OK".green()),
+                    "warn" => format!("{}  ", "WARN".yellow()),
+                    "fail" => format!("{}  ", "FAIL".red()),
+                    other => format!("{other:<6}"),
+                };
+                let detail = check.detail.as_deref().unwrap_or(&check.name);
+                writeln!(out, "    {status_str} {detail}").ok();
+            }
+        }
+
+        writeln!(out).ok();
+    }
+
+    // Preflight warnings
+    if !data.preflight_warnings.is_empty() {
+        writeln!(out, "{}", "Config consistency:".bold()).ok();
+        for warning in &data.preflight_warnings {
+            writeln!(out, "  {} {}", "WARN".yellow(), warning).ok();
+        }
+        writeln!(out).ok();
+    }
+
+    // Summary
+    let summary = format!(
+        "Verify complete: {} OK, {} warnings, {} failures",
+        data.ok_count, data.warn_count, data.fail_count
+    );
+    if data.fail_count > 0 {
+        writeln!(out, "{}", summary.red().bold()).ok();
+    } else if data.warn_count > 0 {
+        writeln!(out, "{}", summary.yellow().bold()).ok();
+    } else {
+        writeln!(out, "{}", summary.green().bold()).ok();
+    }
+
+    out
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::output::{
-        BackupSummary, ChainHealth, ChainHealthEntry, DriveInfo, LastRunInfo, SendSummary,
-        SkippedSubvolume, StatusAssessment, StatusDriveAssessment, SubvolumeSummary,
+        BackupSummary, CalibrateEntry, CalibrateOutput, CalibrateResult, ChainHealth,
+        ChainHealthEntry, DriveInfo, HistoryOutput, HistoryRun, LastRunInfo,
+        PlanOperationEntry, PlanOutput, PlanSummaryOutput, SendSummary, SkippedSubvolume,
+        StatusAssessment, StatusDriveAssessment, SubvolumeSummary, VerifyCheck, VerifyDrive,
+        VerifyOutput, VerifySubvolume,
     };
 
     fn test_status_output() -> StatusOutput {
@@ -750,6 +1185,7 @@ mod tests {
                     duration_secs: 2.1,
                     sends: vec![],
                     errors: vec![],
+                    structured_errors: vec![],
                 },
                 SubvolumeSummary {
                     name: "htpc-docs".to_string(),
@@ -761,6 +1197,7 @@ mod tests {
                         bytes_transferred: Some(1_500_000),
                     }],
                     errors: vec![],
+                    structured_errors: vec![],
                 },
             ],
             skipped: vec![
@@ -1000,5 +1437,168 @@ mod tests {
             output.contains("4 send(s) skipped"),
             "wrong skip count"
         );
+    }
+
+    // ── Plan tests ──────────────────────────────────────────────────────
+
+    #[test]
+    fn plan_interactive_contains_operations() {
+        let data = PlanOutput {
+            timestamp: "2026-03-26 04:00".to_string(),
+            operations: vec![
+                PlanOperationEntry {
+                    subvolume: "htpc-home".to_string(),
+                    operation: "create".to_string(),
+                    detail: "/home -> /snapshots/htpc-home/20260326-0400-home".to_string(),
+                },
+                PlanOperationEntry {
+                    subvolume: "htpc-home".to_string(),
+                    operation: "send".to_string(),
+                    detail: "20260326-0400-home -> WD-18TB (incremental, parent: 20260325-0400-home) + pin".to_string(),
+                },
+            ],
+            skipped: vec![],
+            summary: PlanSummaryOutput {
+                snapshots: 1,
+                sends: 1,
+                deletions: 0,
+                skipped: 0,
+            },
+        };
+        let output = render_plan(&data, OutputMode::Interactive);
+        assert!(output.contains("htpc-home"), "missing subvolume name");
+        assert!(output.contains("WD-18TB"), "missing drive label");
+        assert!(output.contains("1 snapshots"), "missing summary");
+    }
+
+    #[test]
+    fn plan_daemon_produces_valid_json() {
+        let data = PlanOutput {
+            timestamp: "2026-03-26 04:00".to_string(),
+            operations: vec![],
+            skipped: vec![],
+            summary: PlanSummaryOutput {
+                snapshots: 0,
+                sends: 0,
+                deletions: 0,
+                skipped: 0,
+            },
+        };
+        let output = render_plan(&data, OutputMode::Daemon);
+        let parsed: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
+        assert!(parsed.get("timestamp").is_some());
+    }
+
+    // ── History tests ───────────────────────────────────────────────────
+
+    #[test]
+    fn history_interactive_contains_runs() {
+        let data = HistoryOutput {
+            runs: vec![HistoryRun {
+                id: 42,
+                started_at: "2026-03-26T04:00:03".to_string(),
+                mode: "full".to_string(),
+                result: "success".to_string(),
+                duration: Some("2m 30s".to_string()),
+            }],
+        };
+        let output = render_history(&data, OutputMode::Interactive);
+        assert!(output.contains("42"), "missing run id");
+        assert!(output.contains("2m 30s"), "missing duration");
+    }
+
+    #[test]
+    fn history_daemon_produces_valid_json() {
+        let data = HistoryOutput { runs: vec![] };
+        let output = render_history(&data, OutputMode::Daemon);
+        let _: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
+    }
+
+    // ── Calibrate tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn calibrate_interactive_shows_entries() {
+        let data = CalibrateOutput {
+            entries: vec![
+                CalibrateEntry {
+                    name: "htpc-home".to_string(),
+                    result: CalibrateResult::Ok {
+                        snapshot: "20260326-0400-home".to_string(),
+                        bytes: 1_073_741_824,
+                    },
+                },
+                CalibrateEntry {
+                    name: "htpc-tmp".to_string(),
+                    result: CalibrateResult::Skipped {
+                        reason: "disabled".to_string(),
+                    },
+                },
+            ],
+            calibrated: 1,
+            skipped: 1,
+        };
+        let output = render_calibrate(&data, OutputMode::Interactive);
+        assert!(output.contains("htpc-home"), "missing subvolume name");
+        assert!(output.contains("SKIP"), "missing skip indicator");
+        assert!(output.contains("Calibrated 1"), "missing summary");
+    }
+
+    #[test]
+    fn calibrate_daemon_produces_valid_json() {
+        let data = CalibrateOutput {
+            entries: vec![],
+            calibrated: 0,
+            skipped: 0,
+        };
+        let output = render_calibrate(&data, OutputMode::Daemon);
+        let _: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
+    }
+
+    // ── Verify tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn verify_interactive_shows_checks() {
+        let data = VerifyOutput {
+            subvolumes: vec![VerifySubvolume {
+                name: "htpc-home".to_string(),
+                drives: vec![VerifyDrive {
+                    label: "WD-18TB".to_string(),
+                    checks: vec![
+                        VerifyCheck {
+                            name: "pin-file".to_string(),
+                            status: "ok".to_string(),
+                            detail: Some("Pin: 20260325-0400-home".to_string()),
+                        },
+                        VerifyCheck {
+                            name: "pin-exists-local".to_string(),
+                            status: "fail".to_string(),
+                            detail: Some("Pinned snapshot missing locally".to_string()),
+                        },
+                    ],
+                }],
+            }],
+            preflight_warnings: vec![],
+            ok_count: 1,
+            warn_count: 0,
+            fail_count: 1,
+        };
+        let output = render_verify(&data, OutputMode::Interactive);
+        assert!(output.contains("htpc-home"), "missing subvolume");
+        assert!(output.contains("OK"), "missing ok check");
+        assert!(output.contains("FAIL"), "missing fail check");
+        assert!(output.contains("1 failures"), "missing failure count");
+    }
+
+    #[test]
+    fn verify_daemon_produces_valid_json() {
+        let data = VerifyOutput {
+            subvolumes: vec![],
+            preflight_warnings: vec![],
+            ok_count: 0,
+            warn_count: 0,
+            fail_count: 0,
+        };
+        let output = render_verify(&data, OutputMode::Daemon);
+        let _: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
     }
 }

@@ -16,7 +16,8 @@ use crate::executor::{Executor, ExecutionResult, OpResult, RunResult};
 use crate::heartbeat;
 use crate::metrics::{self, MetricsData, SubvolumeMetrics};
 use crate::output::{
-    BackupSummary, OutputMode, SendSummary, SkippedSubvolume, StatusAssessment, SubvolumeSummary,
+    BackupSummary, OutputMode, SendSummary, SkippedSubvolume, StatusAssessment,
+    StructuredError, SubvolumeSummary,
 };
 use crate::plan::{self, FileSystemState, PlanFilters, RealFileSystemState};
 use crate::preflight;
@@ -66,7 +67,9 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
 
     // Dry run: print plan and exit (no lock needed)
     if args.dry_run {
-        crate::commands::plan_cmd::run_with_plan(&config, &backup_plan)?;
+        let plan_output = crate::commands::plan_cmd::build_plan_output(&backup_plan);
+        let mode = crate::output::OutputMode::detect();
+        print!("{}", crate::voice::render_plan(&plan_output, mode));
         return Ok(());
     }
 
@@ -197,12 +200,37 @@ fn build_backup_summary(
                 })
                 .collect();
 
+            let structured_errors: Vec<StructuredError> = sv
+                .operations
+                .iter()
+                .filter(|op| op.result == OpResult::Failure)
+                .filter_map(|op| {
+                    let btrfs_op = op.btrfs_operation?;
+                    let stderr = op.btrfs_stderr.as_deref().unwrap_or("");
+                    let detail = crate::error::translate_btrfs_error(
+                        btrfs_op,
+                        stderr,
+                        op.drive_label.as_deref(),
+                        Some(&sv.name),
+                    );
+                    Some(StructuredError {
+                        operation: op.operation.clone(),
+                        summary: detail.summary,
+                        cause: detail.cause,
+                        remediation: detail.remediation,
+                        drive: op.drive_label.clone(),
+                        bytes_transferred: op.bytes_transferred,
+                    })
+                })
+                .collect();
+
             SubvolumeSummary {
                 name: sv.name.clone(),
                 success: sv.success,
                 duration_secs: sv.duration.as_secs_f64(),
                 sends,
                 errors,
+                structured_errors,
             }
         })
         .collect();
@@ -547,6 +575,8 @@ mod tests {
             duration: Duration::from_millis(100),
             error: error.map(str::to_string),
             bytes_transferred: bytes,
+            btrfs_operation: None,
+            btrfs_stderr: None,
         }
     }
 

@@ -77,6 +77,7 @@ pub fn run(config: Config) -> anyhow::Result<()> {
     print!("Checking sudo btrfs... ");
     std::io::stdout().flush()?;
     match std::process::Command::new("sudo")
+        .env("LC_ALL", "C")
         .arg("-n") // non-interactive: fail immediately if password required
         .arg(&config.general.btrfs_path)
         .args(["filesystem", "show", "/"])
