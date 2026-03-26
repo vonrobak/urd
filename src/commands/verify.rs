@@ -389,7 +389,14 @@ mod tests {
         let mut ok = 0;
         let mut warn = 0;
         let interval = Interval::hours(4);
-        collect_stale_pin_check(dir.path(), "WD-18TB", &interval, &mut checks, &mut ok, &mut warn);
+        collect_stale_pin_check(
+            dir.path(),
+            "WD-18TB",
+            &interval,
+            &mut checks,
+            &mut ok,
+            &mut warn,
+        );
         assert_eq!(ok, 1);
         assert_eq!(warn, 0);
         assert_eq!(checks.len(), 1);

@@ -1,11 +1,11 @@
 use std::io::{BufReader, Write};
 use std::path::{Component, Path, PathBuf};
 
-use anyhow::{anyhow, bail, Context};
+use anyhow::{Context, anyhow, bail};
 use chrono::{NaiveDate, NaiveDateTime};
 
 use crate::cli::GetArgs;
-use crate::config::{expand_tilde, Config, SubvolumeConfig};
+use crate::config::{Config, SubvolumeConfig, expand_tilde};
 use crate::output::{GetOutput, OutputMode};
 use crate::plan::read_snapshot_dir;
 use crate::types::SnapshotName;
@@ -23,7 +23,11 @@ pub fn run(config: Config, args: GetArgs, output_mode: OutputMode) -> anyhow::Re
             .find(|sv| sv.name == *name)
             .ok_or_else(|| anyhow!("no subvolume named {name:?} in config"))?,
         None => find_subvolume_for_path(&path, &config.subvolumes).ok_or_else(|| {
-            let sources: Vec<_> = config.subvolumes.iter().map(|sv| sv.source.display().to_string()).collect();
+            let sources: Vec<_> = config
+                .subvolumes
+                .iter()
+                .map(|sv| sv.source.display().to_string())
+                .collect();
             anyhow!(
                 "no subvolume source matches path {}\nConfigured sources: {}",
                 path.display(),
@@ -37,9 +41,12 @@ pub fn run(config: Config, args: GetArgs, output_mode: OutputMode) -> anyhow::Re
     let target_date = parse_date_reference(&args.at, now)?;
 
     // 4. Find snapshot directory and list snapshots
-    let snapshot_dir = config
-        .local_snapshot_dir(&subvol.name)
-        .ok_or_else(|| anyhow!("no snapshot root configured for subvolume {:?}", subvol.name))?;
+    let snapshot_dir = config.local_snapshot_dir(&subvol.name).ok_or_else(|| {
+        anyhow!(
+            "no snapshot root configured for subvolume {:?}",
+            subvol.name
+        )
+    })?;
 
     let mut snapshots = read_snapshot_dir(&snapshot_dir)?;
     snapshots.sort();
@@ -73,13 +80,13 @@ pub fn run(config: Config, args: GetArgs, output_mode: OutputMode) -> anyhow::Re
     })?;
 
     // 6. Compute relative path and validate
-    let relative_path = path
-        .strip_prefix(&subvol.source)
-        .map_err(|_| anyhow!(
+    let relative_path = path.strip_prefix(&subvol.source).map_err(|_| {
+        anyhow!(
             "path {} is not within subvolume source {}",
             path.display(),
             subvol.source.display(),
-        ))?;
+        )
+    })?;
 
     validate_no_traversal(relative_path)?;
 
@@ -88,7 +95,10 @@ pub fn run(config: Config, args: GetArgs, output_mode: OutputMode) -> anyhow::Re
 
     // Defense-in-depth: verify the constructed path is within the snapshot dir
     if !snapshot_file.starts_with(&snapshot_dir) {
-        bail!("path escapes snapshot boundary: {}", snapshot_file.display());
+        bail!(
+            "path escapes snapshot boundary: {}",
+            snapshot_file.display()
+        );
     }
 
     // 8. Check existence and type
@@ -146,8 +156,7 @@ pub fn run(config: Config, args: GetArgs, output_mode: OutputMode) -> anyhow::Re
             .with_context(|| format!("failed to open {}", snapshot_file.display()))?;
         let mut reader = BufReader::new(file);
         let mut stdout = std::io::stdout().lock();
-        std::io::copy(&mut reader, &mut stdout)
-            .context("failed to write to stdout")?;
+        std::io::copy(&mut reader, &mut stdout).context("failed to write to stdout")?;
         stdout.flush().context("failed to flush stdout")?;
     }
 
@@ -205,9 +214,7 @@ fn parse_date_reference(s: &str, now: NaiveDateTime) -> anyhow::Result<NaiveDate
         "today" => Ok(now),
         "yesterday" => {
             let yesterday = now.date() - chrono::Duration::days(1);
-            Ok(yesterday
-                .and_hms_opt(23, 59, 59)
-                .expect("valid HMS"))
+            Ok(yesterday.and_hms_opt(23, 59, 59).expect("valid HMS"))
         }
         _ => {
             // Try YYYY-MM-DD HH:MM
@@ -232,10 +239,7 @@ fn parse_date_reference(s: &str, now: NaiveDateTime) -> anyhow::Result<NaiveDate
 
 /// Select the most recent snapshot with datetime <= target.
 fn select_snapshot(snapshots: &[SnapshotName], target: NaiveDateTime) -> Option<&SnapshotName> {
-    snapshots
-        .iter()
-        .rev()
-        .find(|s| s.datetime() <= target)
+    snapshots.iter().rev().find(|s| s.datetime() <= target)
 }
 
 /// Validate that a relative path contains no `..` components.
@@ -341,6 +345,8 @@ mod tests {
                 send_enabled: None,
                 local_retention: None,
                 external_retention: None,
+                protection_level: None,
+                drives: None,
             },
             SubvolumeConfig {
                 name: "htpc-home".to_string(),
@@ -353,6 +359,8 @@ mod tests {
                 send_enabled: None,
                 local_retention: None,
                 external_retention: None,
+                protection_level: None,
+                drives: None,
             },
             SubvolumeConfig {
                 name: "subvol3-opptak".to_string(),
@@ -365,6 +373,8 @@ mod tests {
                 send_enabled: None,
                 local_retention: None,
                 external_retention: None,
+                protection_level: None,
+                drives: None,
             },
         ]
     }
@@ -396,20 +406,20 @@ mod tests {
     #[test]
     fn subvolume_no_match_without_root() {
         // Without a root subvolume, unmatched paths return None
-        let svs = vec![
-            SubvolumeConfig {
-                name: "htpc-home".to_string(),
-                short_name: "htpc-home".to_string(),
-                source: PathBuf::from("/home"),
-                priority: 1,
-                enabled: None,
-                snapshot_interval: None,
-                send_interval: None,
-                send_enabled: None,
-                local_retention: None,
-                external_retention: None,
-            },
-        ];
+        let svs = vec![SubvolumeConfig {
+            name: "htpc-home".to_string(),
+            short_name: "htpc-home".to_string(),
+            source: PathBuf::from("/home"),
+            priority: 1,
+            enabled: None,
+            snapshot_interval: None,
+            send_interval: None,
+            send_enabled: None,
+            local_retention: None,
+            external_retention: None,
+            protection_level: None,
+            drives: None,
+        }];
         let result = find_subvolume_for_path(Path::new("/etc/config.toml"), &svs);
         assert!(result.is_none());
     }

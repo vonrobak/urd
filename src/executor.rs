@@ -336,8 +336,8 @@ impl<'a> Executor<'a> {
                     duration: start.elapsed(),
                     error: Some("snapshot creation failed".to_string()),
                     bytes_transferred: None,
-                btrfs_operation: None,
-                btrfs_stderr: None,
+                    btrfs_operation: None,
+                    btrfs_stderr: None,
                 },
                 false,
             );
@@ -572,8 +572,8 @@ impl<'a> Executor<'a> {
                     duration: start.elapsed(),
                     error: None,
                     bytes_transferred: None,
-                btrfs_operation: None,
-                btrfs_stderr: None,
+                    btrfs_operation: None,
+                    btrfs_stderr: None,
                 }
             }
             Err(e) => {
@@ -1358,7 +1358,10 @@ source = "/data/b"
         let result = executor.execute(&plan, "full");
 
         assert_eq!(result.overall, RunResult::Success);
-        assert!(dest_dir.exists(), "dest_dir should have been created by executor");
+        assert!(
+            dest_dir.exists(),
+            "dest_dir should have been created by executor"
+        );
 
         let calls = mock.calls();
         assert!(matches!(calls[0], MockBtrfsCall::CreateSnapshot { .. }));
