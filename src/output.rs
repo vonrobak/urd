@@ -181,6 +181,56 @@ pub struct GetOutput {
     pub file_size: u64,
 }
 
+// ── BackupSummary ──────────────────────────────────────────────────────
+
+/// Structured output for the post-backup summary.
+#[derive(Debug, Serialize)]
+pub struct BackupSummary {
+    /// Overall run result: "success", "partial", or "failure".
+    pub result: String,
+    /// Run ID from SQLite (if available).
+    pub run_id: Option<i64>,
+    /// Total wall-clock duration of the executor run.
+    pub duration_secs: f64,
+
+    /// Per-subvolume execution results.
+    pub subvolumes: Vec<SubvolumeSummary>,
+    /// Subvolumes/sends skipped by the planner (name, reason).
+    pub skipped: Vec<SkippedSubvolume>,
+
+    /// Per-subvolume promise status AFTER the run (from awareness model).
+    pub assessments: Vec<StatusAssessment>,
+
+    /// Summary warnings (pin failures, skipped deletions, etc.)
+    pub warnings: Vec<String>,
+}
+
+/// Per-subvolume execution summary.
+#[derive(Debug, Serialize)]
+pub struct SubvolumeSummary {
+    pub name: String,
+    pub success: bool,
+    pub duration_secs: f64,
+    /// Per-drive send results (zero or more per subvolume).
+    pub sends: Vec<SendSummary>,
+    pub errors: Vec<String>,
+}
+
+/// Result of a single send operation to one drive.
+#[derive(Debug, Serialize)]
+pub struct SendSummary {
+    pub drive: String,
+    pub send_type: String,
+    pub bytes_transferred: Option<u64>,
+}
+
+/// A planner-skipped subvolume/send with reason.
+#[derive(Debug, Serialize)]
+pub struct SkippedSubvolume {
+    pub name: String,
+    pub reason: String,
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]

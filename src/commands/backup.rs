@@ -7,17 +7,20 @@ use std::time::{Duration, Instant};
 
 use colored::Colorize;
 
-use crate::awareness;
+use crate::awareness::{self, SubvolAssessment};
 use crate::btrfs::RealBtrfs;
 use crate::cli::BackupArgs;
 use crate::config::Config;
 use crate::drives;
-use crate::executor::{Executor, RunResult, SendType};
+use crate::executor::{Executor, ExecutionResult, OpResult, RunResult};
 use crate::heartbeat;
 use crate::metrics::{self, MetricsData, SubvolumeMetrics};
+use crate::output::{
+    BackupSummary, OutputMode, SendSummary, SkippedSubvolume, StatusAssessment, SubvolumeSummary,
+};
 use crate::plan::{self, FileSystemState, PlanFilters, RealFileSystemState};
 use crate::state::StateDb;
-use crate::types::ByteSize;
+use crate::types::{BackupPlan, ByteSize};
 
 pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     let now = chrono::Local::now().naive_local();
@@ -102,105 +105,14 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     };
 
     let executor = Executor::new(&btrfs, state_db.as_ref(), &config, &shutdown);
+    let exec_start = Instant::now();
     let result = executor.execute(&backup_plan, mode);
+    let exec_duration = exec_start.elapsed();
 
     // Stop progress display
     progress_shutdown.store(true, Ordering::SeqCst);
     if let Some(h) = progress_handle {
         h.join().ok();
-    }
-
-    // Print results
-    println!(
-        "{}",
-        format!("Urd backup completed: {}", result.overall.as_str()).bold()
-    );
-    println!();
-
-    let mut total_pin_failures: u32 = 0;
-
-    for sv in &result.subvolume_results {
-        let status = if sv.success {
-            "OK".green()
-        } else {
-            "FAILED".red()
-        };
-        let send_info = match sv.send_type {
-            SendType::Full => " (full send)".to_string(),
-            SendType::Incremental => " (incremental)".to_string(),
-            SendType::NoSend => String::new(),
-        };
-        println!(
-            "  {} {} [{:.1}s]{}",
-            status,
-            sv.name.bold(),
-            sv.duration.as_secs_f64(),
-            send_info,
-        );
-
-        // Print errors for failed operations
-        for op in &sv.operations {
-            if let Some(err) = &op.error
-                && op.result == crate::executor::OpResult::Failure
-            {
-                println!("    {} {}: {}", "ERROR".red(), op.operation, err);
-            }
-        }
-
-        // Print pin failure warnings prominently
-        if sv.pin_failures > 0 {
-            total_pin_failures += sv.pin_failures;
-            println!(
-                "    {} {} pin file write(s) failed — next send may be full instead of incremental",
-                "WARNING".yellow(),
-                sv.pin_failures,
-            );
-        }
-    }
-
-    // Print skipped subvolumes
-    for (name, reason) in &backup_plan.skipped {
-        println!("  {} {} ({})", "SKIP".dimmed(), name, reason.dimmed());
-    }
-
-    // Summary for skipped deletions (space recovery)
-    let planned_deletes = backup_plan
-        .operations
-        .iter()
-        .filter(|op| matches!(op, crate::types::PlannedOperation::DeleteSnapshot { .. }))
-        .count();
-    let skipped_deletes: usize = result
-        .subvolume_results
-        .iter()
-        .flat_map(|sv| sv.operations.iter())
-        .filter(|op| {
-            op.operation == "delete"
-                && op.result == crate::executor::OpResult::Skipped
-                && op
-                    .error
-                    .as_ref()
-                    .is_some_and(|e| e.contains("space recovered"))
-        })
-        .count();
-    if skipped_deletes > 0 {
-        println!();
-        println!(
-            "{} {} of {} planned deletion(s) skipped (space recovered)",
-            "NOTE:".dimmed().bold(),
-            skipped_deletes,
-            planned_deletes,
-        );
-    }
-
-    // Summary warning for pin failures
-    if total_pin_failures > 0 {
-        println!();
-        println!(
-            "{} {} pin file write(s) failed. Run {} to diagnose.",
-            "WARNING:".yellow().bold(),
-            total_pin_failures,
-            "urd verify".bold(),
-        );
     }
 
     // Write metrics
@@ -214,12 +126,133 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
         log::warn!("Failed to write heartbeat: {e}");
     }
 
+    // Build and render structured summary
+    let summary = build_backup_summary(&backup_plan, &result, &assessments, exec_duration);
+    let output_mode = OutputMode::detect();
+    let rendered = crate::voice::render_backup_summary(&summary, output_mode);
+    println!("{rendered}");
+
     // Exit with appropriate code
     if result.overall != RunResult::Success {
         std::process::exit(1);
     }
 
     Ok(())
+}
+
+// ── Summary builder ─────────────────────────────────────────────────────
+
+/// Build a structured backup summary from plan, execution results, and awareness assessments.
+/// Pure function — no I/O.
+fn build_backup_summary(
+    plan: &BackupPlan,
+    result: &ExecutionResult,
+    assessments: &[SubvolAssessment],
+    duration: Duration,
+) -> BackupSummary {
+    let subvolumes: Vec<SubvolumeSummary> = result
+        .subvolume_results
+        .iter()
+        .map(|sv| {
+            let sends: Vec<SendSummary> = sv
+                .operations
+                .iter()
+                .filter(|op| {
+                    (op.operation == "send_incremental" || op.operation == "send_full")
+                        && op.result == OpResult::Success
+                })
+                .map(|op| SendSummary {
+                    drive: op.drive_label.clone().unwrap_or_default(),
+                    send_type: if op.operation == "send_full" {
+                        "full".to_string()
+                    } else {
+                        "incremental".to_string()
+                    },
+                    bytes_transferred: op.bytes_transferred,
+                })
+                .collect();
+
+            let errors: Vec<String> = sv
+                .operations
+                .iter()
+                .filter(|op| op.result == OpResult::Failure)
+                .filter_map(|op| {
+                    op.error
+                        .as_ref()
+                        .map(|e| format!("{}: {}", op.operation, e))
+                })
+                .collect();
+
+            SubvolumeSummary {
+                name: sv.name.clone(),
+                success: sv.success,
+                duration_secs: sv.duration.as_secs_f64(),
+                sends,
+                errors,
+            }
+        })
+        .collect();
+
+    let skipped: Vec<SkippedSubvolume> = plan
+        .skipped
+        .iter()
+        .map(|(name, reason)| SkippedSubvolume {
+            name: name.clone(),
+            reason: reason.clone(),
+        })
+        .collect();
+
+    let mut warnings = Vec::new();
+
+    // Pin failure warnings
+    let total_pin_failures: u32 = result
+        .subvolume_results
+        .iter()
+        .map(|sv| sv.pin_failures)
+        .sum();
+    if total_pin_failures > 0 {
+        warnings.push(format!(
+            "{total_pin_failures} pin file write(s) failed. Run `urd verify` to diagnose."
+        ));
+    }
+
+    // Skipped deletions (space recovery)
+    let planned_deletes = plan
+        .operations
+        .iter()
+        .filter(|op| matches!(op, crate::types::PlannedOperation::DeleteSnapshot { .. }))
+        .count();
+    let skipped_deletes: usize = result
+        .subvolume_results
+        .iter()
+        .flat_map(|sv| sv.operations.iter())
+        .filter(|op| {
+            op.operation == "delete"
+                && op.result == OpResult::Skipped
+                && op
+                    .error
+                    .as_ref()
+                    .is_some_and(|e| e.contains("space recovered"))
+        })
+        .count();
+    if skipped_deletes > 0 {
+        warnings.push(format!(
+            "{skipped_deletes} of {planned_deletes} planned deletion(s) skipped (space recovered)"
+        ));
+    }
+
+    BackupSummary {
+        result: result.overall.as_str().to_string(),
+        run_id: result.run_id,
+        duration_secs: duration.as_secs_f64(),
+        subvolumes,
+        skipped,
+        assessments: assessments
+            .iter()
+            .map(StatusAssessment::from_assessment)
+            .collect(),
+        warnings,
+    }
 }
 
 /// Acquire an advisory lock to prevent concurrent backup runs.
@@ -465,5 +498,329 @@ fn format_elapsed(d: Duration) -> String {
         format!("{hours}:{mins:02}:{secs:02}")
     } else {
         format!("{mins}:{secs:02}")
+    }
+}
+
+// ── Tests ───────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::awareness::{LocalAssessment, PromiseStatus, SubvolAssessment};
+    use crate::types::Interval;
+    use crate::executor::{
+        ExecutionResult, OperationOutcome, OpResult, RunResult, SendType, SubvolumeResult,
+    };
+    use crate::types::PlannedOperation;
+    use std::path::PathBuf;
+
+    fn make_outcome(
+        operation: &str,
+        drive: Option<&str>,
+        result: OpResult,
+        error: Option<&str>,
+        bytes: Option<u64>,
+    ) -> OperationOutcome {
+        OperationOutcome {
+            operation: operation.to_string(),
+            drive_label: drive.map(str::to_string),
+            result,
+            duration: Duration::from_millis(100),
+            error: error.map(str::to_string),
+            bytes_transferred: bytes,
+        }
+    }
+
+    fn make_subvol_result(
+        name: &str,
+        success: bool,
+        operations: Vec<OperationOutcome>,
+        send_type: SendType,
+        pin_failures: u32,
+    ) -> SubvolumeResult {
+        SubvolumeResult {
+            name: name.to_string(),
+            success,
+            operations,
+            duration: Duration::from_secs(2),
+            send_type,
+            pin_failures,
+        }
+    }
+
+    fn empty_assessments() -> Vec<SubvolAssessment> {
+        vec![]
+    }
+
+    fn sample_assessments() -> Vec<SubvolAssessment> {
+        vec![SubvolAssessment {
+            name: "htpc-home".to_string(),
+            status: PromiseStatus::Protected,
+            local: LocalAssessment {
+                status: PromiseStatus::Protected,
+                snapshot_count: 10,
+                newest_age: None,
+                configured_interval: Interval::hours(1),
+            },
+            external: vec![],
+            advisories: vec![],
+            errors: vec![],
+        }]
+    }
+
+    fn empty_plan() -> BackupPlan {
+        BackupPlan {
+            operations: vec![],
+            timestamp: chrono::NaiveDateTime::default(),
+            skipped: vec![],
+        }
+    }
+
+    #[test]
+    fn build_summary_extracts_successful_sends_only() {
+        let result = ExecutionResult {
+            overall: RunResult::Partial,
+            subvolume_results: vec![make_subvol_result(
+                "htpc-home",
+                true,
+                vec![
+                    make_outcome("snapshot", None, OpResult::Success, None, None),
+                    make_outcome(
+                        "send_incremental",
+                        Some("WD-18TB"),
+                        OpResult::Success,
+                        None,
+                        Some(5_000_000),
+                    ),
+                    make_outcome(
+                        "send_full",
+                        Some("2TB-backup"),
+                        OpResult::Failure,
+                        Some("btrfs send failed"),
+                        Some(1_000),
+                    ),
+                ],
+                SendType::Incremental,
+                0,
+            )],
+            run_id: Some(10),
+        };
+
+        let summary = build_backup_summary(&empty_plan(), &result, &empty_assessments(), Duration::from_secs(5));
+
+        assert_eq!(summary.subvolumes.len(), 1);
+        let sv = &summary.subvolumes[0];
+        // Only the successful send should appear
+        assert_eq!(sv.sends.len(), 1, "failed sends should not appear in sends list");
+        assert_eq!(sv.sends[0].drive, "WD-18TB");
+        assert_eq!(sv.sends[0].send_type, "incremental");
+        assert_eq!(sv.sends[0].bytes_transferred, Some(5_000_000));
+        // The failed send should appear in errors
+        assert_eq!(sv.errors.len(), 1);
+        assert!(sv.errors[0].contains("btrfs send failed"));
+    }
+
+    #[test]
+    fn build_summary_multi_drive_sends() {
+        let result = ExecutionResult {
+            overall: RunResult::Success,
+            subvolume_results: vec![make_subvol_result(
+                "htpc-docs",
+                true,
+                vec![
+                    make_outcome(
+                        "send_incremental",
+                        Some("WD-18TB"),
+                        OpResult::Success,
+                        None,
+                        Some(2_000_000),
+                    ),
+                    make_outcome(
+                        "send_full",
+                        Some("2TB-backup"),
+                        OpResult::Success,
+                        None,
+                        Some(80_000_000_000),
+                    ),
+                ],
+                SendType::Full,
+                0,
+            )],
+            run_id: Some(11),
+        };
+
+        let summary = build_backup_summary(&empty_plan(), &result, &empty_assessments(), Duration::from_secs(120));
+
+        let sv = &summary.subvolumes[0];
+        assert_eq!(sv.sends.len(), 2, "both successful sends should appear");
+        assert_eq!(sv.sends[0].drive, "WD-18TB");
+        assert_eq!(sv.sends[0].send_type, "incremental");
+        assert_eq!(sv.sends[1].drive, "2TB-backup");
+        assert_eq!(sv.sends[1].send_type, "full");
+    }
+
+    #[test]
+    fn build_summary_pin_failure_warning() {
+        let result = ExecutionResult {
+            overall: RunResult::Success,
+            subvolume_results: vec![
+                make_subvol_result("sv1", true, vec![], SendType::NoSend, 1),
+                make_subvol_result("sv2", true, vec![], SendType::NoSend, 2),
+            ],
+            run_id: Some(12),
+        };
+
+        let summary = build_backup_summary(&empty_plan(), &result, &empty_assessments(), Duration::from_secs(1));
+
+        assert_eq!(summary.warnings.len(), 1);
+        assert!(summary.warnings[0].contains("3 pin file write(s) failed"));
+        assert!(summary.warnings[0].contains("urd verify"));
+    }
+
+    #[test]
+    fn build_summary_no_warnings_when_clean() {
+        let result = ExecutionResult {
+            overall: RunResult::Success,
+            subvolume_results: vec![make_subvol_result(
+                "sv1",
+                true,
+                vec![],
+                SendType::NoSend,
+                0,
+            )],
+            run_id: Some(13),
+        };
+
+        let summary = build_backup_summary(&empty_plan(), &result, &empty_assessments(), Duration::from_secs(1));
+
+        assert!(summary.warnings.is_empty(), "should have no warnings on clean run");
+    }
+
+    #[test]
+    fn build_summary_skipped_deletions_warning() {
+        let plan = BackupPlan {
+            operations: vec![
+                PlannedOperation::DeleteSnapshot {
+                    path: PathBuf::from("/snaps/sv1/20260320-0400-sv1"),
+                    reason: "retention".to_string(),
+                    subvolume_name: "sv1".to_string(),
+                },
+                PlannedOperation::DeleteSnapshot {
+                    path: PathBuf::from("/snaps/sv1/20260319-0400-sv1"),
+                    reason: "retention".to_string(),
+                    subvolume_name: "sv1".to_string(),
+                },
+            ],
+            timestamp: chrono::NaiveDateTime::default(),
+            skipped: vec![],
+        };
+
+        let result = ExecutionResult {
+            overall: RunResult::Success,
+            subvolume_results: vec![make_subvol_result(
+                "sv1",
+                true,
+                vec![make_outcome(
+                    "delete",
+                    None,
+                    OpResult::Skipped,
+                    Some("space recovered by prior deletes"),
+                    None,
+                )],
+                SendType::NoSend,
+                0,
+            )],
+            run_id: Some(14),
+        };
+
+        let summary = build_backup_summary(&plan, &result, &empty_assessments(), Duration::from_secs(1));
+
+        assert_eq!(summary.warnings.len(), 1);
+        assert!(summary.warnings[0].contains("1 of 2 planned deletion(s) skipped"));
+    }
+
+    #[test]
+    fn build_summary_maps_plan_skips() {
+        let plan = BackupPlan {
+            operations: vec![],
+            timestamp: chrono::NaiveDateTime::default(),
+            skipped: vec![
+                ("htpc-home".to_string(), "drive WD-18TB not mounted".to_string()),
+                ("htpc-docs".to_string(), "disabled".to_string()),
+            ],
+        };
+
+        let result = ExecutionResult {
+            overall: RunResult::Success,
+            subvolume_results: vec![],
+            run_id: None,
+        };
+
+        let summary = build_backup_summary(&plan, &result, &empty_assessments(), Duration::from_secs(0));
+
+        assert_eq!(summary.skipped.len(), 2);
+        assert_eq!(summary.skipped[0].name, "htpc-home");
+        assert_eq!(summary.skipped[0].reason, "drive WD-18TB not mounted");
+        assert_eq!(summary.skipped[1].name, "htpc-docs");
+        assert_eq!(summary.skipped[1].reason, "disabled");
+    }
+
+    #[test]
+    fn build_summary_maps_assessments() {
+        let result = ExecutionResult {
+            overall: RunResult::Success,
+            subvolume_results: vec![],
+            run_id: Some(15),
+        };
+
+        let summary = build_backup_summary(&empty_plan(), &result, &sample_assessments(), Duration::from_secs(1));
+
+        assert_eq!(summary.assessments.len(), 1);
+        assert_eq!(summary.assessments[0].name, "htpc-home");
+        assert_eq!(summary.assessments[0].status, "PROTECTED");
+    }
+
+    #[test]
+    fn build_summary_overall_fields() {
+        let result = ExecutionResult {
+            overall: RunResult::Partial,
+            subvolume_results: vec![],
+            run_id: Some(99),
+        };
+
+        let summary = build_backup_summary(
+            &empty_plan(),
+            &result,
+            &empty_assessments(),
+            Duration::from_millis(12300),
+        );
+
+        assert_eq!(summary.result, "partial");
+        assert_eq!(summary.run_id, Some(99));
+        assert!((summary.duration_secs - 12.3).abs() < 0.01);
+    }
+
+    #[test]
+    fn build_summary_failed_op_without_error_message() {
+        // An operation can fail without an error message (e.g., if the error
+        // was captured at a higher level). The builder should not panic.
+        let result = ExecutionResult {
+            overall: RunResult::Failure,
+            subvolume_results: vec![make_subvol_result(
+                "sv1",
+                false,
+                vec![make_outcome("send_full", Some("WD-18TB"), OpResult::Failure, None, None)],
+                SendType::NoSend,
+                0,
+            )],
+            run_id: Some(16),
+        };
+
+        let summary = build_backup_summary(&empty_plan(), &result, &empty_assessments(), Duration::from_secs(1));
+
+        // Failed op with no error message should not appear in errors list
+        assert!(summary.subvolumes[0].errors.is_empty());
+        // And should not appear in sends list (it failed)
+        assert!(summary.subvolumes[0].sends.is_empty());
     }
 }
