@@ -98,6 +98,9 @@ pub struct StatusOutput {
 pub struct StatusAssessment {
     pub name: String,
     pub status: String,
+    /// Promise level from config (e.g., "protected", "resilient"), or None for custom/unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub promise_level: Option<String>,
     pub local_snapshot_count: usize,
     pub local_status: String,
     pub external: Vec<StatusDriveAssessment>,
@@ -111,6 +114,7 @@ impl StatusAssessment {
         Self {
             name: a.name.clone(),
             status: a.status.to_string(),
+            promise_level: None,
             local_snapshot_count: a.local.snapshot_count,
             local_status: a.local.status.to_string(),
             external: a

@@ -75,12 +75,16 @@ fn render_subvolume_table(data: &StatusOutput, out: &mut String) {
         .map(|d| d.label.as_str())
         .collect();
 
-    // Build headers: STATUS  SUBVOLUME  LOCAL  [DRIVE1]  [DRIVE2]  CHAIN
-    let mut headers: Vec<String> = vec![
-        "STATUS".to_string(),
-        "SUBVOLUME".to_string(),
-        "LOCAL".to_string(),
-    ];
+    // Check if any assessment has a promise level — only show column if so
+    let has_promises = data.assessments.iter().any(|a| a.promise_level.is_some());
+
+    // Build headers: STATUS  [PROMISE]  SUBVOLUME  LOCAL  [DRIVE1]  [DRIVE2]  CHAIN
+    let mut headers: Vec<String> = vec!["STATUS".to_string()];
+    if has_promises {
+        headers.push("PROMISE".to_string());
+    }
+    headers.push("SUBVOLUME".to_string());
+    headers.push("LOCAL".to_string());
     for label in &mounted_drives {
         headers.push(label.to_string());
     }
@@ -89,11 +93,17 @@ fn render_subvolume_table(data: &StatusOutput, out: &mut String) {
     // Build rows
     let mut rows: Vec<Vec<String>> = Vec::new();
     for assessment in &data.assessments {
-        let mut row = vec![
-            assessment.status.clone(),
-            assessment.name.clone(),
-            assessment.local_snapshot_count.to_string(),
-        ];
+        let mut row = vec![assessment.status.clone()];
+        if has_promises {
+            row.push(
+                assessment
+                    .promise_level
+                    .clone()
+                    .unwrap_or_else(|| "\u{2014}".to_string()),
+            );
+        }
+        row.push(assessment.name.clone());
+        row.push(assessment.local_snapshot_count.to_string());
 
         // Per-drive external snapshot count
         for label in &mounted_drives {
@@ -478,12 +488,15 @@ fn render_assessment_table(data: &BackupSummary, out: &mut String) {
         }
     }
 
-    // Build headers: STATUS  SUBVOLUME  LOCAL  [DRIVE1]  [DRIVE2]
-    let mut headers: Vec<String> = vec![
-        "STATUS".to_string(),
-        "SUBVOLUME".to_string(),
-        "LOCAL".to_string(),
-    ];
+    let has_promises = data.assessments.iter().any(|a| a.promise_level.is_some());
+
+    // Build headers: STATUS  [PROMISE]  SUBVOLUME  LOCAL  [DRIVE1]  [DRIVE2]
+    let mut headers: Vec<String> = vec!["STATUS".to_string()];
+    if has_promises {
+        headers.push("PROMISE".to_string());
+    }
+    headers.push("SUBVOLUME".to_string());
+    headers.push("LOCAL".to_string());
     for label in &drive_labels {
         headers.push(label.clone());
     }
@@ -491,11 +504,17 @@ fn render_assessment_table(data: &BackupSummary, out: &mut String) {
     // Build rows
     let mut rows: Vec<Vec<String>> = Vec::new();
     for assessment in &data.assessments {
-        let mut row = vec![
-            assessment.status.clone(),
-            assessment.name.clone(),
-            assessment.local_snapshot_count.to_string(),
-        ];
+        let mut row = vec![assessment.status.clone()];
+        if has_promises {
+            row.push(
+                assessment
+                    .promise_level
+                    .clone()
+                    .unwrap_or_else(|| "\u{2014}".to_string()),
+            );
+        }
+        row.push(assessment.name.clone());
+        row.push(assessment.local_snapshot_count.to_string());
 
         for label in &drive_labels {
             let count = assessment
@@ -1001,6 +1020,7 @@ mod tests {
                 StatusAssessment {
                     name: "htpc-home".to_string(),
                     status: "PROTECTED".to_string(),
+                    promise_level: None,
                     local_snapshot_count: 47,
                     local_status: "PROTECTED".to_string(),
                     external: vec![StatusDriveAssessment {
@@ -1015,6 +1035,7 @@ mod tests {
                 StatusAssessment {
                     name: "htpc-docs".to_string(),
                     status: "AT RISK".to_string(),
+                    promise_level: None,
                     local_snapshot_count: 5,
                     local_status: "AT RISK".to_string(),
                     external: vec![StatusDriveAssessment {
@@ -1073,6 +1094,33 @@ mod tests {
         let output = render_status(&test_status_output(), OutputMode::Interactive);
         assert!(output.contains("PROTECTED"), "missing PROTECTED");
         assert!(output.contains("AT RISK"), "missing AT RISK");
+    }
+
+    #[test]
+    fn interactive_promise_column_shown_when_set() {
+        colored::control::set_override(false);
+        let mut data = test_status_output();
+        // Set a promise level on one assessment
+        data.assessments[0].promise_level = Some("protected".to_string());
+        let output = render_status(&data, OutputMode::Interactive);
+        assert!(output.contains("PROMISE"), "missing PROMISE header");
+        assert!(output.contains("protected"), "missing promise level value");
+        // The second assessment should show an em dash
+        assert!(
+            output.contains("\u{2014}"),
+            "missing em dash for unset promise"
+        );
+    }
+
+    #[test]
+    fn interactive_no_promise_column_when_none_set() {
+        colored::control::set_override(false);
+        let data = test_status_output(); // all promise_level are None
+        let output = render_status(&data, OutputMode::Interactive);
+        assert!(
+            !output.contains("PROMISE"),
+            "PROMISE column should be hidden when no promises set"
+        );
     }
 
     #[test]
@@ -1235,6 +1283,7 @@ mod tests {
             assessments: vec![StatusAssessment {
                 name: "htpc-home".to_string(),
                 status: "PROTECTED".to_string(),
+                promise_level: None,
                 local_snapshot_count: 12,
                 local_status: "PROTECTED".to_string(),
                 external: vec![],

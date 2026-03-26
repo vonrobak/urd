@@ -77,6 +77,11 @@ pub struct BackupArgs {
     /// Only run external operations
     #[arg(long)]
     pub external_only: bool,
+
+    /// Confirm that retention deletions derived from protection promises are intended.
+    /// Without this flag, retention is skipped for promise-level subvolumes (fail-closed).
+    #[arg(long)]
+    pub confirm_retention_change: bool,
 }
 
 #[derive(clap::Args, Debug)]

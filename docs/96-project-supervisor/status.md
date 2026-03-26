@@ -5,57 +5,64 @@
 
 ## Current State
 
-**Operational cutover in progress. Urd is the sole backup system.**
+**Operational cutover nearing completion. Urd is the sole backup system.**
 Urd's systemd timer has been running at 04:00 nightly since 2026-03-24. The bash script
-(`btrfs-snapshot-backup.sh`) is disabled. Five consecutive successful runs (runs 7–11) across
-manual and autonomous operation, passing 251 tests. The parallel-run step was skipped in favor
-of direct cutover — a conscious risk decision documented in
-[first-night journal](../98-journals/2026-03-25-first-night.md). Two nights of unattended
-operation (2026-03-25, 2026-03-26) completed without failures.
+(`btrfs-snapshot-backup.sh`) is disabled. The parallel-run step was skipped in favor of direct
+cutover — a conscious risk decision documented in
+[first-night journal](../98-journals/2026-03-25-first-night.md). Monitoring target was
+2026-04-01 (1 week from cutover on 2026-03-25).
 
-A third NVMe space exhaustion incident (2026-03-26) motivated immediate implementation of the
-**local space guard** in `plan_local_snapshot` — the fix designed in the
-[March 24 postmortem](../98-journals/2026-03-24-local-space-exhaustion-postmortem.md) but
-never built. The planner now checks `filesystem_free_bytes` against `min_free_bytes` before
-creating any local snapshot. `force` does not override (a forced snapshot on a full filesystem
-is still catastrophic). 4 new tests. This closes the most dangerous safety gap in the
-application. [Journal](../98-journals/2026-03-26-operational-evaluation.md)
+**298 tests. All pass. Clippy clean.**
 
-**Post-backup structured summary** (Priorities 2b + 2d) implemented in the same session.
-The backup command now produces a `BackupSummary` output type rendered by the voice layer,
-replacing ~90 lines of ad-hoc `println!`. Answers "is my data safer now?" in one screen:
-executed subvolumes with per-drive send info, grouped skip reasons (drive-not-mounted entries
-collapsed, UUID mismatch/space/disabled shown individually), conditional awareness table
-(shown only when AT RISK or UNPROTECTED), and warning aggregation (pin failures, skipped
-deletions). Daemon mode outputs JSON. 21 new tests (9 builder, 12 renderer).
-[Design](../95-ideas/2026-03-26-design-backup-summary.md) |
-[Review](../99-reports/2026-03-26-backup-summary-design-review.md) |
-[Journal](../98-journals/2026-03-26-backup-summary.md)
+### Recent development (2026-03-26 — 2026-03-27)
 
-**Pre-flight config consistency checks** (Priority 2c) implemented in a later session.
-New `preflight.rs` module — pure function of `&Config`, no I/O (ADR-108). Two checks:
-(1) retention/send interval compatibility — computes guaranteed survival floor
-(`hourly + daily * 24` hours) and warns when send interval exceeds it; (2) send-without-drives
-— single global warning when `send_enabled` subvolumes exist but no drives are configured.
-Integrated into `backup` (log + summary warnings), `init` (rendered section), and `verify`
-(rendered + counted in summary). The arch-adversary review revealed that the three-layer pin
-protection system (planner unsent protection, retention `is_pinned` guard, executor re-check)
-prevents the originally claimed consequence ("pinned parent deleted") — the warning was reframed
-as a defense-in-depth signal about config depending on pin protection rather than retention
-alignment. 10 new tests (251 total).
-[Design](../95-ideas/2026-03-26-design-next-sessions.md) |
-[Design review](../99-reports/2026-03-26-next-sessions-design-review.md) |
-[Implementation review](../99-reports/2026-03-26-preflight-implementation-review.md) |
-[Journal](../98-journals/2026-03-26-preflight-checks.md)
+**Voice migration complete** (7 of 8 commands). All commands except `init` now produce
+structured output types rendered by `voice.rs`. Migrated: status, backup, plan, history,
+verify, calibrate, get. `init.rs` still uses direct `println!` — it's the only holdout.
+[Design](../95-ideas/2026-03-26-design-next-sessions.md)
 
-**Multi-session design** for the next 2–3 sessions was produced and reviewed alongside the
-preflight work. Session 2: voice migration for remaining commands (plan, calibrate, history,
-verify). Session 3: Protection Promise ADR (ADR-110, gates Phase 6). Both designs are reviewed
-and ready to build. [Design](../95-ideas/2026-03-26-design-next-sessions.md)
+**Structured error messages** (Priority 2e) implemented. `error.rs` has `translate_btrfs_error()`
+— pattern-matches btrfs stderr into actionable `BtrfsErrorDetail` with summary, cause, and
+remediation steps. Covers 7 patterns: no-space (receive and snapshot), permission denied,
+read-only filesystem, no-such-file (receive and delete), parent-not-found. Integrated into
+backup summary's `structured_errors` field. 9 tests.
+
+**ADR-110: Protection Promises** written and implemented across two sessions.
+[ADR](../00-foundation/decisions/2026-03-26-ADR-110-protection-promises.md) |
+[Design](../95-ideas/2026-03-26-design-protection-promises.md)
+
+**Protection promises session 1** (committed, on `feat/protection-promises-types` branch):
+Core types, derivation function, config parsing, and resolution branching. `ProtectionLevel`
+enum (Guarded/Protected/Resilient/Custom), `RunFrequency` (Timer/Sentinel), `DerivedPolicy`
+struct, and `derive_policy()` pure function in `types.rs`. Config resolution branches: named
+levels derive base values from ADR-110 outcome targets; explicit overrides replace derived;
+`None`/Custom falls through to existing code path (migration identity confirmed by test).
+`run_frequency` on `GeneralConfig`, `protection_level` and `drives` on `SubvolumeConfig` and
+`ResolvedSubvolume`. Validation: `drives` labels must exist in `config.drives`. Example config
+updated. 19 new tests (267 → 286).
+[Journal](../98-journals/2026-03-27-protection-promises-session1.md)
+
+**Protection promises session 2** (uncommitted, working tree):
+Integration layer completing Phase 6. Five additions:
+1. **Preflight achievability checks** (`preflight.rs`) — three new check types:
+   `drive-count-vs-promise` (resilient needs ≥ 2, protected ≥ 1), `voiding-override`
+   (send_enabled=false or drives=[] on levels requiring external copies), `weakening-override`
+   (intervals longer than derived, retention tighter than derived).
+2. **Planner drive filtering** (`plan.rs`) — when `subvol.drives` is set, the planner silently
+   skips drives not in the allowed list.
+3. **`--confirm-retention-change`** (`cli.rs`, `backup.rs`) — new flag on `urd backup`. Without
+   it, retention deletions are filtered out for promise-level subvolumes (ADR-107 fail-closed).
+4. **Status display** (`output.rs`, `voice.rs`, `status.rs`) — `promise_level` field on
+   `StatusAssessment`, conditional PROMISE column in status and backup summary tables (hidden
+   when no subvolumes have promises).
+5. **12 new tests** (286 → 298): 8 preflight, 1 planner, 2 voice, 1 drive filtering.
 
 Config intervals (1h–6h snapshots, 1h–4h sends) were set for the travel period and are
 misaligned with the daily timer — the awareness model reports UNPROTECTED for most of each
-day. Interval tuning to match daily reality is the next operational action.
+day. Now that protection promises exist, setting `protection_level` with `run_frequency = "daily"`
+would derive matching intervals automatically. This is the first real-world validation opportunity.
+
+### Earlier development (through 2026-03-26)
 
 Safety hardening completed:
 
@@ -146,12 +153,9 @@ is right, the mythic voice follows naturally from well-structured presentation l
 
 No code changes. Just do it. See [cutover checklist](#active-work--operational-cutover).
 
-### Priority 2: Safety Hardening (during/after cutover)
+### Priority 2: Safety Hardening (during/after cutover) — COMPLETE
 
-Low-risk, high-value improvements to the existing architecture. Reordered 2026-03-26 based
-on operational data: surfacing skip reasons and post-backup summaries are the highest-leverage
-UX improvements — the returning-from-travel experience proved that "is my data safe?" is the
-most important question, and currently requires three commands to answer.
+All five items complete. Low-risk, high-value improvements to the existing architecture.
 
 | # | Feature | Effort | Notes |
 |---|---------|--------|-------|
@@ -160,7 +164,7 @@ most important question, and currently requires three commands to answer.
 | 2b | ~~**Surface skipped sends loudly**~~ | ~~Low~~ | **COMPLETE.** Subsumed by 2d — skip grouping is one section of the structured summary. "Not mounted" skips collapsed by drive; UUID mismatch/space/disabled rendered individually. |
 | 2d | ~~**Post-backup structured summary**~~ | ~~Medium~~ | **COMPLETE.** `BackupSummary` output type in `output.rs`, rendered by `voice::render_backup_summary()`. Replaces ~90 lines of `println!`. Per-drive send info, grouped skips, conditional awareness table, warning aggregation. 21 tests. [Design](../95-ideas/2026-03-26-design-backup-summary.md) | [Review](../99-reports/2026-03-26-backup-summary-design-review.md) | [Journal](../98-journals/2026-03-26-backup-summary.md) |
 | 2c | ~~**Pre-flight checks**~~ | ~~Low~~ | **COMPLETE.** `preflight.rs` — pure function of `&Config`, 2 checks: retention/send compatibility (guaranteed survival floor model) and send-without-drives. Integrated into backup, init, verify. Arch-adversary review revealed three-layer pin protection prevents the originally claimed consequence; warning reframed as defense-in-depth signal. 10 tests. [Design](../95-ideas/2026-03-26-design-next-sessions.md) | [Implementation review](../99-reports/2026-03-26-preflight-implementation-review.md) | [Journal](../98-journals/2026-03-26-preflight-checks.md) |
-| 2e | **Structured error messages** | Medium | Pattern-match common btrfs stderr. Build as a translation layer in `error.rs`, not scattered across commands. |
+| 2e | ~~**Structured error messages**~~ | ~~Medium~~ | **COMPLETE.** `translate_btrfs_error()` in `error.rs` — pattern-matches 7 btrfs stderr patterns into `BtrfsErrorDetail` (summary, cause, remediation). Integrated into backup summary `structured_errors`. 9 tests. |
 
 ### Priority 3: Architectural Foundation (design before code)
 
@@ -203,7 +207,8 @@ migrate incrementally.
 - [x] Global TTY-aware color control (`colored::control::set_override` in main)
 - [x] Testable: 10 voice tests asserting output contains expected facts
 - [x] `backup` command returns structured `BackupSummary`, rendered by `voice::render_backup_summary()`
-- [ ] Remaining commands (`plan`, `history`, `verify`, `init`, `calibrate`) migrate incrementally
+- [x] `plan`, `history`, `verify`, `calibrate`, `get` commands migrated to voice layer
+- [ ] `init` command still uses direct `println!` — only remaining holdout
 
 **3d. `urd get file --at date`** — **COMPLETE.** Restore via direct path construction.
 O(1) — no search, no indexing. Automatic subvolume detection (longest-prefix match on
@@ -218,17 +223,17 @@ filter, added `--output` overwrite protection, removed dead_code allow on `local
 - [x] Path validation (normalize + no `..` + starts_with defense-in-depth)
 - [x] Read-only operation, no sudo needed
 
-**Gate before Priority 4:** Write ADR for protection promises:
-- [ ] Exact retention/interval derivations for each promise level
-- [ ] Config conflict resolution: what if promise + manual intervals both set?
-- [ ] Migration path for existing configs (implicit `custom`)
-- [ ] Promise validation: "this promise is unachievable given your drive connection pattern"
-- [ ] `custom` designed as first-class, not afterthought
-- [ ] Timer frequency as input to achievability — promises must be derivable from actual run frequency, not assumed sub-daily (operational data from 2026-03-26 showed awareness model reporting UNPROTECTED 18h/day because config intervals assumed sub-daily runs)
-- [ ] Drive topology constraints — subvolumes that exceed drive capacity cannot have external promises on those drives (subvol3-opptak at ~3.4TB vs 2TB-backup at ~1.1TB)
-- [ ] Awareness threshold mode — should thresholds adapt to timer frequency vs. Sentinel frequency, or should config intervals simply be required to be achievable?
+**Gate before Priority 4:** ~~Write ADR for protection promises~~ — **COMPLETE (ADR-110).**
+- [x] Exact retention/interval derivations for each promise level
+- [x] Config conflict resolution: what if promise + manual intervals both set?
+- [x] Migration path for existing configs (implicit `custom`)
+- [x] Promise validation: "this promise is unachievable given your drive connection pattern"
+- [x] `custom` designed as first-class, not afterthought
+- [x] Timer frequency as input to achievability — `RunFrequency` is explicit input to `derive_policy()`
+- [ ] Drive topology constraints — subvolumes that exceed drive capacity cannot have external promises on those drives (subvol3-opptak at ~3.4TB vs 2TB-backup at ~1.1TB). Not yet implemented — preflight checks cover drive count but not capacity.
+- [ ] Awareness threshold mode — thresholds still use fixed multipliers regardless of run frequency. Deferred to Sentinel work.
 
-### Priority 4: Protection Promises (score: 10 — build after ADR)
+### Priority 4: Protection Promises (score: 10) — SUBSTANTIALLY COMPLETE
 
 Config extension: optional `protection_level` per subvolume. Planner derives intervals
 and retention from promise level. Existing operation-focused configs continue to work
@@ -236,9 +241,9 @@ as implicit `custom`. The awareness model (3a) evaluates whether promises are be
 
 | # | Feature | Effort | Notes |
 |---|---------|--------|-------|
-| 4a | **Promise config + planner derivation** | Medium-High | `guarded`/`protected`/`resilient`/`archival`/`custom`. Planner routes to promise-based or operation-based logic. Anchor to data types users recognize. |
-| 4b | **Promise-anchored status** | Low-Medium | `urd status` opens with awareness model output. Confidence statement in plain language. |
-| 4c | **Subvolume-to-drive mapping** | Medium | Per-subvolume `drives = [...]`. Required for promises — "resilient" needs to know which drives count toward min_copies. |
+| 4a | ~~**Promise config + planner derivation**~~ | ~~Medium-High~~ | **COMPLETE.** `ProtectionLevel` (Guarded/Protected/Resilient/Custom), `RunFrequency` (Timer/Sentinel), `derive_policy()` pure function. Config resolution branches on promise level. Planner uses derived values. `--confirm-retention-change` fail-closed gate for retention. 31 new tests across sessions 1 + 2. [ADR-110](../00-foundation/decisions/2026-03-26-ADR-110-protection-promises.md) |
+| 4b | ~~**Promise-anchored status**~~ | ~~Low-Medium~~ | **COMPLETE.** `promise_level` on `StatusAssessment`, conditional PROMISE column in `urd status` and backup summary tables. Hidden when no promises configured. |
+| 4c | ~~**Subvolume-to-drive mapping**~~ | ~~Medium~~ | **COMPLETE.** `drives = [...]` on `SubvolumeConfig`. Planner filters drives per subvolume. Preflight validates drive labels against config. |
 
 ### Priority 5: Sentinel (score: 10 — decompose into three components)
 
@@ -312,8 +317,8 @@ timestamp staleness handling, space check deduplication, ANSI line clearing.
 - **Awareness model** (Phase 5, P3a) — `awareness.rs`: pure function `assess(config, now, fs)`
   computing PROTECTED / AT RISK / UNPROTECTED per subvolume. Asymmetric thresholds, best-drive
   aggregation, clock skew protection, error capture, offsite advisories. `FileSystemState`
-  extended with `last_successful_send_time()`. 24 tests. Integrated into heartbeat; not yet
-  integrated into status command.
+  extended with `last_successful_send_time()`. 24 tests. Integrated into heartbeat, status
+  command (STATUS column), and backup summary (conditional awareness table).
   [Journal](../98-journals/2026-03-23-awareness-model.md)
 - **Heartbeat file** (Phase 5, P3b) — `heartbeat.rs`: JSON health signal written after every
   backup run. Schema v1 with per-subvolume promise status from awareness model. Atomic writes,
@@ -391,6 +396,31 @@ timestamp staleness handling, space check deduplication, ANSI line clearing.
   [Journal](../98-journals/2026-03-24-pre-cutover-hardening.md) |
   [Review](../99-reports/2026-03-24-pre-cutover-testing-review.md)
 
+- **Voice migration** (Phase 5, P3c continued, 2026-03-26/27) — all commands except `init` now
+  use structured output types rendered by `voice.rs`. Migrated: `plan` (via `PlanView` adapter),
+  `history` (including subvolume history and failures views), `verify` (with `exit_code()` on
+  `VerifyOutput`), `calibrate`, `get`. 7 of 8 commands complete. `init` remains as the only
+  direct-println holdout. [Design](../95-ideas/2026-03-26-design-next-sessions.md)
+- **Structured error messages** (P2e, 2026-03-26) — `error.rs`: `translate_btrfs_error()` function
+  pattern-matches 7 btrfs stderr patterns into `BtrfsErrorDetail` structs with summary, cause,
+  and remediation steps. Covers: no-space (receive and snapshot), permission denied, read-only
+  filesystem, no-such-file (receive and delete), parent-not-found. Unknown errors pass through
+  with original stderr. Integrated into backup summary's `structured_errors` field. 9 tests.
+- **ADR-110: Protection Promises** (Phase 6, 2026-03-27) — Two-session implementation.
+  [ADR](../00-foundation/decisions/2026-03-26-ADR-110-protection-promises.md) |
+  [Design](../95-ideas/2026-03-26-design-protection-promises.md) |
+  [Session 1 journal](../98-journals/2026-03-27-protection-promises-session1.md)
+  - **Session 1** (committed): `ProtectionLevel` enum (Guarded/Protected/Resilient/Custom),
+    `RunFrequency` (Timer/Sentinel), `DerivedPolicy` struct, `derive_policy()` pure function.
+    Config resolution branching in `SubvolumeConfig::resolved()` — named levels derive base
+    values, explicit overrides replace, `None`/Custom preserves existing path. `run_frequency`
+    on `GeneralConfig`, `protection_level` and `drives` on `SubvolumeConfig`/`ResolvedSubvolume`.
+    Migration identity test confirms zero behavior change for existing configs. 19 new tests.
+  - **Session 2** (uncommitted): Preflight achievability checks (drive-count, voiding-override,
+    weakening-override), planner drive filtering (per-subvolume `drives` list), `--confirm-retention-change`
+    fail-closed gate for promise-derived retention (ADR-107), `promise_level` on `StatusAssessment`
+    with conditional PROMISE column in status/backup tables. 12 new tests. Total: 298.
+
 ### Not Building (dropped per adversary review)
 
 - **Tier 2 filesystem-level upper bound** — wrong in both directions for the actual data
@@ -408,11 +438,11 @@ timestamp staleness handling, space check deduplication, ANSI line clearing.
 - [x] **Phase 3** — CLI commands (`status`, `history`, `verify`) + systemd units
 - [x] **Phase 3.5** — Hardening for cutover (adversary review fixes)
 - [x] **Phase 4 code** — Cutover polish + space estimation + real-world testing
-- [ ] **Phase 4 cutover** — Operational transition from bash to Urd (in progress — Urd is sole system since 2026-03-25, monitoring until 2026-04-01)
+- [ ] **Phase 4 cutover** — Operational transition from bash to Urd (Urd is sole system since 2026-03-25, monitoring target 2026-04-01)
 - [x] **Post-cutover features** — failed-send bytes, progress, calibrate (Priorities 2-4)
-- [x] **Phase 5** — Architectural foundation: awareness model, heartbeat, presentation layer, `urd get`
-- [ ] **Phase 5 gate** — ADR: protection promise design (retention mappings, config conflicts, migration)
-- [ ] **Phase 6** — Protection promises in config + planner + status
+- [x] **Phase 5** — Architectural foundation: awareness model, heartbeat, presentation layer, `urd get`, voice migration (7/8 commands), structured errors
+- [x] **Phase 5 gate** — ADR-110: protection promise design (retention mappings, config conflicts, migration)
+- [x] **Phase 6** — Protection promises: types, derivation, config resolution, preflight checks, planner drive filtering, `--confirm-retention-change`, status display (session 2 uncommitted)
 - [ ] **Phase 7** — Sentinel: notification dispatcher → event reactor → active mode
 - [ ] **Phase 8** — Expansion: completions, smart defaults, setup wizard, drive lifecycle
 
@@ -472,6 +502,7 @@ rationale.
 | [ADR-107](../00-foundation/decisions/2026-03-24-ADR-107-fail-open-cleanup-on-failure.md) | Backups fail open; deletions fail closed | Phase 2 + space estimation |
 | [ADR-108](../00-foundation/decisions/2026-03-24-ADR-108-pure-function-module-pattern.md) | Core logic modules are pure functions | Planner → awareness → voice |
 | [ADR-109](../00-foundation/decisions/2026-03-24-ADR-109-config-boundary-validation.md) | Validate at config boundary, trust afterward | Phase 1 hardening |
+| [ADR-110](../00-foundation/decisions/2026-03-26-ADR-110-protection-promises.md) | Protection promises: 4 levels, pure derivation, zero-breaking-change migration | Phase 6 gate |
 | [ADR-020](../00-foundation/decisions/ADR-relating-to-bash-script/2026-03-21-ADR-020-daily-external-backups.md) | Daily external sends, graduated local retention | Bash-era, still active |
 
 ## Recent Decisions
@@ -505,18 +536,24 @@ for the graduation rationale.
 | Retention/send warning reframed: defense-in-depth signal, not active threat | 2026-03-26 | [Implementation review](../99-reports/2026-03-26-preflight-implementation-review.md) Finding 1 |
 | Voice migration: `PlanView` adapter (not `Serialize` on core types) | 2026-03-26 | [Design review](../99-reports/2026-03-26-next-sessions-design-review.md) Finding 3 |
 | `VerifyOutput.exit_code()` as single source of truth for severity→exit | 2026-03-26 | [Design review](../99-reports/2026-03-26-next-sessions-design-review.md) Finding 4 |
+| ADR-110: Protection promises — 4 levels, pure derivation, zero-breaking-change migration | 2026-03-26 | [ADR-110](../00-foundation/decisions/2026-03-26-ADR-110-protection-promises.md) |
+| `derive_policy()` in `types.rs` (not `config.rs`) — pure function, no config dependency | 2026-03-27 | [Session 1 journal](../98-journals/2026-03-27-protection-promises-session1.md) |
+| `resolved()` takes `RunFrequency` — timer frequency is explicit input, not assumed | 2026-03-27 | [Session 1 journal](../98-journals/2026-03-27-protection-promises-session1.md) |
+| `--confirm-retention-change` fail-closed gate — ADR-107 applied to promise-derived retention | 2026-03-27 | Session 2 (uncommitted) |
+| PROMISE column conditional — hidden when no subvolumes have promises (zero visual change for existing users) | 2026-03-27 | Session 2 (uncommitted) |
 
 ## Key Documents
 
 | Purpose | Document |
 |---------|----------|
-| Founding ADRs (ADR-100–105) | [decisions/](../00-foundation/decisions/) |
+| Founding ADRs (ADR-100–109) + ADR-110 | [decisions/](../00-foundation/decisions/) |
 | Original roadmap & architecture | [roadmap.md](roadmap.md) |
 | Feature priorities & user rankings | [Brainstorm synthesis](../99-reports/2026-03-23-brainstorm-synthesis.md) + [review](../99-reports/2026-03-23-brainstorm-synthesis-review.md) |
 | Vision brainstorm (promises, mythic voice, sentinel) | [Realizing the vision](../95-ideas/2026-03-23-brainstorm-realizing-the-vision.md) |
 | Future directions brainstorm | [Feature ideas](../95-ideas/2026-03-23-brainstorm-urd-future.md) |
 | UX design principles brainstorm | [Norman principles](../95-ideas/2026-03-23-brainstorm-ux-norman-principles.md) |
 | Vision architecture review | [2026-03-23 Architectural criteria for vision](../99-reports/2026-03-23-vision-architecture-review.md) |
+| Protection promises design | [ADR-110](../00-foundation/decisions/2026-03-26-ADR-110-protection-promises.md) + [Design](../95-ideas/2026-03-26-design-protection-promises.md) |
 | Latest adversary review | [2026-03-26 Preflight implementation review](../99-reports/2026-03-26-preflight-implementation-review.md) |
 | Code conventions & architecture | [CLAUDE.md](../../CLAUDE.md) |
 | Documentation standards | [CONTRIBUTING.md](../../CONTRIBUTING.md) |
@@ -530,7 +567,7 @@ for the graduation rationale.
 - `FileSystemState` trait (10 methods, including `drive_availability`) is outgrowing its name — consider renaming to `SystemState` if more methods are added
 - `SubvolumeResult.send_type` in executor.rs records only the last send type when a subvolume is sent to multiple drives — the per-operation data in `OperationOutcome` is correct, but the summary field is misleading. The backup summary works around this by extracting from operations directly
 - `heartbeat::read()` returns `Option` — cannot distinguish missing file from corrupt JSON (upgrade to `Result<Option>` when Sentinel is built)
-- Remaining commands (`plan`, `history`, `verify`, `init`, `calibrate`) still use direct `println!` — migrate to voice layer incrementally (`status` and `backup` now migrated)
+- `init` command still uses direct `println!` — only command not yet migrated to voice layer (all others complete)
 - Per-drive pin protection for external retention — current all-drives-union is conservative but suboptimal for space
 - `urd get` normalizes paths without filesystem access (no `canonicalize`) — symlinked paths won't match subvolume sources. Documented limitation; correct behavior (use canonical paths)
 - `urd get` doesn't support directory restore — files only in v1. Error message guides user.
@@ -543,5 +580,5 @@ for the graduation rationale.
 - Journal persistence gap: `journalctl --user -u urd-backup.service --since "2 days ago"` returned no entries despite successful runs (2026-03-26). Journal rotation or vacuum purges user-unit logs. Heartbeat partially compensates, but human-readable run logs may need a local file complement
 - htpc-root retention/send-interval coupling: chain break likely caused by manual snapshot deletion during third NVMe exhaustion incident (unverified hypothesis), not by automated retention — the three-layer pin protection system prevents retention from deleting pinned parents. Pre-flight check (2c) now warns about the config inconsistency as a defense-in-depth signal. Chain self-heals via full send
 - NVMe snapshot accumulation: 12 htpc-home snapshots (legacy + Urd) on 118GB drive is the primary space pressure source. Space guard now prevents catastrophic exhaustion, but gradual accumulation above the 10GB threshold is not gated. Retention tuning for constrained volumes deserves attention
-- Config/timer interval mismatch: send intervals (1h–4h) assume sub-daily timer but Urd runs once daily. Causes awareness model to report UNPROTECTED for ~18h/day. Operational action: tune intervals to match daily reality. Design question for Promise ADR: should timer frequency be an explicit input?
+- Config/timer interval mismatch: send intervals (1h–4h) assume sub-daily timer but Urd runs once daily. Causes awareness model to report UNPROTECTED for ~18h/day. Now solvable: set `protection_level` per subvolume with `run_frequency = "daily"` to auto-derive matching intervals. This is the first real-world validation of protection promises. Timer frequency is now an explicit input to `derive_policy()` (ADR-110)
 - Idea: [systemd unit drift check](../95-ideas/2026-03-23-systemd-unit-drift-check.md) in `urd verify`

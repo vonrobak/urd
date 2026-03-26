@@ -22,7 +22,7 @@ use crate::output::{
 use crate::plan::{self, FileSystemState, PlanFilters, RealFileSystemState};
 use crate::preflight;
 use crate::state::StateDb;
-use crate::types::{BackupPlan, ByteSize};
+use crate::types::{BackupPlan, ByteSize, PlannedOperation, ProtectionLevel};
 
 pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     let now = chrono::Local::now().naive_local();
@@ -54,7 +54,14 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     let fs_state = RealFileSystemState {
         state: state_db.as_ref(),
     };
-    let backup_plan = plan::plan(&config, now, &filters, &fs_state)?;
+    let mut backup_plan = plan::plan(&config, now, &filters, &fs_state)?;
+
+    // ADR-107: fail-closed for retention on promise-level subvolumes.
+    // If a subvolume has a protection_level, skip retention deletions unless
+    // --confirm-retention-change is explicitly set.
+    if !args.confirm_retention_change {
+        filter_promise_retention(&config, &mut backup_plan);
+    }
 
     // Warn about drives without UUID fingerprinting
     drives::warn_missing_uuids(&config.drives);
@@ -545,6 +552,43 @@ fn format_elapsed(d: Duration) -> String {
         format!("{hours}:{mins:02}:{secs:02}")
     } else {
         format!("{mins}:{secs:02}")
+    }
+}
+
+/// Remove retention delete operations for subvolumes that have a protection promise.
+///
+/// ADR-107 fail-closed: when a protection level derives retention parameters, those
+/// deletions are skipped unless the user explicitly confirms with `--confirm-retention-change`.
+/// Backups proceed normally — only deletions are held back.
+fn filter_promise_retention(config: &Config, plan: &mut BackupPlan) {
+    let resolved = config.resolved_subvolumes();
+    let promise_subvols: std::collections::HashSet<&str> = resolved
+        .iter()
+        .filter(|sv| {
+            matches!(
+                sv.protection_level,
+                Some(level) if level != ProtectionLevel::Custom
+            )
+        })
+        .map(|sv| sv.name.as_str())
+        .collect();
+
+    if promise_subvols.is_empty() {
+        return;
+    }
+
+    let before = plan.operations.len();
+    plan.operations.retain(|op| {
+        !matches!(op, PlannedOperation::DeleteSnapshot { subvolume_name, .. }
+            if promise_subvols.contains(subvolume_name.as_str()))
+    });
+    let removed = before - plan.operations.len();
+
+    if removed > 0 {
+        log::info!(
+            "Skipped {removed} retention deletion(s) for promise-level subvolumes \
+             (use --confirm-retention-change to apply)"
+        );
     }
 }
 
