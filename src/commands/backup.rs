@@ -19,6 +19,7 @@ use crate::output::{
     BackupSummary, OutputMode, SendSummary, SkippedSubvolume, StatusAssessment, SubvolumeSummary,
 };
 use crate::plan::{self, FileSystemState, PlanFilters, RealFileSystemState};
+use crate::preflight;
 use crate::state::StateDb;
 use crate::types::{BackupPlan, ByteSize};
 
@@ -56,6 +57,12 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
 
     // Warn about drives without UUID fingerprinting
     drives::warn_missing_uuids(&config.drives);
+
+    // Run pre-flight config consistency checks
+    let preflight_warnings = preflight::preflight_checks(&config);
+    for check in &preflight_warnings {
+        log::warn!("[preflight] {}", check.message);
+    }
 
     // Dry run: print plan and exit (no lock needed)
     if args.dry_run {
@@ -127,7 +134,13 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     }
 
     // Build and render structured summary
-    let summary = build_backup_summary(&backup_plan, &result, &assessments, exec_duration);
+    let summary = build_backup_summary(
+        &backup_plan,
+        &result,
+        &assessments,
+        exec_duration,
+        &preflight_warnings,
+    );
     let output_mode = OutputMode::detect();
     let rendered = crate::voice::render_backup_summary(&summary, output_mode);
     println!("{rendered}");
@@ -149,6 +162,7 @@ fn build_backup_summary(
     result: &ExecutionResult,
     assessments: &[SubvolAssessment],
     duration: Duration,
+    preflight_warnings: &[preflight::PreflightCheck],
 ) -> BackupSummary {
     let subvolumes: Vec<SubvolumeSummary> = result
         .subvolume_results
@@ -203,6 +217,11 @@ fn build_backup_summary(
         .collect();
 
     let mut warnings = Vec::new();
+
+    // Pre-flight config consistency warnings
+    for check in preflight_warnings {
+        warnings.push(format!("[preflight] {}", check.message));
+    }
 
     // Pin failure warnings
     let total_pin_failures: u32 = result
@@ -606,7 +625,7 @@ mod tests {
             run_id: Some(10),
         };
 
-        let summary = build_backup_summary(&empty_plan(), &result, &empty_assessments(), Duration::from_secs(5));
+        let summary = build_backup_summary(&empty_plan(), &result, &empty_assessments(), Duration::from_secs(5), &[]);
 
         assert_eq!(summary.subvolumes.len(), 1);
         let sv = &summary.subvolumes[0];
@@ -649,7 +668,7 @@ mod tests {
             run_id: Some(11),
         };
 
-        let summary = build_backup_summary(&empty_plan(), &result, &empty_assessments(), Duration::from_secs(120));
+        let summary = build_backup_summary(&empty_plan(), &result, &empty_assessments(), Duration::from_secs(120), &[]);
 
         let sv = &summary.subvolumes[0];
         assert_eq!(sv.sends.len(), 2, "both successful sends should appear");
@@ -670,7 +689,7 @@ mod tests {
             run_id: Some(12),
         };
 
-        let summary = build_backup_summary(&empty_plan(), &result, &empty_assessments(), Duration::from_secs(1));
+        let summary = build_backup_summary(&empty_plan(), &result, &empty_assessments(), Duration::from_secs(1), &[]);
 
         assert_eq!(summary.warnings.len(), 1);
         assert!(summary.warnings[0].contains("3 pin file write(s) failed"));
@@ -691,7 +710,7 @@ mod tests {
             run_id: Some(13),
         };
 
-        let summary = build_backup_summary(&empty_plan(), &result, &empty_assessments(), Duration::from_secs(1));
+        let summary = build_backup_summary(&empty_plan(), &result, &empty_assessments(), Duration::from_secs(1), &[]);
 
         assert!(summary.warnings.is_empty(), "should have no warnings on clean run");
     }
@@ -733,7 +752,7 @@ mod tests {
             run_id: Some(14),
         };
 
-        let summary = build_backup_summary(&plan, &result, &empty_assessments(), Duration::from_secs(1));
+        let summary = build_backup_summary(&plan, &result, &empty_assessments(), Duration::from_secs(1), &[]);
 
         assert_eq!(summary.warnings.len(), 1);
         assert!(summary.warnings[0].contains("1 of 2 planned deletion(s) skipped"));
@@ -756,7 +775,7 @@ mod tests {
             run_id: None,
         };
 
-        let summary = build_backup_summary(&plan, &result, &empty_assessments(), Duration::from_secs(0));
+        let summary = build_backup_summary(&plan, &result, &empty_assessments(), Duration::from_secs(0), &[]);
 
         assert_eq!(summary.skipped.len(), 2);
         assert_eq!(summary.skipped[0].name, "htpc-home");
@@ -773,7 +792,7 @@ mod tests {
             run_id: Some(15),
         };
 
-        let summary = build_backup_summary(&empty_plan(), &result, &sample_assessments(), Duration::from_secs(1));
+        let summary = build_backup_summary(&empty_plan(), &result, &sample_assessments(), Duration::from_secs(1), &[]);
 
         assert_eq!(summary.assessments.len(), 1);
         assert_eq!(summary.assessments[0].name, "htpc-home");
@@ -793,6 +812,7 @@ mod tests {
             &result,
             &empty_assessments(),
             Duration::from_millis(12300),
+            &[],
         );
 
         assert_eq!(summary.result, "partial");
@@ -816,7 +836,7 @@ mod tests {
             run_id: Some(16),
         };
 
-        let summary = build_backup_summary(&empty_plan(), &result, &empty_assessments(), Duration::from_secs(1));
+        let summary = build_backup_summary(&empty_plan(), &result, &empty_assessments(), Duration::from_secs(1), &[]);
 
         // Failed op with no error message should not appear in errors list
         assert!(summary.subvolumes[0].errors.is_empty());

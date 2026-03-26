@@ -11,6 +11,7 @@ mod heartbeat;
 mod metrics;
 mod output;
 mod plan;
+mod preflight;
 mod retention;
 mod state;
 mod types;

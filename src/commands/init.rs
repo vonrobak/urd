@@ -298,6 +298,16 @@ pub fn run(config: Config) -> anyhow::Result<()> {
         );
     }
 
+    // 8. Pre-flight config consistency checks
+    let preflight_results = crate::preflight::preflight_checks(&config);
+    if !preflight_results.is_empty() {
+        println!();
+        println!("{}", "Config consistency checks:".bold());
+        for check in &preflight_results {
+            println!("  {} {}", "WARN".yellow(), check.message);
+        }
+    }
+
     println!();
     println!("{}", "Initialization complete.".green().bold());
     Ok(())

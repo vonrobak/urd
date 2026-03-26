@@ -196,6 +196,17 @@ pub fn run(config: Config, args: VerifyArgs) -> anyhow::Result<()> {
     }
 
     // Summary
+    // Pre-flight config consistency checks
+    let preflight_results = crate::preflight::preflight_checks(&config);
+    if !preflight_results.is_empty() {
+        println!();
+        println!("{}", "Config consistency:".bold());
+        for check in &preflight_results {
+            println!("  {} {}", "WARN".yellow(), check.message);
+            total_warn += 1;
+        }
+    }
+
     let summary = format!(
         "Verify complete: {} OK, {} warnings, {} failures",
         total_ok, total_warn, total_fail
