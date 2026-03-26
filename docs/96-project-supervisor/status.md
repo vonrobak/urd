@@ -8,7 +8,7 @@
 **Operational cutover in progress. Urd is the sole backup system.**
 Urd's systemd timer has been running at 04:00 nightly since 2026-03-24. The bash script
 (`btrfs-snapshot-backup.sh`) is disabled. Five consecutive successful runs (runs 7–11) across
-manual and autonomous operation, passing 241 tests. The parallel-run step was skipped in favor
+manual and autonomous operation, passing 251 tests. The parallel-run step was skipped in favor
 of direct cutover — a conscious risk decision documented in
 [first-night journal](../98-journals/2026-03-25-first-night.md). Two nights of unattended
 operation (2026-03-25, 2026-03-26) completed without failures.
@@ -31,6 +31,27 @@ deletions). Daemon mode outputs JSON. 21 new tests (9 builder, 12 renderer).
 [Design](../95-ideas/2026-03-26-design-backup-summary.md) |
 [Review](../99-reports/2026-03-26-backup-summary-design-review.md) |
 [Journal](../98-journals/2026-03-26-backup-summary.md)
+
+**Pre-flight config consistency checks** (Priority 2c) implemented in a later session.
+New `preflight.rs` module — pure function of `&Config`, no I/O (ADR-108). Two checks:
+(1) retention/send interval compatibility — computes guaranteed survival floor
+(`hourly + daily * 24` hours) and warns when send interval exceeds it; (2) send-without-drives
+— single global warning when `send_enabled` subvolumes exist but no drives are configured.
+Integrated into `backup` (log + summary warnings), `init` (rendered section), and `verify`
+(rendered + counted in summary). The arch-adversary review revealed that the three-layer pin
+protection system (planner unsent protection, retention `is_pinned` guard, executor re-check)
+prevents the originally claimed consequence ("pinned parent deleted") — the warning was reframed
+as a defense-in-depth signal about config depending on pin protection rather than retention
+alignment. 10 new tests (251 total).
+[Design](../95-ideas/2026-03-26-design-next-sessions.md) |
+[Design review](../99-reports/2026-03-26-next-sessions-design-review.md) |
+[Implementation review](../99-reports/2026-03-26-preflight-implementation-review.md) |
+[Journal](../98-journals/2026-03-26-preflight-checks.md)
+
+**Multi-session design** for the next 2–3 sessions was produced and reviewed alongside the
+preflight work. Session 2: voice migration for remaining commands (plan, calibrate, history,
+verify). Session 3: Protection Promise ADR (ADR-110, gates Phase 6). Both designs are reviewed
+and ready to build. [Design](../95-ideas/2026-03-26-design-next-sessions.md)
 
 Config intervals (1h–6h snapshots, 1h–4h sends) were set for the travel period and are
 misaligned with the daily timer — the awareness model reports UNPROTECTED for most of each
@@ -138,7 +159,7 @@ most important question, and currently requires three commands to answer.
 | 2a+ | ~~**Local space guard**~~ | ~~Low~~ | **COMPLETE.** `plan_local_snapshot` checks `filesystem_free_bytes` against `min_free_bytes` before creating. `force` does not override. Fails open if unreadable. 4 tests. Closes the most dangerous safety gap (three NVMe exhaustion incidents). [Journal](../98-journals/2026-03-26-operational-evaluation.md) |
 | 2b | ~~**Surface skipped sends loudly**~~ | ~~Low~~ | **COMPLETE.** Subsumed by 2d — skip grouping is one section of the structured summary. "Not mounted" skips collapsed by drive; UUID mismatch/space/disabled rendered individually. |
 | 2d | ~~**Post-backup structured summary**~~ | ~~Medium~~ | **COMPLETE.** `BackupSummary` output type in `output.rs`, rendered by `voice::render_backup_summary()`. Replaces ~90 lines of `println!`. Per-drive send info, grouped skips, conditional awareness table, warning aggregation. 21 tests. [Design](../95-ideas/2026-03-26-design-backup-summary.md) | [Review](../99-reports/2026-03-26-backup-summary-design-review.md) | [Journal](../98-journals/2026-03-26-backup-summary.md) |
-| 2c | **Pre-flight checks** | Low | Extract `init.rs` validation into shared `preflight_checks()`. Include retention/send-interval compatibility: warn if retention policy would delete a pinned snapshot before the next send interval can use it as incremental parent (motivated by htpc-root chain break). |
+| 2c | ~~**Pre-flight checks**~~ | ~~Low~~ | **COMPLETE.** `preflight.rs` — pure function of `&Config`, 2 checks: retention/send compatibility (guaranteed survival floor model) and send-without-drives. Integrated into backup, init, verify. Arch-adversary review revealed three-layer pin protection prevents the originally claimed consequence; warning reframed as defense-in-depth signal. 10 tests. [Design](../95-ideas/2026-03-26-design-next-sessions.md) | [Implementation review](../99-reports/2026-03-26-preflight-implementation-review.md) | [Journal](../98-journals/2026-03-26-preflight-checks.md) |
 | 2e | **Structured error messages** | Medium | Pattern-match common btrfs stderr. Build as a translation layer in `error.rs`, not scattered across commands. |
 
 ### Priority 3: Architectural Foundation (design before code)
@@ -347,6 +368,18 @@ timestamp staleness handling, space check deduplication, ANSI line clearing.
   [Design](../95-ideas/2026-03-26-design-backup-summary.md) |
   [Review](../99-reports/2026-03-26-backup-summary-design-review.md) |
   [Journal](../98-journals/2026-03-26-backup-summary.md)
+- **Pre-flight config consistency checks** (P2c, 2026-03-26) — `preflight.rs`: pure function
+  of `&Config` (ADR-108), 2 checks. (1) Retention/send compatibility: guaranteed survival floor
+  (`hourly + daily × 24` hours) vs. send interval — warns when retention window is shorter,
+  meaning incremental chain depends on pin protection rather than retention alignment.
+  (2) Send-without-drives: single global warning when `send_enabled` subvolumes exist but no
+  drives configured. Integrated into backup (log + summary warnings), init (rendered section),
+  verify (rendered + counted). Arch-adversary review revealed three-layer pin protection
+  prevents the originally claimed consequence; warning reframed as defense-in-depth signal.
+  10 tests. Design-reviewed and implementation-reviewed.
+  [Design](../95-ideas/2026-03-26-design-next-sessions.md) |
+  [Implementation review](../99-reports/2026-03-26-preflight-implementation-review.md) |
+  [Journal](../98-journals/2026-03-26-preflight-checks.md)
 - **Pre-cutover hardening** (2026-03-24) — Three bugs found and fixed during pre-cutover manual
   testing. (1) `executor.rs`: mkdir before `btrfs receive` — first-ever sends to any drive would
   fail without destination directory. Parent-exists guard preserves test behavior and unmounted-drive
@@ -468,6 +501,10 @@ for the graduation rationale.
 | `Vec<SendSummary>` for multi-drive sends (not single `send_drive` field) | 2026-03-26 | [Backup summary review](../99-reports/2026-03-26-backup-summary-design-review.md) Finding 1 |
 | Only "not mounted" skips grouped; UUID mismatch always renders individually | 2026-03-26 | [Backup summary review](../99-reports/2026-03-26-backup-summary-design-review.md) Finding 3 |
 | Awareness table conditional: shown only when AT RISK or UNPROTECTED | 2026-03-26 | [Backup summary design](../95-ideas/2026-03-26-design-backup-summary.md) Open Question 3 |
+| Preflight module is pure `&Config` only — no `FileSystemState`, no I/O | 2026-03-26 | [Design review](../99-reports/2026-03-26-next-sessions-design-review.md) Finding 2 |
+| Retention/send warning reframed: defense-in-depth signal, not active threat | 2026-03-26 | [Implementation review](../99-reports/2026-03-26-preflight-implementation-review.md) Finding 1 |
+| Voice migration: `PlanView` adapter (not `Serialize` on core types) | 2026-03-26 | [Design review](../99-reports/2026-03-26-next-sessions-design-review.md) Finding 3 |
+| `VerifyOutput.exit_code()` as single source of truth for severity→exit | 2026-03-26 | [Design review](../99-reports/2026-03-26-next-sessions-design-review.md) Finding 4 |
 
 ## Key Documents
 
@@ -480,7 +517,7 @@ for the graduation rationale.
 | Future directions brainstorm | [Feature ideas](../95-ideas/2026-03-23-brainstorm-urd-future.md) |
 | UX design principles brainstorm | [Norman principles](../95-ideas/2026-03-23-brainstorm-ux-norman-principles.md) |
 | Vision architecture review | [2026-03-23 Architectural criteria for vision](../99-reports/2026-03-23-vision-architecture-review.md) |
-| Latest adversary review | [2026-03-26 Backup summary design review](../99-reports/2026-03-26-backup-summary-design-review.md) |
+| Latest adversary review | [2026-03-26 Preflight implementation review](../99-reports/2026-03-26-preflight-implementation-review.md) |
 | Code conventions & architecture | [CLAUDE.md](../../CLAUDE.md) |
 | Documentation standards | [CONTRIBUTING.md](../../CONTRIBUTING.md) |
 
@@ -504,7 +541,7 @@ for the graduation rationale.
 - Bootstrap pattern — code that touches `external_snapshot_dir()` may assume per-subvolume dirs exist. Three instances found and fixed (mkdir, verify pins, space estimation). Watch for more
 - MockBtrfs tests don't exercise filesystem preconditions — `tempfile::TempDir` approach needed for code that touches real filesystem
 - Journal persistence gap: `journalctl --user -u urd-backup.service --since "2 days ago"` returned no entries despite successful runs (2026-03-26). Journal rotation or vacuum purges user-unit logs. Heartbeat partially compensates, but human-readable run logs may need a local file complement
-- htpc-root retention/send-interval coupling: retention policy (`daily = 3, weekly = 2`) deletes pinned snapshot before the 1-week send interval can use it as incremental parent. Chain self-heals via full send, but the planner does not warn about this incompatibility. Candidate for 2c pre-flight check
+- htpc-root retention/send-interval coupling: chain break likely caused by manual snapshot deletion during third NVMe exhaustion incident (unverified hypothesis), not by automated retention — the three-layer pin protection system prevents retention from deleting pinned parents. Pre-flight check (2c) now warns about the config inconsistency as a defense-in-depth signal. Chain self-heals via full send
 - NVMe snapshot accumulation: 12 htpc-home snapshots (legacy + Urd) on 118GB drive is the primary space pressure source. Space guard now prevents catastrophic exhaustion, but gradual accumulation above the 10GB threshold is not gated. Retention tuning for constrained volumes deserves attention
 - Config/timer interval mismatch: send intervals (1h–4h) assume sub-daily timer but Urd runs once daily. Causes awareness model to report UNPROTECTED for ~18h/day. Operational action: tune intervals to match daily reality. Design question for Promise ADR: should timer frequency be an explicit input?
 - Idea: [systemd unit drift check](../95-ideas/2026-03-23-systemd-unit-drift-check.md) in `urd verify`
