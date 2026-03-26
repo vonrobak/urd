@@ -11,7 +11,7 @@ use std::fmt::Write;
 
 use colored::Colorize;
 
-use crate::output::{GetOutput, OutputMode, StatusOutput};
+use crate::output::{BackupSummary, GetOutput, OutputMode, StatusOutput};
 use crate::types::ByteSize;
 
 // ── Status ──────────────────────────────────────────────────────────────
@@ -261,6 +261,250 @@ fn color_result(result: &str) -> String {
     }
 }
 
+// ── Backup Summary ─────────────────────────────────────────────────────
+
+/// Render post-backup summary according to the given mode.
+#[must_use]
+pub fn render_backup_summary(data: &BackupSummary, mode: OutputMode) -> String {
+    match mode {
+        OutputMode::Interactive => render_backup_interactive(data),
+        OutputMode::Daemon => render_backup_daemon(data),
+    }
+}
+
+fn render_backup_daemon(data: &BackupSummary) -> String {
+    serde_json::to_string_pretty(data).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
+}
+
+fn render_backup_interactive(data: &BackupSummary) -> String {
+    let mut out = String::new();
+
+    // ── Header ───────────────────────────────────────────────────────
+    let result_colored = color_result(&data.result);
+    let run_info = match data.run_id {
+        Some(id) => format!("run #{id}, "),
+        None => String::new(),
+    };
+    writeln!(
+        out,
+        "{}",
+        format!(
+            "── Urd backup: {result_colored} ── [{run_info}{:.1}s] ──",
+            data.duration_secs,
+        )
+        .bold()
+    )
+    .ok();
+
+    // ── Executed subvolumes ──────────────────────────────────────────
+    if !data.subvolumes.is_empty() {
+        writeln!(out).ok();
+        for sv in &data.subvolumes {
+            let status = if sv.success {
+                "OK".green().to_string()
+            } else {
+                "FAILED".red().to_string()
+            };
+
+            let send_info = format_send_info(&sv.sends);
+            writeln!(
+                out,
+                "  {:<6} {}  [{:.1}s]{}",
+                status,
+                sv.name.bold(),
+                sv.duration_secs,
+                send_info,
+            )
+            .ok();
+
+            for err in &sv.errors {
+                writeln!(out, "    {} {}", "ERROR".red(), err).ok();
+            }
+        }
+    }
+
+    // ── Skipped sends ────────────────────────────────────────────────
+    render_skipped_block(&data.skipped, &mut out);
+
+    // ── Awareness table ──────────────────────────────────────────────
+    let any_not_protected = data
+        .assessments
+        .iter()
+        .any(|a| a.status != "PROTECTED");
+    if any_not_protected {
+        writeln!(out).ok();
+        render_assessment_table(data, &mut out);
+        render_assessment_advisories(data, &mut out);
+    } else if !data.assessments.is_empty() {
+        writeln!(out).ok();
+        writeln!(out, "All subvolumes {}.", "PROTECTED".green()).ok();
+    }
+
+    // ── Warnings ─────────────────────────────────────────────────────
+    if !data.warnings.is_empty() {
+        writeln!(out).ok();
+        for warning in &data.warnings {
+            writeln!(out, "{} {}", "WARNING:".yellow().bold(), warning).ok();
+        }
+    }
+
+    out
+}
+
+fn format_send_info(sends: &[crate::output::SendSummary]) -> String {
+    if sends.is_empty() {
+        return String::new();
+    }
+    let parts: Vec<String> = sends
+        .iter()
+        .map(|s| {
+            let bytes_info = s
+                .bytes_transferred
+                .map(|b| format!(", {}", ByteSize(b)))
+                .unwrap_or_default();
+            format!("{} \u{2192} {}{}", s.send_type, s.drive, bytes_info)
+        })
+        .collect();
+    format!("  ({})", parts.join("; "))
+}
+
+/// Render skipped subvolumes, grouping "drive X not mounted" entries.
+fn render_skipped_block(skipped: &[crate::output::SkippedSubvolume], out: &mut String) {
+    if skipped.is_empty() {
+        return;
+    }
+
+    writeln!(out).ok();
+
+    // Separate "not mounted" skips from unique skips.
+    // Only exact "drive {label} not mounted" reasons are grouped.
+    let mut not_mounted_drives: Vec<String> = Vec::new();
+    let mut not_mounted_subvols: Vec<String> = Vec::new();
+    let mut unique_skips: Vec<&crate::output::SkippedSubvolume> = Vec::new();
+
+    for skip in skipped {
+        if let Some(label) = skip
+            .reason
+            .strip_prefix("drive ")
+            .and_then(|r| r.strip_suffix(" not mounted"))
+        {
+            if !not_mounted_drives.contains(&label.to_string()) {
+                not_mounted_drives.push(label.to_string());
+            }
+            if !not_mounted_subvols.contains(&skip.name) {
+                not_mounted_subvols.push(skip.name.clone());
+            }
+        } else {
+            unique_skips.push(skip);
+        }
+    }
+
+    // Grouped "not mounted" line
+    if !not_mounted_drives.is_empty() {
+        writeln!(
+            out,
+            "  {} {}",
+            "Drives not mounted:".dimmed(),
+            not_mounted_drives.join(", "),
+        )
+        .ok();
+        writeln!(
+            out,
+            "    {} {} send(s) skipped ({})",
+            "\u{2192}".dimmed(),
+            skipped.len() - unique_skips.len(),
+            not_mounted_subvols.join(", "),
+        )
+        .ok();
+    }
+
+    // Individual skips (UUID mismatch, space, disabled, etc.)
+    for skip in &unique_skips {
+        writeln!(
+            out,
+            "  {} {}  {}",
+            "SKIP".yellow(),
+            skip.name.bold(),
+            skip.reason,
+        )
+        .ok();
+    }
+}
+
+/// Render the awareness assessment table (same layout as status command).
+fn render_assessment_table(data: &BackupSummary, out: &mut String) {
+    // Reuse the same table structure as render_subvolume_table in status rendering.
+    // Build a StatusOutput-compatible view for the shared table formatter.
+    if data.assessments.is_empty() {
+        return;
+    }
+
+    // Collect drive labels from assessments
+    let mut drive_labels: Vec<String> = Vec::new();
+    for assessment in &data.assessments {
+        for ext in &assessment.external {
+            if ext.mounted && !drive_labels.contains(&ext.drive_label) {
+                drive_labels.push(ext.drive_label.clone());
+            }
+        }
+    }
+
+    // Build headers: STATUS  SUBVOLUME  LOCAL  [DRIVE1]  [DRIVE2]
+    let mut headers: Vec<String> = vec![
+        "STATUS".to_string(),
+        "SUBVOLUME".to_string(),
+        "LOCAL".to_string(),
+    ];
+    for label in &drive_labels {
+        headers.push(label.clone());
+    }
+
+    // Build rows
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    for assessment in &data.assessments {
+        let mut row = vec![
+            assessment.status.clone(),
+            assessment.name.clone(),
+            assessment.local_snapshot_count.to_string(),
+        ];
+
+        for label in &drive_labels {
+            let count = assessment
+                .external
+                .iter()
+                .find(|e| e.drive_label == *label)
+                .and_then(|e| e.snapshot_count);
+            row.push(match count {
+                Some(c) if c > 0 => c.to_string(),
+                _ => "\u{2014}".to_string(),
+            });
+        }
+
+        rows.push(row);
+    }
+
+    format_table(&headers, &rows, out);
+}
+
+/// Render advisories and errors from awareness assessments.
+fn render_assessment_advisories(data: &BackupSummary, out: &mut String) {
+    for assessment in &data.assessments {
+        for error in &assessment.errors {
+            writeln!(out, "  {} {}: {}", "ERROR".red(), assessment.name, error).ok();
+        }
+        for advisory in &assessment.advisories {
+            writeln!(
+                out,
+                "  {} {}: {}",
+                "NOTE".dimmed(),
+                assessment.name,
+                advisory,
+            )
+            .ok();
+        }
+    }
+}
+
 // ── Get ────────────────────────────────────────────────────────────────
 
 /// Render get metadata according to the given mode (for stderr, not content).
@@ -290,8 +534,8 @@ fn render_get_interactive(data: &GetOutput) -> String {
 mod tests {
     use super::*;
     use crate::output::{
-        ChainHealth, ChainHealthEntry, DriveInfo, LastRunInfo, StatusAssessment,
-        StatusDriveAssessment,
+        BackupSummary, ChainHealth, ChainHealthEntry, DriveInfo, LastRunInfo, SendSummary,
+        SkippedSubvolume, StatusAssessment, StatusDriveAssessment, SubvolumeSummary,
     };
 
     fn test_status_output() -> StatusOutput {
@@ -489,6 +733,272 @@ mod tests {
         assert!(
             output.contains("no runs recorded"),
             "missing no-runs message"
+        );
+    }
+
+    // ── Backup summary tests ────────────────────────────────────────
+
+    fn test_backup_summary() -> BackupSummary {
+        BackupSummary {
+            result: "success".to_string(),
+            run_id: Some(47),
+            duration_secs: 12.3,
+            subvolumes: vec![
+                SubvolumeSummary {
+                    name: "htpc-home".to_string(),
+                    success: true,
+                    duration_secs: 2.1,
+                    sends: vec![],
+                    errors: vec![],
+                },
+                SubvolumeSummary {
+                    name: "htpc-docs".to_string(),
+                    success: true,
+                    duration_secs: 0.3,
+                    sends: vec![SendSummary {
+                        drive: "WD-18TB".to_string(),
+                        send_type: "incremental".to_string(),
+                        bytes_transferred: Some(1_500_000),
+                    }],
+                    errors: vec![],
+                },
+            ],
+            skipped: vec![
+                SkippedSubvolume {
+                    name: "htpc-home".to_string(),
+                    reason: "drive 2TB-backup not mounted".to_string(),
+                },
+                SkippedSubvolume {
+                    name: "htpc-docs".to_string(),
+                    reason: "drive 2TB-backup not mounted".to_string(),
+                },
+            ],
+            assessments: vec![StatusAssessment {
+                name: "htpc-home".to_string(),
+                status: "PROTECTED".to_string(),
+                local_snapshot_count: 12,
+                local_status: "PROTECTED".to_string(),
+                external: vec![],
+                advisories: vec![],
+                errors: vec![],
+            }],
+            warnings: vec![],
+        }
+    }
+
+    #[test]
+    fn backup_interactive_contains_header() {
+        colored::control::set_override(false);
+        let output = render_backup_summary(&test_backup_summary(), OutputMode::Interactive);
+        assert!(output.contains("success"), "missing result in header");
+        assert!(output.contains("#47"), "missing run ID");
+        assert!(output.contains("12.3"), "missing duration");
+    }
+
+    #[test]
+    fn backup_interactive_contains_subvolumes() {
+        colored::control::set_override(false);
+        let output = render_backup_summary(&test_backup_summary(), OutputMode::Interactive);
+        assert!(output.contains("htpc-home"), "missing subvolume name");
+        assert!(output.contains("htpc-docs"), "missing subvolume name");
+        assert!(output.contains("OK"), "missing OK status");
+    }
+
+    #[test]
+    fn backup_interactive_contains_send_info() {
+        colored::control::set_override(false);
+        let output = render_backup_summary(&test_backup_summary(), OutputMode::Interactive);
+        assert!(
+            output.contains("incremental") && output.contains("WD-18TB"),
+            "missing send info"
+        );
+    }
+
+    #[test]
+    fn backup_interactive_groups_not_mounted_skips() {
+        colored::control::set_override(false);
+        let output = render_backup_summary(&test_backup_summary(), OutputMode::Interactive);
+        assert!(
+            output.contains("Drives not mounted"),
+            "missing grouped skip header"
+        );
+        assert!(
+            output.contains("2TB-backup"),
+            "missing drive name in grouped skip"
+        );
+        assert!(
+            output.contains("2 send(s) skipped"),
+            "missing skip count"
+        );
+    }
+
+    #[test]
+    fn backup_interactive_uuid_mismatch_not_grouped() {
+        colored::control::set_override(false);
+        let mut data = test_backup_summary();
+        data.skipped = vec![
+            SkippedSubvolume {
+                name: "htpc-home".to_string(),
+                reason: "drive WD-18TB not mounted".to_string(),
+            },
+            SkippedSubvolume {
+                name: "htpc-home".to_string(),
+                reason: "drive 2TB-backup UUID mismatch (expected abc, found def)".to_string(),
+            },
+        ];
+        let output = render_backup_summary(&data, OutputMode::Interactive);
+        assert!(
+            output.contains("UUID mismatch"),
+            "UUID mismatch must render individually"
+        );
+        assert!(
+            output.contains("SKIP"),
+            "UUID mismatch must show SKIP label"
+        );
+    }
+
+    #[test]
+    fn backup_interactive_all_protected_one_line() {
+        colored::control::set_override(false);
+        let output = render_backup_summary(&test_backup_summary(), OutputMode::Interactive);
+        assert!(
+            output.contains("All subvolumes PROTECTED"),
+            "missing all-protected summary"
+        );
+        // Should NOT contain a table header
+        assert!(
+            !output.contains("SUBVOLUME"),
+            "should not show table when all protected"
+        );
+    }
+
+    #[test]
+    fn backup_interactive_shows_table_when_at_risk() {
+        colored::control::set_override(false);
+        let mut data = test_backup_summary();
+        data.assessments[0].status = "AT RISK".to_string();
+        let output = render_backup_summary(&data, OutputMode::Interactive);
+        assert!(
+            output.contains("SUBVOLUME"),
+            "should show table when not all protected"
+        );
+        assert!(output.contains("AT RISK"), "missing AT RISK status");
+    }
+
+    #[test]
+    fn backup_interactive_shows_warnings() {
+        colored::control::set_override(false);
+        let mut data = test_backup_summary();
+        data.warnings = vec!["2 pin file write(s) failed. Run `urd verify` to diagnose.".to_string()];
+        let output = render_backup_summary(&data, OutputMode::Interactive);
+        assert!(
+            output.contains("pin file write"),
+            "missing warning"
+        );
+        assert!(
+            output.contains("WARNING"),
+            "missing WARNING label"
+        );
+    }
+
+    #[test]
+    fn backup_interactive_shows_errors() {
+        colored::control::set_override(false);
+        let mut data = test_backup_summary();
+        data.subvolumes[1].success = false;
+        data.subvolumes[1].errors = vec!["send_full: btrfs send failed".to_string()];
+        data.result = "partial".to_string();
+        let output = render_backup_summary(&data, OutputMode::Interactive);
+        assert!(
+            output.contains("FAILED"),
+            "missing FAILED status"
+        );
+        assert!(
+            output.contains("btrfs send failed"),
+            "missing error detail"
+        );
+    }
+
+    #[test]
+    fn backup_interactive_multi_drive_sends() {
+        colored::control::set_override(false);
+        let mut data = test_backup_summary();
+        data.subvolumes[1].sends = vec![
+            SendSummary {
+                drive: "WD-18TB".to_string(),
+                send_type: "incremental".to_string(),
+                bytes_transferred: Some(1_500_000),
+            },
+            SendSummary {
+                drive: "2TB-backup".to_string(),
+                send_type: "full".to_string(),
+                bytes_transferred: Some(50_000_000_000),
+            },
+        ];
+        let output = render_backup_summary(&data, OutputMode::Interactive);
+        assert!(output.contains("WD-18TB"), "missing first drive");
+        assert!(output.contains("2TB-backup"), "missing second drive");
+        assert!(output.contains("full"), "missing full send type");
+        assert!(output.contains("incremental"), "missing incremental send type");
+    }
+
+    #[test]
+    fn backup_daemon_produces_valid_json() {
+        let output = render_backup_summary(&test_backup_summary(), OutputMode::Daemon);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&output).unwrap_or_else(|e| panic!("invalid JSON: {e}\n{output}"));
+        assert_eq!(parsed["result"], "success");
+        assert_eq!(parsed["run_id"], 47);
+        assert!(parsed["subvolumes"].is_array(), "missing subvolumes");
+        assert!(parsed["skipped"].is_array(), "missing skipped");
+        assert!(parsed["assessments"].is_array(), "missing assessments");
+    }
+
+    #[test]
+    fn backup_all_skips_run() {
+        colored::control::set_override(false);
+        let data = BackupSummary {
+            result: "success".to_string(),
+            run_id: Some(48),
+            duration_secs: 0.1,
+            subvolumes: vec![],
+            skipped: vec![
+                SkippedSubvolume {
+                    name: "htpc-home".to_string(),
+                    reason: "drive WD-18TB not mounted".to_string(),
+                },
+                SkippedSubvolume {
+                    name: "htpc-docs".to_string(),
+                    reason: "drive WD-18TB not mounted".to_string(),
+                },
+                SkippedSubvolume {
+                    name: "htpc-home".to_string(),
+                    reason: "drive 2TB-backup not mounted".to_string(),
+                },
+                SkippedSubvolume {
+                    name: "htpc-docs".to_string(),
+                    reason: "drive 2TB-backup not mounted".to_string(),
+                },
+            ],
+            assessments: vec![],
+            warnings: vec![],
+        };
+        let output = render_backup_summary(&data, OutputMode::Interactive);
+        assert!(
+            output.contains("Drives not mounted"),
+            "missing grouped header for all-skips run"
+        );
+        assert!(
+            output.contains("WD-18TB"),
+            "missing first drive in grouped skips"
+        );
+        assert!(
+            output.contains("2TB-backup"),
+            "missing second drive in grouped skips"
+        );
+        assert!(
+            output.contains("4 send(s) skipped"),
+            "wrong skip count"
         );
     }
 }

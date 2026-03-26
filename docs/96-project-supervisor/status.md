@@ -5,18 +5,36 @@
 
 ## Current State
 
-**Phase 5 complete. Safety hardening in progress (2a done). Pre-cutover hardening done.**
-Awareness model (3a), heartbeat file (3b), presentation layer (3c), `urd get` (3d), and UUID
-drive fingerprinting (2a) are built, reviewed, and passing 216 tests. Pre-cutover testing
-(2026-03-24) found and fixed two bugs: executor didn't mkdir before `btrfs receive` (every
-first-send to a new drive would fail), and verify reported false chain breaks from legacy
-pin files. A third bug — space estimation querying per-subvolume dir instead of mount path —
-was also found and fixed in the same session. UUID fingerprints configured for both mounted
-drives. Operational cutover has not started — the bash script (`btrfs-snapshot-backup.sh`)
-is still the sole production backup system, running nightly at 02:00 via
-`btrfs-backup-daily.timer`. Urd v0.2.2026-03-24 is installed (`~/.cargo/bin/urd`) and has
-been tested manually on real subvolumes (all read-only tests pass, one successful incremental
-send to 2TB-backup). Full backup run (Test 11) is the last gate before installing the timer.
+**Operational cutover in progress. Urd is the sole backup system.**
+Urd's systemd timer has been running at 04:00 nightly since 2026-03-24. The bash script
+(`btrfs-snapshot-backup.sh`) is disabled. Five consecutive successful runs (runs 7–11) across
+manual and autonomous operation, passing 241 tests. The parallel-run step was skipped in favor
+of direct cutover — a conscious risk decision documented in
+[first-night journal](../98-journals/2026-03-25-first-night.md). Two nights of unattended
+operation (2026-03-25, 2026-03-26) completed without failures.
+
+A third NVMe space exhaustion incident (2026-03-26) motivated immediate implementation of the
+**local space guard** in `plan_local_snapshot` — the fix designed in the
+[March 24 postmortem](../98-journals/2026-03-24-local-space-exhaustion-postmortem.md) but
+never built. The planner now checks `filesystem_free_bytes` against `min_free_bytes` before
+creating any local snapshot. `force` does not override (a forced snapshot on a full filesystem
+is still catastrophic). 4 new tests. This closes the most dangerous safety gap in the
+application. [Journal](../98-journals/2026-03-26-operational-evaluation.md)
+
+**Post-backup structured summary** (Priorities 2b + 2d) implemented in the same session.
+The backup command now produces a `BackupSummary` output type rendered by the voice layer,
+replacing ~90 lines of ad-hoc `println!`. Answers "is my data safer now?" in one screen:
+executed subvolumes with per-drive send info, grouped skip reasons (drive-not-mounted entries
+collapsed, UUID mismatch/space/disabled shown individually), conditional awareness table
+(shown only when AT RISK or UNPROTECTED), and warning aggregation (pin failures, skipped
+deletions). Daemon mode outputs JSON. 21 new tests (9 builder, 12 renderer).
+[Design](../95-ideas/2026-03-26-design-backup-summary.md) |
+[Review](../99-reports/2026-03-26-backup-summary-design-review.md) |
+[Journal](../98-journals/2026-03-26-backup-summary.md)
+
+Config intervals (1h–6h snapshots, 1h–4h sends) were set for the travel period and are
+misaligned with the daily timer — the awareness model reports UNPROTECTED for most of each
+day. Interval tuning to match daily reality is the next operational action.
 
 Safety hardening completed:
 
@@ -109,14 +127,18 @@ No code changes. Just do it. See [cutover checklist](#active-work--operational-c
 
 ### Priority 2: Safety Hardening (during/after cutover)
 
-Low-risk, high-value improvements to the existing architecture.
+Low-risk, high-value improvements to the existing architecture. Reordered 2026-03-26 based
+on operational data: surfacing skip reasons and post-backup summaries are the highest-leverage
+UX improvements — the returning-from-travel experience proved that "is my data safe?" is the
+most important question, and currently requires three commands to answer.
 
 | # | Feature | Effort | Notes |
 |---|---------|--------|-------|
 | 2a | ~~**UUID drive fingerprinting**~~ | ~~Low~~ | **COMPLETE.** `DriveAvailability` enum, `findmnt` UUID detection, planner integration, config validation. 10 tests. Adversary-reviewed. |
-| 2b | **Surface skipped sends loudly** | Low | Prominent warning block in backup output. |
-| 2c | **Pre-flight checks** | Low | Extract `init.rs` validation into shared `preflight_checks()`. |
-| 2d | **Post-backup structured summary** | Medium | Answer "is my data safer now?" Format as structured data, render via presentation layer. |
+| 2a+ | ~~**Local space guard**~~ | ~~Low~~ | **COMPLETE.** `plan_local_snapshot` checks `filesystem_free_bytes` against `min_free_bytes` before creating. `force` does not override. Fails open if unreadable. 4 tests. Closes the most dangerous safety gap (three NVMe exhaustion incidents). [Journal](../98-journals/2026-03-26-operational-evaluation.md) |
+| 2b | ~~**Surface skipped sends loudly**~~ | ~~Low~~ | **COMPLETE.** Subsumed by 2d — skip grouping is one section of the structured summary. "Not mounted" skips collapsed by drive; UUID mismatch/space/disabled rendered individually. |
+| 2d | ~~**Post-backup structured summary**~~ | ~~Medium~~ | **COMPLETE.** `BackupSummary` output type in `output.rs`, rendered by `voice::render_backup_summary()`. Replaces ~90 lines of `println!`. Per-drive send info, grouped skips, conditional awareness table, warning aggregation. 21 tests. [Design](../95-ideas/2026-03-26-design-backup-summary.md) | [Review](../99-reports/2026-03-26-backup-summary-design-review.md) | [Journal](../98-journals/2026-03-26-backup-summary.md) |
+| 2c | **Pre-flight checks** | Low | Extract `init.rs` validation into shared `preflight_checks()`. Include retention/send-interval compatibility: warn if retention policy would delete a pinned snapshot before the next send interval can use it as incremental parent (motivated by htpc-root chain break). |
 | 2e | **Structured error messages** | Medium | Pattern-match common btrfs stderr. Build as a translation layer in `error.rs`, not scattered across commands. |
 
 ### Priority 3: Architectural Foundation (design before code)
@@ -159,7 +181,8 @@ migrate incrementally.
 - [x] Daemon mode: JSON serialization of `StatusOutput`
 - [x] Global TTY-aware color control (`colored::control::set_override` in main)
 - [x] Testable: 10 voice tests asserting output contains expected facts
-- [ ] Remaining commands migrate incrementally (not blocked on this)
+- [x] `backup` command returns structured `BackupSummary`, rendered by `voice::render_backup_summary()`
+- [ ] Remaining commands (`plan`, `history`, `verify`, `init`, `calibrate`) migrate incrementally
 
 **3d. `urd get file --at date`** — **COMPLETE.** Restore via direct path construction.
 O(1) — no search, no indexing. Automatic subvolume detection (longest-prefix match on
@@ -180,6 +203,9 @@ filter, added `--output` overwrite protection, removed dead_code allow on `local
 - [ ] Migration path for existing configs (implicit `custom`)
 - [ ] Promise validation: "this promise is unachievable given your drive connection pattern"
 - [ ] `custom` designed as first-class, not afterthought
+- [ ] Timer frequency as input to achievability — promises must be derivable from actual run frequency, not assumed sub-daily (operational data from 2026-03-26 showed awareness model reporting UNPROTECTED 18h/day because config intervals assumed sub-daily runs)
+- [ ] Drive topology constraints — subvolumes that exceed drive capacity cannot have external promises on those drives (subvol3-opptak at ~3.4TB vs 2TB-backup at ~1.1TB)
+- [ ] Awareness threshold mode — should thresholds adapt to timer frequency vs. Sentinel frequency, or should config intervals simply be required to be achievable?
 
 ### Priority 4: Protection Promises (score: 10 — build after ADR)
 
@@ -302,6 +328,25 @@ timestamp staleness handling, space check deduplication, ANSI line clearing.
   uniqueness check, `log::warn!` over `eprintln!`.
   [Design review](../99-reports/2026-03-24-uuid-fingerprinting-design-review.md) |
   [Implementation review](../99-reports/2026-03-24-uuid-fingerprinting-implementation-review.md)
+- **Local space guard** (2026-03-26) — `plan_local_snapshot` checks `filesystem_free_bytes`
+  against `min_free_bytes` before creating any local snapshot. Skips with clear reason if
+  below threshold. `force` does not override — a forced snapshot on a full filesystem is still
+  catastrophic. Fails open if free bytes unreadable (`unwrap_or(u64::MAX)`, per ADR-107).
+  Motivated by third NVMe space exhaustion incident. Design from
+  [postmortem](../98-journals/2026-03-24-local-space-exhaustion-postmortem.md), implemented
+  in [operational evaluation session](../98-journals/2026-03-26-operational-evaluation.md).
+  4 new tests.
+- **Post-backup structured summary** (P2b + P2d, 2026-03-26) — `BackupSummary` output type
+  in `output.rs`, rendered by `voice::render_backup_summary()`. Replaces ~90 lines of ad-hoc
+  `println!` in backup command. Per-subvolume results with multi-drive send info
+  (`Vec<SendSummary>`), grouped skip reasons (drive-not-mounted collapsed, UUID mismatch and
+  other safety-relevant skips rendered individually), conditional awareness table (shown only
+  when AT RISK or UNPROTECTED), warning aggregation (pin failures, skipped deletions). Daemon
+  mode outputs JSON. 2b subsumed by 2d — skip surfacing is one section of the summary.
+  21 new tests (9 builder, 12 renderer). Design-reviewed before implementation.
+  [Design](../95-ideas/2026-03-26-design-backup-summary.md) |
+  [Review](../99-reports/2026-03-26-backup-summary-design-review.md) |
+  [Journal](../98-journals/2026-03-26-backup-summary.md)
 - **Pre-cutover hardening** (2026-03-24) — Three bugs found and fixed during pre-cutover manual
   testing. (1) `executor.rs`: mkdir before `btrfs receive` — first-ever sends to any drive would
   fail without destination directory. Parent-exists guard preserves test behavior and unmounted-drive
@@ -330,7 +375,7 @@ timestamp staleness handling, space check deduplication, ANSI line clearing.
 - [x] **Phase 3** — CLI commands (`status`, `history`, `verify`) + systemd units
 - [x] **Phase 3.5** — Hardening for cutover (adversary review fixes)
 - [x] **Phase 4 code** — Cutover polish + space estimation + real-world testing
-- [ ] **Phase 4 cutover** — Operational transition from bash to Urd (see below)
+- [ ] **Phase 4 cutover** — Operational transition from bash to Urd (in progress — Urd is sole system since 2026-03-25, monitoring until 2026-04-01)
 - [x] **Post-cutover features** — failed-send bytes, progress, calibrate (Priorities 2-4)
 - [x] **Phase 5** — Architectural foundation: awareness model, heartbeat, presentation layer, `urd get`
 - [ ] **Phase 5 gate** — ADR: protection promise design (retention mappings, config conflicts, migration)
@@ -348,21 +393,24 @@ See [Phase 4 journal](../98-journals/2026-03-22-urd-phase4.md) section "What Was
 (`urd-backup.*`) are owned by this repo. See [deployment conventions](../../CONTRIBUTING.md#systemd-deployment)
 for details.
 
-### Step 1: Install Urd units (this repo)
+### Step 1: Install Urd units (this repo) — COMPLETE
 
-- [ ] Install Urd systemd units: `cp ~/projects/urd/systemd/urd-backup.{service,timer} ~/.config/systemd/user/`
-- [ ] Reload and enable: `systemctl --user daemon-reload && systemctl --user enable --now urd-backup.timer`
+- [x] Install Urd systemd units (2026-03-24)
+- [x] Reload and enable urd-backup.timer at 04:00 daily
 
-### Step 2: Parallel run (requires action in ~/containers repo)
+### Step 2: Parallel run — SKIPPED
 
-- [ ] _(~/containers)_ Shift bash timer to 03:00: `systemctl --user edit btrfs-backup-daily.timer` → `OnCalendar=*-*-* 03:00:00`
-- [ ] Verify both systems run nightly and produce equivalent results (compare Prometheus metrics, snapshot directories, pin files)
-- [ ] Run parallel for at least 1 week, ideally 2
+Parallel run was skipped in favor of direct cutover. The bash timer was disabled on
+2026-03-25, not shifted to a different time. This was a conscious risk decision: recent
+snapshots existed on both external drives, and the congestion risk of two backup systems
+outweighed the safety net of parallel operation. Five clean runs (7–11) validate the decision.
+[First-night journal](../98-journals/2026-03-25-first-night.md)
 
-### Step 3: Cutover (requires action in ~/containers repo)
+### Step 3: Cutover — IN PROGRESS
 
-- [ ] _(~/containers)_ Disable bash timer: `systemctl --user disable --now btrfs-backup-daily.timer`
-- [ ] Monitor Urd as sole system for 1 week
+- [x] _(~/containers)_ Bash timer disabled (2026-03-25)
+- [x] Urd running as sole backup system (2 nights unattended, 5 total successful runs)
+- [ ] Monitor for 1 week total (started 2026-03-25, target: 2026-04-01)
 - [ ] Verify Grafana dashboard continuity (metrics names/labels must match)
 
 ### Step 4: Cleanup (cross-repo)
@@ -412,6 +460,14 @@ for the graduation rationale.
 | `PinResult` with `PinSource` enum — legacy pins downgraded to WARN | 2026-03-24 | [Pre-cutover journal](../98-journals/2026-03-24-pre-cutover-hardening.md) |
 | Space estimation queries mount path, not per-subvolume dir | 2026-03-24 | [Pre-cutover journal](../98-journals/2026-03-24-pre-cutover-hardening.md) |
 | Founding ADRs formalized (ADR-100 through ADR-109) | 2026-03-24 | [Design evolution analysis](../99-reports/2026-03-24-design-evolution-analysis.md) |
+| Skip parallel run — direct cutover with bash disabled | 2026-03-25 | [First-night journal](../98-journals/2026-03-25-first-night.md) |
+| Local space guard: planner gates snapshot creation on free space | 2026-03-26 | [Operational evaluation](../98-journals/2026-03-26-operational-evaluation.md) |
+| Priority 2 reordered: 2b/2d before 2c/2e (data-driven) | 2026-03-26 | [Operational evaluation](../98-journals/2026-03-26-operational-evaluation.md) |
+| Promise ADR enriched: timer frequency, drive topology, threshold modes | 2026-03-26 | [Operational evaluation](../98-journals/2026-03-26-operational-evaluation.md) |
+| 2b subsumed by 2d — skip surfacing is one section of the structured summary | 2026-03-26 | [Backup summary design](../95-ideas/2026-03-26-design-backup-summary.md) |
+| `Vec<SendSummary>` for multi-drive sends (not single `send_drive` field) | 2026-03-26 | [Backup summary review](../99-reports/2026-03-26-backup-summary-design-review.md) Finding 1 |
+| Only "not mounted" skips grouped; UUID mismatch always renders individually | 2026-03-26 | [Backup summary review](../99-reports/2026-03-26-backup-summary-design-review.md) Finding 3 |
+| Awareness table conditional: shown only when AT RISK or UNPROTECTED | 2026-03-26 | [Backup summary design](../95-ideas/2026-03-26-design-backup-summary.md) Open Question 3 |
 
 ## Key Documents
 
@@ -424,7 +480,7 @@ for the graduation rationale.
 | Future directions brainstorm | [Feature ideas](../95-ideas/2026-03-23-brainstorm-urd-future.md) |
 | UX design principles brainstorm | [Norman principles](../95-ideas/2026-03-23-brainstorm-ux-norman-principles.md) |
 | Vision architecture review | [2026-03-23 Architectural criteria for vision](../99-reports/2026-03-23-vision-architecture-review.md) |
-| Latest adversary review | [2026-03-24 Pre-cutover testing review](../99-reports/2026-03-24-pre-cutover-testing-review.md) |
+| Latest adversary review | [2026-03-26 Backup summary design review](../99-reports/2026-03-26-backup-summary-design-review.md) |
 | Code conventions & architecture | [CLAUDE.md](../../CLAUDE.md) |
 | Documentation standards | [CONTRIBUTING.md](../../CONTRIBUTING.md) |
 
@@ -435,9 +491,9 @@ for the graduation rationale.
 - Stale failed send estimates persist indefinitely for (subvolume, drive, send_type) triples with no subsequent sends — consider TTL or clearing on successful calibration
 - Successful sends could update `subvolume_sizes` table to keep calibration fresh, but pipe bytes ≠ `du -sb` bytes (method mixing concern)
 - `FileSystemState` trait (10 methods, including `drive_availability`) is outgrowing its name — consider renaming to `SystemState` if more methods are added
-- Awareness model integrated into heartbeat and `urd status` but not yet into backup post-run summary
+- `SubvolumeResult.send_type` in executor.rs records only the last send type when a subvolume is sent to multiple drives — the per-operation data in `OperationOutcome` is correct, but the summary field is misleading. The backup summary works around this by extracting from operations directly
 - `heartbeat::read()` returns `Option` — cannot distinguish missing file from corrupt JSON (upgrade to `Result<Option>` when Sentinel is built)
-- Remaining commands (`plan`, `backup`, `history`, `verify`, `init`, `calibrate`) still use direct `println!` — migrate to voice layer incrementally
+- Remaining commands (`plan`, `history`, `verify`, `init`, `calibrate`) still use direct `println!` — migrate to voice layer incrementally (`status` and `backup` now migrated)
 - Per-drive pin protection for external retention — current all-drives-union is conservative but suboptimal for space
 - `urd get` normalizes paths without filesystem access (no `canonicalize`) — symlinked paths won't match subvolume sources. Documented limitation; correct behavior (use canonical paths)
 - `urd get` doesn't support directory restore — files only in v1. Error message guides user.
@@ -447,4 +503,8 @@ for the graduation rationale.
 - urd-backup.service has 6-hour timeout — may be insufficient for full send of largest subvolume (opptak ~3TB). March 23 failed send ran 2.3 hours
 - Bootstrap pattern — code that touches `external_snapshot_dir()` may assume per-subvolume dirs exist. Three instances found and fixed (mkdir, verify pins, space estimation). Watch for more
 - MockBtrfs tests don't exercise filesystem preconditions — `tempfile::TempDir` approach needed for code that touches real filesystem
+- Journal persistence gap: `journalctl --user -u urd-backup.service --since "2 days ago"` returned no entries despite successful runs (2026-03-26). Journal rotation or vacuum purges user-unit logs. Heartbeat partially compensates, but human-readable run logs may need a local file complement
+- htpc-root retention/send-interval coupling: retention policy (`daily = 3, weekly = 2`) deletes pinned snapshot before the 1-week send interval can use it as incremental parent. Chain self-heals via full send, but the planner does not warn about this incompatibility. Candidate for 2c pre-flight check
+- NVMe snapshot accumulation: 12 htpc-home snapshots (legacy + Urd) on 118GB drive is the primary space pressure source. Space guard now prevents catastrophic exhaustion, but gradual accumulation above the 10GB threshold is not gated. Retention tuning for constrained volumes deserves attention
+- Config/timer interval mismatch: send intervals (1h–4h) assume sub-daily timer but Urd runs once daily. Causes awareness model to report UNPROTECTED for ~18h/day. Operational action: tune intervals to match daily reality. Design question for Promise ADR: should timer frequency be an explicit input?
 - Idea: [systemd unit drift check](../95-ideas/2026-03-23-systemd-unit-drift-check.md) in `urd verify`

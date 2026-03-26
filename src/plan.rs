@@ -137,12 +137,15 @@ pub fn plan(
         // The executor relies on this ordering within each subvolume.
         // Do not reorder without updating the executor contract in PLAN.md.
         if !filters.external_only {
+            let min_free = config.root_min_free_bytes(&subvol.name).unwrap_or(0);
             plan_local_snapshot(
                 subvol,
                 &local_dir,
                 &local_snaps,
                 now,
                 force,
+                min_free,
+                fs,
                 &mut operations,
                 &mut skipped,
             );
@@ -225,9 +228,31 @@ fn plan_local_snapshot(
     local_snaps: &[SnapshotName],
     now: NaiveDateTime,
     force: bool,
+    min_free: u64,
+    fs: &dyn FileSystemState,
     operations: &mut Vec<PlannedOperation>,
     skipped: &mut Vec<(String, String)>,
 ) {
+    // Space guard: refuse to create if local filesystem is below min_free_bytes threshold.
+    // This prevents the catastrophic failure mode where snapshot creation fills the source
+    // filesystem. force does NOT override — a forced snapshot on a full filesystem is still
+    // catastrophic. See 2026-03-24-local-space-exhaustion-postmortem.md.
+    if min_free > 0 {
+        let free = fs.filesystem_free_bytes(local_dir).unwrap_or(u64::MAX);
+        if free < min_free {
+            use crate::types::ByteSize;
+            skipped.push((
+                subvol.name.clone(),
+                format!(
+                    "local filesystem low on space ({} free, {} required)",
+                    ByteSize(free),
+                    ByteSize(min_free),
+                ),
+            ));
+            return;
+        }
+    }
+
     // Check if interval has elapsed since newest snapshot
     let newest = local_snaps.iter().max();
 
@@ -1681,5 +1706,99 @@ send_enabled = false
             !sends.is_empty(),
             "Backward compat: mounted_drives should still trigger sends"
         );
+    }
+
+    // ── Local space guard tests ─────────────────────────────────────────
+
+    #[test]
+    fn skips_snapshot_when_local_space_below_threshold() {
+        let config = test_config(); // min_free_bytes = 10GB
+        let mut fs = MockFileSystemState::new();
+        // sv1 interval elapsed, but local filesystem has only 5GB free (below 10GB threshold)
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap("20260322-1440-one")]);
+        fs.free_bytes
+            .insert(PathBuf::from("/snap/sv1"), 5_000_000_000);
+
+        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+
+        // No snapshot should be created for sv1
+        let creates: Vec<_> = result
+            .operations
+            .iter()
+            .filter(|op| matches!(op, PlannedOperation::CreateSnapshot { subvolume_name, .. } if subvolume_name == "sv1"))
+            .collect();
+        assert!(creates.is_empty(), "Should not create snapshot when below min_free_bytes");
+
+        // Should have a skip reason mentioning low space
+        let skip_reasons: Vec<_> = result
+            .skipped
+            .iter()
+            .filter(|(name, reason)| name == "sv1" && reason.contains("low on space"))
+            .collect();
+        assert_eq!(skip_reasons.len(), 1, "Should record skip reason for low space");
+    }
+
+    #[test]
+    fn creates_snapshot_when_local_space_above_threshold() {
+        let config = test_config(); // min_free_bytes = 10GB
+        let mut fs = MockFileSystemState::new();
+        // sv1 interval elapsed, local filesystem has 50GB free (above 10GB threshold)
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap("20260322-1440-one")]);
+        fs.free_bytes
+            .insert(PathBuf::from("/snap/sv1"), 50_000_000_000);
+
+        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+
+        let creates: Vec<_> = result
+            .operations
+            .iter()
+            .filter(|op| matches!(op, PlannedOperation::CreateSnapshot { subvolume_name, .. } if subvolume_name == "sv1"))
+            .collect();
+        assert_eq!(creates.len(), 1, "Should create snapshot when above min_free_bytes");
+    }
+
+    #[test]
+    fn space_guard_not_overridden_by_force() {
+        let config = test_config(); // min_free_bytes = 10GB
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap("20260322-1440-one")]);
+        fs.free_bytes
+            .insert(PathBuf::from("/snap/sv1"), 5_000_000_000);
+
+        // Force sv1 — should still be blocked by space guard
+        let filters = PlanFilters {
+            subvolume: Some("sv1".to_string()),
+            ..PlanFilters::default()
+        };
+        let result = plan(&config, now(), &filters, &fs).unwrap();
+
+        let creates: Vec<_> = result
+            .operations
+            .iter()
+            .filter(|op| matches!(op, PlannedOperation::CreateSnapshot { subvolume_name, .. } if subvolume_name == "sv1"))
+            .collect();
+        assert!(creates.is_empty(), "Force should NOT override space guard");
+    }
+
+    #[test]
+    fn space_guard_fails_open_when_free_bytes_unreadable() {
+        let config = test_config(); // min_free_bytes = 10GB
+        let mut fs = MockFileSystemState::new();
+        // sv1 interval elapsed, but no free_bytes entry — defaults to u64::MAX (fail open)
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap("20260322-1440-one")]);
+        // Note: no fs.free_bytes entry for /snap/sv1
+
+        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+
+        let creates: Vec<_> = result
+            .operations
+            .iter()
+            .filter(|op| matches!(op, PlannedOperation::CreateSnapshot { subvolume_name, .. } if subvolume_name == "sv1"))
+            .collect();
+        assert_eq!(creates.len(), 1, "Should create snapshot when free bytes unreadable (fail open)");
     }
 }
