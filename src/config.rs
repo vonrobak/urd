@@ -4,7 +4,10 @@ use std::path::{Component, Path, PathBuf};
 use serde::Deserialize;
 
 use crate::error::UrdError;
-use crate::types::{ByteSize, DriveRole, GraduatedRetention, Interval, ResolvedGraduatedRetention};
+use crate::types::{
+    ByteSize, DriveRole, GraduatedRetention, Interval, ProtectionLevel, ResolvedGraduatedRetention,
+    RunFrequency,
+};
 
 // ── Top-level config ────────────────────────────────────────────────────
 
@@ -28,6 +31,14 @@ pub struct GeneralConfig {
     pub btrfs_path: String,
     #[serde(default = "default_heartbeat_path")]
     pub heartbeat_file: PathBuf,
+    #[serde(default = "default_run_frequency")]
+    pub run_frequency: RunFrequency,
+}
+
+fn default_run_frequency() -> RunFrequency {
+    RunFrequency::Timer {
+        interval: Interval::days(1),
+    }
 }
 
 fn default_btrfs_path() -> String {
@@ -95,6 +106,10 @@ pub struct SubvolumeConfig {
     pub send_enabled: Option<bool>,
     pub local_retention: Option<GraduatedRetention>,
     pub external_retention: Option<GraduatedRetention>,
+    #[serde(default)]
+    pub protection_level: Option<ProtectionLevel>,
+    #[serde(default)]
+    pub drives: Option<Vec<String>>,
 }
 
 fn default_priority() -> u8 {
@@ -104,7 +119,7 @@ fn default_priority() -> u8 {
 // ── Resolved subvolume (all defaults filled in) ─────────────────────────
 
 /// A subvolume config with all optional fields resolved against defaults.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedSubvolume {
     pub name: String,
     pub short_name: String,
@@ -116,31 +131,96 @@ pub struct ResolvedSubvolume {
     pub send_enabled: bool,
     pub local_retention: ResolvedGraduatedRetention,
     pub external_retention: ResolvedGraduatedRetention,
+    pub protection_level: Option<ProtectionLevel>,
+    pub drives: Option<Vec<String>>,
 }
 
 impl SubvolumeConfig {
-    /// Resolve this subvolume config against the provided defaults.
+    /// Resolve this subvolume config against the provided defaults and run frequency.
+    ///
+    /// When `protection_level` is set to a named level (not `Custom`), derives base
+    /// operational parameters from the promise level via `derive_policy()`. Explicit
+    /// overrides on the subvolume replace derived values. When `protection_level` is
+    /// `None` or `Custom`, falls through to the existing defaults-based resolution
+    /// (migration identity: zero behavior change for existing configs).
     #[must_use]
-    pub fn resolved(&self, defaults: &DefaultsConfig) -> ResolvedSubvolume {
-        let local_ret = match &self.local_retention {
-            Some(lr) => lr.merged_with(&defaults.local_retention).resolved(),
-            None => defaults.local_retention.resolved(),
-        };
-        let external_ret = match &self.external_retention {
-            Some(er) => er.merged_with(&defaults.external_retention).resolved(),
-            None => defaults.external_retention.resolved(),
-        };
-        ResolvedSubvolume {
-            name: self.name.clone(),
-            short_name: self.short_name.clone(),
-            source: self.source.clone(),
-            priority: self.priority,
-            enabled: self.enabled.unwrap_or(defaults.enabled),
-            snapshot_interval: self.snapshot_interval.unwrap_or(defaults.snapshot_interval),
-            send_interval: self.send_interval.unwrap_or(defaults.send_interval),
-            send_enabled: self.send_enabled.unwrap_or(defaults.send_enabled),
-            local_retention: local_ret,
-            external_retention: external_ret,
+    pub fn resolved(
+        &self,
+        defaults: &DefaultsConfig,
+        run_frequency: RunFrequency,
+    ) -> ResolvedSubvolume {
+        use crate::types::derive_policy;
+
+        let effective_level = self.protection_level.unwrap_or(ProtectionLevel::Custom);
+
+        match derive_policy(effective_level, run_frequency) {
+            Some(policy) => {
+                // Named level: derived values are the base, explicit overrides replace them.
+                let local_ret = match &self.local_retention {
+                    Some(lr) => {
+                        // User's partial retention merges with derived floor as base
+                        let derived_as_graduated = GraduatedRetention {
+                            hourly: Some(policy.local_retention.hourly),
+                            daily: Some(policy.local_retention.daily),
+                            weekly: Some(policy.local_retention.weekly),
+                            monthly: Some(policy.local_retention.monthly),
+                        };
+                        lr.merged_with(&derived_as_graduated).resolved()
+                    }
+                    None => policy.local_retention,
+                };
+                let external_ret = match &self.external_retention {
+                    Some(er) => {
+                        let derived_as_graduated = GraduatedRetention {
+                            hourly: Some(policy.external_retention.hourly),
+                            daily: Some(policy.external_retention.daily),
+                            weekly: Some(policy.external_retention.weekly),
+                            monthly: Some(policy.external_retention.monthly),
+                        };
+                        er.merged_with(&derived_as_graduated).resolved()
+                    }
+                    None => policy.external_retention,
+                };
+                ResolvedSubvolume {
+                    name: self.name.clone(),
+                    short_name: self.short_name.clone(),
+                    source: self.source.clone(),
+                    priority: self.priority,
+                    enabled: self.enabled.unwrap_or(defaults.enabled),
+                    snapshot_interval: self.snapshot_interval.unwrap_or(policy.snapshot_interval),
+                    send_interval: self.send_interval.unwrap_or(policy.send_interval),
+                    send_enabled: self.send_enabled.unwrap_or(policy.send_enabled),
+                    local_retention: local_ret,
+                    external_retention: external_ret,
+                    protection_level: Some(effective_level),
+                    drives: self.drives.clone(),
+                }
+            }
+            None => {
+                // Custom / no level: existing defaults-based resolution (migration path).
+                let local_ret = match &self.local_retention {
+                    Some(lr) => lr.merged_with(&defaults.local_retention).resolved(),
+                    None => defaults.local_retention.resolved(),
+                };
+                let external_ret = match &self.external_retention {
+                    Some(er) => er.merged_with(&defaults.external_retention).resolved(),
+                    None => defaults.external_retention.resolved(),
+                };
+                ResolvedSubvolume {
+                    name: self.name.clone(),
+                    short_name: self.short_name.clone(),
+                    source: self.source.clone(),
+                    priority: self.priority,
+                    enabled: self.enabled.unwrap_or(defaults.enabled),
+                    snapshot_interval: self.snapshot_interval.unwrap_or(defaults.snapshot_interval),
+                    send_interval: self.send_interval.unwrap_or(defaults.send_interval),
+                    send_enabled: self.send_enabled.unwrap_or(defaults.send_enabled),
+                    local_retention: local_ret,
+                    external_retention: external_ret,
+                    protection_level: self.protection_level,
+                    drives: self.drives.clone(),
+                }
+            }
         }
     }
 }
@@ -200,10 +280,11 @@ impl Config {
     /// Resolve all subvolumes against defaults, sorted by priority.
     #[must_use]
     pub fn resolved_subvolumes(&self) -> Vec<ResolvedSubvolume> {
+        let freq = self.general.run_frequency;
         let mut resolved: Vec<_> = self
             .subvolumes
             .iter()
-            .map(|sv| sv.resolved(&self.defaults))
+            .map(|sv| sv.resolved(&self.defaults, freq))
             .collect();
         resolved.sort_by_key(|sv| sv.priority);
         resolved
@@ -343,6 +424,21 @@ impl Config {
             validate_path_safe(&sv.source, &format!("subvolume {:?} source", sv.name))?;
             validate_name_safe(&sv.name, "subvolume name")?;
             validate_name_safe(&sv.short_name, "subvolume short_name")?;
+        }
+
+        // Subvolume drives must reference configured drive labels
+        let drive_labels: HashSet<&str> = self.drives.iter().map(|d| d.label.as_str()).collect();
+        for sv in &self.subvolumes {
+            if let Some(ref drives) = sv.drives {
+                for label in drives {
+                    if !drive_labels.contains(label.as_str()) {
+                        return Err(UrdError::Config(format!(
+                            "subvolume {:?} references unknown drive: {:?}",
+                            sv.name, label
+                        )));
+                    }
+                }
+            }
         }
 
         Ok(())
@@ -496,7 +592,8 @@ send_interval = "2h"
         assert_eq!(config.drives.len(), 1);
         assert_eq!(config.drives[0].role, DriveRole::Primary);
 
-        let resolved = config.subvolumes[0].resolved(&config.defaults);
+        let resolved =
+            config.subvolumes[0].resolved(&config.defaults, config.general.run_frequency);
         assert_eq!(resolved.snapshot_interval, Interval::minutes(15));
         assert_eq!(resolved.send_interval, Interval::hours(1));
         assert!(resolved.enabled);
@@ -505,7 +602,8 @@ send_interval = "2h"
         assert_eq!(resolved.local_retention.daily, 30);
 
         // Second subvolume inherits defaults for retention
-        let resolved2 = config.subvolumes[1].resolved(&config.defaults);
+        let resolved2 =
+            config.subvolumes[1].resolved(&config.defaults, config.general.run_frequency);
         assert_eq!(resolved2.snapshot_interval, Interval::hours(1));
         assert_eq!(resolved2.local_retention.weekly, 26);
         assert_eq!(resolved2.local_retention.monthly, 12);
@@ -731,7 +829,8 @@ send_enabled = false
 local_retention = { daily = 7, weekly = 4 }
 "#;
         let config: Config = toml::from_str(config_str).unwrap();
-        let resolved = config.subvolumes[0].resolved(&config.defaults);
+        let resolved =
+            config.subvolumes[0].resolved(&config.defaults, config.general.run_frequency);
 
         // Explicitly overridden
         assert!(!resolved.send_enabled);
@@ -853,5 +952,343 @@ source = "/data"
         config.expand_paths();
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("forbidden characters"));
+    }
+
+    // ── Protection promise tests ────────────────────────────────────
+
+    #[test]
+    fn migration_identity_no_protection_level() {
+        // Critical test: configs without protection_level must produce
+        // identical ResolvedSubvolume via both old (custom) and new paths.
+        let config_str = r#"
+[general]
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp"
+
+[local_snapshots]
+roots = [{ path = "/snap", subvolumes = ["sv1", "sv2"] }]
+
+[defaults]
+snapshot_interval = "1h"
+send_interval = "4h"
+send_enabled = true
+enabled = true
+[defaults.local_retention]
+hourly = 24
+daily = 30
+weekly = 26
+monthly = 12
+[defaults.external_retention]
+daily = 30
+weekly = 26
+monthly = 0
+
+[[drives]]
+label = "D1"
+mount_path = "/mnt/d1"
+snapshot_root = ".snapshots"
+role = "test"
+
+[[subvolumes]]
+name = "sv1"
+short_name = "sv1"
+source = "/sv1"
+snapshot_interval = "15m"
+send_interval = "1h"
+
+[[subvolumes]]
+name = "sv2"
+short_name = "sv2"
+source = "/sv2"
+send_enabled = false
+local_retention = { daily = 7, weekly = 4 }
+"#;
+        let config: Config = toml::from_str(config_str).unwrap();
+        let freq = config.general.run_frequency;
+
+        for sv in &config.subvolumes {
+            let resolved = sv.resolved(&config.defaults, freq);
+            // No protection_level set, so it should be None
+            assert_eq!(resolved.protection_level, None);
+            assert_eq!(resolved.drives, None);
+            // Verify all fields match defaults-based resolution
+            assert_eq!(
+                resolved.snapshot_interval,
+                sv.snapshot_interval
+                    .unwrap_or(config.defaults.snapshot_interval)
+            );
+            assert_eq!(
+                resolved.send_interval,
+                sv.send_interval.unwrap_or(config.defaults.send_interval)
+            );
+            assert_eq!(
+                resolved.send_enabled,
+                sv.send_enabled.unwrap_or(config.defaults.send_enabled)
+            );
+        }
+
+        // Specific check: sv2 with overrides
+        let sv2 = config.subvolumes[1].resolved(&config.defaults, freq);
+        assert!(!sv2.send_enabled);
+        assert_eq!(sv2.local_retention.daily, 7);
+        assert_eq!(sv2.local_retention.weekly, 4);
+        assert_eq!(sv2.local_retention.hourly, 24); // from defaults
+        assert_eq!(sv2.local_retention.monthly, 12); // from defaults
+    }
+
+    #[test]
+    fn protection_level_derives_values() {
+        let config_str = r#"
+[general]
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp"
+
+[local_snapshots]
+roots = [{ path = "/snap", subvolumes = ["sv"] }]
+
+[defaults]
+snapshot_interval = "1h"
+send_interval = "4h"
+[defaults.local_retention]
+hourly = 24
+[defaults.external_retention]
+daily = 30
+
+[[drives]]
+label = "D1"
+mount_path = "/mnt/d1"
+snapshot_root = ".snapshots"
+role = "test"
+
+[[subvolumes]]
+name = "sv"
+short_name = "sv"
+source = "/sv"
+protection_level = "protected"
+"#;
+        let config: Config = toml::from_str(config_str).unwrap();
+        let resolved =
+            config.subvolumes[0].resolved(&config.defaults, config.general.run_frequency);
+
+        // Should use derived values from "protected" + daily timer, not defaults
+        assert_eq!(resolved.protection_level, Some(ProtectionLevel::Protected));
+        assert_eq!(resolved.snapshot_interval, Interval::days(1)); // derived from timer
+        assert_eq!(resolved.send_interval, Interval::days(1)); // derived from timer
+        assert!(resolved.send_enabled);
+        assert_eq!(resolved.local_retention.hourly, 24);
+        assert_eq!(resolved.local_retention.daily, 30);
+        assert_eq!(resolved.local_retention.weekly, 26);
+        assert_eq!(resolved.local_retention.monthly, 12);
+    }
+
+    #[test]
+    fn protection_level_with_overrides() {
+        let config_str = r#"
+[general]
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp"
+
+[local_snapshots]
+roots = [{ path = "/snap", subvolumes = ["sv"] }]
+
+[defaults]
+snapshot_interval = "1h"
+send_interval = "4h"
+[defaults.local_retention]
+hourly = 24
+[defaults.external_retention]
+daily = 30
+
+[[drives]]
+label = "D1"
+mount_path = "/mnt/d1"
+snapshot_root = ".snapshots"
+role = "test"
+
+[[subvolumes]]
+name = "sv"
+short_name = "sv"
+source = "/sv"
+protection_level = "protected"
+snapshot_interval = "15m"
+"#;
+        let config: Config = toml::from_str(config_str).unwrap();
+        let resolved =
+            config.subvolumes[0].resolved(&config.defaults, config.general.run_frequency);
+
+        // Explicit override replaces derived value
+        assert_eq!(resolved.snapshot_interval, Interval::minutes(15));
+        // Derived values used where not overridden
+        assert_eq!(resolved.send_interval, Interval::days(1));
+        assert!(resolved.send_enabled);
+    }
+
+    #[test]
+    fn protection_level_retention_override_merges() {
+        let config_str = r#"
+[general]
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp"
+
+[local_snapshots]
+roots = [{ path = "/snap", subvolumes = ["sv"] }]
+
+[defaults]
+snapshot_interval = "1h"
+send_interval = "4h"
+[defaults.local_retention]
+hourly = 24
+[defaults.external_retention]
+daily = 30
+
+[[drives]]
+label = "D1"
+mount_path = "/mnt/d1"
+snapshot_root = ".snapshots"
+role = "test"
+
+[[subvolumes]]
+name = "sv"
+short_name = "sv"
+source = "/sv"
+protection_level = "protected"
+local_retention = { daily = 60 }
+"#;
+        let config: Config = toml::from_str(config_str).unwrap();
+        let resolved =
+            config.subvolumes[0].resolved(&config.defaults, config.general.run_frequency);
+
+        // User override for daily
+        assert_eq!(resolved.local_retention.daily, 60);
+        // Derived values fill in unspecified fields
+        assert_eq!(resolved.local_retention.hourly, 24);
+        assert_eq!(resolved.local_retention.weekly, 26);
+        assert_eq!(resolved.local_retention.monthly, 12);
+    }
+
+    #[test]
+    fn drives_field_parsed_and_passed_through() {
+        let config_str = r#"
+[general]
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp"
+
+[local_snapshots]
+roots = [{ path = "/snap", subvolumes = ["sv"] }]
+
+[defaults]
+snapshot_interval = "1h"
+send_interval = "4h"
+[defaults.local_retention]
+hourly = 24
+[defaults.external_retention]
+daily = 30
+
+[[drives]]
+label = "D1"
+mount_path = "/mnt/d1"
+snapshot_root = ".snapshots"
+role = "test"
+
+[[subvolumes]]
+name = "sv"
+short_name = "sv"
+source = "/sv"
+drives = ["D1"]
+"#;
+        let config: Config = toml::from_str(config_str).unwrap();
+        let resolved =
+            config.subvolumes[0].resolved(&config.defaults, config.general.run_frequency);
+        assert_eq!(resolved.drives, Some(vec!["D1".to_string()]));
+    }
+
+    #[test]
+    fn drives_field_validates_against_configured_drives() {
+        let config_str = r#"
+[general]
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp"
+
+[local_snapshots]
+roots = [{ path = "/snap", subvolumes = ["sv"] }]
+
+[defaults]
+snapshot_interval = "1h"
+send_interval = "4h"
+[defaults.local_retention]
+hourly = 24
+[defaults.external_retention]
+daily = 30
+
+[[drives]]
+label = "D1"
+mount_path = "/mnt/d1"
+snapshot_root = ".snapshots"
+role = "test"
+
+[[subvolumes]]
+name = "sv"
+short_name = "sv"
+source = "/sv"
+drives = ["NONEXISTENT"]
+"#;
+        let mut config: Config = toml::from_str(config_str).unwrap();
+        config.expand_paths();
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("unknown drive"));
+        assert!(err.to_string().contains("NONEXISTENT"));
+    }
+
+    #[test]
+    fn run_frequency_parsed_from_config() {
+        let config_str = r#"
+[general]
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp"
+run_frequency = "6h"
+
+[local_snapshots]
+roots = [{ path = "/snap", subvolumes = ["sv"] }]
+
+[defaults]
+snapshot_interval = "1h"
+send_interval = "4h"
+[defaults.local_retention]
+hourly = 24
+[defaults.external_retention]
+daily = 30
+
+[[drives]]
+label = "D1"
+mount_path = "/mnt/d1"
+snapshot_root = ".snapshots"
+role = "test"
+
+[[subvolumes]]
+name = "sv"
+short_name = "sv"
+source = "/sv"
+protection_level = "protected"
+"#;
+        let config: Config = toml::from_str(config_str).unwrap();
+        assert_eq!(
+            config.general.run_frequency,
+            RunFrequency::Timer {
+                interval: Interval::hours(6)
+            }
+        );
+
+        // Protected + 6h timer → 6h intervals
+        let resolved =
+            config.subvolumes[0].resolved(&config.defaults, config.general.run_frequency);
+        assert_eq!(resolved.snapshot_interval, Interval::hours(6));
+        assert_eq!(resolved.send_interval, Interval::hours(6));
     }
 }

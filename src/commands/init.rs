@@ -165,7 +165,13 @@ pub fn run(config: Config) -> anyhow::Result<()> {
             for label in &drive_labels {
                 match chain::read_pin_file(&local_dir, label) {
                     Ok(Some(result)) => {
-                        println!("  {} {}/{}: {}", "OK".green(), subvol_name, label, result.name);
+                        println!(
+                            "  {} {}/{}: {}",
+                            "OK".green(),
+                            subvol_name,
+                            label,
+                            result.name
+                        );
                     }
                     Ok(None) => {
                         println!("  {} {}/{}: no pin file", "—".dimmed(), subvol_name, label);

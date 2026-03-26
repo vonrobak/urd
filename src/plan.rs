@@ -186,10 +186,7 @@ pub fn plan(
                     DriveAvailability::UuidCheckFailed(reason) => {
                         skipped.push((
                             subvol.name.clone(),
-                            format!(
-                                "drive {} UUID check failed: {}",
-                                drive.label, reason
-                            ),
+                            format!("drive {} UUID check failed: {}", drive.label, reason),
                         ));
                         continue;
                     }
@@ -593,7 +590,9 @@ fn exceeds_available_space(
     fs: &dyn FileSystemState,
 ) -> Option<(u64, u64, u64, u64)> {
     let estimated = (raw_bytes as f64 * 1.2) as u64; // 20% safety margin
-    let free = fs.filesystem_free_bytes(&drive.mount_path).unwrap_or(u64::MAX);
+    let free = fs
+        .filesystem_free_bytes(&drive.mount_path)
+        .unwrap_or(u64::MAX);
     let min_free = drive.min_free_bytes.map(|b| b.bytes()).unwrap_or(0);
     let available = free.saturating_sub(min_free);
     if estimated > available {
@@ -649,8 +648,7 @@ impl FileSystemState for RealFileSystemState<'_> {
         local_dir: &Path,
         drive_label: &str,
     ) -> crate::error::Result<Option<SnapshotName>> {
-        crate::chain::read_pin_file(local_dir, drive_label)
-            .map(|opt| opt.map(|r| r.name))
+        crate::chain::read_pin_file(local_dir, drive_label).map(|opt| opt.map(|r| r.name))
     }
 
     fn pinned_snapshots(&self, local_dir: &Path, drive_labels: &[String]) -> HashSet<SnapshotName> {
@@ -1470,8 +1468,7 @@ send_enabled = false
         fs.mounted_drives.insert("D1".to_string());
         // No send_sizes entry — first-ever send
         // Tiny free space — but no history means we can't estimate, so proceed
-        fs.free_bytes
-            .insert(PathBuf::from("/mnt/d1"), 1_000_000);
+        fs.free_bytes.insert(PathBuf::from("/mnt/d1"), 1_000_000);
 
         let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
         let sends: Vec<_> = result
@@ -1564,8 +1561,7 @@ send_enabled = false
             .insert("sv1".to_string(), vec![snap("20260322-1300-one")]);
         fs.mounted_drives.insert("D1".to_string());
         // No send_sizes, no calibrated_sizes — fail open
-        fs.free_bytes
-            .insert(PathBuf::from("/mnt/d1"), 1_000_000);
+        fs.free_bytes.insert(PathBuf::from("/mnt/d1"), 1_000_000);
 
         let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
         let sends: Vec<_> = result
@@ -1639,9 +1635,17 @@ send_enabled = false
         let sends: Vec<_> = result
             .operations
             .iter()
-            .filter(|op| matches!(op, PlannedOperation::SendFull { .. } | PlannedOperation::SendIncremental { .. }))
+            .filter(|op| {
+                matches!(
+                    op,
+                    PlannedOperation::SendFull { .. } | PlannedOperation::SendIncremental { .. }
+                )
+            })
             .collect();
-        assert!(sends.is_empty(), "No sends should be planned on UUID mismatch");
+        assert!(
+            sends.is_empty(),
+            "No sends should be planned on UUID mismatch"
+        );
     }
 
     #[test]
@@ -1679,7 +1683,12 @@ send_enabled = false
         let sends: Vec<_> = result
             .operations
             .iter()
-            .filter(|op| matches!(op, PlannedOperation::SendFull { .. } | PlannedOperation::SendIncremental { .. }))
+            .filter(|op| {
+                matches!(
+                    op,
+                    PlannedOperation::SendFull { .. } | PlannedOperation::SendIncremental { .. }
+                )
+            })
             .collect();
         assert!(
             !sends.is_empty(),
@@ -1700,7 +1709,12 @@ send_enabled = false
         let sends: Vec<_> = result
             .operations
             .iter()
-            .filter(|op| matches!(op, PlannedOperation::SendFull { .. } | PlannedOperation::SendIncremental { .. }))
+            .filter(|op| {
+                matches!(
+                    op,
+                    PlannedOperation::SendFull { .. } | PlannedOperation::SendIncremental { .. }
+                )
+            })
             .collect();
         assert!(
             !sends.is_empty(),
@@ -1728,7 +1742,10 @@ send_enabled = false
             .iter()
             .filter(|op| matches!(op, PlannedOperation::CreateSnapshot { subvolume_name, .. } if subvolume_name == "sv1"))
             .collect();
-        assert!(creates.is_empty(), "Should not create snapshot when below min_free_bytes");
+        assert!(
+            creates.is_empty(),
+            "Should not create snapshot when below min_free_bytes"
+        );
 
         // Should have a skip reason mentioning low space
         let skip_reasons: Vec<_> = result
@@ -1736,7 +1753,11 @@ send_enabled = false
             .iter()
             .filter(|(name, reason)| name == "sv1" && reason.contains("low on space"))
             .collect();
-        assert_eq!(skip_reasons.len(), 1, "Should record skip reason for low space");
+        assert_eq!(
+            skip_reasons.len(),
+            1,
+            "Should record skip reason for low space"
+        );
     }
 
     #[test]
@@ -1756,7 +1777,11 @@ send_enabled = false
             .iter()
             .filter(|op| matches!(op, PlannedOperation::CreateSnapshot { subvolume_name, .. } if subvolume_name == "sv1"))
             .collect();
-        assert_eq!(creates.len(), 1, "Should create snapshot when above min_free_bytes");
+        assert_eq!(
+            creates.len(),
+            1,
+            "Should create snapshot when above min_free_bytes"
+        );
     }
 
     #[test]
@@ -1799,6 +1824,10 @@ send_enabled = false
             .iter()
             .filter(|op| matches!(op, PlannedOperation::CreateSnapshot { subvolume_name, .. } if subvolume_name == "sv1"))
             .collect();
-        assert_eq!(creates.len(), 1, "Should create snapshot when free bytes unreadable (fail open)");
+        assert_eq!(
+            creates.len(),
+            1,
+            "Should create snapshot when free bytes unreadable (fail open)"
+        );
     }
 }

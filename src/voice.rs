@@ -323,7 +323,14 @@ fn render_backup_interactive(data: &BackupSummary) -> String {
             if !sv.structured_errors.is_empty() {
                 // Render structured errors with layered detail
                 for se in &sv.structured_errors {
-                    writeln!(out, "    {} {}: {}", "ERROR".red(), se.operation, se.summary).ok();
+                    writeln!(
+                        out,
+                        "    {} {}: {}",
+                        "ERROR".red(),
+                        se.operation,
+                        se.summary
+                    )
+                    .ok();
                     writeln!(out, "          Why: {}", se.cause).ok();
                     if let Some(bytes) = se.bytes_transferred {
                         writeln!(
@@ -352,10 +359,7 @@ fn render_backup_interactive(data: &BackupSummary) -> String {
     render_skipped_block(&data.skipped, &mut out);
 
     // ── Awareness table ──────────────────────────────────────────────
-    let any_not_protected = data
-        .assessments
-        .iter()
-        .any(|a| a.status != "PROTECTED");
+    let any_not_protected = data.assessments.iter().any(|a| a.status != "PROTECTED");
     if any_not_protected {
         writeln!(out).ok();
         render_assessment_table(data, &mut out);
@@ -561,8 +565,7 @@ pub fn render_plan(data: &PlanOutput, mode: OutputMode) -> String {
     match mode {
         OutputMode::Interactive => render_plan_interactive(data),
         OutputMode::Daemon => {
-            serde_json::to_string_pretty(data)
-                .unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
+            serde_json::to_string_pretty(data).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
         }
     }
 }
@@ -570,7 +573,12 @@ pub fn render_plan(data: &PlanOutput, mode: OutputMode) -> String {
 fn render_plan_interactive(data: &PlanOutput) -> String {
     let mut out = String::new();
 
-    writeln!(out, "{}", format!("Urd backup plan for {}", data.timestamp).bold()).ok();
+    writeln!(
+        out,
+        "{}",
+        format!("Urd backup plan for {}", data.timestamp).bold()
+    )
+    .ok();
     writeln!(out).ok();
 
     if data.operations.is_empty() && data.skipped.is_empty() {
@@ -621,7 +629,10 @@ fn render_plan_interactive(data: &PlanOutput) -> String {
         "{}",
         format!(
             "Summary: {} snapshots, {} sends, {} deletions, {} skipped",
-            data.summary.snapshots, data.summary.sends, data.summary.deletions, data.summary.skipped
+            data.summary.snapshots,
+            data.summary.sends,
+            data.summary.deletions,
+            data.summary.skipped
         )
         .bold()
     )
@@ -638,8 +649,7 @@ pub fn render_history(data: &HistoryOutput, mode: OutputMode) -> String {
     match mode {
         OutputMode::Interactive => render_history_interactive(data),
         OutputMode::Daemon => {
-            serde_json::to_string_pretty(data)
-                .unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
+            serde_json::to_string_pretty(data).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
         }
     }
 }
@@ -683,8 +693,7 @@ pub fn render_subvolume_history(data: &SubvolumeHistoryOutput, mode: OutputMode)
     match mode {
         OutputMode::Interactive => render_subvolume_history_interactive(data),
         OutputMode::Daemon => {
-            serde_json::to_string_pretty(data)
-                .unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
+            serde_json::to_string_pretty(data).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
         }
     }
 }
@@ -693,7 +702,12 @@ fn render_subvolume_history_interactive(data: &SubvolumeHistoryOutput) -> String
     let mut out = String::new();
 
     if data.operations.is_empty() {
-        writeln!(out, "No operations recorded for subvolume {:?}.", data.subvolume).ok();
+        writeln!(
+            out,
+            "No operations recorded for subvolume {:?}.",
+            data.subvolume
+        )
+        .ok();
         return out;
     }
 
@@ -717,7 +731,9 @@ fn render_subvolume_history_interactive(data: &SubvolumeHistoryOutput) -> String
                 op.operation.clone(),
                 op.drive.clone().unwrap_or_else(|| "\u{2014}".to_string()),
                 op.result.clone(),
-                op.duration.clone().unwrap_or_else(|| "\u{2014}".to_string()),
+                op.duration
+                    .clone()
+                    .unwrap_or_else(|| "\u{2014}".to_string()),
                 truncate_str(op.error.as_deref().unwrap_or(""), 30),
             ]
         })
@@ -733,8 +749,7 @@ pub fn render_failures(data: &FailuresOutput, mode: OutputMode) -> String {
     match mode {
         OutputMode::Interactive => render_failures_interactive(data),
         OutputMode::Daemon => {
-            serde_json::to_string_pretty(data)
-                .unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
+            serde_json::to_string_pretty(data).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
         }
     }
 }
@@ -843,8 +858,7 @@ pub fn render_calibrate(data: &CalibrateOutput, mode: OutputMode) -> String {
     match mode {
         OutputMode::Interactive => render_calibrate_interactive(data),
         OutputMode::Daemon => {
-            serde_json::to_string_pretty(data)
-                .unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
+            serde_json::to_string_pretty(data).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
         }
     }
 }
@@ -852,7 +866,12 @@ pub fn render_calibrate(data: &CalibrateOutput, mode: OutputMode) -> String {
 fn render_calibrate_interactive(data: &CalibrateOutput) -> String {
     let mut out = String::new();
 
-    writeln!(out, "{}", "Urd calibrate \u{2014} measuring snapshot sizes".bold()).ok();
+    writeln!(
+        out,
+        "{}",
+        "Urd calibrate \u{2014} measuring snapshot sizes".bold()
+    )
+    .ok();
     writeln!(out).ok();
 
     for entry in &data.entries {
@@ -891,7 +910,11 @@ fn render_calibrate_interactive(data: &CalibrateOutput) -> String {
         data.calibrated, data.skipped
     )
     .ok();
-    writeln!(out, "Sizes stored in state database. The planner will use these as fallback").ok();
+    writeln!(
+        out,
+        "Sizes stored in state database. The planner will use these as fallback"
+    )
+    .ok();
     writeln!(out, "estimates when no send history exists.").ok();
 
     out
@@ -905,8 +928,7 @@ pub fn render_verify(data: &VerifyOutput, mode: OutputMode) -> String {
     match mode {
         OutputMode::Interactive => render_verify_interactive(data),
         OutputMode::Daemon => {
-            serde_json::to_string_pretty(data)
-                .unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
+            serde_json::to_string_pretty(data).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
         }
     }
 }
@@ -967,10 +989,10 @@ mod tests {
     use super::*;
     use crate::output::{
         BackupSummary, CalibrateEntry, CalibrateOutput, CalibrateResult, ChainHealth,
-        ChainHealthEntry, DriveInfo, HistoryOutput, HistoryRun, LastRunInfo,
-        PlanOperationEntry, PlanOutput, PlanSummaryOutput, SendSummary, SkippedSubvolume,
-        StatusAssessment, StatusDriveAssessment, SubvolumeSummary, VerifyCheck, VerifyDrive,
-        VerifyOutput, VerifySubvolume,
+        ChainHealthEntry, DriveInfo, HistoryOutput, HistoryRun, LastRunInfo, PlanOperationEntry,
+        PlanOutput, PlanSummaryOutput, SendSummary, SkippedSubvolume, StatusAssessment,
+        StatusDriveAssessment, SubvolumeSummary, VerifyCheck, VerifyDrive, VerifyOutput,
+        VerifySubvolume,
     };
 
     fn test_status_output() -> StatusOutput {
@@ -1263,10 +1285,7 @@ mod tests {
             output.contains("2TB-backup"),
             "missing drive name in grouped skip"
         );
-        assert!(
-            output.contains("2 send(s) skipped"),
-            "missing skip count"
-        );
+        assert!(output.contains("2 send(s) skipped"), "missing skip count");
     }
 
     #[test]
@@ -1326,16 +1345,11 @@ mod tests {
     fn backup_interactive_shows_warnings() {
         colored::control::set_override(false);
         let mut data = test_backup_summary();
-        data.warnings = vec!["2 pin file write(s) failed. Run `urd verify` to diagnose.".to_string()];
+        data.warnings =
+            vec!["2 pin file write(s) failed. Run `urd verify` to diagnose.".to_string()];
         let output = render_backup_summary(&data, OutputMode::Interactive);
-        assert!(
-            output.contains("pin file write"),
-            "missing warning"
-        );
-        assert!(
-            output.contains("WARNING"),
-            "missing WARNING label"
-        );
+        assert!(output.contains("pin file write"), "missing warning");
+        assert!(output.contains("WARNING"), "missing WARNING label");
     }
 
     #[test]
@@ -1346,14 +1360,8 @@ mod tests {
         data.subvolumes[1].errors = vec!["send_full: btrfs send failed".to_string()];
         data.result = "partial".to_string();
         let output = render_backup_summary(&data, OutputMode::Interactive);
-        assert!(
-            output.contains("FAILED"),
-            "missing FAILED status"
-        );
-        assert!(
-            output.contains("btrfs send failed"),
-            "missing error detail"
-        );
+        assert!(output.contains("FAILED"), "missing FAILED status");
+        assert!(output.contains("btrfs send failed"), "missing error detail");
     }
 
     #[test]
@@ -1376,7 +1384,10 @@ mod tests {
         assert!(output.contains("WD-18TB"), "missing first drive");
         assert!(output.contains("2TB-backup"), "missing second drive");
         assert!(output.contains("full"), "missing full send type");
-        assert!(output.contains("incremental"), "missing incremental send type");
+        assert!(
+            output.contains("incremental"),
+            "missing incremental send type"
+        );
     }
 
     #[test]
@@ -1433,10 +1444,7 @@ mod tests {
             output.contains("2TB-backup"),
             "missing second drive in grouped skips"
         );
-        assert!(
-            output.contains("4 send(s) skipped"),
-            "wrong skip count"
-        );
+        assert!(output.contains("4 send(s) skipped"), "wrong skip count");
     }
 
     // ── Plan tests ──────────────────────────────────────────────────────

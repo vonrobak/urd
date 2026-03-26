@@ -97,7 +97,10 @@ impl BtrfsOps for RealBtrfs {
     ) -> crate::error::Result<SendResult> {
         // Build send command
         let mut send_cmd = Command::new("sudo");
-        send_cmd.env("LC_ALL", "C").arg(&self.btrfs_path).arg("send");
+        send_cmd
+            .env("LC_ALL", "C")
+            .arg(&self.btrfs_path)
+            .arg("send");
         if let Some(p) = parent {
             send_cmd.arg("-p").arg(p);
         }

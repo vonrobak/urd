@@ -12,12 +12,12 @@ use crate::btrfs::RealBtrfs;
 use crate::cli::BackupArgs;
 use crate::config::Config;
 use crate::drives;
-use crate::executor::{Executor, ExecutionResult, OpResult, RunResult};
+use crate::executor::{ExecutionResult, Executor, OpResult, RunResult};
 use crate::heartbeat;
 use crate::metrics::{self, MetricsData, SubvolumeMetrics};
 use crate::output::{
-    BackupSummary, OutputMode, SendSummary, SkippedSubvolume, StatusAssessment,
-    StructuredError, SubvolumeSummary,
+    BackupSummary, OutputMode, SendSummary, SkippedSubvolume, StatusAssessment, StructuredError,
+    SubvolumeSummary,
 };
 use crate::plan::{self, FileSystemState, PlanFilters, RealFileSystemState};
 use crate::preflight;
@@ -554,10 +554,10 @@ fn format_elapsed(d: Duration) -> String {
 mod tests {
     use super::*;
     use crate::awareness::{LocalAssessment, PromiseStatus, SubvolAssessment};
-    use crate::types::Interval;
     use crate::executor::{
-        ExecutionResult, OperationOutcome, OpResult, RunResult, SendType, SubvolumeResult,
+        ExecutionResult, OpResult, OperationOutcome, RunResult, SendType, SubvolumeResult,
     };
+    use crate::types::Interval;
     use crate::types::PlannedOperation;
     use std::path::PathBuf;
 
@@ -655,12 +655,22 @@ mod tests {
             run_id: Some(10),
         };
 
-        let summary = build_backup_summary(&empty_plan(), &result, &empty_assessments(), Duration::from_secs(5), &[]);
+        let summary = build_backup_summary(
+            &empty_plan(),
+            &result,
+            &empty_assessments(),
+            Duration::from_secs(5),
+            &[],
+        );
 
         assert_eq!(summary.subvolumes.len(), 1);
         let sv = &summary.subvolumes[0];
         // Only the successful send should appear
-        assert_eq!(sv.sends.len(), 1, "failed sends should not appear in sends list");
+        assert_eq!(
+            sv.sends.len(),
+            1,
+            "failed sends should not appear in sends list"
+        );
         assert_eq!(sv.sends[0].drive, "WD-18TB");
         assert_eq!(sv.sends[0].send_type, "incremental");
         assert_eq!(sv.sends[0].bytes_transferred, Some(5_000_000));
@@ -698,7 +708,13 @@ mod tests {
             run_id: Some(11),
         };
 
-        let summary = build_backup_summary(&empty_plan(), &result, &empty_assessments(), Duration::from_secs(120), &[]);
+        let summary = build_backup_summary(
+            &empty_plan(),
+            &result,
+            &empty_assessments(),
+            Duration::from_secs(120),
+            &[],
+        );
 
         let sv = &summary.subvolumes[0];
         assert_eq!(sv.sends.len(), 2, "both successful sends should appear");
@@ -719,7 +735,13 @@ mod tests {
             run_id: Some(12),
         };
 
-        let summary = build_backup_summary(&empty_plan(), &result, &empty_assessments(), Duration::from_secs(1), &[]);
+        let summary = build_backup_summary(
+            &empty_plan(),
+            &result,
+            &empty_assessments(),
+            Duration::from_secs(1),
+            &[],
+        );
 
         assert_eq!(summary.warnings.len(), 1);
         assert!(summary.warnings[0].contains("3 pin file write(s) failed"));
@@ -730,19 +752,22 @@ mod tests {
     fn build_summary_no_warnings_when_clean() {
         let result = ExecutionResult {
             overall: RunResult::Success,
-            subvolume_results: vec![make_subvol_result(
-                "sv1",
-                true,
-                vec![],
-                SendType::NoSend,
-                0,
-            )],
+            subvolume_results: vec![make_subvol_result("sv1", true, vec![], SendType::NoSend, 0)],
             run_id: Some(13),
         };
 
-        let summary = build_backup_summary(&empty_plan(), &result, &empty_assessments(), Duration::from_secs(1), &[]);
+        let summary = build_backup_summary(
+            &empty_plan(),
+            &result,
+            &empty_assessments(),
+            Duration::from_secs(1),
+            &[],
+        );
 
-        assert!(summary.warnings.is_empty(), "should have no warnings on clean run");
+        assert!(
+            summary.warnings.is_empty(),
+            "should have no warnings on clean run"
+        );
     }
 
     #[test]
@@ -782,7 +807,13 @@ mod tests {
             run_id: Some(14),
         };
 
-        let summary = build_backup_summary(&plan, &result, &empty_assessments(), Duration::from_secs(1), &[]);
+        let summary = build_backup_summary(
+            &plan,
+            &result,
+            &empty_assessments(),
+            Duration::from_secs(1),
+            &[],
+        );
 
         assert_eq!(summary.warnings.len(), 1);
         assert!(summary.warnings[0].contains("1 of 2 planned deletion(s) skipped"));
@@ -794,7 +825,10 @@ mod tests {
             operations: vec![],
             timestamp: chrono::NaiveDateTime::default(),
             skipped: vec![
-                ("htpc-home".to_string(), "drive WD-18TB not mounted".to_string()),
+                (
+                    "htpc-home".to_string(),
+                    "drive WD-18TB not mounted".to_string(),
+                ),
                 ("htpc-docs".to_string(), "disabled".to_string()),
             ],
         };
@@ -805,7 +839,13 @@ mod tests {
             run_id: None,
         };
 
-        let summary = build_backup_summary(&plan, &result, &empty_assessments(), Duration::from_secs(0), &[]);
+        let summary = build_backup_summary(
+            &plan,
+            &result,
+            &empty_assessments(),
+            Duration::from_secs(0),
+            &[],
+        );
 
         assert_eq!(summary.skipped.len(), 2);
         assert_eq!(summary.skipped[0].name, "htpc-home");
@@ -822,7 +862,13 @@ mod tests {
             run_id: Some(15),
         };
 
-        let summary = build_backup_summary(&empty_plan(), &result, &sample_assessments(), Duration::from_secs(1), &[]);
+        let summary = build_backup_summary(
+            &empty_plan(),
+            &result,
+            &sample_assessments(),
+            Duration::from_secs(1),
+            &[],
+        );
 
         assert_eq!(summary.assessments.len(), 1);
         assert_eq!(summary.assessments[0].name, "htpc-home");
@@ -859,14 +905,26 @@ mod tests {
             subvolume_results: vec![make_subvol_result(
                 "sv1",
                 false,
-                vec![make_outcome("send_full", Some("WD-18TB"), OpResult::Failure, None, None)],
+                vec![make_outcome(
+                    "send_full",
+                    Some("WD-18TB"),
+                    OpResult::Failure,
+                    None,
+                    None,
+                )],
                 SendType::NoSend,
                 0,
             )],
             run_id: Some(16),
         };
 
-        let summary = build_backup_summary(&empty_plan(), &result, &empty_assessments(), Duration::from_secs(1), &[]);
+        let summary = build_backup_summary(
+            &empty_plan(),
+            &result,
+            &empty_assessments(),
+            Duration::from_secs(1),
+            &[],
+        );
 
         // Failed op with no error message should not appear in errors list
         assert!(summary.subvolumes[0].errors.is_empty());

@@ -186,7 +186,7 @@ mod tests {
         Config, DefaultsConfig, GeneralConfig, LocalSnapshotsConfig, SnapshotRoot, SubvolumeConfig,
     };
     use crate::executor::{ExecutionResult, RunResult, SendType, SubvolumeResult};
-    use crate::types::{GraduatedRetention, Interval};
+    use crate::types::{GraduatedRetention, Interval, RunFrequency};
     use std::path::PathBuf;
 
     fn test_config(intervals: &[(&str, &str)]) -> Config {
@@ -203,6 +203,8 @@ mod tests {
                 send_enabled: None,
                 local_retention: None,
                 external_retention: None,
+                protection_level: None,
+                drives: None,
             })
             .collect();
 
@@ -213,6 +215,9 @@ mod tests {
                 log_dir: PathBuf::from("/tmp"),
                 btrfs_path: "/usr/sbin/btrfs".to_string(),
                 heartbeat_file: PathBuf::from("/tmp/heartbeat.json"),
+                run_frequency: RunFrequency::Timer {
+                    interval: Interval::days(1),
+                },
             },
             local_snapshots: LocalSnapshotsConfig {
                 roots: vec![SnapshotRoot {

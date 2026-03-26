@@ -12,6 +12,8 @@ log_dir = "~/containers/data/backup-logs"
 btrfs_path = "/usr/sbin/btrfs"
 # Heartbeat file — JSON health signal written after each backup run
 # heartbeat_file = "~/.local/share/urd/heartbeat.json"
+# How often Urd runs: "daily" (systemd timer), "sentinel" (daemon), or interval like "6h"
+# run_frequency = "daily"
 
 # ─── Local Snapshot Roots ──────────────────────────────────────────────
 # Each root maps to a directory where snapshot subdirectories are created.
@@ -98,6 +100,12 @@ source = "/mnt/btrfs-pool/subvol3-opptak"
 priority = 1
 snapshot_interval = "1h"
 send_interval = "2h"
+# Protection promise: "guarded" (local only), "protected" (local + 1 drive),
+# "resilient" (local + 2+ drives), or "custom" (manual config, the default).
+# When set, Urd derives intervals and retention from the promise level.
+# Explicit overrides (like snapshot_interval above) replace derived values.
+# protection_level = "resilient"
+# drives = ["WD-18TB", "WD-18TB1"]   # Which drives serve this promise
 # NOTE: Irreplaceable recordings — highest backup priority
 
 [[subvolumes]]
@@ -157,6 +165,7 @@ name = "subvol6-tmp"
 short_name = "tmp"
 source = "/mnt/btrfs-pool/subvol6-tmp"
 priority = 3
+# protection_level = "guarded"  # Equivalent to: send_enabled=false + minimal retention
 snapshot_interval = "1d"
 send_enabled = false           # Cache data — local snapshots only
 local_retention = { daily = 7 }

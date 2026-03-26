@@ -68,8 +68,7 @@ fn check_retention_send_compatibility(
     }
 
     let retention = &subvol.local_retention;
-    let guaranteed_survival_hours =
-        i64::from(retention.hourly) + i64::from(retention.daily) * 24;
+    let guaranteed_survival_hours = i64::from(retention.hourly) + i64::from(retention.daily) * 24;
     let send_interval_hours = subvol.send_interval.as_secs() / 3600;
 
     if send_interval_hours > guaranteed_survival_hours {
@@ -82,11 +81,7 @@ fn check_retention_send_compatibility(
                 "{}: retention window ({}, hourly={}, daily={}) is shorter than \
                  send interval ({}) — incremental chain depends on pin protection \
                  rather than retention to keep parents alive",
-                subvol.name,
-                survival_display,
-                retention.hourly,
-                retention.daily,
-                interval_display,
+                subvol.name, survival_display, retention.hourly, retention.daily, interval_display,
             ),
         });
     }
@@ -142,17 +137,14 @@ fn format_hours(hours: i64) -> String {
 mod tests {
     use super::*;
     use crate::config::{
-        Config, DefaultsConfig, DriveConfig, GeneralConfig, LocalSnapshotsConfig,
-        SnapshotRoot, SubvolumeConfig,
+        Config, DefaultsConfig, DriveConfig, GeneralConfig, LocalSnapshotsConfig, SnapshotRoot,
+        SubvolumeConfig,
     };
-    use crate::types::{ByteSize, DriveRole, GraduatedRetention};
+    use crate::types::{ByteSize, DriveRole, GraduatedRetention, Interval, RunFrequency};
     use std::path::PathBuf;
 
     /// Build a minimal valid config for testing.
-    fn test_config(
-        subvolumes: Vec<SubvolumeConfig>,
-        drives: Vec<DriveConfig>,
-    ) -> Config {
+    fn test_config(subvolumes: Vec<SubvolumeConfig>, drives: Vec<DriveConfig>) -> Config {
         Config {
             general: GeneralConfig {
                 state_db: PathBuf::from("/tmp/urd-test.db"),
@@ -160,6 +152,9 @@ mod tests {
                 log_dir: PathBuf::from("/tmp/urd-logs"),
                 btrfs_path: "/usr/sbin/btrfs".to_string(),
                 heartbeat_file: PathBuf::from("/tmp/urd-heartbeat.json"),
+                run_frequency: RunFrequency::Timer {
+                    interval: Interval::days(1),
+                },
             },
             local_snapshots: LocalSnapshotsConfig {
                 roots: vec![SnapshotRoot {
@@ -214,6 +209,8 @@ mod tests {
             send_enabled: None,
             local_retention: None,
             external_retention: None,
+            protection_level: None,
+            drives: None,
         }
     }
 
@@ -239,6 +236,8 @@ mod tests {
                 monthly: Some(0),
             }),
             external_retention: None,
+            protection_level: None,
+            drives: None,
         }
     }
 

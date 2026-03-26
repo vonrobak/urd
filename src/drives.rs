@@ -78,9 +78,7 @@ pub fn get_filesystem_uuid(mount_path: &Path) -> crate::error::Result<Option<Str
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(UrdError::Io {
             path: mount_path.to_path_buf(),
-            source: std::io::Error::other(
-                format!("findmnt failed: {}", stderr.trim()),
-            ),
+            source: std::io::Error::other(format!("findmnt failed: {}", stderr.trim())),
         });
     }
 

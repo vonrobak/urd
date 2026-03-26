@@ -347,19 +347,11 @@ pub struct CalibrateEntry {
 #[serde(tag = "status")]
 pub enum CalibrateResult {
     #[serde(rename = "ok")]
-    Ok {
-        snapshot: String,
-        bytes: u64,
-    },
+    Ok { snapshot: String, bytes: u64 },
     #[serde(rename = "skipped")]
-    Skipped {
-        reason: String,
-    },
+    Skipped { reason: String },
     #[serde(rename = "failed")]
-    Failed {
-        snapshot: String,
-        error: String,
-    },
+    Failed { snapshot: String, error: String },
 }
 
 // ── VerifyOutput ──────────────────────────────────────────────────────
