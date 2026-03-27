@@ -1,15 +1,18 @@
 # ADR-110: Protection Promises
 
-> **TL;DR:** Protection promises are named levels (`guarded`, `protected`, `resilient`, `custom`)
-> that map to concrete retention and interval policies. The user declares intent; Urd derives
-> operations. Existing configs continue to work as implicit `custom` with zero breaking changes.
-> Promise derivation is a pure function at config resolution time — the planner, executor, and
-> awareness model are unchanged.
+> **TL;DR:** Protection promises are named levels that map to concrete operational policies.
+> The user declares intent; Urd derives operations. Named levels are opaque — no per-field
+> overrides. `Custom` means the user manages all parameters explicitly. Named levels must
+> earn opaque status through operational track record; the current taxonomy
+> (guarded/protected/resilient) is provisional and subject to rework.
 
-**Date:** 2026-03-26
-**Status:** Accepted
+**Date:** 2026-03-26 (revised 2026-03-27)
+**Status:** Accepted (taxonomy provisional — see Maturity Model)
 **Depends on:** ADR-100 (planner/executor separation), ADR-108 (pure function modules),
-ADR-109 (config boundary validation)
+ADR-109 (config boundary validation), ADR-111 (config system architecture)
+**Ownership:** This ADR is authoritative for protection promise *semantics* — what levels
+mean, how they derive policy, the maturity model, and the opacity rule. ADR-111 is
+authoritative for config *structure* — what fields exist, how validation works, versioning.
 
 ## Context
 
@@ -26,23 +29,56 @@ describes *desired cadence* without reference to *actual run frequency*.
 
 Protection promises bridge this gap: the user declares what they want; Urd derives what to do.
 
+A subsequent design review (2026-03-27) found that the original override semantics
+(voiding/weakening overrides on named levels) created contradictory configs and noisy
+preflight warnings. The review also found the current three-level taxonomy insufficiently
+mature — "guarded" vs "protected" are near-synonyms that don't communicate the operational
+axis (local-only vs external copies). These findings led to the revised design below.
+
 ## Decision
 
-### Four promise levels
+### Named levels are opaque
+
+When `protection_level` is set to a named level, the level's derived parameters are the
+final values. There are no per-field overrides. The level is a sealed policy — the user
+trusts Urd to deliver it.
+
+If the user needs different parameters from what a named level provides, they omit
+`protection_level` and specify all values explicitly (custom policy). There is no middle
+ground. This eliminates the override resolution complexity, the voiding/weakening
+distinction, and preflight warnings from intentional deviations.
+
+### Custom is first-class
+
+`Custom` is not a fallback or inferior mode. It means the operator owns the full policy.
+No code path treats it as lesser. It is the appropriate — and currently recommended —
+choice when named levels haven't earned their keep through operational evidence.
+
+### Current taxonomy (provisional)
+
+The current named levels are:
 
 ```rust
 pub enum ProtectionLevel {
     Guarded,    // Local snapshots only. For: temp data, caches, build artifacts.
     Protected,  // Local + at least one external drive current. For: documents, photos.
     Resilient,  // Local + multiple external drives current. For: irreplaceable data.
-    Custom,     // User manages all parameters manually. Default for migration.
+    Custom,     // User manages all parameters manually.
 }
 ```
 
-No `archival` level. Retention depth is orthogonal to protection freshness — a subvolume can
-be `protected` (current copies exist) and have deep retention (keep monthly snapshots
-indefinitely). Conflating them creates confusing semantics. If archival becomes needed, it
-should be a separate `retention_profile`.
+**This taxonomy is provisional.** The design review identified that:
+
+- "Guarded" and "protected" are near-synonyms that don't communicate the actual
+  operational difference (local-only vs external copies).
+- "Protected" and "resilient" are operationally identical except for `min_external_drives`.
+  This may be insufficient to justify two distinct opaque levels.
+- Level names should communicate operational meaning to the user — the naming axis should
+  make the promise legible without reading documentation.
+
+The taxonomy will be reworked in a future design session once more operational experience
+exists. Until then, `custom` with explicit parameters is the recommended approach for
+production configs.
 
 ### Outcome targets per level
 
@@ -59,12 +95,12 @@ frequencies. These targets are primary policy, defensible independent of awarene
 ### Pure derivation function
 
 ```rust
-pub fn derive_policy(level: ProtectionLevel, run_frequency: RunFrequency) -> DerivedPolicy
+pub fn derive_policy(level: ProtectionLevel, run_frequency: RunFrequency) -> Option<DerivedPolicy>
 ```
 
 This is a pure function (ADR-108) that maps a promise level + run frequency to concrete
 operational parameters: snapshot_interval, send_interval, send_enabled, local_retention,
-external_retention, min_external_drives.
+external_retention, min_external_drives. Returns `None` for `Custom`.
 
 Run frequency is an explicit config field, not inferred:
 
@@ -75,37 +111,36 @@ pub enum RunFrequency {
 }
 ```
 
-### Config schema
+### Config interaction
+
+Named levels produce all operational parameters. The subvolume config for a named level
+contains only identity and the level itself:
 
 ```toml
-[general]
-run_frequency = "daily"
-
 [[subvolumes]]
 name = "subvol3-opptak"
+source = "/mnt/btrfs-pool/subvol3-opptak"
+snapshot_root = "/mnt/btrfs-pool/.snapshots"
 protection_level = "resilient"
-drives = ["WD-18TB"]  # Which drives serve this promise
-
-[[subvolumes]]
-name = "subvol6-tmp"
-# No protection_level -> implicit "custom"
-snapshot_interval = "1d"
-send_enabled = false
+drives = ["WD-18TB", "WD-18TB1"]
 ```
 
-### Override resolution
+Operational fields (`snapshot_interval`, `send_interval`, `local_retention`,
+`external_retention`) are **not permitted** alongside a named protection level. If present,
+config validation rejects the file as a structural error (ADR-111). This is the enforcement
+mechanism for opacity.
 
-When `protection_level` is set, the promise derives default values. Explicit overrides replace
-the derived values. The preflight module warns when overrides weaken or void the promise.
+For custom policies, all operational fields are specified explicitly:
 
-**Voiding overrides** (structurally incompatible — status shows degradation marker):
-- `send_enabled = false` on `protected` or `resilient`
-- `drives = []` on levels requiring external copies
-
-**Weakening overrides** (warning in preflight, status shows promise level normally):
-- `snapshot_interval` longer than derived
-- `send_interval` longer than derived
-- `local_retention` tighter than derived
+```toml
+[[subvolumes]]
+name = "htpc-root"
+source = "/"
+snapshot_root = "~/.snapshots"
+snapshot_interval = "1w"
+send_enabled = false
+local_retention = { daily = 3, weekly = 2 }
+```
 
 ### Transition safety
 
@@ -115,67 +150,91 @@ if the derived retention is tighter than the previous explicit retention. Mitiga
 Without it, backups proceed but retention is skipped for affected subvolumes (fail open,
 ADR-107).
 
-### Migration path
-
-Zero breaking changes. Every existing config continues to work identically:
-
-1. No `protection_level` field -> implicit `custom`
-2. `custom` means: user's explicit values, same resolution as today
-3. No `drives` field on subvolume -> send to all drives (current behavior)
-4. No `run_frequency` field -> default `daily` (24h timer)
-
-Property test required: for all configs without `protection_level`, the new resolution path
-must produce byte-identical output to the current `SubvolumeConfig::resolved()`.
-
 ### Achievability validation
 
 A promise is achievable if the derived policy can be fulfilled given run frequency, drive
-topology, and retention alignment. Achievability is checked by the preflight module — advisory
-(warnings), not blocking (errors). ADR-107: fail open.
+topology, and retention alignment. Achievability has two tiers:
 
-### Subvolume-to-drive mapping
+**Structural unachievability (hard error — refuse to start):** The config makes it
+impossible to fulfill the promise. Examples: a `resilient` subvolume with only 1 drive
+in its `drives` list (needs 2), or a named level with `drives` omitted when the level
+requires external sends. These are authoring mistakes, not runtime conditions — the
+config is wrong. Caught by `Config::validate()` (ADR-109, ADR-111).
 
-New optional `drives` field on subvolume config. `None` = send to all drives (current
-behavior). `Some(["WD-18TB"])` = send only to listed drives. Validated against configured
-drives at config load time.
+**Runtime unachievability (advisory warning — fail open):** The config is correct but the
+world isn't ready. Examples: a drive is configured but not mounted, or a filesystem is
+temporarily below `min_free_bytes`. The backup runs what it can and reports what was
+skipped (ADR-107, ADR-111 structural vs runtime distinction).
+
+## Maturity Model
+
+Named levels earn opaque status through a two-phase trajectory:
+
+### Phase 1: Custom-first (current)
+
+Custom is the recommended default. Named levels exist in the codebase but are understood
+to be provisional. Templates based on named level parameters help operators scaffold
+custom configs — the template is guidance, the resulting custom config is the policy.
+
+### Phase 2: Named levels graduate
+
+A named level graduates to production-ready opaque status when it has:
+
+1. **Operational track record** — run as a template-based custom policy in production for
+   a meaningful period without the operator needing to intervene or override.
+2. **Distinct operational identity** — parameters that are meaningfully different from
+   every other level. If two levels are identical except for one field, they may not
+   justify separate names.
+3. **Self-explanatory name** — the operator can infer what the level does from its name
+   without reading documentation. The naming axis should communicate operational meaning
+   (where copies exist, what failures the data survives).
+4. **ADR documentation** — rationale for the level's specific parameter choices, grounded
+   in operational evidence from Phase 1.
+
+Design completeness alone (tests, docs, ADR) is necessary but insufficient. Graduation
+requires data and operational understanding — you can't design a battle-tested level at a
+desk.
 
 ## Consequences
 
 ### Positive
 
 - Users express intent, not operations — "protect my recordings" instead of interval math
-- Config validation catches unachievable promises at load time
+- No override complexity — levels are sealed, custom is explicit
+- Config validation catches structural errors (operational fields mixed with named levels)
 - Status output answers "is my data safe?" in promise-level terms
 - The awareness model is completely unchanged — promises affect inputs, not evaluation
-- Zero migration burden for existing users
+- The maturity model prevents premature promotion of untested levels
 
 ### Negative
 
-- Config resolution has two paths (`custom` vs named level) — must be tested for equivalence
-- Override interactions create a combinatorial space for preflight warnings
-- `--confirm-retention-change` is a speed bump for legitimate config changes
+- Operators cannot make small adjustments to named levels — they must go fully custom for
+  any deviation. Templates mitigate this by providing a starting point.
+- The provisional taxonomy means named levels are not yet recommended for production use.
+  This is honest but means the promise model's full value is deferred.
+- Taxonomy rework will require a config schema version bump and `urd migrate` (ADR-111).
 
 ### Risks
 
 - **Retroactive deletion on level change** — mitigated by `--confirm-retention-change` flag
-  and fail-open retention skip. Two critical safety tests required:
-  `test_promise_derived_retention_preserves_pinned_snapshots` and
-  `test_promise_derived_retention_with_space_pressure_preserves_pins`.
+  and fail-open retention skip.
 - **Promise-derived retention bypassing pin protection** — one bug from silent data loss.
-  The three-layer pin protection (ADR-106) is the safety net. Test required:
-  `test_promise_level_to_retention_decision_pipeline`.
+  The three-layer pin protection (ADR-106) is the safety net.
+- **Permanent deferral** — if graduation criteria are too strict, named levels never mature
+  and custom remains the permanent reality. Mitigation: the criteria are evidence-based
+  (operational track record), not process-based (committee approval).
 
 ## Invariants
 
-1. **Promises derive operations; they don't bypass the planner.** Config resolution happens
+1. **Named levels are opaque.** When set, derived parameters are final. No overrides.
+   Operational fields alongside a named level are a config validation error. (ADR-111)
+2. **Custom is first-class.** No code path treats it as inferior. It means "the operator's
+   config is the policy." (ADR-111)
+3. **Promises derive operations; they don't bypass the planner.** Config resolution happens
    before the planner runs. The planner receives `ResolvedSubvolume` with concrete values,
    never `ProtectionLevel`. (ADR-100)
-2. **`custom` is first-class.** No code path treats it as inferior. It means "the user's
-   config is the policy." (ADR-109)
-3. **Promise derivation is a pure function.** `derive_policy()` has no I/O, no state, no
+4. **Promise derivation is a pure function.** `derive_policy()` has no I/O, no state, no
    side effects. (ADR-108)
-4. **Existing configs don't break.** All new fields are optional with backward-compatible
-   defaults. No migration script needed. (ADR-105)
 5. **Achievability is advisory, not blocking.** Warnings, not errors. The user may be in
    transition. (ADR-107)
 6. **The awareness model is unchanged.** Promise levels affect what intervals are configured,
@@ -187,8 +246,8 @@ This ADR is considered implemented when:
 
 - [ ] `ProtectionLevel` enum and `derive_policy()` exist in `types.rs`
 - [ ] `protection_level`, `drives`, `run_frequency` config fields are parsed and validated
+- [ ] Config validation rejects operational fields alongside named protection levels
 - [ ] `resolve_subvolume()` branches on protection level with custom fallthrough
-- [ ] Migration identity property test passes
 - [ ] Achievability preflight checks are active
 - [ ] `--confirm-retention-change` flag gates retention tightening
 - [ ] `urd status` shows promise level column
@@ -196,6 +255,8 @@ This ADR is considered implemented when:
 
 ## Related
 
+- ADR-111: Config system architecture (governs config structure, versioning, validation)
 - Design: `docs/95-ideas/2026-03-26-design-protection-promises.md`
 - Design review: `docs/99-reports/2026-03-26-protection-promises-design-review.md`
+- Config design review: `docs/98-journals/2026-03-27-config-design-review.md`
 - Test strategy review: `docs/99-reports/2026-03-26-test-strategy-review.md`

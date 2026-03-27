@@ -14,7 +14,48 @@ cutover — a conscious risk decision documented in
 
 **318 tests. All pass. Clippy clean.**
 
-### Recent development (2026-03-27, session 3)
+### Recent development (2026-03-27, session 4)
+
+**Config system design review.** Systematic review of the configuration system through 11
+design questions. Identified five structural problems (two-masters override semantics,
+vestigial defaults, semantic inversion in drive routing, cross-reference fragility,
+over-specified identity) and established 10 design principles.
+[Journal](../98-journals/2026-03-27-config-design-review.md)
+
+Key decisions:
+- Named protection levels must be opaque (no per-field overrides) — or use `custom`
+- Current taxonomy (guarded/protected/resilient) is provisional, needs rework
+- `custom` with templates is the honest default until levels earn opaque status
+- Config files must be complete, self-describing artifacts (no `[defaults]` inheritance)
+- Templates scaffold configs at setup time; they don't govern runtime behavior
+- Explicit drive routing per subvolume (no implicit "all drives" behavior)
+- Structural config errors are hard failures; runtime conditions are per-unit soft errors
+
+**ADR-111: Config System Architecture** written. Describes the target config schema:
+subvolume carries `snapshot_root`, `[local_snapshots]` eliminated, `[[space_constraints]]`
+as first-class section, `config_version` field with `urd migrate`, required vs optional
+field table for custom subvolumes. Status: Accepted — not yet implemented.
+[ADR-111](../00-foundation/decisions/2026-03-27-ADR-111-config-system-architecture.md)
+
+**ADR-110 revised.** Override semantics replaced with opaque-only rule. Maturity model
+added (two-phase: custom-first → named levels graduate through operational evidence).
+Achievability split into structural (hard error) and runtime (advisory warning).
+Ownership boundary clarified: ADR-110 owns promise semantics, ADR-111 owns config structure.
+
+**Four ADRs updated** for cross-ADR consistency: ADR-103, ADR-104 (defaults references
+removed), ADR-105 (scoped to on-disk data formats), ADR-109 (structural vs runtime
+error distinction added).
+
+**ADR suite adversary review** — limited review focused on cross-ADR consistency, precision,
+and gaps. 3 significant + 4 moderate findings, all fixed. Key fixes: implementation gates
+added to ADR-111, achievability tightened for opaque levels, `name`/`short_name` on-disk
+roles clarified, `send_enabled`/`drives` interaction specified.
+[Review](../99-reports/2026-03-27-adr-suite-consistency-review.md)
+
+**CLAUDE.md rewritten.** Updated to reflect current module structure (18 modules), all 11
+ADRs, config system transition state, and 10 architectural invariants.
+
+### Earlier development (2026-03-27, session 3)
 
 **Notification dispatcher** (Priority 5a) implemented. `notify.rs` module with
 `compute_notifications()` pure function (heartbeat state transition → notifications),
@@ -246,21 +287,29 @@ filter, added `--output` overwrite protection, removed dead_code allow on `local
 - [x] Path validation (normalize + no `..` + starts_with defense-in-depth)
 - [x] Read-only operation, no sudo needed
 
-**Gate before Priority 4:** ~~Write ADR for protection promises~~ — **COMPLETE (ADR-110).**
+**Gate before Priority 4:** ~~Write ADR for protection promises~~ — **COMPLETE (ADR-110, revised 2026-03-27).**
 - [x] Exact retention/interval derivations for each promise level
-- [x] Config conflict resolution: what if promise + manual intervals both set?
+- [x] ~~Config conflict resolution: what if promise + manual intervals both set?~~ **Superseded:** ADR-110 revision makes named levels opaque — no per-field overrides. Operational fields alongside a named level are a config validation error (ADR-111).
 - [x] Migration path for existing configs (implicit `custom`)
 - [x] Promise validation: "this promise is unachievable given your drive connection pattern"
 - [x] `custom` designed as first-class, not afterthought
 - [x] Timer frequency as input to achievability — `RunFrequency` is explicit input to `derive_policy()`
-- [ ] Drive topology constraints — subvolumes that exceed drive capacity cannot have external promises on those drives (subvol3-opptak at ~3.4TB vs 2TB-backup at ~1.1TB). Not yet implemented — preflight checks cover drive count but not capacity.
+- [ ] Drive topology constraints — subvolumes that exceed drive capacity cannot have external promises on those drives. Not yet implemented — preflight checks cover drive count but not capacity. Better suited for Sentinel (5b).
 - [ ] Awareness threshold mode — thresholds still use fixed multipliers regardless of run frequency. Deferred to Sentinel work.
+- [ ] **Config schema migration (ADR-111)** — target architecture defined but not yet implemented. Current code uses legacy schema (`[defaults]`, `[local_snapshots]`, override merging). Implement incrementally alongside other work; do not rush — taxonomy rework may change the schema again.
+- [ ] **Protection level taxonomy rework** — current names (guarded/protected/resilient) are provisional. Needs operational experience before redesign. Collect data from production runs first.
 
 ### Priority 4: Protection Promises (score: 10) — SUBSTANTIALLY COMPLETE
 
 Config extension: optional `protection_level` per subvolume. Planner derives intervals
-and retention from promise level. Existing operation-focused configs continue to work
-as implicit `custom`. The awareness model (3a) evaluates whether promises are being kept.
+and retention from promise level. `custom` is the recommended default until named levels
+earn opaque status through operational evidence (ADR-110 maturity model). The awareness
+model (3a) evaluates whether promises are being kept.
+
+**Design review (2026-03-27):** Named levels must be opaque (no overrides) or use `custom`.
+Current taxonomy is provisional — names don't communicate operational meaning well enough.
+Config system redesign documented in ADR-111 (target architecture, not yet implemented).
+See [config design review journal](../98-journals/2026-03-27-config-design-review.md).
 
 | # | Feature | Effort | Notes |
 |---|---------|--------|-------|
