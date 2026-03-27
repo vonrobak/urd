@@ -12,14 +12,32 @@ cutover — a conscious risk decision documented in
 [first-night journal](../98-journals/2026-03-25-first-night.md). Monitoring target was
 2026-04-01 (1 week from cutover on 2026-03-25).
 
-**298 tests. All pass. Clippy clean.**
+**318 tests. All pass. Clippy clean.**
 
-### Recent development (2026-03-26 — 2026-03-27)
+### Recent development (2026-03-27, session 3)
 
-**Voice migration complete** (7 of 8 commands). All commands except `init` now produce
-structured output types rendered by `voice.rs`. Migrated: status, backup, plan, history,
-verify, calibrate, get. `init.rs` still uses direct `println!` — it's the only holdout.
-[Design](../95-ideas/2026-03-26-design-next-sessions.md)
+**Notification dispatcher** (Priority 5a) implemented. `notify.rs` module with
+`compute_notifications()` pure function (heartbeat state transition → notifications),
+4 channel types (Desktop/Webhook/Command/Log), urgency filtering, mythic voice text.
+Heartbeat gains `notifications_dispatched` field for crash recovery. Integrated into
+`backup.rs` (read old → assess → write → dispatch → mark dispatched). `[notifications]`
+config section (optional, backward-compatible). 18 tests.
+
+**Voice migration complete** (8/8 commands). `init.rs` migrated to `InitOutput` struct +
+`voice::render_init()`. Interactive deletion prompt stays in command; all rendering in voice
+layer. JSON output in daemon mode. 2 tests.
+
+**Operational config tuning.** Example config updated to use protection promises:
+`run_frequency = "daily"` explicit, defaults aligned to 1d/1d, all 9 subvolumes assigned
+protection levels (3 resilient, 3 protected, 3 guarded). Organized by promise level.
+Drive restrictions pin resilient subvolumes to 18TB drives. Resolves the interval mismatch
+(1h–4h intervals vs daily timer) that caused spurious UNPROTECTED status.
+
+**Drive topology constraints** deferred. Capacity checks require I/O (subvolume size +
+drive capacity) — not a pure preflight check. The config already handles this manually via
+`drives = [...]` restrictions. Better suited for Sentinel (5b).
+
+### Earlier development (2026-03-26 — 2026-03-27)
 
 **Structured error messages** (Priority 2e) implemented. `error.rs` has `translate_btrfs_error()`
 — pattern-matches btrfs stderr into actionable `BtrfsErrorDetail` with summary, cause, and
@@ -208,7 +226,7 @@ migrate incrementally.
 - [x] Testable: 10 voice tests asserting output contains expected facts
 - [x] `backup` command returns structured `BackupSummary`, rendered by `voice::render_backup_summary()`
 - [x] `plan`, `history`, `verify`, `calibrate`, `get` commands migrated to voice layer
-- [ ] `init` command still uses direct `println!` — only remaining holdout
+- [x] `init` command migrated to voice layer (session 3)
 
 **3d. `urd get file --at date`** — **COMPLETE.** Restore via direct path construction.
 O(1) — no search, no indexing. Automatic subvolume detection (longest-prefix match on
@@ -252,7 +270,7 @@ The Sentinel is three independent systems that compose. Build and test them sepa
 
 | # | Component | Depends On | Notes |
 |---|-----------|------------|-------|
-| 5a | **Notification dispatcher** | Awareness model (3a) | Subscribe to promise state changes, route to desktop/webhook. Works without event reactor. |
+| 5a | ~~**Notification dispatcher**~~ | ~~Awareness model (3a)~~ | **COMPLETE.** `notify.rs`: `compute_notifications()` pure function, 4 channel types (Desktop/Webhook/Command/Log), urgency filtering. Heartbeat gains `notifications_dispatched` for crash recovery. `[notifications]` config section. Integrated into `backup.rs`. 18 tests. |
 | 5b | **Event reactor** | Awareness model (3a), heartbeat (3b) | udev drive events, timer management. Long-running daemon. Start passive (no auto-trigger). |
 | 5c | **Active mode** | Event reactor (5b) | Auto-trigger backups to meet promises. Circuit breaker (no cascade on error). Lock contention with manual `urd backup` resolved. |
 
@@ -420,6 +438,28 @@ timestamp staleness handling, space check deduplication, ANSI line clearing.
     weakening-override), planner drive filtering (per-subvolume `drives` list), `--confirm-retention-change`
     fail-closed gate for promise-derived retention (ADR-107), `promise_level` on `StatusAssessment`
     with conditional PROMISE column in status/backup tables. 12 new tests. Total: 298.
+- **Notification dispatcher** (Phase 7, P5a, 2026-03-27) — `notify.rs`: `compute_notifications()`
+  pure function comparing previous/current heartbeat state transitions. Four event types:
+  `PromiseDegraded`, `PromiseRecovered`, `BackupFailures`, `AllUnprotected` (plus `BackupOverdue`
+  for Sentinel). Three urgency levels (Info/Warning/Critical) with configurable minimum threshold.
+  Four notification channels: Desktop (`notify-send`), Webhook (`curl`), Command (subprocess with
+  env vars), Log. `NotificationConfig` in `[notifications]` config section (optional, zero change
+  for existing configs). `notifications_dispatched` boolean on `Heartbeat` for crash recovery.
+  Integrated into `backup.rs` with correct ordering (read old → assess → write → dispatch → mark).
+  18 tests. [Design](../95-ideas/2026-03-26-design-sentinel.md) §5a
+- **`init` voice migration** (Phase 5, P3c completion, 2026-03-27) — 8/8 commands now use the voice
+  layer. `InitOutput` struct with 8 sections (infrastructure, sources, roots, drives, pins,
+  incompletes, counts, preflight). `voice::render_init()` renders interactive and daemon modes.
+  Interactive deletion prompt stays in command (correct: I/O belongs in command, rendering in voice).
+  2 tests.
+- **Operational config tuning** (2026-03-27) — Example config (`config/urd.toml.example`) updated
+  to use protection promises. `run_frequency = "daily"` explicit. Defaults aligned to 1d/1d
+  (was 1h/4h — mismatch with daily timer). All 9 subvolumes assigned protection levels:
+  3 resilient (htpc-home, opptak, pics — irreplaceable data, 2 drives), 3 protected (docs,
+  containers, music — important, any drive), 3 guarded (htpc-root, multimedia, tmp — local only).
+  Organized by promise level instead of priority number. Drive restrictions pin resilient subvolumes
+  to 18TB drives (opptak exceeds 2TB-backup capacity). Resolves the interval mismatch that caused
+  spurious UNPROTECTED status. Test updated.
 
 ### Not Building (dropped per adversary review)
 
@@ -541,6 +581,11 @@ for the graduation rationale.
 | `resolved()` takes `RunFrequency` — timer frequency is explicit input, not assumed | 2026-03-27 | [Session 1 journal](../98-journals/2026-03-27-protection-promises-session1.md) |
 | `--confirm-retention-change` fail-closed gate — ADR-107 applied to promise-derived retention | 2026-03-27 | Session 2 (uncommitted) |
 | PROMISE column conditional — hidden when no subvolumes have promises (zero visual change for existing users) | 2026-03-27 | Session 2 (uncommitted) |
+| Notification dispatcher as post-backup hook (not daemon) — `compute_notifications()` pure function | 2026-03-27 | Session 3 |
+| `notifications_dispatched` boolean in heartbeat for crash recovery | 2026-03-27 | Session 3 |
+| Webhook via `curl` subprocess (not `ureq` dep) — keeps Urd dependency-light | 2026-03-27 | Session 3 |
+| Drive topology constraints deferred — requires I/O, not a pure preflight check | 2026-03-27 | Session 3 |
+| `init` voice migration: `InitOutput` struct + interactive prompts stay in command | 2026-03-27 | Session 3 |
 
 ## Key Documents
 
@@ -567,7 +612,7 @@ for the graduation rationale.
 - `FileSystemState` trait (10 methods, including `drive_availability`) is outgrowing its name — consider renaming to `SystemState` if more methods are added
 - `SubvolumeResult.send_type` in executor.rs records only the last send type when a subvolume is sent to multiple drives — the per-operation data in `OperationOutcome` is correct, but the summary field is misleading. The backup summary works around this by extracting from operations directly
 - `heartbeat::read()` returns `Option` — cannot distinguish missing file from corrupt JSON (upgrade to `Result<Option>` when Sentinel is built)
-- `init` command still uses direct `println!` — only command not yet migrated to voice layer (all others complete)
+- ~~`init` command still uses direct `println!`~~ — resolved: migrated to voice layer (session 3)
 - Per-drive pin protection for external retention — current all-drives-union is conservative but suboptimal for space
 - `urd get` normalizes paths without filesystem access (no `canonicalize`) — symlinked paths won't match subvolume sources. Documented limitation; correct behavior (use canonical paths)
 - `urd get` doesn't support directory restore — files only in v1. Error message guides user.
@@ -580,5 +625,5 @@ for the graduation rationale.
 - Journal persistence gap: `journalctl --user -u urd-backup.service --since "2 days ago"` returned no entries despite successful runs (2026-03-26). Journal rotation or vacuum purges user-unit logs. Heartbeat partially compensates, but human-readable run logs may need a local file complement
 - htpc-root retention/send-interval coupling: chain break likely caused by manual snapshot deletion during third NVMe exhaustion incident (unverified hypothesis), not by automated retention — the three-layer pin protection system prevents retention from deleting pinned parents. Pre-flight check (2c) now warns about the config inconsistency as a defense-in-depth signal. Chain self-heals via full send
 - NVMe snapshot accumulation: 12 htpc-home snapshots (legacy + Urd) on 118GB drive is the primary space pressure source. Space guard now prevents catastrophic exhaustion, but gradual accumulation above the 10GB threshold is not gated. Retention tuning for constrained volumes deserves attention
-- Config/timer interval mismatch: send intervals (1h–4h) assume sub-daily timer but Urd runs once daily. Causes awareness model to report UNPROTECTED for ~18h/day. Now solvable: set `protection_level` per subvolume with `run_frequency = "daily"` to auto-derive matching intervals. This is the first real-world validation of protection promises. Timer frequency is now an explicit input to `derive_policy()` (ADR-110)
+- ~~Config/timer interval mismatch~~ — resolved: example config updated with `run_frequency = "daily"` and protection promises. Defaults aligned to 1d/1d. All subvolumes have appropriate protection levels (session 3)
 - Idea: [systemd unit drift check](../95-ideas/2026-03-23-systemd-unit-drift-check.md) in `urd verify`

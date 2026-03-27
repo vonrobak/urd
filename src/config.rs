@@ -4,6 +4,7 @@ use std::path::{Component, Path, PathBuf};
 use serde::Deserialize;
 
 use crate::error::UrdError;
+use crate::notify::NotificationConfig;
 use crate::types::{
     ByteSize, DriveRole, GraduatedRetention, Interval, ProtectionLevel, ResolvedGraduatedRetention,
     RunFrequency,
@@ -19,6 +20,8 @@ pub struct Config {
     pub drives: Vec<DriveConfig>,
     #[serde(rename = "subvolumes", alias = "subvolume")]
     pub subvolumes: Vec<SubvolumeConfig>,
+    #[serde(default)]
+    pub notifications: NotificationConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -622,27 +625,27 @@ send_interval = "2h"
         assert_eq!(config.drives.len(), 3);
         assert_eq!(config.local_snapshots.roots.len(), 2);
 
-        // Verify defaults
-        assert_eq!(config.defaults.snapshot_interval, Interval::hours(1));
-        assert_eq!(config.defaults.send_interval, Interval::hours(4));
+        // Verify defaults match run_frequency
+        assert_eq!(config.defaults.snapshot_interval, Interval::days(1));
+        assert_eq!(config.defaults.send_interval, Interval::days(1));
 
-        // Verify a subvolume with overrides
+        // Verify resilient subvolume with drive restriction
         let htpc = config
             .subvolumes
             .iter()
             .find(|s| s.name == "htpc-home")
             .unwrap();
-        assert_eq!(htpc.snapshot_interval, Some(Interval::minutes(15)));
-        assert_eq!(htpc.send_interval, Some(Interval::hours(1)));
+        assert_eq!(htpc.protection_level, Some(ProtectionLevel::Resilient));
+        assert_eq!(htpc.drives, Some(vec!["WD-18TB".into(), "WD-18TB1".into()]));
         assert_eq!(htpc.priority, 1);
 
-        // Verify a subvolume with send_enabled=false
+        // Verify guarded subvolume (derives send_enabled=false)
         let tmp = config
             .subvolumes
             .iter()
             .find(|s| s.name == "subvol6-tmp")
             .unwrap();
-        assert_eq!(tmp.send_enabled, Some(false));
+        assert_eq!(tmp.protection_level, Some(ProtectionLevel::Guarded));
 
         // Verify validation passes
         let mut config = config;

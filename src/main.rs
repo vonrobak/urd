@@ -9,6 +9,7 @@ mod error;
 mod executor;
 mod heartbeat;
 mod metrics;
+mod notify;
 mod output;
 mod plan;
 mod preflight;

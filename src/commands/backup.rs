@@ -19,6 +19,7 @@ use crate::output::{
     BackupSummary, OutputMode, SendSummary, SkippedSubvolume, StatusAssessment, StructuredError,
     SubvolumeSummary,
 };
+use crate::notify;
 use crate::plan::{self, FileSystemState, PlanFilters, RealFileSystemState};
 use crate::preflight;
 use crate::state::StateDb;
@@ -87,11 +88,13 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
         println!("{}", "Nothing to do.".dimmed());
         write_metrics_for_skipped(&config, &backup_plan, now)?;
         let heartbeat_now = chrono::Local::now().naive_local();
+        let previous_hb = heartbeat::read(&config.general.heartbeat_file);
         let assessments = awareness::assess(&config, heartbeat_now, &fs_state);
         let hb = heartbeat::build_empty(&config, heartbeat_now, &assessments);
         if let Err(e) = heartbeat::write(&config.general.heartbeat_file, &hb) {
             log::warn!("Failed to write heartbeat: {e}");
         }
+        dispatch_notifications(previous_hb.as_ref(), &hb, &config);
         return Ok(());
     }
 
@@ -135,6 +138,9 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     // Write metrics
     write_metrics_after_execution(&config, &result, &backup_plan, now, &fs_state)?;
 
+    // Read previous heartbeat BEFORE writing the new one (notification comparison).
+    let previous_hb = heartbeat::read(&config.general.heartbeat_file);
+
     // Write heartbeat (fresh timestamp — `now` is from before execution)
     let heartbeat_now = chrono::Local::now().naive_local();
     let assessments = awareness::assess(&config, heartbeat_now, &fs_state);
@@ -142,6 +148,9 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     if let Err(e) = heartbeat::write(&config.general.heartbeat_file, &hb) {
         log::warn!("Failed to write heartbeat: {e}");
     }
+
+    // Dispatch notifications for promise state changes
+    dispatch_notifications(previous_hb.as_ref(), &hb, &config);
 
     // Build and render structured summary
     let summary = build_backup_summary(
@@ -552,6 +561,32 @@ fn format_elapsed(d: Duration) -> String {
         format!("{hours}:{mins:02}:{secs:02}")
     } else {
         format!("{mins}:{secs:02}")
+    }
+}
+
+/// Compute and dispatch notifications for promise state changes.
+///
+/// Sequence: compute from heartbeat transition → dispatch → mark dispatched.
+/// If dispatch fails, the `notifications_dispatched` flag stays false so the
+/// next run (or Sentinel) can retry.
+fn dispatch_notifications(
+    previous: Option<&heartbeat::Heartbeat>,
+    current: &heartbeat::Heartbeat,
+    config: &Config,
+) {
+    let notifications = notify::compute_notifications(previous, current);
+    if notifications.is_empty() {
+        // No state changes — mark dispatched immediately
+        if let Err(e) = heartbeat::mark_dispatched(&config.general.heartbeat_file) {
+            log::warn!("Failed to update heartbeat dispatched flag: {e}");
+        }
+        return;
+    }
+
+    notify::dispatch(&notifications, &config.notifications);
+
+    if let Err(e) = heartbeat::mark_dispatched(&config.general.heartbeat_file) {
+        log::warn!("Failed to update heartbeat dispatched flag: {e}");
     }
 }
 
