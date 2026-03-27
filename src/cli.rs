@@ -35,6 +35,22 @@ pub enum Commands {
     Calibrate(CalibrateArgs),
     /// Retrieve a file from a past snapshot
     Get(GetArgs),
+    /// Sentinel daemon — monitors backup health and drive connections
+    Sentinel(SentinelArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub struct SentinelArgs {
+    #[command(subcommand)]
+    pub command: SentinelCommands,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SentinelCommands {
+    /// Start the Sentinel (foreground, for systemd)
+    Run,
+    /// Show Sentinel status
+    Status,
 }
 
 #[derive(clap::Args, Debug)]

@@ -104,8 +104,10 @@ impl SentinelState {
 #[derive(Debug, Clone)]
 pub struct CircuitBreakerConfig {
     /// Minimum interval between auto-triggered backups.
+    #[allow(dead_code)] // Session 4: active mode
     pub min_interval: Duration,
     /// Maximum consecutive failures before the circuit opens.
+    #[allow(dead_code)] // Session 4: active mode
     pub max_failures: u32,
 }
 
@@ -126,11 +128,14 @@ impl Default for CircuitBreakerConfig {
 /// - HalfOpen: one trial trigger allowed — success closes, failure re-opens.
 #[derive(Debug, Clone)]
 pub struct CircuitBreaker {
+    #[allow(dead_code)] // Session 4: active mode
     pub config: CircuitBreakerConfig,
     pub state: CircuitState,
     pub failure_count: u32,
+    #[allow(dead_code)] // Session 4: active mode
     pub last_trigger: Option<NaiveDateTime>,
     /// Current backoff duration (doubles on each failure, capped at 24h).
+    #[allow(dead_code)] // Session 4: active mode
     pub backoff: Duration,
 }
 
@@ -153,8 +158,10 @@ impl std::fmt::Display for CircuitState {
 }
 
 /// Maximum backoff duration: 24 hours.
+#[allow(dead_code)] // Session 4: active mode
 const MAX_BACKOFF: Duration = Duration::from_secs(24 * 3600);
 /// Initial backoff after first circuit open: 15 minutes.
+#[allow(dead_code)] // Session 4: active mode
 const INITIAL_BACKOFF: Duration = Duration::from_secs(15 * 60);
 
 impl CircuitBreaker {
@@ -178,6 +185,7 @@ impl CircuitBreaker {
     /// `evaluate_trigger_result` so the circuit breaker knows whether to
     /// apply half-open semantics — no implicit protocol.
     #[must_use]
+    #[allow(dead_code)] // Session 4: active mode
     pub fn check_trigger(&self, now: NaiveDateTime) -> TriggerPermission {
         match self.state {
             CircuitState::Open => {
@@ -223,6 +231,7 @@ impl CircuitBreaker {
 /// of trigger this is, so `evaluate_trigger_result` can apply the correct
 /// circuit breaker semantics without an implicit protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Session 4: active mode
 pub enum TriggerPermission {
     /// Normal trigger (circuit closed, min_interval elapsed).
     Allowed,
@@ -234,6 +243,7 @@ pub enum TriggerPermission {
     Blocked,
 }
 
+#[allow(dead_code)] // Session 4: active mode
 impl TriggerPermission {
     /// Whether this permission allows a trigger to proceed.
     #[must_use]
@@ -244,6 +254,7 @@ impl TriggerPermission {
 
 /// Why the sentinel wants to trigger a backup.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // Session 4: active mode
 pub enum TriggerReason {
     /// A drive was mounted that has pending sends.
     DriveMounted { label: String },
@@ -253,6 +264,7 @@ pub enum TriggerReason {
 
 /// A decision to trigger a backup, with context for result evaluation.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // Session 4: active mode
 pub struct BackupTrigger {
     pub reason: TriggerReason,
     pub triggered_at: NaiveDateTime,
@@ -264,6 +276,7 @@ pub struct BackupTrigger {
 
 /// Outcome of a triggered backup, for circuit breaker evaluation.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // Session 4: active mode
 pub enum TriggerOutcome {
     /// Backup succeeded (exit 0, or heartbeat shows improvement).
     Success,
@@ -369,6 +382,7 @@ pub fn sentinel_transition(
 ///
 /// Only relevant when active mode is enabled (`[sentinel] active = true`).
 #[must_use]
+#[allow(dead_code)] // Session 4: active mode
 pub fn should_trigger_backup(
     state: &SentinelState,
     event: &SentinelEvent,
@@ -432,6 +446,7 @@ pub fn should_trigger_backup(
 
 /// Check if any subvolume's promise status degraded (got worse) between
 /// the previous snapshot and current assessments.
+#[allow(dead_code)] // Session 4: active mode (used by should_trigger_backup)
 fn has_promise_degradation(
     previous: &[PromiseSnapshot],
     current: &[SubvolAssessment],
@@ -456,6 +471,7 @@ fn has_promise_degradation(
 /// Pure function — the runner calls this after a triggered backup completes
 /// and stores the result.
 #[must_use]
+#[allow(dead_code)] // Session 4: active mode
 pub fn evaluate_trigger_result(
     circuit: &CircuitBreaker,
     trigger: &BackupTrigger,
