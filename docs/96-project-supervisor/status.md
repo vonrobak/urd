@@ -12,9 +12,33 @@ cutover — a conscious risk decision documented in
 [first-night journal](../98-journals/2026-03-25-first-night.md). Monitoring target was
 2026-04-01 (1 week from cutover on 2026-03-25).
 
-**318 tests. All pass. Clippy clean.**
+**366 tests. All pass. Clippy clean.**
 
-### Recent development (2026-03-27, session 4)
+### Recent development (2026-03-27, session 5)
+
+**Sentinel Session 1: Lock extraction + pure state machine.** Built the Sentinel's core
+pure module (`sentinel.rs`) and extracted the backup lock to a shared module (`lock.rs`).
+[Journal](../98-journals/2026-03-27-sentinel-session1.md)
+
+New modules:
+- `lock.rs` — shared advisory lock with `LockGuard`, `LockInfo` metadata (PID, timestamp,
+  trigger source), `acquire_lock()`, `try_acquire_lock()`, `read_lock_info()`. Handles empty,
+  corrupt, and missing lock files gracefully.
+- `sentinel.rs` — pure state machine (ADR-108 pattern). `sentinel_transition()` maps events
+  to actions. Adaptive tick (15m/5m/2m by worst promise status). Circuit breaker with
+  exponential backoff (15m initial, 24h cap). `TriggerPermission` enum for explicit
+  Open→HalfOpen protocol. `should_trigger_backup()` as runner-level decision (not state
+  machine). First-assessment notification suppression.
+
+**Arch-adversary review** found and fixed: `File::create` truncation race in lock acquisition,
+implicit HalfOpen protocol replaced with `TriggerPermission` enum, `LockHeld` no longer
+consumes min_interval cooldown, `DriveMounted` guarded against pre-initial-assessment triggers.
+[Review](../99-reports/2026-03-27-sentinel-session1-review.md)
+
+32 sentinel tests + 8 lock tests. Modified `backup.rs` to use shared lock module (one-line
+change). Session 2 will build the I/O runner with poll loop first (per review recommendation).
+
+### Earlier development (2026-03-27, session 4)
 
 **Config system design review.** Systematic review of the configuration system through 11
 design questions. Identified five structural problems (two-masters override semantics,
@@ -325,15 +349,15 @@ The Sentinel is three independent systems that compose. Build and test them sepa
 | # | Component | Depends On | Notes |
 |---|-----------|------------|-------|
 | 5a | ~~**Notification dispatcher**~~ | ~~Awareness model (3a)~~ | **COMPLETE.** `notify.rs`: `compute_notifications()` pure function, 4 channel types (Desktop/Webhook/Command/Log), urgency filtering. Heartbeat gains `notifications_dispatched` for crash recovery. `[notifications]` config section. Integrated into `backup.rs`. 18 tests. |
-| 5b | **Event reactor** | Awareness model (3a), heartbeat (3b) | udev drive events, timer management. Long-running daemon. Start passive (no auto-trigger). |
-| 5c | **Active mode** | Event reactor (5b) | Auto-trigger backups to meet promises. Circuit breaker (no cascade on error). Lock contention with manual `urd backup` resolved. |
+| 5b | **Event reactor** | Awareness model (3a), heartbeat (3b) | Session 1 complete: pure state machine (`sentinel.rs`), shared lock (`lock.rs`), circuit breaker, adaptive tick. Session 2 next: I/O runner + CLI. [Design](../95-ideas/2026-03-27-design-sentinel-implementation.md) |
+| 5c | **Active mode** | Event reactor (5b) | Auto-trigger logic designed in Session 1: `should_trigger_backup()`, `TriggerPermission`, `evaluate_trigger_result()`. Implementation in Session 4. |
 
 Architectural gates:
 - [x] Awareness model works independently (tested, no Sentinel dependency)
 - [x] Heartbeat works independently (written by `urd backup`, read by Sentinel)
-- [ ] Event/action types defined as enums (testable state machine)
-- [ ] Lock contention with manual `urd backup` designed
-- [ ] Circuit breaker designed (min interval between auto-triggers)
+- [x] Event/action types defined as enums (testable state machine) — `sentinel.rs` Session 1
+- [x] Lock contention with manual `urd backup` designed — `lock.rs` shared module
+- [x] Circuit breaker designed (min interval between auto-triggers) — `CircuitBreaker` with `TriggerPermission`
 - [ ] Passive mode ships and works before active mode is attempted
 - [ ] Sentinel can be killed without affecting promise state computation
 
@@ -537,7 +561,7 @@ timestamp staleness handling, space check deduplication, ANSI line clearing.
 - [x] **Phase 5** — Architectural foundation: awareness model, heartbeat, presentation layer, `urd get`, voice migration (8/8 commands), structured errors
 - [x] **Phase 5 gate** — ADR-110: protection promise design (retention mappings, config conflicts, migration)
 - [x] **Phase 6** — Protection promises: types, derivation, config resolution, preflight checks, planner drive filtering, `--confirm-retention-change`, status display. Config deployed with promises.
-- [ ] **Phase 7** — Sentinel: ~~notification dispatcher~~ (5a done) → event reactor → active mode
+- [ ] **Phase 7** — Sentinel: ~~notification dispatcher~~ (5a done) → ~~state machine + lock~~ (Session 1 done) → I/O runner → active mode
 - [ ] **Phase 8** — Expansion: completions, smart defaults, setup wizard, drive lifecycle
 
 ## Active Work — Operational Cutover
@@ -654,8 +678,9 @@ for the graduation rationale.
 | Vision architecture review | [2026-03-23 Architectural criteria for vision](../99-reports/2026-03-23-vision-architecture-review.md) |
 | Protection promises design | [ADR-110](../00-foundation/decisions/2026-03-26-ADR-110-protection-promises.md) + [Design](../95-ideas/2026-03-26-design-protection-promises.md) |
 | Sentinel design (5a/5b/5c) | [Sentinel design](../95-ideas/2026-03-26-design-sentinel.md) |
+| Sentinel implementation plan (5b+5c) | [Implementation plan](../95-ideas/2026-03-27-design-sentinel-implementation.md) |
 | Session 3 deployment + verification tests | [Session 3 journal](../98-journals/2026-03-27-session3-deployment.md) |
-| Latest adversary review | [2026-03-26 Preflight implementation review](../99-reports/2026-03-26-preflight-implementation-review.md) |
+| Latest adversary review | [Sentinel Session 1 review](../99-reports/2026-03-27-sentinel-session1-review.md) |
 | Code conventions & architecture | [CLAUDE.md](../../CLAUDE.md) |
 | Documentation standards | [CONTRIBUTING.md](../../CONTRIBUTING.md) |
 

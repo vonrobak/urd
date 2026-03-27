@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::fs::File;
 use std::io::IsTerminal;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -14,6 +13,7 @@ use crate::config::Config;
 use crate::drives;
 use crate::executor::{ExecutionResult, Executor, OpResult, RunResult};
 use crate::heartbeat;
+use crate::lock;
 use crate::metrics::{self, MetricsData, SubvolumeMetrics};
 use crate::output::{
     BackupSummary, OutputMode, SendSummary, SkippedSubvolume, StatusAssessment, StructuredError,
@@ -82,7 +82,8 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     }
 
     // Acquire advisory lock to prevent concurrent backup runs
-    let _lock = acquire_lock(&config)?;
+    let lock_path = config.general.state_db.with_extension("lock");
+    let _lock = lock::acquire_lock(&lock_path, "timer")?;
 
     if backup_plan.is_empty() && backup_plan.skipped.is_empty() {
         println!("{}", "Nothing to do.".dimmed());
@@ -315,31 +316,6 @@ fn build_backup_summary(
             .map(StatusAssessment::from_assessment)
             .collect(),
         warnings,
-    }
-}
-
-/// Acquire an advisory lock to prevent concurrent backup runs.
-/// Returns the lock file (lock is held until dropped).
-fn acquire_lock(config: &Config) -> anyhow::Result<nix::fcntl::Flock<File>> {
-    let lock_path = config.general.state_db.with_extension("lock");
-
-    if let Some(parent) = lock_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    let file = File::create(&lock_path)?;
-
-    match nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock) {
-        Ok(lock) => Ok(lock),
-        Err((_, errno)) if errno == nix::errno::Errno::EWOULDBLOCK => {
-            anyhow::bail!(
-                "Another urd backup is already running (lock file: {})",
-                lock_path.display()
-            );
-        }
-        Err((_, errno)) => {
-            anyhow::bail!("Failed to acquire lock {}: {errno}", lock_path.display());
-        }
     }
 }
 
