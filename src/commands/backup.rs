@@ -567,8 +567,8 @@ fn format_elapsed(d: Duration) -> String {
 /// Compute and dispatch notifications for promise state changes.
 ///
 /// Sequence: compute from heartbeat transition → dispatch → mark dispatched.
-/// If dispatch fails, the `notifications_dispatched` flag stays false so the
-/// next run (or Sentinel) can retry.
+/// Only marks dispatched if at least one channel succeeded, so the Sentinel (5b)
+/// can retry on total failure.
 fn dispatch_notifications(
     previous: Option<&heartbeat::Heartbeat>,
     current: &heartbeat::Heartbeat,
@@ -583,10 +583,17 @@ fn dispatch_notifications(
         return;
     }
 
-    notify::dispatch(&notifications, &config.notifications);
+    let any_delivered = notify::dispatch(&notifications, &config.notifications);
 
-    if let Err(e) = heartbeat::mark_dispatched(&config.general.heartbeat_file) {
-        log::warn!("Failed to update heartbeat dispatched flag: {e}");
+    if any_delivered {
+        if let Err(e) = heartbeat::mark_dispatched(&config.general.heartbeat_file) {
+            log::warn!("Failed to update heartbeat dispatched flag: {e}");
+        }
+    } else {
+        log::warn!(
+            "All notification channels failed — heartbeat not marked as dispatched \
+             (Sentinel will retry)"
+        );
     }
 }
 

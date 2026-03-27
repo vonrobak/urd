@@ -51,6 +51,10 @@ pub struct SubvolumeHeartbeat {
     pub backup_success: Option<bool>,
     /// Promise status from the awareness model: "PROTECTED", "AT RISK", "UNPROTECTED".
     pub promise_status: String,
+    /// Number of sends that succeeded but whose pin file write failed.
+    /// Defaults to 0 for backward compat with pre-pin-tracking heartbeats.
+    #[serde(default)]
+    pub pin_failures: u32,
 }
 
 // ── Builder ─────────────────────────────────────────────────────────────
@@ -107,17 +111,15 @@ fn build_subvolume_entries(
     assessments
         .iter()
         .map(|a| {
-            let backup_success = result.and_then(|r| {
-                r.subvolume_results
-                    .iter()
-                    .find(|sv| sv.name == a.name)
-                    .map(|sv| sv.success)
+            let sv_result = result.and_then(|r| {
+                r.subvolume_results.iter().find(|sv| sv.name == a.name)
             });
 
             SubvolumeHeartbeat {
                 name: a.name.clone(),
-                backup_success,
+                backup_success: sv_result.map(|sv| sv.success),
                 promise_status: a.status.to_string(),
+                pin_failures: sv_result.map(|sv| sv.pin_failures).unwrap_or(0),
             }
         })
         .collect()

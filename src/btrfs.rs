@@ -305,7 +305,19 @@ impl BtrfsOps for RealBtrfs {
     }
 
     fn subvolume_exists(&self, path: &Path) -> bool {
-        path.exists()
+        // Use `btrfs subvolume show` instead of path.exists() to confirm
+        // the path is actually a btrfs subvolume, not a regular directory.
+        // This prevents the crash recovery path from treating a non-subvolume
+        // directory as an already-sent snapshot.
+        Command::new("sudo")
+            .env("LC_ALL", "C")
+            .arg(&self.btrfs_path)
+            .args(["subvolume", "show"])
+            .arg(path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
     }
 
     fn filesystem_free_bytes(&self, path: &Path) -> crate::error::Result<u64> {

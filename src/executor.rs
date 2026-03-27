@@ -493,19 +493,20 @@ impl<'a> Executor<'a> {
     ) -> OperationOutcome {
         let start = Instant::now();
 
-        // External retention re-check: if we're deleting on an external drive
-        // and space has already been recovered for this drive, skip
-        if self.is_external_path(path)
-            && let Some(label) = self.drive_label_for_path(path)
-            && *space_recovered.get(&label).unwrap_or(&false)
+        // Space recovery re-check: if space has already been recovered for this
+        // location (external drive or local snapshot root), skip further deletes.
+        // Prevents over-deletion when only a few deletes were needed to free space.
+        let recovery_key = self.space_recovery_key(path, subvolume_name);
+        if let Some(ref key) = recovery_key
+            && *space_recovered.get(key).unwrap_or(&false)
         {
             log::info!(
-                "Skipping deletion of {} (space already recovered on {label})",
+                "Skipping deletion of {} (space already recovered on {key})",
                 path.display()
             );
             return OperationOutcome {
                 operation: "delete".to_string(),
-                drive_label: Some(label),
+                drive_label: self.drive_label_for_path(path),
                 result: OpResult::Skipped,
                 duration: start.elapsed(),
                 error: Some("space recovered, deletion skipped".to_string()),
@@ -548,21 +549,33 @@ impl<'a> Executor<'a> {
 
         match self.btrfs.delete_subvolume(path) {
             Ok(()) => {
-                // After external deletion, check if min_free_bytes is now satisfied
-                if self.is_external_path(path)
-                    && let Some(drive) = self.drive_for_path(path)
-                    && let Some(min_free_bytes) = drive.min_free_bytes
-                    && min_free_bytes.bytes() > 0
-                    && let Ok(free) = self.btrfs.filesystem_free_bytes(&drive.mount_path)
-                    && free >= min_free_bytes.bytes()
-                {
-                    log::info!(
-                        "Free space on {} is now {} (>= {}), stopping further deletions",
-                        drive.label,
-                        crate::types::ByteSize(free),
-                        min_free_bytes,
-                    );
-                    space_recovered.insert(drive.label.clone(), true);
+                // After deletion, check if min_free_bytes is now satisfied.
+                // Applies to both external drives and local snapshot roots.
+                if let Some(ref key) = recovery_key {
+                    let (check_path, min_free) = if self.is_external_path(path) {
+                        // External: check drive's mount path and min_free_bytes
+                        self.drive_for_path(path)
+                            .and_then(|d| d.min_free_bytes.map(|m| (d.mount_path.clone(), m.bytes())))
+                            .unwrap_or_default()
+                    } else {
+                        // Local: check snapshot root's min_free_bytes
+                        let min = self.config.root_min_free_bytes(subvolume_name).unwrap_or(0);
+                        let root = self.config.snapshot_root_for(subvolume_name)
+                            .unwrap_or_default();
+                        (root, min)
+                    };
+
+                    if min_free > 0
+                        && let Ok(free) = self.btrfs.filesystem_free_bytes(&check_path)
+                        && free >= min_free
+                    {
+                        log::info!(
+                            "Free space on {key} is now {} (>= {}), stopping further deletions",
+                            crate::types::ByteSize(free),
+                            crate::types::ByteSize(min_free),
+                        );
+                        space_recovered.insert(key.clone(), true);
+                    }
                 }
 
                 OperationOutcome {
@@ -595,6 +608,19 @@ impl<'a> Executor<'a> {
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────
+
+    /// Return a key for space recovery tracking. External paths use the drive
+    /// label; local paths use the snapshot root path string. Returns None if
+    /// the path doesn't match any known location.
+    fn space_recovery_key(&self, path: &Path, subvolume_name: &str) -> Option<String> {
+        if let Some(label) = self.drive_label_for_path(path) {
+            Some(label)
+        } else {
+            self.config
+                .snapshot_root_for(subvolume_name)
+                .map(|root| root.to_string_lossy().to_string())
+        }
+    }
 
     fn is_external_path(&self, path: &Path) -> bool {
         self.config
@@ -1124,6 +1150,100 @@ source = "/data/b"
         );
 
         // Only one delete should have been called
+        let delete_count = mock
+            .calls()
+            .iter()
+            .filter(|c| matches!(c, MockBtrfsCall::DeleteSubvolume { .. }))
+            .count();
+        assert_eq!(delete_count, 1);
+    }
+
+    fn test_config_with_local_min_free() -> Config {
+        let config_str = r#"
+[general]
+state_db = "/tmp/urd-test/urd.db"
+metrics_file = "/tmp/urd-test/backup.prom"
+log_dir = "/tmp/urd-test"
+
+[local_snapshots]
+roots = [
+  { path = "/snap", subvolumes = ["sv-a", "sv-b"], min_free_bytes = "100GB" }
+]
+
+[defaults]
+snapshot_interval = "1h"
+send_interval = "4h"
+[defaults.local_retention]
+hourly = 24
+[defaults.external_retention]
+daily = 30
+
+[[drives]]
+label = "TEST-DRIVE"
+mount_path = "/mnt/test"
+snapshot_root = ".snapshots"
+role = "test"
+min_free_bytes = "100GB"
+
+[[subvolumes]]
+name = "sv-a"
+short_name = "a"
+source = "/data/a"
+
+[[subvolumes]]
+name = "sv-b"
+short_name = "b"
+source = "/data/b"
+"#;
+        toml::from_str(config_str).unwrap()
+    }
+
+    #[test]
+    fn local_space_recovery_stops_further_deletes() {
+        let mock = MockBtrfs::new();
+        // Free space is above threshold — after first delete, space is recovered
+        *mock.free_bytes.borrow_mut() = 200_000_000_000; // 200GB > 100GB threshold
+
+        let config = test_config_with_local_min_free();
+        let shutdown = no_shutdown();
+        let executor = Executor::new(&mock, None, &config, &shutdown);
+
+        let ts = NaiveDate::from_ymd_opt(2026, 3, 22)
+            .unwrap()
+            .and_hms_opt(14, 30, 0)
+            .unwrap();
+        let plan = BackupPlan {
+            operations: vec![
+                PlannedOperation::DeleteSnapshot {
+                    path: PathBuf::from("/snap/sv-a/20260301-a"),
+                    reason: "space pressure".to_string(),
+                    subvolume_name: "sv-a".to_string(),
+                },
+                PlannedOperation::DeleteSnapshot {
+                    path: PathBuf::from("/snap/sv-a/20260302-a"),
+                    reason: "space pressure".to_string(),
+                    subvolume_name: "sv-a".to_string(),
+                },
+                PlannedOperation::DeleteSnapshot {
+                    path: PathBuf::from("/snap/sv-a/20260303-a"),
+                    reason: "space pressure".to_string(),
+                    subvolume_name: "sv-a".to_string(),
+                },
+            ],
+            timestamp: ts,
+            skipped: vec![],
+        };
+
+        let result = executor.execute(&plan, "full");
+
+        // First delete succeeds and triggers space_recovered for local root
+        let sv = &result.subvolume_results[0];
+        assert_eq!(sv.operations[0].result, OpResult::Success);
+        // Remaining should be skipped — space already recovered
+        assert_eq!(sv.operations[1].result, OpResult::Skipped);
+        assert_eq!(sv.operations[2].result, OpResult::Skipped);
+
+        // Only one delete should have been called on the mock
         let delete_count = mock
             .calls()
             .iter()

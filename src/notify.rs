@@ -40,6 +40,11 @@ pub enum NotificationEvent {
     },
     /// All promises are now UNPROTECTED (critical).
     AllUnprotected,
+    /// Pin file write(s) failed after successful send — next send will be
+    /// full instead of incremental (potentially hours instead of seconds).
+    PinWriteFailures {
+        total_failures: u32,
+    },
     /// Heartbeat is stale — no backup completed within expected window.
     /// Evaluated by the Sentinel (5b), not by `urd backup` itself.
     #[allow(dead_code)] // Constructed by Sentinel (5b), not backup command
@@ -255,6 +260,23 @@ pub fn compute_notifications(
         });
     }
 
+    // ── Pin file write failures ─────────────────────────────────────
+    let total_pin_failures: u32 = current.subvolumes.iter().map(|sv| sv.pin_failures).sum();
+    if total_pin_failures > 0 {
+        notifications.push(Notification {
+            event: NotificationEvent::PinWriteFailures {
+                total_failures: total_pin_failures,
+            },
+            urgency: Urgency::Warning,
+            title: format!("Urd: {total_pin_failures} pin file write(s) failed"),
+            body: format!(
+                "{total_pin_failures} send(s) succeeded but their chain markers could not be \
+                 written. The next send will be full instead of incremental. \
+                 Run `urd verify` to diagnose."
+            ),
+        });
+    }
+
     notifications
 }
 
@@ -279,9 +301,13 @@ fn is_degradation(from: &str, to: &str) -> bool {
 /// Filters by `min_urgency` — only notifications at or above the threshold
 /// are dispatched. Errors are logged but never propagated (notifications
 /// must not prevent backups).
-pub fn dispatch(notifications: &[Notification], config: &NotificationConfig) {
+///
+/// Returns `true` if at least one notification was successfully delivered
+/// through at least one channel, `false` if all channels failed or there
+/// were no eligible notifications.
+pub fn dispatch(notifications: &[Notification], config: &NotificationConfig) -> bool {
     if !config.enabled || config.channels.is_empty() {
-        return;
+        return false;
     }
 
     let eligible: Vec<&Notification> = notifications
@@ -290,27 +316,33 @@ pub fn dispatch(notifications: &[Notification], config: &NotificationConfig) {
         .collect();
 
     if eligible.is_empty() {
-        return;
+        return false;
     }
+
+    let mut any_succeeded = false;
 
     for notification in &eligible {
         for channel in &config.channels {
-            match channel {
-                NotificationChannel::Desktop => {
-                    dispatch_desktop(notification);
-                }
+            let ok = match channel {
+                NotificationChannel::Desktop => dispatch_desktop(notification),
                 NotificationChannel::Webhook { url, template } => {
-                    dispatch_webhook(notification, url, template.as_deref());
+                    dispatch_webhook(notification, url, template.as_deref())
                 }
                 NotificationChannel::Command { path, args } => {
-                    dispatch_command(notification, path, args);
+                    dispatch_command(notification, path, args)
                 }
                 NotificationChannel::Log => {
                     dispatch_log(notification);
+                    true // Log channel always succeeds
                 }
+            };
+            if ok {
+                any_succeeded = true;
             }
         }
     }
+
+    any_succeeded
 }
 
 fn urgency_to_notify_send(urgency: Urgency) -> &'static str {
@@ -321,7 +353,7 @@ fn urgency_to_notify_send(urgency: Urgency) -> &'static str {
     }
 }
 
-fn dispatch_desktop(notification: &Notification) {
+fn dispatch_desktop(notification: &Notification) -> bool {
     let result = Command::new("notify-send")
         .arg("--urgency")
         .arg(urgency_to_notify_send(notification.urgency))
@@ -332,21 +364,23 @@ fn dispatch_desktop(notification: &Notification) {
         .output();
 
     match result {
-        Ok(output) if !output.status.success() => {
+        Ok(output) if output.status.success() => true,
+        Ok(output) => {
             log::warn!(
                 "notify-send failed (exit {}): {}",
                 output.status.code().unwrap_or(-1),
                 String::from_utf8_lossy(&output.stderr)
             );
+            false
         }
         Err(e) => {
             log::warn!("Failed to run notify-send: {e}");
+            false
         }
-        _ => {}
     }
 }
 
-fn dispatch_webhook(notification: &Notification, url: &str, template: Option<&str>) {
+fn dispatch_webhook(notification: &Notification, url: &str, template: Option<&str>) -> bool {
     let body = match template {
         Some(_tmpl) => {
             // Future: template substitution. For now, use default JSON.
@@ -370,18 +404,20 @@ fn dispatch_webhook(notification: &Notification, url: &str, template: Option<&st
         .output();
 
     match result {
-        Ok(output) if !output.status.success() => {
+        Ok(output) if output.status.success() => true,
+        Ok(output) => {
             log::warn!(
                 "Webhook POST to {} failed (exit {}): {}",
                 url,
                 output.status.code().unwrap_or(-1),
                 String::from_utf8_lossy(&output.stderr)
             );
+            false
         }
         Err(e) => {
             log::warn!("Failed to run curl for webhook: {e}");
+            false
         }
-        _ => {}
     }
 }
 
@@ -395,7 +431,7 @@ fn default_webhook_body(notification: &Notification) -> String {
     )
 }
 
-fn dispatch_command(notification: &Notification, path: &PathBuf, args: &[String]) {
+fn dispatch_command(notification: &Notification, path: &PathBuf, args: &[String]) -> bool {
     let result = Command::new(path)
         .args(args)
         .env("URD_NOTIFICATION_TITLE", &notification.title)
@@ -404,18 +440,20 @@ fn dispatch_command(notification: &Notification, path: &PathBuf, args: &[String]
         .output();
 
     match result {
-        Ok(output) if !output.status.success() => {
+        Ok(output) if output.status.success() => true,
+        Ok(output) => {
             log::warn!(
                 "Notification command {:?} failed (exit {}): {}",
                 path,
                 output.status.code().unwrap_or(-1),
                 String::from_utf8_lossy(&output.stderr)
             );
+            false
         }
         Err(e) => {
             log::warn!("Failed to run notification command {:?}: {e}", path);
+            false
         }
-        _ => {}
     }
 }
 
@@ -435,6 +473,13 @@ mod tests {
     use crate::heartbeat::{Heartbeat, SubvolumeHeartbeat};
 
     fn make_heartbeat(statuses: &[(&str, &str, Option<bool>)]) -> Heartbeat {
+        make_heartbeat_with_pins(statuses, 0)
+    }
+
+    fn make_heartbeat_with_pins(
+        statuses: &[(&str, &str, Option<bool>)],
+        pin_failures: u32,
+    ) -> Heartbeat {
         Heartbeat {
             schema_version: 1,
             timestamp: "2026-03-27T04:00:00".to_string(),
@@ -448,6 +493,7 @@ mod tests {
                     name: name.to_string(),
                     promise_status: status.to_string(),
                     backup_success: *success,
+                    pin_failures,
                 })
                 .collect(),
         }
@@ -628,6 +674,39 @@ mod tests {
         assert!(failures.is_empty());
     }
 
+    // ── Pin failure notifications ──────────────────────────────────
+
+    #[test]
+    fn pin_failures_generate_warning() {
+        let curr = make_heartbeat_with_pins(
+            &[("home", "PROTECTED", Some(true))],
+            2,
+        );
+
+        let notifications = compute_notifications(None, &curr);
+
+        let pin_events: Vec<_> = notifications
+            .iter()
+            .filter(|n| matches!(n.event, NotificationEvent::PinWriteFailures { .. }))
+            .collect();
+        assert_eq!(pin_events.len(), 1);
+        assert_eq!(pin_events[0].urgency, Urgency::Warning);
+        assert!(pin_events[0].title.contains("2 pin file write(s) failed"));
+    }
+
+    #[test]
+    fn no_pin_failures_no_notification() {
+        let curr = make_heartbeat(&[("home", "PROTECTED", Some(true))]);
+
+        let notifications = compute_notifications(None, &curr);
+
+        let pin_events: Vec<_> = notifications
+            .iter()
+            .filter(|n| matches!(n.event, NotificationEvent::PinWriteFailures { .. }))
+            .collect();
+        assert!(pin_events.is_empty());
+    }
+
     // ── Urgency ordering ───────────────────────────────────────────
 
     #[test]
@@ -690,19 +769,56 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_disabled_does_nothing() {
+    fn dispatch_disabled_returns_false() {
         let config = NotificationConfig {
             enabled: false,
             min_urgency: Urgency::Info,
             channels: vec![NotificationChannel::Log],
         };
-        // Should not panic or error
-        dispatch(&[Notification {
+        let result = dispatch(&[Notification {
             event: NotificationEvent::AllUnprotected,
             urgency: Urgency::Critical,
             title: "test".to_string(),
             body: "test".to_string(),
         }], &config);
+        assert!(!result, "disabled config should return false");
+    }
+
+    #[test]
+    fn dispatch_log_channel_returns_true() {
+        let config = NotificationConfig {
+            enabled: true,
+            min_urgency: Urgency::Info,
+            channels: vec![NotificationChannel::Log],
+        };
+        let result = dispatch(&[Notification {
+            event: NotificationEvent::AllUnprotected,
+            urgency: Urgency::Critical,
+            title: "test".to_string(),
+            body: "test".to_string(),
+        }], &config);
+        assert!(result, "log channel should always succeed");
+    }
+
+    #[test]
+    fn dispatch_no_eligible_returns_false() {
+        let config = NotificationConfig {
+            enabled: true,
+            min_urgency: Urgency::Critical,
+            channels: vec![NotificationChannel::Log],
+        };
+        // Warning urgency < Critical minimum — no eligible notifications
+        let result = dispatch(&[Notification {
+            event: NotificationEvent::PromiseDegraded {
+                subvolume: "test".to_string(),
+                from: "PROTECTED".to_string(),
+                to: "AT RISK".to_string(),
+            },
+            urgency: Urgency::Warning,
+            title: "test".to_string(),
+            body: "test".to_string(),
+        }], &config);
+        assert!(!result, "no eligible notifications should return false");
     }
 
     // ── Config deserialization ──────────────────────────────────────
