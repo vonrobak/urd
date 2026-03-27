@@ -8,12 +8,15 @@ mod drives;
 mod error;
 mod executor;
 mod heartbeat;
+mod lock;
 mod metrics;
 mod notify;
 mod output;
 mod plan;
 mod preflight;
 mod retention;
+#[allow(dead_code)] // Session 2 (sentinel_runner) will consume this module
+mod sentinel;
 mod state;
 mod types;
 mod voice;

@@ -64,6 +64,8 @@ All backup logic flows through: config -> plan -> execute. No exceptions.
 | `drives.rs` | Detect mounted drives, UUID fingerprinting, check space | Mount/unmount drives |
 | `output.rs` | Define structured output types | Render text (voice.rs does that) |
 | `voice.rs` | Render structured output as text (mythic voice) | Perform I/O or compute state |
+| `lock.rs` | Shared advisory lock with metadata (PID, trigger source) | Decide whether to proceed (caller's job) |
+| `sentinel.rs` | Pure state machine for Sentinel daemon (events, actions, circuit breaker) | Perform I/O (sentinel_runner.rs does that) |
 | `error.rs` | Error types, `translate_btrfs_error()` for actionable messages | Recovery logic |
 | `commands/` | CLI subcommand handlers (wire pure modules to I/O) | Core logic (delegate to above) |
 
@@ -139,7 +141,7 @@ See ADR-111 implementation gates for the migration checklist.
 - Integration tests: `tests/integration/`, `#[ignore]` by default. Run: `cargo test -- --ignored`
 - Use `MockBtrfs` and `MockFileSystemState` for anything that would call btrfs or read filesystem
 - Test retention logic exhaustively — it protects against data loss
-- 318 tests, all passing, clippy clean
+- 366 tests, all passing, clippy clean
 
 ## Backward Compatibility (ADR-105)
 
@@ -170,7 +172,7 @@ stringified — prevents shell injection and preserves non-UTF-8 paths.
 ```bash
 cargo build                          # Debug
 cargo build --release                # Release
-cargo test                           # Unit tests (318 tests)
+cargo test                           # Unit tests (366 tests)
 cargo test -- --ignored              # Integration tests (needs drives)
 cargo clippy -- -D warnings          # Lint (all warnings are errors)
 cargo run -- plan                    # Preview backup plan
