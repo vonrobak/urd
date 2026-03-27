@@ -13,7 +13,8 @@ btrfs_path = "/usr/sbin/btrfs"
 # Heartbeat file — JSON health signal written after each backup run
 # heartbeat_file = "~/.local/share/urd/heartbeat.json"
 # How often Urd runs: "daily" (systemd timer), "sentinel" (daemon), or interval like "6h"
-# run_frequency = "daily"
+# Protection promises derive intervals from this — set it to match your systemd timer.
+run_frequency = "daily"
 
 # ─── Local Snapshot Roots ──────────────────────────────────────────────
 # Each root maps to a directory where snapshot subdirectories are created.
@@ -29,11 +30,13 @@ roots = [
 ]
 
 # ─── Defaults ──────────────────────────────────────────────────────────
-# Per-subvolume settings inherit from these unless overridden.
+# Fallback for subvolumes without a protection_level (custom config).
+# Subvolumes with a named protection_level derive their values from the
+# promise level + run_frequency — these defaults do not apply to them.
 
 [defaults]
-snapshot_interval = "1h"       # How often to create local snapshots
-send_interval = "4h"           # How often to send to external drives
+snapshot_interval = "1d"       # Match run_frequency to avoid interval mismatch
+send_interval = "1d"           # Match run_frequency
 send_enabled = true            # Whether to send to external drives
 enabled = true                 # Whether to back up at all
 
@@ -83,89 +86,117 @@ role = "test"
 max_usage_percent = 85
 min_free_bytes = "100GB"
 
-# ─── Priority 1: Critical (frequent snapshots + sends) ────────────────
+# ─── Notifications ────────────────────────────────────────────────────
+# Urd dispatches notifications when promise states change after a backup.
+# Channels receive notifications at or above the configured urgency threshold.
+# Urgency levels: "info" (recoveries), "warning" (degradations), "critical" (all broken).
+
+# [notifications]
+# enabled = true
+# min_urgency = "warning"
+#
+# [[notifications.channels]]
+# type = "desktop"                          # Uses notify-send
+#
+# [[notifications.channels]]
+# type = "webhook"
+# url = "https://ntfy.sh/my-backups"        # Any JSON-accepting endpoint
+#
+# [[notifications.channels]]
+# type = "command"
+# path = "/usr/local/bin/my-notify-script"  # Receives URD_NOTIFICATION_* env vars
+# args = ["--json"]
+#
+# [[notifications.channels]]
+# type = "log"                              # Writes to Urd's log file
+
+# ─── Protection Promises ──────────────────────────────────────────────
+#
+# Each subvolume declares a protection_level that tells Urd what safety
+# guarantee you want. Urd derives snapshot/send intervals and retention
+# from the promise level + run_frequency. Explicit overrides replace
+# derived values when you need finer control.
+#
+# Levels (with daily timer):
+#   guarded   — local snapshots only, minimal retention (d:7, w:4)
+#   protected — local + 1 external drive, full retention
+#   resilient — local + 2+ external drives, full retention
+#   custom    — manual config (default, no derivation)
+#
+# "drives" restricts which external drives serve a subvolume's promise.
+# Omit to use all configured drives.
+
+# ─── Resilient: irreplaceable data on multiple drives ─────────────────
 
 [[subvolumes]]
 name = "htpc-home"
 short_name = "htpc-home"
 source = "/home"
 priority = 1
-snapshot_interval = "15m"      # Very frequent — active workstation
-send_interval = "1h"
+protection_level = "resilient"
+drives = ["WD-18TB", "WD-18TB1"]   # Active workstation — keep off small test drive
 
 [[subvolumes]]
 name = "subvol3-opptak"
 short_name = "opptak"
 source = "/mnt/btrfs-pool/subvol3-opptak"
 priority = 1
-snapshot_interval = "1h"
-send_interval = "2h"
-# Protection promise: "guarded" (local only), "protected" (local + 1 drive),
-# "resilient" (local + 2+ drives), or "custom" (manual config, the default).
-# When set, Urd derives intervals and retention from the promise level.
-# Explicit overrides (like snapshot_interval above) replace derived values.
-# protection_level = "resilient"
-# drives = ["WD-18TB", "WD-18TB1"]   # Which drives serve this promise
-# NOTE: Irreplaceable recordings — highest backup priority
+protection_level = "resilient"
+drives = ["WD-18TB", "WD-18TB1"]   # ~3.4TB — exceeds 2TB-backup capacity
 
 [[subvolumes]]
-name = "subvol7-containers"
-short_name = "containers"
-source = "/mnt/btrfs-pool/subvol7-containers"
-priority = 1
-snapshot_interval = "1h"
-send_interval = "2h"
+name = "subvol2-pics"
+short_name = "pics"
+source = "/mnt/btrfs-pool/subvol2-pics"
+priority = 2
+protection_level = "resilient"
+drives = ["WD-18TB", "WD-18TB1"]   # Photos are irreplaceable
 
-# ─── Priority 2: Important (default frequency) ────────────────────────
+# ─── Protected: important data on at least one drive ──────────────────
 
 [[subvolumes]]
 name = "subvol1-docs"
 short_name = "docs"
 source = "/mnt/btrfs-pool/subvol1-docs"
 priority = 2
-# Inherits defaults: 1h snapshot, 4h send
-
-# ─── Priority 3: Standard (less frequent) ─────────────────────────────
+protection_level = "protected"
 
 [[subvolumes]]
-name = "htpc-root"
-short_name = "htpc-root"
-source = "/"
-priority = 3
-snapshot_interval = "1d"
-send_interval = "1d"
-local_retention = { daily = 7, weekly = 4 }   # Minimal — root changes rarely
-
-[[subvolumes]]
-name = "subvol2-pics"
-short_name = "pics"
-source = "/mnt/btrfs-pool/subvol2-pics"
-priority = 3
-snapshot_interval = "1d"
-send_interval = "1d"
-
-[[subvolumes]]
-name = "subvol4-multimedia"
-short_name = "multimedia"
-source = "/mnt/btrfs-pool/subvol4-multimedia"
-priority = 3
-snapshot_interval = "1w"
-send_enabled = false           # Disabled until initial manual full send
+name = "subvol7-containers"
+short_name = "containers"
+source = "/mnt/btrfs-pool/subvol7-containers"
+priority = 2
+protection_level = "protected"
 
 [[subvolumes]]
 name = "subvol5-music"
 short_name = "music"
 source = "/mnt/btrfs-pool/subvol5-music"
 priority = 3
-snapshot_interval = "1d"
-send_interval = "1d"
+protection_level = "protected"
+
+# ─── Guarded: local snapshots only ────────────────────────────────────
+
+[[subvolumes]]
+name = "htpc-root"
+short_name = "htpc-root"
+source = "/"
+priority = 3
+protection_level = "guarded"
+local_retention = { daily = 7 }    # Override: root changes rarely, keep less
+
+[[subvolumes]]
+name = "subvol4-multimedia"
+short_name = "multimedia"
+source = "/mnt/btrfs-pool/subvol4-multimedia"
+priority = 3
+protection_level = "guarded"
+snapshot_interval = "1w"           # Override: large volume, weekly is sufficient
 
 [[subvolumes]]
 name = "subvol6-tmp"
 short_name = "tmp"
 source = "/mnt/btrfs-pool/subvol6-tmp"
 priority = 3
-# protection_level = "guarded"  # Equivalent to: send_enabled=false + minimal retention
-snapshot_interval = "1d"
-send_enabled = false           # Cache data — local snapshots only
-local_retention = { daily = 7 }
+protection_level = "guarded"
+local_retention = { daily = 7 }    # Override: cache data, minimal history needed

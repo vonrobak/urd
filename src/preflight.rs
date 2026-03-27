@@ -278,6 +278,7 @@ mod tests {
             },
             drives,
             subvolumes,
+            notifications: Default::default(),
         }
     }
 

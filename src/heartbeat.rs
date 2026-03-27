@@ -32,6 +32,15 @@ pub struct Heartbeat {
     pub run_result: String,
     pub run_id: Option<i64>,
     pub subvolumes: Vec<SubvolumeHeartbeat>,
+    /// Whether notifications were dispatched for this heartbeat.
+    /// Used for crash recovery: if false on next read, re-compute and re-send.
+    /// Defaults to true for backward compat with pre-notification heartbeats.
+    #[serde(default = "default_dispatched")]
+    pub notifications_dispatched: bool,
+}
+
+fn default_dispatched() -> bool {
+    true
 }
 
 /// Per-subvolume summary in the heartbeat.
@@ -65,6 +74,7 @@ pub fn build_from_run(
         run_result: result.overall.as_str().to_string(),
         run_id: result.run_id,
         subvolumes,
+        notifications_dispatched: false,
     }
 }
 
@@ -86,6 +96,7 @@ pub fn build_empty(
         run_result: "empty".to_string(),
         run_id: None,
         subvolumes,
+        notifications_dispatched: false,
     }
 }
 
@@ -170,10 +181,18 @@ pub fn write(path: &Path, heartbeat: &Heartbeat) -> crate::error::Result<()> {
 
 /// Read and parse a heartbeat file. Returns `None` if the file doesn't exist.
 #[must_use]
-#[allow(dead_code)]
 pub fn read(path: &Path) -> Option<Heartbeat> {
     let content = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&content).ok()
+}
+
+/// Mark notifications as dispatched in an existing heartbeat file.
+pub fn mark_dispatched(path: &Path) -> crate::error::Result<()> {
+    if let Some(mut hb) = read(path) {
+        hb.notifications_dispatched = true;
+        write(path, &hb)?;
+    }
+    Ok(())
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
@@ -246,6 +265,7 @@ mod tests {
             },
             drives: vec![],
             subvolumes,
+            notifications: Default::default(),
         }
     }
 
@@ -330,6 +350,7 @@ mod tests {
         assert_eq!(parsed.timestamp, "2026-03-24T02:05:00");
         assert_eq!(parsed.run_result, "partial");
         assert_eq!(parsed.run_id, Some(42));
+        assert!(!parsed.notifications_dispatched);
         assert_eq!(parsed.subvolumes.len(), 2);
         assert_eq!(parsed.subvolumes[0].name, "home");
         assert_eq!(parsed.subvolumes[0].backup_success, Some(true));

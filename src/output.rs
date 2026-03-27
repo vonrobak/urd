@@ -392,6 +392,85 @@ pub struct VerifyCheck {
     pub detail: Option<String>,
 }
 
+// ── Init output ─────────────────────────────────────────────────────────
+
+/// Output from the `urd init` command.
+#[derive(Debug, Serialize)]
+pub struct InitOutput {
+    pub infrastructure: Vec<InitCheck>,
+    pub subvolume_sources: Vec<InitCheck>,
+    pub snapshot_roots: Vec<InitCheck>,
+    pub drives: Vec<InitDriveStatus>,
+    pub pin_files: Vec<InitPinFile>,
+    pub incomplete_snapshots: Vec<InitIncomplete>,
+    pub snapshot_counts: Vec<InitSnapshotCount>,
+    pub preflight_warnings: Vec<String>,
+}
+
+/// A pass/fail/warn check result.
+#[derive(Debug, Serialize)]
+pub struct InitCheck {
+    pub name: String,
+    pub status: InitStatus,
+    pub detail: Option<String>,
+}
+
+/// Status of an init check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InitStatus {
+    Ok,
+    Warn,
+    Error,
+}
+
+impl std::fmt::Display for InitStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ok => write!(f, "ok"),
+            Self::Warn => write!(f, "warn"),
+            Self::Error => write!(f, "error"),
+        }
+    }
+}
+
+/// Drive status in init output.
+#[derive(Debug, Serialize)]
+pub struct InitDriveStatus {
+    pub label: String,
+    pub role: String,
+    pub mount_path: String,
+    pub mounted: bool,
+    pub free_bytes: Option<u64>,
+}
+
+/// Pin file status in init output.
+#[derive(Debug, Serialize)]
+pub struct InitPinFile {
+    pub subvolume: String,
+    pub drive: String,
+    pub status: InitStatus,
+    pub snapshot_name: Option<String>,
+    pub error: Option<String>,
+}
+
+/// Potentially incomplete snapshot on an external drive.
+#[derive(Debug, Serialize)]
+pub struct InitIncomplete {
+    pub subvolume: String,
+    pub drive: String,
+    pub snapshot: String,
+    pub path: String,
+}
+
+/// Snapshot count for a subvolume.
+#[derive(Debug, Serialize)]
+pub struct InitSnapshotCount {
+    pub subvolume: String,
+    pub local_count: usize,
+    pub external_counts: Vec<(String, usize)>,
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]
