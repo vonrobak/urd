@@ -37,6 +37,11 @@ Drive restrictions pin resilient subvolumes to 18TB drives. Resolves the interva
 drive capacity) — not a pure preflight check. The config already handles this manually via
 `drives = [...]` restrictions. Better suited for Sentinel (5b).
 
+**Version 0.3.2026-03-27** deployed. Release build installed via `cargo install --path .`.
+Production config at `~/.config/urd/urd.toml` updated with protection promises. First real
+run at 04:00 on 2026-03-28. Verification tests designed in
+[session 3 journal](../98-journals/2026-03-27-session3-deployment.md).
+
 ### Earlier development (2026-03-26 — 2026-03-27)
 
 **Structured error messages** (Priority 2e) implemented. `error.rs` has `translate_btrfs_error()`
@@ -60,7 +65,7 @@ levels derive base values from ADR-110 outcome targets; explicit overrides repla
 updated. 19 new tests (267 → 286).
 [Journal](../98-journals/2026-03-27-protection-promises-session1.md)
 
-**Protection promises session 2** (uncommitted, working tree):
+**Protection promises session 2** (committed, PR #25 merged):
 Integration layer completing Phase 6. Five additions:
 1. **Preflight achievability checks** (`preflight.rs`) — three new check types:
    `drive-count-vs-promise` (resilient needs ≥ 2, protected ≥ 1), `voiding-override`
@@ -75,10 +80,10 @@ Integration layer completing Phase 6. Five additions:
    when no subvolumes have promises).
 5. **12 new tests** (286 → 298): 8 preflight, 1 planner, 2 voice, 1 drive filtering.
 
-Config intervals (1h–6h snapshots, 1h–4h sends) were set for the travel period and are
-misaligned with the daily timer — the awareness model reports UNPROTECTED for most of each
-day. Now that protection promises exist, setting `protection_level` with `run_frequency = "daily"`
-would derive matching intervals automatically. This is the first real-world validation opportunity.
+Config interval mismatch resolved in session 3: production config deployed with protection
+promises and `run_frequency = "daily"`. Defaults aligned to 1d/1d. First real backup with
+promises runs 2026-03-28 04:00.
+[Session 3 journal](../98-journals/2026-03-27-session3-deployment.md)
 
 ### Earlier development (through 2026-03-26)
 
@@ -414,11 +419,11 @@ timestamp staleness handling, space check deduplication, ANSI line clearing.
   [Journal](../98-journals/2026-03-24-pre-cutover-hardening.md) |
   [Review](../99-reports/2026-03-24-pre-cutover-testing-review.md)
 
-- **Voice migration** (Phase 5, P3c continued, 2026-03-26/27) — all commands except `init` now
-  use structured output types rendered by `voice.rs`. Migrated: `plan` (via `PlanView` adapter),
-  `history` (including subvolume history and failures views), `verify` (with `exit_code()` on
-  `VerifyOutput`), `calibrate`, `get`. 7 of 8 commands complete. `init` remains as the only
-  direct-println holdout. [Design](../95-ideas/2026-03-26-design-next-sessions.md)
+- **Voice migration** (Phase 5, P3c, 2026-03-26/27) — all 8 commands use structured output types
+  rendered by `voice.rs`. Migrated: `plan` (via `PlanView` adapter), `history` (including
+  subvolume history and failures views), `verify` (with `exit_code()` on `VerifyOutput`),
+  `calibrate`, `get`, `init` (session 3). 8/8 complete.
+  [Design](../95-ideas/2026-03-26-design-next-sessions.md)
 - **Structured error messages** (P2e, 2026-03-26) — `error.rs`: `translate_btrfs_error()` function
   pattern-matches 7 btrfs stderr patterns into `BtrfsErrorDetail` structs with summary, cause,
   and remediation steps. Covers: no-space (receive and snapshot), permission denied, read-only
@@ -434,7 +439,7 @@ timestamp staleness handling, space check deduplication, ANSI line clearing.
     values, explicit overrides replace, `None`/Custom preserves existing path. `run_frequency`
     on `GeneralConfig`, `protection_level` and `drives` on `SubvolumeConfig`/`ResolvedSubvolume`.
     Migration identity test confirms zero behavior change for existing configs. 19 new tests.
-  - **Session 2** (uncommitted): Preflight achievability checks (drive-count, voiding-override,
+  - **Session 2** (committed, PR #25 merged): Preflight achievability checks (drive-count, voiding-override,
     weakening-override), planner drive filtering (per-subvolume `drives` list), `--confirm-retention-change`
     fail-closed gate for promise-derived retention (ADR-107), `promise_level` on `StatusAssessment`
     with conditional PROMISE column in status/backup tables. 12 new tests. Total: 298.
@@ -480,10 +485,10 @@ timestamp staleness handling, space check deduplication, ANSI line clearing.
 - [x] **Phase 4 code** — Cutover polish + space estimation + real-world testing
 - [ ] **Phase 4 cutover** — Operational transition from bash to Urd (Urd is sole system since 2026-03-25, monitoring target 2026-04-01)
 - [x] **Post-cutover features** — failed-send bytes, progress, calibrate (Priorities 2-4)
-- [x] **Phase 5** — Architectural foundation: awareness model, heartbeat, presentation layer, `urd get`, voice migration (7/8 commands), structured errors
+- [x] **Phase 5** — Architectural foundation: awareness model, heartbeat, presentation layer, `urd get`, voice migration (8/8 commands), structured errors
 - [x] **Phase 5 gate** — ADR-110: protection promise design (retention mappings, config conflicts, migration)
-- [x] **Phase 6** — Protection promises: types, derivation, config resolution, preflight checks, planner drive filtering, `--confirm-retention-change`, status display (session 2 uncommitted)
-- [ ] **Phase 7** — Sentinel: notification dispatcher → event reactor → active mode
+- [x] **Phase 6** — Protection promises: types, derivation, config resolution, preflight checks, planner drive filtering, `--confirm-retention-change`, status display. Config deployed with promises.
+- [ ] **Phase 7** — Sentinel: ~~notification dispatcher~~ (5a done) → event reactor → active mode
 - [ ] **Phase 8** — Expansion: completions, smart defaults, setup wizard, drive lifecycle
 
 ## Active Work — Operational Cutover
@@ -599,6 +604,8 @@ for the graduation rationale.
 | UX design principles brainstorm | [Norman principles](../95-ideas/2026-03-23-brainstorm-ux-norman-principles.md) |
 | Vision architecture review | [2026-03-23 Architectural criteria for vision](../99-reports/2026-03-23-vision-architecture-review.md) |
 | Protection promises design | [ADR-110](../00-foundation/decisions/2026-03-26-ADR-110-protection-promises.md) + [Design](../95-ideas/2026-03-26-design-protection-promises.md) |
+| Sentinel design (5a/5b/5c) | [Sentinel design](../95-ideas/2026-03-26-design-sentinel.md) |
+| Session 3 deployment + verification tests | [Session 3 journal](../98-journals/2026-03-27-session3-deployment.md) |
 | Latest adversary review | [2026-03-26 Preflight implementation review](../99-reports/2026-03-26-preflight-implementation-review.md) |
 | Code conventions & architecture | [CLAUDE.md](../../CLAUDE.md) |
 | Documentation standards | [CONTRIBUTING.md](../../CONTRIBUTING.md) |
