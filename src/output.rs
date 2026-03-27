@@ -5,7 +5,7 @@
 
 use std::io::IsTerminal;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::awareness::{DriveAssessment, SubvolAssessment};
 
@@ -469,6 +469,64 @@ pub struct InitSnapshotCount {
     pub subvolume: String,
     pub local_count: usize,
     pub external_counts: Vec<(String, usize)>,
+}
+
+// ── SentinelStatusOutput ─────────────────────────────────────────────────
+
+/// Sentinel state file schema — written atomically by the runner, read by
+/// `urd sentinel status`. Also serves as a "running" indicator (PID check).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SentinelStateFile {
+    pub schema_version: u32,
+    pub pid: u32,
+    pub started: String,
+    pub last_assessment: Option<String>,
+    pub mounted_drives: Vec<String>,
+    pub tick_interval_secs: u64,
+    pub promise_states: Vec<SentinelPromiseState>,
+    pub circuit_breaker: SentinelCircuitState,
+}
+
+/// Per-subvolume promise state in the sentinel state file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SentinelPromiseState {
+    pub name: String,
+    pub status: String,
+}
+
+/// Circuit breaker summary in the sentinel state file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SentinelCircuitState {
+    pub state: String,
+    pub failure_count: u32,
+}
+
+/// Structured output for `urd sentinel status`.
+#[derive(Debug, Serialize)]
+#[serde(tag = "status")]
+pub enum SentinelStatusOutput {
+    /// Sentinel is running (PID alive, state file present).
+    #[serde(rename = "running")]
+    Running {
+        state: SentinelStateFile,
+        /// Human-readable uptime (e.g., "3h 12m").
+        uptime: String,
+    },
+    /// Sentinel is not running (no state file, or stale file cleaned up).
+    #[serde(rename = "not_running")]
+    NotRunning {
+        /// If a stale state file was found, when the sentinel was last seen.
+        last_seen: Option<String>,
+    },
+}
+
+impl SentinelStateFile {
+    /// Read and parse a sentinel state file. Returns `None` if missing or corrupt.
+    #[must_use]
+    pub fn read(path: &std::path::Path) -> Option<Self> {
+        let content = std::fs::read_to_string(path).ok()?;
+        serde_json::from_str(&content).ok()
+    }
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────

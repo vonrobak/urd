@@ -13,8 +13,8 @@ use colored::Colorize;
 
 use crate::output::{
     BackupSummary, CalibrateOutput, CalibrateResult, FailuresOutput, GetOutput, HistoryOutput,
-    InitOutput, InitStatus, OutputMode, PlanOutput, StatusOutput, SubvolumeHistoryOutput,
-    VerifyOutput,
+    InitOutput, InitStatus, OutputMode, PlanOutput, SentinelStatusOutput, StatusOutput,
+    SubvolumeHistoryOutput, VerifyOutput,
 };
 use crate::types::ByteSize;
 
@@ -1182,6 +1182,94 @@ fn format_init_status(status: InitStatus) -> String {
     }
 }
 
+// ── Sentinel Status ──────────────────────────────────────────────────────
+
+/// Render sentinel status output according to the given mode.
+#[must_use]
+pub fn render_sentinel_status(data: &SentinelStatusOutput, mode: OutputMode) -> String {
+    match mode {
+        OutputMode::Interactive => render_sentinel_status_interactive(data),
+        OutputMode::Daemon => {
+            serde_json::to_string_pretty(data)
+                .unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
+        }
+    }
+}
+
+fn render_sentinel_status_interactive(data: &SentinelStatusOutput) -> String {
+    let mut out = String::new();
+
+    match data {
+        SentinelStatusOutput::Running { state, uptime } => {
+            writeln!(out, "{}", "SENTINEL — watching".bold()).ok();
+            writeln!(out).ok();
+            writeln!(
+                out,
+                "  {:<14}since {} (PID {})",
+                "Running", uptime, state.pid
+            )
+            .ok();
+
+            // Assessment timing
+            if let Some(ref last) = state.last_assessment {
+                let tick_desc = format_tick_description(state.tick_interval_secs, &state.promise_states);
+                writeln!(out, "  {:<14}{} (tick: {})", "Assessment", last, tick_desc).ok();
+            }
+
+            // Mounted drives
+            if state.mounted_drives.is_empty() {
+                writeln!(out, "  {:<14}{}", "Mounted", "none".dimmed()).ok();
+            } else {
+                writeln!(out, "  {:<14}{}", "Mounted", state.mounted_drives.join(", ")).ok();
+            }
+        }
+        SentinelStatusOutput::NotRunning { last_seen } => {
+            if let Some(seen) = last_seen {
+                writeln!(
+                    out,
+                    "{}",
+                    format!("SENTINEL — not running (last seen {seen})").bold()
+                )
+                .ok();
+            } else {
+                writeln!(out, "{}", "SENTINEL — not running".bold()).ok();
+            }
+            writeln!(out).ok();
+            writeln!(out, "  Start with: {}", "systemctl --user start urd-sentinel".dimmed()).ok();
+            writeln!(out, "  Or: {}", "urd sentinel run".dimmed()).ok();
+        }
+    }
+
+    out
+}
+
+fn format_tick_description(tick_secs: u64, promise_states: &[crate::output::SentinelPromiseState]) -> String {
+    let tick_str = if tick_secs >= 60 {
+        format!("{}m", tick_secs / 60)
+    } else {
+        format!("{tick_secs}s")
+    };
+
+    let worst = promise_states
+        .iter()
+        .map(|p| p.status.as_str())
+        .min_by_key(|s| match *s {
+            "UNPROTECTED" => 0,
+            "AT RISK" => 1,
+            "PROTECTED" => 2,
+            _ => 0,
+        });
+
+    let state_desc = match worst {
+        Some("PROTECTED") | None => "all promises held",
+        Some("AT RISK") => "promises at risk",
+        Some("UNPROTECTED") => "promises broken",
+        Some(_) => "assessing",
+    };
+
+    format!("{tick_str} — {state_desc}")
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1910,5 +1998,89 @@ mod tests {
         };
         let output = render_init(&data, OutputMode::Daemon);
         let _: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
+    }
+
+    // ── Sentinel status tests ──────────────────────────────────────────
+
+    use crate::output::{SentinelCircuitState, SentinelPromiseState, SentinelStateFile};
+
+    fn test_sentinel_running() -> SentinelStatusOutput {
+        SentinelStatusOutput::Running {
+            state: SentinelStateFile {
+                schema_version: 1,
+                pid: 12345,
+                started: "2026-03-27T10:00:00".to_string(),
+                last_assessment: Some("2026-03-27T13:12:00".to_string()),
+                mounted_drives: vec!["WD-18TB".to_string()],
+                tick_interval_secs: 900,
+                promise_states: vec![SentinelPromiseState {
+                    name: "home".to_string(),
+                    status: "PROTECTED".to_string(),
+                }],
+                circuit_breaker: SentinelCircuitState {
+                    state: "closed".to_string(),
+                    failure_count: 0,
+                },
+            },
+            uptime: "3h 12m".to_string(),
+        }
+    }
+
+    #[test]
+    fn sentinel_running_contains_watching() {
+        colored::control::set_override(false);
+        let output = render_sentinel_status(&test_sentinel_running(), OutputMode::Interactive);
+        assert!(output.contains("watching"), "missing 'watching'");
+    }
+
+    #[test]
+    fn sentinel_running_contains_pid() {
+        colored::control::set_override(false);
+        let output = render_sentinel_status(&test_sentinel_running(), OutputMode::Interactive);
+        assert!(output.contains("12345"), "missing PID");
+    }
+
+    #[test]
+    fn sentinel_running_contains_tick() {
+        colored::control::set_override(false);
+        let output = render_sentinel_status(&test_sentinel_running(), OutputMode::Interactive);
+        assert!(output.contains("15m"), "missing tick interval");
+        assert!(output.contains("all promises held"), "missing promise summary");
+    }
+
+    #[test]
+    fn sentinel_running_contains_drive() {
+        colored::control::set_override(false);
+        let output = render_sentinel_status(&test_sentinel_running(), OutputMode::Interactive);
+        assert!(output.contains("WD-18TB"), "missing drive label");
+    }
+
+    #[test]
+    fn sentinel_not_running_shows_message() {
+        colored::control::set_override(false);
+        let data = SentinelStatusOutput::NotRunning { last_seen: None };
+        let output = render_sentinel_status(&data, OutputMode::Interactive);
+        assert!(output.contains("not running"), "missing 'not running'");
+        assert!(output.contains("urd sentinel run"), "missing start hint");
+    }
+
+    #[test]
+    fn sentinel_not_running_with_last_seen() {
+        colored::control::set_override(false);
+        let data = SentinelStatusOutput::NotRunning {
+            last_seen: Some("2026-03-27T10:00:00".to_string()),
+        };
+        let output = render_sentinel_status(&data, OutputMode::Interactive);
+        assert!(output.contains("not running"), "missing 'not running'");
+        assert!(output.contains("2026-03-27T10:00:00"), "missing last seen timestamp");
+    }
+
+    #[test]
+    fn sentinel_daemon_produces_valid_json() {
+        let output = render_sentinel_status(&test_sentinel_running(), OutputMode::Daemon);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&output).unwrap_or_else(|e| panic!("invalid JSON: {e}\n{output}"));
+        assert_eq!(parsed["status"], "running");
+        assert_eq!(parsed["state"]["pid"], 12345);
     }
 }

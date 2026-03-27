@@ -12,9 +12,41 @@ cutover — a conscious risk decision documented in
 [first-night journal](../98-journals/2026-03-25-first-night.md). Monitoring target was
 2026-04-01 (1 week from cutover on 2026-03-25).
 
-**366 tests. All pass. Clippy clean.**
+**389 tests. All pass. Clippy clean.**
 
-### Recent development (2026-03-27, session 5)
+### Recent development (2026-03-27, session 6)
+
+**Sentinel Session 2: I/O runner + CLI.** Built the poll-based event loop (`sentinel_runner.rs`)
+and CLI scaffolding (`urd sentinel run`, `urd sentinel status`). The runner connects Session 1's
+pure state machine to real I/O: 5-second poll loop detects drive mounts, heartbeat changes, and
+tick deadlines. Events feed through `sentinel_transition()`, actions execute (assess, log, exit).
+[Journal](../98-journals/2026-03-27-sentinel-session2.md)
+
+New modules:
+- `sentinel_runner.rs` — I/O runner with poll loop, event detection, action execution (assess
+  coalescing, initial drive scan through state machine), state file I/O (atomic write),
+  `build_notifications()` pure function, `check_backup_overdue()` pure function with 4h debounce.
+- `commands/sentinel.rs` — CLI handlers for `run` (foreground daemon) and `status` (reads state
+  file, checks PID liveness, cleans up stale files).
+
+Voice rendering for `urd sentinel status`: interactive mode shows uptime, PID, assessment timing,
+mounted drives, promise summary. Daemon mode outputs JSON.
+
+**Design review** (pre-implementation): 2 significant + 2 moderate findings, all addressed in
+implementation: heartbeat baseline S1 fix, notification contract S2 specification, assess
+coalescing M1, initial drive scan routing M2.
+[Design review](../99-reports/2026-03-27-sentinel-session2-design-review.md)
+
+**Implementation review** found and fixed: BackupOverdue was gated behind `has_promise_changes()`
+(would never fire for silent backup failures — the most common overdue scenario). Extracted
+`check_backup_overdue()` as pure function with independent evaluation. Lifecycle logs promoted to
+`warn!()` for journald visibility. BackupOverdue debounced at 4h to prevent notification spam.
+[Implementation review](../99-reports/2026-03-27-sentinel-session2-implementation-review.md)
+
+23 new tests (state file I/O, PID checks, promise notifications, BackupOverdue pure function,
+voice rendering). Session 3 next: hardening + notification deduplication.
+
+### Earlier development (2026-03-27, session 5)
 
 **Sentinel Session 1: Lock extraction + pure state machine.** Built the Sentinel's core
 pure module (`sentinel.rs`) and extracted the backup lock to a shared module (`lock.rs`).
@@ -349,7 +381,7 @@ The Sentinel is three independent systems that compose. Build and test them sepa
 | # | Component | Depends On | Notes |
 |---|-----------|------------|-------|
 | 5a | ~~**Notification dispatcher**~~ | ~~Awareness model (3a)~~ | **COMPLETE.** `notify.rs`: `compute_notifications()` pure function, 4 channel types (Desktop/Webhook/Command/Log), urgency filtering. Heartbeat gains `notifications_dispatched` for crash recovery. `[notifications]` config section. Integrated into `backup.rs`. 18 tests. |
-| 5b | **Event reactor** | Awareness model (3a), heartbeat (3b) | Session 1 complete: pure state machine (`sentinel.rs`), shared lock (`lock.rs`), circuit breaker, adaptive tick. Session 2 next: I/O runner + CLI. [Design](../95-ideas/2026-03-27-design-sentinel-implementation.md) |
+| 5b | **Event reactor** | Awareness model (3a), heartbeat (3b) | Session 1 complete: pure state machine. Session 2 complete: I/O runner (`sentinel_runner.rs`), CLI (`urd sentinel run/status`), passive monitoring with BackupOverdue detection + 4h debounce. Session 3 next: hardening + notification deduplication. [Design](../95-ideas/2026-03-27-design-sentinel-implementation.md) |
 | 5c | **Active mode** | Event reactor (5b) | Auto-trigger logic designed in Session 1: `should_trigger_backup()`, `TriggerPermission`, `evaluate_trigger_result()`. Implementation in Session 4. |
 
 Architectural gates:
@@ -358,8 +390,8 @@ Architectural gates:
 - [x] Event/action types defined as enums (testable state machine) — `sentinel.rs` Session 1
 - [x] Lock contention with manual `urd backup` designed — `lock.rs` shared module
 - [x] Circuit breaker designed (min interval between auto-triggers) — `CircuitBreaker` with `TriggerPermission`
-- [ ] Passive mode ships and works before active mode is attempted
-- [ ] Sentinel can be killed without affecting promise state computation
+- [x] Passive mode ships and works before active mode is attempted — Session 2: `urd sentinel run` polls, assesses, notifies
+- [x] Sentinel can be killed without affecting promise state computation — ctrlc handler, state file cleanup on exit
 
 ### Priority 6: Core Expansion
 
@@ -561,7 +593,7 @@ timestamp staleness handling, space check deduplication, ANSI line clearing.
 - [x] **Phase 5** — Architectural foundation: awareness model, heartbeat, presentation layer, `urd get`, voice migration (8/8 commands), structured errors
 - [x] **Phase 5 gate** — ADR-110: protection promise design (retention mappings, config conflicts, migration)
 - [x] **Phase 6** — Protection promises: types, derivation, config resolution, preflight checks, planner drive filtering, `--confirm-retention-change`, status display. Config deployed with promises.
-- [ ] **Phase 7** — Sentinel: ~~notification dispatcher~~ (5a done) → ~~state machine + lock~~ (Session 1 done) → I/O runner → active mode
+- [ ] **Phase 7** — Sentinel: ~~notification dispatcher~~ (5a done) → ~~state machine + lock~~ (Session 1 done) → ~~I/O runner + CLI~~ (Session 2 done) → hardening/dedup (Session 3) → active mode (Session 4)
 - [ ] **Phase 8** — Expansion: completions, smart defaults, setup wizard, drive lifecycle
 
 ## Active Work — Operational Cutover
@@ -680,7 +712,8 @@ for the graduation rationale.
 | Sentinel design (5a/5b/5c) | [Sentinel design](../95-ideas/2026-03-26-design-sentinel.md) |
 | Sentinel implementation plan (5b+5c) | [Implementation plan](../95-ideas/2026-03-27-design-sentinel-implementation.md) |
 | Session 3 deployment + verification tests | [Session 3 journal](../98-journals/2026-03-27-session3-deployment.md) |
-| Latest adversary review | [Sentinel Session 1 review](../99-reports/2026-03-27-sentinel-session1-review.md) |
+| Sentinel Session 2 design + reviews | [Design](../95-ideas/2026-03-27-design-sentinel-session2.md), [design review](../99-reports/2026-03-27-sentinel-session2-design-review.md), [impl review](../99-reports/2026-03-27-sentinel-session2-implementation-review.md) |
+| Latest adversary review | [Sentinel Session 2 implementation review](../99-reports/2026-03-27-sentinel-session2-implementation-review.md) |
 | Code conventions & architecture | [CLAUDE.md](../../CLAUDE.md) |
 | Documentation standards | [CONTRIBUTING.md](../../CONTRIBUTING.md) |
 
@@ -692,7 +725,7 @@ for the graduation rationale.
 - Successful sends could update `subvolume_sizes` table to keep calibration fresh, but pipe bytes ≠ `du -sb` bytes (method mixing concern)
 - `FileSystemState` trait (10 methods, including `drive_availability`) is outgrowing its name — consider renaming to `SystemState` if more methods are added
 - `SubvolumeResult.send_type` in executor.rs records only the last send type when a subvolume is sent to multiple drives — the per-operation data in `OperationOutcome` is correct, but the summary field is misleading. The backup summary works around this by extracting from operations directly
-- `heartbeat::read()` returns `Option` — cannot distinguish missing file from corrupt JSON (upgrade to `Result<Option>` when Sentinel is built)
+- `heartbeat::read()` returns `Option` — cannot distinguish missing file from corrupt JSON. Sentinel's `check_backup_overdue()` handles this gracefully (returns `None` on any parse failure), but a `Result<Option>` upgrade would allow logging corrupt heartbeat files
 - ~~`init` command still uses direct `println!`~~ — resolved: migrated to voice layer (session 3)
 - Per-drive pin protection for external retention — current all-drives-union is conservative but suboptimal for space
 - `urd get` normalizes paths without filesystem access (no `canonicalize`) — symlinked paths won't match subvolume sources. Documented limitation; correct behavior (use canonical paths)

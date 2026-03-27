@@ -15,8 +15,8 @@ mod output;
 mod plan;
 mod preflight;
 mod retention;
-#[allow(dead_code)] // Session 2 (sentinel_runner) will consume this module
 mod sentinel;
+mod sentinel_runner;
 mod state;
 mod types;
 mod voice;
@@ -57,5 +57,9 @@ fn main() -> anyhow::Result<()> {
         Commands::History(args) => commands::history::run(config, args, output_mode),
         Commands::Verify(args) => commands::verify::run(config, args, output_mode),
         Commands::Get(args) => commands::get::run(config, args, output_mode),
+        Commands::Sentinel(args) => match args.command {
+            cli::SentinelCommands::Run => commands::sentinel::run_daemon(config),
+            cli::SentinelCommands::Status => commands::sentinel::status(config, output_mode),
+        },
     }
 }
