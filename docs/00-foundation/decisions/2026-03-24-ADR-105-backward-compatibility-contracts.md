@@ -57,6 +57,13 @@ pin file format breaks incremental sends).
   Per-drive metrics may be added later but must not replace the global ones.
 - Written atomically (temp file + rename) to prevent partial reads by node exporter.
 
+### Scope: data formats, not config schema
+
+These contracts govern **on-disk data formats** — snapshot names, directory structure, pin
+files, and Prometheus metrics. The config file schema has its own versioning contract
+(ADR-111) and is not subject to these backward-compatibility rules. Config schema changes
+are handled by `urd migrate`; data format changes require a migration plan and a new ADR.
+
 ## Consequences
 
 ### Positive

@@ -35,8 +35,9 @@ The planner checks whether enough time has elapsed since the last snapshot/send 
 subvolume. If not, the operation is skipped with a "next in ~Xh" message. This makes the
 plan idempotent and safe to run repeatedly.
 
-Per-subvolume overrides inherit from `[defaults]`. Most subvolumes share the same policy;
-only those with different needs specify their own intervals.
+Per-subvolume intervals come from either a named protection level (opaque — see ADR-110) or
+explicit values on the subvolume (custom policy). See ADR-111 for the config inheritance
+model — there is no `[defaults]` section; configs are self-describing artifacts.
 
 ## Consequences
 
@@ -46,7 +47,7 @@ only those with different needs specify their own intervals.
 - Per-subvolume cadences let critical data (home directory) snapshot more frequently than
   stable data (music collection)
 - Decoupled snapshot/send intervals reduce unnecessary external I/O
-- The `[defaults]` inheritance model means most config is 3 lines, not repeated per subvolume
+- Templates provide starting points for common policies, reducing config verbosity (ADR-111)
 
 ### Negative
 
@@ -60,9 +61,9 @@ only those with different needs specify their own intervals.
 
 - Snapshot naming includes time (`YYYYMMDD-HHMM-shortname`) to support sub-daily snapshots.
   Legacy `YYYYMMDD-shortname` names are parsed as midnight for backward compatibility.
-- The systemd timer fires at a fixed time (02:00 daily). Interval-based scheduling means
-  "at least this much time between operations," not "run at this exact time." The timer
-  is the trigger; the intervals are the filter.
+- The systemd timer fires at a fixed daily time. Interval-based scheduling means "at least
+  this much time between operations," not "run at this exact time." The timer is the
+  trigger; the intervals are the filter.
 
 ## Related
 

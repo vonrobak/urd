@@ -4,94 +4,68 @@
 
 **Urd** (Old Norse: Urðr) — a BTRFS Time Machine for Linux, written in Rust.
 
-Urd is the norn who tends the Well of Urðr and knows all that has passed. She preserves your
-filesystem history silently and faithfully. When you invoke her, the encounter should be
-pleasant and clear. When she demands your attention, you should be glad she did.
+Urd preserves filesystem history silently and faithfully. When invoked, the encounter
+should be pleasant and clear. When Urd demands attention, the user should be glad it did.
 
 **Design north star:** Every feature must pass two tests: (1) does it make the user's data
 safer? (2) does it reduce the attention the user needs to spend on backups? If a feature
 adds complexity the user must manage, it needs a very strong justification.
 
 **Two modes of existence:**
-- **The invisible worker.** Urd runs autonomously — systemd timer, Sentinel daemon, tray icon.
-  Silence is a good sign. The user should trust that if Urd is quiet, their data is safe.
-- **The invoked norn.** When the user calls `urd status`, `urd restore`, or any command, they
-  are consulting Urd. She speaks with authority and clarity, guiding decisions about their data.
-  When Urd surfaces a problem unbidden (notification, broken promise), it's because it matters.
+- **The invisible worker.** Runs autonomously via systemd timer (nightly at ~04:00).
+  Silence means data is safe. Future: Sentinel daemon for sub-hourly cadence.
+- **The invoked norn.** `urd status`, `urd get`, `urd restore` — the user is consulting Urd.
+  Speaks with authority and clarity. Surfaces problems only when they matter.
 
-**The mythic voice.** Urd's text-based interactions carry the character of the norn — evocative,
-wise, grounding. Not cosplay or gimmick, but a consistent tone that makes the experience of
-managing backups feel considered and trustworthy. "Your recordings are woven into the well"
-rather than "backup completed: success." Apply this voice to status output, setup conversation,
-recovery contracts, and notifications. Technical details remain precise; the framing is mythic.
+**The mythic voice.** Urd's presentation layer carries the character of the norn — evocative
+and grounding. Not cosplay, but a consistent tone. The voice belongs entirely in the
+presentation layer (`voice.rs`), never in config or data structures. Technical details
+remain precise; the framing is mythic.
 
-**Protection promises.** Urd thinks in promises, not operations. The user declares what matters
-("protect my home directory," "keep my recordings resilient") and Urd derives the operations.
-Anchor promises to the user's actual data: documents, photos, recordings, projects — not
-subvolume IDs. Promise states (PROTECTED / AT RISK / UNPROTECTED) are the universal language
-of the app.
+**Protection promises.** Urd thinks in promises, not operations. The user declares what
+matters; Urd derives the operations. Promise states (PROTECTED / AT RISK / UNPROTECTED)
+are the universal language. Current taxonomy (guarded/protected/resilient) is provisional
+and needs rework — see ADR-110 maturity model.
 
 ## Orient Yourself
 
-Read `docs/96-project-supervisor/status.md` first — it has current state, priorities, and
-links to everything else. See `CONTRIBUTING.md` for documentation standards.
+Read `docs/96-project-supervisor/status.md` first — current state, priorities, and links.
+See `CONTRIBUTING.md` for documentation structure and conventions.
 
 ## Architecture
 
-### Core Invariant: Planner/Executor Separation
+### Core Flow
 
-The planner (`plan.rs`) is a **pure function**: config + filesystem state in, `BackupPlan` out.
-It never modifies anything. The executor (`executor.rs`) takes a plan and runs it.
+```
+config  -->  plan (pure function)  -->  execute (I/O)
+                                           |
+                                      btrfs (sudo)
+```
 
-This is the most important architectural property. Do not bypass it. All backup logic flows
-through: config -> plan -> execute.
-
-### BtrfsOps Trait
-
-`btrfs.rs` defines `BtrfsOps`. `RealBtrfs` shells out to `sudo btrfs`; `MockBtrfs` records
-calls for testing. This is the **only module that calls btrfs**. Everything else uses the trait.
+All backup logic flows through: config -> plan -> execute. No exceptions.
 
 ### Module Responsibilities
 
 | Module | Does | Does NOT |
 |--------|------|----------|
-| `config.rs` | Parse TOML, validate, expand paths | Touch filesystem beyond path checks |
-| `types.rs` | Define domain types, parsing, Display | Contain business logic |
-| `plan.rs` | Decide what operations to run | Execute anything or call btrfs |
-| `executor.rs` | Execute planned operations | Decide what to do (planner's job) |
-| `btrfs.rs` | Wrap btrfs subprocess calls | Know about retention, plans, config |
-| `retention.rs` | Compute which snapshots to keep/delete | Delete anything (returns lists) |
+| `config.rs` | Parse TOML, validate, expand paths, resolve subvolumes | Touch filesystem beyond path checks |
+| `types.rs` | Domain types, parsing, Display, `derive_policy()` | Contain business logic |
+| `plan.rs` | Decide what operations to run (pure function) | Execute anything or call btrfs |
+| `executor.rs` | Execute planned operations, error isolation | Decide what to do (planner's job) |
+| `btrfs.rs` | Wrap `sudo btrfs` subprocess calls via `BtrfsOps` trait | Know about retention, plans, config |
+| `retention.rs` | Compute which snapshots to keep/delete (pure) | Delete anything (returns lists) |
+| `awareness.rs` | Compute promise states per subvolume (pure) | Perform I/O |
 | `chain.rs` | Track incremental chain parents (pin files) | Send snapshots |
 | `state.rs` | Record history in SQLite | Influence backup decisions |
-| `metrics.rs` | Write Prometheus .prom files | Read metrics |
-| `drives.rs` | Detect mounted drives, check space | Mount/unmount drives |
-| `commands/` | CLI subcommand handlers | Core logic (delegate to above) |
-
-### Error Handling
-
-- `thiserror` for types in `error.rs`; `anyhow` in `main.rs` / CLI layer
-- Individual subvolume failures must NOT abort the entire backup run
-- Failed sends must clean up partial snapshots at the destination
-- SQLite failures must NOT prevent backups (log warning, continue)
-
-### UX Principles
-
-These encode design decisions from the Norman UX analysis and user feedback:
-
-- **Invisible worker, invoked norn.** Two interaction modes (see Vision above). Autonomous
-  operation is silent; invoked interaction is rich, guided, and carries the mythic voice.
-  Failures and broken promises are always impossible to miss, regardless of mode.
-- **Answer "is my data safe?"** Every user-facing surface should answer this in human terms
-  — promise states, plain language, data types the user cares about (not subvolume IDs).
-- **Guide through affordances, not error messages.** The interface should lead users toward
-  correct choices so errors don't happen. Smart defaults, setup guidance, and promise-level
-  config are better than post-hoc warnings. The goal is fewer errors, not better errors.
-- **Flexibility only earns its keep if it's easy to operate.** A powerful feature behind a
-  confusing interface is a feature nobody uses. When in doubt, choose the simpler design.
-  Power users interact with config files directly — don't over-build the config UI for them.
-- **The Sentinel is the integration layer.** An event-driven state machine that holds the
-  awareness model, reacts to events (drive plug, timer, backup result), updates promise
-  states, and drives notifications. Other features subscribe to its event stream.
+| `preflight.rs` | Validate config achievability (pure) | Block backups (advisory only) |
+| `heartbeat.rs` | Write JSON health signal after each run | Block backups on failure |
+| `metrics.rs` | Write Prometheus `.prom` files | Read metrics |
+| `notify.rs` | Compute and dispatch notifications | Decide promise states (uses awareness) |
+| `drives.rs` | Detect mounted drives, UUID fingerprinting, check space | Mount/unmount drives |
+| `output.rs` | Define structured output types | Render text (voice.rs does that) |
+| `voice.rs` | Render structured output as text (mythic voice) | Perform I/O or compute state |
+| `error.rs` | Error types, `translate_btrfs_error()` for actionable messages | Recovery logic |
+| `commands/` | CLI subcommand handlers (wire pure modules to I/O) | Core logic (delegate to above) |
 
 ### Architectural Invariants
 
@@ -103,10 +77,49 @@ Each references an ADR in `docs/00-foundation/decisions/` with full rationale.
 3. **Filesystem is truth, SQLite is history.** Pin files and snapshot dirs are authoritative. SQLite failures never prevent backups. (ADR-102)
 4. **Individual subvolume failures never abort the run.** The executor isolates errors per subvolume. (ADR-100)
 5. **Retention never deletes pinned snapshots.** Three independent layers: unsent protection, planner exclusion, executor re-check. (ADR-106)
-6. **Backups fail open; deletions fail closed.** Missing data means proceed and clean up, never refuse to back up. But never delete a snapshot you can't confirm is safe to remove. (ADR-107)
+6. **Backups fail open; deletions fail closed.** Proceed on missing data, never delete what can't be confirmed safe. (ADR-107)
 7. **Core logic modules are pure functions.** Planner, awareness, retention, voice — inputs in, outputs out, no I/O. (ADR-108)
-8. **Validate at config boundary, trust afterward.** Paths and names validated once at load; no re-validation in hot paths. (ADR-109)
-9. **Backward compatibility contracts are sacred.** Snapshot names, pin files, Prometheus metrics — changes require an ADR with migration plan. (ADR-105)
+8. **Validate structure at load time; isolate failures at runtime.** Structural config errors refuse to start. Runtime conditions (unmounted drive, full filesystem) skip per-unit and report. (ADR-109, ADR-111)
+9. **Backward compatibility contracts are sacred.** Snapshot names, pin files, Prometheus metrics — on-disk data format changes require an ADR with migration plan. Config schema changes use `urd migrate`. (ADR-105, ADR-111)
+10. **Named protection levels are opaque or they don't exist.** No per-field overrides on named levels. Custom is first-class. Named levels must earn opaque status through operational track record. (ADR-110, ADR-111)
+
+### Config System (ADR-111 — target architecture, not yet implemented)
+
+The config system is undergoing a redesign. Key principles:
+
+- **Config files are complete, self-describing artifacts.** Each subvolume block is readable
+  in isolation. No hidden inheritance, no cross-section joins.
+- **Two modes: named level or custom.** Named levels derive all operational parameters
+  (opaque, no overrides). Custom subvolumes specify all parameters explicitly.
+- **Templates scaffold; they don't govern.** One-time generation at setup, not runtime inheritance.
+- **`[defaults]` section is being removed.** Hardcoded fallbacks in the binary for omitted fields.
+- **Explicit drive routing.** Every subvolume names its target drives. No implicit "all drives."
+- **Space constraints are a filesystem concern.** `[[space_constraints]]` section on paths.
+- **One schema version at a time.** `config_version` field, `urd migrate` for transitions.
+
+Current implementation still uses the legacy schema (`[defaults]`, `[local_snapshots]`).
+See ADR-111 implementation gates for the migration checklist.
+
+### Error Handling
+
+- `thiserror` for types in `error.rs`; `anyhow` in `main.rs` / CLI layer
+- Individual subvolume failures must NOT abort the entire backup run
+- Failed sends must clean up partial snapshots at the destination
+- SQLite failures must NOT prevent backups (log warning, continue)
+- `translate_btrfs_error()` converts btrfs stderr into actionable `BtrfsErrorDetail`
+
+### UX Principles
+
+- **Invisible worker, invoked norn.** Autonomous operation is silent; invoked interaction
+  is rich and guided. Failures are always impossible to miss.
+- **Answer "is my data safe?"** Every surface should answer this in promise states and
+  plain language — not subvolume IDs.
+- **Guide through affordances, not error messages.** Lead users toward correct choices.
+  Fewer errors, not better errors.
+- **Precision in config, voice in presentation.** Config layer is mechanical and explicit.
+  Mythic voice belongs entirely in `voice.rs` and notifications.
+- **The Sentinel is the integration layer.** Event-driven state machine (future) that
+  reacts to events, updates promise states, and drives notifications.
 
 ## Coding Conventions
 
@@ -124,17 +137,20 @@ Each references an ADR in `docs/00-foundation/decisions/` with full rationale.
 
 - Unit tests: `#[cfg(test)] mod tests` in same file. Run: `cargo test`
 - Integration tests: `tests/integration/`, `#[ignore]` by default. Run: `cargo test -- --ignored`
-- Use `MockBtrfs` for anything that would call btrfs
+- Use `MockBtrfs` and `MockFileSystemState` for anything that would call btrfs or read filesystem
 - Test retention logic exhaustively — it protects against data loss
+- 318 tests, all passing, clippy clean
 
-## Backward Compatibility
+## Backward Compatibility (ADR-105)
 
-These formats are **load-bearing** — existing snapshots, monitoring, and pin files depend on them:
+These **on-disk data formats** are load-bearing — existing snapshots, monitoring, and pin
+files depend on them. Config schema has separate versioning (ADR-111).
 
-1. **Snapshot names:** Legacy `YYYYMMDD-<name>` (read-only, parsed as midnight) and current
-   `YYYYMMDD-HHMM-<name>` (all new snapshots). Both coexist; ordering by datetime, not string.
-2. **Snapshot dirs:** `<snapshot_root>/<subvolume_name>/`
-3. **Pin files:** `.last-external-parent-<DRIVE_LABEL>` in local snapshot dir
+1. **Snapshot names:** Legacy `YYYYMMDD-{short_name}` (read-only, parsed as midnight) and
+   current `YYYYMMDD-HHMM-{short_name}` (all new snapshots). Ordering by datetime, not string.
+2. **Snapshot dirs:** `{snapshot_root}/{name}/` — `name` is the directory, `short_name` is
+   in the snapshot name. Both are on-disk contracts.
+3. **Pin files:** `.last-external-parent-{DRIVE_LABEL}` in local snapshot dir
 4. **Prometheus metrics:** exact names, labels, and value semantics must be preserved
 
 ## BTRFS Commands
@@ -145,27 +161,47 @@ All operations require `sudo` (scoped via sudoers). The `BtrfsOps` trait wraps:
 snapshot -r, send [-p parent], receive, subvolume delete, subvolume show, filesystem show
 ```
 
-The send|receive pipeline must capture stderr from both sides, check both exit codes, and
-clean up partial snapshots on failure.
+The send|receive pipeline captures stderr from both sides, checks both exit codes, and
+cleans up partial snapshots on failure. Paths passed as `&Path` to `Command::arg()`, never
+stringified — prevents shell injection and preserves non-UTF-8 paths.
 
 ## Build & Run
 
 ```bash
 cargo build                          # Debug
 cargo build --release                # Release
-cargo test                           # Unit tests
+cargo test                           # Unit tests (318 tests)
 cargo test -- --ignored              # Integration tests (needs drives)
-cargo clippy -- -D warnings          # Lint
+cargo clippy -- -D warnings          # Lint (all warnings are errors)
 cargo run -- plan                    # Preview backup plan
 cargo run -- backup --dry-run        # Dry-run
-cargo run -- status                  # Current state
+cargo run -- status                  # Current promise states
+cargo run -- get FILE --at DATE      # Restore file from snapshot
 ```
 
 ## Configuration
 
 - Config: `~/.config/urd/urd.toml` (override: `--config`)
 - State DB: `~/.local/share/urd/urd.db`
+- Heartbeat: `~/.local/share/urd/heartbeat.json`
 - Example: `config/urd.toml.example`
+
+## ADR Index
+
+| ADR | Title | Scope |
+|-----|-------|-------|
+| 100 | Planner/executor separation | Core architecture |
+| 101 | BtrfsOps trait | Btrfs abstraction |
+| 102 | Filesystem truth, SQLite history | State management |
+| 103 | Interval-based scheduling | Snapshot/send timing |
+| 104 | Graduated retention | Snapshot lifecycle |
+| 105 | Backward compatibility contracts | On-disk data formats |
+| 106 | Defense-in-depth data integrity | Pin protection layers |
+| 107 | Fail-open backups, fail-closed deletions | Error philosophy |
+| 108 | Pure-function module pattern | Module design |
+| 109 | Config-boundary validation | Security/correctness |
+| 110 | Protection promises | Promise semantics, maturity model |
+| 111 | Config system architecture | Config structure, versioning (target, not yet implemented) |
 
 ## Project State
 

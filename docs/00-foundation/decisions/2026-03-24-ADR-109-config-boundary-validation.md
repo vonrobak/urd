@@ -44,6 +44,19 @@ This means validation is for **correctness** (catching typos, malformed paths), 
 **security against the config author**. The security boundary is between the config and
 the system — validated paths are safe to pass to sudo commands.
 
+### Structural vs runtime errors
+
+Config validation catches **structural errors** — authoring mistakes that make the config
+meaningless. These are hard failures: Urd refuses to start.
+
+**Runtime conditions** (drive not mounted, filesystem below `min_free_bytes`, source path
+missing) are not config errors — the config is correct but the world isn't ready. These
+are handled at runtime by the executor, which isolates failures per-unit and produces a
+structured result describing what was skipped and why (ADR-111).
+
+The distinction: "this config is *wrong*" vs "this config is *right but the world isn't
+ready*." Config validation owns the first; the executor owns the second.
+
 ### No re-validation in hot paths
 
 After `Config::validate()` succeeds, modules that consume config values (planner, executor,
@@ -89,6 +102,7 @@ are separate from config validation because they come from a different trust bou
 ## Related
 
 - ADR-101: BtrfsOps trait (the module where validated paths reach sudo commands)
+- ADR-111: Config system architecture (structural vs runtime error distinction, new fields)
 - [Phase 1 hardening review](../../99-reports/2026-03-22-phase1-hardening-review.md) —
   path validation introduced
 - [Phase 3.5 adversary review](../../99-reports/2026-03-22-arch-adversary-phase35.md) —

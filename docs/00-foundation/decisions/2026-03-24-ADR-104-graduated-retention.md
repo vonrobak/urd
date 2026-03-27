@@ -24,19 +24,25 @@ retention model must handle both.
 
 ### Local retention: graduated time windows
 
+A typical graduated retention policy:
+
 ```toml
-[defaults.local_retention]
-hourly = 24      # keep 24 hourly snapshots (1 day of hourly granularity)
-daily = 30       # then 30 daily (1 per day, newest in each day)
-weekly = 26      # then 26 weekly (1 per ISO week)
-monthly = 12     # then 12 monthly (1 per calendar month)
+# Per-subvolume (custom policy) or derived from a named protection level
+local_retention = { hourly = 24, daily = 30, weekly = 26, monthly = 12 }
 ```
+
+- `hourly = 24` — keep 24 hourly snapshots (1 day of hourly granularity)
+- `daily = 30` — then 30 daily (1 per day, newest in each day)
+- `weekly = 26` — then 26 weekly (1 per ISO week)
+- `monthly = 12` — then 12 monthly (1 per calendar month)
 
 Within each window, keep the *newest* snapshot per time period. This produces ~92 snapshots
 covering ~18 months, with fine granularity for recent data and coarse granularity for old.
 
-Per-subvolume overrides use `Option<u32>` fields that merge with defaults. A subvolume can
-override `daily = 7` without restating all four windows.
+Per-subvolume retention comes from either a named protection level (opaque — see ADR-110)
+or explicit values on the subvolume (custom policy). There is no `[defaults]` merge — configs
+are self-describing artifacts (ADR-111). Custom subvolumes specify their full retention;
+omitted fields use hardcoded fallbacks in the binary.
 
 ### Space pressure mode
 
