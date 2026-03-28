@@ -115,9 +115,10 @@ Preserves historical record while keeping active directories uncluttered.
 notes. Ideas that mature get promoted to a plan in `97-plans/`; abandoned ideas stay here
 with their status updated. Low ceremony — the point is to capture thinking before it's lost.
 
-**96-project-supervisor** — The central tracking hub. Contains `status.md` (the living
-progress tracker) and `roadmap.md` (the original project roadmap, a founding artifact).
-This is the bird's-eye view of where the project stands.
+**96-project-supervisor** — The central tracking hub. Contains `status.md` (short
+current-state document, overwritten each session) and `roadmap.md` (feature priorities,
+completed work, tech debt — the long-lived tracker). Read status.md first for orientation;
+follow links to roadmap.md for the full picture.
 
 **97-plans** — Implementation plans. Each plan is a dated snapshot of intent — what we're
 going to build and how. When scope changes significantly, write a new plan.
@@ -323,9 +324,9 @@ The adversary review reviews the proposal before implementation begins.
 
 ### After a development session
 
-1. Write a journal entry in `98-journals/` — what you did, what you learned, what's open
-2. Update `96-project-supervisor/status.md` — check off completed items, add new issues
-3. If an architectural decision was made, write an ADR in `00-foundation/decisions/`
+1. Run `/journal` — writes a journal entry to `98-journals/` and overwrites `status.md`
+   with current state (both outputs from one invocation)
+2. If an architectural decision was made, write an ADR in `00-foundation/decisions/`
 
 ### Before starting new work
 

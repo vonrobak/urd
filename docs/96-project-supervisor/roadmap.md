@@ -1,11 +1,10 @@
 # Urd: BTRFS Time Machine for Linux
 
-> **Provenance:** This is the original project roadmap, written during project inception
-> (2026-03-22). It serves as the founding architectural vision, phase plan, and technical
-> specification. As Urd matures, the living [status tracker](status.md) supersedes this
-> document for current project state. The roadmap remains as reference for original design
-> rationale and decisions. Once the status tracker fully covers the project's ongoing needs,
-> this document should be moved to `docs/90-archive/96-project-supervisor/roadmap.md`.
+> **Provenance:** This document combines the original project roadmap (2026-03-22) with
+> the living feature tracker. The first half (Context through Critical Files Reference) is
+> the founding architectural vision. The second half (Current Priorities onward) tracks
+> what to build next, what's been completed, and known tech debt. For current project
+> state (what's deployed right now), see [status.md](status.md).
 
 ## Context
 
@@ -475,3 +474,116 @@ After each phase:
 - `~/.config/systemd/user/btrfs-backup-daily.service` — systemd patterns to follow
 - `~/.snapshots/htpc-home/.last-external-parent-WD-18TB1` — pin file format
 - `/etc/sudoers.d/btrfs-backup` — scope constraints for btrfs commands
+
+---
+
+## Current Priorities
+
+> This section is a living tracker. Updated when priorities change.
+
+### Priority 5: Sentinel (in progress)
+
+The Sentinel is three independent systems that compose. Build and test them separately.
+
+| # | Component | Status | Notes |
+|---|-----------|--------|-------|
+| 5a | **Notification dispatcher** | **Complete** | `notify.rs`: `compute_notifications()` pure function, 4 channel types, urgency filtering. 18 tests. |
+| 5b | **Event reactor (passive)** | **Session 2 complete** | Pure state machine (Session 1) + I/O runner + CLI (Session 2). Session 3 next: hardening + notification dedup. |
+| 5c | **Active mode** | Designed, not built | Auto-trigger logic in Session 1: `should_trigger_backup()`, `TriggerPermission`. Session 4. |
+
+### Priority 6: Core Expansion
+
+| # | Feature | Effort | Notes |
+|---|---------|--------|-------|
+| 6a | **Shell completions** | Low | `clap_complete` for static; custom completer for subvolume/drive names. |
+| 6b | **Smart defaults** | Medium | Guess subvolume treatment from names/sizes. Pattern matching rules should be data, not code. |
+| 6c | **Conversational setup** | Medium | `urd setup` as guided config generator. Opinionated recommendations. Uses voice layer. |
+| 6d | **Drive replacement workflow** | Medium | Guided migration with safety overlap. Old drive retires as archival copy. |
+| 6e | **`urd find` (cross-snapshot search)** | High | Unsolved performance problem on large subvolumes. Do not build until `urd get` has proven the restore UX. |
+
+### Priority 7: Experience Polish
+
+| # | Feature | Effort | Notes |
+|---|---------|--------|-------|
+| 7a | **Recovery contract** | Low-Medium | Generated from config + awareness model state. |
+| 7b | **Deep verification** | Medium | `urd verify --deep`: random-sample checksums from external vs. local. |
+| 7c | **Attention budget** | Medium | Priority queue in awareness model. Filter by urgency. |
+| 7d | **Config validation as simulation** | Medium | "Here's what your config means in practice." |
+
+### Deferred
+
+| Feature | Rationale |
+|---------|-----------|
+| SSH remote targets | Keep the app simple for now. |
+| Cloud backup (S3/B2) | Indefinitely. |
+| Pull mode / mesh | Indefinitely. |
+| Multi-user / library mode | No current need. |
+
+### Open gates (from ADR-110/111)
+
+- [ ] Drive topology constraints — capacity checks require I/O, deferred to Sentinel
+- [ ] Awareness threshold mode — fixed multipliers regardless of run frequency, deferred
+- [ ] Config schema migration (ADR-111) — target architecture defined, legacy schema in use
+- [ ] Protection level taxonomy rework — provisional names, needs operational data first
+
+## Completed Features
+
+### Priority 2: Safety Hardening — Complete
+
+All five items built, adversary-reviewed, and deployed:
+- UUID drive fingerprinting (`DriveAvailability` enum, `findmnt` detection)
+- Local space guard (planner gates on `min_free_bytes`)
+- Surface skipped sends (subsumed by structured summary)
+- Post-backup structured summary (`BackupSummary` output type)
+- Pre-flight config checks (`preflight.rs`, 2 checks)
+- Structured error messages (`translate_btrfs_error()`, 7 patterns)
+
+### Priority 3: Architectural Foundation — Complete
+
+- Awareness model (`awareness.rs`) — pure function, 24 tests
+- Heartbeat file (`heartbeat.rs`) — JSON health signal, schema v1, 7 tests
+- Presentation layer (`output.rs` + `voice.rs`) — 8/8 commands migrated
+- `urd get` (`commands/get.rs`) — file restore, 19 tests
+
+### Priority 4: Protection Promises — Complete
+
+- `ProtectionLevel` enum, `derive_policy()`, config resolution branching
+- Preflight achievability checks (drive-count, voiding, weakening)
+- Planner drive filtering, `--confirm-retention-change` fail-closed gate
+- Promise-anchored status display (conditional PROMISE column)
+- ADR-110 written and revised, ADR-111 (config target architecture) written
+
+## Phase Checklist
+
+- [x] Phase 1 — Skeleton + Config + Plan (67 tests)
+- [x] Phase 1.5 — Hardening (unsent protection, path safety, pin-on-success)
+- [x] Phase 2 — Executor + State DB + Metrics + `urd backup`
+- [x] Phase 3 — CLI commands + systemd units
+- [x] Phase 3.5 — Hardening for cutover
+- [x] Phase 4 code — Cutover polish + space estimation
+- [ ] Phase 4 cutover — Operational transition (monitoring target: 2026-04-01)
+- [x] Post-cutover — Priorities 2-4 complete
+- [x] Phase 5 — Architectural foundation complete
+- [x] Phase 6 — Protection promises complete
+- [ ] Phase 7 — Sentinel (5a done, 5b Sessions 1-2 done, Sessions 3-4 remaining)
+- [ ] Phase 8 — Core expansion
+
+## Dropped Features
+
+- **Tier 2 filesystem-level upper bound** — wrong for actual data distribution
+- **Tier 3 Option A opportunistic qgroup query** — quotas confirmed off, speculative
+
+## Tech Debt
+
+- Pipe bytes vs. on-disk size mismatch in space estimation (1.2x margin handles common case)
+- `du -sb` may follow symlinks in snapshots — consider `-P` flag
+- Stale failed send estimates persist indefinitely — consider TTL
+- `SubvolumeResult.send_type` records only last send type for multi-drive sends
+- `heartbeat::read()` returns `Option` — can't distinguish missing from corrupt
+- Per-drive pin protection for external retention: all-drives-union is conservative
+- `urd get` doesn't support directory restore (files only in v1)
+- `warn_missing_uuids` spawns `findmnt` per drive on every run
+- Bootstrap pattern: code touching `external_snapshot_dir()` may assume dirs exist
+- MockBtrfs tests don't exercise filesystem preconditions
+- Journal persistence gap: journald may purge user-unit logs
+- NVMe snapshot accumulation above 10GB threshold not gated
