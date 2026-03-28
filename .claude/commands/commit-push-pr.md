@@ -125,10 +125,14 @@ proceed anyway. For documentation-only changes, skip this phase.
 - Never stage: `.env`, credentials, files matching `.gitignore` patterns
 - Review what you're staging against the PII scan results from Phase 2
 
-**Branch check:**
-If on `master`, warn the user and suggest creating a feature branch. The existing branch
-naming convention from git history is `feat/<slug>`, `fix/<slug>`, `docs/<slug>`,
-`refactor/<slug>`. Suggest an appropriate name based on the change type.
+**Branch check (BLOCKING):**
+If on `master`, do NOT commit. Create a feature branch first and switch to it. The branch
+naming convention is `<type>/<slug>` — e.g., `feat/awareness-model`, `fix/space-estimation`,
+`docs/adr-112`, `chore/semver-adoption`. Then commit on the branch and create a PR.
+
+Direct commits to master are not permitted. Every change goes through a branch and PR,
+even for documentation-only or single-contributor work. This creates a clean audit trail
+and is standard practice for serious open-source projects.
 
 **Commit message format:**
 
@@ -211,7 +215,7 @@ Each phase is a gate — if it fails, do not proceed to the next:
 2. **No changes** (Phase 1): Exit gracefully, tell the user
 3. **PII found in source/config** (Phase 2): Stop, fix files, restart
 4. **Quality gate failure** (Phase 5): Show errors, recommend fixing, ask user
-5. **On master without intent** (Phase 6): Suggest feature branch, ask user
+5. **On master** (Phase 6): Create feature branch before committing — never commit to master
 6. **gh not authenticated** (Phase 7): Show `gh auth login` remediation
 7. **Push/PR failure** (Phase 7): Show error output, do not continue
 
