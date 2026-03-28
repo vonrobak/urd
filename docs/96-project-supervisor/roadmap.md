@@ -491,6 +491,65 @@ The Sentinel is three independent systems that compose. Build and test them sepa
 | 5b | **Event reactor (passive)** | **Session 2 complete** | Pure state machine (Session 1) + I/O runner + CLI (Session 2). Session 3 next: hardening + notification dedup. |
 | 5c | **Active mode** | Designed, not built | Auto-trigger logic in Session 1: `should_trigger_backup()`, `TriggerPermission`. Session 4. |
 
+### Priority 5.5: Safety & Visibility (designed, not built)
+
+Three design trajectories that extend Urd's safety model and user-facing feedback.
+Each has been through brainstorm → design → arch-adversary review. Build order
+matters — later items depend on earlier ones.
+
+**Build sequence** (resolved 2026-03-29):
+
+```
+1. HSD-A     Drive tokens + chain health as awareness input
+2. VFM-A     OperationalHealth enum, two-axis CLI rendering
+3. Session 3 Sentinel hardening + notification dedup
+4. HSD-B     Sentinel chain-break detection + full-send gate (Norman escalation)
+5. VFM-B     Sentinel visual state + health notifications
+6. Transient  After foundations are solid
+7. Spindle    After VFM-B
+```
+
+HSD-A before Session 3: no module overlap (drives/awareness vs. sentinel/notify),
+and HSD-A unblocks VFM-A which is the higher-value user-facing deliverable.
+Session 3 is needed by HSD-B and VFM-B (sentinel infrastructure), not earlier.
+
+| # | Feature | Effort | Status | Design doc | Review |
+|---|---------|--------|--------|------------|--------|
+| 5.5a | **Hardware swap defenses** | 2–3 sessions | Designed, reviewed | [design](../95-ideas/2026-03-28-design-hardware-swap-defenses.md) | [review](../99-reports/2026-03-28-hardware-swap-defenses-design-review.md) |
+| | Session A: drive session tokens (`.urd-drive-token`), chain health as pre-computed awareness input | ~1 session | | | |
+| | Session B: sentinel chain-break detection, full-send confirmation gate | ~1 session | | | |
+| 5.5b | **Visual feedback model** | 2 sessions | Designed, reviewed | [design](../95-ideas/2026-03-28-design-visual-feedback-model.md) | [review](../99-reports/2026-03-28-visual-feedback-model-design-review.md) |
+| | Session A: `OperationalHealth` enum in awareness, two-axis CLI rendering | ~1 session | | | |
+| | Session B: sentinel `visual_state` in state file, `HealthDegraded` notifications | ~1 session | | | |
+| 5.5c | **Tray icon (Spindle)** | Low–Medium | Brainstormed | [brainstorm](../95-ideas/2026-03-28-brainstorm-tray-icon-spindle.md) | — |
+| | Reads `sentinel-state.json` visual_state. Start with 4 static icons (ok/warning/critical/active). | | | | |
+| 5.5d | **Transient snapshots** | Medium | Designed | [design](../95-ideas/2026-03-27-design-transient-snapshots.md) | — |
+| | `local_retention = "transient"`: create → send → delete (keep one pinned). For space-constrained NVMe. | | | | |
+
+**Design decisions (resolved 2026-03-29):**
+
+1. **Chain health as awareness input (facade pattern).** Callers pre-compute chain state
+   and pass it into awareness as a simple struct. Awareness stays pure, stays ignorant of
+   pin files and paths, but is the single facade for "subvolume health." This avoids the
+   protocol obligation problem (every consumer assembling the picture themselves).
+
+2. **Full-send gate: never auto-proceed (Norman escalation).** Gated sends escalate through
+   notification urgency, never through automation. Day 1 informational → Day 3 warning →
+   Day 7 critical (channel escalation: desktop → desktop+discord). The gate never lifts
+   without explicit `--force-full`. Awareness transitions affected subvolumes through
+   AT RISK → UNPROTECTED as time passes — truthful natural pressure, not automated override.
+   UX principles: visibility (prominent in status), mapping (notification names the exact
+   command to run), feedback (each status check shows how long gated and what's at risk).
+
+**Other review findings to address:**
+- HSD: Token verification should use `VerifiedDrive` wrapper or collapse into `drive_availability()`
+- VFM: `Blocked` for unmounted drives too aggressive — only block when send is due AND no drives mounted
+- VFM: Start with 4 icon states (ok/warning/critical/active), not 7
+- VFM: Keep structured data only in state file — no pre-computed text
+
+**Supporting brainstorms:**
+- [Hardware swap solutions brainstorm](../95-ideas/2026-03-28-brainstorm-hardware-swap-solutions.md) — drive identity, chain-break detection, space deltas, full-send gates, new-drive onboarding
+
 ### Priority 6: Core Expansion
 
 | # | Feature | Effort | Notes |
@@ -498,7 +557,7 @@ The Sentinel is three independent systems that compose. Build and test them sepa
 | 6a | **Shell completions** | Low | `clap_complete` for static; custom completer for subvolume/drive names. |
 | 6b | **Smart defaults** | Medium | Guess subvolume treatment from names/sizes. Pattern matching rules should be data, not code. |
 | 6c | **Conversational setup** | Medium | `urd setup` as guided config generator. Opinionated recommendations. Uses voice layer. |
-| 6d | **Drive replacement workflow** | Medium | Guided migration with safety overlap. Old drive retires as archival copy. |
+| 6d | **Drive replacement workflow** | Medium | Guided migration with safety overlap. Old drive retires as archival copy. See also HSD drive onboarding ideas. |
 | 6e | **`urd find` (cross-snapshot search)** | High | Unsolved performance problem on large subvolumes. Do not build until `urd get` has proven the restore UX. |
 
 ### Priority 7: Experience Polish
@@ -566,6 +625,7 @@ All five items built, adversary-reviewed, and deployed:
 - [x] Phase 5 — Architectural foundation complete
 - [x] Phase 6 — Protection promises complete
 - [ ] Phase 7 — Sentinel (5a done, 5b Sessions 1-2 done, Sessions 3-4 remaining)
+- [ ] Phase 7.5 — Safety & Visibility (5.5a-d: hardware swap, visual feedback, tray, transient snapshots)
 - [ ] Phase 8 — Core expansion
 
 ## Dropped Features

@@ -18,13 +18,27 @@ Sentinel daemon deployed (passive monitoring, drive detection, backup overdue al
   Sessions 1-2 complete (pure state machine, I/O runner, CLI).
   [Sentinel design](../95-ideas/2026-03-27-design-sentinel-implementation.md)
 
-## Next Up
+## Build Queue
 
-1. **Sentinel active mode** (Session 4) — auto-trigger backups on drive mount events.
-   `should_trigger_backup()` and `TriggerPermission` already designed in Session 1.
-2. **Config system migration** (ADR-111) — target architecture defined, not yet implemented.
-   Legacy schema still in use. Implement incrementally; taxonomy rework may change schema.
-3. **Shell completions** (Priority 6a) — `clap_complete` for static completions.
+Seven-step sequence resolved 2026-03-29. See [roadmap.md Priority 5.5](roadmap.md) for
+full details, design decisions, and review findings.
+
+1. **HSD-A** — drive session tokens + chain health as pre-computed awareness input.
+   Unblocks VFM-A. [Design](../95-ideas/2026-03-28-design-hardware-swap-defenses.md) ← **start here**
+2. **VFM-A** — `OperationalHealth` enum, two-axis CLI rendering.
+   Fixes false reassurance problem. [Design](../95-ideas/2026-03-28-design-visual-feedback-model.md)
+3. **Sentinel Session 3** — hardening + notification deduplication.
+   Needed by HSD-B and VFM-B, not by earlier steps.
+4. **HSD-B** — sentinel chain-break detection + full-send gate (Norman escalation, never auto-proceed).
+5. **VFM-B** — sentinel visual state in state file + health notifications.
+6. **Transient snapshots** — `local_retention = "transient"` for NVMe space pressure.
+7. **Tray icon (Spindle)** — reads sentinel-state.json, 4 static icons.
+
+Key design decisions already resolved:
+- Chain health: facade pattern — callers pre-compute, awareness is single health facade
+- Full-send gate: never auto-proceed, escalate notification urgency (Norman principles)
+
+**Later:** Config system migration (ADR-111), shell completions (6a).
 
 ## Key Links
 
@@ -35,7 +49,7 @@ Sentinel daemon deployed (passive monitoring, drive detection, backup overdue al
 | Documentation standards | [CONTRIBUTING.md](../../CONTRIBUTING.md) |
 | ADRs (100-112) | [decisions/](../00-foundation/decisions/) |
 | Latest journals | `docs/98-journals/` (local only, gitignored) |
-| Latest review | [Sentinel Session 2 impl review](../99-reports/2026-03-27-sentinel-session2-implementation-review.md) |
+| Latest reviews | [HSD review](../99-reports/2026-03-28-hardware-swap-defenses-design-review.md), [VFM review](../99-reports/2026-03-28-visual-feedback-model-design-review.md) |
 
 ## Known Issues
 
