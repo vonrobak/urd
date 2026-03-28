@@ -1,0 +1,70 @@
+# Changelog
+
+All notable changes to Urd are documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+### Changed
+- README rewritten for public repository
+
+## [0.3.0] - 2026-03-27
+
+### Added
+- Sentinel daemon: pure state machine with event-driven transitions and circuit breaker
+- Sentinel I/O runner and `urd sentinel` CLI command
+- Protection promise model (ADR-110): typed promise levels with derivation function
+- Notification dispatcher with promise-state-driven alerts
+- Awareness model: pure function computing promise states per subvolume
+- Heartbeat file: JSON health signal written after every backup run
+- Presentation layer: structured output with interactive/daemon rendering and mythic voice
+- `urd get` command for file restore from snapshots
+- UUID drive fingerprinting: verify drive identity before sending snapshots
+- Post-backup structured summary and local space guard
+- Pre-flight config consistency checks
+- Structured error types with actionable btrfs error translation
+- Lock extraction module with shared advisory locking
+
+### Changed
+- Voice migration initiated: presentation logic moving to voice.rs
+- Config system design review and ADR suite update (ADR-110, ADR-111)
+
+### Fixed
+- Pre-cutover hardening: mkdir before btrfs receive, legacy pin file accuracy
+- Space estimation queries drive mount path instead of per-subvolume directory
+- Phase 4 adversary review findings addressed
+
+## [0.2.0] - 2026-03-24
+
+### Added
+- Phase 4: cutover polish and review-driven fixes
+- Pre-send space estimation with real-world testing
+- Failed-send byte tracking, progress display, and `urd calibrate` command
+- Documentation system, CONTRIBUTING.md, and project status tracking
+- Operating guide covering build, install, update, and daily use
+- Vision document, brainstorm synthesis, and architecture-grounded roadmap
+- Founding ADRs formalized (ADR-100 through ADR-109)
+
+### Fixed
+- Systemd backup timer shifted to 04:00
+
+## [0.1.0] - 2026-03-22
+
+### Added
+- Initial project scaffold with config, types, and example configuration
+- Phase 1: config parsing, retention logic, planner, and `urd plan` CLI
+- Phase 2: executor, SQLite state database, Prometheus metrics, `urd backup` command
+- Phase 3: `urd status`, `urd history`, `urd verify` commands, systemd units
+- Phase 3.5: hardening for production cutover
+- BtrfsOps trait abstracting all btrfs subprocess calls
+- Interval-based scheduling for snapshots and sends
+- Graduated retention policy (hourly/daily/weekly/monthly thinning)
+- Defense-in-depth pin file protection for unsent snapshots
+- Per-subvolume error isolation in executor
+
+[Unreleased]: https://github.com/vonrobak/urd/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/vonrobak/urd/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/vonrobak/urd/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/vonrobak/urd/releases/tag/v0.1.0
