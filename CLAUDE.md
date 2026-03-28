@@ -29,7 +29,8 @@ and needs rework — see ADR-110 maturity model.
 
 ## Orient Yourself
 
-Read `docs/96-project-supervisor/status.md` first — current state, priorities, and links.
+Read `docs/96-project-supervisor/status.md` first — short current-state document (~50 lines).
+Follow links to `roadmap.md` for priorities and feature tracking.
 See `CONTRIBUTING.md` for documentation structure and conventions.
 
 ## Architecture
@@ -141,7 +142,7 @@ See ADR-111 implementation gates for the migration checklist.
 - Integration tests: `tests/integration/`, `#[ignore]` by default. Run: `cargo test -- --ignored`
 - Use `MockBtrfs` and `MockFileSystemState` for anything that would call btrfs or read filesystem
 - Test retention logic exhaustively — it protects against data loss
-- 366 tests, all passing, clippy clean
+- 389+ tests, all passing, clippy clean
 
 ## Backward Compatibility (ADR-105)
 
@@ -187,7 +188,7 @@ stringified — prevents shell injection and preserves non-UTF-8 paths.
 ```bash
 cargo build                          # Debug
 cargo build --release                # Release
-cargo test                           # Unit tests (366 tests)
+cargo test                           # Unit tests (389+ tests)
 cargo test -- --ignored              # Integration tests (needs drives)
 cargo clippy -- -D warnings          # Lint (all warnings are errors)
 cargo run -- plan                    # Preview backup plan
@@ -221,7 +222,30 @@ cargo run -- get FILE --at DATE      # Restore file from snapshot
 | 111 | Config system architecture | Config structure, versioning (target, not yet implemented) |
 | 112 | SemVer and release workflow | Versioning, CHANGELOG, git tags, /release skill |
 
+## Development Workflow
+
+Guideline, not rigid procedure. Skip steps that don't apply to the current work.
+
+```
+/brainstorm → /design → [build] → /simplify → arch-adversary → /post-review → /check → /journal → /commit-push-pr
+```
+
+| Tool | Phase | What it does |
+|------|-------|--------------|
+| `/brainstorm` | Ideation | Divergent thinking, no scoring. Output: `docs/95-ideas/` |
+| `/design` | Design | Module decomposition, ADR gate identification |
+| `/simplify` | Post-build | Simplification pass: abstractions, types, control flow |
+| `arch-adversary` | Review | Severity-ranked findings with catastrophic failure checklist |
+| `/post-review` | Rework | Systematic fix of review findings, structured disagreement |
+| `test-team` | Testing | Risk-proportional coverage analysis and gap identification |
+| `systematic-debugging` | On-demand | Four-phase root cause investigation (any stage) |
+| `/check` | Quality gate | `cargo clippy` + `cargo test` + `cargo build --release` |
+| `/journal` | Documentation | Session journal + status.md update (two outputs, one command) |
+| `/commit-push-pr` | Integration | PII scan, CHANGELOG, branch, commit, PR |
+| `/release` | Release | SemVer bump, CHANGELOG, tag (user pushes manually) |
+
 ## Project State
 
-See `docs/96-project-supervisor/status.md` for current priorities and what to build next.
+See `docs/96-project-supervisor/status.md` for current state and what to build next.
+See `docs/96-project-supervisor/roadmap.md` for the full feature roadmap and priorities.
 See `CONTRIBUTING.md` for documentation structure, conventions, and privacy rules.
