@@ -155,6 +155,21 @@ files depend on them. Config schema has separate versioning (ADR-111).
 3. **Pin files:** `.last-external-parent-{DRIVE_LABEL}` in local snapshot dir
 4. **Prometheus metrics:** exact names, labels, and value semantics must be preserved
 
+## Versioning (ADR-112)
+
+Standard SemVer (`MAJOR.MINOR.PATCH`). Single source of truth: `Cargo.toml` version field.
+
+- **Pre-1.0:** MINOR for features/breaking changes, PATCH for fixes
+- **Post-1.0:** MAJOR for breaking changes (CLI, config, on-disk contracts), MINOR for
+  features, PATCH for fixes
+- **CHANGELOG.md:** Keep a Changelog format. `/commit-push-pr` adds entries to `[Unreleased]`
+  for feat/fix/refactor commits. `/release` moves them to a dated version section.
+- **Git tags:** Annotated tags (`v0.3.0`) on release commits. Dates go in tag annotations.
+- **Release workflow:** `/release patch|minor|major` — bumps Cargo.toml, updates changelog,
+  runs quality gate, commits, and tags. User pushes manually.
+- **Data format versions are independent.** `schema_version` in heartbeat/output and
+  `config_version` (ADR-111) version their data contracts, not the application.
+
 ## BTRFS Commands
 
 All operations require `sudo` (scoped via sudoers). The `BtrfsOps` trait wraps:
@@ -204,6 +219,7 @@ cargo run -- get FILE --at DATE      # Restore file from snapshot
 | 109 | Config-boundary validation | Security/correctness |
 | 110 | Protection promises | Promise semantics, maturity model |
 | 111 | Config system architecture | Config structure, versioning (target, not yet implemented) |
+| 112 | SemVer and release workflow | Versioning, CHANGELOG, git tags, /release skill |
 
 ## Project State
 
