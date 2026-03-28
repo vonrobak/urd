@@ -156,6 +156,17 @@ files depend on them. Config schema has separate versioning (ADR-111).
 3. **Pin files:** `.last-external-parent-{DRIVE_LABEL}` in local snapshot dir
 4. **Prometheus metrics:** exact names, labels, and value semantics must be preserved
 
+**Downstream consumer.** A homelab monitoring stack consumes Urd's metrics and heartbeat.
+Changes to the external interface (metric names/labels, heartbeat schema, systemd unit
+names, `.prom` file format) require a corresponding update to the homelab's ADR-021 at
+`~/containers/docs/00-foundation/decisions/2026-03-28-ADR-021-urd-backup-tool.md`.
+
+**Public release boundary.** Urd targets general-purpose use on any Linux system with BTRFS.
+Metrics, notifications, and observability features must remain monitoring-agnostic. Urd writes
+standard Prometheus textfile exposition format to a user-configured path — it must not assume
+any specific monitoring stack, alert system, or notification service. Keep homelab-specific
+concerns (specific dashboards, webhooks, alert rules) out of Urd's code and defaults.
+
 ## Versioning (ADR-112)
 
 Standard SemVer (`MAJOR.MINOR.PATCH`). Single source of truth: `Cargo.toml` version field.
