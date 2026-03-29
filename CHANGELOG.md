@@ -7,16 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-03-29
+
 ### Added
 - Drive session tokens for hardware swap detection (`.urd-drive-token` identity files)
 - Chain health computation in awareness model (incremental chain intact/broken per drive)
 - Two-axis status display: data safety (OK/aging/gap) + operational health (healthy/degraded/blocked)
 - Temporal context in status table: snapshot counts show age (e.g., "47 (30m)", "12 (2h)")
 - Unmounted drives shown as "away" in status table when they have send history
+- Notification deduplication: backup defers to sentinel when daemon is running
+- Drive connection recording in SQLite (mount/unmount events with typed enums)
 
 ### Changed
 - README rewritten for public repository
 - Status command derives chain health from awareness assessment instead of recomputing
+- `SentinelStateFile::read()` moved from output.rs to sentinel_runner.rs (ADR-108)
+- Sentinel initial assessment log differentiates missing heartbeat (first-run)
 
 ## [0.3.0] - 2026-03-27
 
@@ -72,7 +78,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Defense-in-depth pin file protection for unsent snapshots
 - Per-subvolume error isolation in executor
 
-[Unreleased]: https://github.com/vonrobak/urd/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/vonrobak/urd/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/vonrobak/urd/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/vonrobak/urd/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/vonrobak/urd/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/vonrobak/urd/releases/tag/v0.1.0
