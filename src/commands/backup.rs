@@ -21,6 +21,7 @@ use crate::output::{
 };
 use crate::notify;
 use crate::plan::{self, FileSystemState, PlanFilters, RealFileSystemState};
+use crate::sentinel_runner;
 use crate::preflight;
 use crate::state::StateDb;
 use crate::types::{BackupPlan, ByteSize, PlannedOperation, ProtectionLevel};
@@ -95,7 +96,14 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
         if let Err(e) = heartbeat::write(&config.general.heartbeat_file, &hb) {
             log::warn!("Failed to write heartbeat: {e}");
         }
-        dispatch_notifications(previous_hb.as_ref(), &hb, &config);
+        if sentinel_runner::sentinel_is_running(&config) {
+            log::info!("Sentinel is running — deferring notification dispatch");
+            if let Err(e) = heartbeat::mark_dispatched(&config.general.heartbeat_file) {
+                log::warn!("Failed to update heartbeat dispatched flag: {e}");
+            }
+        } else {
+            dispatch_notifications(previous_hb.as_ref(), &hb, &config);
+        }
         return Ok(());
     }
 
@@ -150,8 +158,15 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
         log::warn!("Failed to write heartbeat: {e}");
     }
 
-    // Dispatch notifications for promise state changes
-    dispatch_notifications(previous_hb.as_ref(), &hb, &config);
+    // Dispatch notifications for promise state changes (unless Sentinel handles it).
+    if sentinel_runner::sentinel_is_running(&config) {
+        log::info!("Sentinel is running — deferring notification dispatch");
+        if let Err(e) = heartbeat::mark_dispatched(&config.general.heartbeat_file) {
+            log::warn!("Failed to update heartbeat dispatched flag: {e}");
+        }
+    } else {
+        dispatch_notifications(previous_hb.as_ref(), &hb, &config);
+    }
 
     // Build and render structured summary
     let summary = build_backup_summary(
@@ -995,5 +1010,93 @@ mod tests {
         assert!(summary.subvolumes[0].errors.is_empty());
         // And should not appear in sends list (it failed)
         assert!(summary.subvolumes[0].sends.is_empty());
+    }
+
+    // ── Sentinel detection tests ────────────────────────────────────
+
+    #[test]
+    fn sentinel_is_running_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_with_state_db(dir.path());
+        assert!(!crate::sentinel_runner::sentinel_is_running(&config));
+    }
+
+    #[test]
+    fn sentinel_is_running_stale_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_with_state_db(dir.path());
+        let state_path = crate::sentinel_runner::sentinel_state_path(&config);
+        write_sentinel_state_file(&state_path, 99_999_999);
+        assert!(!crate::sentinel_runner::sentinel_is_running(&config));
+    }
+
+    #[test]
+    fn sentinel_is_running_live_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_with_state_db(dir.path());
+        let state_path = crate::sentinel_runner::sentinel_state_path(&config);
+        write_sentinel_state_file(&state_path, std::process::id());
+        assert!(crate::sentinel_runner::sentinel_is_running(&config));
+    }
+
+    fn write_sentinel_state_file(path: &std::path::Path, pid: u32) {
+        let state = crate::output::SentinelStateFile {
+            schema_version: 1,
+            pid,
+            started: "2026-03-29T10:00:00".to_string(),
+            last_assessment: None,
+            mounted_drives: vec![],
+            tick_interval_secs: 120,
+            promise_states: vec![],
+            circuit_breaker: crate::output::SentinelCircuitState {
+                state: "closed".to_string(),
+                failure_count: 0,
+            },
+        };
+        let content = serde_json::to_string_pretty(&state).unwrap();
+        std::fs::write(path, content).unwrap();
+    }
+
+    /// Build a minimal Config with state_db pointing into the given directory.
+    fn config_with_state_db(dir: &std::path::Path) -> Config {
+        use crate::config::{DefaultsConfig, GeneralConfig, LocalSnapshotsConfig};
+        use crate::types::RunFrequency;
+        use crate::notify::NotificationConfig;
+        use crate::types::{GraduatedRetention, Interval};
+
+        Config {
+            general: GeneralConfig {
+                state_db: dir.join("urd.db"),
+                metrics_file: dir.join("test.prom"),
+                log_dir: dir.to_path_buf(),
+                btrfs_path: "/usr/sbin/btrfs".to_string(),
+                heartbeat_file: dir.join("heartbeat.json"),
+                run_frequency: RunFrequency::Timer {
+                    interval: Interval::days(1),
+                },
+            },
+            local_snapshots: LocalSnapshotsConfig { roots: vec![] },
+            drives: vec![],
+            defaults: DefaultsConfig {
+                snapshot_interval: "1h".parse().unwrap(),
+                send_interval: "4h".parse().unwrap(),
+                send_enabled: true,
+                enabled: true,
+                local_retention: GraduatedRetention {
+                    hourly: Some(24),
+                    daily: Some(30),
+                    weekly: Some(26),
+                    monthly: Some(12),
+                },
+                external_retention: GraduatedRetention {
+                    hourly: None,
+                    daily: Some(30),
+                    weekly: Some(26),
+                    monthly: Some(0),
+                },
+            },
+            subvolumes: vec![],
+            notifications: NotificationConfig::default(),
+        }
     }
 }

@@ -8,15 +8,15 @@
 
 **Urd is the sole backup system.** Systemd timer running nightly at 04:00 since 2026-03-25.
 Sentinel daemon deployed (passive monitoring, drive detection, backup overdue alerts).
-436 tests, all passing, clippy clean. Current version: v0.3.0.
+444 tests, all passing, clippy clean. Current version: v0.3.0.
 
 ## In Progress
 
-- **VFM-A complete** (2026-03-29). OperationalHealth enum + two-axis CLI rendering.
-  `compute_health()` pure function checks chain health, space pressure (local + external),
-  drive availability. CLI shows SAFETY + HEALTH columns, summary line, temporal context.
-  Reviewed, simplified, post-review fixes applied.
-  [Implementation review](../99-reports/2026-03-29-vfm-a-implementation-review.md)
+- **Sentinel Session 3 complete** (2026-03-29). Notification deduplication between backup
+  command and sentinel daemon. Drive connection recording in SQLite. `SentinelStateFile::read()`
+  moved out of pure-types module (ADR-108). Post-review: heartbeat dispatched flag preserved
+  on deferral. Reviewed, simplified, post-review fixes applied.
+  [Implementation review](../99-reports/2026-03-29-sentinel-session3-implementation-review.md)
 
 ## Build Queue
 
@@ -24,10 +24,9 @@ Seven-step sequence resolved 2026-03-29. See [roadmap.md Priority 5.5](roadmap.m
 full details, design decisions, and review findings.
 
 1. ~~**HSD-A**~~ — drive session tokens + chain health as awareness input. **Done.**
-2. ~~**VFM-A**~~ — `OperationalHealth` enum, two-axis CLI rendering. **Done.** ← **start here**
-3. **Sentinel Session 3** — hardening + notification deduplication.
-   Needed by HSD-B and VFM-B, not by earlier steps.
-4. **HSD-B** — sentinel chain-break detection + full-send gate (Norman escalation, never auto-proceed).
+2. ~~**VFM-A**~~ — `OperationalHealth` enum, two-axis CLI rendering. **Done.**
+3. ~~**Sentinel Session 3**~~ — hardening + notification deduplication. **Done.** ← **completed**
+4. **HSD-B** — sentinel chain-break detection + full-send gate (Norman escalation, never auto-proceed). ← **start here**
 5. **VFM-B** — sentinel visual state in state file + health notifications.
 6. **Transient snapshots** — `local_retention = "transient"` for NVMe space pressure.
 7. **Tray icon (Spindle)** — reads sentinel-state.json, 4 static icons.
@@ -43,7 +42,7 @@ full details, design decisions, and review findings.
 | Documentation standards | [CONTRIBUTING.md](../../CONTRIBUTING.md) |
 | ADRs (100-112) | [decisions/](../00-foundation/decisions/) |
 | Latest journals | `docs/98-journals/` (local only, gitignored) |
-| Latest reviews | [VFM-A review](../99-reports/2026-03-29-vfm-a-implementation-review.md), [HSD-A review](../99-reports/2026-03-29-hsd-a-implementation-review.md) |
+| Latest reviews | [Session 3 review](../99-reports/2026-03-29-sentinel-session3-implementation-review.md), [VFM-A review](../99-reports/2026-03-29-vfm-a-implementation-review.md) |
 
 ## Known Issues
 
@@ -55,5 +54,6 @@ full details, design decisions, and review findings.
 - Orphaned snapshot `20250422-multimedia` on WD-18TB1 — clean up or let crash recovery handle
 - Per-drive pin protection for external retention: all-drives-union is conservative but suboptimal for space
 - Stringly-typed output boundary: three independent status-ranking implementations across notify.rs and voice.rs
+- `drive_connections` table has no retention policy (negligible for years at ~1000 rows/year)
 
 See [roadmap.md](roadmap.md) for the full tech debt list and dropped features.
