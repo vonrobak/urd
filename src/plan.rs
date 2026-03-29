@@ -54,6 +54,11 @@ pub trait FileSystemState {
     /// Returns None if no history exists (e.g., first-ever send).
     fn last_send_size(&self, subvol_name: &str, drive_label: &str, send_type: &str) -> Option<u64>;
 
+    /// Get the bytes_transferred from the most recent successful send of a given type
+    /// across **all** drives. Cross-drive fallback for drive swap scenarios.
+    #[allow(dead_code)]
+    fn last_send_size_any_drive(&self, subvol_name: &str, send_type: &str) -> Option<u64>;
+
     /// Get a calibrated size estimate for a subvolume (from `urd calibrate`).
     /// Returns `(estimated_bytes, measured_at)` or None if not calibrated.
     fn calibrated_size(&self, subvol_name: &str) -> Option<(u64, String)>;
@@ -693,6 +698,23 @@ impl FileSystemState for RealFileSystemState<'_> {
         })
     }
 
+    fn last_send_size_any_drive(&self, subvol_name: &str, send_type: &str) -> Option<u64> {
+        self.state.and_then(|db| {
+            let successful = db
+                .last_successful_send_size_any_drive(subvol_name, send_type)
+                .ok()
+                .flatten();
+            let failed = db
+                .last_failed_send_size_any_drive(subvol_name, send_type)
+                .ok()
+                .flatten();
+            match (successful, failed) {
+                (Some(s), Some(f)) => Some(s.max(f)),
+                (s, f) => s.or(f),
+            }
+        })
+    }
+
     fn calibrated_size(&self, subvol_name: &str) -> Option<(u64, String)> {
         self.state
             .and_then(|db| db.calibrated_size(subvol_name).ok().flatten())
@@ -874,6 +896,17 @@ impl FileSystemState for MockFileSystemState {
                 send_type.to_string(),
             ))
             .copied()
+    }
+
+    fn last_send_size_any_drive(&self, subvol_name: &str, send_type: &str) -> Option<u64> {
+        // Note: returns max by value, not most-recent-by-time.
+        // Real impl uses recency (ORDER BY id DESC). The mock has no
+        // insertion ordering, so max-by-value is the best approximation.
+        self.send_sizes
+            .iter()
+            .filter(|((sv, _, st), _)| sv == subvol_name && st == send_type)
+            .map(|(_, &bytes)| bytes)
+            .max()
     }
 
     fn calibrated_size(&self, subvol_name: &str) -> Option<(u64, String)> {
