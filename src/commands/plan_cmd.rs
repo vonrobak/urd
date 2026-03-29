@@ -2,7 +2,8 @@ use crate::cli::PlanArgs;
 use crate::config::Config;
 use crate::drives;
 use crate::output::{
-    OutputMode, PlanOperationEntry, PlanOutput, PlanSummaryOutput, SkippedSubvolume,
+    OutputMode, PlanOperationEntry, PlanOutput, PlanSummaryOutput, SkipCategory,
+    SkippedSubvolume,
 };
 use crate::plan::{self, PlanFilters, RealFileSystemState};
 use crate::state::StateDb;
@@ -49,6 +50,7 @@ pub fn build_plan_output(backup_plan: &crate::types::BackupPlan) -> PlanOutput {
         .iter()
         .map(|(name, reason)| SkippedSubvolume {
             name: name.clone(),
+            category: SkipCategory::from_reason(reason),
             reason: reason.clone(),
         })
         .collect();

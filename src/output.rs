@@ -257,10 +257,49 @@ pub struct SendSummary {
     pub bytes_transferred: Option<u64>,
 }
 
-/// A planner-skipped subvolume/send with reason.
+/// Skip reason category for grouped rendering and structured JSON output.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkipCategory {
+    DriveNotMounted,
+    IntervalNotElapsed,
+    Disabled,
+    SpaceExceeded,
+    Other,
+}
+
+impl SkipCategory {
+    /// Classify a free-text skip reason from `plan.rs` into a category.
+    ///
+    /// Covers all 14 known skip patterns. Unknown patterns fall to `Other`.
+    #[must_use]
+    pub fn from_reason(reason: &str) -> Self {
+        if reason
+            .strip_prefix("drive ")
+            .is_some_and(|r| r.ends_with(" not mounted"))
+        {
+            Self::DriveNotMounted
+        } else if reason == "disabled" || reason == "send disabled" {
+            Self::Disabled
+        } else if reason.starts_with("interval not elapsed")
+            || reason.contains("not due (next in")
+        {
+            Self::IntervalNotElapsed
+        } else if reason.starts_with("local filesystem low on space")
+            || (reason.contains("skipped:") && reason.contains("exceeds"))
+        {
+            Self::SpaceExceeded
+        } else {
+            Self::Other
+        }
+    }
+}
+
+/// A planner-skipped subvolume/send with reason and category.
 #[derive(Debug, Serialize)]
 pub struct SkippedSubvolume {
     pub name: String,
+    pub category: SkipCategory,
     pub reason: String,
 }
 
@@ -582,5 +621,149 @@ mod tests {
         let full_b = ChainHealth::Full("pin missing on drive".to_string());
         let result = full_a.clone().min(full_b);
         assert!(matches!(result, ChainHealth::Full(_)));
+    }
+
+    // ── SkipCategory classification ────────────────────────────────────
+
+    #[test]
+    fn classify_drive_not_mounted() {
+        assert_eq!(
+            SkipCategory::from_reason("drive WD-18TB1 not mounted"),
+            SkipCategory::DriveNotMounted
+        );
+        assert_eq!(
+            SkipCategory::from_reason("drive 2TB-backup not mounted"),
+            SkipCategory::DriveNotMounted
+        );
+    }
+
+    #[test]
+    fn classify_disabled() {
+        assert_eq!(SkipCategory::from_reason("disabled"), SkipCategory::Disabled);
+        assert_eq!(
+            SkipCategory::from_reason("send disabled"),
+            SkipCategory::Disabled
+        );
+    }
+
+    #[test]
+    fn classify_interval_not_elapsed() {
+        assert_eq!(
+            SkipCategory::from_reason("interval not elapsed (next in ~14h6m)"),
+            SkipCategory::IntervalNotElapsed
+        );
+        assert_eq!(
+            SkipCategory::from_reason("send to WD-18TB not due (next in ~2h30m)"),
+            SkipCategory::IntervalNotElapsed
+        );
+    }
+
+    #[test]
+    fn classify_space_exceeded() {
+        assert_eq!(
+            SkipCategory::from_reason(
+                "local filesystem low on space (5.0 GB free, 10.0 GB required)"
+            ),
+            SkipCategory::SpaceExceeded
+        );
+        assert_eq!(
+            SkipCategory::from_reason(
+                "send to WD-18TB skipped: estimated ~4.1 TB exceeds 2.0 TB available (free: 2.5 TB, min_free: 500.0 GB)"
+            ),
+            SkipCategory::SpaceExceeded
+        );
+        assert_eq!(
+            SkipCategory::from_reason(
+                "send to WD-18TB skipped: calibrated size ~4.1 TB exceeds 2.0 TB available"
+            ),
+            SkipCategory::SpaceExceeded
+        );
+    }
+
+    #[test]
+    fn classify_other() {
+        assert_eq!(
+            SkipCategory::from_reason("snapshot already exists"),
+            SkipCategory::Other
+        );
+        assert_eq!(
+            SkipCategory::from_reason("no local snapshots to send"),
+            SkipCategory::Other
+        );
+        assert_eq!(
+            SkipCategory::from_reason("20260329-0400-home already on WD-18TB"),
+            SkipCategory::Other
+        );
+        assert_eq!(
+            SkipCategory::from_reason(
+                "drive WD-18TB UUID mismatch (expected abc, found def)"
+            ),
+            SkipCategory::Other
+        );
+        assert_eq!(
+            SkipCategory::from_reason("drive WD-18TB UUID check failed: io error"),
+            SkipCategory::Other
+        );
+        assert_eq!(
+            SkipCategory::from_reason(
+                "drive WD-18TB token mismatch (expected abc, found def) — possible drive swap"
+            ),
+            SkipCategory::Other
+        );
+    }
+
+    /// Completeness test: all 14 known plan.rs skip patterns classified correctly.
+    #[test]
+    fn classify_all_14_patterns() {
+        let patterns = [
+            ("disabled", SkipCategory::Disabled),
+            ("drive WD-18TB not mounted", SkipCategory::DriveNotMounted),
+            (
+                "drive WD-18TB UUID mismatch (expected abc, found def)",
+                SkipCategory::Other,
+            ),
+            (
+                "drive WD-18TB UUID check failed: io error",
+                SkipCategory::Other,
+            ),
+            (
+                "drive WD-18TB token mismatch (expected abc, found def) — possible drive swap",
+                SkipCategory::Other,
+            ),
+            ("send disabled", SkipCategory::Disabled),
+            (
+                "local filesystem low on space (5.0 GB free, 10.0 GB required)",
+                SkipCategory::SpaceExceeded,
+            ),
+            ("snapshot already exists", SkipCategory::Other),
+            (
+                "interval not elapsed (next in ~14h6m)",
+                SkipCategory::IntervalNotElapsed,
+            ),
+            (
+                "send to WD-18TB not due (next in ~2h30m)",
+                SkipCategory::IntervalNotElapsed,
+            ),
+            ("no local snapshots to send", SkipCategory::Other),
+            (
+                "20260329-0400-home already on WD-18TB",
+                SkipCategory::Other,
+            ),
+            (
+                "send to WD-18TB skipped: estimated ~4.1 TB exceeds 2.0 TB available (free: 2.5 TB, min_free: 500.0 GB)",
+                SkipCategory::SpaceExceeded,
+            ),
+            (
+                "send to WD-18TB skipped: calibrated size ~4.1 TB exceeds 2.0 TB available",
+                SkipCategory::SpaceExceeded,
+            ),
+        ];
+        for (reason, expected) in &patterns {
+            assert_eq!(
+                SkipCategory::from_reason(reason),
+                *expected,
+                "pattern {reason:?} should classify as {expected:?}"
+            );
+        }
     }
 }
