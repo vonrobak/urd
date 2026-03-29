@@ -800,7 +800,12 @@ fn render_plan_interactive(data: &PlanOutput) -> String {
                 "delete" => "[DELETE]".yellow().to_string(),
                 other => format!("[{other}]"),
             };
-            writeln!(out, "  {:<10} {}", label, entry.detail).ok();
+            let size_annotation = match (entry.estimated_bytes, entry.is_full_send) {
+                (Some(bytes), Some(true)) => format!(" ~{}", ByteSize(bytes)),
+                (Some(bytes), Some(false)) => format!(" last: ~{}", ByteSize(bytes)),
+                _ => String::new(),
+            };
+            writeln!(out, "  {:<10} {}{}", label, entry.detail, size_annotation.dimmed()).ok();
         }
         writeln!(out).ok();
     } else {
@@ -820,13 +825,38 @@ fn render_plan_interactive(data: &PlanOutput) -> String {
     }
 
     writeln!(out).ok();
+
+    // Build sends portion of summary, with estimated total if available.
+    let sends_str = if data.summary.sends == 0 {
+        "0 sends".to_string()
+    } else if let Some(total) = data.summary.estimated_total_bytes {
+        let sends_with_estimates = data
+            .operations
+            .iter()
+            .filter(|op| op.operation == "send" && op.estimated_bytes.is_some())
+            .count();
+        if sends_with_estimates == data.summary.sends {
+            format!("{} sends (~{} total)", data.summary.sends, ByteSize(total))
+        } else {
+            format!(
+                "{} sends (~{} estimated for {} of {})",
+                data.summary.sends,
+                ByteSize(total),
+                sends_with_estimates,
+                data.summary.sends
+            )
+        }
+    } else {
+        format!("{} sends", data.summary.sends)
+    };
+
     writeln!(
         out,
         "{}",
         format!(
-            "Summary: {} snapshots, {} sends, {} deletions, {} skipped",
+            "Summary: {}, {} snapshots, {} deletions, {} skipped",
+            sends_str,
             data.summary.snapshots,
-            data.summary.sends,
             data.summary.deletions,
             data.summary.skipped
         )
@@ -2073,11 +2103,15 @@ mod tests {
                     subvolume: "htpc-home".to_string(),
                     operation: "create".to_string(),
                     detail: "/home -> /snapshots/htpc-home/20260326-0400-home".to_string(),
+                    estimated_bytes: None,
+                    is_full_send: None,
                 },
                 PlanOperationEntry {
                     subvolume: "htpc-home".to_string(),
                     operation: "send".to_string(),
                     detail: "20260326-0400-home -> WD-18TB (incremental, parent: 20260325-0400-home) + pin".to_string(),
+                    estimated_bytes: None,
+                    is_full_send: None,
                 },
             ],
             skipped: vec![],
@@ -2086,6 +2120,7 @@ mod tests {
                 sends: 1,
                 deletions: 0,
                 skipped: 0,
+                estimated_total_bytes: None,
             },
         };
         let output = render_plan(&data, OutputMode::Interactive);
@@ -2105,6 +2140,7 @@ mod tests {
                 sends: 0,
                 deletions: 0,
                 skipped: 0,
+                estimated_total_bytes: None,
             },
         };
         let output = render_plan(&data, OutputMode::Daemon);
@@ -2123,6 +2159,8 @@ mod tests {
                 subvolume: "htpc-home".to_string(),
                 operation: "send".to_string(),
                 detail: "20260329-0404-htpc-home -> WD-18TB (full) + pin".to_string(),
+                estimated_bytes: None,
+                is_full_send: None,
             }],
             skipped: vec![SkippedSubvolume {
                 name: "htpc-docs".to_string(),
@@ -2134,6 +2172,7 @@ mod tests {
                 sends: 1,
                 deletions: 0,
                 skipped: 1,
+                estimated_total_bytes: None,
             },
         };
         let output = render_plan(&data, OutputMode::Interactive);
@@ -2160,6 +2199,7 @@ mod tests {
                 sends: 0,
                 deletions: 0,
                 skipped: 1,
+                estimated_total_bytes: None,
             },
         };
         let output = render_plan(&data, OutputMode::Interactive);
@@ -2201,6 +2241,7 @@ mod tests {
                 sends: 0,
                 deletions: 0,
                 skipped: 3,
+                estimated_total_bytes: None,
             },
         };
         let output = render_plan(&data, OutputMode::Interactive);
@@ -2253,6 +2294,7 @@ mod tests {
                 sends: 0,
                 deletions: 0,
                 skipped: 3,
+                estimated_total_bytes: None,
             },
         };
         let output = render_plan(&data, OutputMode::Interactive);
@@ -2294,6 +2336,7 @@ mod tests {
                 sends: 0,
                 deletions: 0,
                 skipped: 2,
+                estimated_total_bytes: None,
             },
         };
         let output = render_plan(&data, OutputMode::Interactive);
@@ -2332,6 +2375,7 @@ mod tests {
                 sends: 0,
                 deletions: 0,
                 skipped: 3,
+                estimated_total_bytes: None,
             },
         };
         let output = render_plan(&data, OutputMode::Interactive);
@@ -2362,6 +2406,7 @@ mod tests {
                 sends: 0,
                 deletions: 0,
                 skipped: 1,
+                estimated_total_bytes: None,
             },
         };
         let output = render_plan(&data, OutputMode::Interactive);
@@ -2403,6 +2448,7 @@ mod tests {
                 sends: 0,
                 deletions: 0,
                 skipped: 3,
+                estimated_total_bytes: None,
             },
         };
         let output = render_plan(&data, OutputMode::Interactive);
@@ -2434,6 +2480,7 @@ mod tests {
                 sends: 0,
                 deletions: 0,
                 skipped: 1,
+                estimated_total_bytes: None,
             },
         };
         let output = render_plan(&data, OutputMode::Daemon);
@@ -2442,6 +2489,215 @@ mod tests {
             .as_str()
             .expect("category field missing");
         assert_eq!(category, "disabled");
+    }
+
+    // ── Plan estimated size rendering tests ─────────────────────────────
+
+    #[test]
+    fn plan_summary_with_total_estimate() {
+        colored::control::set_override(false);
+        let data = PlanOutput {
+            timestamp: "2026-03-29 13:57".to_string(),
+            operations: vec![
+                PlanOperationEntry {
+                    subvolume: "htpc-home".to_string(),
+                    operation: "send".to_string(),
+                    detail: "snap -> WD-18TB (full)".to_string(),
+                    estimated_bytes: Some(53_000_000_000),
+                    is_full_send: Some(true),
+                },
+                PlanOperationEntry {
+                    subvolume: "htpc-docs".to_string(),
+                    operation: "send".to_string(),
+                    detail: "snap -> WD-18TB (full)".to_string(),
+                    estimated_bytes: Some(1_200_000_000),
+                    is_full_send: Some(true),
+                },
+            ],
+            skipped: vec![],
+            summary: PlanSummaryOutput {
+                snapshots: 0,
+                sends: 2,
+                deletions: 0,
+                skipped: 0,
+                estimated_total_bytes: Some(54_200_000_000),
+            },
+        };
+        let output = render_plan(&data, OutputMode::Interactive);
+        assert!(
+            output.contains("2 sends (~54.2GB total)"),
+            "summary should show total estimate: {output}"
+        );
+        // Size annotation rendered by voice, not embedded in detail
+        assert!(
+            output.contains("~53.0GB"),
+            "should render full send size annotation: {output}"
+        );
+    }
+
+    #[test]
+    fn plan_incremental_send_size_annotation() {
+        colored::control::set_override(false);
+        let data = PlanOutput {
+            timestamp: "2026-03-29 13:57".to_string(),
+            operations: vec![PlanOperationEntry {
+                subvolume: "htpc-home".to_string(),
+                operation: "send".to_string(),
+                detail: "snap -> WD-18TB (incremental, parent: prev)".to_string(),
+                estimated_bytes: Some(5_500_000),
+                is_full_send: Some(false),
+            }],
+            skipped: vec![],
+            summary: PlanSummaryOutput {
+                snapshots: 0,
+                sends: 1,
+                deletions: 0,
+                skipped: 0,
+                estimated_total_bytes: Some(5_500_000),
+            },
+        };
+        let output = render_plan(&data, OutputMode::Interactive);
+        assert!(
+            output.contains("last: ~5.5MB"),
+            "should render incremental size with 'last:' prefix: {output}"
+        );
+    }
+
+    #[test]
+    fn plan_summary_partial_estimates_qualified() {
+        colored::control::set_override(false);
+        let data = PlanOutput {
+            timestamp: "2026-03-29 13:57".to_string(),
+            operations: vec![
+                PlanOperationEntry {
+                    subvolume: "htpc-home".to_string(),
+                    operation: "send".to_string(),
+                    detail: "snap -> WD-18TB (full)".to_string(),
+                    estimated_bytes: Some(53_000_000_000),
+                    is_full_send: Some(true),
+                },
+                PlanOperationEntry {
+                    subvolume: "htpc-docs".to_string(),
+                    operation: "send".to_string(),
+                    detail: "snap -> WD-18TB (full)".to_string(),
+                    estimated_bytes: None,
+                    is_full_send: Some(true),
+                },
+            ],
+            skipped: vec![],
+            summary: PlanSummaryOutput {
+                snapshots: 0,
+                sends: 2,
+                deletions: 0,
+                skipped: 0,
+                estimated_total_bytes: Some(53_000_000_000),
+            },
+        };
+        let output = render_plan(&data, OutputMode::Interactive);
+        assert!(
+            output.contains("2 sends (~53.0GB estimated for 1 of 2)"),
+            "partial estimates should be qualified: {output}"
+        );
+    }
+
+    #[test]
+    fn plan_summary_no_estimates_no_size() {
+        colored::control::set_override(false);
+        let data = PlanOutput {
+            timestamp: "2026-03-29 13:57".to_string(),
+            operations: vec![PlanOperationEntry {
+                subvolume: "htpc-home".to_string(),
+                operation: "send".to_string(),
+                detail: "snap -> WD-18TB (full)".to_string(),
+                estimated_bytes: None,
+                is_full_send: None,
+            }],
+            skipped: vec![],
+            summary: PlanSummaryOutput {
+                snapshots: 0,
+                sends: 1,
+                deletions: 0,
+                skipped: 0,
+                estimated_total_bytes: None,
+            },
+        };
+        let output = render_plan(&data, OutputMode::Interactive);
+        assert!(
+            output.contains("1 sends,"),
+            "no estimates should just show count: {output}"
+        );
+        assert!(
+            !output.contains("total"),
+            "should not mention total without estimates: {output}"
+        );
+    }
+
+    #[test]
+    fn plan_daemon_json_includes_estimated_bytes() {
+        let data = PlanOutput {
+            timestamp: "2026-03-29 13:57".to_string(),
+            operations: vec![PlanOperationEntry {
+                subvolume: "htpc-home".to_string(),
+                operation: "send".to_string(),
+                detail: "snap -> WD-18TB (full)".to_string(),
+                estimated_bytes: Some(53_000_000_000),
+                is_full_send: Some(true),
+            }],
+            skipped: vec![],
+            summary: PlanSummaryOutput {
+                snapshots: 0,
+                sends: 1,
+                deletions: 0,
+                skipped: 0,
+                estimated_total_bytes: Some(53_000_000_000),
+            },
+        };
+        let output = render_plan(&data, OutputMode::Daemon);
+        let parsed: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
+        assert_eq!(
+            parsed["operations"][0]["estimated_bytes"].as_u64(),
+            Some(53_000_000_000)
+        );
+        assert_eq!(
+            parsed["summary"]["estimated_total_bytes"].as_u64(),
+            Some(53_000_000_000)
+        );
+    }
+
+    #[test]
+    fn plan_daemon_json_omits_null_estimated_bytes() {
+        let data = PlanOutput {
+            timestamp: "2026-03-29 13:57".to_string(),
+            operations: vec![PlanOperationEntry {
+                subvolume: "htpc-home".to_string(),
+                operation: "send".to_string(),
+                detail: "snap -> WD-18TB (full)".to_string(),
+                estimated_bytes: None,
+                is_full_send: None,
+            }],
+            skipped: vec![],
+            summary: PlanSummaryOutput {
+                snapshots: 0,
+                sends: 1,
+                deletions: 0,
+                skipped: 0,
+                estimated_total_bytes: None,
+            },
+        };
+        let output = render_plan(&data, OutputMode::Daemon);
+        let parsed: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
+        assert!(
+            parsed["operations"][0].get("estimated_bytes").is_none(),
+            "null estimated_bytes should be omitted from JSON"
+        );
+        assert!(
+            parsed["summary"].get("estimated_total_bytes").is_none(),
+            "null estimated_total_bytes should be omitted from JSON"
+        );
+        assert!(
+            parsed["operations"][0].get("is_full_send").is_none(),
+            "null is_full_send should be omitted from JSON"
+        );
     }
 
     // ── History tests ───────────────────────────────────────────────────
