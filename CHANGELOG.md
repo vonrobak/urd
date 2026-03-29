@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - Cross-drive fallback for send size estimation (covers drive swap scenarios)
+- Structural headings in `urd plan` output (operations and skipped sections)
+- Collapsed skip reasons: grouped by category instead of 20+ individual lines
+- `SkipCategory` enum with structured classification in JSON daemon output
 
 ## [0.4.0] - 2026-03-29
 

@@ -16,7 +16,8 @@ use crate::heartbeat;
 use crate::lock;
 use crate::metrics::{self, MetricsData, SubvolumeMetrics};
 use crate::output::{
-    BackupSummary, OutputMode, SendSummary, SkippedSubvolume, StatusAssessment, StructuredError,
+    BackupSummary, OutputMode, SendSummary, SkipCategory, SkippedSubvolume, StatusAssessment,
+    StructuredError,
     SubvolumeSummary,
 };
 use crate::notify;
@@ -272,6 +273,7 @@ fn build_backup_summary(
         .iter()
         .map(|(name, reason)| SkippedSubvolume {
             name: name.clone(),
+            category: SkipCategory::from_reason(reason),
             reason: reason.clone(),
         })
         .collect();
