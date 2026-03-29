@@ -8,10 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Estimated send sizes in `urd plan` output with three-tier fallback (same-drive > cross-drive > calibrated)
+- Qualified summary totals: `"6 sends (~623 GB total)"` or `"estimated for 4 of 6"` when partial
 - Cross-drive fallback for send size estimation (covers drive swap scenarios)
 - Structural headings in `urd plan` output (operations and skipped sections)
 - Collapsed skip reasons: grouped by category instead of 20+ individual lines
 - `SkipCategory` enum with structured classification in JSON daemon output
+
+### Fixed
+- Planner space check now uses cross-drive fallback (previously only same-drive history)
 
 ## [0.4.0] - 2026-03-29
 

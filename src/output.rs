@@ -363,6 +363,13 @@ pub struct PlanOperationEntry {
     pub subvolume: String,
     pub operation: String,
     pub detail: String,
+    /// Estimated bytes for send operations (from history or calibration).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estimated_bytes: Option<u64>,
+    /// Whether this is a full or incremental send (for size label formatting).
+    /// Only set for send operations.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_full_send: Option<bool>,
 }
 
 /// Summary counts for a backup plan.
@@ -372,6 +379,9 @@ pub struct PlanSummaryOutput {
     pub sends: usize,
     pub deletions: usize,
     pub skipped: usize,
+    /// Aggregated estimated bytes across all sends with estimates.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estimated_total_bytes: Option<u64>,
 }
 
 // ── HistoryOutput ──────────────────────────────────────────────────────

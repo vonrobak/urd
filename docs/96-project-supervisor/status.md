@@ -8,13 +8,14 @@
 
 **Urd is the sole backup system.** Systemd timer running nightly at 04:00 since 2026-03-25.
 Sentinel daemon deployed (passive monitoring, drive detection, backup overdue alerts).
-470 tests, all passing, clippy clean. Current version: v0.4.0.
+488 tests, all passing, clippy clean. Current version: v0.4.0.
 
 ## In Progress
 
-- **UX-1 complete, uncommitted** (2026-03-30). `SkipCategory` enum in output.rs, grouped
-  plan rendering in voice.rs (D5 structural headings + D1 collapsed skips). Arch-adversary
-  review complete, all findings addressed. Ready for `/commit-push-pr`.
+- **UX-2 complete, uncommitted** (2026-03-30). Three-tier size estimation fallback in
+  plan_cmd.rs, structured `estimated_bytes` + `is_full_send` on `PlanOperationEntry`,
+  voice.rs renders size annotations and qualified summary totals. Post-review addressed
+  cross-drive fallback divergence in planner space check. Ready for `/commit-push-pr`.
 
 ## Build Queue
 
@@ -25,8 +26,8 @@ full details, design decisions, and review findings.
 2. ~~**VFM-A**~~ — `OperationalHealth` enum, two-axis CLI rendering. **Done.**
 3. ~~**Sentinel Session 3**~~ — hardening + notification deduplication. **Done.**
 4. ~~**UX-1**~~ — plan output: structural headings (D5) + collapsed skips (D1). **Done.**
-5. **UX-2** — plan output: estimated send sizes (D2+D3), cross-drive fallback (S1 fix). **start here**
-6. **UX-3** — progress display: rich context (P1) + ETA (P3).
+5. ~~**UX-2**~~ — plan output: estimated send sizes (D2+D3), cross-drive fallback (S1 fix). **Done.**
+6. **UX-3** — plan output: progress display: rich context (P1) + ETA (P3). **start here**
 7. **HSD-B** — sentinel chain-break detection + full-send gate (Norman escalation).
    - Reference incident: `docs/98-journals/2026-03-29-clone-drive-incident-analysis.md`
 8. **VFM-B** — sentinel visual state in state file + health notifications.
@@ -34,9 +35,7 @@ full details, design decisions, and review findings.
 10. **Tray icon (Spindle)** — reads sentinel-state.json, 4 static icons.
 
 Designs: `docs/95-ideas/2026-03-29-design-*.md`.
-Review: `docs/99-reports/2026-03-29-progress-display-design-review.md`.
-Post-review: `docs/99-reports/2026-03-29-post-review-cross-drive-fallback-review.md`.
-UX-1 review: `docs/99-reports/2026-03-30-ux1-plan-output-review.md`.
+Reviews: `docs/99-reports/2026-03-30-ux2-estimated-sizes-review.md`.
 
 **Later:** Config system migration (ADR-111), shell completions (6a).
 
@@ -49,7 +48,7 @@ UX-1 review: `docs/99-reports/2026-03-30-ux1-plan-output-review.md`.
 | Documentation standards | [CONTRIBUTING.md](../../CONTRIBUTING.md) |
 | ADRs (100-112) | [decisions/](../00-foundation/decisions/) |
 | Latest journals | `docs/98-journals/` (local only, gitignored) |
-| Latest reviews | [UX-1 review](../99-reports/2026-03-30-ux1-plan-output-review.md), [Design review](../99-reports/2026-03-29-progress-display-design-review.md) |
+| Latest reviews | [UX-2 review](../99-reports/2026-03-30-ux2-estimated-sizes-review.md), [UX-1 review](../99-reports/2026-03-30-ux1-plan-output-review.md) |
 
 ## Known Issues
 

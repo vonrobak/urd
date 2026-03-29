@@ -56,7 +56,6 @@ pub trait FileSystemState {
 
     /// Get the bytes_transferred from the most recent successful send of a given type
     /// across **all** drives. Cross-drive fallback for drive swap scenarios.
-    #[allow(dead_code)]
     fn last_send_size_any_drive(&self, subvol_name: &str, send_type: &str) -> Option<u64>;
 
     /// Get a calibrated size estimate for a subvolume (from `urd calibrate`).
@@ -473,14 +472,17 @@ fn plan_external_send(
     };
 
     // Space estimation: skip if estimated send size exceeds available space.
-    // Tier 1: Historical send data (most accurate). Tier 3: Calibrated sizes (fallback for full sends).
+    // Three-tier fallback: same-drive history > cross-drive history > calibrated (full only).
     let send_type_str = if is_incremental {
         "send_incremental"
     } else {
         "send_full"
     };
-    if let Some(last_size) = fs.last_send_size(&subvol.name, &drive.label, send_type_str) {
-        // Tier 1: historical data from previous sends (successful or failed)
+    if let Some(last_size) = fs
+        .last_send_size(&subvol.name, &drive.label, send_type_str)
+        .or_else(|| fs.last_send_size_any_drive(&subvol.name, send_type_str))
+    {
+        // Tier 1/2: historical data from same drive or cross-drive fallback
         if let Some((estimated, available, free, min_free)) =
             exceeds_available_space(last_size, &ext_dir, drive, fs)
         {
@@ -1644,6 +1646,42 @@ send_enabled = false
             sends.len(),
             1,
             "First-ever send should proceed without history or calibration"
+        );
+    }
+
+    #[test]
+    fn cross_drive_fallback_space_check() {
+        let config = test_config();
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap("20260322-1300-one")]);
+        fs.mounted_drives.insert("D1".to_string());
+        // No same-drive history, but cross-drive history says 1TB
+        fs.send_sizes.insert(
+            ("sv1".to_string(), "OTHER-DRIVE".to_string(), "send_full".to_string()),
+            1_000_000_000_000,
+        );
+        // Drive has only 500GB free
+        fs.free_bytes
+            .insert(PathBuf::from("/mnt/d1"), 500_000_000_000);
+
+        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let sends: Vec<_> = result
+            .operations
+            .iter()
+            .filter(|op| matches!(op, PlannedOperation::SendFull { subvolume_name, .. } if subvolume_name == "sv1"))
+            .collect();
+        assert_eq!(
+            sends.len(),
+            0,
+            "Cross-drive fallback should space-check and skip when too large"
+        );
+        assert!(
+            result
+                .skipped
+                .iter()
+                .any(|(name, reason)| name == "sv1" && reason.contains("estimated")),
+            "Skip reason should mention estimated size"
         );
     }
 

@@ -76,7 +76,7 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
 
     // Dry run: print plan and exit (no lock needed)
     if args.dry_run {
-        let plan_output = crate::commands::plan_cmd::build_plan_output(&backup_plan);
+        let plan_output = crate::commands::plan_cmd::build_plan_output(&backup_plan, &fs_state);
         let mode = crate::output::OutputMode::detect();
         print!("{}", crate::voice::render_plan(&plan_output, mode));
         return Ok(());
