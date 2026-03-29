@@ -17,8 +17,7 @@ use crate::lock;
 use crate::metrics::{self, MetricsData, SubvolumeMetrics};
 use crate::output::{
     BackupSummary, OutputMode, SendSummary, SkipCategory, SkippedSubvolume, StatusAssessment,
-    StructuredError,
-    SubvolumeSummary,
+    StructuredError, SubvolumeSummary,
 };
 use crate::notify;
 use crate::plan::{self, FileSystemState, PlanFilters, RealFileSystemState};

@@ -92,6 +92,8 @@ pub fn plan(
     fs: &dyn FileSystemState,
 ) -> crate::error::Result<BackupPlan> {
     let mut operations = Vec::new();
+    // Skip reason strings are classified by output::SkipCategory::from_reason().
+    // When adding new patterns, update output::tests::classify_all_14_patterns.
     let mut skipped = Vec::new();
 
     let resolved = config.resolved_subvolumes();
@@ -593,7 +595,12 @@ fn plan_external_retention(
     }
 }
 
-fn format_duration_short(minutes: i64) -> String {
+/// Format a duration in minutes to a short human-readable string.
+///
+/// Used by the planner for skip reasons and by voice.rs for grouped rendering.
+/// Produces: `"45m"`, `"2h30m"`, `"3d"`.
+#[must_use]
+pub fn format_duration_short(minutes: i64) -> String {
     if minutes < 60 {
         format!("{minutes}m")
     } else if minutes < 1440 {

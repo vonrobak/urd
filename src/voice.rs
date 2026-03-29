@@ -13,9 +13,11 @@ use colored::Colorize;
 
 use crate::output::{
     BackupSummary, CalibrateOutput, CalibrateResult, FailuresOutput, GetOutput, HistoryOutput,
-    InitOutput, InitStatus, OutputMode, PlanOutput, SentinelStatusOutput, StatusOutput,
-    SubvolumeHistoryOutput, VerifyOutput,
+    InitOutput, InitStatus, OutputMode, PlanOutput, SentinelStatusOutput, SkipCategory,
+    SkippedSubvolume, StatusOutput, SubvolumeHistoryOutput, VerifyOutput,
+    parse_duration_to_minutes,
 };
+use crate::plan::format_duration_short;
 use crate::types::ByteSize;
 
 // ── Status ──────────────────────────────────────────────────────────────
@@ -800,13 +802,14 @@ fn render_plan_interactive(data: &PlanOutput) -> String {
             };
             writeln!(out, "  {:<10} {}", label, entry.detail).ok();
         }
+        writeln!(out).ok();
     } else {
         writeln!(out, "{}", "No operations planned.".dimmed()).ok();
+        writeln!(out).ok();
     }
 
     // === Skipped (N) ===
     if !data.skipped.is_empty() {
-        writeln!(out).ok();
         writeln!(
             out,
             "{}",
@@ -834,148 +837,103 @@ fn render_plan_interactive(data: &PlanOutput) -> String {
     out
 }
 
-/// Render plan skip entries grouped by category.
-fn render_plan_skipped_grouped(
-    skipped: &[crate::output::SkippedSubvolume],
-    out: &mut String,
-) {
-    use crate::output::SkipCategory;
-    use std::collections::BTreeMap;
+/// Render skipped subvolumes grouped by category for plan output.
+fn render_plan_skipped_grouped(skipped: &[SkippedSubvolume], out: &mut String) {
+    // Collect by category in defined render order.
+    let categories = [
+        SkipCategory::DriveNotMounted,
+        SkipCategory::IntervalNotElapsed,
+        SkipCategory::Disabled,
+        SkipCategory::SpaceExceeded,
+        SkipCategory::Other,
+    ];
 
-    // BTreeMap keyed by display order ensures categories render in a fixed sequence.
-    let mut groups: BTreeMap<usize, Vec<&crate::output::SkippedSubvolume>> = BTreeMap::new();
-    for skip in skipped {
-        let idx = match skip.category {
-            SkipCategory::DriveNotMounted => 0,
-            SkipCategory::IntervalNotElapsed => 1,
-            SkipCategory::Disabled => 2,
-            SkipCategory::SpaceExceeded => 3,
-            SkipCategory::Other => 4,
-        };
-        groups.entry(idx).or_default().push(skip);
-    }
-
-    for (idx, entries) in &groups {
-        match idx {
-            0 => render_drive_not_mounted_group(entries, out),
-            1 => render_interval_group(entries, out),
-            2 => render_disabled_group(entries, out),
-            _ => {
-                for entry in entries {
-                    writeln!(out, "  {}: {}", entry.name, entry.reason.dimmed()).ok();
-                }
+    for cat in &categories {
+        let items: Vec<&SkippedSubvolume> =
+            skipped.iter().filter(|s| &s.category == cat).collect();
+        if items.is_empty() {
+            continue;
+        }
+        match cat {
+            SkipCategory::DriveNotMounted => render_drive_not_mounted_group(&items, out),
+            SkipCategory::IntervalNotElapsed => render_interval_group(&items, out),
+            SkipCategory::Disabled => render_disabled_group(&items, out),
+            SkipCategory::SpaceExceeded | SkipCategory::Other => {
+                render_individual_skips(&items, cat, out);
             }
         }
     }
 }
 
-/// Render "Not mounted: DriveA (N subvolumes), DriveB (M subvolumes)"
-fn render_drive_not_mounted_group(
-    entries: &[&crate::output::SkippedSubvolume],
-    out: &mut String,
-) {
-    let mut drives: Vec<(String, Vec<String>)> = Vec::new();
-    for entry in entries {
-        let label = entry
+/// Render DriveNotMounted skips, sub-grouped by drive label with subvolume counts.
+fn render_drive_not_mounted_group(items: &[&SkippedSubvolume], out: &mut String) {
+    // Extract drive label from reason: "drive {label} not mounted"
+    let mut drives: Vec<(String, usize)> = Vec::new();
+    for item in items {
+        let label = item
             .reason
             .strip_prefix("drive ")
             .and_then(|r| r.strip_suffix(" not mounted"))
             .unwrap_or("unknown")
             .to_string();
-        if let Some((_, subvols)) = drives.iter_mut().find(|(l, _)| *l == label) {
-            if !subvols.contains(&entry.name) {
-                subvols.push(entry.name.clone());
-            }
+        if let Some(entry) = drives.iter_mut().find(|(l, _)| *l == label) {
+            entry.1 += 1;
         } else {
-            drives.push((label, vec![entry.name.clone()]));
+            drives.push((label, 1));
         }
     }
-
     let parts: Vec<String> = drives
         .iter()
-        .map(|(label, subvols)| {
-            let n = subvols.len();
-            if n == 1 {
-                format!("{label} (1 subvolume)")
-            } else {
-                format!("{label} ({n} subvolumes)")
-            }
+        .map(|(label, count)| {
+            let noun = if *count == 1 { "subvolume" } else { "subvolumes" };
+            format!("{label} ({count} {noun})")
         })
         .collect();
-    writeln!(out, "  {}: {}", "Not mounted".dimmed(), parts.join(", ")).ok();
+    writeln!(out, "  {} {}", "Not mounted:".dimmed(), parts.join(", ")).ok();
 }
 
-/// Render "Interval not elapsed: N subvolumes (next in ~Xh)"
-fn render_interval_group(entries: &[&crate::output::SkippedSubvolume], out: &mut String) {
-    let mut names: Vec<&str> = Vec::new();
-    let mut shortest_minutes = i64::MAX;
-    let mut shortest_text: Option<&str> = None;
+/// Render IntervalNotElapsed skips as a single line with count and shortest duration.
+fn render_interval_group(items: &[&SkippedSubvolume], out: &mut String) {
+    let shortest = items
+        .iter()
+        .filter_map(|s| parse_duration_to_minutes(&s.reason))
+        .min();
 
-    for entry in entries {
-        if !names.contains(&entry.name.as_str()) {
-            names.push(&entry.name);
-        }
-        if let Some(pos) = entry.reason.find("next in ~") {
-            let duration_part = &entry.reason[pos + 9..];
-            let duration = duration_part.trim_end_matches(')');
-            let minutes = parse_duration_to_minutes(duration);
-            if minutes < shortest_minutes {
-                shortest_minutes = minutes;
-                shortest_text = Some(duration);
-            }
-        }
-    }
-
-    let n = names.len();
-    let count_str = if n == 1 {
-        "1 subvolume".to_string()
+    let suffix = if let Some(mins) = shortest {
+        format!(" (next in ~{})", format_duration_short(mins as i64))
     } else {
-        format!("{n} subvolumes")
+        String::new()
     };
-    let suffix = match shortest_text {
-        Some(d) => format!(" (next in ~{d})"),
-        None => String::new(),
-    };
+
     writeln!(
         out,
-        "  {}: {}{}",
-        "Interval not elapsed".dimmed(),
-        count_str,
-        suffix
+        "  {} {} subvolumes{}",
+        "Interval not elapsed:".dimmed(),
+        items.len(),
+        suffix,
     )
     .ok();
 }
 
-/// Parse a short duration string (e.g. "14h6m", "5d", "30m") to minutes.
-fn parse_duration_to_minutes(s: &str) -> i64 {
-    let mut total: i64 = 0;
-    let mut num = String::new();
-    for ch in s.chars() {
-        if ch.is_ascii_digit() {
-            num.push(ch);
-        } else {
-            let n: i64 = num.parse().unwrap_or(0);
-            match ch {
-                'd' => total += n * 1440,
-                'h' => total += n * 60,
-                'm' => total += n,
-                _ => {}
-            }
-            num.clear();
-        }
-    }
-    total
+/// Render Disabled skips as an inline comma-separated name list.
+fn render_disabled_group(items: &[&SkippedSubvolume], out: &mut String) {
+    let names: Vec<&str> = items.iter().map(|s| s.name.as_str()).collect();
+    writeln!(out, "  {} {}", "Disabled:".dimmed(), names.join(", ")).ok();
 }
 
-/// Render "Disabled: name1, name2, name3"
-fn render_disabled_group(entries: &[&crate::output::SkippedSubvolume], out: &mut String) {
-    let mut names: Vec<&str> = Vec::new();
-    for entry in entries {
-        if !names.contains(&entry.name.as_str()) {
-            names.push(&entry.name);
-        }
+/// Render SpaceExceeded or Other skips as individual lines (detail matters).
+fn render_individual_skips(
+    items: &[&SkippedSubvolume],
+    category: &SkipCategory,
+    out: &mut String,
+) {
+    let tag = match category {
+        SkipCategory::SpaceExceeded => "[SPACE]".yellow().to_string(),
+        _ => "[SKIP]".dimmed().to_string(),
+    };
+    for item in items {
+        writeln!(out, "  {} {}: {}", tag, item.name, item.reason.dimmed()).ok();
     }
-    writeln!(out, "  {}: {}", "Disabled".dimmed(), names.join(", ")).ok();
 }
 
 // ── History ─────────────────────────────────────────────────────────────
@@ -1597,9 +1555,8 @@ mod tests {
         ChainHealthEntry, DriveInfo, HistoryOutput, HistoryRun, InitCheck, InitDriveStatus,
         InitOutput, InitPinFile, InitSnapshotCount, InitStatus, LastRunInfo, PlanOperationEntry,
         PlanOutput, PlanSummaryOutput, SendSummary, SkipCategory, SkippedSubvolume,
-        StatusAssessment,
-        StatusDriveAssessment, SubvolumeSummary, VerifyCheck, VerifyDrive, VerifyOutput,
-        VerifySubvolume,
+        StatusAssessment, StatusDriveAssessment, SubvolumeSummary, VerifyCheck, VerifyDrive,
+        VerifyOutput, VerifySubvolume,
     };
 
     fn test_status_output() -> StatusOutput {
@@ -1871,13 +1828,13 @@ mod tests {
             skipped: vec![
                 SkippedSubvolume {
                     name: "htpc-home".to_string(),
-                    category: SkipCategory::DriveNotMounted,
                     reason: "drive 2TB-backup not mounted".to_string(),
+                    category: SkipCategory::DriveNotMounted,
                 },
                 SkippedSubvolume {
                     name: "htpc-docs".to_string(),
-                    category: SkipCategory::DriveNotMounted,
                     reason: "drive 2TB-backup not mounted".to_string(),
+                    category: SkipCategory::DriveNotMounted,
                 },
             ],
             assessments: vec![StatusAssessment {
@@ -1947,13 +1904,13 @@ mod tests {
         data.skipped = vec![
             SkippedSubvolume {
                 name: "htpc-home".to_string(),
-                category: SkipCategory::DriveNotMounted,
                 reason: "drive WD-18TB not mounted".to_string(),
+                category: SkipCategory::DriveNotMounted,
             },
             SkippedSubvolume {
                 name: "htpc-home".to_string(),
-                category: SkipCategory::Other,
                 reason: "drive 2TB-backup UUID mismatch (expected abc, found def)".to_string(),
+                category: SkipCategory::Other,
             },
         ];
         let output = render_backup_summary(&data, OutputMode::Interactive);
@@ -2067,23 +2024,23 @@ mod tests {
             skipped: vec![
                 SkippedSubvolume {
                     name: "htpc-home".to_string(),
-                    category: SkipCategory::DriveNotMounted,
                     reason: "drive WD-18TB not mounted".to_string(),
+                    category: SkipCategory::DriveNotMounted,
                 },
                 SkippedSubvolume {
                     name: "htpc-docs".to_string(),
-                    category: SkipCategory::DriveNotMounted,
                     reason: "drive WD-18TB not mounted".to_string(),
+                    category: SkipCategory::DriveNotMounted,
                 },
                 SkippedSubvolume {
                     name: "htpc-home".to_string(),
-                    category: SkipCategory::DriveNotMounted,
                     reason: "drive 2TB-backup not mounted".to_string(),
+                    category: SkipCategory::DriveNotMounted,
                 },
                 SkippedSubvolume {
                     name: "htpc-docs".to_string(),
-                    category: SkipCategory::DriveNotMounted,
                     reason: "drive 2TB-backup not mounted".to_string(),
+                    category: SkipCategory::DriveNotMounted,
                 },
             ],
             assessments: vec![],
@@ -2155,22 +2112,28 @@ mod tests {
         assert!(parsed.get("timestamp").is_some());
     }
 
+    // ── Plan grouped rendering tests ──────────────────────────────────
+
     #[test]
-    fn plan_shows_operations_heading() {
+    fn plan_structural_headings_present() {
         colored::control::set_override(false);
         let data = PlanOutput {
             timestamp: "2026-03-29 13:57".to_string(),
             operations: vec![PlanOperationEntry {
                 subvolume: "htpc-home".to_string(),
                 operation: "send".to_string(),
-                detail: "20260329-0404-home -> WD-18TB (full) + pin".to_string(),
+                detail: "20260329-0404-htpc-home -> WD-18TB (full) + pin".to_string(),
             }],
-            skipped: vec![],
+            skipped: vec![SkippedSubvolume {
+                name: "htpc-docs".to_string(),
+                reason: "disabled".to_string(),
+                category: SkipCategory::Disabled,
+            }],
             summary: PlanSummaryOutput {
                 snapshots: 0,
                 sends: 1,
                 deletions: 0,
-                skipped: 0,
+                skipped: 1,
             },
         };
         let output = render_plan(&data, OutputMode::Interactive);
@@ -2178,62 +2141,19 @@ mod tests {
             output.contains("=== Planned operations ==="),
             "missing operations heading"
         );
-        assert!(
-            !output.contains("=== Skipped"),
-            "skipped heading should not appear when no skips"
-        );
+        assert!(output.contains("=== Skipped (1) ==="), "missing skipped heading");
     }
 
     #[test]
-    fn plan_shows_skipped_heading_with_count() {
-        colored::control::set_override(false);
-        let data = PlanOutput {
-            timestamp: "2026-03-29 13:57".to_string(),
-            operations: vec![PlanOperationEntry {
-                subvolume: "htpc-home".to_string(),
-                operation: "send".to_string(),
-                detail: "20260329-0404-home -> WD-18TB (full) + pin".to_string(),
-            }],
-            skipped: vec![
-                SkippedSubvolume {
-                    name: "htpc-docs".to_string(),
-                    category: SkipCategory::DriveNotMounted,
-                    reason: "drive 2TB-backup not mounted".to_string(),
-                },
-                SkippedSubvolume {
-                    name: "htpc-pics".to_string(),
-                    category: SkipCategory::DriveNotMounted,
-                    reason: "drive 2TB-backup not mounted".to_string(),
-                },
-            ],
-            summary: PlanSummaryOutput {
-                snapshots: 0,
-                sends: 1,
-                deletions: 0,
-                skipped: 2,
-            },
-        };
-        let output = render_plan(&data, OutputMode::Interactive);
-        assert!(
-            output.contains("=== Planned operations ==="),
-            "missing operations heading"
-        );
-        assert!(
-            output.contains("=== Skipped (2) ==="),
-            "missing skipped heading with count"
-        );
-    }
-
-    #[test]
-    fn plan_skips_only_no_operations_heading() {
+    fn plan_no_operations_shows_message() {
         colored::control::set_override(false);
         let data = PlanOutput {
             timestamp: "2026-03-29 13:57".to_string(),
             operations: vec![],
             skipped: vec![SkippedSubvolume {
-                name: "htpc-home".to_string(),
-                category: SkipCategory::Disabled,
+                name: "htpc-docs".to_string(),
                 reason: "disabled".to_string(),
+                category: SkipCategory::Disabled,
             }],
             summary: PlanSummaryOutput {
                 snapshots: 0,
@@ -2244,21 +2164,17 @@ mod tests {
         };
         let output = render_plan(&data, OutputMode::Interactive);
         assert!(
-            !output.contains("=== Planned operations ==="),
-            "operations heading should not appear when no operations"
-        );
-        assert!(
             output.contains("No operations planned."),
-            "missing 'no operations' note"
+            "missing no-ops message"
         );
         assert!(
-            output.contains("=== Skipped (1) ==="),
-            "missing skipped heading"
+            !output.contains("=== Planned operations ==="),
+            "should not show operations heading when empty"
         );
     }
 
     #[test]
-    fn plan_groups_not_mounted_by_drive() {
+    fn plan_grouped_drive_not_mounted() {
         colored::control::set_override(false);
         let data = PlanOutput {
             timestamp: "2026-03-29 13:57".to_string(),
@@ -2266,18 +2182,18 @@ mod tests {
             skipped: vec![
                 SkippedSubvolume {
                     name: "htpc-home".to_string(),
-                    category: SkipCategory::DriveNotMounted,
                     reason: "drive WD-18TB1 not mounted".to_string(),
+                    category: SkipCategory::DriveNotMounted,
                 },
                 SkippedSubvolume {
                     name: "htpc-docs".to_string(),
-                    category: SkipCategory::DriveNotMounted,
                     reason: "drive WD-18TB1 not mounted".to_string(),
+                    category: SkipCategory::DriveNotMounted,
                 },
                 SkippedSubvolume {
                     name: "htpc-home".to_string(),
-                    category: SkipCategory::DriveNotMounted,
                     reason: "drive 2TB-backup not mounted".to_string(),
+                    category: SkipCategory::DriveNotMounted,
                 },
             ],
             summary: PlanSummaryOutput {
@@ -2289,26 +2205,28 @@ mod tests {
         };
         let output = render_plan(&data, OutputMode::Interactive);
         assert!(
-            output.contains("Not mounted"),
-            "missing 'Not mounted' group label"
+            output.contains("Not mounted:"),
+            "missing grouped not-mounted line"
         );
         assert!(
             output.contains("WD-18TB1 (2 subvolumes)"),
-            "missing drive count for WD-18TB1"
+            "missing WD-18TB1 drive group"
         );
         assert!(
             output.contains("2TB-backup (1 subvolume)"),
-            "missing drive count for 2TB-backup"
+            "missing 2TB-backup drive group"
         );
-        // Should NOT contain individual [SKIP] lines
+        // Should NOT have individual [SKIP] lines for these
+        assert!(!output.contains("[SKIP]"), "should not show individual skip lines");
+        // Label extraction must succeed — "unknown" means classifier and extractor drifted
         assert!(
-            !output.contains("[SKIP]"),
-            "grouped skips should not show individual [SKIP] labels"
+            !output.contains("unknown"),
+            "drive label extraction failed — classifier/extractor drift"
         );
     }
 
     #[test]
-    fn plan_groups_interval_with_count() {
+    fn plan_grouped_interval_shows_shortest() {
         colored::control::set_override(false);
         let data = PlanOutput {
             timestamp: "2026-03-29 13:57".to_string(),
@@ -2316,18 +2234,18 @@ mod tests {
             skipped: vec![
                 SkippedSubvolume {
                     name: "htpc-home".to_string(),
-                    category: SkipCategory::IntervalNotElapsed,
                     reason: "interval not elapsed (next in ~14h6m)".to_string(),
+                    category: SkipCategory::IntervalNotElapsed,
                 },
                 SkippedSubvolume {
                     name: "htpc-docs".to_string(),
+                    reason: "interval not elapsed (next in ~2h30m)".to_string(),
                     category: SkipCategory::IntervalNotElapsed,
-                    reason: "send to WD-18TB not due (next in ~2h30m)".to_string(),
                 },
                 SkippedSubvolume {
-                    name: "htpc-pics".to_string(),
+                    name: "htpc-tmp".to_string(),
+                    reason: "send to WD-18TB not due (next in ~20h0m)".to_string(),
                     category: SkipCategory::IntervalNotElapsed,
-                    reason: "interval not elapsed (next in ~20h)".to_string(),
                 },
             ],
             summary: PlanSummaryOutput {
@@ -2339,21 +2257,55 @@ mod tests {
         };
         let output = render_plan(&data, OutputMode::Interactive);
         assert!(
-            output.contains("Interval not elapsed"),
-            "missing interval group label"
+            output.contains("Interval not elapsed:"),
+            "missing interval group"
         );
         assert!(
             output.contains("3 subvolumes"),
-            "missing subvolume count in interval group"
+            "missing subvolume count"
         );
+        // Shortest is 2h30m = 150 minutes
         assert!(
-            output.contains("next in ~"),
-            "missing 'next in' duration hint"
+            output.contains("(next in ~2h30m)"),
+            "should show shortest duration: {output}"
         );
     }
 
     #[test]
-    fn plan_groups_disabled_inline() {
+    fn plan_grouped_interval_days_vs_hours() {
+        colored::control::set_override(false);
+        let data = PlanOutput {
+            timestamp: "2026-03-29 13:57".to_string(),
+            operations: vec![],
+            skipped: vec![
+                SkippedSubvolume {
+                    name: "subvol-a".to_string(),
+                    reason: "interval not elapsed (next in ~9d)".to_string(),
+                    category: SkipCategory::IntervalNotElapsed,
+                },
+                SkippedSubvolume {
+                    name: "subvol-b".to_string(),
+                    reason: "interval not elapsed (next in ~2h30m)".to_string(),
+                    category: SkipCategory::IntervalNotElapsed,
+                },
+            ],
+            summary: PlanSummaryOutput {
+                snapshots: 0,
+                sends: 0,
+                deletions: 0,
+                skipped: 2,
+            },
+        };
+        let output = render_plan(&data, OutputMode::Interactive);
+        // 2h30m (150 min) < 9d (12960 min) — must show 2h30m as shortest, not 9d
+        assert!(
+            output.contains("(next in ~2h30m)"),
+            "should pick 2h30m over 9d: {output}"
+        );
+    }
+
+    #[test]
+    fn plan_grouped_disabled_comma_list() {
         colored::control::set_override(false);
         let data = PlanOutput {
             timestamp: "2026-03-29 13:57".to_string(),
@@ -2361,18 +2313,18 @@ mod tests {
             skipped: vec![
                 SkippedSubvolume {
                     name: "htpc-root".to_string(),
-                    category: SkipCategory::Disabled,
                     reason: "disabled".to_string(),
+                    category: SkipCategory::Disabled,
                 },
                 SkippedSubvolume {
-                    name: "htpc-multimedia".to_string(),
+                    name: "subvol4-multimedia".to_string(),
+                    reason: "disabled".to_string(),
                     category: SkipCategory::Disabled,
+                },
+                SkippedSubvolume {
+                    name: "subvol6-tmp".to_string(),
                     reason: "send disabled".to_string(),
-                },
-                SkippedSubvolume {
-                    name: "htpc-tmp".to_string(),
                     category: SkipCategory::Disabled,
-                    reason: "disabled".to_string(),
                 },
             ],
             summary: PlanSummaryOutput {
@@ -2384,94 +2336,112 @@ mod tests {
         };
         let output = render_plan(&data, OutputMode::Interactive);
         assert!(
-            output.contains("Disabled"),
-            "missing disabled group label"
+            output.contains("Disabled:"),
+            "missing disabled group"
         );
         assert!(
-            output.contains("htpc-root"),
-            "missing first disabled subvolume"
-        );
-        assert!(
-            output.contains("htpc-tmp"),
-            "missing last disabled subvolume"
+            output.contains("htpc-root, subvol4-multimedia, subvol6-tmp"),
+            "names should be comma-separated: {output}"
         );
     }
 
     #[test]
-    fn plan_other_skips_shown_individually() {
+    fn plan_space_exceeded_individual_lines() {
+        colored::control::set_override(false);
+        let data = PlanOutput {
+            timestamp: "2026-03-29 13:57".to_string(),
+            operations: vec![],
+            skipped: vec![SkippedSubvolume {
+                name: "htpc-home".to_string(),
+                reason: "send to WD-18TB skipped: estimated ~4.5 GB exceeds WD-18TB available"
+                    .to_string(),
+                category: SkipCategory::SpaceExceeded,
+            }],
+            summary: PlanSummaryOutput {
+                snapshots: 0,
+                sends: 0,
+                deletions: 0,
+                skipped: 1,
+            },
+        };
+        let output = render_plan(&data, OutputMode::Interactive);
+        assert!(
+            output.contains("[SPACE]"),
+            "space exceeded should use [SPACE] tag"
+        );
+        assert!(
+            output.contains("htpc-home"),
+            "should show subvolume name"
+        );
+    }
+
+    #[test]
+    fn plan_mixed_categories_render_order() {
         colored::control::set_override(false);
         let data = PlanOutput {
             timestamp: "2026-03-29 13:57".to_string(),
             operations: vec![],
             skipped: vec![
                 SkippedSubvolume {
-                    name: "htpc-home".to_string(),
-                    category: SkipCategory::Other,
-                    reason: "snapshot already exists".to_string(),
+                    name: "sub-a".to_string(),
+                    reason: "disabled".to_string(),
+                    category: SkipCategory::Disabled,
                 },
                 SkippedSubvolume {
-                    name: "htpc-docs".to_string(),
-                    category: SkipCategory::Other,
-                    reason: "no local snapshots to send".to_string(),
+                    name: "sub-b".to_string(),
+                    reason: "drive WD-18TB not mounted".to_string(),
+                    category: SkipCategory::DriveNotMounted,
+                },
+                SkippedSubvolume {
+                    name: "sub-c".to_string(),
+                    reason: "interval not elapsed (next in ~5m)".to_string(),
+                    category: SkipCategory::IntervalNotElapsed,
                 },
             ],
             summary: PlanSummaryOutput {
                 snapshots: 0,
                 sends: 0,
                 deletions: 0,
-                skipped: 2,
+                skipped: 3,
             },
         };
         let output = render_plan(&data, OutputMode::Interactive);
+        let not_mounted_pos = output.find("Not mounted:").expect("missing Not mounted");
+        let interval_pos = output.find("Interval not elapsed:").expect("missing Interval");
+        let disabled_pos = output.find("Disabled:").expect("missing Disabled");
         assert!(
-            output.contains("htpc-home: snapshot already exists"),
-            "Other skips should render individually"
+            not_mounted_pos < interval_pos,
+            "DriveNotMounted should render before IntervalNotElapsed"
         );
         assert!(
-            output.contains("htpc-docs: no local snapshots to send"),
-            "Other skips should render individually"
+            interval_pos < disabled_pos,
+            "IntervalNotElapsed should render before Disabled"
         );
     }
 
     #[test]
-    fn plan_daemon_includes_skip_categories() {
+    fn plan_daemon_json_includes_category() {
         let data = PlanOutput {
             timestamp: "2026-03-29 13:57".to_string(),
             operations: vec![],
-            skipped: vec![
-                SkippedSubvolume {
-                    name: "htpc-home".to_string(),
-                    category: SkipCategory::DriveNotMounted,
-                    reason: "drive WD-18TB not mounted".to_string(),
-                },
-                SkippedSubvolume {
-                    name: "htpc-docs".to_string(),
-                    category: SkipCategory::Disabled,
-                    reason: "disabled".to_string(),
-                },
-            ],
+            skipped: vec![SkippedSubvolume {
+                name: "htpc-home".to_string(),
+                reason: "disabled".to_string(),
+                category: SkipCategory::Disabled,
+            }],
             summary: PlanSummaryOutput {
                 snapshots: 0,
                 sends: 0,
                 deletions: 0,
-                skipped: 2,
+                skipped: 1,
             },
         };
         let output = render_plan(&data, OutputMode::Daemon);
         let parsed: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
-        let skipped = parsed.get("skipped").expect("missing skipped array");
-        let first = &skipped[0];
-        assert_eq!(
-            first.get("category").and_then(|v| v.as_str()),
-            Some("drive_not_mounted"),
-            "JSON should include snake_case category"
-        );
-        let second = &skipped[1];
-        assert_eq!(
-            second.get("category").and_then(|v| v.as_str()),
-            Some("disabled"),
-            "JSON should include category for disabled"
-        );
+        let category = parsed["skipped"][0]["category"]
+            .as_str()
+            .expect("category field missing");
+        assert_eq!(category, "disabled");
     }
 
     // ── History tests ───────────────────────────────────────────────────

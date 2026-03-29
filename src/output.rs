@@ -257,7 +257,13 @@ pub struct SendSummary {
     pub bytes_transferred: Option<u64>,
 }
 
-/// Skip reason category for grouped rendering and structured JSON output.
+// ── SkipCategory ──────────────────────────────────────────────────────
+
+/// Classification of why a subvolume/send was skipped.
+///
+/// Used for grouped rendering in plan output and structured JSON for daemon consumers.
+/// Classification happens at the output boundary via `from_reason()`, keeping plan.rs
+/// skip reasons as free-text strings.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SkipCategory {
@@ -269,24 +275,26 @@ pub enum SkipCategory {
 }
 
 impl SkipCategory {
-    /// Classify a free-text skip reason from `plan.rs` into a category.
+    /// Classify a skip reason string into a category.
     ///
-    /// Covers all 14 known skip patterns. Unknown patterns fall to `Other`.
+    /// Matches against the 14 known patterns from plan.rs. Unknown patterns
+    /// fall to `Other`. A completeness test in the test module ensures all
+    /// known patterns classify correctly.
     #[must_use]
     pub fn from_reason(reason: &str) -> Self {
-        if reason
-            .strip_prefix("drive ")
-            .is_some_and(|r| r.ends_with(" not mounted"))
+        if reason == "disabled" || reason == "send disabled" {
+            Self::Disabled
+        } else if reason.starts_with("drive ")
+            && reason.ends_with(" not mounted")
         {
             Self::DriveNotMounted
-        } else if reason == "disabled" || reason == "send disabled" {
-            Self::Disabled
         } else if reason.starts_with("interval not elapsed")
             || reason.contains("not due (next in")
         {
             Self::IntervalNotElapsed
         } else if reason.starts_with("local filesystem low on space")
-            || (reason.contains("skipped:") && reason.contains("exceeds"))
+            || reason.contains("skipped: estimated ~")
+            || reason.contains("skipped: calibrated size ~")
         {
             Self::SpaceExceeded
         } else {
@@ -295,12 +303,47 @@ impl SkipCategory {
     }
 }
 
-/// A planner-skipped subvolume/send with reason and category.
+/// Parse a duration string (produced by `format_duration_short` in plan.rs) to minutes.
+///
+/// Handles three formats: `"45m"`, `"2h30m"`, `"3d"`.
+/// When embedded in a reason string, extracts the text between `~` and `)`.
+/// Returns `None` if no parseable duration is found.
+#[must_use]
+pub fn parse_duration_to_minutes(reason: &str) -> Option<u64> {
+    // Extract duration substring: text between '~' and ')'
+    let duration_str = if let Some(start) = reason.find('~') {
+        let after_tilde = &reason[start + 1..];
+        if let Some(end) = after_tilde.find(')') {
+            &after_tilde[..end]
+        } else {
+            after_tilde.trim()
+        }
+    } else {
+        reason.trim()
+    };
+
+    // Parse: "Nd", "NhMm", "Nm"
+    if let Some(d) = duration_str.strip_suffix('d') {
+        d.parse::<u64>().ok().map(|v| v * 1440)
+    } else if let Some(rest) = duration_str.strip_suffix('m') {
+        if let Some(h_pos) = rest.find('h') {
+            let hours = rest[..h_pos].parse::<u64>().ok()?;
+            let mins = rest[h_pos + 1..].parse::<u64>().ok()?;
+            Some(hours * 60 + mins)
+        } else {
+            rest.parse::<u64>().ok()
+        }
+    } else {
+        None
+    }
+}
+
+/// A planner-skipped subvolume/send with reason.
 #[derive(Debug, Serialize)]
 pub struct SkippedSubvolume {
     pub name: String,
-    pub category: SkipCategory,
     pub reason: String,
+    pub category: SkipCategory,
 }
 
 // ── PlanOutput ─────────────────────────────────────────────────────────
@@ -623,19 +666,7 @@ mod tests {
         assert!(matches!(result, ChainHealth::Full(_)));
     }
 
-    // ── SkipCategory classification ────────────────────────────────────
-
-    #[test]
-    fn classify_drive_not_mounted() {
-        assert_eq!(
-            SkipCategory::from_reason("drive WD-18TB1 not mounted"),
-            SkipCategory::DriveNotMounted
-        );
-        assert_eq!(
-            SkipCategory::from_reason("drive 2TB-backup not mounted"),
-            SkipCategory::DriveNotMounted
-        );
-    }
+    // ── SkipCategory classification tests ──────────────────────────────
 
     #[test]
     fn classify_disabled() {
@@ -643,6 +674,18 @@ mod tests {
         assert_eq!(
             SkipCategory::from_reason("send disabled"),
             SkipCategory::Disabled
+        );
+    }
+
+    #[test]
+    fn classify_drive_not_mounted() {
+        assert_eq!(
+            SkipCategory::from_reason("drive WD-18TB not mounted"),
+            SkipCategory::DriveNotMounted
+        );
+        assert_eq!(
+            SkipCategory::from_reason("drive 2TB-backup not mounted"),
+            SkipCategory::DriveNotMounted
         );
     }
 
@@ -662,19 +705,19 @@ mod tests {
     fn classify_space_exceeded() {
         assert_eq!(
             SkipCategory::from_reason(
-                "local filesystem low on space (5.0 GB free, 10.0 GB required)"
+                "local filesystem low on space (1.2 GB free, 5.0 GB required)"
             ),
             SkipCategory::SpaceExceeded
         );
         assert_eq!(
             SkipCategory::from_reason(
-                "send to WD-18TB skipped: estimated ~4.1 TB exceeds 2.0 TB available (free: 2.5 TB, min_free: 500.0 GB)"
+                "send to WD-18TB skipped: estimated ~4.5 GB exceeds WD-18TB available (free: 2.1 GB, min_free: 50.0 GB)"
             ),
             SkipCategory::SpaceExceeded
         );
         assert_eq!(
             SkipCategory::from_reason(
-                "send to WD-18TB skipped: calibrated size ~4.1 TB exceeds 2.0 TB available"
+                "send to WD-18TB skipped: calibrated size ~4.5 GB exceeds WD-18TB available"
             ),
             SkipCategory::SpaceExceeded
         );
@@ -682,18 +725,6 @@ mod tests {
 
     #[test]
     fn classify_other() {
-        assert_eq!(
-            SkipCategory::from_reason("snapshot already exists"),
-            SkipCategory::Other
-        );
-        assert_eq!(
-            SkipCategory::from_reason("no local snapshots to send"),
-            SkipCategory::Other
-        );
-        assert_eq!(
-            SkipCategory::from_reason("20260329-0400-home already on WD-18TB"),
-            SkipCategory::Other
-        );
         assert_eq!(
             SkipCategory::from_reason(
                 "drive WD-18TB UUID mismatch (expected abc, found def)"
@@ -710,13 +741,35 @@ mod tests {
             ),
             SkipCategory::Other
         );
+        assert_eq!(
+            SkipCategory::from_reason("snapshot already exists"),
+            SkipCategory::Other
+        );
+        assert_eq!(
+            SkipCategory::from_reason("no local snapshots to send"),
+            SkipCategory::Other
+        );
+        assert_eq!(
+            SkipCategory::from_reason("20260329-0404-htpc-home already on WD-18TB"),
+            SkipCategory::Other
+        );
     }
 
-    /// Completeness test: all 14 known plan.rs skip patterns classified correctly.
+    #[test]
+    fn classify_unknown_falls_to_other() {
+        assert_eq!(
+            SkipCategory::from_reason("some completely unknown reason"),
+            SkipCategory::Other
+        );
+    }
+
+    /// Completeness test: all 14 known plan.rs skip patterns classify to their
+    /// expected category. Prevents silent regressions when new patterns are added.
     #[test]
     fn classify_all_14_patterns() {
-        let patterns = [
+        let patterns = vec![
             ("disabled", SkipCategory::Disabled),
+            ("send disabled", SkipCategory::Disabled),
             ("drive WD-18TB not mounted", SkipCategory::DriveNotMounted),
             (
                 "drive WD-18TB UUID mismatch (expected abc, found def)",
@@ -730,9 +783,8 @@ mod tests {
                 "drive WD-18TB token mismatch (expected abc, found def) — possible drive swap",
                 SkipCategory::Other,
             ),
-            ("send disabled", SkipCategory::Disabled),
             (
-                "local filesystem low on space (5.0 GB free, 10.0 GB required)",
+                "local filesystem low on space (1.2 GB free, 5.0 GB required)",
                 SkipCategory::SpaceExceeded,
             ),
             ("snapshot already exists", SkipCategory::Other),
@@ -746,24 +798,68 @@ mod tests {
             ),
             ("no local snapshots to send", SkipCategory::Other),
             (
-                "20260329-0400-home already on WD-18TB",
+                "20260329-0404-htpc-home already on WD-18TB",
                 SkipCategory::Other,
             ),
             (
-                "send to WD-18TB skipped: estimated ~4.1 TB exceeds 2.0 TB available (free: 2.5 TB, min_free: 500.0 GB)",
+                "send to WD-18TB skipped: estimated ~4.5 GB exceeds WD-18TB available (free: 2.1 GB, min_free: 50.0 GB)",
                 SkipCategory::SpaceExceeded,
             ),
             (
-                "send to WD-18TB skipped: calibrated size ~4.1 TB exceeds 2.0 TB available",
+                "send to WD-18TB skipped: calibrated size ~4.5 GB exceeds WD-18TB available",
                 SkipCategory::SpaceExceeded,
             ),
         ];
-        for (reason, expected) in &patterns {
+
+        for (reason, expected) in patterns {
             assert_eq!(
                 SkipCategory::from_reason(reason),
-                *expected,
-                "pattern {reason:?} should classify as {expected:?}"
+                expected,
+                "pattern: {reason}"
             );
         }
+    }
+
+    // ── parse_duration_to_minutes tests ────────────────────────────────
+
+    #[test]
+    fn parse_duration_minutes_only() {
+        assert_eq!(parse_duration_to_minutes("~45m"), Some(45));
+    }
+
+    #[test]
+    fn parse_duration_hours_minutes() {
+        assert_eq!(parse_duration_to_minutes("~2h30m"), Some(150));
+    }
+
+    #[test]
+    fn parse_duration_days() {
+        assert_eq!(parse_duration_to_minutes("~3d"), Some(4320));
+    }
+
+    #[test]
+    fn parse_duration_embedded_in_reason() {
+        assert_eq!(
+            parse_duration_to_minutes("interval not elapsed (next in ~14h6m)"),
+            Some(846)
+        );
+        assert_eq!(
+            parse_duration_to_minutes("send to WD-18TB not due (next in ~2h30m)"),
+            Some(150)
+        );
+    }
+
+    #[test]
+    fn parse_duration_no_duration() {
+        assert_eq!(parse_duration_to_minutes("disabled"), None);
+    }
+
+    /// Cross-unit comparison: ensures days > hours even though "9d" is shorter
+    /// than "2h30m" as a string. This caught a real bug in the simplify pass.
+    #[test]
+    fn parse_duration_cross_unit_comparison() {
+        let days = parse_duration_to_minutes("~9d").unwrap();
+        let hours = parse_duration_to_minutes("~2h30m").unwrap();
+        assert!(days > hours, "9d ({days}m) should be > 2h30m ({hours}m)");
     }
 }
