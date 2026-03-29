@@ -1,4 +1,4 @@
-use crate::awareness;
+use crate::awareness::{self, ChainBreakReason, ChainStatus};
 use crate::chain;
 use crate::config::Config;
 use crate::drives;
@@ -6,7 +6,7 @@ use crate::output::{
     ChainHealth, ChainHealthEntry, DriveInfo, LastRunInfo, OutputMode, StatusAssessment,
     StatusOutput,
 };
-use crate::plan::{FileSystemState, RealFileSystemState};
+use crate::plan::RealFileSystemState;
 use crate::state::StateDb;
 use crate::voice;
 
@@ -25,45 +25,30 @@ pub fn run(config: Config, output_mode: OutputMode) -> anyhow::Result<()> {
     let now = chrono::Local::now().naive_local();
     let assessments = awareness::assess(&config, now, &fs_state);
 
-    // ── Chain health per subvolume ───────────────────────────────────
-    let mounted_drives: Vec<_> = config
-        .drives
+    // ── Chain health per subvolume (derived from awareness assessment) ──
+    let chain_health_entries: Vec<ChainHealthEntry> = assessments
         .iter()
-        .filter(|d| drives::is_drive_mounted(d))
-        .collect();
-
-    let resolved = config.resolved_subvolumes();
-    let mut chain_health_entries: Vec<ChainHealthEntry> = Vec::new();
-    for sv in &resolved {
-        if !sv.enabled {
-            continue;
-        }
-        let Some(root) = config.snapshot_root_for(&sv.name) else {
-            continue;
-        };
-        let local_dir = root.join(&sv.name);
-
-        let mut worst_health: Option<ChainHealth> = None;
-        for drive in &mounted_drives {
-            let ext_count = fs_state
-                .external_snapshots(drive, &sv.name)
-                .map(|s| s.len())
-                .unwrap_or(0);
-            let ext_dir = drives::external_snapshot_dir(drive, &sv.name);
-            let health = compute_chain_health(&local_dir, &drive.label, ext_count, &ext_dir);
-            worst_health = Some(match worst_health {
-                Some(current) => current.min(health),
-                None => health,
-            });
-        }
-
-        if let Some(health) = worst_health {
-            chain_health_entries.push(ChainHealthEntry {
-                subvolume: sv.name.clone(),
+        .filter(|a| !a.chain_health.is_empty())
+        .filter_map(|a| {
+            let worst = a
+                .chain_health
+                .iter()
+                .map(|ch| match &ch.status {
+                    ChainStatus::Intact { pin_parent } => {
+                        ChainHealth::Incremental(pin_parent.clone())
+                    }
+                    ChainStatus::Broken { reason, .. } => match reason {
+                        ChainBreakReason::NoDriveData => ChainHealth::NoDriveData,
+                        other => ChainHealth::Full(other.to_string()),
+                    },
+                })
+                .min();
+            worst.map(|health| ChainHealthEntry {
+                subvolume: a.name.clone(),
                 health,
-            });
-        }
-    }
+            })
+        })
+        .collect();
 
     // ── Drive info ──────────────────────────────────────────────────
     let drive_infos: Vec<DriveInfo> = config
@@ -118,12 +103,13 @@ pub fn run(config: Config, output_mode: OutputMode) -> anyhow::Result<()> {
 
     // ── Assemble and render ─────────────────────────────────────────
     // Thread protection_level from resolved config into status assessments
+    let resolved = config.resolved_subvolumes();
     let assessments_with_promises: Vec<StatusAssessment> = assessments
         .iter()
         .map(|a| {
             let mut sa = StatusAssessment::from_assessment(a);
             if let Some(sv) = resolved.iter().find(|sv| sv.name == a.name) {
-                sa.promise_level = sv.protection_level.map(|l| l.to_string());
+                sa.promise_level = sv.protection_level.map(|pl| pl.to_string());
             }
             sa
         })
@@ -143,32 +129,3 @@ pub fn run(config: Config, output_mode: OutputMode) -> anyhow::Result<()> {
     Ok(())
 }
 
-// ── Chain health computation (filesystem I/O) ───────────────────────────
-
-fn compute_chain_health(
-    local_dir: &std::path::Path,
-    drive_label: &str,
-    ext_count: usize,
-    ext_dir: &std::path::Path,
-) -> ChainHealth {
-    if ext_count == 0 {
-        return ChainHealth::NoDriveData;
-    }
-
-    match chain::read_pin_file(local_dir, drive_label) {
-        Ok(Some(result)) => {
-            let pin = &result.name;
-            let local_exists = local_dir.join(pin.as_str()).exists();
-            if !local_exists {
-                return ChainHealth::Full("pin missing locally".to_string());
-            }
-            let ext_exists = ext_dir.join(pin.as_str()).exists();
-            if !ext_exists {
-                return ChainHealth::Full("pin missing on drive".to_string());
-            }
-            ChainHealth::Incremental(pin.to_string())
-        }
-        Ok(None) => ChainHealth::Full("no pin".to_string()),
-        Err(_) => ChainHealth::Full("pin error".to_string()),
-    }
-}

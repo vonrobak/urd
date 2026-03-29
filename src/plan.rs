@@ -197,6 +197,20 @@ pub fn plan(
                         ));
                         continue;
                     }
+                    DriveAvailability::TokenMismatch { expected, found } => {
+                        skipped.push((
+                            subvol.name.clone(),
+                            format!(
+                                "drive {} token mismatch (expected {}, found {}) — possible drive swap",
+                                drive.label, expected, found
+                            ),
+                        ));
+                        continue;
+                    }
+                    DriveAvailability::TokenMissing => {
+                        // Benign: first use or pre-token drive. Proceed with send.
+                        // Token will be written by executor on successful send.
+                    }
                 }
 
                 plan_external_send(
@@ -746,6 +760,8 @@ pub struct MockFileSystemState {
     pub send_times: std::collections::HashMap<(String, String), NaiveDateTime>,
     /// Subvolume names for which local_snapshots() should return an error.
     pub fail_local_snapshots: HashSet<String>,
+    /// (local_dir, drive_label) pairs for which read_pin_file() should return an error.
+    pub fail_pin_reads: HashSet<(PathBuf, String)>,
 }
 
 #[cfg(test)]
@@ -762,6 +778,7 @@ impl MockFileSystemState {
             calibrated_sizes: std::collections::HashMap::new(),
             send_times: std::collections::HashMap::new(),
             fail_local_snapshots: HashSet::new(),
+            fail_pin_reads: HashSet::new(),
         }
     }
 }
@@ -823,10 +840,17 @@ impl FileSystemState for MockFileSystemState {
         local_dir: &Path,
         drive_label: &str,
     ) -> crate::error::Result<Option<SnapshotName>> {
-        Ok(self
-            .pin_files
-            .get(&(local_dir.to_path_buf(), drive_label.to_string()))
-            .cloned())
+        let key = (local_dir.to_path_buf(), drive_label.to_string());
+        if self.fail_pin_reads.contains(&key) {
+            return Err(crate::error::UrdError::Io {
+                path: local_dir.to_path_buf(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "permission denied",
+                ),
+            });
+        }
+        Ok(self.pin_files.get(&key).cloned())
     }
 
     fn pinned_snapshots(&self, local_dir: &Path, drive_labels: &[String]) -> HashSet<SnapshotName> {
@@ -1726,6 +1750,73 @@ send_enabled = false
         assert!(
             !sends.is_empty(),
             "Backward compat: mounted_drives should still trigger sends"
+        );
+    }
+
+    // ── Drive token tests ────────────────────────────────────────────
+
+    #[test]
+    fn token_mismatch_skips_send() {
+        let config = test_config();
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap("20260322-1300-one")]);
+        fs.drive_availability_overrides.insert(
+            "D1".to_string(),
+            DriveAvailability::TokenMismatch {
+                expected: "stored-tok".to_string(),
+                found: "drive-tok".to_string(),
+            },
+        );
+
+        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        assert!(
+            result
+                .skipped
+                .iter()
+                .any(|(_, reason)| reason.contains("token mismatch")),
+            "Token mismatch should produce a skip reason: {:?}",
+            result.skipped
+        );
+        let sends: Vec<_> = result
+            .operations
+            .iter()
+            .filter(|op| {
+                matches!(
+                    op,
+                    PlannedOperation::SendFull { .. } | PlannedOperation::SendIncremental { .. }
+                )
+            })
+            .collect();
+        assert!(
+            sends.is_empty(),
+            "No sends should be planned on token mismatch"
+        );
+    }
+
+    #[test]
+    fn token_missing_allows_send() {
+        let config = test_config();
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap("20260322-1300-one")]);
+        fs.drive_availability_overrides
+            .insert("D1".to_string(), DriveAvailability::TokenMissing);
+
+        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let sends: Vec<_> = result
+            .operations
+            .iter()
+            .filter(|op| {
+                matches!(
+                    op,
+                    PlannedOperation::SendFull { .. } | PlannedOperation::SendIncremental { .. }
+                )
+            })
+            .collect();
+        assert!(
+            !sends.is_empty(),
+            "Sends should proceed when token is missing (backward compat)"
         );
     }
 

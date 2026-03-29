@@ -1,17 +1,19 @@
-// Awareness model — pure function that computes promise states per subvolume.
+// Awareness model — pure function that computes promise states and backup health
+// per subvolume.
 //
 // Given config + filesystem state + history, determines whether each subvolume
-// is PROTECTED, AT_RISK, or UNPROTECTED. This is the foundation for status
-// output, heartbeat, and (eventually) the Sentinel.
+// is PROTECTED, AT_RISK, or UNPROTECTED, and reports chain health per drive.
+// This is the single facade for "is my data safe?" — consumed by the status
+// command, heartbeat, sentinel, and (future) visual feedback model.
 //
 // Design: follows the planner pattern — pure function, no I/O, all external
 // data flows through the `FileSystemState` trait.
 
 use chrono::{Duration, NaiveDateTime};
 
-use crate::config::Config;
+use crate::config::{Config, DriveConfig};
 use crate::plan::FileSystemState;
-use crate::types::Interval;
+use crate::types::{Interval, SnapshotName};
 
 // ── Thresholds ─────────────────────────────────────────────────────────
 
@@ -55,10 +57,63 @@ pub struct SubvolAssessment {
     pub status: PromiseStatus,
     pub local: LocalAssessment,
     pub external: Vec<DriveAssessment>,
+    /// Chain health per mounted, send-enabled drive.
+    /// Empty for subvolumes with send_enabled=false or no mounted drives.
+    pub chain_health: Vec<DriveChainHealth>,
     /// Non-critical information for the presentation layer (e.g., offsite cycling reminders).
     pub advisories: Vec<String>,
     /// Per-subvolume assessment failures (e.g., can't read snapshot directory).
     pub errors: Vec<String>,
+}
+
+/// Chain health for a single subvolume/drive pair.
+///
+/// Richer than `output::ChainHealth` — carries data needed by the sentinel
+/// for simultaneous chain-break detection (HSD Session B).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DriveChainHealth {
+    pub drive_label: String,
+    pub status: ChainStatus,
+}
+
+/// Whether the incremental send chain is intact or broken, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChainStatus {
+    /// Chain is intact: pin file exists, parent found locally and on drive.
+    Intact { pin_parent: String },
+    /// Chain is broken for a known reason.
+    Broken {
+        reason: ChainBreakReason,
+        /// The pin parent snapshot name, if a pin file exists.
+        pin_parent: Option<String>,
+    },
+}
+
+/// Why an incremental send chain is broken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChainBreakReason {
+    /// No snapshots exist on the drive for this subvolume.
+    NoDriveData,
+    /// No pin file exists for this drive.
+    NoPinFile,
+    /// Pin file exists but the parent snapshot is missing locally.
+    PinMissingLocally,
+    /// Pin file exists but the parent snapshot is missing on the drive.
+    PinMissingOnDrive,
+    /// Pin file could not be read.
+    PinReadError,
+}
+
+impl std::fmt::Display for ChainBreakReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoDriveData => write!(f, "no drive data"),
+            Self::NoPinFile => write!(f, "no pin"),
+            Self::PinMissingLocally => write!(f, "pin missing locally"),
+            Self::PinMissingOnDrive => write!(f, "pin missing on drive"),
+            Self::PinReadError => write!(f, "pin error"),
+        }
+    }
 }
 
 /// Local snapshot freshness assessment.
@@ -116,6 +171,7 @@ pub fn assess(
                     configured_interval: subvol.snapshot_interval,
                 },
                 external: Vec::new(),
+                chain_health: Vec::new(),
                 advisories: Vec::new(),
                 errors: vec![format!(
                     "no snapshot root configured for subvolume {:?}",
@@ -126,30 +182,30 @@ pub fn assess(
         };
 
         let mut errors = Vec::new();
+        let local_dir = snapshot_root.join(&subvol.name);
 
         // ── Local assessment ────────────────────────────────────────
         let mut advisories = Vec::new();
-        let local = match fs.local_snapshots(&snapshot_root, &subvol.name) {
-            Ok(snaps) => {
-                let (assessment, advisory) = assess_local(&snaps, now, subvol.snapshot_interval);
-                if let Some(adv) = advisory {
-                    advisories.push(adv);
-                }
-                assessment
-            }
+        let local_snaps = match fs.local_snapshots(&snapshot_root, &subvol.name) {
+            Ok(snaps) => snaps,
             Err(e) => {
                 errors.push(format!("failed to read local snapshots: {e}"));
-                LocalAssessment {
-                    status: PromiseStatus::Unprotected,
-                    snapshot_count: 0,
-                    newest_age: None,
-                    configured_interval: subvol.snapshot_interval,
-                }
+                Vec::new()
             }
         };
 
-        // ── External assessment ─────────────────────────────────────
+        let local = {
+            let (assessment, advisory) =
+                assess_local(&local_snaps, now, subvol.snapshot_interval);
+            if let Some(adv) = advisory {
+                advisories.push(adv);
+            }
+            assessment
+        };
+
+        // ── External assessment + chain health ─────────────────────
         let mut drive_assessments = Vec::new();
+        let mut chain_health_entries = Vec::new();
 
         if subvol.send_enabled {
             if config.drives.is_empty() {
@@ -159,9 +215,9 @@ pub fn assess(
             for drive in &config.drives {
                 let mounted = fs.is_drive_mounted(drive);
 
-                let snap_count = if mounted {
+                let ext_snaps = if mounted {
                     match fs.external_snapshots(drive, &subvol.name) {
-                        Ok(snaps) => Some(snaps.len()),
+                        Ok(snaps) => Some(snaps),
                         Err(e) => {
                             errors.push(format!(
                                 "failed to read external snapshots on {}: {e}",
@@ -173,6 +229,18 @@ pub fn assess(
                 } else {
                     None
                 };
+
+                let snap_count = ext_snaps.as_ref().map(|s| s.len());
+
+                if let Some(ref ext) = ext_snaps {
+                    chain_health_entries.push(assess_chain_health(
+                        fs,
+                        &local_dir,
+                        drive,
+                        &local_snaps,
+                        ext,
+                    ));
+                }
 
                 let last_send_time = fs.last_successful_send_time(&subvol.name, &drive.label);
                 // Clamp negative ages to zero (clock skew protection, same as local)
@@ -217,6 +285,7 @@ pub fn assess(
             status: overall,
             local,
             external: drive_assessments,
+            chain_health: chain_health_entries,
             advisories,
             errors,
         });
@@ -329,6 +398,61 @@ fn compute_overall_status(local: &LocalAssessment, drives: &[DriveAssessment]) -
         .unwrap_or(PromiseStatus::Unprotected);
 
     local.status.min(best_external)
+}
+
+/// Compute chain health for a subvolume on a specific drive.
+///
+/// Pure function: uses already-fetched snapshot lists and `FileSystemState`
+/// for pin file reads. No direct filesystem I/O.
+fn assess_chain_health(
+    fs: &dyn FileSystemState,
+    local_dir: &std::path::Path,
+    drive: &DriveConfig,
+    local_snaps: &[SnapshotName],
+    ext_snaps: &[SnapshotName],
+) -> DriveChainHealth {
+    let status = if ext_snaps.is_empty() {
+        ChainStatus::Broken {
+            reason: ChainBreakReason::NoDriveData,
+            pin_parent: None,
+        }
+    } else {
+        match fs.read_pin_file(local_dir, &drive.label) {
+            Ok(Some(pin)) => {
+                let pin_str = pin.as_str();
+                let parent_local = local_snaps.iter().any(|s| s.as_str() == pin_str);
+                let parent_ext = ext_snaps.iter().any(|s| s.as_str() == pin_str);
+                let pin_name = pin_str.to_string();
+
+                if parent_local && parent_ext {
+                    ChainStatus::Intact { pin_parent: pin_name }
+                } else {
+                    let reason = if !parent_local {
+                        ChainBreakReason::PinMissingLocally
+                    } else {
+                        ChainBreakReason::PinMissingOnDrive
+                    };
+                    ChainStatus::Broken {
+                        reason,
+                        pin_parent: Some(pin_name),
+                    }
+                }
+            }
+            Ok(None) => ChainStatus::Broken {
+                reason: ChainBreakReason::NoPinFile,
+                pin_parent: None,
+            },
+            Err(_) => ChainStatus::Broken {
+                reason: ChainBreakReason::PinReadError,
+                pin_parent: None,
+            },
+        }
+    };
+
+    DriveChainHealth {
+        drive_label: drive.label.clone(),
+        status,
+    }
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────
@@ -1136,5 +1260,295 @@ source = "/data/sv1"
         let sv2 = results.iter().find(|r| r.name == "sv2").unwrap();
         assert!(sv2.errors.is_empty());
         assert_eq!(sv2.status, PromiseStatus::Protected);
+    }
+
+    // ── Chain health tests ──────────────────────────────────────────��─
+
+    fn parse_snap(s: &str) -> SnapshotName {
+        SnapshotName::parse(s).unwrap()
+    }
+
+    fn chain_health_config() -> Config {
+        let toml_str = r#"
+[general]
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp"
+
+[local_snapshots]
+roots = [
+  { path = "/snap", subvolumes = ["sv1"] }
+]
+
+[defaults]
+snapshot_interval = "1h"
+send_interval = "1d"
+send_enabled = true
+enabled = true
+[defaults.local_retention]
+hourly = 24
+[defaults.external_retention]
+daily = 30
+
+[[drives]]
+label = "D1"
+mount_path = "/mnt/d1"
+snapshot_root = ".snapshots"
+role = "primary"
+
+[[subvolumes]]
+name = "sv1"
+short_name = "s1"
+source = "/data/sv1"
+"#;
+        toml::from_str(toml_str).expect("test config should parse")
+    }
+
+    #[test]
+    fn chain_health_incremental_when_pin_and_parent_present() {
+        let config = chain_health_config();
+        let now = dt(2026, 3, 29, 12, 0);
+        let mut fs = MockFileSystemState::new();
+
+        let local = vec![parse_snap("20260329-1100-s1"), parse_snap("20260329-1000-s1")];
+        let ext = vec![parse_snap("20260329-1000-s1")];
+        fs.local_snapshots.insert("sv1".to_string(), local);
+        fs.external_snapshots
+            .insert(("D1".to_string(), "sv1".to_string()), ext);
+        fs.mounted_drives.insert("D1".to_string());
+        // Pin points to the snapshot that exists both locally and on drive
+        fs.pin_files.insert(
+            (std::path::PathBuf::from("/snap/sv1"), "D1".to_string()),
+            parse_snap("20260329-1000-s1"),
+        );
+        fs.send_times.insert(
+            ("sv1".to_string(), "D1".to_string()),
+            dt(2026, 3, 29, 10, 0),
+        );
+
+        let results = assess(&config, now, &fs);
+        let sv = &results[0];
+        assert_eq!(sv.chain_health.len(), 1);
+        assert_eq!(
+            sv.chain_health[0].status,
+            ChainStatus::Intact {
+                pin_parent: "20260329-1000-s1".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn chain_health_broken_when_pin_parent_missing_on_drive() {
+        let config = chain_health_config();
+        let now = dt(2026, 3, 29, 12, 0);
+        let mut fs = MockFileSystemState::new();
+
+        let local = vec![parse_snap("20260329-1100-s1"), parse_snap("20260329-1000-s1")];
+        // Drive has a different snapshot, not the pinned one
+        let ext = vec![parse_snap("20260328-1000-s1")];
+        fs.local_snapshots.insert("sv1".to_string(), local);
+        fs.external_snapshots
+            .insert(("D1".to_string(), "sv1".to_string()), ext);
+        fs.mounted_drives.insert("D1".to_string());
+        fs.pin_files.insert(
+            (std::path::PathBuf::from("/snap/sv1"), "D1".to_string()),
+            parse_snap("20260329-1000-s1"),
+        );
+        fs.send_times.insert(
+            ("sv1".to_string(), "D1".to_string()),
+            dt(2026, 3, 28, 10, 0),
+        );
+
+        let results = assess(&config, now, &fs);
+        let ch = &results[0].chain_health[0];
+        assert!(matches!(
+            ch.status,
+            ChainStatus::Broken {
+                reason: ChainBreakReason::PinMissingOnDrive,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn chain_health_broken_when_pin_parent_missing_locally() {
+        let config = chain_health_config();
+        let now = dt(2026, 3, 29, 12, 0);
+        let mut fs = MockFileSystemState::new();
+
+        // Only the new snapshot locally; the pinned parent was deleted
+        let local = vec![parse_snap("20260329-1100-s1")];
+        let ext = vec![parse_snap("20260329-1000-s1")];
+        fs.local_snapshots.insert("sv1".to_string(), local);
+        fs.external_snapshots
+            .insert(("D1".to_string(), "sv1".to_string()), ext);
+        fs.mounted_drives.insert("D1".to_string());
+        fs.pin_files.insert(
+            (std::path::PathBuf::from("/snap/sv1"), "D1".to_string()),
+            parse_snap("20260329-1000-s1"),
+        );
+        fs.send_times.insert(
+            ("sv1".to_string(), "D1".to_string()),
+            dt(2026, 3, 29, 10, 0),
+        );
+
+        let results = assess(&config, now, &fs);
+        let ch = &results[0].chain_health[0];
+        assert!(matches!(
+            ch.status,
+            ChainStatus::Broken {
+                reason: ChainBreakReason::PinMissingLocally,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn chain_health_no_pin_file() {
+        let config = chain_health_config();
+        let now = dt(2026, 3, 29, 12, 0);
+        let mut fs = MockFileSystemState::new();
+
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![parse_snap("20260329-1100-s1")]);
+        fs.external_snapshots.insert(
+            ("D1".to_string(), "sv1".to_string()),
+            vec![parse_snap("20260329-1000-s1")],
+        );
+        fs.mounted_drives.insert("D1".to_string());
+        // No pin file set
+        fs.send_times.insert(
+            ("sv1".to_string(), "D1".to_string()),
+            dt(2026, 3, 29, 10, 0),
+        );
+
+        let results = assess(&config, now, &fs);
+        let ch = &results[0].chain_health[0];
+        assert_eq!(
+            ch.status,
+            ChainStatus::Broken {
+                reason: ChainBreakReason::NoPinFile,
+                pin_parent: None,
+            }
+        );
+    }
+
+    #[test]
+    fn chain_health_no_drive_data() {
+        let config = chain_health_config();
+        let now = dt(2026, 3, 29, 12, 0);
+        let mut fs = MockFileSystemState::new();
+
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![parse_snap("20260329-1100-s1")]);
+        // Drive mounted but no external snapshots
+        fs.external_snapshots
+            .insert(("D1".to_string(), "sv1".to_string()), vec![]);
+        fs.mounted_drives.insert("D1".to_string());
+
+        let results = assess(&config, now, &fs);
+        let ch = &results[0].chain_health[0];
+        assert!(matches!(
+            ch.status,
+            ChainStatus::Broken {
+                reason: ChainBreakReason::NoDriveData,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn chain_health_empty_for_unmounted_drive() {
+        let config = chain_health_config();
+        let now = dt(2026, 3, 29, 12, 0);
+        let mut fs = MockFileSystemState::new();
+
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![parse_snap("20260329-1100-s1")]);
+        // Drive NOT mounted — no chain health entries
+
+        let results = assess(&config, now, &fs);
+        assert!(
+            results[0].chain_health.is_empty(),
+            "unmounted drives should not produce chain health entries"
+        );
+    }
+
+    #[test]
+    fn chain_health_empty_when_send_disabled() {
+        let toml_str = r#"
+[general]
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp"
+
+[local_snapshots]
+roots = [
+  { path = "/snap", subvolumes = ["sv1"] }
+]
+
+[defaults]
+snapshot_interval = "1h"
+send_interval = "1d"
+send_enabled = false
+enabled = true
+[defaults.local_retention]
+hourly = 24
+[defaults.external_retention]
+daily = 30
+
+[[drives]]
+label = "D1"
+mount_path = "/mnt/d1"
+snapshot_root = ".snapshots"
+role = "primary"
+
+[[subvolumes]]
+name = "sv1"
+short_name = "s1"
+source = "/data/sv1"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let now = dt(2026, 3, 29, 12, 0);
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![parse_snap("20260329-1100-s1")]);
+        fs.mounted_drives.insert("D1".to_string());
+
+        let results = assess(&config, now, &fs);
+        assert!(
+            results[0].chain_health.is_empty(),
+            "send_disabled subvolumes should have no chain health"
+        );
+    }
+
+    #[test]
+    fn chain_health_pin_read_error() {
+        let config = chain_health_config();
+        let now = dt(2026, 3, 29, 12, 0);
+        let mut fs = MockFileSystemState::new();
+
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![parse_snap("20260329-1100-s1")]);
+        fs.external_snapshots.insert(
+            ("D1".to_string(), "sv1".to_string()),
+            vec![parse_snap("20260329-1000-s1")],
+        );
+        fs.mounted_drives.insert("D1".to_string());
+        // Pin file read fails
+        fs.fail_pin_reads.insert((
+            std::path::PathBuf::from("/snap/sv1"),
+            "D1".to_string(),
+        ));
+
+        let results = assess(&config, now, &fs);
+        let ch = &results[0].chain_health[0];
+        assert_eq!(
+            ch.status,
+            ChainStatus::Broken {
+                reason: ChainBreakReason::PinReadError,
+                pin_parent: None,
+            }
+        );
     }
 }

@@ -6,6 +6,7 @@ use std::time::Instant;
 use crate::btrfs::BtrfsOps;
 use crate::chain;
 use crate::config::Config;
+use crate::drives;
 use crate::error::BtrfsOperation;
 use crate::state::{OperationRecord, StateDb};
 use crate::types::{BackupPlan, PlannedOperation};
@@ -446,6 +447,10 @@ impl<'a> Executor<'a> {
                     pin_failed = true;
                 }
 
+                // Token-on-success: write drive session token if not already present.
+                // Same pattern as pin-on-success: failure is logged, not fatal.
+                self.maybe_write_drive_token(drive_label);
+
                 (
                     OperationOutcome {
                         operation: op_name.to_string(),
@@ -682,6 +687,46 @@ impl<'a> Executor<'a> {
                 log::warn!("Failed to record operation to SQLite: {e}");
             }
         }
+    }
+
+    /// Write a drive session token if one does not already exist on the drive.
+    /// Called after a successful send. Failures are logged but not fatal.
+    fn maybe_write_drive_token(&self, drive_label: &str) {
+        let Some(drive) = self.config.drives.iter().find(|d| d.label == drive_label) else {
+            return;
+        };
+
+        // Check if token already exists on drive
+        match drives::read_drive_token(drive) {
+            Ok(Some(_)) => return, // Token already present, nothing to do
+            Ok(None) => {}         // No token — write one
+            Err(e) => {
+                log::warn!("Failed to read drive token for {drive_label}: {e}");
+                return;
+            }
+        }
+
+        let token = drives::generate_drive_token();
+        let now = chrono::Local::now()
+            .format("%Y-%m-%dT%H:%M:%S")
+            .to_string();
+
+        if let Err(e) = drives::write_drive_token(drive, &token) {
+            log::warn!("Failed to write drive token for {drive_label}: {e}");
+            return;
+        }
+
+        // Store in SQLite (if available)
+        if let Some(state) = self.state
+            && let Err(e) = state.store_drive_token(drive_label, &token, &now)
+        {
+            log::warn!(
+                "Token written to drive but failed to store in SQLite for {drive_label}: {e}"
+            );
+            // Not fatal: next verification will self-heal by reading from drive
+        }
+
+        log::info!("Drive session token written for {drive_label}");
     }
 }
 
@@ -1527,5 +1572,105 @@ source = "/data/b"
         // In production, btrfs receive would fail with "No such file or directory"
         assert_eq!(result.overall, RunResult::Success);
         assert!(!PathBuf::from("/nonexistent/drive/.snapshots/sv-a").exists());
+    }
+
+    // ── Drive token tests ─────────────────────────────────────────────
+
+    fn tempdir_config(dir: &std::path::Path) -> Config {
+        let snap_root = "snapshots";
+        std::fs::create_dir_all(dir.join(snap_root)).unwrap();
+        let config_str = format!(
+            r#"
+[general]
+state_db = "/tmp/urd-test/urd.db"
+metrics_file = "/tmp/urd-test/backup.prom"
+log_dir = "/tmp/urd-test"
+
+[local_snapshots]
+roots = [
+  {{ path = "/snap", subvolumes = ["sv1"] }}
+]
+
+[defaults]
+snapshot_interval = "1h"
+send_interval = "4h"
+[defaults.local_retention]
+hourly = 24
+[defaults.external_retention]
+daily = 30
+
+[[drives]]
+label = "TEMP-DRIVE"
+mount_path = "{}"
+snapshot_root = "{}"
+role = "test"
+
+[[subvolumes]]
+name = "sv1"
+short_name = "s1"
+source = "/data/sv1"
+"#,
+            dir.display(),
+            snap_root,
+        );
+        toml::from_str(&config_str).expect("tempdir config should parse")
+    }
+
+    #[test]
+    fn maybe_write_drive_token_writes_on_first_send() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = tempdir_config(tmp.path());
+        let db = crate::state::StateDb::open_memory().unwrap();
+        let mock_btrfs = MockBtrfs::new();
+        let shutdown = no_shutdown();
+        let executor = Executor::new(&mock_btrfs, Some(&db), &config, &shutdown);
+
+        // No token exists on drive
+        let drive = &config.drives[0];
+        assert!(drives::read_drive_token(drive).unwrap().is_none());
+
+        executor.maybe_write_drive_token("TEMP-DRIVE");
+
+        // Token should now exist on drive and in SQLite
+        let drive_token = drives::read_drive_token(drive).unwrap();
+        assert!(drive_token.is_some(), "token should be written to drive");
+
+        let stored_token = db.get_drive_token("TEMP-DRIVE").unwrap();
+        assert_eq!(stored_token, drive_token, "SQLite should match drive token");
+    }
+
+    #[test]
+    fn maybe_write_drive_token_skips_if_exists() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = tempdir_config(tmp.path());
+        let db = crate::state::StateDb::open_memory().unwrap();
+        let mock_btrfs = MockBtrfs::new();
+        let shutdown = no_shutdown();
+        let executor = Executor::new(&mock_btrfs, Some(&db), &config, &shutdown);
+
+        // Pre-write a token
+        let drive = &config.drives[0];
+        drives::write_drive_token(drive, "existing-token").unwrap();
+
+        executor.maybe_write_drive_token("TEMP-DRIVE");
+
+        // Token should still be the original one
+        let token = drives::read_drive_token(drive).unwrap().unwrap();
+        assert_eq!(token, "existing-token", "should not overwrite existing token");
+        // SQLite should NOT have the token (since we didn't store it)
+        assert!(db.get_drive_token("TEMP-DRIVE").unwrap().is_none());
+    }
+
+    #[test]
+    fn maybe_write_drive_token_handles_unknown_drive() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = tempdir_config(tmp.path());
+        let db = crate::state::StateDb::open_memory().unwrap();
+        let mock_btrfs = MockBtrfs::new();
+        let shutdown = no_shutdown();
+        let executor = Executor::new(&mock_btrfs, Some(&db), &config, &shutdown);
+
+        // Should not panic for unknown drive label
+        executor.maybe_write_drive_token("NONEXISTENT-DRIVE");
     }
 }
