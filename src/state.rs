@@ -32,6 +32,50 @@ pub struct RunRecord {
     pub result: String,
 }
 
+/// Whether a drive was mounted or unmounted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriveEventType {
+    Mounted,
+    Unmounted,
+}
+
+impl DriveEventType {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Mounted => "mounted",
+            Self::Unmounted => "unmounted",
+        }
+    }
+}
+
+/// What detected the drive event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Backup variant wired when backup records drive events
+pub enum DriveEventSource {
+    Sentinel,
+    Backup,
+}
+
+impl DriveEventSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Sentinel => "sentinel",
+            Self::Backup => "backup",
+        }
+    }
+}
+
+/// A drive connection event returned from database queries.
+#[derive(Debug)]
+#[allow(dead_code)]
+pub struct DriveConnectionRecord {
+    pub id: i64,
+    pub drive_label: String,
+    pub event_type: String,
+    pub timestamp: String,
+    pub detected_by: String,
+}
+
 /// An operation record returned from database queries.
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -117,6 +161,14 @@ impl StateDb {
                     token TEXT NOT NULL,
                     first_seen TEXT NOT NULL,
                     last_verified TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS drive_connections (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    drive_label TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    detected_by TEXT NOT NULL
                 );",
             )
             .map_err(|e| UrdError::State(format!("failed to create schema: {e}")))?;
@@ -492,6 +544,81 @@ impl StateDb {
             Some(Err(e)) => Err(UrdError::State(format!("failed to read send size: {e}"))),
             None => Ok(None),
         }
+    }
+
+    // ── Drive connection methods ─────────────────────────────────────
+
+    /// Record a drive mount or unmount event.
+    pub fn record_drive_event(
+        &self,
+        drive_label: &str,
+        event_type: DriveEventType,
+        detected_by: DriveEventSource,
+    ) -> crate::error::Result<()> {
+        let now = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+        self.conn
+            .execute(
+                "INSERT INTO drive_connections (drive_label, event_type, timestamp, detected_by)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![drive_label, event_type.as_str(), now, detected_by.as_str()],
+            )
+            .map_err(|e| UrdError::State(format!("failed to record drive event: {e}")))?;
+        Ok(())
+    }
+
+    /// Get the most recent connection event for a drive, if any.
+    #[allow(dead_code)] // consumed by urd sentinel status (future) and tests
+    pub fn last_drive_connection(
+        &self,
+        drive_label: &str,
+    ) -> crate::error::Result<Option<DriveConnectionRecord>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, drive_label, event_type, timestamp, detected_by
+                 FROM drive_connections WHERE drive_label = ?1
+                 ORDER BY id DESC LIMIT 1",
+            )
+            .map_err(|e| UrdError::State(format!("query failed: {e}")))?;
+
+        let mut rows = stmt
+            .query_map(rusqlite::params![drive_label], |row| {
+                Ok(DriveConnectionRecord {
+                    id: row.get(0)?,
+                    drive_label: row.get(1)?,
+                    event_type: row.get(2)?,
+                    timestamp: row.get(3)?,
+                    detected_by: row.get(4)?,
+                })
+            })
+            .map_err(|e| UrdError::State(format!("query failed: {e}")))?;
+
+        match rows.next() {
+            Some(Ok(record)) => Ok(Some(record)),
+            Some(Err(e)) => Err(UrdError::State(format!(
+                "failed to read drive connection: {e}"
+            ))),
+            None => Ok(None),
+        }
+    }
+
+    /// Count drive connection events for a drive since a given ISO 8601 timestamp.
+    #[allow(dead_code)] // consumed by urd sentinel status (future) and tests
+    pub fn drive_connection_count(
+        &self,
+        drive_label: &str,
+        since: &str,
+    ) -> crate::error::Result<u64> {
+        let count: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM drive_connections
+                 WHERE drive_label = ?1 AND timestamp >= ?2",
+                rusqlite::params![drive_label, since],
+                |row| row.get(0),
+            )
+            .map_err(|e| UrdError::State(format!("query failed: {e}")))?;
+        Ok(count as u64)
     }
 
     fn map_operation_row(row: &rusqlite::Row) -> rusqlite::Result<OperationRow> {
@@ -1035,5 +1162,70 @@ mod tests {
             )
             .unwrap();
         assert_eq!(last_verified, "2026-03-29T12:00:00");
+    }
+
+    // ── Drive connection tests ──────────────────────────────────────
+
+    #[test]
+    fn record_drive_mount_event() {
+        let db = StateDb::open_memory().unwrap();
+        db.record_drive_event("WD-18TB", DriveEventType::Mounted, DriveEventSource::Sentinel)
+            .unwrap();
+
+        let record = db.last_drive_connection("WD-18TB").unwrap().unwrap();
+        assert_eq!(record.drive_label, "WD-18TB");
+        assert_eq!(record.event_type, "mounted");
+        assert_eq!(record.detected_by, "sentinel");
+        assert!(!record.timestamp.is_empty());
+    }
+
+    #[test]
+    fn record_drive_unmount_event() {
+        let db = StateDb::open_memory().unwrap();
+        db.record_drive_event("WD-18TB1", DriveEventType::Unmounted, DriveEventSource::Sentinel)
+            .unwrap();
+
+        let record = db.last_drive_connection("WD-18TB1").unwrap().unwrap();
+        assert_eq!(record.event_type, "unmounted");
+    }
+
+    #[test]
+    fn last_drive_connection_returns_most_recent() {
+        let db = StateDb::open_memory().unwrap();
+        db.record_drive_event("WD-18TB", DriveEventType::Mounted, DriveEventSource::Sentinel)
+            .unwrap();
+        db.record_drive_event("WD-18TB", DriveEventType::Unmounted, DriveEventSource::Sentinel)
+            .unwrap();
+
+        let record = db.last_drive_connection("WD-18TB").unwrap().unwrap();
+        assert_eq!(record.event_type, "unmounted");
+    }
+
+    #[test]
+    fn last_drive_connection_none_for_unknown() {
+        let db = StateDb::open_memory().unwrap();
+        assert!(db.last_drive_connection("nonexistent").unwrap().is_none());
+    }
+
+    #[test]
+    fn drive_connection_count() {
+        let db = StateDb::open_memory().unwrap();
+        db.record_drive_event("WD-18TB", DriveEventType::Mounted, DriveEventSource::Sentinel)
+            .unwrap();
+        db.record_drive_event("WD-18TB", DriveEventType::Unmounted, DriveEventSource::Sentinel)
+            .unwrap();
+        db.record_drive_event("WD-18TB", DriveEventType::Mounted, DriveEventSource::Backup)
+            .unwrap();
+
+        let count = db
+            .drive_connection_count("WD-18TB", "2000-01-01T00:00:00")
+            .unwrap();
+        assert_eq!(count, 3);
+
+        // Different drive has zero events.
+        let count = db
+            .drive_connection_count("other", "2000-01-01T00:00:00")
+            .unwrap();
+        assert_eq!(count, 0);
     }
 }

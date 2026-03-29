@@ -535,15 +535,6 @@ pub enum SentinelStatusOutput {
     },
 }
 
-impl SentinelStateFile {
-    /// Read and parse a sentinel state file. Returns `None` if missing or corrupt.
-    #[must_use]
-    pub fn read(path: &std::path::Path) -> Option<Self> {
-        let content = std::fs::read_to_string(path).ok()?;
-        serde_json::from_str(&content).ok()
-    }
-}
-
 // ── Tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]

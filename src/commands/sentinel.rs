@@ -1,8 +1,8 @@
 // CLI handlers for `urd sentinel run` and `urd sentinel status`.
 
 use crate::config::Config;
-use crate::output::{OutputMode, SentinelStateFile, SentinelStatusOutput};
-use crate::sentinel_runner::{self, is_pid_alive, sentinel_state_path};
+use crate::output::{OutputMode, SentinelStatusOutput};
+use crate::sentinel_runner::{self, is_pid_alive, read_sentinel_state_file, sentinel_state_path};
 use crate::voice;
 
 /// Start the sentinel daemon (foreground, for systemd).
@@ -15,7 +15,7 @@ pub fn run_daemon(config: Config) -> anyhow::Result<()> {
 pub fn status(config: Config, output_mode: OutputMode) -> anyhow::Result<()> {
     let state_path = sentinel_state_path(&config);
 
-    let status_output = match SentinelStateFile::read(&state_path) {
+    let status_output = match read_sentinel_state_file(&state_path) {
         Some(state) if is_pid_alive(state.pid) => {
             let uptime = format_uptime(&state.started);
             SentinelStatusOutput::Running { state, uptime }

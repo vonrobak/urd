@@ -269,10 +269,18 @@ impl SentinelRunner {
         self.state.last_promise_states = sentinel::snapshot_promises(&assessments);
         if !self.state.has_initial_assessment {
             self.state.has_initial_assessment = true;
-            log::info!(
-                "Initial assessment complete: {} subvolumes evaluated",
-                assessments.len()
-            );
+            if self.heartbeat_path.exists() {
+                log::info!(
+                    "Initial assessment complete: {} subvolumes evaluated",
+                    assessments.len()
+                );
+            } else {
+                log::info!(
+                    "Initial assessment complete: {} subvolumes evaluated \
+                     (no heartbeat file yet — awaiting first backup)",
+                    assessments.len()
+                );
+            }
         }
 
         // Update adaptive tick.
@@ -286,10 +294,28 @@ impl SentinelRunner {
     }
 
     fn execute_log_drive_change(&self, label: &str, mounted: bool) {
-        if mounted {
-            log::info!("Drive mounted: {label}");
+        use crate::state::{DriveEventSource, DriveEventType};
+
+        let event_type = if mounted {
+            DriveEventType::Mounted
         } else {
-            log::info!("Drive unmounted: {label}");
+            DriveEventType::Unmounted
+        };
+        let verb = if mounted { "mounted" } else { "unmounted" };
+        log::info!("Drive {verb}: {label}");
+
+        // Record in SQLite. ADR-102: failure never prevents operation.
+        match StateDb::open(&self.config.general.state_db) {
+            Ok(db) => {
+                if let Err(e) =
+                    db.record_drive_event(label, event_type, DriveEventSource::Sentinel)
+                {
+                    log::warn!("Failed to record drive event: {e}");
+                }
+            }
+            Err(e) => {
+                log::warn!("Failed to open state DB for drive event: {e}");
+            }
         }
     }
 
@@ -477,6 +503,29 @@ pub fn is_pid_alive(pid: u32) -> bool {
     std::path::Path::new(&format!("/proc/{pid}")).exists()
 }
 
+/// Read and parse a sentinel state file. Returns `None` if missing or corrupt.
+///
+/// Free function rather than impl method on `SentinelStateFile` because it
+/// performs I/O, and `output.rs` (where the type lives) is a pure-types module.
+#[must_use]
+pub fn read_sentinel_state_file(path: &std::path::Path) -> Option<SentinelStateFile> {
+    let content = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+/// Check if the Sentinel daemon is currently running.
+///
+/// Reads sentinel-state.json and verifies the PID is alive.
+/// Fail-open: returns false on any I/O error (callers dispatch normally).
+#[must_use]
+pub fn sentinel_is_running(config: &Config) -> bool {
+    let state_path = sentinel_state_path(config);
+    let Some(state) = read_sentinel_state_file(&state_path) else {
+        return false;
+    };
+    is_pid_alive(state.pid)
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -539,7 +588,7 @@ mod tests {
 
     #[test]
     fn state_file_read_missing_returns_none() {
-        assert!(SentinelStateFile::read(std::path::Path::new(
+        assert!(read_sentinel_state_file(std::path::Path::new(
             "/tmp/nonexistent-sentinel-state-test.json"
         ))
         .is_none());
@@ -550,7 +599,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sentinel-state.json");
         std::fs::write(&path, "not json").unwrap();
-        assert!(SentinelStateFile::read(&path).is_none());
+        assert!(read_sentinel_state_file(&path).is_none());
     }
 
     #[test]
@@ -575,7 +624,7 @@ mod tests {
         let content = serde_json::to_string_pretty(&state).unwrap();
         std::fs::write(&path, &content).unwrap();
 
-        let read_back = SentinelStateFile::read(&path).unwrap();
+        let read_back = read_sentinel_state_file(&path).unwrap();
         assert_eq!(read_back.pid, std::process::id());
     }
 
