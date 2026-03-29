@@ -26,13 +26,17 @@ full details, design decisions, and review findings.
 1. ~~**HSD-A**~~ — drive session tokens + chain health as awareness input. **Done.**
 2. ~~**VFM-A**~~ — `OperationalHealth` enum, two-axis CLI rendering. **Done.**
 3. ~~**Sentinel Session 3**~~ — hardening + notification deduplication. **Done.** ← **completed**
-4. **HSD-B** — sentinel chain-break detection + full-send gate (Norman escalation, never auto-proceed). ← **start here**
-   - **Reference incident:** Clone drive with same UUID caused silent chain break (2026-03-29).
-     Pin parent absent on drive, full sends executed, one-behind design sent stale snapshot.
-     Journal: `docs/98-journals/2026-03-29-clone-drive-incident-analysis.md`
-5. **VFM-B** — sentinel visual state in state file + health notifications.
-6. **Transient snapshots** — `local_retention = "transient"` for NVMe space pressure.
-7. **Tray icon (Spindle)** — reads sentinel-state.json, 4 static icons.
+4. **UX-1** — plan output: structural headings (D5) + collapsed skips (D1). ← **start here**
+5. **UX-2** — plan output: estimated send sizes (D2+D3), cross-drive fallback (S1 fix).
+6. **UX-3** — progress display: rich context (P1) + ETA (P3).
+7. **HSD-B** — sentinel chain-break detection + full-send gate (Norman escalation).
+   - Reference incident: `docs/98-journals/2026-03-29-clone-drive-incident-analysis.md`
+8. **VFM-B** — sentinel visual state in state file + health notifications.
+9. **Transient snapshots** — `local_retention = "transient"` for NVMe space pressure.
+10. **Tray icon (Spindle)** — reads sentinel-state.json, 4 static icons.
+
+Designs: `docs/95-ideas/2026-03-29-design-*.md`.
+Review: `docs/99-reports/2026-03-29-progress-display-design-review.md`.
 
 **Later:** Config system migration (ADR-111), shell completions (6a).
 
@@ -54,6 +58,7 @@ full details, design decisions, and review findings.
 - `FileSystemState` trait (10 methods) outgrowing its name — consider rename to `SystemState`
 - `urd get` doesn't support directory restore (files only in v1)
 - Urd config: consolidate WD-18TB / WD-18TB1 drive entries (same UUID, mount point resolved to `/run/media/patriark/WD-18TB`)
+- Calibrated sizes use `du -sb` but btrfs send streams are ~10% larger — affects size estimates (review Open Q1)
 - Per-drive pin protection for external retention: all-drives-union is conservative but suboptimal for space
 - Stringly-typed output boundary: three independent status-ranking implementations across notify.rs and voice.rs
 - `drive_connections` table has no retention policy (negligible for years at ~1000 rows/year)
