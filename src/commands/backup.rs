@@ -615,7 +615,7 @@ fn filter_promise_retention(config: &Config, plan: &mut BackupPlan) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::awareness::{LocalAssessment, PromiseStatus, SubvolAssessment};
+    use crate::awareness::{LocalAssessment, OperationalHealth, PromiseStatus, SubvolAssessment};
     use crate::executor::{
         ExecutionResult, OpResult, OperationOutcome, RunResult, SendType, SubvolumeResult,
     };
@@ -667,6 +667,8 @@ mod tests {
         vec![SubvolAssessment {
             name: "htpc-home".to_string(),
             status: PromiseStatus::Protected,
+            health: OperationalHealth::Healthy,
+            health_reasons: vec![],
             local: LocalAssessment {
                 status: PromiseStatus::Protected,
                 snapshot_count: 10,

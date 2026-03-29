@@ -36,6 +36,9 @@ fn render_status_daemon(data: &StatusOutput) -> String {
 fn render_status_interactive(data: &StatusOutput) -> String {
     let mut out = String::new();
 
+    // ── Summary line ────────────────────────────────────────────────
+    render_summary_line(data, &mut out);
+
     // ── Per-subvolume table ──────────────────────────────────────────
     render_subvolume_table(data, &mut out);
 
@@ -62,39 +65,116 @@ fn render_status_interactive(data: &StatusOutput) -> String {
     out
 }
 
+fn render_summary_line(data: &StatusOutput, out: &mut String) {
+    if data.assessments.is_empty() {
+        return;
+    }
+
+    let total = data.assessments.len();
+    let safe_count = data
+        .assessments
+        .iter()
+        .filter(|a| a.status == "PROTECTED")
+        .count();
+    let has_health_issues = data.assessments.iter().any(|a| a.health != "healthy");
+
+    let safety_part = if safe_count == total {
+        "All data safe.".green().to_string()
+    } else {
+        let unsafe_names: Vec<&str> = data
+            .assessments
+            .iter()
+            .filter(|a| a.status != "PROTECTED")
+            .map(|a| a.name.as_str())
+            .collect();
+        format!(
+            "{} of {} safe. {} {} attention.",
+            safe_count,
+            total,
+            unsafe_names.join(", "),
+            if unsafe_names.len() == 1 { "needs" } else { "need" },
+        )
+        .yellow()
+        .to_string()
+    };
+
+    let health_part = if has_health_issues {
+        let blocked_count = data
+            .assessments
+            .iter()
+            .filter(|a| a.health == "blocked")
+            .count();
+        let degraded_count = data
+            .assessments
+            .iter()
+            .filter(|a| a.health == "degraded")
+            .count();
+        // Pick the first reason from the worst non-healthy subvolume
+        let first_reason = data
+            .assessments
+            .iter()
+            .find(|a| a.health != "healthy")
+            .and_then(|a| a.health_reasons.first())
+            .map(|r| format!(" \u{2014} {r}"))
+            .unwrap_or_default();
+        let mut parts = Vec::new();
+        if blocked_count > 0 {
+            parts.push(format!("{blocked_count} blocked"));
+        }
+        if degraded_count > 0 {
+            parts.push(format!("{degraded_count} degraded"));
+        }
+        format!(" {}{first_reason}.", parts.join(", "))
+    } else {
+        String::new()
+    };
+
+    writeln!(out, "{safety_part}{health_part}").ok();
+}
+
 fn render_subvolume_table(data: &StatusOutput, out: &mut String) {
     if data.assessments.is_empty() {
         writeln!(out, "{}", "No subvolumes configured.".dimmed()).ok();
         return;
     }
 
-    // Collect mounted drive labels for column headers
-    let mounted_drives: Vec<&str> = data
-        .drives
-        .iter()
-        .filter(|d| d.mounted)
-        .map(|d| d.label.as_str())
-        .collect();
+    // Collect all configured drive labels for column headers (not just mounted)
+    let drive_labels: Vec<&str> = data.drives.iter().map(|d| d.label.as_str()).collect();
 
     // Check if any assessment has a promise level — only show column if so
     let has_promises = data.assessments.iter().any(|a| a.promise_level.is_some());
+    // Only show HEALTH column when at least one subvolume is non-healthy
+    let show_health = data.assessments.iter().any(|a| a.health != "healthy");
 
-    // Build headers: STATUS  [PROMISE]  SUBVOLUME  LOCAL  [DRIVE1]  [DRIVE2]  CHAIN
-    let mut headers: Vec<String> = vec!["STATUS".to_string()];
+    // Build headers: SAFETY  [HEALTH]  [PROMISE]  SUBVOLUME  LOCAL  [DRIVES...]  CHAIN
+    let mut headers: Vec<String> = vec!["SAFETY".to_string()];
+    if show_health {
+        headers.push("HEALTH".to_string());
+    }
     if has_promises {
         headers.push("PROMISE".to_string());
     }
     headers.push("SUBVOLUME".to_string());
     headers.push("LOCAL".to_string());
-    for label in &mounted_drives {
+    for label in &drive_labels {
         headers.push(label.to_string());
     }
     headers.push("CHAIN".to_string());
 
+    // Track which columns need coloring
+    let safety_col = Some(0usize);
+    let health_col = if show_health { Some(1usize) } else { None };
+
     // Build rows
     let mut rows: Vec<Vec<String>> = Vec::new();
     for assessment in &data.assessments {
-        let mut row = vec![assessment.status.clone()];
+        // Safety column — new vocabulary
+        let safety = safety_label(&assessment.status);
+        let mut row = vec![safety];
+
+        if show_health {
+            row.push(assessment.health.clone());
+        }
         if has_promises {
             row.push(
                 assessment
@@ -104,19 +184,33 @@ fn render_subvolume_table(data: &StatusOutput, out: &mut String) {
             );
         }
         row.push(assessment.name.clone());
-        row.push(assessment.local_snapshot_count.to_string());
 
-        // Per-drive external snapshot count
-        for label in &mounted_drives {
-            let count = assessment
+        // LOCAL column with temporal context
+        let local_cell = format_count_with_age(
+            assessment.local_snapshot_count,
+            assessment.local_newest_age_secs,
+        );
+        row.push(local_cell);
+
+        // Per-drive columns (all configured drives, not just mounted)
+        for label in &drive_labels {
+            let ext = assessment
                 .external
                 .iter()
-                .find(|e| e.drive_label == *label)
-                .and_then(|e| e.snapshot_count);
-            row.push(match count {
-                Some(c) if c > 0 => c.to_string(),
-                _ => "\u{2014}".to_string(), // em dash
-            });
+                .find(|e| e.drive_label == *label);
+            let cell = match ext {
+                Some(e) if e.mounted => {
+                    let count = e.snapshot_count.unwrap_or(0);
+                    if count > 0 {
+                        format_count_with_age(count, e.last_send_age_secs)
+                    } else {
+                        "\u{2014}".to_string()
+                    }
+                }
+                Some(e) if e.last_send_age_secs.is_some() => "away".dimmed().to_string(),
+                _ => "\u{2014}".to_string(),
+            };
+            row.push(cell);
         }
 
         // Chain health
@@ -131,7 +225,38 @@ fn render_subvolume_table(data: &StatusOutput, out: &mut String) {
         rows.push(row);
     }
 
-    format_table(&headers, &rows, out);
+    format_status_table(&headers, &rows, safety_col, health_col, out);
+}
+
+/// Map legacy status strings to new vocabulary.
+fn safety_label(status: &str) -> String {
+    match status {
+        "PROTECTED" => "OK".to_string(),
+        "AT RISK" => "aging".to_string(),
+        "UNPROTECTED" => "gap".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Format a snapshot count with optional age: "10 (2h)" or just "10".
+fn format_count_with_age(count: usize, age_secs: Option<i64>) -> String {
+    match age_secs {
+        Some(secs) if secs >= 0 => format!("{} ({})", count, humanize_duration(secs)),
+        _ => count.to_string(),
+    }
+}
+
+/// Humanize seconds into a compact duration string.
+fn humanize_duration(secs: i64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86400)
+    }
 }
 
 fn render_advisories(data: &StatusOutput, out: &mut String) {
@@ -213,13 +338,20 @@ fn render_last_run(data: &StatusOutput, out: &mut String) {
 
 // ── Table formatter ─────────────────────────────────────────────────────
 
-fn format_table(headers: &[String], rows: &[Vec<String>], out: &mut String) {
+/// Format status table with optional colored SAFETY and HEALTH columns.
+fn format_status_table(
+    headers: &[String],
+    rows: &[Vec<String>],
+    safety_col: Option<usize>,
+    health_col: Option<usize>,
+    out: &mut String,
+) {
     let cols = headers.len();
     let mut widths: Vec<usize> = headers.iter().map(|h| h.len()).collect();
     for row in rows {
         for (i, cell) in row.iter().enumerate() {
             if i < cols {
-                widths[i] = widths[i].max(cell.len());
+                widths[i] = widths[i].max(strip_ansi_len(cell));
             }
         }
     }
@@ -232,20 +364,22 @@ fn format_table(headers: &[String], rows: &[Vec<String>], out: &mut String) {
         .collect();
     writeln!(out, "{}", header_line.join("  ").bold()).ok();
 
-    // Rows — color the STATUS column
+    // Rows — color SAFETY and HEALTH columns
     for row in rows {
         let line: Vec<String> = row
             .iter()
             .enumerate()
             .map(|(i, cell)| {
                 let w = widths.get(i).copied().unwrap_or(cell.len());
-                if i == 0 {
-                    // STATUS column — apply color
-                    let colored = color_status_str(cell);
-                    // Pad after coloring (colored strings have invisible ANSI bytes)
-                    let visible_len = cell.len();
+                let visible_len = strip_ansi_len(cell);
+                if safety_col == Some(i) {
+                    color_and_pad(&color_safety_str(cell), cell.len(), w)
+                } else if health_col == Some(i) {
+                    color_and_pad(&color_health_str(cell), cell.len(), w)
+                } else if visible_len != cell.len() {
+                    // Cell already contains ANSI codes (pre-colored) — pad by visible width
                     let padding = w.saturating_sub(visible_len);
-                    format!("{colored}{:padding$}", "", padding = padding)
+                    format!("{cell}{:padding$}", "", padding = padding)
                 } else {
                     format!("{:<width$}", cell, width = w)
                 }
@@ -255,13 +389,52 @@ fn format_table(headers: &[String], rows: &[Vec<String>], out: &mut String) {
     }
 }
 
+/// Generic table formatter (no column coloring). Used by backup summary.
+fn format_table(headers: &[String], rows: &[Vec<String>], out: &mut String) {
+    format_status_table(headers, rows, None, None, out);
+}
+
+/// Get visible (non-ANSI) length of a string.
+fn strip_ansi_len(s: &str) -> usize {
+    // ANSI escape sequences: ESC[ ... m
+    let mut len = 0;
+    let mut in_escape = false;
+    for c in s.chars() {
+        if in_escape {
+            if c == 'm' {
+                in_escape = false;
+            }
+        } else if c == '\x1b' {
+            in_escape = true;
+        } else {
+            len += 1;
+        }
+    }
+    len
+}
+
+/// Apply color then pad to column width (ANSI codes are invisible bytes).
+fn color_and_pad(colored: &str, visible_len: usize, width: usize) -> String {
+    let padding = width.saturating_sub(visible_len);
+    format!("{colored}{:padding$}", "", padding = padding)
+}
+
 // ── Color helpers ───────────────────────────────────────────────────────
 
-fn color_status_str(status: &str) -> String {
-    match status {
-        "PROTECTED" => "PROTECTED".green().to_string(),
-        "AT RISK" => "AT RISK".yellow().to_string(),
-        "UNPROTECTED" => "UNPROTECTED".red().to_string(),
+fn color_safety_str(safety: &str) -> String {
+    match safety {
+        "OK" => "OK".green().to_string(),
+        "aging" => "aging".yellow().to_string(),
+        "gap" => "gap".red().to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn color_health_str(health: &str) -> String {
+    match health {
+        "healthy" => "healthy".dimmed().to_string(),
+        "degraded" => "degraded".yellow().to_string(),
+        "blocked" => "blocked".red().to_string(),
         other => other.to_string(),
     }
 }
@@ -1290,14 +1463,18 @@ mod tests {
                 StatusAssessment {
                     name: "htpc-home".to_string(),
                     status: "PROTECTED".to_string(),
+                    health: "healthy".to_string(),
+                    health_reasons: vec![],
                     promise_level: None,
                     local_snapshot_count: 47,
+                    local_newest_age_secs: Some(1800),
                     local_status: "PROTECTED".to_string(),
                     external: vec![StatusDriveAssessment {
                         drive_label: "WD-18TB".to_string(),
                         status: "PROTECTED".to_string(),
                         mounted: true,
                         snapshot_count: Some(12),
+                        last_send_age_secs: Some(7200),
                     }],
                     advisories: vec![],
                     errors: vec![],
@@ -1305,14 +1482,20 @@ mod tests {
                 StatusAssessment {
                     name: "htpc-docs".to_string(),
                     status: "AT RISK".to_string(),
+                    health: "degraded".to_string(),
+                    health_reasons: vec![
+                        "chain broken on WD-18TB \u{2014} next send will be full".to_string(),
+                    ],
                     promise_level: None,
                     local_snapshot_count: 5,
+                    local_newest_age_secs: Some(10800),
                     local_status: "AT RISK".to_string(),
                     external: vec![StatusDriveAssessment {
                         drive_label: "WD-18TB".to_string(),
                         status: "UNPROTECTED".to_string(),
                         mounted: true,
                         snapshot_count: Some(0),
+                        last_send_age_secs: None,
                     }],
                     advisories: vec![],
                     errors: vec![],
@@ -1359,11 +1542,11 @@ mod tests {
     }
 
     #[test]
-    fn interactive_contains_promise_statuses() {
+    fn interactive_contains_safety_vocabulary() {
         colored::control::set_override(false);
         let output = render_status(&test_status_output(), OutputMode::Interactive);
-        assert!(output.contains("PROTECTED"), "missing PROTECTED");
-        assert!(output.contains("AT RISK"), "missing AT RISK");
+        assert!(output.contains("OK"), "missing OK safety label");
+        assert!(output.contains("aging"), "missing aging safety label");
     }
 
     #[test]
@@ -1553,8 +1736,11 @@ mod tests {
             assessments: vec![StatusAssessment {
                 name: "htpc-home".to_string(),
                 status: "PROTECTED".to_string(),
+                health: "healthy".to_string(),
+                health_reasons: vec![],
                 promise_level: None,
                 local_snapshot_count: 12,
+                local_newest_age_secs: None,
                 local_status: "PROTECTED".to_string(),
                 external: vec![],
                 advisories: vec![],
@@ -2082,5 +2268,104 @@ mod tests {
             serde_json::from_str(&output).unwrap_or_else(|e| panic!("invalid JSON: {e}\n{output}"));
         assert_eq!(parsed["status"], "running");
         assert_eq!(parsed["state"]["pid"], 12345);
+    }
+
+    // ── Two-axis rendering tests ───────────────────────────────────
+
+    #[test]
+    fn summary_line_all_safe_all_healthy() {
+        colored::control::set_override(false);
+        let mut data = test_status_output();
+        // Make all assessments safe and healthy
+        for a in &mut data.assessments {
+            a.status = "PROTECTED".to_string();
+            a.health = "healthy".to_string();
+            a.health_reasons = vec![];
+        }
+        let output = render_status(&data, OutputMode::Interactive);
+        assert!(output.contains("All data safe"), "missing summary line, got: {output}");
+    }
+
+    #[test]
+    fn summary_line_all_safe_degraded() {
+        colored::control::set_override(false);
+        let data = test_status_output(); // htpc-docs is degraded
+        let output = render_status(&data, OutputMode::Interactive);
+        assert!(
+            output.contains("degraded"),
+            "missing health degraded in summary, got: {output}"
+        );
+    }
+
+    #[test]
+    fn safety_column_uses_new_vocabulary() {
+        colored::control::set_override(false);
+        let data = test_status_output();
+        let output = render_status(&data, OutputMode::Interactive);
+        assert!(output.contains("OK"), "missing OK label");
+        assert!(output.contains("aging"), "missing aging label");
+        assert!(!output.contains("PROTECTED"), "should not contain legacy PROTECTED");
+        assert!(!output.contains("AT RISK"), "should not contain legacy AT RISK");
+    }
+
+    #[test]
+    fn health_column_hidden_when_all_healthy() {
+        colored::control::set_override(false);
+        let mut data = test_status_output();
+        for a in &mut data.assessments {
+            a.health = "healthy".to_string();
+            a.health_reasons = vec![];
+        }
+        let output = render_status(&data, OutputMode::Interactive);
+        assert!(!output.contains("HEALTH"), "HEALTH column should be hidden when all healthy");
+    }
+
+    #[test]
+    fn health_column_shown_when_degraded() {
+        colored::control::set_override(false);
+        let data = test_status_output(); // htpc-docs is degraded
+        let output = render_status(&data, OutputMode::Interactive);
+        assert!(output.contains("HEALTH"), "HEALTH column should be visible");
+        assert!(output.contains("degraded"), "missing degraded value");
+    }
+
+    #[test]
+    fn temporal_context_in_local_column() {
+        colored::control::set_override(false);
+        let data = test_status_output();
+        let output = render_status(&data, OutputMode::Interactive);
+        // htpc-home has local_newest_age_secs = 1800 (30m)
+        assert!(output.contains("47 (30m)"), "missing temporal context '47 (30m)' in: {output}");
+    }
+
+    #[test]
+    fn unmounted_drive_shows_away() {
+        colored::control::set_override(false);
+        let mut data = test_status_output();
+        // Add an unmounted drive with send history to one assessment
+        data.assessments[0].external.push(StatusDriveAssessment {
+            drive_label: "Offsite-4TB".to_string(),
+            status: "PROTECTED".to_string(),
+            mounted: false,
+            snapshot_count: None,
+            last_send_age_secs: Some(172800), // 2 days
+        });
+        let output = render_status(&data, OutputMode::Interactive);
+        assert!(output.contains("away"), "unmounted drive with history should show 'away': {output}");
+    }
+
+    #[test]
+    fn daemon_json_includes_health_fields() {
+        let data = test_status_output();
+        let output = render_status(&data, OutputMode::Daemon);
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed["assessments"][0]["health"], "healthy");
+        assert_eq!(parsed["assessments"][1]["health"], "degraded");
+        assert!(
+            parsed["assessments"][1]["health_reasons"][0]
+                .as_str()
+                .unwrap()
+                .contains("chain broken"),
+        );
     }
 }

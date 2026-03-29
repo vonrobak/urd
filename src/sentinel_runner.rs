@@ -482,13 +482,15 @@ pub fn is_pid_alive(pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::awareness::{LocalAssessment, PromiseStatus};
+    use crate::awareness::{LocalAssessment, OperationalHealth, PromiseStatus};
     use crate::types::Interval;
 
     fn make_assessment(name: &str, status: PromiseStatus) -> SubvolAssessment {
         SubvolAssessment {
             name: name.to_string(),
             status,
+            health: OperationalHealth::Healthy,
+            health_reasons: vec![],
             local: LocalAssessment {
                 status,
                 snapshot_count: 5,

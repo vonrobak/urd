@@ -570,7 +570,7 @@ pub fn has_promise_changes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::awareness::{DriveAssessment, LocalAssessment};
+    use crate::awareness::{DriveAssessment, LocalAssessment, OperationalHealth};
     use crate::types::Interval;
 
     fn dt(s: &str) -> NaiveDateTime {
@@ -585,6 +585,8 @@ mod tests {
         SubvolAssessment {
             name: name.to_string(),
             status,
+            health: OperationalHealth::Healthy,
+            health_reasons: vec![],
             local: LocalAssessment {
                 status,
                 snapshot_count: 5,
@@ -607,6 +609,8 @@ mod tests {
         SubvolAssessment {
             name: name.to_string(),
             status,
+            health: OperationalHealth::Healthy,
+            health_reasons: vec![],
             local: LocalAssessment {
                 status: PromiseStatus::Protected,
                 snapshot_count: 5,

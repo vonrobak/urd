@@ -10,6 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Drive session tokens for hardware swap detection (`.urd-drive-token` identity files)
 - Chain health computation in awareness model (incremental chain intact/broken per drive)
+- Two-axis status display: data safety (OK/aging/gap) + operational health (healthy/degraded/blocked)
+- Temporal context in status table: snapshot counts show age (e.g., "47 (30m)", "12 (2h)")
+- Unmounted drives shown as "away" in status table when they have send history
 
 ### Changed
 - README rewritten for public repository
