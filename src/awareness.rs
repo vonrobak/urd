@@ -29,6 +29,13 @@ const EXTERNAL_AT_RISK_MULTIPLIER: f64 = 1.5;
 /// External send freshness: UNPROTECTED if age > 3× interval.
 const EXTERNAL_UNPROTECTED_MULTIPLIER: f64 = 3.0;
 
+/// Operational health: space is "tight" when free bytes are within this percentage
+/// of the min_free_bytes threshold. Applies to both local and external drives.
+const SPACE_TIGHT_MARGIN_PERCENT: u64 = 20;
+
+/// Operational health: an unmounted drive degrades health after this many days.
+const DRIVE_AWAY_DEGRADED_DAYS: i64 = 7;
+
 // ── Types ──────────────────────────────────────────────────────────────
 
 /// Promise status for a subvolume or assessment dimension.
@@ -50,11 +57,37 @@ impl std::fmt::Display for PromiseStatus {
     }
 }
 
+/// Operational health — can the next backup succeed efficiently?
+/// Ordered worst-to-best so `min()` yields the worst health.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum OperationalHealth {
+    /// Something will prevent or severely impair the next backup.
+    Blocked,
+    /// Next backup will work but suboptimally (e.g., full send required).
+    Degraded,
+    /// Everything normal — incremental chains healthy, space adequate.
+    Healthy,
+}
+
+impl std::fmt::Display for OperationalHealth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Blocked => write!(f, "blocked"),
+            Self::Degraded => write!(f, "degraded"),
+            Self::Healthy => write!(f, "healthy"),
+        }
+    }
+}
+
 /// Complete assessment for a single subvolume.
 #[derive(Debug)]
 pub struct SubvolAssessment {
     pub name: String,
     pub status: PromiseStatus,
+    /// Operational health — can the next backup succeed efficiently?
+    pub health: OperationalHealth,
+    /// Reasons for non-Healthy operational health (empty when Healthy).
+    pub health_reasons: Vec<String>,
     pub local: LocalAssessment,
     pub external: Vec<DriveAssessment>,
     /// Chain health per mounted, send-enabled drive.
@@ -121,7 +154,6 @@ impl std::fmt::Display for ChainBreakReason {
 pub struct LocalAssessment {
     pub status: PromiseStatus,
     pub snapshot_count: usize,
-    #[allow(dead_code)] // consumed by verbose status display (future)
     pub newest_age: Option<Duration>,
     #[allow(dead_code)] // consumed by verbose status display (future)
     pub configured_interval: Interval,
@@ -134,7 +166,6 @@ pub struct DriveAssessment {
     pub status: PromiseStatus,
     pub mounted: bool,
     pub snapshot_count: Option<usize>,
-    #[allow(dead_code)] // consumed by verbose status display (future)
     pub last_send_age: Option<Duration>,
     #[allow(dead_code)] // consumed by verbose status display (future)
     pub configured_interval: Interval,
@@ -164,6 +195,8 @@ pub fn assess(
             assessments.push(SubvolAssessment {
                 name: subvol.name.clone(),
                 status: PromiseStatus::Unprotected,
+                health: OperationalHealth::Blocked,
+                health_reasons: vec!["no snapshot root configured".to_string()],
                 local: LocalAssessment {
                     status: PromiseStatus::Unprotected,
                     snapshot_count: 0,
@@ -280,9 +313,38 @@ pub fn assess(
         // ── Overall status ──────────────────────────────────────────
         let overall = compute_overall_status(&local, &drive_assessments);
 
+        // ── Operational health ─────────────────────────────────────
+        // Pre-compute local space pressure (needs config access not available in compute_health)
+        let local_space_tight = config
+            .root_min_free_bytes(&subvol.name)
+            .filter(|&min_free| min_free > 0)
+            .and_then(|min_free| {
+                let local_dir = snapshot_root.join(&subvol.name);
+                fs.filesystem_free_bytes(&local_dir).ok().and_then(|free| {
+                    let tight_threshold = min_free + min_free / (100 / SPACE_TIGHT_MARGIN_PERCENT);
+                    if free < tight_threshold {
+                        Some(free)
+                    } else {
+                        None
+                    }
+                })
+            });
+
+        let (health, health_reasons) = compute_health(
+            subvol.send_enabled,
+            &chain_health_entries,
+            &drive_assessments,
+            &config.drives,
+            fs,
+            &subvol.name,
+            local_space_tight.is_some(),
+        );
+
         assessments.push(SubvolAssessment {
             name: subvol.name.clone(),
             status: overall,
+            health,
+            health_reasons,
             local,
             external: drive_assessments,
             chain_health: chain_health_entries,
@@ -455,6 +517,149 @@ fn assess_chain_health(
     }
 }
 
+/// Compute operational health for a subvolume.
+///
+/// Pure function: chain health + drive state + space info in, health out.
+/// Checks (in priority order): blocked conditions, then degraded conditions.
+fn compute_health(
+    send_enabled: bool,
+    chain_health: &[DriveChainHealth],
+    drive_assessments: &[DriveAssessment],
+    drives_config: &[DriveConfig],
+    fs: &dyn FileSystemState,
+    subvol_name: &str,
+    local_space_tight: bool,
+) -> (OperationalHealth, Vec<String>) {
+    let mut reasons: Vec<String> = Vec::new();
+    let mut worst = OperationalHealth::Healthy;
+
+    // ── Degraded: local snapshot root space tight ──────────────────
+    if local_space_tight {
+        reasons.push("local snapshot space tight".to_string());
+        worst = worst.min(OperationalHealth::Degraded);
+    }
+
+    if !send_enabled {
+        return (worst, reasons);
+    }
+
+    let mounted_drives: Vec<&DriveAssessment> =
+        drive_assessments.iter().filter(|d| d.mounted).collect();
+
+    // ── Blocked: no drives connected ───────────────────────────────
+    if !drives_config.is_empty() && mounted_drives.is_empty() {
+        reasons.push("no backup drives connected".to_string());
+        worst = worst.min(OperationalHealth::Blocked);
+    }
+
+    // ── Blocked: insufficient space on ALL connected drives ────────
+    if !mounted_drives.is_empty() {
+        let mut all_space_blocked = true;
+        for da in &mounted_drives {
+            let drive_cfg = drives_config.iter().find(|d| d.label == da.drive_label);
+            let Some(cfg) = drive_cfg else {
+                all_space_blocked = false;
+                continue;
+            };
+
+            let free = fs.filesystem_free_bytes(&cfg.mount_path).unwrap_or(u64::MAX);
+            let min_free = cfg.min_free_bytes.map(|b| b.bytes()).unwrap_or(0);
+
+            // Estimate next send size: calibrated > last send > skip
+            let est_size = fs
+                .calibrated_size(subvol_name)
+                .map(|(bytes, _)| bytes)
+                .or_else(|| fs.last_send_size(subvol_name, &da.drive_label, "incremental"))
+                .or_else(|| fs.last_send_size(subvol_name, &da.drive_label, "full"));
+
+            // Check if chain is broken on this drive (full send will be needed)
+            let chain_broken = chain_health
+                .iter()
+                .any(|ch| ch.drive_label == da.drive_label && matches!(&ch.status, ChainStatus::Broken { reason, .. } if *reason != ChainBreakReason::NoDriveData));
+
+            match est_size {
+                Some(size) if free.saturating_sub(min_free) < size => {
+                    // This drive can't fit the next send
+                }
+                None if chain_broken => {
+                    // Chain broken (full send needed) but no size estimate —
+                    // can't verify space. Fail open but surface the uncertainty.
+                    all_space_blocked = false;
+                }
+                _ => {
+                    // Either enough space or no estimate with intact chain (fail open)
+                    all_space_blocked = false;
+                }
+            }
+        }
+
+        if all_space_blocked {
+            reasons.push("insufficient space on all connected drives".to_string());
+            worst = worst.min(OperationalHealth::Blocked);
+        }
+    }
+
+    // ── Degraded: chain broken on any connected drive ──────────────
+    for ch in chain_health {
+        if let ChainStatus::Broken { reason, .. } = &ch.status
+            && *reason != ChainBreakReason::NoDriveData
+        {
+            reasons.push(format!(
+                "chain broken on {} \u{2014} next send will be full",
+                ch.drive_label
+            ));
+            worst = worst.min(OperationalHealth::Degraded);
+
+            // Surface uncertainty: chain broken means full send, but no size estimate
+            let has_estimate = fs
+                .calibrated_size(subvol_name)
+                .is_some()
+                || fs.last_send_size(subvol_name, &ch.drive_label, "full").is_some();
+            if !has_estimate {
+                reasons.push(format!(
+                    "full send size unknown for {} \u{2014} space check unavailable",
+                    ch.drive_label
+                ));
+            }
+        }
+    }
+
+    // ── Degraded: space tight on any connected drive ───────────────
+    for da in &mounted_drives {
+        if let Some(cfg) = drives_config.iter().find(|d| d.label == da.drive_label)
+            && let Some(min_free_bytes) = cfg.min_free_bytes
+        {
+            let min_free = min_free_bytes.bytes();
+            if min_free > 0 {
+                let free = fs.filesystem_free_bytes(&cfg.mount_path).unwrap_or(u64::MAX);
+                let tight_threshold =
+                    min_free + min_free / (100 / SPACE_TIGHT_MARGIN_PERCENT);
+                if free < tight_threshold {
+                    reasons.push(format!("space tight on {}", da.drive_label));
+                    worst = worst.min(OperationalHealth::Degraded);
+                }
+            }
+        }
+    }
+
+    // ── Degraded: configured drive unmounted >7 days ───────────────
+    for da in drive_assessments {
+        if !da.mounted
+            && let Some(age) = da.last_send_age
+            && age.num_days() > DRIVE_AWAY_DEGRADED_DAYS
+        {
+            reasons.push(format!(
+                "{} away for {} days",
+                da.drive_label,
+                age.num_days()
+            ));
+            worst = worst.min(OperationalHealth::Degraded);
+        }
+    }
+
+    (worst, reasons)
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -519,6 +724,98 @@ source = "/data/sv2"
 
     fn snap(datetime: NaiveDateTime, name: &str) -> SnapshotName {
         SnapshotName::new(datetime, name)
+    }
+
+    /// Test config with one drive and min_free_bytes set.
+    fn test_config_with_min_free() -> Config {
+        let toml_str = r#"
+[general]
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp"
+
+[local_snapshots]
+roots = [
+  { path = "/snap", subvolumes = ["sv1"] }
+]
+
+[defaults]
+snapshot_interval = "1h"
+send_interval = "1d"
+send_enabled = true
+enabled = true
+[defaults.local_retention]
+hourly = 24
+daily = 30
+weekly = 26
+monthly = 12
+[defaults.external_retention]
+daily = 30
+weekly = 26
+monthly = 0
+
+[[drives]]
+label = "WD-18TB"
+mount_path = "/mnt/wd"
+snapshot_root = ".snapshots"
+role = "primary"
+min_free_bytes = "100GB"
+
+[[subvolumes]]
+name = "sv1"
+short_name = "sv1"
+source = "/data/sv1"
+"#;
+        toml::from_str(toml_str).expect("test config with min_free should parse")
+    }
+
+    /// Test config with two drives.
+    fn test_config_two_drives() -> Config {
+        let toml_str = r#"
+[general]
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp"
+
+[local_snapshots]
+roots = [
+  { path = "/snap", subvolumes = ["sv1"] }
+]
+
+[defaults]
+snapshot_interval = "1h"
+send_interval = "1d"
+send_enabled = true
+enabled = true
+[defaults.local_retention]
+hourly = 24
+daily = 30
+weekly = 26
+monthly = 12
+[defaults.external_retention]
+daily = 30
+weekly = 26
+monthly = 0
+
+[[drives]]
+label = "D1"
+mount_path = "/mnt/d1"
+snapshot_root = ".snapshots"
+role = "primary"
+min_free_bytes = "100GB"
+
+[[drives]]
+label = "D2"
+mount_path = "/mnt/d2"
+snapshot_root = ".snapshots"
+role = "offsite"
+
+[[subvolumes]]
+name = "sv1"
+short_name = "sv1"
+source = "/data/sv1"
+"#;
+        toml::from_str(toml_str).expect("test config two drives should parse")
     }
 
     // ── Test 1: All protected ──────────────────────────────────────
@@ -1549,6 +1846,422 @@ source = "/data/sv1"
                 reason: ChainBreakReason::PinReadError,
                 pin_parent: None,
             }
+        );
+    }
+
+    // ── Operational health tests ───────────────────────────────────
+
+    #[test]
+    fn health_all_chains_intact_is_healthy() {
+        let config = test_config();
+        let now = dt(2026, 3, 23, 14, 0);
+        let mut fs = MockFileSystemState::new();
+
+        let pin_snap = snap(dt(2026, 3, 23, 12, 0), "sv1");
+        // Fresh local snapshots — must include the pin parent
+        fs.local_snapshots.insert(
+            "sv1".to_string(),
+            vec![
+                pin_snap.clone(),
+                snap(dt(2026, 3, 23, 13, 30), "sv1"),
+            ],
+        );
+        // Drive mounted with snapshots and intact chain
+        fs.mounted_drives.insert("WD-18TB".to_string());
+        fs.external_snapshots.insert(
+            ("WD-18TB".to_string(), "sv1".to_string()),
+            vec![pin_snap.clone()],
+        );
+        fs.pin_files.insert(
+            (
+                std::path::PathBuf::from("/snap/sv1"),
+                "WD-18TB".to_string(),
+            ),
+            pin_snap,
+        );
+        fs.send_times.insert(
+            ("sv1".to_string(), "WD-18TB".to_string()),
+            dt(2026, 3, 23, 12, 0),
+        );
+        // Adequate free space
+        fs.free_bytes
+            .insert(std::path::PathBuf::from("/mnt/wd"), 1_000_000_000_000);
+
+        let results = assess(&config, now, &fs);
+        assert_eq!(results[0].health, OperationalHealth::Healthy);
+        assert!(results[0].health_reasons.is_empty());
+    }
+
+    #[test]
+    fn health_chain_broken_is_degraded() {
+        let config = test_config();
+        let now = dt(2026, 3, 23, 14, 0);
+        let mut fs = MockFileSystemState::new();
+
+        fs.local_snapshots.insert(
+            "sv1".to_string(),
+            vec![snap(dt(2026, 3, 23, 13, 30), "sv1")],
+        );
+        fs.mounted_drives.insert("WD-18TB".to_string());
+        fs.external_snapshots.insert(
+            ("WD-18TB".to_string(), "sv1".to_string()),
+            vec![snap(dt(2026, 3, 23, 12, 0), "sv1")],
+        );
+        // No pin file — chain broken
+        fs.send_times.insert(
+            ("sv1".to_string(), "WD-18TB".to_string()),
+            dt(2026, 3, 23, 12, 0),
+        );
+        fs.free_bytes
+            .insert(std::path::PathBuf::from("/mnt/wd"), 1_000_000_000_000);
+
+        let results = assess(&config, now, &fs);
+        assert_eq!(results[0].health, OperationalHealth::Degraded);
+        assert!(results[0].health_reasons[0].contains("chain broken"));
+        assert!(results[0].health_reasons[0].contains("WD-18TB"));
+    }
+
+    #[test]
+    fn health_no_drives_mounted_send_enabled_is_blocked() {
+        let config = test_config();
+        let now = dt(2026, 3, 23, 14, 0);
+        let mut fs = MockFileSystemState::new();
+
+        fs.local_snapshots.insert(
+            "sv1".to_string(),
+            vec![snap(dt(2026, 3, 23, 13, 30), "sv1")],
+        );
+        // No drives mounted, send_enabled=true (default in test config)
+
+        let results = assess(&config, now, &fs);
+        assert_eq!(results[0].health, OperationalHealth::Blocked);
+        assert!(results[0].health_reasons[0].contains("no backup drives connected"));
+    }
+
+    #[test]
+    fn health_send_disabled_no_drives_is_healthy() {
+        let toml_str = r#"
+[general]
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp"
+
+[local_snapshots]
+roots = [
+  { path = "/snap", subvolumes = ["sv1"] }
+]
+
+[defaults]
+snapshot_interval = "1h"
+send_interval = "1d"
+send_enabled = true
+enabled = true
+[defaults.local_retention]
+hourly = 24
+daily = 30
+weekly = 26
+monthly = 12
+[defaults.external_retention]
+daily = 30
+weekly = 26
+monthly = 0
+
+[[drives]]
+label = "WD-18TB"
+mount_path = "/mnt/wd"
+snapshot_root = ".snapshots"
+role = "primary"
+
+[[subvolumes]]
+name = "sv1"
+short_name = "sv1"
+source = "/data/sv1"
+send_enabled = false
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let now = dt(2026, 3, 23, 14, 0);
+        let mut fs = MockFileSystemState::new();
+
+        fs.local_snapshots.insert(
+            "sv1".to_string(),
+            vec![snap(dt(2026, 3, 23, 13, 30), "sv1")],
+        );
+        // No drives mounted — but send_enabled=false, so health should be Healthy
+
+        let results = assess(&config, now, &fs);
+        assert_eq!(results[0].health, OperationalHealth::Healthy);
+    }
+
+    #[test]
+    fn health_space_tight_is_degraded() {
+        let config = test_config_with_min_free();
+        let now = dt(2026, 3, 23, 14, 0);
+        let mut fs = MockFileSystemState::new();
+
+        fs.local_snapshots.insert(
+            "sv1".to_string(),
+            vec![snap(dt(2026, 3, 23, 13, 30), "sv1")],
+        );
+        fs.mounted_drives.insert("WD-18TB".to_string());
+        fs.external_snapshots.insert(
+            ("WD-18TB".to_string(), "sv1".to_string()),
+            vec![snap(dt(2026, 3, 23, 12, 0), "sv1")],
+        );
+        fs.pin_files.insert(
+            (
+                std::path::PathBuf::from("/snap/sv1"),
+                "WD-18TB".to_string(),
+            ),
+            snap(dt(2026, 3, 23, 12, 0), "sv1"),
+        );
+        fs.send_times.insert(
+            ("sv1".to_string(), "WD-18TB".to_string()),
+            dt(2026, 3, 23, 12, 0),
+        );
+        // Free space: 105GB. min_free = 100GB. tight_threshold = 120GB. 105 < 120 → degraded
+        fs.free_bytes
+            .insert(std::path::PathBuf::from("/mnt/wd"), 105_000_000_000);
+
+        let results = assess(&config, now, &fs);
+        assert_eq!(results[0].health, OperationalHealth::Degraded);
+        assert!(results[0].health_reasons.iter().any(|r| r.contains("space tight")));
+    }
+
+    #[test]
+    fn health_space_blocked_all_drives() {
+        let config = test_config_with_min_free();
+        let now = dt(2026, 3, 23, 14, 0);
+        let mut fs = MockFileSystemState::new();
+
+        fs.local_snapshots.insert(
+            "sv1".to_string(),
+            vec![snap(dt(2026, 3, 23, 13, 30), "sv1")],
+        );
+        fs.mounted_drives.insert("WD-18TB".to_string());
+        fs.external_snapshots.insert(
+            ("WD-18TB".to_string(), "sv1".to_string()),
+            vec![snap(dt(2026, 3, 23, 12, 0), "sv1")],
+        );
+        fs.pin_files.insert(
+            (
+                std::path::PathBuf::from("/snap/sv1"),
+                "WD-18TB".to_string(),
+            ),
+            snap(dt(2026, 3, 23, 12, 0), "sv1"),
+        );
+        fs.send_times.insert(
+            ("sv1".to_string(), "WD-18TB".to_string()),
+            dt(2026, 3, 23, 12, 0),
+        );
+        // Free: 150GB, min_free: 100GB, available: 50GB, last send: 60GB → blocked
+        fs.free_bytes
+            .insert(std::path::PathBuf::from("/mnt/wd"), 150_000_000_000);
+        fs.send_sizes.insert(
+            ("sv1".to_string(), "WD-18TB".to_string(), "incremental".to_string()),
+            60_000_000_000,
+        );
+
+        let results = assess(&config, now, &fs);
+        assert_eq!(results[0].health, OperationalHealth::Blocked);
+        assert!(results[0].health_reasons.iter().any(|r| r.contains("insufficient space")));
+    }
+
+    #[test]
+    fn health_drive_away_long_is_degraded() {
+        let config = test_config();
+        let now = dt(2026, 3, 23, 14, 0);
+        let mut fs = MockFileSystemState::new();
+
+        fs.local_snapshots.insert(
+            "sv1".to_string(),
+            vec![snap(dt(2026, 3, 23, 13, 30), "sv1")],
+        );
+        // Drive NOT mounted but has send history >7 days ago
+        fs.send_times.insert(
+            ("sv1".to_string(), "WD-18TB".to_string()),
+            dt(2026, 3, 10, 12, 0), // 13 days ago
+        );
+
+        let results = assess(&config, now, &fs);
+        assert_eq!(results[0].health, OperationalHealth::Blocked);
+        // Blocked because no drives mounted (primary check), plus degraded for away >7d
+        assert!(results[0].health_reasons.iter().any(|r| r.contains("no backup drives connected")));
+    }
+
+    #[test]
+    fn health_drive_away_recent_other_mounted() {
+        let config = test_config_two_drives();
+        let now = dt(2026, 3, 23, 14, 0);
+        let mut fs = MockFileSystemState::new();
+
+        let pin_snap = snap(dt(2026, 3, 23, 12, 0), "sv1");
+        fs.local_snapshots.insert(
+            "sv1".to_string(),
+            vec![
+                pin_snap.clone(),
+                snap(dt(2026, 3, 23, 13, 30), "sv1"),
+            ],
+        );
+        // D1 mounted and healthy
+        fs.mounted_drives.insert("D1".to_string());
+        fs.external_snapshots.insert(
+            ("D1".to_string(), "sv1".to_string()),
+            vec![pin_snap.clone()],
+        );
+        fs.pin_files.insert(
+            (std::path::PathBuf::from("/snap/sv1"), "D1".to_string()),
+            pin_snap,
+        );
+        fs.send_times.insert(
+            ("sv1".to_string(), "D1".to_string()),
+            dt(2026, 3, 23, 12, 0),
+        );
+        // D2 unmounted, last send 2 days ago (< 7 days)
+        fs.send_times.insert(
+            ("sv1".to_string(), "D2".to_string()),
+            dt(2026, 3, 21, 12, 0),
+        );
+        fs.free_bytes
+            .insert(std::path::PathBuf::from("/mnt/d1"), 1_000_000_000_000);
+
+        let results = assess(&config, now, &fs);
+        assert_eq!(results[0].health, OperationalHealth::Healthy, "health_reasons: {:?}", results[0].health_reasons);
+        assert!(results[0].health_reasons.is_empty());
+    }
+
+    #[test]
+    fn health_multiple_reasons_collected() {
+        let config = test_config_two_drives();
+        let now = dt(2026, 3, 23, 14, 0);
+        let mut fs = MockFileSystemState::new();
+
+        fs.local_snapshots.insert(
+            "sv1".to_string(),
+            vec![snap(dt(2026, 3, 23, 13, 30), "sv1")],
+        );
+        // D1 mounted, chain broken, space tight
+        fs.mounted_drives.insert("D1".to_string());
+        fs.external_snapshots.insert(
+            ("D1".to_string(), "sv1".to_string()),
+            vec![snap(dt(2026, 3, 23, 12, 0), "sv1")],
+        );
+        // No pin file → chain broken
+        fs.send_times.insert(
+            ("sv1".to_string(), "D1".to_string()),
+            dt(2026, 3, 23, 12, 0),
+        );
+        // Space tight: 105GB free, 100GB min
+        fs.free_bytes
+            .insert(std::path::PathBuf::from("/mnt/d1"), 105_000_000_000);
+        // D2 unmounted, >7 days
+        fs.send_times.insert(
+            ("sv1".to_string(), "D2".to_string()),
+            dt(2026, 3, 10, 12, 0),
+        );
+
+        let results = assess(&config, now, &fs);
+        assert_eq!(results[0].health, OperationalHealth::Degraded);
+        assert!(results[0].health_reasons.len() >= 2, "expected multiple reasons, got: {:?}", results[0].health_reasons);
+        assert!(results[0].health_reasons.iter().any(|r| r.contains("chain broken")));
+        // Either space tight or drive away, depending on config
+    }
+
+    #[test]
+    fn health_worst_wins() {
+        // OperationalHealth ordering: Blocked < Degraded < Healthy
+        assert!(OperationalHealth::Blocked < OperationalHealth::Degraded);
+        assert!(OperationalHealth::Degraded < OperationalHealth::Healthy);
+        assert_eq!(
+            OperationalHealth::Blocked.min(OperationalHealth::Healthy),
+            OperationalHealth::Blocked
+        );
+    }
+
+    #[test]
+    fn health_local_space_tight_degrades() {
+        let toml_str = r#"
+[general]
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp"
+
+[local_snapshots]
+roots = [
+  { path = "/snap", subvolumes = ["sv1"], min_free_bytes = "10GB" }
+]
+
+[defaults]
+snapshot_interval = "1h"
+send_interval = "1d"
+send_enabled = false
+enabled = true
+[defaults.local_retention]
+hourly = 24
+daily = 30
+weekly = 26
+monthly = 12
+[defaults.external_retention]
+daily = 30
+weekly = 26
+monthly = 0
+
+[[drives]]
+label = "WD-18TB"
+mount_path = "/mnt/wd"
+snapshot_root = ".snapshots"
+role = "primary"
+
+[[subvolumes]]
+name = "sv1"
+short_name = "sv1"
+source = "/data/sv1"
+send_enabled = false
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let now = dt(2026, 3, 23, 14, 0);
+        let mut fs = MockFileSystemState::new();
+
+        fs.local_snapshots.insert(
+            "sv1".to_string(),
+            vec![snap(dt(2026, 3, 23, 13, 30), "sv1")],
+        );
+        // Local space: 11GB free, 10GB min → tight_threshold = 12GB → 11 < 12 → degraded
+        fs.free_bytes
+            .insert(std::path::PathBuf::from("/snap/sv1"), 11_000_000_000);
+
+        let results = assess(&config, now, &fs);
+        assert_eq!(results[0].health, OperationalHealth::Degraded);
+        assert!(results[0].health_reasons.iter().any(|r| r.contains("local snapshot space tight")));
+    }
+
+    #[test]
+    fn health_chain_broken_no_estimate_surfaces_uncertainty() {
+        let config = test_config();
+        let now = dt(2026, 3, 23, 14, 0);
+        let mut fs = MockFileSystemState::new();
+
+        fs.local_snapshots.insert(
+            "sv1".to_string(),
+            vec![snap(dt(2026, 3, 23, 13, 30), "sv1")],
+        );
+        fs.mounted_drives.insert("WD-18TB".to_string());
+        fs.external_snapshots.insert(
+            ("WD-18TB".to_string(), "sv1".to_string()),
+            vec![snap(dt(2026, 3, 23, 12, 0), "sv1")],
+        );
+        // No pin file → chain broken. No send sizes → no estimate.
+        fs.send_times.insert(
+            ("sv1".to_string(), "WD-18TB".to_string()),
+            dt(2026, 3, 23, 12, 0),
+        );
+        fs.free_bytes
+            .insert(std::path::PathBuf::from("/mnt/wd"), 1_000_000_000_000);
+
+        let results = assess(&config, now, &fs);
+        assert_eq!(results[0].health, OperationalHealth::Degraded);
+        assert!(
+            results[0].health_reasons.iter().any(|r| r.contains("full send size unknown")),
+            "expected uncertainty reason, got: {:?}", results[0].health_reasons
         );
     }
 }

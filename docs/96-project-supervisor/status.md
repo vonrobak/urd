@@ -8,14 +8,15 @@
 
 **Urd is the sole backup system.** Systemd timer running nightly at 04:00 since 2026-03-25.
 Sentinel daemon deployed (passive monitoring, drive detection, backup overdue alerts).
-416 tests, all passing, clippy clean. Current version: v0.3.0.
+436 tests, all passing, clippy clean. Current version: v0.3.0.
 
 ## In Progress
 
-- **HSD-A complete** (2026-03-29). Drive session tokens + chain health as awareness input.
-  Token infrastructure built, tested, reviewed. Token verification dormant until HSD-B wires it.
-  Chain health moved from status command into pure awareness module.
-  [Implementation review](../99-reports/2026-03-29-hsd-a-implementation-review.md)
+- **VFM-A complete** (2026-03-29). OperationalHealth enum + two-axis CLI rendering.
+  `compute_health()` pure function checks chain health, space pressure (local + external),
+  drive availability. CLI shows SAFETY + HEALTH columns, summary line, temporal context.
+  Reviewed, simplified, post-review fixes applied.
+  [Implementation review](../99-reports/2026-03-29-vfm-a-implementation-review.md)
 
 ## Build Queue
 
@@ -23,18 +24,13 @@ Seven-step sequence resolved 2026-03-29. See [roadmap.md Priority 5.5](roadmap.m
 full details, design decisions, and review findings.
 
 1. ~~**HSD-A**~~ — drive session tokens + chain health as awareness input. **Done.**
-2. **VFM-A** — `OperationalHealth` enum, two-axis CLI rendering.
-   Fixes false reassurance problem. [Design](../95-ideas/2026-03-28-design-visual-feedback-model.md) ← **start here**
+2. ~~**VFM-A**~~ — `OperationalHealth` enum, two-axis CLI rendering. **Done.** ← **start here**
 3. **Sentinel Session 3** — hardening + notification deduplication.
    Needed by HSD-B and VFM-B, not by earlier steps.
 4. **HSD-B** — sentinel chain-break detection + full-send gate (Norman escalation, never auto-proceed).
 5. **VFM-B** — sentinel visual state in state file + health notifications.
 6. **Transient snapshots** — `local_retention = "transient"` for NVMe space pressure.
 7. **Tray icon (Spindle)** — reads sentinel-state.json, 4 static icons.
-
-Key design decisions already resolved:
-- Chain health: facade pattern — callers pre-compute, awareness is single health facade
-- Full-send gate: never auto-proceed, escalate notification urgency (Norman principles)
 
 **Later:** Config system migration (ADR-111), shell completions (6a).
 
@@ -47,7 +43,7 @@ Key design decisions already resolved:
 | Documentation standards | [CONTRIBUTING.md](../../CONTRIBUTING.md) |
 | ADRs (100-112) | [decisions/](../00-foundation/decisions/) |
 | Latest journals | `docs/98-journals/` (local only, gitignored) |
-| Latest reviews | [HSD-A impl review](../99-reports/2026-03-29-hsd-a-implementation-review.md), [HSD design review](../99-reports/2026-03-28-hardware-swap-defenses-design-review.md) |
+| Latest reviews | [VFM-A review](../99-reports/2026-03-29-vfm-a-implementation-review.md), [HSD-A review](../99-reports/2026-03-29-hsd-a-implementation-review.md) |
 
 ## Known Issues
 
@@ -58,5 +54,6 @@ Key design decisions already resolved:
 - WD-18TB UUID needs adding to config when drive is next mounted
 - Orphaned snapshot `20250422-multimedia` on WD-18TB1 — clean up or let crash recovery handle
 - Per-drive pin protection for external retention: all-drives-union is conservative but suboptimal for space
+- Stringly-typed output boundary: three independent status-ranking implementations across notify.rs and voice.rs
 
 See [roadmap.md](roadmap.md) for the full tech debt list and dropped features.

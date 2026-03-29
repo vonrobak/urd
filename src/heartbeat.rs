@@ -202,7 +202,7 @@ pub fn mark_dispatched(path: &Path) -> crate::error::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::awareness::{DriveAssessment, LocalAssessment, PromiseStatus};
+    use crate::awareness::{DriveAssessment, LocalAssessment, OperationalHealth, PromiseStatus};
     use crate::config::{
         Config, DefaultsConfig, GeneralConfig, LocalSnapshotsConfig, SnapshotRoot, SubvolumeConfig,
     };
@@ -276,6 +276,8 @@ mod tests {
             SubvolAssessment {
                 name: "home".to_string(),
                 status: PromiseStatus::Protected,
+                health: OperationalHealth::Healthy,
+                health_reasons: vec![],
                 local: LocalAssessment {
                     status: PromiseStatus::Protected,
                     snapshot_count: 24,
@@ -297,6 +299,8 @@ mod tests {
             SubvolAssessment {
                 name: "docs".to_string(),
                 status: PromiseStatus::AtRisk,
+                health: OperationalHealth::Healthy,
+                health_reasons: vec![],
                 local: LocalAssessment {
                     status: PromiseStatus::AtRisk,
                     snapshot_count: 5,

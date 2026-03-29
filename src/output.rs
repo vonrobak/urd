@@ -98,10 +98,18 @@ pub struct StatusOutput {
 pub struct StatusAssessment {
     pub name: String,
     pub status: String,
+    /// Operational health: "healthy", "degraded", or "blocked".
+    pub health: String,
+    /// Reasons for non-healthy operational health (empty when healthy).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub health_reasons: Vec<String>,
     /// Promise level from config (e.g., "protected", "resilient"), or None for custom/unset.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub promise_level: Option<String>,
     pub local_snapshot_count: usize,
+    /// Age of newest local snapshot in seconds, if available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_newest_age_secs: Option<i64>,
     pub local_status: String,
     pub external: Vec<StatusDriveAssessment>,
     pub advisories: Vec<String>,
@@ -114,8 +122,11 @@ impl StatusAssessment {
         Self {
             name: a.name.clone(),
             status: a.status.to_string(),
+            health: a.health.to_string(),
+            health_reasons: a.health_reasons.clone(),
             promise_level: None,
             local_snapshot_count: a.local.snapshot_count,
+            local_newest_age_secs: a.local.newest_age.map(|d| d.num_seconds()),
             local_status: a.local.status.to_string(),
             external: a
                 .external
@@ -135,6 +146,9 @@ pub struct StatusDriveAssessment {
     pub status: String,
     pub mounted: bool,
     pub snapshot_count: Option<usize>,
+    /// Age of last send in seconds, if available (even when unmounted).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_send_age_secs: Option<i64>,
 }
 
 impl StatusDriveAssessment {
@@ -145,6 +159,7 @@ impl StatusDriveAssessment {
             status: a.status.to_string(),
             mounted: a.mounted,
             snapshot_count: a.snapshot_count,
+            last_send_age_secs: a.last_send_age.map(|d| d.num_seconds()),
         }
     }
 }
