@@ -8,7 +8,7 @@
 
 **Urd is the sole backup system.** Systemd timer running nightly at 04:00 since 2026-03-25.
 Sentinel daemon deployed (passive monitoring, drive detection, backup overdue alerts).
-444 tests, all passing, clippy clean. Current version: v0.3.0.
+444 tests, all passing, clippy clean. Current version: v0.4.0.
 
 ## In Progress
 
@@ -27,6 +27,9 @@ full details, design decisions, and review findings.
 2. ~~**VFM-A**~~ — `OperationalHealth` enum, two-axis CLI rendering. **Done.**
 3. ~~**Sentinel Session 3**~~ — hardening + notification deduplication. **Done.** ← **completed**
 4. **HSD-B** — sentinel chain-break detection + full-send gate (Norman escalation, never auto-proceed). ← **start here**
+   - **Reference incident:** Clone drive with same UUID caused silent chain break (2026-03-29).
+     Pin parent absent on drive, full sends executed, one-behind design sent stale snapshot.
+     Journal: `docs/98-journals/2026-03-29-clone-drive-incident-analysis.md`
 5. **VFM-B** — sentinel visual state in state file + health notifications.
 6. **Transient snapshots** — `local_retention = "transient"` for NVMe space pressure.
 7. **Tray icon (Spindle)** — reads sentinel-state.json, 4 static icons.
@@ -50,8 +53,7 @@ full details, design decisions, and review findings.
 - Journal persistence gap: journald may purge user-unit logs; heartbeat partially compensates
 - `FileSystemState` trait (10 methods) outgrowing its name — consider rename to `SystemState`
 - `urd get` doesn't support directory restore (files only in v1)
-- WD-18TB UUID needs adding to config when drive is next mounted
-- Orphaned snapshot `20250422-multimedia` on WD-18TB1 — clean up or let crash recovery handle
+- Urd config: consolidate WD-18TB / WD-18TB1 drive entries (same UUID, mount point resolved to `/run/media/patriark/WD-18TB`)
 - Per-drive pin protection for external retention: all-drives-union is conservative but suboptimal for space
 - Stringly-typed output boundary: three independent status-ranking implementations across notify.rs and voice.rs
 - `drive_connections` table has no retention policy (negligible for years at ~1000 rows/year)
