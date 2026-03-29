@@ -8,23 +8,37 @@
 
 **Urd is the sole backup system.** Systemd timer running nightly at 04:00 since 2026-03-25.
 Sentinel daemon deployed (passive monitoring, drive detection, backup overdue alerts).
-462 tests, all passing, clippy clean. Current version: v0.4.0.
+470 tests, all passing, clippy clean. Current version: v0.4.0.
 
 ## In Progress
 
-- **UX-1 complete, uncommitted.** Structural headings (D5) + collapsed skip reasons (D1)
-  in `urd plan` output. `SkipCategory` enum in output.rs, grouped rendering in voice.rs,
-  JSON daemon output enriched with category field. Ready to commit.
-- **Cross-drive fallback infrastructure** (from previous session) also uncommitted in
-  `state.rs`/`plan.rs` — methods not yet called, built for UX-2.
+- **UX-1 complete, uncommitted** (2026-03-30). `SkipCategory` enum in output.rs, grouped
+  plan rendering in voice.rs (D5 structural headings + D1 collapsed skips). Arch-adversary
+  review complete, all findings addressed. Ready for `/commit-push-pr`.
 
-## Next Up
+## Build Queue
 
-1. **Commit UX-1 + cross-drive fallback** — all changes are uncommitted, tests pass.
-2. **UX-2** — estimated send sizes in plan output (D2+D3), uses cross-drive fallback.
-   Design: `docs/95-ideas/2026-03-29-design-d2-estimated-sizes.md`.
-3. **UX-3** — rich progress display (P1) + ETA (P3).
-   Design: `docs/95-ideas/2026-03-29-design-p1-rich-progress-display.md`.
+Seven-step sequence resolved 2026-03-29. See [roadmap.md Priority 5.5](roadmap.md) for
+full details, design decisions, and review findings.
+
+1. ~~**HSD-A**~~ — drive session tokens + chain health as awareness input. **Done.**
+2. ~~**VFM-A**~~ — `OperationalHealth` enum, two-axis CLI rendering. **Done.**
+3. ~~**Sentinel Session 3**~~ — hardening + notification deduplication. **Done.**
+4. ~~**UX-1**~~ — plan output: structural headings (D5) + collapsed skips (D1). **Done.**
+5. **UX-2** — plan output: estimated send sizes (D2+D3), cross-drive fallback (S1 fix). **start here**
+6. **UX-3** — progress display: rich context (P1) + ETA (P3).
+7. **HSD-B** — sentinel chain-break detection + full-send gate (Norman escalation).
+   - Reference incident: `docs/98-journals/2026-03-29-clone-drive-incident-analysis.md`
+8. **VFM-B** — sentinel visual state in state file + health notifications.
+9. **Transient snapshots** — `local_retention = "transient"` for NVMe space pressure.
+10. **Tray icon (Spindle)** — reads sentinel-state.json, 4 static icons.
+
+Designs: `docs/95-ideas/2026-03-29-design-*.md`.
+Review: `docs/99-reports/2026-03-29-progress-display-design-review.md`.
+Post-review: `docs/99-reports/2026-03-29-post-review-cross-drive-fallback-review.md`.
+UX-1 review: `docs/99-reports/2026-03-30-ux1-plan-output-review.md`.
+
+**Later:** Config system migration (ADR-111), shell completions (6a).
 
 ## Key Links
 
@@ -35,9 +49,7 @@ Sentinel daemon deployed (passive monitoring, drive detection, backup overdue al
 | Documentation standards | [CONTRIBUTING.md](../../CONTRIBUTING.md) |
 | ADRs (100-112) | [decisions/](../00-foundation/decisions/) |
 | Latest journals | `docs/98-journals/` (local only, gitignored) |
-| Design review | [Progress display design review](../99-reports/2026-03-29-progress-display-design-review.md) |
-| Post-review | [Cross-drive fallback review](../99-reports/2026-03-29-post-review-cross-drive-fallback-review.md) |
-| UX designs | `docs/95-ideas/2026-03-29-design-{d1,d2,d5,p1,p3}.md` |
+| Latest reviews | [UX-1 review](../99-reports/2026-03-30-ux1-plan-output-review.md), [Design review](../99-reports/2026-03-29-progress-display-design-review.md) |
 
 ## Known Issues
 
@@ -45,8 +57,10 @@ Sentinel daemon deployed (passive monitoring, drive detection, backup overdue al
 - Journal persistence gap: journald may purge user-unit logs; heartbeat partially compensates
 - `FileSystemState` trait (11 methods) outgrowing its name — consider rename to `SystemState`
 - `urd get` doesn't support directory restore (files only in v1)
-- Calibrated sizes use `du -sb` but btrfs send streams are ~10% larger — affects size estimates
+- Calibrated sizes use `du -sb` but btrfs send streams are ~10% larger — affects size estimates (review Open Q1)
+- Per-drive pin protection for external retention: all-drives-union is conservative but suboptimal for space
 - Stringly-typed output boundary: three independent status-ranking implementations across notify.rs and voice.rs
-- `parse_duration_to_minutes` lacks unit test for cross-unit comparisons (d vs h)
+- `drive_connections` table has no retention policy (negligible for years at ~1000 rows/year)
+- `render_skipped_block` (backup summary) uses ad-hoc string grouping; could adopt `SkipCategory`
 
 See [roadmap.md](roadmap.md) for the full tech debt list and dropped features.
