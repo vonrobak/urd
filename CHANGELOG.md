@@ -7,8 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Drive session tokens for hardware swap detection (`.urd-drive-token` identity files)
+- Chain health computation in awareness model (incremental chain intact/broken per drive)
+
 ### Changed
 - README rewritten for public repository
+- Status command derives chain health from awareness assessment instead of recomputing
 
 ## [0.3.0] - 2026-03-27
 

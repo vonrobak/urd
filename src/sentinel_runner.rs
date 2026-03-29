@@ -496,6 +496,7 @@ mod tests {
                 configured_interval: Interval::hours(1),
             },
             external: vec![],
+            chain_health: vec![],
             advisories: vec![],
             errors: vec![],
         }

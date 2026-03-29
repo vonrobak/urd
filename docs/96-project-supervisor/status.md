@@ -8,25 +8,23 @@
 
 **Urd is the sole backup system.** Systemd timer running nightly at 04:00 since 2026-03-25.
 Sentinel daemon deployed (passive monitoring, drive detection, backup overdue alerts).
-389 tests, all passing, clippy clean. Current version: v0.3.0.
+416 tests, all passing, clippy clean. Current version: v0.3.0.
 
 ## In Progress
 
-- **Operational cutover monitoring.** Target: 2026-04-01 (1 week from cutover).
-  Grafana dashboard continuity not yet verified. Bash script cleanup pending in ~/containers.
-- **Sentinel Session 3** next: hardening + notification deduplication.
-  Sessions 1-2 complete (pure state machine, I/O runner, CLI).
-  [Sentinel design](../95-ideas/2026-03-27-design-sentinel-implementation.md)
+- **HSD-A complete** (2026-03-29). Drive session tokens + chain health as awareness input.
+  Token infrastructure built, tested, reviewed. Token verification dormant until HSD-B wires it.
+  Chain health moved from status command into pure awareness module.
+  [Implementation review](../99-reports/2026-03-29-hsd-a-implementation-review.md)
 
 ## Build Queue
 
 Seven-step sequence resolved 2026-03-29. See [roadmap.md Priority 5.5](roadmap.md) for
 full details, design decisions, and review findings.
 
-1. **HSD-A** — drive session tokens + chain health as pre-computed awareness input.
-   Unblocks VFM-A. [Design](../95-ideas/2026-03-28-design-hardware-swap-defenses.md) ← **start here**
+1. ~~**HSD-A**~~ — drive session tokens + chain health as awareness input. **Done.**
 2. **VFM-A** — `OperationalHealth` enum, two-axis CLI rendering.
-   Fixes false reassurance problem. [Design](../95-ideas/2026-03-28-design-visual-feedback-model.md)
+   Fixes false reassurance problem. [Design](../95-ideas/2026-03-28-design-visual-feedback-model.md) ← **start here**
 3. **Sentinel Session 3** — hardening + notification deduplication.
    Needed by HSD-B and VFM-B, not by earlier steps.
 4. **HSD-B** — sentinel chain-break detection + full-send gate (Norman escalation, never auto-proceed).
@@ -49,7 +47,7 @@ Key design decisions already resolved:
 | Documentation standards | [CONTRIBUTING.md](../../CONTRIBUTING.md) |
 | ADRs (100-112) | [decisions/](../00-foundation/decisions/) |
 | Latest journals | `docs/98-journals/` (local only, gitignored) |
-| Latest reviews | [HSD review](../99-reports/2026-03-28-hardware-swap-defenses-design-review.md), [VFM review](../99-reports/2026-03-28-visual-feedback-model-design-review.md) |
+| Latest reviews | [HSD-A impl review](../99-reports/2026-03-29-hsd-a-implementation-review.md), [HSD design review](../99-reports/2026-03-28-hardware-swap-defenses-design-review.md) |
 
 ## Known Issues
 

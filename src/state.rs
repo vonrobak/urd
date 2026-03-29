@@ -110,6 +110,13 @@ impl StateDb {
                     estimated_bytes INTEGER NOT NULL,
                     measured_at TEXT NOT NULL,
                     method TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS drive_tokens (
+                    drive_label TEXT PRIMARY KEY,
+                    token TEXT NOT NULL,
+                    first_seen TEXT NOT NULL,
+                    last_verified TEXT NOT NULL
                 );",
             )
             .map_err(|e| UrdError::State(format!("failed to create schema: {e}")))?;
@@ -393,6 +400,65 @@ impl StateDb {
             ))),
             None => Ok(None),
         }
+    }
+
+    // ── Drive token methods ─────────────────────────────────────────
+
+    /// Store a drive session token (insert or replace).
+    /// On conflict (same drive_label), updates the token and last_verified but
+    /// preserves `first_seen`. Note: `first_seen` records when SQLite first
+    /// learned about this token, not when the token was originally written to
+    /// the drive. On self-healing re-stores, `first_seen` reflects the
+    /// re-discovery time. The token file's `# Written:` comment is the
+    /// authoritative creation timestamp if needed.
+    pub fn store_drive_token(
+        &self,
+        label: &str,
+        token: &str,
+        now: &str,
+    ) -> crate::error::Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO drive_tokens (drive_label, token, first_seen, last_verified)
+                 VALUES (?1, ?2, ?3, ?3)
+                 ON CONFLICT(drive_label) DO UPDATE SET
+                   token = ?2, last_verified = ?3",
+                rusqlite::params![label, token, now],
+            )
+            .map_err(|e| UrdError::State(format!("failed to store drive token: {e}")))?;
+        Ok(())
+    }
+
+    /// Look up a stored drive session token by drive label.
+    /// Returns None if no token is stored for this drive.
+    #[allow(dead_code)] // used by verify_drive_token(); wired in HSD-B
+    pub fn get_drive_token(&self, label: &str) -> crate::error::Result<Option<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT token FROM drive_tokens WHERE drive_label = ?1")
+            .map_err(|e| UrdError::State(format!("query failed: {e}")))?;
+
+        let mut rows = stmt
+            .query_map(rusqlite::params![label], |row| row.get(0))
+            .map_err(|e| UrdError::State(format!("query failed: {e}")))?;
+
+        match rows.next() {
+            Some(Ok(token)) => Ok(Some(token)),
+            Some(Err(e)) => Err(UrdError::State(format!("failed to read drive token: {e}"))),
+            None => Ok(None),
+        }
+    }
+
+    /// Update the last_verified timestamp for a drive token.
+    #[allow(dead_code)] // used by verify_drive_token(); wired in HSD-B
+    pub fn touch_drive_token(&self, label: &str, now: &str) -> crate::error::Result<()> {
+        self.conn
+            .execute(
+                "UPDATE drive_tokens SET last_verified = ?1 WHERE drive_label = ?2",
+                rusqlite::params![now, label],
+            )
+            .map_err(|e| UrdError::State(format!("failed to touch drive token: {e}")))?;
+        Ok(())
     }
 
     /// Get the bytes_transferred from the most recent failed send of a given type
@@ -908,5 +974,66 @@ mod tests {
     fn calibrated_size_returns_none_for_unknown() {
         let db = StateDb::open_memory().unwrap();
         assert_eq!(db.calibrated_size("nonexistent").unwrap(), None);
+    }
+
+    // ── drive token tests ────────────────────────���────────────────────
+
+    #[test]
+    fn store_and_get_drive_token() {
+        let db = StateDb::open_memory().unwrap();
+
+        db.store_drive_token("WD-18TB1", "abc-123", "2026-03-29T10:00:00")
+            .unwrap();
+        let token = db.get_drive_token("WD-18TB1").unwrap();
+        assert_eq!(token, Some("abc-123".to_string()));
+    }
+
+    #[test]
+    fn get_drive_token_returns_none_for_unknown() {
+        let db = StateDb::open_memory().unwrap();
+        assert_eq!(db.get_drive_token("nonexistent").unwrap(), None);
+    }
+
+    #[test]
+    fn store_drive_token_overwrites() {
+        let db = StateDb::open_memory().unwrap();
+
+        db.store_drive_token("D1", "old-token", "2026-03-29T10:00:00")
+            .unwrap();
+        db.store_drive_token("D1", "new-token", "2026-03-29T11:00:00")
+            .unwrap();
+
+        let token = db.get_drive_token("D1").unwrap();
+        assert_eq!(token, Some("new-token".to_string()));
+
+        // first_seen should be preserved (ON CONFLICT keeps original row's first_seen)
+        let first_seen: String = db
+            .conn
+            .query_row(
+                "SELECT first_seen FROM drive_tokens WHERE drive_label = 'D1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(first_seen, "2026-03-29T10:00:00");
+    }
+
+    #[test]
+    fn touch_drive_token_updates_timestamp() {
+        let db = StateDb::open_memory().unwrap();
+
+        db.store_drive_token("D1", "tok", "2026-03-29T10:00:00")
+            .unwrap();
+        db.touch_drive_token("D1", "2026-03-29T12:00:00").unwrap();
+
+        let last_verified: String = db
+            .conn
+            .query_row(
+                "SELECT last_verified FROM drive_tokens WHERE drive_label = 'D1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(last_verified, "2026-03-29T12:00:00");
     }
 }
