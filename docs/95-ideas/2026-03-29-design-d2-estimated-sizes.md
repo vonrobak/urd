@@ -33,11 +33,23 @@ Both `Option` for cases where no estimate is available (first-ever send, no cali
 Expand signature: `build_plan_output(plan: &BackupPlan, fs_state: &dyn FileSystemState)`.
 Both callers (`plan_cmd::run` and `backup::run`) already have `fs_state` in scope.
 
-In `build_operation_entry`, query for each send:
-- **SendFull:** Try `last_send_size(subvol, drive, "send_full")` first (most accurate —
-  actual transfer bytes), fall back to `calibrated_size(subvol)`.
-- **SendIncremental:** Try `last_send_size(subvol, drive, "send_incremental")`. Label as
-  "last:" rather than "~" since incremental sizes vary widely by delta.
+In `build_operation_entry`, query for each send using a three-tier fallback chain
+(arch-adversary S1 — cross-drive fallback for drive swap scenarios):
+
+- **SendFull:**
+  1. `last_send_size(subvol, drive, "send_full")` — same drive history (most accurate)
+  2. `last_send_size_any_drive(subvol, "send_full")` — cross-drive history (covers drive swaps)
+  3. `calibrated_size(subvol)` — `du -sb` measurement (full sends only)
+- **SendIncremental:**
+  1. `last_send_size(subvol, drive, "send_incremental")` — same drive
+  2. `last_send_size_any_drive(subvol, "send_incremental")` — cross-drive
+  3. No calibrated fallback (calibration measures full subvolume, not incremental delta)
+
+Label same-drive history as `~`, cross-drive as `~` (same confidence), calibrated as `~`
+with `(est)` qualifier. Incrementals use `last:` prefix since sizes vary widely by delta.
+
+The `last_send_size_any_drive()` infrastructure is already implemented in `state.rs` and
+the `FileSystemState` trait in `plan.rs`.
 
 Summary: sum all non-None `estimated_bytes`. If some sends lack estimates, render
 qualified: `6 sends (~623 GB estimated for 4 of 6)`.
@@ -58,7 +70,7 @@ Update to pass `&fs_state` to `build_plan_output()`.
 ## Data Flow
 
 1. `plan_cmd::run()` / `backup::run()` both have `fs_state: RealFileSystemState`.
-2. `build_plan_output(plan, &fs_state)` queries `last_send_size()` and `calibrated_size()`
+2. `build_plan_output(plan, &fs_state)` queries size using the three-tier fallback chain
    for each send operation.
 3. Populates `PlanOperationEntry.estimated_bytes`.
 4. Aggregates to `PlanSummaryOutput.estimated_total_bytes`.
@@ -66,9 +78,11 @@ Update to pass `&fs_state` to `build_plan_output()`.
 
 ## Test Strategy
 
-- **Size lookup:** Mock `FileSystemState` returning known sizes. Cases: full with history,
-  full with calibrated only, full with both (history wins), incremental with history,
-  send with no data. ~6 tests.
+- **Size lookup:** Mock `FileSystemState` returning known sizes. Cases: full with same-drive
+  history, full with cross-drive fallback only, full with calibrated only, full with all
+  three (same-drive wins), incremental with history, incremental with cross-drive fallback,
+  send with no data. ~8 tests. Cross-drive fallback infrastructure already tested in
+  `state.rs`.
 - **Summary aggregation:** Partial data, all-None, all-present. ~3 tests.
 - **Rendering:** Output includes `~53 GB`, `last: 5.5 MB`, no annotation for None. ~6 tests.
 - **JSON serialization:** `estimated_bytes` as integer or null. ~1 test.
@@ -84,6 +98,22 @@ backup.rs trivially). `FileSystemState` already in scope at both call sites. **O
 
 None for implementation. Feature 4 (ETA) reuses the same size lookup logic — extract
 to shared helper if both are implemented.
+
+## Known Limitations
+
+**Calibration size gap (arch-adversary open question 1):** `urd calibrate` uses `du -sb`
+which measures filesystem apparent size, not btrfs send stream size. The send stream is
+~10% larger due to btrfs metadata overhead. Real data from run #15:
+
+| Subvolume | Calibrated (`du -sb`) | Actual send | Gap |
+|-----------|----------------------|-------------|-----|
+| subvol3-opptak | 3.1 TB | 3.4 TB | +9.7% |
+| subvol5-music | 1.0 TB | 1.1 TB | +10% |
+
+This is acceptable for v1: all sizes use `~` prefix communicating approximation, and
+the existing 1.2x safety margin in space checks (plan.rs) partially compensates. A
+future improvement would be to calibrate via `btrfs send --dry-run` (measures actual
+stream size) instead of `du -sb`, but this is more complex and not needed now.
 
 ## Risks
 

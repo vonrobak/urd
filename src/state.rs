@@ -365,6 +365,38 @@ impl StateDb {
         }
     }
 
+    /// Get the bytes_transferred from the most recent successful send of a given type
+    /// for a subvolume across **all** drives. Returns None if no matching history exists.
+    /// Used as a cross-drive fallback when the target drive has no history (e.g., drive swap).
+    pub fn last_successful_send_size_any_drive(
+        &self,
+        subvol: &str,
+        send_type: &str,
+    ) -> crate::error::Result<Option<u64>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT bytes_transferred FROM operations
+                 WHERE subvolume = ?1 AND operation = ?2
+                   AND result = 'success' AND bytes_transferred IS NOT NULL
+                 ORDER BY id DESC LIMIT 1",
+            )
+            .map_err(|e| UrdError::State(format!("query failed: {e}")))?;
+
+        let mut rows = stmt
+            .query_map(rusqlite::params![subvol, send_type], |row| {
+                let bytes: i64 = row.get(0)?;
+                Ok(bytes as u64)
+            })
+            .map_err(|e| UrdError::State(format!("query failed: {e}")))?;
+
+        match rows.next() {
+            Some(Ok(size)) => Ok(Some(size)),
+            Some(Err(e)) => Err(UrdError::State(format!("failed to read send size: {e}"))),
+            None => Ok(None),
+        }
+    }
+
     /// Get the timestamp of the most recent successful send (full or incremental)
     /// for a subvolume to a specific drive. Returns the run's started_at timestamp.
     #[allow(dead_code)]
@@ -534,6 +566,38 @@ impl StateDb {
 
         let mut rows = stmt
             .query_map(rusqlite::params![subvol, drive, send_type], |row| {
+                let bytes: i64 = row.get(0)?;
+                Ok(bytes as u64)
+            })
+            .map_err(|e| UrdError::State(format!("query failed: {e}")))?;
+
+        match rows.next() {
+            Some(Ok(size)) => Ok(Some(size)),
+            Some(Err(e)) => Err(UrdError::State(format!("failed to read send size: {e}"))),
+            None => Ok(None),
+        }
+    }
+
+    /// Get the bytes_transferred from the most recent failed send of a given type
+    /// for a subvolume across **all** drives, where partial bytes were recorded.
+    /// Cross-drive fallback counterpart of `last_failed_send_size()`.
+    pub fn last_failed_send_size_any_drive(
+        &self,
+        subvol: &str,
+        send_type: &str,
+    ) -> crate::error::Result<Option<u64>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT bytes_transferred FROM operations
+                 WHERE subvolume = ?1 AND operation = ?2
+                   AND result = 'failure' AND bytes_transferred IS NOT NULL
+                 ORDER BY id DESC LIMIT 1",
+            )
+            .map_err(|e| UrdError::State(format!("query failed: {e}")))?;
+
+        let mut rows = stmt
+            .query_map(rusqlite::params![subvol, send_type], |row| {
                 let bytes: i64 = row.get(0)?;
                 Ok(bytes as u64)
             })
@@ -1068,6 +1132,111 @@ mod tests {
         assert_eq!(
             db.last_failed_send_size("sv1", "D", "send_full").unwrap(),
             None
+        );
+    }
+
+    // ── cross-drive fallback tests ────────────────────────────────────
+
+    #[test]
+    fn any_drive_returns_most_recent_successful() {
+        let db = StateDb::open_memory().unwrap();
+        let run_id = db.begin_run("full").unwrap();
+
+        // Record send to drive A
+        db.record_operation(&OperationRecord {
+            run_id,
+            subvolume: "sv1".to_string(),
+            operation: "send_full".to_string(),
+            drive_label: Some("DriveA".to_string()),
+            duration_secs: Some(10.0),
+            result: "success".to_string(),
+            error_message: None,
+            bytes_transferred: Some(100_000),
+        })
+        .unwrap();
+
+        // Record send to drive B (more recent, higher id)
+        db.record_operation(&OperationRecord {
+            run_id,
+            subvolume: "sv1".to_string(),
+            operation: "send_full".to_string(),
+            drive_label: Some("DriveB".to_string()),
+            duration_secs: Some(20.0),
+            result: "success".to_string(),
+            error_message: None,
+            bytes_transferred: Some(200_000),
+        })
+        .unwrap();
+
+        // Cross-drive query returns most recent (DriveB)
+        assert_eq!(
+            db.last_successful_send_size_any_drive("sv1", "send_full")
+                .unwrap(),
+            Some(200_000)
+        );
+    }
+
+    #[test]
+    fn any_drive_returns_none_when_no_history() {
+        let db = StateDb::open_memory().unwrap();
+        assert_eq!(
+            db.last_successful_send_size_any_drive("sv1", "send_full")
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            db.last_failed_send_size_any_drive("sv1", "send_full")
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn any_drive_isolates_by_subvolume() {
+        let db = StateDb::open_memory().unwrap();
+        let run_id = db.begin_run("full").unwrap();
+
+        db.record_operation(&OperationRecord {
+            run_id,
+            subvolume: "sv1".to_string(),
+            operation: "send_full".to_string(),
+            drive_label: Some("D".to_string()),
+            duration_secs: Some(10.0),
+            result: "success".to_string(),
+            error_message: None,
+            bytes_transferred: Some(500_000),
+        })
+        .unwrap();
+
+        // Different subvolume should not see sv1's data
+        assert_eq!(
+            db.last_successful_send_size_any_drive("sv2", "send_full")
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn any_drive_failed_returns_partial_bytes() {
+        let db = StateDb::open_memory().unwrap();
+        let run_id = db.begin_run("full").unwrap();
+
+        db.record_operation(&OperationRecord {
+            run_id,
+            subvolume: "sv1".to_string(),
+            operation: "send_full".to_string(),
+            drive_label: Some("DriveA".to_string()),
+            duration_secs: Some(5.0),
+            result: "failure".to_string(),
+            error_message: Some("IO error".to_string()),
+            bytes_transferred: Some(75_000),
+        })
+        .unwrap();
+
+        assert_eq!(
+            db.last_failed_send_size_any_drive("sv1", "send_full")
+                .unwrap(),
+            Some(75_000)
         );
     }
 

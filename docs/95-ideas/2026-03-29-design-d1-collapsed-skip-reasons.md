@@ -35,16 +35,17 @@ After:
 #[serde(rename_all = "snake_case")]
 pub enum SkipCategory {
     DriveNotMounted,
-    IntervalNotElapsed,
-    SendIntervalNotElapsed,
-    Disabled,
-    SendDisabled,
-    SpaceExceeded,
-    AlreadyOnDrive,
-    SnapshotExists,
-    Other,
+    IntervalNotElapsed,  // includes send interval not due
+    Disabled,            // includes send disabled
+    SpaceExceeded,       // both historical and calibrated estimates
+    Other,               // UUID/token issues, already on drive, snapshot exists
 }
 ```
+
+**Rationale (arch-adversary S2+M1):** Real-world data shows 5 categories cover 100% of
+observed output. `SendDisabled` merges into `Disabled` (user doesn't care about the
+distinction in a summary). `SendIntervalNotElapsed` merges into `IntervalNotElapsed`.
+UUID/token mismatch, already-on-drive, and snapshot-exists are rare enough for `Other`.
 
 Add `category: SkipCategory` to `SkippedSubvolume`. The `reason` field stays for detail.
 
@@ -53,17 +54,24 @@ Add `category: SkipCategory` to `SkippedSubvolume`. The `reason` field stays for
 Add `classify_skip_reason(reason: &str) -> SkipCategory` that parses known prefixes
 from plan.rs skip reasons:
 
-| Pattern | Category |
-|---------|----------|
-| `"drive " + " not mounted"` | `DriveNotMounted` |
-| `"interval not elapsed"` | `IntervalNotElapsed` |
-| `"send to " + " not due"` | `SendIntervalNotElapsed` |
-| `"disabled"` | `Disabled` |
-| `"send disabled"` | `SendDisabled` |
-| starts with `"send to "` + contains `"skipped"` | `SpaceExceeded` |
-| contains `"already on"` | `AlreadyOnDrive` |
-| `"snapshot already exists"` | `SnapshotExists` |
-| anything else | `Other` |
+All 14 plan.rs skip patterns (verified by grep) mapped to 5 categories:
+
+| # | Pattern | Category |
+|---|---------|----------|
+| 1 | `"disabled"` | `Disabled` |
+| 2 | `"drive {label} not mounted"` | `DriveNotMounted` |
+| 3 | `"drive {label} UUID mismatch …"` | `Other` |
+| 4 | `"drive {label} UUID check failed: …"` | `Other` |
+| 5 | `"drive {label} token mismatch …"` | `Other` |
+| 6 | `"send disabled"` | `Disabled` |
+| 7 | `"local filesystem low on space …"` | `SpaceExceeded` |
+| 8 | `"snapshot already exists"` | `Other` |
+| 9 | `"interval not elapsed (next in ~…)"` | `IntervalNotElapsed` |
+| 10 | `"send to {label} not due (next in ~…)"` | `IntervalNotElapsed` |
+| 11 | `"no local snapshots to send"` | `Other` |
+| 12 | `"{snap} already on {label}"` | `Other` |
+| 13 | `"send to {label} skipped: estimated ~… exceeds …"` | `SpaceExceeded` |
+| 14 | `"send to {label} skipped: calibrated size ~… exceeds …"` | `SpaceExceeded` |
 
 Update `build_plan_output()` to call this when constructing `SkippedSubvolume`.
 
@@ -94,11 +102,17 @@ Replace flat skip loop (lines 802-817) with grouping logic:
 
 ## Test Strategy
 
-- **`classify_skip_reason`:** One test per known pattern + unknown→Other. ~10 tests.
+- **`classify_skip_reason`:** One test per known pattern + unknown→Other. ~5 tests (one per
+  category, plus Other).
+- **Completeness test (arch-adversary S2):** A single test that exercises all 14 plan.rs skip
+  patterns against the classifier. Each pattern must classify to its expected category. This
+  catches silent regressions when new skip reasons are added to plan.rs — any unhandled
+  pattern falls to `Other`, and the test documents which patterns are intentionally `Other`
+  vs accidentally missed.
 - **Grouping/rendering:** PlanOutput with mixed categories, verify collapsed output. ~6 tests.
 - **JSON regression:** Verify daemon output serializes all entries with categories. ~1 test.
 
-**Estimated: 17-18 tests.**
+**Estimated: 13-15 tests.**
 
 ## Effort Estimate
 

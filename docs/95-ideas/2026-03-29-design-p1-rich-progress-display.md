@@ -26,29 +26,40 @@ Target display:
 Define a module-private `ProgressContext` struct:
 
 ```rust
+use crate::executor::SendType;
+
 struct ProgressContext {
     subvolume_name: String,
     drive_label: String,
-    send_type: &'static str,    // "full" or "incremental"
+    send_type: SendType,        // Full or Incremental (from executor.rs)
     send_index: u32,            // 1-based, updated by executor before each send
     total_sends: u32,           // computed from plan before execution
 }
 ```
 
+**Note (arch-adversary P1 item 3):** Uses the existing `SendType` enum from `executor.rs`
+(`Full`, `Incremental`, `NoSend`) instead of a raw `&'static str`. The `NoSend` variant
+is never set in `ProgressContext` since the progress display only activates during sends.
+
 Create `Arc<Mutex<ProgressContext>>` alongside existing `bytes_counter`. Pass clone to
 progress thread and to `Executor`. Rewrite `progress_display_loop` to read from both
 the atomic counter and the mutex-protected context.
 
-**State machine in progress thread (three states):**
+**State machine in progress thread (four states):**
 1. **Idle:** Counter is 0, no active send. Continue polling.
 2. **Active:** Counter > 0. On 0→non-zero transition, read `ProgressContext` via mutex,
    store locally. Display live progress line with `\r` overwrite.
 3. **Completing:** Counter resets to 0 after having been non-zero (next send starting).
    Print permanent completion line via `eprintln!`, then transition back to idle/active.
+4. **Shutdown (arch-adversary M2):** Shutdown flag is set. If `last_display_bytes > 0`,
+   immediately print the final completion line with last known context before thread exit.
+   This handles the last send, whose counter never resets to 0. The executor signals
+   shutdown after all sends complete; the progress thread must not wait for a counter
+   reset that will never come.
 
-**Last-send handling:** The final send's counter never resets to 0 — the thread exits
-via shutdown flag. During shutdown cleanup, print the final completion line using the
-last observed bytes and elapsed time.
+The ~1s gap between sends (snapshot creation time) is acceptable: the progress thread
+shows the previous send's final byte count as a stale line briefly, then detects the
+reset when the next `send_receive()` starts.
 
 Extract formatting into pure functions for testability:
 - `format_progress_line(ctx, bytes, rate, elapsed) -> String`

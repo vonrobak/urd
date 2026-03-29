@@ -8,15 +8,13 @@
 
 **Urd is the sole backup system.** Systemd timer running nightly at 04:00 since 2026-03-25.
 Sentinel daemon deployed (passive monitoring, drive detection, backup overdue alerts).
-444 tests, all passing, clippy clean. Current version: v0.4.0.
+448 tests, all passing, clippy clean. Current version: v0.4.0.
 
 ## In Progress
 
-- **Sentinel Session 3 complete** (2026-03-29). Notification deduplication between backup
-  command and sentinel daemon. Drive connection recording in SQLite. `SentinelStateFile::read()`
-  moved out of pure-types module (ADR-108). Post-review: heartbeat dispatched flag preserved
-  on deferral. Reviewed, simplified, post-review fixes applied.
-  [Implementation review](../99-reports/2026-03-29-sentinel-session3-implementation-review.md)
+- **UX design post-review complete** (2026-03-30). Cross-drive fallback infrastructure
+  built in `state.rs`/`plan.rs` (S1 fix). Design docs D1, D2, P1 updated with review
+  findings. All changes uncommitted — ready to commit with UX-1 or separately.
 
 ## Build Queue
 
@@ -25,7 +23,7 @@ full details, design decisions, and review findings.
 
 1. ~~**HSD-A**~~ — drive session tokens + chain health as awareness input. **Done.**
 2. ~~**VFM-A**~~ — `OperationalHealth` enum, two-axis CLI rendering. **Done.**
-3. ~~**Sentinel Session 3**~~ — hardening + notification deduplication. **Done.** ← **completed**
+3. ~~**Sentinel Session 3**~~ — hardening + notification deduplication. **Done.**
 4. **UX-1** — plan output: structural headings (D5) + collapsed skips (D1). ← **start here**
 5. **UX-2** — plan output: estimated send sizes (D2+D3), cross-drive fallback (S1 fix).
 6. **UX-3** — progress display: rich context (P1) + ETA (P3).
@@ -37,6 +35,7 @@ full details, design decisions, and review findings.
 
 Designs: `docs/95-ideas/2026-03-29-design-*.md`.
 Review: `docs/99-reports/2026-03-29-progress-display-design-review.md`.
+Post-review: `docs/99-reports/2026-03-29-post-review-cross-drive-fallback-review.md`.
 
 **Later:** Config system migration (ADR-111), shell completions (6a).
 
@@ -49,15 +48,15 @@ Review: `docs/99-reports/2026-03-29-progress-display-design-review.md`.
 | Documentation standards | [CONTRIBUTING.md](../../CONTRIBUTING.md) |
 | ADRs (100-112) | [decisions/](../00-foundation/decisions/) |
 | Latest journals | `docs/98-journals/` (local only, gitignored) |
-| Latest reviews | [Session 3 review](../99-reports/2026-03-29-sentinel-session3-implementation-review.md), [VFM-A review](../99-reports/2026-03-29-vfm-a-implementation-review.md) |
+| Latest reviews | [Post-review](../99-reports/2026-03-29-post-review-cross-drive-fallback-review.md), [Design review](../99-reports/2026-03-29-progress-display-design-review.md) |
 
 ## Known Issues
 
 - NVMe snapshot accumulation: space guard prevents catastrophic exhaustion but gradual accumulation above 10GB threshold not gated
 - Journal persistence gap: journald may purge user-unit logs; heartbeat partially compensates
-- `FileSystemState` trait (10 methods) outgrowing its name — consider rename to `SystemState`
+- `FileSystemState` trait (11 methods) outgrowing its name — consider rename to `SystemState`
 - `urd get` doesn't support directory restore (files only in v1)
-- Urd config: consolidate WD-18TB / WD-18TB1 drive entries (same UUID, mount point resolved to `/run/media/patriark/WD-18TB`)
+- Urd config: consolidate WD-18TB / WD-18TB1 drive entries (same UUID, mount point resolved to `/run/media/<user>/WD-18TB`)
 - Calibrated sizes use `du -sb` but btrfs send streams are ~10% larger — affects size estimates (review Open Q1)
 - Per-drive pin protection for external retention: all-drives-union is conservative but suboptimal for space
 - Stringly-typed output boundary: three independent status-ranking implementations across notify.rs and voice.rs
