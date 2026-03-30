@@ -12,8 +12,9 @@ safer? (2) does it reduce the attention the user needs to spend on backups? If a
 adds complexity the user must manage, it needs a very strong justification.
 
 **Two modes of existence:**
-- **The invisible worker.** Runs autonomously via systemd timer (nightly at ~04:00).
-  Silence means data is safe. Future: Sentinel daemon for sub-hourly cadence.
+- **The invisible worker.** Runs autonomously via systemd timer (nightly at ~04:00) and
+  Sentinel daemon (sub-hourly monitoring, drive detection, backup overdue alerts).
+  Silence means data is safe.
 - **The invoked norn.** `urd status`, `urd get`, `urd restore` — the user is consulting Urd.
   Speaks with authority and clarity. Surfaces problems only when they matter.
 
@@ -86,22 +87,11 @@ Each references an ADR in `docs/00-foundation/decisions/` with full rationale.
 9. **Backward compatibility contracts are sacred.** Snapshot names, pin files, Prometheus metrics — on-disk data format changes require an ADR with migration plan. Config schema changes use `urd migrate`. (ADR-105, ADR-111)
 10. **Named protection levels are opaque or they don't exist.** No per-field overrides on named levels. Custom is first-class. Named levels must earn opaque status through operational track record. (ADR-110, ADR-111)
 
-### Config System (ADR-111 — target architecture, not yet implemented)
+### Config System (ADR-111)
 
-The config system is undergoing a redesign. Key principles:
-
-- **Config files are complete, self-describing artifacts.** Each subvolume block is readable
-  in isolation. No hidden inheritance, no cross-section joins.
-- **Two modes: named level or custom.** Named levels derive all operational parameters
-  (opaque, no overrides). Custom subvolumes specify all parameters explicitly.
-- **Templates scaffold; they don't govern.** One-time generation at setup, not runtime inheritance.
-- **`[defaults]` section is being removed.** Hardcoded fallbacks in the binary for omitted fields.
-- **Explicit drive routing.** Every subvolume names its target drives. No implicit "all drives."
-- **Space constraints are a filesystem concern.** `[[space_constraints]]` section on paths.
-- **One schema version at a time.** `config_version` field, `urd migrate` for transitions.
-
-Current implementation still uses the legacy schema (`[defaults]`, `[local_snapshots]`).
-See ADR-111 implementation gates for the migration checklist.
+Current implementation uses the legacy schema (`[defaults]`, `[local_snapshots]`). ADR-111
+defines the target architecture: explicit drive routing, no inheritance, named levels are
+opaque, templates scaffold rather than govern. See ADR-111 for full design and migration gates.
 
 ### Error Handling
 
@@ -121,8 +111,9 @@ See ADR-111 implementation gates for the migration checklist.
   Fewer errors, not better errors.
 - **Precision in config, voice in presentation.** Config layer is mechanical and explicit.
   Mythic voice belongs entirely in `voice.rs` and notifications.
-- **The Sentinel is the integration layer.** Event-driven state machine (future) that
-  reacts to events, updates promise states, and drives notifications.
+- **The Sentinel is the integration layer.** Event-driven state machine that reacts to
+  drive events, updates promise states, and drives notifications. Deployed as a systemd
+  user service.
 
 ## Coding Conventions
 
@@ -134,6 +125,8 @@ See ADR-111 implementation gates for the migration checklist.
 - Derive `Debug` on all types; `Clone`, `PartialEq`, `Eq` where sensible
 - No `unsafe` — no need for it in this project
 - No `unwrap()` / `expect()` in library code — only in tests and `main.rs`
+- Fallback values must be *safe*, not just *convenient*. `unwrap_or(0)` is wrong when 0 is in-range but semantically meaningless (e.g., bytes transferred, age in days). Use `Option` to represent absence.
+- Daemon code (sentinel): lifecycle events use `warn!()` to be visible at default log levels
 - Doc filenames: lowercase kebab-case (exceptions: CLAUDE.md, README.md, CONTRIBUTING.md)
 
 ## Testing
@@ -141,8 +134,10 @@ See ADR-111 implementation gates for the migration checklist.
 - Unit tests: `#[cfg(test)] mod tests` in same file. Run: `cargo test`
 - Integration tests: `tests/integration/`, `#[ignore]` by default. Run: `cargo test -- --ignored`
 - Use `MockBtrfs` and `MockFileSystemState` for anything that would call btrfs or read filesystem
+- Code using path-constructing functions (`external_snapshot_dir()`, `local_snapshot_dir()`) should also have `tempfile::TempDir` tests — mocks are blind to filesystem preconditions like missing parent directories
 - Test retention logic exhaustively — it protects against data loss
-- 389+ tests, all passing, clippy clean
+- When building features, use vertical slicing: write one test, implement to pass, repeat. Never write all tests first then all implementation.
+- 521+ tests, all passing, clippy clean
 
 ## Backward Compatibility (ADR-105)
 
@@ -199,7 +194,7 @@ stringified — prevents shell injection and preserves non-UTF-8 paths.
 ```bash
 cargo build                          # Debug
 cargo build --release                # Release
-cargo test                           # Unit tests (389+ tests)
+cargo test                           # Unit tests (521+ tests)
 cargo test -- --ignored              # Integration tests (needs drives)
 cargo clippy -- -D warnings          # Lint (all warnings are errors)
 cargo run -- plan                    # Preview backup plan
@@ -238,13 +233,14 @@ cargo run -- get FILE --at DATE      # Restore file from snapshot
 Guideline, not rigid procedure. Skip steps that don't apply to the current work.
 
 ```
-/brainstorm → /design → [build] → /simplify → arch-adversary → /post-review → /check → /journal → /commit-push-pr
+/brainstorm → /design → /grill-me → [build] → /simplify → arch-adversary → /post-review → /check → /journal → /commit-push-pr
 ```
 
 | Tool | Phase | What it does |
 |------|-------|--------------|
 | `/brainstorm` | Ideation | Divergent thinking, no scoring. Output: `docs/95-ideas/` |
 | `/design` | Design | Module decomposition, ADR gate identification |
+| `/grill-me` | Stress-test | Socratic interview, resolve decision tree branches |
 | `/simplify` | Post-build | Simplification pass: abstractions, types, control flow |
 | `arch-adversary` | Review | Severity-ranked findings with catastrophic failure checklist |
 | `/post-review` | Rework | Systematic fix of review findings, structured disagreement |

@@ -123,10 +123,12 @@ follow links to roadmap.md for the full picture.
 **97-plans** — Implementation plans. Each plan is a dated snapshot of intent — what we're
 going to build and how. When scope changes significantly, write a new plan.
 
-**98-journals** — Session logs capturing the development journey (gitignored — local only).
-Write freely here: real command output, real paths, real mistakes. This is your private
-working memory. Distill key learnings into tracked docs (status.md, ADRs) so the public
-record stays useful without exposing personal details.
+**98-journals** — Session logs and handoff documents (gitignored — local only). Each
+journal serves two functions: (1) historical record of what was done and learned, and
+(2) handoff to the next session — verification steps, things to watch for, context that
+git history alone can't provide. Write freely: real command output, real paths, real
+mistakes. Distill key learnings into tracked docs (status.md, ADRs) so the public record
+stays useful without exposing personal details.
 
 **99-reports** — Analysis and review output. Arch-adversary reviews, automated reports,
 progress assessments. Each report is tied to a specific point in time and scope.
@@ -226,6 +228,15 @@ type should have. Add sections as needed.
 ## What was done
 
 ## What was learned
+
+## When you return
+
+{Verification steps, things to check, context the next session needs to pick up
+efficiently. This is the handoff — what would you tell the next session before it
+reads the code? Do NOT include git workflow state (PR open/closed, branch needs
+merging) — the next session checks git directly. DO include: operational checks
+(did the timer run?), things to verify about the work, context that git can't provide.
+Remove this section if nothing needs handoff.}
 
 ## Open questions
 ```
@@ -330,9 +341,10 @@ The adversary review reviews the proposal before implementation begins.
 
 ### Before starting new work
 
-1. Read `96-project-supervisor/status.md` for current state
-2. Follow links to relevant plans, recent journals, and open issues
-3. Check `95-ideas/` if exploring options for what to build next
+1. Read `96-project-supervisor/status.md` for current state and what to build next
+2. Read the most recent journal in `98-journals/` — especially "When you return"
+3. Check actual git state: `git log --oneline -5`, `gh pr list`, `git branch`
+4. Follow links to relevant plans, reports, and ideas as needed
 
 ### When you have a rough idea
 
