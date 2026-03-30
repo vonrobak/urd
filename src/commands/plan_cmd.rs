@@ -104,6 +104,7 @@ mod tests {
                 dummy_snap(subvol),
             )),
             subvolume_name: subvol.to_string(),
+            reason: crate::types::FullSendReason::FirstSend,
         }
     }
 
@@ -135,7 +136,7 @@ mod tests {
         assert_eq!(entry.is_full_send, Some(true));
         // Size is NOT in detail — voice.rs renders it from estimated_bytes.
         assert!(!entry.detail.contains('~'), "size should not be in detail");
-        assert!(entry.detail.contains("(full)"), "detail: {}", entry.detail);
+        assert!(entry.detail.contains("(full"), "detail: {}", entry.detail);
     }
 
     #[test]
@@ -185,7 +186,7 @@ mod tests {
         let fs = MockFileSystemState::new();
         let entry = build_operation_entry(&mock_send_full("htpc-home", "WD-18TB"), &fs);
         assert_eq!(entry.estimated_bytes, None);
-        assert!(entry.detail.contains("(full)"), "detail: {}", entry.detail);
+        assert!(entry.detail.contains("(full"), "detail: {}", entry.detail);
         assert!(!entry.detail.contains('~'), "should not have size annotation");
     }
 
@@ -298,6 +299,7 @@ fn build_operation_entry(
             detail: format!("{} -> {}", source.display(), dest.display()),
             estimated_bytes: None,
             is_full_send: None,
+            full_send_reason: None,
         },
         PlannedOperation::SendIncremental {
             snapshot,
@@ -331,6 +333,7 @@ fn build_operation_entry(
                 ),
                 estimated_bytes,
                 is_full_send: Some(false),
+                full_send_reason: None,
             }
         }
         PlannedOperation::SendFull {
@@ -338,6 +341,7 @@ fn build_operation_entry(
             drive_label,
             pin_on_success,
             subvolume_name,
+            reason,
             ..
         } => {
             let snap_name = snapshot.file_name().unwrap_or_default().to_string_lossy();
@@ -356,9 +360,12 @@ fn build_operation_entry(
             PlanOperationEntry {
                 subvolume: subvolume_name.clone(),
                 operation: "send".to_string(),
-                detail: format!("{snap_name} -> {drive_label} (full){pin_suffix}"),
+                detail: format!(
+                    "{snap_name} -> {drive_label} (full \u{2014} {reason}){pin_suffix}"
+                ),
                 estimated_bytes,
                 is_full_send: Some(true),
+                full_send_reason: Some(reason.to_string()),
             }
         }
         PlannedOperation::DeleteSnapshot {
@@ -373,6 +380,7 @@ fn build_operation_entry(
                 detail: format!("{snap_name} ({reason})"),
                 estimated_bytes: None,
                 is_full_send: None,
+                full_send_reason: None,
             }
         }
     }

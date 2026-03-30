@@ -501,6 +501,28 @@ pub struct ResolvedGraduatedRetention {
 
 // ── PlannedOperation ────────────────────────────────────────────────────
 
+/// Why a full send was planned instead of an incremental send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FullSendReason {
+    /// First send to this drive for this subvolume (no external snapshots). Normal.
+    FirstSend,
+    /// Pin file exists but the parent snapshot is missing on the drive.
+    /// The chain broke — this is a red flag that warrants attention.
+    ChainBroken,
+    /// Pin file doesn't exist. Could be first send or pin was lost.
+    NoPinFile,
+}
+
+impl fmt::Display for FullSendReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::FirstSend => write!(f, "first send"),
+            Self::ChainBroken => write!(f, "chain broken"),
+            Self::NoPinFile => write!(f, "no pin"),
+        }
+    }
+}
+
 /// An operation the backup planner has decided to perform.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlannedOperation {
@@ -525,6 +547,8 @@ pub enum PlannedOperation {
         subvolume_name: String,
         /// Pin file to write on successful send: (pin_file_path, snapshot_name_to_write)
         pin_on_success: Option<(PathBuf, SnapshotName)>,
+        /// Why this is a full send instead of incremental.
+        reason: FullSendReason,
     },
     DeleteSnapshot {
         path: PathBuf,
@@ -563,6 +587,7 @@ impl fmt::Display for PlannedOperation {
                 snapshot,
                 drive_label,
                 pin_on_success,
+                reason,
                 ..
             } => {
                 let pin_suffix = if pin_on_success.is_some() {
@@ -572,7 +597,7 @@ impl fmt::Display for PlannedOperation {
                 };
                 write!(
                     f,
-                    "SEND    {} -> {} (full){pin_suffix}",
+                    "SEND    {} -> {} (full \u{2014} {reason}){pin_suffix}",
                     snapshot.display(),
                     drive_label
                 )

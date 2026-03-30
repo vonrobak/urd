@@ -9,7 +9,7 @@ use crate::config::{Config, DriveConfig, ResolvedSubvolume};
 use crate::drives::DriveAvailability;
 use crate::error::UrdError;
 use crate::retention;
-use crate::types::{BackupPlan, PlannedOperation, SnapshotName};
+use crate::types::{BackupPlan, FullSendReason, PlannedOperation, SnapshotName};
 
 // ── FileSystemState trait ───────────────────────────────────────────────
 
@@ -549,12 +549,21 @@ fn plan_external_send(
             pin_on_success: pin_info,
         });
     } else {
+        let reason = if pin.is_some() {
+            // Pin exists but parent not found on drive/locally → chain broke
+            FullSendReason::ChainBroken
+        } else if ext_snaps.is_empty() {
+            FullSendReason::FirstSend
+        } else {
+            FullSendReason::NoPinFile
+        };
         operations.push(PlannedOperation::SendFull {
             snapshot: snap_path,
             dest_dir: ext_dir,
             drive_label: drive.label.clone(),
             subvolume_name: subvol.name.clone(),
             pin_on_success: pin_info,
+            reason,
         });
     }
 }
@@ -1151,6 +1160,11 @@ priority = 2
             .filter(|op| matches!(op, PlannedOperation::SendFull { .. }))
             .collect();
         assert_eq!(sends.len(), 1);
+        // No pin file + no external snapshots → FirstSend
+        assert!(matches!(
+            sends[0],
+            PlannedOperation::SendFull { reason: FullSendReason::FirstSend, .. }
+        ));
     }
 
     #[test]
@@ -1179,6 +1193,11 @@ priority = 2
             .filter(|op| matches!(op, PlannedOperation::SendFull { .. }))
             .collect();
         assert_eq!(sends.len(), 1);
+        // Pin exists but parent missing on drive → ChainBroken
+        assert!(matches!(
+            sends[0],
+            PlannedOperation::SendFull { reason: FullSendReason::ChainBroken, .. }
+        ));
     }
 
     #[test]

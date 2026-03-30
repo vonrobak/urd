@@ -98,6 +98,11 @@ pub struct BackupArgs {
     /// Without this flag, retention is skipped for promise-level subvolumes (fail-closed).
     #[arg(long)]
     pub confirm_retention_change: bool,
+
+    /// Force full sends even when incremental chains are broken.
+    /// Without this flag, chain-break full sends are skipped in autonomous mode (systemd).
+    #[arg(long)]
+    pub force_full: bool,
 }
 
 #[derive(clap::Args, Debug)]

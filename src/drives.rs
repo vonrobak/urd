@@ -27,11 +27,9 @@ pub enum DriveAvailability {
     /// NOTE: The drive session token is an identity signal, not a security
     /// control. A user who copies the token file to a different drive can
     /// defeat verification. Threat model: accidental hardware swaps.
-    #[allow(dead_code)] // constructed by verify_drive_token(); wired in HSD-B
     TokenMismatch { expected: String, found: String },
     /// Drive is mounted and UUID matches, but no token file exists on the drive.
     /// Normal for drives that have not completed their first Urd send.
-    #[allow(dead_code)] // constructed by verify_drive_token(); wired in HSD-B
     TokenMissing,
 }
 
@@ -290,7 +288,6 @@ pub fn generate_drive_token() -> String {
 /// - `TokenMissing` if no token file on drive (benign, sends proceed).
 /// - `TokenMismatch` if tokens differ (sends should be blocked).
 #[must_use]
-#[allow(dead_code)] // wired into sentinel_runner and commands/backup in HSD-B
 pub fn verify_drive_token(drive: &DriveConfig, state: &StateDb) -> DriveAvailability {
     let drive_token = match read_drive_token(drive) {
         Ok(Some(t)) => t,

@@ -370,6 +370,10 @@ pub struct PlanOperationEntry {
     /// Only set for send operations.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_full_send: Option<bool>,
+    /// Why a full send was chosen (e.g., "first send", "chain broken", "no pin").
+    /// Only set for full send operations.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub full_send_reason: Option<String>,
 }
 
 /// Summary counts for a backup plan.
