@@ -8,7 +8,7 @@
 
 **Urd is the sole backup system.** Systemd timer running nightly at 04:00 since 2026-03-25.
 Sentinel daemon deployed (passive monitoring, drive detection, backup overdue alerts).
-563 tests, all passing, clippy clean. Current version: v0.4.3.
+563 tests, all passing, clippy clean. Current version: v0.5.0.
 
 ## Recently Completed
 
