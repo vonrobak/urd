@@ -6,8 +6,8 @@ use serde::Deserialize;
 use crate::error::UrdError;
 use crate::notify::NotificationConfig;
 use crate::types::{
-    ByteSize, DriveRole, GraduatedRetention, Interval, ProtectionLevel, ResolvedGraduatedRetention,
-    RunFrequency,
+    ByteSize, DriveRole, GraduatedRetention, Interval, LocalRetentionConfig, LocalRetentionPolicy,
+    ProtectionLevel, ResolvedGraduatedRetention, RunFrequency,
 };
 
 // ── Top-level config ────────────────────────────────────────────────────
@@ -107,7 +107,7 @@ pub struct SubvolumeConfig {
     pub snapshot_interval: Option<Interval>,
     pub send_interval: Option<Interval>,
     pub send_enabled: Option<bool>,
-    pub local_retention: Option<GraduatedRetention>,
+    pub local_retention: Option<LocalRetentionConfig>,
     pub external_retention: Option<GraduatedRetention>,
     #[serde(default)]
     pub protection_level: Option<ProtectionLevel>,
@@ -132,7 +132,7 @@ pub struct ResolvedSubvolume {
     pub snapshot_interval: Interval,
     pub send_interval: Interval,
     pub send_enabled: bool,
-    pub local_retention: ResolvedGraduatedRetention,
+    pub local_retention: LocalRetentionPolicy,
     pub external_retention: ResolvedGraduatedRetention,
     pub protection_level: Option<ProtectionLevel>,
     pub drives: Option<Vec<String>>,
@@ -160,7 +160,11 @@ impl SubvolumeConfig {
             Some(policy) => {
                 // Named level: derived values are the base, explicit overrides replace them.
                 let local_ret = match &self.local_retention {
-                    Some(lr) => {
+                    Some(LocalRetentionConfig::Transient) => {
+                        // Transient overrides derived policy entirely.
+                        LocalRetentionPolicy::Transient
+                    }
+                    Some(LocalRetentionConfig::Graduated(lr)) => {
                         // User's partial retention merges with derived floor as base
                         let derived_as_graduated = GraduatedRetention {
                             hourly: Some(policy.local_retention.hourly),
@@ -168,9 +172,11 @@ impl SubvolumeConfig {
                             weekly: Some(policy.local_retention.weekly),
                             monthly: Some(policy.local_retention.monthly),
                         };
-                        lr.merged_with(&derived_as_graduated).resolved()
+                        LocalRetentionPolicy::Graduated(
+                            lr.merged_with(&derived_as_graduated).resolved(),
+                        )
                     }
-                    None => policy.local_retention,
+                    None => LocalRetentionPolicy::Graduated(policy.local_retention),
                 };
                 let external_ret = match &self.external_retention {
                     Some(er) => {
@@ -202,8 +208,15 @@ impl SubvolumeConfig {
             None => {
                 // Custom / no level: existing defaults-based resolution (migration path).
                 let local_ret = match &self.local_retention {
-                    Some(lr) => lr.merged_with(&defaults.local_retention).resolved(),
-                    None => defaults.local_retention.resolved(),
+                    Some(LocalRetentionConfig::Transient) => LocalRetentionPolicy::Transient,
+                    Some(LocalRetentionConfig::Graduated(lr)) => {
+                        LocalRetentionPolicy::Graduated(
+                            lr.merged_with(&defaults.local_retention).resolved(),
+                        )
+                    }
+                    None => {
+                        LocalRetentionPolicy::Graduated(defaults.local_retention.resolved())
+                    }
                 };
                 let external_ret = match &self.external_retention {
                     Some(er) => er.merged_with(&defaults.external_retention).resolved(),
@@ -601,15 +614,17 @@ send_interval = "2h"
         assert_eq!(resolved.send_interval, Interval::hours(1));
         assert!(resolved.enabled);
         assert!(resolved.send_enabled);
-        assert_eq!(resolved.local_retention.hourly, 24);
-        assert_eq!(resolved.local_retention.daily, 30);
+        let lr = resolved.local_retention.as_graduated().unwrap();
+        assert_eq!(lr.hourly, 24);
+        assert_eq!(lr.daily, 30);
 
         // Second subvolume inherits defaults for retention
         let resolved2 =
             config.subvolumes[1].resolved(&config.defaults, config.general.run_frequency);
         assert_eq!(resolved2.snapshot_interval, Interval::hours(1));
-        assert_eq!(resolved2.local_retention.weekly, 26);
-        assert_eq!(resolved2.local_retention.monthly, 12);
+        let lr2 = resolved2.local_retention.as_graduated().unwrap();
+        assert_eq!(lr2.weekly, 26);
+        assert_eq!(lr2.monthly, 12);
 
         // Check that drop is ignored (suppresses warning about unused binding)
         let _ = toml_str;
@@ -837,15 +852,16 @@ local_retention = { daily = 7, weekly = 4 }
 
         // Explicitly overridden
         assert!(!resolved.send_enabled);
-        assert_eq!(resolved.local_retention.daily, 7);
-        assert_eq!(resolved.local_retention.weekly, 4);
+        let lr = resolved.local_retention.as_graduated().unwrap();
+        assert_eq!(lr.daily, 7);
+        assert_eq!(lr.weekly, 4);
 
         // Inherited from defaults
         assert_eq!(resolved.snapshot_interval, Interval::hours(1));
         assert_eq!(resolved.send_interval, Interval::hours(4));
         assert!(resolved.enabled);
-        assert_eq!(resolved.local_retention.hourly, 24); // from defaults (not overridden)
-        assert_eq!(resolved.local_retention.monthly, 12); // from defaults (not overridden)
+        assert_eq!(lr.hourly, 24); // from defaults (not overridden)
+        assert_eq!(lr.monthly, 12); // from defaults (not overridden)
         assert_eq!(resolved.external_retention.daily, 30);
     }
 
@@ -1034,10 +1050,11 @@ local_retention = { daily = 7, weekly = 4 }
         // Specific check: sv2 with overrides
         let sv2 = config.subvolumes[1].resolved(&config.defaults, freq);
         assert!(!sv2.send_enabled);
-        assert_eq!(sv2.local_retention.daily, 7);
-        assert_eq!(sv2.local_retention.weekly, 4);
-        assert_eq!(sv2.local_retention.hourly, 24); // from defaults
-        assert_eq!(sv2.local_retention.monthly, 12); // from defaults
+        let lr2 = sv2.local_retention.as_graduated().unwrap();
+        assert_eq!(lr2.daily, 7);
+        assert_eq!(lr2.weekly, 4);
+        assert_eq!(lr2.hourly, 24); // from defaults
+        assert_eq!(lr2.monthly, 12); // from defaults
     }
 
     #[test]
@@ -1080,10 +1097,11 @@ protection_level = "protected"
         assert_eq!(resolved.snapshot_interval, Interval::days(1)); // derived from timer
         assert_eq!(resolved.send_interval, Interval::days(1)); // derived from timer
         assert!(resolved.send_enabled);
-        assert_eq!(resolved.local_retention.hourly, 24);
-        assert_eq!(resolved.local_retention.daily, 30);
-        assert_eq!(resolved.local_retention.weekly, 26);
-        assert_eq!(resolved.local_retention.monthly, 12);
+        let lr = resolved.local_retention.as_graduated().unwrap();
+        assert_eq!(lr.hourly, 24);
+        assert_eq!(lr.daily, 30);
+        assert_eq!(lr.weekly, 26);
+        assert_eq!(lr.monthly, 12);
     }
 
     #[test]
@@ -1166,11 +1184,12 @@ local_retention = { daily = 60 }
             config.subvolumes[0].resolved(&config.defaults, config.general.run_frequency);
 
         // User override for daily
-        assert_eq!(resolved.local_retention.daily, 60);
+        let lr = resolved.local_retention.as_graduated().unwrap();
+        assert_eq!(lr.daily, 60);
         // Derived values fill in unspecified fields
-        assert_eq!(resolved.local_retention.hourly, 24);
-        assert_eq!(resolved.local_retention.weekly, 26);
-        assert_eq!(resolved.local_retention.monthly, 12);
+        assert_eq!(lr.hourly, 24);
+        assert_eq!(lr.weekly, 26);
+        assert_eq!(lr.monthly, 12);
     }
 
     #[test]

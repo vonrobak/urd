@@ -41,6 +41,7 @@ pub fn preflight_checks(config: &Config) -> Vec<PreflightCheck> {
         }
 
         check_retention_send_compatibility(subvol, &mut checks);
+        check_transient_validity(subvol, &mut checks);
         check_promise_achievability(subvol, config, &mut checks);
     }
 
@@ -69,7 +70,12 @@ fn check_retention_send_compatibility(
         return;
     }
 
-    let retention = &subvol.local_retention;
+    // Transient retention has no retention windows — pins handle chain integrity.
+    let retention = match subvol.local_retention.as_graduated() {
+        Some(r) => r,
+        None => return,
+    };
+
     let guaranteed_survival_hours = i64::from(retention.hourly) + i64::from(retention.daily) * 24;
     let send_interval_hours = subvol.send_interval.as_secs() / 3600;
 
@@ -84,6 +90,44 @@ fn check_retention_send_compatibility(
                  send interval ({}) — incremental chain depends on pin protection \
                  rather than retention to keep parents alive",
                 subvol.name, survival_display, retention.hourly, retention.daily, interval_display,
+            ),
+        });
+    }
+}
+
+/// Check transient retention validity.
+///
+/// Transient retention without send_enabled is nonsensical — snapshots would be created
+/// and immediately deleted with no external copy. Transient with a named protection level
+/// (Guarded/Protected/Resilient) is also invalid since named levels imply graduated retention.
+fn check_transient_validity(
+    subvol: &crate::config::ResolvedSubvolume,
+    checks: &mut Vec<PreflightCheck>,
+) {
+    if !subvol.local_retention.is_transient() {
+        return;
+    }
+
+    if !subvol.send_enabled {
+        checks.push(PreflightCheck {
+            name: "transient-without-send",
+            message: format!(
+                "{}: transient local retention with send_enabled=false — snapshots \
+                 would be created and deleted with no external copy",
+                subvol.name,
+            ),
+        });
+    }
+
+    if let Some(level) = subvol.protection_level
+        && level != ProtectionLevel::Custom
+    {
+        checks.push(PreflightCheck {
+            name: "transient-with-named-level",
+            message: format!(
+                "{}: transient local retention is incompatible with {level} protection \
+                 level — use protection_level = \"custom\" or remove it",
+                subvol.name,
             ),
         });
     }
@@ -202,21 +246,23 @@ fn check_promise_achievability(
         });
     }
 
-    // Retention weakening: check if any bucket is tighter than derived
-    let local = &subvol.local_retention;
-    let derived_local = &derived.local_retention;
-    if local.hourly < derived_local.hourly
-        || local.daily < derived_local.daily
-        || local.weekly < derived_local.weekly
-        || (derived_local.monthly > 0 && local.monthly < derived_local.monthly)
-    {
-        checks.push(PreflightCheck {
-            name: "weakening-override",
-            message: format!(
-                "{}: local_retention is tighter than {} baseline — less history preserved",
-                subvol.name, level,
-            ),
-        });
+    // Retention weakening: check if any bucket is tighter than derived.
+    // Skip for transient — it's a fundamentally different model, not a weakened graduated policy.
+    if let Some(local) = subvol.local_retention.as_graduated() {
+        let derived_local = &derived.local_retention;
+        if local.hourly < derived_local.hourly
+            || local.daily < derived_local.daily
+            || local.weekly < derived_local.weekly
+            || (derived_local.monthly > 0 && local.monthly < derived_local.monthly)
+        {
+            checks.push(PreflightCheck {
+                name: "weakening-override",
+                message: format!(
+                    "{}: local_retention is tighter than {} baseline — less history preserved",
+                    subvol.name, level,
+                ),
+            });
+        }
     }
 }
 
@@ -245,7 +291,9 @@ mod tests {
         Config, DefaultsConfig, DriveConfig, GeneralConfig, LocalSnapshotsConfig, SnapshotRoot,
         SubvolumeConfig,
     };
-    use crate::types::{ByteSize, DriveRole, GraduatedRetention, Interval, RunFrequency};
+    use crate::types::{
+        ByteSize, DriveRole, GraduatedRetention, Interval, LocalRetentionConfig, RunFrequency,
+    };
     use std::path::PathBuf;
 
     /// Build a minimal valid config for testing.
@@ -335,12 +383,12 @@ mod tests {
             snapshot_interval: None,
             send_interval: Some(send_interval.parse().unwrap()),
             send_enabled: None,
-            local_retention: Some(GraduatedRetention {
+            local_retention: Some(LocalRetentionConfig::Graduated(GraduatedRetention {
                 hourly: Some(hourly),
                 daily: Some(daily),
                 weekly: Some(0),
                 monthly: Some(0),
-            }),
+            })),
             external_retention: None,
             protection_level: None,
             drives: None,
@@ -571,12 +619,12 @@ mod tests {
         let mut sv = test_subvolume("documents");
         sv.protection_level = Some(crate::types::ProtectionLevel::Protected);
         // Protected derives hourly=24, daily=30. Set tighter retention.
-        sv.local_retention = Some(GraduatedRetention {
+        sv.local_retention = Some(LocalRetentionConfig::Graduated(GraduatedRetention {
             hourly: Some(6),
             daily: Some(7),
             weekly: Some(4),
             monthly: Some(0),
-        });
+        }));
         let config = test_config(vec![sv], vec![test_drive()]);
         let results: Vec<_> = preflight_checks(&config)
             .into_iter()
@@ -624,5 +672,68 @@ mod tests {
             .collect();
 
         assert!(results.is_empty());
+    }
+
+    // ── Transient validity tests ───────────────────────────────────
+
+    #[test]
+    fn transient_without_send_warns() {
+        let mut sv = test_subvolume("root");
+        sv.local_retention = Some(LocalRetentionConfig::Transient);
+        sv.send_enabled = Some(false);
+        let config = test_config(vec![sv], vec![test_drive()]);
+        let results: Vec<_> = preflight_checks(&config)
+            .into_iter()
+            .filter(|c| c.name == "transient-without-send")
+            .collect();
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].message.contains("no external copy"));
+    }
+
+    #[test]
+    fn transient_with_named_level_warns() {
+        let mut sv = test_subvolume("root");
+        sv.local_retention = Some(LocalRetentionConfig::Transient);
+        sv.protection_level = Some(crate::types::ProtectionLevel::Guarded);
+        let config = test_config(vec![sv], vec![test_drive()]);
+        let results: Vec<_> = preflight_checks(&config)
+            .into_iter()
+            .filter(|c| c.name == "transient-with-named-level")
+            .collect();
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].message.contains("incompatible"));
+    }
+
+    #[test]
+    fn transient_with_custom_level_no_warning() {
+        let mut sv = test_subvolume("root");
+        sv.local_retention = Some(LocalRetentionConfig::Transient);
+        sv.protection_level = Some(crate::types::ProtectionLevel::Custom);
+        let config = test_config(vec![sv], vec![test_drive()]);
+        let results: Vec<_> = preflight_checks(&config)
+            .into_iter()
+            .filter(|c| c.name == "transient-with-named-level" || c.name == "transient-without-send")
+            .collect();
+
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn transient_skips_retention_send_compatibility() {
+        let mut sv = test_subvolume("root");
+        sv.local_retention = Some(LocalRetentionConfig::Transient);
+        sv.send_interval = Some("1h".parse().unwrap());
+        let config = test_config(vec![sv], vec![test_drive()]);
+        let results: Vec<_> = preflight_checks(&config)
+            .into_iter()
+            .filter(|c| c.name == "retention-send-compatibility")
+            .collect();
+
+        assert!(
+            results.is_empty(),
+            "transient should skip retention-send-compatibility check"
+        );
     }
 }

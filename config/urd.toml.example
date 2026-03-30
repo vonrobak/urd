@@ -175,15 +175,21 @@ source = "/mnt/btrfs-pool/subvol5-music"
 priority = 3
 protection_level = "protected"
 
-# ─── Guarded: local snapshots only ────────────────────────────────────
+# ─── Transient: send to external, don't keep local history ───────────
+# Transient retention keeps only the pinned snapshot needed for incremental
+# chains. Ideal for subvolumes on space-constrained volumes (NVMe root)
+# where you want external backups but can't afford local snapshot history.
 
 [[subvolumes]]
 name = "htpc-root"
 short_name = "htpc-root"
 source = "/"
 priority = 3
-protection_level = "guarded"
-local_retention = { daily = 7 }    # Override: root changes rarely, keep less
+local_retention = "transient"      # Delete local after send, keep only chain parent
+send_interval = "1d"
+drives = ["WD-18TB1"]              # Send to offsite drive only
+
+# ─── Guarded: local snapshots only ────────────────────────────────────
 
 [[subvolumes]]
 name = "subvol4-multimedia"

@@ -9,7 +9,9 @@ use crate::config::{Config, DriveConfig, ResolvedSubvolume};
 use crate::drives::DriveAvailability;
 use crate::error::UrdError;
 use crate::retention;
-use crate::types::{BackupPlan, FullSendReason, PlannedOperation, SnapshotName};
+use crate::types::{
+    BackupPlan, FullSendReason, LocalRetentionPolicy, PlannedOperation, SnapshotName,
+};
 
 // ── FileSystemState trait ───────────────────────────────────────────────
 
@@ -371,25 +373,41 @@ fn plan_local_retention(
         pinned.clone()
     };
 
-    // Check space pressure
-    let min_free = config.root_min_free_bytes(&subvol.name).unwrap_or(0);
-    let free_bytes = fs.filesystem_free_bytes(local_dir).unwrap_or(u64::MAX);
-    let space_pressure = min_free > 0 && free_bytes < min_free;
+    match &subvol.local_retention {
+        LocalRetentionPolicy::Transient => {
+            // Transient: delete everything not in the protected set (pins + unsent).
+            for snap in local_snaps {
+                if !protected.contains(snap) {
+                    operations.push(PlannedOperation::DeleteSnapshot {
+                        path: local_dir.join(snap.as_str()),
+                        reason: "transient: not pinned".to_string(),
+                        subvolume_name: subvol.name.clone(),
+                    });
+                }
+            }
+        }
+        LocalRetentionPolicy::Graduated(retention_config) => {
+            // Check space pressure
+            let min_free = config.root_min_free_bytes(&subvol.name).unwrap_or(0);
+            let free_bytes = fs.filesystem_free_bytes(local_dir).unwrap_or(u64::MAX);
+            let space_pressure = min_free > 0 && free_bytes < min_free;
 
-    let result = retention::graduated_retention(
-        local_snaps,
-        now,
-        &subvol.local_retention,
-        &protected,
-        space_pressure,
-    );
+            let result = retention::graduated_retention(
+                local_snaps,
+                now,
+                retention_config,
+                &protected,
+                space_pressure,
+            );
 
-    for (snap, reason) in result.delete {
-        operations.push(PlannedOperation::DeleteSnapshot {
-            path: local_dir.join(snap.as_str()),
-            reason,
-            subvolume_name: subvol.name.clone(),
-        });
+            for (snap, reason) in result.delete {
+                operations.push(PlannedOperation::DeleteSnapshot {
+                    path: local_dir.join(snap.as_str()),
+                    reason,
+                    subvolume_name: subvol.name.clone(),
+                });
+            }
+        }
     }
 }
 
@@ -2122,6 +2140,322 @@ drives = ["D1"]
         assert!(
             !d1_sends.is_empty(),
             "D1 should have send operations — it's in the allowed list"
+        );
+    }
+
+    // ── Transient retention tests ──────────────────────────────────
+
+    fn transient_config() -> Config {
+        let toml_str = r#"
+[general]
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp"
+
+[local_snapshots]
+roots = [
+  { path = "/snap", subvolumes = ["sv1"] }
+]
+
+[defaults]
+snapshot_interval = "1h"
+send_interval = "4h"
+send_enabled = true
+enabled = true
+
+[defaults.local_retention]
+hourly = 24
+daily = 30
+weekly = 26
+monthly = 12
+
+[defaults.external_retention]
+daily = 30
+weekly = 26
+monthly = 0
+
+[[drives]]
+label = "D1"
+mount_path = "/mnt/d1"
+snapshot_root = ".snapshots"
+role = "test"
+
+[[subvolumes]]
+name = "sv1"
+short_name = "one"
+source = "/data/sv1"
+priority = 1
+local_retention = "transient"
+"#;
+        toml::from_str(toml_str).unwrap()
+    }
+
+    #[test]
+    fn transient_deletes_all_non_pinned_snapshots() {
+        let config = transient_config();
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots.insert(
+            "sv1".to_string(),
+            vec![
+                snap("20260320-1000-one"),
+                snap("20260321-1000-one"),
+                snap("20260322-1000-one"),
+                snap("20260322-1200-one"),
+                snap("20260322-1400-one"),
+            ],
+        );
+        // Pin on the oldest — means it and everything newer-than-it are protected
+        // Only the pin is truly pinned; newer ones are protected as unsent
+        fs.pin_files.insert(
+            (PathBuf::from("/snap/sv1"), "D1".to_string()),
+            snap("20260320-1000-one"),
+        );
+        // Drive mounted, recent send — so unsent protection kicks in
+        fs.mounted_drives.insert("D1".to_string());
+        fs.external_snapshots.insert(
+            ("D1".to_string(), "sv1".to_string()),
+            vec![snap("20260320-1000-one")],
+        );
+
+        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let deletes: Vec<_> = result
+            .operations
+            .iter()
+            .filter(|op| matches!(op, PlannedOperation::DeleteSnapshot { .. }))
+            .collect();
+
+        // All snapshots newer than pin are unsent-protected, so 0 deletes
+        // (the pin at 20260320 is protected, everything newer is unsent)
+        assert_eq!(
+            deletes.len(),
+            0,
+            "all snapshots should be protected (pinned or unsent)"
+        );
+    }
+
+    #[test]
+    fn transient_deletes_old_snapshots_after_send_advances_pin() {
+        // Simulate: pin has advanced to newest, old snapshots are deletable
+        let config = transient_config();
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots.insert(
+            "sv1".to_string(),
+            vec![
+                snap("20260320-1000-one"),
+                snap("20260321-1000-one"),
+                snap("20260322-1400-one"),
+            ],
+        );
+        // Pin on the newest — all older snapshots are unprotected
+        fs.pin_files.insert(
+            (PathBuf::from("/snap/sv1"), "D1".to_string()),
+            snap("20260322-1400-one"),
+        );
+        fs.mounted_drives.insert("D1".to_string());
+        fs.external_snapshots.insert(
+            ("D1".to_string(), "sv1".to_string()),
+            vec![
+                snap("20260320-1000-one"),
+                snap("20260321-1000-one"),
+                snap("20260322-1400-one"),
+            ],
+        );
+
+        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let deletes: Vec<_> = result
+            .operations
+            .iter()
+            .filter_map(|op| match op {
+                PlannedOperation::DeleteSnapshot {
+                    subvolume_name,
+                    reason,
+                    ..
+                } if subvolume_name == "sv1" => Some(reason.clone()),
+                _ => None,
+            })
+            .collect();
+
+        // 2 old snapshots should be deleted (pin at newest protects only itself)
+        assert_eq!(deletes.len(), 2, "should delete 2 old snapshots");
+        assert!(
+            deletes[0].contains("transient"),
+            "reason should contain 'transient': {}",
+            deletes[0]
+        );
+    }
+
+    #[test]
+    fn transient_no_pins_keeps_everything() {
+        let config = transient_config();
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots.insert(
+            "sv1".to_string(),
+            vec![
+                snap("20260321-1000-one"),
+                snap("20260322-1000-one"),
+            ],
+        );
+        // No pin files — nothing has ever been sent
+        fs.mounted_drives.insert("D1".to_string());
+
+        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let deletes: Vec<_> = result
+            .operations
+            .iter()
+            .filter(|op| {
+                matches!(
+                    op,
+                    PlannedOperation::DeleteSnapshot {
+                        subvolume_name,
+                        ..
+                    } if subvolume_name == "sv1"
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            deletes.len(),
+            0,
+            "no pins means all snapshots are unsent-protected"
+        );
+    }
+
+    #[test]
+    fn transient_empty_local_snapshots_no_ops() {
+        let config = transient_config();
+        let fs = MockFileSystemState::new();
+
+        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let deletes: Vec<_> = result
+            .operations
+            .iter()
+            .filter(|op| {
+                matches!(
+                    op,
+                    PlannedOperation::DeleteSnapshot {
+                        subvolume_name,
+                        ..
+                    } if subvolume_name == "sv1"
+                )
+            })
+            .collect();
+
+        assert_eq!(deletes.len(), 0);
+    }
+
+    fn transient_multi_drive_config() -> Config {
+        let toml_str = r#"
+[general]
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp"
+
+[local_snapshots]
+roots = [
+  { path = "/snap", subvolumes = ["sv1"] }
+]
+
+[defaults]
+snapshot_interval = "1h"
+send_interval = "4h"
+send_enabled = true
+enabled = true
+
+[defaults.local_retention]
+hourly = 24
+daily = 30
+weekly = 26
+monthly = 12
+
+[defaults.external_retention]
+daily = 30
+weekly = 26
+monthly = 0
+
+[[drives]]
+label = "D1"
+mount_path = "/mnt/d1"
+snapshot_root = ".snapshots"
+role = "primary"
+
+[[drives]]
+label = "D2"
+mount_path = "/mnt/d2"
+snapshot_root = ".snapshots"
+role = "offsite"
+
+[[subvolumes]]
+name = "sv1"
+short_name = "one"
+source = "/data/sv1"
+priority = 1
+local_retention = "transient"
+"#;
+        toml::from_str(toml_str).unwrap()
+    }
+
+    #[test]
+    fn transient_multi_drive_pins_at_different_snapshots() {
+        // D1 pin advanced to newest, D2 pin still at older snapshot.
+        // Unsent protection must keep everything from D2's pin onward
+        // (those snapshots haven't been sent to D2 yet).
+        let config = transient_multi_drive_config();
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots.insert(
+            "sv1".to_string(),
+            vec![
+                snap("20260319-1000-one"), // older than both pins
+                snap("20260320-1000-one"), // D2's pin (older)
+                snap("20260321-1000-one"), // between pins (unsent to D2)
+                snap("20260322-1000-one"), // between pins (unsent to D2)
+                snap("20260322-1400-one"), // D1's pin (newest)
+            ],
+        );
+        // D1 pin at newest, D2 pin at older
+        fs.pin_files.insert(
+            (PathBuf::from("/snap/sv1"), "D1".to_string()),
+            snap("20260322-1400-one"),
+        );
+        fs.pin_files.insert(
+            (PathBuf::from("/snap/sv1"), "D2".to_string()),
+            snap("20260320-1000-one"),
+        );
+        fs.mounted_drives.insert("D1".to_string());
+        fs.mounted_drives.insert("D2".to_string());
+        fs.external_snapshots.insert(
+            ("D1".to_string(), "sv1".to_string()),
+            vec![
+                snap("20260320-1000-one"),
+                snap("20260322-1400-one"),
+            ],
+        );
+        fs.external_snapshots.insert(
+            ("D2".to_string(), "sv1".to_string()),
+            vec![snap("20260320-1000-one")],
+        );
+
+        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let deletes: Vec<_> = result
+            .operations
+            .iter()
+            .filter_map(|op| match op {
+                PlannedOperation::DeleteSnapshot {
+                    subvolume_name,
+                    path,
+                    ..
+                } if subvolume_name == "sv1" => {
+                    Some(path.file_name().unwrap().to_string_lossy().to_string())
+                }
+                _ => None,
+            })
+            .collect();
+
+        // Only 20260319 should be deleted — it's older than D2's pin (the oldest pin).
+        // D2's pin (20260320) is pinned. Everything newer is unsent-to-D2-protected.
+        assert_eq!(deletes.len(), 1, "only pre-pin snapshot should be deleted: {deletes:?}");
+        assert!(
+            deletes[0].contains("20260319"),
+            "deleted snapshot should be the one older than both pins: {deletes:?}"
         );
     }
 }
