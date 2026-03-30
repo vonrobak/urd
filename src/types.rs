@@ -499,6 +499,89 @@ pub struct ResolvedGraduatedRetention {
     pub monthly: u32,
 }
 
+// ── LocalRetentionConfig / LocalRetentionPolicy ───────────────────────
+
+/// Config-level local retention: either `"transient"` (string) or a graduated
+/// retention table. Used in `SubvolumeConfig` (the raw TOML layer).
+///
+/// Transient retention means: delete all local snapshots except those pinned
+/// for incremental chains. Designed for subvolumes on space-constrained volumes
+/// that need external sends but not local history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalRetentionConfig {
+    /// Standard time-windowed retention (hourly/daily/weekly/monthly).
+    Graduated(GraduatedRetention),
+    /// Delete after external send, keep only pinned chain parents.
+    Transient,
+}
+
+impl Serialize for LocalRetentionConfig {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Transient => serializer.serialize_str("transient"),
+            Self::Graduated(g) => g.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for LocalRetentionConfig {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct LocalRetentionVisitor;
+
+        impl<'de> Visitor<'de> for LocalRetentionVisitor {
+            type Value = LocalRetentionConfig;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("\"transient\" or a table with hourly/daily/weekly/monthly fields")
+            }
+
+            fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                if value == "transient" {
+                    Ok(LocalRetentionConfig::Transient)
+                } else {
+                    Err(de::Error::custom(format!(
+                        "unknown local_retention mode \"{value}\": expected \"transient\" or a retention table"
+                    )))
+                }
+            }
+
+            fn visit_map<M: de::MapAccess<'de>>(self, map: M) -> Result<Self::Value, M::Error> {
+                let g = GraduatedRetention::deserialize(de::value::MapAccessDeserializer::new(map))?;
+                Ok(LocalRetentionConfig::Graduated(g))
+            }
+        }
+
+        deserializer.deserialize_any(LocalRetentionVisitor)
+    }
+}
+
+/// Fully resolved local retention policy — no optional fields.
+/// Used on `ResolvedSubvolume` after config defaults have been applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalRetentionPolicy {
+    /// Standard time-windowed retention.
+    Graduated(ResolvedGraduatedRetention),
+    /// Transient: delete all local snapshots except pinned chain parents.
+    Transient,
+}
+
+impl LocalRetentionPolicy {
+    /// Returns the graduated retention config, if this is not transient.
+    #[must_use]
+    pub fn as_graduated(&self) -> Option<&ResolvedGraduatedRetention> {
+        match self {
+            Self::Graduated(g) => Some(g),
+            Self::Transient => None,
+        }
+    }
+
+    /// Returns `true` if this is the transient retention mode.
+    #[must_use]
+    pub fn is_transient(&self) -> bool {
+        matches!(self, Self::Transient)
+    }
+}
+
 // ── PlannedOperation ────────────────────────────────────────────────────
 
 /// Why a full send was planned instead of an incremental send.
@@ -1165,5 +1248,124 @@ mod tests {
         assert_eq!(p.send_interval, Interval::hours(6));
         // Retention stays the same regardless of timer interval
         assert_eq!(p.local_retention.daily, 30);
+    }
+
+    // ── LocalRetentionConfig serde tests ───────────────────────────
+
+    #[test]
+    fn local_retention_config_deserializes_transient_string() {
+        let toml_str = r#"local_retention = "transient""#;
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            local_retention: LocalRetentionConfig,
+        }
+
+        let w: Wrapper = toml::from_str(toml_str).unwrap();
+        assert_eq!(w.local_retention, LocalRetentionConfig::Transient);
+    }
+
+    #[test]
+    fn local_retention_config_deserializes_graduated_table() {
+        let toml_str = r#"
+[local_retention]
+daily = 7
+weekly = 4
+"#;
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            local_retention: LocalRetentionConfig,
+        }
+
+        let w: Wrapper = toml::from_str(toml_str).unwrap();
+        match w.local_retention {
+            LocalRetentionConfig::Graduated(g) => {
+                assert_eq!(g.daily, Some(7));
+                assert_eq!(g.weekly, Some(4));
+                assert_eq!(g.hourly, None);
+                assert_eq!(g.monthly, None);
+            }
+            LocalRetentionConfig::Transient => panic!("expected Graduated"),
+        }
+    }
+
+    #[test]
+    fn local_retention_config_deserializes_inline_table() {
+        let toml_str = r#"local_retention = { daily = 30, weekly = 26 }"#;
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            local_retention: LocalRetentionConfig,
+        }
+
+        let w: Wrapper = toml::from_str(toml_str).unwrap();
+        match w.local_retention {
+            LocalRetentionConfig::Graduated(g) => {
+                assert_eq!(g.daily, Some(30));
+                assert_eq!(g.weekly, Some(26));
+            }
+            LocalRetentionConfig::Transient => panic!("expected Graduated"),
+        }
+    }
+
+    #[test]
+    fn local_retention_config_rejects_invalid_string() {
+        let toml_str = r#"local_retention = "bogus""#;
+
+        #[derive(Debug, Deserialize)]
+        struct Wrapper {
+            local_retention: LocalRetentionConfig,
+        }
+
+        let result: Result<Wrapper, _> = toml::from_str(toml_str);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("transient"), "error should mention 'transient': {err}");
+    }
+
+    #[test]
+    fn local_retention_config_serialize_roundtrip() {
+        #[derive(Serialize, Deserialize, PartialEq, Debug)]
+        struct Wrapper {
+            local_retention: LocalRetentionConfig,
+        }
+
+        // Transient roundtrip
+        let transient = Wrapper {
+            local_retention: LocalRetentionConfig::Transient,
+        };
+        let toml_str = toml::to_string(&transient).unwrap();
+        let parsed: Wrapper = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed, transient);
+
+        // Graduated roundtrip
+        let graduated = Wrapper {
+            local_retention: LocalRetentionConfig::Graduated(GraduatedRetention {
+                hourly: Some(24),
+                daily: Some(30),
+                weekly: None,
+                monthly: None,
+            }),
+        };
+        let toml_str = toml::to_string(&graduated).unwrap();
+        let parsed: Wrapper = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed, graduated);
+    }
+
+    #[test]
+    fn local_retention_policy_as_graduated() {
+        let graduated = LocalRetentionPolicy::Graduated(ResolvedGraduatedRetention {
+            hourly: 24,
+            daily: 30,
+            weekly: 26,
+            monthly: 12,
+        });
+        assert!(graduated.as_graduated().is_some());
+        assert!(!graduated.is_transient());
+
+        let transient = LocalRetentionPolicy::Transient;
+        assert!(transient.as_graduated().is_none());
+        assert!(transient.is_transient());
     }
 }

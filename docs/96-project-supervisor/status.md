@@ -8,13 +8,14 @@
 
 **Urd is the sole backup system.** Systemd timer running nightly at 04:00 since 2026-03-25.
 Sentinel daemon deployed (passive monitoring, drive detection, backup overdue alerts).
-542 tests, all passing, clippy clean. Current version: v0.4.2.
+556 tests, all passing, clippy clean. Current version: v0.4.3.
 
 ## In Progress
 
-- **VFM-B complete, needs PR** (2026-03-30). Sentinel health tracking, visual state in
-  state file (schema v2), HealthDegraded/HealthRecovered notifications, NamedSnapshot
-  trait refactor. Reviewed. 7 files changed, +653/-35 lines, 21 new tests.
+- **Transient snapshots** (2026-03-30). `local_retention = "transient"` — delete local
+  snapshots after external send, keep only pinned chain parents. For space-constrained
+  NVMe volumes (htpc-root). New types, config integration, planner branch, preflight
+  checks. 5 files changed, 14 new tests.
 
 ## Build Queue
 
@@ -28,8 +29,8 @@ full details, design decisions, and review findings.
 5. ~~**UX-2**~~ — plan output: estimated send sizes, cross-drive fallback. **Done.**
 6. ~~**UX-3**~~ — plan output: rich progress display + ETA. **Done.**
 7. ~~**HSD-B**~~ — sentinel chain-break detection + full-send gate. **Done (v0.4.2).**
-8. ~~**VFM-B**~~ — sentinel visual state + health notifications. **Done, needs PR.**
-9. **Transient snapshots** — `local_retention = "transient"` for NVMe space pressure. **Start here.**
+8. ~~**VFM-B**~~ — sentinel visual state + health notifications. **Done (v0.4.3).**
+9. **Transient snapshots** — `local_retention = "transient"` for NVMe space pressure. **In progress.**
 10. **Tray icon (Spindle)** — reads sentinel-state.json, 4 static icons.
 
 Designs: `docs/95-ideas/2026-03-29-design-*.md`.
