@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-03-30
+
 ### Added
 - Rich progress display during backup: subvolume name, send counter, completion trail, and ETA for full sends
 - Estimated send sizes in `urd plan` output with three-tier fallback (same-drive > cross-drive > calibrated)
@@ -90,7 +92,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Defense-in-depth pin file protection for unsent snapshots
 - Per-subvolume error isolation in executor
 
-[Unreleased]: https://github.com/vonrobak/urd/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/vonrobak/urd/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/vonrobak/urd/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/vonrobak/urd/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/vonrobak/urd/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/vonrobak/urd/compare/v0.1.0...v0.2.0
