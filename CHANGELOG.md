@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Rich progress display during backup: subvolume name, send counter, completion trail, and ETA for full sends
 - Estimated send sizes in `urd plan` output with three-tier fallback (same-drive > cross-drive > calibrated)
 - Qualified summary totals: `"6 sends (~623 GB total)"` or `"estimated for 4 of 6"` when partial
 - Cross-drive fallback for send size estimation (covers drive swap scenarios)
