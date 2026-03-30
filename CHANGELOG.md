@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-03-30
+
 ### Added
 - Sentinel detects simultaneous chain breaks on a drive and notifies (hardware swap signal)
 - `FullSendReason` annotation on full sends: `first send`, `chain broken`, or `no pin`
