@@ -1,10 +1,12 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::btrfs::BtrfsOps;
 use crate::chain;
+use crate::commands::backup::{ProgressContext, SizeEstimates};
 use crate::config::Config;
 use crate::drives;
 use crate::error::BtrfsOperation;
@@ -97,6 +99,8 @@ pub struct Executor<'a> {
     state: Option<&'a StateDb>,
     config: &'a Config,
     shutdown: &'a AtomicBool,
+    progress_context: Option<Arc<Mutex<ProgressContext>>>,
+    size_estimates: Option<SizeEstimates>,
 }
 
 impl<'a> Executor<'a> {
@@ -112,7 +116,19 @@ impl<'a> Executor<'a> {
             state,
             config,
             shutdown,
+            progress_context: None,
+            size_estimates: None,
         }
+    }
+
+    /// Set progress context for rich progress display.
+    pub fn set_progress(
+        &mut self,
+        context: Arc<Mutex<ProgressContext>>,
+        estimates: SizeEstimates,
+    ) {
+        self.progress_context = Some(context);
+        self.size_estimates = Some(estimates);
     }
 
     /// Execute the backup plan, returning results.
@@ -434,6 +450,30 @@ impl<'a> Executor<'a> {
             drive_label,
             op_name
         );
+
+        // Update progress context for rich display
+        if let Some(ref ctx) = self.progress_context {
+            let send_type = if parent.is_some() {
+                SendType::Incremental
+            } else {
+                SendType::Full
+            };
+            let estimated = self
+                .size_estimates
+                .as_ref()
+                .and_then(|m| {
+                    m.get(&(subvol_name.to_string(), drive_label.to_string()))
+                })
+                .copied()
+                .flatten();
+            if let Ok(mut progress) = ctx.lock() {
+                progress.subvolume_name = subvol_name.to_string();
+                progress.drive_label = drive_label.to_string();
+                progress.send_type = send_type;
+                progress.send_index += 1;
+                progress.estimated_bytes = estimated;
+            }
+        }
 
         match self.btrfs.send_receive(snapshot, parent, dest_dir) {
             Ok(result) => {

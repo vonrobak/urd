@@ -1,6 +1,6 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -11,7 +11,7 @@ use crate::btrfs::RealBtrfs;
 use crate::cli::BackupArgs;
 use crate::config::Config;
 use crate::drives;
-use crate::executor::{ExecutionResult, Executor, OpResult, RunResult};
+use crate::executor::{ExecutionResult, Executor, OpResult, RunResult, SendType};
 use crate::heartbeat;
 use crate::lock;
 use crate::metrics::{self, MetricsData, SubvolumeMetrics};
@@ -121,19 +121,33 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     let bytes_counter = Arc::new(AtomicU64::new(0));
     let btrfs = RealBtrfs::new(&config.general.btrfs_path, bytes_counter.clone());
 
+    // Build progress context for rich display
+    let total_sends = backup_plan.summary().sends as u32;
+    let size_estimates = build_size_estimates(&backup_plan, &fs_state);
+    let progress_ctx = Arc::new(Mutex::new(ProgressContext {
+        subvolume_name: String::new(),
+        drive_label: String::new(),
+        send_type: SendType::Full,
+        send_index: 0,
+        total_sends,
+        estimated_bytes: None,
+    }));
+
     // Spawn progress display thread if running on a TTY
     let progress_shutdown = Arc::new(AtomicBool::new(false));
     let progress_handle = if std::io::stderr().is_terminal() {
         let counter = bytes_counter.clone();
         let shutdown_flag = progress_shutdown.clone();
+        let ctx = progress_ctx.clone();
         Some(std::thread::spawn(move || {
-            progress_display_loop(&counter, &shutdown_flag);
+            progress_display_loop(&counter, &shutdown_flag, &ctx);
         }))
     } else {
         None
     };
 
-    let executor = Executor::new(&btrfs, state_db.as_ref(), &config, &shutdown);
+    let mut executor = Executor::new(&btrfs, state_db.as_ref(), &config, &shutdown);
+    executor.set_progress(progress_ctx, size_estimates);
     let exec_start = Instant::now();
     let result = executor.execute(&backup_plan, mode);
     let exec_duration = exec_start.elapsed();
@@ -492,19 +506,220 @@ fn count_external_snapshots(
     0
 }
 
-/// Polls the byte counter and displays a live progress line on stderr.
+// ── Progress display ──────────────────────────────────────────────────
+
+/// Shared context between executor (writer) and progress display thread (reader).
+/// The executor updates this before each send; the progress thread reads it on
+/// send-start transitions.
+pub(crate) struct ProgressContext {
+    pub subvolume_name: String,
+    pub drive_label: String,
+    pub send_type: SendType,
+    pub send_index: u32,
+    pub total_sends: u32,
+    pub estimated_bytes: Option<u64>,
+}
+
+/// Pre-computed size estimates keyed by (subvolume_name, drive_label).
+pub(crate) type SizeEstimates = HashMap<(String, String), Option<u64>>;
+
+/// Build size estimate map from plan operations using the same three-tier
+/// fallback as plan_cmd.rs (same-drive > cross-drive > calibrated for full
+/// sends; same-drive > cross-drive for incrementals).
+fn build_size_estimates(
+    plan: &BackupPlan,
+    fs_state: &dyn FileSystemState,
+) -> SizeEstimates {
+    let mut estimates = HashMap::new();
+    for op in &plan.operations {
+        match op {
+            PlannedOperation::SendFull {
+                subvolume_name,
+                drive_label,
+                ..
+            } => {
+                let est = fs_state
+                    .last_send_size(subvolume_name, drive_label, "send_full")
+                    .or_else(|| fs_state.last_send_size_any_drive(subvolume_name, "send_full"))
+                    .or_else(|| {
+                        fs_state
+                            .calibrated_size(subvolume_name)
+                            .map(|(bytes, _)| bytes)
+                    });
+                estimates.insert((subvolume_name.clone(), drive_label.clone()), est);
+            }
+            PlannedOperation::SendIncremental {
+                subvolume_name,
+                drive_label,
+                ..
+            } => {
+                let est = fs_state
+                    .last_send_size(subvolume_name, drive_label, "send_incremental")
+                    .or_else(|| {
+                        fs_state.last_send_size_any_drive(subvolume_name, "send_incremental")
+                    });
+                estimates.insert((subvolume_name.clone(), drive_label.clone()), est);
+            }
+            _ => {}
+        }
+    }
+    estimates
+}
+
+/// Format the live progress line shown during an active send.
+#[allow(clippy::too_many_arguments)]
+fn format_progress_line(
+    name: &str,
+    drive: &str,
+    index: u32,
+    total: u32,
+    bytes: u64,
+    rate: f64,
+    elapsed: Duration,
+    estimated: Option<u64>,
+) -> String {
+    let elapsed_str = format_elapsed(elapsed);
+    let prefix = format!("  [{index}/{total}] {name} → {drive}:");
+
+    // ETA and denominator for full sends with estimates
+    let eta_part = match estimated {
+        Some(est) if bytes > est => {
+            // Exceeded estimate — show "(est ~X)" and drop ETA
+            format!(
+                " {} (est ~{}) @ {}/s  [{}]",
+                ByteSize(bytes),
+                ByteSize(est),
+                ByteSize(rate as u64),
+                elapsed_str,
+            )
+        }
+        Some(est) if rate > 0.0 && elapsed.as_secs() >= 5 => {
+            // Normal with ETA
+            let eta = compute_eta(bytes, est, elapsed);
+            match eta {
+                Some(remaining) => format!(
+                    " {} / ~{} @ {}/s  [{}, ~{} left]",
+                    ByteSize(bytes),
+                    ByteSize(est),
+                    ByteSize(rate as u64),
+                    elapsed_str,
+                    format_elapsed(remaining),
+                ),
+                None => format!(
+                    " {} / ~{} @ {}/s  [{}]",
+                    ByteSize(bytes),
+                    ByteSize(est),
+                    ByteSize(rate as u64),
+                    elapsed_str,
+                ),
+            }
+        }
+        Some(est) if rate > 0.0 => {
+            // Early phase (< 5s) — show denominator but suppress ETA
+            format!(
+                " {} / ~{} @ {}/s  [{}]",
+                ByteSize(bytes),
+                ByteSize(est),
+                ByteSize(rate as u64),
+                elapsed_str,
+            )
+        }
+        _ if rate > 0.0 => {
+            // No estimate, but have rate
+            format!(
+                " {} @ {}/s  [{}]",
+                ByteSize(bytes),
+                ByteSize(rate as u64),
+                elapsed_str,
+            )
+        }
+        _ => {
+            // No rate yet
+            format!(" {}  [{}]", ByteSize(bytes), elapsed_str)
+        }
+    };
+
+    format!("{prefix}{eta_part}")
+}
+
+/// Format the permanent completion line printed after each send finishes.
+fn format_completion_line(
+    name: &str,
+    drive: &str,
+    bytes: u64,
+    elapsed: Duration,
+    send_type: SendType,
+) -> String {
+    let type_label = match send_type {
+        SendType::Full => "full",
+        SendType::Incremental => "incremental",
+        SendType::NoSend => "no-send",
+    };
+    format!(
+        "  ✓ {} → {}: {} in {} ({})",
+        name,
+        drive,
+        ByteSize(bytes),
+        format_elapsed(elapsed),
+        type_label,
+    )
+}
+
+/// Compute estimated time remaining based on current progress and total estimate.
+/// Returns None if the estimate is exceeded or rate is zero.
+fn compute_eta(current: u64, estimated: u64, elapsed: Duration) -> Option<Duration> {
+    if current == 0 || current >= estimated {
+        return None;
+    }
+    let rate = current as f64 / elapsed.as_secs_f64();
+    if rate <= 0.0 {
+        return None;
+    }
+    let remaining_bytes = estimated - current;
+    let remaining_secs = remaining_bytes as f64 / rate;
+    Some(Duration::from_secs_f64(remaining_secs))
+}
+
+/// Polls the byte counter and displays a rich progress line on stderr.
 /// Only runs when stderr is a TTY. Cleans up the line on exit.
-fn progress_display_loop(counter: &AtomicU64, shutdown: &AtomicBool) {
+///
+/// State machine: Idle → Active → Completing → Idle (or Shutdown).
+fn progress_display_loop(
+    counter: &AtomicU64,
+    shutdown: &AtomicBool,
+    context: &Mutex<ProgressContext>,
+) {
     let mut send_start = Instant::now();
     let mut last_display_bytes = 0u64;
+
+    // Locally cached context (read from mutex on send-start transition)
+    let mut ctx_name = String::new();
+    let mut ctx_drive = String::new();
+    let mut ctx_send_type = SendType::Full;
+    let mut ctx_index = 0u32;
+    let mut ctx_total = 0u32;
+    let mut ctx_estimated: Option<u64> = None;
 
     while !shutdown.load(Ordering::SeqCst) {
         std::thread::sleep(Duration::from_millis(250));
 
         let current = counter.load(Ordering::Relaxed);
         if current == 0 {
-            // Counter reset to 0 — between sends or before first send.
-            // Reset tracking so next non-zero read starts a fresh timer.
+            if last_display_bytes > 0 {
+                // Completing: counter reset to 0 after active send.
+                // Print permanent completion line.
+                eprint!("\r\x1b[2K"); // clear live line
+                eprintln!(
+                    "{}",
+                    format_completion_line(
+                        &ctx_name,
+                        &ctx_drive,
+                        last_display_bytes,
+                        send_start.elapsed(),
+                        ctx_send_type,
+                    )
+                );
+            }
             last_display_bytes = 0;
             continue;
         }
@@ -515,6 +730,16 @@ fn progress_display_loop(counter: &AtomicU64, shutdown: &AtomicBool) {
         // Detect new send start (counter went from 0 to non-zero)
         if last_display_bytes == 0 {
             send_start = Instant::now();
+            // Read context from mutex (single lock per send).
+            // unwrap_or_else recovers data even from a poisoned mutex —
+            // the data itself isn't corrupt, only the thread that held it panicked.
+            let ctx = context.lock().unwrap_or_else(|e| e.into_inner());
+            ctx_name = ctx.subvolume_name.clone();
+            ctx_drive = ctx.drive_label.clone();
+            ctx_send_type = ctx.send_type;
+            ctx_index = ctx.send_index;
+            ctx_total = ctx.total_sends;
+            ctx_estimated = ctx.estimated_bytes;
         }
         last_display_bytes = current;
 
@@ -525,22 +750,38 @@ fn progress_display_loop(counter: &AtomicU64, shutdown: &AtomicBool) {
             0.0
         };
 
-        let elapsed_str = format_elapsed(elapsed);
-
-        if rate > 0.0 {
-            eprint!(
-                "\r  {} @ {}/s  [{}]    ",
-                ByteSize(current),
-                ByteSize(rate as u64),
-                elapsed_str,
-            );
-        } else {
-            eprint!("\r  {}  [{}]    ", ByteSize(current), elapsed_str);
-        }
+        eprint!(
+            "\r\x1b[2K{}",
+            format_progress_line(
+                &ctx_name,
+                &ctx_drive,
+                ctx_index,
+                ctx_total,
+                current,
+                rate,
+                elapsed,
+                ctx_estimated,
+            )
+        );
     }
 
-    // Clear the progress line
-    eprint!("\r\x1b[2K");
+    // Shutdown: if a send was active, print its completion line
+    if last_display_bytes > 0 {
+        eprint!("\r\x1b[2K");
+        eprintln!(
+            "{}",
+            format_completion_line(
+                &ctx_name,
+                &ctx_drive,
+                last_display_bytes,
+                send_start.elapsed(),
+                ctx_send_type,
+            )
+        );
+    } else {
+        // Clear the progress line
+        eprint!("\r\x1b[2K");
+    }
 }
 
 fn format_elapsed(d: Duration) -> String {
@@ -1056,6 +1297,298 @@ mod tests {
         };
         let content = serde_json::to_string_pretty(&state).unwrap();
         std::fs::write(path, content).unwrap();
+    }
+
+    // ── Progress display tests ─────────────────────────────────────
+
+    #[test]
+    fn format_progress_no_estimate_with_rate() {
+        let line = format_progress_line("htpc-home", "WD-18TB", 1, 3, 1_000_000_000, 178_300_000.0, Duration::from_secs(6), None);
+        assert!(line.contains("[1/3]"));
+        assert!(line.contains("htpc-home → WD-18TB:"));
+        assert!(line.contains("1.0GB"));
+        assert!(line.contains("178.3MB/s"));
+        assert!(!line.contains("left"));
+    }
+
+    #[test]
+    fn format_progress_no_estimate_no_rate() {
+        let line = format_progress_line("sv1", "drive1", 2, 5, 500_000, 0.0, Duration::from_secs(1), None);
+        assert!(line.contains("[2/5]"));
+        assert!(line.contains("500.0KB"));
+        assert!(!line.contains("/s"));
+    }
+
+    #[test]
+    fn format_progress_with_estimate_and_eta() {
+        let line = format_progress_line(
+            "htpc-home", "WD-18TB", 3, 6,
+            23_100_000_000, 178_300_000.0,
+            Duration::from_secs(130),
+            Some(47_600_000_000),
+        );
+        assert!(line.contains("[3/6]"));
+        assert!(line.contains("23.1GB / ~47.6GB"));
+        assert!(line.contains("left"));
+    }
+
+    #[test]
+    fn format_progress_with_estimate_early_phase_no_eta() {
+        let line = format_progress_line(
+            "sv1", "drive1", 1, 1,
+            100_000_000, 50_000_000.0,
+            Duration::from_secs(2), // < 5s
+            Some(10_000_000_000),
+        );
+        assert!(line.contains("/ ~10.0GB"));
+        assert!(!line.contains("left"), "ETA should be suppressed in early phase");
+    }
+
+    #[test]
+    fn format_progress_exceeded_estimate() {
+        let line = format_progress_line(
+            "sv1", "drive1", 1, 1,
+            50_100_000_000, 200_000_000.0,
+            Duration::from_secs(250),
+            Some(47_600_000_000),
+        );
+        assert!(line.contains("50.1GB (est ~47.6GB)"));
+        assert!(!line.contains("left"), "ETA should not show when exceeded");
+    }
+
+    #[test]
+    fn format_progress_with_estimate_zero_rate() {
+        let line = format_progress_line(
+            "sv1", "drive1", 1, 1,
+            100_000, 0.0,
+            Duration::from_secs(1),
+            Some(10_000_000_000),
+        );
+        // Zero rate: falls through to no-rate branch
+        assert!(line.contains("100.0KB"));
+        assert!(!line.contains("/s"));
+    }
+
+    #[test]
+    fn format_progress_hours_elapsed() {
+        let line = format_progress_line(
+            "big-subvol", "WD-18TB", 1, 1,
+            3_800_000_000_000, 300_000_000.0,
+            Duration::from_secs(12_600), // 3:30:00
+            None,
+        );
+        assert!(line.contains("3:30:00"));
+        assert!(line.contains("3.8TB"));
+    }
+
+    #[test]
+    fn format_completion_full_send() {
+        let line = format_completion_line("htpc-home", "WD-18TB", 53_200_000_000, Duration::from_secs(298), SendType::Full);
+        assert!(line.contains("✓ htpc-home → WD-18TB:"));
+        assert!(line.contains("53.2GB"));
+        assert!(line.contains("4:58"));
+        assert!(line.contains("(full)"));
+    }
+
+    #[test]
+    fn format_completion_incremental() {
+        let line = format_completion_line("sv2", "drive1", 5_500_000, Duration::from_secs(3), SendType::Incremental);
+        assert!(line.contains("5.5MB"));
+        assert!(line.contains("(incremental)"));
+    }
+
+    #[test]
+    fn format_completion_tb_scale() {
+        let line = format_completion_line("opptak", "WD-18TB", 3_800_000_000_000, Duration::from_secs(6120), SendType::Full);
+        assert!(line.contains("3.8TB"));
+        assert!(line.contains("1:42:00"));
+    }
+
+    #[test]
+    fn format_completion_short_duration() {
+        let line = format_completion_line("sv1", "d1", 1_000, Duration::from_secs(0), SendType::Incremental);
+        assert!(line.contains("0:00"));
+    }
+
+    #[test]
+    fn compute_eta_normal() {
+        // 50% done in 10s → ~10s remaining
+        let eta = compute_eta(5_000_000_000, 10_000_000_000, Duration::from_secs(10));
+        assert!(eta.is_some());
+        let secs = eta.unwrap().as_secs();
+        assert!((9..=11).contains(&secs), "expected ~10s, got {secs}s");
+    }
+
+    #[test]
+    fn compute_eta_exceeded() {
+        let eta = compute_eta(50_000_000_000, 47_000_000_000, Duration::from_secs(100));
+        assert!(eta.is_none());
+    }
+
+    #[test]
+    fn compute_eta_zero_current() {
+        let eta = compute_eta(0, 10_000_000_000, Duration::from_secs(5));
+        assert!(eta.is_none());
+    }
+
+    #[test]
+    fn compute_eta_exact_completion() {
+        let eta = compute_eta(10_000_000_000, 10_000_000_000, Duration::from_secs(100));
+        assert!(eta.is_none(), "should return None when current == estimated");
+    }
+
+    // ── Size estimate map tests ─────────────────────────────────────
+
+    #[test]
+    fn build_size_estimates_mixed_ops() {
+        use crate::plan::MockFileSystemState;
+
+        let plan = BackupPlan {
+            operations: vec![
+                PlannedOperation::SendFull {
+                    snapshot: PathBuf::from("/snaps/sv1/20260329-0400-sv1"),
+                    dest_dir: PathBuf::from("/mnt/wd/sv1"),
+                    drive_label: "WD-18TB".to_string(),
+                    subvolume_name: "sv1".to_string(),
+                    pin_on_success: None,
+                },
+                PlannedOperation::SendIncremental {
+                    parent: PathBuf::from("/snaps/sv2/20260328-0400-sv2"),
+                    snapshot: PathBuf::from("/snaps/sv2/20260329-0400-sv2"),
+                    dest_dir: PathBuf::from("/mnt/wd/sv2"),
+                    drive_label: "WD-18TB".to_string(),
+                    subvolume_name: "sv2".to_string(),
+                    pin_on_success: None,
+                },
+                PlannedOperation::CreateSnapshot {
+                    source: PathBuf::from("/data/sv1"),
+                    dest: PathBuf::from("/snaps/sv1/20260329-0400-sv1"),
+                    subvolume_name: "sv1".to_string(),
+                },
+            ],
+            timestamp: chrono::NaiveDateTime::default(),
+            skipped: vec![],
+        };
+
+        let mut fs = MockFileSystemState::new();
+        fs.send_sizes.insert(
+            ("sv1".to_string(), "WD-18TB".to_string(), "send_full".to_string()),
+            53_000_000_000,
+        );
+        fs.send_sizes.insert(
+            ("sv2".to_string(), "WD-18TB".to_string(), "send_incremental".to_string()),
+            5_500_000,
+        );
+
+        let estimates = build_size_estimates(&plan, &fs);
+
+        // Full send should have estimate
+        assert_eq!(
+            estimates[&("sv1".to_string(), "WD-18TB".to_string())],
+            Some(53_000_000_000),
+        );
+        // Incremental should have estimate
+        assert_eq!(
+            estimates[&("sv2".to_string(), "WD-18TB".to_string())],
+            Some(5_500_000),
+        );
+        // CreateSnapshot should not be in map
+        assert_eq!(estimates.len(), 2);
+    }
+
+    #[test]
+    fn build_size_estimates_no_history() {
+        use crate::plan::MockFileSystemState;
+
+        let plan = BackupPlan {
+            operations: vec![PlannedOperation::SendFull {
+                snapshot: PathBuf::from("/snaps/sv1/snap"),
+                dest_dir: PathBuf::from("/mnt/d/sv1"),
+                drive_label: "new-drive".to_string(),
+                subvolume_name: "sv1".to_string(),
+                pin_on_success: None,
+            }],
+            timestamp: chrono::NaiveDateTime::default(),
+            skipped: vec![],
+        };
+
+        let fs = MockFileSystemState::new();
+        let estimates = build_size_estimates(&plan, &fs);
+
+        assert_eq!(
+            estimates[&("sv1".to_string(), "new-drive".to_string())],
+            None,
+        );
+    }
+
+    #[test]
+    fn build_size_estimates_cross_drive_fallback() {
+        use crate::plan::MockFileSystemState;
+
+        let plan = BackupPlan {
+            operations: vec![PlannedOperation::SendFull {
+                snapshot: PathBuf::from("/snaps/sv1/snap"),
+                dest_dir: PathBuf::from("/mnt/new/sv1"),
+                drive_label: "new-drive".to_string(),
+                subvolume_name: "sv1".to_string(),
+                pin_on_success: None,
+            }],
+            timestamp: chrono::NaiveDateTime::default(),
+            skipped: vec![],
+        };
+
+        let mut fs = MockFileSystemState::new();
+        // No same-drive ("new-drive") history, but history from "old-drive" exists.
+        // last_send_size_any_drive picks this up.
+        fs.send_sizes.insert(
+            ("sv1".to_string(), "old-drive".to_string(), "send_full".to_string()),
+            50_000_000_000,
+        );
+
+        let estimates = build_size_estimates(&plan, &fs);
+        assert_eq!(
+            estimates[&("sv1".to_string(), "new-drive".to_string())],
+            Some(50_000_000_000),
+        );
+    }
+
+    #[test]
+    fn build_size_estimates_calibrated_fallback_for_full_only() {
+        use crate::plan::MockFileSystemState;
+
+        let mut fs = MockFileSystemState::new();
+        fs.calibrated_sizes.insert("sv1".to_string(), (45_000_000_000, "2026-03-29".to_string()));
+
+        // Full send: should fall through to calibrated
+        let plan_full = BackupPlan {
+            operations: vec![PlannedOperation::SendFull {
+                snapshot: PathBuf::from("/snaps/sv1/snap"),
+                dest_dir: PathBuf::from("/mnt/d/sv1"),
+                drive_label: "d1".to_string(),
+                subvolume_name: "sv1".to_string(),
+                pin_on_success: None,
+            }],
+            timestamp: chrono::NaiveDateTime::default(),
+            skipped: vec![],
+        };
+        let est_full = build_size_estimates(&plan_full, &fs);
+        assert_eq!(est_full[&("sv1".to_string(), "d1".to_string())], Some(45_000_000_000));
+
+        // Incremental send: should NOT use calibrated (two-tier only)
+        let plan_inc = BackupPlan {
+            operations: vec![PlannedOperation::SendIncremental {
+                parent: PathBuf::from("/snaps/sv1/old"),
+                snapshot: PathBuf::from("/snaps/sv1/new"),
+                dest_dir: PathBuf::from("/mnt/d/sv1"),
+                drive_label: "d1".to_string(),
+                subvolume_name: "sv1".to_string(),
+                pin_on_success: None,
+            }],
+            timestamp: chrono::NaiveDateTime::default(),
+            skipped: vec![],
+        };
+        let est_inc = build_size_estimates(&plan_inc, &fs);
+        assert_eq!(est_inc[&("sv1".to_string(), "d1".to_string())], None);
     }
 
     /// Build a minimal Config with state_db pointing into the given directory.
