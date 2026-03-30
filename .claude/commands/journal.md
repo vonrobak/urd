@@ -42,6 +42,13 @@ if nothing is open.}
   "Added `translate_btrfs_error()` covering 7 btrfs stderr patterns" is useful.
 - Journals are private — real paths, real output, real mistakes are fine
 - Don't duplicate the commit message. The journal captures context the commit doesn't.
+- **Forward-looking handoff is encouraged** — "When you return" sections with verification
+  steps, things to watch for, and context the next session needs are high-value. This is a
+  core function of the journal.
+- **Exception: git workflow state.** Don't write "PR #45 is open" or "merge branch X" as
+  pending actions — these decay within minutes. Record PRs as deliverables ("Opened PR #45
+  for HSD-B"), not as tasks. A fresh session checks `git log`, `gh pr list`, and
+  `git branch` for actual git state.
 
 ## Output 2: Update status.md
 
@@ -61,6 +68,9 @@ document (~50 lines) that a fresh session reads first.
 - Update test count, version, and "In Progress" to reflect this session's outcomes
 - "Next Up" should reflect what the user would likely work on in the next session
 - Use PII placeholders for any tracked paths (status.md is tracked, not gitignored)
+- **Git state is checked, not recorded.** Write "HSD-B complete" not "PR #45 open."
+  Status.md tells the next session *what was built and what to build next*. The session
+  checks `git log`, `gh pr list`, `git branch` for actual branch/PR state.
 
 ## Arguments
 
