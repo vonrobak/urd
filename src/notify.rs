@@ -52,6 +52,12 @@ pub enum NotificationEvent {
         last_heartbeat_age_hours: u64,
         stale_after_hours: u64,
     },
+    /// All incremental chains on a drive broke simultaneously.
+    /// Strong signal for drive swap or mass pin file loss.
+    DriveAnomalyDetected {
+        drive_label: String,
+        total_chains: usize,
+    },
 }
 
 // ── Urgency ────────────────────────────────────────────────────────────

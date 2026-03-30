@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-03-30
+
+### Added
+- Sentinel detects simultaneous chain breaks on a drive and notifies (hardware swap signal)
+- `FullSendReason` annotation on full sends: `first send`, `chain broken`, or `no pin`
+- Full-send gate in autonomous mode: chain-break sends are blocked unless `--force-full` is passed
+- Drive token verification wired into backup path (filters sends to token-mismatched drives)
+
 ## [0.4.1] - 2026-03-30
 
 ### Added

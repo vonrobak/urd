@@ -515,7 +515,6 @@ impl StateDb {
 
     /// Look up a stored drive session token by drive label.
     /// Returns None if no token is stored for this drive.
-    #[allow(dead_code)] // used by verify_drive_token(); wired in HSD-B
     pub fn get_drive_token(&self, label: &str) -> crate::error::Result<Option<String>> {
         let mut stmt = self
             .conn
@@ -534,7 +533,6 @@ impl StateDb {
     }
 
     /// Update the last_verified timestamp for a drive token.
-    #[allow(dead_code)] // used by verify_drive_token(); wired in HSD-B
     pub fn touch_drive_token(&self, label: &str, now: &str) -> crate::error::Result<()> {
         self.conn
             .execute(

@@ -261,6 +261,42 @@ impl SentinelRunner {
             self.last_overdue_notified = Some(Instant::now());
         }
 
+        // 3. Simultaneous chain-break detection (HSD-B).
+        //    Only after initial assessment (same suppression as promise changes).
+        //    Debounce is structural: anomalies only fire on state transition
+        //    (previous had intact chains, current doesn't). Persistent broken
+        //    state produces no further notifications.
+        if self.state.has_initial_assessment {
+            let current_chains =
+                sentinel::build_chain_snapshots(&assessments, &self.state.mounted_drives);
+            let anomalies = sentinel::detect_simultaneous_chain_breaks(
+                &self.state.last_chain_health,
+                &current_chains,
+            );
+            for anomaly in &anomalies {
+                log::warn!(
+                    "Drive anomaly: all {} chains broke on {} simultaneously",
+                    anomaly.total_chains,
+                    anomaly.drive_label,
+                );
+                notifications.push(Notification {
+                    event: NotificationEvent::DriveAnomalyDetected {
+                        drive_label: anomaly.drive_label.clone(),
+                        total_chains: anomaly.total_chains,
+                    },
+                    urgency: Urgency::Warning,
+                    title: format!("Drive anomaly on {}", anomaly.drive_label),
+                    body: format!(
+                        "All {} incremental chains on {} broke simultaneously. \
+                         The drive may have been swapped or cloned. \
+                         Run `urd status` to inspect chain health.",
+                        anomaly.total_chains, anomaly.drive_label,
+                    ),
+                });
+            }
+            self.state.last_chain_health = current_chains;
+        }
+
         if !notifications.is_empty() {
             notify::dispatch(&notifications, &self.config.notifications);
         }
@@ -269,6 +305,9 @@ impl SentinelRunner {
         self.state.last_promise_states = sentinel::snapshot_promises(&assessments);
         if !self.state.has_initial_assessment {
             self.state.has_initial_assessment = true;
+            // Populate chain health baseline so the next tick can detect transitions.
+            self.state.last_chain_health =
+                sentinel::build_chain_snapshots(&assessments, &self.state.mounted_drives);
             if self.heartbeat_path.exists() {
                 log::info!(
                     "Initial assessment complete: {} subvolumes evaluated",

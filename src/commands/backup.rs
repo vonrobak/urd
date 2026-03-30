@@ -11,7 +11,7 @@ use crate::btrfs::RealBtrfs;
 use crate::cli::BackupArgs;
 use crate::config::Config;
 use crate::drives;
-use crate::executor::{ExecutionResult, Executor, OpResult, RunResult, SendType};
+use crate::executor::{ExecutionResult, Executor, FullSendPolicy, OpResult, RunResult, SendType};
 use crate::heartbeat;
 use crate::lock;
 use crate::metrics::{self, MetricsData, SubvolumeMetrics};
@@ -121,7 +121,48 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     let bytes_counter = Arc::new(AtomicU64::new(0));
     let btrfs = RealBtrfs::new(&config.general.btrfs_path, bytes_counter.clone());
 
-    // Build progress context for rich display
+    let mut executor = Executor::new(&btrfs, state_db.as_ref(), &config, &shutdown);
+
+    // In autonomous mode (systemd), gate chain-break full sends unless --force-full.
+    if !args.force_full && std::env::var("INVOCATION_ID").is_ok() {
+        executor.set_full_send_policy(FullSendPolicy::SkipAndNotify);
+    }
+
+    // Verify drive tokens: collect mismatched drives, then filter in one pass.
+    if let Some(ref db) = state_db {
+        let mismatched: std::collections::BTreeSet<String> = config
+            .drives
+            .iter()
+            .filter(|d| drives::is_drive_mounted(d))
+            .filter_map(|drive| {
+                if let drives::DriveAvailability::TokenMismatch { expected, found } =
+                    drives::verify_drive_token(drive, db)
+                {
+                    log::warn!(
+                        "Drive {} has a token mismatch (expected {}, found {}) — \
+                         skipping sends to this drive",
+                        drive.label, expected, found,
+                    );
+                    Some(drive.label.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if !mismatched.is_empty() {
+            backup_plan.operations.retain(|op| {
+                !matches!(
+                    op,
+                    PlannedOperation::SendFull { drive_label, .. }
+                    | PlannedOperation::SendIncremental { drive_label, .. }
+                    if mismatched.contains(drive_label)
+                )
+            });
+        }
+    }
+
+    // Build progress context after token filtering so counters reflect actual work.
     let total_sends = backup_plan.summary().sends as u32;
     let size_estimates = build_size_estimates(&backup_plan, &fs_state);
     let progress_ctx = Arc::new(Mutex::new(ProgressContext {
@@ -146,7 +187,6 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
         None
     };
 
-    let mut executor = Executor::new(&btrfs, state_db.as_ref(), &config, &shutdown);
     executor.set_progress(progress_ctx, size_estimates);
     let exec_start = Instant::now();
     let result = executor.execute(&backup_plan, mode);
@@ -877,7 +917,7 @@ mod tests {
         ExecutionResult, OpResult, OperationOutcome, RunResult, SendType, SubvolumeResult,
     };
     use crate::types::Interval;
-    use crate::types::PlannedOperation;
+    use crate::types::{FullSendReason, PlannedOperation};
     use std::path::PathBuf;
 
     fn make_outcome(
@@ -1451,6 +1491,7 @@ mod tests {
                     drive_label: "WD-18TB".to_string(),
                     subvolume_name: "sv1".to_string(),
                     pin_on_success: None,
+                    reason: FullSendReason::FirstSend,
                 },
                 PlannedOperation::SendIncremental {
                     parent: PathBuf::from("/snaps/sv2/20260328-0400-sv2"),
@@ -1507,6 +1548,7 @@ mod tests {
                 drive_label: "new-drive".to_string(),
                 subvolume_name: "sv1".to_string(),
                 pin_on_success: None,
+                reason: FullSendReason::FirstSend,
             }],
             timestamp: chrono::NaiveDateTime::default(),
             skipped: vec![],
@@ -1532,6 +1574,7 @@ mod tests {
                 drive_label: "new-drive".to_string(),
                 subvolume_name: "sv1".to_string(),
                 pin_on_success: None,
+                reason: FullSendReason::FirstSend,
             }],
             timestamp: chrono::NaiveDateTime::default(),
             skipped: vec![],
@@ -1567,6 +1610,7 @@ mod tests {
                 drive_label: "d1".to_string(),
                 subvolume_name: "sv1".to_string(),
                 pin_on_success: None,
+                reason: FullSendReason::FirstSend,
             }],
             timestamp: chrono::NaiveDateTime::default(),
             skipped: vec![],

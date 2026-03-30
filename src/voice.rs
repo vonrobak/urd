@@ -2105,6 +2105,7 @@ mod tests {
                     detail: "/home -> /snapshots/htpc-home/20260326-0400-home".to_string(),
                     estimated_bytes: None,
                     is_full_send: None,
+                    full_send_reason: None,
                 },
                 PlanOperationEntry {
                     subvolume: "htpc-home".to_string(),
@@ -2112,6 +2113,7 @@ mod tests {
                     detail: "20260326-0400-home -> WD-18TB (incremental, parent: 20260325-0400-home) + pin".to_string(),
                     estimated_bytes: None,
                     is_full_send: None,
+                    full_send_reason: None,
                 },
             ],
             skipped: vec![],
@@ -2161,6 +2163,7 @@ mod tests {
                 detail: "20260329-0404-htpc-home -> WD-18TB (full) + pin".to_string(),
                 estimated_bytes: None,
                 is_full_send: None,
+                full_send_reason: None,
             }],
             skipped: vec![SkippedSubvolume {
                 name: "htpc-docs".to_string(),
@@ -2505,6 +2508,7 @@ mod tests {
                     detail: "snap -> WD-18TB (full)".to_string(),
                     estimated_bytes: Some(53_000_000_000),
                     is_full_send: Some(true),
+                    full_send_reason: None,
                 },
                 PlanOperationEntry {
                     subvolume: "htpc-docs".to_string(),
@@ -2512,6 +2516,7 @@ mod tests {
                     detail: "snap -> WD-18TB (full)".to_string(),
                     estimated_bytes: Some(1_200_000_000),
                     is_full_send: Some(true),
+                    full_send_reason: None,
                 },
             ],
             skipped: vec![],
@@ -2546,6 +2551,7 @@ mod tests {
                 detail: "snap -> WD-18TB (incremental, parent: prev)".to_string(),
                 estimated_bytes: Some(5_500_000),
                 is_full_send: Some(false),
+                full_send_reason: None,
             }],
             skipped: vec![],
             summary: PlanSummaryOutput {
@@ -2575,6 +2581,7 @@ mod tests {
                     detail: "snap -> WD-18TB (full)".to_string(),
                     estimated_bytes: Some(53_000_000_000),
                     is_full_send: Some(true),
+                    full_send_reason: None,
                 },
                 PlanOperationEntry {
                     subvolume: "htpc-docs".to_string(),
@@ -2582,6 +2589,7 @@ mod tests {
                     detail: "snap -> WD-18TB (full)".to_string(),
                     estimated_bytes: None,
                     is_full_send: Some(true),
+                    full_send_reason: None,
                 },
             ],
             skipped: vec![],
@@ -2611,6 +2619,7 @@ mod tests {
                 detail: "snap -> WD-18TB (full)".to_string(),
                 estimated_bytes: None,
                 is_full_send: None,
+                full_send_reason: None,
             }],
             skipped: vec![],
             summary: PlanSummaryOutput {
@@ -2642,6 +2651,7 @@ mod tests {
                 detail: "snap -> WD-18TB (full)".to_string(),
                 estimated_bytes: Some(53_000_000_000),
                 is_full_send: Some(true),
+                full_send_reason: None,
             }],
             skipped: vec![],
             summary: PlanSummaryOutput {
@@ -2674,6 +2684,7 @@ mod tests {
                 detail: "snap -> WD-18TB (full)".to_string(),
                 estimated_bytes: None,
                 is_full_send: None,
+                full_send_reason: None,
             }],
             skipped: vec![],
             summary: PlanSummaryOutput {

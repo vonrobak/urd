@@ -11,7 +11,7 @@ use crate::config::Config;
 use crate::drives;
 use crate::error::BtrfsOperation;
 use crate::state::{OperationRecord, StateDb};
-use crate::types::{BackupPlan, PlannedOperation};
+use crate::types::{BackupPlan, FullSendReason, PlannedOperation};
 
 // ── Types ───────────────────────────────────────────────────────────────
 
@@ -59,6 +59,15 @@ pub enum OpResult {
     Skipped,
 }
 
+/// Policy for handling chain-break full sends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FullSendPolicy {
+    /// Proceed on all full sends regardless of reason (interactive default).
+    Allow,
+    /// Skip chain-break full sends and log a warning (autonomous/systemd default).
+    SkipAndNotify,
+}
+
 #[derive(Debug)]
 pub struct OperationOutcome {
     pub operation: String,
@@ -101,6 +110,7 @@ pub struct Executor<'a> {
     shutdown: &'a AtomicBool,
     progress_context: Option<Arc<Mutex<ProgressContext>>>,
     size_estimates: Option<SizeEstimates>,
+    full_send_policy: FullSendPolicy,
 }
 
 impl<'a> Executor<'a> {
@@ -118,7 +128,13 @@ impl<'a> Executor<'a> {
             shutdown,
             progress_context: None,
             size_estimates: None,
+            full_send_policy: FullSendPolicy::Allow,
         }
+    }
+
+    /// Set the full-send policy for chain-break gating.
+    pub fn set_full_send_policy(&mut self, policy: FullSendPolicy) {
+        self.full_send_policy = policy;
     }
 
     /// Set progress context for rich progress display.
@@ -228,24 +244,50 @@ impl<'a> Executor<'a> {
                     dest_dir,
                     drive_label,
                     pin_on_success,
+                    reason,
                     ..
                 } => {
-                    let (result, pin_failed) = self.execute_send(
-                        snapshot,
-                        None,
-                        dest_dir,
-                        drive_label,
-                        pin_on_success.as_ref(),
-                        &failed_creates,
-                        subvol_name,
-                    );
-                    if result.result == OpResult::Success {
-                        send_type = SendType::Full;
+                    // Gate chain-break full sends in autonomous mode.
+                    if *reason == FullSendReason::ChainBroken
+                        && self.full_send_policy == FullSendPolicy::SkipAndNotify
+                    {
+                        log::warn!(
+                            "Skipping chain-break full send for {} to {}: \
+                             use `urd backup --force-full` to override",
+                            subvol_name, drive_label,
+                        );
+                        OperationOutcome {
+                            operation: "send_full".to_string(),
+                            drive_label: Some(drive_label.clone()),
+                            result: OpResult::Failure,
+                            duration: std::time::Duration::ZERO,
+                            error: Some(format!(
+                                "chain-break full send gated — run \
+                                 `urd backup --force-full --subvolume {}` to proceed",
+                                subvol_name,
+                            )),
+                            bytes_transferred: None,
+                            btrfs_operation: None,
+                            btrfs_stderr: None,
+                        }
+                    } else {
+                        let (result, pin_failed) = self.execute_send(
+                            snapshot,
+                            None,
+                            dest_dir,
+                            drive_label,
+                            pin_on_success.as_ref(),
+                            &failed_creates,
+                            subvol_name,
+                        );
+                        if result.result == OpResult::Success {
+                            send_type = SendType::Full;
+                        }
+                        if pin_failed {
+                            pin_failures += 1;
+                        }
+                        result
                     }
-                    if pin_failed {
-                        pin_failures += 1;
-                    }
-                    result
                 }
                 PlannedOperation::DeleteSnapshot {
                     path,
@@ -971,6 +1013,7 @@ source = "/data/b"
                     drive_label: "TEST-DRIVE".to_string(),
                     subvolume_name: "sv-a".to_string(),
                     pin_on_success: None,
+                    reason: FullSendReason::FirstSend,
                 },
             ],
             timestamp: ts,
@@ -1019,6 +1062,7 @@ source = "/data/b"
                 drive_label: "TEST-DRIVE".to_string(),
                 subvolume_name: "sv-a".to_string(),
                 pin_on_success: Some((pin_path.clone(), snap_name)),
+                reason: FullSendReason::FirstSend,
             }],
             timestamp: ts,
             skipped: vec![],
@@ -1179,6 +1223,7 @@ source = "/data/b"
                 drive_label: "TEST-DRIVE".to_string(),
                 subvolume_name: "sv-a".to_string(),
                 pin_on_success: None,
+                reason: FullSendReason::FirstSend,
             }],
             timestamp: ts,
             skipped: vec![],
@@ -1359,6 +1404,7 @@ source = "/data/b"
                 drive_label: "TEST-DRIVE".to_string(),
                 subvolume_name: "sv-a".to_string(),
                 pin_on_success: Some((pin_path, snap_name)),
+                reason: FullSendReason::FirstSend,
             }],
             timestamp: ts,
             skipped: vec![],
@@ -1500,6 +1546,7 @@ source = "/data/b"
                 drive_label: "TEST-DRIVE".to_string(),
                 subvolume_name: "sv-a".to_string(),
                 pin_on_success: None,
+                reason: FullSendReason::FirstSend,
             }],
             timestamp: ts,
             skipped: vec![],
@@ -1554,6 +1601,7 @@ source = "/data/b"
                     drive_label: "TEST-DRIVE".to_string(),
                     subvolume_name: "sv-a".to_string(),
                     pin_on_success: None,
+                    reason: FullSendReason::FirstSend,
                 },
             ],
             timestamp: ts,
@@ -1600,6 +1648,7 @@ source = "/data/b"
                     drive_label: "TEST-DRIVE".to_string(),
                     subvolume_name: "sv-a".to_string(),
                     pin_on_success: None,
+                    reason: FullSendReason::FirstSend,
                 },
             ],
             timestamp: ts,
@@ -1712,5 +1761,91 @@ source = "/data/sv1"
 
         // Should not panic for unknown drive label
         executor.maybe_write_drive_token("NONEXISTENT-DRIVE");
+    }
+
+    // ── Full-send gate tests ──────────────────────────────────────────
+
+    fn chain_broken_plan() -> BackupPlan {
+        let ts = NaiveDate::from_ymd_opt(2026, 3, 22)
+            .unwrap()
+            .and_hms_opt(14, 30, 0)
+            .unwrap();
+        BackupPlan {
+            operations: vec![PlannedOperation::SendFull {
+                snapshot: PathBuf::from("/snap/sv-a/20260322-1430-a"),
+                dest_dir: PathBuf::from("/mnt/test/.snapshots/sv-a"),
+                drive_label: "TEST-DRIVE".to_string(),
+                subvolume_name: "sv-a".to_string(),
+                pin_on_success: None,
+                reason: FullSendReason::ChainBroken,
+            }],
+            timestamp: ts,
+            skipped: vec![],
+        }
+    }
+
+    #[test]
+    fn skip_and_notify_gates_chain_broken() {
+        let mock = MockBtrfs::new();
+        let config = test_config();
+        let shutdown = no_shutdown();
+        let mut executor = Executor::new(&mock, None, &config, &shutdown);
+        executor.set_full_send_policy(FullSendPolicy::SkipAndNotify);
+
+        let result = executor.execute(&chain_broken_plan(), "full");
+
+        assert_eq!(result.subvolume_results[0].operations[0].result, OpResult::Failure);
+        assert!(!result.subvolume_results[0].success, "subvolume should report failure");
+        assert_eq!(result.overall, RunResult::Failure);
+        assert!(mock.calls().is_empty(), "btrfs should not be called");
+        assert!(
+            result.subvolume_results[0].operations[0]
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("chain-break full send gated"),
+            "error message should indicate gating"
+        );
+    }
+
+    #[test]
+    fn skip_and_notify_allows_first_send() {
+        let mock = MockBtrfs::new();
+        let config = test_config();
+        let shutdown = no_shutdown();
+        let mut executor = Executor::new(&mock, None, &config, &shutdown);
+        executor.set_full_send_policy(FullSendPolicy::SkipAndNotify);
+
+        let plan = simple_plan(); // uses FirstSend reason
+        let result = executor.execute(&plan, "full");
+
+        assert_eq!(result.overall, RunResult::Success);
+    }
+
+    #[test]
+    fn allow_proceeds_on_chain_broken() {
+        let mock = MockBtrfs::new();
+        let config = test_config();
+        let shutdown = no_shutdown();
+        let executor = Executor::new(&mock, None, &config, &shutdown);
+        // Default policy is Allow
+
+        let result = executor.execute(&chain_broken_plan(), "full");
+
+        assert_eq!(result.subvolume_results[0].operations[0].result, OpResult::Success);
+        assert!(!mock.calls().is_empty(), "btrfs should be called");
+    }
+
+    #[test]
+    fn force_full_overrides_skip_and_notify() {
+        let mock = MockBtrfs::new();
+        let config = test_config();
+        let shutdown = no_shutdown();
+        let mut executor = Executor::new(&mock, None, &config, &shutdown);
+        executor.set_full_send_policy(FullSendPolicy::Allow); // --force-full sets Allow
+
+        let result = executor.execute(&chain_broken_plan(), "full");
+
+        assert_eq!(result.subvolume_results[0].operations[0].result, OpResult::Success);
     }
 }

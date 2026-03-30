@@ -14,7 +14,7 @@ use std::time::Duration;
 use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
 
-use crate::awareness::{PromiseStatus, SubvolAssessment};
+use crate::awareness::{ChainStatus, PromiseStatus, SubvolAssessment};
 
 // ── Events ──────────────────────────────────────────────────────────────
 
@@ -73,6 +73,9 @@ pub struct SentinelState {
     /// completes. The state machine doesn't set it — it's a pure function
     /// that doesn't know which assessment is "first."
     pub has_initial_assessment: bool,
+    /// Chain health per (subvolume, drive) from the last assessment.
+    /// Used by `detect_simultaneous_chain_breaks()` to compare across ticks.
+    pub last_chain_health: Vec<ChainSnapshot>,
     /// Circuit breaker state (active mode only, but tracked always).
     pub circuit_breaker: CircuitBreaker,
 }
@@ -93,6 +96,7 @@ impl SentinelState {
             mounted_drives: BTreeSet::new(),
             last_promise_states: Vec::new(),
             has_initial_assessment: false,
+            last_chain_health: Vec::new(),
             circuit_breaker: CircuitBreaker::new(circuit_breaker_config),
         }
     }
@@ -565,12 +569,110 @@ pub fn has_promise_changes(
     false
 }
 
+// ── Chain-break detection (HSD-B) ──────────────────────────────────────
+
+/// Chain health from a single assessment tick, for delta comparison.
+/// Built from `SubvolAssessment::chain_health` by `build_chain_snapshots()`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainSnapshot {
+    pub subvolume: String,
+    pub drive_label: String,
+    /// true = incremental chain intact (pin exists, parent found on drive).
+    pub chain_intact: bool,
+}
+
+/// A drive where all incremental chains broke simultaneously.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DriveAnomaly {
+    pub drive_label: String,
+    /// Total number of chains on this drive (all of which broke).
+    pub total_chains: usize,
+}
+
+/// Extract chain snapshots from assessments for mounted drives only.
+///
+/// Pure function: reads `SubvolAssessment::chain_health` (populated by
+/// `awareness::assess()`) and filters to chains for drives in
+/// `mounted_drives`. Unmounted drives are excluded because chain health
+/// cannot be assessed without reading the drive's snapshots.
+#[must_use]
+pub fn build_chain_snapshots(
+    assessments: &[SubvolAssessment],
+    mounted_drives: &BTreeSet<String>,
+) -> Vec<ChainSnapshot> {
+    let mut snapshots = Vec::new();
+    for assessment in assessments {
+        for ch in &assessment.chain_health {
+            if mounted_drives.contains(&ch.drive_label) {
+                snapshots.push(ChainSnapshot {
+                    subvolume: assessment.name.clone(),
+                    drive_label: ch.drive_label.clone(),
+                    chain_intact: matches!(ch.status, ChainStatus::Intact { .. }),
+                });
+            }
+        }
+    }
+    snapshots
+}
+
+/// Detect drives where all incremental chains broke simultaneously.
+///
+/// Compares chain snapshots from two consecutive assessment ticks. Returns
+/// anomalies for drives where:
+/// - The previous tick had >= 2 intact chains on the drive, AND
+/// - The current tick has 0 intact chains on the drive.
+///
+/// The >= 2 threshold prevents false positives from single-subvolume drives
+/// (a single chain break is a normal operational event). This is the
+/// strongest heuristic signal for a drive swap or mass pin file loss.
+#[must_use]
+pub fn detect_simultaneous_chain_breaks(
+    previous: &[ChainSnapshot],
+    current: &[ChainSnapshot],
+) -> Vec<DriveAnomaly> {
+    use std::collections::BTreeMap;
+
+    // Count intact chains per drive in previous state
+    let mut prev_intact: BTreeMap<&str, usize> = BTreeMap::new();
+    for snap in previous {
+        if snap.chain_intact {
+            *prev_intact.entry(&snap.drive_label).or_insert(0) += 1;
+        }
+    }
+
+    // Count intact and total chains per drive in current state
+    let mut curr: BTreeMap<&str, (usize, usize)> = BTreeMap::new(); // (intact, total)
+    for snap in current {
+        let entry = curr.entry(&snap.drive_label).or_insert((0, 0));
+        entry.1 += 1;
+        if snap.chain_intact {
+            entry.0 += 1;
+        }
+    }
+
+    let mut anomalies = Vec::new();
+    for (drive, &prev_count) in &prev_intact {
+        let &(intact, total) = curr.get(drive).unwrap_or(&(0, 0));
+        // Drive had >= 2 intact chains before, and now has 0
+        if prev_count >= 2 && intact == 0 {
+            anomalies.push(DriveAnomaly {
+                drive_label: drive.to_string(),
+                total_chains: total,
+            });
+        }
+    }
+
+    anomalies
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::awareness::{DriveAssessment, LocalAssessment, OperationalHealth};
+    use crate::awareness::{
+        DriveAssessment, DriveChainHealth, LocalAssessment, OperationalHealth,
+    };
     use crate::types::Interval;
 
     fn dt(s: &str) -> NaiveDateTime {
@@ -1201,5 +1303,186 @@ mod tests {
         assert_eq!(snaps[0].status, PromiseStatus::Protected);
         assert_eq!(snaps[1].name, "sv2");
         assert_eq!(snaps[1].status, PromiseStatus::AtRisk);
+    }
+
+    // ── Chain snapshot + anomaly detection tests ───────────────────────
+
+    fn make_assessment_with_chains(
+        name: &str,
+        chains: Vec<(&str, bool)>,
+    ) -> SubvolAssessment {
+        let chain_health = chains
+            .into_iter()
+            .map(|(drive, intact)| DriveChainHealth {
+                drive_label: drive.to_string(),
+                status: if intact {
+                    ChainStatus::Intact {
+                        pin_parent: format!("20260329-1000-{name}"),
+                    }
+                } else {
+                    ChainStatus::Broken {
+                        reason: crate::awareness::ChainBreakReason::PinMissingOnDrive,
+                        pin_parent: Some(format!("20260329-1000-{name}")),
+                    }
+                },
+            })
+            .collect();
+        SubvolAssessment {
+            name: name.to_string(),
+            status: PromiseStatus::Protected,
+            health: OperationalHealth::Healthy,
+            health_reasons: vec![],
+            local: LocalAssessment {
+                status: PromiseStatus::Protected,
+                snapshot_count: 5,
+                newest_age: None,
+                configured_interval: Interval::hours(1),
+            },
+            external: vec![],
+            chain_health,
+            advisories: vec![],
+            errors: vec![],
+        }
+    }
+
+    #[test]
+    fn build_chain_snapshots_filters_mounted_drives() {
+        let mut mounted = BTreeSet::new();
+        mounted.insert("WD-18TB".to_string());
+        // WD-18TB1 is NOT mounted
+
+        let assessments = vec![make_assessment_with_chains(
+            "sv1",
+            vec![("WD-18TB", true), ("WD-18TB1", false)],
+        )];
+
+        let snaps = build_chain_snapshots(&assessments, &mounted);
+        assert_eq!(snaps.len(), 1);
+        assert_eq!(snaps[0].drive_label, "WD-18TB");
+        assert!(snaps[0].chain_intact);
+    }
+
+    #[test]
+    fn build_chain_snapshots_intact_and_broken() {
+        let mut mounted = BTreeSet::new();
+        mounted.insert("D1".to_string());
+
+        let assessments = vec![
+            make_assessment_with_chains("sv1", vec![("D1", true)]),
+            make_assessment_with_chains("sv2", vec![("D1", false)]),
+        ];
+
+        let snaps = build_chain_snapshots(&assessments, &mounted);
+        assert_eq!(snaps.len(), 2);
+        assert!(snaps[0].chain_intact);
+        assert!(!snaps[1].chain_intact);
+    }
+
+    #[test]
+    fn build_chain_snapshots_empty_assessments() {
+        let mounted = BTreeSet::new();
+        let snaps = build_chain_snapshots(&[], &mounted);
+        assert!(snaps.is_empty());
+    }
+
+    #[test]
+    fn build_chain_snapshots_no_mounted_drives() {
+        let mounted = BTreeSet::new();
+        let assessments = vec![make_assessment_with_chains("sv1", vec![("D1", true)])];
+        let snaps = build_chain_snapshots(&assessments, &mounted);
+        assert!(snaps.is_empty());
+    }
+
+    #[test]
+    fn detect_chain_breaks_all_intact_no_anomaly() {
+        let prev = vec![
+            ChainSnapshot { subvolume: "sv1".into(), drive_label: "D1".into(), chain_intact: true },
+            ChainSnapshot { subvolume: "sv2".into(), drive_label: "D1".into(), chain_intact: true },
+        ];
+        let curr = prev.clone();
+
+        assert!(detect_simultaneous_chain_breaks(&prev, &curr).is_empty());
+    }
+
+    #[test]
+    fn detect_chain_breaks_single_break_no_anomaly() {
+        let prev = vec![
+            ChainSnapshot { subvolume: "sv1".into(), drive_label: "D1".into(), chain_intact: true },
+            ChainSnapshot { subvolume: "sv2".into(), drive_label: "D1".into(), chain_intact: true },
+            ChainSnapshot { subvolume: "sv3".into(), drive_label: "D1".into(), chain_intact: true },
+        ];
+        let curr = vec![
+            ChainSnapshot { subvolume: "sv1".into(), drive_label: "D1".into(), chain_intact: false },
+            ChainSnapshot { subvolume: "sv2".into(), drive_label: "D1".into(), chain_intact: true },
+            ChainSnapshot { subvolume: "sv3".into(), drive_label: "D1".into(), chain_intact: true },
+        ];
+
+        assert!(detect_simultaneous_chain_breaks(&prev, &curr).is_empty());
+    }
+
+    #[test]
+    fn detect_chain_breaks_all_break_is_anomaly() {
+        let prev = vec![
+            ChainSnapshot { subvolume: "sv1".into(), drive_label: "D1".into(), chain_intact: true },
+            ChainSnapshot { subvolume: "sv2".into(), drive_label: "D1".into(), chain_intact: true },
+            ChainSnapshot { subvolume: "sv3".into(), drive_label: "D1".into(), chain_intact: true },
+        ];
+        let curr = vec![
+            ChainSnapshot { subvolume: "sv1".into(), drive_label: "D1".into(), chain_intact: false },
+            ChainSnapshot { subvolume: "sv2".into(), drive_label: "D1".into(), chain_intact: false },
+            ChainSnapshot { subvolume: "sv3".into(), drive_label: "D1".into(), chain_intact: false },
+        ];
+
+        let anomalies = detect_simultaneous_chain_breaks(&prev, &curr);
+        assert_eq!(anomalies.len(), 1);
+        assert_eq!(anomalies[0].drive_label, "D1");
+        assert_eq!(anomalies[0].total_chains, 3);
+    }
+
+    #[test]
+    fn detect_chain_breaks_single_subvolume_no_anomaly() {
+        // Threshold is >= 2 intact chains previously — single subvolume can't trigger
+        let prev = vec![
+            ChainSnapshot { subvolume: "sv1".into(), drive_label: "D1".into(), chain_intact: true },
+        ];
+        let curr = vec![
+            ChainSnapshot { subvolume: "sv1".into(), drive_label: "D1".into(), chain_intact: false },
+        ];
+
+        assert!(detect_simultaneous_chain_breaks(&prev, &curr).is_empty());
+    }
+
+    #[test]
+    fn detect_chain_breaks_new_drive_no_anomaly() {
+        // Drive not in previous state — no anomaly (first assessment)
+        let prev = vec![];
+        let curr = vec![
+            ChainSnapshot { subvolume: "sv1".into(), drive_label: "D1".into(), chain_intact: false },
+            ChainSnapshot { subvolume: "sv2".into(), drive_label: "D1".into(), chain_intact: false },
+        ];
+
+        assert!(detect_simultaneous_chain_breaks(&prev, &curr).is_empty());
+    }
+
+    #[test]
+    fn detect_chain_breaks_multiple_drives_independent() {
+        let prev = vec![
+            ChainSnapshot { subvolume: "sv1".into(), drive_label: "D1".into(), chain_intact: true },
+            ChainSnapshot { subvolume: "sv2".into(), drive_label: "D1".into(), chain_intact: true },
+            ChainSnapshot { subvolume: "sv1".into(), drive_label: "D2".into(), chain_intact: true },
+            ChainSnapshot { subvolume: "sv2".into(), drive_label: "D2".into(), chain_intact: true },
+        ];
+        let curr = vec![
+            // D1: all broken
+            ChainSnapshot { subvolume: "sv1".into(), drive_label: "D1".into(), chain_intact: false },
+            ChainSnapshot { subvolume: "sv2".into(), drive_label: "D1".into(), chain_intact: false },
+            // D2: still intact
+            ChainSnapshot { subvolume: "sv1".into(), drive_label: "D2".into(), chain_intact: true },
+            ChainSnapshot { subvolume: "sv2".into(), drive_label: "D2".into(), chain_intact: true },
+        ];
+
+        let anomalies = detect_simultaneous_chain_breaks(&prev, &curr);
+        assert_eq!(anomalies.len(), 1);
+        assert_eq!(anomalies[0].drive_label, "D1");
     }
 }
