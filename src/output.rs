@@ -582,6 +582,51 @@ pub struct InitSnapshotCount {
     pub external_counts: Vec<(String, usize)>,
 }
 
+// ── Visual state types (VFM-B) ──────────────────────────────────────────
+
+/// Icon state for tray icon consumers. Four states, each maps to a static
+/// SVG icon file. The tray applet selects by name: `urd-icon-ok.svg`, etc.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VisualIcon {
+    /// All safe, all healthy.
+    Ok,
+    /// Safety ok but health degraded, or safety aging.
+    Warning,
+    /// Data gap exists (any subvolume UNPROTECTED).
+    Critical,
+    /// Backup currently running (reserved, not yet produced).
+    Active,
+}
+
+/// Safety axis counts using tray-friendly vocabulary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SafetyCounts {
+    pub ok: usize,
+    pub aging: usize,
+    pub gap: usize,
+}
+
+/// Health axis counts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HealthCounts {
+    pub healthy: usize,
+    pub degraded: usize,
+    pub blocked: usize,
+}
+
+/// Structured visual state for tray icon and external consumers.
+/// No pre-computed text — consumers render their own tooltips/summaries
+/// from this structured data (design review S2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VisualState {
+    pub icon: VisualIcon,
+    pub worst_safety: String,
+    pub worst_health: String,
+    pub safety_counts: SafetyCounts,
+    pub health_counts: HealthCounts,
+}
+
 // ── SentinelStatusOutput ─────────────────────────────────────────────────
 
 /// Sentinel state file schema — written atomically by the runner, read by
@@ -596,6 +641,10 @@ pub struct SentinelStateFile {
     pub tick_interval_secs: u64,
     pub promise_states: Vec<SentinelPromiseState>,
     pub circuit_breaker: SentinelCircuitState,
+    /// Visual state for tray icon and external consumers (VFM-B, schema v2+).
+    /// `None` when reading schema v1 files for backward compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visual_state: Option<VisualState>,
 }
 
 /// Per-subvolume promise state in the sentinel state file.
@@ -603,6 +652,16 @@ pub struct SentinelStateFile {
 pub struct SentinelPromiseState {
     pub name: String,
     pub status: String,
+    /// Operational health (VFM-B, schema v2+). Defaults to "healthy" for v1 files.
+    #[serde(default = "default_healthy")]
+    pub health: String,
+    /// Reasons for non-healthy status. Omitted from JSON when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub health_reasons: Vec<String>,
+}
+
+fn default_healthy() -> String {
+    "healthy".to_string()
 }
 
 /// Circuit breaker summary in the sentinel state file.
@@ -619,7 +678,7 @@ pub enum SentinelStatusOutput {
     /// Sentinel is running (PID alive, state file present).
     #[serde(rename = "running")]
     Running {
-        state: SentinelStateFile,
+        state: Box<SentinelStateFile>,
         /// Human-readable uptime (e.g., "3h 12m").
         uptime: String,
     },

@@ -2901,7 +2901,7 @@ mod tests {
 
     fn test_sentinel_running() -> SentinelStatusOutput {
         SentinelStatusOutput::Running {
-            state: SentinelStateFile {
+            state: Box::new(SentinelStateFile {
                 schema_version: 1,
                 pid: 12345,
                 started: "2026-03-27T10:00:00".to_string(),
@@ -2911,12 +2911,15 @@ mod tests {
                 promise_states: vec![SentinelPromiseState {
                     name: "home".to_string(),
                     status: "PROTECTED".to_string(),
+                    health: "healthy".to_string(),
+                    health_reasons: vec![],
                 }],
                 circuit_breaker: SentinelCircuitState {
                     state: "closed".to_string(),
                     failure_count: 0,
                 },
-            },
+                visual_state: None,
+            }),
             uptime: "3h 12m".to_string(),
         }
     }

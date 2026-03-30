@@ -18,7 +18,7 @@ pub fn status(config: Config, output_mode: OutputMode) -> anyhow::Result<()> {
     let status_output = match read_sentinel_state_file(&state_path) {
         Some(state) if is_pid_alive(state.pid) => {
             let uptime = format_uptime(&state.started);
-            SentinelStatusOutput::Running { state, uptime }
+            SentinelStatusOutput::Running { state: Box::new(state), uptime }
         }
         Some(state) => {
             // Stale state file — PID is dead. Clean up and report as not running.

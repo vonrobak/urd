@@ -8,12 +8,13 @@
 
 **Urd is the sole backup system.** Systemd timer running nightly at 04:00 since 2026-03-25.
 Sentinel daemon deployed (passive monitoring, drive detection, backup overdue alerts).
-521 tests, all passing, clippy clean. Current version: v0.4.2.
+542 tests, all passing, clippy clean. Current version: v0.4.2.
 
 ## In Progress
 
-- **HSD-B complete, PR #45 open** (2026-03-30). Chain-break detection, full-send gate,
-  drive token verification wired into backup path. Reviewed, released as v0.4.2.
+- **VFM-B complete, needs PR** (2026-03-30). Sentinel health tracking, visual state in
+  state file (schema v2), HealthDegraded/HealthRecovered notifications, NamedSnapshot
+  trait refactor. Reviewed. 7 files changed, +653/-35 lines, 21 new tests.
 
 ## Build Queue
 
@@ -26,13 +27,13 @@ full details, design decisions, and review findings.
 4. ~~**UX-1**~~ — plan output: structural headings + collapsed skips. **Done.**
 5. ~~**UX-2**~~ — plan output: estimated send sizes, cross-drive fallback. **Done.**
 6. ~~**UX-3**~~ — plan output: rich progress display + ETA. **Done.**
-7. ~~**HSD-B**~~ — sentinel chain-break detection + full-send gate. **Done (PR #45).**
-8. **VFM-B** — sentinel visual state in state file + health notifications. **Start here.**
-9. **Transient snapshots** — `local_retention = "transient"` for NVMe space pressure.
+7. ~~**HSD-B**~~ — sentinel chain-break detection + full-send gate. **Done (v0.4.2).**
+8. ~~**VFM-B**~~ — sentinel visual state + health notifications. **Done, needs PR.**
+9. **Transient snapshots** — `local_retention = "transient"` for NVMe space pressure. **Start here.**
 10. **Tray icon (Spindle)** — reads sentinel-state.json, 4 static icons.
 
 Designs: `docs/95-ideas/2026-03-29-design-*.md`.
-Reviews: `docs/99-reports/2026-03-30-hsd-b-chain-break-detection-review.md`.
+Reviews: `docs/99-reports/2026-03-30-vfm-b-visual-state-review.md`.
 
 **Later:** Config system migration (ADR-111), shell completions (6a).
 
@@ -45,7 +46,7 @@ Reviews: `docs/99-reports/2026-03-30-hsd-b-chain-break-detection-review.md`.
 | Documentation standards | [CONTRIBUTING.md](../../CONTRIBUTING.md) |
 | ADRs (100-112) | [decisions/](../00-foundation/decisions/) |
 | Latest journals | `docs/98-journals/` (local only, gitignored) |
-| Latest reviews | [HSD-B review](../99-reports/2026-03-30-hsd-b-chain-break-detection-review.md), [UX-3 review](../99-reports/2026-03-30-ux3-progress-display-review.md) |
+| Latest reviews | [VFM-B review](../99-reports/2026-03-30-vfm-b-visual-state-review.md), [HSD-B review](../99-reports/2026-03-30-hsd-b-chain-break-detection-review.md) |
 
 ## Known Issues
 
@@ -60,5 +61,6 @@ Reviews: `docs/99-reports/2026-03-30-hsd-b-chain-break-detection-review.md`.
 - `render_skipped_block` (backup summary) uses ad-hoc string grouping; could adopt `SkipCategory`
 - Progress completion line byte count lags true total by up to one poll interval (~45 MB at USB3 speeds)
 - `OpResult::Skipped` is overloaded: four distinct semantics (prior failure, optimization, safety guard, safety gate)
+- `urd sentinel status` interactive mode doesn't render health/visual_state fields yet
 
 See [roadmap.md](roadmap.md) for the full tech debt list and dropped features.
