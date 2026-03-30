@@ -12,13 +12,11 @@ Sentinel daemon deployed (passive monitoring, drive detection, backup overdue al
 
 ## Recently Completed
 
-- **Transient awareness fix** (2026-03-30). Awareness model now understands transient
-  retention: local status = Protected (defers to external send freshness). Includes
-  `clamp_age()` extraction, clock-skew advisory for transient, guard for transient+no-sends
-  edge case. 6 new tests. Reviewed and post-review fixes applied.
-- **Transient snapshots** (2026-03-30). `local_retention = "transient"` — delete local
-  snapshots after external send, keep only pinned chain parents. For space-constrained
-  NVMe volumes (htpc-root). Merged. Ready to deploy to production config.
+- **v0.5.0 released** (2026-03-30). Transient snapshots + awareness fix. Tagged, built,
+  installed. Ready to deploy transient to htpc-root production config.
+- **Transient awareness fix** — awareness model defers to external send freshness for
+  transient subvolumes instead of falsely reporting UNPROTECTED. 6 new tests.
+- **Transient snapshots** — `local_retention = "transient"` for space-constrained NVMe.
 
 ## Next Up
 
