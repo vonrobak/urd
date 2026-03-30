@@ -9,7 +9,7 @@ Named after [Urðr](https://en.wikipedia.org/wiki/Ur%C3%B0r), the Norse norn who
 the Well of Fate and knows all that has passed.
 
 > **Status:** Under active development. Running in production as the sole backup system on
-> the author's machine since March 2026. 389 tests. The core backup pipeline is stable;
+> the author's machine since March 2026. 521+ tests. The core backup pipeline is stable;
 > the Sentinel daemon (passive monitoring) just shipped. Active mode and config redesign
 > are next.
 
@@ -28,7 +28,7 @@ Urd fills that gap:
 - **Drive-aware.** Independent incremental chains per external drive. Plug in a drive,
   run a backup, rotate offsite. Urd tracks each drive's history separately.
 - **Space-aware.** Pre-send space estimation prevents multi-hour sends from failing at 99%.
-  Local snapshot guard prevents filling your NVMe.
+  Local snapshot guard prevents filling your boot drive.
 - **Plan before execute.** `urd plan` shows exactly what would happen. `urd backup --dry-run`
   does everything except touch the filesystem.
 - **Promise-based.** Assign protection levels to subvolumes. Urd derives retention, intervals,
@@ -41,28 +41,27 @@ Urd fills that gap:
 ```
 $ urd status
 
-PROMISE    SUBVOLUME           STATUS      LOCAL  WD-18TB1  2TB-backup
-resilient  subvol1-docs        PROTECTED   15     3         2
-resilient  subvol2-pics        PROTECTED   15     3         2
-resilient  subvol3-opptak      PROTECTED   15     3         2
-protected  subvol5-music       PROTECTED   15     3         —
-protected  htpc-home           PROTECTED   15     3         —
-protected  htpc-root           PROTECTED   15     3         —
-guarded    subvol4-multimedia  PROTECTED   4      —         —
-guarded    subvol6-tmp         PROTECTED   4      —         —
-guarded    subvol7-containers  PROTECTED   4      —         —
+PROMISE    SUBVOLUME      STATUS      LOCAL  external-1  external-2
+resilient  documents      PROTECTED   15     3           2
+resilient  photos         PROTECTED   15     3           2
+resilient  recordings     PROTECTED   15     3           2
+protected  music          PROTECTED   15     3           —
+protected  home           PROTECTED   15     3           —
+guarded    multimedia     PROTECTED   4      —           —
+guarded    scratch        PROTECTED   4      —           —
+guarded    containers     PROTECTED   4      —           —
 
-Drives: WD-18TB1 (4.4 TB free), 2TB-backup (1.1 TB free)
+Drives: external-1 (4.4 TB free), external-2 (1.1 TB free)
 ```
 
 ```
 $ urd sentinel status
 
 SENTINEL — watching
-  Uptime     7h 23m (PID 500258)
+  Uptime     7h 23m (PID 12345)
   Last check 4m ago, next in 11m
-  Drives     WD-18TB1, 2TB-backup
-  Promises   9 PROTECTED
+  Drives     external-1, external-2
+  Promises   8 PROTECTED
 ```
 
 ## Commands
@@ -83,9 +82,9 @@ SENTINEL — watching
 ## How it works
 
 ```
-config  →  plan (pure)  →  execute (I/O)  →  record (SQLite)
-                                 |
-                            btrfs (sudo)
+config  ->  plan (pure)  ->  execute (I/O)  ->  record (SQLite)
+                                  |
+                             btrfs (sudo)
 ```
 
 1. **Plan.** Reads config and filesystem state. Determines which subvolumes need snapshots,
@@ -101,8 +100,8 @@ config  →  plan (pure)  →  execute (I/O)  →  record (SQLite)
 
 Local snapshots use graduated retention:
 - Last 14 days: keep all
-- Weeks 3–8: keep one per ISO week
-- Months 3–5: keep one per month
+- Weeks 3-8: keep one per ISO week
+- Months 3-5: keep one per month
 
 External snapshots use count-based retention. Pinned parents (incremental chain anchors)
 are **never** deleted, regardless of age or policy.
@@ -121,25 +120,25 @@ are **never** deleted, regardless of age or policy.
 # ~/.config/urd/urd.toml
 
 [general]
-snapshot_root = "/mnt/btrfs-pool/.snapshots"
+snapshot_root = "/mnt/your-filesystem/.snapshots"
 run_frequency = "daily"
 
 [[subvolumes]]
-name = "subvol1-docs"
+name = "documents"
 short_name = "docs"
-source = "/mnt/btrfs-pool/subvol1-docs"
+source = "/mnt/your-filesystem/documents"
 protection_level = "resilient"     # Urd derives retention + intervals
-drives = ["WD-18TB1", "2TB-backup"]
+drives = ["external-1", "external-2"]
 
 [[subvolumes]]
-name = "subvol4-multimedia"
+name = "multimedia"
 short_name = "multimedia"
-source = "/mnt/btrfs-pool/subvol4-multimedia"
+source = "/mnt/your-filesystem/multimedia"
 protection_level = "guarded"       # Local snapshots only
 
 [[drives]]
-label = "WD-18TB1"
-mount_path = "/run/media/user/WD-18TB1"
+label = "external-1"
+mount_path = "/run/media/you/external-1"
 uuid = "abcd-1234"
 ```
 
@@ -158,7 +157,7 @@ See [`config/urd.toml.example`](config/urd.toml.example) for a complete referenc
 cargo build --release
 # Binary at target/release/urd
 
-cargo test              # 389 unit tests
+cargo test              # 521+ unit tests
 cargo clippy -- -D warnings
 ```
 
