@@ -13,7 +13,7 @@ use chrono::{Duration, NaiveDateTime};
 
 use crate::config::{Config, DriveConfig};
 use crate::plan::FileSystemState;
-use crate::types::{Interval, SnapshotName};
+use crate::types::{Interval, LocalRetentionPolicy, SnapshotName};
 
 // ── Thresholds ─────────────────────────────────────────────────────────
 
@@ -229,7 +229,7 @@ pub fn assess(
 
         let local = {
             let (assessment, advisory) =
-                assess_local(&local_snaps, now, subvol.snapshot_interval);
+                assess_local(&local_snaps, now, subvol.snapshot_interval, subvol.local_retention);
             if let Some(adv) = advisory {
                 advisories.push(adv);
             }
@@ -276,15 +276,7 @@ pub fn assess(
                 }
 
                 let last_send_time = fs.last_successful_send_time(&subvol.name, &drive.label);
-                // Clamp negative ages to zero (clock skew protection, same as local)
-                let last_send_age = last_send_time.map(|t| {
-                    let age = now - t;
-                    if age < Duration::zero() {
-                        Duration::zero()
-                    } else {
-                        age
-                    }
-                });
+                let last_send_age = last_send_time.map(|t| clamp_age(now - t));
 
                 let status = assess_external_status(last_send_age, subvol.send_interval);
 
@@ -311,7 +303,14 @@ pub fn assess(
         }
 
         // ── Overall status ──────────────────────────────────────────
-        let overall = compute_overall_status(&local, &drive_assessments);
+        let mut overall = compute_overall_status(&local, &drive_assessments);
+
+        // Transient without external sends has no data safety mechanism —
+        // local snapshots get deleted and nothing is sent anywhere.
+        // Preflight warns about this config, but awareness must not lie.
+        if subvol.local_retention.is_transient() && !subvol.send_enabled {
+            overall = PromiseStatus::Unprotected;
+        }
 
         // ── Operational health ─────────────────────────────────────
         // Pre-compute local space pressure (needs config access not available in compute_health)
@@ -359,12 +358,39 @@ pub fn assess(
 // ── Helpers ────────────────────────────────────────────────────────────
 
 /// Returns (LocalAssessment, Option<advisory>) — advisory is set when clock skew is detected.
+///
+/// For transient retention, local snapshots don't determine data safety — external
+/// sends do. Local status is always Protected so `compute_overall_status` reduces to
+/// the external assessment: `min(Protected, external) = external`.
 fn assess_local(
     snapshots: &[crate::types::SnapshotName],
     now: NaiveDateTime,
     interval: Interval,
+    retention: LocalRetentionPolicy,
 ) -> (LocalAssessment, Option<String>) {
     let count = snapshots.len();
+
+    // Transient: local snapshots are ephemeral by design. Data safety comes
+    // from external sends, so local status is always Protected.
+    if retention.is_transient() {
+        let mut advisory = None;
+        let newest_age = snapshots.iter().max().map(|s| {
+            let raw_age = now - s.datetime();
+            if raw_age < Duration::zero() {
+                advisory = Some(clock_skew_advisory(s));
+            }
+            clamp_age(raw_age)
+        });
+        return (
+            LocalAssessment {
+                status: PromiseStatus::Protected,
+                snapshot_count: count,
+                newest_age,
+                configured_interval: interval,
+            },
+            advisory,
+        );
+    }
 
     if count == 0 {
         return (
@@ -384,17 +410,11 @@ fn assess_local(
     // Clock skew: newest snapshot is in the future. Clamp to zero so we don't
     // falsely report PROTECTED (negative age < any threshold). The planner already
     // suppresses new snapshot creation in this case, so the user needs to know.
-    let (age, advisory) = if raw_age < Duration::zero() {
-        (
-            Duration::zero(),
-            Some(format!(
-                "clock skew detected: newest snapshot {} is dated in the future — \
-                 snapshot creation may be suppressed until clock catches up",
-                newest,
-            )),
-        )
+    let age = clamp_age(raw_age);
+    let advisory = if raw_age < Duration::zero() {
+        Some(clock_skew_advisory(newest))
     } else {
-        (raw_age, None)
+        None
     };
 
     let status = freshness_status(
@@ -427,6 +447,14 @@ fn assess_external_status(last_send_age: Option<Duration>, interval: Interval) -
     }
 }
 
+fn clock_skew_advisory(snapshot: &crate::types::SnapshotName) -> String {
+    format!(
+        "clock skew detected: newest snapshot {} is dated in the future — \
+         snapshot creation may be suppressed until clock catches up",
+        snapshot,
+    )
+}
+
 fn freshness_status(
     age: Duration,
     interval: Interval,
@@ -442,6 +470,15 @@ fn freshness_status(
         PromiseStatus::AtRisk
     } else {
         PromiseStatus::Unprotected
+    }
+}
+
+/// Clamp a duration to zero if negative (clock skew protection).
+fn clamp_age(age: Duration) -> Duration {
+    if age < Duration::zero() {
+        Duration::zero()
+    } else {
+        age
     }
 }
 
@@ -2263,5 +2300,206 @@ send_enabled = false
             results[0].health_reasons.iter().any(|r| r.contains("full send size unknown")),
             "expected uncertainty reason, got: {:?}", results[0].health_reasons
         );
+    }
+
+    // ── Transient awareness tests ─────────────────────────────────────
+
+    /// Config with one transient subvolume and one drive.
+    fn transient_config() -> Config {
+        let toml_str = r#"
+[general]
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp"
+
+[local_snapshots]
+roots = [
+  { path = "/snap", subvolumes = ["sv-transient"] }
+]
+
+[defaults]
+snapshot_interval = "1h"
+send_interval = "1d"
+send_enabled = true
+enabled = true
+[defaults.local_retention]
+hourly = 24
+daily = 30
+weekly = 26
+monthly = 12
+[defaults.external_retention]
+daily = 30
+weekly = 26
+monthly = 0
+
+[[drives]]
+label = "WD-18TB"
+mount_path = "/mnt/wd"
+snapshot_root = ".snapshots"
+role = "primary"
+
+[[subvolumes]]
+name = "sv-transient"
+short_name = "svt"
+source = "/data/svt"
+local_retention = "transient"
+"#;
+        toml::from_str(toml_str).expect("transient test config should parse")
+    }
+
+    #[test]
+    fn transient_zero_local_snapshots_with_fresh_external_is_protected() {
+        let config = transient_config();
+        let now = dt(2026, 3, 23, 14, 0);
+        let mut fs = MockFileSystemState::new();
+
+        // No local snapshots — normal transient state after cleanup
+        // Fresh external send (6h ago, within 1.5× of 1d)
+        fs.send_times.insert(
+            ("sv-transient".to_string(), "WD-18TB".to_string()),
+            dt(2026, 3, 23, 8, 0),
+        );
+        fs.mounted_drives.insert("WD-18TB".to_string());
+
+        let results = assess(&config, now, &fs);
+        assert_eq!(results[0].name, "sv-transient");
+        assert_eq!(results[0].local.status, PromiseStatus::Protected);
+        assert_eq!(results[0].local.snapshot_count, 0);
+        assert_eq!(results[0].status, PromiseStatus::Protected);
+    }
+
+    #[test]
+    fn transient_zero_local_snapshots_with_stale_external_is_at_risk() {
+        let config = transient_config();
+        let now = dt(2026, 3, 23, 14, 0);
+        let mut fs = MockFileSystemState::new();
+
+        // No local snapshots, stale external (40h ago > 1.5× of 1d = 36h)
+        fs.send_times.insert(
+            ("sv-transient".to_string(), "WD-18TB".to_string()),
+            dt(2026, 3, 21, 22, 0),
+        );
+        fs.mounted_drives.insert("WD-18TB".to_string());
+
+        let results = assess(&config, now, &fs);
+        assert_eq!(results[0].local.status, PromiseStatus::Protected);
+        // Overall dragged down by external, not local
+        assert_eq!(results[0].status, PromiseStatus::AtRisk);
+    }
+
+    #[test]
+    fn transient_zero_local_snapshots_with_very_stale_external_is_unprotected() {
+        let config = transient_config();
+        let now = dt(2026, 3, 23, 14, 0);
+        let mut fs = MockFileSystemState::new();
+
+        // No local snapshots, very stale external (4 days ago > 3× of 1d)
+        fs.send_times.insert(
+            ("sv-transient".to_string(), "WD-18TB".to_string()),
+            dt(2026, 3, 19, 14, 0),
+        );
+        fs.mounted_drives.insert("WD-18TB".to_string());
+
+        let results = assess(&config, now, &fs);
+        assert_eq!(results[0].local.status, PromiseStatus::Protected);
+        assert_eq!(results[0].status, PromiseStatus::Unprotected);
+    }
+
+    #[test]
+    fn transient_one_pinned_snapshot_is_locally_protected() {
+        let config = transient_config();
+        let now = dt(2026, 3, 23, 14, 0);
+        let mut fs = MockFileSystemState::new();
+
+        // One old pinned snapshot (12h old — would be UNPROTECTED for graduated
+        // with 1h interval, but transient doesn't care about local age)
+        fs.local_snapshots.insert(
+            "sv-transient".to_string(),
+            vec![snap(dt(2026, 3, 23, 2, 0), "svt")],
+        );
+
+        fs.send_times.insert(
+            ("sv-transient".to_string(), "WD-18TB".to_string()),
+            dt(2026, 3, 23, 8, 0),
+        );
+        fs.mounted_drives.insert("WD-18TB".to_string());
+
+        let results = assess(&config, now, &fs);
+        assert_eq!(results[0].local.status, PromiseStatus::Protected);
+        assert_eq!(results[0].local.snapshot_count, 1);
+        assert!(results[0].local.newest_age.is_some());
+        assert_eq!(results[0].status, PromiseStatus::Protected);
+    }
+
+    #[test]
+    fn transient_no_external_sends_ever_is_unprotected() {
+        let config = transient_config();
+        let now = dt(2026, 3, 23, 14, 0);
+        let mut fs = MockFileSystemState::new();
+
+        // No local snapshots, no external sends, drive mounted
+        fs.mounted_drives.insert("WD-18TB".to_string());
+
+        let results = assess(&config, now, &fs);
+        assert_eq!(results[0].local.status, PromiseStatus::Protected);
+        // External: never sent → UNPROTECTED
+        assert_eq!(results[0].external[0].status, PromiseStatus::Unprotected);
+        // Overall: min(Protected, Unprotected) = Unprotected
+        assert_eq!(results[0].status, PromiseStatus::Unprotected);
+    }
+
+    #[test]
+    fn transient_without_send_enabled_is_unprotected() {
+        // Transient + send_enabled=false = no data safety mechanism.
+        // Preflight warns but does not block; awareness must not report Protected.
+        let toml_str = r#"
+[general]
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp"
+
+[local_snapshots]
+roots = [
+  { path = "/snap", subvolumes = ["sv-nosend"] }
+]
+
+[defaults]
+snapshot_interval = "1h"
+send_interval = "1d"
+send_enabled = true
+enabled = true
+[defaults.local_retention]
+hourly = 24
+daily = 30
+weekly = 26
+monthly = 12
+[defaults.external_retention]
+daily = 30
+weekly = 26
+monthly = 0
+
+[[drives]]
+label = "WD-18TB"
+mount_path = "/mnt/wd"
+snapshot_root = ".snapshots"
+role = "primary"
+
+[[subvolumes]]
+name = "sv-nosend"
+short_name = "svns"
+source = "/data/svns"
+local_retention = "transient"
+send_enabled = false
+"#;
+        let config: Config = toml::from_str(toml_str).expect("test config should parse");
+        let now = dt(2026, 3, 23, 14, 0);
+        let fs = MockFileSystemState::new();
+
+        let results = assess(&config, now, &fs);
+        assert_eq!(results[0].name, "sv-nosend");
+        // Local returns Protected (transient branch), but overall must be Unprotected
+        // because there is no external safety mechanism.
+        assert_eq!(results[0].local.status, PromiseStatus::Protected);
+        assert_eq!(results[0].status, PromiseStatus::Unprotected);
     }
 }

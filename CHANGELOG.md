@@ -11,6 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Transient local retention mode (`local_retention = "transient"`): delete local snapshots after external send, keep only pinned chain parents for incremental sends
 - Preflight checks for transient misconfiguration (transient without send, transient with named protection level)
 
+### Fixed
+- Awareness model now understands transient retention: local status defers to external send freshness instead of falsely reporting UNPROTECTED
+
 ## [0.4.3] - 2026-03-30
 
 ### Added

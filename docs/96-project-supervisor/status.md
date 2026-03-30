@@ -8,33 +8,35 @@
 
 **Urd is the sole backup system.** Systemd timer running nightly at 04:00 since 2026-03-25.
 Sentinel daemon deployed (passive monitoring, drive detection, backup overdue alerts).
-556 tests, all passing, clippy clean. Current version: v0.4.3.
+563 tests, all passing, clippy clean. Current version: v0.4.3.
 
-## In Progress
+## Recently Completed
 
+- **Transient awareness fix** (2026-03-30). Awareness model now understands transient
+  retention: local status = Protected (defers to external send freshness). Includes
+  `clamp_age()` extraction, clock-skew advisory for transient, guard for transient+no-sends
+  edge case. 6 new tests. Reviewed and post-review fixes applied.
 - **Transient snapshots** (2026-03-30). `local_retention = "transient"` — delete local
   snapshots after external send, keep only pinned chain parents. For space-constrained
-  NVMe volumes (htpc-root). New types, config integration, planner branch, preflight
-  checks. 5 files changed, 14 new tests.
+  NVMe volumes (htpc-root). Merged. Ready to deploy to production config.
 
-## Build Queue
+## Next Up
 
-Seven-step sequence resolved 2026-03-29. See [roadmap.md Priority 5.5](roadmap.md) for
-full details, design decisions, and review findings.
+1. **Deploy transient to htpc-root** — update production `urd.toml`, monitor after next
+   backup cycle. The awareness gap is resolved; this is now a config change only.
+2. **Tray icon (Spindle)** — reads sentinel-state.json visual_state, 4 static icons.
+   Brainstorm exists, needs design doc. `docs/95-ideas/2026-03-28-brainstorm-tray-icon-spindle.md`
+3. **Shell completions (6a)** — `clap_complete` for static completions. Low effort, no design needed.
 
-1. ~~**HSD-A**~~ — drive session tokens + chain health as awareness input. **Done.**
-2. ~~**VFM-A**~~ — `OperationalHealth` enum, two-axis CLI rendering. **Done.**
-3. ~~**Sentinel Session 3**~~ — hardening + notification deduplication. **Done.**
-4. ~~**UX-1**~~ — plan output: structural headings + collapsed skips. **Done.**
-5. ~~**UX-2**~~ — plan output: estimated send sizes, cross-drive fallback. **Done.**
-6. ~~**UX-3**~~ — plan output: rich progress display + ETA. **Done.**
-7. ~~**HSD-B**~~ — sentinel chain-break detection + full-send gate. **Done (v0.4.2).**
-8. ~~**VFM-B**~~ — sentinel visual state + health notifications. **Done (v0.4.3).**
-9. **Transient snapshots** — `local_retention = "transient"` for NVMe space pressure. **In progress.**
-10. **Tray icon (Spindle)** — reads sentinel-state.json, 4 static icons.
+## Build Queue (Priority 5.5) — Complete
 
-Designs: `docs/95-ideas/2026-03-29-design-*.md`.
-Reviews: `docs/99-reports/2026-03-30-vfm-b-visual-state-review.md`.
+All 10 items in the 5.5 build sequence are done. Designs: `docs/95-ideas/2026-03-2*-design-*.md`.
+
+| # | Feature | Status |
+|---|---------|--------|
+| 1–8 | HSD-A, VFM-A, Session 3, UX-1/2/3, HSD-B, VFM-B | Done (v0.4.1–v0.4.3) |
+| 9 | Transient snapshots | Done (merged, awareness fix applied) |
+| 10 | Tray icon (Spindle) | Brainstormed, not designed |
 
 **Later:** Config system migration (ADR-111), shell completions (6a).
 
@@ -47,7 +49,7 @@ Reviews: `docs/99-reports/2026-03-30-vfm-b-visual-state-review.md`.
 | Documentation standards | [CONTRIBUTING.md](../../CONTRIBUTING.md) |
 | ADRs (100-112) | [decisions/](../00-foundation/decisions/) |
 | Latest journals | `docs/98-journals/` (local only, gitignored) |
-| Latest reviews | [VFM-B review](../99-reports/2026-03-30-vfm-b-visual-state-review.md), [HSD-B review](../99-reports/2026-03-30-hsd-b-chain-break-detection-review.md) |
+| Latest reviews | [Transient awareness review](../99-reports/2026-03-30-transient-awareness-fix-review.md), [Transient snapshots review](../99-reports/2026-03-30-transient-snapshots-review.md) |
 
 ## Known Issues
 
@@ -56,12 +58,8 @@ Reviews: `docs/99-reports/2026-03-30-vfm-b-visual-state-review.md`.
 - `FileSystemState` trait (11 methods) outgrowing its name — consider rename to `SystemState`
 - `urd get` doesn't support directory restore (files only in v1)
 - Calibrated sizes use `du -sb` but btrfs send streams are ~10% larger — affects size estimates
-- Per-drive pin protection for external retention: all-drives-union is conservative but suboptimal for space
 - Stringly-typed output boundary: three independent status-ranking implementations across notify.rs and voice.rs
-- `drive_connections` table has no retention policy (negligible for years at ~1000 rows/year)
-- `render_skipped_block` (backup summary) uses ad-hoc string grouping; could adopt `SkipCategory`
-- Progress completion line byte count lags true total by up to one poll interval (~45 MB at USB3 speeds)
-- `OpResult::Skipped` is overloaded: four distinct semantics (prior failure, optimization, safety guard, safety gate)
+- `OpResult::Skipped` is overloaded: four distinct semantics
 - `urd sentinel status` interactive mode doesn't render health/visual_state fields yet
 
 See [roadmap.md](roadmap.md) for the full tech debt list and dropped features.
