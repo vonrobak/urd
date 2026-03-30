@@ -14,7 +14,7 @@ use std::time::Duration;
 use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
 
-use crate::awareness::{ChainStatus, PromiseStatus, SubvolAssessment};
+use crate::awareness::{ChainStatus, OperationalHealth, PromiseStatus, SubvolAssessment};
 
 // ── Events ──────────────────────────────────────────────────────────────
 
@@ -76,6 +76,9 @@ pub struct SentinelState {
     /// Chain health per (subvolume, drive) from the last assessment.
     /// Used by `detect_simultaneous_chain_breaks()` to compare across ticks.
     pub last_chain_health: Vec<ChainSnapshot>,
+    /// Operational health per subvolume from the last assessment.
+    /// Used by health transition detection to fire HealthDegraded/Recovered.
+    pub last_health_states: Vec<HealthSnapshot>,
     /// Circuit breaker state (active mode only, but tracked always).
     pub circuit_breaker: CircuitBreaker,
 }
@@ -97,6 +100,7 @@ impl SentinelState {
             last_promise_states: Vec::new(),
             has_initial_assessment: false,
             last_chain_health: Vec::new(),
+            last_health_states: Vec::new(),
             circuit_breaker: CircuitBreaker::new(circuit_breaker_config),
         }
     }
@@ -523,7 +527,83 @@ pub fn evaluate_trigger_result(
     new
 }
 
-// ── Promise snapshot helpers ────────────────────────────────────────────
+// ── Snapshot change detection ──────────────────────────────────────────
+
+/// Trait for snapshot types that can be compared against assessments.
+/// Enables generic change detection across promise and health axes.
+pub trait NamedSnapshot {
+    fn name(&self) -> &str;
+    fn changed(&self, assessment: &SubvolAssessment) -> bool;
+}
+
+impl NamedSnapshot for PromiseSnapshot {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn changed(&self, assessment: &SubvolAssessment) -> bool {
+        self.status != assessment.status
+    }
+}
+
+impl NamedSnapshot for HealthSnapshot {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn changed(&self, assessment: &SubvolAssessment) -> bool {
+        self.health != assessment.health
+    }
+}
+
+/// Determine whether snapshot state transitions warrant notifications.
+/// Returns true if any subvolume's tracked state changed, appeared, or disappeared.
+///
+/// Special case: when `previous` is empty (first assessment after startup),
+/// returns false to suppress spurious notifications (review item M3).
+#[must_use]
+pub fn has_changes<T: NamedSnapshot>(
+    previous: &[T],
+    current: &[SubvolAssessment],
+) -> bool {
+    if previous.is_empty() {
+        return false;
+    }
+
+    for assess in current {
+        match previous.iter().find(|p| p.name() == assess.name) {
+            Some(prev) if prev.changed(assess) => return true,
+            None => return true,
+            _ => {}
+        }
+    }
+
+    for prev in previous {
+        if !current.iter().any(|a| a.name == prev.name()) {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Convenience alias: detect promise state changes.
+#[must_use]
+pub fn has_promise_changes(
+    previous: &[PromiseSnapshot],
+    current: &[SubvolAssessment],
+) -> bool {
+    has_changes(previous, current)
+}
+
+/// Convenience alias: detect health state changes.
+#[must_use]
+pub fn has_health_changes(
+    previous: &[HealthSnapshot],
+    current: &[SubvolAssessment],
+) -> bool {
+    has_changes(previous, current)
+}
+
+// ── Snapshot extractors ───────────────────────────────────────────────
 
 /// Extract promise snapshots from assessments for state storage.
 #[must_use]
@@ -537,36 +617,96 @@ pub fn snapshot_promises(assessments: &[SubvolAssessment]) -> Vec<PromiseSnapsho
         .collect()
 }
 
-/// Determine whether promise state transitions warrant notifications.
-/// Returns true if any subvolume's promise status changed.
-///
-/// Special case: when `previous` is empty (first assessment after startup),
-/// returns false to suppress spurious notifications (review item M3).
+/// A snapshot of operational health from a single assessment, for
+/// comparing health transitions to decide notifications.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HealthSnapshot {
+    pub name: String,
+    pub health: OperationalHealth,
+    pub health_reasons: Vec<String>,
+}
+
+/// Extract health snapshots from assessments for state storage.
 #[must_use]
-pub fn has_promise_changes(
-    previous: &[PromiseSnapshot],
-    current: &[SubvolAssessment],
-) -> bool {
-    if previous.is_empty() {
-        return false;
-    }
+pub fn snapshot_health(assessments: &[SubvolAssessment]) -> Vec<HealthSnapshot> {
+    assessments
+        .iter()
+        .map(|a| HealthSnapshot {
+            name: a.name.clone(),
+            health: a.health,
+            health_reasons: a.health_reasons.clone(),
+        })
+        .collect()
+}
 
-    for assess in current {
-        match previous.iter().find(|p| p.name == assess.name) {
-            Some(prev) if prev.status != assess.status => return true,
-            None => return true, // new subvolume appeared
-            _ => {}
+// ── Visual state computation (VFM-B) ──────────────────────────────────
+
+/// Compute the visual state from the current assessment.
+/// Pure function: assessments in, visual state out.
+///
+/// Icon priority: Critical (any Unprotected) > Warning (any AtRisk or
+/// any Degraded/Blocked) > Ok (all Protected and all Healthy).
+/// The `Active` state is reserved for backup-in-progress detection (future).
+#[must_use]
+pub fn compute_visual_state(assessments: &[SubvolAssessment]) -> crate::output::VisualState {
+    use crate::output::{HealthCounts, SafetyCounts, VisualIcon, VisualState};
+
+    let mut safety_counts = SafetyCounts {
+        ok: 0,
+        aging: 0,
+        gap: 0,
+    };
+    let mut health_counts = HealthCounts {
+        healthy: 0,
+        degraded: 0,
+        blocked: 0,
+    };
+
+    for a in assessments {
+        match a.status {
+            PromiseStatus::Protected => safety_counts.ok += 1,
+            PromiseStatus::AtRisk => safety_counts.aging += 1,
+            PromiseStatus::Unprotected => safety_counts.gap += 1,
+        }
+        match a.health {
+            OperationalHealth::Healthy => health_counts.healthy += 1,
+            OperationalHealth::Degraded => health_counts.degraded += 1,
+            OperationalHealth::Blocked => health_counts.blocked += 1,
         }
     }
 
-    // Check for subvolumes that disappeared
-    for prev in previous {
-        if !current.iter().any(|a| a.name == prev.name) {
-            return true;
-        }
-    }
+    let worst_safety = assessments
+        .iter()
+        .map(|a| a.status)
+        .min()
+        .unwrap_or(PromiseStatus::Protected);
 
-    false
+    let worst_health = assessments
+        .iter()
+        .map(|a| a.health)
+        .min()
+        .unwrap_or(OperationalHealth::Healthy);
+
+    let all_blocked =
+        !assessments.is_empty() && assessments.iter().all(|a| a.health == OperationalHealth::Blocked);
+
+    let icon = if worst_safety == PromiseStatus::Unprotected || all_blocked {
+        VisualIcon::Critical
+    } else if worst_safety == PromiseStatus::AtRisk
+        || worst_health <= OperationalHealth::Degraded
+    {
+        VisualIcon::Warning
+    } else {
+        VisualIcon::Ok
+    };
+
+    VisualState {
+        icon,
+        worst_safety: worst_safety.to_string(),
+        worst_health: worst_health.to_string(),
+        safety_counts,
+        health_counts,
+    }
 }
 
 // ── Chain-break detection (HSD-B) ──────────────────────────────────────
@@ -1484,5 +1624,160 @@ mod tests {
         let anomalies = detect_simultaneous_chain_breaks(&prev, &curr);
         assert_eq!(anomalies.len(), 1);
         assert_eq!(anomalies[0].drive_label, "D1");
+    }
+
+    // ── Health snapshot tests (VFM-B) ──────────────────────────────────
+
+    #[test]
+    fn snapshot_health_extracts_from_assessments() {
+        let assessments = vec![
+            make_assessment("sv1", PromiseStatus::Protected),
+            {
+                let mut a = make_assessment("sv2", PromiseStatus::Protected);
+                a.health = OperationalHealth::Degraded;
+                a
+            },
+        ];
+        let snaps = snapshot_health(&assessments);
+        assert_eq!(snaps.len(), 2);
+        assert_eq!(snaps[0].name, "sv1");
+        assert_eq!(snaps[0].health, OperationalHealth::Healthy);
+        assert_eq!(snaps[1].name, "sv2");
+        assert_eq!(snaps[1].health, OperationalHealth::Degraded);
+    }
+
+    #[test]
+    fn has_health_changes_empty_previous_returns_false() {
+        let assessments = vec![make_assessment("sv1", PromiseStatus::Protected)];
+        assert!(!has_health_changes(&[], &assessments));
+    }
+
+    #[test]
+    fn has_health_changes_no_change_returns_false() {
+        let prev = vec![HealthSnapshot {
+            name: "sv1".into(),
+            health: OperationalHealth::Healthy,
+            health_reasons: vec![],
+        }];
+        let curr = vec![make_assessment("sv1", PromiseStatus::Protected)];
+        assert!(!has_health_changes(&prev, &curr));
+    }
+
+    #[test]
+    fn has_health_changes_worsened_returns_true() {
+        let prev = vec![HealthSnapshot {
+            name: "sv1".into(),
+            health: OperationalHealth::Healthy,
+            health_reasons: vec![],
+        }];
+        let mut a = make_assessment("sv1", PromiseStatus::Protected);
+        a.health = OperationalHealth::Degraded;
+        assert!(has_health_changes(&prev, &[a]));
+    }
+
+    #[test]
+    fn has_health_changes_improved_returns_true() {
+        let prev = vec![HealthSnapshot {
+            name: "sv1".into(),
+            health: OperationalHealth::Blocked,
+            health_reasons: vec![],
+        }];
+        let curr = vec![make_assessment("sv1", PromiseStatus::Protected)];
+        assert!(has_health_changes(&prev, &curr));
+    }
+
+    // ── Visual state tests (VFM-B) ───────────────────────────────────
+
+    #[test]
+    fn visual_state_all_healthy_protected_is_ok() {
+        let assessments = vec![
+            make_assessment("sv1", PromiseStatus::Protected),
+            make_assessment("sv2", PromiseStatus::Protected),
+        ];
+        let vs = compute_visual_state(&assessments);
+        assert_eq!(vs.icon, crate::output::VisualIcon::Ok);
+        assert_eq!(vs.safety_counts.ok, 2);
+        assert_eq!(vs.health_counts.healthy, 2);
+    }
+
+    #[test]
+    fn visual_state_any_at_risk_is_warning() {
+        let assessments = vec![
+            make_assessment("sv1", PromiseStatus::Protected),
+            make_assessment("sv2", PromiseStatus::AtRisk),
+        ];
+        let vs = compute_visual_state(&assessments);
+        assert_eq!(vs.icon, crate::output::VisualIcon::Warning);
+        assert_eq!(vs.safety_counts.aging, 1);
+        assert_eq!(vs.worst_safety, "AT RISK");
+    }
+
+    #[test]
+    fn visual_state_any_unprotected_is_critical() {
+        let assessments = vec![
+            make_assessment("sv1", PromiseStatus::Protected),
+            make_assessment("sv2", PromiseStatus::Unprotected),
+        ];
+        let vs = compute_visual_state(&assessments);
+        assert_eq!(vs.icon, crate::output::VisualIcon::Critical);
+        assert_eq!(vs.safety_counts.gap, 1);
+    }
+
+    #[test]
+    fn visual_state_protected_but_degraded_is_warning() {
+        let mut a = make_assessment("sv1", PromiseStatus::Protected);
+        a.health = OperationalHealth::Degraded;
+        let vs = compute_visual_state(&[a]);
+        assert_eq!(vs.icon, crate::output::VisualIcon::Warning);
+        assert_eq!(vs.worst_health, "degraded");
+        assert_eq!(vs.health_counts.degraded, 1);
+    }
+
+    #[test]
+    fn visual_state_all_blocked_is_critical() {
+        let mut a = make_assessment("sv1", PromiseStatus::Protected);
+        a.health = OperationalHealth::Blocked;
+        let vs = compute_visual_state(&[a]);
+        assert_eq!(vs.icon, crate::output::VisualIcon::Critical);
+        assert_eq!(vs.health_counts.blocked, 1);
+    }
+
+    #[test]
+    fn visual_state_some_blocked_some_healthy_is_warning() {
+        let mut a1 = make_assessment("sv1", PromiseStatus::Protected);
+        a1.health = OperationalHealth::Blocked;
+        let a2 = make_assessment("sv2", PromiseStatus::Protected);
+        let vs = compute_visual_state(&[a1, a2]);
+        assert_eq!(vs.icon, crate::output::VisualIcon::Warning);
+    }
+
+    #[test]
+    fn visual_state_empty_assessments_is_ok() {
+        let vs = compute_visual_state(&[]);
+        assert_eq!(vs.icon, crate::output::VisualIcon::Ok);
+        assert_eq!(vs.safety_counts.ok, 0);
+        assert_eq!(vs.health_counts.healthy, 0);
+    }
+
+    #[test]
+    fn visual_state_unprotected_trumps_degraded() {
+        let mut a1 = make_assessment("sv1", PromiseStatus::Unprotected);
+        a1.health = OperationalHealth::Degraded;
+        let vs = compute_visual_state(&[a1]);
+        assert_eq!(vs.icon, crate::output::VisualIcon::Critical);
+    }
+
+    #[test]
+    fn has_health_changes_new_subvolume_returns_true() {
+        let prev = vec![HealthSnapshot {
+            name: "sv1".into(),
+            health: OperationalHealth::Healthy,
+            health_reasons: vec![],
+        }];
+        let curr = vec![
+            make_assessment("sv1", PromiseStatus::Protected),
+            make_assessment("sv2", PromiseStatus::Protected),
+        ];
+        assert!(has_health_changes(&prev, &curr));
     }
 }

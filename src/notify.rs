@@ -52,6 +52,21 @@ pub enum NotificationEvent {
         last_heartbeat_age_hours: u64,
         stale_after_hours: u64,
     },
+    /// A subvolume's operational health worsened (e.g., Healthy -> Degraded).
+    /// Separate from PromiseDegraded — health is operational readiness, not data safety.
+    #[allow(dead_code)] // Constructed by Sentinel (VFM-B), not backup command
+    HealthDegraded {
+        subvolume: String,
+        from: String,
+        to: String,
+    },
+    /// A subvolume's operational health improved.
+    #[allow(dead_code)] // Constructed by Sentinel (VFM-B), not backup command
+    HealthRecovered {
+        subvolume: String,
+        from: String,
+        to: String,
+    },
     /// All incremental chains on a drive broke simultaneously.
     /// Strong signal for drive swap or mass pin file loss.
     DriveAnomalyDetected {

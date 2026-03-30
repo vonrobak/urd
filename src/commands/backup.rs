@@ -1323,7 +1323,7 @@ mod tests {
 
     fn write_sentinel_state_file(path: &std::path::Path, pid: u32) {
         let state = crate::output::SentinelStateFile {
-            schema_version: 1,
+            schema_version: 2,
             pid,
             started: "2026-03-29T10:00:00".to_string(),
             last_assessment: None,
@@ -1334,6 +1334,7 @@ mod tests {
                 state: "closed".to_string(),
                 failure_count: 0,
             },
+            visual_state: None,
         };
         let content = serde_json::to_string_pretty(&state).unwrap();
         std::fs::write(path, content).unwrap();

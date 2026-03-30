@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-03-30
+
+### Added
+- Sentinel tracks health transitions and fires HealthDegraded/HealthRecovered notifications
+- `visual_state` block in sentinel-state.json: icon state and safety/health counts for tray icon consumers
+- Per-subvolume health and health_reasons in sentinel state file promise states
+- Sentinel state file schema version 2 (backward-compatible with v1)
+
+### Changed
+- Generic `NamedSnapshot` trait replaces duplicated change-detection logic for promise and health axes
+- All-blocked health escalates to Critical icon (was Warning)
+
 ## [0.4.2] - 2026-03-30
 
 ### Added

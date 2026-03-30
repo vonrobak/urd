@@ -246,6 +246,16 @@ impl SentinelRunner {
             ));
         }
 
+        // 1b. Health state changes (VFM-B, skip first assessment).
+        if self.state.has_initial_assessment
+            && sentinel::has_health_changes(&self.state.last_health_states, &assessments)
+        {
+            notifications.extend(build_health_notifications(
+                &self.state.last_health_states,
+                &assessments,
+            ));
+        }
+
         // 2. BackupOverdue — independent of promise changes (S1 fix).
         //    Debounced: don't re-send within OVERDUE_DEBOUNCE (M2 fix).
         let debounce_ok = self.state.has_initial_assessment
@@ -303,6 +313,7 @@ impl SentinelRunner {
 
         // Update state.
         self.state.last_promise_states = sentinel::snapshot_promises(&assessments);
+        self.state.last_health_states = sentinel::snapshot_health(&assessments);
         if !self.state.has_initial_assessment {
             self.state.has_initial_assessment = true;
             // Populate chain health baseline so the next tick can detect transitions.
@@ -327,7 +338,7 @@ impl SentinelRunner {
         self.last_assessment_time = Some(Instant::now());
 
         // Write state file.
-        self.write_state_file(now)?;
+        self.write_state_file(now, &assessments)?;
 
         Ok(())
     }
@@ -365,9 +376,13 @@ impl SentinelRunner {
 
     // ── State file I/O ──────────────────────────────────────────────────
 
-    fn write_state_file(&self, now: NaiveDateTime) -> anyhow::Result<()> {
+    fn write_state_file(
+        &self,
+        now: NaiveDateTime,
+        assessments: &[SubvolAssessment],
+    ) -> anyhow::Result<()> {
         let state_file = SentinelStateFile {
-            schema_version: 1,
+            schema_version: 2,
             pid: std::process::id(),
             started: self.started.format("%Y-%m-%dT%H:%M:%S").to_string(),
             last_assessment: Some(now.format("%Y-%m-%dT%H:%M:%S").to_string()),
@@ -377,15 +392,29 @@ impl SentinelRunner {
                 .state
                 .last_promise_states
                 .iter()
-                .map(|p| SentinelPromiseState {
-                    name: p.name.clone(),
-                    status: p.status.to_string(),
+                .map(|p| {
+                    let health_snap = self
+                        .state
+                        .last_health_states
+                        .iter()
+                        .find(|h| h.name == p.name);
+                    SentinelPromiseState {
+                        name: p.name.clone(),
+                        status: p.status.to_string(),
+                        health: health_snap
+                            .map(|h| h.health.to_string())
+                            .unwrap_or_else(|| "healthy".to_string()),
+                        health_reasons: health_snap
+                            .map(|h| h.health_reasons.clone())
+                            .unwrap_or_default(),
+                    }
                 })
                 .collect(),
             circuit_breaker: SentinelCircuitState {
                 state: self.state.circuit_breaker.state.to_string(),
                 failure_count: self.state.circuit_breaker.failure_count,
             },
+            visual_state: Some(sentinel::compute_visual_state(assessments)),
         };
 
         let content = serde_json::to_string_pretty(&state_file)?;
@@ -524,6 +553,70 @@ pub fn check_backup_overdue(
     })
 }
 
+// ── Health notification building (VFM-B) ───────────────────────────────
+
+/// Build notifications from Sentinel-observed health state changes.
+///
+/// Pure function: previous health snapshots + current assessments → notifications.
+/// Parallel to `build_notifications()` for promise changes.
+///
+/// Urgency: Info (health is operational readiness, not data safety).
+pub fn build_health_notifications(
+    previous: &[sentinel::HealthSnapshot],
+    current: &[SubvolAssessment],
+) -> Vec<Notification> {
+    let mut notifications = Vec::new();
+
+    for assess in current {
+        if let Some(prev) = previous.iter().find(|p| p.name == assess.name)
+            && assess.health != prev.health
+        {
+            let from = prev.health.to_string();
+            let to = assess.health.to_string();
+
+            if assess.health < prev.health {
+                let reasons = if assess.health_reasons.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " {} Run `urd status` for details.",
+                        assess.health_reasons.join("; ")
+                    )
+                };
+                notifications.push(Notification {
+                    event: NotificationEvent::HealthDegraded {
+                        subvolume: assess.name.clone(),
+                        from: from.clone(),
+                        to: to.clone(),
+                    },
+                    urgency: Urgency::Info,
+                    title: format!("Urd: {} health now {}", assess.name, to),
+                    body: format!(
+                        "The loom for {} reports {} — was {}.{}",
+                        assess.name, to, from, reasons
+                    ),
+                });
+            } else {
+                notifications.push(Notification {
+                    event: NotificationEvent::HealthRecovered {
+                        subvolume: assess.name.clone(),
+                        from: from.clone(),
+                        to: to.clone(),
+                    },
+                    urgency: Urgency::Info,
+                    title: format!("Urd: {} health restored to {}", assess.name, to),
+                    body: format!(
+                        "The loom for {} is running smoothly again — restored from {} to {}.",
+                        assess.name, from, to
+                    ),
+                });
+            }
+        }
+    }
+
+    notifications
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────────
 
 /// Derive sentinel state file path from config (same directory as state_db).
@@ -597,7 +690,7 @@ mod tests {
     #[test]
     fn state_file_serialization_roundtrip() {
         let state = SentinelStateFile {
-            schema_version: 1,
+            schema_version: 2,
             pid: 12345,
             started: "2026-03-27T10:00:00".to_string(),
             last_assessment: Some("2026-03-27T10:15:00".to_string()),
@@ -606,23 +699,47 @@ mod tests {
             promise_states: vec![SentinelPromiseState {
                 name: "home".to_string(),
                 status: "PROTECTED".to_string(),
+                health: "degraded".to_string(),
+                health_reasons: vec!["chain broken on WD-18TB".to_string()],
             }],
             circuit_breaker: SentinelCircuitState {
                 state: "closed".to_string(),
                 failure_count: 0,
             },
+            visual_state: Some(crate::output::VisualState {
+                icon: crate::output::VisualIcon::Warning,
+                worst_safety: "PROTECTED".to_string(),
+                worst_health: "degraded".to_string(),
+                safety_counts: crate::output::SafetyCounts {
+                    ok: 1,
+                    aging: 0,
+                    gap: 0,
+                },
+                health_counts: crate::output::HealthCounts {
+                    healthy: 0,
+                    degraded: 1,
+                    blocked: 0,
+                },
+            }),
         };
 
         let json = serde_json::to_string_pretty(&state).unwrap();
         let parsed: SentinelStateFile = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(parsed.schema_version, 1);
+        assert_eq!(parsed.schema_version, 2);
         assert_eq!(parsed.pid, 12345);
         assert_eq!(parsed.started, "2026-03-27T10:00:00");
         assert_eq!(parsed.mounted_drives, vec!["WD-18TB"]);
         assert_eq!(parsed.promise_states.len(), 1);
         assert_eq!(parsed.promise_states[0].name, "home");
+        assert_eq!(parsed.promise_states[0].health, "degraded");
+        assert_eq!(parsed.promise_states[0].health_reasons.len(), 1);
         assert_eq!(parsed.circuit_breaker.state, "closed");
+        assert!(parsed.visual_state.is_some());
+        assert_eq!(
+            parsed.visual_state.unwrap().icon,
+            crate::output::VisualIcon::Warning
+        );
     }
 
     #[test]
@@ -647,7 +764,7 @@ mod tests {
         let path = dir.path().join("sentinel-state.json");
 
         let state = SentinelStateFile {
-            schema_version: 1,
+            schema_version: 2,
             pid: std::process::id(),
             started: "2026-03-27T10:00:00".to_string(),
             last_assessment: None,
@@ -658,6 +775,7 @@ mod tests {
                 state: "closed".to_string(),
                 failure_count: 0,
             },
+            visual_state: None,
         };
 
         let content = serde_json::to_string_pretty(&state).unwrap();
@@ -665,6 +783,55 @@ mod tests {
 
         let read_back = read_sentinel_state_file(&path).unwrap();
         assert_eq!(read_back.pid, std::process::id());
+    }
+
+    #[test]
+    fn state_file_v1_backward_compat_deserialization() {
+        // Schema v1 files lack visual_state and health fields — must deserialize cleanly.
+        let v1_json = r#"{
+            "schema_version": 1,
+            "pid": 99999,
+            "started": "2026-03-27T10:00:00",
+            "last_assessment": null,
+            "mounted_drives": [],
+            "tick_interval_secs": 120,
+            "promise_states": [
+                { "name": "home", "status": "PROTECTED" }
+            ],
+            "circuit_breaker": { "state": "closed", "failure_count": 0 }
+        }"#;
+
+        let parsed: SentinelStateFile = serde_json::from_str(v1_json).unwrap();
+        assert_eq!(parsed.schema_version, 1);
+        assert!(parsed.visual_state.is_none());
+        assert_eq!(parsed.promise_states[0].health, "healthy"); // default
+        assert!(parsed.promise_states[0].health_reasons.is_empty()); // default
+    }
+
+    #[test]
+    fn state_file_health_reasons_omitted_when_empty() {
+        let state = SentinelStateFile {
+            schema_version: 2,
+            pid: 1,
+            started: "2026-03-27T10:00:00".to_string(),
+            last_assessment: None,
+            mounted_drives: vec![],
+            tick_interval_secs: 120,
+            promise_states: vec![SentinelPromiseState {
+                name: "home".to_string(),
+                status: "PROTECTED".to_string(),
+                health: "healthy".to_string(),
+                health_reasons: vec![],
+            }],
+            circuit_breaker: SentinelCircuitState {
+                state: "closed".to_string(),
+                failure_count: 0,
+            },
+            visual_state: None,
+        };
+
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(!json.contains("health_reasons"));
     }
 
     // ── PID alive check ─────────────────────────────────────────────
@@ -845,5 +1012,83 @@ mod tests {
         let hb = make_heartbeat("2026-03-27T04:00:00", "2026-03-27T06:00:00");
         let now = dt("2026-03-27T06:00:00");
         assert!(check_backup_overdue(&hb, now).is_none());
+    }
+
+    // ── Health notification tests (VFM-B) ──────────────────────────────
+
+    fn make_health_snapshot(name: &str, health: OperationalHealth) -> sentinel::HealthSnapshot {
+        sentinel::HealthSnapshot {
+            name: name.to_string(),
+            health,
+            health_reasons: vec![],
+        }
+    }
+
+    #[test]
+    fn health_degraded_produces_notification() {
+        let prev = vec![make_health_snapshot("sv1", OperationalHealth::Healthy)];
+        let mut a = make_assessment("sv1", PromiseStatus::Protected);
+        a.health = OperationalHealth::Degraded;
+        a.health_reasons = vec!["chain broken on WD-18TB".to_string()];
+
+        let notifs = build_health_notifications(&prev, &[a]);
+        assert_eq!(notifs.len(), 1);
+        assert!(matches!(
+            &notifs[0].event,
+            NotificationEvent::HealthDegraded { subvolume, from, to }
+            if subvolume == "sv1" && from == "healthy" && to == "degraded"
+        ));
+        assert_eq!(notifs[0].urgency, Urgency::Info);
+    }
+
+    #[test]
+    fn health_recovered_produces_notification() {
+        let prev = vec![make_health_snapshot("sv1", OperationalHealth::Degraded)];
+        let a = make_assessment("sv1", PromiseStatus::Protected);
+
+        let notifs = build_health_notifications(&prev, &[a]);
+        assert_eq!(notifs.len(), 1);
+        assert!(matches!(
+            &notifs[0].event,
+            NotificationEvent::HealthRecovered { subvolume, from, to }
+            if subvolume == "sv1" && from == "degraded" && to == "healthy"
+        ));
+    }
+
+    #[test]
+    fn health_blocked_produces_degraded_notification() {
+        let prev = vec![make_health_snapshot("sv1", OperationalHealth::Healthy)];
+        let mut a = make_assessment("sv1", PromiseStatus::Protected);
+        a.health = OperationalHealth::Blocked;
+
+        let notifs = build_health_notifications(&prev, &[a]);
+        assert_eq!(notifs.len(), 1);
+        assert!(matches!(
+            &notifs[0].event,
+            NotificationEvent::HealthDegraded { to, .. } if to == "blocked"
+        ));
+    }
+
+    #[test]
+    fn health_no_change_produces_nothing() {
+        let prev = vec![make_health_snapshot("sv1", OperationalHealth::Healthy)];
+        let a = make_assessment("sv1", PromiseStatus::Protected);
+        assert!(build_health_notifications(&prev, &[a]).is_empty());
+    }
+
+    #[test]
+    fn health_mixed_transitions() {
+        let prev = vec![
+            make_health_snapshot("sv1", OperationalHealth::Healthy),
+            make_health_snapshot("sv2", OperationalHealth::Degraded),
+        ];
+        let mut a1 = make_assessment("sv1", PromiseStatus::Protected);
+        a1.health = OperationalHealth::Degraded;
+        let a2 = make_assessment("sv2", PromiseStatus::Protected);
+
+        let notifs = build_health_notifications(&prev, &[a1, a2]);
+        assert_eq!(notifs.len(), 2);
+        assert!(matches!(&notifs[0].event, NotificationEvent::HealthDegraded { subvolume, .. } if subvolume == "sv1"));
+        assert!(matches!(&notifs[1].event, NotificationEvent::HealthRecovered { subvolume, .. } if subvolume == "sv2"));
     }
 }
