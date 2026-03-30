@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-03-30
+
 ### Added
 - Sentinel tracks health transitions and fires HealthDegraded/HealthRecovered notifications
 - `visual_state` block in sentinel-state.json: icon state and safety/health counts for tray icon consumers
