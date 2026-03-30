@@ -8,12 +8,12 @@
 
 **Urd is the sole backup system.** Systemd timer running nightly at 04:00 since 2026-03-25.
 Sentinel daemon deployed (passive monitoring, drive detection, backup overdue alerts).
-507 tests, all passing, clippy clean. Current version: v0.4.0.
+521 tests, all passing, clippy clean. Current version: v0.4.2.
 
 ## In Progress
 
-- **UX-3 complete, PR #44 open** (2026-03-30). Rich progress display during backup:
-  subvolume context, send counter, completion trail, ETA for full sends. Ready to merge.
+- **HSD-B complete, PR #45 open** (2026-03-30). Chain-break detection, full-send gate,
+  drive token verification wired into backup path. Reviewed, released as v0.4.2.
 
 ## Build Queue
 
@@ -23,17 +23,16 @@ full details, design decisions, and review findings.
 1. ~~**HSD-A**~~ — drive session tokens + chain health as awareness input. **Done.**
 2. ~~**VFM-A**~~ — `OperationalHealth` enum, two-axis CLI rendering. **Done.**
 3. ~~**Sentinel Session 3**~~ — hardening + notification deduplication. **Done.**
-4. ~~**UX-1**~~ — plan output: structural headings (D5) + collapsed skips (D1). **Done.**
-5. ~~**UX-2**~~ — plan output: estimated send sizes (D2+D3), cross-drive fallback (S1 fix). **Done.**
-6. ~~**UX-3**~~ — plan output: progress display: rich context (P1) + ETA (P3). **Done (PR #44).**
-7. **HSD-B** — sentinel chain-break detection + full-send gate (Norman escalation). **start here**
-   - Reference incident: `docs/98-journals/2026-03-29-clone-drive-incident-analysis.md`
-8. **VFM-B** — sentinel visual state in state file + health notifications.
+4. ~~**UX-1**~~ — plan output: structural headings + collapsed skips. **Done.**
+5. ~~**UX-2**~~ — plan output: estimated send sizes, cross-drive fallback. **Done.**
+6. ~~**UX-3**~~ — plan output: rich progress display + ETA. **Done.**
+7. ~~**HSD-B**~~ — sentinel chain-break detection + full-send gate. **Done (PR #45).**
+8. **VFM-B** — sentinel visual state in state file + health notifications. **Start here.**
 9. **Transient snapshots** — `local_retention = "transient"` for NVMe space pressure.
 10. **Tray icon (Spindle)** — reads sentinel-state.json, 4 static icons.
 
 Designs: `docs/95-ideas/2026-03-29-design-*.md`.
-Reviews: `docs/99-reports/2026-03-30-ux3-progress-display-review.md`.
+Reviews: `docs/99-reports/2026-03-30-hsd-b-chain-break-detection-review.md`.
 
 **Later:** Config system migration (ADR-111), shell completions (6a).
 
@@ -46,7 +45,7 @@ Reviews: `docs/99-reports/2026-03-30-ux3-progress-display-review.md`.
 | Documentation standards | [CONTRIBUTING.md](../../CONTRIBUTING.md) |
 | ADRs (100-112) | [decisions/](../00-foundation/decisions/) |
 | Latest journals | `docs/98-journals/` (local only, gitignored) |
-| Latest reviews | [UX-3 review](../99-reports/2026-03-30-ux3-progress-display-review.md), [UX-2 review](../99-reports/2026-03-30-ux2-estimated-sizes-review.md) |
+| Latest reviews | [HSD-B review](../99-reports/2026-03-30-hsd-b-chain-break-detection-review.md), [UX-3 review](../99-reports/2026-03-30-ux3-progress-display-review.md) |
 
 ## Known Issues
 
@@ -60,5 +59,6 @@ Reviews: `docs/99-reports/2026-03-30-ux3-progress-display-review.md`.
 - `drive_connections` table has no retention policy (negligible for years at ~1000 rows/year)
 - `render_skipped_block` (backup summary) uses ad-hoc string grouping; could adopt `SkipCategory`
 - Progress completion line byte count lags true total by up to one poll interval (~45 MB at USB3 speeds)
+- `OpResult::Skipped` is overloaded: four distinct semantics (prior failure, optimization, safety guard, safety gate)
 
 See [roadmap.md](roadmap.md) for the full tech debt list and dropped features.
