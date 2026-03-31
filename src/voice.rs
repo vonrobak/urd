@@ -12,9 +12,9 @@ use std::fmt::Write;
 use colored::Colorize;
 
 use crate::output::{
-    BackupSummary, CalibrateOutput, CalibrateResult, FailuresOutput, GetOutput, HistoryOutput,
-    InitOutput, InitStatus, OutputMode, PlanOutput, SentinelStatusOutput, SkipCategory,
-    SkippedSubvolume, StatusOutput, SubvolumeHistoryOutput, VerifyOutput,
+    BackupSummary, CalibrateOutput, CalibrateResult, ChainHealth, FailuresOutput, GetOutput,
+    HistoryOutput, InitOutput, InitStatus, OutputMode, PlanOutput, SentinelStatusOutput,
+    SkipCategory, SkippedSubvolume, StatusOutput, SubvolumeHistoryOutput, VerifyOutput,
     parse_duration_to_minutes,
 };
 use crate::plan::format_duration_short;
@@ -81,23 +81,28 @@ fn render_summary_line(data: &StatusOutput, out: &mut String) {
     let has_health_issues = data.assessments.iter().any(|a| a.health != "healthy");
 
     let safety_part = if safe_count == total {
-        "All data safe.".green().to_string()
+        "All sealed.".green().to_string()
     } else {
-        let unsafe_names: Vec<&str> = data
+        let exposed_names: Vec<&str> = data
             .assessments
             .iter()
-            .filter(|a| a.status != "PROTECTED")
+            .filter(|a| a.status == "UNPROTECTED")
             .map(|a| a.name.as_str())
             .collect();
-        format!(
-            "{} of {} safe. {} {} attention.",
-            safe_count,
-            total,
-            unsafe_names.join(", "),
-            if unsafe_names.len() == 1 { "needs" } else { "need" },
-        )
-        .yellow()
-        .to_string()
+        let waning_names: Vec<&str> = data
+            .assessments
+            .iter()
+            .filter(|a| a.status == "AT RISK")
+            .map(|a| a.name.as_str())
+            .collect();
+        let mut parts = vec![format!("{} of {} sealed.", safe_count, total)];
+        if !exposed_names.is_empty() {
+            parts.push(format!("{} exposed.", exposed_names.join(", ")));
+        }
+        if !waning_names.is_empty() {
+            parts.push(format!("{} waning.", waning_names.join(", ")));
+        }
+        parts.join(" ").yellow().to_string()
     };
 
     let health_part = if has_health_issues {
@@ -158,20 +163,21 @@ fn render_subvolume_table(data: &StatusOutput, out: &mut String) {
     // Only show HEALTH column when at least one subvolume is non-healthy
     let show_health = data.assessments.iter().any(|a| a.health != "healthy");
 
-    // Build headers: SAFETY  [HEALTH]  [PROMISE]  SUBVOLUME  LOCAL  [DRIVES...]  CHAIN
-    let mut headers: Vec<String> = vec!["SAFETY".to_string()];
+    // Build headers: EXPOSURE  [HEALTH]  [PROTECTION]  SUBVOLUME  LOCAL  [DRIVES...]  THREAD
+    let mut headers: Vec<String> = vec!["EXPOSURE".to_string()];
     if show_health {
         headers.push("HEALTH".to_string());
     }
     if has_promises {
-        headers.push("PROMISE".to_string());
+        // NOTE: Level names (guarded/protected/resilient) stay until Phase 6
+        headers.push("PROTECTION".to_string());
     }
     headers.push("SUBVOLUME".to_string());
     headers.push("LOCAL".to_string());
     for label in &drive_labels {
         headers.push(label.to_string());
     }
-    headers.push("CHAIN".to_string());
+    headers.push("THREAD".to_string());
 
     // Track which columns need coloring
     let safety_col = Some(0usize);
@@ -181,7 +187,7 @@ fn render_subvolume_table(data: &StatusOutput, out: &mut String) {
     let mut rows: Vec<Vec<String>> = Vec::new();
     for assessment in &data.assessments {
         // Safety column — new vocabulary
-        let safety = safety_label(&assessment.status);
+        let safety = exposure_label(&assessment.status);
         let mut row = vec![safety];
 
         if show_health {
@@ -219,20 +225,22 @@ fn render_subvolume_table(data: &StatusOutput, out: &mut String) {
                         "\u{2014}".to_string()
                     }
                 }
-                Some(e) if e.last_send_age_secs.is_some() => "away".dimmed().to_string(),
+                Some(e) if e.role == DriveRole::Offsite && e.last_send_age_secs.is_some() => {
+                    "away".dimmed().to_string()
+                }
                 _ => "\u{2014}".to_string(),
             };
             row.push(cell);
         }
 
-        // Chain health
-        let chain = data
+        // Thread health (interactive rendering — Display impl feeds daemon JSON, do not change it)
+        let thread = data
             .chain_health
             .iter()
             .find(|c| c.subvolume == assessment.name)
-            .map(|c| c.health.to_string())
+            .map(|c| render_thread_status(&c.health))
             .unwrap_or_else(|| "\u{2014}".to_string());
-        row.push(chain);
+        row.push(thread);
 
         rows.push(row);
     }
@@ -240,13 +248,23 @@ fn render_subvolume_table(data: &StatusOutput, out: &mut String) {
     format_status_table(&headers, &rows, safety_col, health_col, out);
 }
 
-/// Map legacy status strings to new vocabulary.
-fn safety_label(status: &str) -> String {
+/// Map promise status to exposure vocabulary.
+fn exposure_label(status: &str) -> String {
     match status {
-        "PROTECTED" => "OK".to_string(),
-        "AT RISK" => "aging".to_string(),
-        "UNPROTECTED" => "gap".to_string(),
+        "PROTECTED" => "sealed".to_string(),
+        "AT RISK" => "waning".to_string(),
+        "UNPROTECTED" => "exposed".to_string(),
         other => other.to_string(),
+    }
+}
+
+/// Render chain health for interactive display.
+/// The `Display` impl on `ChainHealth` feeds daemon JSON and must not change.
+fn render_thread_status(health: &ChainHealth) -> String {
+    match health {
+        ChainHealth::NoDriveData => "\u{2014}".to_string(),
+        ChainHealth::Incremental(_) => "unbroken".to_string(),
+        ChainHealth::Full(reason) => format!("broken \u{2014} full send ({reason})"),
     }
 }
 
@@ -310,18 +328,17 @@ fn render_drive_summary(data: &StatusOutput, out: &mut String) {
                 out,
                 "Drives: {} {}{}",
                 drive.label.bold(),
-                "mounted".green(),
+                "connected".green(),
                 free_str,
             )
             .ok();
         } else {
-            writeln!(
-                out,
-                "Drives: {} {}",
-                drive.label.bold(),
-                "not mounted".dimmed(),
-            )
-            .ok();
+            let status = if drive.role == DriveRole::Offsite {
+                "away".dimmed()
+            } else {
+                "disconnected".dimmed()
+            };
+            writeln!(out, "Drives: {} {}", drive.label.bold(), status,).ok();
         }
     }
 }
@@ -385,7 +402,7 @@ fn format_status_table(
                 let w = widths.get(i).copied().unwrap_or(cell.len());
                 let visible_len = strip_ansi_len(cell);
                 if safety_col == Some(i) {
-                    color_and_pad(&color_safety_str(cell), cell.len(), w)
+                    color_and_pad(&color_exposure_str(cell), cell.len(), w)
                 } else if health_col == Some(i) {
                     color_and_pad(&color_health_str(cell), cell.len(), w)
                 } else if visible_len != cell.len() {
@@ -401,10 +418,6 @@ fn format_status_table(
     }
 }
 
-/// Generic table formatter (no column coloring). Used by backup summary.
-fn format_table(headers: &[String], rows: &[Vec<String>], out: &mut String) {
-    format_status_table(headers, rows, None, None, out);
-}
 
 /// Get visible (non-ANSI) length of a string.
 fn strip_ansi_len(s: &str) -> usize {
@@ -433,11 +446,11 @@ fn color_and_pad(colored: &str, visible_len: usize, width: usize) -> String {
 
 // ── Color helpers ───────────────────────────────────────────────────────
 
-fn color_safety_str(safety: &str) -> String {
-    match safety {
-        "OK" => "OK".green().to_string(),
-        "aging" => "aging".yellow().to_string(),
-        "gap" => "gap".red().to_string(),
+fn color_exposure_str(exposure: &str) -> String {
+    match exposure {
+        "sealed" => "sealed".green().to_string(),
+        "waning" => "waning".yellow().to_string(),
+        "exposed" => "exposed".red().to_string(),
         other => other.to_string(),
     }
 }
@@ -562,7 +575,7 @@ fn render_backup_interactive(data: &BackupSummary) -> String {
         render_assessment_advisories(data, &mut out);
     } else if !data.assessments.is_empty() {
         writeln!(out).ok();
-        writeln!(out, "All subvolumes {}.", "PROTECTED".green()).ok();
+        writeln!(out, "All subvolumes {}.", "sealed".green()).ok();
     }
 
     // ── Warnings ─────────────────────────────────────────────────────
@@ -628,8 +641,9 @@ fn render_skipped_block(skipped: &[crate::output::SkippedSubvolume], out: &mut S
     if !not_mounted_drives.is_empty() {
         writeln!(
             out,
-            "  {} {}",
-            "Drives not mounted:".dimmed(),
+            "  {}  {} {}",
+            skip_tag(&SkipCategory::DriveNotMounted),
+            "Drives disconnected:".dimmed(),
             not_mounted_drives.join(", "),
         )
         .ok();
@@ -648,7 +662,7 @@ fn render_skipped_block(skipped: &[crate::output::SkippedSubvolume], out: &mut S
         writeln!(
             out,
             "  {} {}  {}",
-            "SKIP".yellow(),
+            skip_tag(&skip.category),
             skip.name.bold(),
             skip.reason,
         )
@@ -676,10 +690,11 @@ fn render_assessment_table(data: &BackupSummary, out: &mut String) {
 
     let has_promises = data.assessments.iter().any(|a| a.promise_level.is_some());
 
-    // Build headers: STATUS  [PROMISE]  SUBVOLUME  LOCAL  [DRIVE1]  [DRIVE2]
-    let mut headers: Vec<String> = vec!["STATUS".to_string()];
+    // Build headers: EXPOSURE  [PROTECTION]  SUBVOLUME  LOCAL  [DRIVE1]  [DRIVE2]
+    let mut headers: Vec<String> = vec!["EXPOSURE".to_string()];
     if has_promises {
-        headers.push("PROMISE".to_string());
+        // NOTE: Level names (guarded/protected/resilient) stay until Phase 6
+        headers.push("PROTECTION".to_string());
     }
     headers.push("SUBVOLUME".to_string());
     headers.push("LOCAL".to_string());
@@ -690,7 +705,7 @@ fn render_assessment_table(data: &BackupSummary, out: &mut String) {
     // Build rows
     let mut rows: Vec<Vec<String>> = Vec::new();
     for assessment in &data.assessments {
-        let mut row = vec![assessment.status.clone()];
+        let mut row = vec![exposure_label(&assessment.status)];
         if has_promises {
             row.push(
                 assessment
@@ -717,7 +732,7 @@ fn render_assessment_table(data: &BackupSummary, out: &mut String) {
         rows.push(row);
     }
 
-    format_table(&headers, &rows, out);
+    format_status_table(&headers, &rows, Some(0), None, out);
 }
 
 /// Render advisories and errors from awareness assessments.
@@ -929,7 +944,14 @@ fn render_drive_not_mounted_group(items: &[&SkippedSubvolume], out: &mut String)
             format!("{label} ({count} {noun})")
         })
         .collect();
-    writeln!(out, "  {} {}", "Not mounted:".dimmed(), parts.join(", ")).ok();
+    writeln!(
+        out,
+        "  {}  {} {}",
+        skip_tag(&SkipCategory::DriveNotMounted),
+        "Disconnected:".dimmed(),
+        parts.join(", "),
+    )
+    .ok();
 }
 
 /// Render IntervalNotElapsed skips as a single line with count and shortest duration.
@@ -947,7 +969,8 @@ fn render_interval_group(items: &[&SkippedSubvolume], out: &mut String) {
 
     writeln!(
         out,
-        "  {} {} subvolumes{}",
+        "  {}  {} {} subvolumes{}",
+        skip_tag(&SkipCategory::IntervalNotElapsed),
         "Interval not elapsed:".dimmed(),
         items.len(),
         suffix,
@@ -958,7 +981,25 @@ fn render_interval_group(items: &[&SkippedSubvolume], out: &mut String) {
 /// Render Disabled skips as an inline comma-separated name list.
 fn render_disabled_group(items: &[&SkippedSubvolume], out: &mut String) {
     let names: Vec<&str> = items.iter().map(|s| s.name.as_str()).collect();
-    writeln!(out, "  {} {}", "Disabled:".dimmed(), names.join(", ")).ok();
+    writeln!(
+        out,
+        "  {}  {} {}",
+        skip_tag(&SkipCategory::Disabled),
+        "Disabled:".dimmed(),
+        names.join(", "),
+    )
+    .ok();
+}
+
+/// Map skip category to a colored tag for display.
+fn skip_tag(category: &SkipCategory) -> String {
+    match category {
+        SkipCategory::SpaceExceeded => "[SPACE]".yellow().to_string(),
+        SkipCategory::IntervalNotElapsed => "[WAIT]".dimmed().to_string(),
+        SkipCategory::DriveNotMounted => "[AWAY]".dimmed().to_string(),
+        SkipCategory::Disabled => "[OFF] ".dimmed().to_string(),
+        SkipCategory::Other => "[SKIP]".dimmed().to_string(),
+    }
 }
 
 /// Render SpaceExceeded or Other skips as individual lines (detail matters).
@@ -967,10 +1008,7 @@ fn render_individual_skips(
     category: &SkipCategory,
     out: &mut String,
 ) {
-    let tag = match category {
-        SkipCategory::SpaceExceeded => "[SPACE]".yellow().to_string(),
-        _ => "[SKIP]".dimmed().to_string(),
-    };
+    let tag = skip_tag(category);
     for item in items {
         writeln!(out, "  {} {}: {}", tag, item.name, item.reason.dimmed()).ok();
     }
@@ -1373,9 +1411,11 @@ fn render_init_interactive(data: &InitOutput) -> String {
     writeln!(out, "{}", "Drive status:".bold()).ok();
     for drive in &data.drives {
         let status = if drive.mounted {
-            "MOUNTED".green().to_string()
+            "CONNECTED".green().to_string()
+        } else if drive.role == DriveRole::Offsite {
+            "AWAY".yellow().to_string()
         } else {
-            "NOT MOUNTED".yellow().to_string()
+            "DISCONNECTED".yellow().to_string()
         };
         let free_info = drive
             .free_bytes
@@ -1533,9 +1573,9 @@ fn render_sentinel_status_interactive(data: &SentinelStatusOutput) -> String {
 
             // Mounted drives
             if state.mounted_drives.is_empty() {
-                writeln!(out, "  {:<14}{}", "Mounted", "none".dimmed()).ok();
+                writeln!(out, "  {:<14}{}", "Connected", "none".dimmed()).ok();
             } else {
-                writeln!(out, "  {:<14}{}", "Mounted", state.mounted_drives.join(", ")).ok();
+                writeln!(out, "  {:<14}{}", "Connected", state.mounted_drives.join(", ")).ok();
             }
         }
         SentinelStatusOutput::NotRunning { last_seen } => {
@@ -1691,8 +1731,8 @@ mod tests {
     fn interactive_contains_safety_vocabulary() {
         colored::control::set_override(false);
         let output = render_status(&test_status_output(), OutputMode::Interactive);
-        assert!(output.contains("OK"), "missing OK safety label");
-        assert!(output.contains("aging"), "missing aging safety label");
+        assert!(output.contains("sealed"), "missing sealed exposure label");
+        assert!(output.contains("waning"), "missing waning exposure label");
     }
 
     #[test]
@@ -1702,7 +1742,7 @@ mod tests {
         // Set a promise level on one assessment
         data.assessments[0].promise_level = Some("protected".to_string());
         let output = render_status(&data, OutputMode::Interactive);
-        assert!(output.contains("PROMISE"), "missing PROMISE header");
+        assert!(output.contains("PROTECTION"), "missing PROTECTION header");
         assert!(output.contains("protected"), "missing promise level value");
         // The second assessment should show an em dash
         assert!(
@@ -1717,8 +1757,8 @@ mod tests {
         let data = test_status_output(); // all promise_level are None
         let output = render_status(&data, OutputMode::Interactive);
         assert!(
-            !output.contains("PROMISE"),
-            "PROMISE column should be hidden when no promises set"
+            !output.contains("PROTECTION"),
+            "PROTECTION column should be hidden when no protection levels set"
         );
     }
 
@@ -1727,9 +1767,9 @@ mod tests {
         colored::control::set_override(false);
         let output = render_status(&test_status_output(), OutputMode::Interactive);
         assert!(output.contains("WD-18TB"), "missing drive label");
-        assert!(output.contains("mounted"), "missing mounted status");
+        assert!(output.contains("connected"), "missing connected status");
         assert!(output.contains("Offsite-4TB"), "missing unmounted drive");
-        assert!(output.contains("not mounted"), "missing not mounted status");
+        assert!(output.contains("away"), "missing away status for offsite drive");
     }
 
     #[test]
@@ -1742,11 +1782,14 @@ mod tests {
     }
 
     #[test]
-    fn interactive_contains_chain_health() {
+    fn interactive_contains_thread_health() {
         colored::control::set_override(false);
         let output = render_status(&test_status_output(), OutputMode::Interactive);
-        assert!(output.contains("incremental"), "missing incremental chain");
-        assert!(output.contains("full (no pin)"), "missing full chain");
+        assert!(output.contains("unbroken"), "missing unbroken thread");
+        assert!(
+            output.contains("broken"),
+            "missing broken thread"
+        );
     }
 
     #[test]
@@ -1913,7 +1956,7 @@ mod tests {
         let output = render_backup_summary(&test_backup_summary(), OutputMode::Interactive);
         assert!(output.contains("htpc-home"), "missing subvolume name");
         assert!(output.contains("htpc-docs"), "missing subvolume name");
-        assert!(output.contains("OK"), "missing OK status");
+        assert!(output.contains("sealed"), "missing sealed status");
     }
 
     #[test]
@@ -1931,7 +1974,7 @@ mod tests {
         colored::control::set_override(false);
         let output = render_backup_summary(&test_backup_summary(), OutputMode::Interactive);
         assert!(
-            output.contains("Drives not mounted"),
+            output.contains("Drives disconnected"),
             "missing grouped skip header"
         );
         assert!(
@@ -1973,8 +2016,8 @@ mod tests {
         colored::control::set_override(false);
         let output = render_backup_summary(&test_backup_summary(), OutputMode::Interactive);
         assert!(
-            output.contains("All subvolumes PROTECTED"),
-            "missing all-protected summary"
+            output.contains("All subvolumes sealed"),
+            "missing all-sealed summary"
         );
         // Should NOT contain a table header
         assert!(
@@ -1993,7 +2036,7 @@ mod tests {
             output.contains("SUBVOLUME"),
             "should show table when not all protected"
         );
-        assert!(output.contains("AT RISK"), "missing AT RISK status");
+        assert!(output.contains("waning"), "missing waning exposure label");
     }
 
     #[test]
@@ -2092,7 +2135,7 @@ mod tests {
         };
         let output = render_backup_summary(&data, OutputMode::Interactive);
         assert!(
-            output.contains("Drives not mounted"),
+            output.contains("Drives disconnected"),
             "missing grouped header for all-skips run"
         );
         assert!(
@@ -2263,7 +2306,7 @@ mod tests {
         };
         let output = render_plan(&data, OutputMode::Interactive);
         assert!(
-            output.contains("Not mounted:"),
+            output.contains("Disconnected:"),
             "missing grouped not-mounted line"
         );
         assert!(
@@ -2469,7 +2512,7 @@ mod tests {
             },
         };
         let output = render_plan(&data, OutputMode::Interactive);
-        let not_mounted_pos = output.find("Not mounted:").expect("missing Not mounted");
+        let not_mounted_pos = output.find("Disconnected:").expect("missing Disconnected");
         let interval_pos = output.find("Interval not elapsed:").expect("missing Interval");
         let disabled_pos = output.find("Disabled:").expect("missing Disabled");
         assert!(
@@ -3009,7 +3052,7 @@ mod tests {
             a.health_reasons = vec![];
         }
         let output = render_status(&data, OutputMode::Interactive);
-        assert!(output.contains("All data safe"), "missing summary line, got: {output}");
+        assert!(output.contains("All sealed"), "missing summary line, got: {output}");
     }
 
     #[test]
@@ -3028,10 +3071,74 @@ mod tests {
         colored::control::set_override(false);
         let data = test_status_output();
         let output = render_status(&data, OutputMode::Interactive);
-        assert!(output.contains("OK"), "missing OK label");
-        assert!(output.contains("aging"), "missing aging label");
+        assert!(output.contains("sealed"), "missing sealed label");
+        assert!(output.contains("waning"), "missing waning label");
         assert!(!output.contains("PROTECTED"), "should not contain legacy PROTECTED");
         assert!(!output.contains("AT RISK"), "should not contain legacy AT RISK");
+    }
+
+    #[test]
+    fn exposure_label_maps_all_statuses() {
+        assert_eq!(exposure_label("PROTECTED"), "sealed");
+        assert_eq!(exposure_label("AT RISK"), "waning");
+        assert_eq!(exposure_label("UNPROTECTED"), "exposed");
+        assert_eq!(exposure_label("UNKNOWN"), "UNKNOWN");
+    }
+
+    #[test]
+    fn render_thread_status_maps_all_variants() {
+        assert_eq!(render_thread_status(&ChainHealth::NoDriveData), "\u{2014}");
+        assert_eq!(
+            render_thread_status(&ChainHealth::Incremental("pin".to_string())),
+            "unbroken"
+        );
+        assert_eq!(
+            render_thread_status(&ChainHealth::Full("no pin".to_string())),
+            "broken \u{2014} full send (no pin)"
+        );
+    }
+
+    #[test]
+    fn summary_line_differentiates_exposed_and_waning() {
+        colored::control::set_override(false);
+        let mut data = test_status_output();
+        data.assessments[0].status = "UNPROTECTED".to_string();
+        data.assessments[1].status = "AT RISK".to_string();
+        let output = render_status(&data, OutputMode::Interactive);
+        assert!(output.contains("exposed"), "missing exposed in summary");
+        assert!(output.contains("waning"), "missing waning in summary");
+        assert!(output.contains("0 of 2 sealed"), "missing sealed count");
+    }
+
+    #[test]
+    fn primary_drive_unmounted_shows_dash_not_away() {
+        colored::control::set_override(false);
+        let mut data = test_status_output();
+        // Add an unmounted Primary drive with send history
+        data.assessments[0].external.push(StatusDriveAssessment {
+            drive_label: "Test-Drive".to_string(),
+            status: "PROTECTED".to_string(),
+            mounted: false,
+            snapshot_count: None,
+            last_send_age_secs: Some(86400),
+            role: DriveRole::Primary,
+        });
+        data.drives.push(DriveInfo {
+            label: "Test-Drive".to_string(),
+            mounted: false,
+            free_bytes: None,
+            role: DriveRole::Primary,
+        });
+        let output = render_status(&data, OutputMode::Interactive);
+        // Primary drives should NOT show "away" — only offsite drives do
+        let lines: Vec<&str> = output.lines().collect();
+        let test_drive_line = lines.iter().find(|l| l.contains("Test-Drive"));
+        assert!(test_drive_line.is_some(), "missing Test-Drive in output");
+        // The drive summary should show "disconnected" not "away"
+        assert!(
+            output.contains("disconnected"),
+            "primary drive should show disconnected, not away: {output}"
+        );
     }
 
     #[test]

@@ -200,7 +200,7 @@ pub fn compute_notifications(
                         ),
                         body: format!(
                             "The thread of {} has frayed — it was {}, now {}. \
-                             The well remembers, but the weave grows thin.",
+                             The well remembers, but the thread grows thin.",
                             current_sv.name, prev_sv.promise_status, current_sv.promise_status
                         ),
                     });
@@ -217,7 +217,7 @@ pub fn compute_notifications(
                             current_sv.name, current_sv.promise_status
                         ),
                         body: format!(
-                            "The thread of {} is rewoven — restored from {} to {}.",
+                            "The thread of {} is mended — restored from {} to {}.",
                             current_sv.name, prev_sv.promise_status, current_sv.promise_status
                         ),
                     });
@@ -239,7 +239,7 @@ pub fn compute_notifications(
             urgency: Urgency::Critical,
             title: "Urd: all promises broken".to_string(),
             body: "Every thread in the well has snapped. No subvolume is protected. \
-                   Attend to this — your data stands unguarded."
+                   Attend to this — your data stands exposed."
                 .to_string(),
         });
     }
@@ -271,10 +271,10 @@ pub fn compute_notifications(
             urgency,
             title: format!("Urd: {failed_count}/{total_count} backups failed"),
             body: if failed_count == total_count {
-                "The loom has seized — every weaving failed. Check the logs.".to_string()
+                "The spindle has stopped — every thread snapped. Check the logs.".to_string()
             } else {
                 format!(
-                    "{failed_count} of {total_count} threads could not be woven. \
+                    "{failed_count} of {total_count} threads could not be spun. \
                      The others hold, but the pattern is incomplete."
                 )
             },

@@ -473,7 +473,7 @@ pub fn build_notifications(
                     title: format!("Urd: {} is now {}", assess.name, to),
                     body: format!(
                         "The thread of {} has frayed — it was {}, now {}. \
-                         The well remembers, but the weave grows thin.",
+                         The well remembers, but the thread grows thin.",
                         assess.name, from, to
                     ),
                 });
@@ -488,7 +488,7 @@ pub fn build_notifications(
                     urgency: Urgency::Info,
                     title: format!("Urd: {} restored to {}", assess.name, to),
                     body: format!(
-                        "The thread of {} is rewoven — restored from {} to {}.",
+                        "The thread of {} is mended — restored from {} to {}.",
                         assess.name, from, to
                     ),
                 });
@@ -508,7 +508,7 @@ pub fn build_notifications(
             urgency: Urgency::Critical,
             title: "Urd: all promises broken".to_string(),
             body: "Every thread in the well has snapped. No subvolume is protected. \
-                   Attend to this — your data stands unguarded."
+                   Attend to this — your data stands exposed."
                 .to_string(),
         });
     }
@@ -548,8 +548,8 @@ pub fn check_backup_overdue(
         urgency: Urgency::Warning,
         title: format!("Urd: no backup in {age_hours}h"),
         body: format!(
-            "The last weaving was {age_hours}h ago — expected within {stale_hours}h. \
-             The loom sits idle. Check that the timer is running."
+            "The last run was {age_hours}h ago — expected within {stale_hours}h. \
+             The spindle sits idle. Check that the timer is running."
         ),
     })
 }
@@ -593,7 +593,7 @@ pub fn build_health_notifications(
                     urgency: Urgency::Info,
                     title: format!("Urd: {} health now {}", assess.name, to),
                     body: format!(
-                        "The loom for {} reports {} — was {}.{}",
+                        "The spindle for {} reports {} — was {}.{}",
                         assess.name, to, from, reasons
                     ),
                 });
@@ -607,7 +607,7 @@ pub fn build_health_notifications(
                     urgency: Urgency::Info,
                     title: format!("Urd: {} health restored to {}", assess.name, to),
                     body: format!(
-                        "The loom for {} is running smoothly again — restored from {} to {}.",
+                        "The spindle for {} is running smoothly again — restored from {} to {}.",
                         assess.name, from, to
                     ),
                 });

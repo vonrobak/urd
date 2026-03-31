@@ -19,23 +19,23 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    /// Show planned backup operations without executing
+    /// Preview what Urd will do next
     Plan(PlanArgs),
-    /// Create snapshots, send to external drives, run retention
+    /// Back up now — snapshot, send, clean up
     Backup(BackupArgs),
-    /// Show snapshot counts, drive status, chain health
+    /// Check whether your data is safe
     Status,
-    /// Show backup history
+    /// Review past backup runs
     History(HistoryArgs),
-    /// Verify incremental chain integrity and pin file health
+    /// Diagnose thread integrity and pin health
     Verify(VerifyArgs),
-    /// Initialize state database and validate system readiness
+    /// Set up Urd and verify the environment
     Init,
-    /// Measure snapshot sizes for space estimation (run before first external send)
+    /// Measure snapshot sizes for send estimates
     Calibrate(CalibrateArgs),
-    /// Retrieve a file from a past snapshot
+    /// Restore a file from a past snapshot
     Get(GetArgs),
-    /// Sentinel daemon — monitors backup health and drive connections
+    /// Sentinel — continuous health monitoring
     Sentinel(SentinelArgs),
 }
 

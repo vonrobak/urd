@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Vocabulary overhaul: safety labels are now sealed/waning/exposed, chain→thread, mounted→connected/disconnected/away, SAFETY→EXPOSURE, CHAIN→THREAD, PROMISE→PROTECTION column headers
+- CLI command descriptions rewritten to intent-first language (e.g., "Check whether your data is safe")
+- Summary line now differentiates exposure levels: "htpc-root exposed. docs waning." instead of generic "needs attention"
+- Skip tags differentiated by category: [WAIT], [AWAY], [SPACE], [OFF], [SKIP] replace overloaded [SKIP]
+- Drive status is now role-aware: offsite drives show "away" when disconnected, primary drives show "disconnected"
+- Notification mythology cleaned up: loom/weave→spindle/thread, rewoven→mended, unguarded→exposed
+- `UrdError::Chain` error message changed from "Chain error" to "Thread error" (log grep patterns may need updating)
+
 ### Added
 - Transient immediate cleanup: executor deletes old pin parent immediately after successful send to all drives, reducing local snapshot count from two to one between runs
 - `Config::drive_labels()` helper for collecting configured drive labels
