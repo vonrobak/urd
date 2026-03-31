@@ -481,118 +481,105 @@ After each phase:
 
 > This section is a living tracker. Updated when priorities change.
 
-### Priority 5: Sentinel (in progress)
+### Priority 5: Sentinel (paused — resumed after Priority 6)
 
-The Sentinel is three independent systems that compose. Build and test them separately.
+The Sentinel is three independent systems that compose. Sessions 1-2 complete and deployed.
+Sessions 3-4 deferred below Priority 6 UX work. Session 3's notification dedup is subsumed
+by 6-I's structured advisory cooldown mechanism.
 
 | # | Component | Status | Notes |
 |---|-----------|--------|-------|
 | 5a | **Notification dispatcher** | **Complete** | `notify.rs`: `compute_notifications()` pure function, 4 channel types, urgency filtering. 18 tests. |
-| 5b | **Event reactor (passive)** | **Session 2 complete** | Pure state machine (Session 1) + I/O runner + CLI (Session 2). Session 3 next: hardening + notification dedup. |
-| 5c | **Active mode** | Designed, not built | Auto-trigger logic in Session 1: `should_trigger_backup()`, `TriggerPermission`. Session 4. |
+| 5b | **Event reactor (passive)** | **Sessions 1-2 complete, deployed** | Pure state machine + I/O runner + CLI. Running as systemd user service. |
+| 5b-3 | **Sentinel hardening** | Deferred | Scoped after 6-I ships (notification dedup subsumed by advisory cooldown). |
+| 5c | **Active mode** | Designed, not built | Auto-trigger logic: `should_trigger_backup()`, `TriggerPermission`. After Priority 6. |
 
-### Priority 5.5: Safety & Visibility (designed, not built)
+### Priority 5.5: Safety & Visibility — Complete
 
-Three design trajectories that extend Urd's safety model and user-facing feedback.
-Each has been through brainstorm → design → arch-adversary review. Build order
-matters — later items depend on earlier ones.
+All 10 items built and deployed (v0.4.1–v0.5.0):
+- Hardware swap defenses (drive session tokens, chain health as awareness input, full-send gate)
+- Visual feedback model (OperationalHealth enum, two-axis CLI, sentinel visual_state)
+- Transient snapshots (local_retention = "transient", immediate cleanup)
 
-**Build sequence** (resolved 2026-03-29):
+| Item | Design | Review |
+|------|--------|--------|
+| Hardware swap defenses | [design](../95-ideas/2026-03-28-design-hardware-swap-defenses.md) | [review](../99-reports/2026-03-28-hardware-swap-defenses-design-review.md) |
+| Visual feedback model | [design](../95-ideas/2026-03-28-design-visual-feedback-model.md) | [review](../99-reports/2026-03-28-visual-feedback-model-design-review.md) |
+| Spindle tray icon | [brainstorm](../95-ideas/2026-03-28-brainstorm-tray-icon-spindle.md) | Needs design doc (build after Phase 5) |
 
-```
-1. HSD-A     Drive tokens + chain health as awareness input
-2. VFM-A     OperationalHealth enum, two-axis CLI rendering
-3. Session 3 Sentinel hardening + notification dedup
-4. HSD-B     Sentinel chain-break detection + full-send gate (Norman escalation)
-5. VFM-B     Sentinel visual state + health notifications
-6. Transient  After foundations are solid
-7. Spindle    After VFM-B
-```
+### Priority 6: Voice, UX & Redundancy Guidance
 
-HSD-A before Session 3: no module overlap (drives/awareness vs. sentinel/notify),
-and HSD-A unblocks VFM-A which is the higher-value user-facing deliverable.
-Session 3 is needed by HSD-B and VFM-B (sentinel infrastructure), not earlier.
+The next arc: unify Urd's voice, build high-impact UX features, and teach 3-2-1 strategy
+through the promise system and progressive disclosure. Two brainstorm sessions resolved
+the complete vocabulary and scored UX features. Six phase designs reviewed by arch-adversary.
 
-| # | Feature | Effort | Status | Design doc | Review |
-|---|---------|--------|--------|------------|--------|
-| 5.5a | **Hardware swap defenses** | 2–3 sessions | Designed, reviewed | [design](../95-ideas/2026-03-28-design-hardware-swap-defenses.md) | [review](../99-reports/2026-03-28-hardware-swap-defenses-design-review.md) |
-| | Session A: drive session tokens (`.urd-drive-token`), chain health as pre-computed awareness input | ~1 session | | | |
-| | Session B: sentinel chain-break detection, full-send confirmation gate | ~1 session | | | |
-| 5.5b | **Visual feedback model** | 2 sessions | Designed, reviewed | [design](../95-ideas/2026-03-28-design-visual-feedback-model.md) | [review](../99-reports/2026-03-28-visual-feedback-model-design-review.md) |
-| | Session A: `OperationalHealth` enum in awareness, two-axis CLI rendering | ~1 session | | | |
-| | Session B: sentinel `visual_state` in state file, `HealthDegraded` notifications | ~1 session | | | |
-| 5.5c | **Tray icon (Spindle)** | Low–Medium | Brainstormed | [brainstorm](../95-ideas/2026-03-28-brainstorm-tray-icon-spindle.md) | — |
-| | Reads `sentinel-state.json` visual_state. Start with 4 static icons (ok/warning/critical/active). | | | | |
-| 5.5d | **Transient snapshots** | Medium | Designed | [design](../95-ideas/2026-03-27-design-transient-snapshots.md) | — |
-| | `local_retention = "transient"`: create → send → delete (keep one pinned). For space-constrained NVMe. | | | | |
-
-**Design decisions (resolved 2026-03-29):**
-
-1. **Chain health as awareness input (facade pattern).** Callers pre-compute chain state
-   and pass it into awareness as a simple struct. Awareness stays pure, stays ignorant of
-   pin files and paths, but is the single facade for "subvolume health." This avoids the
-   protocol obligation problem (every consumer assembling the picture themselves).
-
-2. **Full-send gate: never auto-proceed (Norman escalation).** Gated sends escalate through
-   notification urgency, never through automation. Day 1 informational → Day 3 warning →
-   Day 7 critical (channel escalation: desktop → desktop+discord). The gate never lifts
-   without explicit `--force-full`. Awareness transitions affected subvolumes through
-   AT RISK → UNPROTECTED as time passes — truthful natural pressure, not automated override.
-   UX principles: visibility (prominent in status), mapping (notification names the exact
-   command to run), feedback (each status check shows how long gated and what's at risk).
-
-**Other review findings to address:**
-- HSD: Token verification should use `VerifiedDrive` wrapper or collapse into `drive_availability()`
-- VFM: `Blocked` for unmounted drives too aggressive — only block when send is due AND no drives mounted
-- VFM: Start with 4 icon states (ok/warning/critical/active), not 7
-- VFM: Keep structured data only in state file — no pre-computed text
-
-**Supporting brainstorms:**
-- [Hardware swap solutions brainstorm](../95-ideas/2026-03-28-brainstorm-hardware-swap-solutions.md) — drive identity, chain-break detection, space deltas, full-send gates, new-drive onboarding
-
-### Priority 6: Redundancy Guidance & User Experience
-
-The next arc: teach users 3-2-1 backup strategy through Urd's promise system, advisories,
-and progressive disclosure — not through documentation. The setup wizard is the capstone.
-Build sequence resolved 2026-03-31; dependency arrows flow downward.
-
-**Build sequence:**
+**Two arcs, one dependency chain:**
 
 ```
-1. B   Transient immediate cleanup (executor-only, independent)
-2. E   Promise levels encode redundancy (foundational — I, O, H reference it)
-3. I+N In parallel: redundancy recommendations + retention preview
-4. O   Progressive disclosure (needs E + I infrastructure)
-5. H   Guided setup wizard (capstone — integrates E, N, G; voice is the work)
+Voice & UX Arc                        Progressive & Setup Arc
+──────────────                        ───────────────────────
+Merge 6-B + 6-E (ready now)
+  │
+Phase 1: Vocabulary landing
+  │
+Phase 2a+2c: urd default + completions
+  │
+6-I: Advisory system ─────────────────→ 6-O: Progressive disclosure (2 sessions)
+  │                                        │
+6-N + Phase 2b: Retention + doctor        ADR-110 enum rename (1 session)
+  │                                        │
+Phase 4a+4b: Escalation + suggestions    Config Serialize refactor (0.5 session)
+  │                                        │
+Phase 4c: Mythic transitions             6-H: Guided setup wizard (4 sessions)
 ```
 
-B is independent. E is the foundation. I and N are parallel (I builds advisory
-infrastructure, N builds retention preview — both feed H). O needs E's promise
-semantics and I's advisory types. H pulls everything together.
+**Estimated total: 15 sessions, ~150 new/modified tests, test suite 589 → ~740.**
 
-| # | Feature | Effort | Status | Design doc | Review |
-|---|---------|--------|--------|------------|--------|
-| 6-B | **Transient immediate cleanup** | 1 session | Reviewed | [design](../95-ideas/2026-03-31-design-b-transient-immediate-cleanup.md) | [review](../99-reports/2026-03-31-design-b-review.md) |
-| | Executor deletes old pin parent after send to all drives. No new types. | | | | |
-| 6-E | **Promise redundancy encoding** | 1 session | Reviewed | [design](../95-ideas/2026-03-31-design-e-promise-redundancy-encoding.md) | [review](../99-reports/2026-03-31-design-e-review.md) |
-| | Resilient requires offsite-role drive. Offsite staleness as post-processing overlay. Gate: ADR-110 addendum. | | | | |
-| 6-I | **Redundancy recommendations** | 1–2 sessions | Reviewed | [design](../95-ideas/2026-03-31-design-i-redundancy-recommendations.md) | [review](../99-reports/2026-03-31-design-i-review.md) |
-| | Structured advisory system with notification cooldown. Migrates stringly-typed advisories. | | | | |
-| 6-N | **Retention policy preview** | 1 session | Reviewed | [design](../95-ideas/2026-03-31-design-n-retention-policy-preview.md) | [review](../99-reports/2026-03-31-design-n-review.md) |
-| | Cascading retention windows + status one-liner. Two-tier estimation (Calibrated/Unknown). | | | | |
-| 6-O | **Progressive disclosure** | 2 sessions | Reviewed | [design](../95-ideas/2026-03-31-design-o-progressive-disclosure.md) | [review](../99-reports/2026-03-31-design-o-review.md) |
-| | Delivers through status + Spindle (not notifications). 8 milestones, parameterized identity. | | | | |
-| 6-H | **Guided setup wizard** | 4–5 sessions | Reviewed | [design](../95-ideas/2026-03-31-design-h-guided-setup-wizard.md) | [review](../99-reports/2026-03-31-design-h-review.md) |
-| | Prerequisite: Config Serialize refactor. Migration safety. Tiered discovery. | | | | |
+#### Feature table
 
-**Also in this priority (independent, low effort):**
+| # | Feature | Effort | Status | Design | Review |
+|---|---------|--------|--------|--------|--------|
+| 6-B | **Transient immediate cleanup** | 1 session | **Built, reviewed** | [design](../95-ideas/2026-03-31-design-b-transient-immediate-cleanup.md) | [review](../99-reports/2026-03-31-design-b-review.md) |
+| 6-E | **Promise redundancy encoding** | 1 session | **Built, reviewed** | [design](../95-ideas/2026-03-31-design-e-promise-redundancy-encoding.md) | [review](../99-reports/2026-03-31-design-e-review.md) |
+| P1 | **Vocabulary landing** | 1 session | Designed, reviewed | [design](../95-ideas/2026-03-31-design-phase1-vocabulary-landing.md) | [review](../99-reports/2026-03-31-design-phase1-vocabulary-landing-review.md) |
+| P2a | **`urd` default status** | 1 session | Designed, reviewed | [design](../95-ideas/2026-03-31-design-phase2-ux-commands.md) | [review](../99-reports/2026-03-31-design-phase2-ux-commands-review.md) |
+| P2b | **`urd doctor`** | 1 session | Designed, reviewed | (same as P2a) | (same as P2a) |
+| P2c | **Shell completions** | 0.5 session | Designed, reviewed | (same as P2a) | (same as P2a) |
+| 6-I | **Redundancy recommendations** | 1–2 sessions | Designed, reviewed | [design](../95-ideas/2026-03-31-design-i-redundancy-recommendations.md) | [review](../99-reports/2026-03-31-design-phase3-advisory-retention-review.md) |
+| 6-N | **Retention policy preview** | 1 session | Designed, reviewed | [design](../95-ideas/2026-03-31-design-n-retention-policy-preview.md) | (same as 6-I) |
+| P4a | **Staleness escalation** | 1 session | Designed, reviewed | [design](../95-ideas/2026-03-31-design-phase4-voice-enrichment.md) | [review](../99-reports/2026-03-31-arch-adversary-phase4-voice-enrichment.md) |
+| P4b | **Next-action suggestions** | (with P4a) | Designed, reviewed | (same as P4a) | (same as P4a) |
+| P4c | **Mythic voice on transitions** | 0.5-1 session | Designed, reviewed | (same as P4a) | (same as P4a) |
+| 6-O | **Progressive disclosure** | 2 sessions | Designed, reviewed | [design](../95-ideas/2026-03-31-design-o-progressive-disclosure.md) | [review](../99-reports/2026-03-31-design-phase5-progressive-disclosure-review.md) |
+| P6a | **ADR-110 enum rename** | 1 session | Designed, reviewed | [design](../95-ideas/2026-03-31-design-phase6-protection-rename-wizard.md) | [review](../99-reports/2026-03-31-design-phase6-protection-rename-wizard-review.md) |
+| P6b | **Config Serialize refactor** | 0.5 session | Prerequisite for 6-H | (same as P6a) | (same as P6a) |
+| 6-H | **Guided setup wizard** | 4 sessions | Designed, reviewed | [design](../95-ideas/2026-03-31-design-h-guided-setup-wizard.md) | [review](../99-reports/2026-03-31-design-h-review.md) |
+
+#### Key review findings incorporated
+
+| Finding | Source | Resolution |
+|---------|--------|------------|
+| Heartbeat schema bump likely unnecessary | Phase 6 S-1 | Drop — heartbeat serializes promise states, not level names |
+| Config key rename scope too large | Phase 6 M-1 | Defer to ADR-111 config overhaul |
+| Voice thresholds contradict awareness | Phase 4 S-1 | Derive from PromiseStatus, not independent thresholds |
+| Cooldown key must include drive_label | Phase 3 S-1 | Design update before 6-I implementation |
+| Config error conflation in urd default | Phase 2 S-1 | Distinguish NotFound from ParseError |
+| Sentinel notification dedup | Phase 3 | Subsumed by 6-I cooldown mechanism |
+
+#### Brainstorm artifacts
+
+| Document | Content |
+|----------|---------|
+| [Next-level UX brainstorm](../95-ideas/2026-03-31-brainstorm-next-level-ux.md) | 12 candidates scored, 7 accepted (scores 6-10), 4 rejected |
+| [Vocabulary audit](../95-ideas/2026-03-31-brainstorm-vocabulary-audit.md) | Complete vocabulary redesign: exposure triad, protection levels, thread, drives, skip tags |
+
+#### Also in this priority (independent)
 
 | # | Feature | Effort | Notes |
 |---|---------|--------|-------|
-| 6a | **Shell completions** | Low | `clap_complete` for static; custom completer for subvolume/drive names. |
-| 6-Sp | **Tray icon (Spindle)** | Low–Medium | Reads sentinel-state.json. 4 static icons. [brainstorm](../95-ideas/2026-03-28-brainstorm-tray-icon-spindle.md). Needs design doc. |
+| 6-Sp | **Tray icon (Spindle)** | Low–Medium | Design after Phase 4/5 visual improvements. Build after 6-O. [brainstorm](../95-ideas/2026-03-28-brainstorm-tray-icon-spindle.md). |
 
-**Deferred from old Priority 6:**
+#### Deferred from old Priority 6
 
 | # | Feature | Notes |
 |---|---------|-------|
@@ -622,8 +609,9 @@ semantics and I's advisory types. H pulls everything together.
 
 - [ ] Drive topology constraints — capacity checks require I/O, deferred to Sentinel
 - [ ] Awareness threshold mode — fixed multipliers regardless of run frequency, deferred
-- [ ] Config schema migration (ADR-111) — target architecture defined, legacy schema in use
-- [ ] Protection level taxonomy rework — provisional names, needs operational data first
+- [ ] Config schema migration (ADR-111) — target architecture defined, legacy schema in use; config key rename (`protection_level` → `protection`) deferred here
+- [ ] Protection level enum rename — resolved vocabulary (recorded/sheltered/fortified), scheduled as P6a after 6-O ships
+- [ ] Heartbeat schema bump — likely unnecessary per Phase 6 review S-1 (heartbeat serializes promise states, not level names); verify before P6a
 
 ## Completed Features
 
@@ -664,9 +652,11 @@ All five items built, adversary-reviewed, and deployed:
 - [x] Post-cutover — Priorities 2-4 complete
 - [x] Phase 5 — Architectural foundation complete
 - [x] Phase 6 — Protection promises complete
-- [ ] Phase 7 — Sentinel (5a done, 5b Sessions 1-2 done, Sessions 3-4 remaining)
+- [x] Phase 7 — Sentinel Sessions 1-2 deployed (Sessions 3-4 deferred after Priority 6)
 - [x] Phase 7.5 — Safety & Visibility (5.5a-d: all 10 items complete, v0.4.1–v0.5.0)
-- [ ] Phase 8 — Redundancy guidance & UX (6-B, 6-E, 6-I+N, 6-O, 6-H)
+- [ ] Phase 8 — Voice & UX overhaul (P1→P2→6-I→6-N→P4→6-O→P6a→6-H)
+- [ ] Phase 9 — Sentinel completion (Session 3 hardening, Session 4 active mode)
+- [ ] Phase 10 — Spindle tray icon
 
 ## Dropped Features
 

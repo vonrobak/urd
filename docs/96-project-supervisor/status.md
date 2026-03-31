@@ -13,30 +13,36 @@ Transient retention deployed to htpc-root (2026-03-30). Immediate cleanup built,
 
 ## In Progress
 
-1. **6-E: Promise redundancy encoding** — implemented, reviewed (arch-adversary + simplify +
-   post-review), all findings addressed. Ready for commit and PR. 17 new tests.
+1. **6-B + 6-E merge** — Transient immediate cleanup + promise redundancy encoding.
+   Both implemented, reviewed (arch-adversary + simplify + post-review), all findings
+   addressed. Ready for commit and PR. 17 new tests (6-E).
 
 ## Next Up
 
-1. **6-I + 6-N in parallel** — redundancy recommendations + retention policy preview.
-   Both designed and reviewed. 1-2 sessions each.
-2. **Spindle design post-review update** — incorporate 3 high findings before building.
+1. **Phase 1: Vocabulary landing** — All presentation-layer string changes (sealed/waning/exposed,
+   thread, connected/disconnected/away, skip tags, CLI descriptions, notification mythology).
+   Blocks all subsequent UX work. 1 session. [Design](../95-ideas/2026-03-31-design-phase1-vocabulary-landing.md) |
+   [Review](../99-reports/2026-03-31-design-phase1-vocabulary-landing-review.md)
+2. **Phase 2a + 2c** — `urd` default one-sentence status (score 10) + shell completions (score 8).
+   1 session. [Design](../95-ideas/2026-03-31-design-phase2-ux-commands.md) |
+   [Review](../99-reports/2026-03-31-design-phase2-ux-commands-review.md)
 
-## Build Queue (Priority 6) — Redundancy Guidance & UX
+## Build Queue — Priority 6: Voice & UX Overhaul
+
+Two arcs. The Voice & UX arc lands vocabulary and high-impact commands. The Progressive &
+Setup arc builds the learning/onboarding layer. All designs reviewed by arch-adversary.
 
 ```
-B (merged) → E (ready to merge) → I+N (parallel) → O → H (capstone)
+Voice & UX Arc:                    Progressive & Setup Arc:
+  Phase 1 (vocabulary)               6-O (milestones, 2 sessions)
+  Phase 2a+2c (urd default, compl.)  ADR-110 enum rename (1 session)
+  6-I (advisory system)              Config Serialize (0.5 session)
+  6-N + Phase 2b (retention, doctor) 6-H (wizard, 4 sessions)
+  Phase 4a+4b (escalation, suggest.)
+  Phase 4c (transitions)
 ```
 
-| # | Feature | Effort | Status |
-|---|---------|--------|--------|
-| 6-B | Transient immediate cleanup | 1 session | **Merged** |
-| 6-E | Promise redundancy encoding | 1 session | **Built, reviewed, ready to merge** |
-| 6-I | Redundancy recommendations | 1-2 sessions | Designed, reviewed |
-| 6-N | Retention policy preview | 1 session | Designed, reviewed |
-| 6-O | Progressive disclosure | 2 sessions | Designed, reviewed |
-| 6-H | Guided setup wizard | 4-5 sessions | Designed, reviewed |
-| 6-Sp | Spindle tray icon | 2 sessions | Designed, reviewed |
+Estimated: 15 sessions total, ~150 new/modified tests, test suite → ~740.
 
 ## Key Links
 
@@ -46,7 +52,8 @@ B (merged) → E (ready to merge) → I+N (parallel) → O → H (capstone)
 | Architecture and code conventions | [CLAUDE.md](../../CLAUDE.md) |
 | Documentation standards | [CONTRIBUTING.md](../../CONTRIBUTING.md) |
 | ADRs (100-112) | [decisions/](../00-foundation/decisions/) |
-| Latest review | [6-E implementation review](../99-reports/2026-03-31-design-e-implementation-review.md) |
+| Phase designs (1-6) | [95-ideas/](../95-ideas/) (2026-03-31-design-phase*.md) |
+| Review reports | [99-reports/](../99-reports/) |
 
 ## Known Issues
 
@@ -55,6 +62,7 @@ B (merged) → E (ready to merge) → I+N (parallel) → O → H (capstone)
 - `FileSystemState` trait (11 methods) outgrowing its name — consider rename to `SystemState`
 - `urd get` doesn't support directory restore (files only in v1)
 - Stringly-typed output boundary: three independent status-ranking implementations across notify.rs and voice.rs (addressed by 6-I migration)
-- `OpResult::Skipped` is overloaded: four distinct semantics
+- `OpResult::Skipped` overloaded: four distinct semantics (addressed by Phase 1 skip tag differentiation)
+- Sentinel Sessions 3-4 remaining (Session 3 dedup subsumed by 6-I cooldown mechanism)
 
 See [roadmap.md](roadmap.md) for the full tech debt list and dropped features.
