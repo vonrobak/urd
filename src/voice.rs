@@ -18,7 +18,7 @@ use crate::output::{
     parse_duration_to_minutes,
 };
 use crate::plan::format_duration_short;
-use crate::types::ByteSize;
+use crate::types::{ByteSize, DriveRole};
 
 // ── Status ──────────────────────────────────────────────────────────────
 
@@ -140,8 +140,18 @@ fn render_subvolume_table(data: &StatusOutput, out: &mut String) {
         return;
     }
 
-    // Collect all configured drive labels for column headers (not just mounted)
-    let drive_labels: Vec<&str> = data.drives.iter().map(|d| d.label.as_str()).collect();
+    // Only offsite drives are annotated — primary is the assumed default.
+    let drive_labels: Vec<String> = data
+        .drives
+        .iter()
+        .map(|d| {
+            if d.role == DriveRole::Offsite {
+                format!("{} (offsite)", d.label)
+            } else {
+                d.label.clone()
+            }
+        })
+        .collect();
 
     // Check if any assessment has a promise level — only show column if so
     let has_promises = data.assessments.iter().any(|a| a.promise_level.is_some());
@@ -195,11 +205,11 @@ fn render_subvolume_table(data: &StatusOutput, out: &mut String) {
         row.push(local_cell);
 
         // Per-drive columns (all configured drives, not just mounted)
-        for label in &drive_labels {
+        for drive in &data.drives {
             let ext = assessment
                 .external
                 .iter()
-                .find(|e| e.drive_label == *label);
+                .find(|e| e.drive_label == drive.label);
             let cell = match ext {
                 Some(e) if e.mounted => {
                     let count = e.snapshot_count.unwrap_or(0);
@@ -1607,6 +1617,7 @@ mod tests {
                         mounted: true,
                         snapshot_count: Some(12),
                         last_send_age_secs: Some(7200),
+                        role: DriveRole::Primary,
                     }],
                     advisories: vec![],
                     errors: vec![],
@@ -1628,6 +1639,7 @@ mod tests {
                         mounted: true,
                         snapshot_count: Some(0),
                         last_send_age_secs: None,
+                        role: DriveRole::Primary,
                     }],
                     advisories: vec![],
                     errors: vec![],
@@ -1648,11 +1660,13 @@ mod tests {
                     label: "WD-18TB".to_string(),
                     mounted: true,
                     free_bytes: Some(5_000_000_000_000),
+                    role: DriveRole::Primary,
                 },
                 DriveInfo {
                     label: "Offsite-4TB".to_string(),
                     mounted: false,
                     free_bytes: None,
+                    role: DriveRole::Offsite,
                 },
             ],
             last_run: Some(LastRunInfo {
@@ -2846,7 +2860,7 @@ mod tests {
             }],
             drives: vec![InitDriveStatus {
                 label: "WD-18TB".to_string(),
-                role: "primary".to_string(),
+                role: DriveRole::Primary,
                 mount_path: "/mnt/wd".to_string(),
                 mounted: true,
                 free_bytes: Some(500_000_000_000),
@@ -3061,6 +3075,7 @@ mod tests {
             mounted: false,
             snapshot_count: None,
             last_send_age_secs: Some(172800), // 2 days
+            role: DriveRole::Offsite,
         });
         let output = render_status(&data, OutputMode::Interactive);
         assert!(output.contains("away"), "unmounted drive with history should show 'away': {output}");
@@ -3078,6 +3093,31 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("chain broken"),
+        );
+    }
+
+    #[test]
+    fn offsite_drive_column_header_shows_role() {
+        colored::control::set_override(false);
+        let data = test_status_output();
+        let output = render_status(&data, OutputMode::Interactive);
+        assert!(
+            output.contains("Offsite-4TB (offsite)"),
+            "offsite drive header should show role annotation: {output}"
+        );
+    }
+
+    #[test]
+    fn offsite_degradation_advisory_rendered() {
+        colored::control::set_override(false);
+        let mut data = test_status_output();
+        data.assessments[0]
+            .advisories
+            .push("offsite copy stale — resilient promise degraded".to_string());
+        let output = render_status(&data, OutputMode::Interactive);
+        assert!(
+            output.contains("offsite copy stale"),
+            "offsite degradation advisory should be rendered: {output}"
         );
     }
 }

@@ -6,7 +6,7 @@
 > earn opaque status through operational track record; the current taxonomy
 > (guarded/protected/resilient) is provisional and subject to rework.
 
-**Date:** 2026-03-26 (revised 2026-03-27)
+**Date:** 2026-03-26 (revised 2026-03-27, addendum 2026-03-31)
 **Status:** Accepted (taxonomy provisional — see Maturity Model)
 **Depends on:** ADR-100 (planner/executor separation), ADR-108 (pure function modules),
 ADR-109 (config boundary validation), ADR-111 (config system architecture)
@@ -239,6 +239,58 @@ desk.
    transition. (ADR-107)
 6. **The awareness model is unchanged.** Promise levels affect what intervals are configured,
    not how evaluation works. (ADR-108)
+
+## Addendum: Offsite Freshness Contract (2026-03-31)
+
+**Context:** Design 6-E (Promise Redundancy Encoding) makes the resilient level's geographic
+requirement explicit. This addendum documents the offsite freshness contract and confirms
+that it preserves the invariants above.
+
+### Resilient requires offsite
+
+The resilient level encodes geographic redundancy: at least one configured drive must have
+`role = "offsite"`. A resilient subvolume with no offsite-role drive triggers a preflight
+advisory (`resilient-without-offsite`). This is an achievability gap, not a structural
+error — backups proceed but the promise cannot be fully met (ADR-109).
+
+### Offsite freshness thresholds
+
+For resilient subvolumes, the newest successful send to any offsite-role drive determines
+an offsite freshness status:
+
+| Offsite age (days) | Offsite freshness status |
+|--------------------|--------------------------|
+| 0–30               | PROTECTED                |
+| 31–90              | AT RISK                  |
+| > 90 (or no send)  | UNPROTECTED              |
+
+The overall subvolume status is `min(local_status, best_external_status, offsite_freshness_status)`.
+Offsite freshness is an additional constraint — it does not replace per-drive freshness
+assessment.
+
+These thresholds define what "resilient" means operationally: **monthly-or-better offsite
+rotation.** Users with longer rotation cycles must use `protection_level = "custom"`.
+The thresholds are fixed (not user-configurable), consistent with the opacity principle
+for named levels.
+
+### Invariant 6 preserved
+
+The offsite freshness computation is a **post-processing overlay** (`overlay_offsite_freshness()`)
+that runs after `assess()` returns. The awareness model itself remains protection-level-blind.
+It does not know whether a subvolume is resilient, protected, or guarded. The overlay
+operates on assessment results plus config, outside the awareness loop.
+
+This preserves Invariant 6: promise levels affect what intervals are configured, not how
+evaluation works. The overlay is a separate pure function (ADR-108) that applies an
+additional constraint based on protection level.
+
+### Scope
+
+- Only resilient subvolumes are affected. Protected, guarded, and custom are unchanged.
+- The existing 7-day "consider cycling" advisory is replaced by structured offsite freshness
+  degradation for resilient subvolumes. Protected subvolumes keep the existing advisory.
+- See Design 6-E (`docs/95-ideas/2026-03-31-design-e-promise-redundancy-encoding.md`) for
+  full rationale and review findings.
 
 ## Implementation Gates
 

@@ -94,7 +94,8 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
         write_metrics_for_skipped(&config, &backup_plan, now)?;
         let heartbeat_now = chrono::Local::now().naive_local();
         let previous_hb = heartbeat::read(&config.general.heartbeat_file);
-        let assessments = awareness::assess(&config, heartbeat_now, &fs_state);
+        let mut assessments = awareness::assess(&config, heartbeat_now, &fs_state);
+        awareness::overlay_offsite_freshness(&mut assessments, &config);
         let hb = heartbeat::build_empty(&config, heartbeat_now, &assessments);
         if let Err(e) = heartbeat::write(&config.general.heartbeat_file, &hb) {
             log::warn!("Failed to write heartbeat: {e}");
@@ -209,7 +210,8 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
 
     // Write heartbeat (fresh timestamp — `now` is from before execution)
     let heartbeat_now = chrono::Local::now().naive_local();
-    let assessments = awareness::assess(&config, heartbeat_now, &fs_state);
+    let mut assessments = awareness::assess(&config, heartbeat_now, &fs_state);
+    awareness::overlay_offsite_freshness(&mut assessments, &config);
     let hb = heartbeat::build_from_run(&config, heartbeat_now, &result, &assessments);
     if let Err(e) = heartbeat::write(&config.general.heartbeat_file, &hb) {
         log::warn!("Failed to write heartbeat: {e}");

@@ -8,6 +8,7 @@ use std::io::IsTerminal;
 use serde::{Deserialize, Serialize};
 
 use crate::awareness::{DriveAssessment, SubvolAssessment};
+use crate::types::DriveRole;
 
 // ── OutputMode ──────────────────────────────────────────────────────────
 
@@ -149,6 +150,7 @@ pub struct StatusDriveAssessment {
     /// Age of last send in seconds, if available (even when unmounted).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_send_age_secs: Option<i64>,
+    pub role: DriveRole,
 }
 
 impl StatusDriveAssessment {
@@ -160,6 +162,7 @@ impl StatusDriveAssessment {
             mounted: a.mounted,
             snapshot_count: a.snapshot_count,
             last_send_age_secs: a.last_send_age.map(|d| d.num_seconds()),
+            role: a.role,
         }
     }
 }
@@ -177,6 +180,7 @@ pub struct DriveInfo {
     pub label: String,
     pub mounted: bool,
     pub free_bytes: Option<u64>,
+    pub role: DriveRole,
 }
 
 /// Last backup run summary.
@@ -549,7 +553,7 @@ impl std::fmt::Display for InitStatus {
 #[derive(Debug, Serialize)]
 pub struct InitDriveStatus {
     pub label: String,
-    pub role: String,
+    pub role: DriveRole,
     pub mount_path: String,
     pub mounted: bool,
     pub free_bytes: Option<u64>,

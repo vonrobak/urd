@@ -813,7 +813,7 @@ mod tests {
     use crate::awareness::{
         DriveAssessment, DriveChainHealth, LocalAssessment, OperationalHealth,
     };
-    use crate::types::Interval;
+    use crate::types::{DriveRole, Interval};
 
     fn dt(s: &str) -> NaiveDateTime {
         NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M").unwrap()
@@ -866,6 +866,7 @@ mod tests {
                 snapshot_count: Some(3),
                 last_send_age: None,
                 configured_interval: Interval::hours(24),
+                role: DriveRole::Primary,
             }],
             chain_health: vec![],
             advisories: vec![],
