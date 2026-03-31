@@ -13,7 +13,7 @@ use chrono::{Duration, NaiveDateTime};
 
 use crate::config::{Config, DriveConfig};
 use crate::plan::FileSystemState;
-use crate::types::{Interval, LocalRetentionPolicy, SnapshotName};
+use crate::types::{DriveRole, Interval, LocalRetentionPolicy, ProtectionLevel, SnapshotName};
 
 // ── Thresholds ─────────────────────────────────────────────────────────
 
@@ -169,6 +169,7 @@ pub struct DriveAssessment {
     pub last_send_age: Option<Duration>,
     #[allow(dead_code)] // consumed by verbose status display (future)
     pub configured_interval: Interval,
+    pub role: DriveRole,
 }
 
 // ── Core function ──────────────────────────────────────────────────────
@@ -280,8 +281,14 @@ pub fn assess(
 
                 let status = assess_external_status(last_send_age, subvol.send_interval);
 
-                // Advisory for stale offsite drives
-                if !mounted && let Some(age) = last_send_age {
+                // Advisory for stale offsite drives — scoped to offsite role only,
+                // since "consider cycling" is offsite rotation guidance.
+                // For resilient subvolumes, overlay_offsite_freshness() provides
+                // structured degradation instead.
+                if drive.role == DriveRole::Offsite
+                    && !mounted
+                    && let Some(age) = last_send_age
+                {
                     let days = age.num_days();
                     if days > 7 {
                         advisories.push(format!(
@@ -298,6 +305,7 @@ pub fn assess(
                     snapshot_count: snap_count,
                     last_send_age,
                     configured_interval: subvol.send_interval,
+                    role: drive.role,
                 });
             }
         }
@@ -697,6 +705,67 @@ fn compute_health(
     (worst, reasons)
 }
 
+// ── Offsite freshness overlay ──────────────────────────────────────────
+
+/// Offsite freshness thresholds for resilient subvolumes.
+/// These are fixed (not user-configurable) per ADR-110 addendum.
+const OFFSITE_AT_RISK_DAYS: i64 = 30;
+const OFFSITE_UNPROTECTED_DAYS: i64 = 90;
+
+/// Post-processing overlay: degrade resilient subvolumes with stale offsite copies.
+///
+/// This is NOT part of `assess()` — awareness remains protection-level-blind per
+/// ADR-110 Invariant 6. Call this after `assess()` returns.
+///
+/// Pure function: assessments + config in, mutations in place.
+pub fn overlay_offsite_freshness(assessments: &mut [SubvolAssessment], config: &Config) {
+    let resolved = config.resolved_subvolumes();
+
+    for assessment in assessments.iter_mut() {
+        let protection_level = resolved
+            .iter()
+            .find(|s| s.name == assessment.name)
+            .and_then(|s| s.protection_level);
+
+        if protection_level != Some(ProtectionLevel::Resilient) {
+            continue;
+        }
+
+        let offsite_freshness = compute_offsite_freshness(&assessment.external);
+        if offsite_freshness < assessment.status {
+            assessment.status = offsite_freshness;
+            assessment
+                .advisories
+                .push("offsite copy stale — resilient promise degraded".to_string());
+        }
+    }
+}
+
+/// Compute offsite freshness status from drive assessments.
+///
+/// Finds the best (newest) send age among offsite-role drives and maps to a promise status.
+fn compute_offsite_freshness(drives: &[DriveAssessment]) -> PromiseStatus {
+    let best_offsite_age = drives
+        .iter()
+        .filter(|d| d.role == DriveRole::Offsite)
+        .filter_map(|d| d.last_send_age)
+        .min(); // shortest age = freshest
+
+    match best_offsite_age {
+        None => PromiseStatus::Unprotected, // no offsite send ever
+        Some(age) => {
+            let days = age.num_days();
+            if days <= OFFSITE_AT_RISK_DAYS {
+                PromiseStatus::Protected
+            } else if days <= OFFSITE_UNPROTECTED_DAYS {
+                PromiseStatus::AtRisk
+            } else {
+                PromiseStatus::Unprotected
+            }
+        }
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -738,6 +807,53 @@ label = "WD-18TB"
 mount_path = "/mnt/wd"
 snapshot_root = ".snapshots"
 role = "primary"
+
+[[subvolumes]]
+name = "sv1"
+short_name = "sv1"
+source = "/data/sv1"
+
+[[subvolumes]]
+name = "sv2"
+short_name = "sv2"
+source = "/data/sv2"
+"#;
+        toml::from_str(toml_str).expect("test config should parse")
+    }
+
+    /// Like test_config but with an offsite drive instead of primary.
+    fn offsite_test_config() -> Config {
+        let toml_str = r#"
+[general]
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp"
+
+[local_snapshots]
+roots = [
+  { path = "/snap", subvolumes = ["sv1", "sv2"] }
+]
+
+[defaults]
+snapshot_interval = "1h"
+send_interval = "1d"
+send_enabled = true
+enabled = true
+[defaults.local_retention]
+hourly = 24
+daily = 30
+weekly = 26
+monthly = 12
+[defaults.external_retention]
+daily = 30
+weekly = 26
+monthly = 0
+
+[[drives]]
+label = "offsite-drive"
+mount_path = "/mnt/offsite"
+snapshot_root = ".snapshots"
+role = "offsite"
 
 [[subvolumes]]
 name = "sv1"
@@ -1409,7 +1525,7 @@ source = "/data/sv1"
 
     #[test]
     fn offsite_advisory_for_stale_drive() {
-        let config = test_config();
+        let config = offsite_test_config();
         let now = dt(2026, 3, 23, 14, 0);
         let mut fs = MockFileSystemState::new();
 
@@ -1420,7 +1536,7 @@ source = "/data/sv1"
 
         // Send 10 days ago + drive unmounted → advisory
         fs.send_times.insert(
-            ("sv1".to_string(), "WD-18TB".to_string()),
+            ("sv1".to_string(), "offsite-drive".to_string()),
             dt(2026, 3, 13, 8, 0),
         );
         // Drive NOT mounted
@@ -1430,9 +1546,39 @@ source = "/data/sv1"
             results[0]
                 .advisories
                 .iter()
-                .any(|a| a.contains("consider cycling"))
+                .any(|a| a.contains("consider cycling")),
+            "offsite drive should get cycling advisory: {:?}",
+            results[0].advisories,
         );
-        assert!(results[0].advisories[0].contains("WD-18TB"));
+        assert!(results[0].advisories[0].contains("offsite-drive"));
+    }
+
+    #[test]
+    fn primary_drive_no_cycling_advisory() {
+        let config = test_config();
+        let now = dt(2026, 3, 23, 14, 0);
+        let mut fs = MockFileSystemState::new();
+
+        fs.local_snapshots.insert(
+            "sv1".to_string(),
+            vec![snap(dt(2026, 3, 23, 13, 30), "sv1")],
+        );
+
+        // Primary drive unmounted with 10-day-old send — should NOT get "consider cycling"
+        fs.send_times.insert(
+            ("sv1".to_string(), "WD-18TB".to_string()),
+            dt(2026, 3, 13, 8, 0),
+        );
+
+        let results = assess(&config, now, &fs);
+        assert!(
+            !results[0]
+                .advisories
+                .iter()
+                .any(|a| a.contains("consider cycling")),
+            "primary drive should not get cycling advisory: {:?}",
+            results[0].advisories,
+        );
     }
 
     // ── Test 17: No drives configured → advisory ───────────────────
@@ -2501,5 +2647,256 @@ send_enabled = false
         // because there is no external safety mechanism.
         assert_eq!(results[0].local.status, PromiseStatus::Protected);
         assert_eq!(results[0].status, PromiseStatus::Unprotected);
+    }
+
+    // ── Offsite freshness overlay tests ─────────────────────────────
+
+    fn resilient_config() -> Config {
+        let toml_str = r#"
+[general]
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp"
+
+[local_snapshots]
+roots = [
+  { path = "/snap", subvolumes = ["sv1"] }
+]
+
+[defaults]
+snapshot_interval = "1h"
+send_interval = "1d"
+send_enabled = true
+enabled = true
+[defaults.local_retention]
+hourly = 24
+daily = 30
+weekly = 26
+monthly = 12
+[defaults.external_retention]
+daily = 30
+weekly = 26
+monthly = 0
+
+[[drives]]
+label = "primary-drive"
+mount_path = "/mnt/primary"
+snapshot_root = ".snapshots"
+role = "primary"
+
+[[drives]]
+label = "offsite-drive"
+mount_path = "/mnt/offsite"
+snapshot_root = ".snapshots"
+role = "offsite"
+
+[[subvolumes]]
+name = "sv1"
+short_name = "sv1"
+source = "/data"
+protection_level = "resilient"
+drives = ["primary-drive", "offsite-drive"]
+"#;
+        toml::from_str(toml_str).expect("test config should parse")
+    }
+
+    fn make_assessment(
+        name: &str,
+        status: PromiseStatus,
+        drives: Vec<DriveAssessment>,
+    ) -> SubvolAssessment {
+        SubvolAssessment {
+            name: name.to_string(),
+            status,
+            health: OperationalHealth::Healthy,
+            health_reasons: vec![],
+            local: LocalAssessment {
+                status: PromiseStatus::Protected,
+                snapshot_count: 10,
+                newest_age: Some(Duration::minutes(30)),
+                configured_interval: Interval::hours(1),
+            },
+            external: drives,
+            chain_health: vec![],
+            advisories: vec![],
+            errors: vec![],
+        }
+    }
+
+    fn offsite_drive_assessment(age_days: Option<i64>) -> DriveAssessment {
+        DriveAssessment {
+            drive_label: "offsite-drive".to_string(),
+            status: PromiseStatus::Protected,
+            mounted: age_days.is_some(),
+            snapshot_count: Some(5),
+            last_send_age: age_days.map(Duration::days),
+            configured_interval: Interval::hours(24),
+            role: DriveRole::Offsite,
+        }
+    }
+
+    fn primary_drive_assessment() -> DriveAssessment {
+        DriveAssessment {
+            drive_label: "primary-drive".to_string(),
+            status: PromiseStatus::Protected,
+            mounted: true,
+            snapshot_count: Some(100),
+            last_send_age: Some(Duration::hours(2)),
+            configured_interval: Interval::hours(24),
+            role: DriveRole::Primary,
+        }
+    }
+
+    #[test]
+    fn overlay_fresh_offsite_stays_protected() {
+        let config = resilient_config();
+        let drives = vec![primary_drive_assessment(), offsite_drive_assessment(Some(10))];
+        let mut assessments = vec![make_assessment("sv1", PromiseStatus::Protected, drives)];
+
+        overlay_offsite_freshness(&mut assessments, &config);
+
+        assert_eq!(assessments[0].status, PromiseStatus::Protected);
+        assert!(assessments[0].advisories.is_empty());
+    }
+
+    #[test]
+    fn overlay_stale_offsite_degrades_to_at_risk() {
+        let config = resilient_config();
+        let drives = vec![primary_drive_assessment(), offsite_drive_assessment(Some(31))];
+        let mut assessments = vec![make_assessment("sv1", PromiseStatus::Protected, drives)];
+
+        overlay_offsite_freshness(&mut assessments, &config);
+
+        assert_eq!(assessments[0].status, PromiseStatus::AtRisk);
+        assert!(assessments[0].advisories.iter().any(|a| a.contains("offsite copy stale")));
+    }
+
+    #[test]
+    fn overlay_very_stale_offsite_degrades_to_unprotected() {
+        let config = resilient_config();
+        let drives = vec![primary_drive_assessment(), offsite_drive_assessment(Some(91))];
+        let mut assessments = vec![make_assessment("sv1", PromiseStatus::Protected, drives)];
+
+        overlay_offsite_freshness(&mut assessments, &config);
+
+        assert_eq!(assessments[0].status, PromiseStatus::Unprotected);
+    }
+
+    #[test]
+    fn overlay_no_offsite_send_is_unprotected() {
+        let config = resilient_config();
+        let drives = vec![primary_drive_assessment(), offsite_drive_assessment(None)];
+        let mut assessments = vec![make_assessment("sv1", PromiseStatus::Protected, drives)];
+
+        overlay_offsite_freshness(&mut assessments, &config);
+
+        assert_eq!(assessments[0].status, PromiseStatus::Unprotected);
+    }
+
+    #[test]
+    fn overlay_skips_non_resilient() {
+        // Use the base test_config() which has no protection_level set
+        let config = test_config();
+        let drives = vec![DriveAssessment {
+            drive_label: "WD-18TB".to_string(),
+            status: PromiseStatus::Protected,
+            mounted: true,
+            snapshot_count: Some(5),
+            last_send_age: Some(Duration::days(60)),
+            configured_interval: Interval::hours(24),
+            role: DriveRole::Offsite,
+        }];
+        let mut assessments = vec![make_assessment("sv1", PromiseStatus::Protected, drives)];
+
+        overlay_offsite_freshness(&mut assessments, &config);
+
+        // Should remain Protected — not resilient, so overlay doesn't apply
+        assert_eq!(assessments[0].status, PromiseStatus::Protected);
+        assert!(assessments[0].advisories.is_empty());
+    }
+
+    #[test]
+    fn overlay_independent_of_primary_status() {
+        // Primary drive is AT RISK, offsite is fresh — overall should be AT RISK
+        // (independent constraints, minimum wins)
+        let config = resilient_config();
+        let mut primary = primary_drive_assessment();
+        primary.status = PromiseStatus::AtRisk;
+        let drives = vec![primary, offsite_drive_assessment(Some(5))];
+        let mut assessments = vec![make_assessment("sv1", PromiseStatus::AtRisk, drives)];
+
+        overlay_offsite_freshness(&mut assessments, &config);
+
+        // Offsite freshness is Protected (5 days), but overall was already AT RISK
+        // from the primary drive. Overlay doesn't improve — it only degrades.
+        assert_eq!(assessments[0].status, PromiseStatus::AtRisk);
+    }
+
+    #[test]
+    fn overlay_two_offsite_drives_best_wins() {
+        let config = resilient_config();
+        let stale_offsite = DriveAssessment {
+            drive_label: "offsite-old".to_string(),
+            status: PromiseStatus::AtRisk,
+            mounted: false,
+            snapshot_count: None,
+            last_send_age: Some(Duration::days(60)),
+            configured_interval: Interval::hours(24),
+            role: DriveRole::Offsite,
+        };
+        let fresh_offsite = offsite_drive_assessment(Some(10));
+        let drives = vec![primary_drive_assessment(), stale_offsite, fresh_offsite];
+        let mut assessments = vec![make_assessment("sv1", PromiseStatus::Protected, drives)];
+
+        overlay_offsite_freshness(&mut assessments, &config);
+
+        // Fresh offsite (10 days) wins — status stays Protected
+        assert_eq!(assessments[0].status, PromiseStatus::Protected);
+    }
+
+    #[test]
+    fn overlay_boundary_30_days_is_protected() {
+        let config = resilient_config();
+        let drives = vec![primary_drive_assessment(), offsite_drive_assessment(Some(30))];
+        let mut assessments = vec![make_assessment("sv1", PromiseStatus::Protected, drives)];
+
+        overlay_offsite_freshness(&mut assessments, &config);
+
+        assert_eq!(assessments[0].status, PromiseStatus::Protected);
+    }
+
+    #[test]
+    fn overlay_already_unprotected_no_redundant_advisory() {
+        // If the subvolume is already Unprotected (e.g., local snapshots stale),
+        // the overlay should not add its advisory — Unprotected < Unprotected is false.
+        let config = resilient_config();
+        let drives = vec![primary_drive_assessment(), offsite_drive_assessment(Some(91))];
+        let mut assessments =
+            vec![make_assessment("sv1", PromiseStatus::Unprotected, drives)];
+
+        overlay_offsite_freshness(&mut assessments, &config);
+
+        assert_eq!(assessments[0].status, PromiseStatus::Unprotected);
+        assert!(
+            assessments[0].advisories.is_empty(),
+            "should not add advisory when already at worst status"
+        );
+    }
+
+    #[test]
+    fn overlay_equal_status_no_change() {
+        // If offsite freshness matches current status, overlay should not update or add advisory.
+        // Offsite at 31 days = AtRisk; assessment already AtRisk.
+        let config = resilient_config();
+        let drives = vec![primary_drive_assessment(), offsite_drive_assessment(Some(31))];
+        let mut assessments = vec![make_assessment("sv1", PromiseStatus::AtRisk, drives)];
+
+        overlay_offsite_freshness(&mut assessments, &config);
+
+        assert_eq!(assessments[0].status, PromiseStatus::AtRisk);
+        assert!(
+            assessments[0].advisories.is_empty(),
+            "should not add advisory when status already matches"
+        );
     }
 }

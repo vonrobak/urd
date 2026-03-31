@@ -209,7 +209,7 @@ mod tests {
     use crate::executor::{
         ExecutionResult, RunResult, SendType, SubvolumeResult, TransientCleanupOutcome,
     };
-    use crate::types::{GraduatedRetention, Interval, RunFrequency};
+    use crate::types::{DriveRole, GraduatedRetention, Interval, RunFrequency};
     use std::path::PathBuf;
 
     fn test_config(intervals: &[(&str, &str)]) -> Config {
@@ -293,6 +293,7 @@ mod tests {
                     snapshot_count: Some(10),
                     last_send_age: Some(chrono::Duration::hours(2)),
                     configured_interval: Interval::hours(4),
+                    role: DriveRole::Primary,
                 }],
                 chain_health: vec![],
                 advisories: vec![],

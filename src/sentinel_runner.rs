@@ -231,7 +231,8 @@ impl SentinelRunner {
             state: state_db.as_ref(),
         };
 
-        let assessments = awareness::assess(&self.config, now, &fs);
+        let mut assessments = awareness::assess(&self.config, now, &fs);
+        awareness::overlay_offsite_freshness(&mut assessments, &self.config);
 
         // Collect notifications from two independent sources.
         let mut notifications = Vec::new();

@@ -10,6 +10,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Transient immediate cleanup: executor deletes old pin parent immediately after successful send to all drives, reducing local snapshot count from two to one between runs
 - `Config::drive_labels()` helper for collecting configured drive labels
+- Promise redundancy encoding: resilient protection level now requires at least one offsite-role drive and degrades promise status when the offsite copy goes stale (30/90-day thresholds)
+- Preflight check `resilient-without-offsite` warns when resilient subvolume lacks an offsite drive
+- Offsite drive role shown as "(offsite)" annotation in `urd status` table column headers
+- `DriveRole` plumbed through `DriveAssessment`, `StatusDriveAssessment`, `DriveInfo`, and `InitDriveStatus`
+
+### Fixed
+- 7-day "consider cycling" advisory now scoped to offsite-role drives only (previously fired for all unmounted drives)
 
 ## [0.5.0] - 2026-03-30
 

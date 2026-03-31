@@ -23,7 +23,8 @@ pub fn run(config: Config, output_mode: OutputMode) -> anyhow::Result<()> {
 
     // ── Awareness model ─────────────────────────────────────────────
     let now = chrono::Local::now().naive_local();
-    let assessments = awareness::assess(&config, now, &fs_state);
+    let mut assessments = awareness::assess(&config, now, &fs_state);
+    awareness::overlay_offsite_freshness(&mut assessments, &config);
 
     // ── Chain health per subvolume (derived from awareness assessment) ──
     let chain_health_entries: Vec<ChainHealthEntry> = assessments
@@ -64,6 +65,7 @@ pub fn run(config: Config, output_mode: OutputMode) -> anyhow::Result<()> {
                 } else {
                     None
                 },
+                role: d.role,
             }
         })
         .collect();

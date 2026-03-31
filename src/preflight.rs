@@ -9,7 +9,7 @@
 use serde::Serialize;
 
 use crate::config::Config;
-use crate::types::{ProtectionLevel, derive_policy};
+use crate::types::{DriveRole, ProtectionLevel, derive_policy};
 
 // ── Types ──────────────────────────────────────────────────────────────
 
@@ -184,21 +184,43 @@ fn check_promise_achievability(
         None => return,
     };
 
+    // ── Drives in scope for this subvolume ─────────────────────────
+    let drives_in_scope: Vec<&crate::config::DriveConfig> = match subvol.drives {
+        Some(ref labels) => config
+            .drives
+            .iter()
+            .filter(|d| labels.contains(&d.label))
+            .collect(),
+        None => config.drives.iter().collect(),
+    };
+
     // ── Drive count vs promise ───────────────────────────────────────
-    if derived.min_external_drives > 0 {
-        let available_drives = match subvol.drives {
-            Some(ref drives) => drives.len(),
-            None => config.drives.len(),
-        };
-        if (available_drives as u8) < derived.min_external_drives {
-            checks.push(PreflightCheck {
-                name: "drive-count-vs-promise",
-                message: format!(
-                    "{}: {} promise requires {} external drive(s), but only {} configured",
-                    subvol.name, level, derived.min_external_drives, available_drives,
-                ),
-            });
-        }
+    if derived.min_external_drives > 0
+        && (drives_in_scope.len() as u8) < derived.min_external_drives
+    {
+        checks.push(PreflightCheck {
+            name: "drive-count-vs-promise",
+            message: format!(
+                "{}: {} promise requires {} external drive(s), but only {} configured",
+                subvol.name,
+                level,
+                derived.min_external_drives,
+                drives_in_scope.len(),
+            ),
+        });
+    }
+
+    // ── Resilient without offsite ──────────────────────────────────
+    if level == ProtectionLevel::Resilient
+        && !drives_in_scope.iter().any(|d| d.role == DriveRole::Offsite)
+    {
+        checks.push(PreflightCheck {
+            name: "resilient-without-offsite",
+            message: format!(
+                "{}: resilient promise requires at least one drive with role = \"offsite\"",
+                subvol.name,
+            ),
+        });
     }
 
     // ── Voiding overrides ────────────────────────────────────────────
@@ -735,5 +757,76 @@ mod tests {
             results.is_empty(),
             "transient should skip retention-send-compatibility check"
         );
+    }
+
+    // ── Resilient without offsite ───────────────────────────────────
+
+    fn offsite_drive() -> DriveConfig {
+        DriveConfig {
+            label: "offsite-drive".to_string(),
+            uuid: None,
+            mount_path: PathBuf::from("/mnt/offsite"),
+            snapshot_root: "urd-snapshots".to_string(),
+            role: DriveRole::Offsite,
+            max_usage_percent: Some(90),
+            min_free_bytes: None,
+        }
+    }
+
+    #[test]
+    fn resilient_without_offsite_warns() {
+        let mut sv = test_subvolume("recordings");
+        sv.protection_level = Some(crate::types::ProtectionLevel::Resilient);
+        // Two primary drives — no offsite
+        let mut drive2 = test_drive();
+        drive2.label = "drive-2".to_string();
+        let config = test_config(vec![sv], vec![test_drive(), drive2]);
+        let results: Vec<_> = preflight_checks(&config)
+            .into_iter()
+            .filter(|c| c.name == "resilient-without-offsite")
+            .collect();
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].message.contains("role = \"offsite\""));
+    }
+
+    #[test]
+    fn resilient_with_offsite_no_warning() {
+        let mut sv = test_subvolume("recordings");
+        sv.protection_level = Some(crate::types::ProtectionLevel::Resilient);
+        let config = test_config(vec![sv], vec![test_drive(), offsite_drive()]);
+        let results: Vec<_> = preflight_checks(&config)
+            .into_iter()
+            .filter(|c| c.name == "resilient-without-offsite")
+            .collect();
+
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn protected_without_offsite_no_warning() {
+        let mut sv = test_subvolume("documents");
+        sv.protection_level = Some(crate::types::ProtectionLevel::Protected);
+        let config = test_config(vec![sv], vec![test_drive()]);
+        let results: Vec<_> = preflight_checks(&config)
+            .into_iter()
+            .filter(|c| c.name == "resilient-without-offsite")
+            .collect();
+
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn resilient_with_scoped_offsite_drive_passes() {
+        let mut sv = test_subvolume("recordings");
+        sv.protection_level = Some(crate::types::ProtectionLevel::Resilient);
+        sv.drives = Some(vec!["test-drive".to_string(), "offsite-drive".to_string()]);
+        let config = test_config(vec![sv], vec![test_drive(), offsite_drive()]);
+        let results: Vec<_> = preflight_checks(&config)
+            .into_iter()
+            .filter(|c| c.name == "resilient-without-offsite")
+            .collect();
+
+        assert!(results.is_empty());
     }
 }

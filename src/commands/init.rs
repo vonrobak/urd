@@ -233,7 +233,7 @@ fn collect_drive_status(config: &Config) -> Vec<InitDriveStatus> {
             };
             InitDriveStatus {
                 label: drive.label.clone(),
-                role: drive.role.to_string(),
+                role: drive.role,
                 mount_path: drive.mount_path.display().to_string(),
                 mounted,
                 free_bytes,
