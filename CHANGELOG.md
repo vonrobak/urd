@@ -7,14 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
-- Vocabulary overhaul: safety labels are now sealed/waning/exposed, chain→thread, mounted→connected/disconnected/away, SAFETY→EXPOSURE, CHAIN→THREAD, PROMISE→PROTECTION column headers
-- CLI command descriptions rewritten to intent-first language (e.g., "Check whether your data is safe")
-- Summary line now differentiates exposure levels: "htpc-root exposed. docs waning." instead of generic "needs attention"
-- Skip tags differentiated by category: [WAIT], [AWAY], [SPACE], [OFF], [SKIP] replace overloaded [SKIP]
-- Drive status is now role-aware: offsite drives show "away" when disconnected, primary drives show "disconnected"
-- Notification mythology cleaned up: loom/weave→spindle/thread, rewoven→mended, unguarded→exposed
-- `UrdError::Chain` error message changed from "Chain error" to "Thread error" (log grep patterns may need updating)
+## [0.6.0] - 2026-04-01
 
 ### Added
 - Bare `urd` (no subcommand) shows a one-sentence status: "All sealed. Last backup 7h ago." or "3 of 9 sealed. htpc-root exposed." First-time users see setup guidance instead of help text
@@ -26,6 +19,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Preflight check `resilient-without-offsite` warns when resilient subvolume lacks an offsite drive
 - Offsite drive role shown as "(offsite)" annotation in `urd status` table column headers
 - `DriveRole` plumbed through `DriveAssessment`, `StatusDriveAssessment`, `DriveInfo`, and `InitDriveStatus`
+
+### Changed
+- Vocabulary overhaul: safety labels are now sealed/waning/exposed, chain→thread, mounted→connected/disconnected/away, SAFETY→EXPOSURE, CHAIN→THREAD, PROMISE→PROTECTION column headers
+- CLI command descriptions rewritten to intent-first language (e.g., "Check whether your data is safe")
+- Summary line now differentiates exposure levels: "htpc-root exposed. docs waning." instead of generic "needs attention"
+- Skip tags differentiated by category: [WAIT], [AWAY], [SPACE], [OFF], [SKIP] replace overloaded [SKIP]
+- Drive status is now role-aware: offsite drives show "away" when disconnected, primary drives show "disconnected"
+- Notification mythology cleaned up: loom/weave→spindle/thread, rewoven→mended, unguarded→exposed
+- `UrdError::Chain` error message changed from "Chain error" to "Thread error" (log grep patterns may need updating)
 
 ### Fixed
 - 7-day "consider cycling" advisory now scoped to offsite-role drives only (previously fired for all unmounted drives)
@@ -144,7 +146,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Defense-in-depth pin file protection for unsent snapshots
 - Per-subvolume error isolation in executor
 
-[Unreleased]: https://github.com/vonrobak/urd/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/vonrobak/urd/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/vonrobak/urd/compare/v0.5.0...v0.6.0
+[0.5.0]: https://github.com/vonrobak/urd/compare/v0.4.3...v0.5.0
+[0.4.3]: https://github.com/vonrobak/urd/compare/v0.4.2...v0.4.3
+[0.4.2]: https://github.com/vonrobak/urd/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/vonrobak/urd/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/vonrobak/urd/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/vonrobak/urd/compare/v0.2.0...v0.3.0
