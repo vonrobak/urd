@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Transient immediate cleanup: executor deletes old pin parent immediately after successful send to all drives, reducing local snapshot count from two to one between runs
+- `Config::drive_labels()` helper for collecting configured drive labels
+
 ## [0.5.0] - 2026-03-30
 
 ### Added

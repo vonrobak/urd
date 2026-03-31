@@ -275,6 +275,12 @@ impl Config {
         None
     }
 
+    /// Collect all configured drive labels.
+    #[must_use]
+    pub fn drive_labels(&self) -> Vec<String> {
+        self.drives.iter().map(|d| d.label.clone()).collect()
+    }
+
     /// Get the local snapshot directory for a subvolume: `{root}/{subvol_name}/`
     #[must_use]
     pub fn local_snapshot_dir(&self, subvol_name: &str) -> Option<PathBuf> {
