@@ -12,10 +12,10 @@ use std::fmt::Write;
 use colored::Colorize;
 
 use crate::output::{
-    BackupSummary, CalibrateOutput, CalibrateResult, ChainHealth, FailuresOutput, GetOutput,
-    HistoryOutput, InitOutput, InitStatus, OutputMode, PlanOutput, SentinelStatusOutput,
-    SkipCategory, SkippedSubvolume, StatusOutput, SubvolumeHistoryOutput, VerifyOutput,
-    parse_duration_to_minutes,
+    BackupSummary, CalibrateOutput, CalibrateResult, ChainHealth, DefaultStatusOutput,
+    FailuresOutput, GetOutput, HistoryOutput, InitOutput, InitStatus, OutputMode, PlanOutput,
+    SentinelStatusOutput, SkipCategory, SkippedSubvolume, StatusOutput, SubvolumeHistoryOutput,
+    VerifyOutput, parse_duration_to_minutes,
 };
 use crate::plan::format_duration_short;
 use crate::types::{ByteSize, DriveRole};
@@ -1625,6 +1625,66 @@ fn format_tick_description(tick_secs: u64, promise_states: &[crate::output::Sent
     format!("{tick_str} — {state_desc}")
 }
 
+// ── Default status (bare `urd`) ────────────────────────────────────────
+
+/// Render bare `urd` one-sentence status.
+#[must_use]
+pub fn render_default_status(data: &DefaultStatusOutput, mode: OutputMode) -> String {
+    match mode {
+        OutputMode::Interactive => render_default_status_interactive(data),
+        OutputMode::Daemon => render_default_status_daemon(data),
+    }
+}
+
+fn render_default_status_daemon(data: &DefaultStatusOutput) -> String {
+    serde_json::to_string_pretty(data).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
+}
+
+fn render_default_status_interactive(data: &DefaultStatusOutput) -> String {
+    let mut out = String::new();
+
+    // Safety line
+    if data.sealed_count() == data.total {
+        write!(out, "{}", "All sealed.".green()).ok();
+    } else {
+        write!(out, "{} of {} sealed.", data.sealed_count(), data.total).ok();
+        if !data.exposed_names.is_empty() {
+            write!(out, " {} {}.", data.exposed_names.join(", "), "exposed".red()).ok();
+        }
+        if !data.waning_names.is_empty() {
+            write!(out, " {} waning.", data.waning_names.join(", ")).ok();
+        }
+    }
+
+    // Last backup age (pre-computed by command handler to keep voice pure)
+    if let Some(age_secs) = data.last_run_age_secs {
+        write!(out, " Last backup {} ago.", humanize_duration(age_secs)).ok();
+    }
+
+    writeln!(out).ok();
+
+    // Hint line
+    if data.sealed_count() == data.total {
+        writeln!(out, "Run `urd status` for details, `urd --help` for commands.").ok();
+    } else {
+        writeln!(out, "Run `urd status` for details.").ok();
+    }
+
+    out
+}
+
+/// Render first-time message (no config found).
+#[must_use]
+pub fn render_first_time(mode: OutputMode) -> String {
+    match mode {
+        OutputMode::Interactive => {
+            "Urd is not configured yet.\nRun `urd init` to get started, or see `urd --help`.\n"
+                .to_string()
+        }
+        OutputMode::Daemon => r#"{"status":"not_configured"}"#.to_string(),
+    }
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -3226,5 +3286,155 @@ mod tests {
             output.contains("offsite copy stale"),
             "offsite degradation advisory should be rendered: {output}"
         );
+    }
+
+    // ── Default status tests ───────────────────────────────────────────
+
+    fn test_default_all_sealed() -> DefaultStatusOutput {
+        DefaultStatusOutput {
+            total: 4,
+            waning_names: vec![],
+            exposed_names: vec![],
+            last_run: Some(LastRunInfo {
+                id: 42,
+                started_at: "2026-03-31T21:00:00".to_string(),
+                result: "success".to_string(),
+                duration: Some("1m 30s".to_string()),
+            }),
+            last_run_age_secs: Some(25200), // 7 hours
+        }
+    }
+
+    #[test]
+    fn default_all_sealed() {
+        colored::control::set_override(false);
+        let output = render_default_status(&test_default_all_sealed(), OutputMode::Interactive);
+        assert!(output.contains("All sealed."), "missing 'All sealed.' in: {output}");
+        assert!(
+            output.contains("urd status"),
+            "missing hint to run urd status: {output}"
+        );
+        assert!(
+            output.contains("urd --help"),
+            "all-sealed should mention --help: {output}"
+        );
+    }
+
+    #[test]
+    fn default_some_exposed() {
+        colored::control::set_override(false);
+        let data = DefaultStatusOutput {
+            total: 9,
+            waning_names: vec![],
+            exposed_names: vec!["htpc-root".to_string(), "docs".to_string()],
+            last_run: None,
+            last_run_age_secs: None,
+        };
+        let output = render_default_status(&data, OutputMode::Interactive);
+        assert!(
+            output.contains("7 of 9 sealed."),
+            "missing count in: {output}"
+        );
+        assert!(
+            output.contains("htpc-root, docs"),
+            "missing exposed names in: {output}"
+        );
+        assert!(
+            output.contains("exposed"),
+            "missing 'exposed' label in: {output}"
+        );
+        assert!(
+            !output.contains("urd --help"),
+            "non-sealed should not mention --help: {output}"
+        );
+    }
+
+    #[test]
+    fn default_some_waning() {
+        colored::control::set_override(false);
+        let data = DefaultStatusOutput {
+            total: 5,
+            waning_names: vec!["htpc-config".to_string()],
+            exposed_names: vec!["htpc-root".to_string()],
+            last_run: None,
+            last_run_age_secs: None,
+        };
+        let output = render_default_status(&data, OutputMode::Interactive);
+        assert!(
+            output.contains("3 of 5 sealed."),
+            "missing count in: {output}"
+        );
+        assert!(
+            output.contains("htpc-root"),
+            "missing exposed name in: {output}"
+        );
+        assert!(
+            output.contains("htpc-config waning"),
+            "missing waning name in: {output}"
+        );
+    }
+
+    #[test]
+    fn default_with_last_backup() {
+        colored::control::set_override(false);
+        let output = render_default_status(&test_default_all_sealed(), OutputMode::Interactive);
+        assert!(
+            output.contains("Last backup 7h ago."),
+            "missing deterministic 'Last backup 7h ago.' in: {output}"
+        );
+    }
+
+    #[test]
+    fn default_no_last_backup() {
+        colored::control::set_override(false);
+        let data = DefaultStatusOutput {
+            total: 2,
+            waning_names: vec![],
+            exposed_names: vec![],
+            last_run: None,
+            last_run_age_secs: None,
+        };
+        let output = render_default_status(&data, OutputMode::Interactive);
+        assert!(
+            !output.contains("Last backup"),
+            "should not contain last backup when None: {output}"
+        );
+    }
+
+    #[test]
+    fn default_daemon_json() {
+        let data = DefaultStatusOutput {
+            total: 3,
+            waning_names: vec!["sv1".to_string()],
+            exposed_names: vec![],
+            last_run: None,
+            last_run_age_secs: None,
+        };
+        let output = render_default_status(&data, OutputMode::Daemon);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&output).expect("daemon output should be valid JSON");
+        assert_eq!(parsed["total"], 3);
+        assert_eq!(parsed["waning_names"][0], "sv1");
+    }
+
+    #[test]
+    fn first_time_interactive() {
+        let output = render_first_time(OutputMode::Interactive);
+        assert!(
+            output.contains("not configured yet"),
+            "missing 'not configured yet' in: {output}"
+        );
+        assert!(
+            output.contains("urd init"),
+            "missing 'urd init' guidance in: {output}"
+        );
+    }
+
+    #[test]
+    fn first_time_daemon_json() {
+        let output = render_first_time(OutputMode::Daemon);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&output).expect("daemon first-time should be valid JSON");
+        assert_eq!(parsed["status"], "not_configured");
     }
 }

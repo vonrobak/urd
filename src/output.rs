@@ -192,6 +192,31 @@ pub struct LastRunInfo {
     pub duration: Option<String>,
 }
 
+// ── DefaultStatusOutput ────────────────────────────────────────────────
+
+/// Structured output for bare `urd` — one-sentence status.
+#[derive(Debug, Serialize)]
+pub struct DefaultStatusOutput {
+    /// Total number of configured subvolumes.
+    pub total: usize,
+    /// Names of subvolumes with AT RISK status.
+    pub waning_names: Vec<String>,
+    /// Names of subvolumes with UNPROTECTED status.
+    pub exposed_names: Vec<String>,
+    /// Last backup run info.
+    pub last_run: Option<LastRunInfo>,
+    /// Seconds since last backup started, pre-computed by the command handler.
+    pub last_run_age_secs: Option<i64>,
+}
+
+impl DefaultStatusOutput {
+    /// Number of sealed (PROTECTED) subvolumes, derived from total minus non-sealed.
+    #[must_use]
+    pub fn sealed_count(&self) -> usize {
+        self.total - self.waning_names.len() - self.exposed_names.len()
+    }
+}
+
 // ── GetOutput ──────────────────────────────────────────────────────────
 
 /// Structured output for the `urd get` command (metadata, not file content).

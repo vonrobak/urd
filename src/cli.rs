@@ -6,7 +6,7 @@ use clap::{Parser, Subcommand};
 #[command(name = "urd", about = "BTRFS Time Machine for Linux", version)]
 pub struct Cli {
     #[command(subcommand)]
-    pub command: Commands,
+    pub command: Option<Commands>,
 
     /// Path to config file (default: ~/.config/urd/urd.toml)
     #[arg(long, short)]
@@ -37,6 +37,14 @@ pub enum Commands {
     Get(GetArgs),
     /// Sentinel — continuous health monitoring
     Sentinel(SentinelArgs),
+    /// Generate shell completion scripts
+    Completions(CompletionsArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub struct CompletionsArgs {
+    /// Shell to generate completions for (bash, zsh, fish, elvish, powershell)
+    pub shell: clap_complete::Shell,
 }
 
 #[derive(clap::Args, Debug)]
@@ -154,4 +162,35 @@ pub struct VerifyArgs {
     /// Only verify against this drive
     #[arg(long)]
     pub drive: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn bare_urd_parses_to_none() {
+        let cli = Cli::try_parse_from(["urd"]).expect("bare urd should parse");
+        assert!(cli.command.is_none(), "bare urd should yield None command");
+    }
+
+    #[test]
+    fn completions_bash_parses() {
+        let cli =
+            Cli::try_parse_from(["urd", "completions", "bash"]).expect("completions should parse");
+        assert!(
+            matches!(cli.command, Some(Commands::Completions(_))),
+            "should parse as Completions"
+        );
+    }
+
+    #[test]
+    fn existing_commands_still_parse() {
+        let cli = Cli::try_parse_from(["urd", "status"]).expect("status should parse");
+        assert!(
+            matches!(cli.command, Some(Commands::Status)),
+            "status should parse as Some(Status)"
+        );
+    }
 }

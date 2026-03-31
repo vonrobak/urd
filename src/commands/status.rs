@@ -3,7 +3,7 @@ use crate::chain;
 use crate::config::Config;
 use crate::drives;
 use crate::output::{
-    ChainHealth, ChainHealthEntry, DriveInfo, LastRunInfo, OutputMode, StatusAssessment,
+    ChainHealth, ChainHealthEntry, DriveInfo, OutputMode, StatusAssessment,
     StatusOutput,
 };
 use crate::plan::RealFileSystemState;
@@ -71,25 +71,7 @@ pub fn run(config: Config, output_mode: OutputMode) -> anyhow::Result<()> {
         .collect();
 
     // ── Last run ────────────────────────────────────────────────────
-    let last_run = state_db.as_ref().and_then(|db| match db.last_run() {
-        Ok(Some(run)) => {
-            let duration = run
-                .finished_at
-                .as_ref()
-                .and_then(|f| crate::types::format_run_duration(&run.started_at, f));
-            Some(LastRunInfo {
-                id: run.id,
-                started_at: run.started_at.clone(),
-                result: run.result.clone(),
-                duration,
-            })
-        }
-        Ok(None) => None,
-        Err(e) => {
-            log::warn!("Failed to query last run: {e}");
-            None
-        }
-    });
+    let last_run = state_db.as_ref().and_then(|db| db.last_run_info());
 
     // ── Pin count ───────────────────────────────────────────────────
     let total_pins: usize = config

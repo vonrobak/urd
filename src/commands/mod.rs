@@ -1,5 +1,7 @@
 pub mod backup;
 pub mod calibrate;
+pub mod completions;
+pub mod default;
 pub mod get;
 pub mod history;
 pub mod init;
