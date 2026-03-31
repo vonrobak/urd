@@ -550,24 +550,64 @@ Session 3 is needed by HSD-B and VFM-B (sentinel infrastructure), not earlier.
 **Supporting brainstorms:**
 - [Hardware swap solutions brainstorm](../95-ideas/2026-03-28-brainstorm-hardware-swap-solutions.md) — drive identity, chain-break detection, space deltas, full-send gates, new-drive onboarding
 
-### Priority 6: Core Expansion
+### Priority 6: Redundancy Guidance & User Experience
+
+The next arc: teach users 3-2-1 backup strategy through Urd's promise system, advisories,
+and progressive disclosure — not through documentation. The setup wizard is the capstone.
+Build sequence resolved 2026-03-31; dependency arrows flow downward.
+
+**Build sequence:**
+
+```
+1. B   Transient immediate cleanup (executor-only, independent)
+2. E   Promise levels encode redundancy (foundational — I, O, H reference it)
+3. I+N In parallel: redundancy recommendations + retention preview
+4. O   Progressive disclosure (needs E + I infrastructure)
+5. H   Guided setup wizard (capstone — integrates E, N, G; voice is the work)
+```
+
+B is independent. E is the foundation. I and N are parallel (I builds advisory
+infrastructure, N builds retention preview — both feed H). O needs E's promise
+semantics and I's advisory types. H pulls everything together.
+
+| # | Feature | Effort | Status | Design doc | Review |
+|---|---------|--------|--------|------------|--------|
+| 6-B | **Transient immediate cleanup** | 1 session | Reviewed | [design](../95-ideas/2026-03-31-design-b-transient-immediate-cleanup.md) | [review](../99-reports/2026-03-31-design-b-review.md) |
+| | Executor deletes old pin parent after send to all drives. No new types. | | | | |
+| 6-E | **Promise redundancy encoding** | 1 session | Reviewed | [design](../95-ideas/2026-03-31-design-e-promise-redundancy-encoding.md) | [review](../99-reports/2026-03-31-design-e-review.md) |
+| | Resilient requires offsite-role drive. Offsite staleness as post-processing overlay. Gate: ADR-110 addendum. | | | | |
+| 6-I | **Redundancy recommendations** | 1–2 sessions | Reviewed | [design](../95-ideas/2026-03-31-design-i-redundancy-recommendations.md) | [review](../99-reports/2026-03-31-design-i-review.md) |
+| | Structured advisory system with notification cooldown. Migrates stringly-typed advisories. | | | | |
+| 6-N | **Retention policy preview** | 1 session | Reviewed | [design](../95-ideas/2026-03-31-design-n-retention-policy-preview.md) | [review](../99-reports/2026-03-31-design-n-review.md) |
+| | Cascading retention windows + status one-liner. Two-tier estimation (Calibrated/Unknown). | | | | |
+| 6-O | **Progressive disclosure** | 2 sessions | Reviewed | [design](../95-ideas/2026-03-31-design-o-progressive-disclosure.md) | [review](../99-reports/2026-03-31-design-o-review.md) |
+| | Delivers through status + Spindle (not notifications). 8 milestones, parameterized identity. | | | | |
+| 6-H | **Guided setup wizard** | 4–5 sessions | Reviewed | [design](../95-ideas/2026-03-31-design-h-guided-setup-wizard.md) | [review](../99-reports/2026-03-31-design-h-review.md) |
+| | Prerequisite: Config Serialize refactor. Migration safety. Tiered discovery. | | | | |
+
+**Also in this priority (independent, low effort):**
 
 | # | Feature | Effort | Notes |
 |---|---------|--------|-------|
 | 6a | **Shell completions** | Low | `clap_complete` for static; custom completer for subvolume/drive names. |
-| 6b | **Smart defaults** | Medium | Guess subvolume treatment from names/sizes. Pattern matching rules should be data, not code. |
-| 6c | **Conversational setup** | Medium | `urd setup` as guided config generator. Opinionated recommendations. Uses voice layer. |
-| 6d | **Drive replacement workflow** | Medium | Guided migration with safety overlap. Old drive retires as archival copy. See also HSD drive onboarding ideas. |
-| 6e | **`urd find` (cross-snapshot search)** | High | Unsolved performance problem on large subvolumes. Do not build until `urd get` has proven the restore UX. |
+| 6-Sp | **Tray icon (Spindle)** | Low–Medium | Reads sentinel-state.json. 4 static icons. [brainstorm](../95-ideas/2026-03-28-brainstorm-tray-icon-spindle.md). Needs design doc. |
+
+**Deferred from old Priority 6:**
+
+| # | Feature | Notes |
+|---|---------|-------|
+| 6b | **Smart defaults** | Subsumed by H (wizard infers from filesystem). |
+| 6d | **Drive replacement workflow** | Build after H proves the guided interaction pattern. |
+| 6e | **`urd find` (cross-snapshot search)** | Unsolved perf problem. Deferred until `urd get` proves restore UX. |
 
 ### Priority 7: Experience Polish
 
 | # | Feature | Effort | Notes |
 |---|---------|--------|-------|
-| 7a | **Recovery contract** | Low-Medium | Generated from config + awareness model state. |
+| 7a | **Recovery contract** | Low-Medium | Generated from config + awareness model state. Overlaps with H's coverage map. |
 | 7b | **Deep verification** | Medium | `urd verify --deep`: random-sample checksums from external vs. local. |
 | 7c | **Attention budget** | Medium | Priority queue in awareness model. Filter by urgency. |
-| 7d | **Config validation as simulation** | Medium | "Here's what your config means in practice." |
+| 7d | **Config validation as simulation** | Medium | Subsumed by N (retention preview) and H (setup wizard). |
 
 ### Deferred
 
@@ -625,8 +665,8 @@ All five items built, adversary-reviewed, and deployed:
 - [x] Phase 5 — Architectural foundation complete
 - [x] Phase 6 — Protection promises complete
 - [ ] Phase 7 — Sentinel (5a done, 5b Sessions 1-2 done, Sessions 3-4 remaining)
-- [ ] Phase 7.5 — Safety & Visibility (5.5a-d: hardware swap, visual feedback, tray, transient snapshots)
-- [ ] Phase 8 — Core expansion
+- [x] Phase 7.5 — Safety & Visibility (5.5a-d: all 10 items complete, v0.4.1–v0.5.0)
+- [ ] Phase 8 — Redundancy guidance & UX (6-B, 6-E, 6-I+N, 6-O, 6-H)
 
 ## Dropped Features
 
