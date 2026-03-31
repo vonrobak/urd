@@ -210,7 +210,7 @@ pub fn translate_btrfs_error(
                 .to_string(),
             remediation: vec![
                 "This is usually harmless \u{2014} the snapshot is already gone".to_string(),
-                "Run `urd verify` to check chain health".to_string(),
+                "Run `urd verify` to check thread health".to_string(),
             ],
         };
     }
@@ -229,16 +229,16 @@ pub fn translate_btrfs_error(
         };
     }
 
-    // Pattern 7: Parent not found (chain broken)
+    // Pattern 7: Parent not found (thread broken)
     if stderr_lower.contains("parent not found")
         || stderr_lower.contains("cannot find parent subvolume")
     {
         return BtrfsErrorDetail {
-            summary: "Incremental parent missing (chain broken)".to_string(),
+            summary: "Incremental parent missing (thread broken)".to_string(),
             cause: "The parent snapshot for incremental send no longer exists".to_string(),
             remediation: vec![
                 "This is recoverable \u{2014} next send will be a full send".to_string(),
-                "Check `urd verify` for chain health".to_string(),
+                "Check `urd verify` for thread health".to_string(),
                 "If recurring, check retention/send interval alignment".to_string(),
             ],
         };
@@ -272,7 +272,7 @@ pub enum UrdError {
     #[error("Parse error: {0}")]
     Parse(String),
 
-    #[error("Chain error: {0}")]
+    #[error("Thread error: {0}")]
     Chain(String),
 
     #[error("Retention error: {0}")]
