@@ -17,6 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `UrdError::Chain` error message changed from "Chain error" to "Thread error" (log grep patterns may need updating)
 
 ### Added
+- Bare `urd` (no subcommand) shows a one-sentence status: "All sealed. Last backup 7h ago." or "3 of 9 sealed. htpc-root exposed." First-time users see setup guidance instead of help text
+- `urd completions <shell>` generates tab-completion scripts for bash, zsh, fish, elvish, and powershell
+- `StateDb::last_run_info()` shared helper for building presentation-ready last-run summaries
 - Transient immediate cleanup: executor deletes old pin parent immediately after successful send to all drives, reducing local snapshot count from two to one between runs
 - `Config::drive_labels()` helper for collecting configured drive labels
 - Promise redundancy encoding: resilient protection level now requires at least one offsite-role drive and degrades promise status when the offsite copy goes stale (30/90-day thresholds)

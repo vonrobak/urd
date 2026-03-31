@@ -44,11 +44,24 @@ fn main() -> anyhow::Result<()> {
         })
         .parse_default_env() // RUST_LOG still overrides if set
         .init();
-    let config = config::Config::load(cli.config.as_deref())?;
+
+    // Strategy A: config-free commands — dispatch before config load
+    if let Some(Commands::Completions(ref args)) = cli.command {
+        return commands::completions::run(args);
+    }
 
     let output_mode = output::OutputMode::detect();
 
-    match cli.command {
+    // Strategy B: bare urd — fallible config load (handled inside default::run)
+    if cli.command.is_none() {
+        return commands::default::run(cli.config.as_deref(), output_mode);
+    }
+
+    // Strategy C: mandatory config load (all existing commands)
+    let config = config::Config::load(cli.config.as_deref())?;
+
+    // Safe to unwrap: None case returned above
+    match cli.command.unwrap() {
         Commands::Plan(args) => commands::plan_cmd::run(config, args, output_mode),
         Commands::Backup(args) => commands::backup::run(config, args),
         Commands::Init => commands::init::run(config),
@@ -61,5 +74,6 @@ fn main() -> anyhow::Result<()> {
             cli::SentinelCommands::Run => commands::sentinel::run_daemon(config),
             cli::SentinelCommands::Status => commands::sentinel::status(config, output_mode),
         },
+        Commands::Completions(_) => unreachable!("handled above"),
     }
 }

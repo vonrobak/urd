@@ -248,6 +248,30 @@ impl StateDb {
         }
     }
 
+    /// Query last run and build a presentation-ready `LastRunInfo`.
+    #[must_use]
+    pub fn last_run_info(&self) -> Option<crate::output::LastRunInfo> {
+        match self.last_run() {
+            Ok(Some(run)) => {
+                let duration = run
+                    .finished_at
+                    .as_ref()
+                    .and_then(|f| crate::types::format_run_duration(&run.started_at, f));
+                Some(crate::output::LastRunInfo {
+                    id: run.id,
+                    started_at: run.started_at.clone(),
+                    result: run.result.clone(),
+                    duration,
+                })
+            }
+            Ok(None) => None,
+            Err(e) => {
+                log::warn!("Failed to query last run: {e}");
+                None
+            }
+        }
+    }
+
     /// Get the N most recent runs.
     pub fn recent_runs(&self, limit: usize) -> crate::error::Result<Vec<RunRecord>> {
         let mut stmt = self
