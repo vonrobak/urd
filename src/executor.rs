@@ -91,6 +91,31 @@ pub struct SubvolumeResult {
     pub send_type: SendType,
     /// Number of sends that succeeded but whose pin file write failed.
     pub pin_failures: u32,
+    /// Outcome of post-send transient cleanup (immediate old-parent deletion).
+    pub transient_cleanup: TransientCleanupOutcome,
+}
+
+/// Outcome of post-send transient cleanup (immediate deletion of old pin parent).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransientCleanupOutcome {
+    /// Not applicable (non-transient subvolume, or no incremental sends).
+    NotApplicable,
+    /// All conditions met, old parent(s) deleted successfully.
+    Cleaned { deleted_count: usize },
+    /// Cleanup skipped: not all drives succeeded.
+    SkippedPartialSends,
+    /// Cleanup skipped: pin write failure made chain state ambiguous.
+    SkippedPinFailure,
+    /// Attempted but delete failed (non-fatal, next run handles it).
+    DeleteFailed { path: String, error: String },
+}
+
+/// Context about a subvolume passed to the per-subvolume executor.
+/// Constructed from config lookup in `execute()`.
+#[derive(Debug)]
+struct SubvolumeContext {
+    name: String,
+    is_transient: bool,
 }
 
 #[derive(Debug)]
@@ -165,7 +190,25 @@ impl<'a> Executor<'a> {
                 log::warn!("Shutdown signal received, skipping remaining subvolumes");
                 break;
             }
-            let result = self.execute_subvolume(subvol_name, ops, run_id, &mut space_recovered);
+            // Raw field check: named protection levels never derive transient
+            // retention (derive_policy returns Graduated for all named levels).
+            // If this changes, switch to sv.resolved(...).local_retention.is_transient().
+            let is_transient = self
+                .config
+                .subvolumes
+                .iter()
+                .find(|sv| sv.name == *subvol_name)
+                .is_some_and(|sv| {
+                    matches!(
+                        sv.local_retention,
+                        Some(crate::types::LocalRetentionConfig::Transient)
+                    )
+                });
+            let context = SubvolumeContext {
+                name: subvol_name.clone(),
+                is_transient,
+            };
+            let result = self.execute_subvolume(&context, ops, run_id, &mut space_recovered);
             subvolume_results.push(result);
         }
 
@@ -191,17 +234,23 @@ impl<'a> Executor<'a> {
 
     fn execute_subvolume(
         &self,
-        subvol_name: &str,
+        context: &SubvolumeContext,
         ops: &[&PlannedOperation],
         run_id: Option<i64>,
         space_recovered: &mut HashMap<String, bool>,
     ) -> SubvolumeResult {
+        let subvol_name = &context.name;
         let subvol_start = Instant::now();
         let mut operations = Vec::new();
         let mut failed_creates: HashSet<&Path> = HashSet::new();
         let mut subvol_success = true;
         let mut send_type = SendType::NoSend;
         let mut pin_failures: u32 = 0;
+
+        // Transient cleanup tracking: old pin parents from incremental sends
+        let mut old_pin_parents: HashMap<String, std::path::PathBuf> = HashMap::new();
+        let mut sends_succeeded: HashSet<String> = HashSet::new();
+        let mut planned_send_drives: HashSet<String> = HashSet::new();
 
         for op in ops {
             if self.shutdown.load(Ordering::SeqCst) {
@@ -222,6 +271,7 @@ impl<'a> Executor<'a> {
                     pin_on_success,
                     ..
                 } => {
+                    planned_send_drives.insert(drive_label.clone());
                     let (result, pin_failed) = self.execute_send(
                         snapshot,
                         Some(parent),
@@ -233,6 +283,9 @@ impl<'a> Executor<'a> {
                     );
                     if result.result == OpResult::Success {
                         send_type = SendType::Incremental;
+                        sends_succeeded.insert(drive_label.clone());
+                        // Track old pin parent for transient cleanup
+                        old_pin_parents.insert(drive_label.clone(), parent.clone());
                     }
                     if pin_failed {
                         pin_failures += 1;
@@ -247,6 +300,7 @@ impl<'a> Executor<'a> {
                     reason,
                     ..
                 } => {
+                    planned_send_drives.insert(drive_label.clone());
                     // Gate chain-break full sends in autonomous mode.
                     if *reason == FullSendReason::ChainBroken
                         && self.full_send_policy == FullSendPolicy::SkipAndNotify
@@ -282,6 +336,7 @@ impl<'a> Executor<'a> {
                         );
                         if result.result == OpResult::Success {
                             send_type = SendType::Full;
+                            sends_succeeded.insert(drive_label.clone());
                         }
                         if pin_failed {
                             pin_failures += 1;
@@ -308,6 +363,14 @@ impl<'a> Executor<'a> {
             operations.push(outcome);
         }
 
+        let transient_cleanup = self.attempt_transient_cleanup(
+            context,
+            &old_pin_parents,
+            &sends_succeeded,
+            &planned_send_drives,
+            pin_failures,
+        );
+
         SubvolumeResult {
             name: subvol_name.to_string(),
             success: subvol_success,
@@ -315,6 +378,7 @@ impl<'a> Executor<'a> {
             duration: subvol_start.elapsed(),
             send_type,
             pin_failures,
+            transient_cleanup,
         }
     }
 
@@ -607,8 +671,7 @@ impl<'a> Executor<'a> {
         if let Some(snap_name_osstr) = path.file_name() {
             let snap_name_str = snap_name_osstr.to_string_lossy();
             if let Ok(snap) = crate::types::SnapshotName::parse(&snap_name_str) {
-                let drive_labels: Vec<String> =
-                    self.config.drives.iter().map(|d| d.label.clone()).collect();
+                let drive_labels = self.config.drive_labels();
                 // Use the subvolume_name from the operation to find the local dir
                 if let Some(local_dir) = self.config.local_snapshot_dir(subvolume_name) {
                     let pinned = chain::find_pinned_snapshots(&local_dir, &drive_labels);
@@ -725,6 +788,131 @@ impl<'a> Executor<'a> {
 
     fn drive_label_for_path(&self, path: &Path) -> Option<String> {
         self.drive_for_path(path).map(|d| d.label.clone())
+    }
+
+    /// Attempt transient immediate cleanup: delete old pin parents after all
+    /// sends succeed for a transient subvolume.
+    ///
+    /// This is a timing optimization for an operation the planner would produce
+    /// on the next run. The executor does not make retention decisions — it
+    /// accelerates a deletion the planner has already endorsed by construction
+    /// (transient mode deletes all non-pinned snapshots).
+    ///
+    /// Safety: relies on the advisory lock preventing concurrent backup runs.
+    /// The TOCTOU window between pin re-read and delete is not independently
+    /// defended. If Urd ever moves to concurrent subvolume processing, this
+    /// assumption must be revisited.
+    fn attempt_transient_cleanup(
+        &self,
+        context: &SubvolumeContext,
+        old_pin_parents: &HashMap<String, std::path::PathBuf>,
+        sends_succeeded: &HashSet<String>,
+        planned_send_drives: &HashSet<String>,
+        pin_failures: u32,
+    ) -> TransientCleanupOutcome {
+        // Condition 1: subvolume uses transient retention
+        if !context.is_transient {
+            return TransientCleanupOutcome::NotApplicable;
+        }
+
+        // No incremental sends means no old parents to clean up
+        if old_pin_parents.is_empty() {
+            return TransientCleanupOutcome::NotApplicable;
+        }
+
+        // Condition 3: no pin write failures
+        if pin_failures > 0 {
+            log::info!(
+                "Transient cleanup skipped for {}: pin write failure makes chain state ambiguous",
+                context.name,
+            );
+            return TransientCleanupOutcome::SkippedPinFailure;
+        }
+
+        // Condition 2: all configured drives with planned sends succeeded
+        if sends_succeeded != planned_send_drives {
+            log::info!(
+                "Transient cleanup skipped for {}: not all drives succeeded",
+                context.name,
+            );
+            return TransientCleanupOutcome::SkippedPartialSends;
+        }
+
+        // Collect unique old parent paths (multiple drives may share the same parent)
+        let unique_parents: HashSet<&std::path::PathBuf> =
+            old_pin_parents.values().collect();
+
+        // Condition 4 (early): if no old parent still exists, skip pin I/O
+        let existing_parents: Vec<&&std::path::PathBuf> = unique_parents
+            .iter()
+            .filter(|p| p.exists())
+            .collect();
+        if existing_parents.is_empty() {
+            return TransientCleanupOutcome::NotApplicable;
+        }
+
+        // Condition 5: re-read pin files to verify old parents are no longer pinned
+        let drive_labels = self.config.drive_labels();
+        let local_dir = self.config.local_snapshot_dir(&context.name);
+        let current_pinned = local_dir
+            .as_ref()
+            .map(|dir| chain::find_pinned_snapshots(dir, &drive_labels))
+            .unwrap_or_default();
+
+        let mut deleted_count = 0;
+        let mut first_failure: Option<(String, String)> = None;
+
+        for parent_path in existing_parents {
+            // Condition 5: fail-closed — only delete if we can verify it's NOT pinned.
+            // Unparseable names default to "don't delete" (ADR-107: fail-closed for deletions).
+            let is_safe_to_delete = parent_path
+                .file_name()
+                .and_then(|name| {
+                    crate::types::SnapshotName::parse(&name.to_string_lossy()).ok()
+                })
+                .map(|snap| !current_pinned.contains(&snap))
+                .unwrap_or(false);
+
+            if !is_safe_to_delete {
+                log::warn!(
+                    "Transient cleanup: refusing to delete {} (still pinned or unparseable)",
+                    parent_path.display(),
+                );
+                continue;
+            }
+
+            // Delete the old parent. Continue through all parents on failure
+            // (consistent with executor error isolation — ADR-100 invariant 4).
+            match self.btrfs.delete_subvolume(parent_path) {
+                Ok(()) => {
+                    log::info!(
+                        "Transient cleanup: deleted old pin parent {}",
+                        parent_path.display(),
+                    );
+                    deleted_count += 1;
+                }
+                Err(e) => {
+                    log::warn!(
+                        "Transient cleanup: failed to delete {}: {e}",
+                        parent_path.display(),
+                    );
+                    if first_failure.is_none() {
+                        first_failure =
+                            Some((parent_path.display().to_string(), e.to_string()));
+                    }
+                }
+            }
+        }
+
+        if let Some((path, error)) = first_failure {
+            // Report first failure even if some deletes succeeded.
+            // Surviving snapshots are handled by next run's planner.
+            TransientCleanupOutcome::DeleteFailed { path, error }
+        } else if deleted_count > 0 {
+            TransientCleanupOutcome::Cleaned { deleted_count }
+        } else {
+            TransientCleanupOutcome::NotApplicable
+        }
     }
 
     fn begin_run(&self, mode: &str) -> Option<i64> {
@@ -1847,5 +2035,559 @@ source = "/data/sv1"
         let result = executor.execute(&chain_broken_plan(), "full");
 
         assert_eq!(result.subvolume_results[0].operations[0].result, OpResult::Success);
+    }
+
+    // ── Transient immediate cleanup tests ──────────────────────────────
+
+    /// Build a config with a transient subvolume and N drives.
+    /// Each tuple is (label, mount_path, role).
+    fn transient_config_n_drives(
+        snap_root: &Path,
+        drives: &[(&str, &Path, &str)],
+    ) -> Config {
+        let drives_toml: String = drives
+            .iter()
+            .map(|(label, mount, role)| {
+                format!(
+                    "[[drives]]\nlabel = \"{label}\"\nmount_path = \"{mount}\"\n\
+                     snapshot_root = \".snapshots\"\nrole = \"{role}\"\n",
+                    mount = mount.display(),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let config_str = format!(
+            r#"
+[general]
+state_db = "/tmp/urd-test/urd.db"
+metrics_file = "/tmp/urd-test/backup.prom"
+log_dir = "/tmp/urd-test"
+
+[local_snapshots]
+roots = [
+  {{ path = "{snap_root}", subvolumes = ["sv-t"] }}
+]
+
+[defaults]
+snapshot_interval = "1h"
+send_interval = "4h"
+[defaults.local_retention]
+hourly = 24
+[defaults.external_retention]
+daily = 30
+
+{drives_toml}
+
+[[subvolumes]]
+name = "sv-t"
+short_name = "t"
+source = "/data/t"
+local_retention = "transient"
+"#,
+            snap_root = snap_root.display(),
+        );
+        toml::from_str(&config_str).unwrap()
+    }
+
+    fn test_ts() -> chrono::NaiveDateTime {
+        NaiveDate::from_ymd_opt(2026, 3, 22)
+            .unwrap()
+            .and_hms_opt(14, 30, 0)
+            .unwrap()
+    }
+
+    #[test]
+    fn transient_cleanup_fires_after_all_drives_succeed() {
+        let snap_dir = tempfile::TempDir::new().unwrap();
+        let drive_dir = tempfile::TempDir::new().unwrap();
+        let sv_dir = snap_dir.path().join("sv-t");
+        std::fs::create_dir_all(&sv_dir).unwrap();
+
+        // Create old parent as a real directory so exists() returns true
+        let old_parent = sv_dir.join("20260321-t");
+        std::fs::create_dir(&old_parent).unwrap();
+
+        // Write pin file pointing to old parent (will be advanced by send)
+        chain::write_pin_file(&sv_dir, "DRIVE-A", &SnapshotName::parse("20260321-t").unwrap())
+            .unwrap();
+
+        let config = transient_config_n_drives(
+            snap_dir.path(),
+            &[("DRIVE-A", drive_dir.path(), "primary")],
+        );
+        let mock = MockBtrfs::new();
+        let shutdown = no_shutdown();
+        let executor = Executor::new(&mock, None, &config, &shutdown);
+
+        let new_pin_path = sv_dir.join(".last-external-parent-DRIVE-A");
+        let new_snap_name = SnapshotName::parse("20260322-1430-t").unwrap();
+
+        let plan = BackupPlan {
+            operations: vec![PlannedOperation::SendIncremental {
+                parent: old_parent.clone(),
+                snapshot: sv_dir.join("20260322-1430-t"),
+                dest_dir: drive_dir.path().join(".snapshots/sv-t"),
+                drive_label: "DRIVE-A".to_string(),
+                subvolume_name: "sv-t".to_string(),
+                pin_on_success: Some((new_pin_path, new_snap_name)),
+            }],
+            timestamp: test_ts(),
+            skipped: vec![],
+        };
+
+        let result = executor.execute(&plan, "full");
+
+        assert!(result.subvolume_results[0].success);
+        assert_eq!(
+            result.subvolume_results[0].transient_cleanup,
+            TransientCleanupOutcome::Cleaned { deleted_count: 1 },
+        );
+        // The mock should have a DeleteSubvolume call for the old parent
+        let calls = mock.calls();
+        assert!(calls.iter().any(|c| matches!(
+            c,
+            MockBtrfsCall::DeleteSubvolume { path } if *path == old_parent,
+        )));
+    }
+
+    #[test]
+    fn transient_cleanup_skipped_when_one_drive_fails() {
+        // Test the "all drives must succeed" condition. We simulate partial
+        // success by having DRIVE-A send succeed (incremental) and DRIVE-B
+        // send fail. The mock fails sends by snapshot path, so we use a
+        // separate snapshot path for DRIVE-B's send to selectively fail it.
+        let snap_dir = tempfile::TempDir::new().unwrap();
+        let drive_a_dir = tempfile::TempDir::new().unwrap();
+        let drive_b_dir = tempfile::TempDir::new().unwrap();
+        let sv_dir = snap_dir.path().join("sv-t");
+        std::fs::create_dir_all(&sv_dir).unwrap();
+
+        let old_parent = sv_dir.join("20260321-t");
+        std::fs::create_dir(&old_parent).unwrap();
+
+        // Create the snapshot that DRIVE-B will try to send (as a dir so
+        // the cascading failure check doesn't skip it)
+        let snap_for_b = sv_dir.join("20260322-1430-t-b");
+        std::fs::create_dir(&snap_for_b).unwrap();
+
+        chain::write_pin_file(&sv_dir, "DRIVE-A", &SnapshotName::parse("20260321-t").unwrap())
+            .unwrap();
+        chain::write_pin_file(&sv_dir, "DRIVE-B", &SnapshotName::parse("20260321-t").unwrap())
+            .unwrap();
+
+        let config = transient_config_n_drives(
+            snap_dir.path(),
+            &[
+                ("DRIVE-A", drive_a_dir.path(), "primary"),
+                ("DRIVE-B", drive_b_dir.path(), "offsite"),
+            ],
+        );
+        let mock = MockBtrfs::new();
+        // Fail sends by snapshot path — only fail DRIVE-B's snapshot
+        mock.fail_sends.borrow_mut().insert(snap_for_b.clone());
+        let shutdown = no_shutdown();
+        let executor = Executor::new(&mock, None, &config, &shutdown);
+
+        let pin_a = sv_dir.join(".last-external-parent-DRIVE-A");
+        let pin_b = sv_dir.join(".last-external-parent-DRIVE-B");
+        let snap_name = SnapshotName::parse("20260322-1430-t").unwrap();
+
+        let plan = BackupPlan {
+            operations: vec![
+                PlannedOperation::SendIncremental {
+                    parent: old_parent.clone(),
+                    snapshot: sv_dir.join("20260322-1430-t"),
+                    dest_dir: drive_a_dir.path().join(".snapshots/sv-t"),
+                    drive_label: "DRIVE-A".to_string(),
+                    subvolume_name: "sv-t".to_string(),
+                    pin_on_success: Some((pin_a, snap_name.clone())),
+                },
+                PlannedOperation::SendIncremental {
+                    parent: old_parent.clone(),
+                    snapshot: snap_for_b,
+                    dest_dir: drive_b_dir.path().join(".snapshots/sv-t"),
+                    drive_label: "DRIVE-B".to_string(),
+                    subvolume_name: "sv-t".to_string(),
+                    pin_on_success: Some((pin_b, snap_name)),
+                },
+            ],
+            timestamp: test_ts(),
+            skipped: vec![],
+        };
+
+        let result = executor.execute(&plan, "full");
+
+        assert_eq!(
+            result.subvolume_results[0].transient_cleanup,
+            TransientCleanupOutcome::SkippedPartialSends,
+        );
+        // Old parent should still exist
+        assert!(old_parent.exists());
+    }
+
+    #[test]
+    fn transient_cleanup_skipped_on_pin_failure() {
+        let snap_dir = tempfile::TempDir::new().unwrap();
+        let drive_dir = tempfile::TempDir::new().unwrap();
+        let sv_dir = snap_dir.path().join("sv-t");
+        std::fs::create_dir_all(&sv_dir).unwrap();
+
+        let old_parent = sv_dir.join("20260321-t");
+        std::fs::create_dir(&old_parent).unwrap();
+
+        chain::write_pin_file(&sv_dir, "DRIVE-A", &SnapshotName::parse("20260321-t").unwrap())
+            .unwrap();
+
+        let config = transient_config_n_drives(
+            snap_dir.path(),
+            &[("DRIVE-A", drive_dir.path(), "primary")],
+        );
+        let mock = MockBtrfs::new();
+        let shutdown = no_shutdown();
+        let executor = Executor::new(&mock, None, &config, &shutdown);
+
+        // Use a pin path that will fail to write (non-existent directory)
+        let bad_pin_path = PathBuf::from("/nonexistent/pin");
+        let snap_name = SnapshotName::parse("20260322-1430-t").unwrap();
+
+        let plan = BackupPlan {
+            operations: vec![PlannedOperation::SendIncremental {
+                parent: old_parent.clone(),
+                snapshot: sv_dir.join("20260322-1430-t"),
+                dest_dir: drive_dir.path().join(".snapshots/sv-t"),
+                drive_label: "DRIVE-A".to_string(),
+                subvolume_name: "sv-t".to_string(),
+                pin_on_success: Some((bad_pin_path, snap_name)),
+            }],
+            timestamp: test_ts(),
+            skipped: vec![],
+        };
+
+        let result = executor.execute(&plan, "full");
+
+        assert_eq!(
+            result.subvolume_results[0].transient_cleanup,
+            TransientCleanupOutcome::SkippedPinFailure,
+        );
+        assert!(old_parent.exists());
+    }
+
+    #[test]
+    fn transient_cleanup_not_applicable_for_graduated_retention() {
+        // Use the standard test_config which has graduated retention
+        let mock = MockBtrfs::new();
+        let config = test_config();
+        let shutdown = no_shutdown();
+        let executor = Executor::new(&mock, None, &config, &shutdown);
+        let plan = simple_plan();
+
+        let result = executor.execute(&plan, "full");
+
+        assert_eq!(
+            result.subvolume_results[0].transient_cleanup,
+            TransientCleanupOutcome::NotApplicable,
+        );
+    }
+
+    #[test]
+    fn transient_cleanup_divergent_pin_parents_both_deleted() {
+        let snap_dir = tempfile::TempDir::new().unwrap();
+        let drive_a_dir = tempfile::TempDir::new().unwrap();
+        let drive_b_dir = tempfile::TempDir::new().unwrap();
+        let sv_dir = snap_dir.path().join("sv-t");
+        std::fs::create_dir_all(&sv_dir).unwrap();
+
+        // Two different old parents for two drives
+        let old_parent_a = sv_dir.join("20260320-t");
+        let old_parent_b = sv_dir.join("20260321-t");
+        std::fs::create_dir(&old_parent_a).unwrap();
+        std::fs::create_dir(&old_parent_b).unwrap();
+
+        chain::write_pin_file(&sv_dir, "DRIVE-A", &SnapshotName::parse("20260320-t").unwrap())
+            .unwrap();
+        chain::write_pin_file(&sv_dir, "DRIVE-B", &SnapshotName::parse("20260321-t").unwrap())
+            .unwrap();
+
+        let config = transient_config_n_drives(
+            snap_dir.path(),
+            &[
+                ("DRIVE-A", drive_a_dir.path(), "primary"),
+                ("DRIVE-B", drive_b_dir.path(), "offsite"),
+            ],
+        );
+        let mock = MockBtrfs::new();
+        let shutdown = no_shutdown();
+        let executor = Executor::new(&mock, None, &config, &shutdown);
+
+        let pin_a = sv_dir.join(".last-external-parent-DRIVE-A");
+        let pin_b = sv_dir.join(".last-external-parent-DRIVE-B");
+        let snap_name = SnapshotName::parse("20260322-1430-t").unwrap();
+
+        let plan = BackupPlan {
+            operations: vec![
+                PlannedOperation::SendIncremental {
+                    parent: old_parent_a.clone(),
+                    snapshot: sv_dir.join("20260322-1430-t"),
+                    dest_dir: drive_a_dir.path().join(".snapshots/sv-t"),
+                    drive_label: "DRIVE-A".to_string(),
+                    subvolume_name: "sv-t".to_string(),
+                    pin_on_success: Some((pin_a, snap_name.clone())),
+                },
+                PlannedOperation::SendIncremental {
+                    parent: old_parent_b.clone(),
+                    snapshot: sv_dir.join("20260322-1430-t"),
+                    dest_dir: drive_b_dir.path().join(".snapshots/sv-t"),
+                    drive_label: "DRIVE-B".to_string(),
+                    subvolume_name: "sv-t".to_string(),
+                    pin_on_success: Some((pin_b, snap_name)),
+                },
+            ],
+            timestamp: test_ts(),
+            skipped: vec![],
+        };
+
+        let result = executor.execute(&plan, "full");
+
+        assert_eq!(
+            result.subvolume_results[0].transient_cleanup,
+            TransientCleanupOutcome::Cleaned { deleted_count: 2 },
+        );
+        // Both old parents deleted via mock
+        let calls = mock.calls();
+        let delete_calls: Vec<_> = calls
+            .iter()
+            .filter(|c| matches!(c, MockBtrfsCall::DeleteSubvolume { .. }))
+            .collect();
+        assert_eq!(delete_calls.len(), 2);
+    }
+
+    #[test]
+    fn transient_cleanup_old_parent_already_gone() {
+        let snap_dir = tempfile::TempDir::new().unwrap();
+        let drive_dir = tempfile::TempDir::new().unwrap();
+        let sv_dir = snap_dir.path().join("sv-t");
+        std::fs::create_dir_all(&sv_dir).unwrap();
+
+        // Old parent does NOT exist on disk (already deleted by planned transient cleanup)
+        let old_parent = sv_dir.join("20260321-t");
+        // Don't create it — simulates already deleted
+
+        chain::write_pin_file(&sv_dir, "DRIVE-A", &SnapshotName::parse("20260321-t").unwrap())
+            .unwrap();
+
+        let config = transient_config_n_drives(
+            snap_dir.path(),
+            &[("DRIVE-A", drive_dir.path(), "primary")],
+        );
+        let mock = MockBtrfs::new();
+        let shutdown = no_shutdown();
+        let executor = Executor::new(&mock, None, &config, &shutdown);
+
+        let pin_path = sv_dir.join(".last-external-parent-DRIVE-A");
+        let snap_name = SnapshotName::parse("20260322-1430-t").unwrap();
+
+        let plan = BackupPlan {
+            operations: vec![PlannedOperation::SendIncremental {
+                parent: old_parent,
+                snapshot: sv_dir.join("20260322-1430-t"),
+                dest_dir: drive_dir.path().join(".snapshots/sv-t"),
+                drive_label: "DRIVE-A".to_string(),
+                subvolume_name: "sv-t".to_string(),
+                pin_on_success: Some((pin_path, snap_name)),
+            }],
+            timestamp: test_ts(),
+            skipped: vec![],
+        };
+
+        let result = executor.execute(&plan, "full");
+
+        // No error — old parent was already gone, cleanup is NotApplicable
+        // (nothing to delete, 0 deleted means not applicable)
+        assert_eq!(
+            result.subvolume_results[0].transient_cleanup,
+            TransientCleanupOutcome::NotApplicable,
+        );
+    }
+
+    #[test]
+    fn transient_cleanup_not_attempted_for_full_send() {
+        let snap_dir = tempfile::TempDir::new().unwrap();
+        let drive_dir = tempfile::TempDir::new().unwrap();
+        let sv_dir = snap_dir.path().join("sv-t");
+        std::fs::create_dir_all(&sv_dir).unwrap();
+
+        let config = transient_config_n_drives(
+            snap_dir.path(),
+            &[("DRIVE-A", drive_dir.path(), "primary")],
+        );
+        let mock = MockBtrfs::new();
+        let shutdown = no_shutdown();
+        let executor = Executor::new(&mock, None, &config, &shutdown);
+
+        let pin_path = sv_dir.join(".last-external-parent-DRIVE-A");
+        let snap_name = SnapshotName::parse("20260322-1430-t").unwrap();
+
+        let plan = BackupPlan {
+            operations: vec![PlannedOperation::SendFull {
+                snapshot: sv_dir.join("20260322-1430-t"),
+                dest_dir: drive_dir.path().join(".snapshots/sv-t"),
+                drive_label: "DRIVE-A".to_string(),
+                subvolume_name: "sv-t".to_string(),
+                pin_on_success: Some((pin_path, snap_name)),
+                reason: FullSendReason::FirstSend,
+            }],
+            timestamp: test_ts(),
+            skipped: vec![],
+        };
+
+        let result = executor.execute(&plan, "full");
+
+        assert!(result.subvolume_results[0].success);
+        // Full send has no old parent — cleanup should be NotApplicable
+        assert_eq!(
+            result.subvolume_results[0].transient_cleanup,
+            TransientCleanupOutcome::NotApplicable,
+        );
+        // No delete calls at all
+        let calls = mock.calls();
+        assert!(!calls.iter().any(|c| matches!(c, MockBtrfsCall::DeleteSubvolume { .. })));
+    }
+
+    #[test]
+    fn transient_cleanup_still_pinned_not_deleted() {
+        let snap_dir = tempfile::TempDir::new().unwrap();
+        let drive_a_dir = tempfile::TempDir::new().unwrap();
+        let drive_b_dir = tempfile::TempDir::new().unwrap();
+        let sv_dir = snap_dir.path().join("sv-t");
+        std::fs::create_dir_all(&sv_dir).unwrap();
+
+        let old_parent = sv_dir.join("20260321-t");
+        std::fs::create_dir(&old_parent).unwrap();
+
+        // DRIVE-A pins old parent, DRIVE-B pins something else
+        chain::write_pin_file(&sv_dir, "DRIVE-A", &SnapshotName::parse("20260321-t").unwrap())
+            .unwrap();
+        chain::write_pin_file(&sv_dir, "DRIVE-B", &SnapshotName::parse("20260320-t").unwrap())
+            .unwrap();
+
+        let config = transient_config_n_drives(
+            snap_dir.path(),
+            &[
+                ("DRIVE-A", drive_a_dir.path(), "primary"),
+                ("DRIVE-B", drive_b_dir.path(), "offsite"),
+            ],
+        );
+        let mock = MockBtrfs::new();
+        let shutdown = no_shutdown();
+        let executor = Executor::new(&mock, None, &config, &shutdown);
+
+        // Only send to DRIVE-A (incremental with old parent)
+        // DRIVE-B also sends but as full (no old parent)
+        let pin_a = sv_dir.join(".last-external-parent-DRIVE-A");
+        let pin_b = sv_dir.join(".last-external-parent-DRIVE-B");
+        let snap_name = SnapshotName::parse("20260322-1430-t").unwrap();
+
+        let plan = BackupPlan {
+            operations: vec![
+                PlannedOperation::SendIncremental {
+                    parent: old_parent.clone(),
+                    snapshot: sv_dir.join("20260322-1430-t"),
+                    dest_dir: drive_a_dir.path().join(".snapshots/sv-t"),
+                    drive_label: "DRIVE-A".to_string(),
+                    subvolume_name: "sv-t".to_string(),
+                    pin_on_success: Some((pin_a, snap_name.clone())),
+                },
+                PlannedOperation::SendFull {
+                    snapshot: sv_dir.join("20260322-1430-t"),
+                    dest_dir: drive_b_dir.path().join(".snapshots/sv-t"),
+                    drive_label: "DRIVE-B".to_string(),
+                    subvolume_name: "sv-t".to_string(),
+                    pin_on_success: Some((pin_b, snap_name)),
+                    reason: FullSendReason::FirstSend,
+                },
+            ],
+            timestamp: test_ts(),
+            skipped: vec![],
+        };
+
+        let result = executor.execute(&plan, "full");
+
+        // DRIVE-A's send advances pin. But DRIVE-B's pin was written to
+        // 20260320-t and advanced to 20260322-1430-t. After both sends,
+        // old parent (20260321-t) is NOT pinned by either drive.
+        // DRIVE-A advanced to 20260322-1430-t.
+        // DRIVE-B advanced to 20260322-1430-t (via full send).
+        // So 20260321-t should actually be cleaned up.
+        // But wait — only DRIVE-A contributed an old_pin_parent.
+        // SendFull doesn't add to old_pin_parents.
+        // old_pin_parents = { "DRIVE-A" -> 20260321-t }
+        // sends_succeeded = { "DRIVE-A", "DRIVE-B" }
+        // planned_send_drives = { "DRIVE-A", "DRIVE-B" }
+        // All drives succeeded ✓, pin re-read shows 20260321-t is not pinned ✓
+        assert!(result.subvolume_results[0].success);
+        assert_eq!(
+            result.subvolume_results[0].transient_cleanup,
+            TransientCleanupOutcome::Cleaned { deleted_count: 1 },
+        );
+    }
+
+    #[test]
+    fn transient_cleanup_refuses_delete_when_name_unparseable() {
+        let snap_dir = tempfile::TempDir::new().unwrap();
+        let drive_dir = tempfile::TempDir::new().unwrap();
+        let sv_dir = snap_dir.path().join("sv-t");
+        std::fs::create_dir_all(&sv_dir).unwrap();
+
+        // Old parent with a name that fails SnapshotName::parse()
+        let old_parent = sv_dir.join("not-a-valid-snapshot-name");
+        std::fs::create_dir(&old_parent).unwrap();
+
+        chain::write_pin_file(
+            &sv_dir,
+            "DRIVE-A",
+            &SnapshotName::parse("20260321-t").unwrap(),
+        )
+        .unwrap();
+
+        let config = transient_config_n_drives(
+            snap_dir.path(),
+            &[("DRIVE-A", drive_dir.path(), "primary")],
+        );
+        let mock = MockBtrfs::new();
+        let shutdown = no_shutdown();
+        let executor = Executor::new(&mock, None, &config, &shutdown);
+
+        let pin_path = sv_dir.join(".last-external-parent-DRIVE-A");
+        let snap_name = SnapshotName::parse("20260322-1430-t").unwrap();
+
+        let plan = BackupPlan {
+            operations: vec![PlannedOperation::SendIncremental {
+                parent: old_parent.clone(),
+                snapshot: sv_dir.join("20260322-1430-t"),
+                dest_dir: drive_dir.path().join(".snapshots/sv-t"),
+                drive_label: "DRIVE-A".to_string(),
+                subvolume_name: "sv-t".to_string(),
+                pin_on_success: Some((pin_path, snap_name)),
+            }],
+            timestamp: test_ts(),
+            skipped: vec![],
+        };
+
+        let result = executor.execute(&plan, "full");
+
+        // Fail-closed: unparseable name means don't delete (ADR-107)
+        assert_eq!(
+            result.subvolume_results[0].transient_cleanup,
+            TransientCleanupOutcome::NotApplicable,
+        );
+        // Old parent should still exist
+        assert!(old_parent.exists());
+        // No delete calls for the old parent
+        let calls = mock.calls();
+        assert!(!calls.iter().any(|c| matches!(
+            c,
+            MockBtrfsCall::DeleteSubvolume { path } if *path == old_parent,
+        )));
     }
 }

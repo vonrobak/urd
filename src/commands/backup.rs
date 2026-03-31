@@ -11,7 +11,10 @@ use crate::btrfs::RealBtrfs;
 use crate::cli::BackupArgs;
 use crate::config::Config;
 use crate::drives;
-use crate::executor::{ExecutionResult, Executor, FullSendPolicy, OpResult, RunResult, SendType};
+use crate::executor::{
+    ExecutionResult, Executor, FullSendPolicy, OpResult, RunResult, SendType,
+    TransientCleanupOutcome,
+};
 use crate::heartbeat;
 use crate::lock;
 use crate::metrics::{self, MetricsData, SubvolumeMetrics};
@@ -348,6 +351,26 @@ fn build_backup_summary(
         warnings.push(format!(
             "{total_pin_failures} pin file write(s) failed. Run `urd verify` to diagnose."
         ));
+    }
+
+    // Transient cleanup outcomes
+    for sv in &result.subvolume_results {
+        match &sv.transient_cleanup {
+            TransientCleanupOutcome::Cleaned { deleted_count } => {
+                log::info!(
+                    "Transient cleanup for {}: deleted {} old pin parent(s)",
+                    sv.name, deleted_count,
+                );
+            }
+            TransientCleanupOutcome::DeleteFailed { path, error } => {
+                warnings.push(format!(
+                    "Transient cleanup failed for {} ({}): {error}. \
+                     Next run will handle it.",
+                    sv.name, path,
+                ));
+            }
+            _ => {}
+        }
     }
 
     // Skipped deletions (space recovery)
@@ -915,6 +938,7 @@ mod tests {
     use crate::awareness::{LocalAssessment, OperationalHealth, PromiseStatus, SubvolAssessment};
     use crate::executor::{
         ExecutionResult, OpResult, OperationOutcome, RunResult, SendType, SubvolumeResult,
+        TransientCleanupOutcome,
     };
     use crate::types::Interval;
     use crate::types::{FullSendReason, PlannedOperation};
@@ -953,6 +977,7 @@ mod tests {
             duration: Duration::from_secs(2),
             send_type,
             pin_failures,
+            transient_cleanup: TransientCleanupOutcome::NotApplicable,
         }
     }
 

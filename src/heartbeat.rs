@@ -206,7 +206,9 @@ mod tests {
     use crate::config::{
         Config, DefaultsConfig, GeneralConfig, LocalSnapshotsConfig, SnapshotRoot, SubvolumeConfig,
     };
-    use crate::executor::{ExecutionResult, RunResult, SendType, SubvolumeResult};
+    use crate::executor::{
+        ExecutionResult, RunResult, SendType, SubvolumeResult, TransientCleanupOutcome,
+    };
     use crate::types::{GraduatedRetention, Interval, RunFrequency};
     use std::path::PathBuf;
 
@@ -326,6 +328,7 @@ mod tests {
                     duration: std::time::Duration::from_secs(5),
                     send_type: SendType::Incremental,
                     pin_failures: 0,
+                    transient_cleanup: TransientCleanupOutcome::NotApplicable,
                 },
                 SubvolumeResult {
                     name: "docs".to_string(),
@@ -334,6 +337,7 @@ mod tests {
                     duration: std::time::Duration::from_secs(1),
                     send_type: SendType::NoSend,
                     pin_failures: 0,
+                    transient_cleanup: TransientCleanupOutcome::NotApplicable,
                 },
             ],
             run_id: Some(42),
