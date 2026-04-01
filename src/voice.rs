@@ -13,8 +13,10 @@ use colored::Colorize;
 
 use crate::output::{
     BackupSummary, CalibrateOutput, CalibrateResult, ChainHealth, DefaultStatusOutput,
-    FailuresOutput, GetOutput, HistoryOutput, InitOutput, InitStatus, OutputMode, PlanOutput,
-    RedundancyAdvisoryKind, SentinelStatusOutput, SkipCategory, SkippedSubvolume, StatusOutput,
+    DoctorCheck, DoctorCheckStatus, DoctorOutput, DoctorVerdictStatus, FailuresOutput, GetOutput,
+    HistoryOutput,
+    InitOutput, InitStatus, OutputMode, PlanOutput, RecoveryWindow, RedundancyAdvisoryKind,
+    RetentionPreviewOutput, SentinelStatusOutput, SkipCategory, SkippedSubvolume, StatusOutput,
     SubvolumeHistoryOutput, VerifyOutput, parse_duration_to_minutes,
 };
 use crate::plan::format_duration_short;
@@ -166,7 +168,10 @@ fn render_subvolume_table(data: &StatusOutput, out: &mut String) {
     // Only show HEALTH column when at least one subvolume is non-healthy
     let show_health = data.assessments.iter().any(|a| a.health != "healthy");
 
-    // Build headers: EXPOSURE  [HEALTH]  [PROTECTION]  SUBVOLUME  LOCAL  [DRIVES...]  THREAD
+    // Check if any assessment has a retention summary — only show column if so
+    let has_retention = data.assessments.iter().any(|a| a.retention_summary.is_some());
+
+    // Build headers: EXPOSURE  [HEALTH]  [PROTECTION]  SUBVOLUME  LOCAL  [DRIVES...]  THREAD  [RECOVERY]
     let mut headers: Vec<String> = vec!["EXPOSURE".to_string()];
     if show_health {
         headers.push("HEALTH".to_string());
@@ -181,6 +186,9 @@ fn render_subvolume_table(data: &StatusOutput, out: &mut String) {
         headers.push(label.to_string());
     }
     headers.push("THREAD".to_string());
+    if has_retention {
+        headers.push("RECOVERY".to_string());
+    }
 
     // Track which columns need coloring
     let safety_col = Some(0usize);
@@ -244,6 +252,15 @@ fn render_subvolume_table(data: &StatusOutput, out: &mut String) {
             .map(|c| render_thread_status(&c.health))
             .unwrap_or_else(|| "\u{2014}".to_string());
         row.push(thread);
+
+        if has_retention {
+            row.push(
+                assessment
+                    .retention_summary
+                    .clone()
+                    .unwrap_or_else(|| "\u{2014}".to_string()),
+            );
+        }
 
         rows.push(row);
     }
@@ -1682,6 +1699,327 @@ fn format_tick_description(tick_secs: u64, promise_states: &[crate::output::Sent
     format!("{tick_str} — {state_desc}")
 }
 
+// ── Doctor ────────────────────────────────────────────────────────────
+
+/// Render doctor output.
+#[must_use]
+pub fn render_doctor(data: &DoctorOutput, mode: OutputMode) -> String {
+    match mode {
+        OutputMode::Interactive => render_doctor_interactive(data),
+        OutputMode::Daemon => serde_json::to_string_pretty(data)
+            .unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}")),
+    }
+}
+
+fn render_doctor_interactive(data: &DoctorOutput) -> String {
+    let mut out = String::new();
+
+    writeln!(out, "{}", "Checking Urd health...".bold()).ok();
+    writeln!(out).ok();
+
+    // Config section
+    render_doctor_check_section(&mut out, "Config", &data.config_checks);
+
+    // Infrastructure section
+    writeln!(out).ok();
+    render_doctor_check_section(&mut out, "Infrastructure", &data.infra_checks);
+
+    // Data safety section
+    writeln!(out).ok();
+    writeln!(out, "  {}", "Data safety".bold()).ok();
+    let sealed_count = data
+        .data_safety
+        .iter()
+        .filter(|d| d.status == "PROTECTED")
+        .count();
+    let total = data.data_safety.len();
+    if sealed_count == total {
+        writeln!(
+            out,
+            "    {} {} of {} sealed",
+            "\u{2713}".green(),
+            sealed_count,
+            total
+        )
+        .ok();
+    } else {
+        writeln!(
+            out,
+            "    {} {} of {} sealed",
+            if data.data_safety.iter().any(|d| d.status == "UNPROTECTED") {
+                "\u{2717}".red().to_string()
+            } else {
+                "\u{26a0}".yellow().to_string()
+            },
+            sealed_count,
+            total
+        )
+        .ok();
+        for ds in &data.data_safety {
+            if let Some(ref issue) = ds.issue {
+                writeln!(out, "    \u{2717} {} {}", ds.name, issue.red()).ok();
+                if let Some(ref suggestion) = ds.suggestion {
+                    writeln!(out, "      \u{2192} {suggestion}").ok();
+                }
+            }
+        }
+    }
+
+    // Sentinel section
+    writeln!(out).ok();
+    writeln!(out, "  {}", "Sentinel".bold()).ok();
+    if data.sentinel.running {
+        let pid_info = data
+            .sentinel
+            .pid
+            .map(|p| format!(" (PID {p})"))
+            .unwrap_or_default();
+        let uptime_info = data
+            .sentinel
+            .uptime
+            .as_ref()
+            .map(|u| format!(", uptime {u}"))
+            .unwrap_or_default();
+        writeln!(
+            out,
+            "    {} Sentinel running{pid_info}{uptime_info}",
+            "\u{2713}".green()
+        )
+        .ok();
+    } else {
+        writeln!(
+            out,
+            "    {} Sentinel not running",
+            "\u{26a0}".yellow()
+        )
+        .ok();
+        writeln!(
+            out,
+            "      \u{2192} Start with `systemctl --user start urd-sentinel`"
+        )
+        .ok();
+    }
+
+    // Verify section (--thorough)
+    writeln!(out).ok();
+    if let Some(ref verify) = data.verify {
+        writeln!(out, "  {}", "Threads".bold()).ok();
+        if verify.fail_count == 0 && verify.warn_count == 0 {
+            writeln!(
+                out,
+                "    {} All threads intact ({} checks OK)",
+                "\u{2713}".green(),
+                verify.ok_count
+            )
+            .ok();
+        } else {
+            for sv in &verify.subvolumes {
+                for drive in &sv.drives {
+                    for check in &drive.checks {
+                        let icon = match check.status.as_str() {
+                            "ok" => "\u{2713}".green().to_string(),
+                            "warn" => "\u{26a0}".yellow().to_string(),
+                            _ => "\u{2717}".red().to_string(),
+                        };
+                        let detail = check
+                            .detail
+                            .as_deref()
+                            .unwrap_or(&check.name);
+                        if check.status != "ok" {
+                            writeln!(
+                                out,
+                                "    {icon} {}/{}: {detail}",
+                                sv.name, drive.label
+                            )
+                            .ok();
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        writeln!(
+            out,
+            "  {}",
+            "[Threads \u{2014} run with --thorough]".dimmed()
+        )
+        .ok();
+    }
+
+    // Verdict
+    writeln!(out).ok();
+    match data.verdict.status {
+        DoctorVerdictStatus::Healthy => {
+            writeln!(out, "{}", "All clear.".green().bold()).ok();
+        }
+        DoctorVerdictStatus::Warnings => {
+            writeln!(
+                out,
+                "{}",
+                format!("{} warning(s). Run suggested commands to resolve.", data.verdict.count)
+                    .yellow()
+            )
+            .ok();
+        }
+        DoctorVerdictStatus::Issues => {
+            writeln!(
+                out,
+                "{}",
+                format!("{} issue(s). Run suggested commands to resolve.", data.verdict.count)
+                    .red()
+            )
+            .ok();
+        }
+    }
+
+    out
+}
+
+fn render_doctor_check_section(out: &mut String, title: &str, checks: &[DoctorCheck]) {
+    writeln!(out, "  {}", title.bold()).ok();
+    for check in checks {
+        let (icon, style) = check_icon_style(check.status);
+        let line = format!("    {icon} {}", check.name);
+        writeln!(out, "{}", style(&line)).ok();
+        if let Some(ref detail) = check.detail {
+            writeln!(out, "      {}", detail.dimmed()).ok();
+        }
+    }
+}
+
+fn check_icon_style(status: DoctorCheckStatus) -> (&'static str, fn(&str) -> String) {
+    match status {
+        DoctorCheckStatus::Ok => ("\u{2713}", |s: &str| s.green().to_string()),
+        DoctorCheckStatus::Warn => ("\u{26a0}", |s: &str| s.yellow().to_string()),
+        DoctorCheckStatus::Error => ("\u{2717}", |s: &str| s.red().to_string()),
+    }
+}
+
+// ── Retention Preview ─────────────────────────────────────────────────
+
+/// Render retention preview output.
+#[must_use]
+pub fn render_retention_preview(data: &RetentionPreviewOutput, mode: OutputMode) -> String {
+    match mode {
+        OutputMode::Interactive => render_retention_preview_interactive(data),
+        OutputMode::Daemon => serde_json::to_string_pretty(data)
+            .unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}")),
+    }
+}
+
+fn render_retention_preview_interactive(data: &RetentionPreviewOutput) -> String {
+    let mut out = String::new();
+
+    for (i, preview) in data.previews.iter().enumerate() {
+        if i > 0 {
+            writeln!(out).ok();
+        }
+
+        writeln!(
+            out,
+            "{}",
+            format!("Retention preview for \"{}\":", preview.subvolume_name).bold()
+        )
+        .ok();
+        writeln!(out, "  Policy: {}", preview.policy_description).ok();
+        writeln!(out, "  Snapshot interval: {}", preview.snapshot_interval).ok();
+
+        if preview.recovery_windows.is_empty() {
+            writeln!(out).ok();
+            writeln!(out, "  Recovery windows: {}", "none".yellow()).ok();
+            writeln!(
+                out,
+                "    No local recovery. External drive must be connected to restore."
+            )
+            .ok();
+            writeln!(
+                out,
+                "    Only the current incremental chain parent is kept locally (1 snapshot)."
+            )
+            .ok();
+        } else {
+            writeln!(out).ok();
+            writeln!(out, "  Recovery windows (cumulative):").ok();
+            for w in &preview.recovery_windows {
+                writeln!(
+                    out,
+                    "    {:8} {}",
+                    format!("{}:", w.granularity).dimmed(),
+                    w.cumulative_description
+                )
+                .ok();
+            }
+        }
+
+        if let Some(ref estimate) = preview.estimated_disk_usage {
+            writeln!(out).ok();
+            writeln!(
+                out,
+                "  Estimated snapshots: {} ({})",
+                estimate.total_count,
+                format_snapshot_breakdown(&preview.recovery_windows)
+            )
+            .ok();
+            writeln!(
+                out,
+                "  Estimated disk usage: ~{} ({} snapshots x ~{} average)",
+                ByteSize(estimate.total_bytes),
+                estimate.total_count,
+                ByteSize(estimate.per_snapshot_bytes)
+            )
+            .ok();
+            writeln!(
+                out,
+                "    {}",
+                "Upper bound only. BTRFS shares unchanged data between snapshots;"
+                    .dimmed()
+            )
+            .ok();
+            writeln!(
+                out,
+                "    {}",
+                "actual usage depends on your rate of change and is often 5-10x lower."
+                    .dimmed()
+            )
+            .ok();
+        }
+
+        if let Some(ref comparison) = preview.transient_comparison {
+            writeln!(out).ok();
+            let count_diff =
+                comparison.graduated_count.saturating_sub(comparison.transient_count);
+            if let Some(savings) = comparison.savings_bytes {
+                writeln!(
+                    out,
+                    "  Compared to transient: saves ~{} ({} fewer snapshots)",
+                    ByteSize(savings),
+                    count_diff
+                )
+                .ok();
+            } else {
+                writeln!(
+                    out,
+                    "  Compared to transient: saves {} snapshots",
+                    count_diff
+                )
+                .ok();
+            }
+            writeln!(out, "  Loses: {}", comparison.lost_window).ok();
+        }
+    }
+
+    out
+}
+
+fn format_snapshot_breakdown(windows: &[RecoveryWindow]) -> String {
+    windows
+        .iter()
+        .map(|w| format!("{} {}", w.count, w.granularity))
+        .collect::<Vec<_>>()
+        .join(" + ")
+}
+
+
 // ── Default status (bare `urd`) ────────────────────────────────────────
 
 /// Render bare `urd` one-sentence status.
@@ -1778,6 +2116,7 @@ mod tests {
                     }],
                     advisories: vec![],
                     redundancy_advisories: vec![],
+                    retention_summary: None,
                     errors: vec![],
                 },
                 StatusAssessment {
@@ -1801,6 +2140,7 @@ mod tests {
                     }],
                     advisories: vec![],
                     redundancy_advisories: vec![],
+                    retention_summary: None,
                     errors: vec![],
                 },
             ],
@@ -2103,6 +2443,7 @@ mod tests {
                 external: vec![],
                 advisories: vec![],
                 redundancy_advisories: vec![],
+                retention_summary: None,
                 errors: vec![],
             }],
             warnings: vec![],
@@ -3545,5 +3886,333 @@ mod tests {
         let parsed: serde_json::Value =
             serde_json::from_str(&output).expect("daemon first-time should be valid JSON");
         assert_eq!(parsed["status"], "not_configured");
+    }
+
+    // ── Doctor tests ──────────────────────────────────────────────────
+
+    use crate::output::{
+        DiskEstimate, DoctorCheck, DoctorDataSafety, DoctorOutput, DoctorSentinelStatus,
+        DoctorVerdict, EstimateMethod, RetentionPreview, TransientComparison,
+    };
+
+    fn test_doctor_healthy() -> DoctorOutput {
+        DoctorOutput {
+            config_checks: vec![DoctorCheck {
+                name: "9 subvolumes, 3 drives".to_string(),
+                status: DoctorCheckStatus::Ok,
+                detail: None,
+                suggestion: None,
+            }],
+            infra_checks: vec![
+                DoctorCheck {
+                    name: "Verifying state database".to_string(),
+                    status: DoctorCheckStatus::Ok,
+                    detail: Some("already exists".to_string()),
+                    suggestion: None,
+                },
+                DoctorCheck {
+                    name: "sudo btrfs".to_string(),
+                    status: DoctorCheckStatus::Ok,
+                    detail: None,
+                    suggestion: None,
+                },
+            ],
+            data_safety: vec![
+                DoctorDataSafety {
+                    name: "htpc-home".to_string(),
+                    status: "PROTECTED".to_string(),
+                    health: "healthy".to_string(),
+                    issue: None,
+                    suggestion: None,
+                },
+                DoctorDataSafety {
+                    name: "htpc-docs".to_string(),
+                    status: "PROTECTED".to_string(),
+                    health: "healthy".to_string(),
+                    issue: None,
+                    suggestion: None,
+                },
+            ],
+            sentinel: DoctorSentinelStatus {
+                running: true,
+                pid: Some(12345),
+                uptime: Some("3h 12m".to_string()),
+            },
+            verify: None,
+            verdict: DoctorVerdict::healthy(),
+        }
+    }
+
+    #[test]
+    fn doctor_all_healthy() {
+        colored::control::set_override(false);
+        let output = render_doctor(&test_doctor_healthy(), OutputMode::Interactive);
+        assert!(output.contains("All clear."), "missing verdict: {output}");
+        assert!(output.contains("2 of 2 sealed"), "missing sealed count: {output}");
+        assert!(output.contains("Sentinel running"), "missing sentinel: {output}");
+    }
+
+    #[test]
+    fn doctor_config_warnings() {
+        colored::control::set_override(false);
+        let mut data = test_doctor_healthy();
+        data.config_checks = vec![DoctorCheck {
+            name: "retention window shorter than send interval for htpc-root".to_string(),
+            status: DoctorCheckStatus::Warn,
+            detail: None,
+            suggestion: None,
+        }];
+        data.verdict = DoctorVerdict::warnings(1);
+        let output = render_doctor(&data, OutputMode::Interactive);
+        assert!(
+            output.contains("retention window"),
+            "missing config warning: {output}"
+        );
+        assert!(
+            output.contains("1 warning"),
+            "missing verdict: {output}"
+        );
+    }
+
+    #[test]
+    fn doctor_promise_issues() {
+        colored::control::set_override(false);
+        let mut data = test_doctor_healthy();
+        data.data_safety[1] = DoctorDataSafety {
+            name: "htpc-docs".to_string(),
+            status: "UNPROTECTED".to_string(),
+            health: "blocked".to_string(),
+            issue: Some("exposed — data may not be recoverable".to_string()),
+            suggestion: Some("Run `urd backup` or connect a drive.".to_string()),
+        };
+        data.verdict = DoctorVerdict::issues(1);
+        let output = render_doctor(&data, OutputMode::Interactive);
+        assert!(output.contains("exposed"), "missing exposed issue: {output}");
+        assert!(
+            output.contains("urd backup"),
+            "missing suggestion: {output}"
+        );
+        assert!(output.contains("1 issue"), "missing verdict: {output}");
+    }
+
+    #[test]
+    fn doctor_with_thorough() {
+        colored::control::set_override(false);
+        let mut data = test_doctor_healthy();
+        data.verify = Some(crate::output::VerifyOutput {
+            subvolumes: vec![],
+            preflight_warnings: vec![],
+            ok_count: 5,
+            warn_count: 0,
+            fail_count: 0,
+        });
+        let output = render_doctor(&data, OutputMode::Interactive);
+        assert!(output.contains("Threads"), "missing threads section: {output}");
+        assert!(
+            output.contains("5 checks OK"),
+            "missing verify results: {output}"
+        );
+    }
+
+    #[test]
+    fn doctor_without_thorough() {
+        colored::control::set_override(false);
+        let data = test_doctor_healthy();
+        let output = render_doctor(&data, OutputMode::Interactive);
+        assert!(
+            output.contains("--thorough"),
+            "missing thorough hint: {output}"
+        );
+    }
+
+    #[test]
+    fn doctor_verdict_healthy() {
+        let v = serde_json::to_value(&DoctorVerdict::healthy()).unwrap();
+        assert_eq!(v["status"], "healthy");
+        assert_eq!(v["count"], 0);
+    }
+
+    #[test]
+    fn doctor_verdict_warnings() {
+        let v = serde_json::to_value(&DoctorVerdict::warnings(3)).unwrap();
+        assert_eq!(v["status"], "warnings");
+        assert_eq!(v["count"], 3);
+    }
+
+    #[test]
+    fn doctor_verdict_issues() {
+        let v = serde_json::to_value(&DoctorVerdict::issues(2)).unwrap();
+        assert_eq!(v["status"], "issues");
+        assert_eq!(v["count"], 2);
+    }
+
+    #[test]
+    fn doctor_sentinel_running() {
+        colored::control::set_override(false);
+        let data = test_doctor_healthy();
+        let output = render_doctor(&data, OutputMode::Interactive);
+        assert!(
+            output.contains("PID 12345"),
+            "missing PID: {output}"
+        );
+        assert!(
+            output.contains("3h 12m"),
+            "missing uptime: {output}"
+        );
+    }
+
+    #[test]
+    fn doctor_daemon_json() {
+        let data = test_doctor_healthy();
+        let output = render_doctor(&data, OutputMode::Daemon);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&output).expect("doctor daemon output should be valid JSON");
+        assert_eq!(parsed["verdict"]["status"], "healthy");
+        assert_eq!(parsed["verdict"]["count"], 0);
+        assert!(parsed["config_checks"].is_array());
+        assert!(parsed["infra_checks"].is_array());
+        assert!(parsed["data_safety"].is_array());
+        assert_eq!(parsed["sentinel"]["running"], true);
+    }
+
+    // ── Retention preview tests ──────────────────────────────────────
+
+    fn test_graduated_preview() -> RetentionPreviewOutput {
+        RetentionPreviewOutput {
+            previews: vec![RetentionPreview {
+                subvolume_name: "htpc-root".to_string(),
+                policy_description: "graduated (hourly = 24, daily = 30, weekly = 26)".to_string(),
+                snapshot_interval: "4h".to_string(),
+                recovery_windows: vec![
+                    RecoveryWindow {
+                        granularity: "hourly",
+                        count: 24,
+                        cumulative_days: 1.0,
+                        cumulative_description:
+                            "point-in-time recovery for the last 24 hours".to_string(),
+                    },
+                    RecoveryWindow {
+                        granularity: "daily",
+                        count: 30,
+                        cumulative_days: 31.0,
+                        cumulative_description: "daily snapshots back 31 days".to_string(),
+                    },
+                    RecoveryWindow {
+                        granularity: "weekly",
+                        count: 26,
+                        cumulative_days: 213.0,
+                        cumulative_description: "weekly snapshots back 7 months".to_string(),
+                    },
+                ],
+                estimated_disk_usage: Some(DiskEstimate {
+                    method: EstimateMethod::Calibrated,
+                    per_snapshot_bytes: 1_500_000_000,
+                    total_bytes: 120_000_000_000,
+                    total_count: 80,
+                }),
+                transient_comparison: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn retention_preview_interactive() {
+        colored::control::set_override(false);
+        let output = render_retention_preview(&test_graduated_preview(), OutputMode::Interactive);
+        assert!(
+            output.contains("htpc-root"),
+            "missing subvolume name: {output}"
+        );
+        assert!(output.contains("graduated"), "missing policy: {output}");
+        assert!(
+            output.contains("24 hours"),
+            "missing hourly window: {output}"
+        );
+        assert!(
+            output.contains("31 days"),
+            "missing daily window: {output}"
+        );
+        assert!(
+            output.contains("7 months"),
+            "missing weekly window: {output}"
+        );
+        assert!(
+            output.contains("120.0GB"),
+            "missing disk estimate: {output}"
+        );
+        assert!(
+            output.contains("Upper bound"),
+            "missing caveat: {output}"
+        );
+    }
+
+    #[test]
+    fn retention_preview_daemon_json() {
+        let output = render_retention_preview(&test_graduated_preview(), OutputMode::Daemon);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&output).expect("daemon output should be valid JSON");
+        assert!(parsed["previews"][0]["subvolume_name"]
+            .as_str()
+            .unwrap()
+            .contains("htpc-root"));
+        assert_eq!(parsed["previews"][0]["recovery_windows"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn retention_preview_transient() {
+        colored::control::set_override(false);
+        let output = render_retention_preview(
+            &RetentionPreviewOutput {
+                previews: vec![RetentionPreview {
+                    subvolume_name: "htpc-root".to_string(),
+                    policy_description: "transient".to_string(),
+                    snapshot_interval: "1d".to_string(),
+                    recovery_windows: Vec::new(),
+                    estimated_disk_usage: None,
+                    transient_comparison: None,
+                }],
+            },
+            OutputMode::Interactive,
+        );
+        assert!(output.contains("none"), "missing 'none' for empty windows: {output}");
+        assert!(
+            output.contains("No local recovery"),
+            "missing transient description: {output}"
+        );
+    }
+
+    #[test]
+    fn retention_preview_with_comparison() {
+        colored::control::set_override(false);
+        let output = render_retention_preview(
+            &RetentionPreviewOutput {
+                previews: vec![RetentionPreview {
+                    subvolume_name: "test".to_string(),
+                    policy_description: "graduated (daily = 30)".to_string(),
+                    snapshot_interval: "1d".to_string(),
+                    recovery_windows: vec![RecoveryWindow {
+                        granularity: "daily",
+                        count: 30,
+                        cumulative_days: 30.0,
+                        cumulative_description: "daily snapshots back 30 days".to_string(),
+                    }],
+                    estimated_disk_usage: None,
+                    transient_comparison: Some(TransientComparison {
+                        graduated_count: 30,
+                        transient_count: 1,
+                        graduated_total_bytes: None,
+                        transient_total_bytes: None,
+                        savings_bytes: None,
+                        lost_window: "daily snapshots back 30 days".to_string(),
+                    }),
+                }],
+            },
+            OutputMode::Interactive,
+        );
+        assert!(
+            output.contains("saves 29 snapshots"),
+            "missing savings count: {output}"
+        );
+        assert!(output.contains("Loses:"), "missing loses: {output}");
     }
 }

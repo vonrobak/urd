@@ -74,6 +74,10 @@ fn main() -> anyhow::Result<()> {
             cli::SentinelCommands::Run => commands::sentinel::run_daemon(config),
             cli::SentinelCommands::Status => commands::sentinel::status(config, output_mode),
         },
+        Commands::Doctor(args) => commands::doctor::run(config, args, output_mode),
+        Commands::RetentionPreview(args) => {
+            commands::retention_preview::run(config, args, output_mode)
+        }
         Commands::Completions(_) => unreachable!("handled above"),
     }
 }

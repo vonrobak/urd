@@ -65,7 +65,7 @@ fn collect_init_data(config: &Config, fs_state: &dyn FileSystemState) -> InitOut
     }
 }
 
-fn collect_infrastructure_checks(config: &Config) -> Vec<InitCheck> {
+pub(crate) fn collect_infrastructure_checks(config: &Config) -> Vec<InitCheck> {
     let mut checks = Vec::new();
 
     // State database

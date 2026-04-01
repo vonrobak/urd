@@ -11,6 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Structured redundancy advisory system: detects no-offsite-protection, offsite-drive-stale (>30 days), single-point-of-failure, and transient-no-local-recovery gaps
 - REDUNDANCY section in `urd status` with per-advisory observation and suggestion
 - `advisory_summary` field in sentinel state file (schema v3) for Spindle tray icon integration
+- `urd retention-preview` command: shows recovery windows, disk estimates, and transient/graduated comparison for retention policies
+- RECOVERY column in `urd status` table showing compact retention summary per subvolume (e.g., "31d / 7mo / ∞")
+- `urd doctor` command: unified health check composing config, infrastructure, awareness, sentinel, and optional thread verification (`--thorough`)
 
 ### Changed
 - Offsite cycling advisory migrated from stringly-typed 7-day threshold to structured `OffsiteDriveStale` with 30-day threshold

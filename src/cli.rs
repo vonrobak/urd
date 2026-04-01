@@ -37,8 +37,33 @@ pub enum Commands {
     Get(GetArgs),
     /// Sentinel — continuous health monitoring
     Sentinel(SentinelArgs),
+    /// Run health diagnostics
+    Doctor(DoctorArgs),
+    /// Preview retention policy consequences
+    RetentionPreview(RetentionPreviewArgs),
     /// Generate shell completion scripts
     Completions(CompletionsArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub struct DoctorArgs {
+    /// Include thread verification (slower)
+    #[arg(long)]
+    pub thorough: bool,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct RetentionPreviewArgs {
+    /// Subvolume to preview
+    pub subvolume: Option<String>,
+
+    /// Preview all configured subvolumes
+    #[arg(long)]
+    pub all: bool,
+
+    /// Include transient/graduated comparison
+    #[arg(long)]
+    pub compare: bool,
 }
 
 #[derive(clap::Args, Debug)]
