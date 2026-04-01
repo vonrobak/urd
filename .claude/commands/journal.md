@@ -8,6 +8,7 @@ Write to `docs/98-journals/YYYY-MM-DD-slug.md`. This is gitignored (private, loc
 - Date: today's date
 - Base commit: `git rev-parse --short HEAD`
 - Slug: derived from $ARGUMENTS or inferred from what was done this session
+- Plan file: the `.claude/plans/` filename if a plan was used this session (from conversation context)
 
 **Template:**
 
@@ -18,6 +19,7 @@ Write to `docs/98-journals/YYYY-MM-DD-slug.md`. This is gitignored (private, loc
 
 **Date:** YYYY-MM-DD
 **Base commit:** `{short hash}`
+**Plan file:** `{.claude/plans/filename.md if used, omit this line if no plan}`
 
 ## What was done
 
@@ -50,7 +52,13 @@ if nothing is open.}
   for HSD-B"), not as tasks. A fresh session checks `git log`, `gh pr list`, and
   `git branch` for actual git state.
 
-## Output 2: Update status.md
+## Output 2: Update registry.md
+
+If this session produced artifacts for a UPI (design review, adversary review, PR merge),
+update the corresponding row in `docs/96-project-supervisor/registry.md` — fill in the
+link for the artifact that was produced. If no UPI-related artifacts were produced, skip.
+
+## Output 3: Update status.md
 
 Overwrite `docs/96-project-supervisor/status.md` with the current state. This is a short
 document (~50 lines) that a fresh session reads first.
