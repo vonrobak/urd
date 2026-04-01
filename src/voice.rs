@@ -16,8 +16,8 @@ use crate::output::{
     DoctorCheck, DoctorCheckStatus, DoctorOutput, DoctorVerdictStatus, FailuresOutput, GetOutput,
     HistoryOutput,
     InitOutput, InitStatus, OutputMode, PlanOutput, RecoveryWindow, RedundancyAdvisoryKind,
-    RetentionPreviewOutput, SentinelStatusOutput, SkipCategory, SkippedSubvolume, StatusOutput,
-    SubvolumeHistoryOutput, VerifyOutput, parse_duration_to_minutes,
+    RetentionPreviewOutput, SentinelStatusOutput, SkipCategory, SkippedSubvolume,
+    StatusAssessment, StatusOutput, SubvolumeHistoryOutput, VerifyOutput, parse_duration_to_minutes,
 };
 use crate::plan::format_duration_short;
 use crate::types::{ByteSize, DriveRole};
@@ -68,6 +68,14 @@ fn render_status_interactive(data: &StatusOutput) -> String {
         )
         .ok();
     }
+
+    // ── Next-action suggestion ──────────────────────────────────────
+    let has_exposed = data.assessments.iter().any(|a| a.status == "UNPROTECTED");
+    let has_degraded = data.assessments.iter().any(|a| a.health != "healthy");
+    append_suggestion(
+        &SuggestionContext::Status { has_exposed, has_degraded },
+        &mut out,
+    );
 
     out
 }
@@ -407,12 +415,20 @@ fn render_drive_summary(data: &StatusOutput, out: &mut String) {
             )
             .ok();
         } else {
-            let status = if drive.role == DriveRole::Offsite {
-                "away".dimmed()
+            let (worst_status, max_age) =
+                aggregate_drive_staleness(&data.assessments, &drive.label);
+            if let Some(escalated) =
+                escalated_staleness_text(&drive.label, worst_status, max_age)
+            {
+                writeln!(out, "Drives: {escalated}").ok();
             } else {
-                "disconnected".dimmed()
-            };
-            writeln!(out, "Drives: {} {}", drive.label.bold(), status,).ok();
+                let status = if drive.role == DriveRole::Offsite {
+                    "away".dimmed()
+                } else {
+                    "disconnected".dimmed()
+                };
+                writeln!(out, "Drives: {} {}", drive.label.bold(), status).ok();
+            }
         }
     }
 }
@@ -659,6 +675,10 @@ fn render_backup_interactive(data: &BackupSummary) -> String {
             writeln!(out, "{} {}", "WARNING:".yellow().bold(), warning).ok();
         }
     }
+
+    // ── Next-action suggestion ──────────────────────────────────────
+    let has_failures = data.subvolumes.iter().any(|sv| !sv.success);
+    append_suggestion(&SuggestionContext::Backup { has_failures }, &mut out);
 
     out
 }
@@ -962,6 +982,19 @@ fn render_plan_interactive(data: &PlanOutput) -> String {
         .bold()
     )
     .ok();
+
+    // ── Next-action suggestion ──────────────────────────────────────
+    let has_space_skip = data
+        .skipped
+        .iter()
+        .any(|s| s.category == SkipCategory::SpaceExceeded);
+    append_suggestion(
+        &SuggestionContext::Plan {
+            has_operations: !data.operations.is_empty(),
+            has_space_skip,
+        },
+        &mut out,
+    );
 
     out
 }
@@ -1426,6 +1459,12 @@ fn render_verify_interactive(data: &VerifyOutput) -> String {
         writeln!(out, "{}", summary.green().bold()).ok();
     }
 
+    // ── Next-action suggestion ──────────────────────────────────────
+    append_suggestion(
+        &SuggestionContext::Verify { has_broken: data.fail_count > 0 },
+        &mut out,
+    );
+
     out
 }
 
@@ -1872,6 +1911,9 @@ fn render_doctor_interactive(data: &DoctorOutput) -> String {
         }
     }
 
+    // Doctor verdict already provides guidance; suggestion is always None.
+    append_suggestion(&SuggestionContext::Doctor, &mut out);
+
     out
 }
 
@@ -2058,11 +2100,12 @@ fn render_default_status_interactive(data: &DefaultStatusOutput) -> String {
 
     writeln!(out).ok();
 
-    // Hint line
-    if data.sealed_count() == data.total {
-        writeln!(out, "Run `urd status` for details, `urd --help` for commands.").ok();
+    // Next-action suggestion
+    if data.sealed_count() < data.total {
+        append_suggestion(&SuggestionContext::Default { has_issues: true }, &mut out);
     } else {
-        writeln!(out, "Run `urd status` for details.").ok();
+        writeln!(out, "{}", "Run `urd status` for details, `urd --help` for commands.".dimmed())
+            .ok();
     }
 
     out
@@ -2077,6 +2120,134 @@ pub fn render_first_time(mode: OutputMode) -> String {
                 .to_string()
         }
         OutputMode::Daemon => r#"{"status":"not_configured"}"#.to_string(),
+    }
+}
+
+// ── Staleness Escalation (4a) ──────────────────────────────────────────
+
+/// Severity ranking for promise status strings (higher = worse).
+fn status_severity(status: &str) -> u8 {
+    match status {
+        "UNPROTECTED" => 2,
+        "AT RISK" => 1,
+        _ => 0,
+    }
+}
+
+/// Aggregate worst promise status and maximum send age for a drive label
+/// across all subvolume assessments.
+///
+/// Returns `("PROTECTED", None)` when no assessments reference the drive.
+fn aggregate_drive_staleness<'a>(
+    assessments: &'a [StatusAssessment],
+    drive_label: &str,
+) -> (&'a str, Option<i64>) {
+    let mut worst: &str = "PROTECTED";
+    let mut max_age: Option<i64> = None;
+
+    for assessment in assessments {
+        for ext in &assessment.external {
+            if ext.drive_label == drive_label {
+                if status_severity(&ext.status) > status_severity(worst) {
+                    worst = &ext.status;
+                }
+                if let Some(age) = ext.last_send_age_secs {
+                    max_age = Some(max_age.map_or(age, |current| current.max(age)));
+                }
+            }
+        }
+    }
+
+    (worst, max_age)
+}
+
+/// Graduated text for disconnected drives, calibrated by awareness status.
+///
+/// Returns `None` when no age data is available (caller uses existing fallback).
+/// Text is calibrated to the awareness model's promise status — voice never
+/// claims urgency that awareness doesn't support.
+fn escalated_staleness_text(
+    label: &str,
+    worst_status: &str,
+    max_age_secs: Option<i64>,
+) -> Option<String> {
+    let age_secs = max_age_secs?;
+    let age_str = humanize_duration(age_secs);
+
+    Some(match worst_status {
+        "UNPROTECTED" => format!(
+            "{} absent {} — protection degrading",
+            label.bold(),
+            age_str
+        ),
+        "AT RISK" => format!(
+            "{} away {} — consider connecting",
+            label.bold(),
+            age_str.yellow()
+        ),
+        _ => format!("{} away — {}", label.bold(), age_str.dimmed()),
+    })
+}
+
+// ── Next-Action Suggestions (4b) ──────────────────────────────────────
+
+/// Context for generating next-action suggestions after commands.
+/// Internal to voice.rs — constructed by render functions from their output data.
+enum SuggestionContext {
+    /// Bare `urd` (default command).
+    Default { has_issues: bool },
+    /// `urd status`.
+    Status { has_exposed: bool, has_degraded: bool },
+    /// `urd plan`.
+    Plan { has_operations: bool, has_space_skip: bool },
+    /// `urd backup`.
+    Backup { has_failures: bool },
+    /// `urd verify`.
+    Verify { has_broken: bool },
+    /// `urd doctor` — always returns None (verdict already guides the user).
+    Doctor,
+}
+
+/// Generate a context-specific next-action suggestion.
+///
+/// Returns `None` when the system is healthy or when the command's own output
+/// already guides the user (silence-when-healthy principle).
+fn suggest_next_action(context: &SuggestionContext) -> Option<&'static str> {
+    match context {
+        SuggestionContext::Default { has_issues: true } => {
+            Some("Run `urd status` for details.")
+        }
+        SuggestionContext::Status { has_exposed: true, .. }
+        | SuggestionContext::Status { has_degraded: true, .. } => {
+            Some("Run `urd doctor` to diagnose.")
+        }
+        SuggestionContext::Plan { has_space_skip: true, has_operations: true } => {
+            Some("Run `urd calibrate` to review retention, then `urd backup`.")
+        }
+        SuggestionContext::Plan { has_space_skip: true, .. } => {
+            Some("Run `urd calibrate` to review retention.")
+        }
+        SuggestionContext::Plan { has_operations: true, .. } => {
+            Some("Run `urd backup` to execute this plan.")
+        }
+        SuggestionContext::Backup { has_failures: true } => {
+            Some("Run `urd doctor` to diagnose failures.")
+        }
+        SuggestionContext::Verify { has_broken: true } => {
+            Some("Run `urd doctor` for remediation steps.")
+        }
+        // Doctor verdict already provides user guidance.
+        SuggestionContext::Doctor => None,
+        _ => None,
+    }
+}
+
+/// Append a dimmed next-action suggestion to the output buffer.
+/// No-op when there is nothing to suggest.
+fn append_suggestion(context: &SuggestionContext, out: &mut String) {
+    if let Some(suggestion) = suggest_next_action(context) {
+        writeln!(out).ok();
+        writeln!(out, "{}", suggestion.dimmed()).ok();
     }
 }
 
@@ -2230,6 +2401,36 @@ mod tests {
         assert!(output.contains("connected"), "missing connected status");
         assert!(output.contains("Offsite-4TB"), "missing unmounted drive");
         assert!(output.contains("away"), "missing away status for offsite drive");
+    }
+
+    #[test]
+    fn drive_summary_escalated_at_risk() {
+        colored::control::set_override(false);
+        // Build a status with an unmounted drive that has AT RISK assessment data
+        let mut data = test_status_output();
+        data.drives.push(DriveInfo {
+            label: "Backup-2TB".to_string(),
+            mounted: false,
+            free_bytes: None,
+            role: DriveRole::Primary,
+        });
+        data.assessments[0].external.push(StatusDriveAssessment {
+            drive_label: "Backup-2TB".to_string(),
+            status: "AT RISK".to_string(),
+            mounted: false,
+            snapshot_count: None,
+            last_send_age_secs: Some(604800), // 7 days
+            role: DriveRole::Primary,
+        });
+        let output = render_status(&data, OutputMode::Interactive);
+        assert!(
+            output.contains("consider connecting"),
+            "missing escalated text for AT RISK drive: {output}"
+        );
+        assert!(
+            output.contains("Backup-2TB"),
+            "missing drive label: {output}"
+        );
     }
 
     #[test]
@@ -3640,14 +3841,20 @@ mod tests {
             role: DriveRole::Primary,
         });
         let output = render_status(&data, OutputMode::Interactive);
-        // Primary drives should NOT show "away" — only offsite drives do
+        // With staleness escalation, PROTECTED drives show "away — {age}"
+        // regardless of role (urgency is governed by awareness status, not role)
         let lines: Vec<&str> = output.lines().collect();
-        let test_drive_line = lines.iter().find(|l| l.contains("Test-Drive"));
-        assert!(test_drive_line.is_some(), "missing Test-Drive in output");
-        // The drive summary should show "disconnected" not "away"
+        let test_drive_line = lines
+            .iter()
+            .find(|l| l.starts_with("Drives:") && l.contains("Test-Drive"))
+            .expect("missing Test-Drive drive summary line in output");
         assert!(
-            output.contains("disconnected"),
-            "primary drive should show disconnected, not away: {output}"
+            test_drive_line.contains("away"),
+            "PROTECTED disconnected drive should show 'away': {test_drive_line}"
+        );
+        assert!(
+            test_drive_line.contains("1d"),
+            "should show age: {test_drive_line}"
         );
     }
 
@@ -4214,5 +4421,385 @@ mod tests {
             "missing savings count: {output}"
         );
         assert!(output.contains("Loses:"), "missing loses: {output}");
+    }
+
+    // ── 4a: Staleness Escalation Tests ────────────────────────────────
+
+    #[test]
+    fn status_severity_ordering() {
+        assert!(status_severity("UNPROTECTED") > status_severity("AT RISK"));
+        assert!(status_severity("AT RISK") > status_severity("PROTECTED"));
+        assert_eq!(status_severity("PROTECTED"), 0);
+        assert_eq!(status_severity("unknown"), 0);
+    }
+
+    #[test]
+    fn aggregate_staleness_single_subvol() {
+        let assessments = vec![StatusAssessment {
+            name: "data".to_string(),
+            status: "AT RISK".to_string(),
+            health: "healthy".to_string(),
+            health_reasons: vec![],
+            promise_level: None,
+            local_snapshot_count: 10,
+            local_newest_age_secs: Some(3600),
+            local_status: "PROTECTED".to_string(),
+            external: vec![StatusDriveAssessment {
+                drive_label: "WD-18TB".to_string(),
+                status: "AT RISK".to_string(),
+                mounted: false,
+                snapshot_count: None,
+                last_send_age_secs: Some(604800),
+                role: DriveRole::Primary,
+            }],
+            advisories: vec![],
+            redundancy_advisories: vec![],
+            retention_summary: None,
+            errors: vec![],
+        }];
+
+        let (status, age) = aggregate_drive_staleness(&assessments, "WD-18TB");
+        assert_eq!(status, "AT RISK");
+        assert_eq!(age, Some(604800));
+    }
+
+    #[test]
+    fn aggregate_staleness_worst_across_subvols() {
+        let assessments = vec![
+            StatusAssessment {
+                name: "home".to_string(),
+                status: "PROTECTED".to_string(),
+                health: "healthy".to_string(),
+                health_reasons: vec![],
+                promise_level: None,
+                local_snapshot_count: 10,
+                local_newest_age_secs: Some(1800),
+                local_status: "PROTECTED".to_string(),
+                external: vec![StatusDriveAssessment {
+                    drive_label: "WD-18TB".to_string(),
+                    status: "PROTECTED".to_string(),
+                    mounted: false,
+                    snapshot_count: None,
+                    last_send_age_secs: Some(86400),
+                    role: DriveRole::Primary,
+                }],
+                advisories: vec![],
+                redundancy_advisories: vec![],
+                retention_summary: None,
+                errors: vec![],
+            },
+            StatusAssessment {
+                name: "docs".to_string(),
+                status: "UNPROTECTED".to_string(),
+                health: "healthy".to_string(),
+                health_reasons: vec![],
+                promise_level: None,
+                local_snapshot_count: 5,
+                local_newest_age_secs: Some(3600),
+                local_status: "PROTECTED".to_string(),
+                external: vec![StatusDriveAssessment {
+                    drive_label: "WD-18TB".to_string(),
+                    status: "UNPROTECTED".to_string(),
+                    mounted: false,
+                    snapshot_count: None,
+                    last_send_age_secs: Some(2592000),
+                    role: DriveRole::Primary,
+                }],
+                advisories: vec![],
+                redundancy_advisories: vec![],
+                retention_summary: None,
+                errors: vec![],
+            },
+        ];
+
+        let (status, _) = aggregate_drive_staleness(&assessments, "WD-18TB");
+        assert_eq!(status, "UNPROTECTED");
+    }
+
+    #[test]
+    fn aggregate_staleness_max_age() {
+        let assessments = vec![
+            StatusAssessment {
+                name: "home".to_string(),
+                status: "AT RISK".to_string(),
+                health: "healthy".to_string(),
+                health_reasons: vec![],
+                promise_level: None,
+                local_snapshot_count: 10,
+                local_newest_age_secs: Some(1800),
+                local_status: "PROTECTED".to_string(),
+                external: vec![StatusDriveAssessment {
+                    drive_label: "WD-18TB".to_string(),
+                    status: "AT RISK".to_string(),
+                    mounted: false,
+                    snapshot_count: None,
+                    last_send_age_secs: Some(86400),
+                    role: DriveRole::Primary,
+                }],
+                advisories: vec![],
+                redundancy_advisories: vec![],
+                retention_summary: None,
+                errors: vec![],
+            },
+            StatusAssessment {
+                name: "docs".to_string(),
+                status: "AT RISK".to_string(),
+                health: "healthy".to_string(),
+                health_reasons: vec![],
+                promise_level: None,
+                local_snapshot_count: 5,
+                local_newest_age_secs: Some(3600),
+                local_status: "PROTECTED".to_string(),
+                external: vec![StatusDriveAssessment {
+                    drive_label: "WD-18TB".to_string(),
+                    status: "PROTECTED".to_string(),
+                    mounted: false,
+                    snapshot_count: None,
+                    last_send_age_secs: Some(604800),
+                    role: DriveRole::Primary,
+                }],
+                advisories: vec![],
+                redundancy_advisories: vec![],
+                retention_summary: None,
+                errors: vec![],
+            },
+        ];
+
+        let (_, age) = aggregate_drive_staleness(&assessments, "WD-18TB");
+        assert_eq!(age, Some(604800));
+    }
+
+    #[test]
+    fn aggregate_staleness_no_match() {
+        let assessments = vec![StatusAssessment {
+            name: "data".to_string(),
+            status: "PROTECTED".to_string(),
+            health: "healthy".to_string(),
+            health_reasons: vec![],
+            promise_level: None,
+            local_snapshot_count: 10,
+            local_newest_age_secs: Some(1800),
+            local_status: "PROTECTED".to_string(),
+            external: vec![StatusDriveAssessment {
+                drive_label: "WD-18TB".to_string(),
+                status: "PROTECTED".to_string(),
+                mounted: true,
+                snapshot_count: Some(5),
+                last_send_age_secs: Some(3600),
+                role: DriveRole::Primary,
+            }],
+            advisories: vec![],
+            redundancy_advisories: vec![],
+            retention_summary: None,
+            errors: vec![],
+        }];
+
+        let (status, age) = aggregate_drive_staleness(&assessments, "NONEXISTENT");
+        assert_eq!(status, "PROTECTED");
+        assert_eq!(age, None);
+    }
+
+    #[test]
+    fn staleness_text_protected_minimal() {
+        colored::control::set_override(false);
+        let result =
+            escalated_staleness_text("WD-18TB", "PROTECTED", Some(259200));
+        let text = result.unwrap();
+        assert!(text.contains("WD-18TB"), "missing label: {text}");
+        assert!(text.contains("away"), "missing 'away': {text}");
+        assert!(text.contains("3d"), "missing age: {text}");
+        assert!(!text.contains("consider"), "should not have urgency: {text}");
+        assert!(!text.contains("degrading"), "should not have urgency: {text}");
+    }
+
+    #[test]
+    fn staleness_text_at_risk_consider() {
+        colored::control::set_override(false);
+        let result =
+            escalated_staleness_text("WD-18TB", "AT RISK", Some(604800));
+        let text = result.unwrap();
+        assert!(text.contains("WD-18TB"), "missing label: {text}");
+        assert!(
+            text.contains("consider connecting"),
+            "missing suggestion: {text}"
+        );
+        assert!(text.contains("7d"), "missing age: {text}");
+    }
+
+    #[test]
+    fn staleness_text_unprotected_degrading() {
+        colored::control::set_override(false);
+        let result =
+            escalated_staleness_text("WD-18TB1", "UNPROTECTED", Some(2592000));
+        let text = result.unwrap();
+        assert!(text.contains("WD-18TB1"), "missing label: {text}");
+        assert!(text.contains("absent"), "should use 'absent': {text}");
+        assert!(
+            text.contains("protection degrading"),
+            "missing escalation: {text}"
+        );
+        assert!(text.contains("30d"), "missing age: {text}");
+    }
+
+    #[test]
+    fn staleness_text_no_age_returns_none() {
+        let result = escalated_staleness_text("WD-18TB", "AT RISK", None);
+        assert!(result.is_none());
+    }
+
+    // ── 4b: Next-Action Suggestion Tests ──────────────────────────────
+
+    #[test]
+    fn suggestion_default_healthy_none() {
+        assert!(suggest_next_action(&SuggestionContext::Default { has_issues: false }).is_none());
+    }
+
+    #[test]
+    fn suggestion_default_issues_suggests_status() {
+        let s = suggest_next_action(&SuggestionContext::Default { has_issues: true }).unwrap();
+        assert!(s.contains("urd status"), "should suggest status: {s}");
+    }
+
+    #[test]
+    fn suggestion_status_healthy_none() {
+        assert!(suggest_next_action(&SuggestionContext::Status {
+            has_exposed: false,
+            has_degraded: false,
+        })
+        .is_none());
+    }
+
+    #[test]
+    fn suggestion_status_exposed_suggests_doctor() {
+        let s = suggest_next_action(&SuggestionContext::Status {
+            has_exposed: true,
+            has_degraded: false,
+        })
+        .unwrap();
+        assert!(s.contains("urd doctor"), "should suggest doctor: {s}");
+    }
+
+    #[test]
+    fn suggestion_status_degraded_suggests_doctor() {
+        let s = suggest_next_action(&SuggestionContext::Status {
+            has_exposed: false,
+            has_degraded: true,
+        })
+        .unwrap();
+        assert!(s.contains("urd doctor"), "should suggest doctor: {s}");
+    }
+
+    #[test]
+    fn suggestion_plan_nothing_none() {
+        assert!(suggest_next_action(&SuggestionContext::Plan {
+            has_operations: false,
+            has_space_skip: false,
+        })
+        .is_none());
+    }
+
+    #[test]
+    fn suggestion_plan_operations_suggests_backup() {
+        let s = suggest_next_action(&SuggestionContext::Plan {
+            has_operations: true,
+            has_space_skip: false,
+        })
+        .unwrap();
+        assert!(s.contains("urd backup"), "should suggest backup: {s}");
+    }
+
+    #[test]
+    fn suggestion_plan_space_skip_suggests_calibrate() {
+        let s = suggest_next_action(&SuggestionContext::Plan {
+            has_operations: true,
+            has_space_skip: true,
+        })
+        .unwrap();
+        assert!(s.contains("urd calibrate"), "should suggest calibrate: {s}");
+        assert!(s.contains("urd backup"), "should also suggest backup: {s}");
+    }
+
+    #[test]
+    fn suggestion_backup_clean_none() {
+        assert!(
+            suggest_next_action(&SuggestionContext::Backup { has_failures: false }).is_none()
+        );
+    }
+
+    #[test]
+    fn suggestion_backup_failures_suggests_doctor() {
+        let s =
+            suggest_next_action(&SuggestionContext::Backup { has_failures: true }).unwrap();
+        assert!(s.contains("urd doctor"), "should suggest doctor: {s}");
+    }
+
+    #[test]
+    fn suggestion_verify_clean_none() {
+        assert!(
+            suggest_next_action(&SuggestionContext::Verify { has_broken: false }).is_none()
+        );
+    }
+
+    #[test]
+    fn suggestion_verify_broken_suggests_doctor() {
+        let s =
+            suggest_next_action(&SuggestionContext::Verify { has_broken: true }).unwrap();
+        assert!(s.contains("urd doctor"), "should suggest doctor: {s}");
+    }
+
+    #[test]
+    fn suggestion_doctor_always_none() {
+        // M1 fix + verdict already guides: Doctor suggestions always return None
+        assert!(suggest_next_action(&SuggestionContext::Doctor).is_none());
+    }
+
+    // ── 4b: Integration Tests ─────────────────────────────────────────
+
+    #[test]
+    fn status_interactive_exposed_has_suggestion_line() {
+        colored::control::set_override(false);
+        // test_status_output has htpc-docs as "AT RISK" with degraded health
+        let output = render_status(&test_status_output(), OutputMode::Interactive);
+        assert!(
+            output.contains("urd doctor"),
+            "degraded status should suggest doctor: {output}"
+        );
+    }
+
+    #[test]
+    fn default_status_healthy_has_help_hint() {
+        colored::control::set_override(false);
+        let data = test_default_all_sealed();
+        let output = render_default_status(&data, OutputMode::Interactive);
+        assert!(
+            output.contains("urd --help"),
+            "healthy default should show help hint: {output}"
+        );
+        assert!(
+            !output.contains("urd doctor"),
+            "healthy default should not suggest doctor: {output}"
+        );
+    }
+
+    #[test]
+    fn default_status_issues_suggests_status() {
+        colored::control::set_override(false);
+        let mut data = test_default_all_sealed();
+        data.exposed_names = vec!["htpc-docs".to_string()];
+        let output = render_default_status(&data, OutputMode::Interactive);
+        assert!(
+            output.contains("urd status"),
+            "issues should suggest urd status: {output}"
+        );
+    }
+
+    #[test]
+    fn doctor_interactive_healthy_no_suggestion() {
+        colored::control::set_override(false);
+        let output = render_doctor(&test_doctor_healthy(), OutputMode::Interactive);
+        // Should have verdict "All clear." but no extra suggestion line
+        assert!(output.contains("All clear."), "missing verdict: {output}");
+        // The suggestion system returns None for doctor, so no "urd" command in suggestion
+        // (verdict line already contains guidance for non-healthy cases)
     }
 }

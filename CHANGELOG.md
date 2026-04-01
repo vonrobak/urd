@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Staleness escalation: disconnected drives show graduated urgency text based on awareness promise status (PROTECTED → minimal, AT RISK → "consider connecting", UNPROTECTED → "protection degrading")
+- Next-action suggestions: context-specific dimmed hints after `urd status`, `urd plan`, `urd backup`, `urd verify`, and bare `urd` (silence when healthy)
 - Structured redundancy advisory system: detects no-offsite-protection, offsite-drive-stale (>30 days), single-point-of-failure, and transient-no-local-recovery gaps
 - REDUNDANCY section in `urd status` with per-advisory observation and suggestion
 - `advisory_summary` field in sentinel state file (schema v3) for Spindle tray icon integration
