@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Btrfs receive stdout ("At snapshot ...") no longer leaks into terminal during sends
+- Backup progress display: completion lines now print synchronously from executor, fixing race where wrong subvolume names and missing completions appeared for fast sends
+- `[preflight]` internal prefix removed from user-facing backup warnings
+
+### Changed
+- Default command: "All sealed." → "All connected drives are sealed." with health degradation surfacing
+- Status table: PROTECTION column hidden unless exposure conflicts with promise; disconnected drive columns collapsed; RECOVERY column hidden (showed policy, not actual depth)
+- Backup skipped section: only absent drives and actionable skips shown; [WAIT] and [OFF] suppressed
+- Doctor warnings include concrete numbers (e.g., "snapshot_interval (1w) exceeds guarded requirement (1d)") with fix suggestions
+- UUID missing warning moved from runtime log to `urd doctor` check
+- Log output (WARN level) suppressed on interactive TTY; structured presentation layer handles all user-facing warnings
+
 ## [0.7.0] - 2026-04-01
 
 ### Added

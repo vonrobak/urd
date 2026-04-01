@@ -252,8 +252,8 @@ fn check_promise_achievability(
         checks.push(PreflightCheck {
             name: "weakening-override",
             message: format!(
-                "{}: snapshot_interval is longer than {} baseline — promise may not be met",
-                subvol.name, level,
+                "{}: snapshot_interval ({}) exceeds {} requirement ({})",
+                subvol.name, subvol.snapshot_interval, level, derived.snapshot_interval,
             ),
         });
     }
@@ -262,8 +262,8 @@ fn check_promise_achievability(
         checks.push(PreflightCheck {
             name: "weakening-override",
             message: format!(
-                "{}: send_interval is longer than {} baseline — external copies may lag",
-                subvol.name, level,
+                "{}: send_interval ({}) exceeds {} requirement ({})",
+                subvol.name, subvol.send_interval, level, derived.send_interval,
             ),
         });
     }

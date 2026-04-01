@@ -1,6 +1,7 @@
 use crate::awareness::{self, PromiseStatus};
 use crate::cli::{DoctorArgs, VerifyArgs};
 use crate::config::Config;
+use crate::drives;
 use crate::output::{
     DoctorCheck, DoctorCheckStatus, DoctorDataSafety, DoctorOutput, DoctorSentinelStatus,
     DoctorVerdict, InitStatus, OutputMode,
@@ -37,11 +38,17 @@ pub fn run(config: Config, args: DoctorArgs, output_mode: OutputMode) -> anyhow:
             .iter()
             .map(|c| {
                 warn_count += 1;
+                let suggestion = match c.name {
+                    "weakening-override" => {
+                        Some("Reduce the interval to match, or change protection to custom".to_string())
+                    }
+                    _ => None,
+                };
                 DoctorCheck {
                     name: c.message.clone(),
                     status: DoctorCheckStatus::Warn,
                     detail: None,
-                    suggestion: None,
+                    suggestion,
                 }
             })
             .collect()
@@ -49,7 +56,7 @@ pub fn run(config: Config, args: DoctorArgs, output_mode: OutputMode) -> anyhow:
 
     // ── 2. Infrastructure checks (I/O: DB, dirs, sudo btrfs) ─────
     let init_checks = init::collect_infrastructure_checks(&config);
-    let infra_checks: Vec<DoctorCheck> = init_checks
+    let mut infra_checks: Vec<DoctorCheck> = init_checks
         .into_iter()
         .map(|c| {
             let status = match c.status {
@@ -71,6 +78,17 @@ pub fn run(config: Config, args: DoctorArgs, output_mode: OutputMode) -> anyhow:
             }
         })
         .collect();
+
+    // UUID fingerprinting checks for mounted drives
+    for (label, _uuid, snippet) in drives::check_missing_uuids(&config.drives) {
+        warn_count += 1;
+        infra_checks.push(DoctorCheck {
+            name: format!("{label}: no UUID configured"),
+            status: DoctorCheckStatus::Warn,
+            detail: None,
+            suggestion: Some(format!("Add {snippet} to [[drives]] for {label}")),
+        });
+    }
 
     // ── 3. Data safety (awareness model) ──────────────────────────
     let state_db = if config.general.state_db.exists() {

@@ -4,9 +4,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use std::time::Duration;
+
 use crate::btrfs::BtrfsOps;
 use crate::chain;
-use crate::commands::backup::{ProgressContext, SizeEstimates};
+use crate::commands::backup::{format_completion_line, ProgressContext, SizeEstimates};
 use crate::config::Config;
 use crate::drives;
 use crate::error::BtrfsOperation;
@@ -597,12 +599,35 @@ impl<'a> Executor<'a> {
                 // Same pattern as pin-on-success: failure is logged, not fatal.
                 self.maybe_write_drive_token(drive_label);
 
+                // Print completion line for sends >1s (mutex protocol: lock → clear → print → release)
+                let elapsed = start.elapsed();
+                if elapsed > Duration::from_secs(1)
+                    && let Some(ref ctx) = self.progress_context
+                    && let Ok(_guard) = ctx.lock()
+                {
+                    eprint!("\r\x1b[2K");
+                    eprintln!(
+                        "{}",
+                        format_completion_line(
+                            subvol_name,
+                            drive_label,
+                            result.bytes_transferred.unwrap_or(0),
+                            elapsed,
+                            if parent.is_some() {
+                                SendType::Incremental
+                            } else {
+                                SendType::Full
+                            },
+                        )
+                    );
+                }
+
                 (
                     OperationOutcome {
                         operation: op_name.to_string(),
                         drive_label: Some(drive_label.to_string()),
                         result: OpResult::Success,
-                        duration: start.elapsed(),
+                        duration: elapsed,
                         error: None,
                         bytes_transferred: result.bytes_transferred,
                         btrfs_operation: None,

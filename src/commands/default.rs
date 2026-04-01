@@ -48,11 +48,18 @@ pub fn run(config_path: Option<&Path>, output_mode: OutputMode) -> anyhow::Resul
     let total = assessments.len();
     let mut waning_names = Vec::new();
     let mut exposed_names = Vec::new();
+    let mut degraded_count = 0usize;
+    let mut blocked_count = 0usize;
     for a in &assessments {
         match a.status {
             awareness::PromiseStatus::AtRisk => waning_names.push(a.name.clone()),
             awareness::PromiseStatus::Unprotected => exposed_names.push(a.name.clone()),
             awareness::PromiseStatus::Protected => {}
+        }
+        match a.health {
+            awareness::OperationalHealth::Degraded => degraded_count += 1,
+            awareness::OperationalHealth::Blocked => blocked_count += 1,
+            awareness::OperationalHealth::Healthy => {}
         }
     }
 
@@ -60,6 +67,8 @@ pub fn run(config_path: Option<&Path>, output_mode: OutputMode) -> anyhow::Resul
         total,
         waning_names,
         exposed_names,
+        degraded_count,
+        blocked_count,
         last_run,
         last_run_age_secs,
     };

@@ -68,14 +68,8 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
         filter_promise_retention(&config, &mut backup_plan);
     }
 
-    // Warn about drives without UUID fingerprinting
-    drives::warn_missing_uuids(&config.drives);
-
     // Run pre-flight config consistency checks
     let preflight_warnings = preflight::preflight_checks(&config);
-    for check in &preflight_warnings {
-        log::warn!("[preflight] {}", check.message);
-    }
 
     // Dry run: print plan and exit (no lock needed)
     if args.dry_run {
@@ -355,7 +349,7 @@ fn build_backup_summary(
 
     // Pre-flight config consistency warnings
     for check in preflight_warnings {
-        warnings.push(format!("[preflight] {}", check.message));
+        warnings.push(check.message.clone());
     }
 
     // Pin failure warnings
@@ -590,8 +584,14 @@ fn count_external_snapshots(
 // ── Progress display ──────────────────────────────────────────────────
 
 /// Shared context between executor (writer) and progress display thread (reader).
-/// The executor updates this before each send; the progress thread reads it on
-/// send-start transitions.
+///
+/// **Mutex protocol:** Both the executor and progress thread hold the lock for their
+/// entire clear-print-update cycle to prevent interleaved output on stderr:
+///   1. Lock ProgressContext
+///   2. Clear progress line (`\r\x1b[2K` on stderr)
+///   3. Print completion or progress line
+///   4. Update context fields (executor only)
+///   5. Release lock
 pub(crate) struct ProgressContext {
     pub subvolume_name: String,
     pub drive_label: String,
@@ -724,7 +724,7 @@ fn format_progress_line(
 }
 
 /// Format the permanent completion line printed after each send finishes.
-fn format_completion_line(
+pub(crate) fn format_completion_line(
     name: &str,
     drive: &str,
     bytes: u64,
@@ -776,7 +776,6 @@ fn progress_display_loop(
     // Locally cached context (read from mutex on send-start transition)
     let mut ctx_name = String::new();
     let mut ctx_drive = String::new();
-    let mut ctx_send_type = SendType::Full;
     let mut ctx_index = 0u32;
     let mut ctx_total = 0u32;
     let mut ctx_estimated: Option<u64> = None;
@@ -786,21 +785,7 @@ fn progress_display_loop(
 
         let current = counter.load(Ordering::Relaxed);
         if current == 0 {
-            if last_display_bytes > 0 {
-                // Completing: counter reset to 0 after active send.
-                // Print permanent completion line.
-                eprint!("\r\x1b[2K"); // clear live line
-                eprintln!(
-                    "{}",
-                    format_completion_line(
-                        &ctx_name,
-                        &ctx_drive,
-                        last_display_bytes,
-                        send_start.elapsed(),
-                        ctx_send_type,
-                    )
-                );
-            }
+            // Send completed (counter reset) or idle. Clear display state.
             last_display_bytes = 0;
             continue;
         }
@@ -817,14 +802,18 @@ fn progress_display_loop(
             let ctx = context.lock().unwrap_or_else(|e| e.into_inner());
             ctx_name = ctx.subvolume_name.clone();
             ctx_drive = ctx.drive_label.clone();
-            ctx_send_type = ctx.send_type;
             ctx_index = ctx.send_index;
             ctx_total = ctx.total_sends;
             ctx_estimated = ctx.estimated_bytes;
         }
         last_display_bytes = current;
 
+        // Only render progress for sends active >1s (sub-second sends are silent)
         let elapsed = send_start.elapsed();
+        if elapsed < Duration::from_secs(1) {
+            continue;
+        }
+
         let rate = if elapsed.as_secs_f64() > 0.5 {
             current as f64 / elapsed.as_secs_f64()
         } else {
@@ -846,23 +835,8 @@ fn progress_display_loop(
         );
     }
 
-    // Shutdown: if a send was active, print its completion line
-    if last_display_bytes > 0 {
-        eprint!("\r\x1b[2K");
-        eprintln!(
-            "{}",
-            format_completion_line(
-                &ctx_name,
-                &ctx_drive,
-                last_display_bytes,
-                send_start.elapsed(),
-                ctx_send_type,
-            )
-        );
-    } else {
-        // Clear the progress line
-        eprint!("\r\x1b[2K");
-    }
+    // Shutdown: clear any active progress line
+    eprint!("\r\x1b[2K");
 }
 
 fn format_elapsed(d: Duration) -> String {
