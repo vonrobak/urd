@@ -270,6 +270,10 @@ pub struct DefaultStatusOutput {
     pub waning_names: Vec<String>,
     /// Names of subvolumes with UNPROTECTED status.
     pub exposed_names: Vec<String>,
+    /// Count of subvolumes with degraded operational health.
+    pub degraded_count: usize,
+    /// Count of subvolumes with blocked operational health.
+    pub blocked_count: usize,
     /// Last backup run info.
     pub last_run: Option<LastRunInfo>,
     /// Seconds since last backup started, pre-computed by the command handler.

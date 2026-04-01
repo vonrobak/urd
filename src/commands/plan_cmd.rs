@@ -1,6 +1,5 @@
 use crate::cli::PlanArgs;
 use crate::config::Config;
-use crate::drives;
 use crate::output::{
     OutputMode, PlanOperationEntry, PlanOutput, PlanSummaryOutput, SkipCategory,
     SkippedSubvolume,
@@ -24,9 +23,6 @@ pub fn run(config: Config, args: PlanArgs, mode: OutputMode) -> anyhow::Result<(
         state: state_db.as_ref(),
     };
     let backup_plan = plan::plan(&config, now, &filters, &fs_state)?;
-
-    // Warn about drives without UUID fingerprinting
-    drives::warn_missing_uuids(&config.drives);
 
     let output = build_plan_output(&backup_plan, &fs_state);
     print!("{}", voice::render_plan(&output, mode));

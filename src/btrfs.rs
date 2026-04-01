@@ -166,6 +166,7 @@ impl BtrfsOps for RealBtrfs {
             .arg("receive")
             .arg(dest_dir)
             .stdin(Stdio::piped())
+            .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| UrdError::Btrfs {

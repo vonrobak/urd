@@ -36,9 +36,16 @@ fn main() -> anyhow::Result<()> {
         colored::control::set_override(false);
     }
 
+    // Suppress WARN-level log output on interactive TTY — all warnings that matter
+    // to users are surfaced through the structured presentation layer (doctor checks,
+    // preflight warnings, status advisories). Raw log lines are for daemon mode and
+    // debugging (--verbose or RUST_LOG). Sentinel lifecycle logs (warn-level by convention)
+    // are also suppressed on TTY; use --verbose for interactive sentinel debugging.
     env_logger::Builder::new()
         .filter_level(if cli.verbose {
             log::LevelFilter::Debug
+        } else if std::io::stderr().is_terminal() {
+            log::LevelFilter::Error
         } else {
             log::LevelFilter::Warn
         })

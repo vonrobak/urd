@@ -101,31 +101,22 @@ pub fn get_filesystem_uuid(mount_path: &Path) -> crate::error::Result<Option<Str
     }
 }
 
-/// Log warnings for drives that have no UUID configured, showing the detected
-/// UUID so the user can copy-paste it into their config.
-pub fn warn_missing_uuids(drives: &[DriveConfig]) {
+/// Check mounted drives for missing UUID configuration.
+/// Returns a list of (drive_label, detected_uuid, config_snippet) for each
+/// mounted drive without a UUID configured.
+#[must_use]
+pub fn check_missing_uuids(drives: &[DriveConfig]) -> Vec<(String, String, String)> {
+    let mut results = Vec::new();
     for drive in drives {
-        if drive.uuid.is_some() {
+        if drive.uuid.is_some() || !is_path_mounted(&drive.mount_path) {
             continue;
         }
-        if !is_path_mounted(&drive.mount_path) {
-            continue;
-        }
-        match get_filesystem_uuid(&drive.mount_path) {
-            Ok(Some(uuid)) => {
-                log::warn!(
-                    "drive {:?} has no UUID configured — \
-                     detected {} at {}, add `uuid = \"{}\"` to [[drives]] for safety",
-                    drive.label,
-                    uuid,
-                    drive.mount_path.display(),
-                    uuid
-                );
-            }
-            Ok(None) => {}
-            Err(_) => {}
+        if let Ok(Some(uuid)) = get_filesystem_uuid(&drive.mount_path) {
+            let snippet = format!("uuid = \"{}\"", uuid);
+            results.push((drive.label.clone(), uuid.to_string(), snippet));
         }
     }
+    results
 }
 
 // ── Existing functions ─────────────────────────────────────────────────

@@ -9,29 +9,28 @@
 
 **Urd is the sole backup system.** Systemd timer running nightly at 04:00 since 2026-03-25.
 Sentinel daemon deployed (passive monitoring, drive detection, backup overdue alerts).
-692 tests, all passing, clippy clean. Current version: v0.7.0.
+695 tests, all passing, clippy clean. Current version: v0.7.0.
 
-**Voice & UX arc complete.** All six phases merged: vocabulary (P1), urd default +
-completions (P2a+2c), redundancy advisories (6-I), retention preview + doctor (6-N + P2b),
-staleness escalation + suggestions (P4a+4b), mythic transitions (P4c).
+**Output polish complete (UPI 002).** Progress display bugs fixed, status table simplified
+(hide PROTECTION/RECOVERY, collapse disconnected drives), default wording updated ("All
+connected drives are sealed"), doctor warnings include concrete numbers and fix suggestions,
+UUID warning moved to doctor, log noise suppressed on TTY. Uncommitted — ready for PR.
 
 **Workflow system overhaul complete (UPI 001).** UPI system, registry.md, /sequence skill,
-updated pipeline, archived 550-line roadmap and replaced with 85-line version, validate.sh.
+updated pipeline, archived 550-line roadmap and replaced with 85-line version.
 
 ## In Progress
 
-Nothing active. Last completed: UPI 001 workflow system overhaul.
+**Backup-now imperative (idea stage).** `urd backup` typed by a human should take fresh
+snapshots and send to all connected drives, ignoring interval checks. Idea sketch at
+`docs/95-ideas/2026-04-01-backup-now-imperative.md`. Needs `/design`.
 
 ## Next Up
 
-1. **6-O** — Progressive disclosure (milestones, onboarding layer). ~2 sessions.
+1. **Backup-now imperative** — design and implement manual vs scheduled semantics. ~2 sessions.
+2. **6-O** — Progressive disclosure (milestones, onboarding layer). ~2 sessions.
    Design: [95-ideas/2026-03-31-design-o-progressive-disclosure.md](../95-ideas/2026-03-31-design-o-progressive-disclosure.md)
-2. **P6a** — ADR-110 enum rename. ~1 session.
-3. **P6b** — Config Serialize refactor. ~0.5 session.
-4. **6-H** — Guided setup wizard. ~4 sessions.
-
-These use legacy identifiers from the old Priority 6 system. See
-[roadmap.md](roadmap.md) for sequencing rationale.
+3. **P6a** — ADR-110 enum rename (recorded/sheltered/fortified). ~1 session.
 
 ## Key Links
 
@@ -52,5 +51,6 @@ These use legacy identifiers from the old Priority 6 system. See
 - `FileSystemState` trait (11 methods) outgrowing its name — consider rename to `SystemState`
 - Status string fragility: "UNPROTECTED"/"AT RISK"/"PROTECTED" matched as raw strings — consider constants
 - Parallel notification builders in notify.rs and sentinel_runner.rs (maintenance risk)
-- `assess()` does not respect per-subvolume `drives` scoping
+- `assess()` does not respect per-subvolume `drives` scoping (causes false degradation for htpc-root)
 - Legacy active arc items (6-O, P6a, P6b, 6-H) use old naming — may get UPIs when redesigned
+- RECOVERY column hidden — needs real snapshot depth calculation before it can return

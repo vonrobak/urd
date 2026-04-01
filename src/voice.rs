@@ -158,9 +158,9 @@ fn render_subvolume_table(data: &StatusOutput, out: &mut String) {
         return;
     }
 
-    // Only offsite drives are annotated — primary is the assumed default.
-    let drive_labels: Vec<String> = data
-        .drives
+    // Only show connected drives in the table — absent drives are in the drive summary below.
+    let visible_drives: Vec<_> = data.drives.iter().filter(|d| d.mounted).collect();
+    let drive_labels: Vec<String> = visible_drives
         .iter()
         .map(|d| {
             if d.role == DriveRole::Offsite {
@@ -171,21 +171,19 @@ fn render_subvolume_table(data: &StatusOutput, out: &mut String) {
         })
         .collect();
 
-    // Check if any assessment has a promise level — only show column if so
-    let has_promises = data.assessments.iter().any(|a| a.promise_level.is_some());
+    // Show PROTECTION only when exposure conflicts with promise (sealed but degraded, waning, exposed)
+    let show_protection = data.assessments.iter().any(|a| {
+        a.promise_level.is_some() && a.status != "PROTECTED"
+    });
     // Only show HEALTH column when at least one subvolume is non-healthy
     let show_health = data.assessments.iter().any(|a| a.health != "healthy");
 
-    // Check if any assessment has a retention summary — only show column if so
-    let has_retention = data.assessments.iter().any(|a| a.retention_summary.is_some());
-
-    // Build headers: EXPOSURE  [HEALTH]  [PROTECTION]  SUBVOLUME  LOCAL  [DRIVES...]  THREAD  [RECOVERY]
+    // Build headers: EXPOSURE  [HEALTH]  [PROTECTION]  SUBVOLUME  LOCAL  [DRIVES...]  THREAD
     let mut headers: Vec<String> = vec!["EXPOSURE".to_string()];
     if show_health {
         headers.push("HEALTH".to_string());
     }
-    if has_promises {
-        // NOTE: Level names (guarded/protected/resilient) stay until Phase 6
+    if show_protection {
         headers.push("PROTECTION".to_string());
     }
     headers.push("SUBVOLUME".to_string());
@@ -194,9 +192,6 @@ fn render_subvolume_table(data: &StatusOutput, out: &mut String) {
         headers.push(label.to_string());
     }
     headers.push("THREAD".to_string());
-    if has_retention {
-        headers.push("RECOVERY".to_string());
-    }
 
     // Track which columns need coloring
     let safety_col = Some(0usize);
@@ -212,7 +207,7 @@ fn render_subvolume_table(data: &StatusOutput, out: &mut String) {
         if show_health {
             row.push(assessment.health.clone());
         }
-        if has_promises {
+        if show_protection {
             row.push(
                 assessment
                     .promise_level
@@ -229,8 +224,8 @@ fn render_subvolume_table(data: &StatusOutput, out: &mut String) {
         );
         row.push(local_cell);
 
-        // Per-drive columns (all configured drives, not just mounted)
-        for drive in &data.drives {
+        // Per-drive columns (connected drives only)
+        for drive in &visible_drives {
             let ext = assessment
                 .external
                 .iter()
@@ -243,9 +238,6 @@ fn render_subvolume_table(data: &StatusOutput, out: &mut String) {
                     } else {
                         "\u{2014}".to_string()
                     }
-                }
-                Some(e) if e.role == DriveRole::Offsite && e.last_send_age_secs.is_some() => {
-                    "away".dimmed().to_string()
                 }
                 _ => "\u{2014}".to_string(),
             };
@@ -260,15 +252,6 @@ fn render_subvolume_table(data: &StatusOutput, out: &mut String) {
             .map(|c| render_thread_status(&c.health))
             .unwrap_or_else(|| "\u{2014}".to_string());
         row.push(thread);
-
-        if has_retention {
-            row.push(
-                assessment
-                    .retention_summary
-                    .clone()
-                    .unwrap_or_else(|| "\u{2014}".to_string()),
-            );
-        }
 
         rows.push(row);
     }
@@ -741,19 +724,18 @@ fn format_send_info(sends: &[crate::output::SendSummary]) -> String {
     format!("  ({})", parts.join("; "))
 }
 
-/// Render skipped subvolumes, grouping "drive X not mounted" entries.
+/// Render skipped subvolumes — absent drives and actionable skips only.
+/// [WAIT] and [OFF] skips are suppressed; the summary line covers the total count.
 fn render_skipped_block(skipped: &[crate::output::SkippedSubvolume], out: &mut String) {
     if skipped.is_empty() {
         return;
     }
 
-    writeln!(out).ok();
-
-    // Separate "not mounted" skips from unique skips.
-    // Only exact "drive {label} not mounted" reasons are grouped.
+    // Collect disconnected drive labels and count their skipped sends.
     let mut not_mounted_drives: Vec<String> = Vec::new();
-    let mut not_mounted_subvols: Vec<String> = Vec::new();
-    let mut unique_skips: Vec<&crate::output::SkippedSubvolume> = Vec::new();
+    let mut not_mounted_count = 0usize;
+    // Actionable skips: UUID mismatch, space exceeded, etc. (not WAIT/OFF/drive-not-mounted)
+    let mut actionable_skips: Vec<&crate::output::SkippedSubvolume> = Vec::new();
 
     for skip in skipped {
         if let Some(label) = skip
@@ -764,36 +746,31 @@ fn render_skipped_block(skipped: &[crate::output::SkippedSubvolume], out: &mut S
             if !not_mounted_drives.contains(&label.to_string()) {
                 not_mounted_drives.push(label.to_string());
             }
-            if !not_mounted_subvols.contains(&skip.name) {
-                not_mounted_subvols.push(skip.name.clone());
-            }
-        } else {
-            unique_skips.push(skip);
+            not_mounted_count += 1;
+        } else if skip.category != SkipCategory::IntervalNotElapsed
+            && skip.category != SkipCategory::Disabled
+        {
+            actionable_skips.push(skip);
         }
     }
 
-    // Grouped "not mounted" line
+    if not_mounted_drives.is_empty() && actionable_skips.is_empty() {
+        return;
+    }
+
+    writeln!(out).ok();
+
     if !not_mounted_drives.is_empty() {
         writeln!(
             out,
-            "  {}  {} {}",
-            skip_tag(&SkipCategory::DriveNotMounted),
-            "Drives disconnected:".dimmed(),
+            "  Drives disconnected: {}",
             not_mounted_drives.join(", "),
         )
         .ok();
-        writeln!(
-            out,
-            "    {} {} send(s) skipped ({})",
-            "\u{2192}".dimmed(),
-            skipped.len() - unique_skips.len(),
-            not_mounted_subvols.join(", "),
-        )
-        .ok();
+        writeln!(out, "    {} send(s) skipped", not_mounted_count).ok();
     }
 
-    // Individual skips (UUID mismatch, space, disabled, etc.)
-    for skip in &unique_skips {
+    for skip in &actionable_skips {
         writeln!(
             out,
             "  {} {}  {}",
@@ -1967,6 +1944,9 @@ fn render_doctor_check_section(out: &mut String, title: &str, checks: &[DoctorCh
         if let Some(ref detail) = check.detail {
             writeln!(out, "      {}", detail.dimmed()).ok();
         }
+        if let Some(ref suggestion) = check.suggestion {
+            writeln!(out, "      \u{2192} {suggestion}").ok();
+        }
     }
 }
 
@@ -2123,7 +2103,7 @@ fn render_default_status_interactive(data: &DefaultStatusOutput) -> String {
 
     // Safety line
     if data.sealed_count() == data.total {
-        write!(out, "{}", "All sealed.".green()).ok();
+        write!(out, "{}", "All connected drives are sealed.".green()).ok();
     } else {
         write!(out, "{} of {} sealed.", data.sealed_count(), data.total).ok();
         if !data.exposed_names.is_empty() {
@@ -2134,6 +2114,19 @@ fn render_default_status_interactive(data: &DefaultStatusOutput) -> String {
         }
     }
 
+    // Health degradation
+    let health_issues = data.degraded_count + data.blocked_count;
+    if health_issues > 0 {
+        let mut parts = Vec::new();
+        if data.blocked_count > 0 {
+            parts.push(format!("{} blocked", data.blocked_count));
+        }
+        if data.degraded_count > 0 {
+            parts.push(format!("{} degraded", data.degraded_count));
+        }
+        write!(out, " {}.", parts.join(", ")).ok();
+    }
+
     // Last backup age (pre-computed by command handler to keep voice pure)
     if let Some(age_secs) = data.last_run_age_secs {
         write!(out, " Last backup {} ago.", humanize_duration(age_secs)).ok();
@@ -2142,7 +2135,7 @@ fn render_default_status_interactive(data: &DefaultStatusOutput) -> String {
     writeln!(out).ok();
 
     // Next-action suggestion
-    if data.sealed_count() < data.total {
+    if data.sealed_count() < data.total || health_issues > 0 {
         append_suggestion(&SuggestionContext::Default { has_issues: true }, &mut out);
     } else {
         writeln!(out, "{}", "Run `urd status` for details, `urd --help` for commands.".dimmed())
@@ -2408,18 +2401,29 @@ mod tests {
     }
 
     #[test]
-    fn interactive_promise_column_shown_when_set() {
+    fn interactive_promise_column_shown_when_exposure_conflicts() {
         colored::control::set_override(false);
         let mut data = test_status_output();
-        // Set a promise level on one assessment
-        data.assessments[0].promise_level = Some("protected".to_string());
+        // Set a promise level on a non-PROTECTED assessment — triggers PROTECTION column
+        data.assessments[1].promise_level = Some("protected".to_string());
+        // assessments[1] has status "AT RISK" — conflict with promise
         let output = render_status(&data, OutputMode::Interactive);
         assert!(output.contains("PROTECTION"), "missing PROTECTION header");
         assert!(output.contains("protected"), "missing promise level value");
-        // The second assessment should show an em dash
+    }
+
+    #[test]
+    fn interactive_promise_column_hidden_when_all_sealed() {
+        colored::control::set_override(false);
+        let mut data = test_status_output();
+        // Set a promise level but all statuses are PROTECTED — no conflict
+        data.assessments[0].promise_level = Some("protected".to_string());
+        data.assessments[1].status = "PROTECTED".to_string();
+        data.assessments[1].promise_level = Some("resilient".to_string());
+        let output = render_status(&data, OutputMode::Interactive);
         assert!(
-            output.contains("\u{2014}"),
-            "missing em dash for unset promise"
+            !output.contains("PROTECTION"),
+            "PROTECTION column should be hidden when all sealed"
         );
     }
 
@@ -3964,13 +3968,28 @@ mod tests {
     }
 
     #[test]
-    fn offsite_drive_column_header_shows_role() {
+    fn disconnected_drive_column_collapsed() {
         colored::control::set_override(false);
         let data = test_status_output();
+        // Offsite-4TB is unmounted in the test fixture — should NOT appear as table column
+        let output = render_status(&data, OutputMode::Interactive);
+        assert!(
+            !output.contains("Offsite-4TB (offsite)"),
+            "unmounted drive should not appear as table column: {output}"
+        );
+    }
+
+    #[test]
+    fn mounted_offsite_drive_shows_role_annotation() {
+        colored::control::set_override(false);
+        let mut data = test_status_output();
+        // Mount the offsite drive
+        data.drives[1].mounted = true;
+        data.drives[1].free_bytes = Some(2_000_000_000_000);
         let output = render_status(&data, OutputMode::Interactive);
         assert!(
             output.contains("Offsite-4TB (offsite)"),
-            "offsite drive header should show role annotation: {output}"
+            "mounted offsite drive should show role annotation: {output}"
         );
     }
 
@@ -3995,6 +4014,8 @@ mod tests {
             total: 4,
             waning_names: vec![],
             exposed_names: vec![],
+            degraded_count: 0,
+            blocked_count: 0,
             last_run: Some(LastRunInfo {
                 id: 42,
                 started_at: "2026-03-31T21:00:00".to_string(),
@@ -4009,7 +4030,7 @@ mod tests {
     fn default_all_sealed() {
         colored::control::set_override(false);
         let output = render_default_status(&test_default_all_sealed(), OutputMode::Interactive);
-        assert!(output.contains("All sealed."), "missing 'All sealed.' in: {output}");
+        assert!(output.contains("All connected drives are sealed."), "missing sealed message in: {output}");
         assert!(
             output.contains("urd status"),
             "missing hint to run urd status: {output}"
@@ -4027,6 +4048,8 @@ mod tests {
             total: 9,
             waning_names: vec![],
             exposed_names: vec!["htpc-root".to_string(), "docs".to_string()],
+            degraded_count: 0,
+            blocked_count: 0,
             last_run: None,
             last_run_age_secs: None,
         };
@@ -4056,6 +4079,8 @@ mod tests {
             total: 5,
             waning_names: vec!["htpc-config".to_string()],
             exposed_names: vec!["htpc-root".to_string()],
+            degraded_count: 0,
+            blocked_count: 0,
             last_run: None,
             last_run_age_secs: None,
         };
@@ -4071,6 +4096,22 @@ mod tests {
         assert!(
             output.contains("htpc-config waning"),
             "missing waning name in: {output}"
+        );
+    }
+
+    #[test]
+    fn default_health_degradation_surfaced() {
+        colored::control::set_override(false);
+        let mut data = test_default_all_sealed();
+        data.degraded_count = 1;
+        let output = render_default_status(&data, OutputMode::Interactive);
+        assert!(
+            output.contains("1 degraded"),
+            "missing degraded count in: {output}"
+        );
+        assert!(
+            output.contains("urd status"),
+            "degraded should suggest urd status: {output}"
         );
     }
 
@@ -4091,6 +4132,8 @@ mod tests {
             total: 2,
             waning_names: vec![],
             exposed_names: vec![],
+            degraded_count: 0,
+            blocked_count: 0,
             last_run: None,
             last_run_age_secs: None,
         };
@@ -4107,6 +4150,8 @@ mod tests {
             total: 3,
             waning_names: vec!["sv1".to_string()],
             exposed_names: vec![],
+            degraded_count: 0,
+            blocked_count: 0,
             last_run: None,
             last_run_age_secs: None,
         };
