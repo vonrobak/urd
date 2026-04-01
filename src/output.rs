@@ -475,8 +475,32 @@ pub struct BackupSummary {
     /// Per-subvolume promise status AFTER the run (from awareness model).
     pub assessments: Vec<StatusAssessment>,
 
+    /// State transitions detected during this run (pre/post awareness diff).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transitions: Vec<TransitionEvent>,
+
     /// Summary warnings (pin failures, skipped deletions, etc.)
     pub warnings: Vec<String>,
+}
+
+/// A meaningful state change detected by comparing pre-backup and post-backup
+/// awareness assessments. Rendered as brief voice lines in interactive mode;
+/// serialized as structured JSON in daemon mode.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TransitionEvent {
+    /// Incremental chain was broken before backup, now intact.
+    ThreadRestored { subvolume: String, drive: String },
+    /// Drive had no snapshots for this subvolume before, now has at least one.
+    FirstSendToDrive { subvolume: String, drive: String },
+    /// All subvolumes reached Protected status (and weren't all Protected before).
+    AllSealed,
+    /// A subvolume's promise status improved (e.g., Unprotected → Protected).
+    PromiseRecovered {
+        subvolume: String,
+        from: String,
+        to: String,
+    },
 }
 
 /// Per-subvolume execution summary.
