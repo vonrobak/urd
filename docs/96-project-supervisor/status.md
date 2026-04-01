@@ -8,20 +8,19 @@
 
 **Urd is the sole backup system.** Systemd timer running nightly at 04:00 since 2026-03-25.
 Sentinel daemon deployed (passive monitoring, drive detection, backup overdue alerts).
-625 tests, all passing, clippy clean. Current version: v0.6.0.
+654 tests, all passing, clippy clean. Current version: v0.6.0.
 Transient retention deployed to htpc-root (2026-03-30). Immediate cleanup built, not yet deployed.
 
 ## In Progress
 
-1. **6-I advisory system** — Structured redundancy advisory types (4 kinds), pure function,
-   voice rendering, sentinel state v3. Built, reviewed (simplify + arch-adversary 18/20),
-   all findings addressed. Ready for commit and PR.
+1. **6-N + Phase 2b** — Retention preview + doctor commands. Built, reviewed (/simplify +
+   arch-adversary 17/20), all findings addressed. Ready for merge.
 
 ## Next Up
 
-1. **6-N + Phase 2b** — Retention display in status + `urd doctor` command.
-   [Design](../95-ideas/2026-03-31-design-phase2-ux-commands.md) |
-   [Review](../99-reports/2026-03-31-design-phase2-ux-commands-review.md)
+1. **Phase 4a+4b** — Staleness escalation + next-action suggestions in voice output.
+   [Design](../95-ideas/2026-03-31-design-phase4-voice-enrichment.md) |
+   [Review](../99-reports/2026-03-31-arch-adversary-phase4-voice-enrichment.md)
 2. **6-O milestones** — Progressive learning/onboarding layer. ~2 sessions.
 3. **ADR-110 enum rename** — Vocabulary alignment for protection level enums. ~1 session.
 
@@ -35,12 +34,12 @@ Voice & UX Arc:                    Progressive & Setup Arc:
   Phase 1 (vocabulary) ✓             6-O (milestones, 2 sessions)
   Phase 2a+2c (urd default, compl.)✓ ADR-110 enum rename (1 session)
   6-I (advisory system) ✓            Config Serialize (0.5 session)
-  6-N + Phase 2b (retention, doctor) 6-H (wizard, 4 sessions)
+  6-N + Phase 2b (retention, doctor)✓ 6-H (wizard, 4 sessions)
   Phase 4a+4b (escalation, suggest.)
   Phase 4c (transitions)
 ```
 
-Estimated: 11 sessions remaining, ~120 new/modified tests, test suite -> ~750.
+Estimated: 9 sessions remaining, ~90 new/modified tests, test suite -> ~750.
 
 ## Key Links
 
@@ -52,7 +51,7 @@ Estimated: 11 sessions remaining, ~120 new/modified tests, test suite -> ~750.
 | ADRs (100-112) | [decisions/](../00-foundation/decisions/) |
 | Phase designs (1-6) | [95-ideas/](../95-ideas/) (2026-03-31-design-phase*.md) |
 | Review reports | [99-reports/](../99-reports/) |
-| 6-I implementation review | [99-reports/2026-04-01-arch-adversary-6i-implementation-review.md](../99-reports/2026-04-01-arch-adversary-6i-implementation-review.md) |
+| 6-N + 2b implementation review | [99-reports/2026-04-01-arch-adversary-6n-2b-implementation-review.md](../99-reports/2026-04-01-arch-adversary-6n-2b-implementation-review.md) |
 
 ## Known Issues
 
