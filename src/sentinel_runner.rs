@@ -338,8 +338,14 @@ impl SentinelRunner {
         self.tick_interval = sentinel::compute_next_tick(&assessments);
         self.last_assessment_time = Some(Instant::now());
 
+        // Compute redundancy advisory summary for state file.
+        let redundancy_advisories =
+            awareness::compute_redundancy_advisories(&self.config, &assessments);
+        let advisory_summary =
+            crate::output::AdvisorySummary::from_advisories(&redundancy_advisories);
+
         // Write state file.
-        self.write_state_file(now, &assessments)?;
+        self.write_state_file(now, &assessments, advisory_summary)?;
 
         Ok(())
     }
@@ -381,9 +387,10 @@ impl SentinelRunner {
         &self,
         now: NaiveDateTime,
         assessments: &[SubvolAssessment],
+        advisory_summary: Option<crate::output::AdvisorySummary>,
     ) -> anyhow::Result<()> {
         let state_file = SentinelStateFile {
-            schema_version: 2,
+            schema_version: 3,
             pid: std::process::id(),
             started: self.started.format("%Y-%m-%dT%H:%M:%S").to_string(),
             last_assessment: Some(now.format("%Y-%m-%dT%H:%M:%S").to_string()),
@@ -416,6 +423,7 @@ impl SentinelRunner {
                 failure_count: self.state.circuit_breaker.failure_count,
             },
             visual_state: Some(sentinel::compute_visual_state(assessments)),
+            advisory_summary,
         };
 
         let content = serde_json::to_string_pretty(&state_file)?;
@@ -682,6 +690,7 @@ mod tests {
             external: vec![],
             chain_health: vec![],
             advisories: vec![],
+            redundancy_advisories: vec![],
             errors: vec![],
         }
     }
@@ -722,6 +731,7 @@ mod tests {
                     blocked: 0,
                 },
             }),
+            advisory_summary: None,
         };
 
         let json = serde_json::to_string_pretty(&state).unwrap();
@@ -777,6 +787,7 @@ mod tests {
                 failure_count: 0,
             },
             visual_state: None,
+            advisory_summary: None,
         };
 
         let content = serde_json::to_string_pretty(&state).unwrap();
@@ -829,10 +840,68 @@ mod tests {
                 failure_count: 0,
             },
             visual_state: None,
+            advisory_summary: None,
         };
 
         let json = serde_json::to_string(&state).unwrap();
         assert!(!json.contains("health_reasons"));
+    }
+
+    // ── Advisory summary tests ───────────────────────────────────────
+
+    #[test]
+    fn state_file_v3_with_advisory_summary() {
+        use crate::output::{AdvisorySummary, RedundancyAdvisoryKind};
+
+        let state = SentinelStateFile {
+            schema_version: 3,
+            pid: 1,
+            started: "2026-04-01T10:00:00".to_string(),
+            last_assessment: None,
+            mounted_drives: vec![],
+            tick_interval_secs: 120,
+            promise_states: vec![],
+            circuit_breaker: SentinelCircuitState {
+                state: "closed".to_string(),
+                failure_count: 0,
+            },
+            visual_state: None,
+            advisory_summary: Some(AdvisorySummary {
+                count: 2,
+                worst: Some(RedundancyAdvisoryKind::NoOffsiteProtection),
+            }),
+        };
+
+        let json = serde_json::to_string_pretty(&state).unwrap();
+        assert!(json.contains("advisory_summary"));
+        assert!(json.contains("no_offsite_protection"));
+
+        let parsed: SentinelStateFile = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.schema_version, 3);
+        let summary = parsed.advisory_summary.unwrap();
+        assert_eq!(summary.count, 2);
+        assert_eq!(summary.worst, Some(RedundancyAdvisoryKind::NoOffsiteProtection));
+    }
+
+    #[test]
+    fn state_file_v2_backward_compat_no_advisory_summary() {
+        // v2 files lack advisory_summary — must deserialize with None.
+        let json = r#"{
+            "schema_version": 2,
+            "pid": 1,
+            "started": "2026-03-27T10:00:00",
+            "last_assessment": null,
+            "mounted_drives": [],
+            "tick_interval_secs": 120,
+            "promise_states": [],
+            "circuit_breaker": { "state": "closed", "failure_count": 0 }
+        }"#;
+
+        let parsed: SentinelStateFile = serde_json::from_str(json).unwrap();
+        assert!(
+            parsed.advisory_summary.is_none(),
+            "v2 file should have None advisory_summary, not zero"
+        );
     }
 
     // ── PID alive check ─────────────────────────────────────────────

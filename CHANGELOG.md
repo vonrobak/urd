@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Structured redundancy advisory system: detects no-offsite-protection, offsite-drive-stale (>30 days), single-point-of-failure, and transient-no-local-recovery gaps
+- REDUNDANCY section in `urd status` with per-advisory observation and suggestion
+- `advisory_summary` field in sentinel state file (schema v3) for Spindle tray icon integration
+
+### Changed
+- Offsite cycling advisory migrated from stringly-typed 7-day threshold to structured `OffsiteDriveStale` with 30-day threshold
+
 ## [0.6.0] - 2026-04-01
 
 ### Added
