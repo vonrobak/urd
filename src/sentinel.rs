@@ -838,6 +838,7 @@ mod tests {
             external: vec![],
             chain_health: vec![],
             advisories: vec![],
+            redundancy_advisories: vec![],
             errors: vec![],
         }
     }
@@ -870,6 +871,7 @@ mod tests {
             }],
             chain_health: vec![],
             advisories: vec![],
+            redundancy_advisories: vec![],
             errors: vec![],
         }
     }
@@ -1482,6 +1484,7 @@ mod tests {
             external: vec![],
             chain_health,
             advisories: vec![],
+            redundancy_advisories: vec![],
             errors: vec![],
         }
     }

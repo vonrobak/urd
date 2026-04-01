@@ -85,6 +85,10 @@ pub fn run(config: Config, output_mode: OutputMode) -> anyhow::Result<()> {
         })
         .sum();
 
+    // ── Redundancy advisories ──────────────────────────────────────
+    let redundancy_advisories =
+        awareness::compute_redundancy_advisories(&config, &assessments);
+
     // ── Assemble and render ─────────────────────────────────────────
     // Thread protection_level from resolved config into status assessments
     let resolved = config.resolved_subvolumes();
@@ -105,6 +109,7 @@ pub fn run(config: Config, output_mode: OutputMode) -> anyhow::Result<()> {
         drives: drive_infos,
         last_run,
         total_pins,
+        redundancy_advisories,
     };
 
     let rendered = voice::render_status(&status_output, output_mode);

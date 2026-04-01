@@ -14,8 +14,8 @@ use colored::Colorize;
 use crate::output::{
     BackupSummary, CalibrateOutput, CalibrateResult, ChainHealth, DefaultStatusOutput,
     FailuresOutput, GetOutput, HistoryOutput, InitOutput, InitStatus, OutputMode, PlanOutput,
-    SentinelStatusOutput, SkipCategory, SkippedSubvolume, StatusOutput, SubvolumeHistoryOutput,
-    VerifyOutput, parse_duration_to_minutes,
+    RedundancyAdvisoryKind, SentinelStatusOutput, SkipCategory, SkippedSubvolume, StatusOutput,
+    SubvolumeHistoryOutput, VerifyOutput, parse_duration_to_minutes,
 };
 use crate::plan::format_duration_short;
 use crate::types::{ByteSize, DriveRole};
@@ -46,6 +46,9 @@ fn render_status_interactive(data: &StatusOutput) -> String {
 
     // ── Advisories and errors from awareness model ─────────────────
     render_advisories(data, &mut out);
+
+    // ── Redundancy advisories ───────────────────────────────────────
+    render_redundancy_advisories(data, &mut out);
 
     // ── Drive summary ───────────────────────────────────────────────
     writeln!(out).ok();
@@ -309,6 +312,60 @@ fn render_advisories(data: &StatusOutput, out: &mut String) {
     }
     if any {
         writeln!(out).ok();
+    }
+}
+
+fn render_redundancy_advisories(data: &StatusOutput, out: &mut String) {
+    if data.redundancy_advisories.is_empty() {
+        return;
+    }
+
+    writeln!(out).ok();
+    writeln!(out, "{}", "REDUNDANCY".dimmed()).ok();
+
+    for advisory in &data.redundancy_advisories {
+        let (observation, suggestion) = match advisory.kind {
+            RedundancyAdvisoryKind::NoOffsiteProtection => (
+                format!(
+                    "{} seeks resilience, but all drives share the same fate.",
+                    advisory.subvolume,
+                ),
+                "Consider designating a drive as offsite to protect against site loss.".to_string(),
+            ),
+            RedundancyAdvisoryKind::OffsiteDriveStale => (
+                format!(
+                    "The offsite copy on {} has aged.",
+                    advisory
+                        .drive
+                        .as_deref()
+                        .unwrap_or("unknown"),
+                ),
+                "Cycle the offsite drive to refresh your off-site copy.".to_string(),
+            ),
+            RedundancyAdvisoryKind::SinglePointOfFailure => (
+                format!(
+                    "{} rests on a single external drive.",
+                    advisory.subvolume,
+                ),
+                "A second drive would guard against the failure of one.".to_string(),
+            ),
+            RedundancyAdvisoryKind::TransientNoLocalRecovery => (
+                format!(
+                    "{} lives only on external drives while local copies are transient.",
+                    advisory.subvolume,
+                ),
+                "Recovery requires a connected drive.".to_string(),
+            ),
+        };
+
+        if advisory.kind == RedundancyAdvisoryKind::TransientNoLocalRecovery {
+            // Informational — lighter treatment
+            writeln!(out, "  {} {}", "\u{2139}".dimmed(), observation.dimmed()).ok();
+            writeln!(out, "    {}", suggestion.dimmed()).ok();
+        } else {
+            writeln!(out, "  {} {}", "\u{26a0}".yellow(), observation).ok();
+            writeln!(out, "    \u{2192} {}", suggestion).ok();
+        }
     }
 }
 
@@ -1720,6 +1777,7 @@ mod tests {
                         role: DriveRole::Primary,
                     }],
                     advisories: vec![],
+                    redundancy_advisories: vec![],
                     errors: vec![],
                 },
                 StatusAssessment {
@@ -1742,6 +1800,7 @@ mod tests {
                         role: DriveRole::Primary,
                     }],
                     advisories: vec![],
+                    redundancy_advisories: vec![],
                     errors: vec![],
                 },
             ],
@@ -1776,6 +1835,7 @@ mod tests {
                 duration: Some("1m 30s".to_string()),
             }),
             total_pins: 3,
+            redundancy_advisories: vec![],
         }
     }
 
@@ -1868,6 +1928,7 @@ mod tests {
             drives: vec![],
             last_run: None,
             total_pins: 0,
+            redundancy_advisories: vec![],
         };
         let output = render_status(&data, OutputMode::Interactive);
         assert!(
@@ -1935,11 +1996,57 @@ mod tests {
             drives: vec![],
             last_run: None,
             total_pins: 0,
+            redundancy_advisories: vec![],
         };
         let output = render_status(&data, OutputMode::Interactive);
         assert!(
             output.contains("no runs recorded"),
             "missing no-runs message"
+        );
+    }
+
+    // ── Redundancy advisory rendering tests ─────────────────────────
+
+    #[test]
+    fn render_redundancy_section_with_advisories() {
+        use crate::output::{RedundancyAdvisory, RedundancyAdvisoryKind};
+
+        colored::control::set_override(false);
+        let mut data = test_status_output();
+        data.redundancy_advisories = vec![
+            RedundancyAdvisory {
+                kind: RedundancyAdvisoryKind::NoOffsiteProtection,
+                subvolume: "htpc-home".to_string(),
+                drive: None,
+                detail: "test".to_string(),
+            },
+            RedundancyAdvisory {
+                kind: RedundancyAdvisoryKind::TransientNoLocalRecovery,
+                subvolume: "htpc-tmp".to_string(),
+                drive: None,
+                detail: "test".to_string(),
+            },
+        ];
+        let output = render_status(&data, OutputMode::Interactive);
+        assert!(output.contains("REDUNDANCY"), "missing REDUNDANCY section header");
+        assert!(
+            output.contains("all drives share the same fate"),
+            "missing NoOffsiteProtection text"
+        );
+        assert!(
+            output.contains("Recovery requires a connected drive"),
+            "missing TransientNoLocalRecovery text"
+        );
+    }
+
+    #[test]
+    fn render_no_redundancy_section_when_empty() {
+        colored::control::set_override(false);
+        let data = test_status_output(); // has empty redundancy_advisories
+        let output = render_status(&data, OutputMode::Interactive);
+        assert!(
+            !output.contains("REDUNDANCY"),
+            "REDUNDANCY section should be absent when no advisories"
         );
     }
 
@@ -1995,6 +2102,7 @@ mod tests {
                 local_status: "PROTECTED".to_string(),
                 external: vec![],
                 advisories: vec![],
+                redundancy_advisories: vec![],
                 errors: vec![],
             }],
             warnings: vec![],
@@ -3036,6 +3144,7 @@ mod tests {
                     failure_count: 0,
                 },
                 visual_state: None,
+                advisory_summary: None,
             }),
             uptime: "3h 12m".to_string(),
         }

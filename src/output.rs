@@ -77,6 +77,62 @@ impl std::fmt::Display for ChainHealth {
     }
 }
 
+// ── Redundancy Advisories ──────────────────────────────────────────────
+
+/// Redundancy advisory kind, ordered worst-first so `min()` yields most severe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RedundancyAdvisoryKind {
+    /// All drives are local for a resilient subvolume — no offsite protection.
+    NoOffsiteProtection,
+    /// Offsite drive not seen in > threshold days.
+    OffsiteDriveStale,
+    /// Single external drive for a protected/resilient subvolume.
+    SinglePointOfFailure,
+    /// Informational: transient subvolume with all drives unmounted.
+    TransientNoLocalRecovery,
+}
+
+/// A structured redundancy advisory produced by `compute_redundancy_advisories()`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RedundancyAdvisory {
+    pub kind: RedundancyAdvisoryKind,
+    pub subvolume: String,
+    /// Affected drive label (for offsite-stale and single-point advisories).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub drive: Option<String>,
+    /// Human-readable detail for voice rendering.
+    pub detail: String,
+}
+
+/// Summary of redundancy advisories for the sentinel state file.
+/// `None` in the state file means "unknown, not zero" (backward compat with v2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdvisorySummary {
+    /// Count of non-informational advisories.
+    pub count: usize,
+    /// Worst advisory kind (for badge/icon decisions).
+    pub worst: Option<RedundancyAdvisoryKind>,
+}
+
+impl AdvisorySummary {
+    /// Build from a list of advisories. Returns `None` when the list is empty.
+    /// Informational advisories (`TransientNoLocalRecovery`) are excluded from `count`.
+    #[must_use]
+    pub fn from_advisories(advisories: &[RedundancyAdvisory]) -> Option<Self> {
+        if advisories.is_empty() {
+            return None;
+        }
+        // Exclude informational advisories from both count and worst.
+        // count == 0 && worst == None means "only informational advisories exist."
+        let is_actionable =
+            |a: &&RedundancyAdvisory| a.kind != RedundancyAdvisoryKind::TransientNoLocalRecovery;
+        let count = advisories.iter().filter(is_actionable).count();
+        let worst = advisories.iter().filter(is_actionable).map(|a| a.kind).min();
+        Some(Self { count, worst })
+    }
+}
+
 // ── StatusOutput ────────────────────────────────────────────────────────
 
 /// Structured output for the `urd status` command.
@@ -92,6 +148,9 @@ pub struct StatusOutput {
     pub last_run: Option<LastRunInfo>,
     /// Total pinned snapshot count across all subvolumes.
     pub total_pins: usize,
+    /// Structured redundancy advisories (omitted from JSON when empty).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub redundancy_advisories: Vec<RedundancyAdvisory>,
 }
 
 /// Serializable wrapper around SubvolAssessment data.
@@ -114,6 +173,9 @@ pub struct StatusAssessment {
     pub local_status: String,
     pub external: Vec<StatusDriveAssessment>,
     pub advisories: Vec<String>,
+    /// Structured redundancy advisories (e.g., no offsite, single point of failure).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub redundancy_advisories: Vec<RedundancyAdvisory>,
     pub errors: Vec<String>,
 }
 
@@ -135,6 +197,7 @@ impl StatusAssessment {
                 .map(StatusDriveAssessment::from_assessment)
                 .collect(),
             advisories: a.advisories.clone(),
+            redundancy_advisories: a.redundancy_advisories.clone(),
             errors: a.errors.clone(),
         }
     }
@@ -674,6 +737,10 @@ pub struct SentinelStateFile {
     /// `None` when reading schema v1 files for backward compatibility.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub visual_state: Option<VisualState>,
+    /// Redundancy advisory summary (schema v3+). `None` means "unknown, not zero."
+    /// Absent in v2 files; consumers must treat `None` as "advisories not computed."
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advisory_summary: Option<AdvisorySummary>,
 }
 
 /// Per-subvolume promise state in the sentinel state file.
@@ -766,6 +833,56 @@ mod tests {
         let full_b = ChainHealth::Full("pin missing on drive".to_string());
         let result = full_a.clone().min(full_b);
         assert!(matches!(result, ChainHealth::Full(_)));
+    }
+
+    // ── RedundancyAdvisory tests ────────────────────────────────────────
+
+    #[test]
+    fn from_assessment_propagates_redundancy_advisories() {
+        use crate::awareness::{
+            LocalAssessment, OperationalHealth, PromiseStatus, SubvolAssessment,
+        };
+        use crate::types::Interval;
+
+        let advisory = RedundancyAdvisory {
+            kind: RedundancyAdvisoryKind::NoOffsiteProtection,
+            subvolume: "sv1".to_string(),
+            drive: None,
+            detail: "test detail".to_string(),
+        };
+        let assessment = SubvolAssessment {
+            name: "sv1".to_string(),
+            status: PromiseStatus::Protected,
+            health: OperationalHealth::Healthy,
+            health_reasons: vec![],
+            local: LocalAssessment {
+                status: PromiseStatus::Protected,
+                snapshot_count: 5,
+                newest_age: None,
+                configured_interval: Interval::hours(1),
+            },
+            external: vec![],
+            chain_health: vec![],
+            advisories: vec![],
+            redundancy_advisories: vec![advisory.clone()],
+            errors: vec![],
+        };
+
+        let sa = StatusAssessment::from_assessment(&assessment);
+        assert_eq!(sa.redundancy_advisories.len(), 1);
+        assert_eq!(sa.redundancy_advisories[0], advisory);
+    }
+
+    #[test]
+    fn redundancy_advisory_kind_ordering() {
+        use RedundancyAdvisoryKind::*;
+        // Worst-first: min() yields most severe
+        assert!(NoOffsiteProtection < OffsiteDriveStale);
+        assert!(OffsiteDriveStale < SinglePointOfFailure);
+        assert!(SinglePointOfFailure < TransientNoLocalRecovery);
+
+        let kinds = vec![TransientNoLocalRecovery, NoOffsiteProtection, SinglePointOfFailure];
+        assert_eq!(kinds.into_iter().min(), Some(NoOffsiteProtection));
     }
 
     // ── SkipCategory classification tests ──────────────────────────────

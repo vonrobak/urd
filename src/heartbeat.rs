@@ -297,6 +297,7 @@ mod tests {
                 }],
                 chain_health: vec![],
                 advisories: vec![],
+                redundancy_advisories: vec![],
                 errors: vec![],
             },
             SubvolAssessment {
@@ -313,6 +314,7 @@ mod tests {
                 external: vec![],
                 chain_health: vec![],
                 advisories: vec![],
+                redundancy_advisories: vec![],
                 errors: vec![],
             },
         ]

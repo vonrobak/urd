@@ -12,6 +12,7 @@
 use chrono::{Duration, NaiveDateTime};
 
 use crate::config::{Config, DriveConfig};
+use crate::output::{RedundancyAdvisory, RedundancyAdvisoryKind};
 use crate::plan::FileSystemState;
 use crate::types::{DriveRole, Interval, LocalRetentionPolicy, ProtectionLevel, SnapshotName};
 
@@ -93,8 +94,10 @@ pub struct SubvolAssessment {
     /// Chain health per mounted, send-enabled drive.
     /// Empty for subvolumes with send_enabled=false or no mounted drives.
     pub chain_health: Vec<DriveChainHealth>,
-    /// Non-critical information for the presentation layer (e.g., offsite cycling reminders).
+    /// Non-critical operational information (e.g., clock skew, send config issues).
     pub advisories: Vec<String>,
+    /// Structured redundancy advisories (e.g., no offsite, single point of failure).
+    pub redundancy_advisories: Vec<RedundancyAdvisory>,
     /// Per-subvolume assessment failures (e.g., can't read snapshot directory).
     pub errors: Vec<String>,
 }
@@ -207,6 +210,7 @@ pub fn assess(
                 external: Vec::new(),
                 chain_health: Vec::new(),
                 advisories: Vec::new(),
+                redundancy_advisories: Vec::new(),
                 errors: vec![format!(
                     "no snapshot root configured for subvolume {:?}",
                     subvol.name
@@ -281,23 +285,6 @@ pub fn assess(
 
                 let status = assess_external_status(last_send_age, subvol.send_interval);
 
-                // Advisory for stale offsite drives — scoped to offsite role only,
-                // since "consider cycling" is offsite rotation guidance.
-                // For resilient subvolumes, overlay_offsite_freshness() provides
-                // structured degradation instead.
-                if drive.role == DriveRole::Offsite
-                    && !mounted
-                    && let Some(age) = last_send_age
-                {
-                    let days = age.num_days();
-                    if days > 7 {
-                        advisories.push(format!(
-                            "offsite drive {} last sent {} days ago — consider cycling",
-                            drive.label, days,
-                        ));
-                    }
-                }
-
                 drive_assessments.push(DriveAssessment {
                     drive_label: drive.label.clone(),
                     status,
@@ -356,6 +343,7 @@ pub fn assess(
             external: drive_assessments,
             chain_health: chain_health_entries,
             advisories,
+            redundancy_advisories: Vec::new(),
             errors,
         });
     }
@@ -764,6 +752,144 @@ fn compute_offsite_freshness(drives: &[DriveAssessment]) -> PromiseStatus {
             }
         }
     }
+}
+
+// ── Redundancy advisories ──────────────────────────────────────────────
+
+/// Threshold (days) beyond which an offsite drive is considered stale.
+/// Aligned with OFFSITE_AT_RISK_DAYS (enforcement). The old 7-day threshold
+/// was too aggressive for monthly offsite rotation patterns.
+const OFFSITE_STALE_ADVISORY_DAYS: i64 = 30;
+
+/// Compute redundancy advisories from config and assessment state.
+///
+/// Pure function: config + assessments + now in, advisories out. No I/O.
+/// Called after `assess()` and `overlay_offsite_freshness()`.
+///
+/// Produces structured `RedundancyAdvisory` values for presentation and
+/// Spindle integration. Does not block backups or degrade promise states.
+#[must_use]
+pub fn compute_redundancy_advisories(
+    config: &Config,
+    assessments: &[SubvolAssessment],
+) -> Vec<RedundancyAdvisory> {
+    let resolved = config.resolved_subvolumes();
+    let mut advisories = Vec::new();
+
+    for assessment in assessments {
+        let Some(subvol) = resolved.iter().find(|s| s.name == assessment.name) else {
+            continue;
+        };
+
+        let protection_level = subvol.protection_level;
+
+        // ── NoOffsiteProtection ────────────────────────────────────────
+        // Resilient subvolume where none of its effective drives has offsite role.
+        // Per-subvolume check: respects drive scoping via `drives = [...]` in config.
+        if protection_level == Some(ProtectionLevel::Resilient) && subvol.send_enabled {
+            let has_offsite = match &subvol.drives {
+                Some(drive_list) => drive_list.iter().any(|label| {
+                    config
+                        .drives
+                        .iter()
+                        .any(|d| d.label == *label && d.role == DriveRole::Offsite)
+                }),
+                None => config.drives.iter().any(|d| d.role == DriveRole::Offsite),
+            };
+            if !has_offsite {
+                advisories.push(RedundancyAdvisory {
+                    kind: RedundancyAdvisoryKind::NoOffsiteProtection,
+                    subvolume: assessment.name.clone(),
+                    drive: None,
+                    detail: format!(
+                        "{} seeks resilience, but all drives share the same fate",
+                        assessment.name,
+                    ),
+                });
+            }
+        }
+
+        // Filter drives to the subvolume's effective set (respects `drives = [...]` scoping).
+        let effective_drives: Vec<&DriveAssessment> = match &subvol.drives {
+            Some(allowed) => assessment
+                .external
+                .iter()
+                .filter(|d| allowed.iter().any(|a| a == &d.drive_label))
+                .collect(),
+            None => assessment.external.iter().collect(),
+        };
+
+        // ── OffsiteDriveStale ──────────────────────────────────────────
+        // Offsite drive unmounted with last send older than 30-day threshold.
+        if subvol.send_enabled {
+            for da in &effective_drives {
+                if da.role == DriveRole::Offsite
+                    && !da.mounted
+                    && let Some(age) = da.last_send_age
+                {
+                    let days = age.num_days();
+                    if days > OFFSITE_STALE_ADVISORY_DAYS {
+                        advisories.push(RedundancyAdvisory {
+                            kind: RedundancyAdvisoryKind::OffsiteDriveStale,
+                            subvolume: assessment.name.clone(),
+                            drive: Some(da.drive_label.clone()),
+                            detail: format!(
+                                "offsite drive {} last sent {} days ago",
+                                da.drive_label, days,
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+
+        // ── SinglePointOfFailure ────────────────────────────────────────
+        // Protected or resilient subvolume with exactly 1 non-test drive.
+        if matches!(
+            protection_level,
+            Some(ProtectionLevel::Protected) | Some(ProtectionLevel::Resilient)
+        ) && subvol.send_enabled
+        {
+            let mut non_test_drives = effective_drives
+                .iter()
+                .filter(|d| d.role != DriveRole::Test);
+            if let Some(only) = non_test_drives.next()
+                && non_test_drives.next().is_none()
+            {
+                advisories.push(RedundancyAdvisory {
+                    kind: RedundancyAdvisoryKind::SinglePointOfFailure,
+                    subvolume: assessment.name.clone(),
+                    drive: Some(only.drive_label.clone()),
+                    detail: format!(
+                        "{} rests on a single external drive",
+                        assessment.name,
+                    ),
+                });
+            }
+        }
+
+        // ── TransientNoLocalRecovery ───────────────────────────────────
+        // Transient subvolume with all drives unmounted (informational).
+        if subvol.local_retention.is_transient() && subvol.send_enabled {
+            let all_unmounted = !effective_drives.is_empty()
+                && effective_drives.iter().all(|d| !d.mounted);
+            if all_unmounted {
+                advisories.push(RedundancyAdvisory {
+                    kind: RedundancyAdvisoryKind::TransientNoLocalRecovery,
+                    subvolume: assessment.name.clone(),
+                    drive: None,
+                    detail: format!(
+                        "{} lives only on external drives while local copies are transient",
+                        assessment.name,
+                    ),
+                });
+            }
+        }
+    }
+
+    // Sort worst-first for consistent rendering.
+    advisories.sort_by_key(|a| a.kind);
+    advisories
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────
@@ -1521,10 +1647,13 @@ source = "/data/sv1"
         assert!(results[0].errors.is_empty());
     }
 
-    // ── Test 16: Offsite advisory ──────────────────────────────────
+    // ── Test 16: Offsite advisory (migrated to structured RedundancyAdvisory) ──
 
     #[test]
-    fn offsite_advisory_for_stale_drive() {
+    fn offsite_stale_string_advisory_removed() {
+        // The old 7-day "consider cycling" string advisory was migrated to
+        // structured OffsiteDriveStale with a 30-day threshold. Verify the
+        // old string advisory no longer appears for a 10-day-old send.
         let config = offsite_test_config();
         let now = dt(2026, 3, 23, 14, 0);
         let mut fs = MockFileSystemState::new();
@@ -1534,23 +1663,21 @@ source = "/data/sv1"
             vec![snap(dt(2026, 3, 23, 13, 30), "sv1")],
         );
 
-        // Send 10 days ago + drive unmounted → advisory
+        // Send 10 days ago — under 30-day threshold, no advisory
         fs.send_times.insert(
             ("sv1".to_string(), "offsite-drive".to_string()),
             dt(2026, 3, 13, 8, 0),
         );
-        // Drive NOT mounted
 
         let results = assess(&config, now, &fs);
         assert!(
-            results[0]
+            !results[0]
                 .advisories
                 .iter()
                 .any(|a| a.contains("consider cycling")),
-            "offsite drive should get cycling advisory: {:?}",
+            "old string advisory should be removed: {:?}",
             results[0].advisories,
         );
-        assert!(results[0].advisories[0].contains("offsite-drive"));
     }
 
     #[test]
@@ -1564,7 +1691,7 @@ source = "/data/sv1"
             vec![snap(dt(2026, 3, 23, 13, 30), "sv1")],
         );
 
-        // Primary drive unmounted with 10-day-old send — should NOT get "consider cycling"
+        // Primary drive unmounted with 10-day-old send — should NOT get advisory
         fs.send_times.insert(
             ("sv1".to_string(), "WD-18TB".to_string()),
             dt(2026, 3, 13, 8, 0),
@@ -1572,11 +1699,8 @@ source = "/data/sv1"
 
         let results = assess(&config, now, &fs);
         assert!(
-            !results[0]
-                .advisories
-                .iter()
-                .any(|a| a.contains("consider cycling")),
-            "primary drive should not get cycling advisory: {:?}",
+            results[0].advisories.is_empty(),
+            "primary drive should not get advisories: {:?}",
             results[0].advisories,
         );
     }
@@ -2719,6 +2843,7 @@ drives = ["primary-drive", "offsite-drive"]
             external: drives,
             chain_health: vec![],
             advisories: vec![],
+            redundancy_advisories: vec![],
             errors: vec![],
         }
     }
@@ -2897,6 +3022,379 @@ drives = ["primary-drive", "offsite-drive"]
         assert!(
             assessments[0].advisories.is_empty(),
             "should not add advisory when status already matches"
+        );
+    }
+
+    // ── Redundancy advisory tests ──────────────────────────────────────
+
+    /// Config with resilient subvolume but only primary drives (no offsite).
+    fn resilient_no_offsite_config() -> Config {
+        let toml_str = r#"
+[general]
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp"
+
+[local_snapshots]
+roots = [
+  { path = "/snap", subvolumes = ["sv1"] }
+]
+
+[defaults]
+snapshot_interval = "1h"
+send_interval = "1d"
+send_enabled = true
+enabled = true
+[defaults.local_retention]
+hourly = 24
+daily = 30
+weekly = 26
+monthly = 12
+[defaults.external_retention]
+daily = 30
+weekly = 26
+monthly = 0
+
+[[drives]]
+label = "drive-a"
+mount_path = "/mnt/a"
+snapshot_root = ".snapshots"
+role = "primary"
+
+[[drives]]
+label = "drive-b"
+mount_path = "/mnt/b"
+snapshot_root = ".snapshots"
+role = "primary"
+
+[[subvolumes]]
+name = "sv1"
+short_name = "sv1"
+source = "/data"
+protection_level = "resilient"
+drives = ["drive-a", "drive-b"]
+"#;
+        toml::from_str(toml_str).expect("test config should parse")
+    }
+
+    #[test]
+    fn redundancy_no_offsite_for_resilient() {
+        use crate::output::RedundancyAdvisoryKind;
+
+        let config = resilient_no_offsite_config();
+        let now = dt(2026, 4, 1, 12, 0);
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap(dt(2026, 4, 1, 11, 0), "sv1")]);
+        fs.mounted_drives.insert("drive-a".to_string());
+
+        let assessments = assess(&config, now, &fs);
+        let advisories = compute_redundancy_advisories(&config, &assessments);
+
+        assert_eq!(advisories.len(), 1);
+        assert_eq!(advisories[0].kind, RedundancyAdvisoryKind::NoOffsiteProtection);
+        assert_eq!(advisories[0].subvolume, "sv1");
+        assert!(advisories[0].drive.is_none());
+    }
+
+    #[test]
+    fn redundancy_offsite_stale_at_31_days() {
+        use crate::output::RedundancyAdvisoryKind;
+
+        let config = offsite_test_config();
+        let now = dt(2026, 4, 1, 12, 0);
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap(dt(2026, 4, 1, 11, 0), "sv1")]);
+        // Offsite drive: last sent 31 days ago, unmounted
+        fs.send_times.insert(
+            ("sv1".to_string(), "offsite-drive".to_string()),
+            dt(2026, 3, 1, 12, 0),
+        );
+
+        let assessments = assess(&config, now, &fs);
+        let advisories = compute_redundancy_advisories(&config, &assessments);
+
+        assert_eq!(advisories.len(), 1);
+        assert_eq!(advisories[0].kind, RedundancyAdvisoryKind::OffsiteDriveStale);
+        assert_eq!(advisories[0].subvolume, "sv1");
+        assert_eq!(advisories[0].drive.as_deref(), Some("offsite-drive"));
+    }
+
+    #[test]
+    fn redundancy_offsite_not_stale_at_29_days() {
+        let config = offsite_test_config();
+        let now = dt(2026, 4, 1, 12, 0);
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap(dt(2026, 4, 1, 11, 0), "sv1")]);
+        // Offsite drive: last sent 29 days ago, unmounted
+        fs.send_times.insert(
+            ("sv1".to_string(), "offsite-drive".to_string()),
+            dt(2026, 3, 3, 12, 0),
+        );
+
+        let assessments = assess(&config, now, &fs);
+        let advisories = compute_redundancy_advisories(&config, &assessments);
+
+        assert!(
+            advisories.is_empty(),
+            "29 days should not trigger offsite stale advisory: {advisories:?}"
+        );
+    }
+
+    #[test]
+    fn redundancy_no_advisory_when_offsite_exists() {
+        let config = resilient_config();
+        let now = dt(2026, 4, 1, 12, 0);
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap(dt(2026, 4, 1, 11, 0), "sv1")]);
+        fs.mounted_drives.insert("primary-drive".to_string());
+
+        let assessments = assess(&config, now, &fs);
+        let advisories = compute_redundancy_advisories(&config, &assessments);
+
+        assert!(
+            advisories.is_empty(),
+            "no advisory when offsite drive configured: {advisories:?}"
+        );
+    }
+
+    /// Config with protected subvolume and exactly 1 drive.
+    fn protected_single_drive_config() -> Config {
+        let toml_str = r#"
+[general]
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp"
+
+[local_snapshots]
+roots = [
+  { path = "/snap", subvolumes = ["sv1"] }
+]
+
+[defaults]
+snapshot_interval = "1h"
+send_interval = "1d"
+send_enabled = true
+enabled = true
+[defaults.local_retention]
+hourly = 24
+daily = 30
+weekly = 26
+monthly = 12
+[defaults.external_retention]
+daily = 30
+weekly = 26
+monthly = 0
+
+[[drives]]
+label = "only-drive"
+mount_path = "/mnt/only"
+snapshot_root = ".snapshots"
+role = "primary"
+
+[[subvolumes]]
+name = "sv1"
+short_name = "sv1"
+source = "/data"
+protection_level = "protected"
+"#;
+        toml::from_str(toml_str).expect("test config should parse")
+    }
+
+    #[test]
+    fn redundancy_single_point_of_failure() {
+        use crate::output::RedundancyAdvisoryKind;
+
+        let config = protected_single_drive_config();
+        let now = dt(2026, 4, 1, 12, 0);
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap(dt(2026, 4, 1, 11, 0), "sv1")]);
+        fs.mounted_drives.insert("only-drive".to_string());
+        fs.send_times.insert(
+            ("sv1".to_string(), "only-drive".to_string()),
+            dt(2026, 4, 1, 8, 0),
+        );
+
+        let assessments = assess(&config, now, &fs);
+        let advisories = compute_redundancy_advisories(&config, &assessments);
+
+        assert_eq!(advisories.len(), 1);
+        assert_eq!(advisories[0].kind, RedundancyAdvisoryKind::SinglePointOfFailure);
+        assert_eq!(advisories[0].subvolume, "sv1");
+        assert_eq!(advisories[0].drive.as_deref(), Some("only-drive"));
+    }
+
+    #[test]
+    fn redundancy_no_spof_with_two_drives() {
+        let config = resilient_no_offsite_config(); // 2 primary drives
+        let now = dt(2026, 4, 1, 12, 0);
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap(dt(2026, 4, 1, 11, 0), "sv1")]);
+        fs.mounted_drives.insert("drive-a".to_string());
+        fs.mounted_drives.insert("drive-b".to_string());
+
+        let assessments = assess(&config, now, &fs);
+        let advisories = compute_redundancy_advisories(&config, &assessments);
+
+        // Should have NoOffsiteProtection but NOT SinglePointOfFailure
+        assert!(
+            !advisories
+                .iter()
+                .any(|a| a.kind == crate::output::RedundancyAdvisoryKind::SinglePointOfFailure),
+            "two drives should not trigger SPOF: {advisories:?}"
+        );
+    }
+
+    #[test]
+    fn redundancy_guarded_subvolumes_excluded() {
+        // Guarded subvolumes have send_enabled=false, so all advisory checks
+        // gate on send_enabled and naturally exclude them. Verify this invariant.
+        let toml_str = r#"
+[general]
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp"
+
+[local_snapshots]
+roots = [
+  { path = "/snap", subvolumes = ["sv1"] }
+]
+
+[defaults]
+snapshot_interval = "1h"
+send_interval = "1d"
+send_enabled = true
+enabled = true
+[defaults.local_retention]
+hourly = 24
+daily = 30
+weekly = 26
+monthly = 12
+[defaults.external_retention]
+daily = 30
+weekly = 26
+monthly = 0
+
+[[drives]]
+label = "only-drive"
+mount_path = "/mnt/only"
+snapshot_root = ".snapshots"
+role = "primary"
+
+[[subvolumes]]
+name = "sv1"
+short_name = "sv1"
+source = "/data"
+protection_level = "guarded"
+"#;
+        let config: Config = toml::from_str(toml_str).expect("parse");
+        let now = dt(2026, 4, 1, 12, 0);
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap(dt(2026, 4, 1, 11, 0), "sv1")]);
+
+        let assessments = assess(&config, now, &fs);
+        let advisories = compute_redundancy_advisories(&config, &assessments);
+
+        assert!(
+            advisories.is_empty(),
+            "guarded subvolumes should not trigger advisories: {advisories:?}"
+        );
+    }
+
+    /// Config with transient subvolume and one external drive.
+    fn transient_single_drive_config() -> Config {
+        let toml_str = r#"
+[general]
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp"
+
+[local_snapshots]
+roots = [
+  { path = "/snap", subvolumes = ["sv1"] }
+]
+
+[defaults]
+snapshot_interval = "1h"
+send_interval = "1d"
+send_enabled = true
+enabled = true
+[defaults.local_retention]
+hourly = 24
+daily = 30
+weekly = 26
+monthly = 12
+[defaults.external_retention]
+daily = 30
+weekly = 26
+monthly = 0
+
+[[drives]]
+label = "ext-drive"
+mount_path = "/mnt/ext"
+snapshot_root = ".snapshots"
+role = "primary"
+
+[[subvolumes]]
+name = "sv1"
+short_name = "sv1"
+source = "/data"
+local_retention = "transient"
+"#;
+        toml::from_str(toml_str).expect("test config should parse")
+    }
+
+    #[test]
+    fn redundancy_transient_no_recovery_all_unmounted() {
+        use crate::output::RedundancyAdvisoryKind;
+
+        let config = transient_single_drive_config();
+        let now = dt(2026, 4, 1, 12, 0);
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap(dt(2026, 4, 1, 11, 0), "sv1")]);
+        fs.send_times.insert(
+            ("sv1".to_string(), "ext-drive".to_string()),
+            dt(2026, 3, 30, 12, 0),
+        );
+
+        let assessments = assess(&config, now, &fs);
+        let advisories = compute_redundancy_advisories(&config, &assessments);
+
+        assert!(
+            advisories
+                .iter()
+                .any(|a| a.kind == RedundancyAdvisoryKind::TransientNoLocalRecovery),
+            "transient with all drives unmounted should trigger advisory: {advisories:?}"
+        );
+    }
+
+    #[test]
+    fn redundancy_transient_no_advisory_when_drive_mounted() {
+        let config = transient_single_drive_config();
+        let now = dt(2026, 4, 1, 12, 0);
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap(dt(2026, 4, 1, 11, 0), "sv1")]);
+        fs.mounted_drives.insert("ext-drive".to_string());
+        fs.send_times.insert(
+            ("sv1".to_string(), "ext-drive".to_string()),
+            dt(2026, 4, 1, 8, 0),
+        );
+
+        let assessments = assess(&config, now, &fs);
+        let advisories = compute_redundancy_advisories(&config, &assessments);
+
+        assert!(
+            !advisories.iter().any(|a| a.kind
+                == crate::output::RedundancyAdvisoryKind::TransientNoLocalRecovery),
+            "mounted drive should prevent transient advisory: {advisories:?}"
         );
     }
 }

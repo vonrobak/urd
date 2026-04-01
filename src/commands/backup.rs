@@ -1002,6 +1002,7 @@ mod tests {
             external: vec![],
             chain_health: vec![],
             advisories: vec![],
+            redundancy_advisories: vec![],
             errors: vec![],
         }]
     }
@@ -1362,6 +1363,7 @@ mod tests {
                 failure_count: 0,
             },
             visual_state: None,
+            advisory_summary: None,
         };
         let content = serde_json::to_string_pretty(&state).unwrap();
         std::fs::write(path, content).unwrap();
