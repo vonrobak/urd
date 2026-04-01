@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-04-01
+
 ### Added
 - Staleness escalation: disconnected drives show graduated urgency text based on awareness promise status (PROTECTED → minimal, AT RISK → "consider connecting", UNPROTECTED → "protection degrading")
 - Next-action suggestions: context-specific dimmed hints after `urd status`, `urd plan`, `urd backup`, `urd verify`, and bare `urd` (silence when healthy)
@@ -160,7 +162,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Defense-in-depth pin file protection for unsent snapshots
 - Per-subvolume error isolation in executor
 
-[Unreleased]: https://github.com/vonrobak/urd/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/vonrobak/urd/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/vonrobak/urd/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/vonrobak/urd/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/vonrobak/urd/compare/v0.4.3...v0.5.0
 [0.4.3]: https://github.com/vonrobak/urd/compare/v0.4.2...v0.4.3
