@@ -8,37 +8,39 @@
 
 **Urd is the sole backup system.** Systemd timer running nightly at 04:00 since 2026-03-25.
 Sentinel daemon deployed (passive monitoring, drive detection, backup overdue alerts).
-681 tests, all passing, clippy clean. Current version: v0.6.0.
+692 tests, all passing, clippy clean. Current version: v0.7.0.
 Transient retention deployed to htpc-root (2026-03-30). Immediate cleanup built, not yet deployed.
+
+**Voice & UX arc complete.** All six phases merged: vocabulary (Phase 1), urd default +
+completions (Phase 2a+2c), redundancy advisories (6-I), retention preview + doctor
+(6-N + Phase 2b), staleness escalation + suggestions (Phase 4a+4b), mythic transitions
+(Phase 4c).
 
 ## In Progress
 
-Nothing active. Last completed: Phase 4a+4b (staleness escalation + next-action suggestions).
+Nothing active. Last completed: Phase 4c (mythic voice on transitions) + v0.7.0 release.
 
 ## Next Up
 
-1. **Phase 4c** — Mythic voice on transitions (event-aware voice lines after backup).
-   [Design](../95-ideas/2026-03-31-design-phase4-voice-enrichment.md) |
-   [Review](../99-reports/2026-03-31-arch-adversary-phase4-voice-enrichment.md)
-2. **6-O milestones** — Progressive learning/onboarding layer. ~2 sessions.
-3. **ADR-110 enum rename** — Vocabulary alignment for protection level enums. ~1 session.
+1. **6-O** — Progressive disclosure (milestones, onboarding layer). ~2 sessions.
+   [Design](../95-ideas/2026-03-31-design-o-progressive-disclosure.md) |
+   [Review](../99-reports/2026-03-31-design-phase5-progressive-disclosure-review.md)
+2. **P6a: ADR-110 enum rename** — Vocabulary alignment for protection level enums. ~1 session.
+   [Design](../95-ideas/2026-03-31-design-phase6-protection-rename-wizard.md) |
+   [Review](../99-reports/2026-03-31-design-phase6-protection-rename-wizard-review.md)
+3. **P6b: Config Serialize refactor** — Prerequisite for 6-H wizard. ~0.5 session.
 
-## Build Queue — Priority 6: Voice & UX Overhaul
-
-Two arcs. The Voice & UX arc lands vocabulary and high-impact commands. The Progressive &
-Setup arc builds the learning/onboarding layer. All designs reviewed by arch-adversary.
+## Build Queue — Priority 6: Progressive & Setup Arc
 
 ```
-Voice & UX Arc:                    Progressive & Setup Arc:
-  Phase 1 (vocabulary) ✓             6-O (milestones, 2 sessions)
-  Phase 2a+2c (urd default, compl.)✓ ADR-110 enum rename (1 session)
-  6-I (advisory system) ✓            Config Serialize (0.5 session)
-  6-N + Phase 2b (retention, doctor)✓ 6-H (wizard, 4 sessions)
-  Phase 4a+4b (escalation, suggest.)✓
-  Phase 4c (transitions)
+Progressive & Setup Arc:
+  6-O: Progressive disclosure (2 sessions)
+  P6a: ADR-110 enum rename (1 session)
+  P6b: Config Serialize refactor (0.5 session)
+  6-H: Guided setup wizard (4 sessions)
 ```
 
-Estimated: 8 sessions remaining, ~65 new/modified tests, test suite -> ~750.
+Estimated: ~7.5 sessions remaining, test suite target ~750.
 
 ## Key Links
 
@@ -48,9 +50,9 @@ Estimated: 8 sessions remaining, ~65 new/modified tests, test suite -> ~750.
 | Architecture and code conventions | [CLAUDE.md](../../CLAUDE.md) |
 | Documentation standards | [CONTRIBUTING.md](../../CONTRIBUTING.md) |
 | ADRs (100-112) | [decisions/](../00-foundation/decisions/) |
-| Phase designs (1-6) | [95-ideas/](../95-ideas/) (2026-03-31-design-phase*.md) |
+| Phase designs (1-6) | [95-ideas/](../95-ideas/) (2026-03-31-design-*.md) |
 | Review reports | [99-reports/](../99-reports/) |
-| Phase 4a+4b implementation review | [99-reports/2026-04-01-arch-adversary-phase4ab-implementation-review.md](../99-reports/2026-04-01-arch-adversary-phase4ab-implementation-review.md) |
+| Phase 4c implementation review | [99-reports/2026-04-01-arch-adversary-phase4c-transitions.md](../99-reports/2026-04-01-arch-adversary-phase4c-transitions.md) |
 
 ## Known Issues
 
@@ -61,6 +63,5 @@ Estimated: 8 sessions remaining, ~65 new/modified tests, test suite -> ~750.
 - Parallel notification builders in notify.rs and sentinel_runner.rs — same mythology, different data sources (maintenance risk)
 - Sentinel Sessions 3-4 remaining (Session 3 dedup subsumed by 6-I cooldown mechanism)
 - `assess()` does not respect per-subvolume `drives` scoping — downstream consumers must filter independently (pre-existing, documented in 6-I review)
-- Status string fragility: "UNPROTECTED"/"AT RISK"/"PROTECTED" matched as raw strings across voice.rs — consider constants in output.rs (flagged in Phase 4a+4b review M1)
-
-See [roadmap.md](roadmap.md) for the full tech debt list and dropped features.
+- Status string fragility: "UNPROTECTED"/"AT RISK"/"PROTECTED" matched as raw strings across voice.rs — consider constants in output.rs (flagged in Phase 4a+4b and 4c reviews)
+- PromiseRecovered voice line uses raw status strings instead of vocabulary terms (sealed/waning/exposed) — cosmetic, could fold into P6a
