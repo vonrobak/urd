@@ -233,26 +233,30 @@ cargo run -- get FILE --at DATE      # Restore file from snapshot
 Guideline, not rigid procedure. Skip steps that don't apply to the current work.
 
 ```
-/brainstorm → /design → /grill-me → [build] → /simplify → arch-adversary → /post-review → /check → /journal → /commit-push-pr
+/brainstorm → /design → design-review → /grill-me → /sequence → [plan+build] → /simplify → arch-adversary → /post-review → /check → /journal → /commit-push-pr
 ```
 
 | Tool | Phase | What it does |
 |------|-------|--------------|
 | `/brainstorm` | Ideation | Divergent thinking, no scoring. Output: `docs/95-ideas/` |
-| `/design` | Design | Module decomposition, ADR gate identification |
+| `/design` | Design | Module decomposition, UPI assignment, ADR gate identification |
+| `design-review` | Design review | arch-adversary reviews the design doc (pre-implementation) |
 | `/grill-me` | Stress-test | Socratic interview, resolve decision tree branches |
+| `/sequence` | Sequencing | Order reviewed designs by decision trees and dependencies |
+| `[plan+build]` | Implementation | Planning and execution (intertwined in Claude Code) |
 | `/simplify` | Post-build | Simplification pass: abstractions, types, control flow |
-| `arch-adversary` | Review | Severity-ranked findings with catastrophic failure checklist |
+| `arch-adversary` | Adversary review | Severity-ranked findings on implemented code |
 | `/post-review` | Rework | Systematic fix of review findings, structured disagreement |
 | `test-team` | Testing | Risk-proportional coverage analysis and gap identification |
 | `systematic-debugging` | On-demand | Four-phase root cause investigation (any stage) |
 | `/check` | Quality gate | `cargo clippy` + `cargo test` + `cargo build --release` |
-| `/journal` | Documentation | Session journal + status.md update (two outputs, one command) |
+| `/journal` | Documentation | Session journal + status.md + registry.md updates |
 | `/commit-push-pr` | Integration | PII scan, CHANGELOG, branch, commit, PR |
 | `/release` | Release | SemVer bump, CHANGELOG, tag (user pushes manually) |
 
 ## Project State
 
 See `docs/96-project-supervisor/status.md` for current state and what to build next.
-See `docs/96-project-supervisor/roadmap.md` for the full feature roadmap and priorities.
+See `docs/96-project-supervisor/roadmap.md` for strategy, sequencing, and horizon.
+See `docs/96-project-supervisor/registry.md` for UPI lookup (work items → artifacts).
 See `CONTRIBUTING.md` for documentation structure, conventions, and privacy rules.

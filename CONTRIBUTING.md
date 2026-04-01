@@ -116,9 +116,10 @@ notes. Ideas that mature get promoted to a plan in `97-plans/`; abandoned ideas 
 with their status updated. Low ceremony — the point is to capture thinking before it's lost.
 
 **96-project-supervisor** — The central tracking hub. Contains `status.md` (short
-current-state document, overwritten each session) and `roadmap.md` (feature priorities,
-completed work, tech debt — the long-lived tracker). Read status.md first for orientation;
-follow links to roadmap.md for the full picture.
+current-state document, overwritten each session), `roadmap.md` (strategy, sequencing,
+and horizon — ~80 lines), and `registry.md` (UPI lookup table linking work items to their
+artifacts). Read status.md first for orientation; follow links to roadmap.md for sequencing
+and registry.md for artifact cross-references.
 
 **97-plans** — Implementation plans. Each plan is a dated snapshot of intent — what we're
 going to build and how. When scope changes significantly, write a new plan.
@@ -143,9 +144,20 @@ All documentation files use **lowercase kebab-case** with `.md` extension. Excep
 | Type | Format | Example |
 |------|--------|---------|
 | Dated documents | `YYYY-MM-DD-slug.md` | `2026-03-22-urd-phase01.md` |
-| Living documents | `slug.md` | `status.md`, `backup-recovery.md` |
+| Living documents | `slug.md` | `status.md`, `registry.md` |
 | ADRs | `YYYY-MM-DD-ADR-NNN-slug.md` | `2026-03-21-ADR-020-daily-external-backups.md` |
-| Ideas | `YYYY-MM-DD-slug.md` | `2026-03-25-sentinel-alternatives.md` |
+| Brainstorms | `YYYY-MM-DD-brainstorm-slug.md` | `2026-03-23-brainstorm-ux-norman-principles.md` |
+| Design docs | `YYYY-MM-DD-design-{UPI}-slug.md` | `2026-04-01-design-001-workflow-system-overhaul.md` |
+| Design reviews | `YYYY-MM-DD-design-review-{UPI}-slug.md` | `2026-04-01-design-review-001-workflow-system-overhaul.md` |
+| Adversary reviews | `YYYY-MM-DD-review-adversary-{UPI}-slug.md` | `2026-04-02-review-adversary-001-workflow-system-overhaul.md` |
+| Process analyses | `YYYY-MM-DD-review-analysis-slug.md` | `2026-04-01-review-analysis-workflow.md` |
+
+**UPI (Unique Project Identifier):** Format `NNN` or `NNN-a` (opaque group number, sequential
+letter suffix for sub-items). Assigned by `/design`, registered in `docs/96-project-supervisor/registry.md`.
+Brainstorms do not get UPIs — the identifier is born when an idea becomes a structured design.
+
+**Pre-2026-04-01 naming:** Review files created before 2026-04-01 use legacy naming patterns
+(various conventions). The archived roadmap's feature table provides traceability for those files.
 
 Use subdirectories within a category when a topic has multiple related files
 (e.g., `decisions/ADR-relating-to-bash-script/`).
@@ -294,15 +306,19 @@ Remove this section if nothing needs handoff.}
 
 Use for features that introduce a new module, change a public interface, or affect more
 than 3 existing files. Not needed for bug fixes, config tweaks, or self-contained additions.
-The adversary review reviews the proposal before implementation begins.
+The design review evaluates the proposal before implementation begins.
 
 ```markdown
+---
+upi: "NNN" or "NNN-a"
+status: proposed
+date: YYYY-MM-DD
+---
+
 # Design: {Feature Name}
 
 > **TL;DR:** {2-3 sentences: what, why, key constraint}
 
-**Date:** YYYY-MM-DD
-**Status:** proposed | reviewed | accepted | abandoned
 **Depends on:** {prior features or ADRs}
 
 ## Problem
@@ -315,8 +331,17 @@ The adversary review reviews the proposal before implementation begins.
 
 ## Rejected Alternatives
 
+## Ready for Review
+
 ## Open Questions
 ```
+
+**Status vocabulary** (controlled set):
+- `raw` — brainstorm output, not yet structured
+- `proposed` — structured design, ready for review
+- `reviewed` — design review complete
+- `promoted` — sequenced for implementation
+- `abandoned` — explicitly not proceeding
 
 #### Idea
 

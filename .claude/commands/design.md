@@ -4,6 +4,17 @@ Decompose an idea or feature into an architecturally sound, implementable design
 
 Read CLAUDE.md (module table, invariants), `docs/96-project-supervisor/status.md` (current state), and any relevant ideas in `docs/95-ideas/`. Understand what exists before proposing what to build.
 
+## UPI Assignment
+
+Every design gets a Unique Project Identifier (UPI). Before writing the design doc:
+
+1. Read `docs/96-project-supervisor/registry.md`
+2. Find the highest existing UPI group number
+3. Assign the next number: `NNN` for standalone items, `NNN-a` for the first sub-item
+   in a group (user specifies if this is a sub-item of an existing group)
+4. After writing the design doc, add a row to registry.md (newest at top) with UPI, title,
+   and design doc link. Fill other columns with `-`.
+
 ## Core job
 
 1. **Decompose to module level.** Which existing modules are affected? What new types/traits/enums? What's the data flow? What's the test strategy? If an operation doesn't fit cleanly into one module per CLAUDE.md's table, that's a design signal.
@@ -23,9 +34,21 @@ Read CLAUDE.md (module table, invariants), `docs/96-project-supervisor/status.md
 
 ## Output
 
-For features affecting >3 files or introducing new modules: write a design proposal per CONTRIBUTING.md template to `docs/95-ideas/YYYY-MM-DD-design-slug.md` (status: proposed). Include a **Ready for Review** section telling the arch-adversary what to focus on.
+For features affecting >3 files or introducing new modules: write a design proposal to
+`docs/95-ideas/YYYY-MM-DD-design-{UPI}-{slug}.md` with YAML frontmatter and status `proposed`.
+Include a **Ready for Review** section telling the arch-adversary what to focus on.
 
-For smaller features: deliver the decomposition conversationally with module mapping, effort estimate, and any gate flags.
+**Frontmatter format:**
+
+```yaml
+---
+upi: "001-a"
+status: proposed
+date: YYYY-MM-DD
+---
+```
+
+For smaller features: deliver the decomposition conversationally with module mapping, effort estimate, and any gate flags. Still assign a UPI and add a registry row.
 
 ## Arguments
 
