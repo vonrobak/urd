@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `urd retention-preview` command: shows recovery windows, disk estimates, and transient/graduated comparison for retention policies
 - RECOVERY column in `urd status` table showing compact retention summary per subvolume (e.g., "31d / 7mo / ∞")
 - `urd doctor` command: unified health check composing config, infrastructure, awareness, sentinel, and optional thread verification (`--thorough`)
+- Mythic voice on backup transitions: brief event-aware lines when threads are mended, first sends established, promises recovered, or all subvolumes reach sealed
 
 ### Changed
 - Offsite cycling advisory migrated from stringly-typed 7-day threshold to structured `OffsiteDriveStale` with 30-day threshold

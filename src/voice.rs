@@ -676,11 +676,52 @@ fn render_backup_interactive(data: &BackupSummary) -> String {
         }
     }
 
+    // ── Transitions (mythic voice on events) ─────────────────────────
+    render_transitions(&data.transitions, &mut out);
+
     // ── Next-action suggestion ──────────────────────────────────────
     let has_failures = data.subvolumes.iter().any(|sv| !sv.success);
     append_suggestion(&SuggestionContext::Backup { has_failures }, &mut out);
 
     out
+}
+
+/// Render transition events as brief mythic voice lines.
+/// Each transition gets one line. Empty transitions produce no output.
+fn render_transitions(transitions: &[crate::output::TransitionEvent], out: &mut String) {
+    use crate::output::TransitionEvent;
+
+    if transitions.is_empty() {
+        return;
+    }
+    writeln!(out).ok();
+    for t in transitions {
+        match t {
+            TransitionEvent::ThreadRestored { subvolume, drive } => {
+                writeln!(out, "  {}: thread to {} mended.", subvolume, drive).ok();
+            }
+            TransitionEvent::FirstSendToDrive { subvolume, drive } => {
+                writeln!(out, "  {}: first thread to {} established.", subvolume, drive).ok();
+            }
+            TransitionEvent::AllSealed => {
+                writeln!(out, "  All threads hold.").ok();
+            }
+            TransitionEvent::PromiseRecovered {
+                subvolume,
+                from,
+                to,
+            } => {
+                writeln!(
+                    out,
+                    "  {}: {} \u{2192} {}.",
+                    subvolume,
+                    exposure_label(from),
+                    exposure_label(to),
+                )
+                .ok();
+            }
+        }
+    }
 }
 
 fn format_send_info(sends: &[crate::output::SendSummary]) -> String {
@@ -2261,8 +2302,8 @@ mod tests {
         ChainHealthEntry, DriveInfo, HistoryOutput, HistoryRun, InitCheck, InitDriveStatus,
         InitOutput, InitPinFile, InitSnapshotCount, InitStatus, LastRunInfo, PlanOperationEntry,
         PlanOutput, PlanSummaryOutput, SendSummary, SkipCategory, SkippedSubvolume,
-        StatusAssessment, StatusDriveAssessment, SubvolumeSummary, VerifyCheck, VerifyDrive,
-        VerifyOutput, VerifySubvolume,
+        StatusAssessment, StatusDriveAssessment, SubvolumeSummary, TransitionEvent, VerifyCheck,
+        VerifyDrive, VerifyOutput, VerifySubvolume,
     };
 
     fn test_status_output() -> StatusOutput {
@@ -2647,6 +2688,7 @@ mod tests {
                 retention_summary: None,
                 errors: vec![],
             }],
+            transitions: vec![],
             warnings: vec![],
         }
     }
@@ -2841,6 +2883,7 @@ mod tests {
                 },
             ],
             assessments: vec![],
+            transitions: vec![],
             warnings: vec![],
         };
         let output = render_backup_summary(&data, OutputMode::Interactive);
@@ -4801,5 +4844,63 @@ mod tests {
         assert!(output.contains("All clear."), "missing verdict: {output}");
         // The suggestion system returns None for doctor, so no "urd" command in suggestion
         // (verdict line already contains guidance for non-healthy cases)
+    }
+
+    // ── Transition rendering tests ──────────────────────────────────
+
+    #[test]
+    fn render_transitions_interactive() {
+        colored::control::set_override(false);
+        let mut summary = test_backup_summary();
+        summary.transitions = vec![
+            TransitionEvent::ThreadRestored {
+                subvolume: "htpc-home".to_string(),
+                drive: "WD-18TB".to_string(),
+            },
+            TransitionEvent::FirstSendToDrive {
+                subvolume: "docs".to_string(),
+                drive: "WD-18TB1".to_string(),
+            },
+            TransitionEvent::PromiseRecovered {
+                subvolume: "htpc-home".to_string(),
+                from: "UNPROTECTED".to_string(),
+                to: "PROTECTED".to_string(),
+            },
+            TransitionEvent::AllSealed,
+        ];
+
+        let output = render_backup_summary(&summary, OutputMode::Interactive);
+        assert!(
+            output.contains("thread to WD-18TB mended"),
+            "missing thread restored: {output}"
+        );
+        assert!(
+            output.contains("first thread to WD-18TB1 established"),
+            "missing first send: {output}"
+        );
+        assert!(
+            output.contains("exposed \u{2192} sealed"),
+            "missing promise recovered: {output}"
+        );
+        assert!(
+            output.contains("All threads hold."),
+            "missing all sealed: {output}"
+        );
+    }
+
+    #[test]
+    fn no_transitions_no_output() {
+        colored::control::set_override(false);
+        let summary = test_backup_summary();
+        assert!(summary.transitions.is_empty());
+        let output = render_backup_summary(&summary, OutputMode::Interactive);
+        assert!(
+            !output.contains("thread"),
+            "should have no transition text: {output}"
+        );
+        assert!(
+            !output.contains("All threads hold"),
+            "should have no all-sealed text: {output}"
+        );
     }
 }

@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use colored::Colorize;
 
-use crate::awareness::{self, SubvolAssessment};
+use crate::awareness::{self, ChainStatus, PromiseStatus, SubvolAssessment};
 use crate::btrfs::RealBtrfs;
 use crate::cli::BackupArgs;
 use crate::config::Config;
@@ -20,7 +20,7 @@ use crate::lock;
 use crate::metrics::{self, MetricsData, SubvolumeMetrics};
 use crate::output::{
     BackupSummary, OutputMode, SendSummary, SkipCategory, SkippedSubvolume, StatusAssessment,
-    StructuredError, SubvolumeSummary,
+    StructuredError, SubvolumeSummary, TransitionEvent,
 };
 use crate::notify;
 use crate::plan::{self, FileSystemState, PlanFilters, RealFileSystemState};
@@ -166,6 +166,15 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
         }
     }
 
+    // Snapshot awareness state before execution so we can detect transitions
+    // (thread restored, promise recovered, etc.) by diffing with post-backup state.
+    let pre_assessments = {
+        let pre_now = chrono::Local::now().naive_local();
+        let mut pre = awareness::assess(&config, pre_now, &fs_state);
+        awareness::overlay_offsite_freshness(&mut pre, &config);
+        pre
+    };
+
     // Build progress context after token filtering so counters reflect actual work.
     let total_sends = backup_plan.summary().sends as u32;
     let size_estimates = build_size_estimates(&backup_plan, &fs_state);
@@ -228,10 +237,15 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     }
 
     // Build and render structured summary
+    let transitions = detect_transitions(&pre_assessments, &assessments);
+    if !transitions.is_empty() {
+        log::debug!("Detected {} transition(s)", transitions.len());
+    }
     let summary = build_backup_summary(
         &backup_plan,
         &result,
         &assessments,
+        transitions,
         exec_duration,
         &preflight_warnings,
     );
@@ -255,6 +269,7 @@ fn build_backup_summary(
     plan: &BackupPlan,
     result: &ExecutionResult,
     assessments: &[SubvolAssessment],
+    transitions: Vec<TransitionEvent>,
     duration: Duration,
     preflight_warnings: &[preflight::PreflightCheck],
 ) -> BackupSummary {
@@ -410,6 +425,7 @@ fn build_backup_summary(
             .iter()
             .map(StatusAssessment::from_assessment)
             .collect(),
+        transitions,
         warnings,
     }
 }
@@ -932,12 +948,94 @@ fn filter_promise_retention(config: &Config, plan: &mut BackupPlan) {
     }
 }
 
+// ── Transition detection ────────────────────────────────────────────────
+
+/// Detect meaningful state changes by comparing pre-backup and post-backup
+/// awareness assessments. Pure function: two assessment snapshots in,
+/// transition events out.
+fn detect_transitions(
+    pre: &[SubvolAssessment],
+    post: &[SubvolAssessment],
+) -> Vec<TransitionEvent> {
+    let pre_by_name: HashMap<&str, &SubvolAssessment> =
+        pre.iter().map(|a| (a.name.as_str(), a)).collect();
+
+    let mut transitions = Vec::new();
+
+    for post_a in post {
+        let Some(pre_a) = pre_by_name.get(post_a.name.as_str()) else {
+            continue;
+        };
+
+        // Thread restored: chain was Broken, now Intact
+        for post_ch in &post_a.chain_health {
+            if !matches!(post_ch.status, ChainStatus::Intact { .. }) {
+                continue;
+            }
+            let was_broken = pre_a.chain_health.iter().any(|pre_ch| {
+                pre_ch.drive_label == post_ch.drive_label
+                    && matches!(pre_ch.status, ChainStatus::Broken { .. })
+            });
+            if was_broken {
+                transitions.push(TransitionEvent::ThreadRestored {
+                    subvolume: post_a.name.clone(),
+                    drive: post_ch.drive_label.clone(),
+                });
+            }
+        }
+
+        // First send to drive: mounted with zero snapshots before, has some now.
+        // Only fires for drives that were mounted pre-backup (Some(0)), not
+        // drives that were unmounted (None) — a drive appearing mid-backup
+        // with existing snapshots is not a "first send".
+        for post_ext in &post_a.external {
+            let post_count = post_ext.snapshot_count.unwrap_or(0);
+            if post_count == 0 {
+                continue;
+            }
+            let was_mounted_empty = pre_a.external.iter().any(|pre_ext| {
+                pre_ext.drive_label == post_ext.drive_label
+                    && pre_ext.snapshot_count == Some(0)
+            });
+            if was_mounted_empty {
+                transitions.push(TransitionEvent::FirstSendToDrive {
+                    subvolume: post_a.name.clone(),
+                    drive: post_ext.drive_label.clone(),
+                });
+            }
+        }
+
+        // Promise recovered: status improved
+        if post_a.status > pre_a.status {
+            transitions.push(TransitionEvent::PromiseRecovered {
+                subvolume: post_a.name.clone(),
+                from: format!("{}", pre_a.status),
+                to: format!("{}", post_a.status),
+            });
+        }
+    }
+
+    // AllSealed: all post are Protected, but not all pre were
+    let all_post_protected = !post.is_empty()
+        && post.iter().all(|a| a.status == PromiseStatus::Protected);
+    let any_pre_not_protected = pre.iter().any(|a| a.status != PromiseStatus::Protected);
+    if all_post_protected && any_pre_not_protected {
+        transitions.push(TransitionEvent::AllSealed);
+    }
+
+    transitions
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::awareness::{LocalAssessment, OperationalHealth, PromiseStatus, SubvolAssessment};
+    use crate::awareness::{
+        ChainBreakReason, ChainStatus, DriveAssessment, DriveChainHealth, LocalAssessment,
+        OperationalHealth, PromiseStatus, SubvolAssessment,
+    };
+    use crate::types::DriveRole;
     use crate::executor::{
         ExecutionResult, OpResult, OperationOutcome, RunResult, SendType, SubvolumeResult,
         TransientCleanupOutcome,
@@ -1049,6 +1147,7 @@ mod tests {
             &empty_plan(),
             &result,
             &empty_assessments(),
+            vec![],
             Duration::from_secs(5),
             &[],
         );
@@ -1102,6 +1201,7 @@ mod tests {
             &empty_plan(),
             &result,
             &empty_assessments(),
+            vec![],
             Duration::from_secs(120),
             &[],
         );
@@ -1129,6 +1229,7 @@ mod tests {
             &empty_plan(),
             &result,
             &empty_assessments(),
+            vec![],
             Duration::from_secs(1),
             &[],
         );
@@ -1150,6 +1251,7 @@ mod tests {
             &empty_plan(),
             &result,
             &empty_assessments(),
+            vec![],
             Duration::from_secs(1),
             &[],
         );
@@ -1201,6 +1303,7 @@ mod tests {
             &plan,
             &result,
             &empty_assessments(),
+            vec![],
             Duration::from_secs(1),
             &[],
         );
@@ -1233,6 +1336,7 @@ mod tests {
             &plan,
             &result,
             &empty_assessments(),
+            vec![],
             Duration::from_secs(0),
             &[],
         );
@@ -1256,6 +1360,7 @@ mod tests {
             &empty_plan(),
             &result,
             &sample_assessments(),
+            vec![],
             Duration::from_secs(1),
             &[],
         );
@@ -1277,6 +1382,7 @@ mod tests {
             &empty_plan(),
             &result,
             &empty_assessments(),
+            vec![],
             Duration::from_millis(12300),
             &[],
         );
@@ -1312,6 +1418,7 @@ mod tests {
             &empty_plan(),
             &result,
             &empty_assessments(),
+            vec![],
             Duration::from_secs(1),
             &[],
         );
@@ -1706,5 +1813,265 @@ mod tests {
             subvolumes: vec![],
             notifications: NotificationConfig::default(),
         }
+    }
+
+    // ── Transition detection tests ──────────────────────────────────
+
+    fn make_assessment(
+        name: &str,
+        status: PromiseStatus,
+        chain_health: Vec<DriveChainHealth>,
+        external: Vec<DriveAssessment>,
+    ) -> SubvolAssessment {
+        SubvolAssessment {
+            name: name.to_string(),
+            status,
+            health: OperationalHealth::Healthy,
+            health_reasons: vec![],
+            local: LocalAssessment {
+                status: PromiseStatus::Protected,
+                snapshot_count: 10,
+                newest_age: None,
+                configured_interval: Interval::hours(1),
+            },
+            external,
+            chain_health,
+            advisories: vec![],
+            redundancy_advisories: vec![],
+            errors: vec![],
+        }
+    }
+
+    fn make_drive_assessment(label: &str, count: Option<usize>) -> DriveAssessment {
+        DriveAssessment {
+            drive_label: label.to_string(),
+            status: PromiseStatus::Protected,
+            mounted: true,
+            snapshot_count: count,
+            last_send_age: None,
+            configured_interval: Interval::hours(4),
+            role: DriveRole::Primary,
+        }
+    }
+
+    #[test]
+    fn detect_thread_restored() {
+        let pre = vec![make_assessment(
+            "htpc-home",
+            PromiseStatus::Protected,
+            vec![DriveChainHealth {
+                drive_label: "WD-18TB".to_string(),
+                status: ChainStatus::Broken {
+                    reason: ChainBreakReason::PinMissingOnDrive,
+                    pin_parent: Some("20260401-0400-htpc-home".to_string()),
+                },
+            }],
+            vec![make_drive_assessment("WD-18TB", Some(5))],
+        )];
+        let post = vec![make_assessment(
+            "htpc-home",
+            PromiseStatus::Protected,
+            vec![DriveChainHealth {
+                drive_label: "WD-18TB".to_string(),
+                status: ChainStatus::Intact {
+                    pin_parent: "20260401-1200-htpc-home".to_string(),
+                },
+            }],
+            vec![make_drive_assessment("WD-18TB", Some(6))],
+        )];
+
+        let transitions = detect_transitions(&pre, &post);
+        assert_eq!(
+            transitions,
+            vec![TransitionEvent::ThreadRestored {
+                subvolume: "htpc-home".to_string(),
+                drive: "WD-18TB".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn detect_first_send_to_drive() {
+        let pre = vec![make_assessment(
+            "docs",
+            PromiseStatus::AtRisk,
+            vec![],
+            vec![make_drive_assessment("WD-18TB", Some(0))],
+        )];
+        let post = vec![make_assessment(
+            "docs",
+            PromiseStatus::Protected,
+            vec![],
+            vec![make_drive_assessment("WD-18TB", Some(1))],
+        )];
+
+        let transitions = detect_transitions(&pre, &post);
+        assert!(transitions.contains(&TransitionEvent::FirstSendToDrive {
+            subvolume: "docs".to_string(),
+            drive: "WD-18TB".to_string(),
+        }));
+    }
+
+    #[test]
+    fn detect_all_sealed() {
+        let pre = vec![
+            make_assessment("a", PromiseStatus::Protected, vec![], vec![]),
+            make_assessment("b", PromiseStatus::AtRisk, vec![], vec![]),
+        ];
+        let post = vec![
+            make_assessment("a", PromiseStatus::Protected, vec![], vec![]),
+            make_assessment("b", PromiseStatus::Protected, vec![], vec![]),
+        ];
+
+        let transitions = detect_transitions(&pre, &post);
+        assert!(transitions.contains(&TransitionEvent::AllSealed));
+    }
+
+    #[test]
+    fn detect_promise_recovered() {
+        let pre = vec![make_assessment(
+            "htpc-home",
+            PromiseStatus::Unprotected,
+            vec![],
+            vec![],
+        )];
+        let post = vec![make_assessment(
+            "htpc-home",
+            PromiseStatus::Protected,
+            vec![],
+            vec![],
+        )];
+
+        let transitions = detect_transitions(&pre, &post);
+        assert!(transitions.contains(&TransitionEvent::PromiseRecovered {
+            subvolume: "htpc-home".to_string(),
+            from: "UNPROTECTED".to_string(),
+            to: "PROTECTED".to_string(),
+        }));
+    }
+
+    #[test]
+    fn no_transitions_routine_backup() {
+        let pre = vec![
+            make_assessment("a", PromiseStatus::Protected, vec![], vec![]),
+            make_assessment("b", PromiseStatus::Protected, vec![], vec![]),
+        ];
+        let post = vec![
+            make_assessment("a", PromiseStatus::Protected, vec![], vec![]),
+            make_assessment("b", PromiseStatus::Protected, vec![], vec![]),
+        ];
+
+        let transitions = detect_transitions(&pre, &post);
+        assert!(transitions.is_empty(), "routine backup should have no transitions");
+    }
+
+    #[test]
+    fn multiple_transitions() {
+        let pre = vec![
+            make_assessment(
+                "a",
+                PromiseStatus::Unprotected,
+                vec![DriveChainHealth {
+                    drive_label: "WD-18TB".to_string(),
+                    status: ChainStatus::Broken {
+                        reason: ChainBreakReason::NoPinFile,
+                        pin_parent: None,
+                    },
+                }],
+                vec![make_drive_assessment("WD-18TB", Some(0))],
+            ),
+            make_assessment("b", PromiseStatus::AtRisk, vec![], vec![]),
+        ];
+        let post = vec![
+            make_assessment(
+                "a",
+                PromiseStatus::Protected,
+                vec![DriveChainHealth {
+                    drive_label: "WD-18TB".to_string(),
+                    status: ChainStatus::Intact {
+                        pin_parent: "20260401-1200-a".to_string(),
+                    },
+                }],
+                vec![make_drive_assessment("WD-18TB", Some(1))],
+            ),
+            make_assessment("b", PromiseStatus::Protected, vec![], vec![]),
+        ];
+
+        let transitions = detect_transitions(&pre, &post);
+        // Should detect: ThreadRestored, FirstSendToDrive, PromiseRecovered (for a and b), AllSealed
+        assert!(transitions.len() >= 4, "expected multiple transitions, got {transitions:?}");
+        assert!(transitions.contains(&TransitionEvent::AllSealed));
+        assert!(transitions.contains(&TransitionEvent::ThreadRestored {
+            subvolume: "a".to_string(),
+            drive: "WD-18TB".to_string(),
+        }));
+    }
+
+    #[test]
+    fn all_sealed_not_fired_when_already_sealed() {
+        let pre = vec![
+            make_assessment("a", PromiseStatus::Protected, vec![], vec![]),
+            make_assessment("b", PromiseStatus::Protected, vec![], vec![]),
+        ];
+        let post = vec![
+            make_assessment("a", PromiseStatus::Protected, vec![], vec![]),
+            make_assessment("b", PromiseStatus::Protected, vec![], vec![]),
+        ];
+
+        let transitions = detect_transitions(&pre, &post);
+        assert!(
+            !transitions.contains(&TransitionEvent::AllSealed),
+            "AllSealed should not fire when already all sealed"
+        );
+    }
+
+    #[test]
+    fn promise_degraded_not_a_transition() {
+        let pre = vec![make_assessment(
+            "htpc-home",
+            PromiseStatus::Protected,
+            vec![],
+            vec![],
+        )];
+        let post = vec![make_assessment(
+            "htpc-home",
+            PromiseStatus::AtRisk,
+            vec![],
+            vec![],
+        )];
+
+        let transitions = detect_transitions(&pre, &post);
+        assert!(
+            transitions.is_empty(),
+            "degradation should not produce transitions"
+        );
+    }
+
+    #[test]
+    fn first_send_not_fired_for_unmounted_drive() {
+        // Drive was unmounted (snapshot_count: None) pre-backup, mounted with
+        // existing snapshots post-backup. This is not a "first send" — the
+        // snapshots already existed, the drive was just away.
+        let pre = vec![make_assessment(
+            "docs",
+            PromiseStatus::Protected,
+            vec![],
+            vec![make_drive_assessment("WD-18TB", None)],
+        )];
+        let post = vec![make_assessment(
+            "docs",
+            PromiseStatus::Protected,
+            vec![],
+            vec![make_drive_assessment("WD-18TB", Some(5))],
+        )];
+
+        let transitions = detect_transitions(&pre, &post);
+        assert!(
+            !transitions.contains(&TransitionEvent::FirstSendToDrive {
+                subvolume: "docs".to_string(),
+                drive: "WD-18TB".to_string(),
+            }),
+            "should not fire FirstSendToDrive for previously unmounted drive"
+        );
     }
 }
