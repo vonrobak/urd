@@ -7,6 +7,7 @@ use crate::output::{
     StatusOutput,
 };
 use crate::plan::RealFileSystemState;
+use crate::retention;
 use crate::state::StateDb;
 use crate::voice;
 
@@ -98,6 +99,10 @@ pub fn run(config: Config, output_mode: OutputMode) -> anyhow::Result<()> {
             let mut sa = StatusAssessment::from_assessment(a);
             if let Some(sv) = resolved.iter().find(|sv| sv.name == a.name) {
                 sa.promise_level = sv.protection_level.map(|pl| pl.to_string());
+                sa.retention_summary = Some(retention::retention_summary(
+                    &sv.local_retention,
+                    &sv.snapshot_interval,
+                ));
             }
             sa
         })

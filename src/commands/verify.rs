@@ -9,6 +9,19 @@ use crate::plan::{FileSystemState, RealFileSystemState};
 use crate::voice;
 
 pub fn run(config: Config, args: VerifyArgs, mode: OutputMode) -> anyhow::Result<()> {
+    let data = collect_verify_output(&config, &args);
+
+    print!("{}", voice::render_verify(&data, mode));
+
+    if data.fail_count > 0 {
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
+/// Collect verify data without rendering. Used by `urd verify` and `urd doctor --thorough`.
+pub(crate) fn collect_verify_output(config: &Config, args: &VerifyArgs) -> VerifyOutput {
     let fs_state = RealFileSystemState { state: None };
     let mut total_ok: u32 = 0;
     let mut total_warn: u32 = 0;
@@ -231,7 +244,7 @@ pub fn run(config: Config, args: VerifyArgs, mode: OutputMode) -> anyhow::Result
     }
 
     // Pre-flight config consistency checks
-    let preflight_results = crate::preflight::preflight_checks(&config);
+    let preflight_results = crate::preflight::preflight_checks(config);
     let preflight_warnings: Vec<String> = preflight_results
         .iter()
         .map(|c| {
@@ -240,21 +253,13 @@ pub fn run(config: Config, args: VerifyArgs, mode: OutputMode) -> anyhow::Result
         })
         .collect();
 
-    let data = VerifyOutput {
+    VerifyOutput {
         subvolumes,
         preflight_warnings,
         ok_count: total_ok,
         warn_count: total_warn,
         fail_count: total_fail,
-    };
-
-    print!("{}", voice::render_verify(&data, mode));
-
-    if data.fail_count > 0 {
-        std::process::exit(1);
     }
-
-    Ok(())
 }
 
 fn collect_orphan_checks(

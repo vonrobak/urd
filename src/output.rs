@@ -176,6 +176,9 @@ pub struct StatusAssessment {
     /// Structured redundancy advisories (e.g., no offsite, single point of failure).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub redundancy_advisories: Vec<RedundancyAdvisory>,
+    /// Compact retention summary, e.g. "31d / 7mo / 19mo" or "none (transient)".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retention_summary: Option<String>,
     pub errors: Vec<String>,
 }
 
@@ -198,6 +201,7 @@ impl StatusAssessment {
                 .collect(),
             advisories: a.advisories.clone(),
             redundancy_advisories: a.redundancy_advisories.clone(),
+            retention_summary: None,
             errors: a.errors.clone(),
         }
     }
@@ -277,6 +281,165 @@ impl DefaultStatusOutput {
     #[must_use]
     pub fn sealed_count(&self) -> usize {
         self.total - self.waning_names.len() - self.exposed_names.len()
+    }
+}
+
+// ── RetentionPreview ──────────────────────────────────────────────────
+
+/// Full output for the `urd retention-preview` command.
+#[derive(Debug, Clone, Serialize)]
+pub struct RetentionPreviewOutput {
+    pub previews: Vec<RetentionPreview>,
+}
+
+/// Retention policy preview for a single subvolume.
+#[derive(Debug, Clone, Serialize)]
+pub struct RetentionPreview {
+    pub subvolume_name: String,
+    pub policy_description: String,
+    pub snapshot_interval: String,
+    pub recovery_windows: Vec<RecoveryWindow>,
+    /// Disk usage estimate (absent when no calibration data and no snapshots).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estimated_disk_usage: Option<DiskEstimate>,
+    /// Comparison to the alternate retention mode (graduated vs transient).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transient_comparison: Option<TransientComparison>,
+}
+
+/// A single recovery window in the cascading retention chain.
+#[derive(Debug, Clone, Serialize)]
+pub struct RecoveryWindow {
+    /// Granularity label: "hourly", "daily", "weekly", "monthly".
+    pub granularity: &'static str,
+    /// Number of snapshots kept in this bucket.
+    pub count: u32,
+    /// Cumulative days from now (for compact formatting).
+    pub cumulative_days: f64,
+    /// Cumulative description from now, e.g. "daily snapshots back 31 days".
+    pub cumulative_description: String,
+}
+
+/// Estimated disk usage for retained snapshots.
+#[derive(Debug, Clone, Serialize)]
+pub struct DiskEstimate {
+    pub method: EstimateMethod,
+    pub per_snapshot_bytes: u64,
+    pub total_bytes: u64,
+    pub total_count: u32,
+}
+
+/// How the disk estimate was derived.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EstimateMethod {
+    /// Measured from actual snapshot sizes on disk.
+    Calibrated,
+}
+
+/// Comparison between graduated and transient retention.
+#[derive(Debug, Clone, Serialize)]
+pub struct TransientComparison {
+    pub graduated_count: u32,
+    pub transient_count: u32,
+    /// Byte-based totals (only when calibrated data exists).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub graduated_total_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transient_total_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub savings_bytes: Option<u64>,
+    /// What the user loses by switching to transient.
+    pub lost_window: String,
+}
+
+// ── DoctorOutput ──────────────────────────────────────────────────────
+
+/// Full output for the `urd doctor` command.
+#[derive(Debug, Serialize)]
+pub struct DoctorOutput {
+    pub config_checks: Vec<DoctorCheck>,
+    pub infra_checks: Vec<DoctorCheck>,
+    pub data_safety: Vec<DoctorDataSafety>,
+    pub sentinel: DoctorSentinelStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verify: Option<VerifyOutput>,
+    pub verdict: DoctorVerdict,
+}
+
+/// A single diagnostic check result.
+#[derive(Debug, Clone, Serialize)]
+pub struct DoctorCheck {
+    pub name: String,
+    pub status: DoctorCheckStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suggestion: Option<String>,
+}
+
+/// Status of a diagnostic check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DoctorCheckStatus {
+    Ok,
+    Warn,
+    Error,
+}
+
+/// Subvolume safety summary for doctor output.
+#[derive(Debug, Clone, Serialize)]
+pub struct DoctorDataSafety {
+    pub name: String,
+    pub status: String,
+    pub health: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issue: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suggestion: Option<String>,
+}
+
+/// Sentinel daemon status for doctor output.
+#[derive(Debug, Clone, Serialize)]
+pub struct DoctorSentinelStatus {
+    pub running: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uptime: Option<String>,
+}
+
+/// Overall verdict from doctor.
+/// Serializes as `{ "status": "healthy", "count": 0 }` for uniform JSON shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DoctorVerdict {
+    pub status: DoctorVerdictStatus,
+    pub count: usize,
+}
+
+/// Verdict status for doctor output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DoctorVerdictStatus {
+    Healthy,
+    Warnings,
+    Issues,
+}
+
+impl DoctorVerdict {
+    #[must_use]
+    pub fn healthy() -> Self {
+        Self { status: DoctorVerdictStatus::Healthy, count: 0 }
+    }
+
+    #[must_use]
+    pub fn warnings(count: usize) -> Self {
+        Self { status: DoctorVerdictStatus::Warnings, count }
+    }
+
+    #[must_use]
+    pub fn issues(count: usize) -> Self {
+        Self { status: DoctorVerdictStatus::Issues, count }
     }
 }
 
