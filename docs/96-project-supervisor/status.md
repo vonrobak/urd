@@ -16,21 +16,23 @@ Sentinel daemon deployed (passive monitoring, drive detection, backup overdue al
 connected drives are sealed"), doctor warnings include concrete numbers and fix suggestions,
 UUID warning moved to doctor, log noise suppressed on TTY. Uncommitted — ready for PR.
 
-**Workflow system overhaul complete (UPI 001).** UPI system, registry.md, /sequence skill,
-updated pipeline, archived 550-line roadmap and replaced with 85-line version.
+**Steve Jobs vision review complete (2026-04-02).** Three reports reviewed: project
+trajectory, encounter design, strategy/promise philosophy. Key decisions: vocabulary
+frozen, strategy names stay internal, roadmap resequenced. See roadmap.md.
 
 ## In Progress
 
-**Backup-now imperative (idea stage).** `urd backup` typed by a human should take fresh
-snapshots and send to all connected drives, ignoring interval checks. Idea sketch at
-`docs/95-ideas/2026-04-01-backup-now-imperative.md`. Needs `/design`.
+Nothing active — roadmap just resequenced.
 
 ## Next Up
 
-1. **Backup-now imperative** — design and implement manual vs scheduled semantics. ~2 sessions.
-2. **6-O** — Progressive disclosure (milestones, onboarding layer). ~2 sessions.
+1. **assess() scoping fix** — correctness bug: promise model ignores per-subvolume drive
+   scoping, causes false degradation for htpc-root. Patch tier. ~0.5 session.
+2. **Backup-now imperative** — `urd backup` by a human takes fresh snapshots + sends,
+   ignoring intervals. Idea sketch at `docs/95-ideas/2026-04-01-backup-now-imperative.md`.
+   Needs `/design`. ~2 sessions.
+3. **6-O** — Progressive disclosure (milestones, onboarding layer). ~2 sessions.
    Design: [95-ideas/2026-03-31-design-o-progressive-disclosure.md](../95-ideas/2026-03-31-design-o-progressive-disclosure.md)
-3. **P6a** — ADR-110 enum rename (recorded/sheltered/fortified). ~1 session.
 
 ## Key Links
 
@@ -44,6 +46,7 @@ snapshots and send to all connected drives, ignoring interval checks. Idea sketc
 | Design docs | [95-ideas/](../95-ideas/) |
 | Review reports | [99-reports/](../99-reports/) |
 | Historic roadmap (pre-UPI) | [archived](../90-archive/96-project-supervisor/2026-04-01-historic-roadmap.md) |
+| Steve reviews | [trajectory](../99-reports/2026-04-02-steve-jobs-000-project-trajectory-vision-check.md), [encounter](../99-reports/2026-04-02-steve-jobs-000-the-encounter-is-the-product.md), [strategies](../99-reports/2026-04-02-steve-jobs-000-strategies-need-a-soul.md) |
 
 ## Known Issues
 
@@ -51,6 +54,5 @@ snapshots and send to all connected drives, ignoring interval checks. Idea sketc
 - `FileSystemState` trait (11 methods) outgrowing its name — consider rename to `SystemState`
 - Status string fragility: "UNPROTECTED"/"AT RISK"/"PROTECTED" matched as raw strings — consider constants
 - Parallel notification builders in notify.rs and sentinel_runner.rs (maintenance risk)
-- `assess()` does not respect per-subvolume `drives` scoping (causes false degradation for htpc-root)
-- Legacy active arc items (6-O, P6a, P6b, 6-H) use old naming — may get UPIs when redesigned
+- **assess() does not respect per-subvolume `drives` scoping** — correctness bug, next fix (causes false degradation for htpc-root)
 - RECOVERY column hidden — needs real snapshot depth calculation before it can return
