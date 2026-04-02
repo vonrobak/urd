@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `/steve` skill: Steve Jobs product vision and UX quality gatekeeper — reviews brainstorms, designs, and finished features from the user's perspective
+
 ## [0.7.1] - 2026-04-01
 
 ### Fixed
