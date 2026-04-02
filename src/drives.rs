@@ -30,7 +30,12 @@ pub enum DriveAvailability {
     TokenMismatch { expected: String, found: String },
     /// Drive is mounted and UUID matches, but no token file exists on the drive.
     /// Normal for drives that have not completed their first Urd send.
+    /// Only returned when SQLite has no stored token for this label (genuine first use).
     TokenMissing,
+    /// Drive is mounted and UUID matches, but no token file exists while SQLite
+    /// has a stored token for this label. The drive may have been swapped or cloned.
+    /// Sends should be blocked until the user explicitly adopts the drive.
+    TokenExpectedButMissing,
 }
 
 /// Check whether a drive is available: mounted and UUID-verified.
@@ -283,8 +288,19 @@ pub fn verify_drive_token(drive: &DriveConfig, state: &StateDb) -> DriveAvailabi
     let drive_token = match read_drive_token(drive) {
         Ok(Some(t)) => t,
         Ok(None) => {
-            // No token file on drive. Normal for pre-token drives.
-            return DriveAvailability::TokenMissing;
+            // No token file on drive. Check if SQLite already knows this label.
+            return match state.get_drive_token(&drive.label) {
+                Ok(Some(_)) => {
+                    // SQLite has a record but drive has no file — suspicious.
+                    // Possible swap or clone. Block sends.
+                    DriveAvailability::TokenExpectedButMissing
+                }
+                _ => {
+                    // No SQLite record either (genuine first use), or SQLite
+                    // unavailable (fail-open per ADR-107).
+                    DriveAvailability::TokenMissing
+                }
+            };
         }
         Err(e) => {
             // Fail-open (ADR-107): can't read token, proceed with caution.
@@ -569,18 +585,18 @@ mod tests {
     }
 
     #[test]
-    fn verify_drive_token_no_file_on_drive() {
+    fn verify_drive_token_no_file_sqlite_has_record() {
         let tmp = tempfile::TempDir::new().unwrap();
         let drive = tempdir_drive(tmp.path());
         let db = StateDb::open_memory().unwrap();
 
-        // SQLite has a token but drive has no file
+        // SQLite has a token but drive has no file — suspicious
         db.store_drive_token(&drive.label, "stored-token", "2026-03-29T10:00:00")
             .unwrap();
 
         assert_eq!(
             verify_drive_token(&drive, &db),
-            DriveAvailability::TokenMissing
+            DriveAvailability::TokenExpectedButMissing
         );
     }
 

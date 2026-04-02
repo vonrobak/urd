@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `urd status` no longer shows false degradation for subvolumes scoped to specific drives (assess ignored per-subvolume `drives` field)
+- Cloned or swapped drives with missing identity tokens are now blocked from receiving sends (TokenExpectedButMissing safety gate)
+
+### Changed
+- Local-only subvolumes (`send_enabled = false`) display as `[LOCAL]` instead of `[OFF] Disabled` in plan output
+- Local-only subvolumes suppressed from backup summary skip section (they're complete, not skipped)
+- `urd plan` and `urd backup --dry-run` show `[WARNING]` for drives with token identity issues
+
 ## [0.8.0] - 2026-04-02
 
 ### Added

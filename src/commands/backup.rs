@@ -74,7 +74,13 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
 
     // Dry run: print plan and exit (no lock needed)
     if args.dry_run {
-        let plan_output = crate::commands::plan_cmd::build_plan_output(&backup_plan, &fs_state);
+        let mut plan_output =
+            crate::commands::plan_cmd::build_plan_output(&backup_plan, &fs_state);
+        crate::commands::plan_cmd::populate_token_warnings(
+            &mut plan_output,
+            state_db.as_ref(),
+            &config,
+        );
         let mode = crate::output::OutputMode::detect();
         print!("{}", crate::voice::render_plan(&plan_output, mode));
         return Ok(());
@@ -151,35 +157,47 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
         executor.set_full_send_policy(FullSendPolicy::SkipAndNotify);
     }
 
-    // Verify drive tokens: collect mismatched drives, then filter in one pass.
+    // Verify drive tokens: collect suspicious drives, then filter sends in one pass.
     if let Some(ref db) = state_db {
-        let mismatched: std::collections::BTreeSet<String> = config
+        let blocked: std::collections::BTreeSet<String> = config
             .drives
             .iter()
             .filter(|d| drives::is_drive_mounted(d))
-            .filter_map(|drive| {
-                if let drives::DriveAvailability::TokenMismatch { expected, found } =
-                    drives::verify_drive_token(drive, db)
-                {
+            .filter_map(|drive| match drives::verify_drive_token(drive, db) {
+                drives::DriveAvailability::TokenMismatch { expected, found } => {
                     log::warn!(
                         "Drive {} has a token mismatch (expected {}, found {}) — \
                          skipping sends to this drive",
                         drive.label, expected, found,
                     );
                     Some(drive.label.clone())
-                } else {
-                    None
                 }
+                drives::DriveAvailability::TokenExpectedButMissing => {
+                    // PLACEHOLDER: directs to `urd doctor` until UPI 009 ships
+                    // `urd drives adopt {label}`.
+                    log::warn!(
+                        "Drive {} is mounted but missing its identity token. Urd has \
+                         previously sent to a drive with this label — this may be a \
+                         different physical drive. Sends to {} are blocked. \
+                         Run `urd doctor` for guidance.",
+                        drive.label, drive.label,
+                    );
+                    Some(drive.label.clone())
+                }
+                _ => None,
             })
             .collect();
 
-        if !mismatched.is_empty() {
+        if !blocked.is_empty() {
+            // Only sends are blocked for token-suspicious drives. Retention deletes
+            // proceed — a clone's snapshots are redundant copies, and blocking deletes
+            // would cause space exhaustion without safety benefit.
             backup_plan.operations.retain(|op| {
                 !matches!(
                     op,
                     PlannedOperation::SendFull { drive_label, .. }
                     | PlannedOperation::SendIncremental { drive_label, .. }
-                    if mismatched.contains(drive_label)
+                    if blocked.contains(drive_label)
                 )
             });
         }
@@ -539,7 +557,7 @@ fn build_empty_plan_explanation(
 
     for (_, reason) in &plan.skipped {
         match SkipCategory::from_reason(reason) {
-            SkipCategory::Disabled => has_disabled = true,
+            SkipCategory::Disabled | SkipCategory::LocalOnly => has_disabled = true,
             SkipCategory::SpaceExceeded => has_space = true,
             SkipCategory::DriveNotMounted => has_not_mounted = true,
             SkipCategory::IntervalNotElapsed => has_interval = true,

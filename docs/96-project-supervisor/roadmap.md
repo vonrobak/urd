@@ -5,49 +5,120 @@
 > For completed features and historical context see the
 > [archived roadmap](../90-archive/96-project-supervisor/2026-04-01-historic-roadmap.md).
 
-## Active Arc: Core Correctness & The Encounter
+## Active Arc: Foundation Integrity → The Encounter
 
-**Goal:** Fix correctness gaps in the promise model, deliver backup-now, then build the
-first-encounter experience (setup wizard as a conversation, not a config form).
+**Goal:** Fix correctness and communication issues surfaced by v0.8.0 testing before
+building the first-encounter experience. Every phase answers a question:
+- Phase A: "Is Urd telling the truth?"
+- Phase B: "Is Urd speaking clearly?"
+- Phase C: "Does Urd know its drives?"
+- Phase D: "Can Urd welcome a new user?"
 
-**Sequencing rationale:**
-- assess() scoping fix first — the promise model must not lie (correctness)
-- Backup-now imperative — highest-impact functional gap, already sketched
-- 6-O (progressive disclosure) — builds the framework the encounter needs
-- 6-H (guided setup wizard) — the encounter: Fate Conversation, auto-detection,
-  config generation as pure function, generates ADR-111-schema configs from day one
+**Sequencing rationale:** The v0.8.0 comprehensive test session (30 tests, 3 drive
+configs) proved the foundation has gaps. Cloned drives pass through identity checks
+(F2.3). Status displays false degradation (T3.3). Safety gates announce themselves
+as failures (T1.6). These must be fixed before the encounter (6-H), which is Urd's
+first impression — you don't launch the store with broken display cases.
 
-P6a (enum rename) and P6b (config Serialize) are demoted to patch-tier chores — do them
-as quick PRs when convenient, not as roadmap milestones.
+### Phase A: Make promises true (v0.8.1)
+
+Fix the two correctness issues that make Urd's core outputs unreliable.
 
 ```
-assess() scoping fix (patch, ~0.5 session)
-  │
-Backup-now imperative ✓ (v0.8.0)
-  │
-6-O: Progressive disclosure (2 sessions)
-  │
-6-H: The Encounter (4-6 sessions)
-     ├── Auto-trigger onboarding (any urd command, no config → offer setup)
-     ├── Auto-detection (drives, subvolumes, filesystem content analysis)
-     ├── Fate Conversation (disaster scenario walk → protection level mapping)
-     └── Config generation (EncounterResult → Config, pure function, ADR-111 schema)
+UPI 004 — TokenMissing safety gate     (~0.5 session, patch)
+    Modules: drives.rs, commands/backup.rs, plan_cmd.rs, output.rs
+    
+UPI 005 — Status truth                 (~0.5 session, patch)
+    Modules: awareness.rs, output.rs, voice.rs
+    Subsumes existing "assess() scoping fix" roadmap item
 ```
 
-Estimated: ~9-11 sessions remaining.
+**Dependencies:** None between them — can build in parallel or sequence either way.
+Share `output.rs` but changes are additive (new enum variant, new skip category).
+
+**Gate:** After Phase A, `urd status` tells the truth and cloned drives are blocked.
+
+### Phase B: Make communication honest (v0.8.2)
+
+Fix how Urd communicates about safety decisions and drive state.
+
+```
+UPI 007 — Safety gate communication    (~0.5 session, patch)
+    Modules: executor.rs, output.rs, voice.rs, commands/backup.rs
+
+UPI 008 — Doctor pin-age + UUID fix    (~0.25 session, patch)
+    Modules: commands/verify.rs, commands/doctor.rs, drives.rs
+```
+
+**Dependencies:** None between them. 007 touches `output.rs`/`voice.rs` (shared with
+Phase A) but changes are additive — new `OpResult::Deferred` variant, rendering updates.
+
+**Gate:** After Phase B, "DEFERRED" replaces "FAILED" for safety gates, doctor stops
+giving contradictory UUID advice and false "sends may be failing" warnings.
+
+### Phase C: Give drives a face (v0.9.0)
+
+Drives become first-class citizens with a management surface and lifecycle events.
+
+```
+UPI 009 — `urd drives` subcommand     (~0.5-1 session, standard)
+    Modules: NEW commands/drives.rs, output.rs, voice.rs, main.rs
+
+UPI 006 — Drive reconnection notifications (~0.5-1 session, standard)
+    Modules: notify.rs, sentinel.rs, sentinel_runner.rs
+```
+
+**Dependencies:** 009 and 006 are independent. After 009 lands, update UPI 004's
+interim error message from "Run `urd doctor`" to "Run `urd drives adopt {label}`".
+
+**Gate:** After Phase C, drives have a user-facing identity layer and reconnection
+closes the anxiety loop. MINOR version bump (new command = new feature).
+
+### Phase D: Progressive disclosure + The Encounter
+
+```
+6-O — Progressive disclosure          (~2 sessions)
+    Design: docs/95-ideas/2026-03-31-design-o-progressive-disclosure.md
+
+6-H — The Encounter                   (~4-6 sessions)
+    Auto-trigger onboarding, auto-detection, Fate Conversation, config generation
+```
+
+**Dependencies:** 6-O builds the framework 6-H needs. Both benefit from Phases A-C:
+truthful status (A), honest communication (B), drive identity layer (C).
 
 **Design constraints from Steve reviews (2026-04-02):**
 - The encounter is a conversation about what you're afraid of losing, not a config form
 - "Set and forget" vs "delve deeper" — two exits, same quality config
 - Strategy names (3-2-1, GFS, etc.) stay internal — never user-facing
-- Drop: loom metaphor, scenario simulator, witness mode, summary box-drawing
-- Summary is plain text: survival matrix, gaps, next steps
 - Config generation is a pure function — enables CLI, future TUI, future Spindle
-  to share the same engine
 
-**Legacy identifiers:** 6-O, 6-H, P6a, P6b were designed under the old Priority 6
-numbering. See the [archived roadmap](../90-archive/96-project-supervisor/2026-04-01-historic-roadmap.md)
-for their design and review links.
+```
+Phase A: v0.8.1 (~1 session)
+  004 (token gate) ─┐
+  005 (assess + local) ─┘─→ tag v0.8.1
+                            │
+Phase B: v0.8.2 (~0.75 session)
+  007 (deferred) ─┐
+  008 (doctor) ───┘─→ tag v0.8.2
+                       │
+Phase C: v0.9.0 (~1-2 sessions)
+  009 (urd drives) ─────┐
+  006 (notifications) ──┘─→ tag v0.9.0
+                             │
+                      Update 004 message
+                      (doctor → drives adopt)
+                             │
+Phase D: (~6-8 sessions)
+  6-O (progressive disclosure)
+    │
+  6-H (the encounter) ─→ v1.0 horizon
+```
+
+Estimated: ~10-12 sessions remaining to v1.0 readiness.
+
+P6a (enum rename) and P6b (config Serialize) remain deferred patch-tier chores — do
+as quick PRs when convenient. P6b is a prerequisite for 6-H config generation.
 
 ## Horizon
 
@@ -113,6 +184,7 @@ Maintained here as context for sequencing decisions.
 - Journal persistence gap: journald may purge user-unit logs
 - P6a: ADR-110 enum rename (recorded/sheltered/fortified) — do as patch when convenient
 - P6b: Config Serialize refactor — do as patch, prerequisite for 6-H config generation
+- Planner helper functions approaching parameter limit (10 args) — pass `&PlanFilters` instead of destructured bools in next planner change
 
 ## Deferred (no current timeline)
 

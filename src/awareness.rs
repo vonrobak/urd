@@ -250,7 +250,18 @@ pub fn assess(
                 advisories.push("send_enabled but no drives configured".to_string());
             }
 
-            for drive in &config.drives {
+            // Filter drives to the subvolume's effective set (respects `drives = [...]`
+            // scoping in config). Same pattern as compute_redundancy_advisories().
+            let effective_drives: Vec<&DriveConfig> = match &subvol.drives {
+                Some(allowed) => config
+                    .drives
+                    .iter()
+                    .filter(|d| allowed.iter().any(|a| a == &d.label))
+                    .collect(),
+                None => config.drives.iter().collect(),
+            };
+
+            for drive in &effective_drives {
                 let mounted = fs.is_drive_mounted(drive);
 
                 let ext_snaps = if mounted {
@@ -3395,6 +3406,183 @@ local_retention = "transient"
             !advisories.iter().any(|a| a.kind
                 == crate::output::RedundancyAdvisoryKind::TransientNoLocalRecovery),
             "mounted drive should prevent transient advisory: {advisories:?}"
+        );
+    }
+
+    // ── assess() drive scoping tests (UPI 005) ───────────────────────
+
+    /// Config with two drives but sv1 scoped to only D1.
+    fn test_config_scoped_drives() -> Config {
+        let toml_str = r#"
+[general]
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp"
+
+[local_snapshots]
+roots = [
+  { path = "/snap", subvolumes = ["sv1"] }
+]
+
+[defaults]
+snapshot_interval = "1h"
+send_interval = "1d"
+send_enabled = true
+enabled = true
+[defaults.local_retention]
+hourly = 24
+daily = 30
+weekly = 26
+monthly = 12
+[defaults.external_retention]
+daily = 30
+weekly = 26
+monthly = 0
+
+[[drives]]
+label = "D1"
+mount_path = "/mnt/d1"
+snapshot_root = ".snapshots"
+role = "primary"
+
+[[drives]]
+label = "D2"
+mount_path = "/mnt/d2"
+snapshot_root = ".snapshots"
+role = "offsite"
+
+[[subvolumes]]
+name = "sv1"
+short_name = "sv1"
+source = "/data/sv1"
+drives = ["D1"]
+"#;
+        toml::from_str(toml_str).expect("scoped drives config should parse")
+    }
+
+    #[test]
+    fn assess_respects_subvol_drive_scoping() {
+        let config = test_config_scoped_drives();
+        let now = dt(2026, 4, 1, 12, 0);
+        let mut fs = MockFileSystemState::new();
+
+        // Fresh local snapshot
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap(dt(2026, 4, 1, 11, 0), "sv1")]);
+
+        // D1 is mounted with a recent send
+        fs.mounted_drives.insert("D1".to_string());
+        fs.send_times.insert(
+            ("sv1".to_string(), "D1".to_string()),
+            dt(2026, 4, 1, 10, 0),
+        );
+
+        // D2 is NOT mounted — but sv1 is scoped to D1 only,
+        // so D2 absence should NOT affect sv1's status.
+
+        let assessments = assess(&config, now, &fs);
+        let sv1 = assessments.iter().find(|a| a.name == "sv1").unwrap();
+
+        assert_eq!(
+            sv1.status,
+            PromiseStatus::Protected,
+            "sv1 should be Protected — D2 is out of scope. Got: {:?}",
+            sv1.status
+        );
+    }
+
+    #[test]
+    fn assess_no_drives_field_uses_all_drives() {
+        // Use test_config_two_drives — sv1 has no `drives` field, so all drives affect it
+        let config = test_config_two_drives();
+        let now = dt(2026, 4, 1, 12, 0);
+        let mut fs = MockFileSystemState::new();
+
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap(dt(2026, 4, 1, 11, 0), "sv1")]);
+
+        // D1 is mounted with a recent send
+        fs.mounted_drives.insert("D1".to_string());
+        fs.send_times.insert(
+            ("sv1".to_string(), "D1".to_string()),
+            dt(2026, 4, 1, 10, 0),
+        );
+
+        // D2 is NOT mounted and has no send history
+
+        let assessments = assess(&config, now, &fs);
+        let sv1 = assessments.iter().find(|a| a.name == "sv1").unwrap();
+
+        // Without per-subvolume drives scoping, all configured drives appear in assessments
+        assert_eq!(
+            sv1.external.len(),
+            2,
+            "without drives scoping, all 2 drives should appear in external assessments"
+        );
+    }
+
+    #[test]
+    fn assess_scoped_subvol_external_only_has_scoped_drives() {
+        let config = test_config_scoped_drives();
+        let now = dt(2026, 4, 1, 12, 0);
+        let mut fs = MockFileSystemState::new();
+
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap(dt(2026, 4, 1, 11, 0), "sv1")]);
+        fs.mounted_drives.insert("D1".to_string());
+        fs.mounted_drives.insert("D2".to_string());
+        fs.send_times.insert(
+            ("sv1".to_string(), "D1".to_string()),
+            dt(2026, 4, 1, 10, 0),
+        );
+
+        let assessments = assess(&config, now, &fs);
+        let sv1 = assessments.iter().find(|a| a.name == "sv1").unwrap();
+
+        assert_eq!(
+            sv1.external.len(),
+            1,
+            "scoped to D1, should only have 1 external assessment, got: {:?}",
+            sv1.external.iter().map(|d| &d.drive_label).collect::<Vec<_>>()
+        );
+        assert_eq!(sv1.external[0].drive_label, "D1");
+    }
+
+    #[test]
+    fn assess_scoped_health_ignores_out_of_scope_chains() {
+        let config = test_config_scoped_drives();
+        let now = dt(2026, 4, 1, 12, 0);
+        let mut fs = MockFileSystemState::new();
+
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap(dt(2026, 4, 1, 11, 0), "sv1")]);
+
+        // D1 mounted with healthy chain
+        fs.mounted_drives.insert("D1".to_string());
+        fs.send_times.insert(
+            ("sv1".to_string(), "D1".to_string()),
+            dt(2026, 4, 1, 10, 0),
+        );
+        fs.external_snapshots.insert(
+            ("/mnt/d1/.snapshots".to_string(), "sv1".to_string()),
+            vec![snap(dt(2026, 4, 1, 10, 0), "sv1")],
+        );
+        fs.pin_files.insert(
+            (std::path::PathBuf::from("/snap/sv1"), "D1".to_string()),
+            snap(dt(2026, 4, 1, 10, 0), "sv1"),
+        );
+
+        // D2 would have a broken chain if assessed, but it's out of scope
+        // (sv1 is scoped to D1 only). Verify health is not degraded.
+
+        let assessments = assess(&config, now, &fs);
+        let sv1 = assessments.iter().find(|a| a.name == "sv1").unwrap();
+
+        assert_eq!(
+            sv1.health,
+            OperationalHealth::Healthy,
+            "health should be Healthy — D2 is out of scope. Got: {:?} reasons: {:?}",
+            sv1.health, sv1.health_reasons
         );
     }
 }

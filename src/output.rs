@@ -553,6 +553,9 @@ pub enum SkipCategory {
     DriveNotMounted,
     IntervalNotElapsed,
     Disabled,
+    /// Subvolume has `send_enabled = false` — local snapshots only, by design.
+    /// Distinct from `Disabled` (which means `enabled = false` — does nothing).
+    LocalOnly,
     SpaceExceeded,
     Other,
 }
@@ -565,8 +568,10 @@ impl SkipCategory {
     /// known patterns classify correctly.
     #[must_use]
     pub fn from_reason(reason: &str) -> Self {
-        if reason == "disabled" || reason == "send disabled" {
+        if reason == "disabled" {
             Self::Disabled
+        } else if reason == "send disabled" {
+            Self::LocalOnly
         } else if reason.starts_with("drive ")
             && reason.ends_with(" not mounted")
         {
@@ -638,6 +643,11 @@ pub struct PlanOutput {
     pub operations: Vec<PlanOperationEntry>,
     pub skipped: Vec<SkippedSubvolume>,
     pub summary: PlanSummaryOutput,
+
+    /// Drive-level warnings (token issues, identity concerns).
+    /// Populated by command layer after plan generation — planner is pure (ADR-100/108).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 /// A single planned operation for display.
@@ -1192,9 +1202,13 @@ mod tests {
     #[test]
     fn classify_disabled() {
         assert_eq!(SkipCategory::from_reason("disabled"), SkipCategory::Disabled);
+    }
+
+    #[test]
+    fn classify_local_only() {
         assert_eq!(
             SkipCategory::from_reason("send disabled"),
-            SkipCategory::Disabled
+            SkipCategory::LocalOnly
         );
     }
 
@@ -1284,13 +1298,13 @@ mod tests {
         );
     }
 
-    /// Completeness test: all 14 known plan.rs skip patterns classify to their
+    /// Completeness test: all 15 known plan.rs skip patterns classify to their
     /// expected category. Prevents silent regressions when new patterns are added.
     #[test]
-    fn classify_all_14_patterns() {
+    fn classify_all_15_patterns() {
         let patterns = vec![
             ("disabled", SkipCategory::Disabled),
-            ("send disabled", SkipCategory::Disabled),
+            ("send disabled", SkipCategory::LocalOnly),
             ("drive WD-18TB not mounted", SkipCategory::DriveNotMounted),
             (
                 "drive WD-18TB UUID mismatch (expected abc, found def)",
@@ -1301,7 +1315,11 @@ mod tests {
                 SkipCategory::Other,
             ),
             (
-                "drive WD-18TB token mismatch (expected abc, found def) — possible drive swap",
+                "drive WD-18TB token mismatch (expected abc, found def) \u{2014} possible drive swap",
+                SkipCategory::Other,
+            ),
+            (
+                "drive WD-18TB token expected but missing \u{2014} possible drive swap",
                 SkipCategory::Other,
             ),
             (
@@ -1436,6 +1454,7 @@ mod tests {
                 skipped: 2,
                 estimated_total_bytes: Some(10_000_500_000),
             },
+            warnings: vec![],
         };
 
         let config: crate::config::Config = toml::from_str(
