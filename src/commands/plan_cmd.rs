@@ -1,5 +1,6 @@
 use crate::cli::PlanArgs;
 use crate::config::Config;
+use crate::drives;
 use crate::output::{
     OutputMode, PlanOperationEntry, PlanOutput, PlanSummaryOutput, SkipCategory,
     SkippedSubvolume,
@@ -25,7 +26,8 @@ pub fn run(config: Config, args: PlanArgs, mode: OutputMode) -> anyhow::Result<(
     };
     let backup_plan = plan::plan(&config, now, &filters, &fs_state)?;
 
-    let output = build_plan_output(&backup_plan, &fs_state);
+    let mut output = build_plan_output(&backup_plan, &fs_state);
+    populate_token_warnings(&mut output, state_db.as_ref(), &config);
     print!("{}", voice::render_plan(&output, mode));
 
     Ok(())
@@ -77,6 +79,36 @@ pub fn build_plan_output(
             skipped: summary.skipped,
             estimated_total_bytes,
         },
+        warnings: Vec::new(),
+    }
+}
+
+/// Post-plan token verification — planner is pure (ADR-100/108) and has no
+/// StateDb access. Token checks happen here in the command layer.
+/// See design-004 resolved decision 004-Q2.
+pub fn populate_token_warnings(
+    output: &mut PlanOutput,
+    state_db: Option<&StateDb>,
+    config: &crate::config::Config,
+) {
+    let Some(db) = state_db else { return };
+    for drive in config.drives.iter().filter(|d| drives::is_drive_mounted(d)) {
+        match drives::verify_drive_token(drive, db) {
+            drives::DriveAvailability::TokenExpectedButMissing => {
+                output.warnings.push(format!(
+                    "Drive {} is mounted but missing its identity token \u{2014} \
+                     possible drive swap. Sends blocked. Run `urd doctor` for guidance.",
+                    drive.label,
+                ));
+            }
+            drives::DriveAvailability::TokenMismatch { .. } => {
+                output.warnings.push(format!(
+                    "Drive {} token mismatch \u{2014} possible drive swap. Sends blocked.",
+                    drive.label,
+                ));
+            }
+            _ => {}
+        }
     }
 }
 

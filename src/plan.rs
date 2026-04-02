@@ -219,6 +219,22 @@ pub fn plan(
                         ));
                         continue;
                     }
+                    DriveAvailability::TokenExpectedButMissing => {
+                        // SQLite has a stored token but drive has no token file.
+                        // Possible swap or clone — block sends.
+                        // NOTE: In production, RealFileSystemState::drive_availability()
+                        // never returns token variants (it only checks mount + UUID).
+                        // Production safety comes from commands/backup.rs post-plan filter.
+                        // This arm exists for enum exhaustiveness and mock-based testing.
+                        skipped.push((
+                            subvol.name.clone(),
+                            format!(
+                                "drive {} token expected but missing \u{2014} possible drive swap",
+                                drive.label
+                            ),
+                        ));
+                        continue;
+                    }
                     DriveAvailability::TokenMissing => {
                         // Benign: first use or pre-token drive. Proceed with send.
                         // Token will be written by executor on successful send.
@@ -1939,6 +1955,60 @@ send_enabled = false
         assert!(
             !sends.is_empty(),
             "Sends should proceed when token is missing (backward compat)"
+        );
+    }
+
+    #[test]
+    fn token_expected_but_missing_skips_sends() {
+        let config = test_config();
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap("20260322-1300-one")]);
+        fs.drive_availability_overrides
+            .insert("D1".to_string(), DriveAvailability::TokenExpectedButMissing);
+
+        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        assert!(
+            result
+                .skipped
+                .iter()
+                .any(|(_, reason)| reason.contains("token expected but missing")),
+            "TokenExpectedButMissing should produce a skip reason: {:?}",
+            result.skipped
+        );
+        let sends: Vec<_> = result
+            .operations
+            .iter()
+            .filter(|op| {
+                matches!(
+                    op,
+                    PlannedOperation::SendFull { .. } | PlannedOperation::SendIncremental { .. }
+                )
+            })
+            .collect();
+        assert!(
+            sends.is_empty(),
+            "No sends should be planned on TokenExpectedButMissing"
+        );
+    }
+
+    #[test]
+    fn token_expected_but_missing_still_creates_local_snapshots() {
+        let config = test_config();
+        let mut fs = MockFileSystemState::new();
+        // No existing snapshots — planner should create one
+        fs.drive_availability_overrides
+            .insert("D1".to_string(), DriveAvailability::TokenExpectedButMissing);
+
+        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let creates: Vec<_> = result
+            .operations
+            .iter()
+            .filter(|op| matches!(op, PlannedOperation::CreateSnapshot { .. }))
+            .collect();
+        assert!(
+            !creates.is_empty(),
+            "Local snapshots should still be created when external sends are blocked"
         );
     }
 

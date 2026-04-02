@@ -749,6 +749,7 @@ fn render_skipped_block(skipped: &[crate::output::SkippedSubvolume], out: &mut S
             not_mounted_count += 1;
         } else if skip.category != SkipCategory::IntervalNotElapsed
             && skip.category != SkipCategory::Disabled
+            && skip.category != SkipCategory::LocalOnly
         {
             actionable_skips.push(skip);
         }
@@ -1021,6 +1022,14 @@ fn render_plan_interactive(data: &PlanOutput) -> String {
     .ok();
     writeln!(out).ok();
 
+    // === Warnings ===
+    if !data.warnings.is_empty() {
+        for warning in &data.warnings {
+            writeln!(out, "  {}  {}", "[WARNING]".yellow().bold(), warning).ok();
+        }
+        writeln!(out).ok();
+    }
+
     if data.operations.is_empty() && data.skipped.is_empty() {
         writeln!(out, "{}", "Nothing to do.".dimmed()).ok();
         return out;
@@ -1132,6 +1141,7 @@ fn render_plan_skipped_grouped(skipped: &[SkippedSubvolume], out: &mut String) {
         SkipCategory::DriveNotMounted,
         SkipCategory::IntervalNotElapsed,
         SkipCategory::Disabled,
+        SkipCategory::LocalOnly,
         SkipCategory::SpaceExceeded,
         SkipCategory::Other,
     ];
@@ -1146,6 +1156,7 @@ fn render_plan_skipped_grouped(skipped: &[SkippedSubvolume], out: &mut String) {
             SkipCategory::DriveNotMounted => render_drive_not_mounted_group(&items, out),
             SkipCategory::IntervalNotElapsed => render_interval_group(&items, out),
             SkipCategory::Disabled => render_disabled_group(&items, out),
+            SkipCategory::LocalOnly => render_local_only_group(&items, out),
             SkipCategory::SpaceExceeded | SkipCategory::Other => {
                 render_individual_skips(&items, cat, out);
             }
@@ -1224,14 +1235,27 @@ fn render_disabled_group(items: &[&SkippedSubvolume], out: &mut String) {
     .ok();
 }
 
+fn render_local_only_group(items: &[&SkippedSubvolume], out: &mut String) {
+    let names: Vec<&str> = items.iter().map(|s| s.name.as_str()).collect();
+    writeln!(
+        out,
+        "  {}  {} {}",
+        skip_tag(&SkipCategory::LocalOnly),
+        "Local only:".dimmed(),
+        names.join(", "),
+    )
+    .ok();
+}
+
 /// Map skip category to a colored tag for display.
 fn skip_tag(category: &SkipCategory) -> String {
     match category {
         SkipCategory::SpaceExceeded => "[SPACE]".yellow().to_string(),
         SkipCategory::IntervalNotElapsed => "[WAIT]".dimmed().to_string(),
         SkipCategory::DriveNotMounted => "[AWAY]".dimmed().to_string(),
-        SkipCategory::Disabled => "[OFF] ".dimmed().to_string(),
-        SkipCategory::Other => "[SKIP]".dimmed().to_string(),
+        SkipCategory::Disabled => "[OFF]  ".dimmed().to_string(),
+        SkipCategory::LocalOnly => "[LOCAL]".dimmed().to_string(),
+        SkipCategory::Other => "[SKIP] ".dimmed().to_string(),
     }
 }
 
@@ -3048,6 +3072,7 @@ mod tests {
                 skipped: 0,
                 estimated_total_bytes: None,
             },
+            warnings: vec![],
         };
         let output = render_plan(&data, OutputMode::Interactive);
         assert!(output.contains("htpc-home"), "missing subvolume name");
@@ -3068,6 +3093,7 @@ mod tests {
                 skipped: 0,
                 estimated_total_bytes: None,
             },
+            warnings: vec![],
         };
         let output = render_plan(&data, OutputMode::Daemon);
         let parsed: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
@@ -3102,6 +3128,7 @@ mod tests {
                 skipped: 1,
                 estimated_total_bytes: None,
             },
+            warnings: vec![],
         };
         let output = render_plan(&data, OutputMode::Interactive);
         assert!(
@@ -3129,6 +3156,7 @@ mod tests {
                 skipped: 1,
                 estimated_total_bytes: None,
             },
+            warnings: vec![],
         };
         let output = render_plan(&data, OutputMode::Interactive);
         assert!(
@@ -3171,6 +3199,7 @@ mod tests {
                 skipped: 3,
                 estimated_total_bytes: None,
             },
+            warnings: vec![],
         };
         let output = render_plan(&data, OutputMode::Interactive);
         assert!(
@@ -3224,6 +3253,7 @@ mod tests {
                 skipped: 3,
                 estimated_total_bytes: None,
             },
+            warnings: vec![],
         };
         let output = render_plan(&data, OutputMode::Interactive);
         assert!(
@@ -3266,6 +3296,7 @@ mod tests {
                 skipped: 2,
                 estimated_total_bytes: None,
             },
+            warnings: vec![],
         };
         let output = render_plan(&data, OutputMode::Interactive);
         // 2h30m (150 min) < 9d (12960 min) — must show 2h30m as shortest, not 9d
@@ -3295,7 +3326,7 @@ mod tests {
                 SkippedSubvolume {
                     name: "subvol6-tmp".to_string(),
                     reason: "send disabled".to_string(),
-                    category: SkipCategory::Disabled,
+                    category: SkipCategory::LocalOnly,
                 },
             ],
             summary: PlanSummaryOutput {
@@ -3305,15 +3336,28 @@ mod tests {
                 skipped: 3,
                 estimated_total_bytes: None,
             },
+            warnings: vec![],
         };
         let output = render_plan(&data, OutputMode::Interactive);
         assert!(
             output.contains("Disabled:"),
-            "missing disabled group"
+            "missing disabled group: {output}"
         );
         assert!(
-            output.contains("htpc-root, subvol4-multimedia, subvol6-tmp"),
-            "names should be comma-separated: {output}"
+            output.contains("htpc-root, subvol4-multimedia"),
+            "disabled names should be comma-separated: {output}"
+        );
+        assert!(
+            output.contains("[LOCAL]"),
+            "local-only should render with [LOCAL] tag: {output}"
+        );
+        assert!(
+            output.contains("Local only:"),
+            "missing local-only group: {output}"
+        );
+        assert!(
+            output.contains("subvol6-tmp"),
+            "local-only subvolume should appear: {output}"
         );
     }
 
@@ -3336,6 +3380,7 @@ mod tests {
                 skipped: 1,
                 estimated_total_bytes: None,
             },
+            warnings: vec![],
         };
         let output = render_plan(&data, OutputMode::Interactive);
         assert!(
@@ -3378,6 +3423,7 @@ mod tests {
                 skipped: 3,
                 estimated_total_bytes: None,
             },
+            warnings: vec![],
         };
         let output = render_plan(&data, OutputMode::Interactive);
         let not_mounted_pos = output.find("Disconnected:").expect("missing Disconnected");
@@ -3410,6 +3456,7 @@ mod tests {
                 skipped: 1,
                 estimated_total_bytes: None,
             },
+            warnings: vec![],
         };
         let output = render_plan(&data, OutputMode::Daemon);
         let parsed: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
@@ -3454,6 +3501,7 @@ mod tests {
                 skipped: 0,
                 estimated_total_bytes: Some(54_200_000_000),
             },
+            warnings: vec![],
         };
         let output = render_plan(&data, OutputMode::Interactive);
         assert!(
@@ -3489,6 +3537,7 @@ mod tests {
                 skipped: 0,
                 estimated_total_bytes: Some(5_500_000),
             },
+            warnings: vec![],
         };
         let output = render_plan(&data, OutputMode::Interactive);
         assert!(
@@ -3530,6 +3579,7 @@ mod tests {
                 skipped: 0,
                 estimated_total_bytes: Some(53_000_000_000),
             },
+            warnings: vec![],
         };
         let output = render_plan(&data, OutputMode::Interactive);
         assert!(
@@ -3560,6 +3610,7 @@ mod tests {
                 skipped: 0,
                 estimated_total_bytes: None,
             },
+            warnings: vec![],
         };
         let output = render_plan(&data, OutputMode::Interactive);
         assert!(
@@ -3593,6 +3644,7 @@ mod tests {
                 skipped: 0,
                 estimated_total_bytes: Some(53_000_000_000),
             },
+            warnings: vec![],
         };
         let output = render_plan(&data, OutputMode::Daemon);
         let parsed: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
@@ -3627,6 +3679,7 @@ mod tests {
                 skipped: 0,
                 estimated_total_bytes: None,
             },
+            warnings: vec![],
         };
         let output = render_plan(&data, OutputMode::Daemon);
         let parsed: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
@@ -3641,6 +3694,153 @@ mod tests {
         assert!(
             parsed["operations"][0].get("is_full_send").is_none(),
             "null is_full_send should be omitted from JSON"
+        );
+    }
+
+    // ── Plan warnings tests ─────────────────────────────────────────────
+
+    #[test]
+    fn plan_warnings_render_prominently() {
+        let data = PlanOutput {
+            timestamp: "2026-04-03 12:00".to_string(),
+            operations: vec![],
+            skipped: vec![],
+            summary: PlanSummaryOutput {
+                snapshots: 0,
+                sends: 0,
+                deletions: 0,
+                skipped: 0,
+                estimated_total_bytes: None,
+            },
+            warnings: vec![
+                "Drive WD-18TB token mismatch \u{2014} possible drive swap. Sends blocked."
+                    .to_string(),
+            ],
+        };
+        let output = render_plan(&data, OutputMode::Interactive);
+        assert!(
+            output.contains("[WARNING]"),
+            "warnings should render with [WARNING] tag: {output}"
+        );
+        assert!(
+            output.contains("token mismatch"),
+            "warning content should appear: {output}"
+        );
+    }
+
+    #[test]
+    fn plan_warnings_omitted_from_json_when_empty() {
+        let data = PlanOutput {
+            timestamp: "2026-04-03 12:00".to_string(),
+            operations: vec![],
+            skipped: vec![],
+            summary: PlanSummaryOutput {
+                snapshots: 0,
+                sends: 0,
+                deletions: 0,
+                skipped: 0,
+                estimated_total_bytes: None,
+            },
+            warnings: vec![],
+        };
+        let output = render_plan(&data, OutputMode::Daemon);
+        let parsed: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
+        assert!(
+            parsed.get("warnings").is_none(),
+            "empty warnings should be omitted from JSON: {output}"
+        );
+    }
+
+    #[test]
+    fn plan_warnings_included_in_json_when_present() {
+        let data = PlanOutput {
+            timestamp: "2026-04-03 12:00".to_string(),
+            operations: vec![],
+            skipped: vec![],
+            summary: PlanSummaryOutput {
+                snapshots: 0,
+                sends: 0,
+                deletions: 0,
+                skipped: 0,
+                estimated_total_bytes: None,
+            },
+            warnings: vec!["Drive X identity suspect".to_string()],
+        };
+        let output = render_plan(&data, OutputMode::Daemon);
+        let parsed: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
+        assert_eq!(
+            parsed["warnings"][0].as_str(),
+            Some("Drive X identity suspect"),
+            "warnings should appear in JSON: {output}"
+        );
+    }
+
+    // ── History tests ───────────────────────────────────────────────────
+
+    // ── LocalOnly skip category tests ───────────────────────────────────
+
+    #[test]
+    fn local_only_suppressed_in_backup_summary() {
+        colored::control::set_override(false);
+        let data = BackupSummary {
+            result: "success".to_string(),
+            run_id: Some(1),
+            duration_secs: 10.0,
+            subvolumes: vec![],
+            skipped: vec![
+                SkippedSubvolume {
+                    name: "subvol4-multimedia".to_string(),
+                    reason: "send disabled".to_string(),
+                    category: SkipCategory::LocalOnly,
+                },
+                SkippedSubvolume {
+                    name: "htpc-home".to_string(),
+                    reason: "drive WD-18TB not mounted".to_string(),
+                    category: SkipCategory::DriveNotMounted,
+                },
+            ],
+            assessments: vec![],
+            transitions: vec![],
+            warnings: vec![],
+        };
+        let output = render_backup_summary(&data, OutputMode::Interactive);
+        // Local-only should NOT appear in the skip section
+        assert!(
+            !output.contains("subvol4-multimedia"),
+            "local-only should be suppressed from backup summary: {output}"
+        );
+        // But drive-not-mounted should still appear
+        assert!(
+            output.contains("WD-18TB"),
+            "drive-not-mounted should still appear: {output}"
+        );
+    }
+
+    #[test]
+    fn local_only_preserved_in_daemon_json() {
+        let data = PlanOutput {
+            timestamp: "2026-04-03 12:00".to_string(),
+            operations: vec![],
+            skipped: vec![SkippedSubvolume {
+                name: "subvol4-multimedia".to_string(),
+                reason: "send disabled".to_string(),
+                category: SkipCategory::LocalOnly,
+            }],
+            summary: PlanSummaryOutput {
+                snapshots: 0,
+                sends: 0,
+                deletions: 0,
+                skipped: 1,
+                estimated_total_bytes: None,
+            },
+            warnings: vec![],
+        };
+        let output = render_plan(&data, OutputMode::Daemon);
+        let parsed: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
+        assert_eq!(
+            parsed["skipped"][0]["category"].as_str(),
+            Some("local_only"),
+            "LocalOnly should serialize as 'local_only' in JSON: {output}"
         );
     }
 
