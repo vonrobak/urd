@@ -237,19 +237,19 @@ valuable discoveries. Skipping them should be the exception, not the default.
 ### Patch — bug fixes, small changes, <3 files
 
 ```
-systematic-debugging → build → /check → /commit-push-pr → /journal
+systematic-debugging → build → /check → /commit-push-pr → /session-close
 ```
 
 ### Standard — medium features, clear scope, no new modules
 
 ```
-/design → /grill-me → /prepare → arch-adversary → /post-review → build → /simplify → /check → /commit-push-pr → /journal
+/design → /grill-me → /prepare → arch-adversary → /post-review → build → /simplify → /check → /commit-push-pr → /session-close
 ```
 
 ### Full — new modules, architectural changes, ADR gates
 
 ```
-/brainstorm → /design → /grill-me → [/sequence] → /prepare → arch-adversary → /post-review → build → /simplify → /check → /commit-push-pr → /journal
+/brainstorm → /design → /grill-me → [/sequence] → /prepare → arch-adversary → /post-review → build → /simplify → /check → /commit-push-pr → /session-close
 ```
 
 ### Tool reference
@@ -269,7 +269,8 @@ systematic-debugging → build → /check → /commit-push-pr → /journal
 | `systematic-debugging` | Diagnosis | Four-phase root cause investigation (any tier, especially patch) |
 | `/check` | Quality gate | `cargo clippy` + `cargo test` + `cargo build --release` |
 | `/commit-push-pr` | Integration | PII scan, CHANGELOG, branch, commit, PR |
-| `/journal` | Session close | Session journal + status.md + registry.md updates (always last) |
+| `/journal` | Any time | Focused journal entry about a specific topic or lesson learned |
+| `/session-close` | Session close | Comprehensive journal + status.md + registry.md updates (always last) |
 | `/release` | Release | SemVer bump, CHANGELOG, tag (user pushes manually) |
 
 ## Project State

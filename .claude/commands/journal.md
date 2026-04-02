@@ -1,85 +1,78 @@
-Write a session journal and update the project status document. Two outputs from one invocation.
+Capture a focused journal entry about a specific topic, observation, or lesson learned.
 
-## Output 1: Journal entry
+This is the lightweight, mid-session journal — use it whenever something worth recording
+happens during work. It writes a single focused entry and nothing else. For end-of-session
+wrap-up (journal + status.md + registry.md updates), use `/session-close` instead.
 
-Write to `docs/98-journals/YYYY-MM-DD-slug.md`. This is gitignored (private, local only).
+## When to use
+
+- You hit a surprising behavior or non-obvious finding during implementation
+- You need to retrace a step in the workflow and want to document why
+- You're about to leave and need a quick record so you can pick up later
+- You discovered something about the codebase, a tool, or a pattern worth preserving
+- A debugging session revealed root causes worth recording
+- You encountered a workflow gap or process improvement worth noting
+
+The common thread: something happened that future-you would benefit from knowing, but
+the session isn't over and you don't need the full session-close ritual.
+
+## Output
+
+Write to `docs/98-journals/YYYY-MM-DD-{slug}.md`. This is gitignored (private, local only).
 
 **Auto-fill metadata:**
 - Date: today's date
 - Base commit: `git rev-parse --short HEAD`
-- Slug: derived from $ARGUMENTS or inferred from what was done this session
-- Plan file: the `.claude/plans/` filename if a plan was used this session (from conversation context)
+- Slug: derived from $ARGUMENTS or the topic being documented
 
 **Template:**
 
 ```markdown
-# Session Journal: {Title}
+# Journal: {Specific Topic Title}
 
-> **TL;DR:** {2-3 sentences: what was done and what was learned}
+> **TL;DR:** {1-2 sentences: the key insight or observation}
 
 **Date:** YYYY-MM-DD
 **Base commit:** `{short hash}`
-**Plan file:** `{.claude/plans/filename.md if used, omit this line if no plan}`
+**Context:** {what you were doing when this came up — 1 line}
 
-## What was done
+## What happened
 
-{Concrete deliverables. What was built, fixed, or changed. Reference files, modules,
-test counts. Keep it factual — the diff tells implementation details.}
+{The specific event, behavior, or discovery. Be concrete — name modules, error messages,
+test results, file paths. This section answers "what did I observe?"}
 
-## What was learned
+## Lessons learned
 
-{Insights, surprises, non-obvious findings. This is the most valuable section for future
-sessions — what would you tell yourself before starting this work?}
+{The insight extracted from the observation. This is the most valuable section — what
+would you tell someone about to encounter the same situation? What was non-obvious?
+What assumption was wrong?}
 
-## Open questions
+## Impact on current work
 
-{Unresolved issues, deferred decisions, things to investigate next. Remove this section
-if nothing is open.}
+{How this affects what you're building right now. Does it change the plan? Does it
+require a detour? Is it just context for later? Remove this section if purely
+informational with no impact on active work.}
 ```
 
 **Content guidelines:**
-- Gather context from the current conversation — what was built, reviewed, discussed
-- The TL;DR is the most important line. A future session may read only that.
-- Be specific: name modules, test counts, ADRs. "Improved error handling" is useless.
-  "Added `translate_btrfs_error()` covering 7 btrfs stderr patterns" is useful.
+- Focus tightly on the specific topic — this is not a session summary
+- The TL;DR is the most important line. A future session scanning journal filenames
+  and TL;DRs should be able to decide whether to read further.
+- Be specific: "retention logic silently keeps snapshots when pin file has a trailing
+  newline" is useful. "Found a bug in retention" is not.
 - Journals are private — real paths, real output, real mistakes are fine
-- Don't duplicate the commit message. The journal captures context the commit doesn't.
-- **Forward-looking handoff is encouraged** — "When you return" sections with verification
-  steps, things to watch for, and context the next session needs are high-value. This is a
-  core function of the journal.
-- **Exception: git workflow state.** Don't write "PR #45 is open" or "merge branch X" as
-  pending actions — these decay within minutes. Record PRs as deliverables ("Opened PR #45
-  for HSD-B"), not as tasks. A fresh session checks `git log`, `gh pr list`, and
-  `git branch` for actual git state.
+- Multiple journal entries in one day are fine — use different slugs
 
-## Output 2: Update registry.md
+## What NOT to do
 
-If this session produced artifacts for a UPI (design review, adversary review, PR merge),
-update the corresponding row in `docs/96-project-supervisor/registry.md` — fill in the
-link for the artifact that was produced. If no UPI-related artifacts were produced, skip.
-
-## Output 3: Update status.md
-
-Overwrite `docs/96-project-supervisor/status.md` with the current state. This is a short
-document (~50 lines) that a fresh session reads first.
-
-**Structure:**
-1. **Current State** — what's deployed, test count, current version
-2. **In Progress** — 0-2 items actively being worked on
-3. **Next Up** — 1-3 items from roadmap.md that are next
-4. **Key Links** — pointers to roadmap, CLAUDE.md, CONTRIBUTING.md, latest review
-5. **Known Issues** — only active issues that affect current work (not the full debt list)
-
-**Rules:**
-- Overwrite entirely — don't append to the existing content
-- Keep under 60 lines. Ruthlessly cut anything that belongs in roadmap.md or journals.
-- Update test count, version, and "In Progress" to reflect this session's outcomes
-- "Next Up" should reflect what the user would likely work on in the next session
-- Use PII placeholders for any tracked paths (status.md is tracked, not gitignored)
-- **Git state is checked, not recorded.** Write "HSD-B complete" not "PR #45 open."
-  Status.md tells the next session *what was built and what to build next*. The session
-  checks `git log`, `gh pr list`, `git branch` for actual branch/PR state.
+- Do not update `status.md` — that's `/session-close`'s job
+- Do not update `registry.md` — that's `/session-close`'s job
+- Do not write a comprehensive session summary — keep it focused on the specific topic
+- Do not defer writing because "I'll capture it in the session close" — the detail
+  and immediacy of mid-session capture is the whole point
 
 ## Arguments
 
-$ARGUMENTS — Optional: slug or topic for the journal entry. If empty, infer from conversation context.
+$ARGUMENTS — The topic to document. Can be a short description ("btrfs send failure
+on readonly subvolumes"), a focus area ("lessons from debugging the chain module"),
+or a reference to what just happened ("what we just discovered about retention edge cases").
