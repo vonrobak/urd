@@ -4,7 +4,7 @@ This is a focused simplification pass. The question is not "is this correct?" (t
 
 ## When to run
 
-After building a feature, before running arch-adversary. Simplifying first means arch-adversary reviews cleaner code, which produces more useful findings.
+After building a feature, before `/check`. The build executes a plan already reviewed by arch-adversary — this pass catches implementation-level complexity that crept in during coding.
 
 ## What to examine
 

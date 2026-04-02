@@ -48,7 +48,7 @@ docs/
   90-archive/               Superseded documents (mirrors original directory structure)
   95-ideas/                 Brainstorming, rough proposals, pre-plan thinking
   96-project-supervisor/    Progress tracker and project roadmap — living documents
-  97-plans/                 Implementation plans — dated, mostly immutable
+  97-plans/                 Implementation plans — GITIGNORED, transient working documents
   98-journals/              Session logs — GITIGNORED, private, authentic
   99-reports/               Reviews, analysis, generated output — dated, mostly immutable
 ```
@@ -112,8 +112,9 @@ directory structure inside (e.g., a superseded plan moves to `90-archive/97-plan
 Preserves historical record while keeping active directories uncluttered.
 
 **95-ideas** — Pre-plan thinking. Rough proposals, "what if" explorations, brainstorming
-notes. Ideas that mature get promoted to a plan in `97-plans/`; abandoned ideas stay here
-with their status updated. Low ceremony — the point is to capture thinking before it's lost.
+notes. Ideas that mature get promoted to a design (status updated, `/design` run); abandoned
+ideas stay here with their status updated. Low ceremony — the point is to capture thinking
+before it's lost.
 
 **96-project-supervisor** — The central tracking hub. Contains `status.md` (short
 current-state document, overwritten each session), `roadmap.md` (strategy, sequencing,
@@ -121,8 +122,11 @@ and horizon — ~80 lines), and `registry.md` (UPI lookup table linking work ite
 artifacts). Read status.md first for orientation; follow links to roadmap.md for sequencing
 and registry.md for artifact cross-references.
 
-**97-plans** — Implementation plans. Each plan is a dated snapshot of intent — what we're
-going to build and how. When scope changes significantly, write a new plan.
+**97-plans** — Implementation plans (gitignored — local only). Transient working documents
+produced by `/prepare`, reviewed by arch-adversary, revised by `/post-review`, consumed
+during the build phase. Plans become stale once the code is written — the design docs in
+`95-ideas/` are the durable design artifacts. Write freely: specific file paths, detailed
+steps, raw implementation notes.
 
 **98-journals** — Session logs and handoff documents (gitignored — local only). Each
 journal serves two functions: (1) historical record of what was done and learned, and
@@ -351,7 +355,7 @@ date: YYYY-MM-DD
 > **TL;DR:** {1-2 sentence summary}
 
 **Date:** YYYY-MM-DD
-**Status:** raw | developing | promoted to [plan](link) | abandoned
+**Status:** raw | developing | promoted to [design](link) | abandoned
 
 {free-form exploration}
 ```
@@ -374,8 +378,8 @@ date: YYYY-MM-DD
 ### When you have a rough idea
 
 Write it in `95-ideas/` with status `raw`. No ceremony needed — capture the thinking.
-When the idea matures into something actionable, write a plan in `97-plans/` and update
-the idea's status to `promoted to [plan](link)`.
+When the idea matures into something actionable, run `/design` and update the idea's
+status to `promoted to [design](link)`.
 
 ### When a decision needs to be recorded
 

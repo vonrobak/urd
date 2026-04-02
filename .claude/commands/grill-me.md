@@ -25,7 +25,15 @@ Walk down each branch of the decision tree, resolving dependencies between decis
 
 ## Output
 
-The interview itself is the output. The resolved decision tree becomes input to whatever comes next in the pipeline — typically `/design` (if the idea is still forming) or direct implementation (if the design is already written and we're stress-testing it).
+The interview itself is the primary output. When the interview is complete:
+
+1. **Update the design doc.** Write resolved decisions back into the design document in
+   `docs/95-ideas/`. Add a **Resolved Decisions** section (or update the existing one) with
+   each resolved branch and its rationale. This is critical — `/prepare` reads the design
+   doc in a later session and needs the full picture, not just the original proposal.
+
+2. **Summary.** Present the full resolved decision tree so the user can verify completeness
+   before moving to `/prepare`.
 
 ## Arguments
 
