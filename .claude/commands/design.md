@@ -30,13 +30,13 @@ Every design gets a Unique Project Identifier (UPI). Before writing the design d
 
 5. **Sequence for risk.** High-risk, assumption-heavy pieces first so bugs surface early. The pre-cutover hardening found 3 bugs sharing one root cause — sequencing should expose those patterns.
 
-6. **Leave room for review.** State alternatives you rejected and assumptions you're making. The arch-adversary will push against these — make it productive by being explicit.
+6. **Leave room for stress-testing.** State alternatives you rejected, assumptions you're making, and decision branches that need resolving. `/grill-me` will push on these — make it productive by being explicit.
 
 ## Output
 
 For features affecting >3 files or introducing new modules: write a design proposal to
 `docs/95-ideas/YYYY-MM-DD-design-{UPI}-{slug}.md` with YAML frontmatter and status `proposed`.
-Include a **Ready for Review** section telling the arch-adversary what to focus on.
+Include an **Open Questions** section listing assumptions and decision branches for `/grill-me` to stress-test.
 
 **Frontmatter format:**
 

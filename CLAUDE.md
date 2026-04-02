@@ -230,28 +230,46 @@ cargo run -- get FILE --at DATE      # Restore file from snapshot
 
 ## Development Workflow
 
-Guideline, not rigid procedure. Skip steps that don't apply to the current work.
+Three tiers based on scope. Use the lightest tier that fits — but when in doubt, tier up.
+The review and stress-test phases (`/grill-me`, `arch-adversary`) consistently surface
+valuable discoveries. Skipping them should be the exception, not the default.
+
+### Patch — bug fixes, small changes, <3 files
 
 ```
-/brainstorm → /design → design-review → /grill-me → /sequence → [plan+build] → /simplify → arch-adversary → /post-review → /check → /journal → /commit-push-pr
+systematic-debugging → build → /check → /commit-push-pr → /journal
 ```
+
+### Standard — medium features, clear scope, no new modules
+
+```
+/design → /grill-me → /prepare → arch-adversary → /post-review → build → /simplify → /check → /commit-push-pr → /journal
+```
+
+### Full — new modules, architectural changes, ADR gates
+
+```
+/brainstorm → /design → /grill-me → [/sequence] → /prepare → arch-adversary → /post-review → build → /simplify → /check → /commit-push-pr → /journal
+```
+
+### Tool reference
 
 | Tool | Phase | What it does |
 |------|-------|--------------|
 | `/brainstorm` | Ideation | Divergent thinking, no scoring. Output: `docs/95-ideas/` |
 | `/design` | Design | Module decomposition, UPI assignment, ADR gate identification |
-| `design-review` | Design review | arch-adversary reviews the design doc (pre-implementation) |
-| `/grill-me` | Stress-test | Socratic interview, resolve decision tree branches |
-| `/sequence` | Sequencing | Order reviewed designs by decision trees and dependencies |
-| `[plan+build]` | Implementation | Planning and execution (intertwined in Claude Code) |
+| `/grill-me` | Stress-test | Socratic interview, resolve decisions, update design doc |
+| `/sequence` | Sequencing | (Optional) Order reviewed designs by dependencies when multiple are queued |
+| `/prepare` | Planning | Read design + codebase, produce implementation plan in `docs/97-plans/`. No code. |
+| `arch-adversary` | Plan review | Severity-ranked findings on the implementation plan |
+| `/post-review` | Plan revision | Revise the plan to address adversary findings |
+| `build` | Implementation | Execute the reviewed plan |
 | `/simplify` | Post-build | Simplification pass: abstractions, types, control flow |
-| `arch-adversary` | Adversary review | Severity-ranked findings on implemented code |
-| `/post-review` | Rework | Systematic fix of review findings, structured disagreement |
 | `test-team` | Testing | Risk-proportional coverage analysis and gap identification |
-| `systematic-debugging` | On-demand | Four-phase root cause investigation (any stage) |
+| `systematic-debugging` | Diagnosis | Four-phase root cause investigation (any tier, especially patch) |
 | `/check` | Quality gate | `cargo clippy` + `cargo test` + `cargo build --release` |
-| `/journal` | Documentation | Session journal + status.md + registry.md updates |
 | `/commit-push-pr` | Integration | PII scan, CHANGELOG, branch, commit, PR |
+| `/journal` | Session close | Session journal + status.md + registry.md updates (always last) |
 | `/release` | Release | SemVer bump, CHANGELOG, tag (user pushes manually) |
 
 ## Project State
