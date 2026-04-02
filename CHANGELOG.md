@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-04-02
+
 ### Added
 - `/steve` skill: Steve Jobs product vision and UX quality gatekeeper — reviews brainstorms, designs, and finished features from the user's perspective
 - `urd backup` now acts immediately — fresh snapshots and sends without waiting for intervals. Automated runs use `--auto` to respect interval gating.
