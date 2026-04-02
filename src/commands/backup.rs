@@ -19,8 +19,8 @@ use crate::heartbeat;
 use crate::lock;
 use crate::metrics::{self, MetricsData, SubvolumeMetrics};
 use crate::output::{
-    BackupSummary, OutputMode, SendSummary, SkipCategory, SkippedSubvolume, StatusAssessment,
-    StructuredError, SubvolumeSummary, TransitionEvent,
+    BackupSummary, EmptyPlanExplanation, OutputMode, SendSummary, SkipCategory, SkippedSubvolume,
+    StatusAssessment, StructuredError, SubvolumeSummary, TransitionEvent,
 };
 use crate::notify;
 use crate::plan::{self, FileSystemState, PlanFilters, RealFileSystemState};
@@ -36,6 +36,7 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
         subvolume: args.subvolume,
         local_only: args.local_only,
         external_only: args.external_only,
+        skip_intervals: !args.auto,
     };
 
     let mode = if args.dry_run {
@@ -81,11 +82,21 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
 
     // Acquire advisory lock to prevent concurrent backup runs
     let lock_path = config.general.state_db.with_extension("lock");
-    let _lock = lock::acquire_lock(&lock_path, "timer")?;
+    let trigger = if args.auto { "auto" } else { "manual" };
+    let _lock = lock::acquire_lock(&lock_path, trigger)?;
 
-    if backup_plan.is_empty() && backup_plan.skipped.is_empty() {
-        println!("{}", "Nothing to do.".dimmed());
-        write_metrics_for_skipped(&config, &backup_plan, now)?;
+    if backup_plan.is_empty() {
+        // Empty plan: no operations to execute. This includes plans where all subvolumes
+        // were skipped (drives disconnected, space guard, etc.). Previously this case fell
+        // through to the executor which ran zero operations and reported run_result "success".
+        // Now it uses build_empty() with run_result "empty" — more accurate for monitoring.
+        if !args.auto && !backup_plan.skipped.is_empty() {
+            let explanation = build_empty_plan_explanation(&backup_plan, &filters);
+            print!("{}", crate::voice::render_empty_plan(&explanation));
+        } else {
+            println!("{}", "Nothing to do.".dimmed());
+        }
+        write_metrics_for_skipped(&config, &backup_plan, now, &fs_state)?;
         let heartbeat_now = chrono::Local::now().naive_local();
         let previous_hb = heartbeat::read(&config.general.heartbeat_file);
         let mut assessments = awareness::assess(&config, heartbeat_now, &fs_state);
@@ -113,6 +124,20 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
         eprintln!("\nSignal received, finishing current operation...");
     }) {
         log::warn!("Failed to set signal handler: {e}");
+    }
+
+    // Pre-action briefing for manual TTY runs
+    if !args.auto && std::io::stdout().is_terminal() {
+        let plan_output =
+            crate::commands::plan_cmd::build_plan_output(&backup_plan, &fs_state);
+        let pre_filters = crate::output::PreActionFilters {
+            local_only: filters.local_only,
+            external_only: filters.external_only,
+            subvolume: filters.subvolume.clone(),
+        };
+        let summary =
+            crate::output::build_pre_action_summary(&plan_output, &config, pre_filters);
+        print!("{}", crate::voice::render_pre_action(&summary));
     }
 
     // Set up executor with live byte counter for progress display
@@ -482,15 +507,15 @@ fn write_metrics_for_skipped(
     config: &Config,
     plan: &crate::types::BackupPlan,
     now: chrono::NaiveDateTime,
+    fs_state: &dyn FileSystemState,
 ) -> anyhow::Result<()> {
     let now_ts = now.and_utc().timestamp();
-    let fs_state = RealFileSystemState { state: None };
     let mut subvolume_metrics = Vec::new();
 
     append_skipped_metrics(
         config,
         plan,
-        &fs_state,
+        fs_state,
         &mut subvolume_metrics,
         &HashSet::new(),
     );
@@ -500,6 +525,76 @@ fn write_metrics_for_skipped(
     metrics::apply_carried_forward_timestamps(&mut subvolume_metrics, &carried);
 
     write_global_metrics(config, now_ts, subvolume_metrics)
+}
+
+fn build_empty_plan_explanation(
+    plan: &crate::types::BackupPlan,
+    filters: &PlanFilters,
+) -> EmptyPlanExplanation {
+    // Single pass to classify all skip reasons
+    let mut has_disabled = false;
+    let mut has_space = false;
+    let mut has_not_mounted = false;
+    let mut has_interval = false;
+
+    for (_, reason) in &plan.skipped {
+        match SkipCategory::from_reason(reason) {
+            SkipCategory::Disabled => has_disabled = true,
+            SkipCategory::SpaceExceeded => has_space = true,
+            SkipCategory::DriveNotMounted => has_not_mounted = true,
+            SkipCategory::IntervalNotElapsed => has_interval = true,
+            SkipCategory::Other => {}
+        }
+    }
+
+    let all_disabled = has_disabled && !has_space && !has_not_mounted && !has_interval;
+    let all_space = has_space && !has_disabled && !has_not_mounted && !has_interval;
+    let all_not_mounted = has_not_mounted && !has_disabled && !has_space && !has_interval;
+
+    if all_disabled {
+        EmptyPlanExplanation {
+            reasons: vec!["all subvolumes are disabled in config".to_string()],
+            suggestion: Some("Enable subvolumes in ~/.config/urd/urd.toml".to_string()),
+        }
+    } else if filters.external_only && all_not_mounted {
+        EmptyPlanExplanation {
+            reasons: vec!["no drives are connected".to_string()],
+            suggestion: Some("Connect a drive or run without --external-only".to_string()),
+        }
+    } else if let Some(ref name) = filters.subvolume {
+        EmptyPlanExplanation {
+            reasons: vec![format!("{name} not found or disabled")],
+            suggestion: Some("Check subvolume names with `urd status`".to_string()),
+        }
+    } else if all_space {
+        EmptyPlanExplanation {
+            reasons: vec!["local filesystem full".to_string()],
+            suggestion: Some(
+                "Free space or increase min_free_bytes threshold".to_string(),
+            ),
+        }
+    } else {
+        let mut reasons = Vec::new();
+        if has_not_mounted {
+            reasons.push("drives not connected".to_string());
+        }
+        if has_disabled {
+            reasons.push("some subvolumes disabled".to_string());
+        }
+        if has_space {
+            reasons.push("space exceeded".to_string());
+        }
+        if has_interval {
+            reasons.push("intervals not elapsed".to_string());
+        }
+        if reasons.is_empty() {
+            reasons.push("all operations were skipped".to_string());
+        }
+        EmptyPlanExplanation {
+            reasons,
+            suggestion: Some("Run `urd plan` for details".to_string()),
+        }
+    }
 }
 
 fn append_skipped_metrics(

@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - `/steve` skill: Steve Jobs product vision and UX quality gatekeeper — reviews brainstorms, designs, and finished features from the user's perspective
+- `urd backup` now acts immediately — fresh snapshots and sends without waiting for intervals. Automated runs use `--auto` to respect interval gating.
+- Pre-action briefing shown before manual backups: "Backing up everything to WD-18TB. 7 snapshots, 7 sends, ~53.0GB"
+- Mode-aware empty-plan messages explain why nothing was backed up and suggest fixes
+
+### Changed
+- `urd plan` shows the manual (no-interval) view by default; `urd plan --auto` shows the timer view
+- Lock trigger string changed from "timer" to "auto"/"manual" for clearer diagnostics
 
 ## [0.7.1] - 2026-04-01
 

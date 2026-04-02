@@ -81,6 +81,9 @@ pub struct PlanFilters {
     pub subvolume: Option<String>,
     pub local_only: bool,
     pub external_only: bool,
+    /// When true, bypass interval gating for snapshots and sends.
+    /// Used by manual `urd backup` (default) — automated runs set this to false.
+    pub skip_intervals: bool,
 }
 
 // ── Planner ─────────────────────────────────────────────────────────────
@@ -152,6 +155,7 @@ pub fn plan(
                 &local_snaps,
                 now,
                 force,
+                filters.skip_intervals,
                 min_free,
                 fs,
                 &mut operations,
@@ -228,6 +232,7 @@ pub fn plan(
                     &local_snaps,
                     now,
                     force,
+                    filters.skip_intervals,
                     fs,
                     &mut operations,
                     &mut skipped,
@@ -254,6 +259,7 @@ fn plan_local_snapshot(
     local_snaps: &[SnapshotName],
     now: NaiveDateTime,
     force: bool,
+    skip_intervals: bool,
     min_free: u64,
     fs: &dyn FileSystemState,
     operations: &mut Vec<PlannedOperation>,
@@ -295,7 +301,7 @@ fn plan_local_snapshot(
         );
     }
 
-    let should_create = if force {
+    let should_create = if force || skip_intervals {
         true
     } else if let Some(newest) = newest {
         let elapsed = now.signed_duration_since(newest.datetime());
@@ -419,6 +425,7 @@ fn plan_external_send(
     local_snaps: &[SnapshotName],
     now: NaiveDateTime,
     force: bool,
+    skip_intervals: bool,
     fs: &dyn FileSystemState,
     operations: &mut Vec<PlannedOperation>,
     skipped: &mut Vec<(String, String)>,
@@ -430,7 +437,7 @@ fn plan_external_send(
 
     // Check send interval
     let newest_ext = ext_snaps.iter().max();
-    let should_send = if force {
+    let should_send = if force || skip_intervals {
         true
     } else if let Some(newest) = newest_ext {
         let elapsed = now.signed_duration_since(newest.datetime());
@@ -2457,5 +2464,174 @@ local_retention = "transient"
             deletes[0].contains("20260319"),
             "deleted snapshot should be the one older than both pins: {deletes:?}"
         );
+    }
+
+    // ── skip_intervals tests ────────────────────────────────────────────
+
+    #[test]
+    fn skip_intervals_creates_snapshot_despite_recent_one() {
+        let config = test_config();
+        let mut fs = MockFileSystemState::new();
+        // sv1 last snapshot was 5 minutes ago (interval is 15m) — normally skipped
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap("20260322-1455-one")]);
+
+        let filters = PlanFilters {
+            skip_intervals: true,
+            ..PlanFilters::default()
+        };
+        let result = plan(&config, now(), &filters, &fs).unwrap();
+        let creates: Vec<_> = result
+            .operations
+            .iter()
+            .filter(|op| matches!(op, PlannedOperation::CreateSnapshot { subvolume_name, .. } if subvolume_name == "sv1"))
+            .collect();
+        assert_eq!(creates.len(), 1, "skip_intervals should bypass interval gating");
+    }
+
+    #[test]
+    fn skip_intervals_sends_despite_recent_send() {
+        let config = test_config();
+        let mut fs = MockFileSystemState::new();
+        // sv1 has a local snapshot and a recent external snapshot (30 min ago, interval is 1h)
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap("20260322-1500-one")]);
+        fs.external_snapshots.insert(
+            ("D1".to_string(), "sv1".to_string()),
+            vec![snap("20260322-1430-one")],
+        );
+        fs.drive_availability_overrides
+            .insert("D1".to_string(), DriveAvailability::Available);
+
+        let filters = PlanFilters {
+            skip_intervals: true,
+            ..PlanFilters::default()
+        };
+        let result = plan(&config, now(), &filters, &fs).unwrap();
+        let sends: Vec<_> = result
+            .operations
+            .iter()
+            .filter(|op| {
+                matches!(
+                    op,
+                    PlannedOperation::SendFull { subvolume_name, .. }
+                        | PlannedOperation::SendIncremental { subvolume_name, .. }
+                    if subvolume_name == "sv1"
+                )
+            })
+            .collect();
+        assert!(
+            !sends.is_empty(),
+            "skip_intervals should bypass send interval gating"
+        );
+    }
+
+    #[test]
+    fn skip_intervals_still_respects_space_guard() {
+        let config = test_config();
+        let mut fs = MockFileSystemState::new();
+        // sv1 needs snapshot but local filesystem is below min_free_bytes (10GB)
+        fs.free_bytes
+            .insert(PathBuf::from("/snap/sv1"), 1_000_000_000); // 1GB < 10GB threshold
+
+        let filters = PlanFilters {
+            skip_intervals: true,
+            ..PlanFilters::default()
+        };
+        let result = plan(&config, now(), &filters, &fs).unwrap();
+        let creates: Vec<_> = result
+            .operations
+            .iter()
+            .filter(|op| matches!(op, PlannedOperation::CreateSnapshot { subvolume_name, .. } if subvolume_name == "sv1"))
+            .collect();
+        assert_eq!(
+            creates.len(),
+            0,
+            "skip_intervals must NOT bypass space guard"
+        );
+        assert!(
+            result
+                .skipped
+                .iter()
+                .any(|(name, reason)| name == "sv1" && reason.contains("low on space")),
+            "should report space guard skip"
+        );
+    }
+
+    #[test]
+    fn skip_intervals_still_runs_retention() {
+        // Verify retention runs alongside skip_intervals by creating enough old
+        // snapshots that graduated retention must prune some.
+        let config = test_config();
+        let mut fs = MockFileSystemState::new();
+
+        // Build 30 daily snapshots for sv1 plus one very old one.
+        // Pin the newest so unsent-protection doesn't blanket-protect.
+        let mut snaps = Vec::new();
+        for day in 1..=28 {
+            let d = format!("202603{day:02}-1200-one");
+            snaps.push(snap(&d));
+        }
+        // Add a very old snapshot well outside all retention buckets
+        snaps.push(snap("20240101-1200-one"));
+        let newest = snaps.iter().max().unwrap().clone();
+        fs.local_snapshots.insert("sv1".to_string(), snaps);
+        fs.pin_files.insert(
+            (PathBuf::from("/snap/sv1"), "D1".to_string()),
+            newest,
+        );
+        fs.drive_availability_overrides
+            .insert("D1".to_string(), DriveAvailability::Available);
+
+        let filters = PlanFilters {
+            skip_intervals: true,
+            ..PlanFilters::default()
+        };
+        let result = plan(&config, now(), &filters, &fs).unwrap();
+        let deletes: Vec<_> = result
+            .operations
+            .iter()
+            .filter(|op| matches!(op, PlannedOperation::DeleteSnapshot { subvolume_name, .. } if subvolume_name == "sv1"))
+            .collect();
+        assert!(
+            !deletes.is_empty(),
+            "skip_intervals should not prevent retention from running: ops={:?}",
+            result.operations.iter().map(|o| format!("{o:?}")).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn skip_intervals_composes_with_local_only() {
+        let config = test_config();
+        let mut fs = MockFileSystemState::new();
+        // sv1 recent snapshot (interval not elapsed)
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap("20260322-1455-one")]);
+        fs.drive_availability_overrides
+            .insert("D1".to_string(), DriveAvailability::Available);
+
+        let filters = PlanFilters {
+            skip_intervals: true,
+            local_only: true,
+            ..PlanFilters::default()
+        };
+        let result = plan(&config, now(), &filters, &fs).unwrap();
+        let creates: Vec<_> = result
+            .operations
+            .iter()
+            .filter(|op| matches!(op, PlannedOperation::CreateSnapshot { subvolume_name, .. } if subvolume_name == "sv1"))
+            .collect();
+        let sends: Vec<_> = result
+            .operations
+            .iter()
+            .filter(|op| {
+                matches!(
+                    op,
+                    PlannedOperation::SendFull { .. } | PlannedOperation::SendIncremental { .. }
+                )
+            })
+            .collect();
+        assert_eq!(creates.len(), 1, "skip_intervals + local_only should create snapshot");
+        assert!(sends.is_empty(), "local_only should suppress sends even with skip_intervals");
     }
 }

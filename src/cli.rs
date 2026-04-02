@@ -103,6 +103,10 @@ pub struct PlanArgs {
     /// Only show external operations
     #[arg(long)]
     pub external_only: bool,
+
+    /// Show automated-run plan (apply interval gating)
+    #[arg(long)]
+    pub auto: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -136,6 +140,10 @@ pub struct BackupArgs {
     /// Without this flag, chain-break full sends are skipped in autonomous mode (systemd).
     #[arg(long)]
     pub force_full: bool,
+
+    /// Automated run — apply interval gating. Without this flag, Urd backs up immediately.
+    #[arg(long)]
+    pub auto: bool,
 }
 
 #[derive(clap::Args, Debug)]
