@@ -16,6 +16,7 @@ pub fn run(config: Config, args: PlanArgs, mode: OutputMode) -> anyhow::Result<(
         subvolume: args.subvolume,
         local_only: args.local_only,
         external_only: args.external_only,
+        skip_intervals: !args.auto,
     };
 
     let state_db = StateDb::open(&config.general.state_db).ok();
@@ -293,6 +294,7 @@ fn build_operation_entry(
             subvolume: subvolume_name.clone(),
             operation: "create".to_string(),
             detail: format!("{} -> {}", source.display(), dest.display()),
+            drive_label: None,
             estimated_bytes: None,
             is_full_send: None,
             full_send_reason: None,
@@ -327,6 +329,7 @@ fn build_operation_entry(
                 detail: format!(
                     "{snap_name} -> {drive_label} (incremental, parent: {parent_name}){pin_suffix}"
                 ),
+                drive_label: Some(drive_label.clone()),
                 estimated_bytes,
                 is_full_send: Some(false),
                 full_send_reason: None,
@@ -359,6 +362,7 @@ fn build_operation_entry(
                 detail: format!(
                     "{snap_name} -> {drive_label} (full \u{2014} {reason}){pin_suffix}"
                 ),
+                drive_label: Some(drive_label.clone()),
                 estimated_bytes,
                 is_full_send: Some(true),
                 full_send_reason: Some(reason.to_string()),
@@ -374,6 +378,7 @@ fn build_operation_entry(
                 subvolume: subvolume_name.clone(),
                 operation: "delete".to_string(),
                 detail: format!("{snap_name} ({reason})"),
+                drive_label: None,
                 estimated_bytes: None,
                 is_full_send: None,
                 full_send_reason: None,

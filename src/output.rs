@@ -646,6 +646,9 @@ pub struct PlanOperationEntry {
     pub subvolume: String,
     pub operation: String,
     pub detail: String,
+    /// Target drive label for send operations.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub drive_label: Option<String>,
     /// Estimated bytes for send operations (from history or calibration).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub estimated_bytes: Option<u64>,
@@ -669,6 +672,114 @@ pub struct PlanSummaryOutput {
     /// Aggregated estimated bytes across all sends with estimates.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub estimated_total_bytes: Option<u64>,
+}
+
+// ── EmptyPlanExplanation ───────────────────────────────────────────────
+
+/// Explanation shown when a manual backup produces an empty plan.
+#[derive(Debug)]
+pub struct EmptyPlanExplanation {
+    pub reasons: Vec<String>,
+    pub suggestion: Option<String>,
+}
+
+// ── PreActionSummary ───────────────────────────────────────────────────
+
+/// Pre-action briefing shown to manual+TTY users before execution begins.
+#[derive(Debug)]
+pub struct PreActionSummary {
+    pub snapshot_count: usize,
+    pub send_plan: Vec<PreActionDriveSummary>,
+    pub disconnected_drives: Vec<DisconnectedDrive>,
+    pub filters: PreActionFilters,
+}
+
+/// Per-drive send summary for the pre-action briefing.
+#[derive(Debug)]
+pub struct PreActionDriveSummary {
+    pub drive_label: String,
+    pub subvolume_count: usize,
+    pub estimated_bytes: Option<u64>,
+}
+
+/// A drive that was skipped because it's not mounted.
+#[derive(Debug)]
+pub struct DisconnectedDrive {
+    pub label: String,
+    pub role: DriveRole,
+}
+
+/// Active filters for the pre-action briefing context.
+#[derive(Debug)]
+pub struct PreActionFilters {
+    pub local_only: bool,
+    pub external_only: bool,
+    pub subvolume: Option<String>,
+}
+
+/// Build a pre-action summary from a `PlanOutput` and config.
+/// Pure function — extracts counts, groups sends by drive, classifies disconnected drives.
+#[must_use]
+pub fn build_pre_action_summary(
+    plan_output: &PlanOutput,
+    config: &crate::config::Config,
+    filters: PreActionFilters,
+) -> PreActionSummary {
+    let snapshot_count = plan_output.summary.snapshots;
+
+    let mut drive_map: std::collections::BTreeMap<String, (usize, Option<u64>)> =
+        std::collections::BTreeMap::new();
+    for op in &plan_output.operations {
+        if op.operation == "send"
+            && let Some(ref label) = op.drive_label
+        {
+            let entry = drive_map.entry(label.clone()).or_insert((0, None));
+            entry.0 += 1;
+            if let Some(bytes) = op.estimated_bytes {
+                *entry.1.get_or_insert(0) += bytes;
+            }
+        }
+    }
+    let send_plan: Vec<PreActionDriveSummary> = drive_map
+        .into_iter()
+        .map(|(label, (count, bytes))| PreActionDriveSummary {
+            drive_label: label,
+            subvolume_count: count,
+            estimated_bytes: bytes,
+        })
+        .collect();
+
+    // Disconnected drives: deduplicate by label from skipped entries
+    let mut seen_labels = std::collections::HashSet::new();
+    let disconnected_drives: Vec<DisconnectedDrive> = plan_output
+        .skipped
+        .iter()
+        .filter(|s| s.category == SkipCategory::DriveNotMounted)
+        .filter_map(|s| {
+            // Extract drive label from reason: "drive {label} not mounted"
+            let label = s
+                .reason
+                .strip_prefix("drive ")?
+                .strip_suffix(" not mounted")?
+                .to_string();
+            if !seen_labels.insert(label.clone()) {
+                return None;
+            }
+            let role = config
+                .drives
+                .iter()
+                .find(|d| d.label == label)
+                .map(|d| d.role)?;
+            Some(DisconnectedDrive { label, role })
+        })
+        .collect();
+
+    PreActionSummary {
+        snapshot_count,
+        send_plan,
+        disconnected_drives,
+        filters,
+    }
 }
 
 // ── HistoryOutput ──────────────────────────────────────────────────────
@@ -1271,5 +1382,132 @@ mod tests {
         let days = parse_duration_to_minutes("~9d").unwrap();
         let hours = parse_duration_to_minutes("~2h30m").unwrap();
         assert!(days > hours, "9d ({days}m) should be > 2h30m ({hours}m)");
+    }
+
+    #[test]
+    fn build_pre_action_from_plan_output() {
+        let plan_output = PlanOutput {
+            timestamp: "2026-04-02 15:00".to_string(),
+            operations: vec![
+                PlanOperationEntry {
+                    subvolume: "sv1".to_string(),
+                    operation: "create".to_string(),
+                    detail: "/data/sv1 -> /snap/sv1/...".to_string(),
+                    drive_label: None,
+                    estimated_bytes: None,
+                    is_full_send: None,
+                    full_send_reason: None,
+                },
+                PlanOperationEntry {
+                    subvolume: "sv1".to_string(),
+                    operation: "send".to_string(),
+                    detail: "snap -> D1 (full)".to_string(),
+                    drive_label: Some("D1".to_string()),
+                    estimated_bytes: Some(10_000_000_000),
+                    is_full_send: Some(true),
+                    full_send_reason: None,
+                },
+                PlanOperationEntry {
+                    subvolume: "sv2".to_string(),
+                    operation: "send".to_string(),
+                    detail: "snap -> D1 (incremental)".to_string(),
+                    drive_label: Some("D1".to_string()),
+                    estimated_bytes: Some(500_000),
+                    is_full_send: Some(false),
+                    full_send_reason: None,
+                },
+            ],
+            skipped: vec![
+                SkippedSubvolume {
+                    name: "sv1".to_string(),
+                    reason: "drive D2 not mounted".to_string(),
+                    category: SkipCategory::DriveNotMounted,
+                },
+                SkippedSubvolume {
+                    name: "sv2".to_string(),
+                    reason: "drive D2 not mounted".to_string(),
+                    category: SkipCategory::DriveNotMounted,
+                },
+            ],
+            summary: PlanSummaryOutput {
+                snapshots: 1,
+                sends: 2,
+                deletions: 0,
+                skipped: 2,
+                estimated_total_bytes: Some(10_000_500_000),
+            },
+        };
+
+        let config: crate::config::Config = toml::from_str(
+            r#"
+[general]
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp"
+
+[local_snapshots]
+roots = [{ path = "/snap", subvolumes = ["sv1", "sv2"] }]
+
+[defaults]
+snapshot_interval = "1h"
+send_interval = "4h"
+send_enabled = true
+enabled = true
+
+[defaults.local_retention]
+hourly = 24
+daily = 30
+weekly = 26
+monthly = 12
+
+[defaults.external_retention]
+daily = 30
+weekly = 26
+monthly = 0
+
+[[drives]]
+label = "D1"
+mount_path = "/mnt/d1"
+snapshot_root = ".snapshots"
+role = "primary"
+
+[[drives]]
+label = "D2"
+mount_path = "/mnt/d2"
+snapshot_root = ".snapshots"
+role = "offsite"
+
+[[subvolumes]]
+name = "sv1"
+short_name = "one"
+source = "/data/sv1"
+
+[[subvolumes]]
+name = "sv2"
+short_name = "two"
+source = "/data/sv2"
+"#,
+        )
+        .unwrap();
+
+        let filters = PreActionFilters {
+            local_only: false,
+            external_only: false,
+            subvolume: None,
+        };
+
+        let summary = build_pre_action_summary(&plan_output, &config, filters);
+
+        assert_eq!(summary.snapshot_count, 1);
+        assert_eq!(summary.send_plan.len(), 1);
+        assert_eq!(summary.send_plan[0].drive_label, "D1");
+        assert_eq!(summary.send_plan[0].subvolume_count, 2);
+        assert_eq!(summary.send_plan[0].estimated_bytes, Some(10_000_500_000));
+        assert_eq!(summary.disconnected_drives.len(), 1);
+        assert_eq!(summary.disconnected_drives[0].label, "D2");
+        assert_eq!(
+            summary.disconnected_drives[0].role,
+            crate::types::DriveRole::Offsite
+        );
     }
 }

@@ -14,10 +14,10 @@ use colored::Colorize;
 use crate::output::{
     BackupSummary, CalibrateOutput, CalibrateResult, ChainHealth, DefaultStatusOutput,
     DoctorCheck, DoctorCheckStatus, DoctorOutput, DoctorVerdictStatus, FailuresOutput, GetOutput,
-    HistoryOutput,
-    InitOutput, InitStatus, OutputMode, PlanOutput, RecoveryWindow, RedundancyAdvisoryKind,
-    RetentionPreviewOutput, SentinelStatusOutput, SkipCategory, SkippedSubvolume,
-    StatusAssessment, StatusOutput, SubvolumeHistoryOutput, VerifyOutput, parse_duration_to_minutes,
+    HistoryOutput, InitOutput, InitStatus, OutputMode, PlanOutput, PreActionSummary,
+    RecoveryWindow, RedundancyAdvisoryKind, RetentionPreviewOutput, SentinelStatusOutput,
+    SkipCategory, SkippedSubvolume, StatusAssessment, StatusOutput, SubvolumeHistoryOutput,
+    VerifyOutput, parse_duration_to_minutes,
 };
 use crate::plan::format_duration_short;
 use crate::types::{ByteSize, DriveRole};
@@ -890,6 +890,114 @@ fn render_get_interactive(data: &GetOutput) -> String {
 }
 
 // ── Plan ────────────────────────────────────────────────────────────────
+
+// ── Empty Plan ─────────────────────────────────────────────────────────
+
+/// Render an explanation for why a manual backup produced an empty plan.
+#[must_use]
+pub fn render_empty_plan(explanation: &crate::output::EmptyPlanExplanation) -> String {
+    let mut out = String::new();
+    let reasons = explanation.reasons.join("; ");
+    let _ = write!(out, "Nothing to back up — {reasons}.");
+    if let Some(ref suggestion) = explanation.suggestion {
+        let _ = write!(out, "\n  {suggestion}");
+    }
+    let _ = writeln!(out);
+    out
+}
+
+// ── Pre-Action Summary ─────────────────────────────────────────────────
+
+/// Render a pre-action briefing for manual backup runs.
+#[must_use]
+pub fn render_pre_action(summary: &PreActionSummary) -> String {
+    let mut out = String::new();
+
+    // Build drive list string
+    let drive_labels: Vec<&str> = summary
+        .send_plan
+        .iter()
+        .map(|d| d.drive_label.as_str())
+        .collect();
+    let drive_list = format_list(&drive_labels);
+
+    // Total estimated bytes across all drives
+    let total_bytes: Option<u64> = {
+        let sum: u64 = summary
+            .send_plan
+            .iter()
+            .filter_map(|d| d.estimated_bytes)
+            .sum();
+        if sum > 0 { Some(sum) } else { None }
+    };
+
+    // Size annotation
+    let size_str = total_bytes
+        .map(|b| format!(", ~{}", ByteSize(b)))
+        .unwrap_or_default();
+
+    // Main line depends on filters
+    if summary.filters.local_only {
+        let _ = writeln!(
+            out,
+            "Snapshotting {} subvolume{}.",
+            summary.snapshot_count,
+            if summary.snapshot_count == 1 { "" } else { "s" }
+        );
+    } else if summary.filters.external_only {
+        let total_sends: usize = summary.send_plan.iter().map(|d| d.subvolume_count).sum();
+        let _ = writeln!(
+            out,
+            "Sending to {drive_list}.\n  {total_sends} subvolume{}{size_str}",
+            if total_sends == 1 { "" } else { "s" },
+        );
+    } else if let Some(ref name) = summary.filters.subvolume {
+        let _ = writeln!(
+            out,
+            "Backing up {name} to {drive_list}.\n  1 snapshot{size_str}",
+        );
+    } else {
+        let total_sends: usize = summary.send_plan.iter().map(|d| d.subvolume_count).sum();
+        let _ = writeln!(
+            out,
+            "Backing up everything to {drive_list}.\n  {} snapshot{}, {total_sends} send{}{size_str}",
+            summary.snapshot_count,
+            if summary.snapshot_count == 1 { "" } else { "s" },
+            if total_sends == 1 { "" } else { "s" },
+        );
+    }
+
+    // Disconnected drives
+    for d in &summary.disconnected_drives {
+        match d.role {
+            DriveRole::Offsite => {
+                let _ = writeln!(
+                    out,
+                    "  {} is away — copies will update when it returns.",
+                    d.label
+                );
+            }
+            _ => {
+                let _ = writeln!(out, "  {} not connected.", d.label);
+            }
+        }
+    }
+
+    out
+}
+
+/// Format a list of items as "A", "A and B", or "A, B, and C".
+fn format_list(items: &[&str]) -> String {
+    match items.len() {
+        0 => String::new(),
+        1 => items[0].to_string(),
+        2 => format!("{} and {}", items[0], items[1]),
+        _ => {
+            let (last, rest) = items.split_last().unwrap();
+            format!("{}, and {last}", rest.join(", "))
+        }
+    }
+}
 
 /// Render plan output according to the given mode.
 #[must_use]
@@ -2292,11 +2400,11 @@ mod tests {
     use super::*;
     use crate::output::{
         BackupSummary, CalibrateEntry, CalibrateOutput, CalibrateResult, ChainHealth,
-        ChainHealthEntry, DriveInfo, HistoryOutput, HistoryRun, InitCheck, InitDriveStatus,
-        InitOutput, InitPinFile, InitSnapshotCount, InitStatus, LastRunInfo, PlanOperationEntry,
-        PlanOutput, PlanSummaryOutput, SendSummary, SkipCategory, SkippedSubvolume,
-        StatusAssessment, StatusDriveAssessment, SubvolumeSummary, TransitionEvent, VerifyCheck,
-        VerifyDrive, VerifyOutput, VerifySubvolume,
+        ChainHealthEntry, DisconnectedDrive, DriveInfo, HistoryOutput, HistoryRun, InitCheck,
+        InitDriveStatus, InitOutput, InitPinFile, InitSnapshotCount, InitStatus, LastRunInfo,
+        PlanOperationEntry, PlanOutput, PlanSummaryOutput, SendSummary, SkipCategory,
+        SkippedSubvolume, StatusAssessment, StatusDriveAssessment, SubvolumeSummary,
+        TransitionEvent, VerifyCheck, VerifyDrive, VerifyOutput, VerifySubvolume,
     };
 
     fn test_status_output() -> StatusOutput {
@@ -2917,6 +3025,7 @@ mod tests {
                     subvolume: "htpc-home".to_string(),
                     operation: "create".to_string(),
                     detail: "/home -> /snapshots/htpc-home/20260326-0400-home".to_string(),
+                    drive_label: None,
                     estimated_bytes: None,
                     is_full_send: None,
                     full_send_reason: None,
@@ -2925,6 +3034,7 @@ mod tests {
                     subvolume: "htpc-home".to_string(),
                     operation: "send".to_string(),
                     detail: "20260326-0400-home -> WD-18TB (incremental, parent: 20260325-0400-home) + pin".to_string(),
+                    drive_label: Some("WD-18TB".to_string()),
                     estimated_bytes: None,
                     is_full_send: None,
                     full_send_reason: None,
@@ -2975,6 +3085,7 @@ mod tests {
                 subvolume: "htpc-home".to_string(),
                 operation: "send".to_string(),
                 detail: "20260329-0404-htpc-home -> WD-18TB (full) + pin".to_string(),
+                drive_label: Some("WD-18TB".to_string()),
                 estimated_bytes: None,
                 is_full_send: None,
                 full_send_reason: None,
@@ -3320,6 +3431,7 @@ mod tests {
                     subvolume: "htpc-home".to_string(),
                     operation: "send".to_string(),
                     detail: "snap -> WD-18TB (full)".to_string(),
+                    drive_label: Some("WD-18TB".to_string()),
                     estimated_bytes: Some(53_000_000_000),
                     is_full_send: Some(true),
                     full_send_reason: None,
@@ -3328,6 +3440,7 @@ mod tests {
                     subvolume: "htpc-docs".to_string(),
                     operation: "send".to_string(),
                     detail: "snap -> WD-18TB (full)".to_string(),
+                    drive_label: Some("WD-18TB".to_string()),
                     estimated_bytes: Some(1_200_000_000),
                     is_full_send: Some(true),
                     full_send_reason: None,
@@ -3363,6 +3476,7 @@ mod tests {
                 subvolume: "htpc-home".to_string(),
                 operation: "send".to_string(),
                 detail: "snap -> WD-18TB (incremental, parent: prev)".to_string(),
+                drive_label: Some("WD-18TB".to_string()),
                 estimated_bytes: Some(5_500_000),
                 is_full_send: Some(false),
                 full_send_reason: None,
@@ -3393,6 +3507,7 @@ mod tests {
                     subvolume: "htpc-home".to_string(),
                     operation: "send".to_string(),
                     detail: "snap -> WD-18TB (full)".to_string(),
+                    drive_label: Some("WD-18TB".to_string()),
                     estimated_bytes: Some(53_000_000_000),
                     is_full_send: Some(true),
                     full_send_reason: None,
@@ -3401,6 +3516,7 @@ mod tests {
                     subvolume: "htpc-docs".to_string(),
                     operation: "send".to_string(),
                     detail: "snap -> WD-18TB (full)".to_string(),
+                    drive_label: Some("WD-18TB".to_string()),
                     estimated_bytes: None,
                     is_full_send: Some(true),
                     full_send_reason: None,
@@ -3431,6 +3547,7 @@ mod tests {
                 subvolume: "htpc-home".to_string(),
                 operation: "send".to_string(),
                 detail: "snap -> WD-18TB (full)".to_string(),
+                drive_label: Some("WD-18TB".to_string()),
                 estimated_bytes: None,
                 is_full_send: None,
                 full_send_reason: None,
@@ -3463,6 +3580,7 @@ mod tests {
                 subvolume: "htpc-home".to_string(),
                 operation: "send".to_string(),
                 detail: "snap -> WD-18TB (full)".to_string(),
+                drive_label: Some("WD-18TB".to_string()),
                 estimated_bytes: Some(53_000_000_000),
                 is_full_send: Some(true),
                 full_send_reason: None,
@@ -3496,6 +3614,7 @@ mod tests {
                 subvolume: "htpc-home".to_string(),
                 operation: "send".to_string(),
                 detail: "snap -> WD-18TB (full)".to_string(),
+                drive_label: Some("WD-18TB".to_string()),
                 estimated_bytes: None,
                 is_full_send: None,
                 full_send_reason: None,
@@ -4946,6 +5065,266 @@ mod tests {
         assert!(
             !output.contains("All threads hold"),
             "should have no all-sealed text: {output}"
+        );
+    }
+
+    // ── Pre-action summary rendering tests ────────────────────────────
+
+    #[test]
+    fn pre_action_full_backup_one_drive() {
+        let summary = PreActionSummary {
+            snapshot_count: 7,
+            send_plan: vec![crate::output::PreActionDriveSummary {
+                drive_label: "WD-18TB".to_string(),
+                subvolume_count: 7,
+                estimated_bytes: Some(53_000_000_000),
+            }],
+            disconnected_drives: vec![],
+            filters: crate::output::PreActionFilters {
+                local_only: false,
+                external_only: false,
+                subvolume: None,
+            },
+        };
+        let output = render_pre_action(&summary);
+        assert!(
+            output.contains("Backing up everything to WD-18TB"),
+            "should mention full backup: {output}"
+        );
+        assert!(output.contains("7 snapshots"), "should count snapshots: {output}");
+        assert!(output.contains("~53.0GB"), "should show size estimate: {output}");
+    }
+
+    #[test]
+    fn pre_action_full_backup_multi_drive() {
+        let summary = PreActionSummary {
+            snapshot_count: 7,
+            send_plan: vec![
+                crate::output::PreActionDriveSummary {
+                    drive_label: "WD-18TB".to_string(),
+                    subvolume_count: 7,
+                    estimated_bytes: None,
+                },
+                crate::output::PreActionDriveSummary {
+                    drive_label: "WD-18TB1".to_string(),
+                    subvolume_count: 7,
+                    estimated_bytes: None,
+                },
+            ],
+            disconnected_drives: vec![],
+            filters: crate::output::PreActionFilters {
+                local_only: false,
+                external_only: false,
+                subvolume: None,
+            },
+        };
+        let output = render_pre_action(&summary);
+        assert!(
+            output.contains("WD-18TB and WD-18TB1"),
+            "should list both drives: {output}"
+        );
+    }
+
+    #[test]
+    fn pre_action_local_only() {
+        let summary = PreActionSummary {
+            snapshot_count: 5,
+            send_plan: vec![],
+            disconnected_drives: vec![],
+            filters: crate::output::PreActionFilters {
+                local_only: true,
+                external_only: false,
+                subvolume: None,
+            },
+        };
+        let output = render_pre_action(&summary);
+        assert!(
+            output.contains("Snapshotting 5 subvolumes"),
+            "should show local-only message: {output}"
+        );
+    }
+
+    #[test]
+    fn pre_action_external_only() {
+        let summary = PreActionSummary {
+            snapshot_count: 0,
+            send_plan: vec![crate::output::PreActionDriveSummary {
+                drive_label: "WD-18TB".to_string(),
+                subvolume_count: 3,
+                estimated_bytes: Some(10_000_000_000),
+            }],
+            disconnected_drives: vec![],
+            filters: crate::output::PreActionFilters {
+                local_only: false,
+                external_only: true,
+                subvolume: None,
+            },
+        };
+        let output = render_pre_action(&summary);
+        assert!(
+            output.contains("Sending to WD-18TB"),
+            "should show external-only message: {output}"
+        );
+        assert!(output.contains("3 subvolumes"), "should count subvolumes: {output}");
+    }
+
+    #[test]
+    fn pre_action_single_subvolume() {
+        let summary = PreActionSummary {
+            snapshot_count: 1,
+            send_plan: vec![crate::output::PreActionDriveSummary {
+                drive_label: "WD-18TB".to_string(),
+                subvolume_count: 1,
+                estimated_bytes: Some(500_000_000),
+            }],
+            disconnected_drives: vec![],
+            filters: crate::output::PreActionFilters {
+                local_only: false,
+                external_only: false,
+                subvolume: Some("htpc-home".to_string()),
+            },
+        };
+        let output = render_pre_action(&summary);
+        assert!(
+            output.contains("Backing up htpc-home to WD-18TB"),
+            "should name the subvolume: {output}"
+        );
+    }
+
+    #[test]
+    fn pre_action_disconnected_offsite() {
+        let summary = PreActionSummary {
+            snapshot_count: 7,
+            send_plan: vec![crate::output::PreActionDriveSummary {
+                drive_label: "WD-18TB".to_string(),
+                subvolume_count: 7,
+                estimated_bytes: None,
+            }],
+            disconnected_drives: vec![DisconnectedDrive {
+                label: "WD-offsite".to_string(),
+                role: DriveRole::Offsite,
+            }],
+            filters: crate::output::PreActionFilters {
+                local_only: false,
+                external_only: false,
+                subvolume: None,
+            },
+        };
+        let output = render_pre_action(&summary);
+        assert!(
+            output.contains("WD-offsite is away"),
+            "offsite drive should use 'away' language: {output}"
+        );
+    }
+
+    #[test]
+    fn pre_action_disconnected_primary() {
+        let summary = PreActionSummary {
+            snapshot_count: 7,
+            send_plan: vec![],
+            disconnected_drives: vec![DisconnectedDrive {
+                label: "WD-primary".to_string(),
+                role: DriveRole::Primary,
+            }],
+            filters: crate::output::PreActionFilters {
+                local_only: false,
+                external_only: false,
+                subvolume: None,
+            },
+        };
+        let output = render_pre_action(&summary);
+        assert!(
+            output.contains("WD-primary not connected"),
+            "primary drive should use 'not connected' language: {output}"
+        );
+    }
+
+    // ── Empty plan rendering tests ──────────────────────────────────────
+
+    #[test]
+    fn empty_plan_all_disabled() {
+        let explanation = crate::output::EmptyPlanExplanation {
+            reasons: vec!["all subvolumes are disabled in config".to_string()],
+            suggestion: Some("Enable subvolumes in ~/.config/urd/urd.toml".to_string()),
+        };
+        let output = render_empty_plan(&explanation);
+        assert!(
+            output.contains("Nothing to back up"),
+            "should start with nothing message: {output}"
+        );
+        assert!(
+            output.contains("disabled"),
+            "should mention disabled: {output}"
+        );
+        assert!(
+            output.contains("Enable subvolumes"),
+            "should include suggestion: {output}"
+        );
+    }
+
+    #[test]
+    fn empty_plan_no_drives() {
+        let explanation = crate::output::EmptyPlanExplanation {
+            reasons: vec!["no drives are connected".to_string()],
+            suggestion: Some("Connect a drive or run without --external-only".to_string()),
+        };
+        let output = render_empty_plan(&explanation);
+        assert!(
+            output.contains("no drives are connected"),
+            "should explain no drives: {output}"
+        );
+    }
+
+    #[test]
+    fn empty_plan_subvolume_not_found() {
+        let explanation = crate::output::EmptyPlanExplanation {
+            reasons: vec!["my-vol not found or disabled".to_string()],
+            suggestion: Some("Check subvolume names with `urd status`".to_string()),
+        };
+        let output = render_empty_plan(&explanation);
+        assert!(
+            output.contains("my-vol not found"),
+            "should name the subvolume: {output}"
+        );
+        assert!(
+            output.contains("urd status"),
+            "should suggest urd status: {output}"
+        );
+    }
+
+    #[test]
+    fn empty_plan_space_guard() {
+        let explanation = crate::output::EmptyPlanExplanation {
+            reasons: vec!["local filesystem full".to_string()],
+            suggestion: Some("Free space or increase min_free_bytes threshold".to_string()),
+        };
+        let output = render_empty_plan(&explanation);
+        assert!(
+            output.contains("filesystem full"),
+            "should mention space: {output}"
+        );
+    }
+
+    #[test]
+    fn pre_action_no_estimates() {
+        let summary = PreActionSummary {
+            snapshot_count: 3,
+            send_plan: vec![crate::output::PreActionDriveSummary {
+                drive_label: "WD-18TB".to_string(),
+                subvolume_count: 3,
+                estimated_bytes: None,
+            }],
+            disconnected_drives: vec![],
+            filters: crate::output::PreActionFilters {
+                local_only: false,
+                external_only: false,
+                subvolume: None,
+            },
+        };
+        let output = render_pre_action(&summary);
+        assert!(
+            !output.contains("~"),
+            "no estimates should mean no size annotation: {output}"
         );
     }
 }
