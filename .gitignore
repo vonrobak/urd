@@ -16,6 +16,7 @@ Thumbs.db
 /tmp-test-*/
 
 # Private documentation (contains system-specific details)
+docs/90-archive/
 docs/97-plans/
 !docs/97-plans/README.md
 docs/98-journals/
