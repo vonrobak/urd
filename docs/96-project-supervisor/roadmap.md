@@ -23,7 +23,7 @@ as quick PRs when convenient, not as roadmap milestones.
 ```
 assess() scoping fix (patch, ~0.5 session)
   │
-Backup-now imperative (needs /design, ~2 sessions)
+Backup-now imperative ✓ (v0.8.0)
   │
 6-O: Progressive disclosure (2 sessions)
   │
