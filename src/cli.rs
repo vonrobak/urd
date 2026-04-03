@@ -45,6 +45,8 @@ pub enum Commands {
     RetentionPreview(RetentionPreviewArgs),
     /// Generate shell completion scripts
     Completions(CompletionsArgs),
+    /// Migrate config from legacy schema to v1
+    Migrate(MigrateArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -72,6 +74,13 @@ pub struct RetentionPreviewArgs {
 pub struct CompletionsArgs {
     /// Shell to generate completions for (bash, zsh, fish, elvish, powershell)
     pub shell: clap_complete::Shell,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct MigrateArgs {
+    /// Show what would change without writing files
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 #[derive(clap::Args, Debug)]

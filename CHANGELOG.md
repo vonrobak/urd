@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `urd migrate` command — transforms legacy config to v1 schema with backup, dry-run, and semantic equivalence (no behavioral changes)
+- V1 example config at `config/urd.toml.v1.example`
 - Serialize support on all config types — enables `urd migrate` and config round-tripping
 - V1 config schema parser with `config_version = 1` dispatch — self-describing subvolumes, no `[defaults]`/`[local_snapshots]` sections
 - V1 validation: named protection levels reject operational overrides, enforce drive requirements

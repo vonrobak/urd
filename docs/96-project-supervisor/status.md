@@ -9,11 +9,11 @@
 
 **Urd is the sole backup system.** Systemd timer running nightly at 04:00 since 2026-03-25.
 Sentinel daemon deployed (passive monitoring, drive detection, backup overdue alerts).
-767 tests, all passing, clippy clean. Current version: v0.9.1.
+799 tests, all passing, clippy clean. Current version: v0.9.1.
 
-**UPI 010 sessions 1-2 complete (P6a + P6b).** Protection level vocabulary renamed
-(guarded→recorded, protected→sheltered, resilient→fortified). Serialize + PartialEq/Eq
-added to all config types with round-trip tests. PR #75 and #76 merged.
+**UPI 010 sessions 1-3 complete (P6a + P6b + V1 parser).** Protection level vocabulary
+renamed. Serialize on all config types. V1 config parser with version dispatch, validation,
+synthesized LocalSnapshotsConfig, ResolvedSubvolume enrichment. PR #75, #76, #77 merged.
 
 **Deployment notes:**
 - Systemd timer needs `--auto` added to `ExecStart` line (pending since v0.8.0)
@@ -25,21 +25,20 @@ Nothing active.
 
 ## Next Up (parallel tracks)
 
-**Track A: v0.9.0 test session** (calendar time — live with the tool)
+**Track A: v0.9.1 test session** (calendar time — live with the tool)
    - Fix systemd timer `--auto` flag first (pending since v0.8.0)
    - Live with v0.9.1 for several days (timer, Sentinel, drive plug/unplug cycles)
    - Output: prioritized issue list → targeted fix phase if needed
 
-**Track B: UPI 010 session 3** (concurrent — highest risk session)
-   - V1 parser + ResolvedSubvolume migration
-   - `config_version` dispatch, v1 config structs, validation rules
+**Track B: UPI 010 session 4** (concurrent — medium risk)
+   - `urd migrate` command: legacy → v1 config transformation
+   - v1 example config, updated CLAUDE.md
    - Plan: `docs/97-plans/2026-04-03-plan-010-config-schema-v1.md`
 
 **Then sequential:**
 1. Fix test session findings (~0-2 sessions)
-2. UPI 010 session 4: `urd migrate` + validation + example config
-3. Migrate own production config → validate v1 in real usage
-4. **Phase D: Progressive disclosure + The Encounter** — ~6-8 sessions
+2. Migrate own production config → validate v1 in real usage
+3. **Phase D: Progressive disclosure + The Encounter** — ~6-8 sessions
 
 ## Key Links
 
@@ -62,3 +61,4 @@ Nothing active.
 - RECOVERY column hidden — needs real snapshot depth calculation before it can return
 - Planner helper functions approaching parameter limit (10 args) — pass `&PlanFilters` instead of destructured bools in next planner change
 - ByteSize Display uses `{:.1}` formatting — `urd migrate` (session 4) will emit "10.0GB" not "10GB"; consider clean display mode
+- VersionProbe error message says "failed to read config_version" for TOML syntax errors — UX polish for session 4

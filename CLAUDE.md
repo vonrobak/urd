@@ -89,9 +89,18 @@ Each references an ADR in `docs/00-foundation/decisions/` with full rationale.
 
 ### Config System (ADR-111)
 
-Current implementation uses the legacy schema (`[defaults]`, `[local_snapshots]`). ADR-111
-defines the target architecture: explicit drive routing, no inheritance, named levels are
-opaque, templates scaffold rather than govern. See ADR-111 for full design and migration gates.
+Dual-parser architecture supporting **legacy** and **v1** schemas. `Config::load()` pre-parses
+`config_version` from `[general]`, then dispatches to `parse_legacy()` (absent) or `parse_v1()`
+(`config_version = 1`). Both produce the same internal `Config` struct — v1 synthesizes
+`LocalSnapshotsConfig` and `DefaultsConfig` so downstream code is schema-agnostic.
+
+- **Legacy:** `[defaults]`, `[local_snapshots]`, `protection_level`, `short_name` required.
+- **v1:** Self-describing `[[subvolumes]]` with inline `snapshot_root`/`min_free_bytes`,
+  `protection` field (renamed), `short_name` optional (defaults to `name`), no `[defaults]`
+  or `[local_snapshots]`. Named levels are opaque — no operational overrides.
+- **`urd migrate`:** Transforms legacy → v1. Reads raw TOML, builds v1 as string output.
+  Saves backup to `{path}.legacy`. Dispatched as Strategy A (before config load).
+- **Example configs:** `config/urd.toml.example` (legacy), `config/urd.toml.v1.example` (v1).
 
 ### Error Handling
 
@@ -201,6 +210,8 @@ cargo run -- plan                    # Preview backup plan
 cargo run -- backup --dry-run        # Dry-run
 cargo run -- status                  # Current promise states
 cargo run -- get FILE --at DATE      # Restore file from snapshot
+cargo run -- migrate --dry-run       # Preview legacy → v1 migration
+cargo run -- migrate                 # Migrate config to v1 schema
 ```
 
 ## Configuration
@@ -208,7 +219,8 @@ cargo run -- get FILE --at DATE      # Restore file from snapshot
 - Config: `~/.config/urd/urd.toml` (override: `--config`)
 - State DB: `~/.local/share/urd/urd.db`
 - Heartbeat: `~/.local/share/urd/heartbeat.json`
-- Example: `config/urd.toml.example`
+- Example (legacy): `config/urd.toml.example`
+- Example (v1): `config/urd.toml.v1.example`
 
 ## ADR Index
 

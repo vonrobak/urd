@@ -6,6 +6,7 @@ pub mod doctor;
 pub mod drives;
 pub mod get;
 pub mod history;
+pub mod migrate;
 pub mod init;
 pub mod plan_cmd;
 pub mod retention_preview;

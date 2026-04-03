@@ -291,6 +291,22 @@ impl Config {
         Ok(config)
     }
 
+    /// Parse config from a TOML string with version dispatch (no file I/O, no path expansion).
+    ///
+    /// Used by tests that need to verify generated TOML parses correctly.
+    #[cfg(test)]
+    pub(crate) fn from_str(raw: &str) -> Result<Self, String> {
+        let version = extract_config_version(raw)?;
+        let mut config = match version {
+            None => parse_legacy(raw)?,
+            Some(1) => parse_v1(raw)?,
+            Some(n) => return Err(format!("unsupported config_version {n} (supported: 1)")),
+        };
+        config.expand_paths();
+        config.validate().map_err(|e| e.to_string())?;
+        Ok(config)
+    }
+
     /// Find the snapshot root path for a given subvolume name.
     #[must_use]
     pub fn snapshot_root_for(&self, subvol_name: &str) -> Option<PathBuf> {
@@ -2638,5 +2654,16 @@ drives = []
 "#;
         let err = parse_v1(config_str).unwrap_err();
         assert!(err.contains("empty list"));
+    }
+
+    #[test]
+    fn parse_v1_example_config_file() {
+        let example = include_str!("../config/urd.toml.v1.example");
+        let result = Config::from_str(example);
+        assert!(result.is_ok(), "v1 example config should parse: {:?}", result.err());
+        let config = result.unwrap();
+        assert_eq!(config.general.config_version, Some(1));
+        assert_eq!(config.subvolumes.len(), 5);
+        assert_eq!(config.drives.len(), 2);
     }
 }
