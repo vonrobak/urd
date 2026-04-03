@@ -73,6 +73,15 @@ pub enum NotificationEvent {
         drive_label: String,
         total_chains: usize,
     },
+    /// A drive transitioned from absent to connected.
+    DriveReconnected {
+        drive_label: String,
+        absent_duration: Option<String>,
+    },
+    /// A drive is mounted but needs identity verification before sends proceed.
+    DriveNeedsAdoption {
+        drive_label: String,
+    },
 }
 
 // ── Urgency ────────────────────────────────────────────────────────────
@@ -313,6 +322,48 @@ fn status_rank(status: &str) -> u8 {
 
 fn is_degradation(from: &str, to: &str) -> bool {
     status_rank(from) > status_rank(to)
+}
+
+// ── Drive reconnection notifications ──────────────────────────────────
+
+/// Build a notification for a drive that transitioned from absent to connected.
+#[must_use]
+pub fn build_drive_reconnected_notification(
+    label: &str,
+    absent_duration: Option<&str>,
+) -> Notification {
+    let body = match absent_duration {
+        Some(duration) => format!(
+            "Absent {duration}. Run `urd backup` to restore full protection."
+        ),
+        None => "Run `urd backup` to restore full protection.".to_string(),
+    };
+
+    Notification {
+        event: NotificationEvent::DriveReconnected {
+            drive_label: label.to_string(),
+            absent_duration: absent_duration.map(|s| s.to_string()),
+        },
+        urgency: Urgency::Info,
+        title: format!("{label} is back"),
+        body,
+    }
+}
+
+/// Build a notification for a drive that needs identity verification.
+#[must_use]
+pub fn build_drive_needs_adoption_notification(label: &str) -> Notification {
+    Notification {
+        event: NotificationEvent::DriveNeedsAdoption {
+            drive_label: label.to_string(),
+        },
+        urgency: Urgency::Warning,
+        title: format!("{label} needs identity verification"),
+        body: format!(
+            "Drive is mounted but its identity token is missing or mismatched. \
+             Run `urd drives adopt {label}` to accept this drive."
+        ),
+    }
 }
 
 // ── Dispatch (I/O) ─────────────────────────────────────────────────────
@@ -886,5 +937,52 @@ mod tests {
         let body = default_webhook_body(&notification);
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed["urgency"], "critical");
+    }
+
+    // ── Drive reconnection notifications ──────────────────────────────
+
+    #[test]
+    fn drive_reconnected_with_duration() {
+        let n = build_drive_reconnected_notification("WD-18TB", Some("10 days"));
+        assert_eq!(n.title, "WD-18TB is back");
+        assert!(n.body.contains("Absent 10 days"));
+        assert!(n.body.contains("urd backup"));
+        assert_eq!(n.urgency, Urgency::Info);
+        match &n.event {
+            NotificationEvent::DriveReconnected { drive_label, absent_duration } => {
+                assert_eq!(drive_label, "WD-18TB");
+                assert_eq!(absent_duration.as_deref(), Some("10 days"));
+            }
+            other => panic!("expected DriveReconnected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drive_reconnected_without_duration() {
+        let n = build_drive_reconnected_notification("2TB-backup", None);
+        assert_eq!(n.title, "2TB-backup is back");
+        assert!(!n.body.contains("Absent"));
+        assert!(n.body.contains("urd backup"));
+    }
+
+    #[test]
+    fn drive_reconnected_urgency_is_info() {
+        let n = build_drive_reconnected_notification("D1", Some("3 hours"));
+        assert_eq!(n.urgency, Urgency::Info);
+    }
+
+    #[test]
+    fn drive_needs_adoption_notification() {
+        let n = build_drive_needs_adoption_notification("WD-18TB");
+        assert!(n.title.contains("WD-18TB"));
+        assert!(n.title.contains("identity verification"));
+        assert!(n.body.contains("urd drives adopt WD-18TB"));
+        assert_eq!(n.urgency, Urgency::Warning);
+    }
+
+    #[test]
+    fn drive_needs_adoption_urgency_is_warning() {
+        let n = build_drive_needs_adoption_notification("D1");
+        assert_eq!(n.urgency, Urgency::Warning);
     }
 }

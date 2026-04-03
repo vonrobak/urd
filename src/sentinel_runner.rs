@@ -149,6 +149,9 @@ impl SentinelRunner {
                 SentinelAction::LogDriveChange { label, mounted } => {
                     self.execute_log_drive_change(label, *mounted);
                 }
+                SentinelAction::NotifyDriveReconnected { label } => {
+                    self.execute_drive_reconnection_notification(label);
+                }
                 SentinelAction::Exit => {
                     self.execute_exit();
                 }
@@ -379,6 +382,70 @@ impl SentinelRunner {
     fn execute_exit(&self) {
         log::warn!("Sentinel shutting down");
         let _ = std::fs::remove_file(&self.state_file_path);
+    }
+
+    /// Handle drive reconnection — check token state before dispatching.
+    /// Sends a different notification depending on whether the drive's
+    /// identity is verified or suspect (S1 fix from adversary review).
+    fn execute_drive_reconnection_notification(&self, label: &str) {
+        // Find drive config.
+        let Some(drive) = self.config.drives.iter().find(|d| d.label == label) else {
+            log::warn!("Drive reconnection notification for unknown label '{label}' — skipping");
+            return;
+        };
+
+        // Open state DB for token check and duration lookup.
+        let state_db = match StateDb::open(&self.config.general.state_db) {
+            Ok(db) => db,
+            Err(e) => {
+                // Fail-open: if DB unavailable, proceed with normal reconnection.
+                log::warn!("Failed to open state DB for reconnection notification: {e}");
+                return;
+            }
+        };
+
+        // Check token state before dispatching (S1 fix).
+        let token_state = drives::verify_drive_token(drive, &state_db);
+        match token_state {
+            DriveAvailability::TokenMismatch { .. }
+            | DriveAvailability::TokenExpectedButMissing => {
+                // Identity suspect — notify to adopt, not to backup.
+                let notification = notify::build_drive_needs_adoption_notification(label);
+                notify::dispatch(&[notification], &self.config.notifications);
+                return;
+            }
+            _ => {
+                // Available, TokenMissing, or check failed (fail-open) — proceed
+                // with normal reconnection notification.
+            }
+        }
+
+        // Compute absent duration from last_verified timestamp.
+        let absent_minutes = state_db
+            .get_drive_token_last_verified(label)
+            .ok()
+            .flatten()
+            .and_then(|ts| {
+                let parsed =
+                    NaiveDateTime::parse_from_str(&ts, "%Y-%m-%dT%H:%M:%S").ok()?;
+                let now = chrono::Local::now().naive_local();
+                Some(now.signed_duration_since(parsed).num_minutes())
+            });
+
+        // Suppression: skip notification for short absences (< 1 hour)
+        // or when there's no last_verified timestamp.
+        const MIN_ABSENT_MINUTES: i64 = 60;
+        let duration_str = match absent_minutes {
+            Some(m) if m < MIN_ABSENT_MINUTES => return,
+            Some(m) => Some(crate::plan::format_duration_short(m)),
+            None => return,
+        };
+
+        let notification = notify::build_drive_reconnected_notification(
+            label,
+            duration_str.as_deref(),
+        );
+        notify::dispatch(&[notification], &self.config.notifications);
     }
 
     // ── State file I/O ──────────────────────────────────────────────────

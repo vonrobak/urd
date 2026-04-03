@@ -229,8 +229,8 @@ pub fn plan(
                         skipped.push((
                             subvol.name.clone(),
                             format!(
-                                "drive {} token expected but missing \u{2014} possible drive swap",
-                                drive.label
+                                "drive {} token expected but missing \u{2014} run `urd drives adopt {}`",
+                                drive.label, drive.label
                             ),
                         ));
                         continue;

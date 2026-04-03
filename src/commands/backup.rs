@@ -173,14 +173,12 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
                     Some(drive.label.clone())
                 }
                 drives::DriveAvailability::TokenExpectedButMissing => {
-                    // PLACEHOLDER: directs to `urd doctor` until UPI 009 ships
-                    // `urd drives adopt {label}`.
                     log::warn!(
                         "Drive {} is mounted but missing its identity token. Urd has \
                          previously sent to a drive with this label — this may be a \
                          different physical drive. Sends to {} are blocked. \
-                         Run `urd doctor` for guidance.",
-                        drive.label, drive.label,
+                         Run `urd drives adopt {}` to accept this drive.",
+                        drive.label, drive.label, drive.label,
                     );
                     Some(drive.label.clone())
                 }
