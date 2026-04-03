@@ -570,11 +570,20 @@ fn render_backup_interactive(data: &BackupSummary) -> String {
         Some(id) => format!("run #{id}, "),
         None => String::new(),
     };
+    let (failed_count, deferred_count) = data.subvolumes.iter().fold((0usize, 0usize), |(f, d), sv| {
+        (f + (!sv.success as usize), d + sv.deferred.len())
+    });
+    let count_suffix = match (failed_count, deferred_count) {
+        (0, 0) => String::new(),
+        (0, d) => format!(" ── ({d} deferred)"),
+        (f, 0) => format!(" ── ({f} failed)"),
+        (f, d) => format!(" ── ({f} failed, {d} deferred)"),
+    };
     writeln!(
         out,
         "{}",
         format!(
-            "── Urd backup: {result_colored} ── [{run_info}{:.1}s] ──",
+            "── Urd backup: {result_colored} ── [{run_info}{:.1}s] ──{count_suffix}",
             data.duration_secs,
         )
         .bold()
@@ -585,10 +594,16 @@ fn render_backup_interactive(data: &BackupSummary) -> String {
     if !data.subvolumes.is_empty() {
         writeln!(out).ok();
         for sv in &data.subvolumes {
-            let status = if sv.success {
-                "OK".green().to_string()
-            } else {
+            let has_deferred = !sv.deferred.is_empty();
+            let has_sends = !sv.sends.is_empty();
+
+            // Status label: OK (with or without deferred), DEFERRED (only), or FAILED
+            let status = if !sv.success {
                 "FAILED".red().to_string()
+            } else if has_deferred && !has_sends {
+                "DEFERRED".yellow().to_string()
+            } else {
+                "OK".green().to_string()
             };
 
             let send_info = format_send_info(&sv.sends);
@@ -601,6 +616,11 @@ fn render_backup_interactive(data: &BackupSummary) -> String {
                 send_info,
             )
             .ok();
+
+            for d in &sv.deferred {
+                writeln!(out, "    {} {}", "DEFERRED".yellow(), d.reason).ok();
+                writeln!(out, "    \u{2192} {}", d.suggestion).ok();
+            }
 
             if !sv.structured_errors.is_empty() {
                 // Render structured errors with layered detail
@@ -2424,9 +2444,9 @@ mod tests {
     use super::*;
     use crate::output::{
         BackupSummary, CalibrateEntry, CalibrateOutput, CalibrateResult, ChainHealth,
-        ChainHealthEntry, DisconnectedDrive, DriveInfo, HistoryOutput, HistoryRun, InitCheck,
-        InitDriveStatus, InitOutput, InitPinFile, InitSnapshotCount, InitStatus, LastRunInfo,
-        PlanOperationEntry, PlanOutput, PlanSummaryOutput, SendSummary, SkipCategory,
+        ChainHealthEntry, DeferredInfo, DisconnectedDrive, DriveInfo, HistoryOutput, HistoryRun,
+        InitCheck, InitDriveStatus, InitOutput, InitPinFile, InitSnapshotCount, InitStatus,
+        LastRunInfo, PlanOperationEntry, PlanOutput, PlanSummaryOutput, SendSummary, SkipCategory,
         SkippedSubvolume, StatusAssessment, StatusDriveAssessment, SubvolumeSummary,
         TransitionEvent, VerifyCheck, VerifyDrive, VerifyOutput, VerifySubvolume,
     };
@@ -2783,6 +2803,7 @@ mod tests {
                     sends: vec![],
                     errors: vec![],
                     structured_errors: vec![],
+                    deferred: vec![],
                 },
                 SubvolumeSummary {
                     name: "htpc-docs".to_string(),
@@ -2795,6 +2816,7 @@ mod tests {
                     }],
                     errors: vec![],
                     structured_errors: vec![],
+                    deferred: vec![],
                 },
             ],
             skipped: vec![
@@ -2948,6 +2970,64 @@ mod tests {
         let output = render_backup_summary(&data, OutputMode::Interactive);
         assert!(output.contains("FAILED"), "missing FAILED status");
         assert!(output.contains("btrfs send failed"), "missing error detail");
+    }
+
+    #[test]
+    fn backup_deferred_only_renders_deferred_status() {
+        colored::control::set_override(false);
+        let mut data = test_backup_summary();
+        // htpc-home: deferred-only (no sends)
+        data.subvolumes[0].deferred = vec![DeferredInfo {
+            reason: "full send to 2TB-backup gated — requires opt-in".to_string(),
+            suggestion: "chain-break full send gated — run `urd backup --force-full --subvolume htpc-home` to proceed".to_string(),
+        }];
+        let output = render_backup_summary(&data, OutputMode::Interactive);
+        assert!(output.contains("DEFERRED"), "should show DEFERRED label");
+        assert!(output.contains("requires opt-in"), "should show deferred reason");
+        assert!(output.contains("--force-full"), "should show suggestion");
+    }
+
+    #[test]
+    fn backup_mixed_success_and_deferred_renders_ok() {
+        colored::control::set_override(false);
+        let mut data = test_backup_summary();
+        // htpc-docs: has a successful send AND a deferred op
+        data.subvolumes[1].deferred = vec![DeferredInfo {
+            reason: "full send to 2TB-backup gated — requires opt-in".to_string(),
+            suggestion: "chain-break full send gated — run `urd backup --force-full --subvolume htpc-docs` to proceed".to_string(),
+        }];
+        let output = render_backup_summary(&data, OutputMode::Interactive);
+        assert!(output.contains("OK"), "mixed success+deferred should show OK");
+        assert!(output.contains("DEFERRED"), "should also show deferred info below");
+        assert!(output.contains("WD-18TB"), "should show successful send");
+    }
+
+    #[test]
+    fn backup_header_shows_deferred_count() {
+        colored::control::set_override(false);
+        let mut data = test_backup_summary();
+        data.subvolumes[0].deferred = vec![DeferredInfo {
+            reason: "full send gated".to_string(),
+            suggestion: "run --force-full".to_string(),
+        }];
+        let output = render_backup_summary(&data, OutputMode::Interactive);
+        assert!(output.contains("1 deferred"), "header should show deferred count");
+    }
+
+    #[test]
+    fn backup_header_shows_failed_and_deferred_counts() {
+        colored::control::set_override(false);
+        let mut data = test_backup_summary();
+        data.result = "partial".to_string();
+        data.subvolumes[0].success = false;
+        data.subvolumes[0].errors = vec!["snapshot create failed".to_string()];
+        data.subvolumes[1].deferred = vec![DeferredInfo {
+            reason: "full send gated".to_string(),
+            suggestion: "run --force-full".to_string(),
+        }];
+        let output = render_backup_summary(&data, OutputMode::Interactive);
+        assert!(output.contains("1 failed"), "header should show failed count");
+        assert!(output.contains("1 deferred"), "header should show deferred count");
     }
 
     #[test]

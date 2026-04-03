@@ -324,7 +324,7 @@ fn collect_stale_pin_check(
             name: "stale-pin".to_string(),
             status: "warn".to_string(),
             detail: Some(format!(
-                "Pin file is {days} day(s) old (threshold: {threshold_str}) \u{2014} sends may be failing"
+                "Pin file is {days} day(s) old (threshold: {threshold_str}) \u{2014} last successful send was {days} day(s) ago"
             )),
         });
         *total_warn += 1;
@@ -406,5 +406,47 @@ mod tests {
         assert_eq!(warn, 0);
         assert_eq!(checks.len(), 1);
         assert_eq!(checks[0].status, "ok");
+    }
+
+    #[test]
+    fn stale_pin_warns_with_neutral_message() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let name = SnapshotName::parse("20260322-1430-opptak").unwrap();
+        crate::chain::write_pin_file(dir.path(), "WD-18TB", &name).unwrap();
+
+        // Backdate the pin file to 3 days ago
+        let pin_path = dir.path().join(".last-external-parent-WD-18TB");
+        let three_days_ago = std::time::SystemTime::now()
+            - std::time::Duration::from_secs(3 * 86400);
+        filetime::set_file_mtime(
+            &pin_path,
+            filetime::FileTime::from_system_time(three_days_ago),
+        )
+        .unwrap();
+
+        let mut checks = Vec::new();
+        let mut ok = 0;
+        let mut warn = 0;
+        let interval = Interval::hours(4); // threshold = max(2*4h, 1d) = 1d, pin is 3d old
+        collect_stale_pin_check(
+            dir.path(),
+            "WD-18TB",
+            &interval,
+            &mut checks,
+            &mut ok,
+            &mut warn,
+        );
+        assert_eq!(warn, 1);
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].status, "warn");
+        let detail = checks[0].detail.as_ref().unwrap();
+        assert!(
+            detail.contains("last successful send was"),
+            "should use neutral message, got: {detail}"
+        );
+        assert!(
+            !detail.contains("sends may be failing"),
+            "should not use accusatory message, got: {detail}"
+        );
     }
 }

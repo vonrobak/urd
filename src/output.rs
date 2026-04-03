@@ -519,6 +519,16 @@ pub struct SubvolumeSummary {
     /// Structured error details (when btrfs errors have been translated).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub structured_errors: Vec<StructuredError>,
+    /// Operations deferred by safety gates (not failures).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub deferred: Vec<DeferredInfo>,
+}
+
+/// A safety gate that deliberately blocked an operation.
+#[derive(Debug, Serialize)]
+pub struct DeferredInfo {
+    pub reason: String,
+    pub suggestion: String,
 }
 
 /// A translated btrfs error with layered detail.

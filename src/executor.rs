@@ -57,6 +57,9 @@ impl SendType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpResult {
     Success,
+    /// A safety gate deliberately blocked this operation. Not a failure —
+    /// the tool made a correct decision to defer unsafe work.
+    Deferred,
     Failure,
     Skipped,
 }
@@ -76,6 +79,8 @@ pub struct OperationOutcome {
     pub drive_label: Option<String>,
     pub result: OpResult,
     pub duration: std::time::Duration,
+    /// Contextual message for non-Success results: error details for Failure,
+    /// reason/suggestion for Deferred, skip reason for Skipped.
     pub error: Option<String>,
     pub bytes_transferred: Option<u64>,
     /// Typed btrfs operation for structured error translation.
@@ -315,7 +320,7 @@ impl<'a> Executor<'a> {
                         OperationOutcome {
                             operation: "send_full".to_string(),
                             drive_label: Some(drive_label.clone()),
-                            result: OpResult::Failure,
+                            result: OpResult::Deferred,
                             duration: std::time::Duration::ZERO,
                             error: Some(format!(
                                 "chain-break full send gated — run \
@@ -966,6 +971,7 @@ impl<'a> Executor<'a> {
         if let Some(state) = self.state {
             let result_str = match outcome.result {
                 OpResult::Success => "success",
+                OpResult::Deferred => "deferred",
                 OpResult::Failure => "failure",
                 OpResult::Skipped => "skipped",
             };
@@ -2007,9 +2013,9 @@ source = "/data/sv1"
 
         let result = executor.execute(&chain_broken_plan(), "full");
 
-        assert_eq!(result.subvolume_results[0].operations[0].result, OpResult::Failure);
-        assert!(!result.subvolume_results[0].success, "subvolume should report failure");
-        assert_eq!(result.overall, RunResult::Failure);
+        assert_eq!(result.subvolume_results[0].operations[0].result, OpResult::Deferred);
+        assert!(result.subvolume_results[0].success, "deferred is not a failure");
+        assert_eq!(result.overall, RunResult::Success, "deferred-only run is success");
         assert!(mock.calls().is_empty(), "btrfs should not be called");
         assert!(
             result.subvolume_results[0].operations[0]
@@ -2017,7 +2023,7 @@ source = "/data/sv1"
                 .as_ref()
                 .unwrap()
                 .contains("chain-break full send gated"),
-            "error message should indicate gating"
+            "message should indicate gating"
         );
     }
 
@@ -2060,6 +2066,53 @@ source = "/data/sv1"
         let result = executor.execute(&chain_broken_plan(), "full");
 
         assert_eq!(result.subvolume_results[0].operations[0].result, OpResult::Success);
+    }
+
+    #[test]
+    fn deferred_with_failure_reports_partial() {
+        let mock = MockBtrfs::new();
+        // Fail snapshot creation for sv-b so it genuinely fails
+        mock.fail_creates
+            .borrow_mut()
+            .insert(PathBuf::from("/snap/sv-b/20260322-1430-b"));
+
+        let config = test_config();
+        let shutdown = no_shutdown();
+        let mut executor = Executor::new(&mock, None, &config, &shutdown);
+        executor.set_full_send_policy(FullSendPolicy::SkipAndNotify);
+
+        let ts = NaiveDate::from_ymd_opt(2026, 3, 22)
+            .unwrap()
+            .and_hms_opt(14, 30, 0)
+            .unwrap();
+        let plan = BackupPlan {
+            operations: vec![
+                // sv-a: chain-break full send → will be deferred
+                PlannedOperation::SendFull {
+                    snapshot: PathBuf::from("/snap/sv-a/20260322-1430-a"),
+                    dest_dir: PathBuf::from("/mnt/test/.snapshots/sv-a"),
+                    drive_label: "TEST-DRIVE".to_string(),
+                    subvolume_name: "sv-a".to_string(),
+                    pin_on_success: None,
+                    reason: FullSendReason::ChainBroken,
+                },
+                // sv-b: snapshot create that will fail
+                PlannedOperation::CreateSnapshot {
+                    source: PathBuf::from("/data/b"),
+                    dest: PathBuf::from("/snap/sv-b/20260322-1430-b"),
+                    subvolume_name: "sv-b".to_string(),
+                },
+            ],
+            timestamp: ts,
+            skipped: vec![],
+        };
+
+        let result = executor.execute(&plan, "full");
+
+        // sv-a deferred → success, sv-b failed → overall is partial
+        assert!(result.subvolume_results[0].success, "deferred subvol is success");
+        assert!(!result.subvolume_results[1].success, "failed subvol is failure");
+        assert_eq!(result.overall, RunResult::Partial);
     }
 
     // ── Transient immediate cleanup tests ──────────────────────────────
