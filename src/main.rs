@@ -56,6 +56,9 @@ fn main() -> anyhow::Result<()> {
     if let Some(Commands::Completions(ref args)) = cli.command {
         return commands::completions::run(args);
     }
+    if let Some(Commands::Migrate(ref args)) = cli.command {
+        return commands::migrate::run(cli.config.as_deref(), args);
+    }
 
     let output_mode = output::OutputMode::detect();
 
@@ -91,6 +94,6 @@ fn main() -> anyhow::Result<()> {
         Commands::RetentionPreview(args) => {
             commands::retention_preview::run(config, args, output_mode)
         }
-        Commands::Completions(_) => unreachable!("handled above"),
+        Commands::Completions(_) | Commands::Migrate(_) => unreachable!("handled above"),
     }
 }

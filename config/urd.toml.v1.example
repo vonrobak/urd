@@ -1,0 +1,137 @@
+# Urd v1 configuration
+# Copy to ~/.config/urd/urd.toml and adjust paths for your system.
+# Run `urd migrate` to convert an existing legacy config to v1.
+
+[general]
+config_version = 1
+# How often Urd runs: "daily" (systemd timer), "sentinel" (daemon), or interval like "6h"
+# Protection promises derive intervals from this — set it to match your systemd timer.
+run_frequency = "daily"
+# Uncomment to override XDG defaults:
+# state_db = "~/.local/share/urd/urd.db"
+# metrics_file = "~/.local/share/urd/backup.prom"
+# log_dir = "~/.local/share/urd/logs"
+# heartbeat_file = "~/.local/share/urd/heartbeat.json"
+# btrfs_path = "/usr/sbin/btrfs"
+
+# ── Drives ───────────────────────────────────────────────────────────────
+# Space thresholds trigger aggressive retention when exceeded.
+# uuid: Optional filesystem UUID for identity verification. Prevents sending
+# snapshots to the wrong drive if a different disk mounts at the expected path.
+# Run `findmnt -o UUID <mount_path>` to get the UUID of a mounted drive.
+
+[[drives]]
+label = "WD-18TB"
+uuid = "647693ed-490e-4c09-8816-189ba2baf03f"   # findmnt -o UUID <mount_path>
+mount_path = "/run/media/<user>/WD-18TB"
+snapshot_root = ".snapshots"
+role = "primary"
+max_usage_percent = 90
+min_free_bytes = "500GB"
+
+[[drives]]
+label = "WD-18TB1"
+# uuid = "..."                                   # Recommended: add UUID for safety
+mount_path = "/run/media/<user>/WD-18TB1"
+snapshot_root = ".snapshots"
+role = "offsite"
+max_usage_percent = 90
+min_free_bytes = "500GB"
+
+# ── Protection Promises ──────────────────────────────────────────────────
+#
+# Each subvolume declares a protection level that tells Urd what safety
+# guarantee you want. Urd derives snapshot/send intervals and retention
+# from the promise level + run_frequency. No [defaults] section needed.
+#
+# Levels (with daily timer):
+#   recorded  — local snapshots only, minimal retention (d:7, w:4)
+#   sheltered — local + 1 external drive, full retention
+#   fortified — local + 2+ external drives + offsite, full retention
+#   (no protection field) — custom: all fields set explicitly
+#
+# "drives" restricts which external drives serve a subvolume's promise.
+# Omit to use all configured drives.
+#
+# In v1, snapshot_root and min_free_bytes are inlined on each subvolume.
+# No [local_snapshots] or [defaults] sections — each block is self-describing.
+
+# ── Fortified: irreplaceable data on multiple drives ─────────────────────
+
+[[subvolumes]]
+name = "htpc-home"
+source = "/home"
+snapshot_root = "~/.snapshots"
+min_free_bytes = "10GB"
+priority = 1
+protection = "fortified"
+drives = ["WD-18TB", "WD-18TB1"]   # Active workstation — keep off small test drive
+
+[[subvolumes]]
+name = "subvol2-pics"
+source = "/mnt/btrfs-pool/subvol2-pics"
+snapshot_root = "/mnt/btrfs-pool/.snapshots"
+min_free_bytes = "50GB"
+protection = "fortified"
+drives = ["WD-18TB", "WD-18TB1"]   # Photos are irreplaceable
+
+# ── Sheltered: important data on at least one drive ──────────────────────
+
+[[subvolumes]]
+name = "subvol1-docs"
+source = "/mnt/btrfs-pool/subvol1-docs"
+snapshot_root = "/mnt/btrfs-pool/.snapshots"
+min_free_bytes = "50GB"
+short_name = "docs"
+protection = "sheltered"
+
+# ── Recorded: local snapshots only ───────────────────────────────────────
+
+[[subvolumes]]
+name = "subvol4-multimedia"
+source = "/mnt/btrfs-pool/subvol4-multimedia"
+snapshot_root = "/mnt/btrfs-pool/.snapshots"
+min_free_bytes = "50GB"
+short_name = "multimedia"
+priority = 3
+protection = "recorded"
+
+# ── Custom: manual config (no protection level) ─────────────────────────
+# Transient retention keeps only the pinned snapshot needed for incremental
+# chains. Ideal for subvolumes on space-constrained volumes (NVMe root)
+# where you want external backups but can't afford local snapshot history.
+
+[[subvolumes]]
+name = "htpc-root"
+source = "/"
+snapshot_root = "~/.snapshots"
+min_free_bytes = "10GB"
+priority = 3
+snapshot_interval = "1d"
+send_interval = "1d"
+local_retention = "transient"      # Delete local after send, keep only chain parent
+drives = ["WD-18TB1"]              # Send to offsite drive only
+
+# ── Notifications ────────────────────────────────────────────────────────
+# Urd dispatches notifications when promise states change after a backup.
+# Channels receive notifications at or above the configured urgency threshold.
+# Urgency levels: "info" (recoveries), "warning" (degradations), "critical" (all broken).
+
+# [notifications]
+# enabled = true
+# min_urgency = "warning"
+#
+# [[notifications.channels]]
+# type = "desktop"                          # Uses notify-send
+#
+# [[notifications.channels]]
+# type = "webhook"
+# url = "https://ntfy.sh/my-backups"        # Any JSON-accepting endpoint
+#
+# [[notifications.channels]]
+# type = "command"
+# path = "/usr/local/bin/my-notify-script"  # Receives URD_NOTIFICATION_* env vars
+# args = ["--json"]
+#
+# [[notifications.channels]]
+# type = "log"                              # Writes to Urd's log file
