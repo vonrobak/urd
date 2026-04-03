@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Safety gate (chain-break full send blocked) now reports `DEFERRED` instead of `FAILED` — the tool made a correct decision, not an error
+- Deferred-only backup runs report "success" instead of "failure" in summary, heartbeat, and metrics
+- `urd doctor --thorough` stale-pin message changed from accusatory "sends may be failing" to neutral "last successful send was N day(s) ago"
+- `urd doctor` no longer suggests adding a UUID that's already configured on another drive (cloned drive scenario)
+
 ## [0.8.1] - 2026-04-03
 
 ### Fixed

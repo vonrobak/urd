@@ -19,8 +19,8 @@ use crate::heartbeat;
 use crate::lock;
 use crate::metrics::{self, MetricsData, SubvolumeMetrics};
 use crate::output::{
-    BackupSummary, EmptyPlanExplanation, OutputMode, SendSummary, SkipCategory, SkippedSubvolume,
-    StatusAssessment, StructuredError, SubvolumeSummary, TransitionEvent,
+    BackupSummary, DeferredInfo, EmptyPlanExplanation, OutputMode, SendSummary, SkipCategory,
+    SkippedSubvolume, StatusAssessment, StructuredError, SubvolumeSummary, TransitionEvent,
 };
 use crate::notify;
 use crate::plan::{self, FileSystemState, PlanFilters, RealFileSystemState};
@@ -314,58 +314,58 @@ fn build_backup_summary(
         .subvolume_results
         .iter()
         .map(|sv| {
-            let sends: Vec<SendSummary> = sv
-                .operations
-                .iter()
-                .filter(|op| {
-                    (op.operation == "send_incremental" || op.operation == "send_full")
-                        && op.result == OpResult::Success
-                })
-                .map(|op| SendSummary {
-                    drive: op.drive_label.clone().unwrap_or_default(),
-                    send_type: if op.operation == "send_full" {
-                        "full".to_string()
-                    } else {
-                        "incremental".to_string()
-                    },
-                    bytes_transferred: op.bytes_transferred,
-                })
-                .collect();
+            let mut sends = Vec::new();
+            let mut errors = Vec::new();
+            let mut structured_errors = Vec::new();
+            let mut deferred = Vec::new();
 
-            let errors: Vec<String> = sv
-                .operations
-                .iter()
-                .filter(|op| op.result == OpResult::Failure)
-                .filter_map(|op| {
-                    op.error
-                        .as_ref()
-                        .map(|e| format!("{}: {}", op.operation, e))
-                })
-                .collect();
-
-            let structured_errors: Vec<StructuredError> = sv
-                .operations
-                .iter()
-                .filter(|op| op.result == OpResult::Failure)
-                .filter_map(|op| {
-                    let btrfs_op = op.btrfs_operation?;
-                    let stderr = op.btrfs_stderr.as_deref().unwrap_or("");
-                    let detail = crate::error::translate_btrfs_error(
-                        btrfs_op,
-                        stderr,
-                        op.drive_label.as_deref(),
-                        Some(&sv.name),
-                    );
-                    Some(StructuredError {
-                        operation: op.operation.clone(),
-                        summary: detail.summary,
-                        cause: detail.cause,
-                        remediation: detail.remediation,
-                        drive: op.drive_label.clone(),
-                        bytes_transferred: op.bytes_transferred,
-                    })
-                })
-                .collect();
+            for op in &sv.operations {
+                match op.result {
+                    OpResult::Success => {
+                        if op.operation == "send_incremental" || op.operation == "send_full" {
+                            sends.push(SendSummary {
+                                drive: op.drive_label.clone().unwrap_or_default(),
+                                send_type: if op.operation == "send_full" {
+                                    "full".to_string()
+                                } else {
+                                    "incremental".to_string()
+                                },
+                                bytes_transferred: op.bytes_transferred,
+                            });
+                        }
+                    }
+                    OpResult::Failure => {
+                        if let Some(e) = &op.error {
+                            errors.push(format!("{}: {}", op.operation, e));
+                        }
+                        if let Some(btrfs_op) = op.btrfs_operation {
+                            let stderr = op.btrfs_stderr.as_deref().unwrap_or("");
+                            let detail = crate::error::translate_btrfs_error(
+                                btrfs_op,
+                                stderr,
+                                op.drive_label.as_deref(),
+                                Some(&sv.name),
+                            );
+                            structured_errors.push(StructuredError {
+                                operation: op.operation.clone(),
+                                summary: detail.summary,
+                                cause: detail.cause,
+                                remediation: detail.remediation,
+                                drive: op.drive_label.clone(),
+                                bytes_transferred: op.bytes_transferred,
+                            });
+                        }
+                    }
+                    OpResult::Deferred => {
+                        let drive = op.drive_label.as_deref().unwrap_or("unknown");
+                        deferred.push(DeferredInfo {
+                            reason: format!("full send to {drive} gated — requires opt-in"),
+                            suggestion: op.error.clone().unwrap_or_default(),
+                        });
+                    }
+                    OpResult::Skipped => {}
+                }
+            }
 
             SubvolumeSummary {
                 name: sv.name.clone(),
@@ -374,6 +374,7 @@ fn build_backup_summary(
                 sends,
                 errors,
                 structured_errors,
+                deferred,
             }
         })
         .collect();

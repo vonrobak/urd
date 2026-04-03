@@ -109,19 +109,44 @@ pub fn get_filesystem_uuid(mount_path: &Path) -> crate::error::Result<Option<Str
 /// Check mounted drives for missing UUID configuration.
 /// Returns a list of (drive_label, detected_uuid, config_snippet) for each
 /// mounted drive without a UUID configured.
+///
+/// Suppresses suggestions when the detected UUID is already configured on
+/// another drive (cloned drive scenario — suggesting it would be contradictory).
 #[must_use]
 pub fn check_missing_uuids(drives: &[DriveConfig]) -> Vec<(String, String, String)> {
-    let mut results = Vec::new();
-    for drive in drives {
-        if drive.uuid.is_some() || !is_path_mounted(&drive.mount_path) {
-            continue;
-        }
-        if let Ok(Some(uuid)) = get_filesystem_uuid(&drive.mount_path) {
+    let detected: Vec<(String, String)> = drives
+        .iter()
+        .filter(|d| d.uuid.is_none() && is_path_mounted(&d.mount_path))
+        .filter_map(|d| {
+            get_filesystem_uuid(&d.mount_path)
+                .ok()
+                .flatten()
+                .map(|uuid| (d.label.clone(), uuid))
+        })
+        .collect();
+    filter_uuid_suggestions(drives, detected)
+}
+
+/// Pure filtering logic for UUID suggestion suppression. Filters out detected
+/// UUIDs that are already configured on another drive (cloned drive scenario).
+#[must_use]
+pub(crate) fn filter_uuid_suggestions(
+    drives: &[DriveConfig],
+    detected: Vec<(String, String)>,
+) -> Vec<(String, String, String)> {
+    let configured_uuids: std::collections::HashSet<&str> = drives
+        .iter()
+        .filter_map(|d| d.uuid.as_deref())
+        .collect();
+
+    detected
+        .into_iter()
+        .filter(|(_label, uuid)| !configured_uuids.contains(uuid.as_str()))
+        .map(|(label, uuid)| {
             let snippet = format!("uuid = \"{}\"", uuid);
-            results.push((drive.label.clone(), uuid.to_string(), snippet));
-        }
-    }
-    results
+            (label, uuid, snippet)
+        })
+        .collect()
 }
 
 // ── Existing functions ─────────────────────────────────────────────────
@@ -629,5 +654,70 @@ mod tests {
             verify_drive_token(&drive, &db),
             DriveAvailability::TokenMissing
         );
+    }
+
+    #[test]
+    fn filter_uuid_suggestions_suppresses_duplicate() {
+        let drives = vec![
+            DriveConfig {
+                label: "WD-18TB".to_string(),
+                uuid: Some("aaaa-bbbb".to_string()),
+                mount_path: PathBuf::from("/mnt/wd"),
+                snapshot_root: ".snapshots".to_string(),
+                role: DriveRole::Primary,
+                max_usage_percent: None,
+                min_free_bytes: None,
+            },
+            DriveConfig {
+                label: "WD-18TB1".to_string(),
+                uuid: None, // cloned, no UUID configured
+                mount_path: PathBuf::from("/mnt/wd1"),
+                snapshot_root: ".snapshots".to_string(),
+                role: DriveRole::Primary,
+                max_usage_percent: None,
+                min_free_bytes: None,
+            },
+        ];
+
+        // Detected: WD-18TB1 has the same UUID as WD-18TB
+        let detected = vec![
+            ("WD-18TB1".to_string(), "aaaa-bbbb".to_string()),
+        ];
+
+        let results = filter_uuid_suggestions(&drives, detected);
+        assert!(results.is_empty(), "should suppress UUID already configured on WD-18TB");
+    }
+
+    #[test]
+    fn filter_uuid_suggestions_allows_unique_uuid() {
+        let drives = vec![
+            DriveConfig {
+                label: "WD-18TB".to_string(),
+                uuid: Some("aaaa-bbbb".to_string()),
+                mount_path: PathBuf::from("/mnt/wd"),
+                snapshot_root: ".snapshots".to_string(),
+                role: DriveRole::Primary,
+                max_usage_percent: None,
+                min_free_bytes: None,
+            },
+            DriveConfig {
+                label: "2TB-backup".to_string(),
+                uuid: None,
+                mount_path: PathBuf::from("/mnt/2tb"),
+                snapshot_root: ".snapshots".to_string(),
+                role: DriveRole::Primary,
+                max_usage_percent: None,
+                min_free_bytes: None,
+            },
+        ];
+
+        // Detected: 2TB-backup has a different UUID
+        let detected = vec![
+            ("2TB-backup".to_string(), "cccc-dddd".to_string()),
+        ];
+
+        let results = filter_uuid_suggestions(&drives, detected);
+        assert_eq!(results.len(), 1, "should allow unique UUID suggestion");
+        assert_eq!(results[0].0, "2TB-backup");
     }
 }
