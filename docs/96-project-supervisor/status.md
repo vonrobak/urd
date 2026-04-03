@@ -9,16 +9,17 @@
 
 **Urd is the sole backup system.** Systemd timer running nightly at 04:00 since 2026-03-25.
 Sentinel daemon deployed (passive monitoring, drive detection, backup overdue alerts).
-733 tests, all passing, clippy clean. Current version: v0.8.2.
+763 tests, all passing, clippy clean. Current version: v0.9.0.
 
-**Phase B complete (UPI 007 + 008).** Safety gate (chain-break full send) now reports
-`DEFERRED` instead of `FAILED`. Deferred-only runs report "success" in summary, heartbeat,
-and metrics. Doctor stale-pin message uses neutral language. UUID suggestions suppressed
-for cloned drives. PR #70 merged, v0.8.2 tagged.
+**Phase C complete (UPI 009 + 006).** `urd drives` subcommand lists configured drives
+with status, token state, free space, and role. `urd drives adopt <label>` resets a
+drive's token relationship. Sentinel emits reconnection notifications with token-aware
+dispatch (identity-suspect drives get "needs adoption" guidance). PR #72 merged, v0.9.0
+tagged and deployed.
 
 **Deployment notes:**
 - Systemd timer needs `--auto` added to `ExecStart` line (pending since v0.8.0)
-- After merging PR #70: `cargo install --path .` to deploy v0.8.2
+- v0.9.0 deployed via `cargo install --path .`
 
 ## In Progress
 
@@ -26,12 +27,13 @@ Nothing active.
 
 ## Next Up
 
-1. **Phase C: Give drives a face (v0.9.0)** — ~1-2 sessions total
-   - UPI 009: `urd drives` subcommand
-   - UPI 006: Drive reconnection notifications
-   - Designs: complete, ready for /prepare
-2. **Untracked docs commit** — 6 design docs, brainstorm, Steve reviews, test report
-   from the 2026-04-02 design session remain untracked. Commit as docs PR.
+1. **Phase D: Progressive disclosure + The Encounter** — ~6-8 sessions total
+   - 6-O: Progressive disclosure (~2 sessions)
+   - 6-H: The Encounter — auto-trigger onboarding, Fate Conversation, config generation (~4-6 sessions)
+   - Designs: 6-O has design doc; 6-H needs /design
+   - P6b (config Serialize refactor) is a prerequisite for 6-H config generation
+2. **P6a: ADR-110 enum rename** — deferred patch (recorded/sheltered/fortified)
+3. **P6b: Config Serialize refactor** — deferred patch, prerequisite for 6-H
 
 ## Key Links
 
