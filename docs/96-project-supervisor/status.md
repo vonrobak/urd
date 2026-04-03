@@ -9,17 +9,16 @@
 
 **Urd is the sole backup system.** Systemd timer running nightly at 04:00 since 2026-03-25.
 Sentinel daemon deployed (passive monitoring, drive detection, backup overdue alerts).
-725 tests, all passing, clippy clean. Current version: v0.8.1.
+733 tests, all passing, clippy clean. Current version: v0.8.2.
 
-**Phase A complete (UPI 004 + 005).** Token safety gate blocks sends to drives with
-missing identity tokens when SQLite has a stored record (cloned/swapped drive detection).
-assess() now respects per-subvolume `drives` scoping — fixes false degradation.
-Local-only subvolumes display as `[LOCAL]` instead of `[OFF] Disabled`.
-PR #68 shipped, v0.8.1 tagged.
+**Phase B complete (UPI 007 + 008).** Safety gate (chain-break full send) now reports
+`DEFERRED` instead of `FAILED`. Deferred-only runs report "success" in summary, heartbeat,
+and metrics. Doctor stale-pin message uses neutral language. UUID suggestions suppressed
+for cloned drives. PR #70 merged, v0.8.2 tagged.
 
 **Deployment notes:**
 - Systemd timer needs `--auto` added to `ExecStart` line (pending since v0.8.0)
-- After merging PR #68: `cargo install --path .` to deploy v0.8.1
+- After merging PR #70: `cargo install --path .` to deploy v0.8.2
 
 ## In Progress
 
@@ -27,14 +26,11 @@ Nothing active.
 
 ## Next Up
 
-1. **Phase B: Make communication honest (v0.8.2)** — ~0.75 session total
-   - UPI 007: Safety gate communication (`[DEFERRED]` replaces `[FAILED]`)
-   - UPI 008: Doctor pin-age correlation (fix contradictory UUID advice)
-   - Designs: grill-me complete, ready for /prepare
-2. **Phase C: Give drives a face (v0.9.0)** — ~1-2 sessions total
+1. **Phase C: Give drives a face (v0.9.0)** — ~1-2 sessions total
    - UPI 009: `urd drives` subcommand
    - UPI 006: Drive reconnection notifications
-3. **Untracked docs commit** — 6 design docs, brainstorm, Steve reviews, test report
+   - Designs: complete, ready for /prepare
+2. **Untracked docs commit** — 6 design docs, brainstorm, Steve reviews, test report
    from the 2026-04-02 design session remain untracked. Commit as docs PR.
 
 ## Key Links
