@@ -716,7 +716,16 @@ fn render_operational_fields(
     }
 
     // local_retention
-    if let Some(ref lr) = sv.local_retention {
+    if let Some(ref lr) = sv.local_retention
+        && !is_transient_retention(lr)
+        && let Some(p) = derived
+    {
+        // User had a partial override on a named level — merge with derived policy
+        // so all four fields are explicit. Without this, missing fields would inherit
+        // from v1's synthesized defaults (different from the derived level's values).
+        let merged = merge_retention_with_derived(lr, &p.local_retention);
+        render_resolved_retention(out, "local_retention", &merged);
+    } else if let Some(ref lr) = sv.local_retention {
         render_retention_field(out, "local_retention", lr);
     } else if let Some(p) = derived {
         out.push_str(&format!("# from {} level\n", derived_level_name(sv)));
@@ -729,7 +738,13 @@ fn render_operational_fields(
     }
 
     // external_retention
-    if let Some(ref er) = sv.external_retention {
+    if let Some(ref er) = sv.external_retention
+        && let Some(p) = derived
+    {
+        // Same merge logic for external_retention overrides on named levels.
+        let merged = merge_retention_with_derived(er, &p.external_retention);
+        render_resolved_retention(out, "external_retention", &merged);
+    } else if let Some(ref er) = sv.external_retention {
         render_retention_field(out, "external_retention", er);
     } else if let Some(p) = derived {
         out.push_str(&format!("# from {} level\n", derived_level_name(sv)));
@@ -739,6 +754,27 @@ fn render_operational_fields(
     {
         out.push_str("# inherited from [defaults]\n");
         render_retention_field(out, "external_retention", er);
+    }
+}
+
+/// Merge a user's partial retention override (raw TOML) with the derived policy's
+/// resolved retention. User-specified fields win; missing fields fall back to derived.
+fn merge_retention_with_derived(
+    user_override: &toml::Value,
+    derived: &crate::types::ResolvedGraduatedRetention,
+) -> crate::types::ResolvedGraduatedRetention {
+    let table = match user_override.as_table() {
+        Some(t) => t,
+        None => return *derived, // transient or unexpected — passthrough
+    };
+    fn get_u32(t: &toml::map::Map<String, toml::Value>, key: &str) -> Option<u32> {
+        t.get(key).and_then(|v| v.as_integer()).map(|i| i as u32)
+    }
+    crate::types::ResolvedGraduatedRetention {
+        hourly: get_u32(table, "hourly").unwrap_or(derived.hourly),
+        daily: get_u32(table, "daily").unwrap_or(derived.daily),
+        weekly: get_u32(table, "weekly").unwrap_or(derived.weekly),
+        monthly: get_u32(table, "monthly").unwrap_or(derived.monthly),
     }
 }
 
@@ -753,15 +789,15 @@ fn render_resolved_retention(
     field: &str,
     ret: &crate::types::ResolvedGraduatedRetention,
 ) {
-    let mut parts = Vec::new();
-    if ret.hourly > 0 {
-        parts.push(format!("hourly = {}", ret.hourly));
-    }
-    parts.push(format!("daily = {}", ret.daily));
-    if ret.weekly > 0 {
-        parts.push(format!("weekly = {}", ret.weekly));
-    }
-    parts.push(format!("monthly = {}", ret.monthly));
+    // Always emit all four fields explicitly. In v1 custom subvolumes, missing
+    // fields merge with synthesized defaults (hourly=24, weekly=26), so omitting
+    // e.g. hourly=0 would silently inherit a non-zero value.
+    let parts = [
+        format!("hourly = {}", ret.hourly),
+        format!("daily = {}", ret.daily),
+        format!("weekly = {}", ret.weekly),
+        format!("monthly = {}", ret.monthly),
+    ];
     out.push_str(&format!("{field} = {{ {} }}\n", parts.join(", ")));
 }
 
@@ -1256,6 +1292,69 @@ snapshot_interval = "1w"
             assert_eq!(l.external_retention, v.external_retention,
                 "{}: external_retention", l.name);
         }
+    }
+
+    #[test]
+    fn migrate_partial_retention_override_bakes_all_fields() {
+        // Regression: a subvolume with a named level and partial local_retention
+        // override (e.g., { daily = 7 } on recorded) must bake ALL four retention
+        // fields. Without this, missing fields (hourly, monthly) would inherit from
+        // v1's synthesized defaults instead of the derived level's values.
+        let toml = r#"
+[general]
+state_db = "~/.local/share/urd/urd.db"
+metrics_file = "~/m.prom"
+log_dir = "~/logs"
+run_frequency = "daily"
+
+[local_snapshots]
+roots = [{ path = "/snap", subvolumes = ["cache"], min_free_bytes = "10GB" }]
+
+[defaults]
+snapshot_interval = "1d"
+send_interval = "1d"
+[defaults.local_retention]
+daily = 7
+[defaults.external_retention]
+daily = 7
+
+[[drives]]
+label = "D"
+mount_path = "/mnt/d"
+snapshot_root = ".snap"
+role = "primary"
+
+[[subvolumes]]
+name = "cache"
+short_name = "cache"
+source = "/cache"
+protection_level = "guarded"
+local_retention = { daily = 7 }
+"#;
+        // Legacy resolves: merge { daily = 7 } with derive_policy(Recorded, Daily)
+        // → { hourly: 0, daily: 7, weekly: 4, monthly: 0 }
+        let legacy_config = crate::config::Config::from_str(toml)
+            .expect("legacy config should parse");
+        let legacy_resolved = legacy_config.resolved_subvolumes();
+        let legacy_cache = legacy_resolved.iter().find(|s| s.name == "cache").unwrap();
+        let legacy_lr = legacy_cache.local_retention.as_graduated().unwrap();
+        assert_eq!(legacy_lr.weekly, 4, "legacy should merge weekly from derived");
+        assert_eq!(legacy_lr.hourly, 0, "legacy should merge hourly from derived");
+
+        // Migrate and check v1 resolves identically
+        let legacy: LegacyConfig = toml::from_str(toml).unwrap();
+        let v1_toml = render_v1(&legacy);
+
+        let v1_config = crate::config::Config::from_str(&v1_toml)
+            .expect("v1 config should parse");
+        let v1_resolved = v1_config.resolved_subvolumes();
+        let v1_cache = v1_resolved.iter().find(|s| s.name == "cache").unwrap();
+
+        assert_eq!(legacy_cache.local_retention, v1_cache.local_retention,
+            "local_retention must match after migration. Legacy: {:?}, V1: {:?}",
+            legacy_cache.local_retention, v1_cache.local_retention);
+        assert_eq!(legacy_cache.external_retention, v1_cache.external_retention,
+            "external_retention must match after migration");
     }
 
     #[test]
