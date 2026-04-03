@@ -2743,9 +2743,9 @@ mod tests {
         colored::control::set_override(false);
         let mut data = test_status_output();
         // Set a promise level but all statuses are PROTECTED — no conflict
-        data.assessments[0].promise_level = Some("protected".to_string());
+        data.assessments[0].promise_level = Some("sheltered".to_string());
         data.assessments[1].status = "PROTECTED".to_string();
-        data.assessments[1].promise_level = Some("resilient".to_string());
+        data.assessments[1].promise_level = Some("fortified".to_string());
         let output = render_status(&data, OutputMode::Interactive);
         assert!(
             !output.contains("PROTECTION"),

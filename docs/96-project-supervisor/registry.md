@@ -8,7 +8,7 @@
 | 012 | Sentinel drive-gated transient + space monitoring | [design](../95-ideas/2026-04-03-design-012-sentinel-drive-gated-transient.md) | - | - | - | - |
 | 011 | Transient space safety (emergency fix) | [design](../95-ideas/2026-04-03-design-011-transient-space-safety.md) | [steve](../99-reports/2026-04-03-steve-jobs-011-transient-is-a-lie.md) | - | - | - |
 | 010-a | Transient as first-class config concept | [design](../95-ideas/2026-04-03-design-010a-transient-as-first-class-config.md) | - | - | - | - |
-| 010 | Config Schema v1 (ADR-111 revision) | [design](../95-ideas/2026-04-03-design-010-config-schema-v1.md) | - | [adversary](../99-reports/2026-04-03-design-review-010-config-schema-v1.md) | - | - |
+| 010 | Config Schema v1 (ADR-111 revision) | [design](../95-ideas/2026-04-03-design-010-config-schema-v1.md) | - | [adversary](../99-reports/2026-04-03-design-review-010-config-schema-v1.md) | s1 merged | [#75](https://github.com/vonrobak/urd/pull/75) |
 | 009 | `urd drives` subcommand | [design](../95-ideas/2026-04-02-design-009-urd-drives-subcommand.md) | - | [adversary](../99-reports/2026-04-03-design-review-009-006-phase-c-drives.md) | merged | [#72](https://github.com/vonrobak/urd/pull/72) |
 | 008 | Doctor pin-age correlation | [design](../95-ideas/2026-04-02-design-008-doctor-pin-age-correlation.md) | - | [adversary](../99-reports/2026-04-03-design-review-007-008-phase-b-communication.md) | merged | [#70](https://github.com/vonrobak/urd/pull/70) |
 | 007 | Safety gate communication | [design](../95-ideas/2026-04-02-design-007-safety-gate-communication.md) | - | [adversary](../99-reports/2026-04-03-design-review-007-008-phase-b-communication.md) | merged | [#70](https://github.com/vonrobak/urd/pull/70) |

@@ -706,12 +706,12 @@ fn compute_health(
 
 // ── Offsite freshness overlay ──────────────────────────────────────────
 
-/// Offsite freshness thresholds for resilient subvolumes.
+/// Offsite freshness thresholds for fortified subvolumes.
 /// These are fixed (not user-configurable) per ADR-110 addendum.
 const OFFSITE_AT_RISK_DAYS: i64 = 30;
 const OFFSITE_UNPROTECTED_DAYS: i64 = 90;
 
-/// Post-processing overlay: degrade resilient subvolumes with stale offsite copies.
+/// Post-processing overlay: degrade fortified subvolumes with stale offsite copies.
 ///
 /// This is NOT part of `assess()` — awareness remains protection-level-blind per
 /// ADR-110 Invariant 6. Call this after `assess()` returns.
@@ -726,7 +726,7 @@ pub fn overlay_offsite_freshness(assessments: &mut [SubvolAssessment], config: &
             .find(|s| s.name == assessment.name)
             .and_then(|s| s.protection_level);
 
-        if protection_level != Some(ProtectionLevel::Resilient) {
+        if protection_level != Some(ProtectionLevel::Fortified) {
             continue;
         }
 
@@ -735,7 +735,7 @@ pub fn overlay_offsite_freshness(assessments: &mut [SubvolAssessment], config: &
             assessment.status = offsite_freshness;
             assessment
                 .advisories
-                .push("offsite copy stale — resilient promise degraded".to_string());
+                .push("offsite copy stale — fortified promise degraded".to_string());
         }
     }
 }
@@ -795,9 +795,9 @@ pub fn compute_redundancy_advisories(
         let protection_level = subvol.protection_level;
 
         // ── NoOffsiteProtection ────────────────────────────────────────
-        // Resilient subvolume where none of its effective drives has offsite role.
+        // Fortified subvolume where none of its effective drives has offsite role.
         // Per-subvolume check: respects drive scoping via `drives = [...]` in config.
-        if protection_level == Some(ProtectionLevel::Resilient) && subvol.send_enabled {
+        if protection_level == Some(ProtectionLevel::Fortified) && subvol.send_enabled {
             let has_offsite = match &subvol.drives {
                 Some(drive_list) => drive_list.iter().any(|label| {
                     config
@@ -855,10 +855,10 @@ pub fn compute_redundancy_advisories(
         }
 
         // ── SinglePointOfFailure ────────────────────────────────────────
-        // Protected or resilient subvolume with exactly 1 non-test drive.
+        // Sheltered or fortified subvolume with exactly 1 non-test drive.
         if matches!(
             protection_level,
-            Some(ProtectionLevel::Protected) | Some(ProtectionLevel::Resilient)
+            Some(ProtectionLevel::Sheltered) | Some(ProtectionLevel::Fortified)
         ) && subvol.send_enabled
         {
             let mut non_test_drives = effective_drives
@@ -2786,7 +2786,7 @@ send_enabled = false
 
     // ── Offsite freshness overlay tests ─────────────────────────────
 
-    fn resilient_config() -> Config {
+    fn fortified_config() -> Config {
         let toml_str = r#"
 [general]
 state_db = "/tmp/urd.db"
@@ -2885,7 +2885,7 @@ drives = ["primary-drive", "offsite-drive"]
 
     #[test]
     fn overlay_fresh_offsite_stays_protected() {
-        let config = resilient_config();
+        let config = fortified_config();
         let drives = vec![primary_drive_assessment(), offsite_drive_assessment(Some(10))];
         let mut assessments = vec![make_assessment("sv1", PromiseStatus::Protected, drives)];
 
@@ -2897,7 +2897,7 @@ drives = ["primary-drive", "offsite-drive"]
 
     #[test]
     fn overlay_stale_offsite_degrades_to_at_risk() {
-        let config = resilient_config();
+        let config = fortified_config();
         let drives = vec![primary_drive_assessment(), offsite_drive_assessment(Some(31))];
         let mut assessments = vec![make_assessment("sv1", PromiseStatus::Protected, drives)];
 
@@ -2909,7 +2909,7 @@ drives = ["primary-drive", "offsite-drive"]
 
     #[test]
     fn overlay_very_stale_offsite_degrades_to_unprotected() {
-        let config = resilient_config();
+        let config = fortified_config();
         let drives = vec![primary_drive_assessment(), offsite_drive_assessment(Some(91))];
         let mut assessments = vec![make_assessment("sv1", PromiseStatus::Protected, drives)];
 
@@ -2920,7 +2920,7 @@ drives = ["primary-drive", "offsite-drive"]
 
     #[test]
     fn overlay_no_offsite_send_is_unprotected() {
-        let config = resilient_config();
+        let config = fortified_config();
         let drives = vec![primary_drive_assessment(), offsite_drive_assessment(None)];
         let mut assessments = vec![make_assessment("sv1", PromiseStatus::Protected, drives)];
 
@@ -2930,7 +2930,7 @@ drives = ["primary-drive", "offsite-drive"]
     }
 
     #[test]
-    fn overlay_skips_non_resilient() {
+    fn overlay_skips_non_fortified() {
         // Use the base test_config() which has no protection_level set
         let config = test_config();
         let drives = vec![DriveAssessment {
@@ -2946,7 +2946,7 @@ drives = ["primary-drive", "offsite-drive"]
 
         overlay_offsite_freshness(&mut assessments, &config);
 
-        // Should remain Protected — not resilient, so overlay doesn't apply
+        // Should remain Protected — not fortified, so overlay doesn't apply
         assert_eq!(assessments[0].status, PromiseStatus::Protected);
         assert!(assessments[0].advisories.is_empty());
     }
@@ -2955,7 +2955,7 @@ drives = ["primary-drive", "offsite-drive"]
     fn overlay_independent_of_primary_status() {
         // Primary drive is AT RISK, offsite is fresh — overall should be AT RISK
         // (independent constraints, minimum wins)
-        let config = resilient_config();
+        let config = fortified_config();
         let mut primary = primary_drive_assessment();
         primary.status = PromiseStatus::AtRisk;
         let drives = vec![primary, offsite_drive_assessment(Some(5))];
@@ -2970,7 +2970,7 @@ drives = ["primary-drive", "offsite-drive"]
 
     #[test]
     fn overlay_two_offsite_drives_best_wins() {
-        let config = resilient_config();
+        let config = fortified_config();
         let stale_offsite = DriveAssessment {
             drive_label: "offsite-old".to_string(),
             status: PromiseStatus::AtRisk,
@@ -2992,7 +2992,7 @@ drives = ["primary-drive", "offsite-drive"]
 
     #[test]
     fn overlay_boundary_30_days_is_protected() {
-        let config = resilient_config();
+        let config = fortified_config();
         let drives = vec![primary_drive_assessment(), offsite_drive_assessment(Some(30))];
         let mut assessments = vec![make_assessment("sv1", PromiseStatus::Protected, drives)];
 
@@ -3005,7 +3005,7 @@ drives = ["primary-drive", "offsite-drive"]
     fn overlay_already_unprotected_no_redundant_advisory() {
         // If the subvolume is already Unprotected (e.g., local snapshots stale),
         // the overlay should not add its advisory — Unprotected < Unprotected is false.
-        let config = resilient_config();
+        let config = fortified_config();
         let drives = vec![primary_drive_assessment(), offsite_drive_assessment(Some(91))];
         let mut assessments =
             vec![make_assessment("sv1", PromiseStatus::Unprotected, drives)];
@@ -3023,7 +3023,7 @@ drives = ["primary-drive", "offsite-drive"]
     fn overlay_equal_status_no_change() {
         // If offsite freshness matches current status, overlay should not update or add advisory.
         // Offsite at 31 days = AtRisk; assessment already AtRisk.
-        let config = resilient_config();
+        let config = fortified_config();
         let drives = vec![primary_drive_assessment(), offsite_drive_assessment(Some(31))];
         let mut assessments = vec![make_assessment("sv1", PromiseStatus::AtRisk, drives)];
 
@@ -3038,8 +3038,8 @@ drives = ["primary-drive", "offsite-drive"]
 
     // ── Redundancy advisory tests ──────────────────────────────────────
 
-    /// Config with resilient subvolume but only primary drives (no offsite).
-    fn resilient_no_offsite_config() -> Config {
+    /// Config with fortified subvolume but only primary drives (no offsite).
+    fn fortified_no_offsite_config() -> Config {
         let toml_str = r#"
 [general]
 state_db = "/tmp/urd.db"
@@ -3089,10 +3089,10 @@ drives = ["drive-a", "drive-b"]
     }
 
     #[test]
-    fn redundancy_no_offsite_for_resilient() {
+    fn redundancy_no_offsite_for_fortified() {
         use crate::output::RedundancyAdvisoryKind;
 
-        let config = resilient_no_offsite_config();
+        let config = fortified_no_offsite_config();
         let now = dt(2026, 4, 1, 12, 0);
         let mut fs = MockFileSystemState::new();
         fs.local_snapshots
@@ -3156,7 +3156,7 @@ drives = ["drive-a", "drive-b"]
 
     #[test]
     fn redundancy_no_advisory_when_offsite_exists() {
-        let config = resilient_config();
+        let config = fortified_config();
         let now = dt(2026, 4, 1, 12, 0);
         let mut fs = MockFileSystemState::new();
         fs.local_snapshots
@@ -3173,7 +3173,7 @@ drives = ["drive-a", "drive-b"]
     }
 
     /// Config with protected subvolume and exactly 1 drive.
-    fn protected_single_drive_config() -> Config {
+    fn sheltered_single_drive_config() -> Config {
         let toml_str = r#"
 [general]
 state_db = "/tmp/urd.db"
@@ -3219,7 +3219,7 @@ protection_level = "protected"
     fn redundancy_single_point_of_failure() {
         use crate::output::RedundancyAdvisoryKind;
 
-        let config = protected_single_drive_config();
+        let config = sheltered_single_drive_config();
         let now = dt(2026, 4, 1, 12, 0);
         let mut fs = MockFileSystemState::new();
         fs.local_snapshots
@@ -3241,7 +3241,7 @@ protection_level = "protected"
 
     #[test]
     fn redundancy_no_spof_with_two_drives() {
-        let config = resilient_no_offsite_config(); // 2 primary drives
+        let config = fortified_no_offsite_config(); // 2 primary drives
         let now = dt(2026, 4, 1, 12, 0);
         let mut fs = MockFileSystemState::new();
         fs.local_snapshots
@@ -3262,8 +3262,8 @@ protection_level = "protected"
     }
 
     #[test]
-    fn redundancy_guarded_subvolumes_excluded() {
-        // Guarded subvolumes have send_enabled=false, so all advisory checks
+    fn redundancy_recorded_subvolumes_excluded() {
+        // Recorded subvolumes have send_enabled=false, so all advisory checks
         // gate on send_enabled and naturally exclude them. Verify this invariant.
         let toml_str = r#"
 [general]

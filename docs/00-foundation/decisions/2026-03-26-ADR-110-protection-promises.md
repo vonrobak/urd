@@ -3,11 +3,11 @@
 > **TL;DR:** Protection promises are named levels that map to concrete operational policies.
 > The user declares intent; Urd derives operations. Named levels are opaque — no per-field
 > overrides. `Custom` means the user manages all parameters explicitly. Named levels must
-> earn opaque status through operational track record; the current taxonomy
-> (guarded/protected/resilient) is provisional and subject to rework.
+> earn opaque status through operational track record. Current taxonomy:
+> recorded/sheltered/fortified (renamed 2026-04-03 from guarded/protected/resilient).
 
-**Date:** 2026-03-26 (revised 2026-03-27, addendum 2026-03-31)
-**Status:** Accepted (taxonomy provisional — see Maturity Model)
+**Date:** 2026-03-26 (revised 2026-03-27, addendum 2026-03-31, vocabulary 2026-04-03)
+**Status:** Accepted (taxonomy renamed 2026-04-03 — see Maturity Model)
 **Depends on:** ADR-100 (planner/executor separation), ADR-108 (pure function modules),
 ADR-109 (config boundary validation), ADR-111 (config system architecture)
 **Ownership:** This ADR is authoritative for protection promise *semantics* — what levels
@@ -31,9 +31,14 @@ Protection promises bridge this gap: the user declares what they want; Urd deriv
 
 A subsequent design review (2026-03-27) found that the original override semantics
 (voiding/weakening overrides on named levels) created contradictory configs and noisy
-preflight warnings. The review also found the current three-level taxonomy insufficiently
-mature — "guarded" vs "protected" are near-synonyms that don't communicate the operational
+preflight warnings. The review also found the original three-level taxonomy insufficiently
+mature — "guarded" vs "protected" were near-synonyms that didn't communicate the operational
 axis (local-only vs external copies). These findings led to the revised design below.
+
+A vocabulary session (2026-04-03) renamed the levels to communicate the operational axis:
+recorded (data is recorded locally), sheltered (data is sheltered on external drive),
+fortified (data is fortified across geography). The names describe what the data *becomes*,
+not the mechanism.
 
 ## Decision
 
@@ -54,31 +59,26 @@ distinction, and preflight warnings from intentional deviations.
 No code path treats it as lesser. It is the appropriate — and currently recommended —
 choice when named levels haven't earned their keep through operational evidence.
 
-### Current taxonomy (provisional)
+### Current taxonomy
 
 The current named levels are:
 
 ```rust
 pub enum ProtectionLevel {
-    Guarded,    // Local snapshots only. For: temp data, caches, build artifacts.
-    Protected,  // Local + at least one external drive current. For: documents, photos.
-    Resilient,  // Local + multiple external drives current. For: irreplaceable data.
+    Recorded,   // Local snapshots only. For: temp data, caches, build artifacts.
+    Sheltered,  // Local + at least one external drive current. For: documents, photos.
+    Fortified,  // Local + multiple external drives + offsite. For: irreplaceable data.
     Custom,     // User manages all parameters manually.
 }
 ```
 
-**This taxonomy is provisional.** The design review identified that:
+The names communicate the operational axis — what the data *becomes*:
+- **Recorded:** data is recorded in history (local snapshots exist on this machine)
+- **Sheltered:** data is sheltered from hardware failure (survives drive loss)
+- **Fortified:** data is fortified against site loss (survives fire, theft, flood)
 
-- "Guarded" and "protected" are near-synonyms that don't communicate the actual
-  operational difference (local-only vs external copies).
-- "Protected" and "resilient" are operationally identical except for `min_external_drives`.
-  This may be insufficient to justify two distinct opaque levels.
-- Level names should communicate operational meaning to the user — the naming axis should
-  make the promise legible without reading documentation.
-
-The taxonomy will be reworked in a future design session once more operational experience
-exists. Until then, `custom` with explicit parameters is the recommended approach for
-production configs.
+Until named levels earn opaque status through operational evidence (see Maturity Model),
+`custom` with explicit parameters remains the recommended approach for production configs.
 
 ### Outcome targets per level
 
@@ -87,9 +87,9 @@ frequencies. These targets are primary policy, defensible independent of awarene
 
 | Level | Local max age | External max age | Min external drives | Retention floor |
 |-------|--------------|------------------|--------------------|-----------------------|
-| `guarded` | 48h | — (no external) | 0 | daily=7, weekly=4 |
-| `protected` | 24h | 48h | 1 | daily=30, weekly=26, monthly=12 |
-| `resilient` | 24h | 48h | 2 | daily=30, weekly=26, monthly=12 |
+| `recorded` | 48h | — (no external) | 0 | daily=7, weekly=4 |
+| `sheltered` | 24h | 48h | 1 | daily=30, weekly=26, monthly=12 |
+| `fortified` | 24h | 48h | 2 | daily=30, weekly=26, monthly=12 |
 | `custom` | (from config) | (from config) | (from config) | (from config) |
 
 ### Pure derivation function
@@ -121,7 +121,7 @@ contains only identity and the level itself:
 name = "subvol3-opptak"
 source = "/mnt/btrfs-pool/subvol3-opptak"
 snapshot_root = "/mnt/btrfs-pool/.snapshots"
-protection_level = "resilient"
+protection_level = "fortified"
 drives = ["WD-18TB", "WD-18TB1"]
 ```
 
@@ -156,7 +156,7 @@ A promise is achievable if the derived policy can be fulfilled given run frequen
 topology, and retention alignment. Achievability has two tiers:
 
 **Structural unachievability (hard error — refuse to start):** The config makes it
-impossible to fulfill the promise. Examples: a `resilient` subvolume with only 1 drive
+impossible to fulfill the promise. Examples: a `fortified` subvolume with only 1 drive
 in its `drives` list (needs 2), or a named level with `drives` omitted when the level
 requires external sends. These are authoring mistakes, not runtime conditions — the
 config is wrong. Caught by `Config::validate()` (ADR-109, ADR-111).
@@ -242,20 +242,20 @@ desk.
 
 ## Addendum: Offsite Freshness Contract (2026-03-31)
 
-**Context:** Design 6-E (Promise Redundancy Encoding) makes the resilient level's geographic
+**Context:** Design 6-E (Promise Redundancy Encoding) makes the fortified level's geographic
 requirement explicit. This addendum documents the offsite freshness contract and confirms
 that it preserves the invariants above.
 
-### Resilient requires offsite
+### Fortified requires offsite
 
-The resilient level encodes geographic redundancy: at least one configured drive must have
-`role = "offsite"`. A resilient subvolume with no offsite-role drive triggers a preflight
-advisory (`resilient-without-offsite`). This is an achievability gap, not a structural
+The fortified level encodes geographic redundancy: at least one configured drive must have
+`role = "offsite"`. A fortified subvolume with no offsite-role drive triggers a preflight
+advisory (`fortified-without-offsite`). This is an achievability gap, not a structural
 error — backups proceed but the promise cannot be fully met (ADR-109).
 
 ### Offsite freshness thresholds
 
-For resilient subvolumes, the newest successful send to any offsite-role drive determines
+For fortified subvolumes, the newest successful send to any offsite-role drive determines
 an offsite freshness status:
 
 | Offsite age (days) | Offsite freshness status |
@@ -268,8 +268,8 @@ The overall subvolume status is `min(local_status, best_external_status, offsite
 Offsite freshness is an additional constraint — it does not replace per-drive freshness
 assessment.
 
-These thresholds define what "resilient" means operationally: **monthly-or-better offsite
-rotation.** Users with longer rotation cycles must use `protection_level = "custom"`.
+These thresholds define what "fortified" means operationally: **monthly-or-better offsite
+rotation.** Users with longer rotation cycles must use custom protection.
 The thresholds are fixed (not user-configurable), consistent with the opacity principle
 for named levels.
 
@@ -286,9 +286,9 @@ additional constraint based on protection level.
 
 ### Scope
 
-- Only resilient subvolumes are affected. Protected, guarded, and custom are unchanged.
+- Only fortified subvolumes are affected. Sheltered, recorded, and custom are unchanged.
 - The existing 7-day "consider cycling" advisory is replaced by structured offsite freshness
-  degradation for resilient subvolumes. Protected subvolumes keep the existing advisory.
+  degradation for fortified subvolumes. Sheltered subvolumes keep the existing advisory.
 - See Design 6-E (`docs/95-ideas/2026-03-31-design-e-promise-redundancy-encoding.md`) for
   full rationale and review findings.
 
@@ -296,14 +296,14 @@ additional constraint based on protection level.
 
 This ADR is considered implemented when:
 
-- [ ] `ProtectionLevel` enum and `derive_policy()` exist in `types.rs`
-- [ ] `protection_level`, `drives`, `run_frequency` config fields are parsed and validated
-- [ ] Config validation rejects operational fields alongside named protection levels
-- [ ] `resolve_subvolume()` branches on protection level with custom fallthrough
-- [ ] Achievability preflight checks are active
-- [ ] `--confirm-retention-change` flag gates retention tightening
-- [ ] `urd status` shows promise level column
-- [ ] Pin-protection safety tests pass with derived retention
+- [x] `ProtectionLevel` enum and `derive_policy()` exist in `types.rs`
+- [x] `protection_level`, `drives`, `run_frequency` config fields are parsed and validated
+- [ ] Config validation rejects operational fields alongside named protection levels (v1 schema, ADR-111)
+- [x] `resolve_subvolume()` branches on protection level with custom fallthrough
+- [x] Achievability preflight checks are active
+- [x] `--confirm-retention-change` flag gates retention tightening
+- [x] `urd status` shows promise level column
+- [x] Pin-protection safety tests pass with derived retention
 
 ## Related
 

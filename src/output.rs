@@ -163,7 +163,7 @@ pub struct StatusAssessment {
     /// Reasons for non-healthy operational health (empty when healthy).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub health_reasons: Vec<String>,
-    /// Promise level from config (e.g., "protected", "resilient"), or None for custom/unset.
+    /// Promise level from config (e.g., "sheltered", "fortified"), or None for custom/unset.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub promise_level: Option<String>,
     pub local_snapshot_count: usize,
