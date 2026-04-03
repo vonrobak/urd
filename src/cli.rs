@@ -37,6 +37,8 @@ pub enum Commands {
     Get(GetArgs),
     /// Sentinel — continuous health monitoring
     Sentinel(SentinelArgs),
+    /// Manage backup drives
+    Drives(DrivesArgs),
     /// Run health diagnostics
     Doctor(DoctorArgs),
     /// Preview retention policy consequences
@@ -84,6 +86,21 @@ pub enum SentinelCommands {
     Run,
     /// Show Sentinel status
     Status,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct DrivesArgs {
+    #[command(subcommand)]
+    pub action: Option<DrivesAction>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum DrivesAction {
+    /// Accept a drive into Urd's identity system
+    Adopt {
+        /// Drive label (as configured in urd.toml)
+        label: String,
+    },
 }
 
 #[derive(clap::Args, Debug)]
@@ -216,6 +233,28 @@ mod tests {
             matches!(cli.command, Some(Commands::Completions(_))),
             "should parse as Completions"
         );
+    }
+
+    #[test]
+    fn drives_bare_parses_to_list() {
+        let cli = Cli::try_parse_from(["urd", "drives"]).expect("drives should parse");
+        match cli.command {
+            Some(Commands::Drives(args)) => assert!(args.action.is_none()),
+            other => panic!("expected Drives, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drives_adopt_parses_label() {
+        let cli = Cli::try_parse_from(["urd", "drives", "adopt", "WD-18TB"])
+            .expect("drives adopt should parse");
+        match cli.command {
+            Some(Commands::Drives(args)) => match args.action {
+                Some(DrivesAction::Adopt { label }) => assert_eq!(label, "WD-18TB"),
+                other => panic!("expected Adopt, got {other:?}"),
+            },
+            other => panic!("expected Drives, got {other:?}"),
+        }
     }
 
     #[test]

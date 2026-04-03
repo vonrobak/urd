@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-04-03
+
+### Added
+- `urd drives` subcommand — list configured drives with status, token state, free space, and role
+- `urd drives adopt <label>` — accept a drive into Urd's identity system (reset token relationship)
+- Drive reconnection notifications via Sentinel — desktop alert when an absent drive returns
+- Identity-aware reconnection: drives with token issues get "needs adoption" notification instead of false "all clear"
+
+### Changed
+- TokenExpectedButMissing error messages now direct users to `urd drives adopt` instead of `urd doctor`
+
 ## [0.8.2] - 2026-04-03
 
 ### Fixed

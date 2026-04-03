@@ -556,6 +556,30 @@ impl StateDb {
         }
     }
 
+    /// Get the last_verified timestamp for a drive token.
+    /// Returns the ISO timestamp string, or None if no record exists.
+    pub fn get_drive_token_last_verified(
+        &self,
+        label: &str,
+    ) -> crate::error::Result<Option<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT last_verified FROM drive_tokens WHERE drive_label = ?1")
+            .map_err(|e| UrdError::State(format!("query failed: {e}")))?;
+
+        let mut rows = stmt
+            .query_map(rusqlite::params![label], |row| row.get(0))
+            .map_err(|e| UrdError::State(format!("query failed: {e}")))?;
+
+        match rows.next() {
+            Some(Ok(val)) => Ok(Some(val)),
+            Some(Err(e)) => Err(UrdError::State(format!(
+                "failed to read last_verified: {e}"
+            ))),
+            None => Ok(None),
+        }
+    }
+
     /// Update the last_verified timestamp for a drive token.
     pub fn touch_drive_token(&self, label: &str, now: &str) -> crate::error::Result<()> {
         self.conn
@@ -1353,6 +1377,26 @@ mod tests {
             )
             .unwrap();
         assert_eq!(last_verified, "2026-03-29T12:00:00");
+    }
+
+    #[test]
+    fn get_drive_token_last_verified_returns_timestamp() {
+        let db = StateDb::open_memory().unwrap();
+        db.store_drive_token("D1", "tok", "2026-03-29T10:00:00")
+            .unwrap();
+        db.touch_drive_token("D1", "2026-04-01T08:00:00").unwrap();
+
+        let result = db.get_drive_token_last_verified("D1").unwrap();
+        assert_eq!(result, Some("2026-04-01T08:00:00".to_string()));
+    }
+
+    #[test]
+    fn get_drive_token_last_verified_returns_none_for_unknown() {
+        let db = StateDb::open_memory().unwrap();
+        assert_eq!(
+            db.get_drive_token_last_verified("nonexistent").unwrap(),
+            None
+        );
     }
 
     // ── Drive connection tests ──────────────────────────────────────

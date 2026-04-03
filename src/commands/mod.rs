@@ -3,6 +3,7 @@ pub mod calibrate;
 pub mod completions;
 pub mod default;
 pub mod doctor;
+pub mod drives;
 pub mod get;
 pub mod history;
 pub mod init;

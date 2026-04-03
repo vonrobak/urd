@@ -50,6 +50,11 @@ pub enum SentinelAction {
         label: String,
         mounted: bool,
     },
+    /// Notify the user that a drive reconnected (runner checks token state
+    /// before dispatching — see sentinel_runner.rs execute_drive_reconnection_notification).
+    NotifyDriveReconnected {
+        label: String,
+    },
     /// Clean exit.
     Exit,
 }
@@ -344,6 +349,15 @@ pub fn sentinel_transition(
                     label: label.clone(),
                     mounted: true,
                 });
+                // Only notify reconnection after initial assessment (006-Q1).
+                // First boot discovers drives silently; subsequent absent→present
+                // transitions trigger notifications. Token-aware dispatch is handled
+                // by the runner (S1 fix) — the state machine stays pure.
+                if state.has_initial_assessment {
+                    actions.push(SentinelAction::NotifyDriveReconnected {
+                        label: label.clone(),
+                    });
+                }
                 actions.push(SentinelAction::Assess);
             }
             // Duplicate mount events are ignored (idempotent).
@@ -1783,5 +1797,102 @@ mod tests {
             make_assessment("sv2", PromiseStatus::Protected),
         ];
         assert!(has_health_changes(&prev, &curr));
+    }
+
+    // ── Drive reconnection notification ──────────────────────────────
+
+    #[test]
+    fn drive_mount_with_initial_assessment_emits_reconnection() {
+        let mut state = fresh_state();
+        state.has_initial_assessment = true;
+
+        let (new_state, actions) = sentinel_transition(
+            &state,
+            &SentinelEvent::DriveMounted {
+                label: "WD-18TB".to_string(),
+            },
+        );
+
+        assert!(new_state.mounted_drives.contains("WD-18TB"));
+        assert!(
+            actions.contains(&SentinelAction::NotifyDriveReconnected {
+                label: "WD-18TB".to_string(),
+            }),
+            "should emit NotifyDriveReconnected after initial assessment: {actions:?}"
+        );
+        assert!(
+            actions.contains(&SentinelAction::Assess),
+            "should still emit Assess: {actions:?}"
+        );
+    }
+
+    #[test]
+    fn drive_mount_without_initial_assessment_no_reconnection() {
+        let state = fresh_state(); // has_initial_assessment = false
+
+        let (_new_state, actions) = sentinel_transition(
+            &state,
+            &SentinelEvent::DriveMounted {
+                label: "WD-18TB".to_string(),
+            },
+        );
+
+        assert!(
+            !actions.iter().any(|a| matches!(
+                a,
+                SentinelAction::NotifyDriveReconnected { .. }
+            )),
+            "should NOT emit reconnection before initial assessment: {actions:?}"
+        );
+    }
+
+    #[test]
+    fn duplicate_drive_mount_no_actions() {
+        let mut state = fresh_state();
+        state.has_initial_assessment = true;
+        state.mounted_drives.insert("WD-18TB".to_string());
+
+        let (_new_state, actions) = sentinel_transition(
+            &state,
+            &SentinelEvent::DriveMounted {
+                label: "WD-18TB".to_string(),
+            },
+        );
+
+        assert!(
+            actions.is_empty(),
+            "duplicate mount should produce no actions: {actions:?}"
+        );
+    }
+
+    #[test]
+    fn unmount_then_remount_emits_reconnection() {
+        let mut state = fresh_state();
+        state.has_initial_assessment = true;
+        state.mounted_drives.insert("WD-18TB".to_string());
+
+        // Unmount
+        let (state_after_unmount, _) = sentinel_transition(
+            &state,
+            &SentinelEvent::DriveUnmounted {
+                label: "WD-18TB".to_string(),
+            },
+        );
+        assert!(!state_after_unmount.mounted_drives.contains("WD-18TB"));
+
+        // Remount
+        let (state_after_remount, actions) = sentinel_transition(
+            &state_after_unmount,
+            &SentinelEvent::DriveMounted {
+                label: "WD-18TB".to_string(),
+            },
+        );
+        assert!(state_after_remount.mounted_drives.contains("WD-18TB"));
+        assert!(
+            actions.contains(&SentinelAction::NotifyDriveReconnected {
+                label: "WD-18TB".to_string(),
+            }),
+            "remount should emit reconnection: {actions:?}"
+        );
     }
 }

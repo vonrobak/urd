@@ -8,7 +8,7 @@ use std::io::IsTerminal;
 use serde::{Deserialize, Serialize};
 
 use crate::awareness::{DriveAssessment, SubvolAssessment};
-use crate::types::DriveRole;
+use crate::types::{ByteSize, DriveRole};
 
 // ── OutputMode ──────────────────────────────────────────────────────────
 
@@ -1108,6 +1108,76 @@ pub enum SentinelStatusOutput {
     },
 }
 
+// ── DrivesListOutput ──────────────────────────────────────────────────
+
+/// Structured output for `urd drives`.
+#[derive(Debug, Serialize)]
+pub struct DrivesListOutput {
+    pub drives: Vec<DriveListEntry>,
+}
+
+/// A single drive entry in the drives list.
+#[derive(Debug, Serialize)]
+pub struct DriveListEntry {
+    pub label: String,
+    pub status: DriveStatus,
+    pub token_state: TokenState,
+    pub free_space: Option<ByteSize>,
+    pub role: DriveRole,
+}
+
+/// Drive mount/identity status for display.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum DriveStatus {
+    Connected,
+    UuidMismatch,
+    UuidCheckFailed,
+    Absent {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        last_seen: Option<String>,
+    },
+}
+
+/// Token verification state for display.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenState {
+    /// On-disk token matches SQLite record.
+    Verified,
+    /// No token file and no SQLite record (genuine first use).
+    New,
+    /// On-disk token differs from SQLite record.
+    Mismatch,
+    /// SQLite has a record but drive has no token file.
+    ExpectedButMissing,
+    /// Drive is unmounted but SQLite has a token record.
+    Recorded,
+    /// Token state cannot be determined (unmounted with no record, or DB unavailable).
+    Unknown,
+}
+
+// ── DriveAdoptOutput ──────────────────────────────────────────────────
+
+/// Structured output for `urd drives adopt`.
+#[derive(Debug, Serialize)]
+pub struct DriveAdoptOutput {
+    pub label: String,
+    pub action: AdoptAction,
+}
+
+/// What the adopt command did.
+#[derive(Debug, Serialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum AdoptAction {
+    /// Adopted an existing on-disk token into SQLite.
+    AdoptedExisting { token: String },
+    /// Generated a new token, wrote to drive and SQLite.
+    GeneratedNew { token: String },
+    /// On-disk token already matches SQLite — no action taken.
+    AlreadyCurrent,
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1329,7 +1399,7 @@ mod tests {
                 SkipCategory::Other,
             ),
             (
-                "drive WD-18TB token expected but missing \u{2014} possible drive swap",
+                "drive WD-18TB token expected but missing \u{2014} run `urd drives adopt WD-18TB`",
                 SkipCategory::Other,
             ),
             (
@@ -1538,5 +1608,67 @@ source = "/data/sv2"
             summary.disconnected_drives[0].role,
             crate::types::DriveRole::Offsite
         );
+    }
+
+    // ── Drives output types ───────────────────────────────────────────
+
+    #[test]
+    fn drive_list_entry_all_token_states() {
+        use crate::types::DriveRole;
+
+        let states = [
+            TokenState::Verified,
+            TokenState::New,
+            TokenState::Mismatch,
+            TokenState::ExpectedButMissing,
+            TokenState::Recorded,
+            TokenState::Unknown,
+        ];
+        for state in &states {
+            let entry = DriveListEntry {
+                label: "D1".to_string(),
+                status: DriveStatus::Connected,
+                token_state: state.clone(),
+                free_space: Some(ByteSize(1_000_000_000)),
+                role: DriveRole::Primary,
+            };
+            assert_eq!(entry.label, "D1");
+        }
+    }
+
+    #[test]
+    fn drive_adopt_output_serializes() {
+        let output = DriveAdoptOutput {
+            label: "WD-18TB".to_string(),
+            action: AdoptAction::GeneratedNew {
+                token: "abc-123".to_string(),
+            },
+        };
+        let json = serde_json::to_string(&output).unwrap();
+        assert!(json.contains("generated_new"));
+        assert!(json.contains("abc-123"));
+    }
+
+    #[test]
+    fn drive_status_variants() {
+        let connected = DriveStatus::Connected;
+        let mismatch = DriveStatus::UuidMismatch;
+        let failed = DriveStatus::UuidCheckFailed;
+        let absent = DriveStatus::Absent {
+            last_seen: Some("2026-03-29T10:00:00".to_string()),
+        };
+        let absent_no_history = DriveStatus::Absent { last_seen: None };
+
+        // Verify serialization
+        let json = serde_json::to_string(&connected).unwrap();
+        assert!(json.contains("connected"));
+        let json = serde_json::to_string(&mismatch).unwrap();
+        assert!(json.contains("uuid_mismatch"));
+        let json = serde_json::to_string(&failed).unwrap();
+        assert!(json.contains("uuid_check_failed"));
+        let json = serde_json::to_string(&absent).unwrap();
+        assert!(json.contains("last_seen"));
+        let json = serde_json::to_string(&absent_no_history).unwrap();
+        assert!(!json.contains("last_seen"));
     }
 }
