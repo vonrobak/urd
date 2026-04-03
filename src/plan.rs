@@ -127,17 +127,18 @@ pub fn plan(
         }
 
         // Resolve local snapshot directory
-        let Some(snapshot_root) = config.snapshot_root_for(&subvol.name) else {
-            return Err(UrdError::Config(format!(
-                "no snapshot root found for subvolume {:?}",
-                subvol.name
-            )));
+        let Some(ref snapshot_root) = subvol.snapshot_root else {
+            skipped.push((
+                subvol.name.clone(),
+                "no snapshot root configured".to_string(),
+            ));
+            continue;
         };
         let local_dir = snapshot_root.join(&subvol.name);
 
         // Get existing local snapshots
         let local_snaps = fs
-            .local_snapshots(&snapshot_root, &subvol.name)
+            .local_snapshots(snapshot_root, &subvol.name)
             .unwrap_or_default();
 
         // Get pinned snapshots
@@ -148,7 +149,7 @@ pub fn plan(
         // The executor relies on this ordering within each subvolume.
         // Do not reorder without updating the executor contract in PLAN.md.
         if !filters.external_only {
-            let min_free = config.root_min_free_bytes(&subvol.name).unwrap_or(0);
+            let min_free = subvol.min_free_bytes.unwrap_or(0);
             plan_local_snapshot(
                 subvol,
                 &local_dir,
@@ -162,7 +163,6 @@ pub fn plan(
                 &mut skipped,
             );
             plan_local_retention(
-                config,
                 subvol,
                 &local_dir,
                 &local_snaps,
@@ -354,7 +354,6 @@ fn plan_local_snapshot(
 
 #[allow(clippy::too_many_arguments)]
 fn plan_local_retention(
-    config: &Config,
     subvol: &ResolvedSubvolume,
     local_dir: &Path,
     local_snaps: &[SnapshotName],
@@ -410,7 +409,7 @@ fn plan_local_retention(
         }
         LocalRetentionPolicy::Graduated(retention_config) => {
             // Check space pressure
-            let min_free = config.root_min_free_bytes(&subvol.name).unwrap_or(0);
+            let min_free = subvol.min_free_bytes.unwrap_or(0);
             let free_bytes = fs.filesystem_free_bytes(local_dir).unwrap_or(u64::MAX);
             let space_pressure = min_free > 0 && free_bytes < min_free;
 

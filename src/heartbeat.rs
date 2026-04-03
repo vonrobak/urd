@@ -233,6 +233,7 @@ mod tests {
 
         Config {
             general: GeneralConfig {
+                config_version: None,
                 state_db: PathBuf::from("/tmp/test.db"),
                 metrics_file: PathBuf::from("/tmp/test.prom"),
                 log_dir: PathBuf::from("/tmp"),

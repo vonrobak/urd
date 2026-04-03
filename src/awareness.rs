@@ -195,7 +195,7 @@ pub fn assess(
             continue;
         }
 
-        let Some(snapshot_root) = config.snapshot_root_for(&subvol.name) else {
+        let Some(ref snapshot_root) = subvol.snapshot_root else {
             assessments.push(SubvolAssessment {
                 name: subvol.name.clone(),
                 status: PromiseStatus::Unprotected,
@@ -224,7 +224,7 @@ pub fn assess(
 
         // ── Local assessment ────────────────────────────────────────
         let mut advisories = Vec::new();
-        let local_snaps = match fs.local_snapshots(&snapshot_root, &subvol.name) {
+        let local_snaps = match fs.local_snapshots(snapshot_root, &subvol.name) {
             Ok(snaps) => snaps,
             Err(e) => {
                 errors.push(format!("failed to read local snapshots: {e}"));
@@ -320,8 +320,8 @@ pub fn assess(
 
         // ── Operational health ─────────────────────────────────────
         // Pre-compute local space pressure (needs config access not available in compute_health)
-        let local_space_tight = config
-            .root_min_free_bytes(&subvol.name)
+        let local_space_tight = subvol
+            .min_free_bytes
             .filter(|&min_free| min_free > 0)
             .and_then(|min_free| {
                 let local_dir = snapshot_root.join(&subvol.name);

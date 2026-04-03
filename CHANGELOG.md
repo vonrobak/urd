@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - Serialize support on all config types — enables `urd migrate` and config round-tripping
+- V1 config schema parser with `config_version = 1` dispatch — self-describing subvolumes, no `[defaults]`/`[local_snapshots]` sections
+- V1 validation: named protection levels reject operational overrides, enforce drive requirements
+- `snapshot_root` and `min_free_bytes` fields on `ResolvedSubvolume` — eliminates per-call Config lookups in planner and awareness
 
 ## [0.9.1] - 2026-04-03
 

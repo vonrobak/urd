@@ -322,6 +322,7 @@ mod tests {
     fn test_config(subvolumes: Vec<SubvolumeConfig>, drives: Vec<DriveConfig>) -> Config {
         Config {
             general: GeneralConfig {
+                config_version: None,
                 state_db: PathBuf::from("/tmp/urd-test.db"),
                 metrics_file: PathBuf::from("/tmp/urd-test.prom"),
                 log_dir: PathBuf::from("/tmp/urd-logs"),

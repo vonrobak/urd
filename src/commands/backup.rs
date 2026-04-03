@@ -1867,6 +1867,7 @@ mod tests {
 
         Config {
             general: GeneralConfig {
+                config_version: None,
                 state_db: dir.join("urd.db"),
                 metrics_file: dir.join("test.prom"),
                 log_dir: dir.to_path_buf(),
