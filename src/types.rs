@@ -497,7 +497,7 @@ impl GraduatedRetention {
 }
 
 /// Fully resolved graduated retention — no optional fields.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct ResolvedGraduatedRetention {
     pub hourly: u32,
     pub daily: u32,
@@ -569,6 +569,15 @@ pub enum LocalRetentionPolicy {
     Graduated(ResolvedGraduatedRetention),
     /// Transient: delete all local snapshots except pinned chain parents.
     Transient,
+}
+
+impl Serialize for LocalRetentionPolicy {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Transient => serializer.serialize_str("transient"),
+            Self::Graduated(g) => g.serialize(serializer),
+        }
+    }
 }
 
 impl LocalRetentionPolicy {

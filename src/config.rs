@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::UrdError;
 use crate::notify::NotificationConfig;
@@ -12,7 +12,7 @@ use crate::types::{
 
 // ── Top-level config ────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Config {
     pub general: GeneralConfig,
     pub local_snapshots: LocalSnapshotsConfig,
@@ -24,7 +24,7 @@ pub struct Config {
     pub notifications: NotificationConfig,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[allow(dead_code)]
 pub struct GeneralConfig {
     pub state_db: PathBuf,
@@ -52,12 +52,12 @@ fn default_heartbeat_path() -> PathBuf {
     PathBuf::from("~/.local/share/urd/heartbeat.json")
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct LocalSnapshotsConfig {
     pub roots: Vec<SnapshotRoot>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct SnapshotRoot {
     pub path: PathBuf,
     pub subvolumes: Vec<String>,
@@ -65,7 +65,7 @@ pub struct SnapshotRoot {
     pub min_free_bytes: Option<ByteSize>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[allow(dead_code)]
 pub struct DriveConfig {
     pub label: String,
@@ -80,7 +80,7 @@ pub struct DriveConfig {
     pub min_free_bytes: Option<ByteSize>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct DefaultsConfig {
     pub snapshot_interval: Interval,
     pub send_interval: Interval,
@@ -96,7 +96,7 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct SubvolumeConfig {
     pub name: String,
     pub short_name: String,
@@ -122,7 +122,7 @@ fn default_priority() -> u8 {
 // ── Resolved subvolume (all defaults filled in) ─────────────────────────
 
 /// A subvolume config with all optional fields resolved against defaults.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ResolvedSubvolume {
     pub name: String,
     pub short_name: String,
@@ -1318,5 +1318,102 @@ protection_level = "protected"
             config.subvolumes[0].resolved(&config.defaults, config.general.run_frequency);
         assert_eq!(resolved.snapshot_interval, Interval::hours(6));
         assert_eq!(resolved.send_interval, Interval::hours(6));
+    }
+
+    #[test]
+    fn serialize_round_trip_preserves_config() {
+        let config_str = r#"
+[general]
+state_db = "~/.local/share/urd/urd.db"
+metrics_file = "~/backup-metrics/backup.prom"
+log_dir = "~/backup-logs"
+
+[local_snapshots]
+roots = [
+  { path = "~/.snapshots", subvolumes = ["htpc-home"], min_free_bytes = "10GB" },
+  { path = "/mnt/pool/.snapshots", subvolumes = ["docs", "pics"] }
+]
+
+[defaults]
+snapshot_interval = "1d"
+send_interval = "1d"
+send_enabled = true
+enabled = true
+
+[defaults.local_retention]
+hourly = 24
+daily = 30
+weekly = 26
+monthly = 12
+
+[defaults.external_retention]
+daily = 30
+weekly = 26
+monthly = 0
+
+[[drives]]
+label = "WD-18TB"
+mount_path = "/run/media/user/WD-18TB"
+snapshot_root = ".snapshots"
+role = "primary"
+max_usage_percent = 90
+min_free_bytes = "500GB"
+
+[[subvolumes]]
+name = "htpc-home"
+short_name = "htpc-home"
+source = "/home"
+priority = 1
+protection_level = "fortified"
+drives = ["WD-18TB"]
+
+[[subvolumes]]
+name = "docs"
+short_name = "docs"
+source = "/mnt/pool/docs"
+priority = 2
+protection_level = "sheltered"
+
+[[subvolumes]]
+name = "pics"
+short_name = "pics"
+source = "/mnt/pool/pics"
+priority = 3
+snapshot_interval = "1h"
+send_interval = "2h"
+local_retention = "transient"
+"#;
+        let original: Config = toml::from_str(config_str).expect("parse original");
+        let serialized = toml::to_string(&original).expect("serialize");
+        let reparsed: Config = toml::from_str(&serialized).expect("parse serialized");
+
+        assert_eq!(original, reparsed);
+    }
+
+    #[test]
+    fn serialize_round_trip_example_config_file() {
+        let content = std::fs::read_to_string("config/urd.toml.example")
+            .expect("failed to read example config");
+        let original: Config = toml::from_str(&content).expect("parse original");
+        let serialized = toml::to_string(&original).expect("serialize");
+        let reparsed: Config = toml::from_str(&serialized).expect("parse serialized");
+
+        assert_eq!(original, reparsed);
+    }
+
+    #[test]
+    fn bytesize_serialization_round_trip() {
+        use crate::types::ByteSize;
+        let sizes = vec![
+            ("10GB", ByteSize(10_000_000_000)),
+            ("500GB", ByteSize(500_000_000_000)),
+            ("50GB", ByteSize(50_000_000_000)),
+            ("100MB", ByteSize(100_000_000)),
+        ];
+        for (label, original) in sizes {
+            let json = serde_json::to_string(&original).expect("serialize");
+            let reparsed: ByteSize = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(original, reparsed, "ByteSize round-trip failed for {label}");
+        }
     }
 }
