@@ -215,6 +215,7 @@ enum Change {
     RemovedShortName(usize),
     OmittedGeneralDefaults(usize),
     OverrideConverted(Vec<OverrideConversion>),
+    TransientToLocalSnapshots(usize),
 }
 
 struct OverrideConversion {
@@ -331,6 +332,18 @@ fn build_migration(legacy: &LegacyConfig) -> MigrationResult {
         changes.push(Change::OverrideConverted(conversions));
     }
 
+    // Count transient → local_snapshots = false on custom subvolumes
+    // (named + transient is already reported under OverrideConverted)
+    let transient_count = legacy.subvolumes.iter()
+        .filter(|sv| {
+            sv.local_retention.as_ref().is_some_and(is_transient_retention)
+                && sv.protection_level.as_ref().is_none_or(|l| l.to_lowercase() == "custom")
+        })
+        .count();
+    if transient_count > 0 {
+        changes.push(Change::TransientToLocalSnapshots(transient_count));
+    }
+
     MigrationResult { changes }
 }
 
@@ -392,6 +405,10 @@ fn get_derived_policy(level: &str, freq: Option<&str>) -> Option<DerivedPolicy> 
 
 /// Check if a subvolume's overrides are all no-ops (match derived values).
 fn overrides_are_noop(sv: &LegacySubvolume, policy: &DerivedPolicy) -> bool {
+    // Transient retention is never a no-op — it always forces custom in v1
+    if sv.local_retention.as_ref().is_some_and(is_transient_retention) {
+        return false;
+    }
     if let Some(ref si) = sv.snapshot_interval
         && si != &policy.snapshot_interval.to_string()
     {
@@ -473,7 +490,7 @@ fn has_operational_overrides(sv: &LegacySubvolume) -> bool {
         || sv.send_interval.is_some()
         || sv.send_enabled.is_some()
         || sv.external_retention.is_some()
-        || sv.local_retention.as_ref().is_some_and(|lr| !is_transient_retention(lr))
+        || sv.local_retention.is_some()
 }
 
 // ── Render v1 TOML ─────────────────────────────────────────────────────
@@ -581,6 +598,7 @@ fn render_subvolume(out: &mut String, sv: &LegacySubvolume, legacy: &LegacyConfi
     let freq = legacy.general.run_frequency.as_deref();
     let is_named_level = sv.protection_level.as_ref()
         .is_some_and(|l| l.to_lowercase() != "custom");
+    let is_transient = sv.local_retention.as_ref().is_some_and(is_transient_retention);
 
     // Determine if overrides actually change behavior vs. derived policy
     let (has_real_overrides, derived_policy) = if is_named_level && has_operational_overrides(sv) {
@@ -648,15 +666,12 @@ fn render_subvolume(out: &mut String, sv: &LegacySubvolume, legacy: &LegacyConfi
     // Operational fields — emit for custom subvolumes or converted overrides
     let emit_ops = sv.protection_level.is_none() || has_real_overrides;
     if emit_ops {
-        render_operational_fields(out, sv, legacy, derived_policy.as_ref());
+        render_operational_fields(out, sv, legacy, derived_policy.as_ref(), is_transient);
     }
 
-    // Transient local_retention on named levels is allowed in v1
-    if !emit_ops
-        && let Some(ref lr) = sv.local_retention
-        && is_transient_retention(lr)
-    {
-        out.push_str("local_retention = \"transient\"\n");
+    // local_snapshots = false replaces local_retention = "transient"
+    if is_transient {
+        out.push_str("local_snapshots = false\n");
     }
 
     out.push('\n');
@@ -672,6 +687,7 @@ fn render_operational_fields(
     sv: &LegacySubvolume,
     legacy: &LegacyConfig,
     derived: Option<&DerivedPolicy>,
+    is_transient: bool,
 ) {
     let defaults = &legacy.defaults;
 
@@ -715,26 +731,27 @@ fn render_operational_fields(
         out.push_str("send_enabled = false\n");
     }
 
-    // local_retention
-    if let Some(ref lr) = sv.local_retention
-        && !is_transient_retention(lr)
-        && let Some(p) = derived
-    {
-        // User had a partial override on a named level — merge with derived policy
-        // so all four fields are explicit. Without this, missing fields would inherit
-        // from v1's synthesized defaults (different from the derived level's values).
-        let merged = merge_retention_with_derived(lr, &p.local_retention);
-        render_resolved_retention(out, "local_retention", &merged);
-    } else if let Some(ref lr) = sv.local_retention {
-        render_retention_field(out, "local_retention", lr);
-    } else if let Some(p) = derived {
-        out.push_str(&format!("# from {} level\n", derived_level_name(sv)));
-        render_resolved_retention(out, "local_retention", &p.local_retention);
-    } else if let Some(d) = defaults
-        && let Some(ref lr) = d.local_retention
-    {
-        out.push_str("# inherited from [defaults]\n");
-        render_retention_field(out, "local_retention", lr);
+    // local_retention — skip entirely when transient (handled by local_snapshots = false)
+    if !is_transient {
+        if let Some(ref lr) = sv.local_retention
+            && let Some(p) = derived
+        {
+            // User had a partial override on a named level — merge with derived policy
+            // so all four fields are explicit. Without this, missing fields would inherit
+            // from v1's synthesized defaults (different from the derived level's values).
+            let merged = merge_retention_with_derived(lr, &p.local_retention);
+            render_resolved_retention(out, "local_retention", &merged);
+        } else if let Some(ref lr) = sv.local_retention {
+            render_retention_field(out, "local_retention", lr);
+        } else if let Some(p) = derived {
+            out.push_str(&format!("# from {} level\n", derived_level_name(sv)));
+            render_resolved_retention(out, "local_retention", &p.local_retention);
+        } else if let Some(d) = defaults
+            && let Some(ref lr) = d.local_retention
+        {
+            out.push_str("# inherited from [defaults]\n");
+            render_retention_field(out, "local_retention", lr);
+        }
     }
 
     // external_retention
@@ -861,6 +878,9 @@ fn print_changes(result: &MigrationResult) {
                         conv.subvol_name, conv.old_level, conv.overrides.join(", "));
                     println!("      → Converted to custom (kept your overrides)");
                 }
+            }
+            Change::TransientToLocalSnapshots(n) => {
+                println!("    ✓ Converted local_retention = \"transient\" → local_snapshots = false on {n} subvolumes");
             }
         }
     }
@@ -1082,13 +1102,16 @@ snapshot_interval = "1w"
     }
 
     #[test]
-    fn migrate_preserves_transient_on_named_level() {
+    fn migrate_transient_on_custom_becomes_local_snapshots_false() {
         // htpc-root has transient + send_interval, but no named level (custom)
         let toml = example_legacy_toml();
         let legacy: LegacyConfig = toml::from_str(toml).unwrap();
         let v1 = render_v1(&legacy);
 
-        assert!(v1.contains("local_retention = \"transient\""));
+        assert!(!v1.contains("local_retention = \"transient\""),
+            "transient should not appear in v1 output");
+        assert!(v1.contains("local_snapshots = false"),
+            "transient should become local_snapshots = false");
     }
 
     #[test]
@@ -1393,5 +1416,167 @@ snapshot_interval = "1d"
         assert!(v1.contains("protection = \"recorded\""),
             "no-op override should keep named level");
         assert!(!v1.contains("⚠"), "no warning for no-op overrides");
+    }
+
+    #[test]
+    fn migrate_transient_becomes_local_snapshots_false() {
+        // Custom subvolume with transient retention
+        let toml = r#"
+[general]
+state_db = "~/.local/share/urd/urd.db"
+metrics_file = "~/m.prom"
+log_dir = "~/logs"
+run_frequency = "daily"
+
+[local_snapshots]
+roots = [{ path = "/snap", subvolumes = ["test"], min_free_bytes = "10GB" }]
+
+[defaults]
+snapshot_interval = "1d"
+send_interval = "1d"
+[defaults.local_retention]
+daily = 7
+[defaults.external_retention]
+daily = 7
+
+[[drives]]
+label = "D"
+mount_path = "/mnt/d"
+snapshot_root = ".snap"
+role = "primary"
+
+[[subvolumes]]
+name = "test"
+short_name = "test"
+source = "/data"
+local_retention = "transient"
+drives = ["D"]
+"#;
+        let legacy: LegacyConfig = toml::from_str(toml).unwrap();
+        let v1 = render_v1(&legacy);
+
+        assert!(v1.contains("local_snapshots = false"),
+            "should have local_snapshots = false");
+        assert!(!v1.contains("local_retention = \"transient\""),
+            "should not have local_retention = transient");
+        // Should still parse as valid v1
+        let config = crate::config::Config::from_str(&v1);
+        assert!(config.is_ok(), "migrated config should parse: {}", config.unwrap_err());
+    }
+
+    #[test]
+    fn migrate_named_with_transient_becomes_custom() {
+        // Named level + transient (no other overrides) → custom
+        let toml = r#"
+[general]
+state_db = "~/.local/share/urd/urd.db"
+metrics_file = "~/m.prom"
+log_dir = "~/logs"
+run_frequency = "daily"
+
+[local_snapshots]
+roots = [{ path = "/snap", subvolumes = ["test"], min_free_bytes = "10GB" }]
+
+[defaults]
+snapshot_interval = "1d"
+send_interval = "1d"
+[defaults.local_retention]
+daily = 7
+[defaults.external_retention]
+daily = 7
+
+[[drives]]
+label = "D"
+mount_path = "/mnt/d"
+snapshot_root = ".snap"
+role = "primary"
+
+[[subvolumes]]
+name = "test"
+short_name = "test"
+source = "/data"
+protection_level = "sheltered"
+local_retention = "transient"
+"#;
+        let legacy: LegacyConfig = toml::from_str(toml).unwrap();
+        let v1 = render_v1(&legacy);
+
+        let test_block = v1.split("[[subvolumes]]")
+            .find(|block| block.contains("name = \"test\""))
+            .expect("should find test subvolume block");
+
+        assert!(!test_block.contains("protection = \"sheltered\""),
+            "should not keep named level");
+        assert!(test_block.contains("local_snapshots = false"),
+            "should have local_snapshots = false");
+        assert!(!test_block.contains("local_retention"),
+            "should not have local_retention");
+        // Should have baked fields from derived policy
+        assert!(test_block.contains("snapshot_interval"),
+            "should bake snapshot_interval from derived");
+        assert!(test_block.contains("external_retention"),
+            "should bake external_retention from derived");
+
+        // Must parse as valid v1
+        let config = crate::config::Config::from_str(&v1);
+        assert!(config.is_ok(), "migrated config should parse: {}", config.unwrap_err());
+    }
+
+    #[test]
+    fn migrate_named_with_transient_and_override_becomes_custom() {
+        // Named level + transient + another override → custom (F1: compound case)
+        let toml = r#"
+[general]
+state_db = "~/.local/share/urd/urd.db"
+metrics_file = "~/m.prom"
+log_dir = "~/logs"
+run_frequency = "daily"
+
+[local_snapshots]
+roots = [{ path = "/snap", subvolumes = ["test"], min_free_bytes = "10GB" }]
+
+[defaults]
+snapshot_interval = "1d"
+send_interval = "1d"
+[defaults.local_retention]
+daily = 7
+[defaults.external_retention]
+daily = 7
+
+[[drives]]
+label = "D"
+mount_path = "/mnt/d"
+snapshot_root = ".snap"
+role = "primary"
+
+[[subvolumes]]
+name = "test"
+short_name = "test"
+source = "/data"
+protection_level = "sheltered"
+local_retention = "transient"
+snapshot_interval = "1w"
+"#;
+        let legacy: LegacyConfig = toml::from_str(toml).unwrap();
+        let v1 = render_v1(&legacy);
+
+        let test_block = v1.split("[[subvolumes]]")
+            .find(|block| block.contains("name = \"test\""))
+            .expect("should find test subvolume block");
+
+        assert!(!test_block.contains("protection = \"sheltered\""),
+            "should not keep named level");
+        assert!(test_block.contains("local_snapshots = false"),
+            "should have local_snapshots = false");
+        assert!(test_block.contains("snapshot_interval = \"1w\""),
+            "should keep explicit interval override");
+        assert!(!test_block.contains("local_retention"),
+            "should not have local_retention");
+        assert!(test_block.contains("external_retention"),
+            "should bake external_retention from derived");
+
+        // Must parse as valid v1
+        let config = crate::config::Config::from_str(&v1);
+        assert!(config.is_ok(), "migrated config should parse: {}", config.unwrap_err());
     }
 }

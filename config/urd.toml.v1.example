@@ -96,10 +96,7 @@ short_name = "multimedia"
 priority = 3
 protection = "recorded"
 
-# ── Custom: manual config (no protection level) ─────────────────────────
-# Transient retention keeps only the pinned snapshot needed for incremental
-# chains. Ideal for subvolumes on space-constrained volumes (NVMe root)
-# where you want external backups but can't afford local snapshot history.
+# ── External-only: NVMe root is too small for local history ─────────
 
 [[subvolumes]]
 name = "htpc-root"
@@ -107,10 +104,10 @@ source = "/"
 snapshot_root = "~/.snapshots"
 min_free_bytes = "10GB"
 priority = 3
+local_snapshots = false
 snapshot_interval = "1d"
 send_interval = "1d"
-local_retention = "transient"      # Delete local after send, keep only chain parent
-drives = ["WD-18TB1"]              # Send to offsite drive only
+drives = ["WD-18TB1"]
 
 # ── Notifications ────────────────────────────────────────────────────────
 # Urd dispatches notifications when promise states change after a backup.
