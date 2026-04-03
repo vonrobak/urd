@@ -12,7 +12,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::heartbeat::Heartbeat;
 
@@ -87,7 +87,7 @@ pub enum NotificationEvent {
 // ── Urgency ────────────────────────────────────────────────────────────
 
 /// Urgency determines which channels fire.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Urgency {
     Info,
@@ -120,7 +120,7 @@ pub struct Notification {
 // ── Channels ───────────────────────────────────────────────────────────
 
 /// How to deliver a notification.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum NotificationChannel {
     /// Desktop notification via notify-send.
@@ -144,7 +144,7 @@ pub enum NotificationChannel {
 // ── Config ─────────────────────────────────────────────────────────────
 
 /// Notification configuration from `[notifications]` in urd.toml.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct NotificationConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
