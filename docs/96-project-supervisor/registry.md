@@ -5,9 +5,15 @@
 
 | UPI | Title | Design | Design Review | Adversary Review | PR | GH# |
 |-----|-------|--------|---------------|------------------|----|-----|
+| 018 | External-only runtime experience | [design](../95-ideas/2026-04-03-design-018-external-only-runtime.md) | - | - | - | - |
+| 017 | Thread lineage visualization | [design](../95-ideas/2026-04-03-design-017-thread-lineage-visualization.md) | - | - | - | - |
+| 016 | Emergency space response | [design](../95-ideas/2026-04-03-design-016-emergency-space-response.md) | - | - | - | - |
+| 015 | Change preview in `urd get` | [design](../95-ideas/2026-04-03-design-015-get-change-preview.md) | - | - | - | - |
+| 014 | Skip unchanged subvolumes | [design](../95-ideas/2026-04-03-design-014-skip-unchanged-subvolumes.md) | - | - | - | - |
+| 013 | Btrfs pipeline improvements | [design](../95-ideas/2026-04-03-design-013-btrfs-pipeline-improvements.md) | - | - | - | - |
 | 012 | Sentinel drive-gated transient + space monitoring | [design](../95-ideas/2026-04-03-design-012-sentinel-drive-gated-transient.md) | - | - | - | - |
 | 011 | Transient space safety (emergency fix) | [design](../95-ideas/2026-04-03-design-011-transient-space-safety.md) | [steve](../99-reports/2026-04-03-steve-jobs-011-transient-is-a-lie.md) | - | - | - |
-| 010-a | Transient as first-class config concept | [design](../95-ideas/2026-04-03-design-010a-transient-as-first-class-config.md) | [steve](../99-reports/2026-04-03-steve-jobs-010a-boolean-beats-jargon.md) | [adversary](../99-reports/2026-04-03-review-adversary-010a-local-snapshots-boolean.md) | - | - |
+| 010-a | Transient as first-class config concept | [design](../95-ideas/2026-04-03-design-010a-transient-as-first-class-config.md) | [steve](../99-reports/2026-04-03-steve-jobs-010a-boolean-beats-jargon.md) | [adversary](../99-reports/2026-04-03-review-adversary-010a-local-snapshots-boolean.md) | merged | [#80](https://github.com/vonrobak/urd/pull/80) |
 | 010 | Config Schema v1 (ADR-111 revision) | [design](../95-ideas/2026-04-03-design-010-config-schema-v1.md) | - | [design](../99-reports/2026-04-03-design-review-010-config-schema-v1.md), [s3](../99-reports/2026-04-03-review-adversary-010-v1-parser.md), [s4](../99-reports/2026-04-03-review-adversary-010-migrate.md) | s1-s4 merged | [#75](https://github.com/vonrobak/urd/pull/75), [#76](https://github.com/vonrobak/urd/pull/76), [#77](https://github.com/vonrobak/urd/pull/77), [#78](https://github.com/vonrobak/urd/pull/78) |
 | 009 | `urd drives` subcommand | [design](../95-ideas/2026-04-02-design-009-urd-drives-subcommand.md) | - | [adversary](../99-reports/2026-04-03-design-review-009-006-phase-c-drives.md) | merged | [#72](https://github.com/vonrobak/urd/pull/72) |
 | 008 | Doctor pin-age correlation | [design](../95-ideas/2026-04-02-design-008-doctor-pin-age-correlation.md) | - | [adversary](../99-reports/2026-04-03-design-review-007-008-phase-b-communication.md) | merged | [#70](https://github.com/vonrobak/urd/pull/70) |
