@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `urd migrate` partial retention overrides on named levels now bake all four fields (hourly/daily/weekly/monthly) — previously, unspecified fields silently inherited from v1 synthesized defaults instead of the derived level's values
 
 ### Added
+- `local_snapshots = false` in v1 config — replaces `local_retention = "transient"` with a clear boolean opt-out of local snapshot history
 - `urd migrate` command — transforms legacy config to v1 schema with backup, dry-run, and semantic equivalence (no behavioral changes)
 - V1 example config at `config/urd.toml.v1.example`
 - Serialize support on all config types — enables `urd migrate` and config round-tripping

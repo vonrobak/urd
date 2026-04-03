@@ -137,11 +137,12 @@ When `protection` is set to a named level, operational fields (`snapshot_interva
 permitted** — config validation rejects them as structural errors. The level derives all
 operational parameters.
 
-**Exception: transient retention with named levels.** `local_retention = "transient"` is
-permitted alongside named levels because transient is a storage constraint (the NVMe is
-too small for local history), not a policy override. The named level still derives all
-other parameters. This exception is unique — extending it to other fields would erode
-the opacity principle and requires an ADR amendment.
+**No exceptions to opacity.** In v1, `local_snapshots = false` replaces
+`local_retention = "transient"` as the way to disable local snapshot history (e.g., NVMe
+too small). Since `local_snapshots = false` is incompatible with named levels (which
+require local snapshots), it forces custom configuration. This eliminates the only
+exception to the named-level opacity rule — no operational fields are permitted alongside
+named levels.
 
 ### Templates as scaffolding
 
@@ -178,7 +179,10 @@ Config validation distinguishes two error categories (extends ADR-109):
 **Hard errors (refuse to start):**
 - TOML syntax errors, missing required fields, invalid types
 - Structural contradictions (drive name in `drives` that doesn't exist in `[[drives]]`)
-- Operational fields alongside named protection levels (transient exception only)
+- Operational fields alongside named protection levels (no exceptions)
+- `local_snapshots = false` alongside named levels, or with `local_retention`
+- `local_retention = "transient"` in v1 (use `local_snapshots = false` instead)
+- `local_snapshots = false` without any configured drives
 - Old protection level names in v1 config
 - Config version mismatch
 
@@ -243,7 +247,7 @@ name = "htpc-root"
 source = "/"
 snapshot_root = "~/.snapshots"
 min_free_bytes = "10GB"
-local_retention = "transient"
+local_snapshots = false
 drives = ["WD-18TB1"]
 ```
 
@@ -259,17 +263,19 @@ drives = ["WD-18TB1"]
 | `snapshot_interval` | No | `1d` | How often to snapshot. |
 | `send_interval` | No | `1d` | How often to send externally. |
 | `send_enabled` | No | `true` if `drives` non-empty | Pause button for sends. |
-| `local_retention` | No | `{ hourly = 24, daily = 30, weekly = 26, monthly = 12 }` | Graduated retention or `"transient"`. |
+| `local_snapshots` | No | `true` | Set `false` to disable local snapshot history. |
+| `local_retention` | No | `{ hourly = 24, daily = 30, weekly = 26, monthly = 12 }` | Graduated retention. |
 | `external_retention` | No | `{ daily = 30, weekly = 26 }` | Graduated retention for drives. |
 | `min_free_bytes` | No | — | Skip snapshots when free space low. |
 | `drives` | No | `[]` | Which drives to send to. Omit = no sends. |
 
 **Validation:** When `protection` is set to a named level, operational fields
 (`snapshot_interval`, `send_interval`, `send_enabled`, `local_retention`,
-`external_retention`) are rejected as structural errors. Exception: `local_retention =
-"transient"` is permitted (storage constraint, not policy override). Only identity fields
-(`name`, `source`, `snapshot_root`, `short_name`, `priority`), `drives`, `enabled`, and
-`min_free_bytes` are permitted alongside named levels.
+`external_retention`, `local_snapshots`) are rejected as structural errors — no exceptions.
+Only identity fields (`name`, `source`, `snapshot_root`, `short_name`, `priority`),
+`drives`, `enabled`, and `min_free_bytes` are permitted alongside named levels.
+`local_snapshots = false` requires at least one drive and is mutually exclusive with
+`local_retention`.
 
 ### `[notifications]` section
 
@@ -372,7 +378,7 @@ name = "htpc-root"
 source = "/"
 snapshot_root = "~/.snapshots"
 min_free_bytes = "10GB"
-local_retention = "transient"
+local_snapshots = false
 drives = ["WD-18TB1"]
 
 # ── Storage pool (snapshot root: /mnt/btrfs-pool/.snapshots) ──
@@ -511,7 +517,8 @@ Config error: snapshot_root on [[subvolumes]] requires config_version = 1
 - [ ] v1 parser: `short_name` optional, defaults to `name`
 - [ ] v1 parser: `protection` field (renamed from `protection_level`)
 - [ ] v1 parser: `enabled` field with default `true`
-- [ ] v1 validation: reject operational fields alongside named `protection` (transient exception only)
+- [ ] v1 validation: reject operational fields alongside named `protection` (no exceptions)
+- [x] v1: `local_snapshots = false` replaces `local_retention = "transient"` (UPI 010-a)
 - [ ] v1 validation: error messages guide the user (see Validation Error Messages above)
 - [ ] `ResolvedSubvolume` gains `snapshot_root: PathBuf` and `min_free_bytes: Option<u64>`
 - [ ] All callers of `snapshot_root_for()` / `local_snapshot_dir()` / `root_min_free_bytes()` migrated to `ResolvedSubvolume`

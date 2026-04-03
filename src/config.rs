@@ -584,6 +584,8 @@ struct V1SubvolumeConfig {
     #[serde(default)]
     send_enabled: Option<bool>,
     #[serde(default)]
+    local_snapshots: Option<bool>,
+    #[serde(default)]
     local_retention: Option<LocalRetentionConfig>,
     #[serde(default)]
     external_retention: Option<GraduatedRetention>,
@@ -642,19 +644,27 @@ impl V1Config {
         let subvolumes: Vec<SubvolumeConfig> = self
             .subvolumes
             .into_iter()
-            .map(|sv| SubvolumeConfig {
-                short_name: sv.short_name.unwrap_or_else(|| sv.name.clone()),
-                name: sv.name,
-                source: sv.source,
-                priority: sv.priority,
-                enabled: sv.enabled,
-                snapshot_interval: sv.snapshot_interval,
-                send_interval: sv.send_interval,
-                send_enabled: sv.send_enabled,
-                local_retention: sv.local_retention,
-                external_retention: sv.external_retention,
-                protection_level: sv.protection,
-                drives: sv.drives,
+            .map(|sv| {
+                // local_snapshots = false → Transient internally
+                let local_retention = if sv.local_snapshots == Some(false) {
+                    Some(LocalRetentionConfig::Transient)
+                } else {
+                    sv.local_retention
+                };
+                SubvolumeConfig {
+                    short_name: sv.short_name.unwrap_or_else(|| sv.name.clone()),
+                    name: sv.name,
+                    source: sv.source,
+                    priority: sv.priority,
+                    enabled: sv.enabled,
+                    snapshot_interval: sv.snapshot_interval,
+                    send_interval: sv.send_interval,
+                    send_enabled: sv.send_enabled,
+                    local_retention,
+                    external_retention: sv.external_retention,
+                    protection_level: sv.protection,
+                    drives: sv.drives,
+                }
             })
             .collect();
 
@@ -687,6 +697,25 @@ impl V1Config {
             // compatibility. `urd migrate` will rename them to canonical v1 names.
             let level = sv.protection.unwrap_or(ProtectionLevel::Custom);
 
+            // Rule 1: Reject local_retention = "transient" universally in v1
+            // (applies to both named and custom — use local_snapshots = false instead)
+            if matches!(sv.local_retention, Some(LocalRetentionConfig::Transient)) {
+                return Err(format!(
+                    "subvolume {:?}: local_retention = \"transient\" is not supported in v1 \
+                     — use local_snapshots = false instead.",
+                    sv.name
+                ));
+            }
+
+            // Rule 2: Mutual exclusion — local_snapshots = false + local_retention
+            if sv.local_snapshots == Some(false) && sv.local_retention.is_some() {
+                return Err(format!(
+                    "subvolume {:?}: local_snapshots = false and local_retention are mutually \
+                     exclusive — when local_snapshots is disabled, there is nothing to retain.",
+                    sv.name
+                ));
+            }
+
             // Named levels must not have operational overrides
             if level != ProtectionLevel::Custom {
                 let forbidden = [
@@ -705,17 +734,40 @@ impl V1Config {
                         ));
                     }
                 }
-                // local_retention: only "transient" is permitted alongside named levels
-                if let Some(ref lr) = sv.local_retention
-                    && !matches!(lr, LocalRetentionConfig::Transient)
-                {
+
+                // Rule 3a: local_snapshots = false is incompatible with named levels
+                if sv.local_snapshots == Some(false) {
                     return Err(format!(
-                        "subvolume {:?}: local_retention cannot be customized alongside \
-                         protection = \"{level}\". Only local_retention = \"transient\" \
-                         is permitted. Use protection = \"custom\" for manual control.",
+                        "subvolume {:?}: local_snapshots = false is incompatible with \
+                         protection = \"{level}\" — named levels require local snapshots. \
+                         Remove the protection field for custom configuration.",
                         sv.name
                     ));
                 }
+
+                // Rule 3b: ANY local_retention alongside named level is rejected
+                // (transient already caught by Rule 1 above)
+                if sv.local_retention.is_some() {
+                    return Err(format!(
+                        "subvolume {:?}: local_retention cannot be set alongside \
+                         protection = \"{level}\" — the protection level controls this field. \
+                         Use protection = \"custom\" for manual control.",
+                        sv.name
+                    ));
+                }
+            }
+
+            // Rule 4: local_snapshots = false requires at least one drive
+            let has_any_drives = match sv.drives {
+                Some(ref d) => !d.is_empty(),
+                None => !self.drives.is_empty(),
+            };
+            if sv.local_snapshots == Some(false) && !has_any_drives {
+                return Err(format!(
+                    "subvolume {:?}: local_snapshots = false requires at least one drive \
+                     — without local snapshots or external sends, nothing is being backed up.",
+                    sv.name
+                ));
             }
 
             // Reject empty drives list on any level that requires external sends
@@ -734,18 +786,12 @@ impl V1Config {
             }
 
             // Sheltered requires at least one drive (global or assigned)
-            if level == ProtectionLevel::Sheltered {
-                let has_drives = match sv.drives {
-                    Some(ref d) => !d.is_empty(),
-                    None => !self.drives.is_empty(),
-                };
-                if !has_drives {
-                    return Err(format!(
-                        "subvolume {:?}: protection = \"sheltered\" requires at least one \
-                         configured drive for external backups.",
-                        sv.name
-                    ));
-                }
+            if level == ProtectionLevel::Sheltered && !has_any_drives {
+                return Err(format!(
+                    "subvolume {:?}: protection = \"sheltered\" requires at least one \
+                     configured drive for external backups.",
+                    sv.name
+                ));
             }
 
             // Fortified requires at least one offsite drive
@@ -2121,11 +2167,10 @@ local_retention = { daily = 7 }
 "#;
         let err = parse_v1(config_str).unwrap_err();
         assert!(err.contains("local_retention"));
-        assert!(err.contains("transient"));
     }
 
     #[test]
-    fn v1_allows_transient_on_named_level() {
+    fn v1_rejects_transient_on_named_level() {
         let config_str = r#"
 [general]
 config_version = 1
@@ -2143,9 +2188,9 @@ snapshot_root = "/snap"
 protection = "sheltered"
 local_retention = "transient"
 "#;
-        let config = parse_v1(config_str).unwrap();
-        let resolved = config.subvolumes[0].resolved(&config.defaults, config.general.run_frequency);
-        assert!(resolved.local_retention.is_transient());
+        let err = parse_v1(config_str).unwrap_err();
+        assert!(err.contains("not supported in v1"));
+        assert!(err.contains("local_snapshots = false"));
     }
 
     #[test]
@@ -2213,6 +2258,198 @@ drives = ["D1"]
 "#;
         let err = parse_v1(config_str).unwrap_err();
         assert!(err.contains("offsite"));
+    }
+
+    // ── local_snapshots tests ─────────────────────────────────────────
+
+    #[test]
+    fn v1_local_snapshots_false_maps_to_transient() {
+        let config_str = r#"
+[general]
+config_version = 1
+
+[[drives]]
+label = "D1"
+mount_path = "/mnt/d1"
+snapshot_root = ".snapshots"
+role = "primary"
+
+[[subvolumes]]
+name = "sv"
+source = "/sv"
+snapshot_root = "/snap"
+local_snapshots = false
+drives = ["D1"]
+"#;
+        let config = parse_v1(config_str).unwrap();
+        let resolved = config.subvolumes[0].resolved(&config.defaults, config.general.run_frequency);
+        assert!(resolved.local_retention.is_transient(),
+            "local_snapshots = false should resolve to transient");
+    }
+
+    #[test]
+    fn v1_local_snapshots_absent_is_normal() {
+        let config_str = r#"
+[general]
+config_version = 1
+
+[[subvolumes]]
+name = "sv"
+source = "/sv"
+snapshot_root = "/snap"
+"#;
+        let config = parse_v1(config_str).unwrap();
+        let resolved = config.subvolumes[0].resolved(&config.defaults, config.general.run_frequency);
+        assert!(!resolved.local_retention.is_transient(),
+            "absent local_snapshots should not be transient");
+    }
+
+    #[test]
+    fn v1_local_snapshots_true_is_normal() {
+        let config_str = r#"
+[general]
+config_version = 1
+
+[[subvolumes]]
+name = "sv"
+source = "/sv"
+snapshot_root = "/snap"
+local_snapshots = true
+"#;
+        let config = parse_v1(config_str).unwrap();
+        let resolved = config.subvolumes[0].resolved(&config.defaults, config.general.run_frequency);
+        assert!(!resolved.local_retention.is_transient(),
+            "local_snapshots = true should not be transient");
+    }
+
+    #[test]
+    fn v1_rejects_transient_in_v1() {
+        let config_str = r#"
+[general]
+config_version = 1
+
+[[drives]]
+label = "D1"
+mount_path = "/mnt/d1"
+snapshot_root = ".snapshots"
+role = "primary"
+
+[[subvolumes]]
+name = "sv"
+source = "/sv"
+snapshot_root = "/snap"
+local_retention = "transient"
+drives = ["D1"]
+"#;
+        let err = parse_v1(config_str).unwrap_err();
+        assert!(err.contains("not supported in v1"), "error: {err}");
+        assert!(err.contains("local_snapshots = false"), "error: {err}");
+    }
+
+    #[test]
+    fn v1_rejects_transient_and_local_snapshots_false() {
+        // Both violations present — transient rejection fires first (most helpful)
+        let config_str = r#"
+[general]
+config_version = 1
+
+[[drives]]
+label = "D1"
+mount_path = "/mnt/d1"
+snapshot_root = ".snapshots"
+role = "primary"
+
+[[subvolumes]]
+name = "sv"
+source = "/sv"
+snapshot_root = "/snap"
+local_retention = "transient"
+local_snapshots = false
+drives = ["D1"]
+"#;
+        let err = parse_v1(config_str).unwrap_err();
+        assert!(err.contains("not supported in v1"), "error: {err}");
+    }
+
+    #[test]
+    fn v1_rejects_local_snapshots_false_with_local_retention() {
+        let config_str = r#"
+[general]
+config_version = 1
+
+[[drives]]
+label = "D1"
+mount_path = "/mnt/d1"
+snapshot_root = ".snapshots"
+role = "primary"
+
+[[subvolumes]]
+name = "sv"
+source = "/sv"
+snapshot_root = "/snap"
+local_snapshots = false
+local_retention = { daily = 7 }
+drives = ["D1"]
+"#;
+        let err = parse_v1(config_str).unwrap_err();
+        assert!(err.contains("mutually exclusive"), "error: {err}");
+    }
+
+    #[test]
+    fn v1_rejects_local_snapshots_false_on_named_level() {
+        let config_str = r#"
+[general]
+config_version = 1
+
+[[drives]]
+label = "D1"
+mount_path = "/mnt/d1"
+snapshot_root = ".snapshots"
+role = "primary"
+
+[[subvolumes]]
+name = "sv"
+source = "/sv"
+snapshot_root = "/snap"
+protection = "sheltered"
+local_snapshots = false
+"#;
+        let err = parse_v1(config_str).unwrap_err();
+        assert!(err.contains("incompatible"), "error: {err}");
+        assert!(err.contains("named levels"), "error: {err}");
+    }
+
+    #[test]
+    fn v1_rejects_local_snapshots_false_without_drives() {
+        let config_str = r#"
+[general]
+config_version = 1
+
+[[subvolumes]]
+name = "sv"
+source = "/sv"
+snapshot_root = "/snap"
+local_snapshots = false
+"#;
+        let err = parse_v1(config_str).unwrap_err();
+        assert!(err.contains("requires at least one drive"), "error: {err}");
+    }
+
+    #[test]
+    fn v1_rejects_local_snapshots_false_with_empty_drives() {
+        let config_str = r#"
+[general]
+config_version = 1
+
+[[subvolumes]]
+name = "sv"
+source = "/sv"
+snapshot_root = "/snap"
+local_snapshots = false
+drives = []
+"#;
+        let err = parse_v1(config_str).unwrap_err();
+        assert!(err.contains("requires at least one drive"), "error: {err}");
     }
 
     // ── ResolvedSubvolume enrichment tests ────────────────────────────
