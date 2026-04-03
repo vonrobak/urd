@@ -118,22 +118,22 @@ min_free_bytes = "100GB"
 # derived values when you need finer control.
 #
 # Levels (with daily timer):
-#   guarded   — local snapshots only, minimal retention (d:7, w:4)
-#   protected — local + 1 external drive, full retention
-#   resilient — local + 2+ external drives, full retention
+#   recorded  — local snapshots only, minimal retention (d:7, w:4)
+#   sheltered — local + 1 external drive, full retention
+#   fortified — local + 2+ external drives + offsite, full retention
 #   custom    — manual config (default, no derivation)
 #
 # "drives" restricts which external drives serve a subvolume's promise.
 # Omit to use all configured drives.
 
-# ─── Resilient: irreplaceable data on multiple drives ─────────────────
+# ─── Fortified: irreplaceable data on multiple drives ─────────────────
 
 [[subvolumes]]
 name = "htpc-home"
 short_name = "htpc-home"
 source = "/home"
 priority = 1
-protection_level = "resilient"
+protection_level = "fortified"
 drives = ["WD-18TB", "WD-18TB1"]   # Active workstation — keep off small test drive
 
 [[subvolumes]]
@@ -141,7 +141,7 @@ name = "subvol3-opptak"
 short_name = "opptak"
 source = "/mnt/btrfs-pool/subvol3-opptak"
 priority = 1
-protection_level = "resilient"
+protection_level = "fortified"
 drives = ["WD-18TB", "WD-18TB1"]   # ~3.4TB — exceeds 2TB-backup capacity
 
 [[subvolumes]]
@@ -149,31 +149,31 @@ name = "subvol2-pics"
 short_name = "pics"
 source = "/mnt/btrfs-pool/subvol2-pics"
 priority = 2
-protection_level = "resilient"
+protection_level = "fortified"
 drives = ["WD-18TB", "WD-18TB1"]   # Photos are irreplaceable
 
-# ─── Protected: important data on at least one drive ──────────────────
+# ─── Sheltered: important data on at least one drive ──────────────────
 
 [[subvolumes]]
 name = "subvol1-docs"
 short_name = "docs"
 source = "/mnt/btrfs-pool/subvol1-docs"
 priority = 2
-protection_level = "protected"
+protection_level = "sheltered"
 
 [[subvolumes]]
 name = "subvol7-containers"
 short_name = "containers"
 source = "/mnt/btrfs-pool/subvol7-containers"
 priority = 2
-protection_level = "protected"
+protection_level = "sheltered"
 
 [[subvolumes]]
 name = "subvol5-music"
 short_name = "music"
 source = "/mnt/btrfs-pool/subvol5-music"
 priority = 3
-protection_level = "protected"
+protection_level = "sheltered"
 
 # ─── Transient: send to external, don't keep local history ───────────
 # Transient retention keeps only the pinned snapshot needed for incremental
@@ -189,14 +189,14 @@ local_retention = "transient"      # Delete local after send, keep only chain pa
 send_interval = "1d"
 drives = ["WD-18TB1"]              # Send to offsite drive only
 
-# ─── Guarded: local snapshots only ────────────────────────────────────
+# ─── Recorded: local snapshots only ───────────────────────────────────
 
 [[subvolumes]]
 name = "subvol4-multimedia"
 short_name = "multimedia"
 source = "/mnt/btrfs-pool/subvol4-multimedia"
 priority = 3
-protection_level = "guarded"
+protection_level = "recorded"
 snapshot_interval = "1w"           # Override: large volume, weekly is sufficient
 
 [[subvolumes]]
@@ -204,5 +204,5 @@ name = "subvol6-tmp"
 short_name = "tmp"
 source = "/mnt/btrfs-pool/subvol6-tmp"
 priority = 3
-protection_level = "guarded"
+protection_level = "recorded"
 local_retention = { daily = 7 }    # Override: cache data, minimal history needed

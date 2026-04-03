@@ -656,7 +656,7 @@ send_interval = "2h"
             .iter()
             .find(|s| s.name == "htpc-home")
             .unwrap();
-        assert_eq!(htpc.protection_level, Some(ProtectionLevel::Resilient));
+        assert_eq!(htpc.protection_level, Some(ProtectionLevel::Fortified));
         assert_eq!(htpc.drives, Some(vec!["WD-18TB".into(), "WD-18TB1".into()]));
         assert_eq!(htpc.priority, 1);
 
@@ -666,7 +666,7 @@ send_interval = "2h"
             .iter()
             .find(|s| s.name == "subvol6-tmp")
             .unwrap();
-        assert_eq!(tmp.protection_level, Some(ProtectionLevel::Guarded));
+        assert_eq!(tmp.protection_level, Some(ProtectionLevel::Recorded));
 
         // Verify validation passes
         let mut config = config;
@@ -1099,7 +1099,7 @@ protection_level = "protected"
             config.subvolumes[0].resolved(&config.defaults, config.general.run_frequency);
 
         // Should use derived values from "protected" + daily timer, not defaults
-        assert_eq!(resolved.protection_level, Some(ProtectionLevel::Protected));
+        assert_eq!(resolved.protection_level, Some(ProtectionLevel::Sheltered));
         assert_eq!(resolved.snapshot_interval, Interval::days(1)); // derived from timer
         assert_eq!(resolved.send_interval, Interval::days(1)); // derived from timer
         assert!(resolved.send_enabled);

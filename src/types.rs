@@ -261,12 +261,18 @@ impl fmt::Display for DriveRole {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProtectionLevel {
-    /// Local snapshots only. For: temp data, caches, build artifacts.
-    Guarded,
-    /// Local + at least one external drive current. For: documents, photos.
-    Protected,
-    /// Local + multiple external drives current. For: irreplaceable data.
-    Resilient,
+    /// Data is recorded locally. Snapshots exist on this machine.
+    /// For: temp data, caches, build artifacts.
+    #[serde(alias = "guarded")]
+    Recorded,
+    /// Data is sheltered on an external drive. Survives drive failure.
+    /// For: documents, photos.
+    #[serde(alias = "protected")]
+    Sheltered,
+    /// Data is fortified across geography. Survives site loss.
+    /// For: irreplaceable data.
+    #[serde(alias = "resilient")]
+    Fortified,
     /// User manages all parameters manually.
     Custom,
 }
@@ -274,9 +280,9 @@ pub enum ProtectionLevel {
 impl fmt::Display for ProtectionLevel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Guarded => write!(f, "guarded"),
-            Self::Protected => write!(f, "protected"),
-            Self::Resilient => write!(f, "resilient"),
+            Self::Recorded => write!(f, "recorded"),
+            Self::Sheltered => write!(f, "sheltered"),
+            Self::Fortified => write!(f, "fortified"),
             Self::Custom => write!(f, "custom"),
         }
     }
@@ -362,7 +368,7 @@ pub fn derive_policy(level: ProtectionLevel, freq: RunFrequency) -> Option<Deriv
         return None;
     }
 
-    let guarded_retention = ResolvedGraduatedRetention {
+    let recorded_retention = ResolvedGraduatedRetention {
         hourly: 0,
         daily: 7,
         weekly: 4,
@@ -383,7 +389,7 @@ pub fn derive_policy(level: ProtectionLevel, freq: RunFrequency) -> Option<Deriv
         monthly: 0,
     };
 
-    let guarded_external_retention = ResolvedGraduatedRetention {
+    let recorded_external_retention = ResolvedGraduatedRetention {
         hourly: 0,
         daily: 7,
         weekly: 4,
@@ -392,15 +398,15 @@ pub fn derive_policy(level: ProtectionLevel, freq: RunFrequency) -> Option<Deriv
 
     match (level, freq) {
         // ── Timer mode ──────────────────────────────────────────────
-        (ProtectionLevel::Guarded, RunFrequency::Timer { interval }) => Some(DerivedPolicy {
+        (ProtectionLevel::Recorded, RunFrequency::Timer { interval }) => Some(DerivedPolicy {
             snapshot_interval: interval,
             send_interval: interval,
             send_enabled: false,
-            local_retention: guarded_retention,
-            external_retention: guarded_external_retention,
+            local_retention: recorded_retention,
+            external_retention: recorded_external_retention,
             min_external_drives: 0,
         }),
-        (ProtectionLevel::Protected, RunFrequency::Timer { interval }) => Some(DerivedPolicy {
+        (ProtectionLevel::Sheltered, RunFrequency::Timer { interval }) => Some(DerivedPolicy {
             snapshot_interval: interval,
             send_interval: interval,
             send_enabled: true,
@@ -408,7 +414,7 @@ pub fn derive_policy(level: ProtectionLevel, freq: RunFrequency) -> Option<Deriv
             external_retention: full_external_retention,
             min_external_drives: 1,
         }),
-        (ProtectionLevel::Resilient, RunFrequency::Timer { interval }) => Some(DerivedPolicy {
+        (ProtectionLevel::Fortified, RunFrequency::Timer { interval }) => Some(DerivedPolicy {
             snapshot_interval: interval,
             send_interval: interval,
             send_enabled: true,
@@ -418,15 +424,15 @@ pub fn derive_policy(level: ProtectionLevel, freq: RunFrequency) -> Option<Deriv
         }),
 
         // ── Sentinel mode ───────────────────────────────────────────
-        (ProtectionLevel::Guarded, RunFrequency::Sentinel) => Some(DerivedPolicy {
+        (ProtectionLevel::Recorded, RunFrequency::Sentinel) => Some(DerivedPolicy {
             snapshot_interval: Interval::hours(4),
             send_interval: Interval::hours(4),
             send_enabled: false,
-            local_retention: guarded_retention,
-            external_retention: guarded_external_retention,
+            local_retention: recorded_retention,
+            external_retention: recorded_external_retention,
             min_external_drives: 0,
         }),
-        (ProtectionLevel::Protected, RunFrequency::Sentinel) => Some(DerivedPolicy {
+        (ProtectionLevel::Sheltered, RunFrequency::Sentinel) => Some(DerivedPolicy {
             snapshot_interval: Interval::hours(1),
             send_interval: Interval::hours(4),
             send_enabled: true,
@@ -434,7 +440,7 @@ pub fn derive_policy(level: ProtectionLevel, freq: RunFrequency) -> Option<Deriv
             external_retention: full_external_retention,
             min_external_drives: 1,
         }),
-        (ProtectionLevel::Resilient, RunFrequency::Sentinel) => Some(DerivedPolicy {
+        (ProtectionLevel::Fortified, RunFrequency::Sentinel) => Some(DerivedPolicy {
             snapshot_interval: Interval::hours(1),
             send_interval: Interval::hours(2),
             send_enabled: true,
@@ -1094,18 +1100,18 @@ mod tests {
 
     #[test]
     fn protection_level_display() {
-        assert_eq!(ProtectionLevel::Guarded.to_string(), "guarded");
-        assert_eq!(ProtectionLevel::Protected.to_string(), "protected");
-        assert_eq!(ProtectionLevel::Resilient.to_string(), "resilient");
+        assert_eq!(ProtectionLevel::Recorded.to_string(), "recorded");
+        assert_eq!(ProtectionLevel::Sheltered.to_string(), "sheltered");
+        assert_eq!(ProtectionLevel::Fortified.to_string(), "fortified");
         assert_eq!(ProtectionLevel::Custom.to_string(), "custom");
     }
 
     #[test]
     fn protection_level_serde_roundtrip() {
         let levels = vec![
-            ProtectionLevel::Guarded,
-            ProtectionLevel::Protected,
-            ProtectionLevel::Resilient,
+            ProtectionLevel::Recorded,
+            ProtectionLevel::Sheltered,
+            ProtectionLevel::Fortified,
             ProtectionLevel::Custom,
         ];
         for level in levels {
@@ -1113,6 +1119,16 @@ mod tests {
             let parsed: ProtectionLevel = serde_json::from_str(&json).unwrap();
             assert_eq!(parsed, level);
         }
+    }
+
+    #[test]
+    fn protection_level_legacy_aliases_parse() {
+        let guarded: ProtectionLevel = serde_json::from_str("\"guarded\"").unwrap();
+        assert_eq!(guarded, ProtectionLevel::Recorded);
+        let protected: ProtectionLevel = serde_json::from_str("\"protected\"").unwrap();
+        assert_eq!(protected, ProtectionLevel::Sheltered);
+        let resilient: ProtectionLevel = serde_json::from_str("\"resilient\"").unwrap();
+        assert_eq!(resilient, ProtectionLevel::Fortified);
     }
 
     // ── RunFrequency tests ─────────────────────────────────────────
@@ -1175,25 +1191,25 @@ mod tests {
     }
 
     #[test]
-    fn derive_policy_guarded_timer() {
+    fn derive_policy_recorded_timer() {
         let daily = RunFrequency::Timer {
             interval: Interval::days(1),
         };
-        let p = derive_policy(ProtectionLevel::Guarded, daily).unwrap();
+        let p = derive_policy(ProtectionLevel::Recorded, daily).unwrap();
         assert_eq!(p.snapshot_interval, Interval::days(1));
         assert!(!p.send_enabled);
         assert_eq!(p.min_external_drives, 0);
         assert_eq!(p.local_retention.daily, 7);
         assert_eq!(p.local_retention.weekly, 4);
-        assert_eq!(p.local_retention.hourly, 0); // no hourly for guarded
+        assert_eq!(p.local_retention.hourly, 0); // no hourly for recorded
     }
 
     #[test]
-    fn derive_policy_protected_timer() {
+    fn derive_policy_sheltered_timer() {
         let daily = RunFrequency::Timer {
             interval: Interval::days(1),
         };
-        let p = derive_policy(ProtectionLevel::Protected, daily).unwrap();
+        let p = derive_policy(ProtectionLevel::Sheltered, daily).unwrap();
         assert_eq!(p.snapshot_interval, Interval::days(1));
         assert_eq!(p.send_interval, Interval::days(1));
         assert!(p.send_enabled);
@@ -1207,34 +1223,36 @@ mod tests {
     }
 
     #[test]
-    fn derive_policy_resilient_timer() {
+    fn derive_policy_fortified_timer() {
         let daily = RunFrequency::Timer {
             interval: Interval::days(1),
         };
-        let p = derive_policy(ProtectionLevel::Resilient, daily).unwrap();
+        let p = derive_policy(ProtectionLevel::Fortified, daily).unwrap();
         assert_eq!(p.min_external_drives, 2);
         assert!(p.send_enabled);
-        // Same retention as protected
-        let protected = derive_policy(ProtectionLevel::Protected, daily).unwrap();
-        assert_eq!(p.local_retention, protected.local_retention);
-        assert_eq!(p.external_retention, protected.external_retention);
+        // Same retention as sheltered
+        let sheltered = derive_policy(ProtectionLevel::Sheltered, daily).unwrap();
+        assert_eq!(p.local_retention, sheltered.local_retention);
+        assert_eq!(p.external_retention, sheltered.external_retention);
     }
 
     #[test]
     fn derive_policy_sentinel_variants() {
-        let guarded = derive_policy(ProtectionLevel::Guarded, RunFrequency::Sentinel).unwrap();
-        assert_eq!(guarded.snapshot_interval, Interval::hours(4));
-        assert!(!guarded.send_enabled);
+        let recorded = derive_policy(ProtectionLevel::Recorded, RunFrequency::Sentinel).unwrap();
+        assert_eq!(recorded.snapshot_interval, Interval::hours(4));
+        assert!(!recorded.send_enabled);
 
-        let protected = derive_policy(ProtectionLevel::Protected, RunFrequency::Sentinel).unwrap();
-        assert_eq!(protected.snapshot_interval, Interval::hours(1));
-        assert_eq!(protected.send_interval, Interval::hours(4));
-        assert!(protected.send_enabled);
+        let sheltered =
+            derive_policy(ProtectionLevel::Sheltered, RunFrequency::Sentinel).unwrap();
+        assert_eq!(sheltered.snapshot_interval, Interval::hours(1));
+        assert_eq!(sheltered.send_interval, Interval::hours(4));
+        assert!(sheltered.send_enabled);
 
-        let resilient = derive_policy(ProtectionLevel::Resilient, RunFrequency::Sentinel).unwrap();
-        assert_eq!(resilient.snapshot_interval, Interval::hours(1));
-        assert_eq!(resilient.send_interval, Interval::hours(2));
-        assert_eq!(resilient.min_external_drives, 2);
+        let fortified =
+            derive_policy(ProtectionLevel::Fortified, RunFrequency::Sentinel).unwrap();
+        assert_eq!(fortified.snapshot_interval, Interval::hours(1));
+        assert_eq!(fortified.send_interval, Interval::hours(2));
+        assert_eq!(fortified.min_external_drives, 2);
     }
 
     #[test]
@@ -1243,7 +1261,7 @@ mod tests {
         let freq = RunFrequency::Timer {
             interval: Interval::hours(6),
         };
-        let p = derive_policy(ProtectionLevel::Protected, freq).unwrap();
+        let p = derive_policy(ProtectionLevel::Sheltered, freq).unwrap();
         assert_eq!(p.snapshot_interval, Interval::hours(6));
         assert_eq!(p.send_interval, Interval::hours(6));
         // Retention stays the same regardless of timer interval

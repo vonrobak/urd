@@ -99,7 +99,7 @@ fn check_retention_send_compatibility(
 ///
 /// Transient retention without send_enabled is nonsensical — snapshots would be created
 /// and immediately deleted with no external copy. Transient with a named protection level
-/// (Guarded/Protected/Resilient) is also invalid since named levels imply graduated retention.
+/// (Recorded/Sheltered/Fortified) is also invalid since named levels imply graduated retention.
 fn check_transient_validity(
     subvol: &crate::config::ResolvedSubvolume,
     checks: &mut Vec<PreflightCheck>,
@@ -166,7 +166,7 @@ fn check_send_without_drives(
 /// Three categories of problems:
 /// 1. **Drive count**: not enough drives for the promise level.
 /// 2. **Voiding overrides**: explicit settings that make the promise impossible
-///    (e.g., `send_enabled = false` on a `protected` subvolume).
+///    (e.g., `send_enabled = false` on a `sheltered` subvolume).
 /// 3. **Weakening overrides**: explicit settings that degrade below the derived
 ///    baseline (e.g., longer snapshot interval, tighter retention).
 fn check_promise_achievability(
@@ -210,14 +210,14 @@ fn check_promise_achievability(
         });
     }
 
-    // ── Resilient without offsite ──────────────────────────────────
-    if level == ProtectionLevel::Resilient
+    // ── Fortified without offsite ─────────────────────────────────
+    if level == ProtectionLevel::Fortified
         && !drives_in_scope.iter().any(|d| d.role == DriveRole::Offsite)
     {
         checks.push(PreflightCheck {
-            name: "resilient-without-offsite",
+            name: "fortified-without-offsite",
             message: format!(
-                "{}: resilient promise requires at least one drive with role = \"offsite\"",
+                "{}: fortified promise requires at least one drive with role = \"offsite\"",
                 subvol.name,
             ),
         });
@@ -542,10 +542,10 @@ mod tests {
     // ── Promise achievability ────────────────────────────────────────
 
     #[test]
-    fn resilient_needs_two_drives() {
+    fn fortified_needs_two_drives() {
         let mut sv = test_subvolume("recordings");
-        sv.protection_level = Some(crate::types::ProtectionLevel::Resilient);
-        // Only one drive configured — resilient needs 2
+        sv.protection_level = Some(crate::types::ProtectionLevel::Fortified);
+        // Only one drive configured — fortified needs 2
         let config = test_config(vec![sv], vec![test_drive()]);
         let results: Vec<_> = preflight_checks(&config)
             .into_iter()
@@ -557,9 +557,9 @@ mod tests {
     }
 
     #[test]
-    fn protected_needs_one_drive() {
+    fn sheltered_needs_one_drive() {
         let mut sv = test_subvolume("documents");
-        sv.protection_level = Some(crate::types::ProtectionLevel::Protected);
+        sv.protection_level = Some(crate::types::ProtectionLevel::Sheltered);
         // No drives at all
         let config = test_config(vec![sv], vec![]);
         let results: Vec<_> = preflight_checks(&config)
@@ -572,9 +572,9 @@ mod tests {
     }
 
     #[test]
-    fn guarded_no_drive_requirement() {
+    fn recorded_no_drive_requirement() {
         let mut sv = test_subvolume("logs");
-        sv.protection_level = Some(crate::types::ProtectionLevel::Guarded);
+        sv.protection_level = Some(crate::types::ProtectionLevel::Recorded);
         let config = test_config(vec![sv], vec![]);
         let results: Vec<_> = preflight_checks(&config)
             .into_iter()
@@ -585,9 +585,9 @@ mod tests {
     }
 
     #[test]
-    fn send_disabled_voids_protected_promise() {
+    fn send_disabled_voids_sheltered_promise() {
         let mut sv = test_subvolume("documents");
-        sv.protection_level = Some(crate::types::ProtectionLevel::Protected);
+        sv.protection_level = Some(crate::types::ProtectionLevel::Sheltered);
         sv.send_enabled = Some(false);
         let config = test_config(vec![sv], vec![test_drive()]);
         let results: Vec<_> = preflight_checks(&config)
@@ -601,9 +601,9 @@ mod tests {
     }
 
     #[test]
-    fn empty_drives_list_voids_protected_promise() {
+    fn empty_drives_list_voids_sheltered_promise() {
         let mut sv = test_subvolume("documents");
-        sv.protection_level = Some(crate::types::ProtectionLevel::Protected);
+        sv.protection_level = Some(crate::types::ProtectionLevel::Sheltered);
         sv.drives = Some(vec![]);
         let config = test_config(vec![sv], vec![test_drive()]);
         let results: Vec<_> = preflight_checks(&config)
@@ -618,8 +618,8 @@ mod tests {
     #[test]
     fn weakening_snapshot_interval_warns() {
         let mut sv = test_subvolume("documents");
-        sv.protection_level = Some(crate::types::ProtectionLevel::Protected);
-        // Protected + daily timer derives 24h snapshot interval.
+        sv.protection_level = Some(crate::types::ProtectionLevel::Sheltered);
+        // Sheltered + daily timer derives 24h snapshot interval.
         // Set a longer one to trigger the warning.
         sv.snapshot_interval = Some("2d".parse().unwrap());
         let config = test_config(vec![sv], vec![test_drive()]);
@@ -639,8 +639,8 @@ mod tests {
     #[test]
     fn weakening_retention_warns() {
         let mut sv = test_subvolume("documents");
-        sv.protection_level = Some(crate::types::ProtectionLevel::Protected);
-        // Protected derives hourly=24, daily=30. Set tighter retention.
+        sv.protection_level = Some(crate::types::ProtectionLevel::Sheltered);
+        // Sheltered derives hourly=24, daily=30. Set tighter retention.
         sv.local_retention = Some(LocalRetentionConfig::Graduated(GraduatedRetention {
             hourly: Some(6),
             daily: Some(7),
@@ -717,7 +717,7 @@ mod tests {
     fn transient_with_named_level_warns() {
         let mut sv = test_subvolume("root");
         sv.local_retention = Some(LocalRetentionConfig::Transient);
-        sv.protection_level = Some(crate::types::ProtectionLevel::Guarded);
+        sv.protection_level = Some(crate::types::ProtectionLevel::Recorded);
         let config = test_config(vec![sv], vec![test_drive()]);
         let results: Vec<_> = preflight_checks(&config)
             .into_iter()
@@ -759,7 +759,7 @@ mod tests {
         );
     }
 
-    // ── Resilient without offsite ───────────────────────────────────
+    // ── Fortified without offsite ──────────────────────────────────
 
     fn offsite_drive() -> DriveConfig {
         DriveConfig {
@@ -774,16 +774,16 @@ mod tests {
     }
 
     #[test]
-    fn resilient_without_offsite_warns() {
+    fn fortified_without_offsite_warns() {
         let mut sv = test_subvolume("recordings");
-        sv.protection_level = Some(crate::types::ProtectionLevel::Resilient);
+        sv.protection_level = Some(crate::types::ProtectionLevel::Fortified);
         // Two primary drives — no offsite
         let mut drive2 = test_drive();
         drive2.label = "drive-2".to_string();
         let config = test_config(vec![sv], vec![test_drive(), drive2]);
         let results: Vec<_> = preflight_checks(&config)
             .into_iter()
-            .filter(|c| c.name == "resilient-without-offsite")
+            .filter(|c| c.name == "fortified-without-offsite")
             .collect();
 
         assert_eq!(results.len(), 1);
@@ -791,40 +791,40 @@ mod tests {
     }
 
     #[test]
-    fn resilient_with_offsite_no_warning() {
+    fn fortified_with_offsite_no_warning() {
         let mut sv = test_subvolume("recordings");
-        sv.protection_level = Some(crate::types::ProtectionLevel::Resilient);
+        sv.protection_level = Some(crate::types::ProtectionLevel::Fortified);
         let config = test_config(vec![sv], vec![test_drive(), offsite_drive()]);
         let results: Vec<_> = preflight_checks(&config)
             .into_iter()
-            .filter(|c| c.name == "resilient-without-offsite")
+            .filter(|c| c.name == "fortified-without-offsite")
             .collect();
 
         assert!(results.is_empty());
     }
 
     #[test]
-    fn protected_without_offsite_no_warning() {
+    fn sheltered_without_offsite_no_warning() {
         let mut sv = test_subvolume("documents");
-        sv.protection_level = Some(crate::types::ProtectionLevel::Protected);
+        sv.protection_level = Some(crate::types::ProtectionLevel::Sheltered);
         let config = test_config(vec![sv], vec![test_drive()]);
         let results: Vec<_> = preflight_checks(&config)
             .into_iter()
-            .filter(|c| c.name == "resilient-without-offsite")
+            .filter(|c| c.name == "fortified-without-offsite")
             .collect();
 
         assert!(results.is_empty());
     }
 
     #[test]
-    fn resilient_with_scoped_offsite_drive_passes() {
+    fn fortified_with_scoped_offsite_drive_passes() {
         let mut sv = test_subvolume("recordings");
-        sv.protection_level = Some(crate::types::ProtectionLevel::Resilient);
+        sv.protection_level = Some(crate::types::ProtectionLevel::Fortified);
         sv.drives = Some(vec!["test-drive".to_string(), "offsite-drive".to_string()]);
         let config = test_config(vec![sv], vec![test_drive(), offsite_drive()]);
         let results: Vec<_> = preflight_checks(&config)
             .into_iter()
-            .filter(|c| c.name == "resilient-without-offsite")
+            .filter(|c| c.name == "fortified-without-offsite")
             .collect();
 
         assert!(results.is_empty());
