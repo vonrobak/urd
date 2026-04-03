@@ -74,6 +74,65 @@ interim error message from "Run `urd doctor`" to "Run `urd drives adopt {label}`
 **Gate:** After Phase C, drives have a user-facing identity layer and reconnection
 closes the anxiety loop. MINOR version bump (new command = new feature).
 
+### Validation gate + UPI 010: Config Schema v1 (parallel tracks)
+
+The test session is calendar-bound (live with v0.9.0 for days), not session-bound.
+UPI 010 sessions 1-2 change internals (enum names, Serialize trait) without affecting
+user-facing behavior. These run in parallel. UPI 010 sessions 3-4 change runtime
+behavior (parser, migrate) and come after the test session findings are addressed.
+
+**Track A: v0.9.0 test session** (calendar time)
+
+```
+Test session goals:
+  1. Live with v0.9.0 for several days (timer, Sentinel, drive cycles)
+  2. Simulate the new-user journey (run commands cold, note confusion)
+  3. Read your own config — can you narrate your protection story?
+  4. Fix systemd timer --auto flag before testing (pending since v0.8.0)
+
+Output: prioritized issue list → targeted fix phase if needed
+```
+
+**Track B: UPI 010 sessions 1-2** (concurrent with test session)
+
+```
+UPI 010 session 1:
+  - Revise ADR-111 document (the spec, not code)
+  - Update ADR-110 level names
+  - P6a: enum rename in code (recorded/sheltered/fortified)
+    Legacy serde aliases preserved — production config unchanged
+
+UPI 010 session 2:
+  - P6b: add Serialize to Config and all nested types
+  - No behavioral change — purely additive
+```
+
+These are safe to run during the test session because they don't change what any
+command outputs, how backups run, or what the Sentinel does.
+
+**Gate:** After the test session, the runtime foundation is validated. After sessions
+1-2, the vocabulary and serialization infrastructure are ready.
+
+### Post-validation: UPI 010 runtime changes + fix phase
+
+```
+Fix test findings          (~0-2 sessions, depending on what surfaces)
+
+UPI 010 session 3:
+  - v1 parser (dual-path config loading)
+  - urd migrate command
+  - v1 validation with guided error messages
+  - Example config update
+
+UPI 010 session 4 (if needed):
+  - Edge cases, round-trip tests, CLAUDE.md update
+
+Migrate own production config → live with v1 for several nightly runs
+```
+
+**Gate:** After migrating and validating your own config on v1, the schema is proven
+in production. The encounter can target v1 with confidence.
+
 ### Phase D: Progressive disclosure + The Encounter
 
 ```
@@ -82,43 +141,52 @@ closes the anxiety loop. MINOR version bump (new command = new feature).
 
 6-H — The Encounter                   (~4-6 sessions)
     Auto-trigger onboarding, auto-detection, Fate Conversation, config generation
+    Design: docs/95-ideas/2026-03-31-design-h-guided-setup-wizard.md (reviewed)
 ```
 
 **Dependencies:** 6-O builds the framework 6-H needs. Both benefit from Phases A-C:
-truthful status (A), honest communication (B), drive identity layer (C).
+truthful status (A), honest communication (B), drive identity layer (C). 6-H targets
+v1 schema exclusively — blocked by UPI 010 completion and production validation.
 
-**Design constraints from Steve reviews (2026-04-02):**
+**Design constraints from Steve reviews (2026-04-02, 2026-04-03):**
 - The encounter is a conversation about what you're afraid of losing, not a config form
 - "Set and forget" vs "delve deeper" — two exits, same quality config
 - Strategy names (3-2-1, GFS, etc.) stay internal — never user-facing
 - Config generation is a pure function — enables CLI, future TUI, future Spindle
+- Generated configs include intention comments from the encounter conversation
+- `[general]` section is minimal — infrastructure paths use XDG defaults
+- Subvolume blocks grouped by snapshot root with visual structure comments
 
 ```
-Phase A: v0.8.1 (~1 session)
+Phase A: v0.8.1 ✓
   004 (token gate) ─┐
   005 (assess + local) ─┘─→ tag v0.8.1
                             │
-Phase B: v0.8.2 (~0.75 session)
+Phase B: v0.8.2 ✓
   007 (deferred) ─┐
   008 (doctor) ───┘─→ tag v0.8.2
                        │
-Phase C: v0.9.0 (~1-2 sessions)
+Phase C: v0.9.0 ✓
   009 (urd drives) ─────┐
   006 (notifications) ──┘─→ tag v0.9.0
                              │
-                      Update 004 message
-                      (doctor → drives adopt)
-                             │
+Parallel tracks:
+  Track A: test session ────────────────────┐
+  Track B: UPI 010 s1 (ADR+P6a) ─ s2 (P6b) │
+                                            │
+Post-validation:                            │
+  Fix test findings ─ UPI 010 s3 (v1 parser + migrate)
+                       │
+  Migrate own config, validate v1
+                       │
 Phase D: (~6-8 sessions)
   6-O (progressive disclosure)
     │
   6-H (the encounter) ─→ v1.0 horizon
 ```
 
-Estimated: ~10-12 sessions remaining to v1.0 readiness.
-
-P6a (enum rename) and P6b (config Serialize) remain deferred patch-tier chores — do
-as quick PRs when convenient. P6b is a prerequisite for 6-H config generation.
+Estimated: ~8-10 sessions remaining to v1.0 readiness. The parallel tracks save
+1-2 sessions of calendar time vs purely sequential execution.
 
 ## Horizon
 
@@ -153,11 +221,13 @@ Source: Steve review "project-trajectory."
 
 ## Strategic Context
 
-**ADR-111 config migration is the largest deferred gate.** The target config architecture
-(explicit drive routing, no inheritance, named levels are opaque) is defined but not
-implemented. Legacy schema (`[defaults]`, `[local_snapshots]`) is in use. The guided setup
-wizard (6-H) will generate ADR-111-schema configs from day one. Full migration machinery
-for existing configs comes after the wizard proves the schema in practice.
+**ADR-111 config schema is designed and sequenced (UPI 010).** The v1 schema is fully
+specified: self-describing subvolume blocks, no `[defaults]`, no `[local_snapshots]`,
+`protection = "fortified"` (renamed levels), minimal `[general]`, intention comments
+in generated configs, guided validation error messages, and `urd migrate` with backup
+file. Design: `docs/95-ideas/2026-04-03-design-010-config-schema-v1.md`. Implementation
+runs in parallel with the test session (sessions 1-2) then sequentially after test
+findings (sessions 3-4). The encounter targets v1 exclusively.
 
 **Vocabulary is frozen.** Current terms — sealed/waning/exposed (promise states),
 recorded/sheltered/fortified (protection levels), thread (snapshot chain),
@@ -182,8 +252,7 @@ Maintained here as context for sequencing decisions.
 - Parallel notification builders in notify.rs and sentinel_runner.rs (maintenance risk)
 - Pipe bytes vs. on-disk size mismatch in space estimation (1.2x margin handles common case)
 - Journal persistence gap: journald may purge user-unit logs
-- P6a: ADR-110 enum rename (recorded/sheltered/fortified) — do as patch when convenient
-- P6b: Config Serialize refactor — do as patch, prerequisite for 6-H config generation
+- P6a + P6b: absorbed by UPI 010 (sessions 1-2)
 - Planner helper functions approaching parameter limit (10 args) — pass `&PlanFilters` instead of destructured bools in next planner change
 
 ## Deferred (no current timeline)
