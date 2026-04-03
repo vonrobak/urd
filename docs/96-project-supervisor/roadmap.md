@@ -5,133 +5,117 @@
 > For completed features and historical context see the
 > [archived roadmap](../90-archive/96-project-supervisor/2026-04-01-historic-roadmap.md).
 
-## Active Arc: Foundation Integrity → The Encounter
+## Completed: Foundation Integrity (Phases A-C + Config v1)
 
-**Goal:** Fix correctness and communication issues surfaced by v0.8.0 testing before
-building the first-encounter experience. Every phase answers a question:
-- Phase A: "Is Urd telling the truth?"
-- Phase B: "Is Urd speaking clearly?"
-- Phase C: "Does Urd know its drives?"
-- Phase D: "Can Urd welcome a new user?"
-
-**Sequencing rationale:** The v0.8.0 comprehensive test session (30 tests, 3 drive
-configs) proved the foundation has gaps. Cloned drives pass through identity checks
-(F2.3). Status displays false degradation (T3.3). Safety gates announce themselves
-as failures (T1.6). These must be fixed before the encounter (6-H), which is Urd's
-first impression — you don't launch the store with broken display cases.
-
-### Phase A: Make promises true (v0.8.1)
-
-Fix the two correctness issues that make Urd's core outputs unreliable.
+Phases A-D answered: "Is Urd telling the truth?" → "Is Urd speaking clearly?" →
+"Does Urd know its drives?" → "Can the config describe intent?" All merged.
 
 ```
-UPI 004 — TokenMissing safety gate     (~0.5 session, patch)
-    Modules: drives.rs, commands/backup.rs, plan_cmd.rs, output.rs
-    
-UPI 005 — Status truth                 (~0.5 session, patch)
-    Modules: awareness.rs, output.rs, voice.rs
-    Subsumes existing "assess() scoping fix" roadmap item
+Phase A: v0.8.1 ✓  (004, 005)
+Phase B: v0.8.2 ✓  (007, 008)
+Phase C: v0.9.0 ✓  (009, 006)
+UPI 010: v0.9.1-v0.10.0 ✓  (config v1, migrate, local_snapshots=false)
 ```
 
-**Dependencies:** None between them — can build in parallel or sequence either way.
-Share `output.rs` but changes are additive (new enum variant, new skip category).
+## Active Arc: Test → Smart Worker → The Encounter
 
-**Gate:** After Phase A, `urd status` tells the truth and cloned drives are blocked.
+**Goal:** Validate v0.10.0 in production, make the invisible worker intelligent, then
+build the first-encounter experience. Three phases remain before v1.0.
 
-### Phase B: Make communication honest (v0.8.2)
+### Test session (calendar time — now)
 
-Fix how Urd communicates about safety decisions and drive state.
-
-```
-UPI 007 — Safety gate communication    (~0.5 session, patch)
-    Modules: executor.rs, output.rs, voice.rs, commands/backup.rs
-
-UPI 008 — Doctor pin-age + UUID fix    (~0.25 session, patch)
-    Modules: commands/verify.rs, commands/doctor.rs, drives.rs
-```
-
-**Dependencies:** None between them. 007 touches `output.rs`/`voice.rs` (shared with
-Phase A) but changes are additive — new `OpResult::Deferred` variant, rendering updates.
-
-**Gate:** After Phase B, "DEFERRED" replaces "FAILED" for safety gates, doctor stops
-giving contradictory UUID advice and false "sends may be failing" warnings.
-
-### Phase C: Give drives a face (v0.9.0)
-
-Drives become first-class citizens with a management surface and lifecycle events.
-
-```
-UPI 009 — `urd drives` subcommand     (~0.5-1 session, standard)
-    Modules: NEW commands/drives.rs, output.rs, voice.rs, main.rs
-
-UPI 006 — Drive reconnection notifications (~0.5-1 session, standard)
-    Modules: notify.rs, sentinel.rs, sentinel_runner.rs
-```
-
-**Dependencies:** 009 and 006 are independent. After 009 lands, update UPI 004's
-interim error message from "Run `urd doctor`" to "Run `urd drives adopt {label}`".
-
-**Gate:** After Phase C, drives have a user-facing identity layer and reconnection
-closes the anxiety loop. MINOR version bump (new command = new feature).
-
-### Validation gate + UPI 010: Config Schema v1 (parallel tracks)
-
-The test session is calendar-bound (live with v0.9.0 for days), not session-bound.
-UPI 010 sessions 1-2 change internals (enum names, Serialize trait) without affecting
-user-facing behavior. These run in parallel. UPI 010 sessions 3-4 change runtime
-behavior (parser, migrate) and come after the test session findings are addressed.
-
-**Track A: v0.9.0 test session** (calendar time)
+Live with v0.10.0 for several days: nightly timer, sentinel, drive plug/unplug cycles.
+Output: prioritized issue list. Fix findings before moving on.
 
 ```
 Test session goals:
-  1. Live with v0.9.0 for several days (timer, Sentinel, drive cycles)
-  2. Simulate the new-user journey (run commands cold, note confusion)
+  1. Live with v0.10.0 (timer, Sentinel, drive cycles)
+  2. Watch htpc-root: does "degraded" / "broken" cause anxiety? (→ UPI 018)
   3. Read your own config — can you narrate your protection story?
-  4. Fix systemd timer --auto flag before testing (pending since v0.8.0)
+  4. Note anything surprising or confusing
 
 Output: prioritized issue list → targeted fix phase if needed
 ```
 
-**Track B: UPI 010 sessions 1-2** (concurrent with test session)
+### Phase E: Make the invisible worker smart (~2 sessions)
+
+**Question:** "Is the invisible worker intelligent?"
+
+These features make the nightly run better without user interaction. They serve
+north star #2 (reduce attention) and prepare the runtime for the encounter's first
+impression. Sequenced by dependency and module overlap.
+
+**E1: Btrfs pipeline — UPI 013** (~0.25 session, patch tier)
 
 ```
-UPI 010 session 1:
-  - Revise ADR-111 document (the spec, not code)
-  - Update ADR-110 level names
-  - P6a: enum rename in code (recorded/sheltered/fortified)
-    Legacy serde aliases preserved — production config unchanged
-
-UPI 010 session 2:
-  - P6b: add Serialize to Config and all nested types
-  - No behavioral change — purely additive
+013-a: --compressed-data on sends (auto-detect, enable by default)
+013-b: btrfs subvolume sync after deletions (before space check)
+Modules: btrfs.rs, executor.rs
+Ship during or right after test session — invisible, zero UX surface.
 ```
 
-These are safe to run during the test session because they don't change what any
-command outputs, how backups run, or what the Sentinel does.
-
-**Gate:** After the test session, the runtime foundation is validated. After sessions
-1-2, the vocabulary and serialization infrastructure are ready.
-
-### Post-validation: UPI 010 runtime changes + fix phase
+**E2: External-only runtime — UPI 018** (~0.5 session, patch tier)
 
 ```
-Fix test findings          (~0-2 sessions, depending on what surfaces)
-
-UPI 010 session 3:
-  - v1 parser (dual-path config loading)
-  - urd migrate command
-  - v1 validation with guided error messages
-  - Example config update
-
-UPI 010 session 4 (if needed):
-  - Edge cases, round-trip tests, CLAUDE.md update
-
-Migrate own production config → live with v1 for several nightly runs
+Fix false "degraded" / "broken chain" / "[SKIP]" for local_snapshots = false.
+Modules: awareness.rs, output.rs, voice.rs, commands/status.rs, plan.rs
+Depends on: nothing. Fixes a product bug visible in the test session now.
 ```
 
-**Gate:** After migrating and validating your own config on v1, the schema is proven
-in production. The encounter can target v1 with confidence.
+**E3: Skip unchanged subvolumes — UPI 014** (~0.5 session, standard tier)
+
+```
+Default behavior: skip snapshot creation when generation number unchanged.
+Modules: plan.rs, btrfs.rs (subvolume_generation), output.rs, voice.rs
+Depends on: nothing. Shares subvolume_generation trait method with UPI 015.
+Ship before the encounter — "Urd created 4 snapshots (5 unchanged)" is a
+better first impression than 9 identical snapshots.
+```
+
+**E4: Emergency space response (automatic mode only) — UPI 016-auto** (~0.5 session)
+
+```
+Pre-backup thinning when space is critically low (< 50% of min_free_bytes).
+Modules: retention.rs (emergency_retention pure function), executor.rs
+Depends on: 013-b (sync after delete improves space accuracy for emergency checks)
+Deferred: interactive `urd emergency` command → post-encounter (full design workflow)
+```
+
+**Sequencing rationale:**
+- 013 first: invisible correctness, validates during test session. Also 013-b (sync)
+  improves space accuracy that 016-auto depends on.
+- 018 second: fixes a product bug the test session is actively observing. Blocks on
+  nothing but benefits from 013 being merged (fewer in-flight changes).
+- 014 third: adds intelligence. Touches plan.rs and voice.rs (shared with 018). Sequence
+  after 018 to avoid merge conflicts in voice.rs rendering code.
+- 016-auto last in Phase E: depends on 013-b for accurate space readings. Smallest scope
+  of the deferred 016 — just the retention function + executor integration.
+
+**Module overlap resolution:**
+- awareness.rs: only 018 (017 deferred to Phase F)
+- voice.rs + output.rs: 018 then 014. Both add rendering; 018's SkipCategory::ExternalOnly
+  and 014's SkipCategory::Unchanged are independent enum variants.
+- btrfs.rs: 013 adds sync + compressed-data probe, 014 adds subvolume_generation. Additive.
+
+```
+Test session (calendar days)
+     │
+E1:  013 (btrfs pipeline, 0.25 session) ─── tag v0.11.0
+     │
+E2:  018 (external-only runtime, 0.5 session)
+     │
+E3:  014 (skip unchanged, 0.5 session)
+     │
+E4:  016-auto (emergency pre-backup thinning, 0.5 session)
+     │
+     ├── Fix any test session findings (~0-1 session)
+     │
+Phase D: The Encounter (~6-8 sessions)
+```
+
+**Gate:** After Phase E, the nightly run is smarter (skips unchanged, compressed sends,
+accurate space tracking, correct external-only presentation, emergency thinning). The
+encounter can generate configs with confidence that the runtime handles all cases well.
 
 ### Phase D: Progressive disclosure + The Encounter
 
@@ -144,9 +128,9 @@ in production. The encounter can target v1 with confidence.
     Design: docs/95-ideas/2026-03-31-design-h-guided-setup-wizard.md (reviewed)
 ```
 
-**Dependencies:** 6-O builds the framework 6-H needs. Both benefit from Phases A-C:
-truthful status (A), honest communication (B), drive identity layer (C). 6-H targets
-v1 schema exclusively — blocked by UPI 010 completion and production validation.
+**Dependencies:** 6-O builds the framework 6-H needs. Both benefit from Phase E:
+external-only presentation (018), skip-unchanged intelligence (014). 6-H targets
+v1 schema exclusively — proven in production since v0.10.0.
 
 **Design constraints from Steve reviews (2026-04-02, 2026-04-03):**
 - The encounter is a conversation about what you're afraid of losing, not a config form
@@ -154,106 +138,86 @@ v1 schema exclusively — blocked by UPI 010 completion and production validatio
 - Strategy names (3-2-1, GFS, etc.) stay internal — never user-facing
 - Config generation is a pure function — enables CLI, future TUI, future Spindle
 - Generated configs include intention comments from the encounter conversation
-- `[general]` section is minimal — infrastructure paths use XDG defaults
-- Subvolume blocks grouped by snapshot root with visual structure comments
+
+**Gate:** After Phase D, Urd can welcome a new user. v1.0 horizon.
+
+## Phase F: Trust the Invoked Norn (post-v1.0)
+
+**Question:** "Can I trust what I see?"
+
+Depth features for users who already trust Urd. These make a good product better.
 
 ```
-Phase A: v0.8.1 ✓
-  004 (token gate) ─┐
-  005 (assess + local) ─┘─→ tag v0.8.1
-                            │
-Phase B: v0.8.2 ✓
-  007 (deferred) ─┐
-  008 (doctor) ───┘─→ tag v0.8.2
-                       │
-Phase C: v0.9.0 ✓
-  009 (urd drives) ─────┐
-  006 (notifications) ──┘─→ tag v0.9.0
-                             │
-Parallel tracks:
-  Track A: test session ────────────────────┐
-  Track B: UPI 010 s1 (ADR+P6a) ─ s2 (P6b) │
-                                            │
-Post-validation:                            │
-  Fix test findings ─ UPI 010 s3 (v1 parser + migrate)
-                       │
-  Migrate own config, validate v1
-                       │
-Phase D: (~6-8 sessions)
-  6-O (progressive disclosure)
-    │
-  6-H (the encounter) ─→ v1.0 horizon
+015 — Change preview in `urd get`      (~0.5 session)
+    Show what changed before restoring. Uses subvolume_generation from 014.
+    "These 3 files changed since yesterday. Want them back?"
+
+017 — Thread lineage visualization     (~0.5 session)
+    Enrich `urd doctor --thorough` with chain visualization.
+    Per-subvolume: local pins, drive snapshots, chain status.
+
+016-interactive — `urd emergency`      (full design workflow, ~0.5 session)
+    Guided crisis response. Assess → explain → preview → confirm → execute → report.
+    Needs /grill-me + adversary review before building.
+
+011 — Transient space safety           (~1 session)
+    Behavioral fix for transient snapshot lifecycle.
+    Designed + Steve-reviewed. Needs adversary review.
+
+012 — Sentinel drive-gated transient   (~1 session, depends on 011)
+    Sentinel integration for space monitoring.
 ```
 
-Estimated: ~8-10 sessions remaining to v1.0 readiness. The parallel tracks save
-1-2 sessions of calendar time vs purely sequential execution.
+**Sequencing rationale:** 015 and 017 are post-encounter depth. 016-interactive is a
+power-user tool. 011 and 012 are transient behavioral fixes — important for correctness
+but the config surface (010-a) and runtime presentation (018) are already fixed. The
+behavioral fix can follow.
 
 ## Horizon
 
-Items here have no session estimates yet. They need `/design` before entering the
-active arc. Listed roughly by impact, not by dependency order.
+Items needing `/design` before entering the active arc. Roughly by impact.
 
-**Restore verification** (`urd verify`) — Pick a file, restore it from snapshot, confirm
-it matches, track the result in the awareness model. Category-defining: a backup you've
-never tested is a hope, not a backup. Start manual, graduate to Sentinel-triggered.
+**Restore verification** (`urd verify --test`) — Pick a file, restore from snapshot,
+confirm it matches. Category-defining: an untested backup is a hope, not a backup.
 Source: Steve review "strategies-need-a-soul."
 
-**Directory restore** (`urd get` for directories) — Table stakes for a backup tool. Users
-recovering from failure almost never need a single file. Must ship before v1.0.
+**Directory restore** (`urd get` for directories) — Table stakes. Users recovering from
+failure almost never need a single file. Must ship before v1.0 or shortly after.
 Source: Steve review "project-trajectory."
 
 **Mirror-awareness** — Detect BTRFS RAID1, explain what it does and doesn't protect
-against. Small implementation, high trust-building impact. Corrects the dangerous
-misconception that RAID = backup. Source: Steve review "strategies-need-a-soul."
+against. Small implementation, high trust-building impact.
 
-**Yearly retention** — Add yearly tier to `GraduatedRetention`. Simple, additive, enables
-deep archival. No UX risk. Source: Steve review "strategies-need-a-soul."
+**Yearly retention** — Add yearly tier to `GraduatedRetention`. Simple, additive.
 
-**Sentinel completion** — Notification dedup (subsumed by 6-I cooldown), active mode
-(auto-trigger backup on drive connect). Designed, not built. Active mode requires trust:
-must prove circuit breaker, cooldown, and permission model before deployment.
+**Sentinel completion** — Active mode (auto-trigger backup on drive connect). Requires
+trust: circuit breaker, cooldown, permission model.
 
-**Spindle** — Tray icon for desktop integration. Urd's desktop face. Minimal viable
-version: read-only icon showing promise state + last backup time. Does not require
-Sentinel active mode — just needs to read `urd status` output. Separate technology
-surface (GUI toolkit), so sequence after CLI product is complete.
-Source: Steve review "project-trajectory."
+**Spindle** — Desktop tray icon. Read-only: promise state + last backup time. Separate
+technology surface (GUI toolkit). After CLI product is complete.
 
 ## Strategic Context
 
-**ADR-111 config schema is designed and sequenced (UPI 010).** The v1 schema is fully
-specified: self-describing subvolume blocks, no `[defaults]`, no `[local_snapshots]`,
-`protection = "fortified"` (renamed levels), minimal `[general]`, intention comments
-in generated configs, guided validation error messages, and `urd migrate` with backup
-file. Design: `docs/95-ideas/2026-04-03-design-010-config-schema-v1.md`. Implementation
-runs in parallel with the test session (sessions 1-2) then sequentially after test
-findings (sessions 3-4). The encounter targets v1 exclusively.
+**Vocabulary is frozen.** sealed/waning/exposed, recorded/sheltered/fortified, thread,
+connected/away. No renames unless real user feedback demands it.
 
-**Vocabulary is frozen.** Current terms — sealed/waning/exposed (promise states),
-recorded/sheltered/fortified (protection levels), thread (snapshot chain),
-connected/away (drive status) — are stable. No renames unless real user feedback demands
-it. Every rename breaks muscle memory and documentation.
+**Strategy knowledge is internal.** 3-2-1, GFS, immutability — all internal. The promise
+model is the interface; strategies are the engineering.
 
-**Strategy knowledge is internal.** 3-2-1, GFS, immutability principles, etc. live inside
-Urd's implementation — they inform what "resilient" means. They are never exposed as
-user-facing concepts. The promise model is the interface; strategies are the engineering.
-
-**Documentation effort planned.** Module design guides, architecture principles document,
-API reference. Not in scope until the codebase stabilizes after the encounter. The
-current CLAUDE.md + ADRs + operating guide covers development needs.
+**btrbk competitive analysis completed (2026-04-03).** Key steals: `--compressed-data`
+(013), `subvolume sync` (013), skip-unchanged (014), change preview (015), emergency
+mode (016). Key differentiators to protect: promise model, awareness computation, sentinel,
+mythic voice, guided setup, progressive disclosure. btrbk tells you what snapshots exist;
+Urd tells you if your data is safe.
 
 ## Tech Debt
 
-Maintained here as context for sequencing decisions.
-
-- NVMe snapshot accumulation above 10GB threshold not gated (6-B partially addresses)
-- `FileSystemState` trait (11 methods) outgrowing its name — consider rename to `SystemState`
-- Status string fragility: "UNPROTECTED"/"AT RISK"/"PROTECTED" as raw strings (constants needed)
-- Parallel notification builders in notify.rs and sentinel_runner.rs (maintenance risk)
-- Pipe bytes vs. on-disk size mismatch in space estimation (1.2x margin handles common case)
-- Journal persistence gap: journald may purge user-unit logs
-- P6a + P6b: absorbed by UPI 010 (sessions 1-2)
-- Planner helper functions approaching parameter limit (10 args) — pass `&PlanFilters` instead of destructured bools in next planner change
+- `FileSystemState` trait (11+ methods) outgrowing its name — rename in next trait change (014)
+- Status string fragility: "UNPROTECTED"/"AT RISK"/"PROTECTED" as raw strings
+- Parallel notification builders in notify.rs and sentinel_runner.rs
+- Planner helper functions approaching parameter limit (10 args) — pass `&PlanFilters`
+- ByteSize Display `{:.1}` formatting — "10.0GB" not "10GB"
+- VersionProbe error message says "failed to read config_version" for TOML syntax errors
 
 ## Deferred (no current timeline)
 
@@ -261,5 +225,5 @@ Maintained here as context for sequencing decisions.
 - Cloud backup (S3/B2)
 - Pull mode / mesh topology
 - Multi-user / library mode
-- `urd find` (cross-snapshot search) — unsolved perf problem
-- Drive replacement workflow — build after 6-H proves guided interaction
+- `urd find` (cross-snapshot search)
+- Drive replacement workflow

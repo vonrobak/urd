@@ -9,15 +9,17 @@
 
 **Urd is the sole backup system.** Systemd timer running nightly at 04:00 since 2026-03-25.
 Sentinel daemon deployed (passive monitoring, drive detection, backup overdue alerts).
-821 tests, all passing, clippy clean. Current version: v0.9.1.
+833 tests, all passing, clippy clean. Current version: v0.10.0.
 
-**UPI 010 sessions 1-4 complete.** Protection level rename, Serialize, V1 parser, and
-`urd migrate` command all merged. PR #75-78. The full legacy→v1 config pipeline works:
-parse either schema, migrate between them, semantic equivalence confirmed.
+**UPI 010 complete (all sessions + 010-a).** Config schema v1 fully implemented:
+V1 parser, validation, `urd migrate`, `local_snapshots = false`. PR #75-80 merged.
+The full legacy→v1 config pipeline works: parse either schema, migrate between them,
+semantic equivalence confirmed. Named-level opacity has no exceptions.
 
 **Deployment notes:**
-- v0.9.1 deployed via `cargo install --path .`
-- Systemd timer confirmed: `--auto --confirm-retention-change` in ExecStart
+- v0.10.0 tagged but not yet pushed/installed
+- After install: hand-edit production config `local_retention = "transient"` →
+  `local_snapshots = false` before next timer run
 
 ## In Progress
 
@@ -25,18 +27,18 @@ Nothing active.
 
 ## Recently Completed
 
-**Track B: Production config migrated to v1** (2026-04-03)
-   - Migrated via `urd migrate`, verified with `urd plan` diff
-   - Found and fixed bug: partial retention overrides on named levels lost unspecified
-     fields (e.g., `{ daily = 7 }` on recorded lost `weekly = 4`). Root cause: migration
-     rendered raw user overrides instead of merging with `derive_policy()` values.
-     Also fixed `render_resolved_retention` omitting zero-valued fields (hourly/weekly=0),
-     which would inherit non-zero values from v1 synthesized defaults. +1 regression test.
+**UPI 010-a: `local_snapshots = false`** (2026-04-03)
+   - Replaced `local_retention = "transient"` with boolean opt-out in v1 config
+   - Eliminated the only exception to named-level opacity
+   - Migration handles custom+transient and named+transient→custom with baked fields
+   - 12 new tests, simplify pass fixed 5 issues including a double-count bug
 
 ## Next Up
 
-**Track A: v0.9.1 test session** (calendar time — live with the tool)
-   - Live with v0.9.1 for several days (timer, Sentinel, drive plug/unplug cycles)
+**Immediate: Push v0.10.0 and deploy** (see "When you return" in session journal)
+
+**Track A: v0.10.0 test session** (calendar time — live with the tool)
+   - Live with v0.10.0 for several days (timer, Sentinel, drive plug/unplug cycles)
    - Output: prioritized issue list → targeted fix phase if needed
 
 **Then sequential:**
