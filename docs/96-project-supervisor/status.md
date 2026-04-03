@@ -9,17 +9,16 @@
 
 **Urd is the sole backup system.** Systemd timer running nightly at 04:00 since 2026-03-25.
 Sentinel daemon deployed (passive monitoring, drive detection, backup overdue alerts).
-763 tests, all passing, clippy clean. Current version: v0.9.0.
+764 tests, all passing, clippy clean. Current version: v0.9.1.
 
-**Phase C complete (UPI 009 + 006).** `urd drives` subcommand lists configured drives
-with status, token state, free space, and role. `urd drives adopt <label>` resets a
-drive's token relationship. Sentinel emits reconnection notifications with token-aware
-dispatch (identity-suspect drives get "needs adoption" guidance). PR #72 merged, v0.9.0
-tagged and deployed.
+**UPI 010 session 1 complete (P6a).** Protection level vocabulary renamed:
+guarded→recorded, protected→sheltered, resilient→fortified. Serde aliases preserve
+legacy config backward compat. ADR-111 revised with complete v1 schema specification.
+PR #75 merged, v0.9.1 tagged and deployed.
 
 **Deployment notes:**
 - Systemd timer needs `--auto` added to `ExecStart` line (pending since v0.8.0)
-- v0.9.0 deployed via `cargo install --path .`
+- v0.9.1 deployed via `cargo install --path .`
 
 ## In Progress
 
@@ -29,24 +28,19 @@ Nothing active.
 
 **Track A: v0.9.0 test session** (calendar time — live with the tool)
    - Fix systemd timer `--auto` flag first (pending since v0.8.0)
-   - Live with v0.9.0 for several days (timer, Sentinel, drive plug/unplug cycles)
-   - Simulate the new-user journey: run commands cold, note confusion points
-   - Read your own config — can you narrate your protection story?
+   - Live with v0.9.1 for several days (timer, Sentinel, drive plug/unplug cycles)
    - Output: prioritized issue list → targeted fix phase if needed
 
-**Track B: UPI 010 sessions 1-2** (concurrent — no user-facing changes)
-   - Session 1: Revise ADR-111 document + ADR-110 update + P6a (enum rename)
-   - Session 2: P6b (add Serialize to Config and all nested types)
-   - Design: `docs/95-ideas/2026-04-03-design-010-config-schema-v1.md`
+**Track B: UPI 010 session 2** (concurrent — no user-facing changes)
+   - P6b: add Serialize to Config and all nested types
+   - Clean single-purpose session, low risk
+   - Plan: `.claude/plans/whimsical-honking-snowglobe.md`
 
 **Then sequential:**
 1. Fix test session findings (~0-2 sessions)
 2. UPI 010 sessions 3-4: v1 parser, `urd migrate`, validation messages, example config
 3. Migrate own production config → validate v1 in real usage
 4. **Phase D: Progressive disclosure + The Encounter** — ~6-8 sessions
-   - 6-O: Progressive disclosure (~2 sessions) — design doc exists
-   - 6-H: The Encounter — Fate Conversation, config generation (~4-6 sessions)
-   - Blocked by: UPI 010 completion and v1 production validation
 
 ## Key Links
 
@@ -59,7 +53,6 @@ Nothing active.
 | ADRs (100-112) | [decisions/](../00-foundation/decisions/) |
 | Design docs | [95-ideas/](../95-ideas/) |
 | Review reports | [99-reports/](../99-reports/) |
-| Historic roadmap (pre-UPI) | [archived](../90-archive/96-project-supervisor/2026-04-01-historic-roadmap.md) |
 
 ## Known Issues
 
