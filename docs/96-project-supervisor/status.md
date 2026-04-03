@@ -9,36 +9,39 @@
 
 **Urd is the sole backup system.** Systemd timer running nightly at 04:00 since 2026-03-25.
 Sentinel daemon deployed (passive monitoring, drive detection, backup overdue alerts).
-799 tests, all passing, clippy clean. Current version: v0.9.1.
+821 tests, all passing, clippy clean. Current version: v0.9.1.
 
-**UPI 010 sessions 1-3 complete (P6a + P6b + V1 parser).** Protection level vocabulary
-renamed. Serialize on all config types. V1 config parser with version dispatch, validation,
-synthesized LocalSnapshotsConfig, ResolvedSubvolume enrichment. PR #75, #76, #77 merged.
+**UPI 010 sessions 1-4 complete.** Protection level rename, Serialize, V1 parser, and
+`urd migrate` command all merged. PR #75-78. The full legacy→v1 config pipeline works:
+parse either schema, migrate between them, semantic equivalence confirmed.
 
 **Deployment notes:**
-- Systemd timer needs `--auto` added to `ExecStart` line (pending since v0.8.0)
 - v0.9.1 deployed via `cargo install --path .`
+- Systemd timer confirmed: `--auto --confirm-retention-change` in ExecStart
 
 ## In Progress
 
 Nothing active.
 
-## Next Up (parallel tracks)
+## Recently Completed
+
+**Track B: Production config migrated to v1** (2026-04-03)
+   - Migrated via `urd migrate`, verified with `urd plan` diff
+   - Found and fixed bug: partial retention overrides on named levels lost unspecified
+     fields (e.g., `{ daily = 7 }` on recorded lost `weekly = 4`). Root cause: migration
+     rendered raw user overrides instead of merging with `derive_policy()` values.
+     Also fixed `render_resolved_retention` omitting zero-valued fields (hourly/weekly=0),
+     which would inherit non-zero values from v1 synthesized defaults. +1 regression test.
+
+## Next Up
 
 **Track A: v0.9.1 test session** (calendar time — live with the tool)
-   - Fix systemd timer `--auto` flag first (pending since v0.8.0)
    - Live with v0.9.1 for several days (timer, Sentinel, drive plug/unplug cycles)
    - Output: prioritized issue list → targeted fix phase if needed
 
-**Track B: UPI 010 session 4** (concurrent — medium risk)
-   - `urd migrate` command: legacy → v1 config transformation
-   - v1 example config, updated CLAUDE.md
-   - Plan: `docs/97-plans/2026-04-03-plan-010-config-schema-v1.md`
-
 **Then sequential:**
 1. Fix test session findings (~0-2 sessions)
-2. Migrate own production config → validate v1 in real usage
-3. **Phase D: Progressive disclosure + The Encounter** — ~6-8 sessions
+2. **Phase D: Progressive disclosure + The Encounter** — ~6-8 sessions
 
 ## Key Links
 
@@ -60,5 +63,5 @@ Nothing active.
 - Parallel notification builders in notify.rs and sentinel_runner.rs (maintenance risk)
 - RECOVERY column hidden — needs real snapshot depth calculation before it can return
 - Planner helper functions approaching parameter limit (10 args) — pass `&PlanFilters` instead of destructured bools in next planner change
-- ByteSize Display uses `{:.1}` formatting — `urd migrate` (session 4) will emit "10.0GB" not "10GB"; consider clean display mode
-- VersionProbe error message says "failed to read config_version" for TOML syntax errors — UX polish for session 4
+- ByteSize Display uses `{:.1}` formatting — `urd migrate` emits "10.0GB" not "10GB"; consider clean display mode
+- VersionProbe error message says "failed to read config_version" for TOML syntax errors — UX polish
