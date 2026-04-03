@@ -25,15 +25,28 @@ tagged and deployed.
 
 Nothing active.
 
-## Next Up
+## Next Up (parallel tracks)
 
-1. **Phase D: Progressive disclosure + The Encounter** — ~6-8 sessions total
-   - 6-O: Progressive disclosure (~2 sessions)
-   - 6-H: The Encounter — auto-trigger onboarding, Fate Conversation, config generation (~4-6 sessions)
-   - Designs: 6-O has design doc; 6-H needs /design
-   - P6b (config Serialize refactor) is a prerequisite for 6-H config generation
-2. **P6a: ADR-110 enum rename** — deferred patch (recorded/sheltered/fortified)
-3. **P6b: Config Serialize refactor** — deferred patch, prerequisite for 6-H
+**Track A: v0.9.0 test session** (calendar time — live with the tool)
+   - Fix systemd timer `--auto` flag first (pending since v0.8.0)
+   - Live with v0.9.0 for several days (timer, Sentinel, drive plug/unplug cycles)
+   - Simulate the new-user journey: run commands cold, note confusion points
+   - Read your own config — can you narrate your protection story?
+   - Output: prioritized issue list → targeted fix phase if needed
+
+**Track B: UPI 010 sessions 1-2** (concurrent — no user-facing changes)
+   - Session 1: Revise ADR-111 document + ADR-110 update + P6a (enum rename)
+   - Session 2: P6b (add Serialize to Config and all nested types)
+   - Design: `docs/95-ideas/2026-04-03-design-010-config-schema-v1.md`
+
+**Then sequential:**
+1. Fix test session findings (~0-2 sessions)
+2. UPI 010 sessions 3-4: v1 parser, `urd migrate`, validation messages, example config
+3. Migrate own production config → validate v1 in real usage
+4. **Phase D: Progressive disclosure + The Encounter** — ~6-8 sessions
+   - 6-O: Progressive disclosure (~2 sessions) — design doc exists
+   - 6-H: The Encounter — Fate Conversation, config generation (~4-6 sessions)
+   - Blocked by: UPI 010 completion and v1 production validation
 
 ## Key Links
 
