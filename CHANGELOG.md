@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-04-03
+
 ### Fixed
 - Safety gate (chain-break full send blocked) now reports `DEFERRED` instead of `FAILED` — the tool made a correct decision, not an error
 - Deferred-only backup runs report "success" instead of "failure" in summary, heartbeat, and metrics
