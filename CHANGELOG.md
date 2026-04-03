@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-04-03
+
 ### Changed
 - Protection level vocabulary: guarded→recorded, protected→sheltered, resilient→fortified — names now describe what the data *becomes*, not a generic safety adjective
 - ADR-111 revised with complete v1 schema specification, field tables, migration spec, and validation error messages
