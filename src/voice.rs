@@ -71,12 +71,19 @@ fn render_status_interactive(data: &StatusOutput) -> String {
     }
 
     // ── Next-action suggestion ──────────────────────────────────────
-    let has_exposed = data.assessments.iter().any(|a| a.status == "UNPROTECTED");
-    let has_degraded = data.assessments.iter().any(|a| a.health != "healthy");
-    append_suggestion(
-        &SuggestionContext::Status { has_exposed, has_degraded },
-        &mut out,
-    );
+    if !data.advice.is_empty() {
+        writeln!(out).ok();
+        if data.advice.len() == 1 {
+            let a = &data.advice[0];
+            if let Some(ref cmd) = a.command {
+                writeln!(out, "{}", format!("{} — run `{cmd}` to fix.", a.subvolume).dimmed()).ok();
+            } else if let Some(ref reason) = a.reason {
+                writeln!(out, "{}", format!("{} — {}.", a.subvolume, reason).dimmed()).ok();
+            }
+        } else {
+            writeln!(out, "{}", format!("{} subvolumes need attention — run `urd doctor` for details.", data.advice.len()).dimmed()).ok();
+        }
+    }
 
     out
 }
@@ -1975,6 +1982,9 @@ fn render_doctor_interactive(data: &DoctorOutput) -> String {
                 if let Some(ref suggestion) = ds.suggestion {
                     writeln!(out, "      \u{2192} {suggestion}").ok();
                 }
+                if let Some(ref reason) = ds.reason {
+                    writeln!(out, "      {}", reason.dimmed()).ok();
+                }
             }
         }
     }
@@ -2292,7 +2302,17 @@ fn render_default_status_interactive(data: &DefaultStatusOutput) -> String {
     writeln!(out).ok();
 
     // Next-action suggestion
-    if data.sealed_count() < data.total || health_issues > 0 {
+    if let Some(ref advice) = data.best_advice {
+        if data.total_needing_attention == 1 {
+            if let Some(ref cmd) = advice.command {
+                writeln!(out, "{}", format!("Run `{cmd}`.").dimmed()).ok();
+            } else if let Some(ref reason) = advice.reason {
+                writeln!(out, "{}", reason.dimmed()).ok();
+            }
+        } else {
+            writeln!(out, "{}", format!("{} subvolumes need attention — run `urd status` for details.", data.total_needing_attention).dimmed()).ok();
+        }
+    } else if data.sealed_count() < data.total || health_issues > 0 {
         append_suggestion(&SuggestionContext::Default { has_issues: true }, &mut out);
     } else {
         writeln!(out, "{}", "Run `urd status` for details, `urd --help` for commands.".dimmed())
@@ -2387,8 +2407,6 @@ fn escalated_staleness_text(
 enum SuggestionContext {
     /// Bare `urd` (default command).
     Default { has_issues: bool },
-    /// `urd status`.
-    Status { has_exposed: bool, has_degraded: bool },
     /// `urd plan`.
     Plan { has_operations: bool, has_space_skip: bool },
     /// `urd backup`.
@@ -2407,10 +2425,6 @@ fn suggest_next_action(context: &SuggestionContext) -> Option<&'static str> {
     match context {
         SuggestionContext::Default { has_issues: true } => {
             Some("Run `urd status` for details.")
-        }
-        SuggestionContext::Status { has_exposed: true, .. }
-        | SuggestionContext::Status { has_degraded: true, .. } => {
-            Some("Run `urd doctor` to diagnose.")
         }
         SuggestionContext::Plan { has_space_skip: true, has_operations: true } => {
             Some("Run `urd calibrate` to review retention, then `urd backup`.")
@@ -2620,6 +2634,7 @@ fn render_drives_adopt_interactive(data: &DriveAdoptOutput) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::awareness::ActionableAdvice;
     use crate::output::{
         BackupSummary, CalibrateEntry, CalibrateOutput, CalibrateResult, ChainHealth,
         ChainHealthEntry, DeferredInfo, DisconnectedDrive, DriveInfo, HistoryOutput, HistoryRun,
@@ -2711,6 +2726,7 @@ mod tests {
             }),
             total_pins: 3,
             redundancy_advisories: vec![],
+            advice: vec![],
         }
     }
 
@@ -2845,6 +2861,7 @@ mod tests {
             last_run: None,
             total_pins: 0,
             redundancy_advisories: vec![],
+            advice: vec![],
         };
         let output = render_status(&data, OutputMode::Interactive);
         assert!(
@@ -2913,11 +2930,79 @@ mod tests {
             last_run: None,
             total_pins: 0,
             redundancy_advisories: vec![],
+            advice: vec![],
         };
         let output = render_status(&data, OutputMode::Interactive);
         assert!(
             output.contains("no runs recorded"),
             "missing no-runs message"
+        );
+    }
+
+    // ── Status advice rendering tests ────────────────────────────────
+
+    #[test]
+    fn status_single_issue_shows_inline_fix() {
+        colored::control::set_override(false);
+        let mut data = test_status_output();
+        data.advice = vec![ActionableAdvice {
+            subvolume: "htpc-docs".to_string(),
+            issue: "waning — last backup 3 hours ago".to_string(),
+            command: Some("urd backup --subvolume htpc-docs".to_string()),
+            reason: None,
+        }];
+        let output = render_status(&data, OutputMode::Interactive);
+        assert!(
+            output.contains("htpc-docs"),
+            "missing subvolume name in advice: {output}"
+        );
+        assert!(
+            output.contains("urd backup --subvolume htpc-docs"),
+            "missing inline fix command: {output}"
+        );
+    }
+
+    #[test]
+    fn status_multiple_issues_shows_doctor() {
+        colored::control::set_override(false);
+        let mut data = test_status_output();
+        data.advice = vec![
+            ActionableAdvice {
+                subvolume: "htpc-docs".to_string(),
+                issue: "waning".to_string(),
+                command: Some("urd backup --subvolume htpc-docs".to_string()),
+                reason: None,
+            },
+            ActionableAdvice {
+                subvolume: "htpc-home".to_string(),
+                issue: "exposed".to_string(),
+                command: None,
+                reason: Some("Connect WD-18TB".to_string()),
+            },
+        ];
+        let output = render_status(&data, OutputMode::Interactive);
+        assert!(
+            output.contains("2 subvolumes need attention"),
+            "missing doctor redirect: {output}"
+        );
+        assert!(
+            output.contains("urd doctor"),
+            "missing doctor command: {output}"
+        );
+    }
+
+    #[test]
+    fn status_no_issues_no_suggestion() {
+        colored::control::set_override(false);
+        let data = test_status_output();
+        let output = render_status(&data, OutputMode::Interactive);
+        assert!(
+            !output.contains("need attention"),
+            "healthy state should not have attention message: {output}"
+        );
+        assert!(
+            !output.contains("to fix"),
+            "healthy state should not have fix message: {output}"
         );
     }
 
@@ -4600,6 +4685,8 @@ mod tests {
                 duration: Some("1m 30s".to_string()),
             }),
             last_run_age_secs: Some(25200), // 7 hours
+            best_advice: None,
+            total_needing_attention: 0,
         }
     }
 
@@ -4629,6 +4716,8 @@ mod tests {
             blocked_count: 0,
             last_run: None,
             last_run_age_secs: None,
+            best_advice: None,
+            total_needing_attention: 0,
         };
         let output = render_default_status(&data, OutputMode::Interactive);
         assert!(
@@ -4660,6 +4749,8 @@ mod tests {
             blocked_count: 0,
             last_run: None,
             last_run_age_secs: None,
+            best_advice: None,
+            total_needing_attention: 0,
         };
         let output = render_default_status(&data, OutputMode::Interactive);
         assert!(
@@ -4713,6 +4804,8 @@ mod tests {
             blocked_count: 0,
             last_run: None,
             last_run_age_secs: None,
+            best_advice: None,
+            total_needing_attention: 0,
         };
         let output = render_default_status(&data, OutputMode::Interactive);
         assert!(
@@ -4731,6 +4824,8 @@ mod tests {
             blocked_count: 0,
             last_run: None,
             last_run_age_secs: None,
+            best_advice: None,
+            total_needing_attention: 0,
         };
         let output = render_default_status(&data, OutputMode::Daemon);
         let parsed: serde_json::Value =
@@ -4758,6 +4853,51 @@ mod tests {
         let parsed: serde_json::Value =
             serde_json::from_str(&output).expect("daemon first-time should be valid JSON");
         assert_eq!(parsed["status"], "not_configured");
+    }
+
+    // ── Default advice rendering tests ──────────────────────────────
+
+    #[test]
+    fn default_single_issue_shows_command() {
+        colored::control::set_override(false);
+        let mut data = test_default_all_sealed();
+        data.waning_names = vec!["htpc-docs".to_string()];
+        data.best_advice = Some(ActionableAdvice {
+            subvolume: "htpc-docs".to_string(),
+            issue: "waning — last backup 3 hours ago".to_string(),
+            command: Some("urd backup --subvolume htpc-docs".to_string()),
+            reason: None,
+        });
+        data.total_needing_attention = 1;
+        let output = render_default_status(&data, OutputMode::Interactive);
+        assert!(
+            output.contains("urd backup --subvolume htpc-docs"),
+            "single issue should show specific command: {output}"
+        );
+    }
+
+    #[test]
+    fn default_multiple_issues_shows_count() {
+        colored::control::set_override(false);
+        let mut data = test_default_all_sealed();
+        data.waning_names = vec!["htpc-docs".to_string()];
+        data.exposed_names = vec!["htpc-home".to_string()];
+        data.best_advice = Some(ActionableAdvice {
+            subvolume: "htpc-home".to_string(),
+            issue: "exposed".to_string(),
+            command: None,
+            reason: Some("Connect WD-18TB".to_string()),
+        });
+        data.total_needing_attention = 2;
+        let output = render_default_status(&data, OutputMode::Interactive);
+        assert!(
+            output.contains("2 subvolumes need attention"),
+            "multiple issues should show count: {output}"
+        );
+        assert!(
+            output.contains("urd status"),
+            "multiple issues should suggest urd status: {output}"
+        );
     }
 
     // ── Doctor tests ──────────────────────────────────────────────────
@@ -4796,6 +4936,7 @@ mod tests {
                     health: "healthy".to_string(),
                     issue: None,
                     suggestion: None,
+                    reason: None,
                 },
                 DoctorDataSafety {
                     name: "htpc-docs".to_string(),
@@ -4803,6 +4944,7 @@ mod tests {
                     health: "healthy".to_string(),
                     issue: None,
                     suggestion: None,
+                    reason: None,
                 },
             ],
             sentinel: DoctorSentinelStatus {
@@ -4856,6 +4998,7 @@ mod tests {
             health: "blocked".to_string(),
             issue: Some("exposed — data may not be recoverable".to_string()),
             suggestion: Some("Run `urd backup` or connect a drive.".to_string()),
+            reason: None,
         };
         data.verdict = DoctorVerdict::issues(1);
         let output = render_doctor(&data, OutputMode::Interactive);
@@ -4945,6 +5088,61 @@ mod tests {
         assert!(parsed["infra_checks"].is_array());
         assert!(parsed["data_safety"].is_array());
         assert_eq!(parsed["sentinel"]["running"], true);
+    }
+
+    #[test]
+    fn doctor_chain_broken_shows_force_full() {
+        colored::control::set_override(false);
+        let mut data = test_doctor_healthy();
+        data.data_safety[0] = DoctorDataSafety {
+            name: "htpc-home".to_string(),
+            status: "AT RISK".to_string(),
+            health: "degraded".to_string(),
+            issue: Some("waning — last backup 48 hours ago".to_string()),
+            suggestion: Some("Run `urd backup --force-full --subvolume htpc-home`.".to_string()),
+            reason: Some("thread to WD-18TB broken (pin missing locally)".to_string()),
+        };
+        data.verdict = DoctorVerdict::warnings(1);
+        let output = render_doctor(&data, OutputMode::Interactive);
+        assert!(
+            output.contains("--force-full"),
+            "missing force-full suggestion: {output}"
+        );
+        assert!(
+            output.contains("thread to WD-18TB broken"),
+            "missing chain break reason: {output}"
+        );
+    }
+
+    #[test]
+    fn doctor_absent_drive_shows_connect() {
+        colored::control::set_override(false);
+        let mut data = test_doctor_healthy();
+        data.data_safety[0] = DoctorDataSafety {
+            name: "htpc-home".to_string(),
+            status: "UNPROTECTED".to_string(),
+            health: "blocked".to_string(),
+            issue: Some("exposed — all drives disconnected".to_string()),
+            suggestion: None,
+            reason: Some("Connect WD-18TB to restore protection".to_string()),
+        };
+        data.verdict = DoctorVerdict::issues(1);
+        let output = render_doctor(&data, OutputMode::Interactive);
+        assert!(
+            output.contains("Connect WD-18TB"),
+            "missing connect guidance: {output}"
+        );
+    }
+
+    #[test]
+    fn doctor_protected_healthy_no_suggestion() {
+        colored::control::set_override(false);
+        let data = test_doctor_healthy();
+        let output = render_doctor(&data, OutputMode::Interactive);
+        assert!(
+            !output.contains("Run `urd backup"),
+            "healthy state should have no backup suggestion: {output}"
+        );
     }
 
     // ── Retention preview tests ──────────────────────────────────────
@@ -5326,35 +5524,6 @@ mod tests {
     }
 
     #[test]
-    fn suggestion_status_healthy_none() {
-        assert!(suggest_next_action(&SuggestionContext::Status {
-            has_exposed: false,
-            has_degraded: false,
-        })
-        .is_none());
-    }
-
-    #[test]
-    fn suggestion_status_exposed_suggests_doctor() {
-        let s = suggest_next_action(&SuggestionContext::Status {
-            has_exposed: true,
-            has_degraded: false,
-        })
-        .unwrap();
-        assert!(s.contains("urd doctor"), "should suggest doctor: {s}");
-    }
-
-    #[test]
-    fn suggestion_status_degraded_suggests_doctor() {
-        let s = suggest_next_action(&SuggestionContext::Status {
-            has_exposed: false,
-            has_degraded: true,
-        })
-        .unwrap();
-        assert!(s.contains("urd doctor"), "should suggest doctor: {s}");
-    }
-
-    #[test]
     fn suggestion_plan_nothing_none() {
         assert!(suggest_next_action(&SuggestionContext::Plan {
             has_operations: false,
@@ -5423,11 +5592,18 @@ mod tests {
     #[test]
     fn status_interactive_exposed_has_suggestion_line() {
         colored::control::set_override(false);
-        // test_status_output has htpc-docs as "AT RISK" with degraded health
-        let output = render_status(&test_status_output(), OutputMode::Interactive);
+        let mut data = test_status_output();
+        // Provide advice so the suggestion line renders
+        data.advice = vec![ActionableAdvice {
+            subvolume: "htpc-docs".to_string(),
+            issue: "waning — last backup 3 hours ago".to_string(),
+            command: Some("urd backup --subvolume htpc-docs".to_string()),
+            reason: None,
+        }];
+        let output = render_status(&data, OutputMode::Interactive);
         assert!(
-            output.contains("urd doctor"),
-            "degraded status should suggest doctor: {output}"
+            output.contains("urd backup --subvolume htpc-docs"),
+            "degraded status should suggest specific command: {output}"
         );
     }
 

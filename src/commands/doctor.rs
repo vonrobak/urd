@@ -102,37 +102,49 @@ pub fn run(config: Config, args: DoctorArgs, output_mode: OutputMode) -> anyhow:
     let now = chrono::Local::now().naive_local();
     let assessments = awareness::assess(&config, now, &fs_state);
 
+    let resolved = config.resolved_subvolumes();
     let data_safety: Vec<DoctorDataSafety> = assessments
         .iter()
         .map(|a| {
-            let (issue, suggestion) = match a.status {
+            let sv_config = resolved.iter().find(|sv| sv.name == a.name);
+            let send_enabled = sv_config.is_none_or(|sv| sv.send_enabled);
+            let external_only = sv_config.is_some_and(|sv| sv.local_retention.is_transient());
+            let advice = awareness::compute_advice(a, send_enabled, external_only);
+
+            // Extract structured advice into doctor display fields.
+            let unpack = |adv: &awareness::ActionableAdvice| {
+                (
+                    Some(adv.issue.clone()),
+                    adv.command.as_ref().map(|c| format!("Run `{c}`.")),
+                    adv.reason.clone(),
+                )
+            };
+
+            let (issue, suggestion, reason) = match a.status {
+                PromiseStatus::Protected if a.health == awareness::OperationalHealth::Healthy => {
+                    (None, None, None)
+                }
+                PromiseStatus::Protected => advice.as_ref().map(unpack).unwrap_or_default(),
                 PromiseStatus::Unprotected => {
                     error_count += 1;
-                    (
-                        Some("exposed \u{2014} data may not be recoverable".to_string()),
-                        Some("Run `urd backup` or connect a drive.".to_string()),
-                    )
+                    advice.as_ref().map(unpack).unwrap_or_else(|| {
+                        (
+                            Some("exposed — data may not be recoverable".to_string()),
+                            Some("Run `urd backup` or connect a drive.".to_string()),
+                            None,
+                        )
+                    })
                 }
                 PromiseStatus::AtRisk => {
                     warn_count += 1;
-                    let age = a
-                        .local
-                        .newest_age
-                        .map(|d| {
-                            let secs = d.num_seconds();
-                            if secs >= 86400 {
-                                format!("last backup {} days ago", secs / 86400)
-                            } else {
-                                format!("last backup {} hours ago", secs / 3600)
-                            }
-                        })
-                        .unwrap_or_default();
-                    (
-                        Some(format!("waning{}", if age.is_empty() { String::new() } else { format!(" \u{2014} {age}") })),
-                        Some("Run `urd backup` to refresh.".to_string()),
-                    )
+                    advice.as_ref().map(unpack).unwrap_or_else(|| {
+                        (
+                            Some("waning".to_string()),
+                            Some("Run `urd backup` to refresh.".to_string()),
+                            None,
+                        )
+                    })
                 }
-                PromiseStatus::Protected => (None, None),
             };
             DoctorDataSafety {
                 name: a.name.clone(),
@@ -140,6 +152,7 @@ pub fn run(config: Config, args: DoctorArgs, output_mode: OutputMode) -> anyhow:
                 health: a.health.to_string(),
                 issue,
                 suggestion,
+                reason,
             }
         })
         .collect();

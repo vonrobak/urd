@@ -108,6 +108,14 @@ pub fn run(config: Config, output_mode: OutputMode) -> anyhow::Result<()> {
         })
         .collect();
 
+    let advice: Vec<awareness::ActionableAdvice> = assessments
+        .iter()
+        .filter_map(|a| {
+            let sv = resolved.iter().find(|sv| sv.name == a.name)?;
+            awareness::compute_advice(a, sv.send_enabled, sv.local_retention.is_transient())
+        })
+        .collect();
+
     let status_output = StatusOutput {
         assessments: assessments_with_promises,
         chain_health: chain_health_entries,
@@ -115,6 +123,7 @@ pub fn run(config: Config, output_mode: OutputMode) -> anyhow::Result<()> {
         last_run,
         total_pins,
         redundancy_advisories,
+        advice,
     };
 
     let rendered = voice::render_status(&status_output, output_mode);
