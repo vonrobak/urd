@@ -226,10 +226,14 @@ fn render_subvolume_table(data: &StatusOutput, out: &mut String) {
         row.push(assessment.name.clone());
 
         // LOCAL column with temporal context
-        let local_cell = format_count_with_age(
-            assessment.local_snapshot_count,
-            assessment.local_newest_age_secs,
-        );
+        let local_cell = if assessment.external_only {
+            "\u{2014}".to_string() // em-dash, same as absent drives
+        } else {
+            format_count_with_age(
+                assessment.local_snapshot_count,
+                assessment.local_newest_age_secs,
+            )
+        };
         row.push(local_cell);
 
         // Per-drive columns (connected drives only)
@@ -253,12 +257,15 @@ fn render_subvolume_table(data: &StatusOutput, out: &mut String) {
         }
 
         // Thread health (interactive rendering — Display impl feeds daemon JSON, do not change it)
-        let thread = data
-            .chain_health
-            .iter()
-            .find(|c| c.subvolume == assessment.name)
-            .map(|c| render_thread_status(&c.health))
-            .unwrap_or_else(|| "\u{2014}".to_string());
+        let thread = if assessment.external_only {
+            "ext-only".dimmed().to_string()
+        } else {
+            data.chain_health
+                .iter()
+                .find(|c| c.subvolume == assessment.name)
+                .map(|c| render_thread_status(&c.health))
+                .unwrap_or_else(|| "\u{2014}".to_string())
+        };
         row.push(thread);
 
         rows.push(row);
@@ -367,7 +374,7 @@ fn render_redundancy_advisories(data: &StatusOutput, out: &mut String) {
             ),
             RedundancyAdvisoryKind::TransientNoLocalRecovery => (
                 format!(
-                    "{} lives only on external drives while local copies are transient.",
+                    "{} lives only on external drives \u{2014} local snapshots are disabled.",
                     advisory.subvolume,
                 ),
                 "Recovery requires a connected drive.".to_string(),
@@ -778,6 +785,7 @@ fn render_skipped_block(skipped: &[crate::output::SkippedSubvolume], out: &mut S
         } else if skip.category != SkipCategory::IntervalNotElapsed
             && skip.category != SkipCategory::Disabled
             && skip.category != SkipCategory::LocalOnly
+            && skip.category != SkipCategory::ExternalOnly
         {
             actionable_skips.push(skip);
         }
@@ -1172,6 +1180,7 @@ fn render_plan_skipped_grouped(skipped: &[SkippedSubvolume], out: &mut String) {
         SkipCategory::LocalOnly,
         SkipCategory::SpaceExceeded,
         SkipCategory::NoSnapshotsAvailable,
+        SkipCategory::ExternalOnly,
         SkipCategory::Other,
     ];
 
@@ -1184,8 +1193,9 @@ fn render_plan_skipped_grouped(skipped: &[SkippedSubvolume], out: &mut String) {
         match cat {
             SkipCategory::DriveNotMounted => render_drive_not_mounted_group(&items, out),
             SkipCategory::IntervalNotElapsed => render_interval_group(&items, out),
-            SkipCategory::Disabled => render_disabled_group(&items, out),
-            SkipCategory::LocalOnly => render_local_only_group(&items, out),
+            SkipCategory::Disabled => render_named_group(&items, cat, "Disabled", out),
+            SkipCategory::LocalOnly => render_named_group(&items, cat, "Local only", out),
+            SkipCategory::ExternalOnly => render_named_group(&items, cat, "External only", out),
             SkipCategory::SpaceExceeded
             | SkipCategory::NoSnapshotsAvailable
             | SkipCategory::Other => {
@@ -1253,26 +1263,19 @@ fn render_interval_group(items: &[&SkippedSubvolume], out: &mut String) {
     .ok();
 }
 
-/// Render Disabled skips as an inline comma-separated name list.
-fn render_disabled_group(items: &[&SkippedSubvolume], out: &mut String) {
+/// Render a skip group as: `[TAG]  Label: name1, name2`.
+fn render_named_group(
+    items: &[&SkippedSubvolume],
+    category: &SkipCategory,
+    label: &str,
+    out: &mut String,
+) {
     let names: Vec<&str> = items.iter().map(|s| s.name.as_str()).collect();
     writeln!(
         out,
         "  {}  {} {}",
-        skip_tag(&SkipCategory::Disabled),
-        "Disabled:".dimmed(),
-        names.join(", "),
-    )
-    .ok();
-}
-
-fn render_local_only_group(items: &[&SkippedSubvolume], out: &mut String) {
-    let names: Vec<&str> = items.iter().map(|s| s.name.as_str()).collect();
-    writeln!(
-        out,
-        "  {}  {} {}",
-        skip_tag(&SkipCategory::LocalOnly),
-        "Local only:".dimmed(),
+        skip_tag(category),
+        format!("{label}:").dimmed(),
         names.join(", "),
     )
     .ok();
@@ -1287,6 +1290,7 @@ fn skip_tag(category: &SkipCategory) -> String {
         SkipCategory::Disabled => "[OFF]  ".dimmed().to_string(),
         SkipCategory::LocalOnly => "[LOCAL]".dimmed().to_string(),
         SkipCategory::NoSnapshotsAvailable => "[NOSRC]".yellow().to_string(),
+        SkipCategory::ExternalOnly => "[EXT]  ".dimmed().to_string(),
         SkipCategory::Other => "[SKIP] ".dimmed().to_string(),
     }
 }
@@ -2667,6 +2671,7 @@ mod tests {
                     advisories: vec![],
                     redundancy_advisories: vec![],
                     retention_summary: None,
+                    external_only: false,
                     errors: vec![],
                 },
                 StatusAssessment {
@@ -2691,6 +2696,7 @@ mod tests {
                     advisories: vec![],
                     redundancy_advisories: vec![],
                     retention_summary: None,
+                    external_only: false,
                     errors: vec![],
                 },
             ],
@@ -2939,6 +2945,61 @@ mod tests {
         );
     }
 
+    // ── External-only status table tests (UPI 018) ─────────────────
+
+    #[test]
+    fn status_table_external_only_shows_em_dash_local() {
+        colored::control::set_override(false);
+        let mut data = test_status_output();
+        // Make first subvol external-only
+        data.assessments[0].external_only = true;
+        data.assessments[0].local_snapshot_count = 0;
+        data.assessments[0].local_newest_age_secs = None;
+        let output = render_status(&data, OutputMode::Interactive);
+        // The LOCAL column for htpc-home should show em-dash, not "0"
+        // Split into lines and find the htpc-home row
+        let home_line = output.lines().find(|l| l.contains("htpc-home")).unwrap();
+        assert!(
+            home_line.contains('\u{2014}'),
+            "external_only LOCAL should show em-dash, got: {home_line}"
+        );
+        assert!(
+            !home_line.contains(" 0 "),
+            "external_only LOCAL should not show '0', got: {home_line}"
+        );
+    }
+
+    #[test]
+    fn status_table_external_only_shows_ext_only_thread() {
+        colored::control::set_override(false);
+        let mut data = test_status_output();
+        data.assessments[0].external_only = true;
+        let output = render_status(&data, OutputMode::Interactive);
+        let home_line = output.lines().find(|l| l.contains("htpc-home")).unwrap();
+        assert!(
+            home_line.contains("ext-only"),
+            "external_only THREAD should show 'ext-only', got: {home_line}"
+        );
+    }
+
+    #[test]
+    fn status_table_normal_subvol_unchanged() {
+        colored::control::set_override(false);
+        let data = test_status_output();
+        let output = render_status(&data, OutputMode::Interactive);
+        let home_line = output.lines().find(|l| l.contains("htpc-home")).unwrap();
+        // Normal subvol should show count (47) not em-dash for LOCAL
+        assert!(
+            home_line.contains("47"),
+            "normal subvol LOCAL should show count, got: {home_line}"
+        );
+        // Should show chain health, not ext-only
+        assert!(
+            home_line.contains("unbroken"),
+            "normal subvol THREAD should show chain health, got: {home_line}"
+        );
+    }
+
     // ── Status advice rendering tests ────────────────────────────────
 
     #[test]
@@ -3107,6 +3168,7 @@ mod tests {
                 advisories: vec![],
                 redundancy_advisories: vec![],
                 retention_summary: None,
+                external_only: false,
                 errors: vec![],
             }],
             transitions: vec![],
@@ -3733,6 +3795,61 @@ mod tests {
         assert!(
             output.contains("htpc-home"),
             "should show subvolume name"
+        );
+    }
+
+    #[test]
+    fn plan_skip_external_only_renders_grouped() {
+        colored::control::set_override(false);
+        let data = PlanOutput {
+            timestamp: "2026-03-29 13:57".to_string(),
+            operations: vec![],
+            skipped: vec![SkippedSubvolume {
+                name: "htpc-root".to_string(),
+                reason: "external-only \u{2014} sends on next backup".to_string(),
+                category: SkipCategory::ExternalOnly,
+            }],
+            summary: PlanSummaryOutput {
+                snapshots: 0,
+                sends: 0,
+                deletions: 0,
+                skipped: 1,
+                estimated_total_bytes: None,
+            },
+            warnings: vec![],
+        };
+        let output = render_plan(&data, OutputMode::Interactive);
+        assert!(
+            output.contains("[EXT]"),
+            "external-only should use [EXT] tag: {output}"
+        );
+        assert!(
+            output.contains("External only:"),
+            "should have 'External only:' group header: {output}"
+        );
+        assert!(
+            output.contains("htpc-root"),
+            "should show subvolume name: {output}"
+        );
+    }
+
+    #[test]
+    fn backup_skipped_block_hides_external_only() {
+        colored::control::set_override(false);
+        let mut data = test_backup_summary();
+        data.skipped = vec![SkippedSubvolume {
+            name: "htpc-root".to_string(),
+            reason: "external-only \u{2014} sends on next backup".to_string(),
+            category: SkipCategory::ExternalOnly,
+        }];
+        let output = render_backup_summary(&data, OutputMode::Interactive);
+        assert!(
+            !output.contains("external-only"),
+            "external-only skips should be hidden in backup summary: {output}"
+        );
+        assert!(
+            !output.contains("[EXT]"),
+            "external-only tag should be hidden in backup summary: {output}"
         );
     }
 
@@ -4669,6 +4786,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn advisory_transient_no_recovery_uses_disabled_vocabulary() {
+        colored::control::set_override(false);
+        let mut data = test_status_output();
+        data.redundancy_advisories
+            .push(crate::output::RedundancyAdvisory {
+            kind: crate::output::RedundancyAdvisoryKind::TransientNoLocalRecovery,
+            subvolume: "htpc-root".to_string(),
+            drive: None,
+            detail: "htpc-root lives only on external drives \u{2014} local snapshots are disabled"
+                .to_string(),
+        });
+        let output = render_status(&data, OutputMode::Interactive);
+        assert!(
+            output.contains("local snapshots are disabled"),
+            "advisory should say 'local snapshots are disabled': {output}"
+        );
+        assert!(
+            !output.contains("transient"),
+            "advisory should not contain 'transient': {output}"
+        );
+    }
+
     // ── Default status tests ───────────────────────────────────────────
 
     fn test_default_all_sealed() -> DefaultStatusOutput {
@@ -5318,6 +5458,7 @@ mod tests {
             advisories: vec![],
             redundancy_advisories: vec![],
             retention_summary: None,
+            external_only: false,
             errors: vec![],
         }];
 
@@ -5349,6 +5490,7 @@ mod tests {
                 advisories: vec![],
                 redundancy_advisories: vec![],
                 retention_summary: None,
+                external_only: false,
                 errors: vec![],
             },
             StatusAssessment {
@@ -5371,6 +5513,7 @@ mod tests {
                 advisories: vec![],
                 redundancy_advisories: vec![],
                 retention_summary: None,
+                external_only: false,
                 errors: vec![],
             },
         ];
@@ -5402,6 +5545,7 @@ mod tests {
                 advisories: vec![],
                 redundancy_advisories: vec![],
                 retention_summary: None,
+                external_only: false,
                 errors: vec![],
             },
             StatusAssessment {
@@ -5424,6 +5568,7 @@ mod tests {
                 advisories: vec![],
                 redundancy_advisories: vec![],
                 retention_summary: None,
+                external_only: false,
                 errors: vec![],
             },
         ];
@@ -5454,6 +5599,7 @@ mod tests {
             advisories: vec![],
             redundancy_advisories: vec![],
             retention_summary: None,
+            external_only: false,
             errors: vec![],
         }];
 

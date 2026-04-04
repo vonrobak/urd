@@ -182,6 +182,9 @@ pub struct StatusAssessment {
     /// Compact retention summary, e.g. "31d / 7mo / 19mo" or "none (transient)".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retention_summary: Option<String>,
+    /// True when subvolume uses transient local retention with sends enabled (external-only mode).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub external_only: bool,
     pub errors: Vec<String>,
 }
 
@@ -205,6 +208,7 @@ impl StatusAssessment {
             advisories: a.advisories.clone(),
             redundancy_advisories: a.redundancy_advisories.clone(),
             retention_summary: None,
+            external_only: false,
             errors: a.errors.clone(),
         }
     }
@@ -291,6 +295,10 @@ pub struct DefaultStatusOutput {
 
 fn is_zero(n: &usize) -> bool {
     *n == 0
+}
+
+fn is_false(b: &bool) -> bool {
+    !b
 }
 
 impl DefaultStatusOutput {
@@ -583,16 +591,17 @@ pub enum SkipCategory {
     /// Distinct from `Disabled` (which means `enabled = false` — does nothing).
     LocalOnly,
     SpaceExceeded,
-    /// Send was planned but no local snapshots exist to send.
-    /// Distinct from `Other` — this is an actionable deferral, not an unknown skip.
+    /// Non-transient subvolume with zero local snapshots (unexpected — e.g., first run or external deletion).
     NoSnapshotsAvailable,
+    /// External-only subvolume — local snapshots are transient, sends happen on next backup.
+    ExternalOnly,
     Other,
 }
 
 impl SkipCategory {
     /// Classify a skip reason string into a category.
     ///
-    /// Matches against the 14 known patterns from plan.rs. Unknown patterns
+    /// Matches against the 16 known patterns from plan.rs. Unknown patterns
     /// fall to `Other`. A completeness test in the test module ensures all
     /// known patterns classify correctly.
     #[must_use]
@@ -616,6 +625,8 @@ impl SkipCategory {
             Self::SpaceExceeded
         } else if reason == "no local snapshots to send" {
             Self::NoSnapshotsAvailable
+        } else if reason.starts_with("external-only") {
+            Self::ExternalOnly
         } else {
             Self::Other
         }
@@ -1407,10 +1418,10 @@ mod tests {
         );
     }
 
-    /// Completeness test: all 15 known plan.rs skip patterns classify to their
+    /// Completeness test: all 16 known plan.rs skip patterns classify to their
     /// expected category. Prevents silent regressions when new patterns are added.
     #[test]
-    fn classify_all_15_patterns() {
+    fn classify_all_16_patterns() {
         let patterns = vec![
             ("disabled", SkipCategory::Disabled),
             ("send disabled", SkipCategory::LocalOnly),
@@ -1445,6 +1456,10 @@ mod tests {
                 SkipCategory::IntervalNotElapsed,
             ),
             ("no local snapshots to send", SkipCategory::NoSnapshotsAvailable),
+            (
+                "external-only \u{2014} sends on next backup",
+                SkipCategory::ExternalOnly,
+            ),
             (
                 "20260329-0404-htpc-home already on WD-18TB",
                 SkipCategory::Other,

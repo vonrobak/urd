@@ -547,6 +547,7 @@ pub fn assess(
             fs,
             &subvol.name,
             local_space_tight.is_some(),
+            subvol.local_retention.is_transient(),
         );
 
         assessments.push(SubvolAssessment {
@@ -765,10 +766,21 @@ fn assess_chain_health(
     }
 }
 
+/// Whether a chain break is expected and non-actionable for this subvolume.
+/// External-only subvolumes never have local pin files (NoPinFile) or may
+/// have leftover pins from a previous config (PinMissingLocally). Both are
+/// by-design, not problems.
+fn is_expected_chain_break(is_transient: bool, reason: &ChainBreakReason) -> bool {
+    is_transient
+        && (*reason == ChainBreakReason::NoPinFile
+            || *reason == ChainBreakReason::PinMissingLocally)
+}
+
 /// Compute operational health for a subvolume.
 ///
 /// Pure function: chain health + drive state + space info in, health out.
 /// Checks (in priority order): blocked conditions, then degraded conditions.
+#[allow(clippy::too_many_arguments)]
 fn compute_health(
     send_enabled: bool,
     chain_health: &[DriveChainHealth],
@@ -777,6 +789,7 @@ fn compute_health(
     fs: &dyn FileSystemState,
     subvol_name: &str,
     local_space_tight: bool,
+    is_transient: bool,
 ) -> (OperationalHealth, Vec<String>) {
     let mut reasons: Vec<String> = Vec::new();
     let mut worst = OperationalHealth::Healthy;
@@ -821,9 +834,12 @@ fn compute_health(
                 .or_else(|| fs.last_send_size(subvol_name, &da.drive_label, "full"));
 
             // Check if chain is broken on this drive (full send will be needed)
-            let chain_broken = chain_health
-                .iter()
-                .any(|ch| ch.drive_label == da.drive_label && matches!(&ch.status, ChainStatus::Broken { reason, .. } if *reason != ChainBreakReason::NoDriveData));
+            let chain_broken = chain_health.iter().any(|ch| {
+                ch.drive_label == da.drive_label
+                    && matches!(&ch.status, ChainStatus::Broken { reason, .. }
+                        if *reason != ChainBreakReason::NoDriveData
+                            && !is_expected_chain_break(is_transient, reason))
+            });
 
             match est_size {
                 Some(size) if free.saturating_sub(min_free) < size => {
@@ -851,6 +867,7 @@ fn compute_health(
     for ch in chain_health {
         if let ChainStatus::Broken { reason, .. } = &ch.status
             && *reason != ChainBreakReason::NoDriveData
+            && !is_expected_chain_break(is_transient, reason)
         {
             reasons.push(format!(
                 "chain broken on {} \u{2014} next send will be full",
@@ -1094,7 +1111,7 @@ pub fn compute_redundancy_advisories(
                     subvolume: assessment.name.clone(),
                     drive: None,
                     detail: format!(
-                        "{} lives only on external drives while local copies are transient",
+                        "{} lives only on external drives \u{2014} local snapshots are disabled",
                         assessment.name,
                     ),
                 });
@@ -2988,7 +3005,173 @@ send_enabled = false
         assert_eq!(results[0].status, PromiseStatus::Unprotected);
     }
 
-    // ── Offsite freshness overlay tests ─────────────────────────────
+    // ── External-only health model tests (UPI 018) ���────────────────
+
+    #[test]
+    fn external_only_no_pin_file_is_healthy() {
+        let config = transient_config();
+        let now = dt(2026, 3, 23, 14, 0);
+        let mut fs = MockFileSystemState::new();
+
+        // Mounted drive with external snapshots, no pin file (expected for transient)
+        fs.mounted_drives.insert("WD-18TB".to_string());
+        fs.external_snapshots.insert(
+            ("WD-18TB".to_string(), "sv-transient".to_string()),
+            vec![snap(dt(2026, 3, 23, 12, 0), "svt")],
+        );
+        fs.send_times.insert(
+            ("sv-transient".to_string(), "WD-18TB".to_string()),
+            dt(2026, 3, 23, 12, 0),
+        );
+        fs.free_bytes
+            .insert(std::path::PathBuf::from("/mnt/wd"), 1_000_000_000_000);
+
+        let results = assess(&config, now, &fs);
+        assert_eq!(
+            results[0].health,
+            OperationalHealth::Healthy,
+            "transient subvol with NoPinFile should be Healthy, got: {:?}",
+            results[0].health_reasons
+        );
+    }
+
+    #[test]
+    fn external_only_pin_missing_locally_is_healthy() {
+        let config = transient_config();
+        let now = dt(2026, 3, 23, 14, 0);
+        let mut fs = MockFileSystemState::new();
+
+        // Mounted drive with external snapshots, pin file exists but parent missing locally
+        fs.mounted_drives.insert("WD-18TB".to_string());
+        fs.external_snapshots.insert(
+            ("WD-18TB".to_string(), "sv-transient".to_string()),
+            vec![snap(dt(2026, 3, 23, 12, 0), "svt")],
+        );
+        fs.send_times.insert(
+            ("sv-transient".to_string(), "WD-18TB".to_string()),
+            dt(2026, 3, 23, 12, 0),
+        );
+        // Pin file references a snapshot that's been cleaned up (transient)
+        let local_dir = std::path::PathBuf::from("/snap/sv-transient");
+        fs.pin_files.insert(
+            (local_dir, "WD-18TB".to_string()),
+            snap(dt(2026, 3, 23, 10, 0), "svt"),
+        );
+        // No local snapshots (parent missing locally)
+        fs.free_bytes
+            .insert(std::path::PathBuf::from("/mnt/wd"), 1_000_000_000_000);
+
+        let results = assess(&config, now, &fs);
+        assert_eq!(
+            results[0].health,
+            OperationalHealth::Healthy,
+            "transient subvol with PinMissingLocally should be Healthy, got: {:?}",
+            results[0].health_reasons
+        );
+    }
+
+    #[test]
+    fn external_only_pin_missing_on_drive_still_degrades() {
+        let config = transient_config();
+        let now = dt(2026, 3, 23, 14, 0);
+        let mut fs = MockFileSystemState::new();
+
+        // Local snapshot exists so pin can be checked
+        let parent = snap(dt(2026, 3, 23, 13, 30), "svt");
+        fs.local_snapshots.insert(
+            "sv-transient".to_string(),
+            vec![parent.clone()],
+        );
+        fs.mounted_drives.insert("WD-18TB".to_string());
+        fs.external_snapshots.insert(
+            ("WD-18TB".to_string(), "sv-transient".to_string()),
+            vec![snap(dt(2026, 3, 23, 12, 0), "svt")],
+        );
+        fs.send_times.insert(
+            ("sv-transient".to_string(), "WD-18TB".to_string()),
+            dt(2026, 3, 23, 12, 0),
+        );
+        // Pin file references snapshot present locally but missing on drive
+        let local_dir = std::path::PathBuf::from("/snap/sv-transient");
+        fs.pin_files.insert(
+            (local_dir, "WD-18TB".to_string()),
+            parent,
+        );
+        // Parent snapshot is in local list (added above) but NOT in external list
+        // This triggers PinMissingOnDrive — a real problem even for transient
+        fs.free_bytes
+            .insert(std::path::PathBuf::from("/mnt/wd"), 1_000_000_000_000);
+
+        let results = assess(&config, now, &fs);
+        assert_eq!(
+            results[0].health,
+            OperationalHealth::Degraded,
+            "PinMissingOnDrive should still degrade transient subvols"
+        );
+    }
+
+    #[test]
+    fn non_transient_no_pin_file_still_degrades() {
+        let config = test_config();
+        let now = dt(2026, 3, 23, 14, 0);
+        let mut fs = MockFileSystemState::new();
+
+        fs.local_snapshots.insert(
+            "sv1".to_string(),
+            vec![snap(dt(2026, 3, 23, 13, 30), "sv1")],
+        );
+        fs.mounted_drives.insert("WD-18TB".to_string());
+        fs.external_snapshots.insert(
+            ("WD-18TB".to_string(), "sv1".to_string()),
+            vec![snap(dt(2026, 3, 23, 12, 0), "sv1")],
+        );
+        // No pin file — chain broken for non-transient
+        fs.send_times.insert(
+            ("sv1".to_string(), "WD-18TB".to_string()),
+            dt(2026, 3, 23, 12, 0),
+        );
+        fs.free_bytes
+            .insert(std::path::PathBuf::from("/mnt/wd"), 1_000_000_000_000);
+
+        let results = assess(&config, now, &fs);
+        assert_eq!(
+            results[0].health,
+            OperationalHealth::Degraded,
+            "NoPinFile should still degrade non-transient subvols"
+        );
+    }
+
+    #[test]
+    fn external_only_space_check_treats_chain_as_intact() {
+        let config = transient_config();
+        let now = dt(2026, 3, 23, 14, 0);
+        let mut fs = MockFileSystemState::new();
+
+        fs.mounted_drives.insert("WD-18TB".to_string());
+        fs.external_snapshots.insert(
+            ("WD-18TB".to_string(), "sv-transient".to_string()),
+            vec![snap(dt(2026, 3, 23, 12, 0), "svt")],
+        );
+        fs.send_times.insert(
+            ("sv-transient".to_string(), "WD-18TB".to_string()),
+            dt(2026, 3, 23, 12, 0),
+        );
+        // No pin file (NoPinFile) — but transient so should be treated as intact
+        fs.free_bytes
+            .insert(std::path::PathBuf::from("/mnt/wd"), 1_000_000_000_000);
+
+        let results = assess(&config, now, &fs);
+        // Should not contain "full send size unknown" — chain treated as intact for transient
+        assert!(
+            !results[0]
+                .health_reasons
+                .iter()
+                .any(|r| r.contains("full send size unknown")),
+            "transient subvol should not report full send size unknown for NoPinFile"
+        );
+    }
+
+    // ── Offsite freshness overlay tests ─��───────────────────────────
 
     fn fortified_config() -> Config {
         let toml_str = r#"
@@ -3610,6 +3793,37 @@ local_retention = "transient"
             !advisories.iter().any(|a| a.kind
                 == crate::output::RedundancyAdvisoryKind::TransientNoLocalRecovery),
             "mounted drive should prevent transient advisory: {advisories:?}"
+        );
+    }
+
+    #[test]
+    fn advisory_transient_no_recovery_uses_disabled_vocabulary() {
+        let config = transient_single_drive_config();
+        let now = dt(2026, 4, 1, 12, 0);
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap(dt(2026, 4, 1, 11, 0), "sv1")]);
+        fs.send_times.insert(
+            ("sv1".to_string(), "ext-drive".to_string()),
+            dt(2026, 3, 30, 12, 0),
+        );
+
+        let assessments = assess(&config, now, &fs);
+        let advisories = compute_redundancy_advisories(&config, &assessments);
+
+        let advisory = advisories
+            .iter()
+            .find(|a| a.kind == crate::output::RedundancyAdvisoryKind::TransientNoLocalRecovery)
+            .expect("should have TransientNoLocalRecovery advisory");
+        assert!(
+            advisory.detail.contains("local snapshots are disabled"),
+            "advisory should say 'local snapshots are disabled', got: {}",
+            advisory.detail
+        );
+        assert!(
+            !advisory.detail.contains("transient"),
+            "advisory should not expose 'transient' vocabulary, got: {}",
+            advisory.detail
         );
     }
 

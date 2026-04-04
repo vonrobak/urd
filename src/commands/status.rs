@@ -103,6 +103,7 @@ pub fn run(config: Config, output_mode: OutputMode) -> anyhow::Result<()> {
                     &sv.local_retention,
                     &sv.snapshot_interval,
                 ));
+                sa.external_only = sv.local_retention.is_transient() && sv.send_enabled;
             }
             sa
         })

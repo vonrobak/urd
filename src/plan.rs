@@ -97,7 +97,7 @@ pub fn plan(
 ) -> crate::error::Result<BackupPlan> {
     let mut operations = Vec::new();
     // Skip reason strings are classified by output::SkipCategory::from_reason().
-    // When adding new patterns, update output::tests::classify_all_14_patterns.
+    // When adding new patterns, update output::tests::classify_all_16_patterns.
     let mut skipped = Vec::new();
 
     let resolved = config.resolved_subvolumes();
@@ -477,10 +477,12 @@ fn plan_external_send(
 
     // Find the snapshot to send (newest local)
     let Some(snap_to_send) = local_snaps.iter().max() else {
-        skipped.push((
-            subvol.name.clone(),
-            "no local snapshots to send".to_string(),
-        ));
+        let reason = if subvol.local_retention.is_transient() {
+            "external-only \u{2014} sends on next backup".to_string()
+        } else {
+            "no local snapshots to send".to_string()
+        };
+        skipped.push((subvol.name.clone(), reason));
         return;
     };
 
@@ -2741,5 +2743,38 @@ local_retention = "transient"
             .collect();
         assert_eq!(creates.len(), 1, "skip_intervals + local_only should create snapshot");
         assert!(sends.is_empty(), "local_only should suppress sends even with skip_intervals");
+    }
+
+    #[test]
+    fn plan_external_only_skip_reason() {
+        let config = transient_config();
+        let mut fs = MockFileSystemState::new();
+        // Mounted drive, no local snapshots (transient cleaned them up)
+        fs.mounted_drives.insert("D1".to_string());
+
+        let now = NaiveDate::from_ymd_opt(2026, 3, 23)
+            .unwrap()
+            .and_hms_opt(14, 0, 0)
+            .unwrap();
+
+        let filters = PlanFilters::default();
+        let result = plan(&config, now, &filters, &fs).unwrap();
+
+        // Should have the external-only skip reason, not "no local snapshots to send"
+        let skip = result
+            .skipped
+            .iter()
+            .find(|(name, _)| name == "sv1")
+            .expect("sv1 should be in skipped list");
+        assert!(
+            skip.1.starts_with("external-only"),
+            "transient subvol should use 'external-only' skip reason, got: {}",
+            skip.1
+        );
+        assert!(
+            !skip.1.contains("no local snapshots"),
+            "transient subvol should not use 'no local snapshots' reason, got: {}",
+            skip.1
+        );
     }
 }
