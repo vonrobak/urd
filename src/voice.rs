@@ -1164,6 +1164,7 @@ fn render_plan_skipped_grouped(skipped: &[SkippedSubvolume], out: &mut String) {
         SkipCategory::Disabled,
         SkipCategory::LocalOnly,
         SkipCategory::SpaceExceeded,
+        SkipCategory::NoSnapshotsAvailable,
         SkipCategory::Other,
     ];
 
@@ -1178,7 +1179,9 @@ fn render_plan_skipped_grouped(skipped: &[SkippedSubvolume], out: &mut String) {
             SkipCategory::IntervalNotElapsed => render_interval_group(&items, out),
             SkipCategory::Disabled => render_disabled_group(&items, out),
             SkipCategory::LocalOnly => render_local_only_group(&items, out),
-            SkipCategory::SpaceExceeded | SkipCategory::Other => {
+            SkipCategory::SpaceExceeded
+            | SkipCategory::NoSnapshotsAvailable
+            | SkipCategory::Other => {
                 render_individual_skips(&items, cat, out);
             }
         }
@@ -1276,6 +1279,7 @@ fn skip_tag(category: &SkipCategory) -> String {
         SkipCategory::DriveNotMounted => "[AWAY]".dimmed().to_string(),
         SkipCategory::Disabled => "[OFF]  ".dimmed().to_string(),
         SkipCategory::LocalOnly => "[LOCAL]".dimmed().to_string(),
+        SkipCategory::NoSnapshotsAvailable => "[NOSRC]".yellow().to_string(),
         SkipCategory::Other => "[SKIP] ".dimmed().to_string(),
     }
 }

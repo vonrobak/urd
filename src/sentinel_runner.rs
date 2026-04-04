@@ -1091,7 +1091,7 @@ mod tests {
 
     fn make_heartbeat(timestamp: &str, stale_after: &str) -> heartbeat::Heartbeat {
         heartbeat::Heartbeat {
-            schema_version: 1,
+            schema_version: 2,
             timestamp: timestamp.to_string(),
             stale_after: stale_after.to_string(),
             run_result: "success".to_string(),
