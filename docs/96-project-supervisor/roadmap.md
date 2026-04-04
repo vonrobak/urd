@@ -22,22 +22,13 @@ UPI 010: v0.9.1-v0.10.0 ✓  (config v1, migrate, local_snapshots=false)
 **Goal:** Validate v0.10.0 in production, make the invisible worker intelligent, then
 build the first-encounter experience. Three phases remain before v1.0.
 
-### Test session (calendar time — now)
+### Test session findings (v0.10.0)
 
-Live with v0.10.0 for several days: nightly timer, sentinel, drive plug/unplug cycles.
-Output: prioritized issue list. Fix findings before moving on.
+Test session complete. Two sentinel bugs found (F4: stale config after migration,
+F7: false "all 0 chains broke" anomaly on drive disconnect). UPI 019 (honest worker)
+built and merged. UPIs 020, 021 designed from findings.
 
-```
-Test session goals:
-  1. Live with v0.10.0 (timer, Sentinel, drive cycles)
-  2. Watch htpc-root: does "degraded" / "broken" cause anxiety? (→ UPI 018)
-  3. Read your own config — can you narrate your protection story?
-  4. Note anything surprising or confusing
-
-Output: prioritized issue list → targeted fix phase if needed
-```
-
-### Phase E: Make the invisible worker smart (~2 sessions)
+### Phase E: Make the invisible worker smart (~3 sessions)
 
 **Question:** "Is the invisible worker intelligent?"
 
@@ -45,13 +36,22 @@ These features make the nightly run better without user interaction. They serve
 north star #2 (reduce attention) and prepare the runtime for the encounter's first
 impression. Sequenced by dependency and module overlap.
 
+**E0: Sentinel fixes — UPI 021** (~0.25 session, patch tier)
+
+```
+021-a: Fix anomaly guard — one-line `total > 0` guard in sentinel.rs
+021-b: Config reload on file change — mtime polling, ConfigChanged event
+Modules: sentinel.rs, sentinel_runner.rs
+Ship immediately — fixes two live production bugs. No module overlap with E1-E4.
+```
+
 **E1: Btrfs pipeline — UPI 013** (~0.25 session, patch tier)
 
 ```
 013-a: --compressed-data on sends (auto-detect, enable by default)
 013-b: btrfs subvolume sync after deletions (before space check)
 Modules: btrfs.rs, executor.rs
-Ship during or right after test session — invisible, zero UX surface.
+Ship right after 021 — invisible, zero UX surface.
 ```
 
 **E2: External-only runtime — UPI 018** (~0.5 session, patch tier)
@@ -59,10 +59,23 @@ Ship during or right after test session — invisible, zero UX surface.
 ```
 Fix false "degraded" / "broken chain" / "[SKIP]" for local_snapshots = false.
 Modules: awareness.rs, output.rs, voice.rs, commands/status.rs, plan.rs
-Depends on: nothing. Fixes a product bug visible in the test session now.
+Depends on: nothing. Fixes a product bug visible in the test session.
 ```
 
-**E3: Skip unchanged subvolumes — UPI 014** (~0.5 session, standard tier)
+**E3: Context-aware suggestions — UPI 020** (~0.5 session, standard tier)
+
+```
+compute_advice() pure function in awareness.rs — doctor, status, bare `urd`
+all give correct next-action advice based on chain health and drive state.
+Modules: awareness.rs, output.rs, voice.rs, commands/doctor.rs,
+         commands/status.rs, commands/default.rs
+Depends on: 018 (external-only awareness informs advice for local_snapshots=false).
+         019 merged — advice can reference honest results + token-aware gate.
+This is the bridge to Phase D: when a new user types `urd doctor` after setup,
+the advice must be correct. Last piece of the "is Urd telling the truth?" arc.
+```
+
+**E4: Skip unchanged subvolumes — UPI 014** (~0.5 session, standard tier)
 
 ```
 Default behavior: skip snapshot creation when generation number unchanged.
@@ -72,7 +85,7 @@ Ship before the encounter — "Urd created 4 snapshots (5 unchanged)" is a
 better first impression than 9 identical snapshots.
 ```
 
-**E4: Emergency space response (automatic mode only) — UPI 016-auto** (~0.5 session)
+**E5: Emergency space response (automatic mode only) — UPI 016-auto** (~0.5 session)
 
 ```
 Pre-backup thinning when space is critically low (< 50% of min_free_bytes).
@@ -82,40 +95,46 @@ Deferred: interactive `urd emergency` command → post-encounter (full design wo
 ```
 
 **Sequencing rationale:**
-- 013 first: invisible correctness, validates during test session. Also 013-b (sync)
-  improves space accuracy that 016-auto depends on.
-- 018 second: fixes a product bug the test session is actively observing. Blocks on
-  nothing but benefits from 013 being merged (fewer in-flight changes).
-- 014 third: adds intelligence. Touches plan.rs and voice.rs (shared with 018). Sequence
-  after 018 to avoid merge conflicts in voice.rs rendering code.
-- 016-auto last in Phase E: depends on 013-b for accurate space readings. Smallest scope
-  of the deferred 016 — just the retention function + executor integration.
+- 021 first: bugfix for two live production issues. Isolated to sentinel modules —
+  zero overlap with anything else. Patch tier, ship immediately.
+- 013 second: invisible correctness. 013-b (sync) improves space accuracy that 016-auto
+  depends on.
+- 018 third: fixes a product bug. Blocks on nothing but benefits from 013 being merged.
+- 020 after 018: `compute_advice()` needs external-only awareness from 018 to give
+  correct advice for `local_snapshots = false` subvolumes. Both touch awareness.rs and
+  voice.rs — sequencing avoids rework. 020 completes the "is Urd telling the truth?"
+  arc that started in Phase A — every invoked surface gives correct advice. This is the
+  real gate for Phase D: the encounter must land on a product that doesn't mislead.
+- 014 after 020: adds intelligence. voice.rs suggestion code is stable after 020 lands.
+- 016-auto last: depends on 013-b for accurate space readings.
 
 **Module overlap resolution:**
-- awareness.rs: only 018 (017 deferred to Phase F)
-- voice.rs + output.rs: 018 then 014. Both add rendering; 018's SkipCategory::ExternalOnly
-  and 014's SkipCategory::Unchanged are independent enum variants.
+- awareness.rs: 018 then 020. 018 fixes external-only assessment; 020 consumes it.
+- voice.rs + output.rs: 018 → 020 → 014. All add rendering. Sequencing avoids
+  merge conflicts in suggestion code.
+- sentinel.rs + sentinel_runner.rs: only 021. No overlap with E1-E4.
 - btrfs.rs: 013 adds sync + compressed-data probe, 014 adds subvolume_generation. Additive.
 
 ```
-Test session (calendar days)
+E0:  021 (sentinel fixes, 0.25 session)
      │
 E1:  013 (btrfs pipeline, 0.25 session) ─── tag v0.11.0
      │
 E2:  018 (external-only runtime, 0.5 session)
      │
-E3:  014 (skip unchanged, 0.5 session)
+E3:  020 (context-aware suggestions, 0.5 session)
      │
-E4:  016-auto (emergency pre-backup thinning, 0.5 session)
+E4:  014 (skip unchanged, 0.5 session)
      │
-     ├── Fix any test session findings (~0-1 session)
+E5:  016-auto (emergency pre-backup thinning, 0.5 session)
      │
 Phase D: The Encounter (~6-8 sessions)
 ```
 
-**Gate:** After Phase E, the nightly run is smarter (skips unchanged, compressed sends,
-accurate space tracking, correct external-only presentation, emergency thinning). The
-encounter can generate configs with confidence that the runtime handles all cases well.
+**Gate:** After Phase E, the nightly run is smarter (correct sentinel behavior, skips
+unchanged, compressed sends, accurate space tracking, correct external-only presentation,
+context-aware suggestions, emergency thinning). The encounter can generate configs with
+confidence that the runtime handles all cases well.
 
 ### Phase D: Progressive disclosure + The Encounter
 

@@ -1,13 +1,15 @@
 // CLI handlers for `urd sentinel run` and `urd sentinel status`.
 
+use std::path::Path;
+
 use crate::config::Config;
 use crate::output::{OutputMode, SentinelStatusOutput};
 use crate::sentinel_runner::{self, is_pid_alive, read_sentinel_state_file, sentinel_state_path};
 use crate::voice;
 
 /// Start the sentinel daemon (foreground, for systemd).
-pub fn run_daemon(config: Config) -> anyhow::Result<()> {
-    let mut runner = sentinel_runner::SentinelRunner::new(config)?;
+pub fn run_daemon(config: Config, config_override: Option<&Path>) -> anyhow::Result<()> {
+    let mut runner = sentinel_runner::SentinelRunner::new(config, config_override)?;
     runner.run()
 }
 

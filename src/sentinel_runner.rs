@@ -9,7 +9,7 @@
 // Review: docs/99-reports/2026-03-27-sentinel-session2-design-review.md
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -47,15 +47,28 @@ pub struct SentinelRunner {
     shutdown: Arc<AtomicBool>,
     /// When the last BackupOverdue notification was sent (M2 debounce).
     last_overdue_notified: Option<Instant>,
+    /// Path to the config file (for reload detection).
+    config_path: PathBuf,
+    /// Last observed config file mtime (for change detection).
+    last_config_mtime: Option<SystemTime>,
 }
 
 impl SentinelRunner {
-    pub fn new(config: Config) -> anyhow::Result<Self> {
+    pub fn new(config: Config, config_override: Option<&Path>) -> anyhow::Result<Self> {
         let state_file_path = sentinel_state_path(&config);
         let heartbeat_path = config.general.heartbeat_file.clone();
 
         // S1 fix: read current heartbeat mtime as baseline — no event on startup.
         let last_heartbeat_mtime = std::fs::metadata(&heartbeat_path)
+            .ok()
+            .and_then(|m| m.modified().ok());
+
+        // Resolve config path for reload detection.
+        let config_path = match config_override {
+            Some(p) => p.to_path_buf(),
+            None => crate::config::default_config_path()?,
+        };
+        let last_config_mtime = std::fs::metadata(&config_path)
             .ok()
             .and_then(|m| m.modified().ok());
 
@@ -73,6 +86,8 @@ impl SentinelRunner {
             started,
             shutdown: Arc::new(AtomicBool::new(false)),
             last_overdue_notified: None,
+            config_path,
+            last_config_mtime,
         })
     }
 
@@ -122,11 +137,23 @@ impl SentinelRunner {
             events.push(event);
         }
 
+        if let Some(event) = self.detect_config_change() {
+            events.push(event);
+        }
+
         events
     }
 
     /// Process events through the state machine, coalescing Assess actions (M1 fix).
     fn process_events(&mut self, events: Vec<SentinelEvent>) {
+        // Pre-pass: reload config before state machine processes ConfigChanged.
+        // This ensures the Assess action (emitted by the transition) uses the new config.
+        for event in &events {
+            if matches!(event, SentinelEvent::ConfigChanged) {
+                self.try_reload_config();
+            }
+        }
+
         let mut all_actions = Vec::new();
 
         for event in &events {
@@ -218,6 +245,56 @@ impl SentinelRunner {
             }
             None => Some(SentinelEvent::AssessmentTick), // First tick immediately
             _ => None,
+        }
+    }
+
+    /// Detect config file mtime change. Returns ConfigChanged if the file
+    /// was modified (or appeared/disappeared) since last check.
+    fn detect_config_change(&mut self) -> Option<SentinelEvent> {
+        let mtime = std::fs::metadata(&self.config_path)
+            .ok()
+            .and_then(|m| m.modified().ok());
+        if mtime != self.last_config_mtime {
+            self.last_config_mtime = mtime;
+            Some(SentinelEvent::ConfigChanged)
+        } else {
+            None
+        }
+    }
+
+    /// Attempt to reload config from disk. On success, swap config and update
+    /// cached paths. On failure, log and keep old config.
+    fn try_reload_config(&mut self) {
+        match Config::load(Some(&self.config_path)) {
+            Ok(new_config) => {
+                log::warn!("Config reloaded — reassessing");
+
+                // F1 fix: re-baseline heartbeat mtime if path changed — prevents
+                // spurious BackupCompleted from stale mtime referring to old file.
+                if self.heartbeat_path != new_config.general.heartbeat_file {
+                    self.last_heartbeat_mtime = std::fs::metadata(
+                        &new_config.general.heartbeat_file,
+                    )
+                    .ok()
+                    .and_then(|m| m.modified().ok());
+                }
+
+                // F1 fix: update cached paths derived from config.
+                self.config = new_config;
+                self.heartbeat_path = self.config.general.heartbeat_file.clone();
+                self.state_file_path = sentinel_state_path(&self.config);
+
+                // F2 note: stale drives in self.state.mounted_drives (from old
+                // config) will be cleaned up by the next detect_drive_events()
+                // cycle, which computes current drives from self.config.drives.
+                // This may emit spurious "Drive unmounted" logs for drives removed
+                // from config — correct cleanup behavior, not a bug.
+            }
+            Err(e) => {
+                log::error!(
+                    "Config file changed but reload failed: {e}. Keeping previous config."
+                );
+            }
         }
     }
 
@@ -1227,5 +1304,120 @@ mod tests {
         assert_eq!(notifs.len(), 2);
         assert!(matches!(&notifs[0].event, NotificationEvent::HealthDegraded { subvolume, .. } if subvolume == "sv1"));
         assert!(matches!(&notifs[1].event, NotificationEvent::HealthRecovered { subvolume, .. } if subvolume == "sv2"));
+    }
+
+    // ── Config reload detection (021-b) ────────────────────────────────
+
+    /// Write a minimal valid v1 config to `path`, using `dir` for all filesystem paths.
+    fn write_test_config(path: &std::path::Path, dir: &std::path::Path) {
+        let source = dir.join("source");
+        let snap_root = dir.join("snapshots");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&snap_root).unwrap();
+
+        let config_text = format!(
+            r#"[general]
+config_version = 1
+run_frequency = "daily"
+state_db = "{dir}/urd.db"
+metrics_file = "{dir}/backup.prom"
+heartbeat_file = "{dir}/heartbeat.json"
+
+[[subvolumes]]
+name = "test-sv"
+source = "{source}"
+snapshot_root = "{snap_root}"
+min_free_bytes = "1GB"
+protection = "recorded"
+"#,
+            dir = dir.display(),
+            source = source.display(),
+            snap_root = snap_root.display(),
+        );
+        std::fs::write(path, config_text).unwrap();
+    }
+
+    /// Build a SentinelRunner from a temp config file.
+    fn make_test_runner(
+        config_path: &std::path::Path,
+    ) -> SentinelRunner {
+        let config = Config::load(Some(config_path)).unwrap();
+        SentinelRunner::new(config, Some(config_path)).unwrap()
+    }
+
+    #[test]
+    fn config_mtime_unchanged_no_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("urd.toml");
+        write_test_config(&config_path, dir.path());
+
+        let mut runner = make_test_runner(&config_path);
+
+        // No file change — detect should return None.
+        assert!(runner.detect_config_change().is_none());
+    }
+
+    #[test]
+    fn config_mtime_changed_emits_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("urd.toml");
+        write_test_config(&config_path, dir.path());
+
+        let mut runner = make_test_runner(&config_path);
+
+        // Touch the file to change mtime.
+        std::thread::sleep(Duration::from_millis(50));
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        std::fs::write(&config_path, &content).unwrap();
+
+        assert_eq!(
+            runner.detect_config_change(),
+            Some(SentinelEvent::ConfigChanged),
+        );
+
+        // Second call without further change — should return None.
+        assert!(runner.detect_config_change().is_none());
+    }
+
+    #[test]
+    fn config_reload_failure_keeps_old_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("urd.toml");
+        write_test_config(&config_path, dir.path());
+
+        let mut runner = make_test_runner(&config_path);
+        let original_state_db = runner.config.general.state_db.clone();
+
+        // Overwrite with invalid TOML.
+        std::fs::write(&config_path, "this is not valid toml [[[").unwrap();
+        runner.try_reload_config();
+
+        // Config should be unchanged.
+        assert_eq!(runner.config.general.state_db, original_state_db);
+    }
+
+    #[test]
+    fn config_reload_success_updates_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("urd.toml");
+        write_test_config(&config_path, dir.path());
+
+        let mut runner = make_test_runner(&config_path);
+
+        // Write a new valid config with a different state_db path.
+        let new_dir = dir.path().join("new");
+        std::fs::create_dir_all(&new_dir).unwrap();
+        write_test_config(&config_path, &new_dir);
+
+        runner.try_reload_config();
+
+        // Config should reflect new values.
+        let expected_db = new_dir.join("urd.db");
+        assert_eq!(runner.config.general.state_db, expected_db);
+        // Cached paths should also be updated.
+        assert_eq!(
+            runner.state_file_path,
+            sentinel_state_path(&runner.config),
+        );
     }
 }

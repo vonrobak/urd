@@ -29,6 +29,8 @@ pub enum SentinelEvent {
     AssessmentTick,
     /// A backup run completed (detected via heartbeat change).
     BackupCompleted,
+    /// Config file changed on disk — runner should reload and reassess.
+    ConfigChanged,
     /// Graceful shutdown requested (SIGTERM/SIGINT).
     Shutdown,
 }
@@ -381,6 +383,10 @@ pub fn sentinel_transition(
         SentinelEvent::BackupCompleted => {
             // A backup just finished — re-assess to pick up new promise states
             // and dispatch any notifications the backup left undispatched.
+            actions.push(SentinelAction::Assess);
+        }
+
+        SentinelEvent::ConfigChanged => {
             actions.push(SentinelAction::Assess);
         }
 
@@ -807,8 +813,10 @@ pub fn detect_simultaneous_chain_breaks(
     let mut anomalies = Vec::new();
     for (drive, &prev_count) in &prev_intact {
         let &(intact, total) = curr.get(drive).unwrap_or(&(0, 0));
-        // Drive had >= 2 intact chains before, and now has 0
-        if prev_count >= 2 && intact == 0 {
+        // Drive had >= 2 intact chains before, and now has 0.
+        // Guard: total > 0 ensures we don't fire when a drive simply disconnected
+        // (disconnect removes chains from the current snapshot, leaving total == 0).
+        if prev_count >= 2 && intact == 0 && total > 0 {
             anomalies.push(DriveAnomaly {
                 drive_label: drive.to_string(),
                 total_chains: total,
@@ -957,6 +965,14 @@ mod tests {
         let (_, actions) = sentinel_transition(&state, &SentinelEvent::Shutdown);
 
         assert_eq!(actions, vec![SentinelAction::Exit]);
+    }
+
+    #[test]
+    fn transition_config_changed_triggers_assess() {
+        let state = fresh_state();
+        let (_, actions) = sentinel_transition(&state, &SentinelEvent::ConfigChanged);
+
+        assert_eq!(actions, vec![SentinelAction::Assess]);
     }
 
     // ── Drive tracking ──────────────────────────────────────────────────
@@ -1642,6 +1658,65 @@ mod tests {
         let anomalies = detect_simultaneous_chain_breaks(&prev, &curr);
         assert_eq!(anomalies.len(), 1);
         assert_eq!(anomalies[0].drive_label, "D1");
+    }
+
+    // ── Drive disconnect anomaly guard (021-a) ─────────────────────────
+
+    #[test]
+    fn drive_disconnect_no_anomaly() {
+        // Drive D1 had 3 intact chains, then disconnects (absent from current).
+        // prev_count=3, intact=0, total=0 — should NOT fire (drive just left).
+        let prev = vec![
+            ChainSnapshot { subvolume: "sv1".into(), drive_label: "D1".into(), chain_intact: true },
+            ChainSnapshot { subvolume: "sv2".into(), drive_label: "D1".into(), chain_intact: true },
+            ChainSnapshot { subvolume: "sv3".into(), drive_label: "D1".into(), chain_intact: true },
+        ];
+        let curr = vec![]; // D1 absent — no chains in current snapshot
+
+        assert!(detect_simultaneous_chain_breaks(&prev, &curr).is_empty());
+    }
+
+    #[test]
+    fn all_chains_break_on_present_drive_still_detected() {
+        // Regression: D1 present with 3 broken chains — anomaly must still fire.
+        let prev = vec![
+            ChainSnapshot { subvolume: "sv1".into(), drive_label: "D1".into(), chain_intact: true },
+            ChainSnapshot { subvolume: "sv2".into(), drive_label: "D1".into(), chain_intact: true },
+            ChainSnapshot { subvolume: "sv3".into(), drive_label: "D1".into(), chain_intact: true },
+        ];
+        let curr = vec![
+            ChainSnapshot { subvolume: "sv1".into(), drive_label: "D1".into(), chain_intact: false },
+            ChainSnapshot { subvolume: "sv2".into(), drive_label: "D1".into(), chain_intact: false },
+            ChainSnapshot { subvolume: "sv3".into(), drive_label: "D1".into(), chain_intact: false },
+        ];
+
+        let anomalies = detect_simultaneous_chain_breaks(&prev, &curr);
+        assert_eq!(anomalies.len(), 1);
+        assert_eq!(anomalies[0].drive_label, "D1");
+        assert_eq!(anomalies[0].total_chains, 3);
+    }
+
+    #[test]
+    fn drive_disconnect_then_reconnect_no_anomaly() {
+        // Two transitions: D1 disappears (no anomaly), then returns intact (no anomaly).
+        // Each call is stateless — only compares two snapshots.
+        let prev = vec![
+            ChainSnapshot { subvolume: "sv1".into(), drive_label: "D1".into(), chain_intact: true },
+            ChainSnapshot { subvolume: "sv2".into(), drive_label: "D1".into(), chain_intact: true },
+            ChainSnapshot { subvolume: "sv3".into(), drive_label: "D1".into(), chain_intact: true },
+        ];
+
+        // Transition 1: D1 disconnects
+        let curr_disconnected: Vec<ChainSnapshot> = vec![];
+        assert!(detect_simultaneous_chain_breaks(&prev, &curr_disconnected).is_empty());
+
+        // Transition 2: D1 returns with all chains intact
+        let curr_reconnected = vec![
+            ChainSnapshot { subvolume: "sv1".into(), drive_label: "D1".into(), chain_intact: true },
+            ChainSnapshot { subvolume: "sv2".into(), drive_label: "D1".into(), chain_intact: true },
+            ChainSnapshot { subvolume: "sv3".into(), drive_label: "D1".into(), chain_intact: true },
+        ];
+        assert!(detect_simultaneous_chain_breaks(&curr_disconnected, &curr_reconnected).is_empty());
     }
 
     // ── Health snapshot tests (VFM-B) ──────────────────────────────────
