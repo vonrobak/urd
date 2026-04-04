@@ -148,7 +148,8 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
 
     // Set up executor with live byte counter for progress display
     let bytes_counter = Arc::new(AtomicU64::new(0));
-    let btrfs = RealBtrfs::new(&config.general.btrfs_path, bytes_counter.clone());
+    let sys = crate::btrfs::SystemBtrfs::probe(&config.general.btrfs_path);
+    let btrfs = RealBtrfs::new(&config.general.btrfs_path, bytes_counter.clone(), sys.supports_compressed_data);
 
     let mut executor = Executor::new(&btrfs, state_db.as_ref(), &config, &shutdown);
 

@@ -743,6 +743,17 @@ impl<'a> Executor<'a> {
 
         match self.btrfs.delete_subvolume(path) {
             Ok(()) => {
+                // Sync pending deletions so freed space is visible to the space check.
+                // Fail-open (ADR-107): sync failure leaves behavior identical to today.
+                if let Some(snapshot_root) = path.parent()
+                    && let Err(e) = self.btrfs.sync_subvolumes(snapshot_root)
+                {
+                    log::warn!(
+                        "btrfs subvolume sync failed for {}: {e} — space check may be pessimistic",
+                        snapshot_root.display()
+                    );
+                }
+
                 // After deletion, check if min_free_bytes is now satisfied.
                 // Applies to both external drives and local snapshot roots.
                 if let Some(ref key) = recovery_key {
@@ -1172,10 +1183,11 @@ source = "/data/b"
         assert_eq!(result.subvolume_results[0].send_type, SendType::Incremental);
 
         let calls = mock.calls();
-        assert_eq!(calls.len(), 3);
+        assert_eq!(calls.len(), 4);
         assert!(matches!(calls[0], MockBtrfsCall::CreateSnapshot { .. }));
         assert!(matches!(calls[1], MockBtrfsCall::SendReceive { .. }));
         assert!(matches!(calls[2], MockBtrfsCall::DeleteSubvolume { .. }));
+        assert!(matches!(calls[3], MockBtrfsCall::SyncSubvolumes { .. }));
     }
 
     #[test]
@@ -2792,6 +2804,138 @@ local_retention = "transient"
         assert!(!calls.iter().any(|c| matches!(
             c,
             MockBtrfsCall::DeleteSubvolume { path } if *path == old_parent,
+        )));
+    }
+
+    #[test]
+    fn sync_called_after_delete() {
+        let mock = MockBtrfs::new();
+        let config = test_config();
+        let shutdown = no_shutdown();
+        let executor = Executor::new(&mock, None, &config, &shutdown);
+
+        let ts = NaiveDate::from_ymd_opt(2026, 3, 22)
+            .unwrap()
+            .and_hms_opt(14, 30, 0)
+            .unwrap();
+        let plan = BackupPlan {
+            operations: vec![
+                PlannedOperation::DeleteSnapshot {
+                    path: PathBuf::from("/snap/sv-a/20260301-a"),
+                    reason: "expired".to_string(),
+                    subvolume_name: "sv-a".to_string(),
+                },
+                PlannedOperation::DeleteSnapshot {
+                    path: PathBuf::from("/snap/sv-a/20260302-a"),
+                    reason: "expired".to_string(),
+                    subvolume_name: "sv-a".to_string(),
+                },
+            ],
+            timestamp: ts,
+            skipped: vec![],
+        };
+
+        executor.execute(&plan, "full");
+
+        // Verify: Delete → Sync → Delete → Sync
+        let calls = mock.calls();
+        let relevant: Vec<_> = calls
+            .iter()
+            .filter(|c| {
+                matches!(
+                    c,
+                    MockBtrfsCall::DeleteSubvolume { .. } | MockBtrfsCall::SyncSubvolumes { .. }
+                )
+            })
+            .collect();
+        assert_eq!(relevant.len(), 4);
+        assert!(matches!(
+            relevant[0],
+            MockBtrfsCall::DeleteSubvolume { path } if *path == PathBuf::from("/snap/sv-a/20260301-a")
+        ));
+        assert!(matches!(
+            relevant[1],
+            MockBtrfsCall::SyncSubvolumes { path } if *path == PathBuf::from("/snap/sv-a")
+        ));
+        assert!(matches!(
+            relevant[2],
+            MockBtrfsCall::DeleteSubvolume { path } if *path == PathBuf::from("/snap/sv-a/20260302-a")
+        ));
+        assert!(matches!(
+            relevant[3],
+            MockBtrfsCall::SyncSubvolumes { path } if *path == PathBuf::from("/snap/sv-a")
+        ));
+    }
+
+    #[test]
+    fn sync_failure_does_not_abort_run() {
+        let mock = MockBtrfs::new();
+        // Fail sync for the snapshot root
+        mock.fail_syncs
+            .borrow_mut()
+            .insert(PathBuf::from("/snap/sv-a"));
+
+        let config = test_config();
+        let shutdown = no_shutdown();
+        let executor = Executor::new(&mock, None, &config, &shutdown);
+
+        let ts = NaiveDate::from_ymd_opt(2026, 3, 22)
+            .unwrap()
+            .and_hms_opt(14, 30, 0)
+            .unwrap();
+        let plan = BackupPlan {
+            operations: vec![
+                PlannedOperation::DeleteSnapshot {
+                    path: PathBuf::from("/snap/sv-a/20260301-a"),
+                    reason: "expired".to_string(),
+                    subvolume_name: "sv-a".to_string(),
+                },
+                PlannedOperation::CreateSnapshot {
+                    source: PathBuf::from("/data/a"),
+                    dest: PathBuf::from("/snap/sv-a/20260322-1430-a"),
+                    subvolume_name: "sv-a".to_string(),
+                },
+            ],
+            timestamp: ts,
+            skipped: vec![],
+        };
+
+        let result = executor.execute(&plan, "full");
+
+        // Both delete and create succeed despite sync failure
+        let sv = &result.subvolume_results[0];
+        assert_eq!(sv.operations[0].result, OpResult::Success); // delete
+        assert_eq!(sv.operations[1].result, OpResult::Success); // create
+    }
+
+    #[test]
+    fn sync_called_for_external_deletes() {
+        let mock = MockBtrfs::new();
+        let config = test_config();
+        let shutdown = no_shutdown();
+        let executor = Executor::new(&mock, None, &config, &shutdown);
+
+        let ts = NaiveDate::from_ymd_opt(2026, 3, 22)
+            .unwrap()
+            .and_hms_opt(14, 30, 0)
+            .unwrap();
+        let plan = BackupPlan {
+            operations: vec![PlannedOperation::DeleteSnapshot {
+                path: PathBuf::from("/mnt/test/.snapshots/sv-a/20260301-a"),
+                reason: "expired".to_string(),
+                subvolume_name: "sv-a".to_string(),
+            }],
+            timestamp: ts,
+            skipped: vec![],
+        };
+
+        executor.execute(&plan, "full");
+
+        // Sync should be called on the external snapshot root
+        let calls = mock.calls();
+        assert!(calls.iter().any(|c| matches!(
+            c,
+            MockBtrfsCall::SyncSubvolumes { path } if *path == PathBuf::from("/mnt/test/.snapshots/sv-a")
         )));
     }
 }

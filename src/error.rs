@@ -11,6 +11,7 @@ pub enum BtrfsOperation {
     Send,
     Receive,
     Delete,
+    Sync,
 }
 
 impl fmt::Display for BtrfsOperation {
@@ -20,6 +21,7 @@ impl fmt::Display for BtrfsOperation {
             Self::Send => write!(f, "send"),
             Self::Receive => write!(f, "receive"),
             Self::Delete => write!(f, "delete"),
+            Self::Sync => write!(f, "sync"),
         }
     }
 }
