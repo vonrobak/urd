@@ -9,17 +9,18 @@
 
 **Urd is the sole backup system.** Systemd timer running nightly at 04:00 since 2026-03-25.
 Sentinel daemon deployed (passive monitoring, drive detection, backup overdue alerts).
-871 tests, all passing, clippy clean. Current version: v0.10.0.
+879 tests, all passing, clippy clean. Current version: v0.10.0.
 
-**UPI 020 complete.** Context-aware suggestions: `compute_advice()` pure function in
-awareness.rs replaces static lookup tables. Doctor, status, and bare `urd` now show
-specific commands based on chain health, drive state, and subvolume config. PR #85 merged.
+**UPI 013 complete.** Compressed send pass-through (`--compressed-data` auto-detected at
+startup, no config knob) and post-delete sync (`btrfs subvolume sync` after each retention
+delete for accurate space accounting). PR #86 merged.
 
 **Deployment notes:**
 - v0.10.0 tagged but not yet pushed/installed
 - After install: hand-edit production config `local_retention = "transient"` →
   `local_snapshots = false` before next timer run
 - UPI 021 fix means sentinel will pick up the config change automatically after install
+- Pre-deploy check for 013: run `btrfs send --help` as unprivileged user to verify no-sudo probe
 
 ## In Progress
 
@@ -27,21 +28,21 @@ Nothing active.
 
 ## Recently Completed
 
-**UPI 020: The Doctor Knows** (2026-04-04)
-   - `ActionableAdvice` struct + 8-branch decision tree in awareness.rs
-   - Doctor shows chain-break reasons and `--force-full` when appropriate
-   - Status/default show inline fix commands or "run urd doctor" for multiple issues
-   - `external_only` flag uses send age for transient subvolumes
-   - 17 new tests, simplify pass fixed 3 issues
+**UPI 013: Btrfs Pipeline Improvements** (2026-04-05)
+   - 013-a: `SystemBtrfs::probe()` detects `--compressed-data` support, `RealBtrfs` injects flag
+   - 013-b: Per-delete `sync_subvolumes` in executor, fail-open (ADR-107)
+   - Simplify pass: hoisted probe out of loop in init.rs
+   - 8 new tests
 
 ## Next Up
 
 **Immediate: Push v0.10.0 and deploy** (see session journal for verification steps)
 
 **Then sequential (Phase E: Make the invisible worker smart):**
-1. **E1: UPI 013** — Btrfs pipeline (compressed sends, sync after delete) ~0.25 session
-2. **E2: UPI 018** — External-only runtime (fix false degraded/broken for local_snapshots=false) ~0.5 session
-3. **E4: UPI 014** — Skip unchanged subvolumes ~0.5 session
+1. **E2: UPI 018** — External-only runtime (fix false degraded/broken for local_snapshots=false) ~0.5 session
+2. **E4: UPI 014** — Skip unchanged subvolumes ~0.5 session
+
+**9 unreleased changes in CHANGELOG.md — consider `/release` soon.**
 
 ## Key Links
 

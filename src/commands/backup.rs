@@ -624,7 +624,7 @@ fn build_empty_plan_explanation(
             SkipCategory::SpaceExceeded => has_space = true,
             SkipCategory::DriveNotMounted => has_not_mounted = true,
             SkipCategory::IntervalNotElapsed => has_interval = true,
-            SkipCategory::NoSnapshotsAvailable | SkipCategory::Other => {}
+            SkipCategory::NoSnapshotsAvailable | SkipCategory::ExternalOnly | SkipCategory::Other => {}
         }
     }
 
