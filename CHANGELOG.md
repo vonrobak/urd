@@ -8,11 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Sentinel config reload: daemon detects config file changes via mtime polling and hot-reloads without restart
 - Token-aware chain-break gate: verified drives proceed with full sends in auto mode, breaking the deadlock where broken chains permanently blocked transient subvolumes
 - `send_completed` field in heartbeat (schema v2): distinguishes "backup ran successfully" from "data actually reached an external drive"
 - `SendType::Deferred` (Prometheus metric value 3): distinguishes intentional no-send from blocked-by-gate deferral
 - Deferred synthesis in backup summary: subvolumes with no local snapshots to send now surface actionable guidance instead of silent skips
 - `SkipCategory::NoSnapshotsAvailable` for structured classification of send-blocked skips
+
+### Fixed
+- False "all chains broke simultaneously" anomaly when a drive disconnects (total=0 was treated as all-broken)
+- Duplicate default config path logic in `urd migrate` consolidated to single implementation
 
 ## [0.10.0] - 2026-04-03
 

@@ -930,7 +930,7 @@ fn validate_name_safe(name: &str, label: &str) -> crate::error::Result<()> {
     Ok(())
 }
 
-fn default_config_path() -> crate::error::Result<PathBuf> {
+pub(crate) fn default_config_path() -> crate::error::Result<PathBuf> {
     let config_dir = dirs::config_dir()
         .ok_or_else(|| UrdError::Config("could not determine XDG config directory".to_string()))?;
     Ok(config_dir.join("urd").join("urd.toml"))

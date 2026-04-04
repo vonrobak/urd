@@ -81,7 +81,7 @@ fn main() -> anyhow::Result<()> {
         Commands::Verify(args) => commands::verify::run(config, args, output_mode),
         Commands::Get(args) => commands::get::run(config, args, output_mode),
         Commands::Sentinel(args) => match args.command {
-            cli::SentinelCommands::Run => commands::sentinel::run_daemon(config),
+            cli::SentinelCommands::Run => commands::sentinel::run_daemon(config, cli.config.as_deref()),
             cli::SentinelCommands::Status => commands::sentinel::status(config, output_mode),
         },
         Commands::Drives(args) => match args.action {

@@ -75,11 +75,7 @@ pub fn run(config_path: Option<&Path>, args: &MigrateArgs) -> anyhow::Result<()>
 fn resolve_config_path(path: Option<&Path>) -> anyhow::Result<PathBuf> {
     match path {
         Some(p) => Ok(p.to_path_buf()),
-        None => {
-            let config_dir = dirs::config_dir()
-                .ok_or_else(|| anyhow::anyhow!("could not determine XDG config directory"))?;
-            Ok(config_dir.join("urd").join("urd.toml"))
-        }
+        None => Ok(crate::config::default_config_path()?),
     }
 }
 
