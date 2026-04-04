@@ -604,6 +604,7 @@ fn plan_external_send(
             subvolume_name: subvol.name.clone(),
             pin_on_success: pin_info,
             reason,
+            token_verified: false, // stamped by backup.rs after plan creation
         });
     }
 }
@@ -1238,6 +1239,44 @@ priority = 2
             sends[0],
             PlannedOperation::SendFull { reason: FullSendReason::ChainBroken, .. }
         ));
+    }
+
+    #[test]
+    fn chain_broken_plan_defaults_token_verified_false() {
+        let config = test_config();
+        let mut fs = MockFileSystemState::new();
+        let parent = snap("20260322-1400-one");
+
+        fs.local_snapshots.insert(
+            "sv1".to_string(),
+            vec![parent.clone(), snap("20260322-1500-one")],
+        );
+        // Pin points to parent, but parent is NOT on external drive → ChainBroken
+        fs.mounted_drives.insert("D1".to_string());
+        fs.pin_files
+            .insert((PathBuf::from("/snap/sv1"), "D1".to_string()), parent);
+
+        let filters = PlanFilters {
+            subvolume: Some("sv1".to_string()),
+            ..PlanFilters::default()
+        };
+        let result = plan(&config, now(), &filters, &fs).unwrap();
+        let send = result
+            .operations
+            .iter()
+            .find(|op| matches!(op, PlannedOperation::SendFull { .. }))
+            .expect("should have a full send");
+        match send {
+            PlannedOperation::SendFull {
+                reason,
+                token_verified,
+                ..
+            } => {
+                assert_eq!(*reason, FullSendReason::ChainBroken);
+                assert!(!token_verified, "planner must default token_verified to false");
+            }
+            _ => unreachable!(),
+        }
     }
 
     #[test]

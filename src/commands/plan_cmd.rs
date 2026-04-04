@@ -134,6 +134,7 @@ mod tests {
             )),
             subvolume_name: subvol.to_string(),
             reason: crate::types::FullSendReason::FirstSend,
+            token_verified: false,
         }
     }
 

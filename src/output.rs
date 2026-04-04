@@ -567,6 +567,9 @@ pub enum SkipCategory {
     /// Distinct from `Disabled` (which means `enabled = false` — does nothing).
     LocalOnly,
     SpaceExceeded,
+    /// Send was planned but no local snapshots exist to send.
+    /// Distinct from `Other` — this is an actionable deferral, not an unknown skip.
+    NoSnapshotsAvailable,
     Other,
 }
 
@@ -595,6 +598,8 @@ impl SkipCategory {
             || reason.contains("skipped: calibrated size ~")
         {
             Self::SpaceExceeded
+        } else if reason == "no local snapshots to send" {
+            Self::NoSnapshotsAvailable
         } else {
             Self::Other
         }
@@ -1339,6 +1344,14 @@ mod tests {
     }
 
     #[test]
+    fn classify_no_snapshots_available() {
+        assert_eq!(
+            SkipCategory::from_reason("no local snapshots to send"),
+            SkipCategory::NoSnapshotsAvailable
+        );
+    }
+
+    #[test]
     fn classify_other() {
         assert_eq!(
             SkipCategory::from_reason(
@@ -1362,7 +1375,7 @@ mod tests {
         );
         assert_eq!(
             SkipCategory::from_reason("no local snapshots to send"),
-            SkipCategory::Other
+            SkipCategory::NoSnapshotsAvailable
         );
         assert_eq!(
             SkipCategory::from_reason("20260329-0404-htpc-home already on WD-18TB"),
@@ -1415,7 +1428,7 @@ mod tests {
                 "send to WD-18TB not due (next in ~2h30m)",
                 SkipCategory::IntervalNotElapsed,
             ),
-            ("no local snapshots to send", SkipCategory::Other),
+            ("no local snapshots to send", SkipCategory::NoSnapshotsAvailable),
             (
                 "20260329-0404-htpc-home already on WD-18TB",
                 SkipCategory::Other,

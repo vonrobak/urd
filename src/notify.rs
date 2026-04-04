@@ -566,6 +566,7 @@ mod tests {
                     promise_status: status.to_string(),
                     backup_success: *success,
                     pin_failures,
+                    send_completed: true,
                 })
                 .collect(),
         }

@@ -157,20 +157,28 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
         executor.set_full_send_policy(FullSendPolicy::SkipAndNotify);
     }
 
-    // Verify drive tokens: collect suspicious drives, then filter sends in one pass.
+    // Verify drive tokens: collect suspicious drives and verified drives in one pass.
+    // A drive is "verified" only when its token file is readable AND tokens match.
+    // This excludes fail-open paths (unreadable token file) from being treated as verified.
     if let Some(ref db) = state_db {
-        let blocked: std::collections::BTreeSet<String> = config
-            .drives
-            .iter()
-            .filter(|d| drives::is_drive_mounted(d))
-            .filter_map(|drive| match drives::verify_drive_token(drive, db) {
+        let mut blocked = std::collections::BTreeSet::new();
+        let mut verified = std::collections::BTreeSet::new();
+
+        for drive in config.drives.iter().filter(|d| drives::is_drive_mounted(d)) {
+            // Pre-check: can we read the token file?
+            let has_readable_token = matches!(
+                drives::read_drive_token(drive),
+                Ok(Some(_))
+            );
+
+            match drives::verify_drive_token(drive, db) {
                 drives::DriveAvailability::TokenMismatch { expected, found } => {
                     log::warn!(
                         "Drive {} has a token mismatch (expected {}, found {}) — \
                          skipping sends to this drive",
                         drive.label, expected, found,
                     );
-                    Some(drive.label.clone())
+                    blocked.insert(drive.label.clone());
                 }
                 drives::DriveAvailability::TokenExpectedButMissing => {
                     log::warn!(
@@ -180,11 +188,18 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
                          Run `urd drives adopt {}` to accept this drive.",
                         drive.label, drive.label, drive.label,
                     );
-                    Some(drive.label.clone())
+                    blocked.insert(drive.label.clone());
                 }
-                _ => None,
-            })
-            .collect();
+                drives::DriveAvailability::Available if has_readable_token => {
+                    // Token file exists and matches — drive identity confirmed.
+                    verified.insert(drive.label.clone());
+                }
+                _ => {
+                    // TokenMissing (first use), fail-open, or no token file:
+                    // neither blocked nor verified.
+                }
+            }
+        }
 
         if !blocked.is_empty() {
             // Only sends are blocked for token-suspicious drives. Retention deletes
@@ -198,6 +213,20 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
                     if blocked.contains(drive_label)
                 )
             });
+        }
+
+        // Stamp token_verified on SendFull operations for verified drives.
+        // This allows the executor's chain-break gate to proceed on known-good drives.
+        for op in &mut backup_plan.operations {
+            if let PlannedOperation::SendFull {
+                drive_label,
+                token_verified,
+                ..
+            } = op
+                && verified.contains(drive_label.as_str())
+            {
+                *token_verified = true;
+            }
         }
     }
 
@@ -308,7 +337,7 @@ fn build_backup_summary(
     duration: Duration,
     preflight_warnings: &[preflight::PreflightCheck],
 ) -> BackupSummary {
-    let subvolumes: Vec<SubvolumeSummary> = result
+    let mut subvolumes: Vec<SubvolumeSummary> = result
         .subvolume_results
         .iter()
         .map(|sv| {
@@ -386,6 +415,40 @@ fn build_backup_summary(
             reason: reason.clone(),
         })
         .collect();
+
+    // Synthesize deferred entries for subvolumes that needed sends but had no snapshots.
+    // Works from the skip list outward: adds to existing SubvolumeSummary or creates synthetic.
+    for skip in &skipped {
+        if skip.category != SkipCategory::NoSnapshotsAvailable {
+            continue;
+        }
+        let deferred_info = DeferredInfo {
+            reason: "no local snapshots available for send".to_string(),
+            suggestion: format!(
+                "Run `urd backup --force-full --subvolume {}` to create and send",
+                skip.name
+            ),
+        };
+        if let Some(sv) = subvolumes.iter_mut().find(|sv| sv.name == skip.name) {
+            // Subvolume has execution results (e.g., CreateSnapshot succeeded)
+            // but no sends completed — add deferred entry
+            if sv.sends.is_empty() && sv.deferred.is_empty() {
+                sv.deferred.push(deferred_info);
+            }
+        } else {
+            // Subvolume has zero planned operations (space guard, snapshot exists)
+            // — create a synthetic SubvolumeSummary
+            subvolumes.push(SubvolumeSummary {
+                name: skip.name.clone(),
+                success: true, // not a failure — data exists, just can't send
+                duration_secs: 0.0,
+                sends: vec![],
+                errors: vec![],
+                structured_errors: vec![],
+                deferred: vec![deferred_info],
+            });
+        }
+    }
 
     let mut warnings = Vec::new();
 
@@ -560,7 +623,7 @@ fn build_empty_plan_explanation(
             SkipCategory::SpaceExceeded => has_space = true,
             SkipCategory::DriveNotMounted => has_not_mounted = true,
             SkipCategory::IntervalNotElapsed => has_interval = true,
-            SkipCategory::Other => {}
+            SkipCategory::NoSnapshotsAvailable | SkipCategory::Other => {}
         }
     }
 
@@ -847,6 +910,7 @@ pub(crate) fn format_completion_line(
         SendType::Full => "full",
         SendType::Incremental => "incremental",
         SendType::NoSend => "no-send",
+        SendType::Deferred => "deferred",
     };
     format!(
         "  ✓ {} → {}: {} in {} ({})",
@@ -1715,6 +1779,7 @@ mod tests {
                     subvolume_name: "sv1".to_string(),
                     pin_on_success: None,
                     reason: FullSendReason::FirstSend,
+                    token_verified: false,
                 },
                 PlannedOperation::SendIncremental {
                     parent: PathBuf::from("/snaps/sv2/20260328-0400-sv2"),
@@ -1772,6 +1837,7 @@ mod tests {
                 subvolume_name: "sv1".to_string(),
                 pin_on_success: None,
                 reason: FullSendReason::FirstSend,
+                token_verified: false,
             }],
             timestamp: chrono::NaiveDateTime::default(),
             skipped: vec![],
@@ -1798,6 +1864,7 @@ mod tests {
                 subvolume_name: "sv1".to_string(),
                 pin_on_success: None,
                 reason: FullSendReason::FirstSend,
+                token_verified: false,
             }],
             timestamp: chrono::NaiveDateTime::default(),
             skipped: vec![],
@@ -1834,6 +1901,7 @@ mod tests {
                 subvolume_name: "sv1".to_string(),
                 pin_on_success: None,
                 reason: FullSendReason::FirstSend,
+                token_verified: false,
             }],
             timestamp: chrono::NaiveDateTime::default(),
             skipped: vec![],
@@ -2160,5 +2228,139 @@ mod tests {
             }),
             "should not fire FirstSendToDrive for previously unmounted drive"
         );
+    }
+
+    // ── Deferred synthesis tests ──────────────────────────────────────
+
+    fn empty_plan_with_skips(skipped: Vec<(&str, &str)>) -> BackupPlan {
+        use chrono::NaiveDate;
+        BackupPlan {
+            operations: vec![],
+            timestamp: NaiveDate::from_ymd_opt(2026, 3, 24)
+                .unwrap()
+                .and_hms_opt(4, 0, 0)
+                .unwrap(),
+            skipped: skipped
+                .into_iter()
+                .map(|(n, r)| (n.to_string(), r.to_string()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn no_snapshots_skip_produces_deferred_on_existing_summary() {
+        // Subvolume has a CreateSnapshot result but no sends (the deadlock scenario)
+        let plan = empty_plan_with_skips(vec![
+            ("htpc-root", "no local snapshots to send"),
+        ]);
+        // Add a CreateSnapshot operation to the plan so executor produces a SubvolumeResult
+        let plan = BackupPlan {
+            operations: vec![PlannedOperation::CreateSnapshot {
+                source: PathBuf::from("/data"),
+                dest: PathBuf::from("/snap/htpc-root/20260324-0400-root"),
+                subvolume_name: "htpc-root".to_string(),
+            }],
+            ..plan
+        };
+        let result = ExecutionResult {
+            overall: RunResult::Success,
+            subvolume_results: vec![make_subvol_result(
+                "htpc-root", true, vec![
+                    make_outcome("snapshot", None, OpResult::Success, None, None),
+                ], SendType::NoSend, 0,
+            )],
+            run_id: Some(1),
+        };
+
+        let summary = build_backup_summary(
+            &plan, &result, &empty_assessments(),
+            vec![], Duration::from_secs(1), &[],
+        );
+
+        let sv = summary.subvolumes.iter().find(|s| s.name == "htpc-root").unwrap();
+        assert_eq!(sv.deferred.len(), 1, "should have synthesized deferred entry");
+        assert!(sv.deferred[0].reason.contains("no local snapshots"));
+        assert!(sv.deferred[0].suggestion.contains("--force-full"));
+    }
+
+    #[test]
+    fn no_snapshots_skip_creates_synthetic_summary() {
+        // Subvolume has zero operations (space guard blocked everything)
+        let plan = empty_plan_with_skips(vec![
+            ("htpc-root", "no local snapshots to send"),
+        ]);
+        let result = ExecutionResult {
+            overall: RunResult::Success,
+            subvolume_results: vec![], // no results for htpc-root
+            run_id: Some(1),
+        };
+
+        let summary = build_backup_summary(
+            &plan, &result, &empty_assessments(),
+            vec![], Duration::from_secs(1), &[],
+        );
+
+        let sv = summary.subvolumes.iter().find(|s| s.name == "htpc-root").unwrap();
+        assert!(sv.success, "synthetic summary should be success");
+        assert_eq!(sv.deferred.len(), 1);
+        assert!(sv.deferred[0].suggestion.contains("htpc-root"));
+    }
+
+    #[test]
+    fn local_only_skip_does_not_produce_deferred() {
+        let plan = empty_plan_with_skips(vec![("sv", "send disabled")]);
+        let result = ExecutionResult {
+            overall: RunResult::Success,
+            subvolume_results: vec![],
+            run_id: Some(1),
+        };
+
+        let summary = build_backup_summary(
+            &plan, &result, &empty_assessments(),
+            vec![], Duration::from_secs(1), &[],
+        );
+
+        assert!(
+            summary.subvolumes.is_empty(),
+            "local-only skip should not create synthetic summary"
+        );
+    }
+
+    #[test]
+    fn interval_skip_does_not_produce_deferred() {
+        let plan = empty_plan_with_skips(vec![
+            ("sv", "send to WD-18TB not due (next in ~2h30m)"),
+        ]);
+        let result = ExecutionResult {
+            overall: RunResult::Success,
+            subvolume_results: vec![],
+            run_id: Some(1),
+        };
+
+        let summary = build_backup_summary(
+            &plan, &result, &empty_assessments(),
+            vec![], Duration::from_secs(1), &[],
+        );
+
+        assert!(summary.subvolumes.is_empty());
+    }
+
+    #[test]
+    fn drive_unmounted_skip_does_not_produce_deferred() {
+        let plan = empty_plan_with_skips(vec![
+            ("sv", "drive WD-18TB not mounted"),
+        ]);
+        let result = ExecutionResult {
+            overall: RunResult::Success,
+            subvolume_results: vec![],
+            run_id: Some(1),
+        };
+
+        let summary = build_backup_summary(
+            &plan, &result, &empty_assessments(),
+            vec![], Duration::from_secs(1), &[],
+        );
+
+        assert!(summary.subvolumes.is_empty());
     }
 }

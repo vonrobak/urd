@@ -180,7 +180,7 @@ fn format_metrics(data: &MetricsData) -> String {
     writeln!(out).unwrap();
     writeln!(
         out,
-        "# HELP backup_send_type Send type: 0=full, 1=incremental, 2=no send"
+        "# HELP backup_send_type Send type: 0=full, 1=incremental, 2=no send, 3=deferred"
     )
     .unwrap();
     writeln!(out, "# TYPE backup_send_type gauge").unwrap();

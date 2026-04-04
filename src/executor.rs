@@ -40,16 +40,19 @@ pub enum SendType {
     Full,
     Incremental,
     NoSend,
+    /// A send was needed but deliberately deferred by a safety gate.
+    Deferred,
 }
 
 impl SendType {
-    /// Prometheus metric value: 0=full, 1=incremental, 2=no send
+    /// Prometheus metric value: 0=full, 1=incremental, 2=no send, 3=deferred
     #[must_use]
     pub fn metric_value(&self) -> u8 {
         match self {
             Self::Full => 0,
             Self::Incremental => 1,
             Self::NoSend => 2,
+            Self::Deferred => 3,
         }
     }
 }
@@ -305,18 +308,22 @@ impl<'a> Executor<'a> {
                     drive_label,
                     pin_on_success,
                     reason,
+                    token_verified,
                     ..
                 } => {
                     planned_send_drives.insert(drive_label.clone());
-                    // Gate chain-break full sends in autonomous mode.
+                    // Gate chain-break full sends in autonomous mode,
+                    // unless the drive's identity has been verified via token.
                     if *reason == FullSendReason::ChainBroken
                         && self.full_send_policy == FullSendPolicy::SkipAndNotify
+                        && !token_verified
                     {
                         log::warn!(
                             "Skipping chain-break full send for {} to {}: \
                              use `urd backup --force-full` to override",
                             subvol_name, drive_label,
                         );
+                        send_type = SendType::Deferred;
                         OperationOutcome {
                             operation: "send_full".to_string(),
                             drive_label: Some(drive_label.clone()),
@@ -332,6 +339,13 @@ impl<'a> Executor<'a> {
                             btrfs_stderr: None,
                         }
                     } else {
+                        if *reason == FullSendReason::ChainBroken && *token_verified {
+                            log::info!(
+                                "Chain-break full send for {} to {}: \
+                                 proceeding (drive identity verified)",
+                                subvol_name, drive_label,
+                            );
+                        }
                         let (result, pin_failed) = self.execute_send(
                             snapshot,
                             None,
@@ -1233,6 +1247,7 @@ source = "/data/b"
                     subvolume_name: "sv-a".to_string(),
                     pin_on_success: None,
                     reason: FullSendReason::FirstSend,
+                    token_verified: false,
                 },
             ],
             timestamp: ts,
@@ -1282,6 +1297,7 @@ source = "/data/b"
                 subvolume_name: "sv-a".to_string(),
                 pin_on_success: Some((pin_path.clone(), snap_name)),
                 reason: FullSendReason::FirstSend,
+                token_verified: false,
             }],
             timestamp: ts,
             skipped: vec![],
@@ -1443,6 +1459,7 @@ source = "/data/b"
                 subvolume_name: "sv-a".to_string(),
                 pin_on_success: None,
                 reason: FullSendReason::FirstSend,
+                token_verified: false,
             }],
             timestamp: ts,
             skipped: vec![],
@@ -1624,6 +1641,7 @@ source = "/data/b"
                 subvolume_name: "sv-a".to_string(),
                 pin_on_success: Some((pin_path, snap_name)),
                 reason: FullSendReason::FirstSend,
+                token_verified: false,
             }],
             timestamp: ts,
             skipped: vec![],
@@ -1766,6 +1784,7 @@ source = "/data/b"
                 subvolume_name: "sv-a".to_string(),
                 pin_on_success: None,
                 reason: FullSendReason::FirstSend,
+                token_verified: false,
             }],
             timestamp: ts,
             skipped: vec![],
@@ -1821,6 +1840,7 @@ source = "/data/b"
                     subvolume_name: "sv-a".to_string(),
                     pin_on_success: None,
                     reason: FullSendReason::FirstSend,
+                    token_verified: false,
                 },
             ],
             timestamp: ts,
@@ -1868,6 +1888,7 @@ source = "/data/b"
                     subvolume_name: "sv-a".to_string(),
                     pin_on_success: None,
                     reason: FullSendReason::FirstSend,
+                    token_verified: false,
                 },
             ],
             timestamp: ts,
@@ -1997,6 +2018,7 @@ source = "/data/sv1"
                 subvolume_name: "sv-a".to_string(),
                 pin_on_success: None,
                 reason: FullSendReason::ChainBroken,
+                token_verified: false,
             }],
             timestamp: ts,
             skipped: vec![],
@@ -2015,6 +2037,11 @@ source = "/data/sv1"
 
         assert_eq!(result.subvolume_results[0].operations[0].result, OpResult::Deferred);
         assert!(result.subvolume_results[0].success, "deferred is not a failure");
+        assert_eq!(
+            result.subvolume_results[0].send_type,
+            SendType::Deferred,
+            "gated chain-break send should report SendType::Deferred"
+        );
         assert_eq!(result.overall, RunResult::Success, "deferred-only run is success");
         assert!(mock.calls().is_empty(), "btrfs should not be called");
         assert!(
@@ -2025,6 +2052,11 @@ source = "/data/sv1"
                 .contains("chain-break full send gated"),
             "message should indicate gating"
         );
+    }
+
+    #[test]
+    fn send_type_deferred_metric_value_is_3() {
+        assert_eq!(SendType::Deferred.metric_value(), 3);
     }
 
     #[test]
@@ -2068,6 +2100,97 @@ source = "/data/sv1"
         assert_eq!(result.subvolume_results[0].operations[0].result, OpResult::Success);
     }
 
+    fn chain_broken_verified_plan() -> BackupPlan {
+        let ts = NaiveDate::from_ymd_opt(2026, 3, 22)
+            .unwrap()
+            .and_hms_opt(14, 30, 0)
+            .unwrap();
+        BackupPlan {
+            operations: vec![PlannedOperation::SendFull {
+                snapshot: PathBuf::from("/snap/sv-a/20260322-1430-a"),
+                dest_dir: PathBuf::from("/mnt/test/.snapshots/sv-a"),
+                drive_label: "TEST-DRIVE".to_string(),
+                subvolume_name: "sv-a".to_string(),
+                pin_on_success: None,
+                reason: FullSendReason::ChainBroken,
+                token_verified: true,
+            }],
+            timestamp: ts,
+            skipped: vec![],
+        }
+    }
+
+    #[test]
+    fn chain_break_proceeds_on_verified_drive() {
+        let mock = MockBtrfs::new();
+        let config = test_config();
+        let shutdown = no_shutdown();
+        let mut executor = Executor::new(&mock, None, &config, &shutdown);
+        executor.set_full_send_policy(FullSendPolicy::SkipAndNotify);
+
+        let result = executor.execute(&chain_broken_verified_plan(), "full");
+
+        assert_eq!(
+            result.subvolume_results[0].operations[0].result,
+            OpResult::Success,
+            "verified drive should proceed with chain-break full send"
+        );
+        assert!(
+            !mock.calls().is_empty(),
+            "btrfs should be called for verified drive"
+        );
+    }
+
+    #[test]
+    fn chain_break_gated_on_unknown_token() {
+        // token_verified: false with SkipAndNotify → deferred (same as unverified)
+        let mock = MockBtrfs::new();
+        let config = test_config();
+        let shutdown = no_shutdown();
+        let mut executor = Executor::new(&mock, None, &config, &shutdown);
+        executor.set_full_send_policy(FullSendPolicy::SkipAndNotify);
+
+        let result = executor.execute(&chain_broken_plan(), "full");
+
+        assert_eq!(
+            result.subvolume_results[0].operations[0].result,
+            OpResult::Deferred,
+        );
+        assert!(mock.calls().is_empty(), "btrfs should not be called");
+    }
+
+    #[test]
+    fn first_send_always_allowed_regardless_of_token() {
+        let mock = MockBtrfs::new();
+        let config = test_config();
+        let shutdown = no_shutdown();
+        let mut executor = Executor::new(&mock, None, &config, &shutdown);
+        executor.set_full_send_policy(FullSendPolicy::SkipAndNotify);
+
+        // FirstSend with token_verified: false should still proceed
+        let result = executor.execute(&simple_plan(), "full");
+
+        assert_eq!(result.overall, RunResult::Success);
+        assert!(!mock.calls().is_empty(), "first send should always proceed");
+    }
+
+    #[test]
+    fn force_full_bypasses_gate_regardless_of_token() {
+        let mock = MockBtrfs::new();
+        let config = test_config();
+        let shutdown = no_shutdown();
+        let executor = Executor::new(&mock, None, &config, &shutdown);
+        // Default policy is Allow (equivalent to --force-full)
+
+        // ChainBroken + token_verified: false + Allow → should proceed
+        let result = executor.execute(&chain_broken_plan(), "full");
+
+        assert_eq!(
+            result.subvolume_results[0].operations[0].result,
+            OpResult::Success,
+        );
+    }
+
     #[test]
     fn deferred_with_failure_reports_partial() {
         let mock = MockBtrfs::new();
@@ -2095,6 +2218,7 @@ source = "/data/sv1"
                     subvolume_name: "sv-a".to_string(),
                     pin_on_success: None,
                     reason: FullSendReason::ChainBroken,
+                    token_verified: false,
                 },
                 // sv-b: snapshot create that will fail
                 PlannedOperation::CreateSnapshot {
@@ -2514,6 +2638,7 @@ local_retention = "transient"
                 subvolume_name: "sv-t".to_string(),
                 pin_on_success: Some((pin_path, snap_name)),
                 reason: FullSendReason::FirstSend,
+                token_verified: false,
             }],
             timestamp: test_ts(),
             skipped: vec![],
@@ -2583,6 +2708,7 @@ local_retention = "transient"
                     subvolume_name: "sv-t".to_string(),
                     pin_on_success: Some((pin_b, snap_name)),
                     reason: FullSendReason::FirstSend,
+                    token_verified: false,
                 },
             ],
             timestamp: test_ts(),

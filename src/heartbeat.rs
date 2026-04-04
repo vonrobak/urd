@@ -16,10 +16,10 @@ use serde::{Deserialize, Serialize};
 use crate::awareness::SubvolAssessment;
 use crate::config::Config;
 use crate::error::UrdError;
-use crate::executor::ExecutionResult;
+use crate::executor::{ExecutionResult, SendType};
 
 /// Current schema version. Bump when adding fields (never remove fields).
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 
 // ── Types ───────────────────────────────────────────────────────────────
 
@@ -35,11 +35,11 @@ pub struct Heartbeat {
     /// Whether notifications were dispatched for this heartbeat.
     /// Used for crash recovery: if false on next read, re-compute and re-send.
     /// Defaults to true for backward compat with pre-notification heartbeats.
-    #[serde(default = "default_dispatched")]
+    #[serde(default = "default_true")]
     pub notifications_dispatched: bool,
 }
 
-fn default_dispatched() -> bool {
+fn default_true() -> bool {
     true
 }
 
@@ -55,6 +55,11 @@ pub struct SubvolumeHeartbeat {
     /// Defaults to 0 for backward compat with pre-pin-tracking heartbeats.
     #[serde(default)]
     pub pin_failures: u32,
+    /// Whether at least one send operation completed successfully for this subvolume.
+    /// `false` when sends were needed but couldn't happen (deferred, no snapshots).
+    /// Defaults to `true` for backward compat (schema v1 heartbeats without this field).
+    #[serde(default = "default_true")]
+    pub send_completed: bool,
 }
 
 // ── Builder ─────────────────────────────────────────────────────────────
@@ -115,11 +120,16 @@ fn build_subvolume_entries(
                 r.subvolume_results.iter().find(|sv| sv.name == a.name)
             });
 
+            let send_completed = sv_result.is_some_and(|sv| {
+                matches!(sv.send_type, SendType::Full | SendType::Incremental)
+            });
+
             SubvolumeHeartbeat {
                 name: a.name.clone(),
                 backup_success: sv_result.map(|sv| sv.success),
                 promise_status: a.status.to_string(),
                 pin_failures: sv_result.map(|sv| sv.pin_failures).unwrap_or(0),
+                send_completed,
             }
         })
         .collect()
@@ -362,7 +372,7 @@ mod tests {
         let json = serde_json::to_string_pretty(&heartbeat).unwrap();
         let parsed: Heartbeat = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(parsed.schema_version, 1);
+        assert_eq!(parsed.schema_version, 2);
         assert_eq!(parsed.timestamp, "2026-03-24T02:05:00");
         assert_eq!(parsed.run_result, "partial");
         assert_eq!(parsed.run_id, Some(42));
@@ -371,9 +381,13 @@ mod tests {
         assert_eq!(parsed.subvolumes[0].name, "home");
         assert_eq!(parsed.subvolumes[0].backup_success, Some(true));
         assert_eq!(parsed.subvolumes[0].promise_status, "PROTECTED");
+        // "home" has send_type: Incremental → send_completed: true
+        assert!(parsed.subvolumes[0].send_completed);
         assert_eq!(parsed.subvolumes[1].name, "docs");
         assert_eq!(parsed.subvolumes[1].backup_success, Some(false));
         assert_eq!(parsed.subvolumes[1].promise_status, "AT RISK");
+        // "docs" has send_type: NoSend → send_completed: false
+        assert!(!parsed.subvolumes[1].send_completed);
     }
 
     // ── stale_after ─────────────────────────────────────────────────────
@@ -443,7 +457,7 @@ mod tests {
         assert!(!dir.path().join("heartbeat.json.tmp").exists());
         // File exists and is valid
         let read_back = read(&path).unwrap();
-        assert_eq!(read_back.schema_version, 1);
+        assert_eq!(read_back.schema_version, 2);
         assert_eq!(read_back.timestamp, "2026-03-24T02:00:00");
     }
 
@@ -464,5 +478,130 @@ mod tests {
     #[test]
     fn read_nonexistent_returns_none() {
         assert!(read(Path::new("/tmp/nonexistent-heartbeat-test.json")).is_none());
+    }
+
+    // ── send_completed tests ───────────────────────────────────────────
+
+    fn make_operation(name: &str, result: crate::executor::OpResult) -> crate::executor::OperationOutcome {
+        crate::executor::OperationOutcome {
+            operation: name.to_string(),
+            drive_label: Some("TEST".to_string()),
+            result,
+            duration: std::time::Duration::ZERO,
+            error: None,
+            bytes_transferred: None,
+            btrfs_operation: None,
+            btrfs_stderr: None,
+        }
+    }
+
+    #[test]
+    fn heartbeat_send_completed_true_on_successful_send() {
+        let config = test_config(&[("home", "1h")]);
+        let now =
+            NaiveDateTime::parse_from_str("2026-03-24T02:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
+        let assessments = test_assessments();
+
+        let result = ExecutionResult {
+            overall: RunResult::Success,
+            subvolume_results: vec![SubvolumeResult {
+                name: "home".to_string(),
+                success: true,
+                operations: vec![make_operation(
+                    "send_incremental",
+                    crate::executor::OpResult::Success,
+                )],
+                duration: std::time::Duration::from_secs(5),
+                send_type: SendType::Incremental,
+                pin_failures: 0,
+                transient_cleanup: TransientCleanupOutcome::NotApplicable,
+            }],
+            run_id: Some(1),
+        };
+
+        let hb = build_from_run(&config, now, &result, &assessments);
+        assert!(hb.subvolumes[0].send_completed);
+    }
+
+    #[test]
+    fn heartbeat_send_completed_false_on_deferred_send() {
+        let config = test_config(&[("home", "1h")]);
+        let now =
+            NaiveDateTime::parse_from_str("2026-03-24T02:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
+        let assessments = test_assessments();
+
+        let result = ExecutionResult {
+            overall: RunResult::Success,
+            subvolume_results: vec![SubvolumeResult {
+                name: "home".to_string(),
+                success: true,
+                operations: vec![make_operation(
+                    "send_full",
+                    crate::executor::OpResult::Deferred,
+                )],
+                duration: std::time::Duration::from_secs(0),
+                send_type: SendType::Deferred,
+                pin_failures: 0,
+                transient_cleanup: TransientCleanupOutcome::NotApplicable,
+            }],
+            run_id: Some(1),
+        };
+
+        let hb = build_from_run(&config, now, &result, &assessments);
+        assert!(!hb.subvolumes[0].send_completed);
+    }
+
+    #[test]
+    fn heartbeat_send_completed_false_on_no_send_operations() {
+        let config = test_config(&[("home", "1h")]);
+        let now =
+            NaiveDateTime::parse_from_str("2026-03-24T02:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
+        let assessments = test_assessments();
+
+        let result = ExecutionResult {
+            overall: RunResult::Success,
+            subvolume_results: vec![SubvolumeResult {
+                name: "home".to_string(),
+                success: true,
+                operations: vec![make_operation(
+                    "snapshot",
+                    crate::executor::OpResult::Success,
+                )],
+                duration: std::time::Duration::from_secs(1),
+                send_type: SendType::NoSend,
+                pin_failures: 0,
+                transient_cleanup: TransientCleanupOutcome::NotApplicable,
+            }],
+            run_id: Some(1),
+        };
+
+        let hb = build_from_run(&config, now, &result, &assessments);
+        assert!(!hb.subvolumes[0].send_completed);
+    }
+
+    #[test]
+    fn heartbeat_v1_backward_compat_defaults_send_completed_true() {
+        // Schema v1 JSON without send_completed field should default to true
+        let json = r#"{
+            "schema_version": 1,
+            "timestamp": "2026-03-24T02:00:00",
+            "stale_after": "2026-03-24T04:00:00",
+            "run_result": "success",
+            "run_id": 1,
+            "subvolumes": [
+                {
+                    "name": "home",
+                    "backup_success": true,
+                    "promise_status": "PROTECTED",
+                    "pin_failures": 0
+                }
+            ],
+            "notifications_dispatched": true
+        }"#;
+        let parsed: Heartbeat = serde_json::from_str(json).unwrap();
+        assert!(
+            parsed.subvolumes[0].send_completed,
+            "v1 heartbeat without send_completed should default to true"
+        );
     }
 }

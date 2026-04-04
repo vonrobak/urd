@@ -647,6 +647,10 @@ pub enum PlannedOperation {
         pin_on_success: Option<(PathBuf, SnapshotName)>,
         /// Why this is a full send instead of incremental.
         reason: FullSendReason,
+        /// Whether the target drive's identity has been verified via drive session token.
+        /// Set by `commands/backup.rs` after plan creation (planner doesn't access tokens).
+        /// When true, the executor's chain-break gate allows the send to proceed.
+        token_verified: bool,
     },
     DeleteSnapshot {
         path: PathBuf,
@@ -686,6 +690,7 @@ impl fmt::Display for PlannedOperation {
                 drive_label,
                 pin_on_success,
                 reason,
+                token_verified,
                 ..
             } => {
                 let pin_suffix = if pin_on_success.is_some() {
@@ -693,9 +698,14 @@ impl fmt::Display for PlannedOperation {
                 } else {
                     ""
                 };
+                let verified_suffix = if *token_verified {
+                    " (verified)"
+                } else {
+                    ""
+                };
                 write!(
                     f,
-                    "SEND    {} -> {} (full \u{2014} {reason}){pin_suffix}",
+                    "SEND    {} -> {} (full \u{2014} {reason}){pin_suffix}{verified_suffix}",
                     snapshot.display(),
                     drive_label
                 )
