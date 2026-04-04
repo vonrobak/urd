@@ -29,6 +29,49 @@ pub trait BtrfsOps {
     fn delete_subvolume(&self, path: &Path) -> crate::error::Result<()>;
     fn subvolume_exists(&self, path: &Path) -> bool;
     fn filesystem_free_bytes(&self, path: &Path) -> crate::error::Result<u64>;
+    fn sync_subvolumes(&self, path: &Path) -> crate::error::Result<()>;
+}
+
+// ── SystemBtrfs (startup-only capability probe) ────────────────────────
+
+/// Probes the system's btrfs-progs for capabilities at startup.
+/// Separate from `BtrfsOps` — the trait is for operations, not negotiation.
+pub struct SystemBtrfs {
+    pub supports_compressed_data: bool,
+}
+
+/// Check whether btrfs send help text contains `--compressed-data`.
+#[must_use]
+fn detect_compressed_data_support(output: &[u8]) -> bool {
+    String::from_utf8_lossy(output).contains("--compressed-data")
+}
+
+impl SystemBtrfs {
+    /// Probe btrfs-progs capabilities. Runs `btrfs send --help` without sudo
+    /// (help text doesn't require privileges). Safe to call at startup.
+    #[must_use]
+    pub fn probe(btrfs_path: &str) -> Self {
+        let supports = Command::new(btrfs_path)
+            .args(["send", "--help"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .map(|o| {
+                let combined = [o.stdout, o.stderr].concat();
+                detect_compressed_data_support(&combined)
+            })
+            .unwrap_or(false);
+
+        if supports {
+            log::info!("btrfs send: compressed data pass-through available");
+        } else {
+            log::info!("btrfs send: compressed data pass-through not available");
+        }
+
+        SystemBtrfs {
+            supports_compressed_data: supports,
+        }
+    }
 }
 
 // ── RealBtrfs ───────────────────────────────────────────────────────────
@@ -39,14 +82,16 @@ pub struct RealBtrfs {
     /// this to display transfer progress. Not part of the `BtrfsOps` trait —
     /// progress display is a presentation concern, not a correctness contract.
     bytes_counter: Arc<AtomicU64>,
+    supports_compressed_data: bool,
 }
 
 impl RealBtrfs {
     #[must_use]
-    pub fn new(btrfs_path: &str, bytes_counter: Arc<AtomicU64>) -> Self {
+    pub fn new(btrfs_path: &str, bytes_counter: Arc<AtomicU64>, supports_compressed_data: bool) -> Self {
         Self {
             btrfs_path: btrfs_path.to_string(),
             bytes_counter,
+            supports_compressed_data,
         }
     }
 }
@@ -101,6 +146,10 @@ impl BtrfsOps for RealBtrfs {
             .env("LC_ALL", "C")
             .arg(&self.btrfs_path)
             .arg("send");
+        if self.supports_compressed_data {
+            send_cmd.arg("--compressed-data");
+            log::debug!("btrfs send: using --compressed-data pass-through");
+        }
         if let Some(p) = parent {
             send_cmd.arg("-p").arg(p);
         }
@@ -324,6 +373,41 @@ impl BtrfsOps for RealBtrfs {
     fn filesystem_free_bytes(&self, path: &Path) -> crate::error::Result<u64> {
         crate::drives::filesystem_free_bytes(path)
     }
+
+    fn sync_subvolumes(&self, path: &Path) -> crate::error::Result<()> {
+        log::debug!(
+            "Running: sudo {} subvolume sync {}",
+            self.btrfs_path,
+            path.display()
+        );
+        let output = Command::new("sudo")
+            .env("LC_ALL", "C")
+            .arg(&self.btrfs_path)
+            .args(["subvolume", "sync"])
+            .arg(path)
+            .output()
+            .map_err(|e| UrdError::Btrfs {
+                context: BtrfsErrorContext {
+                    operation: BtrfsOperation::Sync,
+                    exit_code: None,
+                    stderr: format!("failed to spawn btrfs: {e}"),
+                    bytes_transferred: None,
+                },
+            })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            return Err(UrdError::Btrfs {
+                context: BtrfsErrorContext {
+                    operation: BtrfsOperation::Sync,
+                    exit_code: output.status.code(),
+                    stderr,
+                    bytes_transferred: None,
+                },
+            });
+        }
+        Ok(())
+    }
 }
 
 // ── MockBtrfs ───────────────────────────────────────────────────────────
@@ -343,6 +427,9 @@ pub enum MockBtrfsCall {
     DeleteSubvolume {
         path: PathBuf,
     },
+    SyncSubvolumes {
+        path: PathBuf,
+    },
 }
 
 /// Mock implementation of `BtrfsOps` for testing.
@@ -353,6 +440,7 @@ pub struct MockBtrfs {
     pub fail_creates: RefCell<HashSet<PathBuf>>,
     pub fail_sends: RefCell<HashSet<PathBuf>>,
     pub fail_deletes: RefCell<HashSet<PathBuf>>,
+    pub fail_syncs: RefCell<HashSet<PathBuf>>,
     pub existing_subvolumes: RefCell<HashSet<PathBuf>>,
     pub free_bytes: RefCell<u64>,
     pub mock_bytes_transferred: RefCell<Option<u64>>,
@@ -369,6 +457,7 @@ impl MockBtrfs {
             fail_creates: RefCell::new(HashSet::new()),
             fail_sends: RefCell::new(HashSet::new()),
             fail_deletes: RefCell::new(HashSet::new()),
+            fail_syncs: RefCell::new(HashSet::new()),
             existing_subvolumes: RefCell::new(HashSet::new()),
             free_bytes: RefCell::new(1_000_000_000_000), // 1TB default
             mock_bytes_transferred: RefCell::new(None),
@@ -459,6 +548,25 @@ impl BtrfsOps for MockBtrfs {
 
     fn filesystem_free_bytes(&self, _path: &Path) -> crate::error::Result<u64> {
         Ok(*self.free_bytes.borrow())
+    }
+
+    fn sync_subvolumes(&self, path: &Path) -> crate::error::Result<()> {
+        self.calls
+            .borrow_mut()
+            .push(MockBtrfsCall::SyncSubvolumes {
+                path: path.to_path_buf(),
+            });
+        if self.fail_syncs.borrow().contains(path) {
+            return Err(UrdError::Btrfs {
+                context: BtrfsErrorContext {
+                    operation: BtrfsOperation::Sync,
+                    exit_code: Some(1),
+                    stderr: format!("mock: sync failed for {}", path.display()),
+                    bytes_transferred: None,
+                },
+            });
+        }
+        Ok(())
     }
 }
 
@@ -575,5 +683,45 @@ mod tests {
 
         let result = mock.delete_subvolume(&path);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn mock_sync_records_call() {
+        let mock = MockBtrfs::new();
+        let path = PathBuf::from("/snap/home");
+
+        mock.sync_subvolumes(&path).unwrap();
+
+        let calls = mock.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0], MockBtrfsCall::SyncSubvolumes { path });
+    }
+
+    #[test]
+    fn probe_detects_compressed_data_in_help() {
+        let help = b"Usage: btrfs send [-e] [-p parent] [-c clone-src] [--compressed-data] <subvol> [<subvol>...]";
+        assert!(detect_compressed_data_support(help));
+    }
+
+    #[test]
+    fn probe_returns_false_when_flag_absent() {
+        let help = b"Usage: btrfs send [-e] [-p parent] [-c clone-src] <subvol> [<subvol>...]";
+        assert!(!detect_compressed_data_support(help));
+    }
+
+    #[test]
+    fn probe_returns_false_on_empty_output() {
+        assert!(!detect_compressed_data_support(b""));
+    }
+
+    #[test]
+    fn mock_sync_failure_injection() {
+        let mock = MockBtrfs::new();
+        let path = PathBuf::from("/snap/home");
+        mock.fail_syncs.borrow_mut().insert(path.clone());
+
+        let result = mock.sync_subvolumes(&path);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("mock: sync failed"));
     }
 }

@@ -397,6 +397,13 @@ fn handle_incomplete_deletions(
         "Potentially incomplete snapshots on external drives:".bold()
     );
 
+    let sys = crate::btrfs::SystemBtrfs::probe(&config.general.btrfs_path);
+    let btrfs = RealBtrfs::new(
+        &config.general.btrfs_path,
+        std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        sys.supports_compressed_data,
+    );
+
     for inc in incompletes {
         println!(
             "  {} {} on {} (not pinned, may be from interrupted transfer)",
@@ -411,10 +418,6 @@ fn handle_incomplete_deletions(
         let mut input = String::new();
         std::io::stdin().read_line(&mut input)?;
         if input.trim().eq_ignore_ascii_case("y") {
-            let btrfs = RealBtrfs::new(
-                &config.general.btrfs_path,
-                std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            );
             let path = std::path::Path::new(&inc.path);
             match btrfs.delete_subvolume(path) {
                 Ok(()) => {

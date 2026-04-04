@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Compressed send pass-through: auto-detects `--compressed-data` support (btrfs-progs 5.18+) and enables protocol v2 sends — less CPU, preserves compression on destination
+- Post-delete sync: `btrfs subvolume sync` after each retention delete ensures freed space is visible to the space check before the next snapshot
 - Context-aware suggestions: `urd doctor`, `urd status`, and bare `urd` now show specific commands based on chain health, drive state, and subvolume config instead of static "run `urd backup`" advice
 - Sentinel config reload: daemon detects config file changes via mtime polling and hot-reloads without restart
 - Token-aware chain-break gate: verified drives proceed with full sends in auto mode, breaking the deadlock where broken chains permanently blocked transient subvolumes

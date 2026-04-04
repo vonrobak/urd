@@ -9,11 +9,11 @@
 
 **Urd is the sole backup system.** Systemd timer running nightly at 04:00 since 2026-03-25.
 Sentinel daemon deployed (passive monitoring, drive detection, backup overdue alerts).
-857 tests, all passing, clippy clean. Current version: v0.10.0.
+871 tests, all passing, clippy clean. Current version: v0.10.0.
 
-**UPI 021 complete.** Sentinel config reload (mtime polling, hot-reload without restart)
-and chain-break anomaly guard fix. PR #84 merged. Simplify pass consolidated duplicate
-`default_config_path()` in migrate.rs.
+**UPI 020 complete.** Context-aware suggestions: `compute_advice()` pure function in
+awareness.rs replaces static lookup tables. Doctor, status, and bare `urd` now show
+specific commands based on chain health, drive state, and subvolume config. PR #85 merged.
 
 **Deployment notes:**
 - v0.10.0 tagged but not yet pushed/installed
@@ -27,12 +27,12 @@ Nothing active.
 
 ## Recently Completed
 
-**UPI 021: The Living Daemon** (2026-04-04)
-   - 021-a: `total > 0` guard in `detect_simultaneous_chain_breaks()` — prevents false
-     anomaly when drives disconnect
-   - 021-b: `ConfigChanged` event, mtime polling, `try_reload_config()` with cached path
-     refresh — sentinel hot-reloads config without restart
-   - 8 new tests, simplify pass fixed migrate.rs duplication
+**UPI 020: The Doctor Knows** (2026-04-04)
+   - `ActionableAdvice` struct + 8-branch decision tree in awareness.rs
+   - Doctor shows chain-break reasons and `--force-full` when appropriate
+   - Status/default show inline fix commands or "run urd doctor" for multiple issues
+   - `external_only` flag uses send age for transient subvolumes
+   - 17 new tests, simplify pass fixed 3 issues
 
 ## Next Up
 
@@ -41,7 +41,7 @@ Nothing active.
 **Then sequential (Phase E: Make the invisible worker smart):**
 1. **E1: UPI 013** — Btrfs pipeline (compressed sends, sync after delete) ~0.25 session
 2. **E2: UPI 018** — External-only runtime (fix false degraded/broken for local_snapshots=false) ~0.5 session
-3. **E3: UPI 020** — Context-aware suggestions (compute_advice pure function) ~0.5 session
+3. **E4: UPI 014** — Skip unchanged subvolumes ~0.5 session
 
 ## Key Links
 
@@ -52,16 +52,10 @@ Nothing active.
 | Architecture and code conventions | [CLAUDE.md](../../CLAUDE.md) |
 | Documentation standards | [CONTRIBUTING.md](../../CONTRIBUTING.md) |
 | ADRs (100-112) | [decisions/](../00-foundation/decisions/) |
-| Design docs | [95-ideas/](../95-ideas/) |
-| Review reports | [99-reports/](../99-reports/) |
 
 ## Known Issues
 
-- NVMe snapshot accumulation: space guard prevents catastrophic exhaustion but gradual accumulation above 10GB threshold not gated
-- `FileSystemState` trait (11 methods) outgrowing its name — consider rename to `SystemState`
+- htpc-root shows false "degraded"/"broken chain" — awareness doesn't account for `local_snapshots = false` (UPI 018 will fix)
+- WD-18TB and WD-18TB1 share BTRFS UUID from cloning — needs `btrfstune -u` when offsite drive returns
 - Status string fragility: "UNPROTECTED"/"AT RISK"/"PROTECTED" matched as raw strings — consider constants
-- Parallel notification builders in notify.rs and sentinel_runner.rs (maintenance risk)
-- RECOVERY column hidden — needs real snapshot depth calculation before it can return
 - Planner helper functions approaching parameter limit (10 args) — pass `&PlanFilters` instead of destructured bools in next planner change
-- ByteSize Display uses `{:.1}` formatting — `urd migrate` emits "10.0GB" not "10GB"; consider clean display mode
-- VersionProbe error message says "failed to read config_version" for TOML syntax errors — UX polish
