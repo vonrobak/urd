@@ -9,17 +9,17 @@
 
 **Urd is the sole backup system.** Systemd timer running nightly at 04:00 since 2026-03-25.
 Sentinel daemon deployed (passive monitoring, drive detection, backup overdue alerts).
-833 tests, all passing, clippy clean. Current version: v0.10.0.
+857 tests, all passing, clippy clean. Current version: v0.10.0.
 
-**UPI 010 complete (all sessions + 010-a).** Config schema v1 fully implemented:
-V1 parser, validation, `urd migrate`, `local_snapshots = false`. PR #75-80 merged.
-The full legacy→v1 config pipeline works: parse either schema, migrate between them,
-semantic equivalence confirmed. Named-level opacity has no exceptions.
+**UPI 021 complete.** Sentinel config reload (mtime polling, hot-reload without restart)
+and chain-break anomaly guard fix. PR #84 merged. Simplify pass consolidated duplicate
+`default_config_path()` in migrate.rs.
 
 **Deployment notes:**
 - v0.10.0 tagged but not yet pushed/installed
 - After install: hand-edit production config `local_retention = "transient"` →
   `local_snapshots = false` before next timer run
+- UPI 021 fix means sentinel will pick up the config change automatically after install
 
 ## In Progress
 
@@ -27,23 +27,21 @@ Nothing active.
 
 ## Recently Completed
 
-**UPI 010-a: `local_snapshots = false`** (2026-04-03)
-   - Replaced `local_retention = "transient"` with boolean opt-out in v1 config
-   - Eliminated the only exception to named-level opacity
-   - Migration handles custom+transient and named+transient→custom with baked fields
-   - 12 new tests, simplify pass fixed 5 issues including a double-count bug
+**UPI 021: The Living Daemon** (2026-04-04)
+   - 021-a: `total > 0` guard in `detect_simultaneous_chain_breaks()` — prevents false
+     anomaly when drives disconnect
+   - 021-b: `ConfigChanged` event, mtime polling, `try_reload_config()` with cached path
+     refresh — sentinel hot-reloads config without restart
+   - 8 new tests, simplify pass fixed migrate.rs duplication
 
 ## Next Up
 
-**Immediate: Push v0.10.0 and deploy** (see "When you return" in session journal)
+**Immediate: Push v0.10.0 and deploy** (see session journal for verification steps)
 
-**Track A: v0.10.0 test session** (calendar time — live with the tool)
-   - Live with v0.10.0 for several days (timer, Sentinel, drive plug/unplug cycles)
-   - Output: prioritized issue list → targeted fix phase if needed
-
-**Then sequential:**
-1. Fix test session findings (~0-2 sessions)
-2. **Phase D: Progressive disclosure + The Encounter** — ~6-8 sessions
+**Then sequential (Phase E: Make the invisible worker smart):**
+1. **E1: UPI 013** — Btrfs pipeline (compressed sends, sync after delete) ~0.25 session
+2. **E2: UPI 018** — External-only runtime (fix false degraded/broken for local_snapshots=false) ~0.5 session
+3. **E3: UPI 020** — Context-aware suggestions (compute_advice pure function) ~0.5 session
 
 ## Key Links
 

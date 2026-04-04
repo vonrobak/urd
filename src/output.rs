@@ -7,7 +7,7 @@ use std::io::IsTerminal;
 
 use serde::{Deserialize, Serialize};
 
-use crate::awareness::{DriveAssessment, SubvolAssessment};
+use crate::awareness::{ActionableAdvice, DriveAssessment, SubvolAssessment};
 use crate::types::{ByteSize, DriveRole};
 
 // ── OutputMode ──────────────────────────────────────────────────────────
@@ -151,6 +151,9 @@ pub struct StatusOutput {
     /// Structured redundancy advisories (omitted from JSON when empty).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub redundancy_advisories: Vec<RedundancyAdvisory>,
+    /// Actionable advice for subvolumes needing attention (omitted from JSON when empty).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub advice: Vec<ActionableAdvice>,
 }
 
 /// Serializable wrapper around SubvolAssessment data.
@@ -278,6 +281,16 @@ pub struct DefaultStatusOutput {
     pub last_run: Option<LastRunInfo>,
     /// Seconds since last backup started, pre-computed by the command handler.
     pub last_run_age_secs: Option<i64>,
+    /// The most urgent actionable advice, if any subvolumes need attention.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub best_advice: Option<ActionableAdvice>,
+    /// How many subvolumes need attention total.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub total_needing_attention: usize,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 impl DefaultStatusOutput {
@@ -401,6 +414,9 @@ pub struct DoctorDataSafety {
     pub issue: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub suggestion: Option<String>,
+    /// Why this command is suggested, or what physical action to take.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// Sentinel daemon status for doctor output.

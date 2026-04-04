@@ -11,6 +11,8 @@
 
 use chrono::{Duration, NaiveDateTime};
 
+use serde::Serialize;
+
 use crate::config::{Config, DriveConfig};
 use crate::output::{RedundancyAdvisory, RedundancyAdvisoryKind};
 use crate::plan::FileSystemState;
@@ -173,6 +175,208 @@ pub struct DriveAssessment {
     #[allow(dead_code)] // consumed by verbose status display (future)
     pub configured_interval: Interval,
     pub role: DriveRole,
+}
+
+// ── Actionable Advice ─────────────────────────────────────────────────
+
+/// Actionable advice for a subvolume based on its full assessment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ActionableAdvice {
+    /// Which subvolume this advice is for.
+    pub subvolume: String,
+    /// Short problem description ("waning — last external send 43h ago").
+    pub issue: String,
+    /// The exact command to run, or None if no CLI action can help.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// Human explanation of why this command, or what physical action to take.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Compute actionable advice for a subvolume based on its assessment.
+///
+/// Returns `None` when the subvolume is protected and healthy (no action needed).
+/// `send_enabled`: whether external sends are configured for this subvolume.
+/// `external_only`: true when local retention is transient (no local recovery).
+#[must_use]
+pub fn compute_advice(
+    assessment: &SubvolAssessment,
+    send_enabled: bool,
+    external_only: bool,
+) -> Option<ActionableAdvice> {
+    let name = &assessment.name;
+
+    // Branch 1: Protected + Healthy → no advice
+    if assessment.status == PromiseStatus::Protected
+        && assessment.health == OperationalHealth::Healthy
+    {
+        return None;
+    }
+
+    // When sends are disabled, only local staleness matters.
+    if !send_enabled {
+        if assessment.status == PromiseStatus::AtRisk {
+            return Some(ActionableAdvice {
+                subvolume: name.clone(),
+                issue: format!("waning{}", format_age_suffix(assessment, false)),
+                command: Some(format!("urd backup --subvolume {name}")),
+                reason: None,
+            });
+        }
+        // Protected+Degraded with no sends — nothing actionable
+        return None;
+    }
+
+    // Branch 2: Unprotected + no external drives configured
+    if assessment.status == PromiseStatus::Unprotected && assessment.external.is_empty() {
+        return Some(ActionableAdvice {
+            subvolume: name.clone(),
+            issue: "exposed — no external drives configured".to_string(),
+            command: None,
+            reason: Some(
+                "Add a [[drives]] section to your config to enable external backups".to_string(),
+            ),
+        });
+    }
+
+    // Branch 3: Unprotected + all drives absent
+    if assessment.status == PromiseStatus::Unprotected
+        && !assessment.external.is_empty()
+        && assessment.external.iter().all(|d| !d.mounted)
+    {
+        let first_label = &assessment.external[0].drive_label;
+        return Some(ActionableAdvice {
+            subvolume: name.clone(),
+            issue: "exposed — all drives disconnected".to_string(),
+            command: None,
+            reason: Some(format!("Connect {first_label} to restore protection")),
+        });
+    }
+
+    // Branch 4: At Risk or Unprotected + chain broken on a mounted drive
+    if (assessment.status == PromiseStatus::AtRisk
+        || assessment.status == PromiseStatus::Unprotected)
+        && let Some(broken) = find_broken_chain_on_mounted_drive(assessment)
+    {
+        return Some(ActionableAdvice {
+            subvolume: name.clone(),
+            issue: format_age_issue(assessment, external_only),
+            command: Some(format!("urd backup --force-full --subvolume {name}")),
+            reason: Some(chain_break_reason_text(broken)),
+        });
+    }
+
+    // Branch 5: At Risk + drive absent, no broken chain on mounted drives
+    if assessment.status == PromiseStatus::AtRisk
+        && let Some(absent) = assessment.external.iter().find(|d| !d.mounted)
+    {
+        return Some(ActionableAdvice {
+            subvolume: name.clone(),
+            issue: format_age_issue(assessment, external_only),
+            command: None,
+            reason: Some(format!(
+                "Connect {} and run `urd backup`",
+                absent.drive_label
+            )),
+        });
+    }
+
+    // Branch 6: At Risk + drive mounted, no chain break
+    if assessment.status == PromiseStatus::AtRisk {
+        return Some(ActionableAdvice {
+            subvolume: name.clone(),
+            issue: format_age_issue(assessment, external_only),
+            command: Some(format!("urd backup --subvolume {name}")),
+            reason: None,
+        });
+    }
+
+    // Branch 7: Protected + Degraded + chain broken on mounted drive
+    if assessment.status == PromiseStatus::Protected
+        && assessment.health == OperationalHealth::Degraded
+    {
+        if let Some(broken) = find_broken_chain_on_mounted_drive(assessment) {
+            return Some(ActionableAdvice {
+                subvolume: name.clone(),
+                issue: format!("degraded — thread to {} broken", broken.drive_label),
+                command: Some(format!("urd backup --force-full --subvolume {name}")),
+                reason: Some("will need full send on next backup".to_string()),
+            });
+        }
+
+        // Branch 8: Protected + Degraded + drive away long
+        if let Some(absent) = assessment.external.iter().find(|d| !d.mounted) {
+            return Some(ActionableAdvice {
+                subvolume: name.clone(),
+                issue: format!("degraded — {} away", absent.drive_label),
+                command: None,
+                reason: Some(format!("Consider connecting {}", absent.drive_label)),
+            });
+        }
+    }
+
+    None
+}
+
+/// Find the first chain break on a mounted drive.
+fn find_broken_chain_on_mounted_drive(assessment: &SubvolAssessment) -> Option<&DriveChainHealth> {
+    assessment.chain_health.iter().find(|ch| {
+        matches!(ch.status, ChainStatus::Broken { .. })
+            && assessment
+                .external
+                .iter()
+                .any(|d| d.drive_label == ch.drive_label && d.mounted)
+    })
+}
+
+/// Format "thread to {drive} broken ({reason})" from a chain health entry.
+fn chain_break_reason_text(ch: &DriveChainHealth) -> String {
+    if let ChainStatus::Broken { reason, .. } = &ch.status {
+        format!("thread to {} broken ({reason})", ch.drive_label)
+    } else {
+        format!("thread to {} broken", ch.drive_label)
+    }
+}
+
+/// Format an age suffix like " — last backup 43 hours ago".
+fn format_age_suffix(assessment: &SubvolAssessment, external_only: bool) -> String {
+    let age = if external_only {
+        assessment
+            .external
+            .iter()
+            .filter_map(|d| d.last_send_age)
+            .min()
+    } else {
+        assessment.local.newest_age
+    };
+
+    match age {
+        Some(d) => {
+            let secs = d.num_seconds();
+            let label = if external_only {
+                "last external send"
+            } else {
+                "last backup"
+            };
+            if secs >= 86400 {
+                format!(" — {label} {} days ago", secs / 86400)
+            } else {
+                format!(" — {label} {} hours ago", secs / 3600)
+            }
+        }
+        None => String::new(),
+    }
+}
+
+/// Format the issue string with age context.
+fn format_age_issue(assessment: &SubvolAssessment, external_only: bool) -> String {
+    let status_word = match assessment.status {
+        PromiseStatus::Unprotected => "exposed",
+        PromiseStatus::AtRisk => "waning",
+        PromiseStatus::Protected => "sealed",
+    };
+    format!("{status_word}{}", format_age_suffix(assessment, external_only))
 }
 
 // ── Core function ──────────────────────────────────────────────────────
@@ -3583,6 +3787,149 @@ drives = ["D1"]
             OperationalHealth::Healthy,
             "health should be Healthy — D2 is out of scope. Got: {:?} reasons: {:?}",
             sv1.health, sv1.health_reasons
+        );
+    }
+
+    // ── compute_advice tests ──────────────────────────────────────────
+
+    /// Build a minimal SubvolAssessment for advice tests. Tests mutate fields as needed.
+    fn test_assessment_for_advice(
+        name: &str,
+        status: PromiseStatus,
+        health: OperationalHealth,
+    ) -> SubvolAssessment {
+        SubvolAssessment {
+            name: name.to_string(),
+            status,
+            health,
+            health_reasons: vec![],
+            local: LocalAssessment {
+                status: PromiseStatus::Protected,
+                snapshot_count: 5,
+                newest_age: Some(Duration::hours(2)),
+                configured_interval: Interval::hours(1),
+            },
+            external: vec![],
+            chain_health: vec![],
+            advisories: vec![],
+            redundancy_advisories: vec![],
+            errors: vec![],
+        }
+    }
+
+    fn drive_assessment(label: &str, mounted: bool, send_age_hours: Option<i64>) -> DriveAssessment {
+        DriveAssessment {
+            drive_label: label.to_string(),
+            status: PromiseStatus::Protected,
+            mounted,
+            snapshot_count: Some(5),
+            last_send_age: send_age_hours.map(Duration::hours),
+            configured_interval: Interval::hours(24),
+            role: DriveRole::Primary,
+        }
+    }
+
+    #[test]
+    fn advice_protected_healthy_returns_none() {
+        let a = test_assessment_for_advice("sv1", PromiseStatus::Protected, OperationalHealth::Healthy);
+        assert!(compute_advice(&a, true, false).is_none());
+    }
+
+    #[test]
+    fn advice_unprotected_no_drives() {
+        let a = test_assessment_for_advice("sv1", PromiseStatus::Unprotected, OperationalHealth::Healthy);
+        let advice = compute_advice(&a, true, false).unwrap();
+        assert_eq!(advice.issue, "exposed — no external drives configured");
+        assert!(advice.command.is_none());
+        assert!(advice.reason.unwrap().contains("[[drives]]"));
+    }
+
+    #[test]
+    fn advice_unprotected_all_drives_absent() {
+        let mut a = test_assessment_for_advice("sv1", PromiseStatus::Unprotected, OperationalHealth::Blocked);
+        a.external = vec![drive_assessment("WD-18TB", false, None)];
+        let advice = compute_advice(&a, true, false).unwrap();
+        assert_eq!(advice.issue, "exposed — all drives disconnected");
+        assert!(advice.command.is_none());
+        assert!(advice.reason.unwrap().contains("Connect WD-18TB"));
+    }
+
+    #[test]
+    fn advice_at_risk_chain_broken_mounted() {
+        let mut a = test_assessment_for_advice("sv1", PromiseStatus::AtRisk, OperationalHealth::Degraded);
+        a.external = vec![drive_assessment("WD-18TB", true, Some(48))];
+        a.chain_health = vec![DriveChainHealth {
+            drive_label: "WD-18TB".to_string(),
+            status: ChainStatus::Broken {
+                reason: ChainBreakReason::PinMissingLocally,
+                pin_parent: None,
+            },
+        }];
+        let advice = compute_advice(&a, true, false).unwrap();
+        assert!(advice.command.as_ref().unwrap().contains("--force-full"));
+        assert!(advice.reason.as_ref().unwrap().contains("thread to WD-18TB broken"));
+    }
+
+    #[test]
+    fn advice_at_risk_drive_absent() {
+        let mut a = test_assessment_for_advice("sv1", PromiseStatus::AtRisk, OperationalHealth::Degraded);
+        a.external = vec![drive_assessment("WD-18TB", false, Some(48))];
+        let advice = compute_advice(&a, true, false).unwrap();
+        assert!(advice.command.is_none());
+        assert!(advice.reason.as_ref().unwrap().contains("Connect WD-18TB"));
+    }
+
+    #[test]
+    fn advice_at_risk_drive_mounted_no_break() {
+        let mut a = test_assessment_for_advice("sv1", PromiseStatus::AtRisk, OperationalHealth::Healthy);
+        a.external = vec![drive_assessment("WD-18TB", true, Some(48))];
+        let advice = compute_advice(&a, true, false).unwrap();
+        assert!(advice.command.as_ref().unwrap().contains("urd backup --subvolume sv1"));
+        assert!(!advice.command.as_ref().unwrap().contains("--force-full"));
+        assert!(advice.reason.is_none());
+    }
+
+    #[test]
+    fn advice_protected_degraded_chain_broken() {
+        let mut a = test_assessment_for_advice("sv1", PromiseStatus::Protected, OperationalHealth::Degraded);
+        a.external = vec![drive_assessment("WD-18TB", true, Some(6))];
+        a.chain_health = vec![DriveChainHealth {
+            drive_label: "WD-18TB".to_string(),
+            status: ChainStatus::Broken {
+                reason: ChainBreakReason::NoPinFile,
+                pin_parent: None,
+            },
+        }];
+        let advice = compute_advice(&a, true, false).unwrap();
+        assert!(advice.issue.contains("degraded"));
+        assert!(advice.command.as_ref().unwrap().contains("--force-full"));
+        assert!(advice.reason.as_ref().unwrap().contains("full send"));
+    }
+
+    #[test]
+    fn advice_send_disabled_ignores_external() {
+        let mut a = test_assessment_for_advice("sv1", PromiseStatus::AtRisk, OperationalHealth::Degraded);
+        a.external = vec![drive_assessment("WD-18TB", false, None)];
+        let advice = compute_advice(&a, false, false).unwrap();
+        assert!(advice.command.as_ref().unwrap().contains("urd backup --subvolume sv1"));
+        assert!(!advice.command.as_ref().unwrap().contains("--force-full"));
+    }
+
+    #[test]
+    fn advice_external_only_uses_send_age() {
+        let mut a = test_assessment_for_advice("sv1", PromiseStatus::AtRisk, OperationalHealth::Healthy);
+        // Local age is 2h (from test_assessment_for_advice), but external send was 48h ago
+        a.external = vec![drive_assessment("WD-18TB", true, Some(48))];
+        let advice = compute_advice(&a, true, true).unwrap();
+        assert!(
+            advice.issue.contains("last external send"),
+            "expected 'last external send' in issue: {}",
+            advice.issue
+        );
+        assert!(
+            !advice.issue.contains("last backup"),
+            "should not say 'last backup' when external_only: {}",
+            advice.issue
         );
     }
 }

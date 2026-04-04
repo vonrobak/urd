@@ -63,6 +63,19 @@ pub fn run(config_path: Option<&Path>, output_mode: OutputMode) -> anyhow::Resul
         }
     }
 
+    // Compute actionable advice
+    let resolved = config.resolved_subvolumes();
+    let advice_items: Vec<awareness::ActionableAdvice> = assessments
+        .iter()
+        .filter_map(|a| {
+            let sv = resolved.iter().find(|sv| sv.name == a.name)?;
+            awareness::compute_advice(a, sv.send_enabled, sv.local_retention.is_transient())
+        })
+        .collect();
+
+    let total_needing_attention = advice_items.len();
+    let best_advice = advice_items.into_iter().next();
+
     let output = DefaultStatusOutput {
         total,
         waning_names,
@@ -71,6 +84,8 @@ pub fn run(config_path: Option<&Path>, output_mode: OutputMode) -> anyhow::Resul
         blocked_count,
         last_run,
         last_run_age_secs,
+        best_advice,
+        total_needing_attention,
     };
 
     print!("{}", voice::render_default_status(&output, output_mode));

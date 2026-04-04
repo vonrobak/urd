@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Context-aware suggestions: `urd doctor`, `urd status`, and bare `urd` now show specific commands based on chain health, drive state, and subvolume config instead of static "run `urd backup`" advice
 - Sentinel config reload: daemon detects config file changes via mtime polling and hot-reloads without restart
 - Token-aware chain-break gate: verified drives proceed with full sends in auto mode, breaking the deadlock where broken chains permanently blocked transient subvolumes
 - `send_completed` field in heartbeat (schema v2): distinguishes "backup ran successfully" from "data actually reached an external drive"

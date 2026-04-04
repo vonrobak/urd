@@ -5,8 +5,8 @@
 
 | UPI | Title | Design | Design Review | Adversary Review | PR | GH# |
 |-----|-------|--------|---------------|------------------|----|-----|
-| 021 | The Living Daemon (sentinel config reload + anomaly fix) | [design](../95-ideas/2026-04-04-design-021-living-daemon.md) | - | [adversary](../99-reports/2026-04-04-review-adversary-021-living-daemon.md) | - | - |
-| 020 | The Doctor Knows (context-aware suggestions) | [design](../95-ideas/2026-04-04-design-020-doctor-knows.md) | - | - | - | - |
+| 021 | The Living Daemon (sentinel config reload + anomaly fix) | [design](../95-ideas/2026-04-04-design-021-living-daemon.md) | - | [adversary](../99-reports/2026-04-04-review-adversary-021-living-daemon.md) | merged | [#84](https://github.com/vonrobak/urd/pull/84) |
+| 020 | The Doctor Knows (context-aware suggestions) | [design](../95-ideas/2026-04-04-design-020-doctor-knows.md) | - | [adversary](../99-reports/2026-04-04-review-adversary-020-doctor-knows.md) | - | - |
 | 019 | The Honest Worker (token-aware gate + honest results) | [design](../95-ideas/2026-04-04-design-019-honest-worker.md) | - | [adversary](../99-reports/2026-04-04-review-adversary-019-honest-worker.md) | merged | [#83](https://github.com/vonrobak/urd/pull/83) |
 | 018 | External-only runtime experience | [design](../95-ideas/2026-04-03-design-018-external-only-runtime.md) | - | - | - | - |
 | 017 | Thread lineage visualization | [design](../95-ideas/2026-04-03-design-017-thread-lineage-visualization.md) | - | - | - | - |
