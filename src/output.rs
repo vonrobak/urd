@@ -378,6 +378,60 @@ pub struct TransientComparison {
     pub lost_window: String,
 }
 
+// ── EmergencyOutput ───────────────────────────────────────────────────
+
+/// Full output for the `urd emergency` assessment phase.
+#[derive(Debug, Clone, Serialize)]
+pub struct EmergencyOutput {
+    pub roots: Vec<EmergencyRootAssessment>,
+}
+
+impl EmergencyOutput {
+    /// Whether any root is in a critical state.
+    #[must_use]
+    pub fn has_crisis(&self) -> bool {
+        self.roots.iter().any(|r| r.is_critical)
+    }
+}
+
+/// Assessment of a single snapshot root during emergency evaluation.
+#[derive(Debug, Clone, Serialize)]
+pub struct EmergencyRootAssessment {
+    pub root: std::path::PathBuf,
+    pub free_bytes: u64,
+    /// `None` when the user hasn't configured `min_free_bytes` for this root.
+    pub min_free_bytes: Option<u64>,
+    pub is_critical: bool,
+    pub subvolumes: Vec<EmergencySubvolDetail>,
+    /// Count of unsent snapshots that will be deleted (between oldest pin and latest).
+    pub unsent_count: usize,
+    /// Drives whose incremental chain will break after emergency retention.
+    pub drives_needing_full_send: Vec<String>,
+}
+
+/// Per-subvolume breakdown within an emergency root assessment.
+#[derive(Debug, Clone, Serialize)]
+pub struct EmergencySubvolDetail {
+    pub name: String,
+    pub snapshot_count: usize,
+    pub keep_count: usize,
+    pub delete_count: usize,
+    pub latest: String,
+    pub pinned_count: usize,
+}
+
+/// Result of executing emergency deletions on a single root.
+#[derive(Debug, Clone, Serialize)]
+pub struct EmergencyResult {
+    pub root: std::path::PathBuf,
+    pub deleted: usize,
+    pub failed: usize,
+    pub freed_bytes: u64,
+    pub remaining_snapshots: usize,
+    pub remaining_free: u64,
+    pub still_critical: bool,
+}
+
 // ── DoctorOutput ──────────────────────────────────────────────────────
 
 /// Full output for the `urd doctor` command.

@@ -711,32 +711,23 @@ impl<'a> Executor<'a> {
             };
         }
 
-        // Pin protection (defense-in-depth): check if this snapshot is pinned
-        if let Some(snap_name_osstr) = path.file_name() {
-            let snap_name_str = snap_name_osstr.to_string_lossy();
-            if let Ok(snap) = crate::types::SnapshotName::parse(&snap_name_str) {
-                let drive_labels = self.config.drive_labels();
-                // Use the subvolume_name from the operation to find the local dir
-                if let Some(local_dir) = self.config.local_snapshot_dir(subvolume_name) {
-                    let pinned = chain::find_pinned_snapshots(&local_dir, &drive_labels);
-                    if pinned.contains(&snap) {
-                        log::warn!(
-                            "Defense-in-depth: refusing to delete pinned snapshot {}",
-                            path.display()
-                        );
-                        return OperationOutcome {
-                            operation: "delete".to_string(),
-                            drive_label: self.drive_label_for_path(path),
-                            result: OpResult::Skipped,
-                            duration: start.elapsed(),
-                            error: Some("snapshot is pinned".to_string()),
-                            bytes_transferred: None,
-                            btrfs_operation: None,
-                            btrfs_stderr: None,
-                        };
-                    }
-                }
-            }
+        // Pin protection (defense-in-depth, ADR-106 layer 3): re-check pin
+        // status immediately before deletion. Uses shared helper in chain.rs.
+        if chain::is_pinned_at_delete_time(path, subvolume_name, self.config) {
+            log::warn!(
+                "Defense-in-depth: refusing to delete pinned snapshot {}",
+                path.display()
+            );
+            return OperationOutcome {
+                operation: "delete".to_string(),
+                drive_label: self.drive_label_for_path(path),
+                result: OpResult::Skipped,
+                duration: start.elapsed(),
+                error: Some("snapshot is pinned".to_string()),
+                bytes_transferred: None,
+                btrfs_operation: None,
+                btrfs_stderr: None,
+            };
         }
 
         log::info!("Deleting snapshot: {}", path.display());

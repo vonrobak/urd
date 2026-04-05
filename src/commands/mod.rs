@@ -4,6 +4,7 @@ pub mod completions;
 pub mod default;
 pub mod doctor;
 pub mod drives;
+pub mod emergency;
 pub mod get;
 pub mod history;
 pub mod migrate;

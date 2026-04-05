@@ -91,6 +91,7 @@ fn main() -> anyhow::Result<()> {
             }
         },
         Commands::Doctor(args) => commands::doctor::run(config, args, output_mode),
+        Commands::Emergency => commands::emergency::run(config, output_mode),
         Commands::RetentionPreview(args) => {
             commands::retention_preview::run(config, args, output_mode)
         }

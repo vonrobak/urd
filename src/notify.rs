@@ -82,6 +82,14 @@ pub enum NotificationEvent {
     DriveNeedsAdoption {
         drive_label: String,
     },
+    /// Emergency retention ran before a backup to recover critical space.
+    /// Dispatched by the backup command's emergency pre-flight path.
+    #[allow(dead_code)] // Constructed by backup pre-flight, not yet wired to dispatch
+    EmergencyRetentionRan {
+        root: String,
+        freed_bytes: u64,
+        deleted_count: usize,
+    },
 }
 
 // ── Urgency ────────────────────────────────────────────────────────────
@@ -362,6 +370,29 @@ pub fn build_drive_needs_adoption_notification(label: &str) -> Notification {
         body: format!(
             "Drive is mounted but its identity token is missing or mismatched. \
              Run `urd drives adopt {label}` to accept this drive."
+        ),
+    }
+}
+
+/// Build a notification for emergency retention that ran before a backup.
+#[must_use]
+#[allow(dead_code)] // Will be wired to backup dispatch path
+pub fn build_emergency_retention_notification(
+    root: &str,
+    freed_bytes: u64,
+    deleted_count: usize,
+) -> Notification {
+    let freed = crate::types::ByteSize(freed_bytes);
+    Notification {
+        event: NotificationEvent::EmergencyRetentionRan {
+            root: root.to_string(),
+            freed_bytes,
+            deleted_count,
+        },
+        urgency: Urgency::Warning,
+        title: "Emergency retention ran".to_string(),
+        body: format!(
+            "Freed {freed} from {root} by deleting {deleted_count} snapshots before backup."
         ),
     }
 }
@@ -985,5 +1016,25 @@ mod tests {
     fn drive_needs_adoption_urgency_is_warning() {
         let n = build_drive_needs_adoption_notification("D1");
         assert_eq!(n.urgency, Urgency::Warning);
+    }
+
+    #[test]
+    fn emergency_retention_notification_format() {
+        let n = build_emergency_retention_notification("/snap/home", 8_200_000_000, 39);
+        assert_eq!(n.urgency, Urgency::Warning);
+        assert_eq!(n.title, "Emergency retention ran");
+        assert!(n.body.contains("39 snapshots"), "body: {}", n.body);
+        assert!(n.body.contains("/snap/home"), "body: {}", n.body);
+        assert!(
+            matches!(
+                n.event,
+                NotificationEvent::EmergencyRetentionRan {
+                    deleted_count: 39,
+                    ..
+                }
+            ),
+            "event: {:?}",
+            n.event
+        );
     }
 }

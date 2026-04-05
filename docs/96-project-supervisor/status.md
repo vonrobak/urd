@@ -9,12 +9,12 @@
 
 **Urd is the sole backup system.** Systemd timer running nightly at 04:00 since 2026-03-25.
 Sentinel daemon deployed (passive monitoring, drive detection, backup overdue alerts).
-892 tests, all passing, clippy clean. Current version: v0.10.0.
+906 tests, all passing, clippy clean. Current version: v0.10.0.
 
-**UPI 018 complete.** External-only runtime: subvolumes with `local_snapshots = false`
-no longer show false "degraded" health or "broken chain" warnings. Health model exempts
-expected chain breaks for transient subvolumes. Status table, plan output, and advisories
-all treat external-only as first-class. PR #87 merged.
+**UPI 014 complete.** Skip unchanged subvolumes: BTRFS generation comparison avoids
+creating identical snapshots for quiet subvolumes. Plan output shows `[SAME]` tag with
+elapsed time. `--force-snapshot` overrides. Fail-open on generation query failures.
+PR #88 merged.
 
 **Deployment notes:**
 - v0.10.0 tagged but not yet pushed/installed
@@ -30,23 +30,22 @@ Nothing active.
 
 ## Recently Completed
 
-**UPI 018: External-Only Runtime** (2026-04-05)
-   - `is_expected_chain_break()` helper exempts NoPinFile/PinMissingLocally for transient
-   - Status table: em-dash LOCAL, "ext-only" THREAD for external-only subvols
-   - Plan output: `[EXT]` skip tag with grouped rendering, hidden from backup summary
-   - Advisory text: "local snapshots are disabled" (not "transient")
-   - Simplify: extracted `render_named_group()`, fixed doc comments
-   - 13 new tests
+**UPI 014: Skip Unchanged Subvolumes** (2026-04-05)
+   - `parse_generation()` + `subvolume_generation()` standalone in btrfs.rs
+   - Generation comparison in `plan_local_snapshot()` with fail-open semantics
+   - `SkipCategory::Unchanged` with `[SAME]` tag, suppressed in backup summary
+   - `--force-snapshot` flag on `urd plan` and `urd backup`
+   - Simplify: refactored `plan_local_snapshot` to take `&PlanFilters` (parameter sprawl fix)
+   - 11 new tests
 
 ## Next Up
 
 **Immediate: Push v0.10.0 and deploy** (see session journal for verification steps)
 
 **Then sequential (Phase E: Make the invisible worker smart):**
-1. **E4: UPI 014** — Skip unchanged subvolumes ~0.5 session
-2. **E5: UPI 016-auto** — Emergency space response (automatic mode) ~0.5 session
+1. **E5: UPI 016-auto** — Emergency space response (automatic mode) ~0.5 session
 
-**11 unreleased changes in CHANGELOG.md — consider `/release` soon.**
+**12 unreleased changes in CHANGELOG.md — consider `/release` soon.**
 
 ## Key Links
 
@@ -62,5 +61,4 @@ Nothing active.
 
 - WD-18TB and WD-18TB1 share BTRFS UUID from cloning — needs `btrfstune -u` when offsite drive returns
 - Status string fragility: "UNPROTECTED"/"AT RISK"/"PROTECTED" matched as raw strings — consider constants
-- Planner helper functions approaching parameter limit (10 args) — pass `&PlanFilters` instead of destructured bools in next planner change
 - `compute_health` at 8 params — consider struct grouping in next awareness.rs change

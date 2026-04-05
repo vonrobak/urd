@@ -19,6 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `SkipCategory::NoSnapshotsAvailable` for structured classification of send-blocked skips
 - External-only runtime: subvolumes with `local_snapshots = false` no longer show false "degraded" health or "broken chain" warnings — status table shows em-dash for LOCAL and "ext-only" for THREAD, plan output uses `[EXT]` skip tag
 - Skip unchanged subvolumes: compares BTRFS generation counters to avoid creating identical snapshots for quiet subvolumes — shown as `[SAME]` in plan output with elapsed time, overrideable via `--force-snapshot`
+- `urd emergency` command: guided emergency space recovery — assesses snapshot roots, previews aggressive thinning (keep latest + pinned only), executes with confirmation
+- Automatic emergency pre-flight: backup command detects critically low space (<50% of `min_free_bytes`) and runs emergency retention under the advisory lock before planning
+- Doctor space trend warning: `urd doctor` warns when snapshot roots approach free-space thresholds, suggests `urd emergency`
+- Shared pin re-check helper (`chain::is_pinned_at_delete_time`): single implementation of ADR-106 defense-in-depth layer 3, used by executor and emergency paths
 
 ### Fixed
 - False "all chains broke simultaneously" anomaly when a drive disconnects (total=0 was treated as all-broken)

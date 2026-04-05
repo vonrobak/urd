@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use colored::Colorize;
 
 use crate::awareness::{self, ChainStatus, PromiseStatus, SubvolAssessment};
-use crate::btrfs::RealBtrfs;
+use crate::btrfs::{BtrfsOps, RealBtrfs};
 use crate::cli::BackupArgs;
 use crate::config::Config;
 use crate::drives;
@@ -91,6 +91,19 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     let lock_path = config.general.state_db.with_extension("lock");
     let trigger = if args.auto { "auto" } else { "manual" };
     let _lock = lock::acquire_lock(&lock_path, trigger)?;
+
+    // Emergency pre-flight: if any snapshot root is critically below threshold
+    // (< 50% of min_free_bytes), run emergency retention before planning.
+    // Runs under the lock because it performs destructive btrfs deletions.
+    let emergency_ran = run_emergency_preflight(&config)?;
+
+    // Re-plan if emergency freed space — plan may have different space_pressure decisions
+    if emergency_ran {
+        backup_plan = plan::plan(&config, now, &filters, &fs_state)?;
+        if !args.confirm_retention_change {
+            filter_promise_retention(&config, &mut backup_plan);
+        }
+    }
 
     if backup_plan.is_empty() {
         // Empty plan: no operations to execute. This includes plans where all subvolumes
@@ -1061,6 +1074,132 @@ fn dispatch_notifications(
              (Sentinel will retry)"
         );
     }
+}
+
+/// Emergency pre-flight: check each snapshot root for critical space conditions.
+///
+/// If any root has `free_bytes < min_free_bytes / 2` (critical threshold), run
+/// `emergency_retention()` on that root's subvolumes and delete the results.
+/// Returns `true` if any deletions were performed (caller should re-plan).
+///
+/// Runs under the advisory lock. Skips roots without `min_free_bytes`.
+/// Skips transient subvolumes. Isolates per-subvolume failures (ADR-109).
+fn run_emergency_preflight(config: &Config) -> anyhow::Result<bool> {
+    let resolved = config.resolved_subvolumes();
+    let drive_labels = config.drive_labels();
+    let mut any_deleted = false;
+
+    // Lazily created btrfs handle — only probe if we need to delete
+    let mut btrfs: Option<crate::btrfs::RealBtrfs> = None;
+
+    for root in &config.local_snapshots.roots {
+        // Skip roots without min_free_bytes configured
+        let Some(min_free_bs) = root.min_free_bytes else {
+            continue;
+        };
+        let min_free = min_free_bs.bytes();
+
+        let free_bytes = crate::drives::filesystem_free_bytes(&root.path).unwrap_or(u64::MAX);
+
+        // Critical threshold: below 50% of min_free_bytes
+        if free_bytes >= min_free / 2 {
+            continue;
+        }
+
+        log::warn!(
+            "Emergency: snapshot root {} is critically low ({} free, threshold {})",
+            root.path.display(),
+            crate::types::ByteSize(free_bytes),
+            crate::types::ByteSize(min_free),
+        );
+
+        let btrfs = btrfs.get_or_insert_with(|| {
+            let sys = crate::btrfs::SystemBtrfs::probe(&config.general.btrfs_path);
+            let bytes_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            crate::btrfs::RealBtrfs::new(
+                &config.general.btrfs_path,
+                bytes_counter,
+                sys.supports_compressed_data,
+            )
+        });
+
+        for subvol_name in &root.subvolumes {
+            // Skip transient subvolumes — already delete aggressively
+            let subvol = resolved.iter().find(|s| &s.name == subvol_name);
+            if subvol.is_some_and(|s| s.local_retention.is_transient()) {
+                continue;
+            }
+
+            let local_dir = root.path.join(subvol_name);
+            let snaps = match plan::read_snapshot_dir(&local_dir) {
+                Ok(s) => s,
+                Err(e) => {
+                    log::warn!(
+                        "Emergency: cannot read {}: {e} — skipping",
+                        local_dir.display()
+                    );
+                    continue;
+                }
+            };
+
+            if snaps.is_empty() {
+                continue;
+            }
+
+            let latest = snaps.iter().max().unwrap().clone();
+            let pinned =
+                crate::chain::find_pinned_snapshots(&local_dir, &drive_labels);
+
+            let result =
+                crate::retention::emergency_retention(&snaps, &latest, &pinned);
+
+            for (snap, _reason) in &result.delete {
+                let snap_path = local_dir.join(snap.as_str());
+
+                // Defense-in-depth (ADR-106 layer 3)
+                if crate::chain::is_pinned_at_delete_time(
+                    &snap_path,
+                    subvol_name,
+                    config,
+                ) {
+                    log::warn!(
+                        "Emergency: defense-in-depth refused delete of {}",
+                        snap_path.display()
+                    );
+                    continue;
+                }
+
+                match btrfs.delete_subvolume(&snap_path) {
+                    Ok(()) => {
+                        any_deleted = true;
+                        log::info!("Emergency: deleted {}", snap_path.display());
+                    }
+                    Err(e) => {
+                        log::error!(
+                            "Emergency: failed to delete {}: {e}",
+                            snap_path.display()
+                        );
+                    }
+                }
+            }
+        }
+
+        // Sync so freed space is visible to subsequent plan()
+        if any_deleted
+            && let Err(e) = btrfs.sync_subvolumes(&root.path)
+        {
+            log::warn!(
+                "Emergency: sync failed for {}: {e}",
+                root.path.display()
+            );
+        }
+    }
+
+    if any_deleted {
+        log::warn!("Emergency retention freed space before backup");
+    }
+
+    Ok(any_deleted)
 }
 
 /// Remove retention delete operations for subvolumes that have a protection promise.
