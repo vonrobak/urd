@@ -198,12 +198,19 @@ The send|receive pipeline captures stderr from both sides, checks both exit code
 cleans up partial snapshots on failure. Paths passed as `&Path` to `Command::arg()`, never
 stringified — prevents shell injection and preserves non-UTF-8 paths.
 
+## Dependency Reference
+
+Docs in `docs/00-foundation/source-documentation/` cover current API patterns and migration
+notes for rusqlite 0.39, toml 1.x, nix 0.31, colored 3.x, Rust 2024 edition, and BTRFS.
+Consult when working on code that directly uses these APIs (especially `state.rs`, `config.rs`,
+`lock.rs`). Not needed for domain-level work (retention, awareness, voice, planning).
+
 ## Build & Run
 
 ```bash
 cargo build                          # Debug
 cargo build --release                # Release
-cargo test                           # Unit tests (521+ tests)
+cargo test                           # Unit tests (931+ tests)
 cargo test -- --ignored              # Integration tests (needs drives)
 cargo clippy -- -D warnings          # Lint (all warnings are errors)
 cargo run -- plan                    # Preview backup plan
