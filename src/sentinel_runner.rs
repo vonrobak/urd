@@ -366,7 +366,8 @@ impl SentinelRunner {
             );
             for anomaly in &anomalies {
                 log::warn!(
-                    "Drive anomaly: all {} chains broke on {} simultaneously",
+                    "Drive anomaly: {} of {} chains broke on {} simultaneously",
+                    anomaly.broken_count,
                     anomaly.total_chains,
                     anomaly.drive_label,
                 );
@@ -374,14 +375,15 @@ impl SentinelRunner {
                     event: NotificationEvent::DriveAnomalyDetected {
                         drive_label: anomaly.drive_label.clone(),
                         total_chains: anomaly.total_chains,
+                        broken_count: anomaly.broken_count,
                     },
                     urgency: Urgency::Warning,
                     title: format!("Drive anomaly on {}", anomaly.drive_label),
                     body: format!(
-                        "All {} incremental chains on {} broke simultaneously. \
+                        "{} of {} incremental chains on {} broke simultaneously. \
                          The drive may have been swapped or cloned. \
                          Run `urd status` to inspect chain health.",
-                        anomaly.total_chains, anomaly.drive_label,
+                        anomaly.broken_count, anomaly.total_chains, anomaly.drive_label,
                     ),
                 });
             }

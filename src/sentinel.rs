@@ -741,12 +741,14 @@ pub struct ChainSnapshot {
     pub chain_intact: bool,
 }
 
-/// A drive where all incremental chains broke simultaneously.
+/// A drive where multiple incremental chains broke simultaneously.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DriveAnomaly {
     pub drive_label: String,
-    /// Total number of chains on this drive (all of which broke).
+    /// Total number of chains on this drive in the current state.
     pub total_chains: usize,
+    /// Number of chains that broke between the two ticks.
+    pub broken_count: usize,
 }
 
 /// Extract chain snapshots from assessments for mounted drives only.
@@ -775,16 +777,15 @@ pub fn build_chain_snapshots(
     snapshots
 }
 
-/// Detect drives where all incremental chains broke simultaneously.
+/// Detect drives where multiple incremental chains broke simultaneously.
 ///
 /// Compares chain snapshots from two consecutive assessment ticks. Returns
-/// anomalies for drives where:
-/// - The previous tick had >= 2 intact chains on the drive, AND
-/// - The current tick has 0 intact chains on the drive.
+/// anomalies for drives where 2+ chains broke between ticks (computed as
+/// the delta between previous and current intact counts).
 ///
-/// The >= 2 threshold prevents false positives from single-subvolume drives
-/// (a single chain break is a normal operational event). This is the
-/// strongest heuristic signal for a drive swap or mass pin file loss.
+/// The >= 2 threshold prevents false positives from single chain breaks
+/// (normal operational events). This is the strongest heuristic signal
+/// for a drive swap or mass pin file loss.
 #[must_use]
 pub fn detect_simultaneous_chain_breaks(
     previous: &[ChainSnapshot],
@@ -813,13 +814,15 @@ pub fn detect_simultaneous_chain_breaks(
     let mut anomalies = Vec::new();
     for (drive, &prev_count) in &prev_intact {
         let &(intact, total) = curr.get(drive).unwrap_or(&(0, 0));
-        // Drive had >= 2 intact chains before, and now has 0.
+        let broken = prev_count.saturating_sub(intact);
+        // 2+ chains broke simultaneously — suspicious drive-level event.
         // Guard: total > 0 ensures we don't fire when a drive simply disconnected
         // (disconnect removes chains from the current snapshot, leaving total == 0).
-        if prev_count >= 2 && intact == 0 && total > 0 {
+        if broken >= 2 && total > 0 {
             anomalies.push(DriveAnomaly {
                 drive_label: drive.to_string(),
                 total_chains: total,
+                broken_count: broken,
             });
         }
     }
@@ -1611,6 +1614,7 @@ mod tests {
         assert_eq!(anomalies.len(), 1);
         assert_eq!(anomalies[0].drive_label, "D1");
         assert_eq!(anomalies[0].total_chains, 3);
+        assert_eq!(anomalies[0].broken_count, 3);
     }
 
     #[test]
@@ -1658,6 +1662,7 @@ mod tests {
         let anomalies = detect_simultaneous_chain_breaks(&prev, &curr);
         assert_eq!(anomalies.len(), 1);
         assert_eq!(anomalies[0].drive_label, "D1");
+        assert_eq!(anomalies[0].broken_count, 2);
     }
 
     // ── Drive disconnect anomaly guard (021-a) ─────────────────────────
@@ -1694,6 +1699,7 @@ mod tests {
         assert_eq!(anomalies.len(), 1);
         assert_eq!(anomalies[0].drive_label, "D1");
         assert_eq!(anomalies[0].total_chains, 3);
+        assert_eq!(anomalies[0].broken_count, 3);
     }
 
     #[test]
@@ -1717,6 +1723,45 @@ mod tests {
             ChainSnapshot { subvolume: "sv3".into(), drive_label: "D1".into(), chain_intact: true },
         ];
         assert!(detect_simultaneous_chain_breaks(&curr_disconnected, &curr_reconnected).is_empty());
+    }
+
+    // ── Partial chain break detection (UPI 022) ────────────────────────
+
+    #[test]
+    fn detect_chain_breaks_partial_break_two_plus_fires() {
+        // 4 intact previously, 2 intact now → broken=2, fires anomaly.
+        let prev = vec![
+            ChainSnapshot { subvolume: "sv1".into(), drive_label: "D1".into(), chain_intact: true },
+            ChainSnapshot { subvolume: "sv2".into(), drive_label: "D1".into(), chain_intact: true },
+            ChainSnapshot { subvolume: "sv3".into(), drive_label: "D1".into(), chain_intact: true },
+            ChainSnapshot { subvolume: "sv4".into(), drive_label: "D1".into(), chain_intact: true },
+        ];
+        let curr = vec![
+            ChainSnapshot { subvolume: "sv1".into(), drive_label: "D1".into(), chain_intact: true },
+            ChainSnapshot { subvolume: "sv2".into(), drive_label: "D1".into(), chain_intact: true },
+            ChainSnapshot { subvolume: "sv3".into(), drive_label: "D1".into(), chain_intact: false },
+            ChainSnapshot { subvolume: "sv4".into(), drive_label: "D1".into(), chain_intact: false },
+        ];
+
+        let anomalies = detect_simultaneous_chain_breaks(&prev, &curr);
+        assert_eq!(anomalies.len(), 1);
+        assert_eq!(anomalies[0].broken_count, 2);
+        assert_eq!(anomalies[0].total_chains, 4);
+    }
+
+    #[test]
+    fn detect_chain_breaks_one_of_two_no_anomaly() {
+        // 2 intact previously, 1 intact now → broken=1, below threshold.
+        let prev = vec![
+            ChainSnapshot { subvolume: "sv1".into(), drive_label: "D1".into(), chain_intact: true },
+            ChainSnapshot { subvolume: "sv2".into(), drive_label: "D1".into(), chain_intact: true },
+        ];
+        let curr = vec![
+            ChainSnapshot { subvolume: "sv1".into(), drive_label: "D1".into(), chain_intact: true },
+            ChainSnapshot { subvolume: "sv2".into(), drive_label: "D1".into(), chain_intact: false },
+        ];
+
+        assert!(detect_simultaneous_chain_breaks(&prev, &curr).is_empty());
     }
 
     // ── Health snapshot tests (VFM-B) ──────────────────────────────────

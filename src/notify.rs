@@ -67,11 +67,12 @@ pub enum NotificationEvent {
         from: String,
         to: String,
     },
-    /// All incremental chains on a drive broke simultaneously.
+    /// Multiple incremental chains on a drive broke simultaneously.
     /// Strong signal for drive swap or mass pin file loss.
     DriveAnomalyDetected {
         drive_label: String,
         total_chains: usize,
+        broken_count: usize,
     },
     /// A drive transitioned from absent to connected.
     DriveReconnected {

@@ -664,7 +664,7 @@ impl SkipCategory {
     pub fn from_reason(reason: &str) -> Self {
         if reason == "disabled" {
             Self::Disabled
-        } else if reason == "send disabled" {
+        } else if reason == "local only" {
             Self::LocalOnly
         } else if reason.starts_with("drive ")
             && reason.ends_with(" not mounted")
@@ -1377,7 +1377,7 @@ mod tests {
     #[test]
     fn classify_local_only() {
         assert_eq!(
-            SkipCategory::from_reason("send disabled"),
+            SkipCategory::from_reason("local only"),
             SkipCategory::LocalOnly
         );
     }
@@ -1476,13 +1476,13 @@ mod tests {
         );
     }
 
-    /// Completeness test: all 17 known plan.rs skip patterns classify to their
+    /// Completeness test: all 18 known plan.rs skip patterns classify to their
     /// expected category. Prevents silent regressions when new patterns are added.
     #[test]
-    fn classify_all_17_patterns() {
+    fn classify_all_18_patterns() {
         let patterns = vec![
             ("disabled", SkipCategory::Disabled),
-            ("send disabled", SkipCategory::LocalOnly),
+            ("local only", SkipCategory::LocalOnly),
             ("drive WD-18TB not mounted", SkipCategory::DriveNotMounted),
             (
                 "drive WD-18TB UUID mismatch (expected abc, found def)",
@@ -1533,6 +1533,10 @@ mod tests {
             (
                 "unchanged \u{2014} no changes since last snapshot (21h ago)",
                 SkipCategory::Unchanged,
+            ),
+            (
+                "transient \u{2014} no drives available for send",
+                SkipCategory::Other,
             ),
         ];
 

@@ -3936,7 +3936,7 @@ mod tests {
                 },
                 SkippedSubvolume {
                     name: "subvol6-tmp".to_string(),
-                    reason: "send disabled".to_string(),
+                    reason: "local only".to_string(),
                     category: SkipCategory::LocalOnly,
                 },
             ],
@@ -4456,7 +4456,7 @@ mod tests {
             skipped: vec![
                 SkippedSubvolume {
                     name: "subvol4-multimedia".to_string(),
-                    reason: "send disabled".to_string(),
+                    reason: "local only".to_string(),
                     category: SkipCategory::LocalOnly,
                 },
                 SkippedSubvolume {
@@ -4489,7 +4489,7 @@ mod tests {
             operations: vec![],
             skipped: vec![SkippedSubvolume {
                 name: "subvol4-multimedia".to_string(),
-                reason: "send disabled".to_string(),
+                reason: "local only".to_string(),
                 category: SkipCategory::LocalOnly,
             }],
             summary: PlanSummaryOutput {

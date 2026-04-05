@@ -2449,7 +2449,7 @@ mod tests {
 
     #[test]
     fn local_only_skip_does_not_produce_deferred() {
-        let plan = empty_plan_with_skips(vec![("sv", "send disabled")]);
+        let plan = empty_plan_with_skips(vec![("sv", "local only")]);
         let result = ExecutionResult {
             overall: RunResult::Success,
             subvolume_results: vec![],
