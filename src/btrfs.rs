@@ -410,6 +410,64 @@ impl BtrfsOps for RealBtrfs {
     }
 }
 
+// ── Standalone generation query ────────────────────────────────────────
+
+/// Parse the `Generation:` field from `btrfs subvolume show` output.
+#[must_use]
+pub fn parse_generation(output: &str) -> Option<u64> {
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if let Some(value) = trimmed.strip_prefix("Generation:") {
+            return value.trim().parse().ok();
+        }
+    }
+    None
+}
+
+/// Query the BTRFS generation counter for a subvolume or snapshot.
+///
+/// Standalone function (not on `BtrfsOps` trait) — same pattern as
+/// `crate::drives::filesystem_free_bytes`. All btrfs subprocess calls
+/// remain in `btrfs.rs` (invariant #2).
+pub fn subvolume_generation(path: &Path) -> crate::error::Result<u64> {
+    let output = Command::new("sudo")
+        .env("LC_ALL", "C")
+        .arg("btrfs")
+        .args(["subvolume", "show"])
+        .arg(path)
+        .output()
+        .map_err(|e| UrdError::Btrfs {
+            context: BtrfsErrorContext {
+                operation: BtrfsOperation::Show,
+                exit_code: None,
+                stderr: e.to_string(),
+                bytes_transferred: None,
+            },
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        return Err(UrdError::Btrfs {
+            context: BtrfsErrorContext {
+                operation: BtrfsOperation::Show,
+                exit_code: output.status.code(),
+                stderr,
+                bytes_transferred: None,
+            },
+        });
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_generation(&stdout).ok_or_else(|| UrdError::Btrfs {
+        context: BtrfsErrorContext {
+            operation: BtrfsOperation::Show,
+            exit_code: None,
+            stderr: "Generation field not found in btrfs subvolume show output".to_string(),
+            bytes_transferred: None,
+        },
+    })
+}
+
 // ── MockBtrfs ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -723,5 +781,48 @@ mod tests {
         let result = mock.sync_subvolumes(&path);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("mock: sync failed"));
+    }
+
+    // ── parse_generation tests ─────────────────────────────────────────
+
+    #[test]
+    fn parse_generation_valid() {
+        let output = "\
+/data/home
+\tName: \t\t\thome
+\tUUID: \t\t\tabc-123
+\tParent UUID: \t\t-
+\tReceived UUID: \t\t-
+\tCreation time: \t\t2026-03-22 14:40:00 +0100
+\tSubvolume ID: \t\t256
+\tGeneration: \t\t12847
+\tGen at creation: \t1
+\tParent ID: \t\t5
+\tTop level ID: \t\t5
+\tFlags: \t\t\t-
+\tSend transid: \t\t0
+\tSend time: \t\t2026-03-22 14:40:00 +0100
+\tReceive transid: \t0
+\tReceive time: \t\t-
+\tSnapshot(s):
+";
+        assert_eq!(parse_generation(output), Some(12847));
+    }
+
+    #[test]
+    fn parse_generation_missing_field() {
+        let output = "\
+/data/home
+\tName: \t\t\thome
+\tUUID: \t\t\tabc-123
+\tSubvolume ID: \t\t256
+";
+        assert_eq!(parse_generation(output), None);
+    }
+
+    #[test]
+    fn parse_generation_malformed_value() {
+        let output = "\tGeneration: \t\tabc\n";
+        assert_eq!(parse_generation(output), None);
     }
 }

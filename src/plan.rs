@@ -64,6 +64,9 @@ pub trait FileSystemState {
     /// Returns `(estimated_bytes, measured_at)` or None if not calibrated.
     fn calibrated_size(&self, subvol_name: &str) -> Option<(u64, String)>;
 
+    /// Get the BTRFS generation counter for a subvolume or snapshot path.
+    fn subvolume_generation(&self, path: &Path) -> crate::error::Result<u64>;
+
     /// Get the timestamp of the most recent successful send (full or incremental)
     /// for a subvolume to a specific drive. Returns None if no send history exists.
     fn last_successful_send_time(
@@ -84,6 +87,8 @@ pub struct PlanFilters {
     /// When true, bypass interval gating for snapshots and sends.
     /// Used by manual `urd backup` (default) — automated runs set this to false.
     pub skip_intervals: bool,
+    /// When true, create snapshots even if the subvolume has not changed.
+    pub force_snapshot: bool,
 }
 
 // ── Planner ─────────────────────────────────────────────────────────────
@@ -97,7 +102,7 @@ pub fn plan(
 ) -> crate::error::Result<BackupPlan> {
     let mut operations = Vec::new();
     // Skip reason strings are classified by output::SkipCategory::from_reason().
-    // When adding new patterns, update output::tests::classify_all_16_patterns.
+    // When adding new patterns, update output::tests::classify_all_17_patterns.
     let mut skipped = Vec::new();
 
     let resolved = config.resolved_subvolumes();
@@ -156,7 +161,7 @@ pub fn plan(
                 &local_snaps,
                 now,
                 force,
-                filters.skip_intervals,
+                filters,
                 min_free,
                 fs,
                 &mut operations,
@@ -275,7 +280,7 @@ fn plan_local_snapshot(
     local_snaps: &[SnapshotName],
     now: NaiveDateTime,
     force: bool,
-    skip_intervals: bool,
+    filters: &PlanFilters,
     min_free: u64,
     fs: &dyn FileSystemState,
     operations: &mut Vec<PlannedOperation>,
@@ -317,7 +322,7 @@ fn plan_local_snapshot(
         );
     }
 
-    let should_create = if force || skip_intervals {
+    let should_create = if force || filters.skip_intervals {
         true
     } else if let Some(newest) = newest {
         let elapsed = now.signed_duration_since(newest.datetime());
@@ -327,6 +332,54 @@ fn plan_local_snapshot(
     };
 
     if should_create {
+        // Generation comparison: skip if subvolume hasn't changed since last snapshot.
+        // Fail open — if either generation query fails, proceed with snapshot.
+        if !filters.force_snapshot && !force
+            && let Some(newest) = newest
+        {
+            let snap_path = local_dir.join(newest.as_str());
+            match (
+                fs.subvolume_generation(&subvol.source),
+                fs.subvolume_generation(&snap_path),
+            ) {
+                (Ok(sg), Ok(ng)) if sg == ng => {
+                    let elapsed = now.signed_duration_since(newest.datetime());
+                    let mins = elapsed.num_minutes();
+                    skipped.push((
+                        subvol.name.clone(),
+                        format!(
+                            "unchanged \u{2014} no changes since last snapshot ({} ago)",
+                            format_duration_short(mins)
+                        ),
+                    ));
+                    return;
+                }
+                (Err(e1), Err(e2)) => {
+                    log::warn!(
+                        "{}: failed to read source generation: {e1}",
+                        subvol.name
+                    );
+                    log::warn!(
+                        "{}: failed to read snapshot generation: {e2}",
+                        subvol.name
+                    );
+                }
+                (Err(e), _) => {
+                    log::warn!(
+                        "{}: failed to read source generation, proceeding: {e}",
+                        subvol.name
+                    );
+                }
+                (_, Err(e)) => {
+                    log::warn!(
+                        "{}: failed to read snapshot generation, proceeding: {e}",
+                        subvol.name
+                    );
+                }
+                _ => {} // generations differ — proceed
+            }
+        }
+
         let snap_name = SnapshotName::new(now, &subvol.short_name);
         // Check if this exact snapshot already exists
         if local_snaps.iter().any(|s| s.as_str() == snap_name.as_str()) {
@@ -781,6 +834,10 @@ impl FileSystemState for RealFileSystemState<'_> {
             .and_then(|db| db.calibrated_size(subvol_name).ok().flatten())
     }
 
+    fn subvolume_generation(&self, path: &Path) -> crate::error::Result<u64> {
+        crate::btrfs::subvolume_generation(path)
+    }
+
     fn last_successful_send_time(
         &self,
         subvol_name: &str,
@@ -845,6 +902,10 @@ pub struct MockFileSystemState {
     pub fail_local_snapshots: HashSet<String>,
     /// (local_dir, drive_label) pairs for which read_pin_file() should return an error.
     pub fail_pin_reads: HashSet<(PathBuf, String)>,
+    /// Generation counters for subvolume/snapshot paths.
+    pub generations: std::collections::HashMap<PathBuf, u64>,
+    /// Paths for which subvolume_generation() should return an error.
+    pub fail_generations: HashSet<PathBuf>,
 }
 
 #[cfg(test)]
@@ -862,6 +923,8 @@ impl MockFileSystemState {
             send_times: std::collections::HashMap::new(),
             fail_local_snapshots: HashSet::new(),
             fail_pin_reads: HashSet::new(),
+            generations: std::collections::HashMap::new(),
+            fail_generations: HashSet::new(),
         }
     }
 }
@@ -968,6 +1031,28 @@ impl FileSystemState for MockFileSystemState {
             .filter(|((sv, _, st), _)| sv == subvol_name && st == send_type)
             .map(|(_, &bytes)| bytes)
             .max()
+    }
+
+    fn subvolume_generation(&self, path: &Path) -> crate::error::Result<u64> {
+        if self.fail_generations.contains(path) {
+            return Err(crate::error::UrdError::Io {
+                path: path.to_path_buf(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "mock: generation query failed",
+                ),
+            });
+        }
+        self.generations
+            .get(path)
+            .copied()
+            .ok_or_else(|| crate::error::UrdError::Io {
+                path: path.to_path_buf(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "mock: no generation configured",
+                ),
+            })
     }
 
     fn calibrated_size(&self, subvol_name: &str) -> Option<(u64, String)> {
@@ -2775,6 +2860,215 @@ local_retention = "transient"
             !skip.1.contains("no local snapshots"),
             "transient subvol should not use 'no local snapshots' reason, got: {}",
             skip.1
+        );
+    }
+
+    // ── Generation comparison tests (UPI 014) ──────────────────────────
+
+    #[test]
+    fn skip_when_generation_equal() {
+        let config = test_config();
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap("20260322-1440-one")]);
+        // Source and snapshot have same generation → skip
+        fs.generations
+            .insert(PathBuf::from("/data/sv1"), 500);
+        fs.generations
+            .insert(PathBuf::from("/snap/sv1/20260322-1440-one"), 500);
+
+        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let creates: Vec<_> = result
+            .operations
+            .iter()
+            .filter(|op| matches!(op, PlannedOperation::CreateSnapshot { subvolume_name, .. } if subvolume_name == "sv1"))
+            .collect();
+        assert_eq!(creates.len(), 0, "should skip unchanged subvolume");
+        let skip = result.skipped.iter().find(|(name, _)| name == "sv1");
+        assert!(skip.is_some(), "sv1 should be in skipped list");
+        assert!(
+            skip.unwrap().1.starts_with("unchanged"),
+            "reason should start with 'unchanged', got: {}",
+            skip.unwrap().1
+        );
+    }
+
+    #[test]
+    fn create_when_generation_different() {
+        let config = test_config();
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap("20260322-1440-one")]);
+        // Source gen differs from snapshot gen → create
+        fs.generations
+            .insert(PathBuf::from("/data/sv1"), 501);
+        fs.generations
+            .insert(PathBuf::from("/snap/sv1/20260322-1440-one"), 500);
+
+        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let creates: Vec<_> = result
+            .operations
+            .iter()
+            .filter(|op| matches!(op, PlannedOperation::CreateSnapshot { subvolume_name, .. } if subvolume_name == "sv1"))
+            .collect();
+        assert_eq!(creates.len(), 1, "should create snapshot when generation differs");
+    }
+
+    #[test]
+    fn create_when_no_prior_snapshots() {
+        let config = test_config();
+        let fs = MockFileSystemState::new();
+        // No existing snapshots → create (no generation to compare)
+
+        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let creates: Vec<_> = result
+            .operations
+            .iter()
+            .filter(|op| matches!(op, PlannedOperation::CreateSnapshot { subvolume_name, .. } if subvolume_name == "sv1"))
+            .collect();
+        assert_eq!(creates.len(), 1, "should create snapshot when none exist");
+    }
+
+    #[test]
+    fn create_when_source_generation_fails() {
+        let config = test_config();
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap("20260322-1440-one")]);
+        // Source generation fails, snapshot has generation → fail open, create
+        fs.fail_generations
+            .insert(PathBuf::from("/data/sv1"));
+        fs.generations
+            .insert(PathBuf::from("/snap/sv1/20260322-1440-one"), 500);
+
+        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let creates: Vec<_> = result
+            .operations
+            .iter()
+            .filter(|op| matches!(op, PlannedOperation::CreateSnapshot { subvolume_name, .. } if subvolume_name == "sv1"))
+            .collect();
+        assert_eq!(creates.len(), 1, "should create snapshot when source generation fails (fail open)");
+    }
+
+    #[test]
+    fn create_when_snapshot_generation_fails() {
+        let config = test_config();
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap("20260322-1440-one")]);
+        // Source has generation, snapshot generation fails → fail open, create
+        fs.generations
+            .insert(PathBuf::from("/data/sv1"), 500);
+        fs.fail_generations
+            .insert(PathBuf::from("/snap/sv1/20260322-1440-one"));
+
+        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let creates: Vec<_> = result
+            .operations
+            .iter()
+            .filter(|op| matches!(op, PlannedOperation::CreateSnapshot { subvolume_name, .. } if subvolume_name == "sv1"))
+            .collect();
+        assert_eq!(creates.len(), 1, "should create snapshot when snapshot generation fails (fail open)");
+    }
+
+    #[test]
+    fn create_when_both_generation_fetches_fail() {
+        let config = test_config();
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap("20260322-1440-one")]);
+        // Both fail → fail open, create
+        fs.fail_generations
+            .insert(PathBuf::from("/data/sv1"));
+        fs.fail_generations
+            .insert(PathBuf::from("/snap/sv1/20260322-1440-one"));
+
+        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let creates: Vec<_> = result
+            .operations
+            .iter()
+            .filter(|op| matches!(op, PlannedOperation::CreateSnapshot { subvolume_name, .. } if subvolume_name == "sv1"))
+            .collect();
+        assert_eq!(creates.len(), 1, "should create snapshot when both generation queries fail (fail open)");
+    }
+
+    #[test]
+    fn force_snapshot_overrides_generation() {
+        let config = test_config();
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap("20260322-1440-one")]);
+        // Same generation, but force_snapshot → create anyway
+        fs.generations
+            .insert(PathBuf::from("/data/sv1"), 500);
+        fs.generations
+            .insert(PathBuf::from("/snap/sv1/20260322-1440-one"), 500);
+
+        let filters = PlanFilters {
+            force_snapshot: true,
+            ..PlanFilters::default()
+        };
+        let result = plan(&config, now(), &filters, &fs).unwrap();
+        let creates: Vec<_> = result
+            .operations
+            .iter()
+            .filter(|op| matches!(op, PlannedOperation::CreateSnapshot { subvolume_name, .. } if subvolume_name == "sv1"))
+            .collect();
+        assert_eq!(creates.len(), 1, "force_snapshot should override generation check");
+    }
+
+    #[test]
+    fn force_subvolume_overrides_generation() {
+        let config = test_config();
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap("20260322-1440-one")]);
+        // Same generation, but --subvolume filter → force, skip gen check
+        fs.generations
+            .insert(PathBuf::from("/data/sv1"), 500);
+        fs.generations
+            .insert(PathBuf::from("/snap/sv1/20260322-1440-one"), 500);
+
+        let filters = PlanFilters {
+            subvolume: Some("sv1".to_string()),
+            ..PlanFilters::default()
+        };
+        let result = plan(&config, now(), &filters, &fs).unwrap();
+        let creates: Vec<_> = result
+            .operations
+            .iter()
+            .filter(|op| matches!(op, PlannedOperation::CreateSnapshot { subvolume_name, .. } if subvolume_name == "sv1"))
+            .collect();
+        assert_eq!(creates.len(), 1, "--subvolume filter should override generation check");
+    }
+
+    #[test]
+    fn skip_intervals_still_checks_generation() {
+        let config = test_config();
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap("20260322-1440-one")]);
+        // Same generation + skip_intervals (manual run) → still skip unchanged
+        fs.generations
+            .insert(PathBuf::from("/data/sv1"), 500);
+        fs.generations
+            .insert(PathBuf::from("/snap/sv1/20260322-1440-one"), 500);
+
+        let filters = PlanFilters {
+            skip_intervals: true,
+            ..PlanFilters::default()
+        };
+        let result = plan(&config, now(), &filters, &fs).unwrap();
+        let creates: Vec<_> = result
+            .operations
+            .iter()
+            .filter(|op| matches!(op, PlannedOperation::CreateSnapshot { subvolume_name, .. } if subvolume_name == "sv1"))
+            .collect();
+        assert_eq!(creates.len(), 0, "skip_intervals should not override generation check");
+        let skip = result.skipped.iter().find(|(name, _)| name == "sv1");
+        assert!(
+            skip.is_some() && skip.unwrap().1.starts_with("unchanged"),
+            "should report unchanged reason"
         );
     }
 }

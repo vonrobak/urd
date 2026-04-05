@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Deferred synthesis in backup summary: subvolumes with no local snapshots to send now surface actionable guidance instead of silent skips
 - `SkipCategory::NoSnapshotsAvailable` for structured classification of send-blocked skips
 - External-only runtime: subvolumes with `local_snapshots = false` no longer show false "degraded" health or "broken chain" warnings — status table shows em-dash for LOCAL and "ext-only" for THREAD, plan output uses `[EXT]` skip tag
+- Skip unchanged subvolumes: compares BTRFS generation counters to avoid creating identical snapshots for quiet subvolumes — shown as `[SAME]` in plan output with elapsed time, overrideable via `--force-snapshot`
 
 ### Fixed
 - False "all chains broke simultaneously" anomaly when a drive disconnects (total=0 was treated as all-broken)

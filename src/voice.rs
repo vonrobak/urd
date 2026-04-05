@@ -786,6 +786,7 @@ fn render_skipped_block(skipped: &[crate::output::SkippedSubvolume], out: &mut S
             && skip.category != SkipCategory::Disabled
             && skip.category != SkipCategory::LocalOnly
             && skip.category != SkipCategory::ExternalOnly
+            && skip.category != SkipCategory::Unchanged
         {
             actionable_skips.push(skip);
         }
@@ -1181,6 +1182,7 @@ fn render_plan_skipped_grouped(skipped: &[SkippedSubvolume], out: &mut String) {
         SkipCategory::SpaceExceeded,
         SkipCategory::NoSnapshotsAvailable,
         SkipCategory::ExternalOnly,
+        SkipCategory::Unchanged,
         SkipCategory::Other,
     ];
 
@@ -1196,7 +1198,8 @@ fn render_plan_skipped_grouped(skipped: &[SkippedSubvolume], out: &mut String) {
             SkipCategory::Disabled => render_named_group(&items, cat, "Disabled", out),
             SkipCategory::LocalOnly => render_named_group(&items, cat, "Local only", out),
             SkipCategory::ExternalOnly => render_named_group(&items, cat, "External only", out),
-            SkipCategory::SpaceExceeded
+            SkipCategory::Unchanged
+            | SkipCategory::SpaceExceeded
             | SkipCategory::NoSnapshotsAvailable
             | SkipCategory::Other => {
                 render_individual_skips(&items, cat, out);
@@ -1291,6 +1294,7 @@ fn skip_tag(category: &SkipCategory) -> String {
         SkipCategory::LocalOnly => "[LOCAL]".dimmed().to_string(),
         SkipCategory::NoSnapshotsAvailable => "[NOSRC]".yellow().to_string(),
         SkipCategory::ExternalOnly => "[EXT]  ".dimmed().to_string(),
+        SkipCategory::Unchanged => "[SAME] ".dimmed().to_string(),
         SkipCategory::Other => "[SKIP] ".dimmed().to_string(),
     }
 }
@@ -6234,6 +6238,50 @@ mod tests {
         assert!(
             output.contains("already adopted"),
             "already current: {output}"
+        );
+    }
+
+    // ── Unchanged skip rendering tests (UPI 014) ───────────────────────
+
+    #[test]
+    fn plan_output_renders_unchanged_tag() {
+        let data = PlanOutput {
+            timestamp: "2026-03-22 15:00".to_string(),
+            operations: vec![],
+            skipped: vec![SkippedSubvolume {
+                name: "sv1".to_string(),
+                reason: "unchanged \u{2014} no changes since last snapshot (21h ago)".to_string(),
+                category: SkipCategory::Unchanged,
+            }],
+            summary: PlanSummaryOutput {
+                snapshots: 0,
+                sends: 0,
+                deletions: 0,
+                skipped: 1,
+                estimated_total_bytes: None,
+            },
+            warnings: vec![],
+        };
+        let output = render_plan(&data, OutputMode::Interactive);
+        assert!(
+            output.contains("[SAME]"),
+            "plan output should contain [SAME] tag, got: {output}"
+        );
+    }
+
+    #[test]
+    fn backup_summary_suppresses_unchanged() {
+        let skipped = vec![SkippedSubvolume {
+            name: "sv1".to_string(),
+            reason: "unchanged \u{2014} no changes since last snapshot (21h ago)".to_string(),
+            category: SkipCategory::Unchanged,
+        }];
+        let mut out = String::new();
+        render_skipped_block(&skipped, &mut out);
+        // Unchanged is positive info — should be suppressed in backup summary
+        assert!(
+            !out.contains("unchanged"),
+            "backup summary should suppress unchanged skips, got: {out}"
         );
     }
 }

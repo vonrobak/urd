@@ -37,6 +37,7 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
         local_only: args.local_only,
         external_only: args.external_only,
         skip_intervals: !args.auto,
+        force_snapshot: args.force_snapshot,
     };
 
     let mode = if args.dry_run {
@@ -624,7 +625,7 @@ fn build_empty_plan_explanation(
             SkipCategory::SpaceExceeded => has_space = true,
             SkipCategory::DriveNotMounted => has_not_mounted = true,
             SkipCategory::IntervalNotElapsed => has_interval = true,
-            SkipCategory::NoSnapshotsAvailable | SkipCategory::ExternalOnly | SkipCategory::Other => {}
+            SkipCategory::NoSnapshotsAvailable | SkipCategory::ExternalOnly | SkipCategory::Unchanged | SkipCategory::Other => {}
         }
     }
 
