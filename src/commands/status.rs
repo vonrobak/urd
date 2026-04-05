@@ -73,6 +73,7 @@ pub fn run(config: Config, output_mode: OutputMode) -> anyhow::Result<()> {
 
     // ── Last run ────────────────────────────────────────────────────
     let last_run = state_db.as_ref().and_then(|db| db.last_run_info());
+    let last_run_age_secs = last_run.as_ref().and_then(|run| run.age_secs(now));
 
     // ── Pin count ───────────────────────────────────────────────────
     let total_pins: usize = config
@@ -122,6 +123,7 @@ pub fn run(config: Config, output_mode: OutputMode) -> anyhow::Result<()> {
         chain_health: chain_health_entries,
         drives: drive_infos,
         last_run,
+        last_run_age_secs,
         total_pins,
         redundancy_advisories,
         advice,

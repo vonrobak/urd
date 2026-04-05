@@ -888,7 +888,9 @@ impl Serialize for ByteSize {
 /// Format a number of seconds as a human-readable duration string (e.g., "2m 15s", "45s").
 #[must_use]
 pub fn format_duration_secs(secs: i64) -> String {
-    if secs < 60 {
+    if secs <= 0 {
+        "<1s".to_string()
+    } else if secs < 60 {
         format!("{secs}s")
     } else {
         format!("{}m {}s", secs / 60, secs % 60)
@@ -1388,6 +1390,28 @@ weekly = 4
         let toml_str = toml::to_string(&graduated).unwrap();
         let parsed: Wrapper = toml::from_str(&toml_str).unwrap();
         assert_eq!(parsed, graduated);
+    }
+
+    #[test]
+    fn format_duration_secs_zero_returns_less_than_one() {
+        assert_eq!(format_duration_secs(0), "<1s");
+    }
+
+    #[test]
+    fn format_duration_secs_negative_returns_less_than_one() {
+        assert_eq!(format_duration_secs(-1), "<1s");
+    }
+
+    #[test]
+    fn format_duration_secs_seconds() {
+        assert_eq!(format_duration_secs(1), "1s");
+        assert_eq!(format_duration_secs(59), "59s");
+    }
+
+    #[test]
+    fn format_duration_secs_minutes() {
+        assert_eq!(format_duration_secs(60), "1m 0s");
+        assert_eq!(format_duration_secs(135), "2m 15s");
     }
 
     #[test]

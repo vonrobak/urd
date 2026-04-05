@@ -146,6 +146,9 @@ pub struct StatusOutput {
     pub drives: Vec<DriveInfo>,
     /// Last backup run info (if any).
     pub last_run: Option<LastRunInfo>,
+    /// Seconds since last backup started, pre-computed by the command handler.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_run_age_secs: Option<i64>,
     /// Total pinned snapshot count across all subvolumes.
     pub total_pins: usize,
     /// Structured redundancy advisories (omitted from JSON when empty).
@@ -264,6 +267,18 @@ pub struct LastRunInfo {
     pub started_at: String,
     pub result: String,
     pub duration: Option<String>,
+}
+
+impl LastRunInfo {
+    /// Compute seconds since this run started. Returns `None` if the timestamp
+    /// cannot be parsed or the result would be negative (clock skew).
+    #[must_use]
+    pub fn age_secs(&self, now: chrono::NaiveDateTime) -> Option<i64> {
+        let dt = chrono::NaiveDateTime::parse_from_str(&self.started_at, "%Y-%m-%dT%H:%M:%S")
+            .ok()?;
+        let age = now.signed_duration_since(dt).num_seconds();
+        if age >= 0 { Some(age) } else { None }
+    }
 }
 
 // ── DefaultStatusOutput ────────────────────────────────────────────────

@@ -36,13 +36,7 @@ pub fn run(config_path: Option<&Path>, output_mode: OutputMode) -> anyhow::Resul
 
     let last_run = state_db.as_ref().and_then(|db| db.last_run_info());
 
-    // Pre-compute age for voice rendering (voice.rs must stay pure — no I/O)
-    let last_run_age_secs = last_run.as_ref().and_then(|run| {
-        let dt = chrono::NaiveDateTime::parse_from_str(&run.started_at, "%Y-%m-%dT%H:%M:%S")
-            .ok()?;
-        let age = now.signed_duration_since(dt).num_seconds();
-        if age >= 0 { Some(age) } else { None }
-    });
+    let last_run_age_secs = last_run.as_ref().and_then(|run| run.age_secs(now));
 
     // Build output — single pass over assessments
     let total = assessments.len();
