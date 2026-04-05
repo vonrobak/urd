@@ -5,7 +5,7 @@
 
 | UPI | Title | Design | Design Review | Adversary Review | PR | GH# |
 |-----|-------|--------|---------------|------------------|----|-----|
-| 022 | The Honest Nightly (transient fix + sentinel guard + text fix + config scope) | [design](../95-ideas/2026-04-05-design-022-honest-nightly.md) | - | - | - | - |
+| 022 | The Honest Nightly (transient fix + sentinel guard + text fix + config scope) | [design](../95-ideas/2026-04-05-design-022-honest-nightly.md) | [review](../99-reports/2026-04-05-design-review-022-honest-nightly.md) | - | - | - |
 | 021 | The Living Daemon (sentinel config reload + anomaly fix) | [design](../95-ideas/2026-04-04-design-021-living-daemon.md) | - | [adversary](../99-reports/2026-04-04-review-adversary-021-living-daemon.md) | merged | [#84](https://github.com/vonrobak/urd/pull/84) |
 | 020 | The Doctor Knows (context-aware suggestions) | [design](../95-ideas/2026-04-04-design-020-doctor-knows.md) | - | [adversary](../99-reports/2026-04-04-review-adversary-020-doctor-knows.md) | merged | [#85](https://github.com/vonrobak/urd/pull/85) |
 | 019 | The Honest Worker (token-aware gate + honest results) | [design](../95-ideas/2026-04-04-design-019-honest-worker.md) | - | [adversary](../99-reports/2026-04-04-review-adversary-019-honest-worker.md) | merged | [#83](https://github.com/vonrobak/urd/pull/83) |

@@ -91,6 +91,16 @@ pub struct PlanFilters {
     pub force_snapshot: bool,
 }
 
+// ── Helpers ────────────────────────────────────────────────────────────
+
+/// Check if a drive is in scope for a subvolume (respects `drives` field).
+fn is_drive_in_scope(subvol: &ResolvedSubvolume, drive_label: &str) -> bool {
+    subvol
+        .drives
+        .as_ref()
+        .is_none_or(|allowed| allowed.iter().any(|a| a == drive_label))
+}
+
 // ── Planner ─────────────────────────────────────────────────────────────
 
 /// Generate a backup plan based on config, current time, filters, and filesystem state.
@@ -102,7 +112,7 @@ pub fn plan(
 ) -> crate::error::Result<BackupPlan> {
     let mut operations = Vec::new();
     // Skip reason strings are classified by output::SkipCategory::from_reason().
-    // When adding new patterns, update output::tests::classify_all_17_patterns.
+    // When adding new patterns, update output::tests::classify_all_18_patterns.
     let mut skipped = Vec::new();
 
     let resolved = config.resolved_subvolumes();
@@ -149,11 +159,70 @@ pub fn plan(
         // Get pinned snapshots
         let pinned = fs.pinned_snapshots(&local_dir, &drive_labels);
 
+        // Drives in scope for this subvolume that can currently receive sends.
+        // Include TokenMissing: those drives proceed with sends (line ~308),
+        // so their pins represent valid chain parents that must be protected.
+        let usable_drives: Vec<&DriveConfig> = config
+            .drives
+            .iter()
+            .filter(|d| is_drive_in_scope(subvol, &d.label))
+            .filter(|d| {
+                matches!(
+                    fs.drive_availability(d),
+                    DriveAvailability::Available | DriveAvailability::TokenMissing
+                )
+            })
+            .collect();
+
+        // Mounted-only pins for transient retention scoping.
+        let mounted_pins: HashSet<SnapshotName> = usable_drives
+            .iter()
+            .filter_map(|d| match fs.read_pin_file(&local_dir, &d.label) {
+                Ok(Some(snap)) => Some(snap),
+                Ok(None) => None,
+                Err(e) => {
+                    log::warn!(
+                        "Failed to read pin file for drive {:?} in {}: {e}",
+                        d.label,
+                        local_dir.display()
+                    );
+                    None
+                }
+            })
+            .collect();
+
+        let any_drive_mounted = !usable_drives.is_empty();
+
         // ── Local operations ────────────────────────────────────────
         // LOAD-BEARING ORDER: Operations are emitted as create → send → delete.
         // The executor relies on this ordering within each subvolume.
         // Do not reorder without updating the executor contract in PLAN.md.
         if !filters.external_only {
+            // Transient subvolumes: skip snapshot creation when no drives can
+            // receive sends. Creating a snapshot that can't be sent is pointless;
+            // retention will clean up any accumulated snapshots below.
+            if subvol.local_retention.is_transient()
+                && subvol.send_enabled
+                && !local_snaps.is_empty()
+                && !any_drive_mounted
+            {
+                skipped.push((
+                    subvol.name.clone(),
+                    "transient \u{2014} no drives available for send".to_string(),
+                ));
+                plan_local_retention(
+                    subvol,
+                    &local_dir,
+                    &local_snaps,
+                    now,
+                    &pinned,
+                    &mounted_pins,
+                    fs,
+                    &mut operations,
+                );
+                continue;
+            }
+
             let min_free = subvol.min_free_bytes.unwrap_or(0);
             plan_local_snapshot(
                 subvol,
@@ -173,6 +242,7 @@ pub fn plan(
                 &local_snaps,
                 now,
                 &pinned,
+                &mounted_pins,
                 fs,
                 &mut operations,
             );
@@ -181,10 +251,7 @@ pub fn plan(
         // ── External operations ─────────────────────────────────────
         if !filters.local_only && subvol.send_enabled {
             for drive in &config.drives {
-                // Skip drives not in subvol.drives when specified
-                if let Some(ref allowed) = subvol.drives
-                    && !allowed.iter().any(|d| d == &drive.label)
-                {
+                if !is_drive_in_scope(subvol, &drive.label) {
                     continue;
                 }
 
@@ -262,7 +329,7 @@ pub fn plan(
                 plan_external_retention(subvol, drive, now, fs, &pinned, &mut operations);
             }
         } else if !filters.local_only && !subvol.send_enabled {
-            skipped.push((subvol.name.clone(), "send disabled".to_string()));
+            skipped.push((subvol.name.clone(), "local only".to_string()));
         }
     }
 
@@ -412,6 +479,7 @@ fn plan_local_retention(
     local_snaps: &[SnapshotName],
     now: NaiveDateTime,
     pinned: &HashSet<SnapshotName>,
+    mounted_pins: &HashSet<SnapshotName>,
     fs: &dyn FileSystemState,
     operations: &mut Vec<PlannedOperation>,
 ) {
@@ -420,12 +488,18 @@ fn plan_local_retention(
     }
 
     // Protect unsent snapshots from retention deletion.
-    // If send is enabled, snapshots newer than the oldest pin may not have been
-    // sent to all drives yet. Deleting them would lose the only local copy before
-    // it reaches external storage — one step from silent data loss.
+    // For transient subvolumes, only consider pins from mounted drives —
+    // absent drives can't receive sends, and protecting their pins indefinitely
+    // causes space exhaustion on constrained filesystems.
+    // For graduated subvolumes, protect ALL pins (conservative default).
     let protected = if subvol.send_enabled {
-        let oldest_pin = pinned.iter().min();
-        let mut expanded = pinned.clone();
+        let effective_pinned = if subvol.local_retention.is_transient() {
+            mounted_pins.clone()
+        } else {
+            pinned.clone()
+        };
+        let oldest_pin = effective_pinned.iter().min();
+        let mut expanded = effective_pinned.clone();
         match oldest_pin {
             Some(oldest) => {
                 for snap in local_snaps {
@@ -434,8 +508,12 @@ fn plan_local_retention(
                     }
                 }
             }
+            None if subvol.local_retention.is_transient() => {
+                // Transient + no mounted pins = nothing to protect.
+                // Full sends when drives return.
+            }
             None => {
-                // No pins at all — nothing has ever been sent externally.
+                // Non-transient: no pins at all — nothing has ever been sent.
                 // Protect all local snapshots until the first send succeeds.
                 for snap in local_snaps {
                     expanded.insert(snap.clone());
@@ -1437,7 +1515,7 @@ send_enabled = false
             result
                 .skipped
                 .iter()
-                .any(|(_, reason)| reason.contains("send disabled"))
+                .any(|(_, reason)| reason.contains("local only"))
         );
     }
 
@@ -2487,7 +2565,11 @@ local_retention = "transient"
     }
 
     #[test]
-    fn transient_no_pins_keeps_everything() {
+    fn transient_mounted_drive_no_pin_deletes_all() {
+        // Key semantic change from UPI 022: transient + mounted drive + no pin
+        // means nothing to protect. Previously this protected everything (unsent-
+        // protected). Now, with no pin, no send has succeeded — protecting
+        // indefinitely causes accumulation on constrained filesystems.
         let config = transient_config();
         let mut fs = MockFileSystemState::new();
         fs.local_snapshots.insert(
@@ -2517,8 +2599,8 @@ local_retention = "transient"
 
         assert_eq!(
             deletes.len(),
-            0,
-            "no pins means all snapshots are unsent-protected"
+            2,
+            "transient + no pins = nothing to protect, all deletable"
         );
     }
 
@@ -2659,6 +2741,381 @@ local_retention = "transient"
             deletes[0].contains("20260319"),
             "deleted snapshot should be the one older than both pins: {deletes:?}"
         );
+    }
+
+    // ── Transient absent-drive tests (UPI 022) ──────────────────────────
+
+    #[test]
+    fn transient_no_drives_skips_snapshot_creation() {
+        let config = transient_config();
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots.insert(
+            "sv1".to_string(),
+            vec![snap("20260322-1000-one")],
+        );
+        // Drive NOT mounted — transient should skip snapshot creation
+        // (no drive to send to, creating a snapshot is pointless)
+
+        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+
+        let creates: Vec<_> = result
+            .operations
+            .iter()
+            .filter(|op| matches!(op, PlannedOperation::CreateSnapshot { .. }))
+            .collect();
+        assert_eq!(creates.len(), 0, "should not create snapshot when no drives mounted");
+
+        let skip = result
+            .skipped
+            .iter()
+            .find(|(name, _)| name == "sv1")
+            .expect("sv1 should have a skip entry");
+        assert!(
+            skip.1.contains("transient"),
+            "skip reason should mention transient: {}",
+            skip.1
+        );
+    }
+
+    #[test]
+    fn transient_no_drives_first_snapshot_still_created() {
+        let config = transient_config();
+        let fs = MockFileSystemState::new();
+        // No local snapshots, no drives mounted.
+        // First snapshot should still be created (fail-open for first backup).
+
+        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+
+        let creates: Vec<_> = result
+            .operations
+            .iter()
+            .filter(|op| matches!(op, PlannedOperation::CreateSnapshot { .. }))
+            .collect();
+        assert_eq!(creates.len(), 1, "first snapshot should be created even with no drives");
+    }
+
+    #[test]
+    fn transient_absent_drive_pins_not_protected() {
+        // D1 mounted (pin at newest), D2 absent (pin at oldest).
+        // Only D1's pin should be in the mounted set.
+        // Snapshots older than D1's pin should be deleted.
+        let config = transient_multi_drive_config();
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots.insert(
+            "sv1".to_string(),
+            vec![
+                snap("20260319-1000-one"),
+                snap("20260320-1000-one"), // D2's pin (absent)
+                snap("20260321-1000-one"),
+                snap("20260322-1400-one"), // D1's pin (mounted)
+            ],
+        );
+        fs.pin_files.insert(
+            (PathBuf::from("/snap/sv1"), "D1".to_string()),
+            snap("20260322-1400-one"),
+        );
+        fs.pin_files.insert(
+            (PathBuf::from("/snap/sv1"), "D2".to_string()),
+            snap("20260320-1000-one"),
+        );
+        // Only D1 mounted
+        fs.mounted_drives.insert("D1".to_string());
+        fs.external_snapshots.insert(
+            ("D1".to_string(), "sv1".to_string()),
+            vec![snap("20260322-1400-one")],
+        );
+
+        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let deletes: Vec<_> = result
+            .operations
+            .iter()
+            .filter_map(|op| match op {
+                PlannedOperation::DeleteSnapshot {
+                    subvolume_name,
+                    path,
+                    ..
+                } if subvolume_name == "sv1" => {
+                    Some(path.file_name().unwrap().to_string_lossy().to_string())
+                }
+                _ => None,
+            })
+            .collect();
+
+        // D2's pin is ignored (absent). D1's pin at 20260322-1400 is the only pin.
+        // Everything older than D1's pin is deletable.
+        assert_eq!(deletes.len(), 3, "3 snapshots older than D1's pin should be deleted: {deletes:?}");
+    }
+
+    #[test]
+    fn transient_no_mounted_drives_all_deletable() {
+        let config = transient_config();
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots.insert(
+            "sv1".to_string(),
+            vec![
+                snap("20260320-1000-one"),
+                snap("20260321-1000-one"),
+                snap("20260322-1000-one"),
+            ],
+        );
+        // Pin exists but drive is NOT mounted
+        fs.pin_files.insert(
+            (PathBuf::from("/snap/sv1"), "D1".to_string()),
+            snap("20260320-1000-one"),
+        );
+
+        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let deletes: Vec<_> = result
+            .operations
+            .iter()
+            .filter(|op| {
+                matches!(
+                    op,
+                    PlannedOperation::DeleteSnapshot {
+                        subvolume_name,
+                        ..
+                    } if subvolume_name == "sv1"
+                )
+            })
+            .collect();
+
+        // No mounted drives → mounted_pins is empty → nothing protected.
+        // The transient skip guard skips snapshot creation but still runs retention.
+        assert_eq!(deletes.len(), 3, "all snapshots deletable when no drives mounted");
+    }
+
+    #[test]
+    fn transient_all_drives_mounted_same_as_before() {
+        // Both drives mounted — behavior should match the existing
+        // transient_multi_drive_pins_at_different_snapshots test.
+        let config = transient_multi_drive_config();
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots.insert(
+            "sv1".to_string(),
+            vec![
+                snap("20260319-1000-one"),
+                snap("20260320-1000-one"),
+                snap("20260321-1000-one"),
+                snap("20260322-1000-one"),
+                snap("20260322-1400-one"),
+            ],
+        );
+        fs.pin_files.insert(
+            (PathBuf::from("/snap/sv1"), "D1".to_string()),
+            snap("20260322-1400-one"),
+        );
+        fs.pin_files.insert(
+            (PathBuf::from("/snap/sv1"), "D2".to_string()),
+            snap("20260320-1000-one"),
+        );
+        fs.mounted_drives.insert("D1".to_string());
+        fs.mounted_drives.insert("D2".to_string());
+        fs.external_snapshots.insert(
+            ("D1".to_string(), "sv1".to_string()),
+            vec![snap("20260322-1400-one")],
+        );
+        fs.external_snapshots.insert(
+            ("D2".to_string(), "sv1".to_string()),
+            vec![snap("20260320-1000-one")],
+        );
+
+        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let deletes: Vec<_> = result
+            .operations
+            .iter()
+            .filter_map(|op| match op {
+                PlannedOperation::DeleteSnapshot {
+                    subvolume_name,
+                    path,
+                    ..
+                } if subvolume_name == "sv1" => {
+                    Some(path.file_name().unwrap().to_string_lossy().to_string())
+                }
+                _ => None,
+            })
+            .collect();
+
+        // Same as transient_multi_drive_pins_at_different_snapshots:
+        // only 20260319 is older than D2's pin (the oldest mounted pin)
+        assert_eq!(deletes.len(), 1, "only pre-oldest-pin snapshot deleted: {deletes:?}");
+        assert!(deletes[0].contains("20260319"));
+    }
+
+    #[test]
+    fn graduated_absent_drive_pins_still_protected() {
+        // Graduated retention must still protect ALL pins, including absent drives.
+        // This is the conservative default — only transient scopes to mounted pins.
+        let toml_str = r#"
+[general]
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp"
+
+[local_snapshots]
+roots = [
+  { path = "/snap", subvolumes = ["sv1"] }
+]
+
+[defaults]
+snapshot_interval = "1h"
+send_interval = "4h"
+send_enabled = true
+enabled = true
+
+[defaults.local_retention]
+hourly = 24
+daily = 30
+weekly = 26
+monthly = 12
+
+[defaults.external_retention]
+daily = 30
+weekly = 26
+monthly = 0
+
+[[drives]]
+label = "D1"
+mount_path = "/mnt/d1"
+snapshot_root = ".snapshots"
+role = "primary"
+
+[[drives]]
+label = "D2"
+mount_path = "/mnt/d2"
+snapshot_root = ".snapshots"
+role = "offsite"
+
+[[subvolumes]]
+name = "sv1"
+short_name = "one"
+source = "/data/sv1"
+priority = 1
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots.insert(
+            "sv1".to_string(),
+            vec![
+                snap("20260320-1000-one"),
+                snap("20260321-1000-one"),
+                snap("20260322-1400-one"),
+            ],
+        );
+        // D1 mounted, D2 absent. Both have pins.
+        fs.pin_files.insert(
+            (PathBuf::from("/snap/sv1"), "D1".to_string()),
+            snap("20260322-1400-one"),
+        );
+        fs.pin_files.insert(
+            (PathBuf::from("/snap/sv1"), "D2".to_string()),
+            snap("20260320-1000-one"),
+        );
+        fs.mounted_drives.insert("D1".to_string());
+        // D2 NOT mounted
+
+        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let deletes: Vec<_> = result
+            .operations
+            .iter()
+            .filter(|op| {
+                matches!(
+                    op,
+                    PlannedOperation::DeleteSnapshot {
+                        subvolume_name,
+                        ..
+                    } if subvolume_name == "sv1"
+                )
+            })
+            .collect();
+
+        // Graduated uses `pinned` (all drives), not `mounted_pins`.
+        // D2's pin at 20260320 is still in the protected set.
+        // All snapshots are protected (pinned or unsent-to-D2).
+        assert_eq!(
+            deletes.len(),
+            0,
+            "graduated retention must protect absent drive pins"
+        );
+    }
+
+    #[test]
+    fn transient_no_pins_no_mounted_drives_deletes_all() {
+        let config = transient_config();
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots.insert(
+            "sv1".to_string(),
+            vec![
+                snap("20260321-1000-one"),
+                snap("20260322-1000-one"),
+            ],
+        );
+        // No pin files, no drives mounted
+
+        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let deletes: Vec<_> = result
+            .operations
+            .iter()
+            .filter(|op| {
+                matches!(
+                    op,
+                    PlannedOperation::DeleteSnapshot {
+                        subvolume_name,
+                        ..
+                    } if subvolume_name == "sv1"
+                )
+            })
+            .collect();
+
+        assert_eq!(deletes.len(), 2, "no pins + no drives = all deletable");
+    }
+
+    #[test]
+    fn transient_token_missing_drive_pin_protected() {
+        // TokenMissing drives proceed with sends, so their pins must be protected.
+        let config = transient_config();
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots.insert(
+            "sv1".to_string(),
+            vec![
+                snap("20260320-1000-one"),
+                snap("20260321-1000-one"),
+                snap("20260322-1000-one"),
+            ],
+        );
+        fs.pin_files.insert(
+            (PathBuf::from("/snap/sv1"), "D1".to_string()),
+            snap("20260321-1000-one"),
+        );
+        // Drive is TokenMissing (first use, no token file yet) — sends proceed
+        fs.drive_availability_overrides.insert(
+            "D1".to_string(),
+            DriveAvailability::TokenMissing,
+        );
+        fs.external_snapshots.insert(
+            ("D1".to_string(), "sv1".to_string()),
+            vec![snap("20260321-1000-one")],
+        );
+
+        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let deletes: Vec<_> = result
+            .operations
+            .iter()
+            .filter_map(|op| match op {
+                PlannedOperation::DeleteSnapshot {
+                    subvolume_name,
+                    path,
+                    ..
+                } if subvolume_name == "sv1" => {
+                    Some(path.file_name().unwrap().to_string_lossy().to_string())
+                }
+                _ => None,
+            })
+            .collect();
+
+        // Pin at 20260321 should be protected. 20260322 is unsent-protected.
+        // Only 20260320 (older than pin) should be deleted.
+        assert_eq!(deletes.len(), 1, "only pre-pin snapshot deleted: {deletes:?}");
+        assert!(deletes[0].contains("20260320"), "wrong snapshot deleted: {deletes:?}");
     }
 
     // ── skip_intervals tests ────────────────────────────────────────────
