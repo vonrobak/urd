@@ -9,20 +9,21 @@
 
 **Urd is the sole backup system.** Systemd timer running nightly at 04:00 since 2026-03-25.
 Sentinel daemon deployed (passive monitoring, drive detection, backup overdue alerts).
-921 tests, all passing, clippy clean. Current version: v0.11.0.
+931 tests, all passing, clippy clean. Current version: v0.11.1.
 
-**Phase E complete.** All six items shipped: sentinel fixes (021), btrfs pipeline (013),
-external-only runtime (018), context-aware suggestions (020), skip unchanged subvolumes (014),
-emergency space response (016). The invisible worker is now smart: compressed sends,
-post-delete sync, generation-based skip, emergency thinning, correct external-only
-presentation, and context-aware suggestions at every invoked surface.
+**v0.11.1 fixes production issues from the first v0.11.0 nightly (run #29):**
+- Transient retention now scoped to mounted drives — absent drives' pins no longer block
+  cleanup, preventing the NVMe space exhaustion pattern
+- Sentinel chain break detection refined (delta-based, reports actual broken count)
+- "local only" skip text replaces misleading "send disabled"
+- Transient snapshot creation skipped when no drives available (defense-in-depth)
 
-**Deployment notes:**
-- v0.10.0 tagged but never deployed — config migration (`local_snapshots = false`) pending
-- v0.11.0 tagged — includes all Phase E features on top of v0.10.0
-- Decision needed: deploy v0.10.0 first (validate migration) or jump to v0.11.0 directly
+**Deployment status:**
+- v0.11.1 tagged and merged — ready to deploy
 - Pre-deploy: hand-edit config `local_retention = "transient"` → `local_snapshots = false`
+- Pre-deploy: add `drives = ["WD-18TB"]` to htpc-root section (scopes to primary drive)
 - Pre-deploy: run `btrfs send --help` as unprivileged user to verify no-sudo probe (013)
+- Install: `cargo install --path .`
 
 ## In Progress
 
@@ -30,9 +31,7 @@ Nothing active.
 
 ## Next Up
 
-**Phase D: Progressive Disclosure + The Encounter** (~6-8 sessions)
-
-1. **Deploy v0.11.0** — validate production, verify emergency and skip-unchanged in live nightly
+1. **Deploy v0.11.1** — install, edit config, watch next nightly for correct behavior
 2. **6-O: Progressive disclosure** (~2 sessions) — framework for The Encounter
 3. **6-H: The Encounter** (~4-6 sessions) — auto-trigger onboarding, Fate Conversation,
    config generation. Targets v1.0.
@@ -46,10 +45,11 @@ Nothing active.
 | Architecture and code conventions | [CLAUDE.md](../../CLAUDE.md) |
 | Documentation standards | [CONTRIBUTING.md](../../CONTRIBUTING.md) |
 | ADRs (100-112) | [decisions/](../00-foundation/decisions/) |
+| Latest review | [022 design review](../99-reports/2026-04-05-design-review-022-honest-nightly.md) |
 
 ## Known Issues
 
 - WD-18TB and WD-18TB1 share BTRFS UUID from cloning — needs `btrfstune -u` when offsite drive returns
-- Status string fragility: "UNPROTECTED"/"AT RISK"/"PROTECTED" matched as raw strings — consider constants
+- UPI 011 Change 3 (pin self-healing) deferred — orthogonal to 022, still valuable
+- Status string fragility: "UNPROTECTED"/"AT RISK"/"PROTECTED" matched as raw strings
 - `compute_health` at 8 params — consider struct grouping in next awareness.rs change
-- Roadmap lists 016-interactive as Phase F — now complete, roadmap should be updated
