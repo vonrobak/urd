@@ -18,7 +18,7 @@ use crate::output::{
     FailuresOutput, GetOutput, HistoryOutput, InitOutput, InitStatus, OutputMode, PlanOutput,
     PreActionSummary, RecoveryWindow, RedundancyAdvisoryKind, RetentionPreviewOutput,
     SentinelStatusOutput, SkipCategory, SkippedSubvolume, StatusAssessment, StatusOutput,
-    SubvolumeHistoryOutput, TokenState, VerifyOutput, parse_duration_to_minutes,
+    SubvolumeHistoryOutput, TokenState, VerifyCheck, VerifyOutput, parse_duration_to_minutes,
 };
 use crate::plan::format_duration_short;
 use crate::types::{ByteSize, DriveRole};
@@ -1594,16 +1594,24 @@ fn render_calibrate_interactive(data: &CalibrateOutput) -> String {
 
 /// Render verify output according to the given mode.
 #[must_use]
-pub fn render_verify(data: &VerifyOutput, mode: OutputMode) -> String {
+pub fn render_verify(data: &VerifyOutput, mode: OutputMode, detail: bool) -> String {
     match mode {
-        OutputMode::Interactive => render_verify_interactive(data),
+        OutputMode::Interactive => render_verify_interactive(data, detail),
         OutputMode::Daemon => {
             serde_json::to_string_pretty(data).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
         }
     }
 }
 
-fn render_verify_interactive(data: &VerifyOutput) -> String {
+fn render_verify_interactive(data: &VerifyOutput, detail: bool) -> String {
+    if detail {
+        return render_verify_detail(data);
+    }
+    render_verify_findings_first(data)
+}
+
+/// Detail mode: every check for every subvolume/drive (original verbose output).
+fn render_verify_detail(data: &VerifyOutput) -> String {
     let mut out = String::new();
 
     for sv in &data.subvolumes {
@@ -1627,35 +1635,96 @@ fn render_verify_interactive(data: &VerifyOutput) -> String {
         writeln!(out).ok();
     }
 
+    render_verify_tail(data, &mut out);
+    out
+}
+
+/// Findings-first mode: problems first, noise collapsed.
+fn render_verify_findings_first(data: &VerifyOutput) -> String {
+    let mut out = String::new();
+
+    let (findings, absent_drives) = classify_verify_checks(data);
+
+    // Render findings grouped by subvolume/drive
+    if findings.is_empty() {
+        writeln!(
+            out,
+            "{}",
+            format!(
+                "All threads intact. {} verified, {} OK.",
+                pluralize(data.subvolumes.len(), "subvolume", "subvolumes"),
+                pluralize(data.ok_count as usize, "check", "checks")
+            )
+            .green()
+            .bold()
+        )
+        .ok();
+    } else {
+        for (sv_name, drive_label, check) in &findings {
+            let status_str = match check.status.as_str() {
+                "warn" => format!("{}  ", "WARN".yellow()),
+                "fail" => format!("{}  ", "FAIL".red()),
+                other => format!("{other:<6}"),
+            };
+            let detail = check.detail.as_deref().unwrap_or(&check.name);
+            writeln!(out, "{sv_name}/{drive_label}:").ok();
+            writeln!(out, "  {status_str}{detail}").ok();
+            if let Some(ref suggestion) = check.suggestion {
+                writeln!(out, "  \u{2192} {suggestion}").ok();
+            }
+            writeln!(out).ok();
+        }
+
+        // ok_count from verify.rs includes all OK checks; drive-mounted
+        // warnings are counted separately in the absent-drives line below.
+        writeln!(
+            out,
+            "{}",
+            format!(
+                "{} verified, {} OK.",
+                pluralize(data.subvolumes.len(), "subvolume", "subvolumes"),
+                pluralize(data.ok_count as usize, "check", "checks")
+            )
+            .dimmed()
+        )
+        .ok();
+    }
+
+    // Absent drives summary
+    if !absent_drives.is_empty() {
+        writeln!(
+            out,
+            "{}",
+            format!(
+                "{} not mounted ({}) \u{2014} skipped.",
+                pluralize(absent_drives.len(), "drive", "drives"),
+                absent_drives.join(", ")
+            )
+            .dimmed()
+        )
+        .ok();
+    }
+
+    render_verify_tail(data, &mut out);
+    out
+}
+
+/// Shared tail: preflight warnings + next-action suggestion.
+fn render_verify_tail(data: &VerifyOutput, out: &mut String) {
     // Preflight warnings
     if !data.preflight_warnings.is_empty() {
+        writeln!(out).ok();
         writeln!(out, "{}", "Config consistency:".bold()).ok();
         for warning in &data.preflight_warnings {
             writeln!(out, "  {} {}", "WARN".yellow(), warning).ok();
         }
-        writeln!(out).ok();
     }
 
-    // Summary
-    let summary = format!(
-        "Verify complete: {} OK, {} warnings, {} failures",
-        data.ok_count, data.warn_count, data.fail_count
-    );
-    if data.fail_count > 0 {
-        writeln!(out, "{}", summary.red().bold()).ok();
-    } else if data.warn_count > 0 {
-        writeln!(out, "{}", summary.yellow().bold()).ok();
-    } else {
-        writeln!(out, "{}", summary.green().bold()).ok();
-    }
-
-    // ── Next-action suggestion ──────────────────────────────────────
+    // Next-action suggestion
     append_suggestion(
         &SuggestionContext::Verify { has_broken: data.fail_count > 0 },
-        &mut out,
+        out,
     );
-
-    out
 }
 
 // ── Init ────────────────────────────────────────────────────────────────
@@ -2246,28 +2315,38 @@ fn render_doctor_interactive(data: &DoctorOutput) -> String {
             )
             .ok();
         } else {
-            for sv in &verify.subvolumes {
-                for drive in &sv.drives {
-                    for check in &drive.checks {
-                        let icon = match check.status.as_str() {
-                            "ok" => "\u{2713}".green().to_string(),
-                            "warn" => "\u{26a0}".yellow().to_string(),
-                            _ => "\u{2717}".red().to_string(),
-                        };
-                        let detail = check
-                            .detail
-                            .as_deref()
-                            .unwrap_or(&check.name);
-                        if check.status != "ok" {
-                            writeln!(
-                                out,
-                                "    {icon} {}/{}: {detail}",
-                                sv.name, drive.label
-                            )
-                            .ok();
-                        }
-                    }
+            let (findings, absent_drives) = classify_verify_checks(verify);
+
+            // Render findings
+            for (sv_name, drive_label, check) in &findings {
+                let icon = match check.status.as_str() {
+                    "warn" => "\u{26a0}".yellow().to_string(),
+                    _ => "\u{2717}".red().to_string(),
+                };
+                let detail = check.detail.as_deref().unwrap_or(&check.name);
+                writeln!(out, "    {icon} {sv_name}/{drive_label}: {detail}").ok();
+                if let Some(ref suggestion) = check.suggestion {
+                    writeln!(out, "      \u{2192} {suggestion}").ok();
                 }
+            }
+
+            // Summary line
+            let mut summary_parts = Vec::new();
+            if verify.ok_count > 0 {
+                summary_parts.push(format!(
+                    "{} OK",
+                    pluralize(verify.ok_count as usize, "check", "checks")
+                ));
+            }
+            if !absent_drives.is_empty() {
+                summary_parts.push(format!(
+                    "{} not mounted ({}) \u{2014} skipped",
+                    pluralize(absent_drives.len(), "drive", "drives"),
+                    absent_drives.join(", ")
+                ));
+            }
+            if !summary_parts.is_empty() {
+                writeln!(out, "    {}", summary_parts.join(". ").dimmed()).ok();
             }
         }
     } else {
@@ -2289,8 +2368,7 @@ fn render_doctor_interactive(data: &DoctorOutput) -> String {
             writeln!(
                 out,
                 "{}",
-                format!("{} warning(s). Run suggested commands to resolve.", data.verdict.count)
-                    .yellow()
+                format!("{}.", pluralize(data.verdict.count, "warning", "warnings")).yellow()
             )
             .ok();
         }
@@ -2298,8 +2376,19 @@ fn render_doctor_interactive(data: &DoctorOutput) -> String {
             writeln!(
                 out,
                 "{}",
-                format!("{} issue(s). Run suggested commands to resolve.", data.verdict.count)
-                    .red()
+                format!("{} found.", pluralize(data.verdict.count, "issue", "issues")).red()
+            )
+            .ok();
+        }
+        DoctorVerdictStatus::Degraded => {
+            writeln!(
+                out,
+                "{}",
+                format!(
+                    "{} degraded. Data is safe \u{2014} drives are absent.",
+                    pluralize(data.verdict.count, "subvolume", "subvolumes")
+                )
+                .yellow()
             )
             .ok();
         }
@@ -2309,6 +2398,41 @@ fn render_doctor_interactive(data: &DoctorOutput) -> String {
     append_suggestion(&SuggestionContext::Doctor, &mut out);
 
     out
+}
+
+/// Classify verify checks into findings (real problems) and expected conditions (absent drives).
+fn classify_verify_checks(
+    verify: &VerifyOutput,
+) -> (Vec<(&str, &str, &VerifyCheck)>, Vec<&str>) {
+    let mut findings: Vec<(&str, &str, &VerifyCheck)> = Vec::new();
+    let mut absent_drives: Vec<&str> = Vec::new();
+
+    for sv in &verify.subvolumes {
+        for drive in &sv.drives {
+            for check in &drive.checks {
+                if check.status == "ok" {
+                    continue;
+                }
+                if check.is_expected_condition() {
+                    if !absent_drives.contains(&drive.label.as_str()) {
+                        absent_drives.push(&drive.label);
+                    }
+                } else {
+                    findings.push((&sv.name, &drive.label, check));
+                }
+            }
+        }
+    }
+
+    (findings, absent_drives)
+}
+
+fn pluralize(count: usize, singular: &str, plural: &str) -> String {
+    if count == 1 {
+        format!("{count} {singular}")
+    } else {
+        format!("{count} {plural}")
+    }
 }
 
 fn render_doctor_check_section(out: &mut String, title: &str, checks: &[DoctorCheck]) {
@@ -4578,7 +4702,7 @@ mod tests {
     // ── Verify tests ────────────────────────────────────────────────────
 
     #[test]
-    fn verify_interactive_shows_checks() {
+    fn verify_detail_shows_all_checks() {
         let data = VerifyOutput {
             subvolumes: vec![VerifySubvolume {
                 name: "htpc-home".to_string(),
@@ -4589,11 +4713,13 @@ mod tests {
                             name: "pin-file".to_string(),
                             status: "ok".to_string(),
                             detail: Some("Pin: 20260325-0400-home".to_string()),
+                            suggestion: None,
                         },
                         VerifyCheck {
                             name: "pin-exists-local".to_string(),
                             status: "fail".to_string(),
                             detail: Some("Pinned snapshot missing locally".to_string()),
+                            suggestion: None,
                         },
                     ],
                 }],
@@ -4603,11 +4729,10 @@ mod tests {
             warn_count: 0,
             fail_count: 1,
         };
-        let output = render_verify(&data, OutputMode::Interactive);
+        let output = render_verify(&data, OutputMode::Interactive, true);
         assert!(output.contains("htpc-home"), "missing subvolume");
         assert!(output.contains("OK"), "missing ok check");
         assert!(output.contains("FAIL"), "missing fail check");
-        assert!(output.contains("1 failures"), "missing failure count");
     }
 
     #[test]
@@ -4619,8 +4744,177 @@ mod tests {
             warn_count: 0,
             fail_count: 0,
         };
-        let output = render_verify(&data, OutputMode::Daemon);
+        let output = render_verify(&data, OutputMode::Daemon, false);
         let _: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
+    }
+
+    #[test]
+    fn verify_findings_first_all_clean() {
+        colored::control::set_override(false);
+        let data = VerifyOutput {
+            subvolumes: vec![VerifySubvolume {
+                name: "htpc-home".to_string(),
+                drives: vec![VerifyDrive {
+                    label: "WD-18TB".to_string(),
+                    checks: vec![VerifyCheck {
+                        name: "pin-file".to_string(),
+                        status: "ok".to_string(),
+                        detail: Some("Pin: 20260325-0400-home".to_string()),
+                        suggestion: None,
+                    }],
+                }],
+            }],
+            preflight_warnings: vec![],
+            ok_count: 1,
+            warn_count: 0,
+            fail_count: 0,
+        };
+        let output = render_verify(&data, OutputMode::Interactive, false);
+        assert!(
+            output.contains("All threads intact"),
+            "missing all-clean message: {output}"
+        );
+    }
+
+    #[test]
+    fn verify_findings_first_one_failure() {
+        colored::control::set_override(false);
+        let data = VerifyOutput {
+            subvolumes: vec![VerifySubvolume {
+                name: "htpc-home".to_string(),
+                drives: vec![VerifyDrive {
+                    label: "WD-18TB".to_string(),
+                    checks: vec![
+                        VerifyCheck {
+                            name: "pin-file".to_string(),
+                            status: "ok".to_string(),
+                            detail: Some("Pin: 20260325-0400-home".to_string()),
+                            suggestion: None,
+                        },
+                        VerifyCheck {
+                            name: "pin-exists-local".to_string(),
+                            status: "fail".to_string(),
+                            detail: Some("Pinned snapshot missing locally".to_string()),
+                            suggestion: Some("Run `urd backup` when drive is connected.".to_string()),
+                        },
+                    ],
+                }],
+            }],
+            preflight_warnings: vec![],
+            ok_count: 1,
+            warn_count: 0,
+            fail_count: 1,
+        };
+        let output = render_verify(&data, OutputMode::Interactive, false);
+        assert!(
+            output.contains("htpc-home/WD-18TB"),
+            "missing subvol/drive grouping: {output}"
+        );
+        assert!(
+            output.contains("FAIL"),
+            "missing failure indicator: {output}"
+        );
+        assert!(
+            output.contains("1 check OK"),
+            "missing OK summary: {output}"
+        );
+        assert!(
+            !output.contains("All threads intact"),
+            "should not show all-clean: {output}"
+        );
+    }
+
+    #[test]
+    fn verify_findings_first_absent_drives_collapsed() {
+        colored::control::set_override(false);
+        let data = VerifyOutput {
+            subvolumes: vec![VerifySubvolume {
+                name: "htpc-home".to_string(),
+                drives: vec![
+                    VerifyDrive {
+                        label: "WD-18TB1".to_string(),
+                        checks: vec![VerifyCheck {
+                            name: "drive-mounted".to_string(),
+                            status: "warn".to_string(),
+                            detail: Some("Drive not mounted".to_string()),
+                            suggestion: None,
+                        }],
+                    },
+                    VerifyDrive {
+                        label: "2TB-backup".to_string(),
+                        checks: vec![VerifyCheck {
+                            name: "drive-mounted".to_string(),
+                            status: "warn".to_string(),
+                            detail: Some("Drive not mounted".to_string()),
+                            suggestion: None,
+                        }],
+                    },
+                ],
+            }],
+            preflight_warnings: vec![],
+            ok_count: 0,
+            warn_count: 2,
+            fail_count: 0,
+        };
+        let output = render_verify(&data, OutputMode::Interactive, false);
+        assert!(
+            output.contains("2 drives not mounted"),
+            "missing absent drives summary: {output}"
+        );
+        assert!(
+            output.contains("WD-18TB1"),
+            "missing drive label: {output}"
+        );
+        assert!(
+            output.contains("2TB-backup"),
+            "missing drive label: {output}"
+        );
+        assert!(
+            !output.contains("WARN"),
+            "should not show individual warnings: {output}"
+        );
+    }
+
+    #[test]
+    fn verify_findings_first_suggestion_rendered() {
+        colored::control::set_override(false);
+        let data = VerifyOutput {
+            subvolumes: vec![VerifySubvolume {
+                name: "htpc-root".to_string(),
+                drives: vec![VerifyDrive {
+                    label: "WD-18TB".to_string(),
+                    checks: vec![VerifyCheck {
+                        name: "pin-exists-local".to_string(),
+                        status: "fail".to_string(),
+                        detail: Some("Chain broken".to_string()),
+                        suggestion: Some("Run `urd backup` when drive is connected.".to_string()),
+                    }],
+                }],
+            }],
+            preflight_warnings: vec![],
+            ok_count: 0,
+            warn_count: 0,
+            fail_count: 1,
+        };
+        let output = render_verify(&data, OutputMode::Interactive, false);
+        assert!(
+            output.contains("\u{2192} Run `urd backup`"),
+            "missing suggestion: {output}"
+        );
+    }
+
+    #[test]
+    fn verify_daemon_ignores_detail() {
+        let data = VerifyOutput {
+            subvolumes: vec![],
+            preflight_warnings: vec![],
+            ok_count: 0,
+            warn_count: 0,
+            fail_count: 0,
+        };
+        let output_false = render_verify(&data, OutputMode::Daemon, false);
+        let output_true = render_verify(&data, OutputMode::Daemon, true);
+        assert_eq!(output_false, output_true, "daemon mode should ignore detail flag");
     }
 
     // ── Init tests ─────────────────────────────────────────────────────
@@ -5387,6 +5681,177 @@ mod tests {
     }
 
     #[test]
+    fn doctor_thorough_findings_separated() {
+        colored::control::set_override(false);
+        let mut data = test_doctor_healthy();
+        data.verify = Some(VerifyOutput {
+            subvolumes: vec![VerifySubvolume {
+                name: "htpc-root".to_string(),
+                drives: vec![
+                    VerifyDrive {
+                        label: "WD-18TB".to_string(),
+                        checks: vec![VerifyCheck {
+                            name: "pin-exists-local".to_string(),
+                            status: "fail".to_string(),
+                            detail: Some("Chain broken".to_string()),
+                            suggestion: Some(
+                                "Run `urd backup` when drive is connected.".to_string(),
+                            ),
+                        }],
+                    },
+                    VerifyDrive {
+                        label: "WD-18TB1".to_string(),
+                        checks: vec![VerifyCheck {
+                            name: "drive-mounted".to_string(),
+                            status: "warn".to_string(),
+                            detail: Some("Drive not mounted".to_string()),
+                            suggestion: None,
+                        }],
+                    },
+                ],
+            }],
+            preflight_warnings: vec![],
+            ok_count: 3,
+            warn_count: 1,
+            fail_count: 1,
+        });
+        data.verdict = DoctorVerdict::issues(1);
+        let output = render_doctor(&data, OutputMode::Interactive);
+        // Finding should be shown
+        assert!(
+            output.contains("htpc-root/WD-18TB"),
+            "missing finding: {output}"
+        );
+        assert!(
+            output.contains("Chain broken"),
+            "missing detail: {output}"
+        );
+        // Suggestion should be shown
+        assert!(
+            output.contains("\u{2192} Run `urd backup`"),
+            "missing suggestion: {output}"
+        );
+        // Absent drive should be in summary, not as individual warning
+        assert!(
+            output.contains("1 drive not mounted (WD-18TB1)"),
+            "missing absent drives summary: {output}"
+        );
+    }
+
+    #[test]
+    fn doctor_thorough_only_absent_drives() {
+        colored::control::set_override(false);
+        let mut data = test_doctor_healthy();
+        data.verify = Some(VerifyOutput {
+            subvolumes: vec![VerifySubvolume {
+                name: "htpc-home".to_string(),
+                drives: vec![
+                    VerifyDrive {
+                        label: "WD-18TB1".to_string(),
+                        checks: vec![VerifyCheck {
+                            name: "drive-mounted".to_string(),
+                            status: "warn".to_string(),
+                            detail: Some("Drive not mounted".to_string()),
+                            suggestion: None,
+                        }],
+                    },
+                    VerifyDrive {
+                        label: "2TB-backup".to_string(),
+                        checks: vec![VerifyCheck {
+                            name: "drive-mounted".to_string(),
+                            status: "warn".to_string(),
+                            detail: Some("Drive not mounted".to_string()),
+                            suggestion: None,
+                        }],
+                    },
+                ],
+            }],
+            preflight_warnings: vec![],
+            ok_count: 5,
+            warn_count: 2,
+            fail_count: 0,
+        });
+        data.verdict = DoctorVerdict::warnings(2);
+        let output = render_doctor(&data, OutputMode::Interactive);
+        // Should show summary line with drive names, not individual warnings with icons
+        assert!(
+            output.contains("2 drives not mounted"),
+            "missing absent drives summary: {output}"
+        );
+        assert!(
+            output.contains("5 checks OK"),
+            "missing OK count: {output}"
+        );
+    }
+
+    #[test]
+    fn doctor_thorough_all_clean_unchanged() {
+        colored::control::set_override(false);
+        let mut data = test_doctor_healthy();
+        data.verify = Some(VerifyOutput {
+            subvolumes: vec![],
+            preflight_warnings: vec![],
+            ok_count: 35,
+            warn_count: 0,
+            fail_count: 0,
+        });
+        let output = render_doctor(&data, OutputMode::Interactive);
+        assert!(
+            output.contains("All threads intact"),
+            "missing all-clean message: {output}"
+        );
+        assert!(
+            output.contains("35 checks OK"),
+            "missing check count: {output}"
+        );
+    }
+
+    #[test]
+    fn doctor_thorough_absent_drives_deduped() {
+        colored::control::set_override(false);
+        let mut data = test_doctor_healthy();
+        data.verify = Some(VerifyOutput {
+            subvolumes: vec![
+                VerifySubvolume {
+                    name: "htpc-home".to_string(),
+                    drives: vec![VerifyDrive {
+                        label: "WD-18TB1".to_string(),
+                        checks: vec![VerifyCheck {
+                            name: "drive-mounted".to_string(),
+                            status: "warn".to_string(),
+                            detail: Some("Drive not mounted".to_string()),
+                            suggestion: None,
+                        }],
+                    }],
+                },
+                VerifySubvolume {
+                    name: "htpc-docs".to_string(),
+                    drives: vec![VerifyDrive {
+                        label: "WD-18TB1".to_string(),
+                        checks: vec![VerifyCheck {
+                            name: "drive-mounted".to_string(),
+                            status: "warn".to_string(),
+                            detail: Some("Drive not mounted".to_string()),
+                            suggestion: None,
+                        }],
+                    }],
+                },
+            ],
+            preflight_warnings: vec![],
+            ok_count: 0,
+            warn_count: 2,
+            fail_count: 0,
+        });
+        data.verdict = DoctorVerdict::warnings(2);
+        let output = render_doctor(&data, OutputMode::Interactive);
+        // Same drive across two subvolumes should appear once
+        assert!(
+            output.contains("1 drive not mounted (WD-18TB1)"),
+            "drive should be deduped: {output}"
+        );
+    }
+
+    #[test]
     fn doctor_verdict_healthy() {
         let v = serde_json::to_value(&DoctorVerdict::healthy()).unwrap();
         assert_eq!(v["status"], "healthy");
@@ -5405,6 +5870,105 @@ mod tests {
         let v = serde_json::to_value(&DoctorVerdict::issues(2)).unwrap();
         assert_eq!(v["status"], "issues");
         assert_eq!(v["count"], 2);
+    }
+
+    #[test]
+    fn doctor_verdict_degraded() {
+        colored::control::set_override(false);
+        let mut data = test_doctor_healthy();
+        data.data_safety[0].health = "degraded".to_string();
+        data.data_safety[1].health = "degraded".to_string();
+        data.verdict = DoctorVerdict::degraded(2);
+        let output = render_doctor(&data, OutputMode::Interactive);
+        assert!(
+            output.contains("2 subvolumes degraded"),
+            "missing degraded verdict: {output}"
+        );
+        assert!(
+            output.contains("Data is safe"),
+            "missing reassurance: {output}"
+        );
+    }
+
+    #[test]
+    fn doctor_verdict_degraded_singular() {
+        colored::control::set_override(false);
+        let mut data = test_doctor_healthy();
+        data.data_safety[0].health = "degraded".to_string();
+        data.verdict = DoctorVerdict::degraded(1);
+        let output = render_doctor(&data, OutputMode::Interactive);
+        assert!(
+            output.contains("1 subvolume degraded"),
+            "should use singular: {output}"
+        );
+        assert!(
+            !output.contains("subvolumes degraded"),
+            "should not use plural form in verdict: {output}"
+        );
+    }
+
+    #[test]
+    fn doctor_verdict_errors_override_degraded() {
+        let v = serde_json::to_value(&DoctorVerdict::issues(1)).unwrap();
+        assert_eq!(v["status"], "issues", "errors should take precedence over degraded");
+    }
+
+    #[test]
+    fn doctor_verdict_warnings_override_degraded() {
+        let v = serde_json::to_value(&DoctorVerdict::warnings(1)).unwrap();
+        assert_eq!(v["status"], "warnings", "warnings should take precedence over degraded");
+    }
+
+    #[test]
+    fn doctor_verdict_degraded_json() {
+        let v = serde_json::to_value(&DoctorVerdict::degraded(2)).unwrap();
+        assert_eq!(v["status"], "degraded");
+        assert_eq!(v["count"], 2);
+    }
+
+    #[test]
+    fn doctor_verdict_singular_issue() {
+        colored::control::set_override(false);
+        let mut data = test_doctor_healthy();
+        data.data_safety[0].status = "UNPROTECTED".to_string();
+        data.data_safety[0].health = "blocked".to_string();
+        data.data_safety[0].issue = Some("exposed".to_string());
+        data.verdict = DoctorVerdict::issues(1);
+        let output = render_doctor(&data, OutputMode::Interactive);
+        assert!(
+            output.contains("1 issue found."),
+            "should use singular: {output}"
+        );
+    }
+
+    #[test]
+    fn doctor_verdict_plural_warnings() {
+        colored::control::set_override(false);
+        let mut data = test_doctor_healthy();
+        data.verdict = DoctorVerdict::warnings(2);
+        let output = render_doctor(&data, OutputMode::Interactive);
+        assert!(
+            output.contains("2 warnings."),
+            "should use plural: {output}"
+        );
+    }
+
+    #[test]
+    fn doctor_verdict_no_run_suggested_text() {
+        colored::control::set_override(false);
+        for verdict in [
+            DoctorVerdict::warnings(1),
+            DoctorVerdict::issues(1),
+            DoctorVerdict::degraded(1),
+        ] {
+            let mut data = test_doctor_healthy();
+            data.verdict = verdict;
+            let output = render_doctor(&data, OutputMode::Interactive);
+            assert!(
+                !output.contains("Run suggested commands"),
+                "verdict should not contain 'Run suggested commands': {output}"
+            );
+        }
     }
 
     #[test]

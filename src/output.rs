@@ -506,6 +506,7 @@ pub enum DoctorVerdictStatus {
     Healthy,
     Warnings,
     Issues,
+    Degraded,
 }
 
 impl DoctorVerdict {
@@ -522,6 +523,11 @@ impl DoctorVerdict {
     #[must_use]
     pub fn issues(count: usize) -> Self {
         Self { status: DoctorVerdictStatus::Issues, count }
+    }
+
+    #[must_use]
+    pub fn degraded(count: usize) -> Self {
+        Self { status: DoctorVerdictStatus::Degraded, count }
     }
 }
 
@@ -1005,6 +1011,19 @@ pub struct VerifyCheck {
     pub name: String,
     pub status: String,
     pub detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suggestion: Option<String>,
+}
+
+impl VerifyCheck {
+    /// Check name for absent-drive warnings — used by voice.rs to classify expected conditions.
+    pub const DRIVE_MOUNTED: &str = "drive-mounted";
+
+    /// Returns true if this check is an expected condition (absent drive), not a real finding.
+    #[must_use]
+    pub fn is_expected_condition(&self) -> bool {
+        self.name == Self::DRIVE_MOUNTED && self.status == "warn"
+    }
 }
 
 // ── Init output ─────────────────────────────────────────────────────────

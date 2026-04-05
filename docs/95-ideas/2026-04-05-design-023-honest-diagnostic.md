@@ -279,7 +279,8 @@ DoctorVerdictStatus::Warnings => {
 | `cli.rs` | Add `--detail` flag to `VerifyArgs` | Existing clap test patterns |
 | `commands/verify.rs` | Pass `detail` flag through to voice | Minimal — rendering tested via voice |
 | `commands/doctor.rs` | Count degraded subvolumes, new verdict branch | Test verdict computation with various health combinations |
-| `output.rs` | Add `DoctorVerdictStatus::Degraded` variant | Derive coverage (Serialize) |
+| `output.rs` | Add `DoctorVerdictStatus::Degraded` variant, add `suggestion: Option<String>` to `VerifyCheck` | Derive coverage (Serialize) |
+| `commands/verify.rs` | Set `suggestion` on chain-break checks, pass `detail` flag through | Test suggestion text set correctly |
 | `voice.rs` | (1) Findings-first verify, (2) Doctor thorough findings separation, (3) Degraded verdict rendering, (4) Pluralization + verdict text | Bulk of tests — ~15-20 new tests |
 
 ## Effort Estimate
@@ -408,3 +409,40 @@ Option B is more informative but requires the verdict to carry drive-level detai
 currently only in the Data Safety section. Leaning toward **Option A** for the verdict
 line — the Data Safety section already shows the specifics, and the user will see them
 in the output above the verdict.
+
+## Resolved Decisions (grill-me, 2026-04-05)
+
+### R1: Degraded verdict is the anchor
+Add `DoctorVerdictStatus::Degraded` variant. This is the highest-impact change — it
+closes the trust gap where doctor says "All clear" while status says "2 need attention."
+Additive enum change, no ADR needed. Homelab stack consumes Prometheus, not doctor JSON.
+
+### R2: Status advice stays as "urd doctor"
+Do NOT change the advice text to `urd doctor --thorough`. With the degraded verdict (R1),
+plain `urd doctor` now answers the question status raised. Sending every user to
+`--thorough` by default undermines progressive disclosure. Users can discover `--thorough`
+when they want to drill deeper.
+
+### R3: detail as parameter
+`render_verify(data, mode, detail: bool)` — Option A from Q1. Single caller cares about
+the flag (verify command handler). Doctor doesn't call `render_verify` at all (it reads
+`data.verify` directly). Simplest approach, no new public API surface.
+
+### R4: Classification in voice.rs
+Expected-condition classification (`"drive-mounted"` warnings → collapsed summary) stays
+in voice.rs, not output.rs. This is a rendering judgment — which warnings deserve visual
+prominence depends on presentation context. The `"drive-mounted"` string coupling between
+verify.rs and voice.rs is acceptable; both are in-project.
+
+### R5: Generic degraded verdict
+Verdict line: `"2 subvolumes degraded. Data is safe — drives are absent."` — count and
+reassurance only. Drive-specific details are already shown in the Data Safety section
+above the verdict. No drive-level data threaded into verdict computation.
+
+### R6: suggestion field on VerifyCheck
+Add `suggestion: Option<String>` to `VerifyCheck` in output.rs. Verify.rs sets it at the
+source (e.g., chain-break → "Run `urd backup` when ready"). Voice.rs renders if present.
+This replaces the design's original approach of pattern-matching on "Chain broken" in
+detail strings — that was brittle and embedded domain logic in the rendering layer. This
+is a second output.rs change (alongside the Degraded variant), but it's a small additive
+field that respects module boundaries.

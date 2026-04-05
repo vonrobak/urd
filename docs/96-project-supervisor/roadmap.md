@@ -23,25 +23,38 @@ Phase E delivered: sentinel config reload (021), compressed sends + post-delete 
 external-only runtime (018), context-aware suggestions (020), skip unchanged subvolumes (014),
 emergency space response with both automatic pre-flight and interactive `urd emergency` (016).
 
-## Active Arc: Deploy → The Encounter → v1.0
+## Active Arc: Deploy → Polish → The Encounter → v1.0
 
-**Goal:** Deploy v0.11.0, validate in production, then build the first-encounter experience.
-Two phases remain before v1.0.
+**Goal:** Deploy v0.11.1, polish the invoked surfaces based on production experience,
+then build the first-encounter experience. Three phases remain before v1.0.
 
-### Deploy v0.11.0
+### Deploy v0.11.1 ✓
 
-v0.10.0 was tagged but never deployed. v0.11.0 includes all Phase E features on top.
-Deploy directly to v0.11.0 — the config migration path is the same.
+v0.11.1 deployed and running. Includes all Phase E features plus production fixes
+from the first v0.11.0 nightly (run #29).
 
-**Pre-deploy checklist:**
-- Hand-edit config: `local_retention = "transient"` → `local_snapshots = false`
-- Verify: `btrfs send --help` as unprivileged user (compressed-data probe, 013)
-- Install: `cargo install --path .`
-- First nightly: watch for skip-unchanged `[SAME]` tags, emergency pre-flight (if space low)
-- First sentinel tick: expect one-time HealthRecovered for htpc-root
+**Gate:** Live with v0.11.1 for several days before building polish or designing
+The Encounter. The designs must be informed by real nightly logs, real doctor output,
+real sentinel behavior.
 
-**Gate:** Live with v0.11.0 for several days before designing The Encounter. The design
-must be informed by real nightly logs, real doctor output, real sentinel behavior.
+### Phase D-0: Presentation Polish (023, 024)
+
+```
+023 — The Honest Diagnostic            (~1-2 sessions)
+    Findings-first verify, doctor trust coherence, collapsed noise
+    Design: docs/95-ideas/2026-04-05-design-023-honest-diagnostic.md
+
+024 — The Warm Details                  (~1-2 sessions)
+    Relative timestamps, vocabulary, alignment, error guidance
+    Design: docs/95-ideas/2026-04-05-design-024-warm-details.md
+```
+
+**Rationale:** The Encounter is the first-run experience — if `urd status` shows cold
+timestamps and `urd doctor` contradicts `urd status`, trust breaks in the first five
+minutes. Polish the invoked surfaces before building onboarding on top of them.
+
+**Gate:** After D-0, every invoked surface (status, verify, doctor, history) should feel
+crafted. Then The Encounter builds on surfaces the team trusts.
 
 ### Phase D: Progressive Disclosure + The Encounter
 

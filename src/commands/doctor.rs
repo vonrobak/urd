@@ -228,6 +228,7 @@ pub fn run(config: Config, args: DoctorArgs, output_mode: OutputMode) -> anyhow:
         let verify_args = VerifyArgs {
             subvolume: None,
             drive: None,
+            detail: false,
         };
         Some(verify::collect_verify_output(&config, &verify_args))
     } else {
@@ -240,10 +241,21 @@ pub fn run(config: Config, args: DoctorArgs, output_mode: OutputMode) -> anyhow:
     }
 
     // ── 6. Verdict ────────────────────────────────────────────────
+    let degraded_count = data_safety
+        .iter()
+        .filter(|d| d.status == "PROTECTED" && d.health != "healthy")
+        .count();
+
+    // NOTE: When --thorough is used, verify's drive-mounted warnings inflate warn_count.
+    // This can mask the Degraded verdict when absent drives are the only issue.
+    // Accepted trade-off: plain `urd doctor` (where status directs users) works correctly.
+    // The --thorough path may show Warnings instead of Degraded in this scenario.
     let verdict = if error_count > 0 {
         DoctorVerdict::issues(error_count)
     } else if warn_count > 0 {
         DoctorVerdict::warnings(warn_count)
+    } else if degraded_count > 0 {
+        DoctorVerdict::degraded(degraded_count)
     } else {
         DoctorVerdict::healthy()
     };

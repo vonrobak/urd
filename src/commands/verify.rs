@@ -11,7 +11,7 @@ use crate::voice;
 pub fn run(config: Config, args: VerifyArgs, mode: OutputMode) -> anyhow::Result<()> {
     let data = collect_verify_output(&config, &args);
 
-    print!("{}", voice::render_verify(&data, mode));
+    print!("{}", voice::render_verify(&data, mode, args.detail));
 
     if data.fail_count > 0 {
         std::process::exit(1);
@@ -58,6 +58,7 @@ pub(crate) fn collect_verify_output(config: &Config, args: &VerifyArgs) -> Verif
                                      Unsent snapshot protection is disabled \u{2014} retention may delete snapshots not yet on all drives",
                                     pinned.len(),
                                 )),
+                                suggestion: None,
                             }],
                         }],
                     });
@@ -86,9 +87,10 @@ pub(crate) fn collect_verify_output(config: &Config, args: &VerifyArgs) -> Verif
 
             if !drives::is_drive_mounted(drive) {
                 checks.push(VerifyCheck {
-                    name: "drive-mounted".to_string(),
+                    name: VerifyCheck::DRIVE_MOUNTED.to_string(),
                     status: "warn".to_string(),
                     detail: Some("Drive not mounted \u{2014} skipping".to_string()),
+                    suggestion: None,
                 });
                 total_warn += 1;
                 sv_drives.push(VerifyDrive {
@@ -112,6 +114,7 @@ pub(crate) fn collect_verify_output(config: &Config, args: &VerifyArgs) -> Verif
                         name: "pin-file".to_string(),
                         status: "ok".to_string(),
                         detail: Some(format!("Pin: {pin_label}")),
+                        suggestion: None,
                     });
                     total_ok += 1;
 
@@ -122,6 +125,7 @@ pub(crate) fn collect_verify_output(config: &Config, args: &VerifyArgs) -> Verif
                             name: "pin-exists-local".to_string(),
                             status: "ok".to_string(),
                             detail: Some("Exists locally".to_string()),
+                            suggestion: None,
                         });
                         total_ok += 1;
                     } else if is_legacy {
@@ -131,6 +135,7 @@ pub(crate) fn collect_verify_output(config: &Config, args: &VerifyArgs) -> Verif
                             detail: Some(format!(
                                 "Pinned snapshot missing locally: {pin} (legacy pin \u{2014} may not apply to this drive)"
                             )),
+                            suggestion: None,
                         });
                         total_warn += 1;
                     } else {
@@ -140,6 +145,7 @@ pub(crate) fn collect_verify_output(config: &Config, args: &VerifyArgs) -> Verif
                             detail: Some(format!(
                                 "Pinned snapshot missing locally: {pin} \u{2014} Chain broken \u{2014} next send will be full"
                             )),
+                            suggestion: Some("Run `urd backup` when drive is connected.".to_string()),
                         });
                         total_fail += 1;
                     }
@@ -152,6 +158,7 @@ pub(crate) fn collect_verify_output(config: &Config, args: &VerifyArgs) -> Verif
                             name: "pin-exists-drive".to_string(),
                             status: "ok".to_string(),
                             detail: Some("Exists on drive".to_string()),
+                            suggestion: None,
                         });
                         total_ok += 1;
                     } else if is_legacy {
@@ -161,6 +168,7 @@ pub(crate) fn collect_verify_output(config: &Config, args: &VerifyArgs) -> Verif
                             detail: Some(format!(
                                 "Pinned snapshot not on this drive: {pin} (legacy pin \u{2014} run urd backup to establish drive-specific chain)"
                             )),
+                            suggestion: None,
                         });
                         total_warn += 1;
                     } else {
@@ -170,6 +178,7 @@ pub(crate) fn collect_verify_output(config: &Config, args: &VerifyArgs) -> Verif
                             detail: Some(format!(
                                 "Pinned snapshot missing from drive: {pin} \u{2014} Chain broken \u{2014} next send will be full"
                             )),
+                            suggestion: Some("Run `urd backup` when drive is connected.".to_string()),
                         });
                         total_fail += 1;
                     }
@@ -210,6 +219,7 @@ pub(crate) fn collect_verify_output(config: &Config, args: &VerifyArgs) -> Verif
                                 "No pin file, but {ext_count} snapshot(s) on drive \u{2014} \
                                  Next send will be full \u{2014} consider running urd backup to establish chain"
                             )),
+                            suggestion: None,
                         });
                         total_warn += 1;
                     } else {
@@ -217,6 +227,7 @@ pub(crate) fn collect_verify_output(config: &Config, args: &VerifyArgs) -> Verif
                             name: "pin-file".to_string(),
                             status: "ok".to_string(),
                             detail: Some("No pin file (no snapshots on drive)".to_string()),
+                            suggestion: None,
                         });
                         total_ok += 1;
                     }
@@ -226,6 +237,7 @@ pub(crate) fn collect_verify_output(config: &Config, args: &VerifyArgs) -> Verif
                         name: "pin-file".to_string(),
                         status: "fail".to_string(),
                         detail: Some(format!("Pin file error: {e}")),
+                        suggestion: None,
                     });
                     total_fail += 1;
                 }
@@ -281,6 +293,7 @@ fn collect_orphan_checks(
             name: "orphans".to_string(),
             status: "ok".to_string(),
             detail: Some("No orphaned snapshots on drive".to_string()),
+            suggestion: None,
         });
         *total_ok += 1;
     } else {
@@ -291,6 +304,7 @@ fn collect_orphan_checks(
                 detail: Some(format!(
                     "Orphaned snapshot on drive: {orphan} (newer than pin, possibly from interrupted send)"
                 )),
+                suggestion: None,
             });
         }
         *total_warn += orphans.len() as u32;
@@ -326,6 +340,7 @@ fn collect_stale_pin_check(
             detail: Some(format!(
                 "Pin file is {days} day(s) old (threshold: {threshold_str}) \u{2014} last successful send was {days} day(s) ago"
             )),
+            suggestion: None,
         });
         *total_warn += 1;
     } else {
@@ -333,6 +348,7 @@ fn collect_stale_pin_check(
             name: "stale-pin".to_string(),
             status: "ok".to_string(),
             detail: Some("Pin file age OK".to_string()),
+            suggestion: None,
         });
         *total_ok += 1;
     }
