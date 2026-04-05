@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Findings-first verify: `urd verify` now shows problems first and collapses OK checks into a summary; `--detail` restores verbose output
+- Doctor trust gap fix: `urd doctor` no longer says "All clear" when degraded subvolumes exist — shows "N subvolumes degraded. Data is safe — drives are absent."
+- Doctor `--thorough` threads section separates findings from expected conditions (absent drives collapsed into summary line)
+- Actionable suggestions on verify chain-break findings (`suggestion` field on verify checks)
+
+### Changed
+- Doctor verdict text uses proper pluralization and removes misleading "Run suggested commands to resolve"
+
 ## [0.11.1] - 2026-04-05
 
 ### Fixed

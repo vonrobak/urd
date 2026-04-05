@@ -231,6 +231,10 @@ pub struct VerifyArgs {
     /// Only verify against this drive
     #[arg(long)]
     pub drive: Option<String>,
+
+    /// Show every check, not just findings
+    #[arg(long)]
+    pub detail: bool,
 }
 
 #[cfg(test)]

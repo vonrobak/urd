@@ -11,19 +11,12 @@
 Sentinel daemon deployed (passive monitoring, drive detection, backup overdue alerts).
 931 tests, all passing, clippy clean. Current version: v0.11.1.
 
-**v0.11.1 fixes production issues from the first v0.11.0 nightly (run #29):**
+**v0.11.1 deployed and running.** Fixes production issues from the first v0.11.0 nightly:
 - Transient retention now scoped to mounted drives — absent drives' pins no longer block
   cleanup, preventing the NVMe space exhaustion pattern
 - Sentinel chain break detection refined (delta-based, reports actual broken count)
 - "local only" skip text replaces misleading "send disabled"
 - Transient snapshot creation skipped when no drives available (defense-in-depth)
-
-**Deployment status:**
-- v0.11.1 tagged and merged — ready to deploy
-- Pre-deploy: hand-edit config `local_retention = "transient"` → `local_snapshots = false`
-- Pre-deploy: add `drives = ["WD-18TB"]` to htpc-root section (scopes to primary drive)
-- Pre-deploy: run `btrfs send --help` as unprivileged user to verify no-sudo probe (013)
-- Install: `cargo install --path .`
 
 ## In Progress
 
@@ -31,9 +24,12 @@ Nothing active.
 
 ## Next Up
 
-1. **Deploy v0.11.1** — install, edit config, watch next nightly for correct behavior
-2. **6-O: Progressive disclosure** (~2 sessions) — framework for The Encounter
-3. **6-H: The Encounter** (~4-6 sessions) — auto-trigger onboarding, Fate Conversation,
+1. **023: The Honest Diagnostic** (~1-2 sessions) — findings-first verify, doctor trust
+   coherence, collapsed noise. Pure presentation changes.
+2. **024: The Warm Details** (~1-2 sessions) — relative timestamps, vocabulary, alignment,
+   error guidance. Pure voice.rs/output.rs changes.
+3. **6-O: Progressive disclosure** (~2 sessions) — framework for The Encounter
+4. **6-H: The Encounter** (~4-6 sessions) — auto-trigger onboarding, Fate Conversation,
    config generation. Targets v1.0.
 
 ## Key Links
