@@ -41,6 +41,8 @@ pub enum Commands {
     Drives(DrivesArgs),
     /// Run health diagnostics
     Doctor(DoctorArgs),
+    /// Guided emergency space recovery
+    Emergency,
     /// Preview retention policy consequences
     RetentionPreview(RetentionPreviewArgs),
     /// Generate shell completion scripts
@@ -280,6 +282,15 @@ mod tests {
         assert!(
             matches!(cli.command, Some(Commands::Status)),
             "status should parse as Some(Status)"
+        );
+    }
+
+    #[test]
+    fn emergency_parses() {
+        let cli = Cli::try_parse_from(["urd", "emergency"]).expect("emergency should parse");
+        assert!(
+            matches!(cli.command, Some(Commands::Emergency)),
+            "emergency should parse as Some(Emergency)"
         );
     }
 }

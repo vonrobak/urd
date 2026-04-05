@@ -134,6 +134,48 @@ pub fn graduated_retention(
     RetentionResult { keep, delete }
 }
 
+/// Compute the minimal keep set for emergency space recovery.
+///
+/// Keeps: the single newest snapshot (`latest`) plus all `pinned` snapshots
+/// (chain parents for incremental sends). Returns everything else as
+/// candidates for deletion.
+///
+/// This is intentionally more aggressive than `space_pressure` mode in
+/// `graduated_retention()`. It has no time windows, no configuration inputs,
+/// and no space checks — it is purely structural: keep the ends, keep the
+/// pins, delete the middle.
+///
+/// Safety invariants (ADR-106, ADR-107):
+/// - `latest` must be the actual newest snapshot — caller must sort and verify.
+/// - `pinned` must be the result of a pin-file read — caller must not pass empty
+///   when pin files are unreadable (treat read failure as keep-all-pinned).
+#[must_use]
+pub fn emergency_retention(
+    snapshots: &[SnapshotName],
+    latest: &SnapshotName,
+    pinned: &HashSet<SnapshotName>,
+) -> RetentionResult {
+    if snapshots.is_empty() {
+        return RetentionResult {
+            keep: Vec::new(),
+            delete: Vec::new(),
+        };
+    }
+
+    let mut keep = Vec::new();
+    let mut delete = Vec::new();
+
+    for snap in snapshots {
+        if snap == latest || pinned.contains(snap) {
+            keep.push(snap.clone());
+        } else {
+            delete.push((snap.clone(), "emergency: aggressive thinning".to_string()));
+        }
+    }
+
+    RetentionResult { keep, delete }
+}
+
 /// Space-governed retention with graduated thinning.
 ///
 /// First applies graduated thinning, then if the estimated remaining space
@@ -1008,5 +1050,94 @@ mod tests {
             summary.contains('\u{221e}'),
             "summary should contain infinity symbol for unlimited monthly: {summary}"
         );
+    }
+
+    // ── Emergency retention tests ──────────────────────────────────────
+
+    #[test]
+    fn emergency_empty() {
+        let latest = make_snap("20260322", "1400", "home");
+        let result = emergency_retention(&[], &latest, &HashSet::new());
+        assert!(result.keep.is_empty());
+        assert!(result.delete.is_empty());
+    }
+
+    #[test]
+    fn emergency_single_snapshot() {
+        let latest = make_snap("20260322", "1400", "home");
+        let snaps = vec![latest.clone()];
+        let result = emergency_retention(&snaps, &latest, &HashSet::new());
+        assert_eq!(result.keep.len(), 1);
+        assert_eq!(result.keep[0].as_str(), "20260322-1400-home");
+        assert!(result.delete.is_empty());
+    }
+
+    #[test]
+    fn emergency_basic() {
+        // 10 snapshots, 2 pinned (positions 3 and 7), latest is position 10
+        let snaps: Vec<SnapshotName> = (1..=10)
+            .map(|d| make_snap(&format!("202603{d:02}"), "1200", "home"))
+            .collect();
+        let latest = snaps[9].clone(); // 20260310
+        let pinned: HashSet<SnapshotName> =
+            [snaps[2].clone(), snaps[6].clone()].into_iter().collect();
+
+        let result = emergency_retention(&snaps, &latest, &pinned);
+        assert_eq!(result.keep.len(), 3, "keep latest + 2 pinned");
+        assert_eq!(result.delete.len(), 7);
+        assert!(result.keep.contains(&latest));
+        assert!(result.keep.contains(&snaps[2]));
+        assert!(result.keep.contains(&snaps[6]));
+        for (_, reason) in &result.delete {
+            assert_eq!(reason, "emergency: aggressive thinning");
+        }
+    }
+
+    #[test]
+    fn emergency_latest_is_pinned() {
+        let snaps = vec![
+            make_snap("20260320", "1200", "home"),
+            make_snap("20260321", "1200", "home"),
+            make_snap("20260322", "1200", "home"),
+        ];
+        let latest = snaps[2].clone();
+        let pinned: HashSet<SnapshotName> = [snaps[2].clone()].into_iter().collect();
+
+        let result = emergency_retention(&snaps, &latest, &pinned);
+        // latest is also pinned — no double-counting
+        assert_eq!(result.keep.len(), 1, "latest=pinned should not duplicate");
+        assert_eq!(result.delete.len(), 2);
+    }
+
+    #[test]
+    fn emergency_all_pinned() {
+        let snaps = vec![
+            make_snap("20260320", "1200", "home"),
+            make_snap("20260321", "1200", "home"),
+            make_snap("20260322", "1200", "home"),
+        ];
+        let latest = snaps[2].clone();
+        let pinned: HashSet<SnapshotName> = snaps.iter().cloned().collect();
+
+        let result = emergency_retention(&snaps, &latest, &pinned);
+        assert_eq!(result.keep.len(), 3, "all pinned → keep all");
+        assert!(result.delete.is_empty());
+    }
+
+    #[test]
+    fn emergency_no_pins() {
+        let snaps = vec![
+            make_snap("20260318", "1200", "home"),
+            make_snap("20260319", "1200", "home"),
+            make_snap("20260320", "1200", "home"),
+            make_snap("20260321", "1200", "home"),
+            make_snap("20260322", "1200", "home"),
+        ];
+        let latest = snaps[4].clone();
+
+        let result = emergency_retention(&snaps, &latest, &HashSet::new());
+        assert_eq!(result.keep.len(), 1, "no pins → keep latest only");
+        assert_eq!(result.keep[0].as_str(), "20260322-1200-home");
+        assert_eq!(result.delete.len(), 4);
     }
 }

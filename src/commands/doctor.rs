@@ -90,6 +90,36 @@ pub fn run(config: Config, args: DoctorArgs, output_mode: OutputMode) -> anyhow:
         });
     }
 
+    // Space trend warnings: approaching min_free_bytes threshold
+    for root in &config.local_snapshots.roots {
+        let Some(min_free_bs) = root.min_free_bytes else {
+            continue;
+        };
+        let min_free = min_free_bs.bytes();
+        if let Ok(free) = drives::filesystem_free_bytes(&root.path)
+            && free < min_free * 2
+        {
+            warn_count += 1;
+            let free_display = crate::types::ByteSize(free);
+            let threshold_display = crate::types::ByteSize(min_free);
+            infra_checks.push(DoctorCheck {
+                name: format!(
+                    "{}: {} free, threshold {}",
+                    root.path.display(),
+                    free_display,
+                    threshold_display
+                ),
+                status: DoctorCheckStatus::Warn,
+                detail: if free < min_free {
+                    Some("Space pressure active. Emergency retention may trigger on next backup.".to_string())
+                } else {
+                    Some("Approaching space pressure threshold.".to_string())
+                },
+                suggestion: Some("Run `urd emergency` to recover space now.".to_string()),
+            });
+        }
+    }
+
     // ── 3. Data safety (awareness model) ──────────────────────────
     let state_db = if config.general.state_db.exists() {
         StateDb::open(&config.general.state_db).ok()

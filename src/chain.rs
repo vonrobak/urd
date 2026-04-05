@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::path::Path;
 
+use crate::config::Config;
 use crate::error::UrdError;
 use crate::types::SnapshotName;
 
@@ -89,6 +90,35 @@ pub fn find_pinned_snapshots(
     }
 
     pinned
+}
+
+/// Defense-in-depth (ADR-106 layer 3): re-check pin status immediately before
+/// deletion. Returns `true` if the snapshot is pinned and must NOT be deleted.
+///
+/// Called by both the executor's delete path and the emergency command.
+/// Single implementation — one place to update if pin file format evolves.
+///
+/// Fails closed (ADR-107): if the snapshot name can't be parsed, the local dir
+/// can't be resolved, or pin files can't be read, returns `true` (keep snapshot).
+#[must_use]
+pub fn is_pinned_at_delete_time(
+    snapshot_path: &Path,
+    subvolume_name: &str,
+    config: &Config,
+) -> bool {
+    let Some(snap_name_osstr) = snapshot_path.file_name() else {
+        return true; // fail-closed: can't determine name
+    };
+    let snap_name_str = snap_name_osstr.to_string_lossy();
+    let Ok(snap) = SnapshotName::parse(&snap_name_str) else {
+        return true; // fail-closed: can't parse snapshot name
+    };
+    let drive_labels = config.drive_labels();
+    let Some(local_dir) = config.local_snapshot_dir(subvolume_name) else {
+        return true; // fail-closed: can't find local dir
+    };
+    let pinned = find_pinned_snapshots(&local_dir, &drive_labels);
+    pinned.contains(&snap)
 }
 
 /// Write the pin file for a specific drive in a local snapshot directory.
@@ -282,5 +312,86 @@ mod tests {
 
         let result = read_pin_file(dir.path(), "WD-18TB").unwrap().unwrap();
         assert_eq!(result.name.as_str(), "20260322-opptak");
+    }
+
+    // ── is_pinned_at_delete_time tests ─────────────────────────────────
+
+    fn pin_recheck_config(snap_root: &Path) -> Config {
+        let config_str = format!(
+            r#"
+[general]
+state_db = "/tmp/urd-test/urd.db"
+metrics_file = "/tmp/urd-test/backup.prom"
+log_dir = "/tmp/urd-test"
+
+[local_snapshots]
+roots = [
+  {{ path = "{}", subvolumes = ["sv-a"] }}
+]
+
+[defaults]
+snapshot_interval = "1h"
+send_interval = "4h"
+[defaults.local_retention]
+hourly = 24
+[defaults.external_retention]
+daily = 30
+
+[[drives]]
+label = "D1"
+mount_path = "/mnt/d1"
+snapshot_root = ".snapshots"
+role = "offsite"
+
+[[subvolumes]]
+name = "sv-a"
+short_name = "a"
+source = "/data/a"
+"#,
+            snap_root.display()
+        );
+        toml::from_str(&config_str).unwrap()
+    }
+
+    #[test]
+    fn pin_recheck_finds_pinned() {
+        let dir = TempDir::new().unwrap();
+        let local_dir = dir.path().join("sv-a");
+        fs::create_dir(&local_dir).unwrap();
+        fs::write(
+            local_dir.join(".last-external-parent-D1"),
+            "20260322-1200-a",
+        )
+        .unwrap();
+
+        let config = pin_recheck_config(dir.path());
+        let snap_path = local_dir.join("20260322-1200-a");
+        assert!(is_pinned_at_delete_time(&snap_path, "sv-a", &config));
+    }
+
+    #[test]
+    fn pin_recheck_allows_unpinned() {
+        let dir = TempDir::new().unwrap();
+        let local_dir = dir.path().join("sv-a");
+        fs::create_dir(&local_dir).unwrap();
+        fs::write(
+            local_dir.join(".last-external-parent-D1"),
+            "20260322-1200-a",
+        )
+        .unwrap();
+
+        let config = pin_recheck_config(dir.path());
+        // Different snapshot — not pinned
+        let snap_path = local_dir.join("20260321-1200-a");
+        assert!(!is_pinned_at_delete_time(&snap_path, "sv-a", &config));
+    }
+
+    #[test]
+    fn pin_recheck_fails_closed_unknown_subvolume() {
+        let dir = TempDir::new().unwrap();
+        let config = pin_recheck_config(dir.path());
+        // Subvolume "unknown" has no local dir → fail-closed (true = keep)
+        let snap_path = dir.path().join("unknown/20260322-1200-a");
+        assert!(is_pinned_at_delete_time(&snap_path, "unknown", &config));
     }
 }

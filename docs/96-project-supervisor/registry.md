@@ -10,9 +10,9 @@
 | 019 | The Honest Worker (token-aware gate + honest results) | [design](../95-ideas/2026-04-04-design-019-honest-worker.md) | - | [adversary](../99-reports/2026-04-04-review-adversary-019-honest-worker.md) | merged | [#83](https://github.com/vonrobak/urd/pull/83) |
 | 018 | External-only runtime experience | [design](../95-ideas/2026-04-03-design-018-external-only-runtime.md) | - | [adversary](../99-reports/2026-04-05-review-adversary-018-external-only-runtime.md) | merged | [#87](https://github.com/vonrobak/urd/pull/87) |
 | 017 | Thread lineage visualization | [design](../95-ideas/2026-04-03-design-017-thread-lineage-visualization.md) | - | - | - | - |
-| 016 | Emergency space response | [design](../95-ideas/2026-04-03-design-016-emergency-space-response.md) | - | - | - | - |
+| 016 | Emergency space response | [design](../95-ideas/2026-04-03-design-016-emergency-space-response.md) | - | [adversary](../99-reports/2026-04-05-design-review-016-emergency-space-response.md) | - | - |
 | 015 | Change preview in `urd get` | [design](../95-ideas/2026-04-03-design-015-get-change-preview.md) | - | - | - | - |
-| 014 | Skip unchanged subvolumes | [design](../95-ideas/2026-04-03-design-014-skip-unchanged-subvolumes.md) | - | [adversary](../99-reports/2026-04-05-design-review-014-skip-unchanged-subvolumes.md) | - | - |
+| 014 | Skip unchanged subvolumes | [design](../95-ideas/2026-04-03-design-014-skip-unchanged-subvolumes.md) | - | [adversary](../99-reports/2026-04-05-design-review-014-skip-unchanged-subvolumes.md) | merged | [#88](https://github.com/vonrobak/urd/pull/88) |
 | 013 | Btrfs pipeline improvements | [design](../95-ideas/2026-04-03-design-013-btrfs-pipeline-improvements.md) | - | [adversary](../99-reports/2026-04-04-review-adversary-013-btrfs-pipeline-improvements.md) | merged | [#86](https://github.com/vonrobak/urd/pull/86) |
 | 012 | Sentinel drive-gated transient + space monitoring | [design](../95-ideas/2026-04-03-design-012-sentinel-drive-gated-transient.md) | - | - | - | - |
 | 011 | Transient space safety (emergency fix) | [design](../95-ideas/2026-04-03-design-011-transient-space-safety.md) | [steve](../99-reports/2026-04-03-steve-jobs-011-transient-is-a-lie.md) | - | - | - |

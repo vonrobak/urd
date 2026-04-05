@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-04-05
+
 ### Added
 - Compressed send pass-through: auto-detects `--compressed-data` support (btrfs-progs 5.18+) and enables protocol v2 sends — less CPU, preserves compression on destination
 - Post-delete sync: `btrfs subvolume sync` after each retention delete ensures freed space is visible to the space check before the next snapshot
@@ -19,6 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `SkipCategory::NoSnapshotsAvailable` for structured classification of send-blocked skips
 - External-only runtime: subvolumes with `local_snapshots = false` no longer show false "degraded" health or "broken chain" warnings — status table shows em-dash for LOCAL and "ext-only" for THREAD, plan output uses `[EXT]` skip tag
 - Skip unchanged subvolumes: compares BTRFS generation counters to avoid creating identical snapshots for quiet subvolumes — shown as `[SAME]` in plan output with elapsed time, overrideable via `--force-snapshot`
+- `urd emergency` command: guided emergency space recovery — assesses snapshot roots, previews aggressive thinning (keep latest + pinned only), executes with confirmation
+- Automatic emergency pre-flight: backup command detects critically low space (<50% of `min_free_bytes`) and runs emergency retention under the advisory lock before planning
+- Doctor space trend warning: `urd doctor` warns when snapshot roots approach free-space thresholds, suggests `urd emergency`
+- Shared pin re-check helper (`chain::is_pinned_at_delete_time`): single implementation of ADR-106 defense-in-depth layer 3, used by executor and emergency paths
 
 ### Fixed
 - False "all chains broke simultaneously" anomaly when a drive disconnects (total=0 was treated as all-broken)
@@ -257,7 +263,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Defense-in-depth pin file protection for unsent snapshots
 - Per-subvolume error isolation in executor
 
-[Unreleased]: https://github.com/vonrobak/urd/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/vonrobak/urd/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/vonrobak/urd/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/vonrobak/urd/compare/v0.9.1...v0.10.0
 [0.9.1]: https://github.com/vonrobak/urd/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/vonrobak/urd/compare/v0.8.2...v0.9.0
