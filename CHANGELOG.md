@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-04-05
+
 ### Fixed
 - Transient snapshots accumulating for absent drives — retention now only protects pins from mounted drives, preventing space exhaustion on constrained filesystems
 - Sentinel "all N chains broke" phrasing — detection now reports actual broken count and fires on 2+ broken chains (delta-based), not only when all chains break
