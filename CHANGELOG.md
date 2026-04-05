@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-04-05
+
 ### Added
 - Findings-first verify: `urd verify` now shows problems first and collapses OK checks into a summary; `--detail` restores verbose output
 - Doctor trust gap fix: `urd doctor` no longer says "All clear" when degraded subvolumes exist — shows "N subvolumes degraded. Data is safe — drives are absent."
