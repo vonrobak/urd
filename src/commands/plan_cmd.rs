@@ -18,6 +18,7 @@ pub fn run(config: Config, args: PlanArgs, mode: OutputMode) -> anyhow::Result<(
         local_only: args.local_only,
         external_only: args.external_only,
         skip_intervals: !args.auto,
+        force_snapshot: args.force_snapshot,
     };
 
     let state_db = StateDb::open(&config.general.state_db).ok();

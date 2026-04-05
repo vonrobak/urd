@@ -595,13 +595,15 @@ pub enum SkipCategory {
     NoSnapshotsAvailable,
     /// External-only subvolume — local snapshots are transient, sends happen on next backup.
     ExternalOnly,
+    /// Subvolume has not changed since the last snapshot (same BTRFS generation).
+    Unchanged,
     Other,
 }
 
 impl SkipCategory {
     /// Classify a skip reason string into a category.
     ///
-    /// Matches against the 16 known patterns from plan.rs. Unknown patterns
+    /// Matches against the 17 known patterns from plan.rs. Unknown patterns
     /// fall to `Other`. A completeness test in the test module ensures all
     /// known patterns classify correctly.
     #[must_use]
@@ -627,6 +629,8 @@ impl SkipCategory {
             Self::NoSnapshotsAvailable
         } else if reason.starts_with("external-only") {
             Self::ExternalOnly
+        } else if reason.starts_with("unchanged") {
+            Self::Unchanged
         } else {
             Self::Other
         }
@@ -1418,10 +1422,10 @@ mod tests {
         );
     }
 
-    /// Completeness test: all 16 known plan.rs skip patterns classify to their
+    /// Completeness test: all 17 known plan.rs skip patterns classify to their
     /// expected category. Prevents silent regressions when new patterns are added.
     #[test]
-    fn classify_all_16_patterns() {
+    fn classify_all_17_patterns() {
         let patterns = vec![
             ("disabled", SkipCategory::Disabled),
             ("send disabled", SkipCategory::LocalOnly),
@@ -1471,6 +1475,10 @@ mod tests {
             (
                 "send to WD-18TB skipped: calibrated size ~4.5 GB exceeds WD-18TB available",
                 SkipCategory::SpaceExceeded,
+            ),
+            (
+                "unchanged \u{2014} no changes since last snapshot (21h ago)",
+                SkipCategory::Unchanged,
             ),
         ];
 
