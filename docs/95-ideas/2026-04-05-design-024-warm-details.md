@@ -200,7 +200,7 @@ produce negative durations.
 **New:**
 ```rust
 "UNPROTECTED" => format!(
-    "{} absent {} — copies aging",
+    "{} absent {} — protection aging",
     label.bold(), age_str
 ),
 ```
@@ -214,11 +214,11 @@ change needed there.
 
 The `"AT RISK"` case says "consider connecting" which is already appropriate.
 
-"Copies aging" conveys drift without urgency. "Degrading" implies active damage.
+"Protection aging" conveys drift without urgency. "Degrading" implies active damage.
 The user can't act on an absent drive — the vocabulary should match the action space.
 
 **Test strategy:**
-- Test escalated text for UNPROTECTED → contains "copies aging"
+- Test escalated text for UNPROTECTED → contains "protection aging"
 - Test escalated text for AT RISK → "consider connecting" (unchanged)
 - Test PROTECTED fallback → just age shown (unchanged)
 
@@ -440,3 +440,49 @@ already generic enough.
 Leaning toward **Option A (`ok`)** — the TOKEN column already has `recorded`, `new`,
 `MISMATCH`, `MISSING` as descriptive states. The verified state just means "nothing wrong"
 which `ok` conveys. Plus it aligns with the `ok`/`warn`/`fail` vocabulary used elsewhere.
+
+## Resolved Decisions
+
+Resolved during `/grill-me` session (2026-04-05). These decisions are authoritative for
+`/prepare`.
+
+### R1: `last_run_age_secs` placement → `StatusOutput`
+
+Add `last_run_age_secs: Option<i64>` to `StatusOutput`, computed by the status command
+handler. Mirrors the existing pattern in `DefaultStatusOutput`. Additive JSON field —
+backward-compatible. The stable `started_at` field remains for consumers who want absolute
+time; the age field is convenience.
+
+### R2: Health reason dedup → string-based `BTreeSet`
+
+String-based dedup on raw reason strings is correct and sufficient. `awareness.rs` computes
+all assessments from the same `now` timestamp, so identical drives produce identical age
+strings across assessments. No need for a more complex dedup key.
+
+### R3: Vocabulary → "protection aging"
+
+Replace "protection degrading" with "protection aging" for UNPROTECTED absent drives.
+Stays in the same semantic domain as the current text, swaps the alarming verb for one
+that conveys drift without urgency. "Copies aging" was rejected — "copies" is not part of
+Urd's established vocabulary.
+
+### R4: TOKEN column → `ok` / `MISMATCH` / `MISSING` / `-`
+
+Replace Unicode symbols with ASCII: `✓` → `ok`, `✗ mismatch` → `MISMATCH`,
+`✗ missing` → `MISSING`, `—` → `-`. Lowercase for normal states, UPPERCASE for anomalies
+— the case contrast provides strong visual anomaly detection. `ok` is preferred over
+`verified` (shorter, doesn't widen every row for the normal case).
+
+### R5: Summary truncation threshold → 3 named drives
+
+Name up to 3 absent drives in the summary line, then "and N more". Threshold of 3 fits
+~80 columns. Urd should scale to diverse drive setups (network mounts, cloud targets,
+many drives) — building for this future is intentional. The important characteristic is
+identifying primary external and offsite targets per subvolume.
+
+### R6: Open questions Q1–Q3 resolved
+
+- **Q1 (summary line names vs counts):** Option A with truncation — name drives, cap at 3.
+- **Q2 (format_subvolume_chooser genericity):** Option A — specific signature
+  `(command: &str, names: &[&str])` is already generic enough for reuse.
+- **Q3 (TOKEN column text):** Option A — `ok`.

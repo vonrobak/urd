@@ -137,14 +137,26 @@ fn render_summary_line(data: &StatusOutput, out: &mut String) {
             .iter()
             .filter(|a| a.health == "degraded")
             .count();
-        // Pick the first reason from the worst non-healthy subvolume
-        let first_reason = data
+        // Collect all unique health reasons across degraded/blocked assessments.
+        // awareness.rs guarantees health_reasons is non-empty for non-healthy
+        // assessments; if violated, reasons_part is safely empty.
+        let unique_reasons: Vec<&str> = data
             .assessments
             .iter()
-            .find(|a| a.health != "healthy")
-            .and_then(|a| a.health_reasons.first())
-            .map(|r| format!(" \u{2014} {r}"))
-            .unwrap_or_default();
+            .filter(|a| a.health != "healthy")
+            .flat_map(|a| a.health_reasons.iter().map(String::as_str))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let reasons_part = if unique_reasons.is_empty() {
+            String::new()
+        } else if unique_reasons.len() <= 3 {
+            format!(" \u{2014} {}", unique_reasons.join(", "))
+        } else {
+            let shown = &unique_reasons[..3];
+            let remaining = unique_reasons.len() - 3;
+            format!(" \u{2014} {}, and {remaining} more", shown.join(", "))
+        };
         let mut parts = Vec::new();
         if blocked_count > 0 {
             parts.push(format!("{blocked_count} blocked"));
@@ -152,7 +164,7 @@ fn render_summary_line(data: &StatusOutput, out: &mut String) {
         if degraded_count > 0 {
             parts.push(format!("{degraded_count} degraded"));
         }
-        format!(" {}{first_reason}.", parts.join(", "))
+        format!(" {}{reasons_part}.", parts.join(", "))
     } else {
         String::new()
     };
@@ -258,7 +270,7 @@ fn render_subvolume_table(data: &StatusOutput, out: &mut String) {
 
         // Thread health (interactive rendering — Display impl feeds daemon JSON, do not change it)
         let thread = if assessment.external_only {
-            "ext-only".dimmed().to_string()
+            "drive-only".dimmed().to_string()
         } else {
             data.chain_health
                 .iter()
@@ -304,7 +316,9 @@ fn format_count_with_age(count: usize, age_secs: Option<i64>) -> String {
 
 /// Humanize seconds into a compact duration string.
 fn humanize_duration(secs: i64) -> String {
-    if secs < 60 {
+    if secs <= 0 {
+        "<1s".to_string()
+    } else if secs < 60 {
         format!("{secs}s")
     } else if secs < 3600 {
         format!("{}m", secs / 60)
@@ -440,10 +454,14 @@ fn render_last_run(data: &StatusOutput, out: &mut String) {
                 .as_ref()
                 .map(|d| format!(", {d}"))
                 .unwrap_or_default();
+            let time_str = data
+                .last_run_age_secs
+                .map(|secs| format!("{} ago", humanize_duration(secs)))
+                .unwrap_or_else(|| run.started_at.clone());
             writeln!(
                 out,
                 "Last backup: {} ({}{}) [#{}]",
-                run.started_at, result_colored, duration_str, run.id,
+                time_str, result_colored, duration_str, run.id,
             )
             .ok();
         }
@@ -2720,7 +2738,7 @@ fn escalated_staleness_text(
 
     Some(match worst_status {
         "UNPROTECTED" => format!(
-            "{} absent {} — protection degrading",
+            "{} absent {} — protection aging",
             label.bold(),
             age_str
         ),
@@ -2830,7 +2848,7 @@ fn render_drives_list_interactive(data: &DrivesListOutput) -> String {
     // Header.
     writeln!(
         out,
-        "{:<label_w$}   {:<status_w$}   {:<12}   {:>8}   ROLE",
+        "{:<label_w$}   {:<status_w$}   {:<10}   {:>8}   ROLE",
         "DRIVE", "STATUS", "TOKEN", "FREE",
     )
     .ok();
@@ -2847,7 +2865,7 @@ fn render_drives_list_interactive(data: &DrivesListOutput) -> String {
 
         writeln!(
             out,
-            "{:<label_w$}   {:<status_w$}   {:<12}   {:>8}   {}",
+            "{:<label_w$}   {:<status_w$}   {:<10}   {:>8}   {}",
             entry.label, status_colored, token_colored, free_str, role_str,
         )
         .ok();
@@ -2886,12 +2904,12 @@ fn color_drive_status(status: &DriveStatus, text: &str) -> String {
 
 fn format_token_state(state: &TokenState) -> String {
     match state {
-        TokenState::Verified => "\u{2713}".to_string(),
+        TokenState::Verified => "ok".to_string(),
         TokenState::New => "new".to_string(),
-        TokenState::Mismatch => "\u{2717} mismatch".to_string(),
-        TokenState::ExpectedButMissing => "\u{2717} missing".to_string(),
+        TokenState::Mismatch => "MISMATCH".to_string(),
+        TokenState::ExpectedButMissing => "MISSING".to_string(),
         TokenState::Recorded => "recorded".to_string(),
-        TokenState::Unknown => "\u{2014}".to_string(),
+        TokenState::Unknown => "-".to_string(),
     }
 }
 
@@ -2958,6 +2976,23 @@ fn render_drives_adopt_interactive(data: &DriveAdoptOutput) -> String {
             )
             .ok();
         }
+    }
+    out
+}
+
+// ── Guided error messages ───────────────────────────────────────────────
+
+/// Format a subvolume chooser message for commands that require a subvolume argument.
+/// Names are sorted alphabetically for easy scanning.
+#[must_use]
+pub fn format_subvolume_chooser(command: &str, names: &[&str]) -> String {
+    let mut out = format!(
+        "Usage: {command} <subvolume> or {command} --all\n\nAvailable subvolumes:\n"
+    );
+    let mut sorted = names.to_vec();
+    sorted.sort();
+    for name in &sorted {
+        writeln!(out, "  {name}").ok();
     }
     out
 }
@@ -3060,6 +3095,7 @@ mod tests {
                 result: "success".to_string(),
                 duration: Some("1m 30s".to_string()),
             }),
+            last_run_age_secs: Some(36000), // 10h
             total_pins: 3,
             redundancy_advisories: vec![],
             advice: vec![],
@@ -3161,12 +3197,25 @@ mod tests {
     }
 
     #[test]
-    fn interactive_contains_last_run() {
+    fn interactive_contains_last_run_relative_time() {
         colored::control::set_override(false);
         let output = render_status(&test_status_output(), OutputMode::Interactive);
         assert!(output.contains("#42"), "missing run ID");
         assert!(output.contains("success"), "missing run result");
         assert!(output.contains("1m 30s"), "missing duration");
+        assert!(output.contains("10h ago"), "should show relative time, got: {output}");
+    }
+
+    #[test]
+    fn interactive_last_run_falls_back_to_timestamp_without_age() {
+        colored::control::set_override(false);
+        let mut data = test_status_output();
+        data.last_run_age_secs = None;
+        let output = render_status(&data, OutputMode::Interactive);
+        assert!(
+            output.contains("2026-03-24T02:00:00"),
+            "should fall back to ISO timestamp when age is None"
+        );
     }
 
     #[test]
@@ -3195,6 +3244,7 @@ mod tests {
             chain_health: vec![],
             drives: vec![],
             last_run: None,
+            last_run_age_secs: None,
             total_pins: 0,
             redundancy_advisories: vec![],
             advice: vec![],
@@ -3220,6 +3270,10 @@ mod tests {
         assert!(
             parsed.get("chain_health").is_some(),
             "missing chain_health key"
+        );
+        assert!(
+            parsed.get("last_run_age_secs").is_some(),
+            "missing last_run_age_secs key"
         );
     }
 
@@ -3264,6 +3318,7 @@ mod tests {
             chain_health: vec![],
             drives: vec![],
             last_run: None,
+            last_run_age_secs: None,
             total_pins: 0,
             redundancy_advisories: vec![],
             advice: vec![],
@@ -3307,8 +3362,8 @@ mod tests {
         let output = render_status(&data, OutputMode::Interactive);
         let home_line = output.lines().find(|l| l.contains("htpc-home")).unwrap();
         assert!(
-            home_line.contains("ext-only"),
-            "external_only THREAD should show 'ext-only', got: {home_line}"
+            home_line.contains("drive-only"),
+            "external_only THREAD should show 'drive-only', got: {home_line}"
         );
     }
 
@@ -5136,6 +5191,46 @@ mod tests {
     }
 
     #[test]
+    fn summary_line_shows_all_health_reasons() {
+        colored::control::set_override(false);
+        let mut data = test_status_output();
+        data.assessments[0].health = "degraded".to_string();
+        data.assessments[0].health_reasons = vec!["WD-18TB away 8d".to_string()];
+        data.assessments[1].health = "degraded".to_string();
+        data.assessments[1].health_reasons = vec!["2TB-backup away 2d".to_string()];
+        let output = render_status(&data, OutputMode::Interactive);
+        assert!(
+            output.contains("WD-18TB away 8d"),
+            "missing first drive reason in summary"
+        );
+        assert!(
+            output.contains("2TB-backup away 2d"),
+            "missing second drive reason in summary"
+        );
+    }
+
+    #[test]
+    fn summary_line_truncates_at_three_reasons() {
+        colored::control::set_override(false);
+        let mut data = test_status_output();
+        // Clear second assessment's health to isolate the test
+        data.assessments[1].health = "healthy".to_string();
+        data.assessments[1].health_reasons = vec![];
+        data.assessments[0].health = "degraded".to_string();
+        data.assessments[0].health_reasons = vec![
+            "drive-A away 1d".to_string(),
+            "drive-B away 2d".to_string(),
+            "drive-C away 3d".to_string(),
+            "drive-D away 4d".to_string(),
+        ];
+        let output = render_status(&data, OutputMode::Interactive);
+        assert!(
+            output.contains("and 1 more"),
+            "should truncate at 3 reasons, got: {output}"
+        );
+    }
+
+    #[test]
     fn summary_line_differentiates_exposed_and_waning() {
         colored::control::set_override(false);
         let mut data = test_status_output();
@@ -6414,7 +6509,7 @@ mod tests {
         assert!(text.contains("WD-18TB1"), "missing label: {text}");
         assert!(text.contains("absent"), "should use 'absent': {text}");
         assert!(
-            text.contains("protection degrading"),
+            text.contains("protection aging"),
             "missing escalation: {text}"
         );
         assert!(text.contains("30d"), "missing age: {text}");
@@ -6960,6 +7055,18 @@ mod tests {
     }
 
     #[test]
+    fn drives_list_token_column_uses_ascii() {
+        colored::control::set_override(false);
+        let output = render_drives_list(&test_drives_list(), OutputMode::Interactive);
+        assert!(output.contains("ok"), "Verified token should show 'ok': {output}");
+        // Token column should not contain Unicode check/cross marks
+        assert!(
+            !output.contains('\u{2713}') && !output.contains('\u{2717}'),
+            "token column should not contain Unicode check/cross marks: {output}"
+        );
+    }
+
+    #[test]
     fn drives_list_daemon_valid_json() {
         let output = render_drives_list(&test_drives_list(), OutputMode::Daemon);
         let parsed: serde_json::Value =
@@ -7163,5 +7270,35 @@ mod tests {
             output.contains("Still below threshold"),
             "should show still critical: {output}"
         );
+    }
+
+    // ── Subvolume chooser tests ────────────────────────────────────────
+
+    #[test]
+    fn subvolume_chooser_contains_usage_and_names() {
+        let output = format_subvolume_chooser("urd retention-preview", &["docs", "pics", "home"]);
+        assert!(output.contains("Usage: urd retention-preview <subvolume>"));
+        assert!(output.contains("--all"));
+        assert!(output.contains("Available subvolumes:"));
+        // Should be sorted alphabetically
+        let docs_pos = output.find("docs").unwrap();
+        let home_pos = output.find("home").unwrap();
+        let pics_pos = output.find("pics").unwrap();
+        assert!(docs_pos < home_pos && home_pos < pics_pos, "names should be sorted");
+    }
+
+    #[test]
+    fn subvolume_chooser_single_name() {
+        let output = format_subvolume_chooser("urd history", &["only-one"]);
+        assert!(output.contains("only-one"));
+        assert!(output.contains("Usage: urd history"));
+    }
+
+    // ── humanize_duration tests ────────────────────────────────────────
+
+    #[test]
+    fn humanize_duration_zero_returns_less_than_one() {
+        assert_eq!(humanize_duration(0), "<1s");
+        assert_eq!(humanize_duration(-1), "<1s");
     }
 }

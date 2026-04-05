@@ -37,12 +37,11 @@ from the first v0.11.0 nightly (run #29).
 The Encounter. The designs must be informed by real nightly logs, real doctor output,
 real sentinel behavior.
 
-### Phase D-0: Presentation Polish (023, 024)
+### Phase D-0: Presentation Polish (023 ✓, 024)
 
 ```
-023 — The Honest Diagnostic            (~1-2 sessions)
+023 — The Honest Diagnostic  ✓         (1 session, PR #93)
     Findings-first verify, doctor trust coherence, collapsed noise
-    Design: docs/95-ideas/2026-04-05-design-023-honest-diagnostic.md
 
 024 — The Warm Details                  (~1-2 sessions)
     Relative timestamps, vocabulary, alignment, error guidance

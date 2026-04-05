@@ -5,8 +5,8 @@
 
 | UPI | Title | Design | Design Review | Adversary Review | PR | GH# |
 |-----|-------|--------|---------------|------------------|----|-----|
-| 024 | The Warm Details (timestamps, vocabulary, alignment, error guidance) | [design](../95-ideas/2026-04-05-design-024-warm-details.md) | - | - | - | - |
-| 023 | The Honest Diagnostic (findings-first verify + doctor trust coherence) | [design](../95-ideas/2026-04-05-design-023-honest-diagnostic.md) | - | [adversary](../99-reports/2026-04-05-review-adversary-023-honest-diagnostic.md) | - | - |
+| 024 | The Warm Details (timestamps, vocabulary, alignment, error guidance) | [design](../95-ideas/2026-04-05-design-024-warm-details.md) | - | [adversary](../99-reports/2026-04-05-design-review-024-warm-details.md) | - | - |
+| 023 | The Honest Diagnostic (findings-first verify + doctor trust coherence) | [design](../95-ideas/2026-04-05-design-023-honest-diagnostic.md) | - | [adversary](../99-reports/2026-04-05-review-adversary-023-honest-diagnostic.md) | merged | [#93](https://github.com/vonrobak/urd/pull/93) |
 | 022 | The Honest Nightly (transient fix + sentinel guard + text fix + config scope) | [design](../95-ideas/2026-04-05-design-022-honest-nightly.md) | [review](../99-reports/2026-04-05-design-review-022-honest-nightly.md) | - | merged | [#91](https://github.com/vonrobak/urd/pull/91) |
 | 021 | The Living Daemon (sentinel config reload + anomaly fix) | [design](../95-ideas/2026-04-04-design-021-living-daemon.md) | - | [adversary](../99-reports/2026-04-04-review-adversary-021-living-daemon.md) | merged | [#84](https://github.com/vonrobak/urd/pull/84) |
 | 020 | The Doctor Knows (context-aware suggestions) | [design](../95-ideas/2026-04-04-design-020-doctor-knows.md) | - | [adversary](../99-reports/2026-04-04-review-adversary-020-doctor-knows.md) | merged | [#85](https://github.com/vonrobak/urd/pull/85) |

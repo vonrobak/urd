@@ -26,10 +26,9 @@ pub fn run(config: Config, args: RetentionPreviewArgs, mode: OutputMode) -> anyh
             .filter(|sv| sv.enabled)
             .map(|sv| sv.name.as_str())
             .collect();
-        anyhow::bail!(
-            "specify a subvolume or use --all. Configured subvolumes: {}",
-            names.join(", ")
-        );
+        let message = voice::format_subvolume_chooser("urd retention-preview", &names);
+        println!("{message}");
+        return Ok(());
     };
 
     // Optionally load calibrated sizes from state DB
