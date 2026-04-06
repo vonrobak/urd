@@ -15,9 +15,18 @@ Thumbs.db
 # Test artifacts
 /tmp-test-*/
 
-# Private documentation (contains system-specific details)
+# Claude Code (CLAUDE.md stays tracked — commands and settings are local)
+.claude/
+
+# Internal project documentation (kept locally, not published)
+# ADRs and guides remain tracked — they signal engineering rigor
+docs/00-foundation/source-documentation/
+docs/00-foundation/decisions/ADR-relating-to-bash-script/
 docs/90-archive/
+docs/95-ideas/
+docs/96-project-supervisor/
 docs/97-plans/
-!docs/97-plans/README.md
 docs/98-journals/
-!docs/98-journals/README.md
+docs/99-reports/
+docs/contributing-internal.md
+scripts/

@@ -32,7 +32,7 @@ and needs rework — see ADR-110 maturity model.
 
 Read `docs/96-project-supervisor/status.md` first — short current-state document (~50 lines).
 Follow links to `roadmap.md` for priorities and feature tracking.
-See `CONTRIBUTING.md` for documentation structure and conventions.
+See `docs/contributing-internal.md` for documentation structure and conventions.
 
 ## Architecture
 
@@ -297,4 +297,4 @@ systematic-debugging → build → /check → /commit-push-pr → /session-close
 See `docs/96-project-supervisor/status.md` for current state and what to build next.
 See `docs/96-project-supervisor/roadmap.md` for strategy, sequencing, and horizon.
 See `docs/96-project-supervisor/registry.md` for UPI lookup (work items → artifacts).
-See `CONTRIBUTING.md` for documentation structure, conventions, and privacy rules.
+See `docs/contributing-internal.md` for documentation structure, conventions, and privacy rules.
