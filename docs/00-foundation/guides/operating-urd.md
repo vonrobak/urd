@@ -53,6 +53,67 @@ automatically — the service unit runs `%h/.cargo/bin/urd backup` each time, so
 always picks up whatever binary is at that path. No `daemon-reload` needed for binary
 updates (only for unit file changes).
 
+## Sudoers Configuration
+
+Urd runs as a regular user and calls `sudo btrfs` for privileged filesystem operations.
+A scoped sudoers file grants exactly the permissions needed — nothing more.
+
+Create `/etc/sudoers.d/urd` (requires root):
+
+```bash
+sudo visudo -f /etc/sudoers.d/urd
+```
+
+Paste the following template, replacing `<user>` with your username, `<btrfs>` with the
+path to your btrfs binary (`which btrfs`), and adjusting paths to match your layout:
+
+```sudoers
+# Urd — scoped btrfs permissions for automated backups
+# Security principle: scope snapshot creation and deletion to snapshot directories.
+# send/receive need broad paths (source subvolumes and external drives vary).
+# show/sync are read-only diagnostics.
+
+# Snapshot creation — scoped to snapshot directories
+# Add one line per source → snapshot-root mapping in your config.
+<user> ALL=(root) NOPASSWD: <btrfs> subvolume snapshot -r /path/to/source /path/to/snapshot-root/*
+
+# Snapshot deletion — scoped to snapshot directories only
+# Add one line per snapshot root (local and each external drive).
+<user> ALL=(root) NOPASSWD: <btrfs> subvolume delete /path/to/snapshot-root/*
+<user> ALL=(root) NOPASSWD: <btrfs> subvolume delete /run/media/<user>/drive-label/.snapshots/*
+
+# Send/receive — broad paths (source subvolumes and external drives vary)
+<user> ALL=(root) NOPASSWD: <btrfs> send *
+<user> ALL=(root) NOPASSWD: <btrfs> receive *
+
+# Read-only commands — space estimation, diagnostics, sync after delete
+<user> ALL=(root) NOPASSWD: <btrfs> subvolume show *
+<user> ALL=(root) NOPASSWD: <btrfs> filesystem show *
+<user> ALL=(root) NOPASSWD: <btrfs> subvolume sync *
+```
+
+Verify it works:
+
+```bash
+sudo btrfs subvolume show /    # should succeed without a password prompt
+```
+
+**Why scope snapshot and delete?** A wildcard like `btrfs subvolume delete *` would let
+any process running as your user delete any subvolume on the system — not just snapshots.
+Scoping to snapshot directories means a bug or misuse can only affect snapshots, not your
+live data. Send and receive need broad paths because source subvolumes and external drive
+mount points vary, but these operations are non-destructive (send is read-only; receive
+creates new subvolumes).
+
+**How many lines do you need?** One snapshot-creation line per source → snapshot-root
+pair in your config. One deletion line per snapshot directory (each local snapshot root
+plus each external drive's snapshot directory). The read-only commands and send/receive
+are one line each.
+
+> **Path note:** The btrfs binary path varies by distribution. Common locations:
+> `/usr/sbin/btrfs` (Fedora, RHEL), `/usr/bin/btrfs` (Arch, Ubuntu).
+> Check with `which btrfs`.
+
 ## Initial Setup
 
 After the first install, configure and validate:

@@ -2,39 +2,39 @@
 
 **BTRFS Time Machine for Linux**
 
-Urd automates BTRFS snapshots, incremental sends to external drives, and graduated
-retention — so your data is safe without you thinking about it.
+Urd automates BTRFS snapshot management, incremental sends to external drives, and
+graduated retention — so your data is safe without you thinking about it.
 
 Named after [Urðr](https://en.wikipedia.org/wiki/Ur%C3%B0r), the Norse norn who tends
 the Well of Fate and knows all that has passed.
 
-> **Status:** Under active development. Running in production as the sole backup system on
-> the author's machine since March 2026. 521+ tests. The core backup pipeline is stable;
-> the Sentinel daemon (passive monitoring) just shipped. Active mode and config redesign
-> are next.
+> **Status:** Early development — experimental. The core backup pipeline is extensively
+> tested (959 tests) and running in production as the sole backup system for the author.
+> In future releases, Urd will be made more flexible and accessible for users with
+> different setups.
 
 ## Why Urd?
 
-BTRFS gives you instant, free snapshots and incremental sends. The missing piece is
-automation that's smart enough to manage the lifecycle: when to snapshot, what to send,
-what to keep, and what to prune — without losing data.
+BTRFS snapshots are fast and space-efficient, and incremental sends make off-site backups
+practical. What's missing is automation that manages the full lifecycle: when to snapshot,
+what to send, what to keep, and what to prune — without risking data loss.
 
 Urd fills that gap:
 
-- **Incremental-first.** Always attempts `btrfs send -p` with a tracked parent. Full sends
-  only when the chain is genuinely broken.
+- **Incremental sends.** Always attempts `btrfs send -p` with a tracked parent snapshot.
+  Falls back to a full send only when the chain is genuinely broken.
 - **Graduated retention.** Time Machine-style thinning — recent snapshots kept densely,
-  older ones progressively pruned. Pinned chain parents are never deleted.
+  older ones progressively pruned. Chain-critical snapshots (pinned parents) are never
+  deleted, regardless of retention policy.
 - **Drive-aware.** Independent incremental chains per external drive. Plug in a drive,
-  run a backup, rotate offsite. Urd tracks each drive's history separately.
-- **Space-aware.** Pre-send space estimation prevents multi-hour sends from failing at 99%.
-  Local snapshot guard prevents filling your boot drive.
+  run a backup, rotate offsite. Urd tracks each drive's send history separately.
+- **Space-aware.** Pre-send size estimation prevents multi-hour transfers from failing
+  at 99% due to insufficient space on the target drive.
 - **Plan before execute.** `urd plan` shows exactly what would happen. `urd backup --dry-run`
-  does everything except touch the filesystem.
-- **Promise-based.** Assign protection levels to subvolumes. Urd derives retention, intervals,
-  and drive requirements — then tells you whether promises are being kept.
-- **Observable.** Prometheus metrics, SQLite history, structured JSON output, heartbeat file
-  for external monitoring.
+  runs the full pipeline without touching the filesystem.
+- **Promise-based monitoring.** Assign protection levels to subvolumes. Urd derives
+  retention schedules, send intervals, and drive requirements — then tells you whether
+  those promises are being kept.
 
 ## Quick look
 
@@ -54,29 +54,21 @@ guarded    containers     PROTECTED   4      —           —
 Drives: external-1 (4.4 TB free), external-2 (1.1 TB free)
 ```
 
-```
-$ urd sentinel status
-
-SENTINEL — watching
-  Uptime     7h 23m (PID 12345)
-  Last check 4m ago, next in 11m
-  Drives     external-1, external-2
-  Promises   8 PROTECTED
-```
-
 ## Commands
 
 | Command | What it does |
 |---------|-------------|
+| `urd status` | Promise states, snapshot counts, drive health |
 | `urd plan` | Preview planned operations without executing |
 | `urd backup` | Snapshot, send, and prune — the full pipeline |
-| `urd status` | Promise states, snapshot counts, drive health |
 | `urd get FILE --at DATE` | Restore a file from a past snapshot |
-| `urd sentinel run` | Start the passive monitoring daemon |
-| `urd sentinel status` | Check if the Sentinel is running and what it sees |
-| `urd history` | Browse backup history from SQLite |
 | `urd verify` | Check incremental chain integrity and pin health |
-| `urd calibrate` | Measure snapshot sizes for space estimation |
+| `urd doctor` | Run health diagnostics |
+| `urd sentinel run` | Start the passive monitoring daemon |
+| `urd drives` | Manage and inspect backup drives |
+| `urd history` | Browse backup history |
+| `urd calibrate` | Measure snapshot sizes for send estimates |
+| `urd emergency` | Guided emergency space recovery |
 | `urd init` | Initialize state database and validate readiness |
 
 ## How it works
@@ -88,31 +80,39 @@ config  ->  plan (pure)  ->  execute (I/O)  ->  record (SQLite)
 ```
 
 1. **Plan.** Reads config and filesystem state. Determines which subvolumes need snapshots,
-   which need sends (incremental or full), and which old snapshots to prune. Pure function —
-   no side effects.
+   which need sends (incremental or full), and which old snapshots to prune. The planner is
+   a pure function — no side effects.
 2. **Execute.** Runs the plan: create read-only snapshots, pipe `btrfs send | btrfs receive`
-   to external drives, clean up retention. Individual subvolume failures never abort the run.
-3. **Record.** Results stored in SQLite. Promise states assessed. Heartbeat written.
-4. **Watch.** The Sentinel daemon (optional) polls for drive changes and heartbeat updates,
-   reassesses promises, and notifies when something needs attention.
+   to external drives, apply retention policy. Individual subvolume failures never abort the
+   run — other subvolumes continue.
+3. **Record.** Results stored in SQLite. Promise states reassessed. Heartbeat written for
+   external monitoring.
+4. **Watch.** The Sentinel daemon (optional) monitors for drive changes and overdue backups,
+   reassesses promise states, and surfaces problems before they become emergencies.
 
 ### Retention
 
 Local snapshots use graduated retention:
-- Last 14 days: keep all
-- Weeks 3-8: keep one per ISO week
-- Months 3-5: keep one per month
+- Last 14 days: keep all daily snapshots
+- Weeks 3–8: keep one per ISO week
+- Months 3–5: keep one per month
 
-External snapshots use count-based retention. Pinned parents (incremental chain anchors)
-are **never** deleted, regardless of age or policy.
+External snapshots use count-based retention. Pinned parent snapshots (incremental chain
+anchors) are **never** deleted, regardless of age or policy — this is enforced by three
+independent protection layers.
 
-### Safety
+### Safety principles
 
-- Backups fail open; deletions fail closed
-- Three independent layers protect pinned snapshots from accidental deletion
-- UUID fingerprinting detects drive swaps (won't blindly send to a relabeled drive)
-- Failed sends clean up partial snapshots at the destination
-- SQLite failures never prevent backups
+- **Backups fail open; deletions fail closed.** Proceed on uncertainty, never delete what
+  can't be confirmed safe.
+- **Three-layer pin protection.** Unsent-parent tracking, planner exclusion, and executor
+  re-verification all independently prevent deletion of chain-critical snapshots.
+- **UUID fingerprinting.** Detects drive identity by filesystem UUID — won't send to a
+  relabeled or swapped drive.
+- **Partial send cleanup.** Failed sends automatically remove incomplete snapshots at the
+  destination.
+- **SQLite is history, not truth.** The filesystem (snapshot directories, pin files) is
+  authoritative. Database failures never prevent backups.
 
 ## Configuration
 
@@ -127,14 +127,14 @@ run_frequency = "daily"
 name = "documents"
 short_name = "docs"
 source = "/mnt/your-filesystem/documents"
-protection_level = "resilient"     # Urd derives retention + intervals
+protection_level = "resilient"
 drives = ["external-1", "external-2"]
 
 [[subvolumes]]
 name = "multimedia"
 short_name = "multimedia"
 source = "/mnt/your-filesystem/multimedia"
-protection_level = "guarded"       # Local snapshots only
+protection_level = "guarded"
 
 [[drives]]
 label = "external-1"
@@ -146,30 +146,31 @@ See [`config/urd.toml.example`](config/urd.toml.example) for a complete referenc
 
 ## Requirements
 
-- Linux with BTRFS
-- `btrfs-progs`
-- Sudoers entries for `btrfs` subcommands (Urd runs as a regular user, calls `sudo btrfs`)
-- systemd (for timer/service integration)
+- Linux with BTRFS filesystem
+- `btrfs-progs` installed
+- Scoped sudoers entries for `btrfs` subcommands — see the
+  [sudoers template](docs/00-foundation/guides/operating-urd.md#sudoers-configuration)
+  (Urd runs as a regular user, invokes `sudo btrfs` for privileged operations)
+- systemd (optional, for timer and Sentinel daemon integration)
 
 ## Building
 
 ```bash
 cargo build --release
-# Binary at target/release/urd
+cargo install --path .    # Install to ~/.cargo/bin/urd
 
-cargo test              # 521+ unit tests
+cargo test                # 959 unit tests
 cargo clippy -- -D warnings
 ```
 
-## Project status
+## Architecture
 
-Urd is a personal project built for real use. It runs nightly via systemd timer and the
-Sentinel daemon monitors between runs. The architecture is designed carefully — pure-function
-core, defense-in-depth safety, adversary-reviewed at every stage — but it's built for one
-machine so far.
+Urd's architecture is documented through ADRs (Architecture Decision Records) in
+[`docs/00-foundation/decisions/`](docs/00-foundation/decisions/). Key decisions:
 
-If you're interested in BTRFS automation, feel free to explore. Contributions and
-conversations welcome.
+- **[ADR-100](docs/00-foundation/decisions/2026-03-24-ADR-100-planner-executor-separation.md):** Planner/executor separation — pure planning, isolated execution
+- **[ADR-106](docs/00-foundation/decisions/2026-03-24-ADR-106-defense-in-depth-data-integrity.md):** Defense-in-depth pin protection
+- **[ADR-107](docs/00-foundation/decisions/2026-03-24-ADR-107-fail-open-cleanup-on-failure.md):** Fail-open backups, fail-closed deletions
 
 ## License
 
