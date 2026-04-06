@@ -41,15 +41,15 @@ Urd fills that gap:
 ```
 $ urd status
 
-PROMISE    SUBVOLUME      STATUS      LOCAL  external-1  external-2
-resilient  documents      PROTECTED   15     3           2
-resilient  photos         PROTECTED   15     3           2
-resilient  recordings     PROTECTED   15     3           2
-protected  music          PROTECTED   15     3           —
-protected  home           PROTECTED   15     3           —
-guarded    multimedia     PROTECTED   4      —           —
-guarded    scratch        PROTECTED   4      —           —
-guarded    containers     PROTECTED   4      —           —
+EXPOSURE  SUBVOLUME      LOCAL  external-1  external-2
+sealed    documents      15     3           2
+sealed    photos         15     3           2
+sealed    recordings     15     3           2
+sealed    music          15     3           —
+sealed    home           15     3           —
+sealed    multimedia     4      —           —
+sealed    scratch        4      —           —
+sealed    containers     4      —           —
 
 Drives: external-1 (4.4 TB free), external-2 (1.1 TB free)
 ```
@@ -127,14 +127,14 @@ run_frequency = "daily"
 name = "documents"
 short_name = "docs"
 source = "/mnt/your-filesystem/documents"
-protection_level = "resilient"
+protection_level = "fortified"
 drives = ["external-1", "external-2"]
 
 [[subvolumes]]
 name = "multimedia"
 short_name = "multimedia"
 source = "/mnt/your-filesystem/multimedia"
-protection_level = "guarded"
+protection_level = "recorded"
 
 [[drives]]
 label = "external-1"
