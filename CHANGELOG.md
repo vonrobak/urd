@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.1] - 2026-04-06
+
 ### Fixed
 - Transient subvolumes no longer create orphaned snapshots when no drives can receive sends
 - Transient subvolumes no longer create snapshots when send interval hasn't elapsed
