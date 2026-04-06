@@ -101,6 +101,67 @@ fn is_drive_in_scope(subvol: &ResolvedSubvolume, drive_label: &str) -> bool {
         .is_none_or(|allowed| allowed.iter().any(|a| a == drive_label))
 }
 
+/// Check if a drive can receive sends. Returns true if available, false (with
+/// skip reason emitted) if not. Handles all DriveAvailability variants.
+fn check_drive_availability(
+    subvol_name: &str,
+    drive: &DriveConfig,
+    fs: &dyn FileSystemState,
+    skipped: &mut Vec<(String, String)>,
+) -> bool {
+    match fs.drive_availability(drive) {
+        DriveAvailability::Available => true,
+        DriveAvailability::NotMounted => {
+            skipped.push((
+                subvol_name.to_string(),
+                format!("drive {} not mounted", drive.label),
+            ));
+            false
+        }
+        DriveAvailability::UuidMismatch { expected, found } => {
+            skipped.push((
+                subvol_name.to_string(),
+                format!(
+                    "drive {} UUID mismatch (expected {}, found {})",
+                    drive.label, expected, found
+                ),
+            ));
+            false
+        }
+        DriveAvailability::UuidCheckFailed(reason) => {
+            skipped.push((
+                subvol_name.to_string(),
+                format!("drive {} UUID check failed: {}", drive.label, reason),
+            ));
+            false
+        }
+        DriveAvailability::TokenMismatch { expected, found } => {
+            skipped.push((
+                subvol_name.to_string(),
+                format!(
+                    "drive {} token mismatch (expected {}, found {}) — possible drive swap",
+                    drive.label, expected, found
+                ),
+            ));
+            false
+        }
+        DriveAvailability::TokenExpectedButMissing => {
+            skipped.push((
+                subvol_name.to_string(),
+                format!(
+                    "drive {} token expected but missing \u{2014} run `urd drives adopt {}`",
+                    drive.label, drive.label
+                ),
+            ));
+            false
+        }
+        DriveAvailability::TokenMissing => {
+            // Benign: first use or pre-token drive. Proceed with send.
+            true
+        }
+    }
+}
+
 // ── Planner ─────────────────────────────────────────────────────────────
 
 /// Generate a backup plan based on config, current time, filters, and filesystem state.
@@ -191,40 +252,22 @@ pub fn plan(
             })
             .collect();
 
-        let any_drive_mounted = !usable_drives.is_empty();
+        // ── Transient subvolumes: atomic lifecycle planning ────────
+        if subvol.local_retention.is_transient() && subvol.send_enabled {
+            plan_transient_lifecycle(
+                subvol, config, &local_dir, &local_snaps, now, force, filters,
+                &pinned, &mounted_pins, fs, &mut operations, &mut skipped,
+            );
+            continue; // skip the normal two-phase flow
+        }
 
         // ── Local operations ────────────────────────────────────────
         // LOAD-BEARING ORDER: Operations are emitted as create → send → delete.
         // The executor relies on this ordering within each subvolume.
         // Do not reorder without updating the executor contract in PLAN.md.
         if !filters.external_only {
-            // Transient subvolumes: skip snapshot creation when no drives can
-            // receive sends. Creating a snapshot that can't be sent is pointless;
-            // retention will clean up any accumulated snapshots below.
-            if subvol.local_retention.is_transient()
-                && subvol.send_enabled
-                && !local_snaps.is_empty()
-                && !any_drive_mounted
-            {
-                skipped.push((
-                    subvol.name.clone(),
-                    "transient \u{2014} no drives available for send".to_string(),
-                ));
-                plan_local_retention(
-                    subvol,
-                    &local_dir,
-                    &local_snaps,
-                    now,
-                    &pinned,
-                    &mounted_pins,
-                    fs,
-                    &mut operations,
-                );
-                continue;
-            }
-
             let min_free = subvol.min_free_bytes.unwrap_or(0);
-            plan_local_snapshot(
+            let _ = plan_local_snapshot(
                 subvol,
                 &local_dir,
                 &local_snaps,
@@ -255,62 +298,8 @@ pub fn plan(
                     continue;
                 }
 
-                match fs.drive_availability(drive) {
-                    DriveAvailability::Available => {}
-                    DriveAvailability::NotMounted => {
-                        skipped.push((
-                            subvol.name.clone(),
-                            format!("drive {} not mounted", drive.label),
-                        ));
-                        continue;
-                    }
-                    DriveAvailability::UuidMismatch { expected, found } => {
-                        skipped.push((
-                            subvol.name.clone(),
-                            format!(
-                                "drive {} UUID mismatch (expected {}, found {})",
-                                drive.label, expected, found
-                            ),
-                        ));
-                        continue;
-                    }
-                    DriveAvailability::UuidCheckFailed(reason) => {
-                        skipped.push((
-                            subvol.name.clone(),
-                            format!("drive {} UUID check failed: {}", drive.label, reason),
-                        ));
-                        continue;
-                    }
-                    DriveAvailability::TokenMismatch { expected, found } => {
-                        skipped.push((
-                            subvol.name.clone(),
-                            format!(
-                                "drive {} token mismatch (expected {}, found {}) — possible drive swap",
-                                drive.label, expected, found
-                            ),
-                        ));
-                        continue;
-                    }
-                    DriveAvailability::TokenExpectedButMissing => {
-                        // SQLite has a stored token but drive has no token file.
-                        // Possible swap or clone — block sends.
-                        // NOTE: In production, RealFileSystemState::drive_availability()
-                        // never returns token variants (it only checks mount + UUID).
-                        // Production safety comes from commands/backup.rs post-plan filter.
-                        // This arm exists for enum exhaustiveness and mock-based testing.
-                        skipped.push((
-                            subvol.name.clone(),
-                            format!(
-                                "drive {} token expected but missing \u{2014} run `urd drives adopt {}`",
-                                drive.label, drive.label
-                            ),
-                        ));
-                        continue;
-                    }
-                    DriveAvailability::TokenMissing => {
-                        // Benign: first use or pre-token drive. Proceed with send.
-                        // Token will be written by executor on successful send.
-                    }
+                if !check_drive_availability(&subvol.name, drive, fs, &mut skipped) {
+                    continue;
                 }
 
                 plan_external_send(
@@ -333,6 +322,40 @@ pub fn plan(
         }
     }
 
+    // Transient invariant: CreateSnapshot without Send is an orphan.
+    for subvol in &resolved {
+        if !subvol.local_retention.is_transient() || !subvol.send_enabled {
+            continue;
+        }
+        let has_create = operations.iter().any(|op| {
+            matches!(
+                op,
+                PlannedOperation::CreateSnapshot { subvolume_name, .. }
+                if subvolume_name == &subvol.name
+            )
+        });
+        let has_send = operations.iter().any(|op| {
+            matches!(
+                op,
+                PlannedOperation::SendIncremental { subvolume_name, .. }
+                | PlannedOperation::SendFull { subvolume_name, .. }
+                if subvolume_name == &subvol.name
+            )
+        });
+        if has_create && !has_send {
+            log::warn!(
+                "Transient invariant violation: {} has CreateSnapshot without Send — \
+                 snapshot will be orphaned. This is a planner bug.",
+                subvol.name
+            );
+            debug_assert!(
+                false,
+                "transient invariant violated: {} has CreateSnapshot without Send",
+                subvol.name
+            );
+        }
+    }
+
     Ok(BackupPlan {
         operations,
         timestamp: now,
@@ -352,7 +375,7 @@ fn plan_local_snapshot(
     fs: &dyn FileSystemState,
     operations: &mut Vec<PlannedOperation>,
     skipped: &mut Vec<(String, String)>,
-) {
+) -> Option<SnapshotName> {
     // Space guard: refuse to create if local filesystem is below min_free_bytes threshold.
     // This prevents the catastrophic failure mode where snapshot creation fills the source
     // filesystem. force does NOT override — a forced snapshot on a full filesystem is still
@@ -369,7 +392,7 @@ fn plan_local_snapshot(
                     ByteSize(min_free),
                 ),
             ));
-            return;
+            return None;
         }
     }
 
@@ -419,7 +442,7 @@ fn plan_local_snapshot(
                             format_duration_short(mins)
                         ),
                     ));
-                    return;
+                    return None;
                 }
                 (Err(e1), Err(e2)) => {
                     log::warn!(
@@ -451,13 +474,15 @@ fn plan_local_snapshot(
         // Check if this exact snapshot already exists
         if local_snaps.iter().any(|s| s.as_str() == snap_name.as_str()) {
             skipped.push((subvol.name.clone(), "snapshot already exists".to_string()));
-            return;
+            return None;
         }
         operations.push(PlannedOperation::CreateSnapshot {
             source: subvol.source.clone(),
             dest: local_dir.join(snap_name.as_str()),
             subvolume_name: subvol.name.clone(),
         });
+        // Invariant: returned name matches CreateSnapshot.dest filename
+        Some(snap_name)
     } else {
         let next_in = subvol.snapshot_interval.as_chrono()
             - now.signed_duration_since(newest.unwrap().datetime());
@@ -469,6 +494,7 @@ fn plan_local_snapshot(
                 format_duration_short(mins)
             ),
         ));
+        None
     }
 }
 
@@ -561,6 +587,152 @@ fn plan_local_retention(
             }
         }
     }
+}
+
+/// Atomic lifecycle planning for transient subvolumes.
+///
+/// Inverts the normal two-phase flow: checks whether a send can happen first,
+/// then creates the snapshot only if needed. This prevents orphaned snapshots
+/// that can never be sent (Bug B) and avoids creating snapshots when the send
+/// interval hasn't elapsed (Finding 1).
+///
+/// Four phases in order (preserves create → send → delete contract):
+/// 1. Determine if any send will actually happen (availability + timing)
+/// 2. Plan snapshot creation (only if a send will happen)
+/// 3. Plan sends for each sendable drive
+/// 4. Plan transient retention
+#[allow(clippy::too_many_arguments)]
+fn plan_transient_lifecycle(
+    subvol: &ResolvedSubvolume,
+    config: &Config,
+    local_dir: &Path,
+    local_snaps: &[SnapshotName],
+    now: NaiveDateTime,
+    force: bool,
+    filters: &PlanFilters,
+    pinned: &HashSet<SnapshotName>,
+    mounted_pins: &HashSet<SnapshotName>,
+    fs: &dyn FileSystemState,
+    operations: &mut Vec<PlannedOperation>,
+    skipped: &mut Vec<(String, String)>,
+) {
+    // ── Phase 1: Determine if any send will actually happen ────────
+    // Cache newest external snapshot time per drive for skip message formatting.
+    let mut sendable_drives: Vec<(&DriveConfig, Option<NaiveDateTime>)> = Vec::new();
+    let mut any_send_due = false;
+
+    for drive in &config.drives {
+        if !is_drive_in_scope(subvol, &drive.label) {
+            continue;
+        }
+        if !check_drive_availability(&subvol.name, drive, fs, skipped) {
+            continue; // skip reason already emitted
+        }
+
+        // Send-interval check: would this drive actually receive a send?
+        if force || filters.skip_intervals {
+            sendable_drives.push((drive, None));
+            any_send_due = true;
+        } else {
+            let ext_snaps = fs.external_snapshots(drive, &subvol.name).unwrap_or_default();
+            let newest_ext = ext_snaps.iter().max().map(|s| s.datetime());
+            let interval_elapsed = match newest_ext {
+                Some(newest_dt) => {
+                    let elapsed = now.signed_duration_since(newest_dt);
+                    elapsed >= subvol.send_interval.as_chrono()
+                }
+                None => true, // No external snapshots — first send
+            };
+            sendable_drives.push((drive, newest_ext));
+            if interval_elapsed {
+                any_send_due = true;
+            }
+        }
+    }
+
+    // Decision gate
+    if sendable_drives.is_empty() {
+        if !filters.external_only {
+            skipped.push((
+                subvol.name.clone(),
+                "transient \u{2014} no drives available for send".to_string(),
+            ));
+        }
+        // Phase 4 only: retention on leftovers
+        plan_local_retention(subvol, local_dir, local_snaps, now, pinned, mounted_pins, fs, operations);
+        return;
+    }
+
+    if !any_send_due {
+        let skip_msg = sendable_drives
+            .iter()
+            .filter_map(|(drive, newest_ext)| {
+                let newest_dt = (*newest_ext)?;
+                let next_in = subvol.send_interval.as_chrono()
+                    - now.signed_duration_since(newest_dt);
+                Some(format!(
+                    "send to {} not due (next in ~{})",
+                    drive.label,
+                    format_duration_short(next_in.num_minutes())
+                ))
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        if !skip_msg.is_empty() {
+            skipped.push((subvol.name.clone(), skip_msg));
+        }
+        // Phase 4 only: retention on leftovers
+        plan_local_retention(subvol, local_dir, local_snaps, now, pinned, mounted_pins, fs, operations);
+        return;
+    }
+
+    // ── Phase 2: Plan snapshot creation (only if a send will happen) ──
+    let planned_snap = if !filters.external_only {
+        let min_free = subvol.min_free_bytes.unwrap_or(0);
+        plan_local_snapshot(
+            subvol, local_dir, local_snaps, now, force, filters,
+            min_free, fs, operations, skipped,
+        )
+    } else {
+        None
+    };
+
+    if planned_snap.is_none() && local_snaps.iter().max().is_none() {
+        // No planned snapshot and no existing snapshots — nothing to send.
+        plan_local_retention(subvol, local_dir, local_snaps, now, pinned, mounted_pins, fs, operations);
+        return;
+    }
+
+    // ── Phase 3: Plan sends for each sendable drive ───────────────
+    // Build augmented local_snaps once (not per-drive).
+    // Only allocate a new vec when planned_snap adds a snapshot not already in the list.
+    let augmented;
+    let effective_local_snaps = if let Some(ref snap) = planned_snap {
+        if !local_snaps.iter().any(|s| s.as_str() == snap.as_str()) {
+            augmented = {
+                let mut v = local_snaps.to_vec();
+                v.push(snap.clone());
+                v
+            };
+            &augmented
+        } else {
+            local_snaps
+        }
+    } else {
+        local_snaps
+    };
+
+    for (drive, _) in &sendable_drives {
+        plan_external_send(
+            subvol, drive, local_dir, effective_local_snaps, now, force,
+            filters.skip_intervals, fs, operations, skipped,
+        );
+        plan_external_retention(subvol, drive, now, fs, pinned, operations);
+    }
+
+    // ── Phase 4: Plan transient retention ─────────────────────────
+    // Use original local_snaps — retention only operates on existing-on-disk snapshots.
+    plan_local_retention(subvol, local_dir, local_snaps, now, pinned, mounted_pins, fs, operations);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2608,8 +2780,14 @@ local_retention = "transient"
     fn transient_empty_local_snapshots_no_ops() {
         let config = transient_config();
         let fs = MockFileSystemState::new();
+        // No local snapshots, no drives mounted
 
         let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let creates: Vec<_> = result
+            .operations
+            .iter()
+            .filter(|op| matches!(op, PlannedOperation::CreateSnapshot { .. }))
+            .collect();
         let deletes: Vec<_> = result
             .operations
             .iter()
@@ -2624,6 +2802,7 @@ local_retention = "transient"
             })
             .collect();
 
+        assert_eq!(creates.len(), 0, "transient: no create when no drives");
         assert_eq!(deletes.len(), 0);
     }
 
@@ -2765,24 +2944,23 @@ local_retention = "transient"
             .collect();
         assert_eq!(creates.len(), 0, "should not create snapshot when no drives mounted");
 
-        let skip = result
+        let has_transient_skip = result
             .skipped
             .iter()
-            .find(|(name, _)| name == "sv1")
-            .expect("sv1 should have a skip entry");
+            .any(|(name, reason)| name == "sv1" && reason.contains("transient"));
         assert!(
-            skip.1.contains("transient"),
-            "skip reason should mention transient: {}",
-            skip.1
+            has_transient_skip,
+            "should have a transient skip reason, got: {:?}",
+            result.skipped
         );
     }
 
     #[test]
-    fn transient_no_drives_first_snapshot_still_created() {
+    fn transient_no_drives_no_snapshot_created() {
         let config = transient_config();
         let fs = MockFileSystemState::new();
         // No local snapshots, no drives mounted.
-        // First snapshot should still be created (fail-open for first backup).
+        // Transient: no snapshot created — can't be sent, would be orphaned.
 
         let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
 
@@ -2791,7 +2969,7 @@ local_retention = "transient"
             .iter()
             .filter(|op| matches!(op, PlannedOperation::CreateSnapshot { .. }))
             .collect();
-        assert_eq!(creates.len(), 1, "first snapshot should be created even with no drives");
+        assert_eq!(creates.len(), 0, "transient: no snapshot when no drives available");
     }
 
     #[test]
@@ -3287,37 +3465,350 @@ priority = 1
         assert!(sends.is_empty(), "local_only should suppress sends even with skip_intervals");
     }
 
+    // ── Transient lifecycle tests (UPI 025) ─────────────────────────────
+
     #[test]
-    fn plan_external_only_skip_reason() {
+    fn transient_lifecycle_drive_mounted_empty_creates_and_sends() {
+        // Bug B fix: drive mounted, no local snapshots, no external → create + full send
         let config = transient_config();
         let mut fs = MockFileSystemState::new();
-        // Mounted drive, no local snapshots (transient cleaned them up)
         fs.mounted_drives.insert("D1".to_string());
 
-        let now = NaiveDate::from_ymd_opt(2026, 3, 23)
-            .unwrap()
-            .and_hms_opt(14, 0, 0)
-            .unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
 
-        let filters = PlanFilters::default();
-        let result = plan(&config, now, &filters, &fs).unwrap();
+        let creates: Vec<_> = result
+            .operations
+            .iter()
+            .filter(|op| matches!(op, PlannedOperation::CreateSnapshot { subvolume_name, .. } if subvolume_name == "sv1"))
+            .collect();
+        let sends: Vec<_> = result
+            .operations
+            .iter()
+            .filter(|op| matches!(op, PlannedOperation::SendFull { subvolume_name, .. } if subvolume_name == "sv1"))
+            .collect();
 
-        // Should have the external-only skip reason, not "no local snapshots to send"
-        let skip = result
+        assert_eq!(creates.len(), 1, "should create snapshot");
+        assert_eq!(sends.len(), 1, "should send full to D1");
+    }
+
+    #[test]
+    fn transient_lifecycle_no_drives_no_create() {
+        // No drives mounted, no local snapshots → 0 operations, transient skip
+        let config = transient_config();
+        let fs = MockFileSystemState::new();
+
+        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+
+        assert!(
+            result.operations.is_empty(),
+            "no operations expected: {:?}",
+            result.operations
+        );
+        let has_transient_skip = result
             .skipped
             .iter()
-            .find(|(name, _)| name == "sv1")
-            .expect("sv1 should be in skipped list");
-        assert!(
-            skip.1.starts_with("external-only"),
-            "transient subvol should use 'external-only' skip reason, got: {}",
-            skip.1
+            .any(|(name, reason)| name == "sv1" && reason.contains("transient"));
+        assert!(has_transient_skip, "should have transient skip reason");
+    }
+
+    #[test]
+    fn transient_lifecycle_no_drives_cleans_up_leftovers() {
+        // No drives mounted, 2 existing local snapshots → 2 deletes, 0 creates
+        let config = transient_config();
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots.insert(
+            "sv1".to_string(),
+            vec![
+                snap("20260320-1000-one"),
+                snap("20260321-1000-one"),
+            ],
         );
-        assert!(
-            !skip.1.contains("no local snapshots"),
-            "transient subvol should not use 'no local snapshots' reason, got: {}",
-            skip.1
+
+        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+
+        let creates: Vec<_> = result
+            .operations
+            .iter()
+            .filter(|op| matches!(op, PlannedOperation::CreateSnapshot { .. }))
+            .collect();
+        let deletes: Vec<_> = result
+            .operations
+            .iter()
+            .filter(|op| matches!(op, PlannedOperation::DeleteSnapshot { subvolume_name, .. } if subvolume_name == "sv1"))
+            .collect();
+
+        assert_eq!(creates.len(), 0, "no creates when no drives");
+        assert_eq!(deletes.len(), 2, "should clean up leftover snapshots");
+    }
+
+    #[test]
+    fn transient_lifecycle_send_interval_not_elapsed() {
+        // Drive mounted, recent external snapshot → send interval not elapsed
+        // Key test for Finding 1: Phase 1 pre-filter prevents snapshot creation
+        let config = transient_config();
+        let mut fs = MockFileSystemState::new();
+        // Send interval is 4h. now() is 2026-03-22 15:00.
+        // External snap at 14:00 → only 1h ago, interval not elapsed.
+        fs.mounted_drives.insert("D1".to_string());
+        fs.local_snapshots.insert(
+            "sv1".to_string(),
+            vec![snap("20260322-1400-one")],
         );
+        fs.external_snapshots.insert(
+            ("D1".to_string(), "sv1".to_string()),
+            vec![snap("20260322-1400-one")],
+        );
+
+        let filters = PlanFilters {
+            skip_intervals: false,
+            ..Default::default()
+        };
+        let result = plan(&config, now(), &filters, &fs).unwrap();
+
+        let creates: Vec<_> = result
+            .operations
+            .iter()
+            .filter(|op| matches!(op, PlannedOperation::CreateSnapshot { .. }))
+            .collect();
+        let sends: Vec<_> = result
+            .operations
+            .iter()
+            .filter(|op| {
+                matches!(
+                    op,
+                    PlannedOperation::SendFull { .. } | PlannedOperation::SendIncremental { .. }
+                )
+            })
+            .collect();
+
+        assert_eq!(creates.len(), 0, "no create when send interval not elapsed");
+        assert!(sends.is_empty(), "no sends when interval not elapsed");
+        let has_interval_skip = result
+            .skipped
+            .iter()
+            .any(|(name, reason)| name == "sv1" && reason.contains("not due"));
+        assert!(has_interval_skip, "should have interval skip reason: {:?}", result.skipped);
+    }
+
+    #[test]
+    fn transient_lifecycle_generation_unchanged() {
+        // Drive mounted, existing local snapshot, same BTRFS generation
+        // → skip "unchanged", 0 creates. Send still happens (sends existing snapshot).
+        let config = transient_config();
+        let mut fs = MockFileSystemState::new();
+        fs.mounted_drives.insert("D1".to_string());
+        fs.local_snapshots.insert(
+            "sv1".to_string(),
+            vec![snap("20260322-1400-one")],
+        );
+        // Same generation → unchanged
+        fs.generations
+            .insert(PathBuf::from("/data/sv1"), 500);
+        fs.generations
+            .insert(PathBuf::from("/snap/sv1/20260322-1400-one"), 500);
+
+        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+
+        let creates: Vec<_> = result
+            .operations
+            .iter()
+            .filter(|op| matches!(op, PlannedOperation::CreateSnapshot { .. }))
+            .collect();
+        let sends: Vec<_> = result
+            .operations
+            .iter()
+            .filter(|op| {
+                matches!(
+                    op,
+                    PlannedOperation::SendFull { subvolume_name, .. }
+                    | PlannedOperation::SendIncremental { subvolume_name, .. }
+                    if subvolume_name == "sv1"
+                )
+            })
+            .collect();
+
+        assert_eq!(creates.len(), 0, "no create when generation unchanged");
+        assert_eq!(sends.len(), 1, "should still send existing snapshot");
+    }
+
+    #[test]
+    fn transient_lifecycle_space_guard_prevents_create() {
+        // Drive mounted, filesystem below min_free_bytes threshold → no create
+        let toml_str = r#"
+[general]
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp"
+
+[local_snapshots]
+roots = [
+  { path = "/snap", subvolumes = ["sv1"], min_free_bytes = "10GB" }
+]
+
+[defaults]
+snapshot_interval = "1h"
+send_interval = "4h"
+send_enabled = true
+enabled = true
+
+[defaults.local_retention]
+hourly = 24
+daily = 30
+weekly = 26
+monthly = 12
+
+[defaults.external_retention]
+daily = 30
+weekly = 26
+monthly = 0
+
+[[drives]]
+label = "D1"
+mount_path = "/mnt/d1"
+snapshot_root = ".snapshots"
+role = "test"
+
+[[subvolumes]]
+name = "sv1"
+short_name = "one"
+source = "/data/sv1"
+priority = 1
+local_retention = "transient"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let mut fs = MockFileSystemState::new();
+        fs.mounted_drives.insert("D1".to_string());
+        // Filesystem has only 1GB free, min_free is 10GB
+        fs.free_bytes
+            .insert(PathBuf::from("/snap/sv1"), 1_000_000_000);
+
+        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+
+        let creates: Vec<_> = result
+            .operations
+            .iter()
+            .filter(|op| matches!(op, PlannedOperation::CreateSnapshot { .. }))
+            .collect();
+        assert_eq!(creates.len(), 0, "no create when space is low");
+        let has_space_skip = result
+            .skipped
+            .iter()
+            .any(|(name, reason)| name == "sv1" && reason.contains("low on space"));
+        assert!(has_space_skip, "should have space skip reason: {:?}", result.skipped);
+    }
+
+    #[test]
+    fn transient_lifecycle_multi_drive_one_mounted() {
+        // D1 mounted, D2 not mounted → create + send to D1, skip D2
+        let config = transient_multi_drive_config();
+        let mut fs = MockFileSystemState::new();
+        fs.mounted_drives.insert("D1".to_string());
+
+        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+
+        let creates: Vec<_> = result
+            .operations
+            .iter()
+            .filter(|op| matches!(op, PlannedOperation::CreateSnapshot { subvolume_name, .. } if subvolume_name == "sv1"))
+            .collect();
+        let sends: Vec<_> = result
+            .operations
+            .iter()
+            .filter(|op| matches!(op, PlannedOperation::SendFull { subvolume_name, .. } if subvolume_name == "sv1"))
+            .collect();
+
+        assert_eq!(creates.len(), 1, "should create snapshot");
+        assert_eq!(sends.len(), 1, "should send to D1 only");
+
+        let d2_skip = result
+            .skipped
+            .iter()
+            .any(|(name, reason)| name == "sv1" && reason.contains("D2") && reason.contains("not mounted"));
+        assert!(d2_skip, "should skip D2: {:?}", result.skipped);
+    }
+
+    #[test]
+    fn transient_lifecycle_incremental_send() {
+        // Drive mounted, existing local snapshot, pin file, snapshot on external → incremental
+        let config = transient_config();
+        let mut fs = MockFileSystemState::new();
+        fs.mounted_drives.insert("D1".to_string());
+        fs.local_snapshots.insert(
+            "sv1".to_string(),
+            vec![snap("20260321-1000-one")],
+        );
+        fs.pin_files.insert(
+            (PathBuf::from("/snap/sv1"), "D1".to_string()),
+            snap("20260321-1000-one"),
+        );
+        fs.external_snapshots.insert(
+            ("D1".to_string(), "sv1".to_string()),
+            vec![snap("20260321-1000-one")],
+        );
+        // Different generation so a new snapshot is created
+        fs.generations
+            .insert(PathBuf::from("/data/sv1"), 600);
+        fs.generations
+            .insert(PathBuf::from("/snap/sv1/20260321-1000-one"), 500);
+
+        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+
+        let creates: Vec<_> = result
+            .operations
+            .iter()
+            .filter(|op| matches!(op, PlannedOperation::CreateSnapshot { .. }))
+            .collect();
+        let incrementals: Vec<_> = result
+            .operations
+            .iter()
+            .filter(|op| matches!(op, PlannedOperation::SendIncremental { subvolume_name, .. } if subvolume_name == "sv1"))
+            .collect();
+
+        assert_eq!(creates.len(), 1, "should create new snapshot");
+        assert_eq!(incrementals.len(), 1, "should send incremental with pin parent");
+    }
+
+    #[test]
+    fn transient_lifecycle_multi_drive_only_one_needs_send() {
+        // D1 interval elapsed, D2 interval NOT elapsed → create, send to D1 only
+        let config = transient_multi_drive_config();
+        let mut fs = MockFileSystemState::new();
+        fs.mounted_drives.insert("D1".to_string());
+        fs.mounted_drives.insert("D2".to_string());
+        // D1: no external snapshots → first send (interval trivially elapsed)
+        // D2: recent external snapshot → interval not elapsed
+        // Send interval is 4h, now() is 2026-03-22 15:00
+        fs.external_snapshots.insert(
+            ("D2".to_string(), "sv1".to_string()),
+            vec![snap("20260322-1400-one")],
+        );
+
+        let filters = PlanFilters {
+            skip_intervals: false,
+            ..Default::default()
+        };
+        let result = plan(&config, now(), &filters, &fs).unwrap();
+
+        let creates: Vec<_> = result
+            .operations
+            .iter()
+            .filter(|op| matches!(op, PlannedOperation::CreateSnapshot { subvolume_name, .. } if subvolume_name == "sv1"))
+            .collect();
+        let d1_sends: Vec<_> = result
+            .operations
+            .iter()
+            .filter(|op| matches!(op, PlannedOperation::SendFull { drive_label, .. } if drive_label == "D1"))
+            .collect();
+
+        assert_eq!(creates.len(), 1, "should create (at least one drive needs send)");
+        assert_eq!(d1_sends.len(), 1, "should send to D1");
+
+        // D2 should have an interval skip from plan_external_send
+        let d2_skip = result
+            .skipped
+            .iter()
+            .any(|(name, reason)| name == "sv1" && reason.contains("D2") && reason.contains("not due"));
+        assert!(d2_skip, "D2 should be skipped for interval: {:?}", result.skipped);
     }
 
     // ── Generation comparison tests (UPI 014) ──────────────────────────
