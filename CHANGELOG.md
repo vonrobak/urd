@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Daily timer drift no longer silently drops snapshots and sends. Interval
+  checks now apply a grace tolerance (5% of interval, capped at 15 minutes),
+  so a daily run firing a few minutes earlier than yesterday's snapshot still
+  creates today's snapshot instead of waiting another day.
+
 ## [0.12.1] - 2026-04-06
 
 ### Fixed
