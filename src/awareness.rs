@@ -436,9 +436,22 @@ pub fn assess(
             }
         };
 
+        let local_source_unchanged = local_snaps
+            .iter()
+            .max()
+            .is_some_and(|newest| {
+                let snap_path = local_dir.join(newest.as_str());
+                self::local_source_unchanged(fs, &subvol.source, &snap_path)
+            });
+
         let local = {
-            let (assessment, advisory) =
-                assess_local(&local_snaps, now, subvol.snapshot_interval, subvol.local_retention);
+            let (assessment, advisory) = assess_local(
+                &local_snaps,
+                now,
+                subvol.snapshot_interval,
+                subvol.local_retention,
+                local_source_unchanged,
+            );
             if let Some(adv) = advisory {
                 advisories.push(adv);
             }
@@ -498,7 +511,28 @@ pub fn assess(
                 let last_send_time = fs.last_successful_send_time(&subvol.name, &drive.label);
                 let last_send_age = last_send_time.map(|t| clamp_age(now - t));
 
-                let status = assess_external_status(last_send_age, subvol.send_interval);
+                let source_unchanged =
+                    external_source_unchanged(fs, &subvol.source, &local_dir, &drive.label);
+                let status =
+                    assess_external_status(last_send_age, subvol.send_interval, source_unchanged);
+
+                if source_unchanged
+                    && let Some(age) = last_send_age
+                    && status == PromiseStatus::Protected
+                    && age.num_seconds() as f64
+                        > subvol.send_interval.as_secs() as f64 * EXTERNAL_AT_RISK_MULTIPLIER
+                {
+                    let secs = age.num_seconds();
+                    let coarse = if secs >= 86400 {
+                        format!("{} days", secs / 86400)
+                    } else {
+                        format!("{} hours", secs / 3600)
+                    };
+                    advisories.push(format!(
+                        "{}: source unchanged since last send — {coarse} age is expected",
+                        drive.label,
+                    ));
+                }
 
                 drive_assessments.push(DriveAssessment {
                     drive_label: drive.label.clone(),
@@ -579,6 +613,7 @@ fn assess_local(
     now: NaiveDateTime,
     interval: Interval,
     retention: LocalRetentionPolicy,
+    source_unchanged: bool,
 ) -> (LocalAssessment, Option<String>) {
     let count = snapshots.len();
 
@@ -629,12 +664,16 @@ fn assess_local(
         None
     };
 
-    let status = freshness_status(
-        age,
-        interval,
-        LOCAL_AT_RISK_MULTIPLIER,
-        LOCAL_UNPROTECTED_MULTIPLIER,
-    );
+    let status = if source_unchanged {
+        PromiseStatus::Protected
+    } else {
+        freshness_status(
+            age,
+            interval,
+            LOCAL_AT_RISK_MULTIPLIER,
+            LOCAL_UNPROTECTED_MULTIPLIER,
+        )
+    };
 
     (
         LocalAssessment {
@@ -647,15 +686,63 @@ fn assess_local(
     )
 }
 
-fn assess_external_status(last_send_age: Option<Duration>, interval: Interval) -> PromiseStatus {
+fn assess_external_status(
+    last_send_age: Option<Duration>,
+    interval: Interval,
+    source_unchanged: bool,
+) -> PromiseStatus {
     match last_send_age {
         None => PromiseStatus::Unprotected,
+        Some(_) if source_unchanged => PromiseStatus::Protected,
         Some(age) => freshness_status(
             age,
             interval,
             EXTERNAL_AT_RISK_MULTIPLIER,
             EXTERNAL_UNPROTECTED_MULTIPLIER,
         ),
+    }
+}
+
+/// Compare BTRFS generations: did the source change since last successful send
+/// to this drive? Returns false if pin file missing, pin snapshot gone, or any
+/// generation query errors (fail open — fall back to age-based freshness).
+///
+/// Why: a subvolume that hasn't been written to since the last send is already
+/// safely captured on the external drive. Age-based freshness alone misreads
+/// this as staleness ("UNPROTECTED — 10d since last send") when the data is
+/// identical to what was sent.
+fn external_source_unchanged(
+    fs: &dyn FileSystemState,
+    source: &std::path::Path,
+    local_dir: &std::path::Path,
+    drive_label: &str,
+) -> bool {
+    let Ok(Some(pin)) = fs.read_pin_file(local_dir, drive_label) else {
+        return false;
+    };
+    let pin_path = local_dir.join(pin.as_str());
+    match (
+        fs.subvolume_generation(source),
+        fs.subvolume_generation(&pin_path),
+    ) {
+        (Ok(source_gen), Ok(pin_gen)) => source_gen == pin_gen,
+        _ => false,
+    }
+}
+
+/// Compare BTRFS generations: is the source unchanged since the newest local
+/// snapshot? Mirrors the planner's snapshot-skip logic. Fails open.
+fn local_source_unchanged(
+    fs: &dyn FileSystemState,
+    source: &std::path::Path,
+    newest_local_snap_path: &std::path::Path,
+) -> bool {
+    match (
+        fs.subvolume_generation(source),
+        fs.subvolume_generation(newest_local_snap_path),
+    ) {
+        (Ok(source_gen), Ok(snap_gen)) => source_gen == snap_gen,
+        _ => false,
     }
 }
 
@@ -4144,6 +4231,219 @@ drives = ["D1"]
             !advice.issue.contains("last backup"),
             "should not say 'last backup' when external_only: {}",
             advice.issue
+        );
+    }
+
+    // ── Source-unchanged freshness override ──────────────────────────
+
+    /// Stale send age, but source generation matches the pin snapshot's
+    /// generation — nothing has been written since the last send. Status
+    /// must be PROTECTED, not UNPROTECTED.
+    #[test]
+    fn source_unchanged_external_overrides_stale_age() {
+        let config = test_config();
+        let now = dt(2026, 3, 23, 14, 0);
+        let mut fs = MockFileSystemState::new();
+
+        let pin_snap = snap(dt(2026, 3, 13, 10, 0), "sv1");
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![pin_snap.clone()]);
+        fs.external_snapshots.insert(
+            ("WD-18TB".to_string(), "sv1".to_string()),
+            vec![pin_snap.clone()],
+        );
+        fs.mounted_drives.insert("WD-18TB".to_string());
+
+        // Pin file points at the snapshot; last send was 10 days ago (> 3× 1d).
+        fs.pin_files.insert(
+            (std::path::PathBuf::from("/snap/sv1"), "WD-18TB".to_string()),
+            pin_snap.clone(),
+        );
+        fs.send_times.insert(
+            ("sv1".to_string(), "WD-18TB".to_string()),
+            dt(2026, 3, 13, 10, 0),
+        );
+
+        // Generations match — source unchanged since the pin snapshot.
+        fs.generations
+            .insert(std::path::PathBuf::from("/data/sv1"), 42);
+        fs.generations.insert(
+            std::path::PathBuf::from(format!("/snap/sv1/{}", pin_snap.as_str())),
+            42,
+        );
+
+        let r = &assess(&config, now, &fs)[0];
+        assert_eq!(r.external[0].status, PromiseStatus::Protected);
+        // Advisory explains why the old age is still PROTECTED.
+        assert!(
+            r.advisories
+                .iter()
+                .any(|a| a.contains("source unchanged since last send")),
+            "expected source-unchanged advisory, got: {:?}",
+            r.advisories
+        );
+    }
+
+    /// Source generation differs from the pin snapshot → real staleness.
+    /// Must report UNPROTECTED as before.
+    #[test]
+    fn source_changed_external_stale_unprotected() {
+        let config = test_config();
+        let now = dt(2026, 3, 23, 14, 0);
+        let mut fs = MockFileSystemState::new();
+
+        let pin_snap = snap(dt(2026, 3, 13, 10, 0), "sv1");
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![pin_snap.clone()]);
+        fs.external_snapshots.insert(
+            ("WD-18TB".to_string(), "sv1".to_string()),
+            vec![pin_snap.clone()],
+        );
+        fs.mounted_drives.insert("WD-18TB".to_string());
+
+        fs.pin_files.insert(
+            (std::path::PathBuf::from("/snap/sv1"), "WD-18TB".to_string()),
+            pin_snap.clone(),
+        );
+        fs.send_times.insert(
+            ("sv1".to_string(), "WD-18TB".to_string()),
+            dt(2026, 3, 13, 10, 0),
+        );
+
+        fs.generations
+            .insert(std::path::PathBuf::from("/data/sv1"), 99);
+        fs.generations.insert(
+            std::path::PathBuf::from(format!("/snap/sv1/{}", pin_snap.as_str())),
+            42,
+        );
+
+        let r = &assess(&config, now, &fs)[0];
+        assert_eq!(r.external[0].status, PromiseStatus::Unprotected);
+    }
+
+    /// Generation queries error out — fall back to age-based freshness.
+    /// The override is advisory only, never a safety regression.
+    #[test]
+    fn generation_query_fails_no_override() {
+        let config = test_config();
+        let now = dt(2026, 3, 23, 14, 0);
+        let mut fs = MockFileSystemState::new();
+
+        let pin_snap = snap(dt(2026, 3, 13, 10, 0), "sv1");
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![pin_snap.clone()]);
+        fs.external_snapshots.insert(
+            ("WD-18TB".to_string(), "sv1".to_string()),
+            vec![pin_snap.clone()],
+        );
+        fs.mounted_drives.insert("WD-18TB".to_string());
+        fs.pin_files.insert(
+            (std::path::PathBuf::from("/snap/sv1"), "WD-18TB".to_string()),
+            pin_snap.clone(),
+        );
+        fs.send_times.insert(
+            ("sv1".to_string(), "WD-18TB".to_string()),
+            dt(2026, 3, 13, 10, 0),
+        );
+
+        // No generations configured — queries will fail.
+        let r = &assess(&config, now, &fs)[0];
+        assert_eq!(r.external[0].status, PromiseStatus::Unprotected);
+    }
+
+    /// No pin file — no override, normal age-based assessment.
+    #[test]
+    fn no_pin_file_no_external_override() {
+        let config = test_config();
+        let now = dt(2026, 3, 23, 14, 0);
+        let mut fs = MockFileSystemState::new();
+
+        fs.local_snapshots.insert(
+            "sv1".to_string(),
+            vec![snap(dt(2026, 3, 23, 13, 30), "sv1")],
+        );
+        fs.mounted_drives.insert("WD-18TB".to_string());
+
+        // Stale send, no pin file, generations set (irrelevant without pin).
+        fs.send_times.insert(
+            ("sv1".to_string(), "WD-18TB".to_string()),
+            dt(2026, 3, 13, 10, 0),
+        );
+        fs.generations
+            .insert(std::path::PathBuf::from("/data/sv1"), 42);
+
+        let r = &assess(&config, now, &fs)[0];
+        assert_eq!(r.external[0].status, PromiseStatus::Unprotected);
+    }
+
+    /// Local-side mirror: newest local snapshot is stale but source is
+    /// unchanged since it was created → local status PROTECTED.
+    #[test]
+    fn source_unchanged_local_overrides_stale_snapshot() {
+        let config = test_config();
+        // Config sets snapshot_interval = 1h. A snapshot 10h old would be
+        // UNPROTECTED under age rules (> 5× interval).
+        let now = dt(2026, 3, 23, 14, 0);
+        let mut fs = MockFileSystemState::new();
+
+        let newest = snap(dt(2026, 3, 23, 4, 0), "sv1");
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![newest.clone()]);
+
+        // Generations match — source unchanged since newest snapshot.
+        fs.generations
+            .insert(std::path::PathBuf::from("/data/sv1"), 100);
+        fs.generations.insert(
+            std::path::PathBuf::from(format!("/snap/sv1/{}", newest.as_str())),
+            100,
+        );
+
+        // No drive mounted — isolate the local assessment.
+        let r = &assess(&config, now, &fs)[0];
+        assert_eq!(r.local.status, PromiseStatus::Protected);
+    }
+
+    /// Fresh send + source unchanged: override is silent (no nagging advisory
+    /// when things look normal from the outside).
+    #[test]
+    fn source_unchanged_fresh_age_no_advisory() {
+        let config = test_config();
+        let now = dt(2026, 3, 23, 14, 0);
+        let mut fs = MockFileSystemState::new();
+
+        let pin_snap = snap(dt(2026, 3, 23, 8, 0), "sv1");
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![pin_snap.clone()]);
+        fs.external_snapshots.insert(
+            ("WD-18TB".to_string(), "sv1".to_string()),
+            vec![pin_snap.clone()],
+        );
+        fs.mounted_drives.insert("WD-18TB".to_string());
+
+        fs.pin_files.insert(
+            (std::path::PathBuf::from("/snap/sv1"), "WD-18TB".to_string()),
+            pin_snap.clone(),
+        );
+        // Send 6h ago — well within 1.5× of 1d.
+        fs.send_times.insert(
+            ("sv1".to_string(), "WD-18TB".to_string()),
+            dt(2026, 3, 23, 8, 0),
+        );
+
+        fs.generations
+            .insert(std::path::PathBuf::from("/data/sv1"), 42);
+        fs.generations.insert(
+            std::path::PathBuf::from(format!("/snap/sv1/{}", pin_snap.as_str())),
+            42,
+        );
+
+        let r = &assess(&config, now, &fs)[0];
+        assert!(
+            r.advisories
+                .iter()
+                .all(|a| !a.contains("source unchanged since last send")),
+            "fresh age should not emit source-unchanged advisory: {:?}",
+            r.advisories
         );
     }
 }

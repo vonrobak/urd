@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Status no longer reports UNPROTECTED for subvolumes whose source has not changed since the last successful send. Awareness now compares the source's BTRFS generation against the pin snapshot's generation and overrides age-based freshness when they match. Applies to both external send status and local snapshot status. Fails open — if generation queries error, falls back to the previous age-only assessment.
+
 ## [0.12.1] - 2026-04-06
 
 ### Fixed
