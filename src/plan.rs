@@ -162,6 +162,26 @@ fn check_drive_availability(
     }
 }
 
+// ── Interval-check helper ───────────────────────────────────────────────
+
+/// Whether an interval has elapsed, with a grace tolerance that absorbs
+/// timer drift.
+///
+/// A daily timer firing at 04:00 takes snapshots a few seconds or minutes
+/// after 04:00; the next day's run may start slightly earlier, leaving
+/// `elapsed` just short of the 24h threshold. Without grace, that cycle
+/// skips — and the pattern persists, dropping roughly one snapshot per
+/// rotation (observed: missing Mar 28, Apr 4, 7, 12, 14, 16 snapshots for
+/// fortified subvolumes on a daily timer).
+///
+/// Grace is 5% of the interval, capped at 15 minutes. This is small enough
+/// to keep short intervals tight (15 min interval → 45s grace) while
+/// handling the typical multi-minute drift on daily runs.
+fn interval_elapsed(elapsed: chrono::Duration, interval: chrono::Duration) -> bool {
+    let grace = (interval / 20).min(chrono::Duration::minutes(15));
+    elapsed >= interval - grace
+}
+
 // ── Planner ─────────────────────────────────────────────────────────────
 
 /// Generate a backup plan based on config, current time, filters, and filesystem state.
@@ -416,7 +436,7 @@ fn plan_local_snapshot(
         true
     } else if let Some(newest) = newest {
         let elapsed = now.signed_duration_since(newest.datetime());
-        elapsed >= subvol.snapshot_interval.as_chrono()
+        interval_elapsed(elapsed, subvol.snapshot_interval.as_chrono())
     } else {
         true // No snapshots exist — create first one
     };
@@ -636,15 +656,15 @@ fn plan_transient_lifecycle(
         } else {
             let ext_snaps = fs.external_snapshots(drive, &subvol.name).unwrap_or_default();
             let newest_ext = ext_snaps.iter().max().map(|s| s.datetime());
-            let interval_elapsed = match newest_ext {
+            let send_due = match newest_ext {
                 Some(newest_dt) => {
                     let elapsed = now.signed_duration_since(newest_dt);
-                    elapsed >= subvol.send_interval.as_chrono()
+                    interval_elapsed(elapsed, subvol.send_interval.as_chrono())
                 }
                 None => true, // No external snapshots — first send
             };
             sendable_drives.push((drive, newest_ext));
-            if interval_elapsed {
+            if send_due {
                 any_send_due = true;
             }
         }
@@ -759,7 +779,7 @@ fn plan_external_send(
         true
     } else if let Some(newest) = newest_ext {
         let elapsed = now.signed_duration_since(newest.datetime());
-        elapsed >= subvol.send_interval.as_chrono()
+        interval_elapsed(elapsed, subvol.send_interval.as_chrono())
     } else {
         true // No external snapshots — send first one
     };
@@ -1430,6 +1450,74 @@ priority = 2
                 .iter()
                 .any(|(name, reason)| name == "sv1" && reason.contains("interval"))
         );
+    }
+
+    // ── interval_elapsed grace tolerance ────────────────────────────────
+
+    #[test]
+    fn interval_elapsed_exactly_matches_interval() {
+        use chrono::Duration;
+        assert!(interval_elapsed(Duration::hours(24), Duration::hours(24)));
+    }
+
+    #[test]
+    fn interval_elapsed_grace_absorbs_daily_timer_drift() {
+        // Observed production case: daily timer fires 2 minutes early, leaving
+        // elapsed at 23h58m. Without grace this would skip, silently dropping
+        // roughly one snapshot per rotation.
+        use chrono::Duration;
+        let elapsed = Duration::hours(23) + Duration::minutes(58);
+        assert!(interval_elapsed(elapsed, Duration::hours(24)));
+    }
+
+    #[test]
+    fn interval_elapsed_stays_tight_for_short_intervals() {
+        // 15-min interval: grace is 5% = 45s, capped well below the 15-min
+        // cap. 10 minutes elapsed is still a genuine skip.
+        use chrono::Duration;
+        assert!(!interval_elapsed(
+            Duration::minutes(10),
+            Duration::minutes(15)
+        ));
+    }
+
+    #[test]
+    fn interval_elapsed_short_interval_within_grace() {
+        // 15-min interval, 14m30s elapsed: above threshold (14m15s).
+        use chrono::Duration;
+        let elapsed = Duration::minutes(14) + Duration::seconds(30);
+        assert!(interval_elapsed(elapsed, Duration::minutes(15)));
+    }
+
+    #[test]
+    fn interval_elapsed_grace_capped_at_15_min() {
+        // Weekly interval: 5% would be 8.4h, but the cap limits grace to
+        // 15 min — threshold is 6d 23h 45m. 6d 23h elapsed still skips.
+        use chrono::Duration;
+        let elapsed = Duration::days(6) + Duration::hours(23);
+        assert!(!interval_elapsed(elapsed, Duration::days(7)));
+    }
+
+    #[test]
+    fn creates_snapshot_when_daily_timer_drifts_early() {
+        // Regression test for the observed production bug: daily snapshot
+        // interval with last snapshot 23h58m ago should still create.
+        //
+        // "now" is 2026-03-22 15:00:00, last snapshot 2026-03-21 15:02:00
+        // (23h58m ago). Interval 1d. Grace 15 min → create.
+        let mut config = test_config();
+        config.subvolumes[0].snapshot_interval = Some(crate::types::Interval::days(1));
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap("20260321-1502-one")]);
+
+        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let creates: Vec<_> = result
+            .operations
+            .iter()
+            .filter(|op| matches!(op, PlannedOperation::CreateSnapshot { subvolume_name, .. } if subvolume_name == "sv1"))
+            .collect();
+        assert_eq!(creates.len(), 1);
     }
 
     #[test]
