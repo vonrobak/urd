@@ -7,9 +7,12 @@
 Urd preserves filesystem history silently and faithfully. When invoked, the encounter
 should be pleasant and clear. When Urd demands attention, the user should be glad it did.
 
-**Design north star:** Every feature must pass two tests: (1) does it make the user's data
-safer? (2) does it reduce the attention the user needs to spend on backups? If a feature
-adds complexity the user must manage, it needs a very strong justification.
+**Design north star:** Every feature must pass three tests: (1) does it make the user's
+data safer? (2) does it reduce the attention the user needs to spend on backups? (3) does
+Urd do no harm to the host she protects? A backup tool that causes storage pressure, I/O
+contention, or other burden on the system it's supposed to protect has failed both its
+job and its promise. When Urd and the host are in conflict, the host wins. If a feature
+adds complexity the user must manage, it needs a very strong justification. See ADR-113.
 
 **Two modes of existence:**
 - **The invisible worker.** Runs autonomously via systemd timer (nightly at ~04:00) and
@@ -246,6 +249,7 @@ cargo run -- migrate                 # Migrate config to v1 schema
 | 110 | Protection promises | Promise semantics, maturity model |
 | 111 | Config system architecture | Config structure, versioning (target, not yet implemented) |
 | 112 | SemVer and release workflow | Versioning, CHANGELOG, git tags, /release skill |
+| 113 | The Do-No-Harm invariant | Layered, probabilistic defense against Urd-induced host burden |
 
 ## Development Workflow
 
