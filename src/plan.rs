@@ -10,7 +10,8 @@ use crate::drives::DriveAvailability;
 use crate::error::UrdError;
 use crate::retention;
 use crate::types::{
-    BackupPlan, FullSendReason, LocalRetentionPolicy, PlannedOperation, SnapshotName,
+    BackupPlan, DriveEvent, DriveEventKind, FullSendReason, LocalRetentionPolicy, PlannedOperation,
+    SendKind, SnapshotName,
 };
 
 // ── FileSystemState trait ───────────────────────────────────────────────
@@ -52,13 +53,18 @@ pub trait FileSystemState {
     /// Collect all pinned snapshot names for a subvolume across all drives.
     fn pinned_snapshots(&self, local_dir: &Path, drive_labels: &[String]) -> HashSet<SnapshotName>;
 
-    /// Get the bytes_transferred from the most recent successful send of a given type.
+    /// Get the bytes_transferred from the most recent successful send of a given kind.
     /// Returns None if no history exists (e.g., first-ever send).
-    fn last_send_size(&self, subvol_name: &str, drive_label: &str, send_type: &str) -> Option<u64>;
+    fn last_send_size(
+        &self,
+        subvol_name: &str,
+        drive_label: &str,
+        send_kind: SendKind,
+    ) -> Option<u64>;
 
-    /// Get the bytes_transferred from the most recent successful send of a given type
+    /// Get the bytes_transferred from the most recent successful send of a given kind
     /// across **all** drives. Cross-drive fallback for drive swap scenarios.
-    fn last_send_size_any_drive(&self, subvol_name: &str, send_type: &str) -> Option<u64>;
+    fn last_send_size_any_drive(&self, subvol_name: &str, send_kind: SendKind) -> Option<u64>;
 
     /// Get a calibrated size estimate for a subvolume (from `urd calibrate`).
     /// Returns `(estimated_bytes, measured_at)` or None if not calibrated.
@@ -74,6 +80,47 @@ pub trait FileSystemState {
         subvol_name: &str,
         drive_label: &str,
     ) -> Option<NaiveDateTime>;
+
+    /// Most recent mount/unmount event for a drive from `drive_connections`.
+    /// None if no event recorded (drive never seen by sentinel).
+    fn last_drive_event(&self, drive_label: &str) -> Option<DriveEvent>;
+
+    /// Most recent successful send timestamp for this drive (any subvolume).
+    /// None when no successful send has ever completed for this drive.
+    fn last_successful_operation_at(&self, drive_label: &str) -> Option<NaiveDateTime>;
+}
+
+// ── Size estimation helper ──────────────────────────────────────────────
+
+/// Best available estimate of the bytes a next send will transfer.
+/// Strategy: same-drive history > cross-drive history > calibrated
+/// size (full sends only). Returns None when no data is available.
+///
+/// Note: calibrated size is the full subvolume footprint, so it is
+/// only a valid estimate when a full send is needed. For incremental
+/// sends, returning None is correct — callers must treat "unknown"
+/// as not-a-constraint rather than substituting calibrated.
+#[must_use]
+pub fn estimated_send_size(
+    fs: &dyn FileSystemState,
+    subvol_name: &str,
+    drive_label: &str,
+    needs_full: bool,
+) -> Option<u64> {
+    let send_kind = if needs_full {
+        SendKind::Full
+    } else {
+        SendKind::Incremental
+    };
+    fs.last_send_size(subvol_name, drive_label, send_kind)
+        .or_else(|| fs.last_send_size_any_drive(subvol_name, send_kind))
+        .or_else(|| {
+            if needs_full {
+                fs.calibrated_size(subvol_name).map(|(bytes, _)| bytes)
+            } else {
+                None
+            }
+        })
 }
 
 // ── PlanFilters ─────────────────────────────────────────────────────────
@@ -838,14 +885,14 @@ fn plan_external_send(
 
     // Space estimation: skip if estimated send size exceeds available space.
     // Three-tier fallback: same-drive history > cross-drive history > calibrated (full only).
-    let send_type_str = if is_incremental {
-        "send_incremental"
+    let send_kind = if is_incremental {
+        SendKind::Incremental
     } else {
-        "send_full"
+        SendKind::Full
     };
     if let Some(last_size) = fs
-        .last_send_size(&subvol.name, &drive.label, send_type_str)
-        .or_else(|| fs.last_send_size_any_drive(&subvol.name, send_type_str))
+        .last_send_size(&subvol.name, &drive.label, send_kind)
+        .or_else(|| fs.last_send_size_any_drive(&subvol.name, send_kind))
     {
         // Tier 1/2: historical data from same drive or cross-drive fallback
         if let Some((estimated, available, free, min_free)) =
@@ -1065,8 +1112,14 @@ impl FileSystemState for RealFileSystemState<'_> {
         crate::chain::find_pinned_snapshots(local_dir, drive_labels)
     }
 
-    fn last_send_size(&self, subvol_name: &str, drive_label: &str, send_type: &str) -> Option<u64> {
+    fn last_send_size(
+        &self,
+        subvol_name: &str,
+        drive_label: &str,
+        send_kind: SendKind,
+    ) -> Option<u64> {
         self.state.and_then(|db| {
+            let send_type = send_kind.as_db_str();
             let successful = db
                 .last_successful_send_size(subvol_name, drive_label, send_type)
                 .ok()
@@ -1082,8 +1135,9 @@ impl FileSystemState for RealFileSystemState<'_> {
         })
     }
 
-    fn last_send_size_any_drive(&self, subvol_name: &str, send_type: &str) -> Option<u64> {
+    fn last_send_size_any_drive(&self, subvol_name: &str, send_kind: SendKind) -> Option<u64> {
         self.state.and_then(|db| {
+            let send_type = send_kind.as_db_str();
             let successful = db
                 .last_successful_send_size_any_drive(subvol_name, send_type)
                 .ok()
@@ -1115,6 +1169,37 @@ impl FileSystemState for RealFileSystemState<'_> {
     ) -> Option<NaiveDateTime> {
         self.state.and_then(|db| {
             db.last_successful_send_time(subvol_name, drive_label)
+                .ok()
+                .flatten()
+        })
+    }
+
+    fn last_drive_event(&self, drive_label: &str) -> Option<DriveEvent> {
+        let record = self
+            .state
+            .and_then(|db| db.last_drive_connection(drive_label).ok().flatten())?;
+        let kind = match record.event_type.as_str() {
+            "mounted" => DriveEventKind::Mount,
+            "unmounted" => DriveEventKind::Unmount,
+            other => {
+                log::warn!("unknown drive_connections.event_type {other:?} — ignoring");
+                return None;
+            }
+        };
+        let at = chrono::NaiveDateTime::parse_from_str(&record.timestamp, "%Y-%m-%dT%H:%M:%S")
+            .inspect_err(|e| {
+                log::warn!(
+                    "failed to parse drive_connections.timestamp {:?}: {e}",
+                    record.timestamp
+                );
+            })
+            .ok()?;
+        Some(DriveEvent { kind, at })
+    }
+
+    fn last_successful_operation_at(&self, drive_label: &str) -> Option<NaiveDateTime> {
+        self.state.and_then(|db| {
+            db.last_successful_operation_at(drive_label)
                 .ok()
                 .flatten()
         })
@@ -1165,9 +1250,11 @@ pub struct MockFileSystemState {
         std::collections::HashMap<String, crate::drives::DriveAvailability>,
     pub free_bytes: std::collections::HashMap<PathBuf, u64>,
     pub pin_files: std::collections::HashMap<(PathBuf, String), SnapshotName>,
-    pub send_sizes: std::collections::HashMap<(String, String, String), u64>,
+    pub send_sizes: std::collections::HashMap<(String, String, SendKind), u64>,
     pub calibrated_sizes: std::collections::HashMap<String, (u64, String)>,
     pub send_times: std::collections::HashMap<(String, String), NaiveDateTime>,
+    pub drive_events: std::collections::HashMap<String, DriveEvent>,
+    pub last_successful_ops: std::collections::HashMap<String, NaiveDateTime>,
     /// Subvolume names for which local_snapshots() should return an error.
     pub fail_local_snapshots: HashSet<String>,
     /// (local_dir, drive_label) pairs for which read_pin_file() should return an error.
@@ -1191,6 +1278,8 @@ impl MockFileSystemState {
             send_sizes: std::collections::HashMap::new(),
             calibrated_sizes: std::collections::HashMap::new(),
             send_times: std::collections::HashMap::new(),
+            drive_events: std::collections::HashMap::new(),
+            last_successful_ops: std::collections::HashMap::new(),
             fail_local_snapshots: HashSet::new(),
             fail_pin_reads: HashSet::new(),
             generations: std::collections::HashMap::new(),
@@ -1282,23 +1371,28 @@ impl FileSystemState for MockFileSystemState {
         pinned
     }
 
-    fn last_send_size(&self, subvol_name: &str, drive_label: &str, send_type: &str) -> Option<u64> {
+    fn last_send_size(
+        &self,
+        subvol_name: &str,
+        drive_label: &str,
+        send_kind: SendKind,
+    ) -> Option<u64> {
         self.send_sizes
             .get(&(
                 subvol_name.to_string(),
                 drive_label.to_string(),
-                send_type.to_string(),
+                send_kind,
             ))
             .copied()
     }
 
-    fn last_send_size_any_drive(&self, subvol_name: &str, send_type: &str) -> Option<u64> {
+    fn last_send_size_any_drive(&self, subvol_name: &str, send_kind: SendKind) -> Option<u64> {
         // Note: returns max by value, not most-recent-by-time.
         // Real impl uses recency (ORDER BY id DESC). The mock has no
         // insertion ordering, so max-by-value is the best approximation.
         self.send_sizes
             .iter()
-            .filter(|((sv, _, st), _)| sv == subvol_name && st == send_type)
+            .filter(|((sv, _, st), _)| sv == subvol_name && *st == send_kind)
             .map(|(_, &bytes)| bytes)
             .max()
     }
@@ -1337,6 +1431,14 @@ impl FileSystemState for MockFileSystemState {
         self.send_times
             .get(&(subvol_name.to_string(), drive_label.to_string()))
             .copied()
+    }
+
+    fn last_drive_event(&self, drive_label: &str) -> Option<DriveEvent> {
+        self.drive_events.get(drive_label).cloned()
+    }
+
+    fn last_successful_operation_at(&self, drive_label: &str) -> Option<NaiveDateTime> {
+        self.last_successful_ops.get(drive_label).copied()
     }
 }
 
@@ -1410,6 +1512,71 @@ priority = 2
 
     fn snap(s: &str) -> SnapshotName {
         SnapshotName::parse(s).unwrap()
+    }
+
+    // ── estimated_send_size tests ──────────────────────────────────────
+
+    #[test]
+    fn est_full_needed_uses_same_drive_history_first() {
+        let mut fs = MockFileSystemState::new();
+        fs.send_sizes
+            .insert(("sv1".into(), "D1".into(), SendKind::Full), 50_000_000_000);
+        fs.send_sizes
+            .insert(("sv1".into(), "OTHER".into(), SendKind::Full), 10_000_000_000);
+        fs.calibrated_sizes
+            .insert("sv1".into(), (999_999_999_999, "2026-04-01".into()));
+        assert_eq!(estimated_send_size(&fs, "sv1", "D1", true), Some(50_000_000_000));
+    }
+
+    #[test]
+    fn est_full_needed_falls_back_cross_drive() {
+        let mut fs = MockFileSystemState::new();
+        fs.send_sizes
+            .insert(("sv1".into(), "OTHER".into(), SendKind::Full), 10_000_000_000);
+        assert_eq!(estimated_send_size(&fs, "sv1", "D1", true), Some(10_000_000_000));
+    }
+
+    #[test]
+    fn est_full_needed_falls_back_calibrated_when_no_history() {
+        let mut fs = MockFileSystemState::new();
+        fs.calibrated_sizes
+            .insert("sv1".into(), (42_000_000_000, "2026-04-01".into()));
+        assert_eq!(estimated_send_size(&fs, "sv1", "D1", true), Some(42_000_000_000));
+    }
+
+    #[test]
+    fn est_incremental_uses_same_drive_history() {
+        let mut fs = MockFileSystemState::new();
+        fs.send_sizes.insert(
+            ("sv1".into(), "D1".into(), SendKind::Incremental),
+            5_000_000,
+        );
+        assert_eq!(estimated_send_size(&fs, "sv1", "D1", false), Some(5_000_000));
+    }
+
+    #[test]
+    fn est_incremental_falls_back_cross_drive() {
+        let mut fs = MockFileSystemState::new();
+        fs.send_sizes.insert(
+            ("sv1".into(), "OTHER".into(), SendKind::Incremental),
+            3_000_000,
+        );
+        assert_eq!(estimated_send_size(&fs, "sv1", "D1", false), Some(3_000_000));
+    }
+
+    #[test]
+    fn est_incremental_never_uses_calibrated() {
+        let mut fs = MockFileSystemState::new();
+        fs.calibrated_sizes
+            .insert("sv1".into(), (999_999_999_999, "2026-04-01".into()));
+        assert_eq!(estimated_send_size(&fs, "sv1", "D1", false), None);
+    }
+
+    #[test]
+    fn est_returns_none_when_no_data() {
+        let fs = MockFileSystemState::new();
+        assert_eq!(estimated_send_size(&fs, "sv1", "D1", true), None);
+        assert_eq!(estimated_send_size(&fs, "sv1", "D1", false), None);
     }
 
     #[test]
@@ -1999,7 +2166,7 @@ send_enabled = false
         fs.mounted_drives.insert("D1".to_string());
         // Historical full send was 200GB
         fs.send_sizes.insert(
-            ("sv1".to_string(), "D1".to_string(), "send_full".to_string()),
+            ("sv1".to_string(), "D1".to_string(), SendKind::Full),
             200_000_000_000,
         );
         // Only 150GB free on external drive (min_free=100GB, so available=50GB)
@@ -2035,7 +2202,7 @@ send_enabled = false
         fs.mounted_drives.insert("D1".to_string());
         // Historical full send was 50GB
         fs.send_sizes.insert(
-            ("sv1".to_string(), "D1".to_string(), "send_full".to_string()),
+            ("sv1".to_string(), "D1".to_string(), SendKind::Full),
             50_000_000_000,
         );
         // 500GB free on external drive (min_free=100GB, available=400GB, estimated=60GB)
@@ -2124,7 +2291,7 @@ send_enabled = false
         fs.mounted_drives.insert("D1".to_string());
         // Tier 1 says 100KB (small send)
         fs.send_sizes.insert(
-            ("sv1".to_string(), "D1".to_string(), "send_full".to_string()),
+            ("sv1".to_string(), "D1".to_string(), SendKind::Full),
             100_000,
         );
         // Calibrated says 1TB (would block if used)
@@ -2181,7 +2348,7 @@ send_enabled = false
         fs.mounted_drives.insert("D1".to_string());
         // No same-drive history, but cross-drive history says 1TB
         fs.send_sizes.insert(
-            ("sv1".to_string(), "OTHER-DRIVE".to_string(), "send_full".to_string()),
+            ("sv1".to_string(), "OTHER-DRIVE".to_string(), SendKind::Full),
             1_000_000_000_000,
         );
         // Drive has only 500GB free
@@ -4106,5 +4273,24 @@ local_retention = "transient"
             skip.is_some() && skip.unwrap().1.starts_with("unchanged"),
             "should report unchanged reason"
         );
+    }
+
+    #[test]
+    fn real_file_system_state_round_trips_drive_events() {
+        use crate::state::{DriveEventSource, DriveEventType, StateDb};
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let db = StateDb::open(&dir.path().join("urd.db")).unwrap();
+        db.record_drive_event("D1", DriveEventType::Mounted, DriveEventSource::Sentinel)
+            .unwrap();
+        db.record_drive_event("D1", DriveEventType::Unmounted, DriveEventSource::Sentinel)
+            .unwrap();
+
+        let fs = RealFileSystemState { state: Some(&db) };
+        let event = fs
+            .last_drive_event("D1")
+            .expect("round-trip must yield an event — guards schema/parser drift");
+        assert!(matches!(event.kind, DriveEventKind::Unmount));
     }
 }

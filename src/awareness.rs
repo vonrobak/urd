@@ -15,8 +15,10 @@ use serde::Serialize;
 
 use crate::config::{Config, DriveConfig};
 use crate::output::{RedundancyAdvisory, RedundancyAdvisoryKind};
-use crate::plan::FileSystemState;
-use crate::types::{DriveRole, Interval, LocalRetentionPolicy, ProtectionLevel, SnapshotName};
+use crate::plan::{self, FileSystemState};
+use crate::types::{
+    DriveEventKind, DriveRole, Interval, LocalRetentionPolicy, ProtectionLevel, SnapshotName,
+};
 
 // ── Thresholds ─────────────────────────────────────────────────────────
 
@@ -175,6 +177,20 @@ pub struct DriveAssessment {
     #[allow(dead_code)] // consumed by verbose status display (future)
     pub configured_interval: Interval,
     pub role: DriveRole,
+    /// Seconds since the drive's last `Unmount` event in `drive_connections`,
+    /// populated only when the drive is currently unmounted AND the most
+    /// recent physical event is an Unmount. Rule 1 of the voice contract:
+    /// stay silent when the sentinel missed the disconnect (last event is
+    /// Mount but drive is unmounted) — fall through to activity or silence.
+    #[allow(dead_code)] // consumed via StatusDriveAssessment by voice.rs
+    pub absent_duration_secs: Option<i64>,
+    /// Seconds since the most recent successful operation targeting this
+    /// drive in the operations log. Populated only when the drive is
+    /// unmounted AND `drive_connections` holds *no* events for this drive
+    /// at all — the drive predates sentinel observation. Never mixed with
+    /// `absent_duration_secs`.
+    #[allow(dead_code)] // consumed via StatusDriveAssessment by voice.rs
+    pub last_activity_age_secs: Option<i64>,
 }
 
 // ── Actionable Advice ─────────────────────────────────────────────────
@@ -394,6 +410,32 @@ pub fn assess(
     let resolved = config.resolved_subvolumes();
     let mut assessments = Vec::new();
 
+    // Per-drive cascade lookup computed once (identical for all subvols).
+    // Avoids N*M SQLite round-trips on every render.
+    let drive_absence: std::collections::HashMap<String, (Option<i64>, Option<i64>)> = config
+        .drives
+        .iter()
+        .map(|d| {
+            let signal = if fs.is_drive_mounted(d) {
+                (None, None)
+            } else {
+                match fs.last_drive_event(&d.label) {
+                    Some(event) => match event.kind {
+                        DriveEventKind::Unmount => {
+                            (Some((now - event.at).num_seconds()), None)
+                        }
+                        DriveEventKind::Mount => (None, None),
+                    },
+                    None => match fs.last_successful_operation_at(&d.label) {
+                        Some(op_time) => (None, Some((now - op_time).num_seconds())),
+                        None => (None, None),
+                    },
+                }
+            };
+            (d.label.clone(), signal)
+        })
+        .collect();
+
     for subvol in &resolved {
         if !subvol.enabled {
             continue;
@@ -545,6 +587,9 @@ pub fn assess(
                     ));
                 }
 
+                let (absent_duration_secs, last_activity_age_secs) =
+                    drive_absence.get(&drive.label).copied().unwrap_or((None, None));
+
                 drive_assessments.push(DriveAssessment {
                     drive_label: drive.label.clone(),
                     status,
@@ -553,6 +598,8 @@ pub fn assess(
                     last_send_age,
                     configured_interval: subvol.send_interval,
                     role: drive.role,
+                    absent_duration_secs,
+                    last_activity_age_secs,
                 });
             }
         }
@@ -943,13 +990,6 @@ fn compute_health(
             let free = fs.filesystem_free_bytes(&cfg.mount_path).unwrap_or(u64::MAX);
             let min_free = cfg.min_free_bytes.map(|b| b.bytes()).unwrap_or(0);
 
-            // Estimate next send size: calibrated > last send > skip
-            let est_size = fs
-                .calibrated_size(subvol_name)
-                .map(|(bytes, _)| bytes)
-                .or_else(|| fs.last_send_size(subvol_name, &da.drive_label, "incremental"))
-                .or_else(|| fs.last_send_size(subvol_name, &da.drive_label, "full"));
-
             // Check if chain is broken on this drive (full send will be needed)
             let chain_broken = chain_health.iter().any(|ch| {
                 ch.drive_label == da.drive_label
@@ -957,6 +997,10 @@ fn compute_health(
                         if *reason != ChainBreakReason::NoDriveData
                             && !is_expected_chain_break(is_transient, reason))
             });
+
+            // Calibrated size is the full-subvolume footprint; estimated_send_size
+            // only returns it when a full send is needed (chain broken).
+            let est_size = plan::estimated_send_size(fs, subvol_name, &da.drive_label, chain_broken);
 
             match est_size {
                 Some(size) if free.saturating_sub(min_free) < size => {
@@ -993,10 +1037,8 @@ fn compute_health(
             worst = worst.min(OperationalHealth::Degraded);
 
             // Surface uncertainty: chain broken means full send, but no size estimate
-            let has_estimate = fs
-                .calibrated_size(subvol_name)
-                .is_some()
-                || fs.last_send_size(subvol_name, &ch.drive_label, "full").is_some();
+            let has_estimate =
+                plan::estimated_send_size(fs, subvol_name, &ch.drive_label, true).is_some();
             if !has_estimate {
                 reasons.push(format!(
                     "full send size unknown for {} \u{2014} space check unavailable",
@@ -2689,21 +2731,23 @@ send_enabled = false
         let now = dt(2026, 3, 23, 14, 0);
         let mut fs = MockFileSystemState::new();
 
+        // Pin snap present both locally and on drive → chain Intact → incremental path.
+        let pin_snap = snap(dt(2026, 3, 23, 12, 0), "sv1");
         fs.local_snapshots.insert(
             "sv1".to_string(),
-            vec![snap(dt(2026, 3, 23, 13, 30), "sv1")],
+            vec![pin_snap.clone(), snap(dt(2026, 3, 23, 13, 30), "sv1")],
         );
         fs.mounted_drives.insert("WD-18TB".to_string());
         fs.external_snapshots.insert(
             ("WD-18TB".to_string(), "sv1".to_string()),
-            vec![snap(dt(2026, 3, 23, 12, 0), "sv1")],
+            vec![pin_snap.clone()],
         );
         fs.pin_files.insert(
             (
                 std::path::PathBuf::from("/snap/sv1"),
                 "WD-18TB".to_string(),
             ),
-            snap(dt(2026, 3, 23, 12, 0), "sv1"),
+            pin_snap,
         );
         fs.send_times.insert(
             ("sv1".to_string(), "WD-18TB".to_string()),
@@ -2713,13 +2757,285 @@ send_enabled = false
         fs.free_bytes
             .insert(std::path::PathBuf::from("/mnt/wd"), 150_000_000_000);
         fs.send_sizes.insert(
-            ("sv1".to_string(), "WD-18TB".to_string(), "incremental".to_string()),
+            ("sv1".to_string(), "WD-18TB".to_string(), crate::types::SendKind::Incremental),
             60_000_000_000,
         );
 
         let results = assess(&config, now, &fs);
         assert_eq!(results[0].health, OperationalHealth::Blocked);
         assert!(results[0].health_reasons.iter().any(|r| r.contains("insufficient space")));
+    }
+
+    // ── compute_health regression: estimator must not use calibrated size for incrementals ──
+
+    #[test]
+    fn health_intact_chain_large_calibrated_small_incremental_not_blocked() {
+        // Regression: before the fix, awareness consulted calibrated (full subvolume
+        // footprint) even for incrementals with intact chains, triggering false
+        // Blocked states on healthy subvolumes.
+        let config = test_config_with_min_free();
+        let now = dt(2026, 3, 23, 14, 0);
+        let mut fs = MockFileSystemState::new();
+
+        let pin_snap = snap(dt(2026, 3, 23, 12, 0), "sv1");
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![pin_snap.clone(), snap(dt(2026, 3, 23, 13, 30), "sv1")]);
+        fs.mounted_drives.insert("WD-18TB".to_string());
+        fs.external_snapshots
+            .insert(("WD-18TB".to_string(), "sv1".to_string()), vec![pin_snap.clone()]);
+        fs.pin_files.insert(
+            (std::path::PathBuf::from("/snap/sv1"), "WD-18TB".to_string()),
+            pin_snap,
+        );
+        // 6GB free (above min_free=100GB would block, but we set available=6GB here)
+        fs.free_bytes
+            .insert(std::path::PathBuf::from("/mnt/wd"), 106_000_000_000);
+        // Calibrated = 10TB, but incremental history says 5GB — incremental fits easily.
+        fs.calibrated_sizes
+            .insert("sv1".to_string(), (10_000_000_000_000, "2026-04-01".to_string()));
+        fs.send_sizes.insert(
+            ("sv1".to_string(), "WD-18TB".to_string(), crate::types::SendKind::Incremental),
+            5_000_000_000,
+        );
+
+        let results = assess(&config, now, &fs);
+        assert_ne!(
+            results[0].health,
+            OperationalHealth::Blocked,
+            "intact chain with small incremental must not be Blocked by large calibrated size"
+        );
+    }
+
+    #[test]
+    fn health_broken_chain_no_history_fails_open() {
+        // Chain broken (PinMissingOnDrive, not NoDriveData), no size data at all →
+        // fail open (not Blocked) and surface uncertainty.
+        let config = test_config_with_min_free();
+        let now = dt(2026, 3, 23, 14, 0);
+        let mut fs = MockFileSystemState::new();
+
+        // External has snapshots but not the pin → PinMissingOnDrive (a real break).
+        let pin_snap = snap(dt(2026, 3, 23, 12, 0), "sv1");
+        fs.local_snapshots.insert(
+            "sv1".to_string(),
+            vec![pin_snap.clone(), snap(dt(2026, 3, 23, 13, 30), "sv1")],
+        );
+        fs.mounted_drives.insert("WD-18TB".to_string());
+        fs.external_snapshots.insert(
+            ("WD-18TB".to_string(), "sv1".to_string()),
+            vec![snap(dt(2026, 3, 22, 10, 0), "sv1")], // different snap, not the pin
+        );
+        fs.pin_files.insert(
+            (std::path::PathBuf::from("/snap/sv1"), "WD-18TB".to_string()),
+            pin_snap,
+        );
+        fs.free_bytes
+            .insert(std::path::PathBuf::from("/mnt/wd"), 200_000_000_000);
+
+        let results = assess(&config, now, &fs);
+        assert_ne!(
+            results[0].health,
+            OperationalHealth::Blocked,
+            "broken chain with no size data must fail open, not block"
+        );
+        assert!(
+            results[0].health_reasons.iter().any(|r| r.contains("full send size unknown")),
+            "should surface uncertainty: {:?}",
+            results[0].health_reasons
+        );
+    }
+
+    #[test]
+    fn health_regression_false_blocked_on_healthy_incremental() {
+        // Reproduces the original subvol3-opptak report:
+        // intact chain, calibrated=large, incremental history=small, free >> incremental.
+        // Pre-fix: Blocked. Post-fix: not Blocked.
+        let config = test_config_with_min_free();
+        let now = dt(2026, 3, 23, 14, 0);
+        let mut fs = MockFileSystemState::new();
+
+        let pin_snap = snap(dt(2026, 3, 23, 12, 0), "sv1");
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![pin_snap.clone(), snap(dt(2026, 3, 23, 13, 30), "sv1")]);
+        fs.mounted_drives.insert("WD-18TB".to_string());
+        fs.external_snapshots
+            .insert(("WD-18TB".to_string(), "sv1".to_string()), vec![pin_snap.clone()]);
+        fs.pin_files.insert(
+            (std::path::PathBuf::from("/snap/sv1"), "WD-18TB".to_string()),
+            pin_snap,
+        );
+        // 2.7TB free, min_free 100GB → 2.6TB available
+        fs.free_bytes
+            .insert(std::path::PathBuf::from("/mnt/wd"), 2_700_000_000_000);
+        fs.calibrated_sizes
+            .insert("sv1".to_string(), (10_000_000_000_000, "2026-04-01".to_string()));
+        fs.send_sizes.insert(
+            ("sv1".to_string(), "WD-18TB".to_string(), crate::types::SendKind::Incremental),
+            50_000_000_000,
+        );
+
+        let results = assess(&config, now, &fs);
+        assert_ne!(
+            results[0].health,
+            OperationalHealth::Blocked,
+            "subvol3-opptak regression: must not be Blocked when incremental fits"
+        );
+    }
+
+    // ── Drive-absence + last-activity cascade ──
+
+    #[test]
+    fn drive_assessment_absent_duration_populated_when_unmounted_and_last_event_is_unmount() {
+        use crate::types::{DriveEvent, DriveEventKind};
+        let config = test_config();
+        let now = dt(2026, 3, 23, 14, 0);
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap(dt(2026, 3, 23, 13, 30), "sv1")]);
+        // Drive is NOT mounted. Last event is Unmount 6 hours ago.
+        fs.drive_events.insert(
+            "WD-18TB".to_string(),
+            DriveEvent {
+                kind: DriveEventKind::Unmount,
+                at: dt(2026, 3, 23, 8, 0),
+            },
+        );
+
+        let results = assess(&config, now, &fs);
+        let drive = &results[0].external[0];
+        assert_eq!(
+            drive.absent_duration_secs,
+            Some(6 * 3600),
+            "expected 6h since Unmount event"
+        );
+        assert_eq!(drive.last_activity_age_secs, None);
+    }
+
+    #[test]
+    fn drive_assessment_absent_duration_none_when_mounted() {
+        use crate::types::{DriveEvent, DriveEventKind};
+        let config = test_config();
+        let now = dt(2026, 3, 23, 14, 0);
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap(dt(2026, 3, 23, 13, 30), "sv1")]);
+        fs.mounted_drives.insert("WD-18TB".to_string());
+        fs.external_snapshots.insert(
+            ("WD-18TB".to_string(), "sv1".to_string()),
+            vec![snap(dt(2026, 3, 23, 13, 30), "sv1")],
+        );
+        // Event data present but drive is mounted → cascade must yield (None, None).
+        fs.drive_events.insert(
+            "WD-18TB".to_string(),
+            DriveEvent {
+                kind: DriveEventKind::Mount,
+                at: dt(2026, 3, 23, 12, 0),
+            },
+        );
+        fs.last_successful_ops
+            .insert("WD-18TB".to_string(), dt(2026, 3, 22, 12, 0));
+
+        let results = assess(&config, now, &fs);
+        let drive = &results[0].external[0];
+        assert_eq!(drive.absent_duration_secs, None);
+        assert_eq!(drive.last_activity_age_secs, None);
+    }
+
+    #[test]
+    fn drive_assessment_absent_duration_none_when_last_event_is_mount_but_drive_unmounted() {
+        // Sentinel missed the disconnect. Rule 1: stay silent rather than
+        // emit a confident falsehood. Must NOT fall through to ops-log.
+        use crate::types::{DriveEvent, DriveEventKind};
+        let config = test_config();
+        let now = dt(2026, 3, 23, 14, 0);
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap(dt(2026, 3, 23, 13, 30), "sv1")]);
+        // Drive unmounted, last event is Mount (stale — the Unmount was missed).
+        fs.drive_events.insert(
+            "WD-18TB".to_string(),
+            DriveEvent {
+                kind: DriveEventKind::Mount,
+                at: dt(2026, 3, 22, 8, 0),
+            },
+        );
+        // Ops log has data, but cascade must not consult it (an event exists).
+        fs.last_successful_ops
+            .insert("WD-18TB".to_string(), dt(2026, 3, 22, 10, 0));
+
+        let results = assess(&config, now, &fs);
+        let drive = &results[0].external[0];
+        assert_eq!(drive.absent_duration_secs, None);
+        assert_eq!(
+            drive.last_activity_age_secs, None,
+            "must not fall through to ops-log when any drive event exists"
+        );
+    }
+
+    #[test]
+    fn drive_assessment_last_activity_from_ops_log_when_no_event() {
+        // drive_connections empty for this drive → fall through to operations log.
+        let config = test_config();
+        let now = dt(2026, 3, 23, 14, 0);
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap(dt(2026, 3, 23, 13, 30), "sv1")]);
+        // Drive unmounted, zero drive_events → ops-log fallback.
+        fs.last_successful_ops
+            .insert("WD-18TB".to_string(), dt(2026, 3, 20, 14, 0));
+
+        let results = assess(&config, now, &fs);
+        let drive = &results[0].external[0];
+        assert_eq!(drive.absent_duration_secs, None);
+        assert_eq!(
+            drive.last_activity_age_secs,
+            Some(3 * 86400),
+            "expected 3 days since last successful op"
+        );
+    }
+
+    #[test]
+    fn drive_assessment_last_activity_none_when_any_drive_event_exists() {
+        // Even with ops-log data present, a single Unmount event takes precedence:
+        // absent_duration_secs populated, last_activity_age_secs silent.
+        use crate::types::{DriveEvent, DriveEventKind};
+        let config = test_config();
+        let now = dt(2026, 3, 23, 14, 0);
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap(dt(2026, 3, 23, 13, 30), "sv1")]);
+        fs.drive_events.insert(
+            "WD-18TB".to_string(),
+            DriveEvent {
+                kind: DriveEventKind::Unmount,
+                at: dt(2026, 3, 23, 10, 0),
+            },
+        );
+        fs.last_successful_ops
+            .insert("WD-18TB".to_string(), dt(2026, 3, 20, 10, 0));
+
+        let results = assess(&config, now, &fs);
+        let drive = &results[0].external[0];
+        assert_eq!(drive.absent_duration_secs, Some(4 * 3600));
+        assert_eq!(
+            drive.last_activity_age_secs, None,
+            "cascade must not mix sources"
+        );
+    }
+
+    #[test]
+    fn drive_assessment_both_none_when_no_data() {
+        // Unmounted drive, zero drive_events, zero ops-log entries → both None.
+        let config = test_config();
+        let now = dt(2026, 3, 23, 14, 0);
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap(dt(2026, 3, 23, 13, 30), "sv1")]);
+
+        let results = assess(&config, now, &fs);
+        let drive = &results[0].external[0];
+        assert_eq!(drive.absent_duration_secs, None);
+        assert_eq!(drive.last_activity_age_secs, None);
     }
 
     #[test]
@@ -3372,6 +3688,8 @@ drives = ["primary-drive", "offsite-drive"]
             last_send_age: age_days.map(Duration::days),
             configured_interval: Interval::hours(24),
             role: DriveRole::Offsite,
+            absent_duration_secs: None,
+            last_activity_age_secs: None,
         }
     }
 
@@ -3384,6 +3702,8 @@ drives = ["primary-drive", "offsite-drive"]
             last_send_age: Some(Duration::hours(2)),
             configured_interval: Interval::hours(24),
             role: DriveRole::Primary,
+            absent_duration_secs: None,
+            last_activity_age_secs: None,
         }
     }
 
@@ -3445,6 +3765,8 @@ drives = ["primary-drive", "offsite-drive"]
             last_send_age: Some(Duration::days(60)),
             configured_interval: Interval::hours(24),
             role: DriveRole::Offsite,
+            absent_duration_secs: None,
+            last_activity_age_secs: None,
         }];
         let mut assessments = vec![make_assessment("sv1", PromiseStatus::Protected, drives)];
 
@@ -3483,6 +3805,8 @@ drives = ["primary-drive", "offsite-drive"]
             last_send_age: Some(Duration::days(60)),
             configured_interval: Interval::hours(24),
             role: DriveRole::Offsite,
+            absent_duration_secs: None,
+            last_activity_age_secs: None,
         };
         let fresh_offsite = offsite_drive_assessment(Some(10));
         let drives = vec![primary_drive_assessment(), stale_offsite, fresh_offsite];
@@ -4157,6 +4481,8 @@ drives = ["D1"]
             last_send_age: send_age_hours.map(Duration::hours),
             configured_interval: Interval::hours(24),
             role: DriveRole::Primary,
+            absent_duration_secs: None,
+            last_activity_age_secs: None,
         }
     }
 

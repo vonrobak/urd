@@ -27,7 +27,7 @@ use crate::plan::{self, FileSystemState, PlanFilters, RealFileSystemState};
 use crate::sentinel_runner;
 use crate::preflight;
 use crate::state::StateDb;
-use crate::types::{BackupPlan, ByteSize, PlannedOperation, ProtectionLevel};
+use crate::types::{BackupPlan, ByteSize, PlannedOperation, ProtectionLevel, SendKind};
 
 pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     let now = chrono::Local::now().naive_local();
@@ -330,7 +330,11 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     );
     let output_mode = OutputMode::detect();
     let rendered = crate::voice::render_backup_summary(&summary, output_mode);
-    println!("{rendered}");
+    let preamble = crate::commands::acknowledgment::preamble_for(
+        &config.general.state_db,
+        state_db.as_ref(),
+    );
+    println!("{preamble}{rendered}");
 
     // Exit with appropriate code
     if result.overall != RunResult::Success {
@@ -341,6 +345,18 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
 }
 
 // ── Summary builder ─────────────────────────────────────────────────────
+
+/// Maps an `OperationOutcome.operation` string back to the short user-facing
+/// label ("full" / "incremental"). Returns `None` for non-send operations.
+fn send_kind_display(op_name: &str) -> Option<&'static str> {
+    if op_name == SendKind::Full.as_db_str() {
+        Some("full")
+    } else if op_name == SendKind::Incremental.as_db_str() {
+        Some("incremental")
+    } else {
+        None
+    }
+}
 
 /// Build a structured backup summary from plan, execution results, and awareness assessments.
 /// Pure function — no I/O.
@@ -364,14 +380,10 @@ fn build_backup_summary(
             for op in &sv.operations {
                 match op.result {
                     OpResult::Success => {
-                        if op.operation == "send_incremental" || op.operation == "send_full" {
+                        if let Some(send_type) = send_kind_display(&op.operation) {
                             sends.push(SendSummary {
                                 drive: op.drive_label.clone().unwrap_or_default(),
-                                send_type: if op.operation == "send_full" {
-                                    "full".to_string()
-                                } else {
-                                    "incremental".to_string()
-                                },
+                                send_type: send_type.to_string(),
                                 bytes_transferred: op.bytes_transferred,
                             });
                         }
@@ -504,12 +516,10 @@ fn build_backup_summary(
         }
     }
 
-    // Skipped deletions (space recovery)
-    let planned_deletes = plan
-        .operations
-        .iter()
-        .filter(|op| matches!(op, crate::types::PlannedOperation::DeleteSnapshot { .. }))
-        .count();
+    // Skipped deletions (space guard held — ADR-113 do-no-harm behavior).
+    // This is an informational note, not a warning — the user did not ask
+    // for the cleanup, the space guard protected them from a tight margin.
+    let mut notes: Vec<String> = Vec::new();
     let skipped_deletes: usize = result
         .subvolume_results
         .iter()
@@ -524,8 +534,9 @@ fn build_backup_summary(
         })
         .count();
     if skipped_deletes > 0 {
-        warnings.push(format!(
-            "{skipped_deletes} of {planned_deletes} planned deletion(s) skipped (space recovered)"
+        let noun = if skipped_deletes == 1 { "snapshot" } else { "snapshots" };
+        notes.push(format!(
+            "space guard held — {skipped_deletes} {noun} retained."
         ));
     }
 
@@ -541,6 +552,7 @@ fn build_backup_summary(
             .collect(),
         transitions,
         warnings,
+        notes,
     }
 }
 
@@ -809,14 +821,7 @@ fn build_size_estimates(
                 drive_label,
                 ..
             } => {
-                let est = fs_state
-                    .last_send_size(subvolume_name, drive_label, "send_full")
-                    .or_else(|| fs_state.last_send_size_any_drive(subvolume_name, "send_full"))
-                    .or_else(|| {
-                        fs_state
-                            .calibrated_size(subvolume_name)
-                            .map(|(bytes, _)| bytes)
-                    });
+                let est = crate::plan::estimated_send_size(fs_state, subvolume_name, drive_label, true);
                 estimates.insert((subvolume_name.clone(), drive_label.clone()), est);
             }
             PlannedOperation::SendIncremental {
@@ -824,11 +829,7 @@ fn build_size_estimates(
                 drive_label,
                 ..
             } => {
-                let est = fs_state
-                    .last_send_size(subvolume_name, drive_label, "send_incremental")
-                    .or_else(|| {
-                        fs_state.last_send_size_any_drive(subvolume_name, "send_incremental")
-                    });
+                let est = crate::plan::estimated_send_size(fs_state, subvolume_name, drive_label, false);
                 estimates.insert((subvolume_name.clone(), drive_label.clone()), est);
             }
             _ => {}
@@ -1326,7 +1327,7 @@ mod tests {
         ChainBreakReason, ChainStatus, DriveAssessment, DriveChainHealth, LocalAssessment,
         OperationalHealth, PromiseStatus, SubvolAssessment,
     };
-    use crate::types::DriveRole;
+    use crate::types::{DriveRole, SendKind};
     use crate::executor::{
         ExecutionResult, OpResult, OperationOutcome, RunResult, SendType, SubvolumeResult,
         TransientCleanupOutcome,
@@ -1599,8 +1600,95 @@ mod tests {
             &[],
         );
 
-        assert_eq!(summary.warnings.len(), 1);
-        assert!(summary.warnings[0].contains("1 of 2 planned deletion(s) skipped"));
+        assert_eq!(
+            summary.notes,
+            vec!["space guard held — 1 snapshot retained.".to_string()]
+        );
+        assert!(
+            !summary.warnings.iter().any(|w| w.contains("space recovered")),
+            "must not appear as a warning"
+        );
+        assert!(
+            !summary.warnings.iter().any(|w| w.contains("skipped")),
+            "must not appear as a warning"
+        );
+    }
+
+    #[test]
+    fn build_summary_space_guard_plural_snapshots() {
+        let plan = BackupPlan {
+            operations: vec![],
+            timestamp: chrono::NaiveDateTime::default(),
+            skipped: vec![],
+        };
+        let result = ExecutionResult {
+            overall: RunResult::Success,
+            subvolume_results: vec![make_subvol_result(
+                "sv1",
+                true,
+                vec![
+                    make_outcome(
+                        "delete",
+                        None,
+                        OpResult::Skipped,
+                        Some("space recovered by prior deletes"),
+                        None,
+                    ),
+                    make_outcome(
+                        "delete",
+                        None,
+                        OpResult::Skipped,
+                        Some("space recovered by prior deletes"),
+                        None,
+                    ),
+                    make_outcome(
+                        "delete",
+                        None,
+                        OpResult::Skipped,
+                        Some("space recovered by prior deletes"),
+                        None,
+                    ),
+                ],
+                SendType::NoSend,
+                0,
+            )],
+            run_id: Some(15),
+        };
+        let summary = build_backup_summary(
+            &plan,
+            &result,
+            &empty_assessments(),
+            vec![],
+            Duration::from_secs(1),
+            &[],
+        );
+        assert_eq!(
+            summary.notes,
+            vec!["space guard held — 3 snapshots retained.".to_string()]
+        );
+    }
+
+    #[test]
+    fn build_summary_no_notes_when_no_skips() {
+        let plan = BackupPlan {
+            operations: vec![],
+            timestamp: chrono::NaiveDateTime::default(),
+            skipped: vec![],
+        };
+        let result = ExecutionResult {
+            overall: RunResult::Success,
+            subvolume_results: vec![],
+            run_id: Some(16),
+        };
+        let summary = build_backup_summary(
+            &plan,
+            &result,
+            &empty_assessments(),
+            vec![],
+            Duration::from_secs(1),
+            &[],
+        );
+        assert!(summary.notes.is_empty());
     }
 
     #[test]
@@ -1942,11 +2030,11 @@ mod tests {
 
         let mut fs = MockFileSystemState::new();
         fs.send_sizes.insert(
-            ("sv1".to_string(), "WD-18TB".to_string(), "send_full".to_string()),
+            ("sv1".to_string(), "WD-18TB".to_string(), SendKind::Full),
             53_000_000_000,
         );
         fs.send_sizes.insert(
-            ("sv2".to_string(), "WD-18TB".to_string(), "send_incremental".to_string()),
+            ("sv2".to_string(), "WD-18TB".to_string(), SendKind::Incremental),
             5_500_000,
         );
 
@@ -2015,7 +2103,7 @@ mod tests {
         // No same-drive ("new-drive") history, but history from "old-drive" exists.
         // last_send_size_any_drive picks this up.
         fs.send_sizes.insert(
-            ("sv1".to_string(), "old-drive".to_string(), "send_full".to_string()),
+            ("sv1".to_string(), "old-drive".to_string(), SendKind::Full),
             50_000_000_000,
         );
 
@@ -2147,6 +2235,8 @@ mod tests {
             last_send_age: None,
             configured_interval: Interval::hours(4),
             role: DriveRole::Primary,
+            absent_duration_secs: None,
+            last_activity_age_secs: None,
         }
     }
 

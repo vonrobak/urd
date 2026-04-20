@@ -427,20 +427,14 @@ fn render_drive_summary(data: &StatusOutput, out: &mut String) {
             )
             .ok();
         } else {
-            let (worst_status, max_age) =
-                aggregate_drive_staleness(&data.assessments, &drive.label);
-            if let Some(escalated) =
-                escalated_staleness_text(&drive.label, worst_status, max_age)
-            {
-                writeln!(out, "Drives: {escalated}").ok();
-            } else {
-                let status = if drive.role == DriveRole::Offsite {
-                    "away".dimmed()
-                } else {
-                    "disconnected".dimmed()
-                };
-                writeln!(out, "Drives: {} {}", drive.label.bold(), status).ok();
-            }
+            let agg = aggregate_drive_info(&data.assessments, &drive.label);
+            let line = unmounted_drive_label(
+                &drive.label,
+                agg.absent_duration_secs,
+                agg.last_activity_age_secs,
+                agg.worst_status,
+            );
+            writeln!(out, "Drives: {line}").ok();
         }
     }
 }
@@ -709,6 +703,16 @@ fn render_backup_interactive(data: &BackupSummary) -> String {
         writeln!(out).ok();
         for warning in &data.warnings {
             writeln!(out, "{} {}", "WARNING:".yellow().bold(), warning).ok();
+        }
+    }
+
+    // ── Notes (informational, not warnings) ──────────────────────────
+    // Middle-dot glyph, dimmed, two-space indent. No "NOTE:" label —
+    // the dim rendering signals informational tone without yellow gravity.
+    if !data.notes.is_empty() {
+        writeln!(out).ok();
+        for note in &data.notes {
+            writeln!(out, "  {} {}", "·".dimmed(), note.dimmed()).ok();
         }
     }
 
@@ -2696,16 +2700,24 @@ fn status_severity(status: &str) -> u8 {
     }
 }
 
-/// Aggregate worst promise status and maximum send age for a drive label
-/// across all subvolume assessments.
-///
-/// Returns `("PROTECTED", None)` when no assessments reference the drive.
-fn aggregate_drive_staleness<'a>(
+/// Single-pass aggregation of per-drive presentation fields. The drive-level
+/// fields (`absent_duration_secs`, `last_activity_age_secs`) co-travel across
+/// all subvolume `DriveAssessment` entries on the same drive, so we take the
+/// first populated value we see; they are invariant per drive. The worst
+/// promise status across subvolumes drives the gravity escalation.
+struct DriveAggregate<'a> {
+    worst_status: &'a str,
+    absent_duration_secs: Option<i64>,
+    last_activity_age_secs: Option<i64>,
+}
+
+fn aggregate_drive_info<'a>(
     assessments: &'a [StatusAssessment],
     drive_label: &str,
-) -> (&'a str, Option<i64>) {
+) -> DriveAggregate<'a> {
     let mut worst: &str = "PROTECTED";
-    let mut max_age: Option<i64> = None;
+    let mut absent_duration_secs: Option<i64> = None;
+    let mut last_activity_age_secs: Option<i64> = None;
 
     for assessment in assessments {
         for ext in &assessment.external {
@@ -2713,42 +2725,71 @@ fn aggregate_drive_staleness<'a>(
                 if status_severity(&ext.status) > status_severity(worst) {
                     worst = &ext.status;
                 }
-                if let Some(age) = ext.last_send_age_secs {
-                    max_age = Some(max_age.map_or(age, |current| current.max(age)));
+                if absent_duration_secs.is_none() {
+                    absent_duration_secs = ext.absent_duration_secs;
+                }
+                if last_activity_age_secs.is_none() {
+                    last_activity_age_secs = ext.last_activity_age_secs;
                 }
             }
         }
     }
 
-    (worst, max_age)
+    DriveAggregate {
+        worst_status: worst,
+        absent_duration_secs,
+        last_activity_age_secs,
+    }
 }
 
-/// Graduated text for disconnected drives, calibrated by awareness status.
+/// Label for an unmounted drive. Cascade:
+/// - physical Unmount event → "away" + age (gravity-calibrated)
+/// - ops-log fallback → "last backup" + age (same gravity escalation)
+/// - neither → "disconnected" (silent — prefer no claim over a wrong one).
 ///
-/// Returns `None` when no age data is available (caller uses existing fallback).
-/// Text is calibrated to the awareness model's promise status — voice never
-/// claims urgency that awareness doesn't support.
-fn escalated_staleness_text(
-    label: &str,
+/// Never mix sources for a single drive — mixing produces confidently-wrong
+/// labels (e.g. "away 30d" when the drive was only just unplugged but
+/// hadn't backed up recently).
+fn unmounted_drive_label(
+    drive_label: &str,
+    absent_duration_secs: Option<i64>,
+    last_activity_age_secs: Option<i64>,
     worst_status: &str,
-    max_age_secs: Option<i64>,
-) -> Option<String> {
-    let age_secs = max_age_secs?;
-    let age_str = humanize_duration(age_secs);
+) -> String {
+    match (absent_duration_secs, last_activity_age_secs) {
+        (Some(d), _) => format_drive_age_label(drive_label, d, worst_status, "away"),
+        (None, Some(a)) => format_drive_age_label(drive_label, a, worst_status, "last backup"),
+        (None, None) => format!("{} {}", drive_label.bold(), "disconnected".dimmed()),
+    }
+}
 
-    Some(match worst_status {
+/// Shared formatter for "{drive} {phrase} {age}" labels with gravity
+/// escalation. `phrase` is "away" (physical Unmount event) or "last backup"
+/// (ops-log fallback). The word "absent" is reserved — PROTECTED states
+/// should not feel alarming.
+///
+///   UNPROTECTED → bold + "protection aging"
+///   AT RISK     → yellow age + "consider connecting"
+///   PROTECTED   → dimmed age
+fn format_drive_age_label(
+    drive_label: &str,
+    age_secs: i64,
+    worst_status: &str,
+    phrase: &str,
+) -> String {
+    let age_str = humanize_duration(age_secs);
+    match worst_status {
         "UNPROTECTED" => format!(
-            "{} absent {} — protection aging",
-            label.bold(),
-            age_str
+            "{} {phrase} {age_str} — protection aging",
+            drive_label.bold(),
         ),
         "AT RISK" => format!(
-            "{} away {} — consider connecting",
-            label.bold(),
-            age_str.yellow()
+            "{} {phrase} {} — consider connecting",
+            drive_label.bold(),
+            age_str.yellow(),
         ),
-        _ => format!("{} away — {}", label.bold(), age_str.dimmed()),
-    })
+        _ => format!("{} {phrase} — {}", drive_label.bold(), age_str.dimmed()),
+    }
 }
 
 // ── Next-Action Suggestions (4b) ──────────────────────────────────────
@@ -3032,6 +3073,8 @@ mod tests {
                         snapshot_count: Some(12),
                         last_send_age_secs: Some(7200),
                         role: DriveRole::Primary,
+                        absent_duration_secs: None,
+                        last_activity_age_secs: None,
                     }],
                     advisories: vec![],
                     redundancy_advisories: vec![],
@@ -3057,6 +3100,8 @@ mod tests {
                         snapshot_count: Some(0),
                         last_send_age_secs: None,
                         role: DriveRole::Primary,
+                        absent_duration_secs: None,
+                        last_activity_age_secs: None,
                     }],
                     advisories: vec![],
                     redundancy_advisories: vec![],
@@ -3163,7 +3208,13 @@ mod tests {
         assert!(output.contains("WD-18TB"), "missing drive label");
         assert!(output.contains("connected"), "missing connected status");
         assert!(output.contains("Offsite-4TB"), "missing unmounted drive");
-        assert!(output.contains("away"), "missing away status for offsite drive");
+        // With no absent_duration_secs and no last_activity_age_secs, the
+        // cascade stays silent — "disconnected" rather than a fabricated
+        // "away" label driven by role alone.
+        assert!(
+            output.contains("disconnected"),
+            "expected silent fallback: {output}"
+        );
     }
 
     #[test]
@@ -3184,6 +3235,8 @@ mod tests {
             snapshot_count: None,
             last_send_age_secs: Some(604800), // 7 days
             role: DriveRole::Primary,
+            absent_duration_secs: Some(604800), // 7 days — drives the "away" label
+            last_activity_age_secs: None,
         });
         let output = render_status(&data, OutputMode::Interactive);
         assert!(
@@ -3558,6 +3611,7 @@ mod tests {
             }],
             transitions: vec![],
             warnings: vec![],
+            notes: vec![],
         }
     }
 
@@ -3668,6 +3722,70 @@ mod tests {
         let output = render_backup_summary(&data, OutputMode::Interactive);
         assert!(output.contains("pin file write"), "missing warning");
         assert!(output.contains("WARNING"), "missing WARNING label");
+    }
+
+    #[test]
+    fn backup_summary_notes_rendered_dim_no_label() {
+        // Notes render with a middle-dot glyph and no "NOTE:" label — the
+        // dim rendering signals informational tone.
+        colored::control::set_override(false);
+        let mut data = test_backup_summary();
+        data.notes = vec!["space guard held — 1 snapshot retained.".to_string()];
+        let output = render_backup_summary(&data, OutputMode::Interactive);
+        assert!(output.contains("·"), "missing middle-dot glyph: {output}");
+        assert!(
+            output.contains("space guard held"),
+            "missing note text: {output}"
+        );
+        assert!(
+            !output.contains("NOTE:"),
+            "notes must not render with 'NOTE:' prefix: {output}"
+        );
+    }
+
+    #[test]
+    fn backup_summary_notes_below_warnings() {
+        colored::control::set_override(false);
+        let mut data = test_backup_summary();
+        data.warnings = vec!["something worth noting loudly".to_string()];
+        data.notes = vec!["space guard held — 2 snapshots retained.".to_string()];
+        let output = render_backup_summary(&data, OutputMode::Interactive);
+        let warning_pos = output
+            .find("something worth noting loudly")
+            .expect("warning line missing");
+        let note_pos = output
+            .find("space guard held")
+            .expect("note line missing");
+        assert!(
+            note_pos > warning_pos,
+            "note should render after warnings: {output}"
+        );
+    }
+
+    #[test]
+    fn backup_summary_empty_notes_not_rendered() {
+        colored::control::set_override(false);
+        let data = test_backup_summary(); // notes default to empty
+        let output = render_backup_summary(&data, OutputMode::Interactive);
+        assert!(
+            !output.contains("·"),
+            "middle-dot glyph must not appear when notes is empty: {output}"
+        );
+    }
+
+    #[test]
+    fn backup_summary_notes_do_not_render_yellow_warning_prefix() {
+        // A note must never pick up the yellow WARNING gravity indicator.
+        // Under Interactive + forced colors, render_backup_summary must
+        // still not emit "WARNING" for a note.
+        colored::control::set_override(false);
+        let mut data = test_backup_summary();
+        data.notes = vec!["space guard held — 1 snapshot retained.".to_string()];
+        let output = render_backup_summary(&data, OutputMode::Interactive);
+        assert!(
+            !output.contains("WARNING"),
+            "notes must never surface with WARNING gravity: {output}"
+        );
     }
 
     #[test]
@@ -3811,6 +3929,7 @@ mod tests {
             assessments: vec![],
             transitions: vec![],
             warnings: vec![],
+            notes: vec![],
         };
         let output = render_backup_summary(&data, OutputMode::Interactive);
         assert!(
@@ -4647,6 +4766,7 @@ mod tests {
             assessments: vec![],
             transitions: vec![],
             warnings: vec![],
+            notes: vec![],
         };
         let output = render_backup_summary(&data, OutputMode::Interactive);
         // Local-only should NOT appear in the skip section
@@ -5254,6 +5374,8 @@ mod tests {
             snapshot_count: None,
             last_send_age_secs: Some(86400),
             role: DriveRole::Primary,
+            absent_duration_secs: Some(86400),
+            last_activity_age_secs: None,
         });
         data.drives.push(DriveInfo {
             label: "Test-Drive".to_string(),
@@ -5321,6 +5443,8 @@ mod tests {
             snapshot_count: None,
             last_send_age_secs: Some(172800), // 2 days
             role: DriveRole::Offsite,
+            absent_duration_secs: Some(172800),
+            last_activity_age_secs: None,
         });
         let output = render_status(&data, OutputMode::Interactive);
         assert!(output.contains("away"), "unmounted drive with history should show 'away': {output}");
@@ -6301,11 +6425,17 @@ mod tests {
         assert_eq!(status_severity("unknown"), 0);
     }
 
-    #[test]
-    fn aggregate_staleness_single_subvol() {
-        let assessments = vec![StatusAssessment {
-            name: "data".to_string(),
-            status: "AT RISK".to_string(),
+    // ── Unmounted-drive cascade: unmounted_drive_label + aggregate_drive_info ───
+
+    fn drive_aggregate_assessment(
+        drive_label: &str,
+        status: &str,
+        absent: Option<i64>,
+        last_activity: Option<i64>,
+    ) -> StatusAssessment {
+        StatusAssessment {
+            name: "sv1".to_string(),
+            status: status.to_string(),
             health: "healthy".to_string(),
             health_reasons: vec![],
             promise_level: None,
@@ -6313,212 +6443,176 @@ mod tests {
             local_newest_age_secs: Some(3600),
             local_status: "PROTECTED".to_string(),
             external: vec![StatusDriveAssessment {
-                drive_label: "WD-18TB".to_string(),
-                status: "AT RISK".to_string(),
+                drive_label: drive_label.to_string(),
+                status: status.to_string(),
                 mounted: false,
                 snapshot_count: None,
-                last_send_age_secs: Some(604800),
+                last_send_age_secs: None,
                 role: DriveRole::Primary,
+                absent_duration_secs: absent,
+                last_activity_age_secs: last_activity,
             }],
             advisories: vec![],
             redundancy_advisories: vec![],
             retention_summary: None,
             external_only: false,
             errors: vec![],
-        }];
-
-        let (status, age) = aggregate_drive_staleness(&assessments, "WD-18TB");
-        assert_eq!(status, "AT RISK");
-        assert_eq!(age, Some(604800));
+        }
     }
 
     #[test]
-    fn aggregate_staleness_worst_across_subvols() {
+    fn aggregate_drive_info_picks_worst_status() {
         let assessments = vec![
-            StatusAssessment {
-                name: "home".to_string(),
-                status: "PROTECTED".to_string(),
-                health: "healthy".to_string(),
-                health_reasons: vec![],
-                promise_level: None,
-                local_snapshot_count: 10,
-                local_newest_age_secs: Some(1800),
-                local_status: "PROTECTED".to_string(),
-                external: vec![StatusDriveAssessment {
-                    drive_label: "WD-18TB".to_string(),
-                    status: "PROTECTED".to_string(),
-                    mounted: false,
-                    snapshot_count: None,
-                    last_send_age_secs: Some(86400),
-                    role: DriveRole::Primary,
-                }],
-                advisories: vec![],
-                redundancy_advisories: vec![],
-                retention_summary: None,
-                external_only: false,
-                errors: vec![],
-            },
-            StatusAssessment {
-                name: "docs".to_string(),
-                status: "UNPROTECTED".to_string(),
-                health: "healthy".to_string(),
-                health_reasons: vec![],
-                promise_level: None,
-                local_snapshot_count: 5,
-                local_newest_age_secs: Some(3600),
-                local_status: "PROTECTED".to_string(),
-                external: vec![StatusDriveAssessment {
-                    drive_label: "WD-18TB".to_string(),
-                    status: "UNPROTECTED".to_string(),
-                    mounted: false,
-                    snapshot_count: None,
-                    last_send_age_secs: Some(2592000),
-                    role: DriveRole::Primary,
-                }],
-                advisories: vec![],
-                redundancy_advisories: vec![],
-                retention_summary: None,
-                external_only: false,
-                errors: vec![],
-            },
+            drive_aggregate_assessment("WD-18TB", "PROTECTED", Some(86400), None),
+            drive_aggregate_assessment("WD-18TB", "UNPROTECTED", Some(86400), None),
         ];
-
-        let (status, _) = aggregate_drive_staleness(&assessments, "WD-18TB");
-        assert_eq!(status, "UNPROTECTED");
+        let agg = aggregate_drive_info(&assessments, "WD-18TB");
+        assert_eq!(agg.worst_status, "UNPROTECTED");
     }
 
     #[test]
-    fn aggregate_staleness_max_age() {
-        let assessments = vec![
-            StatusAssessment {
-                name: "home".to_string(),
-                status: "AT RISK".to_string(),
-                health: "healthy".to_string(),
-                health_reasons: vec![],
-                promise_level: None,
-                local_snapshot_count: 10,
-                local_newest_age_secs: Some(1800),
-                local_status: "PROTECTED".to_string(),
-                external: vec![StatusDriveAssessment {
-                    drive_label: "WD-18TB".to_string(),
-                    status: "AT RISK".to_string(),
-                    mounted: false,
-                    snapshot_count: None,
-                    last_send_age_secs: Some(86400),
-                    role: DriveRole::Primary,
-                }],
-                advisories: vec![],
-                redundancy_advisories: vec![],
-                retention_summary: None,
-                external_only: false,
-                errors: vec![],
-            },
-            StatusAssessment {
-                name: "docs".to_string(),
-                status: "AT RISK".to_string(),
-                health: "healthy".to_string(),
-                health_reasons: vec![],
-                promise_level: None,
-                local_snapshot_count: 5,
-                local_newest_age_secs: Some(3600),
-                local_status: "PROTECTED".to_string(),
-                external: vec![StatusDriveAssessment {
-                    drive_label: "WD-18TB".to_string(),
-                    status: "PROTECTED".to_string(),
-                    mounted: false,
-                    snapshot_count: None,
-                    last_send_age_secs: Some(604800),
-                    role: DriveRole::Primary,
-                }],
-                advisories: vec![],
-                redundancy_advisories: vec![],
-                retention_summary: None,
-                external_only: false,
-                errors: vec![],
-            },
-        ];
-
-        let (_, age) = aggregate_drive_staleness(&assessments, "WD-18TB");
-        assert_eq!(age, Some(604800));
+    fn aggregate_drive_info_propagates_absent_duration() {
+        let assessments =
+            vec![drive_aggregate_assessment("WD-18TB", "AT RISK", Some(604800), None)];
+        let agg = aggregate_drive_info(&assessments, "WD-18TB");
+        assert_eq!(agg.absent_duration_secs, Some(604800));
+        assert_eq!(agg.last_activity_age_secs, None);
     }
 
     #[test]
-    fn aggregate_staleness_no_match() {
-        let assessments = vec![StatusAssessment {
-            name: "data".to_string(),
-            status: "PROTECTED".to_string(),
-            health: "healthy".to_string(),
-            health_reasons: vec![],
-            promise_level: None,
-            local_snapshot_count: 10,
-            local_newest_age_secs: Some(1800),
-            local_status: "PROTECTED".to_string(),
-            external: vec![StatusDriveAssessment {
-                drive_label: "WD-18TB".to_string(),
-                status: "PROTECTED".to_string(),
-                mounted: true,
-                snapshot_count: Some(5),
-                last_send_age_secs: Some(3600),
-                role: DriveRole::Primary,
-            }],
-            advisories: vec![],
-            redundancy_advisories: vec![],
-            retention_summary: None,
-            external_only: false,
-            errors: vec![],
-        }];
-
-        let (status, age) = aggregate_drive_staleness(&assessments, "NONEXISTENT");
-        assert_eq!(status, "PROTECTED");
-        assert_eq!(age, None);
+    fn aggregate_drive_info_propagates_last_activity() {
+        let assessments =
+            vec![drive_aggregate_assessment("WD-18TB", "AT RISK", None, Some(86400))];
+        let agg = aggregate_drive_info(&assessments, "WD-18TB");
+        assert_eq!(agg.absent_duration_secs, None);
+        assert_eq!(agg.last_activity_age_secs, Some(86400));
     }
 
     #[test]
-    fn staleness_text_protected_minimal() {
+    fn aggregate_drive_info_no_match_defaults_protected_and_none() {
+        let assessments =
+            vec![drive_aggregate_assessment("WD-18TB", "UNPROTECTED", Some(86400), None)];
+        let agg = aggregate_drive_info(&assessments, "MISSING-DRIVE");
+        assert_eq!(agg.worst_status, "PROTECTED");
+        assert_eq!(agg.absent_duration_secs, None);
+        assert_eq!(agg.last_activity_age_secs, None);
+    }
+
+    #[test]
+    fn unmounted_with_physical_event_renders_away() {
         colored::control::set_override(false);
-        let result =
-            escalated_staleness_text("WD-18TB", "PROTECTED", Some(259200));
-        let text = result.unwrap();
-        assert!(text.contains("WD-18TB"), "missing label: {text}");
-        assert!(text.contains("away"), "missing 'away': {text}");
-        assert!(text.contains("3d"), "missing age: {text}");
-        assert!(!text.contains("consider"), "should not have urgency: {text}");
-        assert!(!text.contains("degrading"), "should not have urgency: {text}");
+        let label = unmounted_drive_label("WD-18TB", Some(259200), None, "PROTECTED");
+        assert!(label.contains("WD-18TB"), "missing label: {label}");
+        assert!(label.contains("away"), "missing 'away': {label}");
+        assert!(label.contains("3d"), "missing age: {label}");
     }
 
     #[test]
-    fn staleness_text_at_risk_consider() {
+    fn unmounted_without_event_with_ops_renders_last_backup() {
         colored::control::set_override(false);
-        let result =
-            escalated_staleness_text("WD-18TB", "AT RISK", Some(604800));
-        let text = result.unwrap();
-        assert!(text.contains("WD-18TB"), "missing label: {text}");
+        let label = unmounted_drive_label("WD-18TB", None, Some(259200), "PROTECTED");
+        assert!(label.contains("WD-18TB"), "missing label: {label}");
+        assert!(label.contains("last backup"), "missing 'last backup': {label}");
+        assert!(label.contains("3d"), "missing age: {label}");
+    }
+
+    #[test]
+    fn unmounted_no_data_renders_disconnected_silent() {
+        colored::control::set_override(false);
+        let label = unmounted_drive_label("WD-18TB", None, None, "PROTECTED");
+        assert!(label.contains("WD-18TB"), "missing label: {label}");
         assert!(
-            text.contains("consider connecting"),
-            "missing suggestion: {text}"
+            label.contains("disconnected"),
+            "expected 'disconnected': {label}"
         );
-        assert!(text.contains("7d"), "missing age: {text}");
-    }
-
-    #[test]
-    fn staleness_text_unprotected_degrading() {
-        colored::control::set_override(false);
-        let result =
-            escalated_staleness_text("WD-18TB1", "UNPROTECTED", Some(2592000));
-        let text = result.unwrap();
-        assert!(text.contains("WD-18TB1"), "missing label: {text}");
-        assert!(text.contains("absent"), "should use 'absent': {text}");
+        assert!(!label.contains("away"), "no age should leak 'away': {label}");
         assert!(
-            text.contains("protection aging"),
-            "missing escalation: {text}"
+            !label.contains("last backup"),
+            "must not surface fictional activity: {label}"
         );
-        assert!(text.contains("30d"), "missing age: {text}");
     }
 
     #[test]
-    fn staleness_text_no_age_returns_none() {
-        let result = escalated_staleness_text("WD-18TB", "AT RISK", None);
-        assert!(result.is_none());
+    fn unmounted_last_event_mount_renders_disconnected_silent() {
+        // Rule 1 seed at render layer: if the cascade populated neither field
+        // (sentinel-missed-unmount case, verified by awareness tests), voice
+        // must stay silent — no "away" or "last backup".
+        colored::control::set_override(false);
+        let label = unmounted_drive_label("WD-18TB", None, None, "AT RISK");
+        assert!(label.contains("disconnected"), "must be silent: {label}");
+        assert!(!label.contains("away"));
+        assert!(!label.contains("last backup"));
+    }
+
+    #[test]
+    fn at_risk_escalation_away() {
+        colored::control::set_override(false);
+        let label = unmounted_drive_label("WD-18TB", Some(604800), None, "AT RISK");
+        assert!(label.contains("away"), "missing 'away': {label}");
+        assert!(label.contains("7d"), "missing age: {label}");
+        assert!(
+            label.contains("consider connecting"),
+            "missing suggestion: {label}"
+        );
+    }
+
+    #[test]
+    fn at_risk_escalation_last_backup() {
+        colored::control::set_override(false);
+        let label = unmounted_drive_label("WD-18TB", None, Some(604800), "AT RISK");
+        assert!(label.contains("last backup"), "missing 'last backup': {label}");
+        assert!(label.contains("7d"), "missing age: {label}");
+        assert!(
+            label.contains("consider connecting"),
+            "missing suggestion: {label}"
+        );
+    }
+
+    #[test]
+    fn unprotected_escalation_away() {
+        colored::control::set_override(false);
+        let label = unmounted_drive_label("WD-18TB1", Some(2592000), None, "UNPROTECTED");
+        assert!(label.contains("WD-18TB1"), "missing label: {label}");
+        assert!(label.contains("away"), "missing 'away': {label}");
+        assert!(label.contains("30d"), "missing age: {label}");
+        assert!(
+            label.contains("protection aging"),
+            "missing escalation: {label}"
+        );
+        // The word "absent" must never render on PROTECTED drives.
+        assert!(
+            !label.contains("absent"),
+            "the word 'absent' must not appear: {label}"
+        );
+    }
+
+    #[test]
+    fn unprotected_escalation_last_backup() {
+        colored::control::set_override(false);
+        let label = unmounted_drive_label("WD-18TB", None, Some(2592000), "UNPROTECTED");
+        assert!(label.contains("last backup"), "missing 'last backup': {label}");
+        assert!(label.contains("30d"), "missing age: {label}");
+        assert!(
+            label.contains("protection aging"),
+            "missing escalation: {label}"
+        );
+    }
+
+    #[test]
+    fn unmounted_away_uses_absent_duration_not_activity() {
+        // Voice-Contract-Rule-1 seed test: absent_duration_secs wins over
+        // last_activity_age_secs; the right field drives the right label.
+        colored::control::set_override(false);
+        let label = unmounted_drive_label("WD-18TB", Some(15 * 60), Some(7 * 86400), "PROTECTED");
+        assert!(label.contains("15m"), "should render 15m: {label}");
+        assert!(
+            !label.contains("7d"),
+            "must not leak ops-log age when event exists: {label}"
+        );
+        assert!(
+            !label.contains("last backup"),
+            "must not use ops-log label when event exists: {label}"
+        );
     }
 
     // ── 4b: Next-Action Suggestion Tests ──────────────────────────────

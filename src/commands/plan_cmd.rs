@@ -117,7 +117,7 @@ pub fn populate_token_warnings(
 mod tests {
     use super::*;
     use crate::plan::MockFileSystemState;
-    use crate::types::SnapshotName;
+    use crate::types::{SendKind, SnapshotName};
     use std::path::PathBuf;
 
     fn dummy_snap(subvol: &str) -> SnapshotName {
@@ -159,7 +159,7 @@ mod tests {
     fn full_send_same_drive_history() {
         let mut fs = MockFileSystemState::new();
         fs.send_sizes.insert(
-            ("htpc-home".into(), "WD-18TB".into(), "send_full".into()),
+            ("htpc-home".into(), "WD-18TB".into(), SendKind::Full),
             53_000_000_000,
         );
         let entry = build_operation_entry(&mock_send_full("htpc-home", "WD-18TB"), &fs);
@@ -175,7 +175,7 @@ mod tests {
         let mut fs = MockFileSystemState::new();
         // History on different drive, not on target drive
         fs.send_sizes.insert(
-            ("htpc-home".into(), "OTHER-DRIVE".into(), "send_full".into()),
+            ("htpc-home".into(), "OTHER-DRIVE".into(), SendKind::Full),
             50_000_000_000,
         );
         let entry = build_operation_entry(&mock_send_full("htpc-home", "WD-18TB"), &fs);
@@ -197,11 +197,11 @@ mod tests {
     fn full_send_same_drive_wins_over_cross_drive() {
         let mut fs = MockFileSystemState::new();
         fs.send_sizes.insert(
-            ("htpc-home".into(), "WD-18TB".into(), "send_full".into()),
+            ("htpc-home".into(), "WD-18TB".into(), SendKind::Full),
             53_000_000_000,
         );
         fs.send_sizes.insert(
-            ("htpc-home".into(), "OTHER".into(), "send_full".into()),
+            ("htpc-home".into(), "OTHER".into(), SendKind::Full),
             50_000_000_000,
         );
         fs.calibrated_sizes.insert(
@@ -225,7 +225,7 @@ mod tests {
     fn incremental_send_same_drive_history() {
         let mut fs = MockFileSystemState::new();
         fs.send_sizes.insert(
-            ("htpc-home".into(), "WD-18TB".into(), "send_incremental".into()),
+            ("htpc-home".into(), "WD-18TB".into(), SendKind::Incremental),
             5_500_000,
         );
         let entry = build_operation_entry(&mock_send_incremental("htpc-home", "WD-18TB"), &fs);
@@ -239,7 +239,7 @@ mod tests {
     fn incremental_send_cross_drive_fallback() {
         let mut fs = MockFileSystemState::new();
         fs.send_sizes.insert(
-            ("htpc-home".into(), "OTHER".into(), "send_incremental".into()),
+            ("htpc-home".into(), "OTHER".into(), SendKind::Incremental),
             3_000_000,
         );
         let entry = build_operation_entry(&mock_send_incremental("htpc-home", "WD-18TB"), &fs);
@@ -264,11 +264,11 @@ mod tests {
     fn summary_aggregates_all_estimates() {
         let mut fs = MockFileSystemState::new();
         fs.send_sizes.insert(
-            ("htpc-home".into(), "WD-18TB".into(), "send_full".into()),
+            ("htpc-home".into(), "WD-18TB".into(), SendKind::Full),
             53_000_000_000,
         );
         fs.send_sizes.insert(
-            ("htpc-docs".into(), "WD-18TB".into(), "send_full".into()),
+            ("htpc-docs".into(), "WD-18TB".into(), SendKind::Full),
             1_200_000_000,
         );
         let plan = crate::types::BackupPlan {
@@ -287,7 +287,7 @@ mod tests {
     fn summary_partial_estimates() {
         let mut fs = MockFileSystemState::new();
         fs.send_sizes.insert(
-            ("htpc-home".into(), "WD-18TB".into(), "send_full".into()),
+            ("htpc-home".into(), "WD-18TB".into(), SendKind::Full),
             53_000_000_000,
         );
         let plan = crate::types::BackupPlan {
@@ -349,13 +349,8 @@ fn build_operation_entry(
                 ""
             };
 
-            // Two-tier fallback: same-drive history, then cross-drive.
-            // No calibrated fallback for incrementals (calibration measures full subvolume).
-            let estimated_bytes = fs_state
-                .last_send_size(subvolume_name, drive_label, "send_incremental")
-                .or_else(|| {
-                    fs_state.last_send_size_any_drive(subvolume_name, "send_incremental")
-                });
+            let estimated_bytes =
+                plan::estimated_send_size(fs_state, subvolume_name, drive_label, false);
 
             PlanOperationEntry {
                 subvolume: subvolume_name.clone(),
@@ -384,11 +379,8 @@ fn build_operation_entry(
                 ""
             };
 
-            // Three-tier fallback: same-drive, cross-drive, calibrated.
-            let estimated_bytes = fs_state
-                .last_send_size(subvolume_name, drive_label, "send_full")
-                .or_else(|| fs_state.last_send_size_any_drive(subvolume_name, "send_full"))
-                .or_else(|| fs_state.calibrated_size(subvolume_name).map(|(bytes, _)| bytes));
+            let estimated_bytes =
+                plan::estimated_send_size(fs_state, subvolume_name, drive_label, true);
 
             PlanOperationEntry {
                 subvolume: subvolume_name.clone(),

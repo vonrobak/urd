@@ -219,7 +219,7 @@ mod tests {
     use crate::executor::{
         ExecutionResult, RunResult, SendType, SubvolumeResult, TransientCleanupOutcome,
     };
-    use crate::types::{DriveRole, GraduatedRetention, Interval, RunFrequency};
+    use crate::types::{DriveRole, GraduatedRetention, Interval, RunFrequency, SendKind};
     use std::path::PathBuf;
 
     fn test_config(intervals: &[(&str, &str)]) -> Config {
@@ -305,6 +305,8 @@ mod tests {
                     last_send_age: Some(chrono::Duration::hours(2)),
                     configured_interval: Interval::hours(4),
                     role: DriveRole::Primary,
+                    absent_duration_secs: None,
+                    last_activity_age_secs: None,
                 }],
                 chain_health: vec![],
                 advisories: vec![],
@@ -508,7 +510,7 @@ mod tests {
                 name: "home".to_string(),
                 success: true,
                 operations: vec![make_operation(
-                    "send_incremental",
+                    SendKind::Incremental.as_db_str(),
                     crate::executor::OpResult::Success,
                 )],
                 duration: std::time::Duration::from_secs(5),
@@ -536,7 +538,7 @@ mod tests {
                 name: "home".to_string(),
                 success: true,
                 operations: vec![make_operation(
-                    "send_full",
+                    SendKind::Full.as_db_str(),
                     crate::executor::OpResult::Deferred,
                 )],
                 duration: std::time::Duration::from_secs(0),
