@@ -13,7 +13,7 @@ use crate::config::Config;
 use crate::drives;
 use crate::error::BtrfsOperation;
 use crate::state::{OperationRecord, StateDb};
-use crate::types::{BackupPlan, FullSendReason, PlannedOperation};
+use crate::types::{BackupPlan, FullSendReason, PlannedOperation, SendKind};
 
 // ── Types ───────────────────────────────────────────────────────────────
 
@@ -325,7 +325,7 @@ impl<'a> Executor<'a> {
                         );
                         send_type = SendType::Deferred;
                         OperationOutcome {
-                            operation: "send_full".to_string(),
+                            operation: SendKind::Full.as_db_str().to_string(),
                             drive_label: Some(drive_label.clone()),
                             result: OpResult::Deferred,
                             duration: std::time::Duration::ZERO,
@@ -460,11 +460,12 @@ impl<'a> Executor<'a> {
         subvol_name: &str,
     ) -> (OperationOutcome, bool) {
         let start = Instant::now();
-        let op_name = if parent.is_some() {
-            "send_incremental"
+        let send_kind = if parent.is_some() {
+            SendKind::Incremental
         } else {
-            "send_full"
+            SendKind::Full
         };
+        let op_name = send_kind.as_db_str();
 
         // Cascading failure check: if the snapshot was not created, skip
         if failed_creates.contains(snapshot) {

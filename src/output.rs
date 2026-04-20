@@ -228,6 +228,16 @@ pub struct StatusDriveAssessment {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_send_age_secs: Option<i64>,
     pub role: DriveRole,
+    /// Seconds since the drive's last recorded Unmount event. Populated only
+    /// when drive is currently unmounted AND the most recent physical event
+    /// is an Unmount. See awareness::DriveAssessment for cascade rules.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub absent_duration_secs: Option<i64>,
+    /// Seconds since the most recent successful operation targeting this
+    /// drive. Populated only when drive is unmounted and no physical events
+    /// exist for this drive at all (ops-log fallback).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_activity_age_secs: Option<i64>,
 }
 
 impl StatusDriveAssessment {
@@ -240,6 +250,8 @@ impl StatusDriveAssessment {
             snapshot_count: a.snapshot_count,
             last_send_age_secs: a.last_send_age.map(|d| d.num_seconds()),
             role: a.role,
+            absent_duration_secs: a.absent_duration_secs,
+            last_activity_age_secs: a.last_activity_age_secs,
         }
     }
 }
@@ -584,6 +596,12 @@ pub struct BackupSummary {
 
     /// Summary warnings (pin failures, skipped deletions, etc.)
     pub warnings: Vec<String>,
+
+    /// Informational outcomes that are not warnings: conservative-cleanup
+    /// completion, by-design skips, reassurance about safety behaviors the
+    /// user did not explicitly request. See ADR-113 (do-no-harm) — when the
+    /// storage guard retains snapshots, that's a success, not a warning.
+    pub notes: Vec<String>,
 }
 
 /// A meaningful state change detected by comparing pre-backup and post-backup

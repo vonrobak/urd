@@ -461,6 +461,63 @@ impl StateDb {
         }
     }
 
+    /// Get the timestamp of the most recent successful send (any subvolume) for a
+    /// given drive. Used by the D-1 drive-absence cascade to estimate when a
+    /// drive was last actively written to, when `drive_connections` is empty.
+    pub fn last_successful_operation_at(
+        &self,
+        drive_label: &str,
+    ) -> crate::error::Result<Option<chrono::NaiveDateTime>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT MAX(r.started_at) FROM operations o
+                 JOIN runs r ON o.run_id = r.id
+                 WHERE o.drive_label = ?1
+                   AND o.operation IN ('send_full', 'send_incremental')
+                   AND o.result = 'success'",
+            )
+            .map_err(|e| UrdError::State(format!("query failed: {e}")))?;
+
+        let mut rows = stmt
+            .query_map(rusqlite::params![drive_label], |row| {
+                let ts: Option<String> = row.get(0)?;
+                Ok(ts)
+            })
+            .map_err(|e| UrdError::State(format!("query failed: {e}")))?;
+
+        match rows.next() {
+            Some(Ok(Some(ts))) => {
+                let parsed = chrono::NaiveDateTime::parse_from_str(&ts, "%Y-%m-%dT%H:%M:%S")
+                    .map_err(|e| {
+                        UrdError::State(format!("failed to parse operation timestamp {ts:?}: {e}"))
+                    })?;
+                Ok(Some(parsed))
+            }
+            Some(Ok(None)) => Ok(None),
+            Some(Err(e)) => Err(UrdError::State(format!(
+                "failed to read operation time: {e}"
+            ))),
+            None => Ok(None),
+        }
+    }
+
+    /// Whether any run has been recorded. Used to gate first-run-only output
+    /// (e.g., the post-upgrade acknowledgment) behind actual usage.
+    pub fn has_any_completed_runs(&self) -> crate::error::Result<bool> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT 1 FROM runs LIMIT 1")
+            .map_err(|e| UrdError::State(format!("query failed: {e}")))?;
+        let mut rows = stmt
+            .query(rusqlite::params![])
+            .map_err(|e| UrdError::State(format!("query failed: {e}")))?;
+        Ok(rows
+            .next()
+            .map_err(|e| UrdError::State(format!("query failed: {e}")))?
+            .is_some())
+    }
+
     // ── Calibration methods ─────────────────────────────────────────
 
     /// Store (or update) a calibrated size for a subvolume.
@@ -677,7 +734,6 @@ impl StateDb {
     }
 
     /// Get the most recent connection event for a drive, if any.
-    #[allow(dead_code)] // consumed by urd sentinel status (future) and tests
     pub fn last_drive_connection(
         &self,
         drive_label: &str,
@@ -1462,5 +1518,129 @@ mod tests {
             .drive_connection_count("other", "2000-01-01T00:00:00")
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    // ── Drive activity + first-run gating ─────────
+
+    #[test]
+    fn last_successful_operation_at_returns_none_when_empty() {
+        let db = StateDb::open_memory().unwrap();
+        assert_eq!(db.last_successful_operation_at("WD-18TB").unwrap(), None);
+    }
+
+    #[test]
+    fn last_successful_operation_at_returns_none_when_only_failed() {
+        let db = StateDb::open_memory().unwrap();
+        let run_id = db.begin_run("full").unwrap();
+        db.record_operation(&OperationRecord {
+            run_id,
+            subvolume: "sv1".to_string(),
+            operation: "send_full".to_string(),
+            drive_label: Some("WD-18TB".to_string()),
+            duration_secs: Some(1.0),
+            result: "failed".to_string(),
+            error_message: Some("boom".to_string()),
+            bytes_transferred: None,
+        })
+        .unwrap();
+        assert_eq!(db.last_successful_operation_at("WD-18TB").unwrap(), None);
+    }
+
+    #[test]
+    fn last_successful_operation_at_returns_most_recent_success() {
+        let db = StateDb::open_memory().unwrap();
+        let run1 = db.begin_run("full").unwrap();
+        db.record_operation(&OperationRecord {
+            run_id: run1,
+            subvolume: "sv1".to_string(),
+            operation: "send_full".to_string(),
+            drive_label: Some("WD-18TB".to_string()),
+            duration_secs: Some(2.0),
+            result: "success".to_string(),
+            error_message: None,
+            bytes_transferred: Some(100),
+        })
+        .unwrap();
+        // Second, later run — MAX(started_at) should pick this one.
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        let run2 = db.begin_run("incremental").unwrap();
+        db.record_operation(&OperationRecord {
+            run_id: run2,
+            subvolume: "sv1".to_string(),
+            operation: "send_incremental".to_string(),
+            drive_label: Some("WD-18TB".to_string()),
+            duration_secs: Some(1.0),
+            result: "success".to_string(),
+            error_message: None,
+            bytes_transferred: Some(50),
+        })
+        .unwrap();
+
+        let t1: String = db
+            .conn
+            .query_row("SELECT started_at FROM runs WHERE id = ?1", [run1], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let t2: String = db
+            .conn
+            .query_row("SELECT started_at FROM runs WHERE id = ?1", [run2], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(t2 > t1, "run2 should have later started_at than run1");
+
+        let got = db.last_successful_operation_at("WD-18TB").unwrap().unwrap();
+        let expected = chrono::NaiveDateTime::parse_from_str(&t2, "%Y-%m-%dT%H:%M:%S").unwrap();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn last_successful_operation_at_filtered_by_drive_label() {
+        let db = StateDb::open_memory().unwrap();
+        let run = db.begin_run("full").unwrap();
+        db.record_operation(&OperationRecord {
+            run_id: run,
+            subvolume: "sv1".to_string(),
+            operation: "send_full".to_string(),
+            drive_label: Some("OTHER-DRIVE".to_string()),
+            duration_secs: Some(1.0),
+            result: "success".to_string(),
+            error_message: None,
+            bytes_transferred: Some(10),
+        })
+        .unwrap();
+        assert_eq!(db.last_successful_operation_at("WD-18TB").unwrap(), None);
+    }
+
+    #[test]
+    fn last_successful_operation_at_ignores_non_send_operations() {
+        let db = StateDb::open_memory().unwrap();
+        let run = db.begin_run("full").unwrap();
+        db.record_operation(&OperationRecord {
+            run_id: run,
+            subvolume: "sv1".to_string(),
+            operation: "snapshot".to_string(),
+            drive_label: Some("WD-18TB".to_string()),
+            duration_secs: Some(0.5),
+            result: "success".to_string(),
+            error_message: None,
+            bytes_transferred: None,
+        })
+        .unwrap();
+        assert_eq!(db.last_successful_operation_at("WD-18TB").unwrap(), None);
+    }
+
+    #[test]
+    fn has_any_completed_runs_false_for_fresh_db() {
+        let db = StateDb::open_memory().unwrap();
+        assert!(!db.has_any_completed_runs().unwrap());
+    }
+
+    #[test]
+    fn has_any_completed_runs_true_after_begin_run() {
+        let db = StateDb::open_memory().unwrap();
+        let _ = db.begin_run("full").unwrap();
+        assert!(db.has_any_completed_runs().unwrap());
     }
 }

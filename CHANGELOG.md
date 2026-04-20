@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-04-21
+
+### Added
+- `BackupSummary.notes` — separate output channel for by-design informational
+  outcomes (not warnings). Currently carries the space-guard message; future
+  similar advisory outputs will land here.
+- One-time post-upgrade acknowledgment shown to returning users whose
+  previously-reported `blocked` states become `healthy`. Appears above
+  `urd status` / `urd backup` / `urd` output once, then never again. Fresh
+  installs see nothing.
+
+### Fixed
+- Incremental space estimates no longer use the full subvolume's calibrated
+  size — fixes false `blocked` health reports on healthy incremental chains
+  where the actual delta fits comfortably.
+- Drive operation-type queries now use the correct schema strings; previously
+  dead size-estimate fallback tiers now activate.
+- Drive `away` duration now sources from drive connection events rather than
+  last send age — a freshly unplugged drive no longer reports `away 3d`
+  based on the last successful backup timestamp. When no connection event
+  is available, the status line shows `last backup Nd ago` instead.
+- Informational cleanup outcomes no longer render as warnings. "Space
+  recovered — N skipped deletion(s)" is replaced with a dimmed note
+  "space guard held — N snapshot(s) retained."
+
+### Changed
+- Homelab monitoring consumers: the `warnings` bucket semantically narrowed
+  (the cleanup `space recovered` string moves to `notes`). No currently
+  shipped homelab alert is affected; see the homelab ADR-021 update for
+  future JSON-consumer precedent.
+- Unmounted drive labels use the word `away` uniformly; the severity
+  escalation (yellow, `protection aging`) is carried by color and suffix,
+  not by a separate word.
+
 ## [0.12.2] - 2026-04-17
 
 ### Fixed
@@ -306,7 +340,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Defense-in-depth pin file protection for unsent snapshots
 - Per-subvolume error isolation in executor
 
-[Unreleased]: https://github.com/vonrobak/urd/compare/v0.12.2...HEAD
+[Unreleased]: https://github.com/vonrobak/urd/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/vonrobak/urd/compare/v0.12.2...v0.13.0
 [0.12.2]: https://github.com/vonrobak/urd/compare/v0.12.1...v0.12.2
 [0.12.1]: https://github.com/vonrobak/urd/compare/v0.12.0...v0.12.1
 [0.12.0]: https://github.com/vonrobak/urd/compare/v0.11.1...v0.12.0

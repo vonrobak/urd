@@ -103,6 +103,47 @@ impl Serialize for Interval {
     }
 }
 
+// ── SendKind ────────────────────────────────────────────────────────────
+
+/// Whether a btrfs send is full (no parent snapshot) or incremental
+/// (parent snapshot already on destination). Used in size estimation,
+/// operations-log filtering, and health assessment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SendKind {
+    /// No parent snapshot on the destination — sends the entire subvolume.
+    Full,
+    /// Parent snapshot present — sends only the delta since the parent.
+    Incremental,
+}
+
+impl SendKind {
+    /// Canonical string form used in `OperationRecord.operation` and
+    /// SQL queries against `operations.operation`.
+    #[must_use]
+    pub const fn as_db_str(self) -> &'static str {
+        match self {
+            SendKind::Full => "send_full",
+            SendKind::Incremental => "send_incremental",
+        }
+    }
+}
+
+// ── DriveEvent ──────────────────────────────────────────────────────────
+
+/// A drive mount or unmount event recorded by the sentinel daemon.
+/// Sourced from the `drive_connections` table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DriveEvent {
+    pub kind: DriveEventKind,
+    pub at: NaiveDateTime,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriveEventKind {
+    Mount,
+    Unmount,
+}
+
 // ── SnapshotName ────────────────────────────────────────────────────────
 
 /// A snapshot name in the format `YYYYMMDD-HHMM-shortname`.
@@ -950,6 +991,18 @@ mod tests {
         assert!("5x".parse::<Interval>().is_err());
         assert!("h".parse::<Interval>().is_err());
         assert!("".parse::<Interval>().is_err());
+    }
+
+    // ── SendKind tests ──────────────────────────────────────────────
+
+    #[test]
+    fn send_kind_db_str_full() {
+        assert_eq!(SendKind::Full.as_db_str(), "send_full");
+    }
+
+    #[test]
+    fn send_kind_db_str_incremental() {
+        assert_eq!(SendKind::Incremental.as_db_str(), "send_incremental");
     }
 
     // ── SnapshotName tests ──────────────────────────────────────────

@@ -893,6 +893,8 @@ mod tests {
                 last_send_age: None,
                 configured_interval: Interval::hours(24),
                 role: DriveRole::Primary,
+                absent_duration_secs: None,
+                last_activity_age_secs: None,
             }],
             chain_health: vec![],
             advisories: vec![],

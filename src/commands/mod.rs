@@ -1,3 +1,4 @@
+pub mod acknowledgment;
 pub mod backup;
 pub mod calibrate;
 pub mod completions;
