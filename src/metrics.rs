@@ -12,6 +12,19 @@ pub struct MetricsData {
     pub external_drive_mounted: bool,
     pub external_free_bytes: u64,
     pub script_last_run_timestamp: i64,
+    /// Counters derived from the events table at write time.
+    /// Empty/zero when no state DB is available.
+    pub event_counters: EventCounters,
+}
+
+/// Prometheus counter family derived from the events table by
+/// `state.rs::count_*` helpers.
+#[derive(Debug, Default, Clone)]
+pub struct EventCounters {
+    pub circuit_breaker_trips: u64,
+    pub full_sends_by_reason: Vec<(String, u64)>,
+    pub defers_by_scope: Vec<(String, u64)>,
+    pub prunes_by_rule: Vec<(String, u64)>,
 }
 
 /// Per-subvolume metrics for a backup run.
@@ -238,6 +251,82 @@ fn format_metrics(data: &MetricsData) -> String {
     )
     .unwrap();
 
+    // ── Structured event counters ─────────────────────────────────
+
+    let counters = &data.event_counters;
+
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "# HELP urd_circuit_breaker_trips_total Sentinel circuit-breaker open transitions."
+    )
+    .unwrap();
+    writeln!(out, "# TYPE urd_circuit_breaker_trips_total counter").unwrap();
+    writeln!(
+        out,
+        "urd_circuit_breaker_trips_total {}",
+        counters.circuit_breaker_trips
+    )
+    .unwrap();
+
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "# HELP urd_planner_full_sends_total Full-send choices, by reason."
+    )
+    .unwrap();
+    writeln!(out, "# TYPE urd_planner_full_sends_total counter").unwrap();
+    if counters.full_sends_by_reason.is_empty() {
+        // Emit a zero so consumers can detect the metric exists.
+        writeln!(out, "urd_planner_full_sends_total{{reason=\"none\"}} 0").unwrap();
+    } else {
+        for (reason, count) in &counters.full_sends_by_reason {
+            writeln!(
+                out,
+                "urd_planner_full_sends_total{{reason=\"{reason}\"}} {count}"
+            )
+            .unwrap();
+        }
+    }
+
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "# HELP urd_planner_defers_total Planner deferrals, by scope."
+    )
+    .unwrap();
+    writeln!(out, "# TYPE urd_planner_defers_total counter").unwrap();
+    if counters.defers_by_scope.is_empty() {
+        writeln!(out, "urd_planner_defers_total{{scope=\"none\"}} 0").unwrap();
+    } else {
+        for (scope, count) in &counters.defers_by_scope {
+            writeln!(
+                out,
+                "urd_planner_defers_total{{scope=\"{scope}\"}} {count}"
+            )
+            .unwrap();
+        }
+    }
+
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "# HELP urd_retention_prunes_total Snapshots pruned by retention, by rule."
+    )
+    .unwrap();
+    writeln!(out, "# TYPE urd_retention_prunes_total counter").unwrap();
+    if counters.prunes_by_rule.is_empty() {
+        writeln!(out, "urd_retention_prunes_total{{rule=\"none\"}} 0").unwrap();
+    } else {
+        for (rule, count) in &counters.prunes_by_rule {
+            writeln!(
+                out,
+                "urd_retention_prunes_total{{rule=\"{rule}\"}} {count}"
+            )
+            .unwrap();
+        }
+    }
+
     out
 }
 
@@ -272,6 +361,7 @@ mod tests {
             external_drive_mounted: true,
             external_free_bytes: 4_400_000_000_000,
             script_last_run_timestamp: 1_711_100_120,
+            event_counters: EventCounters::default(),
         }
     }
 
@@ -354,6 +444,7 @@ mod tests {
             external_drive_mounted: false,
             external_free_bytes: 0,
             script_last_run_timestamp: 1_711_100_000,
+            event_counters: EventCounters::default(),
         };
         let output = format_metrics(&data);
         assert!(output.contains("backup_external_drive_mounted 0"));
@@ -371,7 +462,7 @@ mod tests {
 
         let ts = read_existing_timestamps(&path);
         assert_eq!(ts.get("subvol3-opptak"), Some(&1_711_100_000));
-        assert!(ts.get("htpc-home").is_none()); // was not emitted (no success)
+        assert!(!ts.contains_key("htpc-home")); // was not emitted (no success)
     }
 
     #[test]
@@ -396,7 +487,7 @@ mod tests {
         let ts = read_existing_timestamps(&path);
         assert_eq!(ts.get("good"), Some(&12345));
         assert_eq!(ts.get("also-good"), Some(&67890));
-        assert!(ts.get("bad").is_none());
+        assert!(!ts.contains_key("bad"));
     }
 
     #[test]
@@ -461,6 +552,7 @@ mod tests {
             external_drive_mounted: true,
             external_free_bytes: 1_000_000,
             script_last_run_timestamp: 12345,
+            event_counters: EventCounters::default(),
         };
         write_metrics(&path, &data).unwrap();
 
@@ -478,5 +570,65 @@ mod tests {
         apply_carried_forward_timestamps(&mut svs, &carried);
 
         assert_eq!(svs[0].last_success_timestamp, Some(12345));
+    }
+
+    // ── Event-counter family tests ────────────────────────────────
+
+    #[test]
+    fn format_includes_event_counter_help_lines() {
+        let data = sample_data();
+        let output = format_metrics(&data);
+        assert!(output.contains("# HELP urd_circuit_breaker_trips_total"));
+        assert!(output.contains("# TYPE urd_circuit_breaker_trips_total counter"));
+        assert!(output.contains("# HELP urd_planner_full_sends_total"));
+        assert!(output.contains("# TYPE urd_planner_full_sends_total counter"));
+        assert!(output.contains("# HELP urd_planner_defers_total"));
+        assert!(output.contains("# TYPE urd_planner_defers_total counter"));
+        assert!(output.contains("# HELP urd_retention_prunes_total"));
+        assert!(output.contains("# TYPE urd_retention_prunes_total counter"));
+    }
+
+    #[test]
+    fn format_emits_zero_counters_when_empty() {
+        let data = sample_data();
+        let output = format_metrics(&data);
+        // Trips: bare counter, no labels.
+        assert!(output.contains("urd_circuit_breaker_trips_total 0"));
+        // Family counters: emit a sentinel zero with reason="none" / scope="none".
+        assert!(output.contains("urd_planner_full_sends_total{reason=\"none\"} 0"));
+        assert!(output.contains("urd_planner_defers_total{scope=\"none\"} 0"));
+        assert!(output.contains("urd_retention_prunes_total{rule=\"none\"} 0"));
+    }
+
+    #[test]
+    fn format_renders_full_send_reasons_as_labels() {
+        let mut data = sample_data();
+        data.event_counters.full_sends_by_reason = vec![
+            ("first_send".to_string(), 3),
+            ("chain_broken".to_string(), 1),
+        ];
+        let output = format_metrics(&data);
+        assert!(output.contains("urd_planner_full_sends_total{reason=\"first_send\"} 3"));
+        assert!(output.contains("urd_planner_full_sends_total{reason=\"chain_broken\"} 1"));
+    }
+
+    #[test]
+    fn format_renders_prune_rules_and_defer_scopes() {
+        let mut data = sample_data();
+        data.event_counters.prunes_by_rule = vec![
+            ("graduated_daily".to_string(), 14),
+            ("emergency".to_string(), 2),
+        ];
+        data.event_counters.defers_by_scope = vec![
+            ("subvolume".to_string(), 7),
+            ("drive".to_string(), 3),
+        ];
+        data.event_counters.circuit_breaker_trips = 5;
+        let output = format_metrics(&data);
+        assert!(output.contains("urd_retention_prunes_total{rule=\"graduated_daily\"} 14"));
+        assert!(output.contains("urd_retention_prunes_total{rule=\"emergency\"} 2"));
+        assert!(output.contains("urd_planner_defers_total{scope=\"subvolume\"} 7"));
+        assert!(output.contains("urd_planner_defers_total{scope=\"drive\"} 3"));
+        assert!(output.contains("urd_circuit_breaker_trips_total 5"));
     }
 }

@@ -24,7 +24,8 @@ use crate::notify::{self, Notification, NotificationEvent, Urgency};
 use crate::output::{SentinelCircuitState, SentinelPromiseState, SentinelStateFile};
 use crate::plan::RealFileSystemState;
 use crate::sentinel::{
-    self, SentinelAction, SentinelEvent, SentinelState, CircuitBreakerConfig, PromiseSnapshot,
+    self, CircuitBreakerConfig, PromiseSnapshot, SentinelAction, SentinelEvent, SentinelState,
+    TransitionResult,
 };
 use crate::state::StateDb;
 
@@ -107,10 +108,14 @@ impl SentinelRunner {
         // Main poll loop.
         loop {
             if self.shutdown.load(Ordering::SeqCst) {
-                let (new_state, actions) =
-                    sentinel::sentinel_transition(&self.state, &SentinelEvent::Shutdown);
+                let TransitionResult {
+                    state: new_state,
+                    actions,
+                } = sentinel::sentinel_transition(&self.state, &SentinelEvent::Shutdown);
                 self.state = new_state;
-                self.execute_actions(&actions);
+                // Shutdown path: no audit events to collect, no trigger.
+                let mut audit_events = Vec::new();
+                self.execute_actions(&actions, None, &mut audit_events);
                 break;
             }
 
@@ -145,29 +150,60 @@ impl SentinelRunner {
     }
 
     /// Process events through the state machine, coalescing Assess actions (M1 fix).
+    ///
+    /// Collects audit-log events from each transition and from
+    /// config-reload outcomes, then persists them best-effort after all
+    /// actions have run. The originating triggers are passed to
+    /// `execute_assess` so it can emit promise-transition events with the
+    /// correct `TransitionTrigger`.
     fn process_events(&mut self, events: Vec<SentinelEvent>) {
+        let mut all_audit_events: Vec<crate::events::Event> = Vec::new();
+
         // Pre-pass: reload config before state machine processes ConfigChanged.
         // This ensures the Assess action (emitted by the transition) uses the new config.
         for event in &events {
             if matches!(event, SentinelEvent::ConfigChanged) {
-                self.try_reload_config();
+                self.try_reload_config(&mut all_audit_events);
             }
         }
 
         let mut all_actions = Vec::new();
 
         for event in &events {
-            let (new_state, actions) = sentinel::sentinel_transition(&self.state, event);
+            let TransitionResult { state: new_state, actions } =
+                sentinel::sentinel_transition(&self.state, event);
             self.state = new_state;
             all_actions.extend(actions);
         }
 
-        self.execute_actions(&all_actions);
+        // Skip the diff on BackupCompleted — the backup already emitted
+        // promise transitions with trigger=Run, so the sentinel must not
+        // duplicate them. DriveMounted/ConfigChanged take precedence over
+        // a routine Tick when both fire in the same cycle.
+        let trigger = pick_transition_trigger(&events);
+
+        self.execute_actions(&all_actions, trigger, &mut all_audit_events);
+
+        // Persist all collected audit events best-effort.
+        if !all_audit_events.is_empty()
+            && let Ok(db) = StateDb::open(&self.config.general.state_db)
+        {
+            db.record_events_best_effort(&all_audit_events);
+        }
     }
 
     /// Execute actions with Assess coalescing (M1 fix): if multiple Assess actions
     /// are queued, execute only one. LogDriveChange and Exit run individually.
-    fn execute_actions(&mut self, actions: &[SentinelAction]) {
+    ///
+    /// `trigger` is `Some(t)` when one of the originating events should
+    /// produce promise-transition audit events; `None` on
+    /// `BackupCompleted`-only cycles.
+    fn execute_actions(
+        &mut self,
+        actions: &[SentinelAction],
+        trigger: Option<crate::events::TransitionTrigger>,
+        audit_events: &mut Vec<crate::events::Event>,
+    ) {
         let mut need_assess = false;
 
         for action in actions {
@@ -186,7 +222,7 @@ impl SentinelRunner {
         }
 
         if need_assess
-            && let Err(e) = self.execute_assess()
+            && let Err(e) = self.execute_assess(trigger, audit_events)
         {
             log::error!("Assessment failed: {e}");
         }
@@ -264,7 +300,12 @@ impl SentinelRunner {
 
     /// Attempt to reload config from disk. On success, swap config and update
     /// cached paths. On failure, log and keep old config.
-    fn try_reload_config(&mut self) {
+    ///
+    /// Emits `ConfigReloaded` on success or `ConfigReloadFailed` on
+    /// parse error. Initial loads (sentinel startup) do **not** call this
+    /// — only sentinel-detected reloads do.
+    fn try_reload_config(&mut self, audit_events: &mut Vec<crate::events::Event>) {
+        let now = chrono::Local::now().naive_local();
         match Config::load(Some(&self.config_path)) {
             Ok(new_config) => {
                 log::warn!("Config reloaded — reassessing");
@@ -279,10 +320,24 @@ impl SentinelRunner {
                     .and_then(|m| m.modified().ok());
                 }
 
+                let version = new_config
+                    .general
+                    .config_version
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "legacy".to_string());
+
                 // F1 fix: update cached paths derived from config.
                 self.config = new_config;
                 self.heartbeat_path = self.config.general.heartbeat_file.clone();
                 self.state_file_path = sentinel_state_path(&self.config);
+
+                audit_events.push(crate::events::Event::pure(
+                    now,
+                    crate::events::EventPayload::ConfigReloaded {
+                        config_version: version,
+                        source: self.config_path.display().to_string(),
+                    },
+                ));
 
                 // F2 note: stale drives in self.state.mounted_drives (from old
                 // config) will be cleaned up by the next detect_drive_events()
@@ -294,13 +349,23 @@ impl SentinelRunner {
                 log::error!(
                     "Config file changed but reload failed: {e}. Keeping previous config."
                 );
+                audit_events.push(crate::events::Event::pure(
+                    now,
+                    crate::events::EventPayload::ConfigReloadFailed {
+                        reason: e.to_string(),
+                    },
+                ));
             }
         }
     }
 
     // ── Action execution ────────────────────────────────────────────────
 
-    fn execute_assess(&mut self) -> anyhow::Result<()> {
+    fn execute_assess(
+        &mut self,
+        trigger: Option<crate::events::TransitionTrigger>,
+        audit_events: &mut Vec<crate::events::Event>,
+    ) -> anyhow::Result<()> {
         let now = chrono::Local::now().naive_local();
         let state_db = if self.config.general.state_db.exists() {
             StateDb::open(&self.config.general.state_db).ok()
@@ -313,6 +378,21 @@ impl SentinelRunner {
 
         let mut assessments = awareness::assess(&self.config, now, &fs);
         awareness::overlay_offsite_freshness(&mut assessments, &self.config);
+
+        // Emit promise-transition events when the originating event was
+        // Tick/DriveMounted/ConfigChanged. On BackupCompleted the backup
+        // itself emitted these with trigger=Run; sentinel just refreshes
+        // its baseline.
+        if self.state.has_initial_assessment
+            && let Some(t) = trigger
+        {
+            audit_events.extend(awareness::diff_promise_states(
+                &self.state.last_promise_states,
+                &assessments,
+                now,
+                t,
+            ));
+        }
 
         // Collect notifications from two independent sources.
         let mut notifications = Vec::new();
@@ -386,6 +466,19 @@ impl SentinelRunner {
                         anomaly.broken_count, anomaly.total_chains, anomaly.drive_label,
                     ),
                 });
+                let mut event = crate::events::Event::pure(
+                    now,
+                    crate::events::EventPayload::SentinelAnomaly {
+                        description: format!(
+                            "{} of {} incremental chains on {} broke simultaneously",
+                            anomaly.broken_count,
+                            anomaly.total_chains,
+                            anomaly.drive_label,
+                        ),
+                    },
+                );
+                event.drive_label = Some(anomaly.drive_label.clone());
+                audit_events.push(event);
             }
             self.state.last_chain_health = current_chains;
         }
@@ -601,6 +694,35 @@ impl SentinelRunner {
 ///
 /// This is a separate path from `notify::compute_notifications()`, which operates
 /// on heartbeat data. The two paths converge at `notify::dispatch()`.
+/// Pick the originating `TransitionTrigger` for promise-transition events
+/// emitted during this cycle. Returns `None` when only `BackupCompleted`
+/// fired — in that case the backup itself emitted promise transitions
+/// with `trigger=Run` and the sentinel must not duplicate them.
+///
+/// Precedence (when multiple events fire in the same cycle): an explicit
+/// trigger event (DriveMounted, ConfigChanged) wins over a routine Tick.
+fn pick_transition_trigger(
+    events: &[SentinelEvent],
+) -> Option<crate::events::TransitionTrigger> {
+    let mut chosen = None;
+    for event in events {
+        match event {
+            SentinelEvent::DriveMounted { .. } => {
+                return Some(crate::events::TransitionTrigger::DriveMounted);
+            }
+            SentinelEvent::ConfigChanged => {
+                return Some(crate::events::TransitionTrigger::ConfigChanged);
+            }
+            SentinelEvent::AssessmentTick => {
+                chosen.get_or_insert(crate::events::TransitionTrigger::Tick);
+            }
+            // BackupCompleted, DriveUnmounted, Shutdown — no diff trigger.
+            _ => {}
+        }
+    }
+    chosen
+}
+
 pub fn build_notifications(
     previous: &[PromiseSnapshot],
     current: &[SubvolAssessment],
@@ -1392,10 +1514,15 @@ protection = "recorded"
 
         // Overwrite with invalid TOML.
         std::fs::write(&config_path, "this is not valid toml [[[").unwrap();
-        runner.try_reload_config();
+        let mut events = Vec::new();
+        runner.try_reload_config(&mut events);
 
         // Config should be unchanged.
         assert_eq!(runner.config.general.state_db, original_state_db);
+        assert!(events.iter().any(|e| matches!(
+            e.payload,
+            crate::events::EventPayload::ConfigReloadFailed { .. }
+        )));
     }
 
     #[test]
@@ -1411,7 +1538,13 @@ protection = "recorded"
         std::fs::create_dir_all(&new_dir).unwrap();
         write_test_config(&config_path, &new_dir);
 
-        runner.try_reload_config();
+        let mut events = Vec::new();
+        runner.try_reload_config(&mut events);
+
+        assert!(events.iter().any(|e| matches!(
+            e.payload,
+            crate::events::EventPayload::ConfigReloaded { .. }
+        )));
 
         // Config should reflect new values.
         let expected_db = new_dir.join("urd.db");
@@ -1421,5 +1554,58 @@ protection = "recorded"
             runner.state_file_path,
             sentinel_state_path(&runner.config),
         );
+    }
+
+    // ── pick_transition_trigger tests ──────────────────────────────
+
+    #[test]
+    fn trigger_drive_mounted_wins_over_tick() {
+        let events = vec![
+            SentinelEvent::AssessmentTick,
+            SentinelEvent::DriveMounted {
+                label: "WD-18TB".into(),
+            },
+        ];
+        assert_eq!(
+            pick_transition_trigger(&events),
+            Some(crate::events::TransitionTrigger::DriveMounted)
+        );
+    }
+
+    #[test]
+    fn trigger_config_changed_wins_over_tick() {
+        let events = vec![
+            SentinelEvent::AssessmentTick,
+            SentinelEvent::ConfigChanged,
+        ];
+        assert_eq!(
+            pick_transition_trigger(&events),
+            Some(crate::events::TransitionTrigger::ConfigChanged)
+        );
+    }
+
+    #[test]
+    fn trigger_tick_when_alone() {
+        let events = vec![SentinelEvent::AssessmentTick];
+        assert_eq!(
+            pick_transition_trigger(&events),
+            Some(crate::events::TransitionTrigger::Tick)
+        );
+    }
+
+    #[test]
+    fn trigger_none_for_backup_completed_only() {
+        // BackupCompleted by itself does not yield a trigger — the backup
+        // itself emitted the promise transitions with Run.
+        let events = vec![SentinelEvent::BackupCompleted];
+        assert_eq!(pick_transition_trigger(&events), None);
+    }
+
+    #[test]
+    fn trigger_none_for_drive_unmounted_alone() {
+        let events = vec![SentinelEvent::DriveUnmounted {
+            label: "WD-18TB".into(),
+        }];
+        assert_eq!(pick_transition_trigger(&events), None);
     }
 }

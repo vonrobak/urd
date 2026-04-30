@@ -1062,7 +1062,7 @@ protection_level = "recorded"
 snapshot_interval = "1w"
 "#;
         let legacy: LegacyConfig = toml::from_str(toml).unwrap();
-        let result = build_migration(&legacy);
+        let _result = build_migration(&legacy);
         let v1 = render_v1(&legacy);
 
         // Should NOT have protection = "recorded"
@@ -1166,7 +1166,7 @@ snapshot_interval = "1w"
     fn dry_run_does_not_write_files() {
         let toml = example_legacy_toml();
         let legacy: LegacyConfig = toml::from_str(toml).unwrap();
-        let result = build_migration(&legacy);
+        let _result = build_migration(&legacy);
         let v1 = render_v1(&legacy);
 
         assert!(!v1.is_empty());
@@ -1199,12 +1199,10 @@ snapshot_interval = "1w"
     fn migrate_already_v1_is_noop() {
         let dir = tempfile::TempDir::new().unwrap();
         let config_path = dir.path().join("urd.toml");
-        let v1_content = format!(
-            "[general]\nconfig_version = 1\n\n\
+        let v1_content = "[general]\nconfig_version = 1\n\n\
              [[drives]]\nlabel = \"D\"\nmount_path = \"/mnt/d\"\nsnapshot_root = \".snap\"\nrole = \"offsite\"\n\n\
-             [[subvolumes]]\nname = \"test\"\nsource = \"/test\"\nsnapshot_root = \"/snap\"\n"
-        );
-        std::fs::write(&config_path, &v1_content).unwrap();
+             [[subvolumes]]\nname = \"test\"\nsource = \"/test\"\nsnapshot_root = \"/snap\"\n";
+        std::fs::write(&config_path, v1_content).unwrap();
 
         let args = MigrateArgs { dry_run: false };
         let result = run(Some(config_path.as_path()), &args);
@@ -1254,7 +1252,7 @@ protection_level = "sheltered"
 snapshot_interval = "1w"
 "#;
         let legacy: LegacyConfig = toml::from_str(toml).unwrap();
-        let result = build_migration(&legacy);
+        let _result = build_migration(&legacy);
         let v1 = render_v1(&legacy);
 
         // Should have baked all operational fields since it's converted to custom
@@ -1405,7 +1403,7 @@ protection_level = "guarded"
 snapshot_interval = "1d"
 "#;
         let legacy: LegacyConfig = toml::from_str(toml).unwrap();
-        let result = build_migration(&legacy);
+        let _result = build_migration(&legacy);
         let v1 = render_v1(&legacy);
 
         // Should keep the named level (no conversion) since override matches derived

@@ -95,7 +95,7 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     // Emergency pre-flight: if any snapshot root is critically below threshold
     // (< 50% of min_free_bytes), run emergency retention before planning.
     // Runs under the lock because it performs destructive btrfs deletions.
-    let emergency_ran = run_emergency_preflight(&config)?;
+    let emergency_ran = run_emergency_preflight(&config, state_db.as_ref())?;
 
     // Re-plan if emergency freed space — plan may have different space_pressure decisions
     if emergency_ran {
@@ -320,6 +320,27 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     if !transitions.is_empty() {
         log::debug!("Detected {} transition(s)", transitions.len());
     }
+
+    // Backup is canonical for in-run promise transitions (trigger=Run);
+    // sentinel skips on BackupCompleted to avoid duplicates.
+    if let Some(ref db) = state_db {
+        let prev_snapshots = crate::sentinel::snapshot_promises(&pre_assessments);
+        let promise_events = awareness::diff_promise_states(
+            &prev_snapshots,
+            &assessments,
+            heartbeat_now,
+            crate::events::TransitionTrigger::Run,
+        );
+        if !promise_events.is_empty() {
+            // Stamp run_id from the executor result.
+            let mut stamped = promise_events;
+            for ev in &mut stamped {
+                ev.run_id = result.run_id;
+            }
+            db.record_events_best_effort(&stamped);
+        }
+    }
+
     let summary = build_backup_summary(
         &backup_plan,
         &result,
@@ -740,11 +761,24 @@ fn write_global_metrics(
 ) -> anyhow::Result<()> {
     let (drive_mounted, free_bytes) = drives::first_mounted_drive_status(config);
 
+    // Aggregate counter families from the events table.
+    // Best-effort: a missing or unreadable DB yields zeros, never an error.
+    let event_counters = StateDb::open(&config.general.state_db)
+        .ok()
+        .map(|db| crate::metrics::EventCounters {
+            circuit_breaker_trips: db.count_circuit_breaker_trips().unwrap_or(0),
+            full_sends_by_reason: db.count_full_sends_by_reason().unwrap_or_default(),
+            defers_by_scope: db.count_defers_by_scope().unwrap_or_default(),
+            prunes_by_rule: db.count_prunes_by_rule().unwrap_or_default(),
+        })
+        .unwrap_or_default();
+
     let data = MetricsData {
         subvolumes: subvolume_metrics,
         external_drive_mounted: drive_mounted,
         external_free_bytes: free_bytes,
         script_last_run_timestamp: now_ts,
+        event_counters,
     };
 
     metrics::write_metrics(&config.general.metrics_file, &data)?;
@@ -1085,10 +1119,19 @@ fn dispatch_notifications(
 ///
 /// Runs under the advisory lock. Skips roots without `min_free_bytes`.
 /// Skips transient subvolumes. Isolates per-subvolume failures (ADR-109).
-fn run_emergency_preflight(config: &Config) -> anyhow::Result<bool> {
+///
+/// Emits `RetentionPrune { rule: Emergency }` events for each successful
+/// delete and persists them best-effort to the events log (when
+/// `state_db` is `Some`). Emergency runs before `begin_run`, so these
+/// events have `run_id = None`.
+fn run_emergency_preflight(
+    config: &Config,
+    state_db: Option<&StateDb>,
+) -> anyhow::Result<bool> {
     let resolved = config.resolved_subvolumes();
     let drive_labels = config.drive_labels();
     let mut any_deleted = false;
+    let mut emitted_events: Vec<crate::events::Event> = Vec::new();
 
     // Lazily created btrfs handle — only probe if we need to delete
     let mut btrfs: Option<crate::btrfs::RealBtrfs> = None;
@@ -1151,9 +1194,15 @@ fn run_emergency_preflight(config: &Config) -> anyhow::Result<bool> {
             let pinned =
                 crate::chain::find_pinned_snapshots(&local_dir, &drive_labels);
 
-            let result =
-                crate::retention::emergency_retention(&snaps, &latest, &pinned);
+            let mut result = crate::retention::emergency_retention(
+                &snaps,
+                &latest,
+                &pinned,
+                chrono::Local::now().naive_local(),
+            );
 
+            // Map snap → its emitted event (by snapshot name) so we can
+            // persist only events whose underlying delete succeeded.
             for (snap, _reason) in &result.delete {
                 let snap_path = local_dir.join(snap.as_str());
 
@@ -1174,6 +1223,23 @@ fn run_emergency_preflight(config: &Config) -> anyhow::Result<bool> {
                     Ok(()) => {
                         any_deleted = true;
                         log::info!("Emergency: deleted {}", snap_path.display());
+                        // Stamp the matching emitted event with the
+                        // subvolume name and stash for persistence.
+                        if let Some(idx) =
+                            result.events.iter().position(|ev| match &ev.payload {
+                                crate::events::EventPayload::RetentionPrune {
+                                    snapshot,
+                                    ..
+                                } => snapshot == snap.as_str(),
+                                _ => false,
+                            })
+                        {
+                            let mut ev = result.events.remove(idx);
+                            if ev.subvolume.is_none() {
+                                ev.subvolume = Some(subvol_name.clone());
+                            }
+                            emitted_events.push(ev);
+                        }
                     }
                     Err(e) => {
                         log::error!(
@@ -1198,6 +1264,10 @@ fn run_emergency_preflight(config: &Config) -> anyhow::Result<bool> {
 
     if any_deleted {
         log::warn!("Emergency retention freed space before backup");
+    }
+
+    if let Some(db) = state_db {
+        db.record_events_best_effort(&emitted_events);
     }
 
     Ok(any_deleted)
@@ -1402,6 +1472,7 @@ mod tests {
             operations: vec![],
             timestamp: chrono::NaiveDateTime::default(),
             skipped: vec![],
+            events: Vec::new(),
         }
     }
 
@@ -1571,6 +1642,7 @@ mod tests {
             ],
             timestamp: chrono::NaiveDateTime::default(),
             skipped: vec![],
+            events: Vec::new(),
         };
 
         let result = ExecutionResult {
@@ -1620,6 +1692,7 @@ mod tests {
             operations: vec![],
             timestamp: chrono::NaiveDateTime::default(),
             skipped: vec![],
+            events: Vec::new(),
         };
         let result = ExecutionResult {
             overall: RunResult::Success,
@@ -1674,6 +1747,7 @@ mod tests {
             operations: vec![],
             timestamp: chrono::NaiveDateTime::default(),
             skipped: vec![],
+            events: Vec::new(),
         };
         let result = ExecutionResult {
             overall: RunResult::Success,
@@ -1703,6 +1777,7 @@ mod tests {
                 ),
                 ("htpc-docs".to_string(), "disabled".to_string()),
             ],
+            events: Vec::new(),
         };
 
         let result = ExecutionResult {
@@ -2026,6 +2101,7 @@ mod tests {
             ],
             timestamp: chrono::NaiveDateTime::default(),
             skipped: vec![],
+            events: Vec::new(),
         };
 
         let mut fs = MockFileSystemState::new();
@@ -2070,6 +2146,7 @@ mod tests {
             }],
             timestamp: chrono::NaiveDateTime::default(),
             skipped: vec![],
+            events: Vec::new(),
         };
 
         let fs = MockFileSystemState::new();
@@ -2097,6 +2174,7 @@ mod tests {
             }],
             timestamp: chrono::NaiveDateTime::default(),
             skipped: vec![],
+            events: Vec::new(),
         };
 
         let mut fs = MockFileSystemState::new();
@@ -2134,6 +2212,7 @@ mod tests {
             }],
             timestamp: chrono::NaiveDateTime::default(),
             skipped: vec![],
+            events: Vec::new(),
         };
         let est_full = build_size_estimates(&plan_full, &fs);
         assert_eq!(est_full[&("sv1".to_string(), "d1".to_string())], Some(45_000_000_000));
@@ -2150,6 +2229,7 @@ mod tests {
             }],
             timestamp: chrono::NaiveDateTime::default(),
             skipped: vec![],
+            events: Vec::new(),
         };
         let est_inc = build_size_estimates(&plan_inc, &fs);
         assert_eq!(est_inc[&("sv1".to_string(), "d1".to_string())], None);
@@ -2475,6 +2555,7 @@ mod tests {
                 .into_iter()
                 .map(|(n, r)| (n.to_string(), r.to_string()))
                 .collect(),
+            events: Vec::new(),
         }
     }
 

@@ -2,16 +2,44 @@ use std::collections::HashSet;
 
 use chrono::{Datelike, Months, NaiveDateTime, Timelike};
 
+use crate::events::{Event, EventPayload, ProtectReason, PruneRule};
 use crate::output::{
     DiskEstimate, EstimateMethod, RecoveryWindow, RetentionPreview, TransientComparison,
 };
 use crate::types::{Interval, LocalRetentionPolicy, ResolvedGraduatedRetention, SnapshotName};
 
 /// The result of a retention computation.
-#[derive(Debug, Clone)]
+///
+/// `events` carries rationale for the planner's audit log. Pure modules
+/// emit; impure callers (executor) persist via
+/// `state::record_events_best_effort`. Contextual fields
+/// (`run_id`, `subvolume`, `drive_label`) are stamped by the caller.
+#[derive(Debug, Clone, Default)]
 pub struct RetentionResult {
     pub keep: Vec<SnapshotName>,
     pub delete: Vec<(SnapshotName, String)>,
+    pub events: Vec<Event>,
+}
+
+fn prune_event(snap: &SnapshotName, rule: PruneRule, now: NaiveDateTime) -> Event {
+    Event::pure(
+        now,
+        EventPayload::RetentionPrune {
+            snapshot: snap.as_str().to_string(),
+            rule,
+            tier: None,
+        },
+    )
+}
+
+fn protect_event(snap: &SnapshotName, reason: ProtectReason, now: NaiveDateTime) -> Event {
+    Event::pure(
+        now,
+        EventPayload::RetentionProtect {
+            snapshot: snap.as_str().to_string(),
+            reason,
+        },
+    )
 }
 
 /// Apply graduated retention to a list of snapshots.
@@ -33,10 +61,7 @@ pub fn graduated_retention(
     space_pressure: bool,
 ) -> RetentionResult {
     if snapshots.is_empty() {
-        return RetentionResult {
-            keep: Vec::new(),
-            delete: Vec::new(),
-        };
+        return RetentionResult::default();
     }
 
     let mut sorted: Vec<SnapshotName> = snapshots.to_vec();
@@ -45,6 +70,7 @@ pub fn graduated_retention(
 
     let mut keep = Vec::new();
     let mut delete = Vec::new();
+    let mut events = Vec::new();
 
     // Compute window boundaries as timestamps
     let hourly_cutoff = now - chrono::Duration::hours(i64::from(config.hourly));
@@ -72,15 +98,35 @@ pub fn graduated_retention(
     // For space pressure: track hourly slots
     let mut hourly_slots: HashSet<(i32, u32, u32, u32)> = HashSet::new(); // (y, m, d, hour)
 
+    let apply_slot_thinning =
+        |snap: &SnapshotName,
+         slot_was_empty: bool,
+         is_pinned: bool,
+         rule: PruneRule,
+         delete_reason: &str,
+         keep: &mut Vec<SnapshotName>,
+         delete: &mut Vec<(SnapshotName, String)>,
+         events: &mut Vec<Event>| {
+            if slot_was_empty {
+                keep.push(snap.clone());
+            } else if is_pinned {
+                keep.push(snap.clone());
+                events.push(protect_event(snap, ProtectReason::PinOverrodeThinning, now));
+            } else {
+                delete.push((snap.clone(), delete_reason.to_string()));
+                events.push(prune_event(snap, rule, now));
+            }
+        };
+
     for snap in &sorted {
         let dt = snap.datetime();
         let is_pinned = pinned.contains(snap);
 
         if dt > now {
-            // Future snapshot — keep it (clock skew protection)
+            // Clock-skew guard: future-dated snapshots are kept regardless.
             keep.push(snap.clone());
+            events.push(protect_event(snap, ProtectReason::ClockSkewFuture, now));
         } else if dt >= hourly_cutoff {
-            // Hourly window
             if space_pressure {
                 let slot = (
                     dt.date().year(),
@@ -88,50 +134,77 @@ pub fn graduated_retention(
                     dt.date().day(),
                     dt.time().hour(),
                 );
-                if hourly_slots.insert(slot) || is_pinned {
-                    keep.push(snap.clone());
-                } else {
-                    delete.push((snap.clone(), "space pressure: hourly thinning".to_string()));
-                }
+                let slot_was_empty = hourly_slots.insert(slot);
+                apply_slot_thinning(
+                    snap,
+                    slot_was_empty,
+                    is_pinned,
+                    PruneRule::SpacePressure,
+                    "space pressure: hourly thinning",
+                    &mut keep,
+                    &mut delete,
+                    &mut events,
+                );
             } else {
                 keep.push(snap.clone());
             }
         } else if dt >= daily_cutoff {
-            // Daily window: keep newest per calendar day
             let day_key = dt.date().and_hms_opt(0, 0, 0).unwrap_or(dt);
-            if daily_slots.insert(day_key) || is_pinned {
-                keep.push(snap.clone());
-            } else {
-                delete.push((snap.clone(), "graduated: daily thinning".to_string()));
-            }
+            let slot_was_empty = daily_slots.insert(day_key);
+            apply_slot_thinning(
+                snap,
+                slot_was_empty,
+                is_pinned,
+                PruneRule::GraduatedDaily,
+                "graduated: daily thinning",
+                &mut keep,
+                &mut delete,
+                &mut events,
+            );
         } else if dt >= weekly_cutoff {
-            // Weekly window: keep newest per ISO week
             let iso = dt.date().iso_week();
             let week_key = (iso.year(), iso.week());
-            if weekly_slots.insert(week_key) || is_pinned {
-                keep.push(snap.clone());
-            } else {
-                delete.push((snap.clone(), "graduated: weekly thinning".to_string()));
-            }
+            let slot_was_empty = weekly_slots.insert(week_key);
+            apply_slot_thinning(
+                snap,
+                slot_was_empty,
+                is_pinned,
+                PruneRule::GraduatedWeekly,
+                "graduated: weekly thinning",
+                &mut keep,
+                &mut delete,
+                &mut events,
+            );
         } else if monthly_cutoff.is_none() || dt >= monthly_cutoff.unwrap() {
-            // Monthly window: keep newest per year-month
             let month_key = (dt.date().year(), dt.date().month());
-            if monthly_slots.insert(month_key) || is_pinned {
-                keep.push(snap.clone());
-            } else {
-                delete.push((snap.clone(), "graduated: monthly thinning".to_string()));
-            }
+            let slot_was_empty = monthly_slots.insert(month_key);
+            apply_slot_thinning(
+                snap,
+                slot_was_empty,
+                is_pinned,
+                PruneRule::GraduatedMonthly,
+                "graduated: monthly thinning",
+                &mut keep,
+                &mut delete,
+                &mut events,
+            );
         } else if is_pinned {
             keep.push(snap.clone());
+            events.push(protect_event(snap, ProtectReason::PinOverrodeWindow, now));
         } else {
             delete.push((
                 snap.clone(),
                 "graduated: beyond retention window".to_string(),
             ));
+            events.push(prune_event(snap, PruneRule::BeyondWindow, now));
         }
     }
 
-    RetentionResult { keep, delete }
+    RetentionResult {
+        keep,
+        delete,
+        events,
+    }
 }
 
 /// Compute the minimal keep set for emergency space recovery.
@@ -154,26 +227,30 @@ pub fn emergency_retention(
     snapshots: &[SnapshotName],
     latest: &SnapshotName,
     pinned: &HashSet<SnapshotName>,
+    now: NaiveDateTime,
 ) -> RetentionResult {
     if snapshots.is_empty() {
-        return RetentionResult {
-            keep: Vec::new(),
-            delete: Vec::new(),
-        };
+        return RetentionResult::default();
     }
 
     let mut keep = Vec::new();
     let mut delete = Vec::new();
+    let mut events = Vec::new();
 
     for snap in snapshots {
         if snap == latest || pinned.contains(snap) {
             keep.push(snap.clone());
         } else {
             delete.push((snap.clone(), "emergency: aggressive thinning".to_string()));
+            events.push(prune_event(snap, PruneRule::Emergency, now));
         }
     }
 
-    RetentionResult { keep, delete }
+    RetentionResult {
+        keep,
+        delete,
+        events,
+    }
 }
 
 /// Space-governed retention with graduated thinning.
@@ -202,6 +279,7 @@ pub fn space_governed_retention(
         keep_sorted.sort(); // oldest first
 
         let mut additional_deletes = Vec::new();
+        let mut additional_events = Vec::new();
         for snap in &keep_sorted {
             if pinned.contains(snap) {
                 continue;
@@ -211,12 +289,14 @@ pub fn space_governed_retention(
                 break;
             }
             additional_deletes.push((snap.clone(), "space pressure: freeing space".to_string()));
+            additional_events.push(prune_event(snap, PruneRule::SpacePressure, now));
         }
 
         // Remove additional deletes from keep, add to delete
         let delete_set: HashSet<_> = additional_deletes.iter().map(|(s, _)| s.clone()).collect();
         result.keep.retain(|s| !delete_set.contains(s));
         result.delete.extend(additional_deletes);
+        result.events.extend(additional_events);
     }
 
     result
@@ -1057,7 +1137,7 @@ mod tests {
     #[test]
     fn emergency_empty() {
         let latest = make_snap("20260322", "1400", "home");
-        let result = emergency_retention(&[], &latest, &HashSet::new());
+        let result = emergency_retention(&[], &latest, &HashSet::new(), now());
         assert!(result.keep.is_empty());
         assert!(result.delete.is_empty());
     }
@@ -1066,7 +1146,7 @@ mod tests {
     fn emergency_single_snapshot() {
         let latest = make_snap("20260322", "1400", "home");
         let snaps = vec![latest.clone()];
-        let result = emergency_retention(&snaps, &latest, &HashSet::new());
+        let result = emergency_retention(&snaps, &latest, &HashSet::new(), now());
         assert_eq!(result.keep.len(), 1);
         assert_eq!(result.keep[0].as_str(), "20260322-1400-home");
         assert!(result.delete.is_empty());
@@ -1082,7 +1162,7 @@ mod tests {
         let pinned: HashSet<SnapshotName> =
             [snaps[2].clone(), snaps[6].clone()].into_iter().collect();
 
-        let result = emergency_retention(&snaps, &latest, &pinned);
+        let result = emergency_retention(&snaps, &latest, &pinned, now());
         assert_eq!(result.keep.len(), 3, "keep latest + 2 pinned");
         assert_eq!(result.delete.len(), 7);
         assert!(result.keep.contains(&latest));
@@ -1103,7 +1183,7 @@ mod tests {
         let latest = snaps[2].clone();
         let pinned: HashSet<SnapshotName> = [snaps[2].clone()].into_iter().collect();
 
-        let result = emergency_retention(&snaps, &latest, &pinned);
+        let result = emergency_retention(&snaps, &latest, &pinned, now());
         // latest is also pinned — no double-counting
         assert_eq!(result.keep.len(), 1, "latest=pinned should not duplicate");
         assert_eq!(result.delete.len(), 2);
@@ -1119,7 +1199,7 @@ mod tests {
         let latest = snaps[2].clone();
         let pinned: HashSet<SnapshotName> = snaps.iter().cloned().collect();
 
-        let result = emergency_retention(&snaps, &latest, &pinned);
+        let result = emergency_retention(&snaps, &latest, &pinned, now());
         assert_eq!(result.keep.len(), 3, "all pinned → keep all");
         assert!(result.delete.is_empty());
     }
@@ -1135,9 +1215,228 @@ mod tests {
         ];
         let latest = snaps[4].clone();
 
-        let result = emergency_retention(&snaps, &latest, &HashSet::new());
+        let result = emergency_retention(&snaps, &latest, &HashSet::new(), now());
         assert_eq!(result.keep.len(), 1, "no pins → keep latest only");
         assert_eq!(result.keep[0].as_str(), "20260322-1200-home");
         assert_eq!(result.delete.len(), 4);
+    }
+
+    // ── Event emission tests ───────────────────────────────────────────
+
+    #[test]
+    fn graduated_emits_one_prune_event_per_delete() {
+        let snaps = vec![
+            make_snap("20260320", "1400", "home"),
+            make_snap("20260320", "1000", "home"),
+            make_snap("20260320", "0800", "home"),
+        ];
+        let result =
+            graduated_retention(&snaps, now(), &default_config(), &HashSet::new(), false);
+        assert_eq!(result.delete.len(), 2);
+        let prune_count = result
+            .events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.payload,
+                    crate::events::EventPayload::RetentionPrune { .. }
+                )
+            })
+            .count();
+        assert_eq!(prune_count, result.delete.len());
+    }
+
+    #[test]
+    fn graduated_emits_correct_prune_rule_per_branch() {
+        // Daily window: 3 same-day snapshots → 2 deletes with GraduatedDaily
+        let snaps = vec![
+            make_snap("20260320", "1400", "home"),
+            make_snap("20260320", "1000", "home"),
+            make_snap("20260320", "0800", "home"),
+        ];
+        let result =
+            graduated_retention(&snaps, now(), &default_config(), &HashSet::new(), false);
+        for ev in &result.events {
+            if let crate::events::EventPayload::RetentionPrune { rule, .. } = ev.payload {
+                assert_eq!(rule, crate::events::PruneRule::GraduatedDaily);
+            }
+        }
+    }
+
+    #[test]
+    fn graduated_emits_beyond_window_for_old_snapshot() {
+        // Config keeps only hourly+daily+weekly; nothing monthly. Snapshot
+        // older than weekly_cutoff with no monthly slot → BeyondWindow.
+        let config = ResolvedGraduatedRetention {
+            hourly: 1,
+            daily: 1,
+            weekly: 1,
+            monthly: 1, // very narrow monthly so older snap falls beyond
+        };
+        let very_old = make_daily_snap("20240101", "home"); // way past all windows
+        let snaps = vec![make_snap("20260322", "1400", "home"), very_old.clone()];
+        let result = graduated_retention(&snaps, now(), &config, &HashSet::new(), false);
+        let saw = result.events.iter().any(|e| {
+            matches!(
+                e.payload,
+                crate::events::EventPayload::RetentionPrune {
+                    rule: crate::events::PruneRule::BeyondWindow,
+                    ..
+                }
+            )
+        });
+        assert!(saw, "should emit BeyondWindow prune event for 2024-01-01");
+    }
+
+    #[test]
+    fn graduated_emits_protect_clock_skew_for_future_snapshot() {
+        // Snapshot in the future (clock skew protection branch).
+        let future = make_snap("20260401", "1200", "home"); // 10 days after now()
+        let snaps = vec![future.clone()];
+        let result =
+            graduated_retention(&snaps, now(), &default_config(), &HashSet::new(), false);
+        assert!(result.keep.contains(&future));
+        let saw = result.events.iter().any(|e| {
+            matches!(
+                e.payload,
+                crate::events::EventPayload::RetentionProtect {
+                    reason: crate::events::ProtectReason::ClockSkewFuture,
+                    ..
+                }
+            )
+        });
+        assert!(saw, "future snapshot should emit ClockSkewFuture protect event");
+    }
+
+    #[test]
+    fn graduated_emits_protect_pin_overrode_thinning_for_pinned_in_filled_slot() {
+        // Two snapshots same day; the older one is pinned. Without the pin
+        // the older would be thinned; with the pin it is kept and we emit
+        // PinOverrodeThinning.
+        let newer = make_snap("20260320", "1400", "home");
+        let older = make_snap("20260320", "1000", "home");
+        let pinned: HashSet<SnapshotName> = [older.clone()].into_iter().collect();
+        let snaps = vec![newer.clone(), older.clone()];
+        let result = graduated_retention(&snaps, now(), &default_config(), &pinned, false);
+        assert!(result.keep.contains(&older));
+        let saw = result.events.iter().any(|e| {
+            matches!(
+                e.payload,
+                crate::events::EventPayload::RetentionProtect {
+                    reason: crate::events::ProtectReason::PinOverrodeThinning,
+                    ..
+                }
+            )
+        });
+        assert!(saw, "pinned same-day snapshot should emit PinOverrodeThinning");
+    }
+
+    #[test]
+    fn graduated_emits_protect_pin_overrode_window_for_pinned_old_snapshot() {
+        // Snapshot beyond all windows but pinned → PinOverrodeWindow.
+        let very_old = make_daily_snap("20240101", "home");
+        let snaps = vec![make_snap("20260322", "1400", "home"), very_old.clone()];
+        let pinned: HashSet<SnapshotName> = [very_old.clone()].into_iter().collect();
+        let result = graduated_retention(&snaps, now(), &default_config(), &pinned, false);
+        assert!(result.keep.contains(&very_old));
+        let saw = result.events.iter().any(|e| {
+            matches!(
+                e.payload,
+                crate::events::EventPayload::RetentionProtect {
+                    reason: crate::events::ProtectReason::PinOverrodeWindow,
+                    ..
+                }
+            )
+        });
+        assert!(saw, "old pinned snapshot should emit PinOverrodeWindow");
+    }
+
+    #[test]
+    fn graduated_silent_on_routine_in_window_keeps() {
+        // All within hourly window, no thinning; no protect events should
+        // fire for routine keeps.
+        let snaps = vec![
+            make_snap("20260322", "1400", "home"),
+            make_snap("20260322", "1300", "home"),
+        ];
+        let result =
+            graduated_retention(&snaps, now(), &default_config(), &HashSet::new(), false);
+        let protect_count = result
+            .events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.payload,
+                    crate::events::EventPayload::RetentionProtect { .. }
+                )
+            })
+            .count();
+        assert_eq!(protect_count, 0);
+    }
+
+    #[test]
+    fn space_governed_propagates_events_from_graduated() {
+        let snaps = vec![
+            make_snap("20260320", "1400", "home"),
+            make_snap("20260320", "1000", "home"),
+        ];
+        let result = space_governed_retention(
+            &snaps,
+            now(),
+            &default_config(),
+            &HashSet::new(),
+            500_000_000_000, // plenty of free space
+            10_000_000_000,
+        );
+        // Should still surface events from the graduated step.
+        assert!(!result.events.is_empty());
+    }
+
+    #[test]
+    fn space_governed_emits_space_pressure_for_additional_deletes() {
+        let snaps = vec![
+            make_daily_snap("20260322", "home"),
+            make_daily_snap("20260321", "home"),
+            make_daily_snap("20260320", "home"),
+            make_daily_snap("20260319", "home"),
+        ];
+        let result = space_governed_retention(
+            &snaps,
+            now(),
+            &default_config(),
+            &HashSet::new(),
+            1_000_000_000,  // 1GB free
+            10_000_000_000, // 10GB min
+        );
+        let saw = result.events.iter().any(|e| {
+            matches!(
+                e.payload,
+                crate::events::EventPayload::RetentionPrune {
+                    rule: crate::events::PruneRule::SpacePressure,
+                    ..
+                }
+            )
+        });
+        assert!(saw, "additional deletes should emit SpacePressure events");
+    }
+
+    #[test]
+    fn emergency_emits_one_prune_emergency_per_delete() {
+        let snaps: Vec<SnapshotName> = (1..=5)
+            .map(|d| make_snap(&format!("202603{d:02}"), "1200", "home"))
+            .collect();
+        let latest = snaps[4].clone();
+        let result = emergency_retention(&snaps, &latest, &HashSet::new(), now());
+        assert_eq!(result.delete.len(), 4);
+        for ev in &result.events {
+            assert!(matches!(
+                ev.payload,
+                crate::events::EventPayload::RetentionPrune {
+                    rule: crate::events::PruneRule::Emergency,
+                    ..
+                }
+            ));
+        }
+        assert_eq!(result.events.len(), result.delete.len());
     }
 }

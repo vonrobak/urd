@@ -8,11 +8,52 @@ use chrono::NaiveDateTime;
 use crate::config::{Config, DriveConfig, ResolvedSubvolume};
 use crate::drives::DriveAvailability;
 use crate::error::UrdError;
+use crate::events::{DeferScope, Event, EventPayload};
 use crate::retention;
 use crate::types::{
     BackupPlan, DriveEvent, DriveEventKind, FullSendReason, LocalRetentionPolicy, PlannedOperation,
     SendKind, SnapshotName,
 };
+
+// ── Audit helpers ──────────────────────────────────────────────────────
+
+/// Push a `(subvol, reason)` skip onto `skipped` and emit a matching
+/// `PlannerDefer` event. `drive_label` is `Some` when the deferral is
+/// drive-specific (e.g., "send to {drive} not due"), `None` for
+/// subvolume-wide deferrals.
+fn record_defer(
+    skipped: &mut Vec<(String, String)>,
+    events: &mut Vec<Event>,
+    subvol_name: &str,
+    drive_label: Option<&str>,
+    reason: String,
+    scope: DeferScope,
+    now: NaiveDateTime,
+) {
+    skipped.push((subvol_name.to_string(), reason.clone()));
+    let mut event = Event::pure(now, EventPayload::PlannerDefer { reason, scope });
+    event.subvolume = Some(subvol_name.to_string());
+    event.drive_label = drive_label.map(str::to_string);
+    events.push(event);
+}
+
+/// Stamp `subvolume` and/or `drive_label` onto events that don't already
+/// carry one. Used after a pure helper returns so the run-level accumulator
+/// has full context before persistence.
+fn stamp_context(events: &mut [Event], subvolume: Option<&str>, drive_label: Option<&str>) {
+    for ev in events.iter_mut() {
+        if let Some(sv) = subvolume
+            && ev.subvolume.is_none()
+        {
+            ev.subvolume = Some(sv.to_string());
+        }
+        if let Some(d) = drive_label
+            && ev.drive_label.is_none()
+        {
+            ev.drive_label = Some(d.to_string());
+        }
+    }
+}
 
 // ── FileSystemState trait ───────────────────────────────────────────────
 
@@ -155,51 +196,78 @@ fn check_drive_availability(
     drive: &DriveConfig,
     fs: &dyn FileSystemState,
     skipped: &mut Vec<(String, String)>,
+    events: &mut Vec<Event>,
+    now: NaiveDateTime,
 ) -> bool {
     match fs.drive_availability(drive) {
         DriveAvailability::Available => true,
         DriveAvailability::NotMounted => {
-            skipped.push((
-                subvol_name.to_string(),
+            record_defer(
+                skipped,
+                events,
+                subvol_name,
+                Some(&drive.label),
                 format!("drive {} not mounted", drive.label),
-            ));
+                DeferScope::Drive,
+                now,
+            );
             false
         }
         DriveAvailability::UuidMismatch { expected, found } => {
-            skipped.push((
-                subvol_name.to_string(),
+            record_defer(
+                skipped,
+                events,
+                subvol_name,
+                Some(&drive.label),
                 format!(
                     "drive {} UUID mismatch (expected {}, found {})",
                     drive.label, expected, found
                 ),
-            ));
+                DeferScope::Drive,
+                now,
+            );
             false
         }
         DriveAvailability::UuidCheckFailed(reason) => {
-            skipped.push((
-                subvol_name.to_string(),
+            record_defer(
+                skipped,
+                events,
+                subvol_name,
+                Some(&drive.label),
                 format!("drive {} UUID check failed: {}", drive.label, reason),
-            ));
+                DeferScope::Drive,
+                now,
+            );
             false
         }
         DriveAvailability::TokenMismatch { expected, found } => {
-            skipped.push((
-                subvol_name.to_string(),
+            record_defer(
+                skipped,
+                events,
+                subvol_name,
+                Some(&drive.label),
                 format!(
                     "drive {} token mismatch (expected {}, found {}) — possible drive swap",
                     drive.label, expected, found
                 ),
-            ));
+                DeferScope::Drive,
+                now,
+            );
             false
         }
         DriveAvailability::TokenExpectedButMissing => {
-            skipped.push((
-                subvol_name.to_string(),
+            record_defer(
+                skipped,
+                events,
+                subvol_name,
+                Some(&drive.label),
                 format!(
                     "drive {} token expected but missing \u{2014} run `urd drives adopt {}`",
                     drive.label, drive.label
                 ),
-            ));
+                DeferScope::Drive,
+                now,
+            );
             false
         }
         DriveAvailability::TokenMissing => {
@@ -242,6 +310,7 @@ pub fn plan(
     // Skip reason strings are classified by output::SkipCategory::from_reason().
     // When adding new patterns, update output::tests::classify_all_18_patterns.
     let mut skipped = Vec::new();
+    let mut events: Vec<Event> = Vec::new();
 
     let resolved = config.resolved_subvolumes();
     let drive_labels: Vec<String> = config.drives.iter().map(|d| d.label.clone()).collect();
@@ -249,7 +318,15 @@ pub fn plan(
     for subvol in &resolved {
         // Filter: enabled
         if !subvol.enabled {
-            skipped.push((subvol.name.clone(), "disabled".to_string()));
+            record_defer(
+                &mut skipped,
+                &mut events,
+                &subvol.name,
+                None,
+                "disabled".to_string(),
+                DeferScope::Subvolume,
+                now,
+            );
             continue;
         }
 
@@ -271,10 +348,15 @@ pub fn plan(
 
         // Resolve local snapshot directory
         let Some(ref snapshot_root) = subvol.snapshot_root else {
-            skipped.push((
-                subvol.name.clone(),
+            record_defer(
+                &mut skipped,
+                &mut events,
+                &subvol.name,
+                None,
                 "no snapshot root configured".to_string(),
-            ));
+                DeferScope::Subvolume,
+                now,
+            );
             continue;
         };
         let local_dir = snapshot_root.join(&subvol.name);
@@ -323,7 +405,7 @@ pub fn plan(
         if subvol.local_retention.is_transient() && subvol.send_enabled {
             plan_transient_lifecycle(
                 subvol, config, &local_dir, &local_snaps, now, force, filters,
-                &pinned, &mounted_pins, fs, &mut operations, &mut skipped,
+                &pinned, &mounted_pins, fs, &mut operations, &mut skipped, &mut events,
             );
             continue; // skip the normal two-phase flow
         }
@@ -345,6 +427,7 @@ pub fn plan(
                 fs,
                 &mut operations,
                 &mut skipped,
+                &mut events,
             );
             plan_local_retention(
                 subvol,
@@ -355,6 +438,7 @@ pub fn plan(
                 &mounted_pins,
                 fs,
                 &mut operations,
+                &mut events,
             );
         }
 
@@ -365,7 +449,14 @@ pub fn plan(
                     continue;
                 }
 
-                if !check_drive_availability(&subvol.name, drive, fs, &mut skipped) {
+                if !check_drive_availability(
+                    &subvol.name,
+                    drive,
+                    fs,
+                    &mut skipped,
+                    &mut events,
+                    now,
+                ) {
                     continue;
                 }
 
@@ -380,12 +471,29 @@ pub fn plan(
                     fs,
                     &mut operations,
                     &mut skipped,
+                    &mut events,
                 );
 
-                plan_external_retention(subvol, drive, now, fs, &pinned, &mut operations);
+                plan_external_retention(
+                    subvol,
+                    drive,
+                    now,
+                    fs,
+                    &pinned,
+                    &mut operations,
+                    &mut events,
+                );
             }
         } else if !filters.local_only && !subvol.send_enabled {
-            skipped.push((subvol.name.clone(), "local only".to_string()));
+            record_defer(
+                &mut skipped,
+                &mut events,
+                &subvol.name,
+                None,
+                "local only".to_string(),
+                DeferScope::Subvolume,
+                now,
+            );
         }
     }
 
@@ -427,6 +535,7 @@ pub fn plan(
         operations,
         timestamp: now,
         skipped,
+        events,
     })
 }
 
@@ -442,6 +551,7 @@ fn plan_local_snapshot(
     fs: &dyn FileSystemState,
     operations: &mut Vec<PlannedOperation>,
     skipped: &mut Vec<(String, String)>,
+    events: &mut Vec<Event>,
 ) -> Option<SnapshotName> {
     // Space guard: refuse to create if local filesystem is below min_free_bytes threshold.
     // This prevents the catastrophic failure mode where snapshot creation fills the source
@@ -451,14 +561,19 @@ fn plan_local_snapshot(
         let free = fs.filesystem_free_bytes(local_dir).unwrap_or(u64::MAX);
         if free < min_free {
             use crate::types::ByteSize;
-            skipped.push((
-                subvol.name.clone(),
+            record_defer(
+                skipped,
+                events,
+                &subvol.name,
+                None,
                 format!(
                     "local filesystem low on space ({} free, {} required)",
                     ByteSize(free),
                     ByteSize(min_free),
                 ),
-            ));
+                DeferScope::Subvolume,
+                now,
+            );
             return None;
         }
     }
@@ -502,13 +617,18 @@ fn plan_local_snapshot(
                 (Ok(sg), Ok(ng)) if sg == ng => {
                     let elapsed = now.signed_duration_since(newest.datetime());
                     let mins = elapsed.num_minutes();
-                    skipped.push((
-                        subvol.name.clone(),
+                    record_defer(
+                        skipped,
+                        events,
+                        &subvol.name,
+                        None,
                         format!(
                             "unchanged \u{2014} no changes since last snapshot ({} ago)",
                             format_duration_short(mins)
                         ),
-                    ));
+                        DeferScope::Subvolume,
+                        now,
+                    );
                     return None;
                 }
                 (Err(e1), Err(e2)) => {
@@ -540,7 +660,15 @@ fn plan_local_snapshot(
         let snap_name = SnapshotName::new(now, &subvol.short_name);
         // Check if this exact snapshot already exists
         if local_snaps.iter().any(|s| s.as_str() == snap_name.as_str()) {
-            skipped.push((subvol.name.clone(), "snapshot already exists".to_string()));
+            record_defer(
+                skipped,
+                events,
+                &subvol.name,
+                None,
+                "snapshot already exists".to_string(),
+                DeferScope::Subvolume,
+                now,
+            );
             return None;
         }
         operations.push(PlannedOperation::CreateSnapshot {
@@ -554,13 +682,18 @@ fn plan_local_snapshot(
         let next_in = subvol.snapshot_interval.as_chrono()
             - now.signed_duration_since(newest.unwrap().datetime());
         let mins = next_in.num_minutes();
-        skipped.push((
-            subvol.name.clone(),
+        record_defer(
+            skipped,
+            events,
+            &subvol.name,
+            None,
             format!(
                 "interval not elapsed (next in ~{})",
                 format_duration_short(mins)
             ),
-        ));
+            DeferScope::Subvolume,
+            now,
+        );
         None
     }
 }
@@ -575,6 +708,7 @@ fn plan_local_retention(
     mounted_pins: &HashSet<SnapshotName>,
     fs: &dyn FileSystemState,
     operations: &mut Vec<PlannedOperation>,
+    events: &mut Vec<Event>,
 ) {
     if local_snaps.is_empty() {
         return;
@@ -637,7 +771,7 @@ fn plan_local_retention(
             let free_bytes = fs.filesystem_free_bytes(local_dir).unwrap_or(u64::MAX);
             let space_pressure = min_free > 0 && free_bytes < min_free;
 
-            let result = retention::graduated_retention(
+            let mut result = retention::graduated_retention(
                 local_snaps,
                 now,
                 retention_config,
@@ -652,6 +786,9 @@ fn plan_local_retention(
                     subvolume_name: subvol.name.clone(),
                 });
             }
+
+            stamp_context(&mut result.events, Some(&subvol.name), None);
+            events.extend(result.events);
         }
     }
 }
@@ -682,6 +819,7 @@ fn plan_transient_lifecycle(
     fs: &dyn FileSystemState,
     operations: &mut Vec<PlannedOperation>,
     skipped: &mut Vec<(String, String)>,
+    events: &mut Vec<Event>,
 ) {
     // ── Phase 1: Determine if any send will actually happen ────────
     // Cache newest external snapshot time per drive for skip message formatting.
@@ -692,7 +830,7 @@ fn plan_transient_lifecycle(
         if !is_drive_in_scope(subvol, &drive.label) {
             continue;
         }
-        if !check_drive_availability(&subvol.name, drive, fs, skipped) {
+        if !check_drive_availability(&subvol.name, drive, fs, skipped, events, now) {
             continue; // skip reason already emitted
         }
 
@@ -720,13 +858,28 @@ fn plan_transient_lifecycle(
     // Decision gate
     if sendable_drives.is_empty() {
         if !filters.external_only {
-            skipped.push((
-                subvol.name.clone(),
+            record_defer(
+                skipped,
+                events,
+                &subvol.name,
+                None,
                 "transient \u{2014} no drives available for send".to_string(),
-            ));
+                DeferScope::Subvolume,
+                now,
+            );
         }
         // Phase 4 only: retention on leftovers
-        plan_local_retention(subvol, local_dir, local_snaps, now, pinned, mounted_pins, fs, operations);
+        plan_local_retention(
+            subvol,
+            local_dir,
+            local_snaps,
+            now,
+            pinned,
+            mounted_pins,
+            fs,
+            operations,
+            events,
+        );
         return;
     }
 
@@ -746,10 +899,30 @@ fn plan_transient_lifecycle(
             .collect::<Vec<_>>()
             .join("; ");
         if !skip_msg.is_empty() {
-            skipped.push((subvol.name.clone(), skip_msg));
+            // Subvolume-scope: applies to the whole subvolume across the
+            // batch of sendable drives, not a single drive.
+            record_defer(
+                skipped,
+                events,
+                &subvol.name,
+                None,
+                skip_msg,
+                DeferScope::Subvolume,
+                now,
+            );
         }
         // Phase 4 only: retention on leftovers
-        plan_local_retention(subvol, local_dir, local_snaps, now, pinned, mounted_pins, fs, operations);
+        plan_local_retention(
+            subvol,
+            local_dir,
+            local_snaps,
+            now,
+            pinned,
+            mounted_pins,
+            fs,
+            operations,
+            events,
+        );
         return;
     }
 
@@ -758,7 +931,7 @@ fn plan_transient_lifecycle(
         let min_free = subvol.min_free_bytes.unwrap_or(0);
         plan_local_snapshot(
             subvol, local_dir, local_snaps, now, force, filters,
-            min_free, fs, operations, skipped,
+            min_free, fs, operations, skipped, events,
         )
     } else {
         None
@@ -766,7 +939,17 @@ fn plan_transient_lifecycle(
 
     if planned_snap.is_none() && local_snaps.iter().max().is_none() {
         // No planned snapshot and no existing snapshots — nothing to send.
-        plan_local_retention(subvol, local_dir, local_snaps, now, pinned, mounted_pins, fs, operations);
+        plan_local_retention(
+            subvol,
+            local_dir,
+            local_snaps,
+            now,
+            pinned,
+            mounted_pins,
+            fs,
+            operations,
+            events,
+        );
         return;
     }
 
@@ -792,14 +975,24 @@ fn plan_transient_lifecycle(
     for (drive, _) in &sendable_drives {
         plan_external_send(
             subvol, drive, local_dir, effective_local_snaps, now, force,
-            filters.skip_intervals, fs, operations, skipped,
+            filters.skip_intervals, fs, operations, skipped, events,
         );
-        plan_external_retention(subvol, drive, now, fs, pinned, operations);
+        plan_external_retention(subvol, drive, now, fs, pinned, operations, events);
     }
 
     // ── Phase 4: Plan transient retention ─────────────────────────
     // Use original local_snaps — retention only operates on existing-on-disk snapshots.
-    plan_local_retention(subvol, local_dir, local_snaps, now, pinned, mounted_pins, fs, operations);
+    plan_local_retention(
+        subvol,
+        local_dir,
+        local_snaps,
+        now,
+        pinned,
+        mounted_pins,
+        fs,
+        operations,
+        events,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -814,6 +1007,7 @@ fn plan_external_send(
     fs: &dyn FileSystemState,
     operations: &mut Vec<PlannedOperation>,
     skipped: &mut Vec<(String, String)>,
+    events: &mut Vec<Event>,
 ) {
     let ext_dir = crate::drives::external_snapshot_dir(drive, &subvol.name);
     let ext_snaps = fs
@@ -834,14 +1028,19 @@ fn plan_external_send(
     if !should_send {
         let next_in = subvol.send_interval.as_chrono()
             - now.signed_duration_since(newest_ext.unwrap().datetime());
-        skipped.push((
-            subvol.name.clone(),
+        record_defer(
+            skipped,
+            events,
+            &subvol.name,
+            Some(&drive.label),
             format!(
                 "send to {} not due (next in ~{})",
                 drive.label,
                 format_duration_short(next_in.num_minutes())
             ),
-        ));
+            DeferScope::Drive,
+            now,
+        );
         return;
     }
 
@@ -852,7 +1051,15 @@ fn plan_external_send(
         } else {
             "no local snapshots to send".to_string()
         };
-        skipped.push((subvol.name.clone(), reason));
+        record_defer(
+            skipped,
+            events,
+            &subvol.name,
+            None,
+            reason,
+            DeferScope::Subvolume,
+            now,
+        );
         return;
     };
 
@@ -861,10 +1068,15 @@ fn plan_external_send(
         .iter()
         .any(|s| s.as_str() == snap_to_send.as_str())
     {
-        skipped.push((
-            subvol.name.clone(),
+        record_defer(
+            skipped,
+            events,
+            &subvol.name,
+            Some(&drive.label),
             format!("{} already on {}", snap_to_send, drive.label),
-        ));
+            DeferScope::Drive,
+            now,
+        );
         return;
     }
 
@@ -899,8 +1111,11 @@ fn plan_external_send(
             exceeds_available_space(last_size, &ext_dir, drive, fs)
         {
             use crate::types::ByteSize;
-            skipped.push((
-                subvol.name.clone(),
+            record_defer(
+                skipped,
+                events,
+                &subvol.name,
+                Some(&drive.label),
                 format!(
                     "send to {} skipped: estimated ~{} exceeds {} available (free: {}, min_free: {})",
                     drive.label,
@@ -909,7 +1124,9 @@ fn plan_external_send(
                     ByteSize(free),
                     ByteSize(min_free),
                 ),
-            ));
+                DeferScope::Drive,
+                now,
+            );
             return;
         }
     } else if !is_incremental {
@@ -929,8 +1146,11 @@ fn plan_external_send(
                 exceeds_available_space(cal_bytes, &ext_dir, drive, fs)
             {
                 use crate::types::ByteSize;
-                skipped.push((
-                    subvol.name.clone(),
+                record_defer(
+                    skipped,
+                    events,
+                    &subvol.name,
+                    Some(&drive.label),
                     format!(
                         "send to {} skipped: calibrated size ~{} exceeds {} available{}",
                         drive.label,
@@ -938,7 +1158,9 @@ fn plan_external_send(
                         ByteSize(available),
                         staleness,
                     ),
-                ));
+                    DeferScope::Drive,
+                    now,
+                );
                 return;
             }
         }
@@ -978,6 +1200,19 @@ fn plan_external_send(
             reason,
             token_verified: false, // stamped by backup.rs after plan creation
         });
+        // PlannerSendChoice only on full sends — incrementals are routine
+        // and covered by the operations log.
+        let mut event = Event::pure(
+            now,
+            EventPayload::PlannerSendChoice {
+                send_kind: SendKind::Full,
+                reason,
+                drive_label: drive.label.clone(),
+            },
+        );
+        event.subvolume = Some(subvol.name.clone());
+        event.drive_label = Some(drive.label.clone());
+        events.push(event);
     }
 }
 
@@ -988,6 +1223,7 @@ fn plan_external_retention(
     fs: &dyn FileSystemState,
     pinned: &HashSet<SnapshotName>,
     operations: &mut Vec<PlannedOperation>,
+    events: &mut Vec<Event>,
 ) {
     let ext_dir = crate::drives::external_snapshot_dir(drive, &subvol.name);
     let ext_snaps = fs
@@ -1001,7 +1237,7 @@ fn plan_external_retention(
     let free_bytes = fs.filesystem_free_bytes(&ext_dir).unwrap_or(u64::MAX);
     let min_free = drive.min_free_bytes.map(|b| b.bytes()).unwrap_or(0);
 
-    let result = retention::space_governed_retention(
+    let mut result = retention::space_governed_retention(
         &ext_snaps,
         now,
         &subvol.external_retention,
@@ -1017,6 +1253,9 @@ fn plan_external_retention(
             subvolume_name: subvol.name.clone(),
         });
     }
+
+    stamp_context(&mut result.events, Some(&subvol.name), Some(&drive.label));
+    events.extend(result.events);
 }
 
 /// Format a duration in minutes to a short human-readable string.
@@ -1401,10 +1640,7 @@ impl FileSystemState for MockFileSystemState {
         if self.fail_generations.contains(path) {
             return Err(crate::error::UrdError::Io {
                 path: path.to_path_buf(),
-                source: std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "mock: generation query failed",
-                ),
+                source: std::io::Error::other("mock: generation query failed"),
             });
         }
         self.generations
@@ -4292,5 +4528,145 @@ local_retention = "transient"
             .last_drive_event("D1")
             .expect("round-trip must yield an event — guards schema/parser drift");
         assert!(matches!(event.kind, DriveEventKind::Unmount));
+    }
+
+    // ── Planner event-emission tests ───────────────────────────────────
+
+    fn count_planner_send_choices_for(
+        events: &[Event],
+        drive: &str,
+    ) -> usize {
+        events
+            .iter()
+            .filter(|e| match &e.payload {
+                EventPayload::PlannerSendChoice { drive_label, .. } => drive_label == drive,
+                _ => false,
+            })
+            .count()
+    }
+
+    #[test]
+    fn plan_emits_full_send_choice_with_first_send_reason() {
+        let config = test_config();
+        let mut fs = MockFileSystemState::new();
+        fs.mounted_drives.insert("D1".to_string());
+        // sv1 has a local snapshot but no external — first send to D1.
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap("20260322-1455-one")]);
+        fs.external_snapshots
+            .insert(("D1".to_string(), "sv1".to_string()), vec![]);
+
+        let plan = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let saw_first_send = plan.events.iter().any(|e| {
+            matches!(
+                &e.payload,
+                EventPayload::PlannerSendChoice {
+                    reason: FullSendReason::FirstSend,
+                    drive_label,
+                    ..
+                } if drive_label == "D1"
+            )
+        });
+        assert!(saw_first_send, "should emit FirstSend PlannerSendChoice");
+    }
+
+    #[test]
+    fn plan_does_not_emit_send_choice_for_routine_incremental() {
+        // Note: plan() in this test returns full incremental_or_full ops based
+        // on pin presence. Without a pin file we get a SendFull (NoPinFile),
+        // not an incremental. Mock out a pin so we get an incremental.
+        let config = test_config();
+        let mut fs = MockFileSystemState::new();
+        fs.mounted_drives.insert("D1".to_string());
+        let local_snap = snap("20260322-1455-one");
+        let parent = snap("20260322-1300-one");
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![parent.clone(), local_snap.clone()]);
+        fs.external_snapshots.insert(
+            ("D1".to_string(), "sv1".to_string()),
+            vec![parent.clone()],
+        );
+        // Set pin file to parent so incremental is chosen.
+        fs.pin_files
+            .insert((PathBuf::from("/snap/sv1"), "D1".to_string()), parent.clone());
+
+        let plan = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        // Sanity: ensure an incremental was actually chosen (else the test is moot).
+        let any_incremental = plan
+            .operations
+            .iter()
+            .any(|op| matches!(op, PlannedOperation::SendIncremental { .. }));
+        assert!(any_incremental, "test setup should result in incremental");
+        // Incrementals should NOT emit PlannerSendChoice.
+        assert_eq!(count_planner_send_choices_for(&plan.events, "D1"), 0);
+    }
+
+    #[test]
+    fn plan_emits_planner_defer_for_disabled_subvolume() {
+        let mut config = test_config();
+        // Disable sv1.
+        for sv in &mut config.subvolumes {
+            if sv.name == "sv1" {
+                sv.enabled = Some(false);
+            }
+        }
+        let fs = MockFileSystemState::new();
+        let plan = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let saw_disabled_defer = plan.events.iter().any(|e| match &e.payload {
+            EventPayload::PlannerDefer { reason, scope } => {
+                reason == "disabled" && *scope == DeferScope::Subvolume
+            }
+            _ => false,
+        });
+        assert!(
+            saw_disabled_defer,
+            "disabled subvolume should emit PlannerDefer with subvolume scope"
+        );
+    }
+
+    #[test]
+    fn plan_emits_planner_defer_with_drive_scope_for_unavailable_drive() {
+        // No drives mounted → NotMounted defer for sv2 (sv1 mounted check
+        // is also affected; both produce drive-scoped defers).
+        let config = test_config();
+        let mut fs = MockFileSystemState::new();
+        // Give sv1 something to send so we get past the local-snapshot phase.
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap("20260322-1455-one")]);
+        // Drive D1 not mounted.
+
+        let plan = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let saw_drive_defer = plan.events.iter().any(|e| match &e.payload {
+            EventPayload::PlannerDefer { reason, scope } => {
+                reason.contains("not mounted") && *scope == DeferScope::Drive
+            }
+            _ => false,
+        });
+        assert!(
+            saw_drive_defer,
+            "unmounted drive should emit PlannerDefer with drive scope"
+        );
+    }
+
+    #[test]
+    fn plan_events_carry_subvol_for_planner_defers() {
+        let mut config = test_config();
+        for sv in &mut config.subvolumes {
+            if sv.name == "sv2" {
+                sv.enabled = Some(false);
+            }
+        }
+        let fs = MockFileSystemState::new();
+        let plan = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let sv2_defers: Vec<_> = plan
+            .events
+            .iter()
+            .filter(|e| matches!(e.payload, EventPayload::PlannerDefer { .. }))
+            .filter(|e| e.subvolume.as_deref() == Some("sv2"))
+            .collect();
+        assert!(
+            !sv2_defers.is_empty(),
+            "PlannerDefer for sv2 should carry subvolume='sv2'"
+        );
     }
 }

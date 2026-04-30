@@ -67,7 +67,12 @@ pub fn run(config: Config, output_mode: OutputMode) -> anyhow::Result<()> {
                 };
                 total_unsent += unsent.len();
 
-                let result = retention::emergency_retention(&snaps, &latest, &pinned);
+                let result = retention::emergency_retention(
+                    &snaps,
+                    &latest,
+                    &pinned,
+                    chrono::Local::now().naive_local(),
+                );
 
                 subvol_details.push(EmergencySubvolDetail {
                     name: subvol_name.clone(),
@@ -161,7 +166,12 @@ pub fn run(config: Config, output_mode: OutputMode) -> anyhow::Result<()> {
 
             let latest = snaps.iter().max().unwrap().clone();
             let pinned = chain::find_pinned_snapshots(&local_dir, &drive_labels);
-            let result = retention::emergency_retention(&snaps, &latest, &pinned);
+            let result = retention::emergency_retention(
+                &snaps,
+                &latest,
+                &pinned,
+                chrono::Local::now().naive_local(),
+            );
 
             for (snap, _reason) in &result.delete {
                 let snap_path = local_dir.join(snap.as_str());

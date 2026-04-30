@@ -49,6 +49,8 @@ pub enum Commands {
     Completions(CompletionsArgs),
     /// Migrate config from legacy schema to v1
     Migrate(MigrateArgs),
+    /// View the structured event log
+    Events(EventsArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -83,6 +85,35 @@ pub struct MigrateArgs {
     /// Show what would change without writing files
     #[arg(long)]
     pub dry_run: bool,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct EventsArgs {
+    /// Only events from the last duration (e.g., 7d, 24h, 30m)
+    #[arg(long)]
+    pub since: Option<String>,
+
+    /// Filter by event kind: retention | planner | promise | sentinel | config | drive
+    #[arg(long)]
+    pub kind: Option<String>,
+
+    /// Filter by subvolume name
+    #[arg(long)]
+    pub subvolume: Option<String>,
+
+    /// Filter by drive label
+    #[arg(long)]
+    pub drive: Option<String>,
+
+    /// Maximum number of events to display (1..=1000, default 50)
+    #[arg(long, default_value = "50")]
+    pub limit: usize,
+
+    /// Line-delimited JSON for ad-hoc inspection. Format is
+    /// additive-friendly but not a stable public contract; expect new
+    /// fields and new event variants in future versions.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(clap::Args, Debug)]

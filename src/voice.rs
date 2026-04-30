@@ -1333,6 +1333,18 @@ fn render_individual_skips(
     }
 }
 
+// ── Events ──────────────────────────────────────────────────────────────
+
+/// Render the `urd events` view. Delegates to `voice_events` for the
+/// per-variant columnar / NDJSON formatting.
+#[must_use]
+pub fn render_events(view: &crate::output::EventsView, mode: OutputMode) -> String {
+    match mode {
+        OutputMode::Interactive => crate::voice_events::render_interactive(view),
+        OutputMode::Daemon => crate::voice_events::render_ndjson(view),
+    }
+}
+
 // ── History ─────────────────────────────────────────────────────────────
 
 /// Render history (recent runs) output.
@@ -6072,21 +6084,21 @@ mod tests {
 
     #[test]
     fn doctor_verdict_healthy() {
-        let v = serde_json::to_value(&DoctorVerdict::healthy()).unwrap();
+        let v = serde_json::to_value(DoctorVerdict::healthy()).unwrap();
         assert_eq!(v["status"], "healthy");
         assert_eq!(v["count"], 0);
     }
 
     #[test]
     fn doctor_verdict_warnings() {
-        let v = serde_json::to_value(&DoctorVerdict::warnings(3)).unwrap();
+        let v = serde_json::to_value(DoctorVerdict::warnings(3)).unwrap();
         assert_eq!(v["status"], "warnings");
         assert_eq!(v["count"], 3);
     }
 
     #[test]
     fn doctor_verdict_issues() {
-        let v = serde_json::to_value(&DoctorVerdict::issues(2)).unwrap();
+        let v = serde_json::to_value(DoctorVerdict::issues(2)).unwrap();
         assert_eq!(v["status"], "issues");
         assert_eq!(v["count"], 2);
     }
@@ -6128,19 +6140,19 @@ mod tests {
 
     #[test]
     fn doctor_verdict_errors_override_degraded() {
-        let v = serde_json::to_value(&DoctorVerdict::issues(1)).unwrap();
+        let v = serde_json::to_value(DoctorVerdict::issues(1)).unwrap();
         assert_eq!(v["status"], "issues", "errors should take precedence over degraded");
     }
 
     #[test]
     fn doctor_verdict_warnings_override_degraded() {
-        let v = serde_json::to_value(&DoctorVerdict::warnings(1)).unwrap();
+        let v = serde_json::to_value(DoctorVerdict::warnings(1)).unwrap();
         assert_eq!(v["status"], "warnings", "warnings should take precedence over degraded");
     }
 
     #[test]
     fn doctor_verdict_degraded_json() {
-        let v = serde_json::to_value(&DoctorVerdict::degraded(2)).unwrap();
+        let v = serde_json::to_value(DoctorVerdict::degraded(2)).unwrap();
         assert_eq!(v["status"], "degraded");
         assert_eq!(v["count"], 2);
     }
