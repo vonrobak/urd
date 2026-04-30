@@ -3,6 +3,7 @@ use std::path::Path;
 use rusqlite::Connection;
 
 use crate::error::UrdError;
+use crate::events::{Event, EventKind, EventPayload};
 
 // ── Types ───────────────────────────────────────────────────────────────
 
@@ -39,17 +40,11 @@ pub enum DriveEventType {
     Unmounted,
 }
 
-impl DriveEventType {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Mounted => "mounted",
-            Self::Unmounted => "unmounted",
-        }
-    }
-}
-
 /// What detected the drive event.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
 #[allow(dead_code)] // Backup variant wired when backup records drive events
 pub enum DriveEventSource {
     Sentinel,
@@ -57,7 +52,11 @@ pub enum DriveEventSource {
 }
 
 impl DriveEventSource {
-    fn as_str(self) -> &'static str {
+    /// Wire form for the legacy `DriveConnectionRecord.detected_by`
+    /// projection — preserved post-UPI-036 so consumers (notably
+    /// `RealFileSystemState::last_drive_event`) keep matching against
+    /// the "sentinel" / "backup" strings.
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Sentinel => "sentinel",
             Self::Backup => "backup",
@@ -163,15 +162,88 @@ impl StateDb {
                     last_verified TEXT NOT NULL
                 );
 
-                CREATE TABLE IF NOT EXISTS drive_connections (
+                CREATE TABLE IF NOT EXISTS events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    drive_label TEXT NOT NULL,
-                    event_type TEXT NOT NULL,
-                    timestamp TEXT NOT NULL,
-                    detected_by TEXT NOT NULL
-                );",
+                    kind TEXT NOT NULL,
+                    occurred_at TEXT NOT NULL,
+                    run_id INTEGER REFERENCES runs(id),
+                    subvolume TEXT,
+                    drive_label TEXT,
+                    payload TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS events_by_run
+                    ON events(run_id);
+                CREATE INDEX IF NOT EXISTS events_by_kind_time
+                    ON events(kind, occurred_at DESC);
+                CREATE INDEX IF NOT EXISTS events_by_subvolume_time
+                    ON events(subvolume, occurred_at DESC) WHERE subvolume IS NOT NULL;
+                CREATE INDEX IF NOT EXISTS events_by_drive_time
+                    ON events(drive_label, occurred_at DESC) WHERE drive_label IS NOT NULL;",
             )
             .map_err(|e| UrdError::State(format!("failed to create schema: {e}")))?;
+
+        // Migration: subsume drive_connections into events.
+        // Best-effort — logs and continues on failure (next run retries).
+        // Idempotent — skips when drive_connections is absent (fresh DB or
+        // already migrated).
+        if let Err(e) = self.subsume_drive_connections() {
+            log::warn!(
+                "drive_connections → events migration failed (best-effort, continuing): {e}"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Idempotent migration: copy `drive_connections` rows into `events`
+    /// with `kind='drive'` and the appropriate JSON payload, then drop the
+    /// old table. Wrapped in a transaction so failure leaves both tables
+    /// intact and the next run retries.
+    fn subsume_drive_connections(&self) -> crate::error::Result<()> {
+        // Skip if already migrated or never existed.
+        let exists: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='table' AND name='drive_connections'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| UrdError::State(format!("migration probe failed: {e}")))?;
+        if exists == 0 {
+            return Ok(());
+        }
+
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| UrdError::State(format!("migration tx: {e}")))?;
+
+        // Copy rows into events. The CASE turns the legacy `event_type`
+        // string into the EventPayload variant tag.
+        tx.execute(
+            "INSERT INTO events (kind, occurred_at, drive_label, payload)
+             SELECT 'drive', timestamp, drive_label,
+                    json_object(
+                        'type',
+                        CASE event_type
+                            WHEN 'mounted' THEN 'DriveMounted'
+                            ELSE 'DriveUnmounted'
+                        END,
+                        'detected_by', detected_by
+                    )
+             FROM drive_connections",
+            [],
+        )
+        .map_err(|e| UrdError::State(format!("migration insert: {e}")))?;
+
+        tx.execute("DROP TABLE drive_connections", [])
+            .map_err(|e| UrdError::State(format!("migration drop: {e}")))?;
+
+        tx.commit()
+            .map_err(|e| UrdError::State(format!("migration commit: {e}")))?;
+
         Ok(())
     }
 
@@ -715,25 +787,29 @@ impl StateDb {
 
     // ── Drive connection methods ─────────────────────────────────────
 
-    /// Record a drive mount or unmount event.
+    /// Record a drive mount or unmount event. Post-UPI-036, drive events
+    /// are written to the `events` table; the public signature is
+    /// preserved so callers (executor, sentinel_runner) need no change.
     pub fn record_drive_event(
         &self,
         drive_label: &str,
         event_type: DriveEventType,
         detected_by: DriveEventSource,
     ) -> crate::error::Result<()> {
-        let now = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
-        self.conn
-            .execute(
-                "INSERT INTO drive_connections (drive_label, event_type, timestamp, detected_by)
-                 VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![drive_label, event_type.as_str(), now, detected_by.as_str()],
-            )
-            .map_err(|e| UrdError::State(format!("failed to record drive event: {e}")))?;
-        Ok(())
+        let payload = match event_type {
+            DriveEventType::Mounted => EventPayload::DriveMounted { detected_by },
+            DriveEventType::Unmounted => EventPayload::DriveUnmounted { detected_by },
+        };
+        let mut event = Event::pure(chrono::Local::now().naive_local(), payload);
+        event.drive_label = Some(drive_label.to_string());
+        self.record_events_inner(&[event])
+            .map_err(|e| UrdError::State(format!("failed to record drive event: {e}")))
     }
 
-    /// Get the most recent connection event for a drive, if any.
+    /// Get the most recent drive event for a drive, if any. Reads from
+    /// the `events` table post-UPI-036; reconstructs the legacy
+    /// `DriveConnectionRecord` shape from the JSON payload so existing
+    /// callers (`RealFileSystemState::last_drive_event`) keep working.
     pub fn last_drive_connection(
         &self,
         drive_label: &str,
@@ -741,50 +817,57 @@ impl StateDb {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, drive_label, event_type, timestamp, detected_by
-                 FROM drive_connections WHERE drive_label = ?1
+                "SELECT id, occurred_at, payload
+                 FROM events
+                 WHERE kind = 'drive' AND drive_label = ?1
                  ORDER BY id DESC LIMIT 1",
             )
             .map_err(|e| UrdError::State(format!("query failed: {e}")))?;
 
         let mut rows = stmt
-            .query_map(rusqlite::params![drive_label], |row| {
-                Ok(DriveConnectionRecord {
-                    id: row.get(0)?,
-                    drive_label: row.get(1)?,
-                    event_type: row.get(2)?,
-                    timestamp: row.get(3)?,
-                    detected_by: row.get(4)?,
-                })
-            })
+            .query(rusqlite::params![drive_label])
             .map_err(|e| UrdError::State(format!("query failed: {e}")))?;
 
-        match rows.next() {
-            Some(Ok(record)) => Ok(Some(record)),
-            Some(Err(e)) => Err(UrdError::State(format!(
-                "failed to read drive connection: {e}"
-            ))),
+        match rows
+            .next()
+            .map_err(|e| UrdError::State(format!("query failed: {e}")))?
+        {
+            Some(row) => {
+                let id: i64 = row
+                    .get(0)
+                    .map_err(|e| UrdError::State(format!("read id: {e}")))?;
+                let timestamp: String = row
+                    .get(1)
+                    .map_err(|e| UrdError::State(format!("read occurred_at: {e}")))?;
+                let payload_json: String = row
+                    .get(2)
+                    .map_err(|e| UrdError::State(format!("read payload: {e}")))?;
+                let payload: EventPayload = serde_json::from_str(&payload_json).map_err(|e| {
+                    UrdError::State(format!("decode drive event payload: {e}"))
+                })?;
+                let (event_type, detected_by) = match payload {
+                    EventPayload::DriveMounted { detected_by } => {
+                        ("mounted".to_string(), detected_by.as_str().to_string())
+                    }
+                    EventPayload::DriveUnmounted { detected_by } => {
+                        ("unmounted".to_string(), detected_by.as_str().to_string())
+                    }
+                    other => {
+                        return Err(UrdError::State(format!(
+                            "drive event row #{id} has non-drive payload: {other:?}"
+                        )));
+                    }
+                };
+                Ok(Some(DriveConnectionRecord {
+                    id,
+                    drive_label: drive_label.to_string(),
+                    event_type,
+                    timestamp,
+                    detected_by,
+                }))
+            }
             None => Ok(None),
         }
-    }
-
-    /// Count drive connection events for a drive since a given ISO 8601 timestamp.
-    #[allow(dead_code)] // consumed by urd sentinel status (future) and tests
-    pub fn drive_connection_count(
-        &self,
-        drive_label: &str,
-        since: &str,
-    ) -> crate::error::Result<u64> {
-        let count: i64 = self
-            .conn
-            .query_row(
-                "SELECT COUNT(*) FROM drive_connections
-                 WHERE drive_label = ?1 AND timestamp >= ?2",
-                rusqlite::params![drive_label, since],
-                |row| row.get(0),
-            )
-            .map_err(|e| UrdError::State(format!("query failed: {e}")))?;
-        Ok(count as u64)
     }
 
     fn map_operation_row(row: &rusqlite::Row) -> rusqlite::Result<OperationRow> {
@@ -800,6 +883,223 @@ impl StateDb {
             bytes_transferred: row.get(8)?,
         })
     }
+
+    // ── Event log methods ───────────────────────────────────────────
+
+    /// Persist a batch of events. Best-effort per ADR-102: failures are
+    /// logged and swallowed so the audit log never blocks a backup.
+    /// The naming carries the contract — there is no `Result`-returning
+    /// public variant.
+    pub fn record_events_best_effort(&self, events: &[Event]) {
+        if events.is_empty() {
+            return;
+        }
+        if let Err(e) = self.record_events_inner(events) {
+            log::warn!(
+                "event log write failed (best-effort, continuing): {e} ({} event(s) lost)",
+                events.len()
+            );
+        }
+    }
+
+    /// Inner persistence used by the best-effort wrapper and by
+    /// `record_drive_event`. One transaction per batch keeps multi-event
+    /// emit-points (e.g., a retention sweep) atomic.
+    fn record_events_inner(&self, events: &[Event]) -> crate::error::Result<()> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| UrdError::State(format!("events tx: {e}")))?;
+        for ev in events {
+            let payload = serde_json::to_string(&ev.payload)
+                .map_err(|e| UrdError::State(format!("events serialize: {e}")))?;
+            tx.execute(
+                "INSERT INTO events (kind, occurred_at, run_id, subvolume, drive_label, payload)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    ev.kind().as_str(),
+                    ev.occurred_at.format("%Y-%m-%dT%H:%M:%S").to_string(),
+                    ev.run_id,
+                    ev.subvolume,
+                    ev.drive_label,
+                    payload,
+                ],
+            )
+            .map_err(|e| UrdError::State(format!("events insert: {e}")))?;
+        }
+        tx.commit()
+            .map_err(|e| UrdError::State(format!("events commit: {e}")))?;
+        Ok(())
+    }
+
+    /// Query events with optional filters, newest first.
+    #[allow(dead_code)]
+    pub fn query_events(
+        &self,
+        filter: &EventQueryFilter,
+    ) -> crate::error::Result<Vec<EventQueryRow>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, kind, occurred_at, run_id, subvolume, drive_label, payload
+                 FROM events
+                 WHERE (?1 IS NULL OR occurred_at >= ?1)
+                   AND (?2 IS NULL OR kind = ?2)
+                   AND (?3 IS NULL OR subvolume = ?3)
+                   AND (?4 IS NULL OR drive_label = ?4)
+                 ORDER BY occurred_at DESC, id DESC
+                 LIMIT ?5",
+            )
+            .map_err(|e| UrdError::State(format!("query failed: {e}")))?;
+
+        let since = filter.since.as_ref().map(|dt| dt.format("%Y-%m-%dT%H:%M:%S").to_string());
+        let kind_str = filter.kind.map(|k| k.as_str().to_string());
+
+        let rows = stmt
+            .query_map(
+                rusqlite::params![
+                    since,
+                    kind_str,
+                    filter.subvolume,
+                    filter.drive_label,
+                    filter.limit as i64,
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, String>(6)?,
+                    ))
+                },
+            )
+            .map_err(|e| UrdError::State(format!("query failed: {e}")))?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, kind_s, occurred_at, run_id, subvolume, drive_label, payload_json) =
+                row.map_err(|e| UrdError::State(format!("read event row: {e}")))?;
+            let Some(kind) = EventKind::from_str(&kind_s) else {
+                log::warn!("skipping event id={id} with unknown kind {kind_s:?}");
+                continue;
+            };
+            let payload: EventPayload = match serde_json::from_str(&payload_json) {
+                Ok(p) => p,
+                Err(e) => {
+                    log::warn!("skipping event id={id} with undecodable payload: {e}");
+                    continue;
+                }
+            };
+            out.push(EventQueryRow {
+                id,
+                kind,
+                occurred_at,
+                run_id,
+                subvolume,
+                drive_label,
+                payload,
+            });
+        }
+        Ok(out)
+    }
+
+    // ── Counter helpers for Prometheus metrics ──────────────────────
+
+    /// Total number of `SentinelCircuitBreak` events whose `to` is `open`.
+    #[allow(dead_code)]
+    pub fn count_circuit_breaker_trips(&self) -> crate::error::Result<u64> {
+        let n: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE kind = 'sentinel'
+                   AND json_extract(payload, '$.type') = 'SentinelCircuitBreak'
+                   AND json_extract(payload, '$.to') = 'open'",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| UrdError::State(format!("counter query failed: {e}")))?;
+        Ok(n as u64)
+    }
+
+    /// `PlannerSendChoice` counts grouped by `reason` (full-send reason).
+    #[allow(dead_code)]
+    pub fn count_full_sends_by_reason(
+        &self,
+    ) -> crate::error::Result<Vec<(String, u64)>> {
+        self.count_grouped("planner", "PlannerSendChoice", "reason")
+    }
+
+    /// `PlannerDefer` counts grouped by `scope`.
+    #[allow(dead_code)]
+    pub fn count_defers_by_scope(&self) -> crate::error::Result<Vec<(String, u64)>> {
+        self.count_grouped("planner", "PlannerDefer", "scope")
+    }
+
+    /// `RetentionPrune` counts grouped by `rule`.
+    #[allow(dead_code)]
+    pub fn count_prunes_by_rule(&self) -> crate::error::Result<Vec<(String, u64)>> {
+        self.count_grouped("retention", "RetentionPrune", "rule")
+    }
+
+    fn count_grouped(
+        &self,
+        kind: &str,
+        payload_type: &str,
+        field: &str,
+    ) -> crate::error::Result<Vec<(String, u64)>> {
+        let sql = format!(
+            "SELECT json_extract(payload, '$.{field}') as g, COUNT(*)
+             FROM events
+             WHERE kind = ?1
+               AND json_extract(payload, '$.type') = ?2
+             GROUP BY g",
+        );
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .map_err(|e| UrdError::State(format!("counter query failed: {e}")))?;
+        let rows = stmt
+            .query_map(rusqlite::params![kind, payload_type], |r| {
+                let label: Option<String> = r.get(0)?;
+                let count: i64 = r.get(1)?;
+                Ok((label.unwrap_or_default(), count as u64))
+            })
+            .map_err(|e| UrdError::State(format!("counter query failed: {e}")))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| UrdError::State(format!("read counter rows: {e}")))
+    }
+}
+
+// ── Event query types ──────────────────────────────────────────────────
+
+/// Filter parameters for `StateDb::query_events`.
+#[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
+pub struct EventQueryFilter {
+    pub since: Option<chrono::NaiveDateTime>,
+    pub kind: Option<EventKind>,
+    pub subvolume: Option<String>,
+    pub drive_label: Option<String>,
+    pub limit: usize,
+}
+
+/// One row returned from `StateDb::query_events` with the payload
+/// already deserialized. Presentation projection (`output::EventRow`)
+/// wraps this for the `urd events` subcommand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct EventQueryRow {
+    pub id: i64,
+    pub kind: EventKind,
+    pub occurred_at: String,
+    pub run_id: Option<i64>,
+    pub subvolume: Option<String>,
+    pub drive_label: Option<String>,
+    pub payload: EventPayload,
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
@@ -1498,27 +1798,9 @@ mod tests {
         assert!(db.last_drive_connection("nonexistent").unwrap().is_none());
     }
 
-    #[test]
-    fn drive_connection_count() {
-        let db = StateDb::open_memory().unwrap();
-        db.record_drive_event("WD-18TB", DriveEventType::Mounted, DriveEventSource::Sentinel)
-            .unwrap();
-        db.record_drive_event("WD-18TB", DriveEventType::Unmounted, DriveEventSource::Sentinel)
-            .unwrap();
-        db.record_drive_event("WD-18TB", DriveEventType::Mounted, DriveEventSource::Backup)
-            .unwrap();
-
-        let count = db
-            .drive_connection_count("WD-18TB", "2000-01-01T00:00:00")
-            .unwrap();
-        assert_eq!(count, 3);
-
-        // Different drive has zero events.
-        let count = db
-            .drive_connection_count("other", "2000-01-01T00:00:00")
-            .unwrap();
-        assert_eq!(count, 0);
-    }
+    // (test `drive_connection_count` removed — function deleted in
+    // UPI 036 since callers were dead code; counts now derive from
+    // the `events` table via dedicated counter helpers.)
 
     // ── Drive activity + first-run gating ─────────
 
@@ -1642,5 +1924,440 @@ mod tests {
         let db = StateDb::open_memory().unwrap();
         let _ = db.begin_run("full").unwrap();
         assert!(db.has_any_completed_runs().unwrap());
+    }
+
+    // ── Event log tests ─────────────────────────────────────────────
+
+    use crate::events::{
+        DeferScope, Event, EventKind, EventPayload, PruneRule, TransitionTrigger,
+    };
+    use chrono::NaiveDateTime;
+
+    fn ev(payload: EventPayload, dt: &str) -> Event {
+        Event {
+            occurred_at: NaiveDateTime::parse_from_str(dt, "%Y-%m-%dT%H:%M:%S").unwrap(),
+            run_id: None,
+            subvolume: None,
+            drive_label: None,
+            payload,
+        }
+    }
+
+    #[test]
+    fn events_table_created_on_open() {
+        let db = StateDb::open_memory().unwrap();
+        let count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn events_indexes_created() {
+        let db = StateDb::open_memory().unwrap();
+        let names: Vec<String> = db
+            .conn
+            .prepare(
+                "SELECT name FROM sqlite_master
+                 WHERE type='index' AND tbl_name='events'",
+            )
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        for expected in [
+            "events_by_run",
+            "events_by_kind_time",
+            "events_by_subvolume_time",
+        ] {
+            assert!(
+                names.iter().any(|n| n == expected),
+                "missing index {expected}; got {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn record_events_best_effort_empty_is_noop() {
+        let db = StateDb::open_memory().unwrap();
+        db.record_events_best_effort(&[]); // does not panic
+        let count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn record_events_best_effort_persists_one() {
+        let db = StateDb::open_memory().unwrap();
+        let event = ev(
+            EventPayload::PlannerDefer {
+                reason: "interval not elapsed".into(),
+                scope: DeferScope::Subvolume,
+            },
+            "2026-04-30T03:14:22",
+        );
+        db.record_events_best_effort(&[event]);
+        let count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn record_events_best_effort_atomic_batch() {
+        let db = StateDb::open_memory().unwrap();
+        let batch = vec![
+            ev(
+                EventPayload::RetentionPrune {
+                    snapshot: "a".into(),
+                    rule: PruneRule::GraduatedDaily,
+                    tier: None,
+                },
+                "2026-04-30T03:00:00",
+            ),
+            ev(
+                EventPayload::RetentionPrune {
+                    snapshot: "b".into(),
+                    rule: PruneRule::GraduatedDaily,
+                    tier: None,
+                },
+                "2026-04-30T03:00:01",
+            ),
+            ev(
+                EventPayload::RetentionPrune {
+                    snapshot: "c".into(),
+                    rule: PruneRule::GraduatedDaily,
+                    tier: None,
+                },
+                "2026-04-30T03:00:02",
+            ),
+        ];
+        db.record_events_best_effort(&batch);
+        let count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn query_events_returns_newest_first() {
+        let db = StateDb::open_memory().unwrap();
+        let events = vec![
+            ev(
+                EventPayload::PlannerDefer {
+                    reason: "older".into(),
+                    scope: DeferScope::Subvolume,
+                },
+                "2026-04-29T03:00:00",
+            ),
+            ev(
+                EventPayload::PlannerDefer {
+                    reason: "newer".into(),
+                    scope: DeferScope::Subvolume,
+                },
+                "2026-04-30T03:00:00",
+            ),
+        ];
+        db.record_events_best_effort(&events);
+        let rows = db
+            .query_events(&EventQueryFilter {
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].occurred_at, "2026-04-30T03:00:00");
+        assert_eq!(rows[1].occurred_at, "2026-04-29T03:00:00");
+    }
+
+    #[test]
+    fn query_events_filters_by_kind() {
+        let db = StateDb::open_memory().unwrap();
+        db.record_events_best_effort(&[
+            ev(
+                EventPayload::PlannerDefer {
+                    reason: "x".into(),
+                    scope: DeferScope::Subvolume,
+                },
+                "2026-04-30T03:00:00",
+            ),
+            ev(
+                EventPayload::RetentionPrune {
+                    snapshot: "a".into(),
+                    rule: PruneRule::GraduatedDaily,
+                    tier: None,
+                },
+                "2026-04-30T03:00:01",
+            ),
+        ]);
+        let rows = db
+            .query_events(&EventQueryFilter {
+                kind: Some(EventKind::Retention),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, EventKind::Retention);
+    }
+
+    #[test]
+    fn query_events_filters_by_since() {
+        let db = StateDb::open_memory().unwrap();
+        db.record_events_best_effort(&[
+            ev(
+                EventPayload::PlannerDefer {
+                    reason: "old".into(),
+                    scope: DeferScope::Subvolume,
+                },
+                "2026-04-29T03:00:00",
+            ),
+            ev(
+                EventPayload::PlannerDefer {
+                    reason: "new".into(),
+                    scope: DeferScope::Subvolume,
+                },
+                "2026-04-30T03:00:00",
+            ),
+        ]);
+        let cutoff =
+            NaiveDateTime::parse_from_str("2026-04-30T00:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
+        let rows = db
+            .query_events(&EventQueryFilter {
+                since: Some(cutoff),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].occurred_at, "2026-04-30T03:00:00");
+    }
+
+    #[test]
+    fn query_events_filters_by_subvolume_and_drive() {
+        let db = StateDb::open_memory().unwrap();
+        let mut e1 = ev(
+            EventPayload::PlannerDefer {
+                reason: "x".into(),
+                scope: DeferScope::Subvolume,
+            },
+            "2026-04-30T03:00:00",
+        );
+        e1.subvolume = Some("htpc-home".into());
+        let mut e2 = ev(
+            EventPayload::PlannerDefer {
+                reason: "x".into(),
+                scope: DeferScope::Subvolume,
+            },
+            "2026-04-30T03:00:00",
+        );
+        e2.subvolume = Some("htpc-root".into());
+        e2.drive_label = Some("WD-18TB".into());
+        db.record_events_best_effort(&[e1, e2]);
+
+        let by_sv = db
+            .query_events(&EventQueryFilter {
+                subvolume: Some("htpc-home".into()),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(by_sv.len(), 1);
+        assert_eq!(by_sv[0].subvolume.as_deref(), Some("htpc-home"));
+
+        let by_drive = db
+            .query_events(&EventQueryFilter {
+                drive_label: Some("WD-18TB".into()),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(by_drive.len(), 1);
+        assert_eq!(by_drive[0].drive_label.as_deref(), Some("WD-18TB"));
+    }
+
+    #[test]
+    fn query_events_respects_limit() {
+        let db = StateDb::open_memory().unwrap();
+        let mut events = Vec::new();
+        for i in 0..5 {
+            events.push(ev(
+                EventPayload::PlannerDefer {
+                    reason: format!("e{i}"),
+                    scope: DeferScope::Subvolume,
+                },
+                &format!("2026-04-30T03:00:{i:02}"),
+            ));
+        }
+        db.record_events_best_effort(&events);
+        let rows = db
+            .query_events(&EventQueryFilter {
+                limit: 2,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn record_drive_event_writes_to_events_table() {
+        let db = StateDb::open_memory().unwrap();
+        db.record_drive_event(
+            "WD-18TB",
+            DriveEventType::Mounted,
+            DriveEventSource::Sentinel,
+        )
+        .unwrap();
+
+        // Direct check: row in events table.
+        let kind: String = db
+            .conn
+            .query_row(
+                "SELECT kind FROM events WHERE drive_label = 'WD-18TB' ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kind, "drive");
+
+        // Backward-compat read API still works.
+        let record = db.last_drive_connection("WD-18TB").unwrap().unwrap();
+        assert_eq!(record.event_type, "mounted");
+        assert_eq!(record.detected_by, "sentinel");
+    }
+
+    #[test]
+    fn record_drive_event_unmount_payload_decoded_correctly() {
+        let db = StateDb::open_memory().unwrap();
+        db.record_drive_event(
+            "WD-18TB",
+            DriveEventType::Unmounted,
+            DriveEventSource::Backup,
+        )
+        .unwrap();
+        let record = db.last_drive_connection("WD-18TB").unwrap().unwrap();
+        assert_eq!(record.event_type, "unmounted");
+        assert_eq!(record.detected_by, "backup");
+    }
+
+    #[test]
+    fn last_drive_connection_returns_most_recent_via_events() {
+        let db = StateDb::open_memory().unwrap();
+        db.record_drive_event(
+            "WD-18TB",
+            DriveEventType::Mounted,
+            DriveEventSource::Sentinel,
+        )
+        .unwrap();
+        db.record_drive_event(
+            "WD-18TB",
+            DriveEventType::Unmounted,
+            DriveEventSource::Sentinel,
+        )
+        .unwrap();
+        let record = db.last_drive_connection("WD-18TB").unwrap().unwrap();
+        assert_eq!(record.event_type, "unmounted"); // most recent wins
+    }
+
+    #[test]
+    fn migration_subsumes_legacy_drive_connections() {
+        // Build a pre-UPI-036 DB by hand, then open it and verify the
+        // legacy rows landed in events and the old table is gone.
+        use rusqlite::Connection;
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE drive_connections (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                drive_label TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                detected_by TEXT NOT NULL
+            );
+            INSERT INTO drive_connections (drive_label, event_type, timestamp, detected_by)
+            VALUES ('WD-18TB', 'mounted',  '2026-03-01T08:00:00', 'sentinel'),
+                   ('WD-18TB', 'unmounted','2026-03-01T18:00:00', 'sentinel');",
+        )
+        .unwrap();
+        let db = StateDb { conn };
+        db.init_schema().unwrap();
+
+        // Old table is gone.
+        let exists: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='table' AND name='drive_connections'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 0);
+
+        // Two events copied.
+        let rows = db
+            .query_events(&EventQueryFilter {
+                kind: Some(EventKind::Drive),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        // Most-recent first.
+        assert!(matches!(
+            rows[0].payload,
+            EventPayload::DriveUnmounted { .. }
+        ));
+        assert!(matches!(
+            rows[1].payload,
+            EventPayload::DriveMounted { .. }
+        ));
+    }
+
+    #[test]
+    fn migration_is_idempotent_on_fresh_db() {
+        // Brand-new DB has no drive_connections table — migration is a no-op.
+        let db = StateDb::open_memory().unwrap();
+        db.init_schema().unwrap(); // second call must not error
+        let count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn promise_transition_trigger_value_persists() {
+        // Smoke test that the new TransitionTrigger enum survives a roundtrip
+        // through SQLite, since TransitionTrigger is the only payload field
+        // exercised purely via this path post-Step-7.
+        let db = StateDb::open_memory().unwrap();
+        db.record_events_best_effort(&[ev(
+            EventPayload::PromiseTransition {
+                from: crate::awareness::PromiseStatus::Protected,
+                to: crate::awareness::PromiseStatus::AtRisk,
+                trigger: TransitionTrigger::DriveMounted,
+            },
+            "2026-04-30T03:00:00",
+        )]);
+        let rows = db
+            .query_events(&EventQueryFilter {
+                kind: Some(EventKind::Promise),
+                limit: 1,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        match &rows[0].payload {
+            EventPayload::PromiseTransition { trigger, .. } => {
+                assert_eq!(*trigger, TransitionTrigger::DriveMounted);
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
     }
 }

@@ -330,16 +330,27 @@ pub fn compute_next_tick(assessments: &[SubvolAssessment]) -> Duration {
 
 // ── State machine transition ────────────────────────────────────────────
 
+/// What `sentinel_transition` returns: new state and actions for the
+/// runner to execute. Named struct (not a tuple) so future additions stay
+/// stable across destructures.
+#[derive(Debug, Clone)]
+pub struct TransitionResult {
+    pub state: SentinelState,
+    pub actions: Vec<SentinelAction>,
+}
+
 /// Pure state machine: given current state and an event, compute the new
-/// state and the actions the runner should execute.
+/// state and the actions the runner should execute. Never performs I/O.
 ///
-/// The runner calls this, executes the actions, then stores the new state.
-/// This function never performs I/O.
+/// Audit events for sentinel transitions are emitted by the runner, not
+/// here — drive mount/unmount via `record_drive_event`, promise transitions
+/// via `awareness::diff_promise_states`, anomalies from the chain-break
+/// detector. Circuit-breaker events are deferred to active mode.
 #[must_use]
 pub fn sentinel_transition(
     state: &SentinelState,
     event: &SentinelEvent,
-) -> (SentinelState, Vec<SentinelAction>) {
+) -> TransitionResult {
     let mut new_state = state.clone();
     let mut actions = Vec::new();
 
@@ -395,7 +406,10 @@ pub fn sentinel_transition(
         }
     }
 
-    (new_state, actions)
+    TransitionResult {
+        state: new_state,
+        actions,
+    }
 }
 
 // ── Trigger decision (runner-level) ─────────────────────────────────────
@@ -912,7 +926,7 @@ mod tests {
             label: "WD-18TB".to_string(),
         };
 
-        let (new_state, actions) = sentinel_transition(&state, &event);
+        let TransitionResult { state: new_state, actions, .. } = sentinel_transition(&state, &event);
 
         assert!(new_state.mounted_drives.contains("WD-18TB"));
         assert_eq!(actions.len(), 2);
@@ -934,7 +948,7 @@ mod tests {
         let event = SentinelEvent::DriveUnmounted {
             label: "WD-18TB".to_string(),
         };
-        let (new_state, actions) = sentinel_transition(&state, &event);
+        let TransitionResult { state: new_state, actions, .. } = sentinel_transition(&state, &event);
 
         assert!(!new_state.mounted_drives.contains("WD-18TB"));
         assert_eq!(actions.len(), 2);
@@ -951,7 +965,7 @@ mod tests {
     #[test]
     fn transition_assessment_tick_triggers_assess() {
         let state = fresh_state();
-        let (_, actions) = sentinel_transition(&state, &SentinelEvent::AssessmentTick);
+        let TransitionResult { actions, .. } = sentinel_transition(&state, &SentinelEvent::AssessmentTick);
 
         assert_eq!(actions, vec![SentinelAction::Assess]);
     }
@@ -959,7 +973,7 @@ mod tests {
     #[test]
     fn transition_backup_completed_triggers_assess() {
         let state = fresh_state();
-        let (_, actions) = sentinel_transition(&state, &SentinelEvent::BackupCompleted);
+        let TransitionResult { actions, .. } = sentinel_transition(&state, &SentinelEvent::BackupCompleted);
 
         assert_eq!(actions, vec![SentinelAction::Assess]);
     }
@@ -967,7 +981,7 @@ mod tests {
     #[test]
     fn transition_shutdown_triggers_exit() {
         let state = fresh_state();
-        let (_, actions) = sentinel_transition(&state, &SentinelEvent::Shutdown);
+        let TransitionResult { actions, .. } = sentinel_transition(&state, &SentinelEvent::Shutdown);
 
         assert_eq!(actions, vec![SentinelAction::Exit]);
     }
@@ -975,7 +989,7 @@ mod tests {
     #[test]
     fn transition_config_changed_triggers_assess() {
         let state = fresh_state();
-        let (_, actions) = sentinel_transition(&state, &SentinelEvent::ConfigChanged);
+        let TransitionResult { actions, .. } = sentinel_transition(&state, &SentinelEvent::ConfigChanged);
 
         assert_eq!(actions, vec![SentinelAction::Assess]);
     }
@@ -990,7 +1004,7 @@ mod tests {
         let event = SentinelEvent::DriveMounted {
             label: "WD-18TB".to_string(),
         };
-        let (new_state, actions) = sentinel_transition(&state, &event);
+        let TransitionResult { state: new_state, actions, .. } = sentinel_transition(&state, &event);
 
         assert_eq!(new_state.mounted_drives.len(), 1);
         assert!(actions.is_empty(), "duplicate mount should produce no actions");
@@ -1002,7 +1016,7 @@ mod tests {
         let event = SentinelEvent::DriveUnmounted {
             label: "unknown".to_string(),
         };
-        let (_, actions) = sentinel_transition(&state, &event);
+        let TransitionResult { actions, .. } = sentinel_transition(&state, &event);
 
         assert!(actions.is_empty());
     }
@@ -1011,13 +1025,13 @@ mod tests {
     fn multiple_drives_tracked_independently() {
         let state = fresh_state();
 
-        let (state, _) = sentinel_transition(
+        let TransitionResult { state, .. } = sentinel_transition(
             &state,
             &SentinelEvent::DriveMounted {
                 label: "WD-18TB".to_string(),
             },
         );
-        let (state, _) = sentinel_transition(
+        let TransitionResult { state, .. } = sentinel_transition(
             &state,
             &SentinelEvent::DriveMounted {
                 label: "2TB-backup".to_string(),
@@ -1028,7 +1042,7 @@ mod tests {
         assert!(state.mounted_drives.contains("WD-18TB"));
         assert!(state.mounted_drives.contains("2TB-backup"));
 
-        let (state, actions) = sentinel_transition(
+        let TransitionResult { state, actions, .. } = sentinel_transition(
             &state,
             &SentinelEvent::DriveUnmounted {
                 label: "WD-18TB".to_string(),
@@ -1928,7 +1942,7 @@ mod tests {
         let mut state = fresh_state();
         state.has_initial_assessment = true;
 
-        let (new_state, actions) = sentinel_transition(
+        let TransitionResult { state: new_state, actions, .. } = sentinel_transition(
             &state,
             &SentinelEvent::DriveMounted {
                 label: "WD-18TB".to_string(),
@@ -1952,7 +1966,7 @@ mod tests {
     fn drive_mount_without_initial_assessment_no_reconnection() {
         let state = fresh_state(); // has_initial_assessment = false
 
-        let (_new_state, actions) = sentinel_transition(
+        let TransitionResult { state: _new_state, actions, .. } = sentinel_transition(
             &state,
             &SentinelEvent::DriveMounted {
                 label: "WD-18TB".to_string(),
@@ -1974,7 +1988,7 @@ mod tests {
         state.has_initial_assessment = true;
         state.mounted_drives.insert("WD-18TB".to_string());
 
-        let (_new_state, actions) = sentinel_transition(
+        let TransitionResult { state: _new_state, actions, .. } = sentinel_transition(
             &state,
             &SentinelEvent::DriveMounted {
                 label: "WD-18TB".to_string(),
@@ -1994,7 +2008,7 @@ mod tests {
         state.mounted_drives.insert("WD-18TB".to_string());
 
         // Unmount
-        let (state_after_unmount, _) = sentinel_transition(
+        let TransitionResult { state: state_after_unmount, .. } = sentinel_transition(
             &state,
             &SentinelEvent::DriveUnmounted {
                 label: "WD-18TB".to_string(),
@@ -2003,7 +2017,7 @@ mod tests {
         assert!(!state_after_unmount.mounted_drives.contains("WD-18TB"));
 
         // Remount
-        let (state_after_remount, actions) = sentinel_transition(
+        let TransitionResult { state: state_after_remount, actions, .. } = sentinel_transition(
             &state_after_unmount,
             &SentinelEvent::DriveMounted {
                 label: "WD-18TB".to_string(),

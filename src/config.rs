@@ -2013,7 +2013,7 @@ min_free_bytes = "50GB"
             .local_snapshots
             .roots
             .iter()
-            .find(|r| r.path == PathBuf::from("/snap-data"))
+            .find(|r| r.path == Path::new("/snap-data"))
             .unwrap();
         assert_eq!(data_root.min_free_bytes, Some(ByteSize(50_000_000_000)));
     }

@@ -6,6 +6,7 @@ mod commands;
 mod config;
 mod drives;
 mod error;
+mod events;
 mod executor;
 mod heartbeat;
 mod lock;
@@ -20,6 +21,7 @@ mod sentinel_runner;
 mod state;
 mod types;
 mod voice;
+mod voice_events;
 
 use std::io::IsTerminal;
 
@@ -95,6 +97,7 @@ fn main() -> anyhow::Result<()> {
         Commands::RetentionPreview(args) => {
             commands::retention_preview::run(config, args, output_mode)
         }
+        Commands::Events(args) => commands::events::run(config, args, output_mode),
         Commands::Completions(_) | Commands::Migrate(_) => unreachable!("handled above"),
     }
 }

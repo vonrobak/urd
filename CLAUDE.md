@@ -69,6 +69,8 @@ All backup logic flows through: config -> plan -> execute. No exceptions.
 | `drives.rs` | Detect mounted drives, UUID fingerprinting, check space | Mount/unmount drives |
 | `output.rs` | Define structured output types | Render text (voice.rs does that) |
 | `voice.rs` | Render structured output as text (mythic voice) | Perform I/O or compute state |
+| `voice_events.rs` | Per-variant `EventPayload` renderer (columnar + NDJSON) | Perform I/O or query state |
+| `events.rs` | Pure: `Event`, `EventKind`, `EventPayload`, `Severity`, typed payload enums (UPI 036) | Perform I/O |
 | `lock.rs` | Shared advisory lock with metadata (PID, trigger source) | Decide whether to proceed (caller's job) |
 | `sentinel.rs` | Pure state machine for Sentinel daemon (events, actions, circuit breaker) | Perform I/O (sentinel_runner.rs does that) |
 | `error.rs` | Error types, `translate_btrfs_error()` for actionable messages | Recovery logic |
@@ -130,7 +132,7 @@ Dual-parser architecture supporting **legacy** and **v1** schemas. `Config::load
 ## Coding Conventions
 
 - Standard Rust: `snake_case` functions, `CamelCase` types
-- `cargo clippy -- -D warnings` (all warnings are errors)
+- `cargo clippy --all-targets -- -D warnings` (all warnings are errors; `--all-targets` includes test code, which bare clippy skips)
 - `rustfmt` before committing
 - Strong types over primitives: `SnapshotName` not `String`, `Tier` not `u8`
 - `#[must_use]` on functions whose return values matter
@@ -215,7 +217,8 @@ cargo build                          # Debug
 cargo build --release                # Release
 cargo test                           # Unit tests (931+ tests)
 cargo test -- --ignored              # Integration tests (needs drives)
-cargo clippy -- -D warnings          # Lint (all warnings are errors)
+cargo clippy --all-targets -- -D warnings   # Lint (covers test code too)
+cargo check --all-targets            # Fast type-check after mass edits (covers test code; bare `cargo check` does not)
 cargo run -- plan                    # Preview backup plan
 cargo run -- backup --dry-run        # Dry-run
 cargo run -- status                  # Current promise states

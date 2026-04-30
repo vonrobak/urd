@@ -235,6 +235,19 @@ impl<'a> Executor<'a> {
         // Finish run in SQLite
         self.finish_run(run_id, overall.as_str());
 
+        // Persist plan-level events (planner choices, deferrals, retention
+        // rationale) best-effort. Stamp run_id on a clone so the pure plan
+        // stays unmutated and the &BackupPlan signature is preserved.
+        if let Some(state) = self.state
+            && !plan.events.is_empty()
+        {
+            let mut stamped: Vec<crate::events::Event> = plan.events.clone();
+            for ev in &mut stamped {
+                ev.run_id = run_id;
+            }
+            state.record_events_best_effort(&stamped);
+        }
+
         ExecutionResult {
             overall,
             subvolume_results,
@@ -1081,7 +1094,7 @@ mod tests {
     use crate::btrfs::{MockBtrfs, MockBtrfsCall};
     use crate::types::SnapshotName;
     use chrono::NaiveDate;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     /// Shutdown flag that never triggers — used for all tests that don't test signal handling.
     fn no_shutdown() -> AtomicBool {
@@ -1156,6 +1169,7 @@ source = "/data/b"
             ],
             timestamp: ts,
             skipped: vec![],
+            events: Vec::new(),
         }
     }
 
@@ -1213,6 +1227,7 @@ source = "/data/b"
             ],
             timestamp: ts,
             skipped: vec![],
+            events: Vec::new(),
         };
 
         let result = executor.execute(&plan, "full");
@@ -1256,6 +1271,7 @@ source = "/data/b"
             ],
             timestamp: ts,
             skipped: vec![],
+            events: Vec::new(),
         };
 
         let result = executor.execute(&plan, "full");
@@ -1305,6 +1321,7 @@ source = "/data/b"
             }],
             timestamp: ts,
             skipped: vec![],
+            events: Vec::new(),
         };
 
         let result = executor.execute(&plan, "full");
@@ -1348,6 +1365,7 @@ source = "/data/b"
             ],
             timestamp: ts,
             skipped: vec![],
+            events: Vec::new(),
         };
 
         let result = executor.execute(&plan, "full");
@@ -1369,6 +1387,7 @@ source = "/data/b"
             operations: vec![],
             timestamp: ts,
             skipped: vec![],
+            events: Vec::new(),
         };
 
         let result = executor.execute(&plan, "full");
@@ -1409,6 +1428,7 @@ source = "/data/b"
             ],
             timestamp: ts,
             skipped: vec![],
+            events: Vec::new(),
         };
 
         let result = executor.execute(&plan, "full");
@@ -1467,6 +1487,7 @@ source = "/data/b"
             }],
             timestamp: ts,
             skipped: vec![],
+            events: Vec::new(),
         };
 
         let result = executor.execute(&plan, "full");
@@ -1504,6 +1525,7 @@ source = "/data/b"
             ],
             timestamp: ts,
             skipped: vec![],
+            events: Vec::new(),
         };
 
         let result = executor.execute(&plan, "full");
@@ -1602,6 +1624,7 @@ source = "/data/b"
             ],
             timestamp: ts,
             skipped: vec![],
+            events: Vec::new(),
         };
 
         let result = executor.execute(&plan, "full");
@@ -1649,6 +1672,7 @@ source = "/data/b"
             }],
             timestamp: ts,
             skipped: vec![],
+            events: Vec::new(),
         };
 
         let result = executor.execute(&plan, "full");
@@ -1713,6 +1737,7 @@ source = "/data/b"
             ],
             timestamp: ts,
             skipped: vec![],
+            events: Vec::new(),
         };
 
         let result = executor.execute(&plan, "full");
@@ -1749,6 +1774,7 @@ source = "/data/b"
             ],
             timestamp: ts,
             skipped: vec![],
+            events: Vec::new(),
         };
 
         // Set shutdown after sv-a would have executed — but since we can't
@@ -1792,6 +1818,7 @@ source = "/data/b"
             }],
             timestamp: ts,
             skipped: vec![],
+            events: Vec::new(),
         };
 
         let result = executor.execute(&plan, "full");
@@ -1849,6 +1876,7 @@ source = "/data/b"
             ],
             timestamp: ts,
             skipped: vec![],
+            events: Vec::new(),
         };
 
         let result = executor.execute(&plan, "full");
@@ -1897,6 +1925,7 @@ source = "/data/b"
             ],
             timestamp: ts,
             skipped: vec![],
+            events: Vec::new(),
         };
 
         let result = executor.execute(&plan, "full");
@@ -2026,6 +2055,7 @@ source = "/data/sv1"
             }],
             timestamp: ts,
             skipped: vec![],
+            events: Vec::new(),
         }
     }
 
@@ -2121,6 +2151,7 @@ source = "/data/sv1"
             }],
             timestamp: ts,
             skipped: vec![],
+            events: Vec::new(),
         }
     }
 
@@ -2233,6 +2264,7 @@ source = "/data/sv1"
             ],
             timestamp: ts,
             skipped: vec![],
+            events: Vec::new(),
         };
 
         let result = executor.execute(&plan, "full");
@@ -2340,6 +2372,7 @@ local_retention = "transient"
             }],
             timestamp: test_ts(),
             skipped: vec![],
+            events: Vec::new(),
         };
 
         let result = executor.execute(&plan, "full");
@@ -2420,6 +2453,7 @@ local_retention = "transient"
             ],
             timestamp: test_ts(),
             skipped: vec![],
+            events: Vec::new(),
         };
 
         let result = executor.execute(&plan, "full");
@@ -2468,6 +2502,7 @@ local_retention = "transient"
             }],
             timestamp: test_ts(),
             skipped: vec![],
+            events: Vec::new(),
         };
 
         let result = executor.execute(&plan, "full");
@@ -2551,6 +2586,7 @@ local_retention = "transient"
             ],
             timestamp: test_ts(),
             skipped: vec![],
+            events: Vec::new(),
         };
 
         let result = executor.execute(&plan, "full");
@@ -2604,6 +2640,7 @@ local_retention = "transient"
             }],
             timestamp: test_ts(),
             skipped: vec![],
+            events: Vec::new(),
         };
 
         let result = executor.execute(&plan, "full");
@@ -2646,6 +2683,7 @@ local_retention = "transient"
             }],
             timestamp: test_ts(),
             skipped: vec![],
+            events: Vec::new(),
         };
 
         let result = executor.execute(&plan, "full");
@@ -2717,6 +2755,7 @@ local_retention = "transient"
             ],
             timestamp: test_ts(),
             skipped: vec![],
+            events: Vec::new(),
         };
 
         let result = executor.execute(&plan, "full");
@@ -2780,6 +2819,7 @@ local_retention = "transient"
             }],
             timestamp: test_ts(),
             skipped: vec![],
+            events: Vec::new(),
         };
 
         let result = executor.execute(&plan, "full");
@@ -2825,6 +2865,7 @@ local_retention = "transient"
             ],
             timestamp: ts,
             skipped: vec![],
+            events: Vec::new(),
         };
 
         executor.execute(&plan, "full");
@@ -2843,19 +2884,19 @@ local_retention = "transient"
         assert_eq!(relevant.len(), 4);
         assert!(matches!(
             relevant[0],
-            MockBtrfsCall::DeleteSubvolume { path } if *path == PathBuf::from("/snap/sv-a/20260301-a")
+            MockBtrfsCall::DeleteSubvolume { path } if path == Path::new("/snap/sv-a/20260301-a")
         ));
         assert!(matches!(
             relevant[1],
-            MockBtrfsCall::SyncSubvolumes { path } if *path == PathBuf::from("/snap/sv-a")
+            MockBtrfsCall::SyncSubvolumes { path } if path == Path::new("/snap/sv-a")
         ));
         assert!(matches!(
             relevant[2],
-            MockBtrfsCall::DeleteSubvolume { path } if *path == PathBuf::from("/snap/sv-a/20260302-a")
+            MockBtrfsCall::DeleteSubvolume { path } if path == Path::new("/snap/sv-a/20260302-a")
         ));
         assert!(matches!(
             relevant[3],
-            MockBtrfsCall::SyncSubvolumes { path } if *path == PathBuf::from("/snap/sv-a")
+            MockBtrfsCall::SyncSubvolumes { path } if path == Path::new("/snap/sv-a")
         ));
     }
 
@@ -2890,6 +2931,7 @@ local_retention = "transient"
             ],
             timestamp: ts,
             skipped: vec![],
+            events: Vec::new(),
         };
 
         let result = executor.execute(&plan, "full");
@@ -2919,6 +2961,7 @@ local_retention = "transient"
             }],
             timestamp: ts,
             skipped: vec![],
+            events: Vec::new(),
         };
 
         executor.execute(&plan, "full");
@@ -2927,7 +2970,102 @@ local_retention = "transient"
         let calls = mock.calls();
         assert!(calls.iter().any(|c| matches!(
             c,
-            MockBtrfsCall::SyncSubvolumes { path } if *path == PathBuf::from("/mnt/test/.snapshots/sv-a")
+            MockBtrfsCall::SyncSubvolumes { path } if path == Path::new("/mnt/test/.snapshots/sv-a")
         )));
+    }
+
+    // ── BackupPlan.events persistence ──────────────────────────────
+
+    #[test]
+    fn execute_persists_plan_events_with_run_id_stamped() {
+        use crate::events::{DeferScope, Event, EventPayload};
+        use crate::state::{EventQueryFilter, StateDb};
+
+        let mock = MockBtrfs::new();
+        let config = test_config();
+        let shutdown = no_shutdown();
+        let db = StateDb::open_memory().unwrap();
+        let executor = Executor::new(&mock, Some(&db), &config, &shutdown);
+
+        let ts = NaiveDate::from_ymd_opt(2026, 4, 30)
+            .unwrap()
+            .and_hms_opt(3, 14, 22)
+            .unwrap();
+        let mut plan = simple_plan();
+        let mut event = Event::pure(
+            ts,
+            EventPayload::PlannerDefer {
+                reason: "interval not elapsed".to_string(),
+                scope: DeferScope::Subvolume,
+            },
+        );
+        event.subvolume = Some("sv-a".to_string());
+        plan.events.push(event);
+
+        let result = executor.execute(&plan, "full");
+        assert_eq!(result.overall, RunResult::Success);
+
+        let rows = db
+            .query_events(&EventQueryFilter {
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].run_id, result.run_id);
+        assert!(matches!(
+            rows[0].payload,
+            EventPayload::PlannerDefer { .. }
+        ));
+    }
+
+    #[test]
+    fn execute_with_no_state_drops_events_without_panic() {
+        use crate::events::{DeferScope, Event, EventPayload};
+
+        let mock = MockBtrfs::new();
+        let config = test_config();
+        let shutdown = no_shutdown();
+        let executor = Executor::new(&mock, None, &config, &shutdown);
+
+        let ts = NaiveDate::from_ymd_opt(2026, 4, 30)
+            .unwrap()
+            .and_hms_opt(3, 14, 22)
+            .unwrap();
+        let mut plan = simple_plan();
+        let mut event = Event::pure(
+            ts,
+            EventPayload::PlannerDefer {
+                reason: "x".to_string(),
+                scope: DeferScope::Subvolume,
+            },
+        );
+        event.subvolume = Some("sv-a".to_string());
+        plan.events.push(event);
+
+        // No state DB, no panic — events are silently dropped.
+        let result = executor.execute(&plan, "full");
+        assert_eq!(result.overall, RunResult::Success);
+    }
+
+    #[test]
+    fn execute_persists_empty_events_as_noop() {
+        use crate::state::{EventQueryFilter, StateDb};
+
+        let mock = MockBtrfs::new();
+        let config = test_config();
+        let shutdown = no_shutdown();
+        let db = StateDb::open_memory().unwrap();
+        let executor = Executor::new(&mock, Some(&db), &config, &shutdown);
+        let plan = simple_plan(); // events is empty
+
+        let _ = executor.execute(&plan, "full");
+        let rows = db
+            .query_events(&EventQueryFilter {
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(rows.is_empty());
     }
 }

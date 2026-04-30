@@ -570,6 +570,60 @@ pub struct GetOutput {
     pub file_size: u64,
 }
 
+// ── EventsView ────────────────────────────────────────────────────────
+
+/// Presentation projection of one event log row, ready for rendering.
+/// Wraps `state::EventQueryRow` for serde + voice consumption.
+#[derive(Debug, Clone, Serialize)]
+pub struct EventRow {
+    pub id: i64,
+    pub kind: crate::events::EventKind,
+    pub occurred_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subvolume: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub drive_label: Option<String>,
+    pub payload: crate::events::EventPayload,
+}
+
+impl From<crate::state::EventQueryRow> for EventRow {
+    fn from(row: crate::state::EventQueryRow) -> Self {
+        Self {
+            id: row.id,
+            kind: row.kind,
+            occurred_at: row.occurred_at,
+            run_id: row.run_id,
+            subvolume: row.subvolume,
+            drive_label: row.drive_label,
+            payload: row.payload,
+        }
+    }
+}
+
+/// Top-level output for `urd events`. Holds the rows plus an echo of
+/// the applied filter (handy for daemon consumers).
+#[derive(Debug, Serialize)]
+pub struct EventsView {
+    pub events: Vec<EventRow>,
+    pub applied_filter: AppliedEventFilter,
+}
+
+/// Echo of the filter actually applied, after parsing and clamping.
+#[derive(Debug, Serialize)]
+pub struct AppliedEventFilter {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub since: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subvolume: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub drive: Option<String>,
+    pub limit: usize,
+}
+
 // ── BackupSummary ──────────────────────────────────────────────────────
 
 /// Structured output for the post-backup summary.

@@ -113,6 +113,104 @@ pub fn populate_token_warnings(
     }
 }
 
+fn build_operation_entry(
+    op: &PlannedOperation,
+    fs_state: &dyn FileSystemState,
+) -> PlanOperationEntry {
+    match op {
+        PlannedOperation::CreateSnapshot {
+            source,
+            dest,
+            subvolume_name,
+        } => PlanOperationEntry {
+            subvolume: subvolume_name.clone(),
+            operation: "create".to_string(),
+            detail: format!("{} -> {}", source.display(), dest.display()),
+            drive_label: None,
+            estimated_bytes: None,
+            is_full_send: None,
+            full_send_reason: None,
+        },
+        PlannedOperation::SendIncremental {
+            snapshot,
+            drive_label,
+            parent,
+            pin_on_success,
+            subvolume_name,
+            ..
+        } => {
+            let snap_name = snapshot.file_name().unwrap_or_default().to_string_lossy();
+            let parent_name = parent.file_name().unwrap_or_default().to_string_lossy();
+            let pin_suffix = if pin_on_success.is_some() {
+                " + pin"
+            } else {
+                ""
+            };
+
+            let estimated_bytes =
+                plan::estimated_send_size(fs_state, subvolume_name, drive_label, false);
+
+            PlanOperationEntry {
+                subvolume: subvolume_name.clone(),
+                operation: "send".to_string(),
+                detail: format!(
+                    "{snap_name} -> {drive_label} (incremental, parent: {parent_name}){pin_suffix}"
+                ),
+                drive_label: Some(drive_label.clone()),
+                estimated_bytes,
+                is_full_send: Some(false),
+                full_send_reason: None,
+            }
+        }
+        PlannedOperation::SendFull {
+            snapshot,
+            drive_label,
+            pin_on_success,
+            subvolume_name,
+            reason,
+            ..
+        } => {
+            let snap_name = snapshot.file_name().unwrap_or_default().to_string_lossy();
+            let pin_suffix = if pin_on_success.is_some() {
+                " + pin"
+            } else {
+                ""
+            };
+
+            let estimated_bytes =
+                plan::estimated_send_size(fs_state, subvolume_name, drive_label, true);
+
+            PlanOperationEntry {
+                subvolume: subvolume_name.clone(),
+                operation: "send".to_string(),
+                detail: format!(
+                    "{snap_name} -> {drive_label} (full \u{2014} {reason}){pin_suffix}"
+                ),
+                drive_label: Some(drive_label.clone()),
+                estimated_bytes,
+                is_full_send: Some(true),
+                full_send_reason: Some(reason.to_string()),
+            }
+        }
+        PlannedOperation::DeleteSnapshot {
+            path,
+            reason,
+            subvolume_name,
+        } => {
+            let snap_name = path.file_name().unwrap_or_default().to_string_lossy();
+            PlanOperationEntry {
+                subvolume: subvolume_name.clone(),
+                operation: "delete".to_string(),
+                detail: format!("{snap_name} ({reason})"),
+                drive_label: None,
+                estimated_bytes: None,
+                is_full_send: None,
+                full_send_reason: None,
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,6 +376,7 @@ mod tests {
                 mock_send_full("htpc-docs", "WD-18TB"),
             ],
             skipped: vec![],
+            events: Vec::new(),
         };
         let output = build_plan_output(&plan, &fs);
         assert_eq!(output.summary.estimated_total_bytes, Some(54_200_000_000));
@@ -297,6 +396,7 @@ mod tests {
                 mock_send_full("htpc-docs", "WD-18TB"), // no estimate
             ],
             skipped: vec![],
+            events: Vec::new(),
         };
         let output = build_plan_output(&plan, &fs);
         assert_eq!(output.summary.estimated_total_bytes, Some(53_000_000_000));
@@ -309,106 +409,9 @@ mod tests {
             timestamp: chrono::NaiveDateTime::default(),
             operations: vec![mock_send_full("htpc-home", "WD-18TB")],
             skipped: vec![],
+            events: Vec::new(),
         };
         let output = build_plan_output(&plan, &fs);
         assert_eq!(output.summary.estimated_total_bytes, None);
-    }
-}
-
-fn build_operation_entry(
-    op: &PlannedOperation,
-    fs_state: &dyn FileSystemState,
-) -> PlanOperationEntry {
-    match op {
-        PlannedOperation::CreateSnapshot {
-            source,
-            dest,
-            subvolume_name,
-        } => PlanOperationEntry {
-            subvolume: subvolume_name.clone(),
-            operation: "create".to_string(),
-            detail: format!("{} -> {}", source.display(), dest.display()),
-            drive_label: None,
-            estimated_bytes: None,
-            is_full_send: None,
-            full_send_reason: None,
-        },
-        PlannedOperation::SendIncremental {
-            snapshot,
-            drive_label,
-            parent,
-            pin_on_success,
-            subvolume_name,
-            ..
-        } => {
-            let snap_name = snapshot.file_name().unwrap_or_default().to_string_lossy();
-            let parent_name = parent.file_name().unwrap_or_default().to_string_lossy();
-            let pin_suffix = if pin_on_success.is_some() {
-                " + pin"
-            } else {
-                ""
-            };
-
-            let estimated_bytes =
-                plan::estimated_send_size(fs_state, subvolume_name, drive_label, false);
-
-            PlanOperationEntry {
-                subvolume: subvolume_name.clone(),
-                operation: "send".to_string(),
-                detail: format!(
-                    "{snap_name} -> {drive_label} (incremental, parent: {parent_name}){pin_suffix}"
-                ),
-                drive_label: Some(drive_label.clone()),
-                estimated_bytes,
-                is_full_send: Some(false),
-                full_send_reason: None,
-            }
-        }
-        PlannedOperation::SendFull {
-            snapshot,
-            drive_label,
-            pin_on_success,
-            subvolume_name,
-            reason,
-            ..
-        } => {
-            let snap_name = snapshot.file_name().unwrap_or_default().to_string_lossy();
-            let pin_suffix = if pin_on_success.is_some() {
-                " + pin"
-            } else {
-                ""
-            };
-
-            let estimated_bytes =
-                plan::estimated_send_size(fs_state, subvolume_name, drive_label, true);
-
-            PlanOperationEntry {
-                subvolume: subvolume_name.clone(),
-                operation: "send".to_string(),
-                detail: format!(
-                    "{snap_name} -> {drive_label} (full \u{2014} {reason}){pin_suffix}"
-                ),
-                drive_label: Some(drive_label.clone()),
-                estimated_bytes,
-                is_full_send: Some(true),
-                full_send_reason: Some(reason.to_string()),
-            }
-        }
-        PlannedOperation::DeleteSnapshot {
-            path,
-            reason,
-            subvolume_name,
-        } => {
-            let snap_name = path.file_name().unwrap_or_default().to_string_lossy();
-            PlanOperationEntry {
-                subvolume: subvolume_name.clone(),
-                operation: "delete".to_string(),
-                detail: format!("{snap_name} ({reason})"),
-                drive_label: None,
-                estimated_bytes: None,
-                is_full_send: None,
-                full_send_reason: None,
-            }
-        }
     }
 }

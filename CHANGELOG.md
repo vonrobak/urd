@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Structured event log (ADR-114): typed `Event` records of decisions and
+  state transitions persisted to a new `events` SQLite table. Pure modules
+  (planner, retention, awareness, sentinel state machine) emit events as
+  part of their output; impure callers persist them best-effort. Visible
+  via the new `urd events` subcommand with `--since`, `--kind`,
+  `--subvolume`, `--drive`, `--limit`, and `--json` filters. Drive
+  connection records and four Prometheus counter families
+  (circuit-breaker trips, full sends by reason, deferrals by scope,
+  prunes by rule) now derive from the same table.
+
+### Changed
+- Quality gate command updated to `cargo clippy --all-targets` (covers
+  test code, which bare clippy skips). CLAUDE.md adds a
+  `cargo check --all-targets` line specifically for post-mass-edit
+  verification — the bare form misses lints and type errors that live
+  in `mod tests` / `tests/`.
+
 ## [0.13.0] - 2026-04-21
 
 ### Added

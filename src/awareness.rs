@@ -45,7 +45,10 @@ const DRIVE_AWAY_DEGRADED_DAYS: i64 = 7;
 
 /// Promise status for a subvolume or assessment dimension.
 /// Ordered worst-to-best so `min()` yields the worst status.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum PromiseStatus {
     Unprotected,
     AtRisk,
@@ -396,6 +399,47 @@ fn format_age_issue(assessment: &SubvolAssessment, external_only: bool) -> Strin
 }
 
 // ── Core function ──────────────────────────────────────────────────────
+
+/// Diff a previous set of promise snapshots against the current
+/// assessment list and emit one `PromiseTransition` event per subvolume
+/// whose status changed.
+///
+/// Pure function. Empty `previous` returns an empty Vec (suppresses
+/// noise on first run, matching the precedent in
+/// `sentinel::has_changes`). Subvolumes present in `previous` but
+/// missing from `current` are silent (deletion is not a transition we
+/// log). Subvolumes new in `current` (not in `previous`) are also
+/// silent — appearance is not a transition either.
+#[must_use]
+#[allow(dead_code)]
+pub fn diff_promise_states(
+    previous: &[crate::sentinel::PromiseSnapshot],
+    current: &[SubvolAssessment],
+    now: NaiveDateTime,
+    trigger: crate::events::TransitionTrigger,
+) -> Vec<crate::events::Event> {
+    if previous.is_empty() {
+        return Vec::new();
+    }
+    let mut events = Vec::new();
+    for assess in current {
+        if let Some(prev) = previous.iter().find(|p| p.name == assess.name)
+            && prev.status != assess.status
+        {
+            let mut event = crate::events::Event::pure(
+                now,
+                crate::events::EventPayload::PromiseTransition {
+                    from: prev.status,
+                    to: assess.status,
+                    trigger,
+                },
+            );
+            event.subvolume = Some(assess.name.clone());
+            events.push(event);
+        }
+    }
+    events
+}
 
 /// Compute promise states for all enabled subvolumes.
 ///
@@ -4947,5 +4991,146 @@ source = "/data/sv1"
             "fresh age should not emit source-unchanged advisory: {:?}",
             r.advisories
         );
+    }
+
+    // ── diff_promise_states tests ──────────────────────────────────
+
+    fn make_assess(name: &str, status: PromiseStatus) -> SubvolAssessment {
+        SubvolAssessment {
+            name: name.to_string(),
+            status,
+            health: OperationalHealth::Healthy,
+            health_reasons: vec![],
+            local: LocalAssessment {
+                status,
+                snapshot_count: 0,
+                newest_age: None,
+                configured_interval: Interval::hours(1),
+            },
+            external: vec![],
+            chain_health: vec![],
+            advisories: vec![],
+            redundancy_advisories: vec![],
+            errors: vec![],
+        }
+    }
+
+    fn make_promise_snapshot(
+        name: &str,
+        status: PromiseStatus,
+    ) -> crate::sentinel::PromiseSnapshot {
+        crate::sentinel::PromiseSnapshot {
+            name: name.to_string(),
+            status,
+        }
+    }
+
+    fn diff_dt() -> NaiveDateTime {
+        NaiveDate::from_ymd_opt(2026, 4, 30)
+            .unwrap()
+            .and_hms_opt(3, 14, 22)
+            .unwrap()
+    }
+
+    #[test]
+    fn diff_no_change_returns_empty() {
+        let prev = vec![make_promise_snapshot("sv1", PromiseStatus::Protected)];
+        let curr = vec![make_assess("sv1", PromiseStatus::Protected)];
+        let events = diff_promise_states(
+            &prev,
+            &curr,
+            diff_dt(),
+            crate::events::TransitionTrigger::Tick,
+        );
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn diff_emits_on_degradation() {
+        let prev = vec![make_promise_snapshot("sv1", PromiseStatus::Protected)];
+        let curr = vec![make_assess("sv1", PromiseStatus::AtRisk)];
+        let events = diff_promise_states(
+            &prev,
+            &curr,
+            diff_dt(),
+            crate::events::TransitionTrigger::Tick,
+        );
+        assert_eq!(events.len(), 1);
+        match &events[0].payload {
+            crate::events::EventPayload::PromiseTransition { from, to, trigger } => {
+                assert_eq!(*from, PromiseStatus::Protected);
+                assert_eq!(*to, PromiseStatus::AtRisk);
+                assert_eq!(*trigger, crate::events::TransitionTrigger::Tick);
+            }
+            other => panic!("expected PromiseTransition, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn diff_emits_on_recovery() {
+        let prev = vec![make_promise_snapshot("sv1", PromiseStatus::Unprotected)];
+        let curr = vec![make_assess("sv1", PromiseStatus::Protected)];
+        let events = diff_promise_states(
+            &prev,
+            &curr,
+            diff_dt(),
+            crate::events::TransitionTrigger::Run,
+        );
+        assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn diff_first_run_returns_empty() {
+        // Empty `previous` → no events, no matter what current looks like.
+        let curr = vec![
+            make_assess("sv1", PromiseStatus::Protected),
+            make_assess("sv2", PromiseStatus::AtRisk),
+        ];
+        let events = diff_promise_states(
+            &[],
+            &curr,
+            diff_dt(),
+            crate::events::TransitionTrigger::Run,
+        );
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn diff_carries_trigger_into_payload() {
+        let prev = vec![make_promise_snapshot("sv1", PromiseStatus::Protected)];
+        let curr = vec![make_assess("sv1", PromiseStatus::AtRisk)];
+        for trigger in [
+            crate::events::TransitionTrigger::Run,
+            crate::events::TransitionTrigger::Tick,
+            crate::events::TransitionTrigger::DriveMounted,
+            crate::events::TransitionTrigger::ConfigChanged,
+        ] {
+            let events = diff_promise_states(&prev, &curr, diff_dt(), trigger);
+            assert_eq!(events.len(), 1);
+            if let crate::events::EventPayload::PromiseTransition { trigger: t, .. } =
+                events[0].payload
+            {
+                assert_eq!(t, trigger);
+            } else {
+                panic!("expected PromiseTransition");
+            }
+        }
+    }
+
+    #[test]
+    fn diff_silent_for_new_subvolume_in_current() {
+        // sv1 in current but not in previous → silent (appearance, not transition).
+        let prev = vec![make_promise_snapshot("sv2", PromiseStatus::Protected)];
+        let curr = vec![
+            make_assess("sv1", PromiseStatus::AtRisk),
+            make_assess("sv2", PromiseStatus::Protected),
+        ];
+        let events = diff_promise_states(
+            &prev,
+            &curr,
+            diff_dt(),
+            crate::events::TransitionTrigger::Tick,
+        );
+        assert!(events.is_empty(), "appearance should not emit a transition");
     }
 }

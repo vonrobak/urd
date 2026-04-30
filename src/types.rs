@@ -108,7 +108,8 @@ impl Serialize for Interval {
 /// Whether a btrfs send is full (no parent snapshot) or incremental
 /// (parent snapshot already on destination). Used in size estimation,
 /// operations-log filtering, and health assessment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SendKind {
     /// No parent snapshot on the destination — sends the entire subvolume.
     Full,
@@ -641,7 +642,8 @@ impl LocalRetentionPolicy {
 // ── PlannedOperation ────────────────────────────────────────────────────
 
 /// Why a full send was planned instead of an incremental send.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum FullSendReason {
     /// First send to this drive for this subvolume (no external snapshots). Normal.
     FirstSend,
@@ -761,12 +763,18 @@ impl fmt::Display for PlannedOperation {
 // ── BackupPlan ──────────────────────────────────────────────────────────
 
 /// The complete output of the backup planner.
+///
+/// `events` carries the planner's audit-log emissions: full-send choices
+/// with reason, deferrals with scope, and retention rationale flowed up
+/// from `RetentionResult.events`. The executor persists them at run end
+/// via `state::record_events_best_effort`.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct BackupPlan {
     pub operations: Vec<PlannedOperation>,
     pub timestamp: NaiveDateTime,
     pub skipped: Vec<(String, String)>, // (subvolume_name, reason)
+    pub events: Vec<crate::events::Event>,
 }
 
 #[allow(dead_code)]
@@ -1162,6 +1170,7 @@ mod tests {
                 "subvol6-tmp".to_string(),
                 "interval not elapsed".to_string(),
             )],
+            events: Vec::new(),
         };
         let s = plan.summary();
         assert_eq!(s.snapshots, 1);
@@ -1407,6 +1416,7 @@ weekly = 4
 
         #[derive(Debug, Deserialize)]
         struct Wrapper {
+            #[allow(dead_code)] // deserialize-only validation; field is read by serde
             local_retention: LocalRetentionConfig,
         }
 
