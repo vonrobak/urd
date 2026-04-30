@@ -250,6 +250,7 @@ cargo run -- migrate                 # Migrate config to v1 schema
 | 111 | Config system architecture | Config structure, versioning (target, not yet implemented) |
 | 112 | SemVer and release workflow | Versioning, CHANGELOG, git tags, /release skill |
 | 113 | The Do-No-Harm invariant | Layered, probabilistic defense against Urd-induced host burden |
+| 114 | Structured event log | Typed change-and-decision history; complement to Prometheus gauges and UPI 030 drift_samples |
 
 ## Development Workflow
 
