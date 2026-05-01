@@ -127,6 +127,19 @@ impl SendKind {
             SendKind::Incremental => "send_incremental",
         }
     }
+
+    /// Parse the canonical DB form back into a `SendKind`. Returns `None`
+    /// for any string that does not match `as_db_str()` exactly. Used by
+    /// readers of the `drift_samples.send_type` column and for cross-table
+    /// joins against `operations.operation`.
+    #[must_use]
+    pub fn from_db_str(s: &str) -> Option<Self> {
+        match s {
+            "send_full" => Some(SendKind::Full),
+            "send_incremental" => Some(SendKind::Incremental),
+            _ => None,
+        }
+    }
 }
 
 // ── DriveEvent ──────────────────────────────────────────────────────────

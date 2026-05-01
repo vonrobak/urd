@@ -599,6 +599,8 @@ mod tests {
                     backup_success: *success,
                     pin_failures,
                     send_completed: true,
+                    churn_bytes_per_second: None,
+                    last_full_send_bytes: None,
                 })
                 .collect(),
         }

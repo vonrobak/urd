@@ -19,8 +19,9 @@ use crate::heartbeat;
 use crate::lock;
 use crate::metrics::{self, MetricsData, SubvolumeMetrics};
 use crate::output::{
-    BackupSummary, DeferredInfo, EmptyPlanExplanation, OutputMode, SendSummary, SkipCategory,
-    SkippedSubvolume, StatusAssessment, StructuredError, SubvolumeSummary, TransitionEvent,
+    BackupSummary, ChurnHeartbeatFields, ChurnRender, DeferredInfo, EmptyPlanExplanation,
+    OutputMode, SendSummary, SkipCategory, SkippedSubvolume, StatusAssessment, StructuredError,
+    SubvolumeSummary, TransitionEvent,
 };
 use crate::notify;
 use crate::plan::{self, FileSystemState, PlanFilters, RealFileSystemState};
@@ -116,12 +117,13 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
         } else {
             println!("{}", "Nothing to do.".dimmed());
         }
-        write_metrics_for_skipped(&config, &backup_plan, now, &fs_state)?;
         let heartbeat_now = chrono::Local::now().naive_local();
+        let churn_views = build_churn_views(&config, state_db.as_ref(), heartbeat_now);
+        write_metrics_for_skipped(&config, &backup_plan, now, &fs_state, &churn_views)?;
         let previous_hb = heartbeat::read(&config.general.heartbeat_file);
         let mut assessments = awareness::assess(&config, heartbeat_now, &fs_state);
         awareness::overlay_offsite_freshness(&mut assessments, &config);
-        let hb = heartbeat::build_empty(&config, heartbeat_now, &assessments);
+        let hb = heartbeat::build_empty(&config, heartbeat_now, &assessments, &churn_views);
         if let Err(e) = heartbeat::write(&config.general.heartbeat_file, &hb) {
             log::warn!("Failed to write heartbeat: {e}");
         }
@@ -290,17 +292,21 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
         h.join().ok();
     }
 
-    // Write metrics
-    write_metrics_after_execution(&config, &result, &backup_plan, now, &fs_state)?;
-
     // Read previous heartbeat BEFORE writing the new one (notification comparison).
     let previous_hb = heartbeat::read(&config.general.heartbeat_file);
 
-    // Write heartbeat (fresh timestamp — `now` is from before execution)
+    // Compute churn views from the just-recorded drift samples, then thread
+    // the same projection into both metrics and heartbeat (UPI 030).
     let heartbeat_now = chrono::Local::now().naive_local();
+    let churn_views = build_churn_views(&config, state_db.as_ref(), heartbeat_now);
+
+    // Write metrics
+    write_metrics_after_execution(&config, &result, &backup_plan, now, &fs_state, &churn_views)?;
+
+    // Write heartbeat (fresh timestamp — `now` is from before execution)
     let mut assessments = awareness::assess(&config, heartbeat_now, &fs_state);
     awareness::overlay_offsite_freshness(&mut assessments, &config);
-    let hb = heartbeat::build_from_run(&config, heartbeat_now, &result, &assessments);
+    let hb = heartbeat::build_from_run(&config, heartbeat_now, &result, &assessments, &churn_views);
     if let Err(e) = heartbeat::write(&config.general.heartbeat_file, &hb) {
         log::warn!("Failed to write heartbeat: {e}");
     }
@@ -583,6 +589,7 @@ fn write_metrics_after_execution(
     plan: &crate::types::BackupPlan,
     now: chrono::NaiveDateTime,
     fs_state: &dyn FileSystemState,
+    churn_views: &HashMap<String, ChurnHeartbeatFields>,
 ) -> anyhow::Result<()> {
     let now_ts = now.and_utc().timestamp();
     let mut subvolume_metrics = Vec::new();
@@ -598,6 +605,7 @@ fn write_metrics_after_execution(
 
         let local_count = count_local_snapshots(config, &sv_result.name, fs_state);
         let external_count = count_external_snapshots(config, &sv_result.name, fs_state);
+        let churn = churn_views.get(&sv_result.name).copied().unwrap_or_default();
 
         subvolume_metrics.push(SubvolumeMetrics {
             name: sv_result.name.clone(),
@@ -607,6 +615,8 @@ fn write_metrics_after_execution(
             local_snapshot_count: local_count,
             external_snapshot_count: external_count,
             send_type: sv_result.send_type.metric_value(),
+            churn_bytes_per_second: churn.churn_bytes_per_second,
+            last_full_send_bytes: churn.last_full_send_bytes,
         });
     }
 
@@ -622,6 +632,7 @@ fn write_metrics_after_execution(
         fs_state,
         &mut subvolume_metrics,
         &already_emitted,
+        churn_views,
     );
 
     // Carry forward last_success_timestamp from previous .prom file
@@ -636,6 +647,7 @@ fn write_metrics_for_skipped(
     plan: &crate::types::BackupPlan,
     now: chrono::NaiveDateTime,
     fs_state: &dyn FileSystemState,
+    churn_views: &HashMap<String, ChurnHeartbeatFields>,
 ) -> anyhow::Result<()> {
     let now_ts = now.and_utc().timestamp();
     let mut subvolume_metrics = Vec::new();
@@ -646,6 +658,7 @@ fn write_metrics_for_skipped(
         fs_state,
         &mut subvolume_metrics,
         &HashSet::new(),
+        churn_views,
     );
 
     // Carry forward last_success_timestamp from previous .prom file
@@ -653,6 +666,54 @@ fn write_metrics_for_skipped(
     metrics::apply_carried_forward_timestamps(&mut subvolume_metrics, &carried);
 
     write_global_metrics(config, now_ts, subvolume_metrics)
+}
+
+/// Compute heartbeat / metrics churn projections for every configured
+/// subvolume. UPI 030: queries `drift_samples` for each subvolume, runs the
+/// pure aggregator, and projects the render to two flat fields.
+///
+/// Returns an empty map when `state_db` is `None` (no churn data available).
+/// Errors querying drift samples for any one subvolume produce `Default`
+/// (both fields `None`) for that subvolume — best-effort, never fatal.
+fn build_churn_views(
+    config: &Config,
+    state_db: Option<&StateDb>,
+    now: chrono::NaiveDateTime,
+) -> HashMap<String, ChurnHeartbeatFields> {
+    let mut out: HashMap<String, ChurnHeartbeatFields> = HashMap::new();
+    let Some(db) = state_db else { return out };
+    let since = now - crate::drift::default_window();
+    for sv in config.subvolumes.iter() {
+        let rows = match db.drift_samples_for_subvolume(&sv.name, since) {
+            Ok(r) => r,
+            Err(e) => {
+                log::warn!("drift query failed for {}: {e}", sv.name);
+                continue;
+            }
+        };
+        let samples: Vec<crate::drift::DriftSample> =
+            rows.into_iter().map(StateDb::drift_row_to_sample).collect();
+        let estimate =
+            crate::drift::compute_rolling_churn(&samples, crate::drift::default_window(), now);
+        let fields = match crate::output::render_churn(&estimate) {
+            ChurnRender::NotMeasured => ChurnHeartbeatFields::default(),
+            ChurnRender::FirstMeasurement { bytes_per_second }
+            | ChurnRender::Incremental { bytes_per_second } => ChurnHeartbeatFields {
+                churn_bytes_per_second: Some(bytes_per_second),
+                last_full_send_bytes: None,
+            },
+            ChurnRender::FullSendOnly { .. } => ChurnHeartbeatFields {
+                churn_bytes_per_second: None,
+                last_full_send_bytes: estimate.latest_full_bytes,
+            },
+            ChurnRender::FullSendOnlyFirst { bytes } => ChurnHeartbeatFields {
+                churn_bytes_per_second: None,
+                last_full_send_bytes: Some(bytes),
+            },
+        };
+        out.insert(sv.name.clone(), fields);
+    }
+    out
 }
 
 fn build_empty_plan_explanation(
@@ -731,6 +792,7 @@ fn append_skipped_metrics(
     fs_state: &dyn FileSystemState,
     subvolume_metrics: &mut Vec<SubvolumeMetrics>,
     already_emitted: &HashSet<String>,
+    churn_views: &HashMap<String, ChurnHeartbeatFields>,
 ) {
     let mut seen = already_emitted.clone();
 
@@ -741,6 +803,7 @@ fn append_skipped_metrics(
 
         let local_count = count_local_snapshots(config, name, fs_state);
         let external_count = count_external_snapshots(config, name, fs_state);
+        let churn = churn_views.get(name).copied().unwrap_or_default();
 
         subvolume_metrics.push(SubvolumeMetrics {
             name: name.clone(),
@@ -750,6 +813,8 @@ fn append_skipped_metrics(
             local_snapshot_count: local_count,
             external_snapshot_count: external_count,
             send_type: 2,
+            churn_bytes_per_second: churn.churn_bytes_per_second,
+            last_full_send_bytes: churn.last_full_send_bytes,
         });
     }
 }

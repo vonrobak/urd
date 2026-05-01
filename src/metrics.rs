@@ -40,6 +40,13 @@ pub struct SubvolumeMetrics {
     pub external_snapshot_count: usize,
     /// 0 = full, 1 = incremental, 2 = no send
     pub send_type: u8,
+    /// Rolling time-windowed churn rate (UPI 030). Emitted only when `Some`.
+    /// Absent for cold-start subvolumes and for subvolumes whose latest
+    /// in-window send was a full send (use `last_full_send_bytes` instead).
+    pub churn_bytes_per_second: Option<f64>,
+    /// Bytes of the most recent in-window full send (UPI 030). Emitted only
+    /// when `Some`. Absent for incremental-only and cold-start subvolumes.
+    pub last_full_send_bytes: Option<u64>,
 }
 
 // ── Writer ──────────────────────────────────────────────────────────────
@@ -251,6 +258,52 @@ fn format_metrics(data: &MetricsData) -> String {
     )
     .unwrap();
 
+    // ── Drift telemetry (UPI 030) ─────────────────────────────────
+
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "# HELP backup_subvolume_churn_bytes_per_second Rolling time-windowed churn rate per subvolume (bytes/second). Absent for cold-start subvolumes and for subvolumes whose latest in-window send was a full send."
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "# TYPE backup_subvolume_churn_bytes_per_second gauge"
+    )
+    .unwrap();
+    for sv in &data.subvolumes {
+        if let Some(churn) = sv.churn_bytes_per_second {
+            writeln!(
+                out,
+                "backup_subvolume_churn_bytes_per_second{{subvolume=\"{}\"}} {}",
+                sv.name, churn
+            )
+            .unwrap();
+        }
+    }
+
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "# HELP backup_subvolume_last_full_send_bytes Bytes of the most recent in-window full send for subvolumes whose latest send was a full send (e.g., transient/storage_critical subvolumes). Absent for incremental-only and cold-start subvolumes."
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "# TYPE backup_subvolume_last_full_send_bytes gauge"
+    )
+    .unwrap();
+    for sv in &data.subvolumes {
+        if let Some(bytes) = sv.last_full_send_bytes {
+            writeln!(
+                out,
+                "backup_subvolume_last_full_send_bytes{{subvolume=\"{}\"}} {}",
+                sv.name, bytes
+            )
+            .unwrap();
+        }
+    }
+
     // ── Structured event counters ─────────────────────────────────
 
     let counters = &data.event_counters;
@@ -347,6 +400,8 @@ mod tests {
                     local_snapshot_count: 15,
                     external_snapshot_count: 14,
                     send_type: 1,
+                    churn_bytes_per_second: None,
+                    last_full_send_bytes: None,
                 },
                 SubvolumeMetrics {
                     name: "htpc-home".to_string(),
@@ -356,6 +411,8 @@ mod tests {
                     local_snapshot_count: 20,
                     external_snapshot_count: 18,
                     send_type: 2,
+                    churn_bytes_per_second: None,
+                    last_full_send_bytes: None,
                 },
             ],
             external_drive_mounted: true,
@@ -501,6 +558,8 @@ mod tests {
                 local_snapshot_count: 5,
                 external_snapshot_count: 3,
                 send_type: 1,
+                churn_bytes_per_second: None,
+                last_full_send_bytes: None,
             },
             SubvolumeMetrics {
                 name: "sv-b".to_string(),
@@ -510,6 +569,8 @@ mod tests {
                 local_snapshot_count: 5,
                 external_snapshot_count: 3,
                 send_type: 2,
+                churn_bytes_per_second: None,
+                last_full_send_bytes: None,
             },
             SubvolumeMetrics {
                 name: "sv-c".to_string(),
@@ -519,6 +580,8 @@ mod tests {
                 local_snapshot_count: 5,
                 external_snapshot_count: 3,
                 send_type: 2,
+                churn_bytes_per_second: None,
+                last_full_send_bytes: None,
             },
         ];
 
@@ -548,6 +611,8 @@ mod tests {
                 local_snapshot_count: 5,
                 external_snapshot_count: 3,
                 send_type: 1,
+                churn_bytes_per_second: None,
+                last_full_send_bytes: None,
             }],
             external_drive_mounted: true,
             external_free_bytes: 1_000_000,
@@ -566,6 +631,8 @@ mod tests {
             local_snapshot_count: 5,
             external_snapshot_count: 3,
             send_type: 2,
+            churn_bytes_per_second: None,
+            last_full_send_bytes: None,
         }];
         apply_carried_forward_timestamps(&mut svs, &carried);
 
@@ -610,6 +677,60 @@ mod tests {
         let output = format_metrics(&data);
         assert!(output.contains("urd_planner_full_sends_total{reason=\"first_send\"} 3"));
         assert!(output.contains("urd_planner_full_sends_total{reason=\"chain_broken\"} 1"));
+    }
+
+    // ── UPI 030: churn / last-full-send gauges ─────────────────────
+
+    #[test]
+    fn format_metrics_emits_churn_help_and_type_lines_unconditionally() {
+        let data = sample_data(); // both subvols have None
+        let output = format_metrics(&data);
+        assert!(output.contains("# HELP backup_subvolume_churn_bytes_per_second"));
+        assert!(output.contains("# TYPE backup_subvolume_churn_bytes_per_second gauge"));
+    }
+
+    #[test]
+    fn format_metrics_emits_churn_value_when_some() {
+        let mut data = sample_data();
+        data.subvolumes[0].churn_bytes_per_second = Some(1234.5);
+        let output = format_metrics(&data);
+        assert!(output.contains(
+            "backup_subvolume_churn_bytes_per_second{subvolume=\"subvol3-opptak\"} 1234.5"
+        ));
+    }
+
+    #[test]
+    fn format_metrics_omits_churn_value_line_when_none_but_keeps_help_type() {
+        let data = sample_data(); // all None
+        let output = format_metrics(&data);
+        assert!(output.contains("# HELP backup_subvolume_churn_bytes_per_second"));
+        assert!(!output.contains("backup_subvolume_churn_bytes_per_second{"));
+    }
+
+    #[test]
+    fn format_metrics_emits_last_full_send_bytes_help_and_type_lines_unconditionally() {
+        let data = sample_data();
+        let output = format_metrics(&data);
+        assert!(output.contains("# HELP backup_subvolume_last_full_send_bytes"));
+        assert!(output.contains("# TYPE backup_subvolume_last_full_send_bytes gauge"));
+    }
+
+    #[test]
+    fn format_metrics_emits_last_full_send_bytes_value_when_some() {
+        let mut data = sample_data();
+        data.subvolumes[0].last_full_send_bytes = Some(12_000_000_000);
+        let output = format_metrics(&data);
+        assert!(output.contains(
+            "backup_subvolume_last_full_send_bytes{subvolume=\"subvol3-opptak\"} 12000000000"
+        ));
+    }
+
+    #[test]
+    fn format_metrics_omits_last_full_send_bytes_value_line_when_none_but_keeps_help_type() {
+        let data = sample_data(); // all None
+        let output = format_metrics(&data);
+        assert!(output.contains("# HELP backup_subvolume_last_full_send_bytes"));
+        assert!(!output.contains("backup_subvolume_last_full_send_bytes{"));
     }
 
     #[test]

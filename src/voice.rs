@@ -2392,6 +2392,28 @@ fn render_doctor_interactive(data: &DoctorOutput) -> String {
         .ok();
     }
 
+    // Churn section (--thorough only). UPI 030.
+    if let Some(ref churn) = data.churn {
+        writeln!(out).ok();
+        let header = format!("Churn ({})", churn.window_label);
+        writeln!(out, "  {}", header.bold()).ok();
+
+        if churn.rows.is_empty() {
+            writeln!(out, "    {}", "(no subvolumes)".dimmed()).ok();
+        } else {
+            let name_width = churn
+                .rows
+                .iter()
+                .map(|r| r.name.len())
+                .max()
+                .unwrap_or(8)
+                .max(8);
+            for row in &churn.rows {
+                writeln!(out, "    {}", format_churn_row(&row.name, &row.state, name_width)).ok();
+            }
+        }
+    }
+
     // Verdict
     writeln!(out).ok();
     match data.verdict.status {
@@ -2468,6 +2490,53 @@ fn pluralize(count: usize, singular: &str, plural: &str) -> String {
         format!("{count} {plural}")
     }
 }
+
+/// Render one Churn-section row: padded name + per-state body.
+/// Helper for `render_doctor_interactive`'s --thorough Churn block (UPI 030).
+fn format_churn_row(
+    name: &str,
+    state: &crate::output::ChurnRender,
+    name_width: usize,
+) -> String {
+    use crate::output::ChurnRender::*;
+    use crate::types::ByteSize;
+    let pad = format!("{:width$}", name, width = name_width);
+    match state {
+        NotMeasured => format!("{pad}    {}", "not yet measured".dimmed()),
+        FirstMeasurement { bytes_per_second } => {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let per_day = (*bytes_per_second * 86_400.0) as u64;
+            format!(
+                "{pad}    ~{}/day        {}",
+                ByteSize(per_day),
+                "(first measurement, no trend yet)".dimmed()
+            )
+        }
+        Incremental { bytes_per_second } => {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let per_day = (*bytes_per_second * 86_400.0) as u64;
+            format!(
+                "{pad}    ~{}/day        {}",
+                ByteSize(per_day),
+                "(incremental)".dimmed()
+            )
+        }
+        FullSendOnly {
+            bytes_per_send,
+            seconds_between,
+        } => format!(
+            "{pad}    ~{}/full-send   {}",
+            ByteSize(*bytes_per_send),
+            format!("(every ~{})", format_duration_short(*seconds_between / 60)).dimmed()
+        ),
+        FullSendOnlyFirst { bytes } => format!(
+            "{pad}    ~{} recorded     {}",
+            ByteSize(*bytes),
+            "(one full send so far, no trend yet)".dimmed()
+        ),
+    }
+}
+
 
 fn render_doctor_check_section(out: &mut String, title: &str, checks: &[DoctorCheck]) {
     writeln!(out, "  {}", title.bold()).ok();
@@ -3288,6 +3357,7 @@ pub(crate) mod test_fixtures {
                 uptime: Some("3h 12m".to_string()),
             },
             verify: None,
+            churn: None,
             verdict: DoctorVerdict::healthy(),
         }
     }
@@ -7489,5 +7559,190 @@ mod tests {
     fn humanize_duration_zero_returns_less_than_one() {
         assert_eq!(humanize_duration(0), "<1s");
         assert_eq!(humanize_duration(-1), "<1s");
+    }
+
+    // ── UPI 030 Churn section ──────────────────────────────────────
+
+    fn churn_doctor_output(view: crate::output::DoctorChurnView) -> DoctorOutput {
+        let mut data = test_doctor_output();
+        data.churn = Some(view);
+        data
+    }
+
+    #[test]
+    fn doctor_thorough_renders_churn_section_with_header_and_disclaimer() {
+        let _color = color_guard(false);
+        let view = crate::output::DoctorChurnView {
+            window_label: "rolling 7 days, time-weighted; bursty subvolumes may differ"
+                .to_string(),
+            rows: vec![crate::output::DoctorChurnRow {
+                name: "home".to_string(),
+                state: crate::output::ChurnRender::NotMeasured,
+            }],
+        };
+        let output = render_doctor(&churn_doctor_output(view), OutputMode::Interactive);
+        assert!(
+            output.contains(
+                "Churn (rolling 7 days, time-weighted; bursty subvolumes may differ)"
+            ),
+            "missing header + disclaimer: {output}"
+        );
+    }
+
+    #[test]
+    fn doctor_thorough_churn_renders_first_measurement_label() {
+        let _color = color_guard(false);
+        let view = crate::output::DoctorChurnView {
+            window_label: "rolling 7 days".to_string(),
+            rows: vec![crate::output::DoctorChurnRow {
+                name: "home".to_string(),
+                state: crate::output::ChurnRender::FirstMeasurement {
+                    bytes_per_second: 1000.0,
+                },
+            }],
+        };
+        let output = render_doctor(&churn_doctor_output(view), OutputMode::Interactive);
+        assert!(
+            output.contains("(first measurement, no trend yet)"),
+            "missing first-measurement label: {output}"
+        );
+    }
+
+    #[test]
+    fn doctor_thorough_churn_renders_incremental_label() {
+        let _color = color_guard(false);
+        let view = crate::output::DoctorChurnView {
+            window_label: "rolling 7 days".to_string(),
+            rows: vec![crate::output::DoctorChurnRow {
+                name: "home".to_string(),
+                state: crate::output::ChurnRender::Incremental {
+                    bytes_per_second: 4_745.37, // ~410 MB/day
+                },
+            }],
+        };
+        let output = render_doctor(&churn_doctor_output(view), OutputMode::Interactive);
+        assert!(
+            output.contains("(incremental)"),
+            "missing incremental label: {output}"
+        );
+        assert!(output.contains("/day"), "missing /day suffix: {output}");
+    }
+
+    #[test]
+    fn doctor_thorough_churn_renders_full_send_only_label() {
+        let _color = color_guard(false);
+        let view = crate::output::DoctorChurnView {
+            window_label: "rolling 7 days".to_string(),
+            rows: vec![crate::output::DoctorChurnRow {
+                name: "htpc-root".to_string(),
+                state: crate::output::ChurnRender::FullSendOnly {
+                    bytes_per_send: 12_000_000_000,
+                    seconds_between: 86_400,
+                },
+            }],
+        };
+        let output = render_doctor(&churn_doctor_output(view), OutputMode::Interactive);
+        assert!(
+            output.contains("/full-send"),
+            "missing /full-send suffix: {output}"
+        );
+        assert!(output.contains("(every ~"), "missing every-~ label: {output}");
+    }
+
+    #[test]
+    fn doctor_thorough_churn_renders_full_send_only_first_label() {
+        let _color = color_guard(false);
+        let view = crate::output::DoctorChurnView {
+            window_label: "rolling 7 days".to_string(),
+            rows: vec![crate::output::DoctorChurnRow {
+                name: "transient".to_string(),
+                state: crate::output::ChurnRender::FullSendOnlyFirst {
+                    bytes: 12_000_000_000,
+                },
+            }],
+        };
+        let output = render_doctor(&churn_doctor_output(view), OutputMode::Interactive);
+        assert!(
+            output.contains("recorded"),
+            "missing recorded label: {output}"
+        );
+        assert!(
+            output.contains("(one full send so far, no trend yet)"),
+            "missing first-full-send disclaimer: {output}"
+        );
+    }
+
+    #[test]
+    fn doctor_thorough_churn_renders_not_measured_label() {
+        let _color = color_guard(false);
+        let view = crate::output::DoctorChurnView {
+            window_label: "rolling 7 days".to_string(),
+            rows: vec![crate::output::DoctorChurnRow {
+                name: "fresh".to_string(),
+                state: crate::output::ChurnRender::NotMeasured,
+            }],
+        };
+        let output = render_doctor(&churn_doctor_output(view), OutputMode::Interactive);
+        assert!(
+            output.contains("not yet measured"),
+            "missing not-yet-measured label: {output}"
+        );
+    }
+
+    #[test]
+    fn doctor_thorough_churn_renders_five_state_ladder_full_fixture() {
+        let _color = color_guard(false);
+        let view = crate::output::DoctorChurnView {
+            window_label: "rolling 7 days, time-weighted; bursty subvolumes may differ"
+                .to_string(),
+            rows: vec![
+                crate::output::DoctorChurnRow {
+                    name: "home".to_string(),
+                    state: crate::output::ChurnRender::Incremental {
+                        bytes_per_second: 4_745.37,
+                    },
+                },
+                crate::output::DoctorChurnRow {
+                    name: "rootbackup".to_string(),
+                    state: crate::output::ChurnRender::FirstMeasurement {
+                        bytes_per_second: 37_037.04,
+                    },
+                },
+                crate::output::DoctorChurnRow {
+                    name: "htpc-root".to_string(),
+                    state: crate::output::ChurnRender::FullSendOnly {
+                        bytes_per_send: 12_000_000_000,
+                        seconds_between: 86_400,
+                    },
+                },
+                crate::output::DoctorChurnRow {
+                    name: "transient".to_string(),
+                    state: crate::output::ChurnRender::FullSendOnlyFirst {
+                        bytes: 8_000_000_000,
+                    },
+                },
+                crate::output::DoctorChurnRow {
+                    name: "other".to_string(),
+                    state: crate::output::ChurnRender::NotMeasured,
+                },
+            ],
+        };
+        let output = render_doctor(&churn_doctor_output(view), OutputMode::Interactive);
+        assert!(output.contains("(incremental)"));
+        assert!(output.contains("(first measurement, no trend yet)"));
+        assert!(output.contains("/full-send"));
+        assert!(output.contains("(one full send so far, no trend yet)"));
+        assert!(output.contains("not yet measured"));
+    }
+
+    #[test]
+    fn doctor_without_thorough_omits_churn_section() {
+        let _color = color_guard(false);
+        // Default test_doctor_output has churn=None.
+        let output = render_doctor(&test_doctor_output(), OutputMode::Interactive);
+        assert!(
+            !output.contains("Churn ("),
+            "Churn section should not render when churn=None: {output}"
+        );
     }
 }

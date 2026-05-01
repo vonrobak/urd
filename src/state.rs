@@ -8,7 +8,7 @@ use crate::events::{Event, EventKind, EventPayload};
 // ── Types ───────────────────────────────────────────────────────────────
 
 pub struct StateDb {
-    conn: Connection,
+    pub(crate) conn: Connection,
 }
 
 /// Input record for writing a single operation to the database.
@@ -88,6 +88,22 @@ pub struct OperationRow {
     pub result: String,
     pub error_message: Option<String>,
     pub bytes_transferred: Option<i64>,
+}
+
+/// Persisted shape of a `drift_samples` row.
+/// `run_id` is `Option` so future test fixtures can construct rows without
+/// a run; production writes always have one. The send_kind serializes via
+/// `SendKind::as_db_str()` (`"send_full"` / `"send_incremental"`) — same
+/// strings as `operations.operation` for join compatibility (post-F7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DriftSampleRow {
+    pub run_id: Option<i64>,
+    pub subvolume: String,
+    pub sampled_at: chrono::NaiveDateTime,
+    pub seconds_since_prev_send: Option<i64>,
+    pub bytes_transferred: u64,
+    pub source_free_bytes: Option<u64>,
+    pub send_kind: crate::types::SendKind,
 }
 
 // ── StateDb ─────────────────────────────────────────────────────────────
@@ -179,7 +195,21 @@ impl StateDb {
                 CREATE INDEX IF NOT EXISTS events_by_subvolume_time
                     ON events(subvolume, occurred_at DESC) WHERE subvolume IS NOT NULL;
                 CREATE INDEX IF NOT EXISTS events_by_drive_time
-                    ON events(drive_label, occurred_at DESC) WHERE drive_label IS NOT NULL;",
+                    ON events(drive_label, occurred_at DESC) WHERE drive_label IS NOT NULL;
+
+                CREATE TABLE IF NOT EXISTS drift_samples (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id INTEGER REFERENCES runs(id),
+                    subvolume TEXT NOT NULL,
+                    sampled_at TEXT NOT NULL,
+                    seconds_since_prev_send INTEGER,
+                    bytes_transferred INTEGER NOT NULL,
+                    source_free_bytes INTEGER,
+                    send_type TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS drift_samples_by_subvolume_time
+                    ON drift_samples(subvolume, sampled_at DESC);",
             )
             .map_err(|e| UrdError::State(format!("failed to create schema: {e}")))?;
 
@@ -193,6 +223,70 @@ impl StateDb {
             );
         }
 
+        // One-shot drift_samples backfill from operations history.
+        // Best-effort and idempotent: a non-empty drift_samples table skips
+        // the work. Failures (e.g., older SQLite without window functions)
+        // log and continue — users without backfill simply see empty churn
+        // until one nightly run accumulates a fresh sample.
+        if let Err(e) = self.backfill_drift_samples_from_operations() {
+            log::warn!(
+                "drift_samples backfill failed (best-effort, continuing): {e}"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Idempotent one-shot: project history rows from `operations` JOIN
+    /// `runs` into `drift_samples`. Skipped when `drift_samples` is already
+    /// non-empty. Backfilled rows carry `source_free_bytes = NULL` (no
+    /// historical statvfs data) and `send_type` carrying the canonical DB
+    /// strings (`send_full` / `send_incremental`) directly from
+    /// `operations.operation`. The window-function-derived
+    /// `seconds_since_prev_send` chain partitions on `(subvolume, drive_label)`,
+    /// so historical multi-drive runs may produce one row per drive — the
+    /// time-weighted mean handles this. Going-forward writes are deduped
+    /// at the executor layer (one row per `(run_id, subvolume)`).
+    fn backfill_drift_samples_from_operations(&self) -> crate::error::Result<()> {
+        let any: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM drift_samples LIMIT 1", [], |row| {
+                row.get(0)
+            })
+            .map_err(|e| UrdError::State(format!("backfill probe: {e}")))?;
+        if any > 0 {
+            return Ok(());
+        }
+
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| UrdError::State(format!("backfill tx: {e}")))?;
+        tx.execute(
+            "INSERT INTO drift_samples (run_id, subvolume, sampled_at,
+                 seconds_since_prev_send, bytes_transferred,
+                 source_free_bytes, send_type)
+             SELECT
+                 o.run_id,
+                 o.subvolume,
+                 r.started_at,
+                 CAST((julianday(r.started_at) -
+                       julianday(LAG(r.started_at) OVER w)) * 86400 AS INTEGER),
+                 o.bytes_transferred,
+                 NULL,
+                 o.operation
+             FROM operations o
+             JOIN runs r ON o.run_id = r.id
+             WHERE o.operation IN ('send_full', 'send_incremental')
+               AND o.result = 'success'
+               AND o.bytes_transferred IS NOT NULL
+             WINDOW w AS (PARTITION BY o.subvolume, o.drive_label
+                          ORDER BY r.started_at)",
+            [],
+        )
+        .map_err(|e| UrdError::State(format!("backfill insert: {e}")))?;
+        tx.commit()
+            .map_err(|e| UrdError::State(format!("backfill commit: {e}")))?;
         Ok(())
     }
 
@@ -867,6 +961,126 @@ impl StateDb {
                 }))
             }
             None => Ok(None),
+        }
+    }
+
+    // ── Drift-sample methods ────────────────────────────────────────
+
+    /// Persist a drift sample. Best-effort per ADR-102 (telemetry must
+    /// never block backups): failures are logged and swallowed.
+    pub fn record_drift_sample_best_effort(&self, sample: &DriftSampleRow) {
+        if let Err(e) = self.record_drift_sample_inner(sample) {
+            log::warn!(
+                "drift sample write failed (best-effort, continuing): {e}"
+            );
+        }
+    }
+
+    fn record_drift_sample_inner(&self, sample: &DriftSampleRow) -> crate::error::Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO drift_samples (run_id, subvolume, sampled_at,
+                     seconds_since_prev_send, bytes_transferred,
+                     source_free_bytes, send_type)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    sample.run_id,
+                    sample.subvolume,
+                    sample.sampled_at.format("%Y-%m-%dT%H:%M:%S").to_string(),
+                    sample.seconds_since_prev_send,
+                    sample.bytes_transferred as i64,
+                    sample.source_free_bytes.map(|b| b as i64),
+                    sample.send_kind.as_db_str(),
+                ],
+            )
+            .map_err(|e| UrdError::State(format!("failed to record drift sample: {e}")))?;
+        Ok(())
+    }
+
+    /// Query drift samples for a subvolume since the given timestamp,
+    /// newest first. The `since` lower bound is inclusive so callers can
+    /// pass `now - default_window()` to walk the rolling window without
+    /// off-by-one fudging.
+    pub fn drift_samples_for_subvolume(
+        &self,
+        subvolume: &str,
+        since: chrono::NaiveDateTime,
+    ) -> crate::error::Result<Vec<DriftSampleRow>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT run_id, subvolume, sampled_at, seconds_since_prev_send,
+                        bytes_transferred, source_free_bytes, send_type
+                 FROM drift_samples
+                 WHERE subvolume = ?1 AND sampled_at >= ?2
+                 ORDER BY sampled_at DESC",
+            )
+            .map_err(|e| UrdError::State(format!("query failed: {e}")))?;
+
+        let since_str = since.format("%Y-%m-%dT%H:%M:%S").to_string();
+        let rows = stmt
+            .query_map(
+                rusqlite::params![subvolume, since_str],
+                Self::map_drift_sample_row,
+            )
+            .map_err(|e| UrdError::State(format!("query failed: {e}")))?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            match row {
+                Ok(Some(r)) => out.push(r),
+                Ok(None) => continue, // unparseable send_type, already logged
+                Err(e) => return Err(UrdError::State(format!("read drift row: {e}"))),
+            }
+        }
+        Ok(out)
+    }
+
+    fn map_drift_sample_row(row: &rusqlite::Row) -> rusqlite::Result<Option<DriftSampleRow>> {
+        let run_id: Option<i64> = row.get(0)?;
+        let subvolume: String = row.get(1)?;
+        let sampled_at_s: String = row.get(2)?;
+        let seconds_since_prev_send: Option<i64> = row.get(3)?;
+        let bytes_transferred: i64 = row.get(4)?;
+        let source_free_bytes: Option<i64> = row.get(5)?;
+        let send_type_s: String = row.get(6)?;
+
+        let sampled_at = match chrono::NaiveDateTime::parse_from_str(
+            &sampled_at_s,
+            "%Y-%m-%dT%H:%M:%S",
+        ) {
+            Ok(dt) => dt,
+            Err(e) => {
+                log::warn!("skipping drift row with unparseable sampled_at {sampled_at_s:?}: {e}");
+                return Ok(None);
+            }
+        };
+        let Some(send_kind) = crate::types::SendKind::from_db_str(&send_type_s) else {
+            log::warn!("skipping drift row with unknown send_type {send_type_s:?}");
+            return Ok(None);
+        };
+
+        Ok(Some(DriftSampleRow {
+            run_id,
+            subvolume,
+            sampled_at,
+            seconds_since_prev_send,
+            bytes_transferred: bytes_transferred.max(0) as u64,
+            source_free_bytes: source_free_bytes.map(|b| b.max(0) as u64),
+            send_kind,
+        }))
+    }
+
+    /// Convert a persisted row into the domain shape used by `drift::compute_rolling_churn`.
+    /// Drops the `run_id` and `subvolume` fields (the domain function does not use them).
+    #[must_use]
+    pub fn drift_row_to_sample(row: DriftSampleRow) -> crate::drift::DriftSample {
+        crate::drift::DriftSample {
+            sampled_at: row.sampled_at,
+            seconds_since_prev_send: row.seconds_since_prev_send,
+            bytes_transferred: row.bytes_transferred,
+            source_free_bytes: row.source_free_bytes,
+            send_kind: row.send_kind,
         }
     }
 
@@ -2359,5 +2573,408 @@ mod tests {
             }
             other => panic!("unexpected payload: {other:?}"),
         }
+    }
+
+    // ── Drift sample tests (UPI 030) ─────────────────────────────────
+
+    fn drift_dt(s: &str) -> chrono::NaiveDateTime {
+        chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S").unwrap()
+    }
+
+    fn make_drift_row(
+        run_id: Option<i64>,
+        subvol: &str,
+        sampled_at: &str,
+        secs_prev: Option<i64>,
+        bytes: u64,
+        free: Option<u64>,
+        kind: crate::types::SendKind,
+    ) -> DriftSampleRow {
+        DriftSampleRow {
+            run_id,
+            subvolume: subvol.to_string(),
+            sampled_at: drift_dt(sampled_at),
+            seconds_since_prev_send: secs_prev,
+            bytes_transferred: bytes,
+            source_free_bytes: free,
+            send_kind: kind,
+        }
+    }
+
+    #[test]
+    fn drift_samples_table_created_on_open() {
+        let db = StateDb::open_memory().unwrap();
+        let count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM drift_samples", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn drift_samples_index_created() {
+        let db = StateDb::open_memory().unwrap();
+        let n: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='index' AND name='drift_samples_by_subvolume_time'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn record_drift_sample_persists_one() {
+        let db = StateDb::open_memory().unwrap();
+        let run_id = db.begin_run("full").unwrap();
+        let row = make_drift_row(
+            Some(run_id),
+            "home",
+            "2026-04-30T04:00:00",
+            Some(86_400),
+            123_456_789,
+            Some(1_000_000_000),
+            crate::types::SendKind::Incremental,
+        );
+        db.record_drift_sample_best_effort(&row);
+        let count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM drift_samples", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+
+        let stored: (i64, String, i64, i64, i64, String) = db
+            .conn
+            .query_row(
+                "SELECT run_id, subvolume, seconds_since_prev_send,
+                        bytes_transferred, source_free_bytes, send_type
+                 FROM drift_samples LIMIT 1",
+                [],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(stored.0, run_id);
+        assert_eq!(stored.1, "home");
+        assert_eq!(stored.2, 86_400);
+        assert_eq!(stored.3, 123_456_789);
+        assert_eq!(stored.4, 1_000_000_000);
+        assert_eq!(stored.5, "send_incremental");
+    }
+
+    #[test]
+    fn record_drift_sample_with_null_free_bytes_persists() {
+        let db = StateDb::open_memory().unwrap();
+        let run_id = db.begin_run("full").unwrap();
+        let row = make_drift_row(
+            Some(run_id),
+            "home",
+            "2026-04-30T04:00:00",
+            Some(86_400),
+            1_000_000,
+            None,
+            crate::types::SendKind::Incremental,
+        );
+        db.record_drift_sample_best_effort(&row);
+
+        let free: Option<i64> = db
+            .conn
+            .query_row(
+                "SELECT source_free_bytes FROM drift_samples LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(free, None);
+    }
+
+    #[test]
+    fn record_drift_sample_with_null_seconds_since_prev_send_persists() {
+        let db = StateDb::open_memory().unwrap();
+        let run_id = db.begin_run("full").unwrap();
+        let row = make_drift_row(
+            Some(run_id),
+            "home",
+            "2026-04-30T04:00:00",
+            None,
+            1_000_000,
+            None,
+            crate::types::SendKind::Full,
+        );
+        db.record_drift_sample_best_effort(&row);
+
+        let secs: Option<i64> = db
+            .conn
+            .query_row(
+                "SELECT seconds_since_prev_send FROM drift_samples LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(secs, None);
+    }
+
+    #[test]
+    fn record_drift_sample_best_effort_swallows_errors_on_closed_db() {
+        // Force a write failure by passing a foreign-run-id that violates
+        // the FK reference once a CHECK is added — for now, simulate via
+        // dropping the table first.
+        let db = StateDb::open_memory().unwrap();
+        db.conn.execute("DROP TABLE drift_samples", []).unwrap();
+        let row = make_drift_row(
+            None,
+            "home",
+            "2026-04-30T04:00:00",
+            Some(86_400),
+            1_000_000,
+            None,
+            crate::types::SendKind::Incremental,
+        );
+        // Must not panic.
+        db.record_drift_sample_best_effort(&row);
+    }
+
+    #[test]
+    fn drift_samples_for_subvolume_filters_by_name_and_since() {
+        let db = StateDb::open_memory().unwrap();
+        let run_id = db.begin_run("full").unwrap();
+        // Three subvolumes, several time-points.
+        let rows = vec![
+            make_drift_row(
+                Some(run_id),
+                "home",
+                "2026-04-30T04:00:00",
+                Some(86_400),
+                100,
+                None,
+                crate::types::SendKind::Incremental,
+            ),
+            make_drift_row(
+                Some(run_id),
+                "home",
+                "2026-04-25T04:00:00",
+                Some(86_400),
+                200,
+                None,
+                crate::types::SendKind::Incremental,
+            ),
+            make_drift_row(
+                Some(run_id),
+                "home",
+                "2026-04-15T04:00:00", // older than since
+                Some(86_400),
+                300,
+                None,
+                crate::types::SendKind::Incremental,
+            ),
+            make_drift_row(
+                Some(run_id),
+                "photos",
+                "2026-04-30T04:00:00",
+                Some(86_400),
+                400,
+                None,
+                crate::types::SendKind::Incremental,
+            ),
+        ];
+        for r in &rows {
+            db.record_drift_sample_best_effort(r);
+        }
+
+        let since = drift_dt("2026-04-20T00:00:00");
+        let result = db.drift_samples_for_subvolume("home", since).unwrap();
+        assert_eq!(result.len(), 2);
+        // Newest first.
+        assert_eq!(result[0].sampled_at, drift_dt("2026-04-30T04:00:00"));
+        assert_eq!(result[1].sampled_at, drift_dt("2026-04-25T04:00:00"));
+    }
+
+    #[test]
+    fn drift_samples_for_subvolume_returns_empty_vec_when_none() {
+        let db = StateDb::open_memory().unwrap();
+        let result = db
+            .drift_samples_for_subvolume("nope", drift_dt("2026-01-01T00:00:00"))
+            .unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn drift_sample_send_type_string_matches_operations_operation_string() {
+        // Round-trip a drift sample with SendKind::Full and an operation row
+        // with operation="send_full" — the persisted strings must be byte-equal
+        // (post-F7: drift_samples.send_type joins operations.operation).
+        let db = StateDb::open_memory().unwrap();
+        let run_id = db.begin_run("full").unwrap();
+        db.record_operation(&OperationRecord {
+            run_id,
+            subvolume: "home".to_string(),
+            operation: "send_full".to_string(),
+            drive_label: Some("WD-18TB".to_string()),
+            duration_secs: Some(10.0),
+            result: "success".to_string(),
+            error_message: None,
+            bytes_transferred: Some(1_000_000),
+        })
+        .unwrap();
+        db.record_drift_sample_best_effort(&make_drift_row(
+            Some(run_id),
+            "home",
+            "2026-04-30T04:00:00",
+            Some(86_400),
+            1_000_000,
+            None,
+            crate::types::SendKind::Full,
+        ));
+        let op_str: String = db
+            .conn
+            .query_row("SELECT operation FROM operations LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        let drift_str: String = db
+            .conn
+            .query_row("SELECT send_type FROM drift_samples LIMIT 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(op_str, drift_str);
+        assert_eq!(op_str, "send_full");
+    }
+
+    #[test]
+    fn backfill_populates_drift_samples_from_operations_history() {
+        // Open one DB to seed runs + operations.
+        let db = StateDb::open_memory().unwrap();
+
+        // Seed three runs with operations on a single drive chain so the
+        // window-function-derived seconds_since_prev_send is meaningful.
+        db.conn
+            .execute(
+                "INSERT INTO runs (id, started_at, mode, result)
+                 VALUES (1, '2026-04-15T04:00:00', 'full', 'success'),
+                        (2, '2026-04-22T04:00:00', 'full', 'success'),
+                        (3, '2026-04-29T04:00:00', 'full', 'success')",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO operations (run_id, subvolume, operation, drive_label,
+                                         result, bytes_transferred)
+                 VALUES (1, 'home', 'send_full', 'WD-18TB', 'success', 1000000),
+                        (2, 'home', 'send_incremental', 'WD-18TB', 'success', 200000),
+                        (3, 'home', 'send_incremental', 'WD-18TB', 'success', 300000),
+                        (1, 'home', 'snapshot', 'WD-18TB', 'success', NULL),
+                        (2, 'home', 'send_incremental', 'WD-18TB', 'failure', NULL)",
+                [],
+            )
+            .unwrap();
+
+        // Drop drift_samples so backfill runs fresh on next init_schema call.
+        db.conn.execute("DELETE FROM drift_samples", []).unwrap();
+
+        // Re-trigger backfill (idempotent guard sees empty table → runs).
+        db.backfill_drift_samples_from_operations().unwrap();
+
+        // Three successful sends → three rows.
+        let count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM drift_samples", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 3);
+
+        // All backfilled rows have NULL source_free_bytes.
+        let null_free: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM drift_samples WHERE source_free_bytes IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(null_free, 3);
+
+        // First in chain has NULL seconds_since_prev_send (no prior).
+        let first_secs: Option<i64> = db
+            .conn
+            .query_row(
+                "SELECT seconds_since_prev_send FROM drift_samples
+                 ORDER BY sampled_at ASC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(first_secs, None);
+
+        // Second has 7-day interval = 604_800.
+        let second_secs: Option<i64> = db
+            .conn
+            .query_row(
+                "SELECT seconds_since_prev_send FROM drift_samples
+                 ORDER BY sampled_at ASC LIMIT 1 OFFSET 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(second_secs, Some(604_800));
+
+        // send_type strings match operations.operation directly.
+        let kinds: Vec<String> = db
+            .conn
+            .prepare("SELECT send_type FROM drift_samples ORDER BY sampled_at ASC")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            kinds,
+            vec!["send_full", "send_incremental", "send_incremental"]
+        );
+    }
+
+    #[test]
+    fn backfill_idempotent_when_drift_samples_already_populated() {
+        let db = StateDb::open_memory().unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO runs (id, started_at, mode, result)
+                 VALUES (1, '2026-04-15T04:00:00', 'full', 'success')",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO operations (run_id, subvolume, operation, drive_label,
+                                         result, bytes_transferred)
+                 VALUES (1, 'home', 'send_full', 'WD-18TB', 'success', 1000000)",
+                [],
+            )
+            .unwrap();
+
+        // First backfill: writes one row.
+        db.backfill_drift_samples_from_operations().unwrap();
+        let count_after_first: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM drift_samples", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count_after_first, 1);
+
+        // Second backfill: must be a no-op.
+        db.backfill_drift_samples_from_operations().unwrap();
+        let count_after_second: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM drift_samples", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count_after_second, 1);
     }
 }

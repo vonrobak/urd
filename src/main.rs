@@ -4,6 +4,7 @@ mod chain;
 mod cli;
 mod commands;
 mod config;
+mod drift;
 mod drives;
 mod error;
 mod events;

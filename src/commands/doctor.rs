@@ -240,6 +240,13 @@ pub fn run(config: Config, args: DoctorArgs, output_mode: OutputMode) -> anyhow:
         error_count += v.fail_count as usize;
     }
 
+    // ── 5.5 Churn (UPI 030 — only with --thorough) ────────────────
+    let churn_view = if args.thorough {
+        Some(build_doctor_churn_view(&config))
+    } else {
+        None
+    };
+
     // ── 6. Verdict ────────────────────────────────────────────────
     let degraded_count = data_safety
         .iter()
@@ -266,10 +273,151 @@ pub fn run(config: Config, args: DoctorArgs, output_mode: OutputMode) -> anyhow:
         data_safety,
         sentinel,
         verify: verify_output,
+        churn: churn_view,
         verdict,
     };
 
     print!("{}", voice::render_doctor(&output, output_mode));
 
     Ok(())
+}
+
+/// Build the `--thorough` Churn-section view from `drift_samples` history.
+///
+/// Opens the state DB once; falls back to all-NotMeasured when unavailable.
+/// Best-effort per-subvolume: a query failure renders as `NotMeasured`.
+fn build_doctor_churn_view(config: &Config) -> crate::output::DoctorChurnView {
+    let state_db = StateDb::open(&config.general.state_db).ok();
+    let now = chrono::Local::now().naive_local();
+    build_doctor_churn_view_inner(config, state_db.as_ref(), now)
+}
+
+/// Pure-ish core (still does DB I/O via `state_db`) — extracted so unit tests
+/// can pass an in-memory `StateDb` and a fixed `now`.
+fn build_doctor_churn_view_inner(
+    config: &Config,
+    state_db: Option<&StateDb>,
+    now: chrono::NaiveDateTime,
+) -> crate::output::DoctorChurnView {
+    use crate::output::{DoctorChurnRow, DoctorChurnView};
+
+    let since = now - crate::drift::default_window();
+    let rows: Vec<DoctorChurnRow> = config
+        .subvolumes
+        .iter()
+        .map(|sv| {
+            let state = state_db
+                .and_then(|db| db.drift_samples_for_subvolume(&sv.name, since).ok())
+                .map(|rows| {
+                    let samples: Vec<crate::drift::DriftSample> =
+                        rows.into_iter().map(StateDb::drift_row_to_sample).collect();
+                    let estimate = crate::drift::compute_rolling_churn(
+                        &samples,
+                        crate::drift::default_window(),
+                        now,
+                    );
+                    crate::output::render_churn(&estimate)
+                })
+                .unwrap_or(crate::output::ChurnRender::NotMeasured);
+            DoctorChurnRow {
+                name: sv.name.clone(),
+                state,
+            }
+        })
+        .collect();
+
+    DoctorChurnView {
+        window_label: "rolling 7 days, time-weighted; bursty subvolumes may differ".to_string(),
+        rows,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg() -> Config {
+        let toml_str = r#"
+drives = []
+
+[general]
+state_db = "/tmp/urd-doctor-test/urd.db"
+metrics_file = "/tmp/urd-doctor-test/backup.prom"
+log_dir = "/tmp/urd-doctor-test"
+heartbeat_file = "/tmp/urd-doctor-test/heartbeat.json"
+
+[local_snapshots]
+roots = [
+  { path = "/snap", subvolumes = ["alpha", "beta", "gamma"] }
+]
+
+[defaults]
+snapshot_interval = "1h"
+send_interval = "4h"
+[defaults.local_retention]
+hourly = 24
+[defaults.external_retention]
+daily = 30
+
+[[subvolumes]]
+name = "alpha"
+short_name = "alpha"
+source = "/data/alpha"
+
+[[subvolumes]]
+name = "beta"
+short_name = "beta"
+source = "/data/beta"
+
+[[subvolumes]]
+name = "gamma"
+short_name = "gamma"
+source = "/data/gamma"
+"#;
+        toml::from_str(toml_str).unwrap()
+    }
+
+    #[test]
+    fn doctor_thorough_populates_churn_view_for_all_subvolumes() {
+        let config = cfg();
+        let db = StateDb::open_memory().unwrap();
+        let now = chrono::NaiveDateTime::parse_from_str(
+            "2026-05-01T12:00:00",
+            "%Y-%m-%dT%H:%M:%S",
+        )
+        .unwrap();
+
+        // Seed alpha + beta with a successful incremental sample each.
+        // Leave gamma without any samples so it renders as NotMeasured.
+        for name in &["alpha", "beta"] {
+            db.record_drift_sample_best_effort(&crate::state::DriftSampleRow {
+                run_id: None,
+                subvolume: (*name).to_string(),
+                sampled_at: now - chrono::Duration::days(1),
+                seconds_since_prev_send: Some(86_400),
+                bytes_transferred: 1_000_000,
+                source_free_bytes: None,
+                send_kind: crate::types::SendKind::Incremental,
+            });
+        }
+
+        let view = build_doctor_churn_view_inner(&config, Some(&db), now);
+        assert_eq!(view.rows.len(), 3);
+        assert_eq!(view.rows[0].name, "alpha");
+        assert_eq!(view.rows[1].name, "beta");
+        assert_eq!(view.rows[2].name, "gamma");
+        assert!(matches!(
+            view.rows[2].state,
+            crate::output::ChurnRender::NotMeasured
+        ));
+        // alpha and beta each have one incremental → FirstMeasurement.
+        assert!(matches!(
+            view.rows[0].state,
+            crate::output::ChurnRender::FirstMeasurement { .. }
+        ));
+        assert!(matches!(
+            view.rows[1].state,
+            crate::output::ChurnRender::FirstMeasurement { .. }
+        ));
+    }
 }
