@@ -21,6 +21,8 @@ mod sentinel_runner;
 mod state;
 mod types;
 mod voice;
+#[cfg(test)]
+mod voice_contract;
 mod voice_events;
 
 use std::io::IsTerminal;
