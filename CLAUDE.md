@@ -66,6 +66,7 @@ All backup logic flows through: config -> plan -> execute. No exceptions.
 | `heartbeat.rs` | Write JSON health signal after each run | Block backups on failure |
 | `metrics.rs` | Write Prometheus `.prom` files | Read metrics |
 | `notify.rs` | Compute and dispatch notifications | Decide promise states (uses awareness) |
+| `drift.rs` | Pure: rolling time-windowed churn aggregation from `drift_samples` (UPI 030) | Perform I/O or persist |
 | `drives.rs` | Detect mounted drives, UUID fingerprinting, check space | Mount/unmount drives |
 | `output.rs` | Define structured output types | Render text (voice.rs does that) |
 | `voice.rs` | Render structured output as text (mythic voice) | Perform I/O or compute state |

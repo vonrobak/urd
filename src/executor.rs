@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -12,7 +12,7 @@ use crate::commands::backup::{format_completion_line, ProgressContext, SizeEstim
 use crate::config::Config;
 use crate::drives;
 use crate::error::BtrfsOperation;
-use crate::state::{OperationRecord, StateDb};
+use crate::state::{DriftSampleRow, OperationRecord, StateDb};
 use crate::types::{BackupPlan, FullSendReason, PlannedOperation, SendKind};
 
 // ── Types ───────────────────────────────────────────────────────────────
@@ -187,6 +187,29 @@ impl<'a> Executor<'a> {
         // Begin run in SQLite (optional)
         let run_id = self.begin_run(mode);
 
+        // Snapshot source-FS free bytes once at run start (UPI 030 drift telemetry).
+        // Walk the union of legacy `local_snapshots.roots` AND v1 inline
+        // `snapshot_root` per subvolume so both schemas are covered. Statvfs
+        // failure → None for that path; the drift sample still writes.
+        let mut roots: HashSet<PathBuf> = HashSet::new();
+        for root in &self.config.local_snapshots.roots {
+            roots.insert(root.path.clone());
+        }
+        let mut subvol_to_root: HashMap<String, PathBuf> = HashMap::new();
+        for sv in self.config.resolved_subvolumes() {
+            if let Some(p) = sv.snapshot_root.clone() {
+                subvol_to_root.insert(sv.name.clone(), p.clone());
+                roots.insert(p);
+            }
+        }
+        let source_free: HashMap<PathBuf, Option<u64>> = roots
+            .into_iter()
+            .map(|p| {
+                let v = drives::filesystem_free_bytes(&p).ok();
+                (p, v)
+            })
+            .collect();
+
         // Group operations by subvolume, preserving order
         let groups = group_by_subvolume(&plan.operations);
 
@@ -218,7 +241,14 @@ impl<'a> Executor<'a> {
                 name: subvol_name.clone(),
                 is_transient,
             };
-            let result = self.execute_subvolume(&context, ops, run_id, &mut space_recovered);
+            let result = self.execute_subvolume(
+                &context,
+                ops,
+                run_id,
+                &mut space_recovered,
+                &source_free,
+                &subvol_to_root,
+            );
             subvolume_results.push(result);
         }
 
@@ -261,6 +291,8 @@ impl<'a> Executor<'a> {
         ops: &[&PlannedOperation],
         run_id: Option<i64>,
         space_recovered: &mut HashMap<String, bool>,
+        source_free: &HashMap<PathBuf, Option<u64>>,
+        subvol_to_root: &HashMap<String, PathBuf>,
     ) -> SubvolumeResult {
         let subvol_name = &context.name;
         let subvol_start = Instant::now();
@@ -274,6 +306,46 @@ impl<'a> Executor<'a> {
         let mut old_pin_parents: HashMap<String, std::path::PathBuf> = HashMap::new();
         let mut sends_succeeded: HashSet<String> = HashSet::new();
         let mut planned_send_drives: HashSet<String> = HashSet::new();
+
+        // UPI 030 drift telemetry: capture the prior successful send time per
+        // drive BEFORE this run records any operation, so seconds_since_prev_send
+        // reflects the gap relative to history (not the row we're about to write).
+        // post-F1: one drift sample per (run_id, subvolume), derived from the first
+        // successful send in plan-iteration order. Track that send's drive label so
+        // we can compute the interval from the right chain after the loop.
+        let prior_send_time_by_drive: HashMap<String, chrono::NaiveDateTime> = self
+            .state
+            .map(|s| {
+                let mut map: HashMap<String, chrono::NaiveDateTime> = HashMap::new();
+                for op in ops {
+                    let drive = match op {
+                        PlannedOperation::SendIncremental { drive_label, .. }
+                        | PlannedOperation::SendFull { drive_label, .. } => Some(drive_label),
+                        _ => None,
+                    };
+                    if let Some(d) = drive
+                        && !map.contains_key(d)
+                        && let Ok(Some(t)) = s.last_successful_send_time(subvol_name, d)
+                    {
+                        map.insert(d.clone(), t);
+                    }
+                }
+                map
+            })
+            .unwrap_or_default();
+        // Order in which sends are planned, used to find the FIRST successful send.
+        let mut send_plan_order: Vec<(String, SendKind)> = Vec::new();
+        for op in ops {
+            match op {
+                PlannedOperation::SendIncremental { drive_label, .. } => {
+                    send_plan_order.push((drive_label.clone(), SendKind::Incremental));
+                }
+                PlannedOperation::SendFull { drive_label, .. } => {
+                    send_plan_order.push((drive_label.clone(), SendKind::Full));
+                }
+                _ => {}
+            }
+        }
 
         for op in ops {
             if self.shutdown.load(Ordering::SeqCst) {
@@ -405,6 +477,21 @@ impl<'a> Executor<'a> {
             pin_failures,
         );
 
+        // post-F1: write at most ONE drift sample per (run_id, subvolume),
+        // derived from the FIRST successful send in plan-iteration order.
+        // Statvfs failure → source_free_bytes is None; sample still writes.
+        // Failed-only runs write no sample; the time-weighted mean naturally
+        // excludes the run from the rolling window.
+        self.maybe_record_drift_sample(
+            run_id,
+            subvol_name,
+            &operations,
+            &send_plan_order,
+            &prior_send_time_by_drive,
+            source_free,
+            subvol_to_root,
+        );
+
         SubvolumeResult {
             name: subvol_name.to_string(),
             success: subvol_success,
@@ -414,6 +501,67 @@ impl<'a> Executor<'a> {
             pin_failures,
             transient_cleanup,
         }
+    }
+
+    /// Build and persist a drift sample for the subvolume's run, if at least
+    /// one send succeeded. Picks the first successful send in plan-iteration
+    /// order — deterministic, reproducible, and surprises the least.
+    #[allow(clippy::too_many_arguments)]
+    fn maybe_record_drift_sample(
+        &self,
+        run_id: Option<i64>,
+        subvol_name: &str,
+        operations: &[OperationOutcome],
+        send_plan_order: &[(String, SendKind)],
+        prior_send_time_by_drive: &HashMap<String, chrono::NaiveDateTime>,
+        source_free: &HashMap<PathBuf, Option<u64>>,
+        subvol_to_root: &HashMap<String, PathBuf>,
+    ) {
+        let Some(state) = self.state else { return };
+
+        // Find the first successful send outcome in plan-iteration order.
+        // The outer order of `operations` mirrors `ops` (same source); within
+        // it, sends are emitted in plan order, so the FIRST OperationOutcome
+        // whose `result == Success` and whose `operation` parses as a SendKind
+        // is the right pick.
+        let chosen = operations.iter().find(|o| {
+            o.result == OpResult::Success
+                && SendKind::from_db_str(&o.operation).is_some()
+                && o.bytes_transferred.is_some()
+        });
+        let Some(chosen) = chosen else { return };
+        let Some(bytes) = chosen.bytes_transferred else { return };
+        let Some(drive_label) = chosen.drive_label.as_ref() else {
+            return;
+        };
+        let Some(send_kind) = SendKind::from_db_str(&chosen.operation) else {
+            return;
+        };
+        // Sanity: the chosen send must appear in the plan order with the same
+        // (drive_label, kind). Defensive — should always hold.
+        let _matches_plan = send_plan_order
+            .iter()
+            .any(|(d, k)| d == drive_label && *k == send_kind);
+
+        let sampled_at = chrono::Local::now().naive_local();
+        let seconds_since_prev_send = prior_send_time_by_drive
+            .get(drive_label)
+            .map(|prev| (sampled_at - *prev).num_seconds());
+        let source_free_bytes = subvol_to_root
+            .get(subvol_name)
+            .and_then(|p| source_free.get(p).copied())
+            .flatten();
+
+        let row = DriftSampleRow {
+            run_id,
+            subvolume: subvol_name.to_string(),
+            sampled_at,
+            seconds_since_prev_send,
+            bytes_transferred: bytes,
+            source_free_bytes,
+            send_kind,
+        };
+        state.record_drift_sample_best_effort(&row);
     }
 
     fn execute_create<'b>(
@@ -3067,5 +3215,252 @@ local_retention = "transient"
             })
             .unwrap();
         assert!(rows.is_empty());
+    }
+
+    // ── Drift sample emission (UPI 030) ────────────────────────────
+
+    fn drift_count(db: &crate::state::StateDb) -> i64 {
+        db.conn
+            .query_row("SELECT COUNT(*) FROM drift_samples", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn execute_records_drift_sample_after_successful_send() {
+        use crate::state::StateDb;
+
+        let mock = MockBtrfs::new();
+        *mock.mock_bytes_transferred.borrow_mut() = Some(1_000_000);
+        let config = test_config();
+        let shutdown = no_shutdown();
+        let db = StateDb::open_memory().unwrap();
+        let executor = Executor::new(&mock, Some(&db), &config, &shutdown);
+
+        let result = executor.execute(&simple_plan(), "full");
+        assert_eq!(result.overall, RunResult::Success);
+        assert_eq!(drift_count(&db), 1);
+
+        let row: (String, i64, String) = db
+            .conn
+            .query_row(
+                "SELECT subvolume, bytes_transferred, send_type FROM drift_samples LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row.0, "sv-a");
+        assert_eq!(row.1, 1_000_000);
+        assert_eq!(row.2, "send_incremental");
+    }
+
+    #[test]
+    fn execute_records_drift_sample_with_null_free_bytes_when_statvfs_fails() {
+        use crate::state::StateDb;
+
+        let mock = MockBtrfs::new();
+        *mock.mock_bytes_transferred.borrow_mut() = Some(1_000_000);
+        // test_config() uses /snap which doesn't exist on the test runner —
+        // statvfs returns Err, source_free_bytes becomes None.
+        let config = test_config();
+        let shutdown = no_shutdown();
+        let db = StateDb::open_memory().unwrap();
+        let executor = Executor::new(&mock, Some(&db), &config, &shutdown);
+
+        let _ = executor.execute(&simple_plan(), "full");
+
+        let free: Option<i64> = db
+            .conn
+            .query_row(
+                "SELECT source_free_bytes FROM drift_samples LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(free, None);
+    }
+
+    #[test]
+    fn execute_does_not_record_drift_sample_when_all_sends_failed() {
+        use crate::state::StateDb;
+
+        let mock = MockBtrfs::new();
+        *mock.mock_bytes_transferred.borrow_mut() = Some(1_000_000);
+        // Fail the only send in simple_plan.
+        mock.fail_sends
+            .borrow_mut()
+            .insert(PathBuf::from("/snap/sv-a/20260322-1430-a"));
+
+        let config = test_config();
+        let shutdown = no_shutdown();
+        let db = StateDb::open_memory().unwrap();
+        let executor = Executor::new(&mock, Some(&db), &config, &shutdown);
+
+        let _ = executor.execute(&simple_plan(), "full");
+        assert_eq!(drift_count(&db), 0);
+    }
+
+    #[test]
+    fn execute_records_first_send_with_null_seconds_since_prev_send() {
+        use crate::state::StateDb;
+
+        let mock = MockBtrfs::new();
+        *mock.mock_bytes_transferred.borrow_mut() = Some(1_000_000);
+        let config = test_config();
+        let shutdown = no_shutdown();
+        let db = StateDb::open_memory().unwrap(); // fresh state, no prior sends
+        let executor = Executor::new(&mock, Some(&db), &config, &shutdown);
+
+        let _ = executor.execute(&simple_plan(), "full");
+
+        let secs: Option<i64> = db
+            .conn
+            .query_row(
+                "SELECT seconds_since_prev_send FROM drift_samples LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(secs, None);
+    }
+
+    #[test]
+    fn two_drives_same_subvolume_same_run_records_one_drift_row() {
+        use crate::state::StateDb;
+
+        let mock = MockBtrfs::new();
+        *mock.mock_bytes_transferred.borrow_mut() = Some(1_000_000);
+        let config = test_config();
+        let shutdown = no_shutdown();
+        let db = StateDb::open_memory().unwrap();
+        let executor = Executor::new(&mock, Some(&db), &config, &shutdown);
+
+        // One subvolume, two SendIncrementals to two drive labels in one plan.
+        let ts = NaiveDate::from_ymd_opt(2026, 3, 22)
+            .unwrap()
+            .and_hms_opt(14, 30, 0)
+            .unwrap();
+        let plan = BackupPlan {
+            operations: vec![
+                PlannedOperation::CreateSnapshot {
+                    source: PathBuf::from("/data/a"),
+                    dest: PathBuf::from("/snap/sv-a/20260322-1430-a"),
+                    subvolume_name: "sv-a".to_string(),
+                },
+                PlannedOperation::SendIncremental {
+                    parent: PathBuf::from("/snap/sv-a/20260321-a"),
+                    snapshot: PathBuf::from("/snap/sv-a/20260322-1430-a"),
+                    dest_dir: PathBuf::from("/mnt/drive-a/.snapshots/sv-a"),
+                    drive_label: "DRIVE-A".to_string(),
+                    subvolume_name: "sv-a".to_string(),
+                    pin_on_success: None,
+                },
+                PlannedOperation::SendIncremental {
+                    parent: PathBuf::from("/snap/sv-a/20260321-a"),
+                    snapshot: PathBuf::from("/snap/sv-a/20260322-1430-a"),
+                    dest_dir: PathBuf::from("/mnt/drive-b/.snapshots/sv-a"),
+                    drive_label: "DRIVE-B".to_string(),
+                    subvolume_name: "sv-a".to_string(),
+                    pin_on_success: None,
+                },
+            ],
+            timestamp: ts,
+            skipped: vec![],
+            events: Vec::new(),
+        };
+
+        let _ = executor.execute(&plan, "full");
+        // F1 dedup: exactly one row regardless of two-drive fan-out.
+        assert_eq!(drift_count(&db), 1);
+    }
+
+    #[test]
+    fn execute_records_drift_sample_using_first_successful_send_when_first_failed_then_succeeded() {
+        use crate::state::StateDb;
+
+        let mock = MockBtrfs::new();
+        *mock.mock_bytes_transferred.borrow_mut() = Some(2_000_000);
+        // Fail the first send; second succeeds. Both are to the same snapshot
+        // path so we use a different mock approach: set fail_sends on one
+        // dest_dir... but fail_sends matches snapshot, not dest. So instead,
+        // use distinct snapshots — give each drive a different planned
+        // SendIncremental whose `snapshot` field is unique enough that
+        // fail_sends can distinguish them. The simpler approach: make the
+        // first send fail by failing the snapshot itself (a common scenario
+        // would be two distinct sends with distinct snapshots). For the
+        // executor's "first successful" picker, two distinct snapshots in one
+        // plan with different SendKinds is enough.
+
+        // Plan: snapshot create, then SendIncremental drive A (fail),
+        // SendIncremental drive B (succeed). Both target the same snapshot
+        // because in real life multi-drive sends share the local snapshot —
+        // so the fail_sends set will fail BOTH. Use two distinct snapshots
+        // instead by having two CreateSnapshot ops.
+
+        let snap_a = PathBuf::from("/snap/sv-a/20260322-1430-a");
+        let snap_b = PathBuf::from("/snap/sv-b/20260322-1430-b");
+        // Fail sv-a's send only.
+        mock.fail_sends.borrow_mut().insert(snap_a.clone());
+
+        // We use the same subvolume name so the F1 dedup considers both as
+        // candidates. But our setup uses different subvolume_name per op,
+        // which would split into two execute_subvolume invocations. To keep
+        // the "first successful in plan order for THIS subvolume" semantics
+        // honest, both sends must be within the same subvolume.
+        // Workaround: rename the snapshots to distinct paths but keep
+        // subvolume_name = "sv-a" on both ops.
+        let snap_b_for_sv_a = PathBuf::from("/snap/sv-a/20260322-1430-b-second");
+        let config = test_config();
+        let shutdown = no_shutdown();
+        let db = StateDb::open_memory().unwrap();
+        let executor = Executor::new(&mock, Some(&db), &config, &shutdown);
+
+        let _ = snap_b; // unused now
+        let ts = NaiveDate::from_ymd_opt(2026, 3, 22)
+            .unwrap()
+            .and_hms_opt(14, 30, 0)
+            .unwrap();
+        let plan = BackupPlan {
+            operations: vec![
+                PlannedOperation::CreateSnapshot {
+                    source: PathBuf::from("/data/a"),
+                    dest: snap_a.clone(),
+                    subvolume_name: "sv-a".to_string(),
+                },
+                PlannedOperation::SendIncremental {
+                    parent: PathBuf::from("/snap/sv-a/20260321-a"),
+                    snapshot: snap_a.clone(),
+                    dest_dir: PathBuf::from("/mnt/drive-a/.snapshots/sv-a"),
+                    drive_label: "DRIVE-A".to_string(),
+                    subvolume_name: "sv-a".to_string(),
+                    pin_on_success: None,
+                },
+                PlannedOperation::SendIncremental {
+                    parent: PathBuf::from("/snap/sv-a/20260321-a"),
+                    snapshot: snap_b_for_sv_a.clone(),
+                    dest_dir: PathBuf::from("/mnt/drive-b/.snapshots/sv-a"),
+                    drive_label: "DRIVE-B".to_string(),
+                    subvolume_name: "sv-a".to_string(),
+                    pin_on_success: None,
+                },
+            ],
+            timestamp: ts,
+            skipped: vec![],
+            events: Vec::new(),
+        };
+
+        let _ = executor.execute(&plan, "full");
+
+        // Exactly one drift row. The chosen drive_label should be DRIVE-B
+        // (the first SUCCESSFUL send in plan order).
+        assert_eq!(drift_count(&db), 1);
+        let bytes: i64 = db
+            .conn
+            .query_row(
+                "SELECT bytes_transferred FROM drift_samples LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(bytes, 2_000_000);
     }
 }

@@ -470,7 +470,83 @@ pub struct DoctorOutput {
     pub sentinel: DoctorSentinelStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verify: Option<VerifyOutput>,
+    /// Per-subvolume churn aggregates rendered under `urd doctor --thorough`.
+    /// `None` for default `urd doctor` (no Churn section). UPI 030.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub churn: Option<DoctorChurnView>,
     pub verdict: DoctorVerdict,
+}
+
+// ── Churn (UPI 030) ────────────────────────────────────────────────────
+
+/// `urd doctor --thorough` Churn-section view: a header label and one row per
+/// configured subvolume. The header carries a one-line disclaimer about
+/// time-weighted aggregation hiding bursty churn (post-F9).
+#[derive(Debug, Clone, Serialize)]
+pub struct DoctorChurnView {
+    pub window_label: String,
+    pub rows: Vec<DoctorChurnRow>,
+}
+
+/// One row of the Churn section.
+#[derive(Debug, Clone, Serialize)]
+pub struct DoctorChurnRow {
+    pub name: String,
+    pub state: ChurnRender,
+}
+
+/// Presentation enum mapped from `drift::ChurnEstimate`. Mapping rules
+/// (post-F8 adds the n=1 full-send variant):
+/// - 0 samples         → `NotMeasured`
+/// - 1 incremental     → `FirstMeasurement`
+/// - ≥2 incrementals   → `Incremental`
+/// - 0 incr & 1 full   → `FullSendOnlyFirst`
+/// - 0 incr & ≥2 full  → `FullSendOnly`
+///
+/// (Mixed: incrementals win — full counts are silent in the render.)
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ChurnRender {
+    NotMeasured,
+    FirstMeasurement { bytes_per_second: f64 },
+    Incremental { bytes_per_second: f64 },
+    FullSendOnly { bytes_per_send: u64, seconds_between: i64 },
+    FullSendOnlyFirst { bytes: u64 },
+}
+
+/// Pure mapping from raw aggregates (`drift::ChurnEstimate`) to the
+/// presentation enum (`ChurnRender`). No I/O.
+#[must_use]
+pub fn render_churn(estimate: &crate::drift::ChurnEstimate) -> ChurnRender {
+    use ChurnRender::*;
+    match (estimate.incremental_count, estimate.full_count) {
+        (0, 0) => NotMeasured,
+        (0, 1) => FullSendOnlyFirst {
+            bytes: estimate.latest_full_bytes.unwrap_or(0),
+        },
+        (0, _) => FullSendOnly {
+            bytes_per_send: estimate.median_full_bytes.unwrap_or(0),
+            seconds_between: estimate.latest_full_interval_secs.unwrap_or(0),
+        },
+        (1, _) => FirstMeasurement {
+            bytes_per_second: estimate.mean_bytes_per_second.unwrap_or(0.0),
+        },
+        (_, _) => Incremental {
+            bytes_per_second: estimate.mean_bytes_per_second.unwrap_or(0.0),
+        },
+    }
+}
+
+/// Heartbeat / metrics projection of a single subvolume's churn state.
+/// `commands/backup.rs` builds a `HashMap<String, ChurnHeartbeatFields>` and
+/// passes it to both `heartbeat::build_from_run` and
+/// `metrics::write_metrics_after_execution` so both surfaces share the same
+/// policy: incremental → `churn_bytes_per_second`; full-only →
+/// `last_full_send_bytes`. Cold-start subvolumes have both `None`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ChurnHeartbeatFields {
+    pub churn_bytes_per_second: Option<f64>,
+    pub last_full_send_bytes: Option<u64>,
 }
 
 /// A single diagnostic check result.
@@ -1886,5 +1962,130 @@ source = "/data/sv2"
         assert!(json.contains("last_seen"));
         let json = serde_json::to_string(&absent_no_history).unwrap();
         assert!(!json.contains("last_seen"));
+    }
+
+    // ── UPI 030: render_churn mapping table + JSON omission ────────
+
+    fn drift_estimate(
+        incr: usize,
+        full: usize,
+        mean: Option<f64>,
+        median_full: Option<u64>,
+        latest_full: Option<u64>,
+        latest_full_secs: Option<i64>,
+    ) -> crate::drift::ChurnEstimate {
+        crate::drift::ChurnEstimate {
+            mean_bytes_per_second: mean,
+            incremental_count: incr,
+            full_count: full,
+            median_full_bytes: median_full,
+            latest_full_bytes: latest_full,
+            latest_full_interval_secs: latest_full_secs,
+        }
+    }
+
+    #[test]
+    fn render_churn_table() {
+        // Cold start: all zero.
+        assert_eq!(
+            render_churn(&drift_estimate(0, 0, None, None, None, None)),
+            ChurnRender::NotMeasured
+        );
+
+        // Single incremental: FirstMeasurement.
+        assert_eq!(
+            render_churn(&drift_estimate(1, 0, Some(100.0), None, None, None)),
+            ChurnRender::FirstMeasurement {
+                bytes_per_second: 100.0
+            }
+        );
+
+        // Two incrementals: Incremental.
+        assert_eq!(
+            render_churn(&drift_estimate(2, 0, Some(123.4), None, None, None)),
+            ChurnRender::Incremental {
+                bytes_per_second: 123.4
+            }
+        );
+
+        // Single full: FullSendOnlyFirst.
+        assert_eq!(
+            render_churn(&drift_estimate(
+                0,
+                1,
+                None,
+                Some(12_000_000_000),
+                Some(12_000_000_000),
+                Some(86_400),
+            )),
+            ChurnRender::FullSendOnlyFirst {
+                bytes: 12_000_000_000
+            }
+        );
+
+        // Two fulls: FullSendOnly with median + latest interval.
+        assert_eq!(
+            render_churn(&drift_estimate(
+                0,
+                2,
+                None,
+                Some(14_000_000_000),
+                Some(14_000_000_000),
+                Some(93_600),
+            )),
+            ChurnRender::FullSendOnly {
+                bytes_per_send: 14_000_000_000,
+                seconds_between: 93_600
+            }
+        );
+
+        // Mixed (1 incr, 1 full): incrementals win → FirstMeasurement.
+        assert_eq!(
+            render_churn(&drift_estimate(
+                1,
+                1,
+                Some(50.0),
+                Some(10_000_000_000),
+                Some(10_000_000_000),
+                Some(86_400),
+            )),
+            ChurnRender::FirstMeasurement {
+                bytes_per_second: 50.0
+            }
+        );
+
+        // Mixed (2 incr, 1 full): incrementals win → Incremental.
+        assert_eq!(
+            render_churn(&drift_estimate(
+                2,
+                1,
+                Some(75.0),
+                Some(10_000_000_000),
+                Some(10_000_000_000),
+                Some(86_400),
+            )),
+            ChurnRender::Incremental {
+                bytes_per_second: 75.0
+            }
+        );
+    }
+
+    #[test]
+    fn doctor_output_serializes_with_omitted_churn_when_none() {
+        let output = DoctorOutput {
+            config_checks: vec![],
+            infra_checks: vec![],
+            data_safety: vec![],
+            sentinel: DoctorSentinelStatus {
+                running: false,
+                pid: None,
+                uptime: None,
+            },
+            verify: None,
+            churn: None,
+            verdict: DoctorVerdict::healthy(),
+        };
+        let json = serde_json::to_string(&output).unwrap();
+        assert!(!json.contains("\"churn\""), "churn should be omitted when None: {json}");
     }
 }

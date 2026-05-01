@@ -8,6 +8,7 @@
 // fields from a higher version. The writer MUST NOT remove fields between
 // versions — only add. Additive changes bump the version.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use chrono::NaiveDateTime;
@@ -17,9 +18,10 @@ use crate::awareness::SubvolAssessment;
 use crate::config::Config;
 use crate::error::UrdError;
 use crate::executor::{ExecutionResult, SendType};
+use crate::output::ChurnHeartbeatFields;
 
 /// Current schema version. Bump when adding fields (never remove fields).
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 
 // ── Types ───────────────────────────────────────────────────────────────
 
@@ -60,6 +62,16 @@ pub struct SubvolumeHeartbeat {
     /// Defaults to `true` for backward compat (schema v1 heartbeats without this field).
     #[serde(default = "default_true")]
     pub send_completed: bool,
+    /// Rolling time-windowed churn rate in bytes per second (UPI 030, schema v3).
+    /// `None` for cold-start subvolumes and for subvolumes whose latest in-window
+    /// send was a full send (use `last_full_send_bytes` for those).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub churn_bytes_per_second: Option<f64>,
+    /// Bytes of the most recent in-window full send (UPI 030, schema v3).
+    /// `None` for subvolumes with no in-window full send (incremental-only or
+    /// cold-start subvolumes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_full_send_bytes: Option<u64>,
 }
 
 // ── Builder ─────────────────────────────────────────────────────────────
@@ -71,8 +83,9 @@ pub fn build_from_run(
     now: NaiveDateTime,
     result: &ExecutionResult,
     assessments: &[SubvolAssessment],
+    churn_views: &HashMap<String, ChurnHeartbeatFields>,
 ) -> Heartbeat {
-    let subvolumes = build_subvolume_entries(Some(result), assessments);
+    let subvolumes = build_subvolume_entries(Some(result), assessments, churn_views);
 
     Heartbeat {
         schema_version: SCHEMA_VERSION,
@@ -93,8 +106,9 @@ pub fn build_empty(
     config: &Config,
     now: NaiveDateTime,
     assessments: &[SubvolAssessment],
+    churn_views: &HashMap<String, ChurnHeartbeatFields>,
 ) -> Heartbeat {
-    let subvolumes = build_subvolume_entries(None, assessments);
+    let subvolumes = build_subvolume_entries(None, assessments, churn_views);
 
     Heartbeat {
         schema_version: SCHEMA_VERSION,
@@ -112,6 +126,7 @@ pub fn build_empty(
 fn build_subvolume_entries(
     result: Option<&ExecutionResult>,
     assessments: &[SubvolAssessment],
+    churn_views: &HashMap<String, ChurnHeartbeatFields>,
 ) -> Vec<SubvolumeHeartbeat> {
     assessments
         .iter()
@@ -124,12 +139,16 @@ fn build_subvolume_entries(
                 matches!(sv.send_type, SendType::Full | SendType::Incremental)
             });
 
+            let churn = churn_views.get(&a.name).copied().unwrap_or_default();
+
             SubvolumeHeartbeat {
                 name: a.name.clone(),
                 backup_success: sv_result.map(|sv| sv.success),
                 promise_status: a.status.to_string(),
                 pin_failures: sv_result.map(|sv| sv.pin_failures).unwrap_or(0),
                 send_completed,
+                churn_bytes_per_second: churn.churn_bytes_per_second,
+                last_full_send_bytes: churn.last_full_send_bytes,
             }
         })
         .collect()
@@ -370,11 +389,11 @@ mod tests {
         let assessments = test_assessments();
         let result = test_execution_result();
 
-        let heartbeat = build_from_run(&config, now, &result, &assessments);
+        let heartbeat = build_from_run(&config, now, &result, &assessments, &HashMap::new());
         let json = serde_json::to_string_pretty(&heartbeat).unwrap();
         let parsed: Heartbeat = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(parsed.schema_version, 2);
+        assert_eq!(parsed.schema_version, 3);
         assert_eq!(parsed.timestamp, "2026-03-24T02:05:00");
         assert_eq!(parsed.run_result, "partial");
         assert_eq!(parsed.run_id, Some(42));
@@ -427,7 +446,7 @@ mod tests {
             NaiveDateTime::parse_from_str("2026-03-24T02:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
         let assessments = test_assessments();
 
-        let heartbeat = build_empty(&config, now, &assessments);
+        let heartbeat = build_empty(&config, now, &assessments, &HashMap::new());
 
         assert_eq!(heartbeat.run_result, "empty");
         assert_eq!(heartbeat.run_id, None);
@@ -452,14 +471,14 @@ mod tests {
             NaiveDateTime::parse_from_str("2026-03-24T02:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
         let assessments = test_assessments();
 
-        let heartbeat = build_empty(&config, now, &assessments);
+        let heartbeat = build_empty(&config, now, &assessments, &HashMap::new());
         write(&path, &heartbeat).unwrap();
 
         // Temp file cleaned up
         assert!(!dir.path().join("heartbeat.json.tmp").exists());
         // File exists and is valid
         let read_back = read(&path).unwrap();
-        assert_eq!(read_back.schema_version, 2);
+        assert_eq!(read_back.schema_version, 3);
         assert_eq!(read_back.timestamp, "2026-03-24T02:00:00");
     }
 
@@ -471,10 +490,117 @@ mod tests {
         let config = test_config(&[("home", "1h")]);
         let now =
             NaiveDateTime::parse_from_str("2026-03-24T02:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
-        let heartbeat = build_empty(&config, now, &test_assessments());
+        let heartbeat = build_empty(&config, now, &test_assessments(), &HashMap::new());
         write(&path, &heartbeat).unwrap();
 
         assert!(path.exists());
+    }
+
+    // ── UPI 030: schema v3 + churn / last-full-send fields ──────────────
+
+    #[test]
+    fn heartbeat_serializes_at_schema_version_3() {
+        let config = test_config(&[("home", "1h")]);
+        let now =
+            NaiveDateTime::parse_from_str("2026-04-30T03:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
+        let heartbeat = build_empty(&config, now, &test_assessments(), &HashMap::new());
+        assert_eq!(heartbeat.schema_version, 3);
+    }
+
+    #[test]
+    fn heartbeat_roundtrip_with_churn_field_present() {
+        let config = test_config(&[("home", "1h")]);
+        let now =
+            NaiveDateTime::parse_from_str("2026-04-30T03:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
+        let mut churn = HashMap::new();
+        churn.insert(
+            "home".to_string(),
+            ChurnHeartbeatFields {
+                churn_bytes_per_second: Some(1234.5),
+                last_full_send_bytes: None,
+            },
+        );
+
+        let hb = build_empty(&config, now, &test_assessments(), &churn);
+        let json = serde_json::to_string(&hb).unwrap();
+        let parsed: Heartbeat = serde_json::from_str(&json).unwrap();
+        let home = parsed.subvolumes.iter().find(|s| s.name == "home").unwrap();
+        assert_eq!(home.churn_bytes_per_second, Some(1234.5));
+        assert_eq!(home.last_full_send_bytes, None);
+    }
+
+    #[test]
+    fn heartbeat_roundtrip_with_last_full_send_bytes_field_present() {
+        let config = test_config(&[("home", "1h")]);
+        let now =
+            NaiveDateTime::parse_from_str("2026-04-30T03:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
+        let mut churn = HashMap::new();
+        churn.insert(
+            "home".to_string(),
+            ChurnHeartbeatFields {
+                churn_bytes_per_second: None,
+                last_full_send_bytes: Some(12_000_000_000),
+            },
+        );
+
+        let hb = build_empty(&config, now, &test_assessments(), &churn);
+        let json = serde_json::to_string(&hb).unwrap();
+        let parsed: Heartbeat = serde_json::from_str(&json).unwrap();
+        let home = parsed.subvolumes.iter().find(|s| s.name == "home").unwrap();
+        assert_eq!(home.last_full_send_bytes, Some(12_000_000_000));
+        assert_eq!(home.churn_bytes_per_second, None);
+    }
+
+    #[test]
+    fn heartbeat_roundtrip_v2_file_without_new_fields_defaults_to_none() {
+        // A v2-on-disk JSON file (no churn / last_full_send_bytes fields)
+        // must deserialize cleanly with both new fields = None.
+        let json = r#"{
+            "schema_version": 2,
+            "timestamp": "2026-03-24T02:00:00",
+            "stale_after": "2026-03-24T04:00:00",
+            "run_result": "success",
+            "run_id": 1,
+            "subvolumes": [
+                {
+                    "name": "home",
+                    "backup_success": true,
+                    "promise_status": "PROTECTED",
+                    "pin_failures": 0,
+                    "send_completed": true
+                }
+            ],
+            "notifications_dispatched": true
+        }"#;
+        let parsed: Heartbeat = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.subvolumes[0].churn_bytes_per_second, None);
+        assert_eq!(parsed.subvolumes[0].last_full_send_bytes, None);
+    }
+
+    #[test]
+    fn heartbeat_omits_churn_field_when_none() {
+        let config = test_config(&[("home", "1h")]);
+        let now =
+            NaiveDateTime::parse_from_str("2026-04-30T03:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
+        let hb = build_empty(&config, now, &test_assessments(), &HashMap::new());
+        let json = serde_json::to_string(&hb).unwrap();
+        assert!(
+            !json.contains("churn_bytes_per_second"),
+            "field should be omitted when None: {json}"
+        );
+    }
+
+    #[test]
+    fn heartbeat_omits_last_full_send_bytes_when_none() {
+        let config = test_config(&[("home", "1h")]);
+        let now =
+            NaiveDateTime::parse_from_str("2026-04-30T03:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
+        let hb = build_empty(&config, now, &test_assessments(), &HashMap::new());
+        let json = serde_json::to_string(&hb).unwrap();
+        assert!(
+            !json.contains("last_full_send_bytes"),
+            "field should be omitted when None: {json}"
+        );
     }
 
     #[test]
@@ -521,7 +647,7 @@ mod tests {
             run_id: Some(1),
         };
 
-        let hb = build_from_run(&config, now, &result, &assessments);
+        let hb = build_from_run(&config, now, &result, &assessments, &HashMap::new());
         assert!(hb.subvolumes[0].send_completed);
     }
 
@@ -549,7 +675,7 @@ mod tests {
             run_id: Some(1),
         };
 
-        let hb = build_from_run(&config, now, &result, &assessments);
+        let hb = build_from_run(&config, now, &result, &assessments, &HashMap::new());
         assert!(!hb.subvolumes[0].send_completed);
     }
 
@@ -577,7 +703,7 @@ mod tests {
             run_id: Some(1),
         };
 
-        let hb = build_from_run(&config, now, &result, &assessments);
+        let hb = build_from_run(&config, now, &result, &assessments, &HashMap::new());
         assert!(!hb.subvolumes[0].send_completed);
     }
 

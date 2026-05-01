@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Drift telemetry (UPI 030, ADR-113 Layer 0): a new `src/drift.rs` pure
+  module aggregates per-send wire bytes into a rolling time-windowed
+  churn rate, persisted in a new `drift_samples` SQLite table populated
+  by a one-shot idempotent backfill from `operations` history on first
+  open. Each backup run writes one drift sample per `(run_id, subvolume)`
+  derived from the first successful send in plan order. Heartbeat schema
+  bumps 2 → 3 with two additive `Option` fields
+  (`churn_bytes_per_second`, `last_full_send_bytes`); two new Prometheus
+  gauges (`backup_subvolume_churn_bytes_per_second`,
+  `backup_subvolume_last_full_send_bytes`) expose the same signal in
+  base units. `urd doctor --thorough` gains a Churn section with a
+  five-state ladder (cold-start, first measurement, incremental,
+  full-send-only first, full-send-only) and a bursty-churn disclaimer.
 - Voice contract tests (UPI 035): a new `src/voice_contract.rs` test
   module encodes the seven-rule presentation-layer contract (no
   falsehoods, no contradictions, acknowledged transitions, first-line
