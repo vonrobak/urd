@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Voice contract tests (UPI 035): a new `src/voice_contract.rs` test
+  module encodes the seven-rule presentation-layer contract (no
+  falsehoods, no contradictions, acknowledged transitions, first-line
+  answer, gravity calibration) so future voice changes can't silently
+  regress UPI 026's fixes. Surfaces two pre-existing findings as
+  `#[ignore]`d tests: `urd doctor` and `urd plan` emit a process-header
+  first line rather than the verdict/operation count. Lifts shared test
+  fixtures (`test_status_output`, `test_backup_summary`,
+  `test_doctor_output`, `test_verify_output`, `test_plan_output`) into
+  `voice::test_fixtures` for reuse across test modules.
+
+### Changed
+- `colored::control::set_override` calls in `voice.rs` and
+  `voice_events.rs` tests now route through a shared `color_guard()`
+  Mutex-backed helper, eliminating the parallel-test colour-override
+  race that the new contract tests would otherwise hit.
+
 ## [0.14.0] - 2026-05-01
 
 ### Added

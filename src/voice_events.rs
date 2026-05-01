@@ -236,13 +236,13 @@ mod tests {
         }
     }
 
-    fn setup() {
-        colored::control::set_override(false);
+    fn setup() -> std::sync::MutexGuard<'static, ()> {
+        crate::voice::test_fixtures::color_guard(false)
     }
 
     #[test]
     fn render_empty_shows_dimmed_message() {
-        setup();
+        let _color = setup();
         let view = EventsView {
             events: vec![],
             applied_filter: empty_filter(),
@@ -253,7 +253,7 @@ mod tests {
 
     #[test]
     fn render_retention_prune() {
-        setup();
+        let _color = setup();
         let row = make_row(
             EventPayload::RetentionPrune {
                 snapshot: "20260423-0400-htpc-home".into(),
@@ -272,7 +272,7 @@ mod tests {
 
     #[test]
     fn render_retention_protect_uses_mythic_verb() {
-        setup();
+        let _color = setup();
         let row = make_row(
             EventPayload::RetentionProtect {
                 snapshot: "20240101-htpc-home".into(),
@@ -288,7 +288,7 @@ mod tests {
 
     #[test]
     fn render_planner_send_choice_shows_drive_and_reason() {
-        setup();
+        let _color = setup();
         let row = make_row(
             EventPayload::PlannerSendChoice {
                 send_kind: crate::types::SendKind::Full,
@@ -306,7 +306,7 @@ mod tests {
 
     #[test]
     fn render_planner_defer_shows_reason() {
-        setup();
+        let _color = setup();
         let row = make_row(
             EventPayload::PlannerDefer {
                 reason: "interval not elapsed (next in ~30m)".into(),
@@ -322,7 +322,7 @@ mod tests {
 
     #[test]
     fn render_promise_transition_degradation_uses_frayed_verb() {
-        setup();
+        let _color = setup();
         let row = make_row(
             EventPayload::PromiseTransition {
                 from: crate::awareness::PromiseStatus::Protected,
@@ -339,7 +339,7 @@ mod tests {
 
     #[test]
     fn render_promise_transition_recovery_uses_mended_verb() {
-        setup();
+        let _color = setup();
         let row = make_row(
             EventPayload::PromiseTransition {
                 from: crate::awareness::PromiseStatus::Unprotected,
@@ -356,7 +356,7 @@ mod tests {
 
     #[test]
     fn render_sentinel_circuit_break() {
-        setup();
+        let _color = setup();
         let row = make_row(
             EventPayload::SentinelCircuitBreak {
                 from: crate::sentinel::CircuitState::Closed,
@@ -374,7 +374,7 @@ mod tests {
 
     #[test]
     fn render_drive_mount_unmount() {
-        setup();
+        let _color = setup();
         let mounted = make_row(
             EventPayload::DriveMounted {
                 detected_by: DriveEventSource::Sentinel,
@@ -396,7 +396,7 @@ mod tests {
 
     #[test]
     fn render_config_reload_success_and_fail() {
-        setup();
+        let _color = setup();
         let ok = make_row(
             EventPayload::ConfigReloaded {
                 config_version: "1".into(),

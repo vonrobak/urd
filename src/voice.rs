@@ -3053,20 +3053,40 @@ pub fn format_subvolume_chooser(command: &str, names: &[&str]) -> String {
 // ── Tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_fixtures {
+    //! Shared test fixtures for the voice rendering layer.
+    //!
+    //! Lifted from `mod tests` so sibling test modules such as
+    //! `crate::voice_contract::contract` can share canonical shapes
+    //! without drift. See
+    //! `docs/97-plans/2026-05-01-plan-035-voice-contract-tests.md`.
     use super::*;
-    use crate::awareness::ActionableAdvice;
     use crate::output::{
-        BackupSummary, CalibrateEntry, CalibrateOutput, CalibrateResult, ChainHealth,
-        ChainHealthEntry, DeferredInfo, DisconnectedDrive, DriveInfo, EmergencyRootAssessment,
-        EmergencySubvolDetail, HistoryOutput, HistoryRun, InitCheck, InitDriveStatus, InitOutput,
-        InitPinFile, InitSnapshotCount, InitStatus, LastRunInfo, PlanOperationEntry, PlanOutput,
-        PlanSummaryOutput, SendSummary, SkipCategory, SkippedSubvolume, StatusAssessment,
-        StatusDriveAssessment, SubvolumeSummary, TransitionEvent, VerifyCheck, VerifyDrive,
-        VerifyOutput, VerifySubvolume,
+        ChainHealthEntry, DoctorDataSafety, DoctorSentinelStatus, DoctorVerdict, DriveInfo,
+        LastRunInfo, PlanOperationEntry, PlanSummaryOutput, SendSummary, StatusDriveAssessment,
+        SubvolumeSummary,
     };
+    use std::sync::{Mutex, MutexGuard, PoisonError};
 
-    fn test_status_output() -> StatusOutput {
+    /// Global mutex serializing every test that touches the colored
+    /// crate's global override. `colored::control::set_override` writes
+    /// to a process-wide static, so any two tests that disagree about
+    /// the desired color state will race under cargo test's default
+    /// parallelism. Every voice test (and every voice_contract test)
+    /// must acquire this guard via `color_guard(...)` instead of calling
+    /// `colored::control::set_override` directly.
+    static COLOR_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Acquire the global color lock and apply the requested override.
+    /// Hold the returned guard for the duration of the test by binding
+    /// it to a `let _color = color_guard(...);` variable.
+    pub(crate) fn color_guard(color_on: bool) -> MutexGuard<'static, ()> {
+        let g = COLOR_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        colored::control::set_override(color_on);
+        g
+    }
+
+    pub(crate) fn test_status_output() -> StatusOutput {
         StatusOutput {
             assessments: vec![
                 StatusAssessment {
@@ -3159,412 +3179,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn interactive_contains_subvolume_names() {
-        colored::control::set_override(false);
-        let output = render_status(&test_status_output(), OutputMode::Interactive);
-        assert!(output.contains("htpc-home"), "missing htpc-home");
-        assert!(output.contains("htpc-docs"), "missing htpc-docs");
-    }
-
-    #[test]
-    fn interactive_contains_safety_vocabulary() {
-        colored::control::set_override(false);
-        let output = render_status(&test_status_output(), OutputMode::Interactive);
-        assert!(output.contains("sealed"), "missing sealed exposure label");
-        assert!(output.contains("waning"), "missing waning exposure label");
-    }
-
-    #[test]
-    fn interactive_promise_column_shown_when_exposure_conflicts() {
-        colored::control::set_override(false);
-        let mut data = test_status_output();
-        // Set a promise level on a non-PROTECTED assessment — triggers PROTECTION column
-        data.assessments[1].promise_level = Some("protected".to_string());
-        // assessments[1] has status "AT RISK" — conflict with promise
-        let output = render_status(&data, OutputMode::Interactive);
-        assert!(output.contains("PROTECTION"), "missing PROTECTION header");
-        assert!(output.contains("protected"), "missing promise level value");
-    }
-
-    #[test]
-    fn interactive_promise_column_hidden_when_all_sealed() {
-        colored::control::set_override(false);
-        let mut data = test_status_output();
-        // Set a promise level but all statuses are PROTECTED — no conflict
-        data.assessments[0].promise_level = Some("sheltered".to_string());
-        data.assessments[1].status = "PROTECTED".to_string();
-        data.assessments[1].promise_level = Some("fortified".to_string());
-        let output = render_status(&data, OutputMode::Interactive);
-        assert!(
-            !output.contains("PROTECTION"),
-            "PROTECTION column should be hidden when all sealed"
-        );
-    }
-
-    #[test]
-    fn interactive_no_promise_column_when_none_set() {
-        colored::control::set_override(false);
-        let data = test_status_output(); // all promise_level are None
-        let output = render_status(&data, OutputMode::Interactive);
-        assert!(
-            !output.contains("PROTECTION"),
-            "PROTECTION column should be hidden when no protection levels set"
-        );
-    }
-
-    #[test]
-    fn interactive_contains_drive_info() {
-        colored::control::set_override(false);
-        let output = render_status(&test_status_output(), OutputMode::Interactive);
-        assert!(output.contains("WD-18TB"), "missing drive label");
-        assert!(output.contains("connected"), "missing connected status");
-        assert!(output.contains("Offsite-4TB"), "missing unmounted drive");
-        // With no absent_duration_secs and no last_activity_age_secs, the
-        // cascade stays silent — "disconnected" rather than a fabricated
-        // "away" label driven by role alone.
-        assert!(
-            output.contains("disconnected"),
-            "expected silent fallback: {output}"
-        );
-    }
-
-    #[test]
-    fn drive_summary_escalated_at_risk() {
-        colored::control::set_override(false);
-        // Build a status with an unmounted drive that has AT RISK assessment data
-        let mut data = test_status_output();
-        data.drives.push(DriveInfo {
-            label: "Backup-2TB".to_string(),
-            mounted: false,
-            free_bytes: None,
-            role: DriveRole::Primary,
-        });
-        data.assessments[0].external.push(StatusDriveAssessment {
-            drive_label: "Backup-2TB".to_string(),
-            status: "AT RISK".to_string(),
-            mounted: false,
-            snapshot_count: None,
-            last_send_age_secs: Some(604800), // 7 days
-            role: DriveRole::Primary,
-            absent_duration_secs: Some(604800), // 7 days — drives the "away" label
-            last_activity_age_secs: None,
-        });
-        let output = render_status(&data, OutputMode::Interactive);
-        assert!(
-            output.contains("consider connecting"),
-            "missing escalated text for AT RISK drive: {output}"
-        );
-        assert!(
-            output.contains("Backup-2TB"),
-            "missing drive label: {output}"
-        );
-    }
-
-    #[test]
-    fn interactive_contains_last_run_relative_time() {
-        colored::control::set_override(false);
-        let output = render_status(&test_status_output(), OutputMode::Interactive);
-        assert!(output.contains("#42"), "missing run ID");
-        assert!(output.contains("success"), "missing run result");
-        assert!(output.contains("1m 30s"), "missing duration");
-        assert!(output.contains("10h ago"), "should show relative time, got: {output}");
-    }
-
-    #[test]
-    fn interactive_last_run_falls_back_to_timestamp_without_age() {
-        colored::control::set_override(false);
-        let mut data = test_status_output();
-        data.last_run_age_secs = None;
-        let output = render_status(&data, OutputMode::Interactive);
-        assert!(
-            output.contains("2026-03-24T02:00:00"),
-            "should fall back to ISO timestamp when age is None"
-        );
-    }
-
-    #[test]
-    fn interactive_contains_thread_health() {
-        colored::control::set_override(false);
-        let output = render_status(&test_status_output(), OutputMode::Interactive);
-        assert!(output.contains("unbroken"), "missing unbroken thread");
-        assert!(
-            output.contains("broken"),
-            "missing broken thread"
-        );
-    }
-
-    #[test]
-    fn interactive_contains_pin_count() {
-        colored::control::set_override(false);
-        let output = render_status(&test_status_output(), OutputMode::Interactive);
-        assert!(output.contains("3"), "missing pin count");
-    }
-
-    #[test]
-    fn interactive_no_subvolumes() {
-        colored::control::set_override(false);
-        let data = StatusOutput {
-            assessments: vec![],
-            chain_health: vec![],
-            drives: vec![],
-            last_run: None,
-            last_run_age_secs: None,
-            total_pins: 0,
-            redundancy_advisories: vec![],
-            advice: vec![],
-        };
-        let output = render_status(&data, OutputMode::Interactive);
-        assert!(
-            output.contains("No subvolumes configured"),
-            "missing empty message"
-        );
-    }
-
-    #[test]
-    fn daemon_produces_valid_json() {
-        let output = render_status(&test_status_output(), OutputMode::Daemon);
-        let parsed: serde_json::Value =
-            serde_json::from_str(&output).unwrap_or_else(|e| panic!("invalid JSON: {e}\n{output}"));
-        assert!(
-            parsed.get("assessments").is_some(),
-            "missing assessments key"
-        );
-        assert!(parsed.get("drives").is_some(), "missing drives key");
-        assert!(parsed.get("last_run").is_some(), "missing last_run key");
-        assert!(
-            parsed.get("chain_health").is_some(),
-            "missing chain_health key"
-        );
-        assert!(
-            parsed.get("last_run_age_secs").is_some(),
-            "missing last_run_age_secs key"
-        );
-    }
-
-    #[test]
-    fn daemon_contains_subvolume_data() {
-        let output = render_status(&test_status_output(), OutputMode::Daemon);
-        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
-        let assessments = parsed["assessments"].as_array().unwrap();
-        assert_eq!(assessments.len(), 2);
-        assert_eq!(assessments[0]["name"], "htpc-home");
-        assert_eq!(assessments[0]["status"], "PROTECTED");
-        assert_eq!(assessments[1]["name"], "htpc-docs");
-        assert_eq!(assessments[1]["status"], "AT RISK");
-    }
-
-    #[test]
-    fn interactive_renders_advisories_and_errors() {
-        colored::control::set_override(false);
-        let mut data = test_status_output();
-        data.assessments[0]
-            .errors
-            .push("can't read snapshot directory".to_string());
-        data.assessments[1]
-            .advisories
-            .push("offsite drive not connected in 14 days".to_string());
-        let output = render_status(&data, OutputMode::Interactive);
-        assert!(
-            output.contains("can't read snapshot directory"),
-            "missing error"
-        );
-        assert!(
-            output.contains("offsite drive not connected"),
-            "missing advisory"
-        );
-    }
-
-    #[test]
-    fn interactive_no_last_run() {
-        colored::control::set_override(false);
-        let data = StatusOutput {
-            assessments: vec![],
-            chain_health: vec![],
-            drives: vec![],
-            last_run: None,
-            last_run_age_secs: None,
-            total_pins: 0,
-            redundancy_advisories: vec![],
-            advice: vec![],
-        };
-        let output = render_status(&data, OutputMode::Interactive);
-        assert!(
-            output.contains("no runs recorded"),
-            "missing no-runs message"
-        );
-    }
-
-    // ── External-only status table tests (UPI 018) ─────────────────
-
-    #[test]
-    fn status_table_external_only_shows_em_dash_local() {
-        colored::control::set_override(false);
-        let mut data = test_status_output();
-        // Make first subvol external-only
-        data.assessments[0].external_only = true;
-        data.assessments[0].local_snapshot_count = 0;
-        data.assessments[0].local_newest_age_secs = None;
-        let output = render_status(&data, OutputMode::Interactive);
-        // The LOCAL column for htpc-home should show em-dash, not "0"
-        // Split into lines and find the htpc-home row
-        let home_line = output.lines().find(|l| l.contains("htpc-home")).unwrap();
-        assert!(
-            home_line.contains('\u{2014}'),
-            "external_only LOCAL should show em-dash, got: {home_line}"
-        );
-        assert!(
-            !home_line.contains(" 0 "),
-            "external_only LOCAL should not show '0', got: {home_line}"
-        );
-    }
-
-    #[test]
-    fn status_table_external_only_shows_ext_only_thread() {
-        colored::control::set_override(false);
-        let mut data = test_status_output();
-        data.assessments[0].external_only = true;
-        let output = render_status(&data, OutputMode::Interactive);
-        let home_line = output.lines().find(|l| l.contains("htpc-home")).unwrap();
-        assert!(
-            home_line.contains("drive-only"),
-            "external_only THREAD should show 'drive-only', got: {home_line}"
-        );
-    }
-
-    #[test]
-    fn status_table_normal_subvol_unchanged() {
-        colored::control::set_override(false);
-        let data = test_status_output();
-        let output = render_status(&data, OutputMode::Interactive);
-        let home_line = output.lines().find(|l| l.contains("htpc-home")).unwrap();
-        // Normal subvol should show count (47) not em-dash for LOCAL
-        assert!(
-            home_line.contains("47"),
-            "normal subvol LOCAL should show count, got: {home_line}"
-        );
-        // Should show chain health, not ext-only
-        assert!(
-            home_line.contains("unbroken"),
-            "normal subvol THREAD should show chain health, got: {home_line}"
-        );
-    }
-
-    // ── Status advice rendering tests ────────────────────────────────
-
-    #[test]
-    fn status_single_issue_shows_inline_fix() {
-        colored::control::set_override(false);
-        let mut data = test_status_output();
-        data.advice = vec![ActionableAdvice {
-            subvolume: "htpc-docs".to_string(),
-            issue: "waning — last backup 3 hours ago".to_string(),
-            command: Some("urd backup --subvolume htpc-docs".to_string()),
-            reason: None,
-        }];
-        let output = render_status(&data, OutputMode::Interactive);
-        assert!(
-            output.contains("htpc-docs"),
-            "missing subvolume name in advice: {output}"
-        );
-        assert!(
-            output.contains("urd backup --subvolume htpc-docs"),
-            "missing inline fix command: {output}"
-        );
-    }
-
-    #[test]
-    fn status_multiple_issues_shows_doctor() {
-        colored::control::set_override(false);
-        let mut data = test_status_output();
-        data.advice = vec![
-            ActionableAdvice {
-                subvolume: "htpc-docs".to_string(),
-                issue: "waning".to_string(),
-                command: Some("urd backup --subvolume htpc-docs".to_string()),
-                reason: None,
-            },
-            ActionableAdvice {
-                subvolume: "htpc-home".to_string(),
-                issue: "exposed".to_string(),
-                command: None,
-                reason: Some("Connect WD-18TB".to_string()),
-            },
-        ];
-        let output = render_status(&data, OutputMode::Interactive);
-        assert!(
-            output.contains("2 subvolumes need attention"),
-            "missing doctor redirect: {output}"
-        );
-        assert!(
-            output.contains("urd doctor"),
-            "missing doctor command: {output}"
-        );
-    }
-
-    #[test]
-    fn status_no_issues_no_suggestion() {
-        colored::control::set_override(false);
-        let data = test_status_output();
-        let output = render_status(&data, OutputMode::Interactive);
-        assert!(
-            !output.contains("need attention"),
-            "healthy state should not have attention message: {output}"
-        );
-        assert!(
-            !output.contains("to fix"),
-            "healthy state should not have fix message: {output}"
-        );
-    }
-
-    // ── Redundancy advisory rendering tests ─────────────────────────
-
-    #[test]
-    fn render_redundancy_section_with_advisories() {
-        use crate::output::{RedundancyAdvisory, RedundancyAdvisoryKind};
-
-        colored::control::set_override(false);
-        let mut data = test_status_output();
-        data.redundancy_advisories = vec![
-            RedundancyAdvisory {
-                kind: RedundancyAdvisoryKind::NoOffsiteProtection,
-                subvolume: "htpc-home".to_string(),
-                drive: None,
-                detail: "test".to_string(),
-            },
-            RedundancyAdvisory {
-                kind: RedundancyAdvisoryKind::TransientNoLocalRecovery,
-                subvolume: "htpc-tmp".to_string(),
-                drive: None,
-                detail: "test".to_string(),
-            },
-        ];
-        let output = render_status(&data, OutputMode::Interactive);
-        assert!(output.contains("REDUNDANCY"), "missing REDUNDANCY section header");
-        assert!(
-            output.contains("all drives share the same fate"),
-            "missing NoOffsiteProtection text"
-        );
-        assert!(
-            output.contains("Recovery requires a connected drive"),
-            "missing TransientNoLocalRecovery text"
-        );
-    }
-
-    #[test]
-    fn render_no_redundancy_section_when_empty() {
-        colored::control::set_override(false);
-        let data = test_status_output(); // has empty redundancy_advisories
-        let output = render_status(&data, OutputMode::Interactive);
-        assert!(
-            !output.contains("REDUNDANCY"),
-            "REDUNDANCY section should be absent when no advisories"
-        );
-    }
-
-    // ── Backup summary tests ────────────────────────────────────────
-
-    fn test_backup_summary() -> BackupSummary {
+    pub(crate) fn test_backup_summary() -> BackupSummary {
         BackupSummary {
             result: "success".to_string(),
             run_id: Some(47),
@@ -3627,9 +3242,527 @@ mod tests {
         }
     }
 
+    pub(crate) fn test_doctor_output() -> DoctorOutput {
+        DoctorOutput {
+            config_checks: vec![DoctorCheck {
+                name: "9 subvolumes, 3 drives".to_string(),
+                status: DoctorCheckStatus::Ok,
+                detail: None,
+                suggestion: None,
+            }],
+            infra_checks: vec![
+                DoctorCheck {
+                    name: "Verifying state database".to_string(),
+                    status: DoctorCheckStatus::Ok,
+                    detail: Some("already exists".to_string()),
+                    suggestion: None,
+                },
+                DoctorCheck {
+                    name: "sudo btrfs".to_string(),
+                    status: DoctorCheckStatus::Ok,
+                    detail: None,
+                    suggestion: None,
+                },
+            ],
+            data_safety: vec![
+                DoctorDataSafety {
+                    name: "htpc-home".to_string(),
+                    status: "PROTECTED".to_string(),
+                    health: "healthy".to_string(),
+                    issue: None,
+                    suggestion: None,
+                    reason: None,
+                },
+                DoctorDataSafety {
+                    name: "htpc-docs".to_string(),
+                    status: "PROTECTED".to_string(),
+                    health: "healthy".to_string(),
+                    issue: None,
+                    suggestion: None,
+                    reason: None,
+                },
+            ],
+            sentinel: DoctorSentinelStatus {
+                running: true,
+                pid: Some(12345),
+                uptime: Some("3h 12m".to_string()),
+            },
+            verify: None,
+            verdict: DoctorVerdict::healthy(),
+        }
+    }
+
+    pub(crate) fn test_verify_output() -> VerifyOutput {
+        VerifyOutput {
+            subvolumes: vec![],
+            preflight_warnings: vec![],
+            ok_count: 5,
+            warn_count: 0,
+            fail_count: 0,
+        }
+    }
+
+    pub(crate) fn test_plan_output() -> PlanOutput {
+        PlanOutput {
+            timestamp: "2026-03-26 04:00".to_string(),
+            operations: vec![
+                PlanOperationEntry {
+                    subvolume: "htpc-home".to_string(),
+                    operation: "create".to_string(),
+                    detail: "/home -> /snapshots/htpc-home/20260326-0400-home".to_string(),
+                    drive_label: None,
+                    estimated_bytes: None,
+                    is_full_send: None,
+                    full_send_reason: None,
+                },
+                PlanOperationEntry {
+                    subvolume: "htpc-home".to_string(),
+                    operation: "send".to_string(),
+                    detail:
+                        "20260326-0400-home -> WD-18TB (incremental, parent: 20260325-0400-home) + pin"
+                            .to_string(),
+                    drive_label: Some("WD-18TB".to_string()),
+                    estimated_bytes: None,
+                    is_full_send: None,
+                    full_send_reason: None,
+                },
+            ],
+            skipped: vec![],
+            summary: PlanSummaryOutput {
+                snapshots: 1,
+                sends: 1,
+                deletions: 0,
+                skipped: 0,
+                estimated_total_bytes: None,
+            },
+            warnings: vec![],
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::test_fixtures::*;
+    use crate::awareness::ActionableAdvice;
+    use crate::output::{
+        BackupSummary, CalibrateEntry, CalibrateOutput, CalibrateResult, ChainHealth,
+        DeferredInfo, DisconnectedDrive, DriveInfo, EmergencyRootAssessment,
+        EmergencySubvolDetail, HistoryOutput, HistoryRun, InitCheck, InitDriveStatus, InitOutput,
+        InitPinFile, InitSnapshotCount, InitStatus, LastRunInfo, PlanOperationEntry, PlanOutput,
+        PlanSummaryOutput, SendSummary, SkipCategory, SkippedSubvolume, StatusAssessment,
+        StatusDriveAssessment, TransitionEvent, VerifyCheck, VerifyDrive,
+        VerifyOutput, VerifySubvolume,
+    };
+
+    #[test]
+    fn interactive_contains_subvolume_names() {
+        let _color = color_guard(false);
+        let output = render_status(&test_status_output(), OutputMode::Interactive);
+        assert!(output.contains("htpc-home"), "missing htpc-home");
+        assert!(output.contains("htpc-docs"), "missing htpc-docs");
+    }
+
+    #[test]
+    fn interactive_contains_safety_vocabulary() {
+        let _color = color_guard(false);
+        let output = render_status(&test_status_output(), OutputMode::Interactive);
+        assert!(output.contains("sealed"), "missing sealed exposure label");
+        assert!(output.contains("waning"), "missing waning exposure label");
+    }
+
+    #[test]
+    fn interactive_promise_column_shown_when_exposure_conflicts() {
+        let _color = color_guard(false);
+        let mut data = test_status_output();
+        // Set a promise level on a non-PROTECTED assessment — triggers PROTECTION column
+        data.assessments[1].promise_level = Some("protected".to_string());
+        // assessments[1] has status "AT RISK" — conflict with promise
+        let output = render_status(&data, OutputMode::Interactive);
+        assert!(output.contains("PROTECTION"), "missing PROTECTION header");
+        assert!(output.contains("protected"), "missing promise level value");
+    }
+
+    #[test]
+    fn interactive_promise_column_hidden_when_all_sealed() {
+        let _color = color_guard(false);
+        let mut data = test_status_output();
+        // Set a promise level but all statuses are PROTECTED — no conflict
+        data.assessments[0].promise_level = Some("sheltered".to_string());
+        data.assessments[1].status = "PROTECTED".to_string();
+        data.assessments[1].promise_level = Some("fortified".to_string());
+        let output = render_status(&data, OutputMode::Interactive);
+        assert!(
+            !output.contains("PROTECTION"),
+            "PROTECTION column should be hidden when all sealed"
+        );
+    }
+
+    #[test]
+    fn interactive_no_promise_column_when_none_set() {
+        let _color = color_guard(false);
+        let data = test_status_output(); // all promise_level are None
+        let output = render_status(&data, OutputMode::Interactive);
+        assert!(
+            !output.contains("PROTECTION"),
+            "PROTECTION column should be hidden when no protection levels set"
+        );
+    }
+
+    #[test]
+    fn interactive_contains_drive_info() {
+        let _color = color_guard(false);
+        let output = render_status(&test_status_output(), OutputMode::Interactive);
+        assert!(output.contains("WD-18TB"), "missing drive label");
+        assert!(output.contains("connected"), "missing connected status");
+        assert!(output.contains("Offsite-4TB"), "missing unmounted drive");
+        // With no absent_duration_secs and no last_activity_age_secs, the
+        // cascade stays silent — "disconnected" rather than a fabricated
+        // "away" label driven by role alone.
+        assert!(
+            output.contains("disconnected"),
+            "expected silent fallback: {output}"
+        );
+    }
+
+    #[test]
+    fn drive_summary_escalated_at_risk() {
+        let _color = color_guard(false);
+        // Build a status with an unmounted drive that has AT RISK assessment data
+        let mut data = test_status_output();
+        data.drives.push(DriveInfo {
+            label: "Backup-2TB".to_string(),
+            mounted: false,
+            free_bytes: None,
+            role: DriveRole::Primary,
+        });
+        data.assessments[0].external.push(StatusDriveAssessment {
+            drive_label: "Backup-2TB".to_string(),
+            status: "AT RISK".to_string(),
+            mounted: false,
+            snapshot_count: None,
+            last_send_age_secs: Some(604800), // 7 days
+            role: DriveRole::Primary,
+            absent_duration_secs: Some(604800), // 7 days — drives the "away" label
+            last_activity_age_secs: None,
+        });
+        let output = render_status(&data, OutputMode::Interactive);
+        assert!(
+            output.contains("consider connecting"),
+            "missing escalated text for AT RISK drive: {output}"
+        );
+        assert!(
+            output.contains("Backup-2TB"),
+            "missing drive label: {output}"
+        );
+    }
+
+    #[test]
+    fn interactive_contains_last_run_relative_time() {
+        let _color = color_guard(false);
+        let output = render_status(&test_status_output(), OutputMode::Interactive);
+        assert!(output.contains("#42"), "missing run ID");
+        assert!(output.contains("success"), "missing run result");
+        assert!(output.contains("1m 30s"), "missing duration");
+        assert!(output.contains("10h ago"), "should show relative time, got: {output}");
+    }
+
+    #[test]
+    fn interactive_last_run_falls_back_to_timestamp_without_age() {
+        let _color = color_guard(false);
+        let mut data = test_status_output();
+        data.last_run_age_secs = None;
+        let output = render_status(&data, OutputMode::Interactive);
+        assert!(
+            output.contains("2026-03-24T02:00:00"),
+            "should fall back to ISO timestamp when age is None"
+        );
+    }
+
+    #[test]
+    fn interactive_contains_thread_health() {
+        let _color = color_guard(false);
+        let output = render_status(&test_status_output(), OutputMode::Interactive);
+        assert!(output.contains("unbroken"), "missing unbroken thread");
+        assert!(
+            output.contains("broken"),
+            "missing broken thread"
+        );
+    }
+
+    #[test]
+    fn interactive_contains_pin_count() {
+        let _color = color_guard(false);
+        let output = render_status(&test_status_output(), OutputMode::Interactive);
+        assert!(output.contains("3"), "missing pin count");
+    }
+
+    #[test]
+    fn interactive_no_subvolumes() {
+        let _color = color_guard(false);
+        let data = StatusOutput {
+            assessments: vec![],
+            chain_health: vec![],
+            drives: vec![],
+            last_run: None,
+            last_run_age_secs: None,
+            total_pins: 0,
+            redundancy_advisories: vec![],
+            advice: vec![],
+        };
+        let output = render_status(&data, OutputMode::Interactive);
+        assert!(
+            output.contains("No subvolumes configured"),
+            "missing empty message"
+        );
+    }
+
+    #[test]
+    fn daemon_produces_valid_json() {
+        let output = render_status(&test_status_output(), OutputMode::Daemon);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&output).unwrap_or_else(|e| panic!("invalid JSON: {e}\n{output}"));
+        assert!(
+            parsed.get("assessments").is_some(),
+            "missing assessments key"
+        );
+        assert!(parsed.get("drives").is_some(), "missing drives key");
+        assert!(parsed.get("last_run").is_some(), "missing last_run key");
+        assert!(
+            parsed.get("chain_health").is_some(),
+            "missing chain_health key"
+        );
+        assert!(
+            parsed.get("last_run_age_secs").is_some(),
+            "missing last_run_age_secs key"
+        );
+    }
+
+    #[test]
+    fn daemon_contains_subvolume_data() {
+        let output = render_status(&test_status_output(), OutputMode::Daemon);
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        let assessments = parsed["assessments"].as_array().unwrap();
+        assert_eq!(assessments.len(), 2);
+        assert_eq!(assessments[0]["name"], "htpc-home");
+        assert_eq!(assessments[0]["status"], "PROTECTED");
+        assert_eq!(assessments[1]["name"], "htpc-docs");
+        assert_eq!(assessments[1]["status"], "AT RISK");
+    }
+
+    #[test]
+    fn interactive_renders_advisories_and_errors() {
+        let _color = color_guard(false);
+        let mut data = test_status_output();
+        data.assessments[0]
+            .errors
+            .push("can't read snapshot directory".to_string());
+        data.assessments[1]
+            .advisories
+            .push("offsite drive not connected in 14 days".to_string());
+        let output = render_status(&data, OutputMode::Interactive);
+        assert!(
+            output.contains("can't read snapshot directory"),
+            "missing error"
+        );
+        assert!(
+            output.contains("offsite drive not connected"),
+            "missing advisory"
+        );
+    }
+
+    #[test]
+    fn interactive_no_last_run() {
+        let _color = color_guard(false);
+        let data = StatusOutput {
+            assessments: vec![],
+            chain_health: vec![],
+            drives: vec![],
+            last_run: None,
+            last_run_age_secs: None,
+            total_pins: 0,
+            redundancy_advisories: vec![],
+            advice: vec![],
+        };
+        let output = render_status(&data, OutputMode::Interactive);
+        assert!(
+            output.contains("no runs recorded"),
+            "missing no-runs message"
+        );
+    }
+
+    // ── External-only status table tests (UPI 018) ─────────────────
+
+    #[test]
+    fn status_table_external_only_shows_em_dash_local() {
+        let _color = color_guard(false);
+        let mut data = test_status_output();
+        // Make first subvol external-only
+        data.assessments[0].external_only = true;
+        data.assessments[0].local_snapshot_count = 0;
+        data.assessments[0].local_newest_age_secs = None;
+        let output = render_status(&data, OutputMode::Interactive);
+        // The LOCAL column for htpc-home should show em-dash, not "0"
+        // Split into lines and find the htpc-home row
+        let home_line = output.lines().find(|l| l.contains("htpc-home")).unwrap();
+        assert!(
+            home_line.contains('\u{2014}'),
+            "external_only LOCAL should show em-dash, got: {home_line}"
+        );
+        assert!(
+            !home_line.contains(" 0 "),
+            "external_only LOCAL should not show '0', got: {home_line}"
+        );
+    }
+
+    #[test]
+    fn status_table_external_only_shows_ext_only_thread() {
+        let _color = color_guard(false);
+        let mut data = test_status_output();
+        data.assessments[0].external_only = true;
+        let output = render_status(&data, OutputMode::Interactive);
+        let home_line = output.lines().find(|l| l.contains("htpc-home")).unwrap();
+        assert!(
+            home_line.contains("drive-only"),
+            "external_only THREAD should show 'drive-only', got: {home_line}"
+        );
+    }
+
+    #[test]
+    fn status_table_normal_subvol_unchanged() {
+        let _color = color_guard(false);
+        let data = test_status_output();
+        let output = render_status(&data, OutputMode::Interactive);
+        let home_line = output.lines().find(|l| l.contains("htpc-home")).unwrap();
+        // Normal subvol should show count (47) not em-dash for LOCAL
+        assert!(
+            home_line.contains("47"),
+            "normal subvol LOCAL should show count, got: {home_line}"
+        );
+        // Should show chain health, not ext-only
+        assert!(
+            home_line.contains("unbroken"),
+            "normal subvol THREAD should show chain health, got: {home_line}"
+        );
+    }
+
+    // ── Status advice rendering tests ────────────────────────────────
+
+    #[test]
+    fn status_single_issue_shows_inline_fix() {
+        let _color = color_guard(false);
+        let mut data = test_status_output();
+        data.advice = vec![ActionableAdvice {
+            subvolume: "htpc-docs".to_string(),
+            issue: "waning — last backup 3 hours ago".to_string(),
+            command: Some("urd backup --subvolume htpc-docs".to_string()),
+            reason: None,
+        }];
+        let output = render_status(&data, OutputMode::Interactive);
+        assert!(
+            output.contains("htpc-docs"),
+            "missing subvolume name in advice: {output}"
+        );
+        assert!(
+            output.contains("urd backup --subvolume htpc-docs"),
+            "missing inline fix command: {output}"
+        );
+    }
+
+    #[test]
+    fn status_multiple_issues_shows_doctor() {
+        let _color = color_guard(false);
+        let mut data = test_status_output();
+        data.advice = vec![
+            ActionableAdvice {
+                subvolume: "htpc-docs".to_string(),
+                issue: "waning".to_string(),
+                command: Some("urd backup --subvolume htpc-docs".to_string()),
+                reason: None,
+            },
+            ActionableAdvice {
+                subvolume: "htpc-home".to_string(),
+                issue: "exposed".to_string(),
+                command: None,
+                reason: Some("Connect WD-18TB".to_string()),
+            },
+        ];
+        let output = render_status(&data, OutputMode::Interactive);
+        assert!(
+            output.contains("2 subvolumes need attention"),
+            "missing doctor redirect: {output}"
+        );
+        assert!(
+            output.contains("urd doctor"),
+            "missing doctor command: {output}"
+        );
+    }
+
+    #[test]
+    fn status_no_issues_no_suggestion() {
+        let _color = color_guard(false);
+        let data = test_status_output();
+        let output = render_status(&data, OutputMode::Interactive);
+        assert!(
+            !output.contains("need attention"),
+            "healthy state should not have attention message: {output}"
+        );
+        assert!(
+            !output.contains("to fix"),
+            "healthy state should not have fix message: {output}"
+        );
+    }
+
+    // ── Redundancy advisory rendering tests ─────────────────────────
+
+    #[test]
+    fn render_redundancy_section_with_advisories() {
+        use crate::output::{RedundancyAdvisory, RedundancyAdvisoryKind};
+
+        let _color = color_guard(false);
+        let mut data = test_status_output();
+        data.redundancy_advisories = vec![
+            RedundancyAdvisory {
+                kind: RedundancyAdvisoryKind::NoOffsiteProtection,
+                subvolume: "htpc-home".to_string(),
+                drive: None,
+                detail: "test".to_string(),
+            },
+            RedundancyAdvisory {
+                kind: RedundancyAdvisoryKind::TransientNoLocalRecovery,
+                subvolume: "htpc-tmp".to_string(),
+                drive: None,
+                detail: "test".to_string(),
+            },
+        ];
+        let output = render_status(&data, OutputMode::Interactive);
+        assert!(output.contains("REDUNDANCY"), "missing REDUNDANCY section header");
+        assert!(
+            output.contains("all drives share the same fate"),
+            "missing NoOffsiteProtection text"
+        );
+        assert!(
+            output.contains("Recovery requires a connected drive"),
+            "missing TransientNoLocalRecovery text"
+        );
+    }
+
+    #[test]
+    fn render_no_redundancy_section_when_empty() {
+        let _color = color_guard(false);
+        let data = test_status_output(); // has empty redundancy_advisories
+        let output = render_status(&data, OutputMode::Interactive);
+        assert!(
+            !output.contains("REDUNDANCY"),
+            "REDUNDANCY section should be absent when no advisories"
+        );
+    }
+
+    // ── Backup summary tests ────────────────────────────────────────
+
     #[test]
     fn backup_interactive_contains_header() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let output = render_backup_summary(&test_backup_summary(), OutputMode::Interactive);
         assert!(output.contains("success"), "missing result in header");
         assert!(output.contains("#47"), "missing run ID");
@@ -3638,7 +3771,7 @@ mod tests {
 
     #[test]
     fn backup_interactive_contains_subvolumes() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let output = render_backup_summary(&test_backup_summary(), OutputMode::Interactive);
         assert!(output.contains("htpc-home"), "missing subvolume name");
         assert!(output.contains("htpc-docs"), "missing subvolume name");
@@ -3647,7 +3780,7 @@ mod tests {
 
     #[test]
     fn backup_interactive_contains_send_info() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let output = render_backup_summary(&test_backup_summary(), OutputMode::Interactive);
         assert!(
             output.contains("incremental") && output.contains("WD-18TB"),
@@ -3657,7 +3790,7 @@ mod tests {
 
     #[test]
     fn backup_interactive_groups_not_mounted_skips() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let output = render_backup_summary(&test_backup_summary(), OutputMode::Interactive);
         assert!(
             output.contains("Drives disconnected"),
@@ -3672,7 +3805,7 @@ mod tests {
 
     #[test]
     fn backup_interactive_uuid_mismatch_not_grouped() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let mut data = test_backup_summary();
         data.skipped = vec![
             SkippedSubvolume {
@@ -3699,7 +3832,7 @@ mod tests {
 
     #[test]
     fn backup_interactive_all_protected_one_line() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let output = render_backup_summary(&test_backup_summary(), OutputMode::Interactive);
         assert!(
             output.contains("All subvolumes sealed"),
@@ -3714,7 +3847,7 @@ mod tests {
 
     #[test]
     fn backup_interactive_shows_table_when_at_risk() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let mut data = test_backup_summary();
         data.assessments[0].status = "AT RISK".to_string();
         let output = render_backup_summary(&data, OutputMode::Interactive);
@@ -3727,7 +3860,7 @@ mod tests {
 
     #[test]
     fn backup_interactive_shows_warnings() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let mut data = test_backup_summary();
         data.warnings =
             vec!["2 pin file write(s) failed. Run `urd verify` to diagnose.".to_string()];
@@ -3740,7 +3873,7 @@ mod tests {
     fn backup_summary_notes_rendered_dim_no_label() {
         // Notes render with a middle-dot glyph and no "NOTE:" label — the
         // dim rendering signals informational tone.
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let mut data = test_backup_summary();
         data.notes = vec!["space guard held — 1 snapshot retained.".to_string()];
         let output = render_backup_summary(&data, OutputMode::Interactive);
@@ -3757,7 +3890,7 @@ mod tests {
 
     #[test]
     fn backup_summary_notes_below_warnings() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let mut data = test_backup_summary();
         data.warnings = vec!["something worth noting loudly".to_string()];
         data.notes = vec!["space guard held — 2 snapshots retained.".to_string()];
@@ -3776,7 +3909,7 @@ mod tests {
 
     #[test]
     fn backup_summary_empty_notes_not_rendered() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let data = test_backup_summary(); // notes default to empty
         let output = render_backup_summary(&data, OutputMode::Interactive);
         assert!(
@@ -3790,7 +3923,7 @@ mod tests {
         // A note must never pick up the yellow WARNING gravity indicator.
         // Under Interactive + forced colors, render_backup_summary must
         // still not emit "WARNING" for a note.
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let mut data = test_backup_summary();
         data.notes = vec!["space guard held — 1 snapshot retained.".to_string()];
         let output = render_backup_summary(&data, OutputMode::Interactive);
@@ -3802,7 +3935,7 @@ mod tests {
 
     #[test]
     fn backup_interactive_shows_errors() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let mut data = test_backup_summary();
         data.subvolumes[1].success = false;
         data.subvolumes[1].errors = vec!["send_full: btrfs send failed".to_string()];
@@ -3814,7 +3947,7 @@ mod tests {
 
     #[test]
     fn backup_deferred_only_renders_deferred_status() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let mut data = test_backup_summary();
         // htpc-home: deferred-only (no sends)
         data.subvolumes[0].deferred = vec![DeferredInfo {
@@ -3829,7 +3962,7 @@ mod tests {
 
     #[test]
     fn backup_mixed_success_and_deferred_renders_ok() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let mut data = test_backup_summary();
         // htpc-docs: has a successful send AND a deferred op
         data.subvolumes[1].deferred = vec![DeferredInfo {
@@ -3844,7 +3977,7 @@ mod tests {
 
     #[test]
     fn backup_header_shows_deferred_count() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let mut data = test_backup_summary();
         data.subvolumes[0].deferred = vec![DeferredInfo {
             reason: "full send gated".to_string(),
@@ -3856,7 +3989,7 @@ mod tests {
 
     #[test]
     fn backup_header_shows_failed_and_deferred_counts() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let mut data = test_backup_summary();
         data.result = "partial".to_string();
         data.subvolumes[0].success = false;
@@ -3872,7 +4005,7 @@ mod tests {
 
     #[test]
     fn backup_interactive_multi_drive_sends() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let mut data = test_backup_summary();
         data.subvolumes[1].sends = vec![
             SendSummary {
@@ -3910,7 +4043,7 @@ mod tests {
 
     #[test]
     fn backup_all_skips_run() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let data = BackupSummary {
             result: "success".to_string(),
             run_id: Some(48),
@@ -4025,7 +4158,7 @@ mod tests {
 
     #[test]
     fn plan_structural_headings_present() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let data = PlanOutput {
             timestamp: "2026-03-29 13:57".to_string(),
             operations: vec![PlanOperationEntry {
@@ -4061,7 +4194,7 @@ mod tests {
 
     #[test]
     fn plan_no_operations_shows_message() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let data = PlanOutput {
             timestamp: "2026-03-29 13:57".to_string(),
             operations: vec![],
@@ -4092,7 +4225,7 @@ mod tests {
 
     #[test]
     fn plan_grouped_drive_not_mounted() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let data = PlanOutput {
             timestamp: "2026-03-29 13:57".to_string(),
             operations: vec![],
@@ -4146,7 +4279,7 @@ mod tests {
 
     #[test]
     fn plan_grouped_interval_shows_shortest() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let data = PlanOutput {
             timestamp: "2026-03-29 13:57".to_string(),
             operations: vec![],
@@ -4194,7 +4327,7 @@ mod tests {
 
     #[test]
     fn plan_grouped_interval_days_vs_hours() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let data = PlanOutput {
             timestamp: "2026-03-29 13:57".to_string(),
             operations: vec![],
@@ -4229,7 +4362,7 @@ mod tests {
 
     #[test]
     fn plan_grouped_disabled_comma_list() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let data = PlanOutput {
             timestamp: "2026-03-29 13:57".to_string(),
             operations: vec![],
@@ -4284,7 +4417,7 @@ mod tests {
 
     #[test]
     fn plan_space_exceeded_individual_lines() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let data = PlanOutput {
             timestamp: "2026-03-29 13:57".to_string(),
             operations: vec![],
@@ -4316,7 +4449,7 @@ mod tests {
 
     #[test]
     fn plan_skip_external_only_renders_grouped() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let data = PlanOutput {
             timestamp: "2026-03-29 13:57".to_string(),
             operations: vec![],
@@ -4351,7 +4484,7 @@ mod tests {
 
     #[test]
     fn backup_skipped_block_hides_external_only() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let mut data = test_backup_summary();
         data.skipped = vec![SkippedSubvolume {
             name: "htpc-root".to_string(),
@@ -4371,7 +4504,7 @@ mod tests {
 
     #[test]
     fn plan_mixed_categories_render_order() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let data = PlanOutput {
             timestamp: "2026-03-29 13:57".to_string(),
             operations: vec![],
@@ -4446,7 +4579,7 @@ mod tests {
 
     #[test]
     fn plan_summary_with_total_estimate() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let data = PlanOutput {
             timestamp: "2026-03-29 13:57".to_string(),
             operations: vec![
@@ -4493,7 +4626,7 @@ mod tests {
 
     #[test]
     fn plan_incremental_send_size_annotation() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let data = PlanOutput {
             timestamp: "2026-03-29 13:57".to_string(),
             operations: vec![PlanOperationEntry {
@@ -4524,7 +4657,7 @@ mod tests {
 
     #[test]
     fn plan_summary_partial_estimates_qualified() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let data = PlanOutput {
             timestamp: "2026-03-29 13:57".to_string(),
             operations: vec![
@@ -4566,7 +4699,7 @@ mod tests {
 
     #[test]
     fn plan_summary_no_estimates_no_size() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let data = PlanOutput {
             timestamp: "2026-03-29 13:57".to_string(),
             operations: vec![PlanOperationEntry {
@@ -4757,7 +4890,7 @@ mod tests {
 
     #[test]
     fn local_only_suppressed_in_backup_summary() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let data = BackupSummary {
             result: "success".to_string(),
             run_id: Some(1),
@@ -4937,7 +5070,7 @@ mod tests {
 
     #[test]
     fn verify_findings_first_all_clean() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let data = VerifyOutput {
             subvolumes: vec![VerifySubvolume {
                 name: "htpc-home".to_string(),
@@ -4965,7 +5098,7 @@ mod tests {
 
     #[test]
     fn verify_findings_first_one_failure() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let data = VerifyOutput {
             subvolumes: vec![VerifySubvolume {
                 name: "htpc-home".to_string(),
@@ -5013,7 +5146,7 @@ mod tests {
 
     #[test]
     fn verify_findings_first_absent_drives_collapsed() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let data = VerifyOutput {
             subvolumes: vec![VerifySubvolume {
                 name: "htpc-home".to_string(),
@@ -5064,7 +5197,7 @@ mod tests {
 
     #[test]
     fn verify_findings_first_suggestion_rendered() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let data = VerifyOutput {
             subvolumes: vec![VerifySubvolume {
                 name: "htpc-root".to_string(),
@@ -5207,21 +5340,21 @@ mod tests {
 
     #[test]
     fn sentinel_running_contains_watching() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let output = render_sentinel_status(&test_sentinel_running(), OutputMode::Interactive);
         assert!(output.contains("watching"), "missing 'watching'");
     }
 
     #[test]
     fn sentinel_running_contains_pid() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let output = render_sentinel_status(&test_sentinel_running(), OutputMode::Interactive);
         assert!(output.contains("12345"), "missing PID");
     }
 
     #[test]
     fn sentinel_running_contains_tick() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let output = render_sentinel_status(&test_sentinel_running(), OutputMode::Interactive);
         assert!(output.contains("15m"), "missing tick interval");
         assert!(output.contains("all promises held"), "missing promise summary");
@@ -5229,14 +5362,14 @@ mod tests {
 
     #[test]
     fn sentinel_running_contains_drive() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let output = render_sentinel_status(&test_sentinel_running(), OutputMode::Interactive);
         assert!(output.contains("WD-18TB"), "missing drive label");
     }
 
     #[test]
     fn sentinel_not_running_shows_message() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let data = SentinelStatusOutput::NotRunning { last_seen: None };
         let output = render_sentinel_status(&data, OutputMode::Interactive);
         assert!(output.contains("not running"), "missing 'not running'");
@@ -5245,7 +5378,7 @@ mod tests {
 
     #[test]
     fn sentinel_not_running_with_last_seen() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let data = SentinelStatusOutput::NotRunning {
             last_seen: Some("2026-03-27T10:00:00".to_string()),
         };
@@ -5267,7 +5400,7 @@ mod tests {
 
     #[test]
     fn summary_line_all_safe_all_healthy() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let mut data = test_status_output();
         // Make all assessments safe and healthy
         for a in &mut data.assessments {
@@ -5281,7 +5414,7 @@ mod tests {
 
     #[test]
     fn summary_line_all_safe_degraded() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let data = test_status_output(); // htpc-docs is degraded
         let output = render_status(&data, OutputMode::Interactive);
         assert!(
@@ -5292,7 +5425,7 @@ mod tests {
 
     #[test]
     fn safety_column_uses_new_vocabulary() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let data = test_status_output();
         let output = render_status(&data, OutputMode::Interactive);
         assert!(output.contains("sealed"), "missing sealed label");
@@ -5324,7 +5457,7 @@ mod tests {
 
     #[test]
     fn summary_line_shows_all_health_reasons() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let mut data = test_status_output();
         data.assessments[0].health = "degraded".to_string();
         data.assessments[0].health_reasons = vec!["WD-18TB away 8d".to_string()];
@@ -5343,7 +5476,7 @@ mod tests {
 
     #[test]
     fn summary_line_truncates_at_three_reasons() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let mut data = test_status_output();
         // Clear second assessment's health to isolate the test
         data.assessments[1].health = "healthy".to_string();
@@ -5364,7 +5497,7 @@ mod tests {
 
     #[test]
     fn summary_line_differentiates_exposed_and_waning() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let mut data = test_status_output();
         data.assessments[0].status = "UNPROTECTED".to_string();
         data.assessments[1].status = "AT RISK".to_string();
@@ -5376,7 +5509,7 @@ mod tests {
 
     #[test]
     fn primary_drive_unmounted_shows_dash_not_away() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let mut data = test_status_output();
         // Add an unmounted Primary drive with send history
         data.assessments[0].external.push(StatusDriveAssessment {
@@ -5415,7 +5548,7 @@ mod tests {
 
     #[test]
     fn health_column_hidden_when_all_healthy() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let mut data = test_status_output();
         for a in &mut data.assessments {
             a.health = "healthy".to_string();
@@ -5427,7 +5560,7 @@ mod tests {
 
     #[test]
     fn health_column_shown_when_degraded() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let data = test_status_output(); // htpc-docs is degraded
         let output = render_status(&data, OutputMode::Interactive);
         assert!(output.contains("HEALTH"), "HEALTH column should be visible");
@@ -5436,7 +5569,7 @@ mod tests {
 
     #[test]
     fn temporal_context_in_local_column() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let data = test_status_output();
         let output = render_status(&data, OutputMode::Interactive);
         // htpc-home has local_newest_age_secs = 1800 (30m)
@@ -5445,7 +5578,7 @@ mod tests {
 
     #[test]
     fn unmounted_drive_shows_away() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let mut data = test_status_output();
         // Add an unmounted drive with send history to one assessment
         data.assessments[0].external.push(StatusDriveAssessment {
@@ -5479,7 +5612,7 @@ mod tests {
 
     #[test]
     fn disconnected_drive_column_collapsed() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let data = test_status_output();
         // Offsite-4TB is unmounted in the test fixture — should NOT appear as table column
         let output = render_status(&data, OutputMode::Interactive);
@@ -5491,7 +5624,7 @@ mod tests {
 
     #[test]
     fn mounted_offsite_drive_shows_role_annotation() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let mut data = test_status_output();
         // Mount the offsite drive
         data.drives[1].mounted = true;
@@ -5505,7 +5638,7 @@ mod tests {
 
     #[test]
     fn offsite_degradation_advisory_rendered() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let mut data = test_status_output();
         data.assessments[0]
             .advisories
@@ -5519,7 +5652,7 @@ mod tests {
 
     #[test]
     fn advisory_transient_no_recovery_uses_disabled_vocabulary() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let mut data = test_status_output();
         data.redundancy_advisories
             .push(crate::output::RedundancyAdvisory {
@@ -5563,7 +5696,7 @@ mod tests {
 
     #[test]
     fn default_all_sealed() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let output = render_default_status(&test_default_all_sealed(), OutputMode::Interactive);
         assert!(output.contains("All connected drives are sealed."), "missing sealed message in: {output}");
         assert!(
@@ -5578,7 +5711,7 @@ mod tests {
 
     #[test]
     fn default_some_exposed() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let data = DefaultStatusOutput {
             total: 9,
             waning_names: vec![],
@@ -5611,7 +5744,7 @@ mod tests {
 
     #[test]
     fn default_some_waning() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let data = DefaultStatusOutput {
             total: 5,
             waning_names: vec!["htpc-config".to_string()],
@@ -5640,7 +5773,7 @@ mod tests {
 
     #[test]
     fn default_health_degradation_surfaced() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let mut data = test_default_all_sealed();
         data.degraded_count = 1;
         let output = render_default_status(&data, OutputMode::Interactive);
@@ -5656,7 +5789,7 @@ mod tests {
 
     #[test]
     fn default_with_last_backup() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let output = render_default_status(&test_default_all_sealed(), OutputMode::Interactive);
         assert!(
             output.contains("Last backup 7h ago."),
@@ -5666,7 +5799,7 @@ mod tests {
 
     #[test]
     fn default_no_last_backup() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let data = DefaultStatusOutput {
             total: 2,
             waning_names: vec![],
@@ -5730,7 +5863,7 @@ mod tests {
 
     #[test]
     fn default_single_issue_shows_command() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let mut data = test_default_all_sealed();
         data.waning_names = vec!["htpc-docs".to_string()];
         data.best_advice = Some(ActionableAdvice {
@@ -5749,7 +5882,7 @@ mod tests {
 
     #[test]
     fn default_multiple_issues_shows_count() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let mut data = test_default_all_sealed();
         data.waning_names = vec!["htpc-docs".to_string()];
         data.exposed_names = vec!["htpc-home".to_string()];
@@ -5774,64 +5907,14 @@ mod tests {
     // ── Doctor tests ──────────────────────────────────────────────────
 
     use crate::output::{
-        DiskEstimate, DoctorCheck, DoctorDataSafety, DoctorOutput, DoctorSentinelStatus,
-        DoctorVerdict, EstimateMethod, RetentionPreview, TransientComparison,
+        DiskEstimate, DoctorCheck, DoctorDataSafety, DoctorVerdict, EstimateMethod,
+        RetentionPreview, TransientComparison,
     };
-
-    fn test_doctor_healthy() -> DoctorOutput {
-        DoctorOutput {
-            config_checks: vec![DoctorCheck {
-                name: "9 subvolumes, 3 drives".to_string(),
-                status: DoctorCheckStatus::Ok,
-                detail: None,
-                suggestion: None,
-            }],
-            infra_checks: vec![
-                DoctorCheck {
-                    name: "Verifying state database".to_string(),
-                    status: DoctorCheckStatus::Ok,
-                    detail: Some("already exists".to_string()),
-                    suggestion: None,
-                },
-                DoctorCheck {
-                    name: "sudo btrfs".to_string(),
-                    status: DoctorCheckStatus::Ok,
-                    detail: None,
-                    suggestion: None,
-                },
-            ],
-            data_safety: vec![
-                DoctorDataSafety {
-                    name: "htpc-home".to_string(),
-                    status: "PROTECTED".to_string(),
-                    health: "healthy".to_string(),
-                    issue: None,
-                    suggestion: None,
-                    reason: None,
-                },
-                DoctorDataSafety {
-                    name: "htpc-docs".to_string(),
-                    status: "PROTECTED".to_string(),
-                    health: "healthy".to_string(),
-                    issue: None,
-                    suggestion: None,
-                    reason: None,
-                },
-            ],
-            sentinel: DoctorSentinelStatus {
-                running: true,
-                pid: Some(12345),
-                uptime: Some("3h 12m".to_string()),
-            },
-            verify: None,
-            verdict: DoctorVerdict::healthy(),
-        }
-    }
 
     #[test]
     fn doctor_all_healthy() {
-        colored::control::set_override(false);
-        let output = render_doctor(&test_doctor_healthy(), OutputMode::Interactive);
+        let _color = color_guard(false);
+        let output = render_doctor(&test_doctor_output(), OutputMode::Interactive);
         assert!(output.contains("All clear."), "missing verdict: {output}");
         assert!(output.contains("2 of 2 sealed"), "missing sealed count: {output}");
         assert!(output.contains("Sentinel running"), "missing sentinel: {output}");
@@ -5839,8 +5922,8 @@ mod tests {
 
     #[test]
     fn doctor_config_warnings() {
-        colored::control::set_override(false);
-        let mut data = test_doctor_healthy();
+        let _color = color_guard(false);
+        let mut data = test_doctor_output();
         data.config_checks = vec![DoctorCheck {
             name: "retention window shorter than send interval for htpc-root".to_string(),
             status: DoctorCheckStatus::Warn,
@@ -5861,8 +5944,8 @@ mod tests {
 
     #[test]
     fn doctor_promise_issues() {
-        colored::control::set_override(false);
-        let mut data = test_doctor_healthy();
+        let _color = color_guard(false);
+        let mut data = test_doctor_output();
         data.data_safety[1] = DoctorDataSafety {
             name: "htpc-docs".to_string(),
             status: "UNPROTECTED".to_string(),
@@ -5883,8 +5966,8 @@ mod tests {
 
     #[test]
     fn doctor_with_thorough() {
-        colored::control::set_override(false);
-        let mut data = test_doctor_healthy();
+        let _color = color_guard(false);
+        let mut data = test_doctor_output();
         data.verify = Some(crate::output::VerifyOutput {
             subvolumes: vec![],
             preflight_warnings: vec![],
@@ -5902,8 +5985,8 @@ mod tests {
 
     #[test]
     fn doctor_without_thorough() {
-        colored::control::set_override(false);
-        let data = test_doctor_healthy();
+        let _color = color_guard(false);
+        let data = test_doctor_output();
         let output = render_doctor(&data, OutputMode::Interactive);
         assert!(
             output.contains("--thorough"),
@@ -5913,8 +5996,8 @@ mod tests {
 
     #[test]
     fn doctor_thorough_findings_separated() {
-        colored::control::set_override(false);
-        let mut data = test_doctor_healthy();
+        let _color = color_guard(false);
+        let mut data = test_doctor_output();
         data.verify = Some(VerifyOutput {
             subvolumes: vec![VerifySubvolume {
                 name: "htpc-root".to_string(),
@@ -5971,8 +6054,8 @@ mod tests {
 
     #[test]
     fn doctor_thorough_only_absent_drives() {
-        colored::control::set_override(false);
-        let mut data = test_doctor_healthy();
+        let _color = color_guard(false);
+        let mut data = test_doctor_output();
         data.verify = Some(VerifyOutput {
             subvolumes: vec![VerifySubvolume {
                 name: "htpc-home".to_string(),
@@ -6017,8 +6100,8 @@ mod tests {
 
     #[test]
     fn doctor_thorough_all_clean_unchanged() {
-        colored::control::set_override(false);
-        let mut data = test_doctor_healthy();
+        let _color = color_guard(false);
+        let mut data = test_doctor_output();
         data.verify = Some(VerifyOutput {
             subvolumes: vec![],
             preflight_warnings: vec![],
@@ -6039,8 +6122,8 @@ mod tests {
 
     #[test]
     fn doctor_thorough_absent_drives_deduped() {
-        colored::control::set_override(false);
-        let mut data = test_doctor_healthy();
+        let _color = color_guard(false);
+        let mut data = test_doctor_output();
         data.verify = Some(VerifyOutput {
             subvolumes: vec![
                 VerifySubvolume {
@@ -6105,8 +6188,8 @@ mod tests {
 
     #[test]
     fn doctor_verdict_degraded() {
-        colored::control::set_override(false);
-        let mut data = test_doctor_healthy();
+        let _color = color_guard(false);
+        let mut data = test_doctor_output();
         data.data_safety[0].health = "degraded".to_string();
         data.data_safety[1].health = "degraded".to_string();
         data.verdict = DoctorVerdict::degraded(2);
@@ -6123,8 +6206,8 @@ mod tests {
 
     #[test]
     fn doctor_verdict_degraded_singular() {
-        colored::control::set_override(false);
-        let mut data = test_doctor_healthy();
+        let _color = color_guard(false);
+        let mut data = test_doctor_output();
         data.data_safety[0].health = "degraded".to_string();
         data.verdict = DoctorVerdict::degraded(1);
         let output = render_doctor(&data, OutputMode::Interactive);
@@ -6159,8 +6242,8 @@ mod tests {
 
     #[test]
     fn doctor_verdict_singular_issue() {
-        colored::control::set_override(false);
-        let mut data = test_doctor_healthy();
+        let _color = color_guard(false);
+        let mut data = test_doctor_output();
         data.data_safety[0].status = "UNPROTECTED".to_string();
         data.data_safety[0].health = "blocked".to_string();
         data.data_safety[0].issue = Some("exposed".to_string());
@@ -6174,8 +6257,8 @@ mod tests {
 
     #[test]
     fn doctor_verdict_plural_warnings() {
-        colored::control::set_override(false);
-        let mut data = test_doctor_healthy();
+        let _color = color_guard(false);
+        let mut data = test_doctor_output();
         data.verdict = DoctorVerdict::warnings(2);
         let output = render_doctor(&data, OutputMode::Interactive);
         assert!(
@@ -6186,13 +6269,13 @@ mod tests {
 
     #[test]
     fn doctor_verdict_no_run_suggested_text() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         for verdict in [
             DoctorVerdict::warnings(1),
             DoctorVerdict::issues(1),
             DoctorVerdict::degraded(1),
         ] {
-            let mut data = test_doctor_healthy();
+            let mut data = test_doctor_output();
             data.verdict = verdict;
             let output = render_doctor(&data, OutputMode::Interactive);
             assert!(
@@ -6204,8 +6287,8 @@ mod tests {
 
     #[test]
     fn doctor_sentinel_running() {
-        colored::control::set_override(false);
-        let data = test_doctor_healthy();
+        let _color = color_guard(false);
+        let data = test_doctor_output();
         let output = render_doctor(&data, OutputMode::Interactive);
         assert!(
             output.contains("PID 12345"),
@@ -6219,7 +6302,7 @@ mod tests {
 
     #[test]
     fn doctor_daemon_json() {
-        let data = test_doctor_healthy();
+        let data = test_doctor_output();
         let output = render_doctor(&data, OutputMode::Daemon);
         let parsed: serde_json::Value =
             serde_json::from_str(&output).expect("doctor daemon output should be valid JSON");
@@ -6233,8 +6316,8 @@ mod tests {
 
     #[test]
     fn doctor_chain_broken_shows_force_full() {
-        colored::control::set_override(false);
-        let mut data = test_doctor_healthy();
+        let _color = color_guard(false);
+        let mut data = test_doctor_output();
         data.data_safety[0] = DoctorDataSafety {
             name: "htpc-home".to_string(),
             status: "AT RISK".to_string(),
@@ -6257,8 +6340,8 @@ mod tests {
 
     #[test]
     fn doctor_absent_drive_shows_connect() {
-        colored::control::set_override(false);
-        let mut data = test_doctor_healthy();
+        let _color = color_guard(false);
+        let mut data = test_doctor_output();
         data.data_safety[0] = DoctorDataSafety {
             name: "htpc-home".to_string(),
             status: "UNPROTECTED".to_string(),
@@ -6277,8 +6360,8 @@ mod tests {
 
     #[test]
     fn doctor_protected_healthy_no_suggestion() {
-        colored::control::set_override(false);
-        let data = test_doctor_healthy();
+        let _color = color_guard(false);
+        let data = test_doctor_output();
         let output = render_doctor(&data, OutputMode::Interactive);
         assert!(
             !output.contains("Run `urd backup"),
@@ -6328,7 +6411,7 @@ mod tests {
 
     #[test]
     fn retention_preview_interactive() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let output = render_retention_preview(&test_graduated_preview(), OutputMode::Interactive);
         assert!(
             output.contains("htpc-root"),
@@ -6371,7 +6454,7 @@ mod tests {
 
     #[test]
     fn retention_preview_transient() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let output = render_retention_preview(
             &RetentionPreviewOutput {
                 previews: vec![RetentionPreview {
@@ -6394,7 +6477,7 @@ mod tests {
 
     #[test]
     fn retention_preview_with_comparison() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let output = render_retention_preview(
             &RetentionPreviewOutput {
                 previews: vec![RetentionPreview {
@@ -6512,7 +6595,7 @@ mod tests {
 
     #[test]
     fn unmounted_with_physical_event_renders_away() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let label = unmounted_drive_label("WD-18TB", Some(259200), None, "PROTECTED");
         assert!(label.contains("WD-18TB"), "missing label: {label}");
         assert!(label.contains("away"), "missing 'away': {label}");
@@ -6521,7 +6604,7 @@ mod tests {
 
     #[test]
     fn unmounted_without_event_with_ops_renders_last_backup() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let label = unmounted_drive_label("WD-18TB", None, Some(259200), "PROTECTED");
         assert!(label.contains("WD-18TB"), "missing label: {label}");
         assert!(label.contains("last backup"), "missing 'last backup': {label}");
@@ -6530,7 +6613,7 @@ mod tests {
 
     #[test]
     fn unmounted_no_data_renders_disconnected_silent() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let label = unmounted_drive_label("WD-18TB", None, None, "PROTECTED");
         assert!(label.contains("WD-18TB"), "missing label: {label}");
         assert!(
@@ -6549,7 +6632,7 @@ mod tests {
         // Rule 1 seed at render layer: if the cascade populated neither field
         // (sentinel-missed-unmount case, verified by awareness tests), voice
         // must stay silent — no "away" or "last backup".
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let label = unmounted_drive_label("WD-18TB", None, None, "AT RISK");
         assert!(label.contains("disconnected"), "must be silent: {label}");
         assert!(!label.contains("away"));
@@ -6558,7 +6641,7 @@ mod tests {
 
     #[test]
     fn at_risk_escalation_away() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let label = unmounted_drive_label("WD-18TB", Some(604800), None, "AT RISK");
         assert!(label.contains("away"), "missing 'away': {label}");
         assert!(label.contains("7d"), "missing age: {label}");
@@ -6570,7 +6653,7 @@ mod tests {
 
     #[test]
     fn at_risk_escalation_last_backup() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let label = unmounted_drive_label("WD-18TB", None, Some(604800), "AT RISK");
         assert!(label.contains("last backup"), "missing 'last backup': {label}");
         assert!(label.contains("7d"), "missing age: {label}");
@@ -6582,7 +6665,7 @@ mod tests {
 
     #[test]
     fn unprotected_escalation_away() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let label = unmounted_drive_label("WD-18TB1", Some(2592000), None, "UNPROTECTED");
         assert!(label.contains("WD-18TB1"), "missing label: {label}");
         assert!(label.contains("away"), "missing 'away': {label}");
@@ -6600,7 +6683,7 @@ mod tests {
 
     #[test]
     fn unprotected_escalation_last_backup() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let label = unmounted_drive_label("WD-18TB", None, Some(2592000), "UNPROTECTED");
         assert!(label.contains("last backup"), "missing 'last backup': {label}");
         assert!(label.contains("30d"), "missing age: {label}");
@@ -6614,7 +6697,7 @@ mod tests {
     fn unmounted_away_uses_absent_duration_not_activity() {
         // Voice-Contract-Rule-1 seed test: absent_duration_secs wins over
         // last_activity_age_secs; the right field drives the right label.
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let label = unmounted_drive_label("WD-18TB", Some(15 * 60), Some(7 * 86400), "PROTECTED");
         assert!(label.contains("15m"), "should render 15m: {label}");
         assert!(
@@ -6708,7 +6791,7 @@ mod tests {
 
     #[test]
     fn status_interactive_exposed_has_suggestion_line() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let mut data = test_status_output();
         // Provide advice so the suggestion line renders
         data.advice = vec![ActionableAdvice {
@@ -6726,7 +6809,7 @@ mod tests {
 
     #[test]
     fn default_status_healthy_has_help_hint() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let data = test_default_all_sealed();
         let output = render_default_status(&data, OutputMode::Interactive);
         assert!(
@@ -6741,7 +6824,7 @@ mod tests {
 
     #[test]
     fn default_status_issues_suggests_status() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let mut data = test_default_all_sealed();
         data.exposed_names = vec!["htpc-docs".to_string()];
         let output = render_default_status(&data, OutputMode::Interactive);
@@ -6753,8 +6836,8 @@ mod tests {
 
     #[test]
     fn doctor_interactive_healthy_no_suggestion() {
-        colored::control::set_override(false);
-        let output = render_doctor(&test_doctor_healthy(), OutputMode::Interactive);
+        let _color = color_guard(false);
+        let output = render_doctor(&test_doctor_output(), OutputMode::Interactive);
         // Should have verdict "All clear." but no extra suggestion line
         assert!(output.contains("All clear."), "missing verdict: {output}");
         // The suggestion system returns None for doctor, so no "urd" command in suggestion
@@ -6765,7 +6848,7 @@ mod tests {
 
     #[test]
     fn render_transitions_interactive() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let mut summary = test_backup_summary();
         summary.transitions = vec![
             TransitionEvent::ThreadRestored {
@@ -6805,7 +6888,7 @@ mod tests {
 
     #[test]
     fn no_transitions_no_output() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let summary = test_backup_summary();
         assert!(summary.transitions.is_empty());
         let output = render_backup_summary(&summary, OutputMode::Interactive);
@@ -7122,7 +7205,7 @@ mod tests {
 
     #[test]
     fn drives_list_interactive_columns() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let output = render_drives_list(&test_drives_list(), OutputMode::Interactive);
         assert!(output.contains("DRIVE"), "should have header: {output}");
         assert!(output.contains("STATUS"), "should have header: {output}");
@@ -7141,7 +7224,7 @@ mod tests {
 
     #[test]
     fn drives_list_absent_shows_duration() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let output = render_drives_list(&test_drives_list(), OutputMode::Interactive);
         // The absent drive's last_seen is 2026-03-24, so "absent Nd" should appear
         assert!(
@@ -7152,7 +7235,7 @@ mod tests {
 
     #[test]
     fn drives_list_uuid_mismatch_shows_status() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let output = render_drives_list(&test_drives_list(), OutputMode::Interactive);
         assert!(
             output.contains("uuid mismatch"),
@@ -7162,7 +7245,7 @@ mod tests {
 
     #[test]
     fn drives_list_token_column_uses_ascii() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
         let output = render_drives_list(&test_drives_list(), OutputMode::Interactive);
         assert!(output.contains("ok"), "Verified token should show 'ok': {output}");
         // Token column should not contain Unicode check/cross marks
@@ -7183,7 +7266,7 @@ mod tests {
 
     #[test]
     fn drives_adopt_messages() {
-        colored::control::set_override(false);
+        let _color = color_guard(false);
 
         let adopted = DriveAdoptOutput {
             label: "WD-18TB".to_string(),
