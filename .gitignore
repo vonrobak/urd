@@ -32,4 +32,9 @@ docs/97-plans/
 docs/98-journals/
 docs/99-reports/
 docs/contributing-internal.md
-scripts/
+# Local scripts and prompts stay private; tracked dev tooling is whitelisted below.
+scripts/*
+!scripts/install-hooks.sh
+!scripts/pre-commit-pii.sh
+!scripts/check-docs.sh
+!scripts/check-registry.sh

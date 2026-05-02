@@ -9,6 +9,31 @@ cargo build --release       # Binary at target/release/urd
 cargo install --path .      # Install to ~/.cargo/bin/urd
 ```
 
+## Local dev setup
+
+Install the repo's git hooks once after cloning:
+
+```bash
+scripts/install-hooks.sh
+```
+
+This wires up a `pre-commit` PII guard that scans staged diffs for the operator's
+username, hostname, and home/mount paths. The repo is public — accidental leaks
+have happened before. See `scripts/pre-commit-pii.sh` for the patterns scanned.
+
+## Doc checks
+
+Two helper scripts validate the documentation tree:
+
+```bash
+scripts/check-docs.sh       # all relative links in tracked markdown resolve
+scripts/check-registry.sh   # UPI registry ↔ design files are consistent (local-only)
+```
+
+`check-docs.sh` is CI-safe. `check-registry.sh` requires the gitignored
+`docs/96-project-supervisor/registry.md` and `docs/95-ideas/`, so it short-circuits
+in environments where those are absent.
+
 ## Testing
 
 ```bash
