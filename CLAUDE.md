@@ -37,6 +37,10 @@ Read `docs/96-project-supervisor/status.md` first — short current-state docume
 Follow links to `roadmap.md` for priorities and feature tracking.
 See `docs/contributing-internal.md` for documentation structure and conventions.
 
+For controlled vocabulary (promise states, voice labels, protection levels, retention
+tiers, identifier conventions) see `docs/00-foundation/glossary.md`. For a one-screen
+flow diagram of how the modules below connect, see `docs/00-foundation/architecture.md`.
+
 ## Architecture
 
 ### Core Flow
