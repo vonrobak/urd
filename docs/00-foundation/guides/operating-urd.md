@@ -138,11 +138,16 @@ urd backup --dry-run
 # 6. Run a real backup
 urd backup
 
-# 7. Install the systemd timer for nightly runs
-cp ~/projects/urd/systemd/urd-backup.{service,timer} ~/.config/systemd/user/
+# 7. Install the systemd units for nightly backups and the sentinel
+cp ~/projects/urd/systemd/urd-*.{service,timer} ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now urd-backup.timer
+systemctl --user enable --now urd-sentinel.service   # recommended; see below
 ```
+
+The sentinel is the continuous protection layer — without it, Urd runs only at
+04:00 and promise states drift between runs. Skip the sentinel enable line if you
+want the nightly cron without the always-on watchdog.
 
 ## CLI Commands
 
@@ -236,37 +241,51 @@ urd init
 
 ## Systemd Operation
 
-### Timer and service
+### Units
 
-Urd runs nightly at 02:00 via a user-level systemd timer.
+Urd ships three systemd user units. The nightly pair is required; the sentinel
+is recommended.
 
 | Unit | Purpose |
 |------|---------|
-| `urd-backup.timer` | Triggers the service at 02:00 daily (with 5m random delay) |
+| `urd-backup.timer` | Triggers the service nightly at 04:00 (with 5m random delay) |
 | `urd-backup.service` | Runs `~/.cargo/bin/urd backup` as a oneshot |
+| `urd-sentinel.service` | Long-running daemon: drive events, promise refresh, notifications |
 
-The service runs at low priority (`Nice=19`, `IOSchedulingClass=idle`) and allows up
-to 6 hours for large sends.
+All three run at low priority (`Nice=19`, `IOSchedulingClass=idle`). The backup
+service allows up to 6 hours for large sends. The sentinel restarts on failure
+with a 30-second back-off.
+
+The sentinel is the integration layer — drive plug/unplug detection, sub-hourly
+promise-state updates, and notification dispatch all live there. Without it,
+Urd is a nightly cron job; with it, Urd is a continuous protection layer.
 
 ### Install / update units
 
 ```bash
-cp ~/projects/urd/systemd/urd-backup.{service,timer} ~/.config/systemd/user/
+cp ~/projects/urd/systemd/urd-*.{service,timer} ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now urd-backup.timer
+systemctl --user enable --now urd-sentinel.service   # optional but recommended
 ```
 
-Re-run this after modifying unit files in the repo. Copying (rather than symlinking)
-keeps the installed unit stable across `git checkout` operations.
+Re-run this after modifying unit files in the repo. Copying (rather than
+symlinking) keeps the installed units stable across `git checkout` operations.
 
 ### Monitor
 
 ```bash
+# Backup timer
 systemctl --user status urd-backup.timer      # next scheduled run
 systemctl --user list-timers urd-backup*      # timer details
 journalctl --user -u urd-backup.service       # all run output
 journalctl --user -u urd-backup.service -f    # follow live
 journalctl --user -u urd-backup.service --since today
+
+# Sentinel daemon
+systemctl --user status urd-sentinel.service  # daemon health, restart count
+journalctl --user -u urd-sentinel.service -f  # follow live (warn-level lifecycle by default)
+urd sentinel status                           # Urd's own view of the daemon
 ```
 
 ### Manual trigger via systemd
@@ -318,9 +337,14 @@ urd plan                          # preview with new logic
 If systemd units changed too:
 
 ```bash
-cp systemd/urd-backup.{service,timer} ~/.config/systemd/user/
+cp systemd/urd-*.{service,timer} ~/.config/systemd/user/
 systemctl --user daemon-reload
+systemctl --user restart urd-sentinel.service   # if you run the sentinel
 ```
+
+(The backup unit is a oneshot driven by the timer — no restart needed; the next
+scheduled run picks up the new unit. The sentinel is long-lived, so a restart is
+required for unit changes to take effect.)
 
 ### Backup to a specific drive
 

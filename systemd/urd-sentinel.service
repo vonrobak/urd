@@ -1,0 +1,21 @@
+[Unit]
+Description=Urd Sentinel — passive filesystem and drive monitor
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/.cargo/bin/urd sentinel run
+Environment=RUST_LOG=warn
+Restart=on-failure
+RestartSec=30
+
+# Low priority — don't interfere with interactive use
+Nice=19
+IOSchedulingClass=idle
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

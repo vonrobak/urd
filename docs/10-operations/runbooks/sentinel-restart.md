@@ -37,7 +37,7 @@ Do **not** restart the Sentinel as a habit. If something feels wrong,
 
 ```bash
 urd sentinel status
-systemctl --user status urd-sentinel.service    # if installed
+systemctl --user status urd-sentinel.service
 journalctl --user -u urd-sentinel.service -n 50 --no-pager
 ```
 
@@ -53,8 +53,6 @@ revived it. If it didn't, check `journalctl` for the crash reason — Urd's
 philosophy is to fix the cause, not paper over it with a restart.
 
 ### Restart
-
-If installed as a user service:
 
 ```bash
 systemctl --user restart urd-sentinel.service
