@@ -256,9 +256,8 @@ systemctl --user daemon-reload
 systemctl --user enable --now urd-backup.timer
 ```
 
-Re-run this after modifying unit files in the repo. See
-[CONTRIBUTING.md](../../CONTRIBUTING.md#systemd-deployment) for the rationale behind
-copying rather than symlinking.
+Re-run this after modifying unit files in the repo. Copying (rather than symlinking)
+keeps the installed unit stable across `git checkout` operations.
 
 ### Monitor
 
