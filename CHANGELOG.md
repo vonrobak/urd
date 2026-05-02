@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.1] - 2026-05-02
+
+### Fixed
+- Non-transient planner now augments `local_snaps` with the just-planned
+  snapshot before computing sends, so a freshly-created snapshot ships in
+  the same run when latest local already equals latest external (the
+  "caught up" state). Mirrors the transient-lifecycle fix from 0f52555.
+  Previously, after emergency retention or a generation-equality skip
+  caught local and external up, the next run would create a new local
+  snapshot and silently defer its send as "already on <drive>", stranding
+  the snapshot until the following night's run.
+
 ## [0.15.0] - 2026-05-01
 
 ### Added
@@ -393,7 +405,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Defense-in-depth pin file protection for unsent snapshots
 - Per-subvolume error isolation in executor
 
-[Unreleased]: https://github.com/vonrobak/urd/compare/v0.15.0...HEAD
+[Unreleased]: https://github.com/vonrobak/urd/compare/v0.15.1...HEAD
+[0.15.1]: https://github.com/vonrobak/urd/compare/v0.15.0...v0.15.1
 [0.15.0]: https://github.com/vonrobak/urd/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/vonrobak/urd/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/vonrobak/urd/compare/v0.12.2...v0.13.0
