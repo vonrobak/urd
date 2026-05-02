@@ -414,9 +414,9 @@ pub fn plan(
         // LOAD-BEARING ORDER: Operations are emitted as create → send → delete.
         // The executor relies on this ordering within each subvolume.
         // Do not reorder without updating the executor contract in PLAN.md.
-        if !filters.external_only {
+        let planned_snap = if !filters.external_only {
             let min_free = subvol.min_free_bytes.unwrap_or(0);
-            let _ = plan_local_snapshot(
+            let planned = plan_local_snapshot(
                 subvol,
                 &local_dir,
                 &local_snaps,
@@ -440,7 +440,31 @@ pub fn plan(
                 &mut operations,
                 &mut events,
             );
-        }
+            planned
+        } else {
+            None
+        };
+
+        // Send planning must consider the just-planned snapshot. Without
+        // this augmentation, a "caught up" state (latest local already on
+        // drive) defers the send and strands tonight's snapshot until the
+        // next run. Mirrors plan_transient_lifecycle's effective_local_snaps
+        // (Bug B fixed for transient in 0f52555 — same shape applies here).
+        let augmented;
+        let effective_local_snaps: &[SnapshotName] = if let Some(ref snap) = planned_snap {
+            if !local_snaps.iter().any(|s| s.as_str() == snap.as_str()) {
+                augmented = {
+                    let mut v = local_snaps.clone();
+                    v.push(snap.clone());
+                    v
+                };
+                &augmented
+            } else {
+                &local_snaps
+            }
+        } else {
+            &local_snaps
+        };
 
         // ── External operations ─────────────────────────────────────
         if !filters.local_only && subvol.send_enabled {
@@ -464,7 +488,7 @@ pub fn plan(
                     subvol,
                     drive,
                     &local_dir,
-                    &local_snaps,
+                    effective_local_snaps,
                     now,
                     force,
                     filters.skip_intervals,
@@ -2965,6 +2989,73 @@ send_enabled = false
     }
 
     #[test]
+    fn non_transient_sends_when_local_caught_up_to_external() {
+        // Regression: same class of bug fixed for transient in commit 0f52555
+        // ("Bug B: phase 2 sends used a stale local_snaps list that didn't
+        //  include the snapshot planned in phase 1").
+        // The non-transient code path was unpatched until this fix.
+        //
+        // Trigger: latest local == latest external (caught-up state). This is
+        // reached after any prior run that deferred snapshot creation but
+        // successfully sent the existing latest. In the wild this happened for
+        // htpc-home on 2026-05-02 after emergency retention freed space.
+        let config = test_config();
+        let mut fs = MockFileSystemState::new();
+
+        // Caught-up: same single snapshot S1 exists locally and on D1.
+        let s1 = snap("20260322-1330-one"); // 1.5h before now() — past 15m and 1h intervals
+        fs.local_snapshots.insert("sv1".to_string(), vec![s1.clone()]);
+        fs.mounted_drives.insert("D1".to_string());
+        fs.external_snapshots
+            .insert(("D1".to_string(), "sv1".to_string()), vec![s1.clone()]);
+        fs.pin_files.insert(
+            (PathBuf::from("/snap/sv1"), "D1".to_string()),
+            s1.clone(),
+        );
+
+        // Plenty of local space (above the 10GB min_free threshold).
+        fs.free_bytes
+            .insert(PathBuf::from("/snap/sv1"), 50_000_000_000);
+
+        // Source generation differs from the snapshot's, so the
+        // "unchanged" generation check at plan_local_snapshot does NOT fire.
+        fs.generations.insert(PathBuf::from("/data/sv1"), 100);
+        fs.generations
+            .insert(PathBuf::from("/snap/sv1").join(s1.as_str()), 50);
+
+        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+
+        let creates: Vec<_> = result
+            .operations
+            .iter()
+            .filter(|op| matches!(
+                op,
+                PlannedOperation::CreateSnapshot { subvolume_name, .. }
+                if subvolume_name == "sv1"
+            ))
+            .collect();
+        let sends: Vec<_> = result
+            .operations
+            .iter()
+            .filter(|op| matches!(
+                op,
+                PlannedOperation::SendIncremental { subvolume_name, .. }
+                | PlannedOperation::SendFull { subvolume_name, .. }
+                if subvolume_name == "sv1"
+            ))
+            .collect();
+
+        assert_eq!(creates.len(), 1, "should create new snapshot");
+        assert_eq!(
+            sends.len(),
+            1,
+            "should plan send of newly-created snapshot when caught up; \
+             skipped: {:?}",
+            result.skipped
+        );
+    }
+
+    #[test]
     fn space_guard_fails_open_when_free_bytes_unreadable() {
         let config = test_config(); // min_free_bytes = 10GB
         let mut fs = MockFileSystemState::new();
@@ -4575,7 +4666,15 @@ local_retention = "transient"
         // Note: plan() in this test returns full incremental_or_full ops based
         // on pin presence. Without a pin file we get a SendFull (NoPinFile),
         // not an incremental. Mock out a pin so we get an incremental.
-        let config = test_config();
+        // sv2 is disabled to keep the test focused on sv1's incremental —
+        // otherwise sv2 plans its own first send (SendFull) which emits a
+        // PlannerSendChoice and pollutes the count.
+        let mut config = test_config();
+        for sv in &mut config.subvolumes {
+            if sv.name == "sv2" {
+                sv.enabled = Some(false);
+            }
+        }
         let mut fs = MockFileSystemState::new();
         fs.mounted_drives.insert("D1".to_string());
         let local_snap = snap("20260322-1455-one");

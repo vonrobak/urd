@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Non-transient planner now augments `local_snaps` with the just-planned
+  snapshot before computing sends, so a freshly-created snapshot ships in
+  the same run when latest local already equals latest external (the
+  "caught up" state). Mirrors the transient-lifecycle fix from 0f52555.
+  Previously, after emergency retention or a generation-equality skip
+  caught local and external up, the next run would create a new local
+  snapshot and silently defer its send as "already on <drive>", stranding
+  the snapshot until the following night's run.
+
 ## [0.15.0] - 2026-05-01
 
 ### Added
