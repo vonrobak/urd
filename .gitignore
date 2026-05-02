@@ -18,10 +18,13 @@ Thumbs.db
 # Claude Code (CLAUDE.md stays tracked — commands and settings are local)
 .claude/
 
-# Internal project documentation (kept locally, not published)
-# ADRs and guides remain tracked — they signal engineering rigor
-docs/00-foundation/source-documentation/
-docs/00-foundation/decisions/ADR-relating-to-bash-script/
+# Project-management documentation (kept locally, not published)
+# Everything in the 9*-* range is internal: ideas, plans, journals, reports,
+# project supervisor (status/roadmap/registry), and the archive.
+# Topic-oriented docs (00-foundation, 10-operations, 20-reference) stay tracked
+# — they're the public engineering record. The internal documentation guide
+# itself (contributing-internal.md) stays local; CONTRIBUTING.md is its public
+# counterpart.
 docs/90-archive/
 docs/95-ideas/
 docs/96-project-supervisor/
