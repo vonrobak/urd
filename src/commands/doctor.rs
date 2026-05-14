@@ -3,13 +3,15 @@ use crate::cli::{DoctorArgs, VerifyArgs};
 use crate::config::Config;
 use crate::drives;
 use crate::output::{
-    DoctorCheck, DoctorCheckStatus, DoctorDataSafety, DoctorOutput, DoctorSentinelStatus,
-    DoctorVerdict, InitStatus, OutputMode,
+    DoctorCheck, DoctorCheckStatus, DoctorDataSafety, DoctorOutput, DoctorRecommendationRow,
+    DoctorRecommendationView, DoctorSentinelStatus, DoctorVerdict, InitStatus, OutputMode,
 };
 use crate::plan::RealFileSystemState;
+use crate::policy::{self, ShapeRole};
 use crate::preflight;
 use crate::sentinel_runner;
 use crate::state::StateDb;
+use crate::types::{LocalRetentionPolicy, ProtectionLevel};
 use crate::voice;
 
 use crate::commands::{init, verify};
@@ -242,7 +244,14 @@ pub fn run(config: Config, args: DoctorArgs, output_mode: OutputMode) -> anyhow:
 
     // ── 5.5 Churn (UPI 030 — only with --thorough) ────────────────
     let churn_view = if args.thorough {
-        Some(build_doctor_churn_view(&config))
+        Some(build_doctor_churn_view(&config, state_db.as_ref()))
+    } else {
+        None
+    };
+
+    // ── 5.6 Recommendations (UPI 041 — only with --thorough) ──────
+    let recommendation_view = if args.thorough {
+        Some(build_doctor_recommendation_view(&config, state_db.as_ref()))
     } else {
         None
     };
@@ -274,6 +283,7 @@ pub fn run(config: Config, args: DoctorArgs, output_mode: OutputMode) -> anyhow:
         sentinel,
         verify: verify_output,
         churn: churn_view,
+        recommendations: recommendation_view,
         verdict,
     };
 
@@ -284,12 +294,131 @@ pub fn run(config: Config, args: DoctorArgs, output_mode: OutputMode) -> anyhow:
 
 /// Build the `--thorough` Churn-section view from `drift_samples` history.
 ///
-/// Opens the state DB once; falls back to all-NotMeasured when unavailable.
 /// Best-effort per-subvolume: a query failure renders as `NotMeasured`.
-fn build_doctor_churn_view(config: &Config) -> crate::output::DoctorChurnView {
-    let state_db = StateDb::open(&config.general.state_db).ok();
+fn build_doctor_churn_view(
+    config: &Config,
+    state_db: Option<&StateDb>,
+) -> crate::output::DoctorChurnView {
     let now = chrono::Local::now().naive_local();
-    build_doctor_churn_view_inner(config, state_db.as_ref(), now)
+    build_doctor_churn_view_inner(config, state_db, now)
+}
+
+/// Build the `--thorough` Recommendations-section view (UPI 041).
+///
+/// Iterates resolved subvolumes, computes a recommendation per role from
+/// the same rolling-churn aggregate the Churn section uses, drops aligned
+/// rows, and sorts by recovery magnitude descending.
+fn build_doctor_recommendation_view(
+    config: &Config,
+    state_db: Option<&StateDb>,
+) -> DoctorRecommendationView {
+    let now = chrono::Local::now().naive_local();
+    build_doctor_recommendation_view_inner(config, state_db, now)
+}
+
+fn build_doctor_recommendation_view_inner(
+    config: &Config,
+    state_db: Option<&StateDb>,
+    now: chrono::NaiveDateTime,
+) -> DoctorRecommendationView {
+    let window = crate::drift::default_window();
+    let since = now - window;
+    let header = format!(
+        "based on {}-day churn observation; apply by editing ~/.config/urd/urd.toml",
+        window.num_days()
+    );
+    let resolved = config.resolved_subvolumes();
+    let mut rows: Vec<DoctorRecommendationRow> = Vec::new();
+
+    for sv in resolved.iter().filter(|sv| sv.enabled) {
+        let churn = compute_churn_for(state_db, &sv.name, since, window, now);
+
+        let local = match &sv.local_retention {
+            LocalRetentionPolicy::Transient => None,
+            LocalRetentionPolicy::Graduated(g) => {
+                policy::recommend_shape(g, &churn, ShapeRole::Local)
+            }
+        };
+
+        let external = if sv.send_enabled {
+            policy::recommend_shape(&sv.external_retention, &churn, ShapeRole::External)
+        } else {
+            None
+        };
+
+        let local = local.filter(|r| r.suggested != r.current);
+        let external = external.filter(|r| r.suggested != r.current);
+
+        if local.is_none() && external.is_none() {
+            continue;
+        }
+
+        let note = local
+            .as_ref()
+            .and_then(|r| r.note)
+            .or_else(|| external.as_ref().and_then(|r| r.note));
+
+        let was_named_level = sv
+            .protection_level
+            .filter(|p| *p != ProtectionLevel::Custom);
+
+        rows.push(DoctorRecommendationRow {
+            name: sv.name.clone(),
+            local,
+            external,
+            note,
+            was_named_level,
+        });
+    }
+
+    rows.sort_by_key(|r| std::cmp::Reverse(recovery_bytes(r)));
+
+    DoctorRecommendationView { header, rows }
+}
+
+fn recovery_bytes(row: &DoctorRecommendationRow) -> u64 {
+    let local = row
+        .local
+        .as_ref()
+        .map(|r| {
+            r.current_cost
+                .data_bytes
+                .saturating_sub(r.suggested_cost.data_bytes)
+        })
+        .unwrap_or(0);
+    let external = row
+        .external
+        .as_ref()
+        .map(|r| {
+            r.current_cost
+                .data_bytes
+                .saturating_sub(r.suggested_cost.data_bytes)
+        })
+        .unwrap_or(0);
+    local.saturating_add(external)
+}
+
+fn compute_churn_for(
+    state_db: Option<&StateDb>,
+    name: &str,
+    since: chrono::NaiveDateTime,
+    window: chrono::Duration,
+    now: chrono::NaiveDateTime,
+) -> crate::drift::ChurnEstimate {
+    state_db
+        .and_then(|db| db.drift_samples_for_subvolume(name, since).ok())
+        .map(|rows| {
+            let samples: Vec<_> = rows.into_iter().map(StateDb::drift_row_to_sample).collect();
+            crate::drift::compute_rolling_churn(&samples, window, now)
+        })
+        .unwrap_or(crate::drift::ChurnEstimate {
+            mean_bytes_per_second: None,
+            incremental_count: 0,
+            full_count: 0,
+            median_full_bytes: None,
+            latest_full_bytes: None,
+            latest_full_interval_secs: None,
+        })
 }
 
 /// Pure-ish core (still does DB I/O via `state_db`) — extracted so unit tests
@@ -419,5 +548,397 @@ source = "/data/gamma"
             view.rows[1].state,
             crate::output::ChurnRender::FirstMeasurement { .. }
         ));
+    }
+
+    // ── UPI 041 Recommendations builder ────────────────────────────
+
+    fn empty_cfg() -> Config {
+        let toml_str = r#"
+drives = []
+subvolumes = []
+
+[general]
+state_db = "/tmp/urd-doctor-rec-test/urd.db"
+metrics_file = "/tmp/urd-doctor-rec-test/backup.prom"
+log_dir = "/tmp/urd-doctor-rec-test"
+heartbeat_file = "/tmp/urd-doctor-rec-test/heartbeat.json"
+
+[local_snapshots]
+roots = []
+
+[defaults]
+snapshot_interval = "1h"
+send_interval = "4h"
+[defaults.local_retention]
+hourly = 24
+[defaults.external_retention]
+daily = 30
+"#;
+        toml::from_str(toml_str).unwrap()
+    }
+
+    /// Three subvolumes — containers (hot), photos (warmer), docs (cold).
+    /// Configured retention covers the symmetry case for recovery sorting.
+    fn three_subvols_cfg() -> Config {
+        let toml_str = r#"
+drives = []
+
+[general]
+state_db = "/tmp/urd-doctor-rec-test/urd.db"
+metrics_file = "/tmp/urd-doctor-rec-test/backup.prom"
+log_dir = "/tmp/urd-doctor-rec-test"
+heartbeat_file = "/tmp/urd-doctor-rec-test/heartbeat.json"
+
+[local_snapshots]
+roots = [
+  { path = "/snap", subvolumes = ["containers", "photos", "docs"] }
+]
+
+[defaults]
+snapshot_interval = "1h"
+send_interval = "4h"
+[defaults.local_retention]
+hourly = 24
+daily = 60
+weekly = 52
+monthly = 24
+[defaults.external_retention]
+hourly = 0
+daily = 60
+weekly = 52
+monthly = 24
+
+[[subvolumes]]
+name = "containers"
+short_name = "containers"
+source = "/data/containers"
+
+[[subvolumes]]
+name = "photos"
+short_name = "photos"
+source = "/data/photos"
+
+[[subvolumes]]
+name = "docs"
+short_name = "docs"
+source = "/data/docs"
+"#;
+        toml::from_str(toml_str).unwrap()
+    }
+
+    fn seed_incremental(db: &StateDb, name: &str, sampled_at: chrono::NaiveDateTime, bytes: u64) {
+        db.record_drift_sample_best_effort(&crate::state::DriftSampleRow {
+            run_id: None,
+            subvolume: name.to_string(),
+            sampled_at,
+            seconds_since_prev_send: Some(86_400),
+            bytes_transferred: bytes,
+            source_free_bytes: None,
+            send_kind: crate::types::SendKind::Incremental,
+        });
+    }
+
+    fn now_fixed() -> chrono::NaiveDateTime {
+        chrono::NaiveDateTime::parse_from_str("2026-05-01T12:00:00", "%Y-%m-%dT%H:%M:%S").unwrap()
+    }
+
+    #[test]
+    fn recommendation_view_empty_when_no_subvolumes() {
+        let config = empty_cfg();
+        let db = StateDb::open_memory().unwrap();
+        let view = build_doctor_recommendation_view_inner(&config, Some(&db), now_fixed());
+        assert!(view.rows.is_empty());
+    }
+
+    #[test]
+    fn recommendation_view_suppresses_aligned_shapes() {
+        // Build a config whose configured shape already matches the
+        // engine's output: a single cold subvolume with retention =
+        // {24, 60, 52, 24} for both local and external. With churn ≈ 81 B/s
+        // the engine clamps to the same max-shape, so suggested == current
+        // and the row is dropped.
+        let toml_str = r#"
+drives = []
+
+[general]
+state_db = "/tmp/urd-doctor-rec-test/urd.db"
+metrics_file = "/tmp/urd-doctor-rec-test/backup.prom"
+log_dir = "/tmp/urd-doctor-rec-test"
+heartbeat_file = "/tmp/urd-doctor-rec-test/heartbeat.json"
+
+[local_snapshots]
+roots = [
+  { path = "/snap", subvolumes = ["cold"] }
+]
+
+[defaults]
+snapshot_interval = "1h"
+send_interval = "4h"
+[defaults.local_retention]
+hourly = 24
+daily = 60
+weekly = 52
+monthly = 24
+[defaults.external_retention]
+hourly = 0
+daily = 60
+weekly = 52
+monthly = 24
+
+[[subvolumes]]
+name = "cold"
+short_name = "cold"
+source = "/data/cold"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let db = StateDb::open_memory().unwrap();
+        let now = now_fixed();
+        // ~81 B/s — clamps every slot to clamp_max for both roles.
+        // bytes_transferred = 81 * 86_400 ≈ 7_000_000 over one-day interval.
+        seed_incremental(&db, "cold", now - chrono::Duration::hours(12), 7_000_000);
+        let view = build_doctor_recommendation_view_inner(&config, Some(&db), now);
+        assert!(
+            view.rows.is_empty(),
+            "aligned shape must be suppressed: {:?}",
+            view.rows
+        );
+    }
+
+    #[test]
+    fn recommendation_view_emits_row_when_one_role_differs() {
+        // Hot churn against the max-shape config: at minimum the local
+        // recommendation tightens. Some external slots may also clamp,
+        // but the test only needs *some* row to surface.
+        let config = three_subvols_cfg();
+        let db = StateDb::open_memory().unwrap();
+        let now = now_fixed();
+        // Hot rate ~ 31_250 B/s = ~2.7 GB/day. bytes for 1-day interval.
+        seed_incremental(&db, "containers", now - chrono::Duration::hours(12), 2_700_000_000);
+        let view = build_doctor_recommendation_view_inner(&config, Some(&db), now);
+        let containers_row = view
+            .rows
+            .iter()
+            .find(|r| r.name == "containers")
+            .expect("containers row present");
+        assert!(
+            containers_row.local.is_some() || containers_row.external.is_some(),
+            "containers must have at least one role recommendation"
+        );
+    }
+
+    #[test]
+    fn recommendation_view_skips_local_for_transient() {
+        let toml_str = r#"
+drives = []
+
+[general]
+state_db = "/tmp/urd-doctor-rec-test/urd.db"
+metrics_file = "/tmp/urd-doctor-rec-test/backup.prom"
+log_dir = "/tmp/urd-doctor-rec-test"
+heartbeat_file = "/tmp/urd-doctor-rec-test/heartbeat.json"
+
+[local_snapshots]
+roots = [
+  { path = "/snap", subvolumes = ["transient"] }
+]
+
+[defaults]
+snapshot_interval = "1h"
+send_interval = "4h"
+[defaults.local_retention]
+hourly = 24
+daily = 60
+weekly = 52
+monthly = 24
+[defaults.external_retention]
+hourly = 0
+daily = 60
+weekly = 52
+monthly = 24
+
+[[subvolumes]]
+name = "transient"
+short_name = "transient"
+source = "/data/transient"
+local_retention = "transient"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let db = StateDb::open_memory().unwrap();
+        let now = now_fixed();
+        seed_incremental(&db, "transient", now - chrono::Duration::hours(12), 2_700_000_000);
+        let view = build_doctor_recommendation_view_inner(&config, Some(&db), now);
+        let row = view
+            .rows
+            .iter()
+            .find(|r| r.name == "transient")
+            .expect("transient row should surface from external recommendation");
+        assert!(row.local.is_none(), "transient must have no local rec");
+        assert!(
+            row.external.is_some(),
+            "transient row should be carried by external recommendation"
+        );
+    }
+
+    #[test]
+    fn recommendation_view_omits_external_for_send_disabled() {
+        let toml_str = r#"
+drives = []
+
+[general]
+state_db = "/tmp/urd-doctor-rec-test/urd.db"
+metrics_file = "/tmp/urd-doctor-rec-test/backup.prom"
+log_dir = "/tmp/urd-doctor-rec-test"
+heartbeat_file = "/tmp/urd-doctor-rec-test/heartbeat.json"
+
+[local_snapshots]
+roots = [
+  { path = "/snap", subvolumes = ["local-only"] }
+]
+
+[defaults]
+snapshot_interval = "1h"
+send_interval = "4h"
+[defaults.local_retention]
+hourly = 24
+daily = 60
+weekly = 52
+monthly = 24
+[defaults.external_retention]
+hourly = 0
+daily = 60
+weekly = 52
+monthly = 24
+
+[[subvolumes]]
+name = "local-only"
+short_name = "local-only"
+source = "/data/local-only"
+send_enabled = false
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let db = StateDb::open_memory().unwrap();
+        let now = now_fixed();
+        seed_incremental(&db, "local-only", now - chrono::Duration::hours(12), 2_700_000_000);
+        let view = build_doctor_recommendation_view_inner(&config, Some(&db), now);
+        let row = view
+            .rows
+            .iter()
+            .find(|r| r.name == "local-only")
+            .expect("local-only row should surface from local recommendation");
+        assert!(
+            row.external.is_none(),
+            "send_enabled=false must have no external rec"
+        );
+        assert!(
+            row.local.is_some(),
+            "local-only row should be carried by local recommendation"
+        );
+    }
+
+    #[test]
+    fn recommendation_view_sorts_by_recovery_magnitude_descending() {
+        // Three subvolumes with rates that produce ordered recovery
+        // magnitudes: containers (hot) → photos (warm) → docs (cold).
+        // docs is already at max-shape (the engine's output for cold
+        // churn) so its recovery is zero.
+        let config = three_subvols_cfg();
+        let db = StateDb::open_memory().unwrap();
+        let now = now_fixed();
+        seed_incremental(&db, "containers", now - chrono::Duration::hours(12), 2_700_000_000); // ~31_250 B/s
+        seed_incremental(&db, "photos", now - chrono::Duration::hours(12), 50_000_000); // ~580 B/s
+        seed_incremental(&db, "docs", now - chrono::Duration::hours(12), 7_000_000); // ~81 B/s (cold)
+        let view = build_doctor_recommendation_view_inner(&config, Some(&db), now);
+        // At least the first two rows must be ordered by descending
+        // recovery; the third may or may not exist depending on whether
+        // docs gets suppressed by the aligned-shape filter.
+        let names: Vec<&str> = view.rows.iter().map(|r| r.name.as_str()).collect();
+        let containers_idx = names.iter().position(|n| *n == "containers");
+        let photos_idx = names.iter().position(|n| *n == "photos");
+        assert!(containers_idx.is_some(), "containers must surface");
+        if let (Some(c), Some(p)) = (containers_idx, photos_idx) {
+            assert!(
+                c < p,
+                "containers (higher recovery) must precede photos: {names:?}"
+            );
+        }
+        // docs is already aligned with the engine's cold-clamp output,
+        // so it should be suppressed.
+        assert!(
+            !names.contains(&"docs"),
+            "docs at max-shape should be suppressed: {names:?}"
+        );
+    }
+
+    #[test]
+    fn recommendation_view_populates_was_named_level_for_named_level_subvol() {
+        // Two subvolumes: one declares protection_level = "sheltered",
+        // the other "custom". Both have a differing recommendation.
+        let toml_str = r#"
+drives = []
+
+[general]
+state_db = "/tmp/urd-doctor-rec-test/urd.db"
+metrics_file = "/tmp/urd-doctor-rec-test/backup.prom"
+log_dir = "/tmp/urd-doctor-rec-test"
+heartbeat_file = "/tmp/urd-doctor-rec-test/heartbeat.json"
+run_frequency = "daily"
+
+[local_snapshots]
+roots = [
+  { path = "/snap", subvolumes = ["sheltered-sv", "custom-sv"] }
+]
+
+[defaults]
+snapshot_interval = "1h"
+send_interval = "4h"
+[defaults.local_retention]
+hourly = 24
+daily = 60
+weekly = 52
+monthly = 24
+[defaults.external_retention]
+hourly = 0
+daily = 60
+weekly = 52
+monthly = 24
+
+[[subvolumes]]
+name = "sheltered-sv"
+short_name = "sheltered-sv"
+source = "/data/sheltered-sv"
+protection_level = "sheltered"
+
+[[subvolumes]]
+name = "custom-sv"
+short_name = "custom-sv"
+source = "/data/custom-sv"
+protection_level = "custom"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let db = StateDb::open_memory().unwrap();
+        let now = now_fixed();
+        // Hot enough to force a differing recommendation in both rows.
+        seed_incremental(&db, "sheltered-sv", now - chrono::Duration::hours(12), 2_700_000_000);
+        seed_incremental(&db, "custom-sv", now - chrono::Duration::hours(12), 2_700_000_000);
+        let view = build_doctor_recommendation_view_inner(&config, Some(&db), now);
+
+        let sheltered_row = view
+            .rows
+            .iter()
+            .find(|r| r.name == "sheltered-sv")
+            .expect("sheltered-sv row");
+        assert_eq!(
+            sheltered_row.was_named_level,
+            Some(crate::types::ProtectionLevel::Sheltered)
+        );
+
+        let custom_row = view
+            .rows
+            .iter()
+            .find(|r| r.name == "custom-sv")
+            .expect("custom-sv row");
+        assert!(custom_row.was_named_level.is_none(),
+            "custom protection_level must not populate was_named_level"
+        );
     }
 }

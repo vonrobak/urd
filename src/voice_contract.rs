@@ -38,8 +38,9 @@
 mod contract {
     use crate::output::{BackupSummary, OutputMode, TransitionEvent};
     use crate::voice::test_fixtures::{
-        color_guard, test_backup_summary, test_default_status_output, test_doctor_output,
-        test_plan_output, test_status_output, test_verify_output,
+        color_guard, recommendations_doctor_output, test_backup_summary,
+        test_default_status_output, test_doctor_output, test_plan_output, test_status_output,
+        test_verify_output,
     };
     use crate::voice::{
         render_backup_summary, render_default_status, render_doctor, render_first_time,
@@ -842,6 +843,119 @@ mod contract {
         assert!(
             !row.contains("21d") && !row.contains("3w"),
             "external_only row must not surface the suppressed local age, got: {row}"
+        );
+    }
+
+    // ── Rule 1 / 5 / 7 — Recommendations section (UPI 041) ──────────────
+
+    fn recommendation_row_with_recovery() -> crate::output::DoctorRecommendationRow {
+        use crate::policy::{CostProjection, ShapeRecommendation, ShapeRole};
+        use crate::types::ResolvedGraduatedRetention as Shape;
+        let current = Shape {
+            hourly: 24,
+            daily: 30,
+            weekly: 26,
+            monthly: 12,
+        };
+        let suggested = Shape {
+            hourly: 0,
+            daily: 7,
+            weekly: 4,
+            monthly: 0,
+        };
+        crate::output::DoctorRecommendationRow {
+            name: "containers".to_string(),
+            local: Some(ShapeRecommendation {
+                role: ShapeRole::Local,
+                current,
+                suggested,
+                current_cost: CostProjection {
+                    data_bytes: 200_000_000_000,
+                    snapshot_count: 92,
+                },
+                suggested_cost: CostProjection {
+                    data_bytes: 50_000_000_000,
+                    snapshot_count: 11,
+                },
+                note: None,
+            }),
+            external: None,
+            note: None,
+            was_named_level: None,
+        }
+    }
+
+    #[test]
+    fn rule1_recommendations_recovery_renders_with_bytesize_not_size_labels() {
+        let _color = color_guard(false);
+        let view = crate::output::DoctorRecommendationView {
+            header: "header".to_string(),
+            rows: vec![recommendation_row_with_recovery()],
+        };
+        let output = render_doctor(
+            &recommendations_doctor_output(view),
+            OutputMode::Interactive,
+        );
+        let stripped = helpers::strip_ansi(&output);
+        // Rule 1 (precision): recovery framing must use ByteSize units,
+        // not approximate prose like "small" / "medium" / "huge".
+        assert!(
+            stripped.contains("GB") || stripped.contains("MB") || stripped.contains("KB"),
+            "recovery framing must use ByteSize units, got: {stripped}"
+        );
+        for prose in &["small", "medium", "large", "tiny", "huge"] {
+            assert!(
+                !stripped.contains(prose),
+                "Rule 1 violation: recommendation prose contains '{prose}': {stripped}"
+            );
+        }
+    }
+
+    #[test]
+    fn rule5_recommendations_emit_does_not_change_first_line() {
+        let _color = color_guard(false);
+        // Compare with-vs-without recommendations: emitting the
+        // Recommendations section must not change the first non-blank
+        // line. Order-independent with respect to UPI 045's verdict-as-
+        // first-line shift.
+        let without = render_doctor(&test_doctor_output(), OutputMode::Interactive);
+        let view = crate::output::DoctorRecommendationView {
+            header: "header".to_string(),
+            rows: vec![recommendation_row_with_recovery()],
+        };
+        let with = render_doctor(
+            &recommendations_doctor_output(view),
+            OutputMode::Interactive,
+        );
+        let first_without = helpers::non_blank_lines(&without)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("empty doctor output without recs:\n{without}"));
+        let first_with = helpers::non_blank_lines(&with)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("empty doctor output with recs:\n{with}"));
+        assert_eq!(
+            first_without, first_with,
+            "Rule 5 violation: recommendations section changed the first non-blank line"
+        );
+    }
+
+    #[test]
+    fn rule7_recommendations_section_omitted_when_no_rows() {
+        let _color = color_guard(false);
+        let view = crate::output::DoctorRecommendationView {
+            header: "header".to_string(),
+            rows: vec![],
+        };
+        let output = render_doctor(
+            &recommendations_doctor_output(view),
+            OutputMode::Interactive,
+        );
+        let stripped = helpers::strip_ansi(&output);
+        assert!(
+            !stripped.contains("Recommendations"),
+            "Rule 7 violation: Recommendations header emitted with empty rows: {stripped}"
         );
     }
 

@@ -15,6 +15,7 @@ mod metrics;
 mod notify;
 mod output;
 mod plan;
+mod policy;
 mod preflight;
 mod retention;
 mod sentinel;
