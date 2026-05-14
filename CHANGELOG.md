@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-05-14
+
 ### Added
 - `urd doctor --thorough` Recommendations section: per-subvolume retention
   shape advice derived from observed churn (UPI 041, ADR-115). New pure
@@ -14,6 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a four-slot shape per role. Advisory only; nothing is applied
   automatically. Rows are sorted by recovery magnitude descending and
   suppressed when current matches the suggestion.
+- `urd-sentinel.service` systemd user unit shipped alongside the existing
+  backup service/timer pair, so the in-binary
+  `systemctl --user start urd-sentinel` instruction now works for new
+  installs (UPI 044). Type=simple, Restart=on-failure, low-priority
+  (Nice=19, IOSchedulingClass=idle).
 
 ## [0.15.1] - 2026-05-02
 
@@ -413,7 +420,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Defense-in-depth pin file protection for unsent snapshots
 - Per-subvolume error isolation in executor
 
-[Unreleased]: https://github.com/vonrobak/urd/compare/v0.15.1...HEAD
+[Unreleased]: https://github.com/vonrobak/urd/compare/v0.16.0...HEAD
+[0.16.0]: https://github.com/vonrobak/urd/compare/v0.15.1...v0.16.0
 [0.15.1]: https://github.com/vonrobak/urd/compare/v0.15.0...v0.15.1
 [0.15.0]: https://github.com/vonrobak/urd/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/vonrobak/urd/compare/v0.13.0...v0.14.0
