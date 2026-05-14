@@ -156,6 +156,7 @@ Dual-parser architecture supporting **legacy** and **v1** schemas. `Config::load
 - Code using path-constructing functions (`external_snapshot_dir()`, `local_snapshot_dir()`) should also have `tempfile::TempDir` tests — mocks are blind to filesystem preconditions like missing parent directories
 - Test retention logic exhaustively — it protects against data loss
 - When building features, use vertical slicing: write one test, implement to pass, repeat. Never write all tests first then all implementation.
+- **Symmetric fixes need symmetric reviews.** When a bug is rooted in a shared planning or rendering pattern (e.g. "augment local_snaps with planned_snap" in plan.rs), grep for the pattern in adjacent code paths before closing the fix. The May 2 stranded-snapshots incident: commit `0f52555` correctly fixed the transient planner branch in April; the symmetric bug in the non-transient branch went unnoticed for nearly a month. See [2026-05-02-stranded-snapshots-non-transient-planner.md](docs/98-journals/2026-05-02-stranded-snapshots-non-transient-planner.md).
 - 521+ tests, all passing, clippy clean
 
 ## Backward Compatibility (ADR-105)
@@ -259,6 +260,7 @@ cargo run -- migrate                 # Migrate config to v1 schema
 | 112 | SemVer and release workflow | Versioning, CHANGELOG, git tags, /release skill |
 | 113 | The Do-No-Harm invariant | Layered, probabilistic defense against Urd-induced host burden |
 | 114 | Structured event log | Typed change-and-decision history; complement to Prometheus gauges and UPI 030 drift_samples |
+| 115 | Retention shape symmetry and the recommendation layer | Symmetric data-cost model + advisory recommendation surface; amends ADR-110 |
 
 ## Development Workflow
 

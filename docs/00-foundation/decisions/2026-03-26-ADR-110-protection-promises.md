@@ -6,10 +6,11 @@
 > earn opaque status through operational track record. Current taxonomy:
 > recorded/sheltered/fortified (renamed 2026-04-03 from guarded/protected/resilient).
 
-**Date:** 2026-03-26 (revised 2026-03-27, addendum 2026-03-31, vocabulary 2026-04-03)
-**Status:** Accepted (taxonomy renamed 2026-04-03 — see Maturity Model)
+**Date:** 2026-03-26 (revised 2026-03-27, addendum 2026-03-31, vocabulary 2026-04-03, amendment 2026-05-09)
+**Status:** Accepted (taxonomy renamed 2026-04-03 — see Maturity Model; recommendation-layer amendment 2026-05-09 — see [Amendment 2026-05-09](#amendment-2026-05-09-recommendation-layer-as-graduation-evidence-path-adr-115))
 **Depends on:** ADR-100 (planner/executor separation), ADR-108 (pure function modules),
 ADR-109 (config boundary validation), ADR-111 (config system architecture)
+**Amended by:** ADR-115 (Retention shape symmetry and the recommendation layer)
 **Ownership:** This ADR is authoritative for protection promise *semantics* — what levels
 mean, how they derive policy, the maturity model, and the opacity rule. ADR-111 is
 authoritative for config *structure* — what fields exist, how validation works, versioning.
@@ -292,6 +293,88 @@ additional constraint based on protection level.
 - See Design 6-E (`docs/95-ideas/2026-03-31-design-e-promise-redundancy-encoding.md`) for
   full rationale and review findings.
 
+## Amendment 2026-05-09: Recommendation Layer as Graduation Evidence Path (ADR-115)
+
+**Context:** Phase D-2 (UPI 041) introduces a recommendation layer over
+the symmetric data-cost model — see ADR-115. The recommendation layer
+surfaces, per subvolume, a retention shape that fits the observed churn,
+and tells the user what the current shape costs. This amendment names
+the recommendation layer as the **path by which named levels accumulate
+the operational evidence this ADR's Maturity Model required for
+graduation to opaque status**.
+
+### How named levels graduate under the amended model
+
+Phase 1 (Custom-first, current) is unchanged. Custom remains the
+recommended default until named levels earn opaque status.
+
+The amended graduation criteria (replacing the original four) are:
+
+1. **Operational track record** — run as a template-based custom policy
+   in production for a meaningful period without operator intervention.
+   *(Unchanged from original.)*
+2. **Distinct operational identity** — parameters meaningfully different
+   from every other level. *(Unchanged from original.)*
+3. **Self-explanatory name** — operator can infer what the level does
+   from its name without reading documentation. *(Unchanged from
+   original.)*
+4. **ADR documentation** — rationale for the level's specific parameter
+   choices, grounded in operational evidence from Phase 1. *(Unchanged
+   from original.)*
+5. **Alignment with the recommendation engine across enough hosts to
+   constitute a track record (NEW).** A named level is calibrated when
+   the recommendation engine, given representative real-world drift
+   signals, produces shapes that match the level's derived retention
+   for the kind of subvolume the level is supposed to fit. Persistent
+   divergence — the engine consistently recommending tighter or looser
+   shapes than the named level produces — is evidence that the level's
+   parameters are miscalibrated and not yet ready for opaque status.
+
+### Why this amendment
+
+ADR-110 originally framed graduation as "operational track record +
+ADR documentation." It did not specify *what evidence track-record
+generates*. The recommendation layer fills that gap: the engine's
+output **is** the evidence. Named levels graduate when their derived
+shapes consistently match what the engine recommends for representative
+data. Until then, named levels remain provisional templates — useful
+scaffolding for new operators, not yet sealed policies.
+
+This is consistent with ADR-110's original intent ("you can't design a
+battle-tested level at a desk") — it just makes the evidence channel
+concrete.
+
+### What this amendment does NOT change
+
+- **Opacity of named levels remains absolute.** When `protection_level`
+  is set to a named level, derived parameters are final. No per-field
+  overrides. This is enforced by config validation (ADR-111).
+- **The recommendation engine never mutates `derive_policy()`** (ADR-115
+  invariant 2). Recommendations are advisory; if a recommendation
+  differs from a named-level shape, the user must switch to `custom`
+  to apply it. Voice surfaces this transition explicitly per the X1
+  design.
+- **The maturity model remains evidence-based, not process-based.**
+  Graduation is not a vote or a committee decision; it is a finding
+  that the recommendation engine and the named level converge on
+  representative data.
+
+### Phase 2 trigger
+
+Phase 2 (Named levels graduate) is triggered when, across a population
+of hosts running Urd in production, the recommendation engine's outputs
+align with at least one named level's derived shapes for the
+characteristic subvolumes that level is meant to serve. The arc's
+done-ness criterion 6 (post-X4 evidence checkpoint) is the first
+opportunity to evaluate this on a single host; broader graduation
+requires multi-host evidence as Urd matures toward v1.0.
+
+If the evidence shows persistent divergence — recommendations
+consistently differ from named-level shapes — the named-level taxonomy
+itself may be miscalibrated and warrant rework rather than graduation.
+Either outcome is honest: graduation on alignment, taxonomy revision on
+divergence, both grounded in evidence.
+
 ## Implementation Gates
 
 This ADR is considered implemented when:
@@ -304,6 +387,7 @@ This ADR is considered implemented when:
 - [x] `--confirm-retention-change` flag gates retention tightening
 - [x] `urd status` shows promise level column
 - [x] Pin-protection safety tests pass with derived retention
+- [ ] Recommendation layer ships and surfaces per-subvolume shape advice (UPI 041 / ADR-115)
 
 ## Related
 
