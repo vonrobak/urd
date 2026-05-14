@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Live progress line in `urd backup` no longer latches to the first send's
+  subvolume name and `[i/N]` index after subsequent sends start (#118).
+  The display thread keyed new-send detection off the `bytes_counter == 0`
+  transition inside `RealBtrfs::send_receive`; that window is sub-millisecond
+  and the 250 ms poll missed it, so the cached context never refreshed
+  while byte/rate values kept updating from later sends. The display now
+  uses `send_index` as a generation marker, refreshing cached fields and
+  the elapsed-time anchor whenever the executor moves to a new send.
+
 ## [0.16.0] - 2026-05-14
 
 ### Added
