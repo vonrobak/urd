@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `urd doctor --thorough` Recommendations section: per-subvolume retention
+  shape advice derived from observed churn (UPI 041, ADR-115). New pure
+  module `src/policy.rs` projects steady-state data cost and recommends
+  a four-slot shape per role. Advisory only; nothing is applied
+  automatically. Rows are sorted by recovery magnitude descending and
+  suppressed when current matches the suggestion.
+
 ## [0.15.1] - 2026-05-02
 
 ### Fixed

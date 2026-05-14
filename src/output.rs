@@ -474,7 +474,47 @@ pub struct DoctorOutput {
     /// `None` for default `urd doctor` (no Churn section). UPI 030.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub churn: Option<DoctorChurnView>,
+    /// Per-subvolume retention shape recommendations under
+    /// `urd doctor --thorough` (UPI 041, ADR-115). Advisory only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recommendations: Option<DoctorRecommendationView>,
     pub verdict: DoctorVerdict,
+}
+
+// ── Recommendations (UPI 041, ADR-115) ─────────────────────────────────
+
+/// `urd doctor --thorough` Recommendations-section view: an apply-hint
+/// header and one row per subvolume whose current retention diverges
+/// from the engine's suggestion. Advisory only; nothing here is applied
+/// automatically.
+#[derive(Debug, Clone, Serialize)]
+pub struct DoctorRecommendationView {
+    pub header: String,
+    /// Rows pre-sorted by recovery magnitude descending (largest recovery
+    /// first; looser-recommendation rows sort to the bottom because their
+    /// recovery is zero).
+    pub rows: Vec<DoctorRecommendationRow>,
+}
+
+/// One row of the Recommendations section — at most one suggestion per
+/// role. At least one of `local` / `external` is `Some` (rows with
+/// nothing to say are omitted by the builder).
+#[derive(Debug, Clone, Serialize)]
+pub struct DoctorRecommendationRow {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local: Option<crate::policy::ShapeRecommendation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external: Option<crate::policy::ShapeRecommendation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<crate::policy::RecommendationNote>,
+    /// `Some(level)` only when (a) the subvolume's `protection_level` is
+    /// non-Custom AND (b) at least one role's recommendation differs from
+    /// current. Voice renders the dimmed hint unconditionally on
+    /// `Some(_)`; the builder is the single source of truth for this
+    /// gate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub was_named_level: Option<crate::types::ProtectionLevel>,
 }
 
 // ── Churn (UPI 030) ────────────────────────────────────────────────────
@@ -2083,6 +2123,7 @@ source = "/data/sv2"
             },
             verify: None,
             churn: None,
+            recommendations: None,
             verdict: DoctorVerdict::healthy(),
         };
         let json = serde_json::to_string(&output).unwrap();

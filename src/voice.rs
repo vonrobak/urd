@@ -2414,6 +2414,22 @@ fn render_doctor_interactive(data: &DoctorOutput) -> String {
         }
     }
 
+    // Recommendations section (--thorough only). UPI 041, ADR-115.
+    if let Some(ref recs) = data.recommendations
+        && !recs.rows.is_empty()
+    {
+        writeln!(out).ok();
+        writeln!(out, "  {}", "Recommendations".bold()).ok();
+        writeln!(out, "    {}", recs.header.dimmed()).ok();
+        writeln!(out).ok();
+        for (i, row) in recs.rows.iter().enumerate() {
+            if i > 0 {
+                writeln!(out).ok();
+            }
+            write!(out, "{}", format_recommendation_row(row)).ok();
+        }
+    }
+
     // Verdict
     writeln!(out).ok();
     match data.verdict.status {
@@ -2537,6 +2553,98 @@ fn format_churn_row(
     }
 }
 
+
+// ── Recommendations (UPI 041, ADR-115) ────────────────────────────────
+
+/// Render one role-line of a Recommendations-section row: a key=value
+/// list of non-zero slots ("daily=7  weekly=4") followed by the
+/// dimmed framing tail ("(recover ~135 GB)" / "(extends chain to
+/// ~N {unit})").
+fn render_shape_kv(shape: &crate::types::ResolvedGraduatedRetention) -> String {
+    let mut parts: Vec<String> = Vec::with_capacity(4);
+    if shape.hourly != 0 {
+        parts.push(format!("hourly={}", shape.hourly));
+    }
+    if shape.daily != 0 {
+        parts.push(format!("daily={}", shape.daily));
+    }
+    if shape.weekly != 0 {
+        parts.push(format!("weekly={}", shape.weekly));
+    }
+    if shape.monthly != 0 {
+        parts.push(format!("monthly={}", shape.monthly));
+    }
+    parts.join("  ")
+}
+
+/// Recovery-or-extends-chain framing for one role-line, based on the
+/// cost delta between current and suggested. Returns an empty string
+/// when the costs are equal (which should not happen — the builder
+/// suppresses aligned rows).
+fn render_cost_delta(
+    current: u64,
+    suggested: u64,
+    suggested_shape: &crate::types::ResolvedGraduatedRetention,
+) -> String {
+    use std::cmp::Ordering;
+    use crate::types::ByteSize;
+    match suggested.cmp(&current) {
+        Ordering::Less => format!("(recover ~{})", ByteSize(current - suggested)),
+        Ordering::Greater => {
+            let secs = crate::policy::chain_span_seconds(suggested_shape);
+            let (n, unit) = if secs <= 60 * 86_400 {
+                (secs / 86_400, "days")
+            } else if secs <= 364 * 86_400 {
+                (secs / (7 * 86_400), "weeks")
+            } else {
+                (secs / (365 * 86_400), "years")
+            };
+            format!("(extends chain to ~{n} {unit})")
+        }
+        Ordering::Equal => String::new(),
+    }
+}
+
+/// Render one Recommendations-section row: subvolume name + up-to-two
+/// role lines (`local:` / `external:`) + optional bursty/named-level
+/// hint lines.
+fn format_recommendation_row(row: &crate::output::DoctorRecommendationRow) -> String {
+    let mut out = String::new();
+    writeln!(out, "    {}", row.name).ok();
+
+    let mut role_line = |label: &str, rec: &crate::policy::ShapeRecommendation| {
+        let kv = render_shape_kv(&rec.suggested);
+        let tail = render_cost_delta(
+            rec.current_cost.data_bytes,
+            rec.suggested_cost.data_bytes,
+            &rec.suggested,
+        );
+        let line = if tail.is_empty() {
+            format!("      {label:9} {kv}")
+        } else {
+            format!("      {label:9} {kv}   {}", tail.dimmed())
+        };
+        writeln!(out, "{line}").ok();
+    };
+    if let Some(ref rec) = row.local {
+        role_line("local:", rec);
+    }
+    if let Some(ref rec) = row.external {
+        role_line("external:", rec);
+    }
+    if matches!(row.note, Some(crate::policy::RecommendationNote::BurstyPattern)) {
+        writeln!(out, "      {}", "bursty pattern — frequent full sends".dimmed()).ok();
+    }
+    if let Some(level) = row.was_named_level {
+        writeln!(
+            out,
+            "      {}",
+            format!("currently {level} — applying switches to custom").dimmed()
+        )
+        .ok();
+    }
+    out
+}
 
 fn render_doctor_check_section(out: &mut String, title: &str, checks: &[DoctorCheck]) {
     writeln!(out, "  {}", title.bold()).ok();
@@ -3358,6 +3466,7 @@ pub(crate) mod test_fixtures {
             },
             verify: None,
             churn: None,
+            recommendations: None,
             verdict: DoctorVerdict::healthy(),
         }
     }
@@ -3426,6 +3535,16 @@ pub(crate) mod test_fixtures {
             },
             warnings: vec![],
         }
+    }
+
+    /// Build a `DoctorOutput` populated with a single-row Recommendations
+    /// view for use by voice tests and contract tests (UPI 041).
+    pub(crate) fn recommendations_doctor_output(
+        view: crate::output::DoctorRecommendationView,
+    ) -> DoctorOutput {
+        let mut data = test_doctor_output();
+        data.recommendations = Some(view);
+        data
     }
 }
 
@@ -7743,6 +7862,401 @@ mod tests {
         assert!(
             !output.contains("Churn ("),
             "Churn section should not render when churn=None: {output}"
+        );
+    }
+
+    // ── UPI 041 Recommendations section ───────────────────────────
+
+    fn shape(h: u32, d: u32, w: u32, m: u32) -> crate::types::ResolvedGraduatedRetention {
+        crate::types::ResolvedGraduatedRetention {
+            hourly: h,
+            daily: d,
+            weekly: w,
+            monthly: m,
+        }
+    }
+
+    fn recommendation(
+        role: crate::policy::ShapeRole,
+        current: crate::types::ResolvedGraduatedRetention,
+        suggested: crate::types::ResolvedGraduatedRetention,
+        current_bytes: u64,
+        suggested_bytes: u64,
+    ) -> crate::policy::ShapeRecommendation {
+        use crate::policy::{CostProjection, ShapeRecommendation};
+        let total = |s: crate::types::ResolvedGraduatedRetention| {
+            s.hourly + s.daily + s.weekly + s.monthly
+        };
+        ShapeRecommendation {
+            role,
+            current,
+            suggested,
+            current_cost: CostProjection {
+                data_bytes: current_bytes,
+                snapshot_count: total(current),
+            },
+            suggested_cost: CostProjection {
+                data_bytes: suggested_bytes,
+                snapshot_count: total(suggested),
+            },
+            note: None,
+        }
+    }
+
+    #[test]
+    fn doctor_thorough_recommendations_renders_section_header_and_apply_hint() {
+        let _color = color_guard(false);
+        let view = crate::output::DoctorRecommendationView {
+            header: "based on 7-day churn observation; apply by editing ~/.config/urd/urd.toml"
+                .to_string(),
+            rows: vec![crate::output::DoctorRecommendationRow {
+                name: "containers".to_string(),
+                local: Some(recommendation(
+                    crate::policy::ShapeRole::Local,
+                    shape(24, 30, 26, 12),
+                    shape(0, 7, 4, 0),
+                    200_000_000_000,
+                    50_000_000_000,
+                )),
+                external: None,
+                note: None,
+                was_named_level: None,
+            }],
+        };
+        let output = render_doctor(
+            &recommendations_doctor_output(view),
+            OutputMode::Interactive,
+        );
+        assert!(
+            output.contains("Recommendations"),
+            "missing Recommendations header: {output}"
+        );
+        assert!(
+            output.contains("based on 7-day churn observation; apply by editing"),
+            "missing apply-hint: {output}"
+        );
+    }
+
+    #[test]
+    fn doctor_thorough_recommendations_renders_local_and_external_lines() {
+        let _color = color_guard(false);
+        let view = crate::output::DoctorRecommendationView {
+            header: "header".to_string(),
+            rows: vec![crate::output::DoctorRecommendationRow {
+                name: "containers".to_string(),
+                local: Some(recommendation(
+                    crate::policy::ShapeRole::Local,
+                    shape(24, 30, 26, 12),
+                    shape(0, 7, 4, 0),
+                    200_000_000_000,
+                    50_000_000_000,
+                )),
+                external: Some(recommendation(
+                    crate::policy::ShapeRole::External,
+                    shape(0, 30, 26, 12),
+                    shape(0, 14, 8, 6),
+                    400_000_000_000,
+                    100_000_000_000,
+                )),
+                note: None,
+                was_named_level: None,
+            }],
+        };
+        let output = render_doctor(
+            &recommendations_doctor_output(view),
+            OutputMode::Interactive,
+        );
+        assert!(output.contains("local:"), "missing local label: {output}");
+        assert!(output.contains("external:"), "missing external label: {output}");
+        assert!(output.contains("daily="), "missing daily slot label: {output}");
+        assert!(output.contains("weekly="), "missing weekly slot label: {output}");
+    }
+
+    #[test]
+    fn doctor_thorough_recommendations_omits_zero_slot_windows() {
+        let _color = color_guard(false);
+        let view = crate::output::DoctorRecommendationView {
+            header: "header".to_string(),
+            rows: vec![crate::output::DoctorRecommendationRow {
+                name: "containers".to_string(),
+                local: Some(recommendation(
+                    crate::policy::ShapeRole::Local,
+                    shape(24, 30, 26, 12),
+                    shape(0, 7, 4, 0),
+                    200_000_000_000,
+                    50_000_000_000,
+                )),
+                external: None,
+                note: None,
+                was_named_level: None,
+            }],
+        };
+        let output = render_doctor(
+            &recommendations_doctor_output(view),
+            OutputMode::Interactive,
+        );
+        assert!(output.contains("daily=7"), "missing daily=7: {output}");
+        assert!(output.contains("weekly=4"), "missing weekly=4: {output}");
+        // hourly and monthly should be omitted.
+        assert!(!output.contains("hourly="), "hourly should be omitted: {output}");
+        assert!(!output.contains("monthly="), "monthly should be omitted: {output}");
+    }
+
+    #[test]
+    fn doctor_thorough_recommendations_renders_recover_framing_for_tighter_suggestion() {
+        let _color = color_guard(false);
+        let view = crate::output::DoctorRecommendationView {
+            header: "header".to_string(),
+            rows: vec![crate::output::DoctorRecommendationRow {
+                name: "containers".to_string(),
+                local: Some(recommendation(
+                    crate::policy::ShapeRole::Local,
+                    shape(24, 30, 26, 12),
+                    shape(0, 7, 4, 0),
+                    200_000_000_000,
+                    50_000_000_000,
+                )),
+                external: None,
+                note: None,
+                was_named_level: None,
+            }],
+        };
+        let output = render_doctor(
+            &recommendations_doctor_output(view),
+            OutputMode::Interactive,
+        );
+        assert!(
+            output.contains("(recover"),
+            "missing recover framing: {output}"
+        );
+        assert!(output.contains("GB"), "missing GB unit on delta: {output}");
+    }
+
+    #[test]
+    fn doctor_thorough_recommendations_renders_extends_chain_framing_for_looser_suggestion() {
+        let _color = color_guard(false);
+        // Days branch: suggested shape with chain_span ~30 days.
+        let days_view = crate::output::DoctorRecommendationView {
+            header: "header".to_string(),
+            rows: vec![crate::output::DoctorRecommendationRow {
+                name: "docs".to_string(),
+                local: None,
+                external: Some(recommendation(
+                    crate::policy::ShapeRole::External,
+                    shape(0, 30, 0, 0),
+                    shape(0, 30, 0, 0), // 30 days chain
+                    1_000_000_000,
+                    2_000_000_000,
+                )),
+                note: None,
+                was_named_level: None,
+            }],
+        };
+        let days_out = render_doctor(
+            &recommendations_doctor_output(days_view),
+            OutputMode::Interactive,
+        );
+        assert!(
+            days_out.contains("(extends chain to ~30 days)"),
+            "days branch: {days_out}"
+        );
+
+        // Weeks branch: chain ~24 weeks (~168 days).
+        let weeks_view = crate::output::DoctorRecommendationView {
+            header: "header".to_string(),
+            rows: vec![crate::output::DoctorRecommendationRow {
+                name: "docs".to_string(),
+                local: None,
+                external: Some(recommendation(
+                    crate::policy::ShapeRole::External,
+                    shape(0, 30, 0, 0),
+                    shape(0, 0, 24, 0), // 24 weeks chain
+                    1_000_000_000,
+                    2_000_000_000,
+                )),
+                note: None,
+                was_named_level: None,
+            }],
+        };
+        let weeks_out = render_doctor(
+            &recommendations_doctor_output(weeks_view),
+            OutputMode::Interactive,
+        );
+        assert!(
+            weeks_out.contains("(extends chain to ~24 weeks)"),
+            "weeks branch: {weeks_out}"
+        );
+
+        // Years branch: chain 24 months (~720 days).
+        let years_view = crate::output::DoctorRecommendationView {
+            header: "header".to_string(),
+            rows: vec![crate::output::DoctorRecommendationRow {
+                name: "docs".to_string(),
+                local: None,
+                external: Some(recommendation(
+                    crate::policy::ShapeRole::External,
+                    shape(0, 30, 0, 0),
+                    shape(0, 0, 0, 24), // 24 months chain
+                    1_000_000_000,
+                    2_000_000_000,
+                )),
+                note: None,
+                was_named_level: None,
+            }],
+        };
+        let years_out = render_doctor(
+            &recommendations_doctor_output(years_view),
+            OutputMode::Interactive,
+        );
+        // 24 months * 30 days = 720 days; 720 / 365 = 1 (u64 truncation).
+        assert!(
+            years_out.contains("(extends chain to ~1 years)"),
+            "years branch: {years_out}"
+        );
+    }
+
+    #[test]
+    fn doctor_thorough_recommendations_renders_bursty_pattern_hint_dimmed() {
+        let _color = color_guard(false);
+        let view = crate::output::DoctorRecommendationView {
+            header: "header".to_string(),
+            rows: vec![crate::output::DoctorRecommendationRow {
+                name: "containers".to_string(),
+                local: Some(recommendation(
+                    crate::policy::ShapeRole::Local,
+                    shape(24, 30, 26, 12),
+                    shape(0, 7, 4, 0),
+                    200_000_000_000,
+                    50_000_000_000,
+                )),
+                external: None,
+                note: Some(crate::policy::RecommendationNote::BurstyPattern),
+                was_named_level: None,
+            }],
+        };
+        let output = render_doctor(
+            &recommendations_doctor_output(view),
+            OutputMode::Interactive,
+        );
+        assert!(
+            output.contains("bursty pattern"),
+            "missing bursty pattern hint: {output}"
+        );
+    }
+
+    #[test]
+    fn doctor_thorough_recommendations_renders_was_named_level_hint() {
+        let _color = color_guard(false);
+        let with_level_view = crate::output::DoctorRecommendationView {
+            header: "header".to_string(),
+            rows: vec![crate::output::DoctorRecommendationRow {
+                name: "photos".to_string(),
+                local: Some(recommendation(
+                    crate::policy::ShapeRole::Local,
+                    shape(24, 30, 26, 12),
+                    shape(0, 14, 8, 6),
+                    100_000_000_000,
+                    30_000_000_000,
+                )),
+                external: None,
+                note: None,
+                was_named_level: Some(crate::types::ProtectionLevel::Sheltered),
+            }],
+        };
+        let with_level = render_doctor(
+            &recommendations_doctor_output(with_level_view),
+            OutputMode::Interactive,
+        );
+        assert!(
+            with_level.contains("currently sheltered \u{2014} applying switches to custom")
+                || with_level.contains("currently sheltered — applying switches to custom"),
+            "missing named-level hint: {with_level}"
+        );
+
+        // Inverse: was_named_level = None → no hint.
+        let no_level_view = crate::output::DoctorRecommendationView {
+            header: "header".to_string(),
+            rows: vec![crate::output::DoctorRecommendationRow {
+                name: "photos".to_string(),
+                local: Some(recommendation(
+                    crate::policy::ShapeRole::Local,
+                    shape(24, 30, 26, 12),
+                    shape(0, 14, 8, 6),
+                    100_000_000_000,
+                    30_000_000_000,
+                )),
+                external: None,
+                note: None,
+                was_named_level: None,
+            }],
+        };
+        let no_level = render_doctor(
+            &recommendations_doctor_output(no_level_view),
+            OutputMode::Interactive,
+        );
+        assert!(
+            !no_level.contains("applying switches to custom"),
+            "named-level hint should be absent when was_named_level=None: {no_level}"
+        );
+    }
+
+    #[test]
+    fn doctor_thorough_recommendations_daemon_mode_emits_json_with_recommendations_field() {
+        let _color = color_guard(false);
+        let view = crate::output::DoctorRecommendationView {
+            header: "header".to_string(),
+            rows: vec![crate::output::DoctorRecommendationRow {
+                name: "containers".to_string(),
+                local: Some(recommendation(
+                    crate::policy::ShapeRole::Local,
+                    shape(24, 30, 26, 12),
+                    shape(0, 7, 4, 0),
+                    200_000_000_000,
+                    50_000_000_000,
+                )),
+                external: None,
+                note: Some(crate::policy::RecommendationNote::BurstyPattern),
+                was_named_level: Some(crate::types::ProtectionLevel::Sheltered),
+            }],
+        };
+        let output = render_doctor(&recommendations_doctor_output(view), OutputMode::Daemon);
+        let json: serde_json::Value =
+            serde_json::from_str(&output).expect("doctor JSON must parse");
+        let recs = json
+            .get("recommendations")
+            .expect("recommendations field present");
+        let rows = recs.get("rows").and_then(|v| v.as_array()).expect("rows array");
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.get("name").and_then(|v| v.as_str()), Some("containers"));
+        let local = row.get("local").expect("local recommendation");
+        assert!(
+            local.get("role").is_some(),
+            "ShapeRecommendation.role missing from JSON"
+        );
+        assert!(
+            local.get("current").is_some(),
+            "ShapeRecommendation.current missing from JSON"
+        );
+        assert!(
+            local.get("suggested").is_some(),
+            "ShapeRecommendation.suggested missing from JSON"
+        );
+        assert!(
+            local.get("current_cost").is_some(),
+            "ShapeRecommendation.current_cost missing from JSON"
+        );
+        assert!(
+            local.get("suggested_cost").is_some(),
+            "ShapeRecommendation.suggested_cost missing from JSON"
+        );
+        assert_eq!(
+            row.get("note").and_then(|v| v.as_str()),
+            Some("bursty_pattern")
+        );
+        assert_eq!(
+            row.get("was_named_level").and_then(|v| v.as_str()),
+            Some("sheltered")
         );
     }
 }
