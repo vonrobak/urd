@@ -177,6 +177,11 @@ pub struct DriveAssessment {
     pub mounted: bool,
     pub snapshot_count: Option<usize>,
     pub last_send_age: Option<Duration>,
+    /// Source generation matches this drive's pin snapshot — there is nothing
+    /// pending to send to this drive, regardless of `last_send_age`. Used by
+    /// `compute_health` to suppress "drive away" degradation when the absent
+    /// drive's data is already fully current.
+    pub source_unchanged: bool,
     #[allow(dead_code)] // consumed by verbose status display (future)
     pub configured_interval: Interval,
     pub role: DriveRole,
@@ -640,6 +645,7 @@ pub fn assess(
                     mounted,
                     snapshot_count: snap_count,
                     last_send_age,
+                    source_unchanged,
                     configured_interval: subvol.send_interval,
                     role: drive.role,
                     absent_duration_secs,
@@ -1111,8 +1117,13 @@ fn compute_health(
     }
 
     // ── Degraded: configured drive unmounted >7 days ───────────────
+    // Suppressed when `source_unchanged` for the drive: if the pin generation
+    // matches the live source, there is nothing pending to send and the
+    // drive's absence is not an operational concern. Mirrors the planner's
+    // skip-when-source-unchanged behavior (see issue #120, defect 1).
     for da in drive_assessments {
         if !da.mounted
+            && !da.source_unchanged
             && let Some(age) = da.last_send_age
             && age.num_days() > DRIVE_AWAY_DEGRADED_DAYS
         {
@@ -3146,6 +3157,72 @@ send_enabled = false
     }
 
     #[test]
+    fn health_drive_away_long_but_source_unchanged_is_healthy() {
+        // An offsite drive that's been away >7 days but whose pin generation
+        // matches the live source has nothing pending to send — degrading
+        // operational health for it would be a false alarm. The promise-status
+        // path already honors source_unchanged; this asserts compute_health
+        // does too (issue #120, defect 1).
+        let config = test_config_two_drives();
+        let now = dt(2026, 3, 23, 14, 0);
+        let mut fs = MockFileSystemState::new();
+
+        let pin_snap = snap(dt(2026, 3, 10, 12, 0), "sv1");
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![pin_snap.clone()]);
+
+        // D1 mounted, sealed, plenty of space.
+        fs.mounted_drives.insert("D1".to_string());
+        fs.external_snapshots.insert(
+            ("D1".to_string(), "sv1".to_string()),
+            vec![pin_snap.clone()],
+        );
+        fs.pin_files.insert(
+            (std::path::PathBuf::from("/snap/sv1"), "D1".to_string()),
+            pin_snap.clone(),
+        );
+        fs.send_times.insert(
+            ("sv1".to_string(), "D1".to_string()),
+            dt(2026, 3, 23, 12, 0),
+        );
+        fs.free_bytes
+            .insert(std::path::PathBuf::from("/mnt/d1"), 1_000_000_000_000);
+
+        // D2 unmounted, last send 13 days ago — but source unchanged since
+        // that send (pin generation matches live source).
+        fs.pin_files.insert(
+            (std::path::PathBuf::from("/snap/sv1"), "D2".to_string()),
+            pin_snap.clone(),
+        );
+        fs.send_times.insert(
+            ("sv1".to_string(), "D2".to_string()),
+            dt(2026, 3, 10, 12, 0),
+        );
+        fs.generations
+            .insert(std::path::PathBuf::from("/data/sv1"), 42);
+        fs.generations.insert(
+            std::path::PathBuf::from(format!("/snap/sv1/{}", pin_snap.as_str())),
+            42,
+        );
+
+        let results = assess(&config, now, &fs);
+        assert_eq!(
+            results[0].health,
+            OperationalHealth::Healthy,
+            "source_unchanged on the absent drive must suppress 'away' degradation. reasons: {:?}",
+            results[0].health_reasons,
+        );
+        assert!(
+            !results[0]
+                .health_reasons
+                .iter()
+                .any(|r| r.contains("away for")),
+            "should not produce an 'away for N days' reason when source is unchanged. reasons: {:?}",
+            results[0].health_reasons,
+        );
+    }
+
+    #[test]
     fn health_multiple_reasons_collected() {
         let config = test_config_two_drives();
         let now = dt(2026, 3, 23, 14, 0);
@@ -3730,6 +3807,7 @@ drives = ["primary-drive", "offsite-drive"]
             mounted: age_days.is_some(),
             snapshot_count: Some(5),
             last_send_age: age_days.map(Duration::days),
+            source_unchanged: false,
             configured_interval: Interval::hours(24),
             role: DriveRole::Offsite,
             absent_duration_secs: None,
@@ -3744,6 +3822,7 @@ drives = ["primary-drive", "offsite-drive"]
             mounted: true,
             snapshot_count: Some(100),
             last_send_age: Some(Duration::hours(2)),
+            source_unchanged: false,
             configured_interval: Interval::hours(24),
             role: DriveRole::Primary,
             absent_duration_secs: None,
@@ -3807,6 +3886,7 @@ drives = ["primary-drive", "offsite-drive"]
             mounted: true,
             snapshot_count: Some(5),
             last_send_age: Some(Duration::days(60)),
+            source_unchanged: false,
             configured_interval: Interval::hours(24),
             role: DriveRole::Offsite,
             absent_duration_secs: None,
@@ -3847,6 +3927,7 @@ drives = ["primary-drive", "offsite-drive"]
             mounted: false,
             snapshot_count: None,
             last_send_age: Some(Duration::days(60)),
+            source_unchanged: false,
             configured_interval: Interval::hours(24),
             role: DriveRole::Offsite,
             absent_duration_secs: None,
@@ -4523,6 +4604,7 @@ drives = ["D1"]
             mounted,
             snapshot_count: Some(5),
             last_send_age: send_age_hours.map(Duration::hours),
+            source_unchanged: false,
             configured_interval: Interval::hours(24),
             role: DriveRole::Primary,
             absent_duration_secs: None,
