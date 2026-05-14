@@ -1052,57 +1052,85 @@ fn compute_eta(current: u64, estimated: u64, elapsed: Duration) -> Option<Durati
     Some(Duration::from_secs_f64(remaining_secs))
 }
 
-/// Polls the byte counter and displays a rich progress line on stderr.
-/// Only runs when stderr is a TTY. Cleans up the line on exit.
+/// Snapshot of the executor-owned `ProgressContext`, read once per display tick.
+#[derive(Clone, Debug)]
+pub(crate) struct ProgressSnapshot {
+    pub send_index: u32,
+    pub subvolume_name: String,
+    pub drive_label: String,
+    pub total_sends: u32,
+    pub estimated_bytes: Option<u64>,
+}
+
+/// Persistent state of the progress display across ticks.
 ///
-/// State machine: Idle → Active → Completing → Idle (or Shutdown).
-fn progress_display_loop(
-    counter: &AtomicU64,
-    shutdown: &AtomicBool,
-    context: &Mutex<ProgressContext>,
-) {
-    let mut send_start = Instant::now();
-    let mut last_display_bytes = 0u64;
+/// `send_index` is the generation marker: every change observed in the
+/// executor's mutex means a new send is active, so cached fields and the
+/// elapsed-time anchor must be refreshed. Relying on `bytes_counter == 0`
+/// as the new-send signal is unreliable — the reset window inside
+/// `RealBtrfs::send_receive` is sub-millisecond and easily missed by the
+/// 250 ms poll. See issue #118.
+pub(crate) struct ProgressDisplayState {
+    send_start: Instant,
+    last_display_bytes: u64,
+    cached_index: u32,
+    cached_name: String,
+    cached_drive: String,
+    cached_total: u32,
+    cached_estimated: Option<u64>,
+}
 
-    // Locally cached context (read from mutex on send-start transition)
-    let mut ctx_name = String::new();
-    let mut ctx_drive = String::new();
-    let mut ctx_index = 0u32;
-    let mut ctx_total = 0u32;
-    let mut ctx_estimated: Option<u64> = None;
-
-    while !shutdown.load(Ordering::SeqCst) {
-        std::thread::sleep(Duration::from_millis(250));
-
-        let current = counter.load(Ordering::Relaxed);
-        if current == 0 {
-            // Send completed (counter reset) or idle. Clear display state.
-            last_display_bytes = 0;
-            continue;
+impl ProgressDisplayState {
+    pub(crate) fn new(now: Instant) -> Self {
+        Self {
+            send_start: now,
+            last_display_bytes: 0,
+            cached_index: 0,
+            cached_name: String::new(),
+            cached_drive: String::new(),
+            cached_total: 0,
+            cached_estimated: None,
         }
-        if current == last_display_bytes {
-            continue;
+    }
+
+    /// Advance one tick. Returns the line to render, if any.
+    ///
+    /// Behavior:
+    /// - `send_index == 0` → no send has started yet, nothing to render.
+    /// - `send_index` changed → new send: refresh cached fields, reset
+    ///   `send_start` and `last_display_bytes`, suppress this tick's render
+    ///   (the >1 s gate will start fresh).
+    /// - `current == 0` or unchanged from last tick → skip (idle or
+    ///   redundant).
+    /// - Otherwise → render once `send_start.elapsed() >= 1 s`.
+    pub(crate) fn tick(
+        &mut self,
+        snapshot: &ProgressSnapshot,
+        current: u64,
+        now: Instant,
+    ) -> Option<String> {
+        if snapshot.send_index == 0 {
+            return None;
         }
 
-        // Detect new send start (counter went from 0 to non-zero)
-        if last_display_bytes == 0 {
-            send_start = Instant::now();
-            // Read context from mutex (single lock per send).
-            // unwrap_or_else recovers data even from a poisoned mutex —
-            // the data itself isn't corrupt, only the thread that held it panicked.
-            let ctx = context.lock().unwrap_or_else(|e| e.into_inner());
-            ctx_name = ctx.subvolume_name.clone();
-            ctx_drive = ctx.drive_label.clone();
-            ctx_index = ctx.send_index;
-            ctx_total = ctx.total_sends;
-            ctx_estimated = ctx.estimated_bytes;
+        if snapshot.send_index != self.cached_index {
+            self.send_start = now;
+            self.last_display_bytes = 0;
+            self.cached_index = snapshot.send_index;
+            self.cached_name.clone_from(&snapshot.subvolume_name);
+            self.cached_drive.clone_from(&snapshot.drive_label);
+            self.cached_total = snapshot.total_sends;
+            self.cached_estimated = snapshot.estimated_bytes;
         }
-        last_display_bytes = current;
 
-        // Only render progress for sends active >1s (sub-second sends are silent)
-        let elapsed = send_start.elapsed();
+        if current == 0 || current == self.last_display_bytes {
+            return None;
+        }
+        self.last_display_bytes = current;
+
+        let elapsed = now.saturating_duration_since(self.send_start);
         if elapsed < Duration::from_secs(1) {
-            continue;
+            return None;
         }
 
         let rate = if elapsed.as_secs_f64() > 0.5 {
@@ -1111,19 +1139,50 @@ fn progress_display_loop(
             0.0
         };
 
-        eprint!(
-            "\r\x1b[2K{}",
-            format_progress_line(
-                &ctx_name,
-                &ctx_drive,
-                ctx_index,
-                ctx_total,
-                current,
-                rate,
-                elapsed,
-                ctx_estimated,
-            )
-        );
+        Some(format_progress_line(
+            &self.cached_name,
+            &self.cached_drive,
+            self.cached_index,
+            self.cached_total,
+            current,
+            rate,
+            elapsed,
+            self.cached_estimated,
+        ))
+    }
+}
+
+/// Polls the byte counter and displays a rich progress line on stderr.
+/// Only runs when stderr is a TTY. Cleans up the line on exit.
+fn progress_display_loop(
+    counter: &AtomicU64,
+    shutdown: &AtomicBool,
+    context: &Mutex<ProgressContext>,
+) {
+    let mut state = ProgressDisplayState::new(Instant::now());
+
+    while !shutdown.load(Ordering::SeqCst) {
+        std::thread::sleep(Duration::from_millis(250));
+
+        // Brief lock once per tick; the executor only holds this mutex for
+        // microseconds while it updates the context between sends.
+        // unwrap_or_else recovers data even from a poisoned mutex — the
+        // data itself isn't corrupt, only the thread that held it panicked.
+        let snapshot = {
+            let ctx = context.lock().unwrap_or_else(|e| e.into_inner());
+            ProgressSnapshot {
+                send_index: ctx.send_index,
+                subvolume_name: ctx.subvolume_name.clone(),
+                drive_label: ctx.drive_label.clone(),
+                total_sends: ctx.total_sends,
+                estimated_bytes: ctx.estimated_bytes,
+            }
+        };
+        let current = counter.load(Ordering::Relaxed);
+
+        if let Some(line) = state.tick(&snapshot, current, Instant::now()) {
+            eprint!("\r\x1b[2K{line}");
+        }
     }
 
     // Shutdown: clear any active progress line
@@ -2131,6 +2190,144 @@ mod tests {
     fn compute_eta_exact_completion() {
         let eta = compute_eta(10_000_000_000, 10_000_000_000, Duration::from_secs(100));
         assert!(eta.is_none(), "should return None when current == estimated");
+    }
+
+    // ── Progress display state tests ───────────────────────────────
+
+    fn snap(idx: u32, name: &str, drive: &str) -> ProgressSnapshot {
+        ProgressSnapshot {
+            send_index: idx,
+            subvolume_name: name.to_string(),
+            drive_label: drive.to_string(),
+            total_sends: 6,
+            estimated_bytes: None,
+        }
+    }
+
+    #[test]
+    fn display_state_no_render_before_first_send() {
+        let mut state = ProgressDisplayState::new(Instant::now());
+        let s = snap(0, "", "");
+        assert!(state.tick(&s, 0, Instant::now()).is_none());
+        assert!(state.tick(&s, 1_000_000, Instant::now()).is_none());
+    }
+
+    #[test]
+    fn display_state_renders_after_one_second() {
+        let t0 = Instant::now();
+        let mut state = ProgressDisplayState::new(t0);
+        let s = snap(1, "sv1", "WD-18TB");
+
+        // First tick observes the new send_index and refreshes the anchor;
+        // the render is suppressed until the next tick whose elapsed ≥ 1s.
+        assert!(state.tick(&s, 0, t0).is_none(), "anchor reset → no render");
+        assert!(
+            state.tick(&s, 500_000, t0 + Duration::from_millis(500)).is_none(),
+            "elapsed < 1s → no render",
+        );
+        let line = state
+            .tick(&s, 1_000_000, t0 + Duration::from_secs(2))
+            .expect("should render after 1s with non-zero bytes");
+        assert!(line.contains("[1/6]"));
+        assert!(line.contains("sv1 → WD-18TB"));
+    }
+
+    /// Regression test for issue #118.
+    ///
+    /// Bug: `progress_display_loop` keyed new-send detection off the
+    /// `bytes_counter == 0` transition. The counter is only at 0 for a
+    /// sub-millisecond window inside `RealBtrfs::send_receive`, easily
+    /// missed by the 250 ms poll — so the display latched onto the first
+    /// send's name and `[i/N]` index forever, while bytes/rate kept
+    /// updating from later sends.
+    ///
+    /// Fix: use `send_index` as the generation marker. This test simulates
+    /// the worst case where the counter NEVER visits 0 between sends and
+    /// asserts that the second send's name reaches the rendered line.
+    #[test]
+    fn display_state_recovers_when_counter_never_zero_between_sends() {
+        let t0 = Instant::now();
+        let mut state = ProgressDisplayState::new(t0);
+
+        // First send: index=1, sv1 → WD-18TB. First tick after a fresh
+        // state observes the new index and resets the elapsed anchor; the
+        // second tick clears the 1s gate and renders.
+        let s1 = snap(1, "sv1", "WD-18TB");
+        let _ = state.tick(&s1, 1_000_000, t0 + Duration::from_millis(100));
+        let line1 = state
+            .tick(&s1, 5_000_000, t0 + Duration::from_secs(2))
+            .expect("first send should render");
+        assert!(line1.contains("[1/6]"));
+        assert!(line1.contains("sv1 → WD-18TB"));
+
+        // Executor moves to send 2. counter does NOT visit 0 in any tick
+        // observed by the display thread — it jumps straight from the
+        // leftover of sv1 to bytes of sv2.
+        let s2 = snap(2, "sv2", "WD-18TB");
+        let line2 = state
+            .tick(&s2, 12_000_000, t0 + Duration::from_secs(4))
+            .or_else(|| {
+                // First tick after the index change resets send_start and
+                // suppresses the render (elapsed < 1s); the next tick with
+                // ≥1s elapsed must show sv2.
+                state.tick(&s2, 13_000_000, t0 + Duration::from_secs(6))
+            })
+            .expect("second send should eventually render");
+        assert!(
+            line2.contains("[2/6]"),
+            "expected [2/6], got: {line2}",
+        );
+        assert!(
+            line2.contains("sv2 → WD-18TB"),
+            "expected sv2 in line, got: {line2}",
+        );
+        assert!(
+            !line2.contains("sv1"),
+            "second send must not show stale sv1 name, got: {line2}",
+        );
+    }
+
+    #[test]
+    fn display_state_resets_elapsed_anchor_across_sends() {
+        let t0 = Instant::now();
+        let mut state = ProgressDisplayState::new(t0);
+
+        // Send 1 has been running long enough that its elapsed time is large.
+        let s1 = snap(1, "sv1", "WD-18TB");
+        let _ = state.tick(&s1, 1_000_000, t0 + Duration::from_secs(30));
+
+        // Send 2 starts. First tick after the index change refreshes
+        // send_start, so elapsed from the new anchor is ~0 and we suppress
+        // the render.
+        let s2 = snap(2, "sv2", "WD-18TB");
+        let line = state.tick(&s2, 2_000_000, t0 + Duration::from_secs(31));
+        assert!(
+            line.is_none(),
+            "first tick after index change must reset elapsed and suppress",
+        );
+
+        // ~2s later, the new send should render with a small elapsed time,
+        // not the cumulative time from send 1.
+        let line2 = state
+            .tick(&s2, 5_000_000, t0 + Duration::from_secs(33))
+            .expect("send 2 should render after >=1s on its own anchor");
+        // Elapsed shows minutes:seconds via format_elapsed; should be "0:02".
+        assert!(
+            line2.contains("[0:02]") || line2.contains("0:02"),
+            "expected ~2s elapsed for send 2, got: {line2}",
+        );
+    }
+
+    #[test]
+    fn display_state_skips_when_bytes_unchanged() {
+        let t0 = Instant::now();
+        let mut state = ProgressDisplayState::new(t0);
+        let s = snap(1, "sv1", "drive1");
+        let _ = state.tick(&s, 1_000_000, t0 + Duration::from_secs(2));
+        assert!(
+            state.tick(&s, 1_000_000, t0 + Duration::from_secs(3)).is_none(),
+            "unchanged byte counter → no render",
+        );
     }
 
     // ── Size estimate map tests ─────────────────────────────────────
