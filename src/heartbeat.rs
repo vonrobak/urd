@@ -322,6 +322,7 @@ mod tests {
                     mounted: true,
                     snapshot_count: Some(10),
                     last_send_age: Some(chrono::Duration::hours(2)),
+                    source_unchanged: false,
                     configured_interval: Interval::hours(4),
                     role: DriveRole::Primary,
                     absent_duration_secs: None,

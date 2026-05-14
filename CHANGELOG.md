@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Bare `urd` no longer reports "1 degraded" and recommends connecting an
+  offsite drive when a subvolume's source has had no changes since the last
+  send (#120). `compute_health`'s "drive away >7 days" check now honors
+  `source_unchanged`, mirroring the planner's skip-when-source-unchanged
+  behavior: if the absent drive's pin generation matches the live source,
+  there is nothing pending to send and the drive's absence is not an
+  operational concern. The promise-status path already had this guard; the
+  operational-health path was missing it, which is what produced the
+  contradictory "All connected drives are sealed. 1 degraded." output.
+
 ## [0.16.1] - 2026-05-14
 
 ### Fixed
