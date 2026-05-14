@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.2] - 2026-05-14
+
 ### Fixed
 - Bare `urd` no longer reports "1 degraded" and recommends connecting an
   offsite drive when a subvolume's source has had no changes since the last
@@ -443,7 +445,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Defense-in-depth pin file protection for unsent snapshots
 - Per-subvolume error isolation in executor
 
-[Unreleased]: https://github.com/vonrobak/urd/compare/v0.16.1...HEAD
+[Unreleased]: https://github.com/vonrobak/urd/compare/v0.16.2...HEAD
+[0.16.2]: https://github.com/vonrobak/urd/compare/v0.16.1...v0.16.2
 [0.16.1]: https://github.com/vonrobak/urd/compare/v0.16.0...v0.16.1
 [0.16.0]: https://github.com/vonrobak/urd/compare/v0.15.1...v0.16.0
 [0.15.1]: https://github.com/vonrobak/urd/compare/v0.15.0...v0.15.1
