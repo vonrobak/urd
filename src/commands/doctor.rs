@@ -5,6 +5,7 @@ use crate::drives;
 use crate::output::{
     DoctorCheck, DoctorCheckStatus, DoctorDataSafety, DoctorOutput, DoctorRecommendationRow,
     DoctorRecommendationView, DoctorSentinelStatus, DoctorVerdict, InitStatus, OutputMode,
+    SchemaStatus,
 };
 use crate::plan::RealFileSystemState;
 use crate::policy::{self, ShapeRole};
@@ -276,11 +277,24 @@ pub fn run(config: Config, args: DoctorArgs, output_mode: OutputMode) -> anyhow:
         DoctorVerdict::healthy()
     };
 
+    // UPI 042 Branch G: surface a soft notice when loaded config is older
+    // than the current schema. Build SchemaStatus only when there's
+    // something to say (current < latest).
+    const LATEST_SCHEMA_VERSION: u32 = 2;
+    let schema_status = match config.general.config_version {
+        Some(v) if v >= LATEST_SCHEMA_VERSION => None,
+        current => Some(SchemaStatus {
+            current,
+            latest: LATEST_SCHEMA_VERSION,
+        }),
+    };
+
     let output = DoctorOutput {
         config_checks,
         infra_checks,
         data_safety,
         sentinel,
+        schema_status,
         verify: verify_output,
         churn: churn_view,
         recommendations: recommendation_view,

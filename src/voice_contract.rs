@@ -855,13 +855,15 @@ mod contract {
             hourly: 24,
             daily: 30,
             weekly: 26,
-            monthly: 12,
+            monthly: crate::types::MonthlyCount::Count(12),
+            yearly: 0,
         };
         let suggested = Shape {
             hourly: 0,
             daily: 7,
             weekly: 4,
-            monthly: 0,
+            monthly: crate::types::MonthlyCount::Count(0),
+            yearly: 0,
         };
         crate::output::DoctorRecommendationRow {
             name: "containers".to_string(),
@@ -997,5 +999,54 @@ mod contract {
         // advisory across multiple consecutive runs and assert it
         // appears in run 1 and run K but is suppressed in runs 2..K-1.
         unimplemented!("UPI 024+ Voice Evolution — see voice_contract.rs header");
+    }
+
+    // ── UPI 042 R7 — Count(0) render-omission invariant ──────────────
+    //
+    // Brute-force backstop for the Count(0) internal/external
+    // disagreement hazard (Risk Flag #1 in plan-042). Any future render
+    // path that emits `monthly = 0` for `Count(0)` is a regression — it
+    // would surface a value that v2 TOML rejects, confusing users who
+    // copy/paste from `urd doctor --thorough` output.
+
+    #[test]
+    fn count_zero_monthly_never_renders_in_any_surface() {
+        use crate::types::{MonthlyCount, ResolvedGraduatedRetention};
+        let shape = ResolvedGraduatedRetention {
+            hourly: 0,
+            daily: 7,
+            weekly: 4,
+            monthly: MonthlyCount::Count(0),
+            yearly: 0,
+        };
+
+        // Surface 1: render_shape_kv (private helper, accessed via
+        // recommendation rendering; we test through retention_summary too).
+        let interval = crate::types::Interval::days(1);
+        let summary = crate::retention::retention_summary(
+            &crate::types::LocalRetentionPolicy::Graduated(shape),
+            &interval,
+        );
+        for forbidden in &["monthly = 0", "monthly=0", "monthly: 0"] {
+            assert!(
+                !summary.contains(forbidden),
+                "retention_summary contains forbidden '{forbidden}' for Count(0): {summary}"
+            );
+        }
+
+        // Surface 2: compute_retention_preview / recovery_windows path.
+        let pol = crate::types::LocalRetentionPolicy::Graduated(shape);
+        let preview =
+            crate::retention::compute_retention_preview("sv", &pol, &interval, None);
+        let preview_str = format!("{preview:?}");
+        for forbidden in &["monthly = 0", "monthly=0", "monthly: 0"] {
+            // Allow the `monthly: Count(0)` Debug form (it's the typed
+            // representation, not a wire-format leak). Strip that token.
+            let pruned = preview_str.replace("monthly: Count(0)", "");
+            assert!(
+                !pruned.contains(forbidden),
+                "retention preview Debug contains forbidden '{forbidden}' for Count(0): {pruned}"
+            );
+        }
     }
 }

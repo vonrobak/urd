@@ -2250,6 +2250,23 @@ fn render_doctor_interactive(data: &DoctorOutput) -> String {
     writeln!(out, "{}", "Checking Urd health...".bold()).ok();
     writeln!(out).ok();
 
+    // UPI 042 Branch G: schema deprecation notice. Emitted near the top so
+    // it's the first thing the user sees when their config is older than v2.
+    if let Some(status) = data.schema_status {
+        let label = match status.current {
+            None => "legacy".to_string(),
+            Some(n) => format!("v{n}"),
+        };
+        writeln!(
+            out,
+            "  Schema: {} (current: v{}; run `urd migrate` to upgrade)",
+            label.dimmed(),
+            status.latest
+        )
+        .ok();
+        writeln!(out).ok();
+    }
+
     // Config section
     render_doctor_check_section(&mut out, "Config", &data.config_checks);
 
@@ -2571,8 +2588,13 @@ fn render_shape_kv(shape: &crate::types::ResolvedGraduatedRetention) -> String {
     if shape.weekly != 0 {
         parts.push(format!("weekly={}", shape.weekly));
     }
-    if shape.monthly != 0 {
-        parts.push(format!("monthly={}", shape.monthly));
+    match shape.monthly {
+        crate::types::MonthlyCount::Unlimited => parts.push("monthly=unlimited".to_string()),
+        crate::types::MonthlyCount::Count(0) => {} // omit, consistent with hourly/daily/weekly
+        crate::types::MonthlyCount::Count(n) => parts.push(format!("monthly={n}")),
+    }
+    if shape.yearly != 0 {
+        parts.push(format!("yearly={}", shape.yearly));
     }
     parts.join("  ")
 }
@@ -3464,6 +3486,7 @@ pub(crate) mod test_fixtures {
                 pid: Some(12345),
                 uptime: Some("3h 12m".to_string()),
             },
+            schema_status: None,
             verify: None,
             churn: None,
             recommendations: None,
@@ -7867,12 +7890,19 @@ mod tests {
 
     // ── UPI 041 Recommendations section ───────────────────────────
 
-    fn shape(h: u32, d: u32, w: u32, m: u32) -> crate::types::ResolvedGraduatedRetention {
+    fn shape(
+        h: u32,
+        d: u32,
+        w: u32,
+        m: crate::types::MonthlyCount,
+        y: u32,
+    ) -> crate::types::ResolvedGraduatedRetention {
         crate::types::ResolvedGraduatedRetention {
             hourly: h,
             daily: d,
             weekly: w,
             monthly: m,
+            yearly: y,
         }
     }
 
@@ -7885,7 +7915,11 @@ mod tests {
     ) -> crate::policy::ShapeRecommendation {
         use crate::policy::{CostProjection, ShapeRecommendation};
         let total = |s: crate::types::ResolvedGraduatedRetention| {
-            s.hourly + s.daily + s.weekly + s.monthly
+            let m = match s.monthly {
+                crate::types::MonthlyCount::Unlimited => 0,
+                crate::types::MonthlyCount::Count(n) => n,
+            };
+            s.hourly + s.daily + s.weekly + m + s.yearly
         };
         ShapeRecommendation {
             role,
@@ -7913,8 +7947,8 @@ mod tests {
                 name: "containers".to_string(),
                 local: Some(recommendation(
                     crate::policy::ShapeRole::Local,
-                    shape(24, 30, 26, 12),
-                    shape(0, 7, 4, 0),
+                    shape(24, 30, 26, crate::types::MonthlyCount::Count(12), 0),
+                    shape(0, 7, 4, crate::types::MonthlyCount::Count(0), 0),
                     200_000_000_000,
                     50_000_000_000,
                 )),
@@ -7946,15 +7980,15 @@ mod tests {
                 name: "containers".to_string(),
                 local: Some(recommendation(
                     crate::policy::ShapeRole::Local,
-                    shape(24, 30, 26, 12),
-                    shape(0, 7, 4, 0),
+                    shape(24, 30, 26, crate::types::MonthlyCount::Count(12), 0),
+                    shape(0, 7, 4, crate::types::MonthlyCount::Count(0), 0),
                     200_000_000_000,
                     50_000_000_000,
                 )),
                 external: Some(recommendation(
                     crate::policy::ShapeRole::External,
-                    shape(0, 30, 26, 12),
-                    shape(0, 14, 8, 6),
+                    shape(0, 30, 26, crate::types::MonthlyCount::Count(12), 0),
+                    shape(0, 14, 8, crate::types::MonthlyCount::Count(6), 0),
                     400_000_000_000,
                     100_000_000_000,
                 )),
@@ -7981,8 +8015,8 @@ mod tests {
                 name: "containers".to_string(),
                 local: Some(recommendation(
                     crate::policy::ShapeRole::Local,
-                    shape(24, 30, 26, 12),
-                    shape(0, 7, 4, 0),
+                    shape(24, 30, 26, crate::types::MonthlyCount::Count(12), 0),
+                    shape(0, 7, 4, crate::types::MonthlyCount::Count(0), 0),
                     200_000_000_000,
                     50_000_000_000,
                 )),
@@ -8011,8 +8045,8 @@ mod tests {
                 name: "containers".to_string(),
                 local: Some(recommendation(
                     crate::policy::ShapeRole::Local,
-                    shape(24, 30, 26, 12),
-                    shape(0, 7, 4, 0),
+                    shape(24, 30, 26, crate::types::MonthlyCount::Count(12), 0),
+                    shape(0, 7, 4, crate::types::MonthlyCount::Count(0), 0),
                     200_000_000_000,
                     50_000_000_000,
                 )),
@@ -8043,8 +8077,8 @@ mod tests {
                 local: None,
                 external: Some(recommendation(
                     crate::policy::ShapeRole::External,
-                    shape(0, 30, 0, 0),
-                    shape(0, 30, 0, 0), // 30 days chain
+                    shape(0, 30, 0, crate::types::MonthlyCount::Count(0), 0),
+                    shape(0, 30, 0, crate::types::MonthlyCount::Count(0), 0), // 30 days chain
                     1_000_000_000,
                     2_000_000_000,
                 )),
@@ -8069,8 +8103,8 @@ mod tests {
                 local: None,
                 external: Some(recommendation(
                     crate::policy::ShapeRole::External,
-                    shape(0, 30, 0, 0),
-                    shape(0, 0, 24, 0), // 24 weeks chain
+                    shape(0, 30, 0, crate::types::MonthlyCount::Count(0), 0),
+                    shape(0, 0, 24, crate::types::MonthlyCount::Count(0), 0), // 24 weeks chain
                     1_000_000_000,
                     2_000_000_000,
                 )),
@@ -8095,8 +8129,8 @@ mod tests {
                 local: None,
                 external: Some(recommendation(
                     crate::policy::ShapeRole::External,
-                    shape(0, 30, 0, 0),
-                    shape(0, 0, 0, 24), // 24 months chain
+                    shape(0, 30, 0, crate::types::MonthlyCount::Count(0), 0),
+                    shape(0, 0, 0, crate::types::MonthlyCount::Count(24), 0), // 24 months chain
                     1_000_000_000,
                     2_000_000_000,
                 )),
@@ -8124,8 +8158,8 @@ mod tests {
                 name: "containers".to_string(),
                 local: Some(recommendation(
                     crate::policy::ShapeRole::Local,
-                    shape(24, 30, 26, 12),
-                    shape(0, 7, 4, 0),
+                    shape(24, 30, 26, crate::types::MonthlyCount::Count(12), 0),
+                    shape(0, 7, 4, crate::types::MonthlyCount::Count(0), 0),
                     200_000_000_000,
                     50_000_000_000,
                 )),
@@ -8153,8 +8187,8 @@ mod tests {
                 name: "photos".to_string(),
                 local: Some(recommendation(
                     crate::policy::ShapeRole::Local,
-                    shape(24, 30, 26, 12),
-                    shape(0, 14, 8, 6),
+                    shape(24, 30, 26, crate::types::MonthlyCount::Count(12), 0),
+                    shape(0, 14, 8, crate::types::MonthlyCount::Count(6), 0),
                     100_000_000_000,
                     30_000_000_000,
                 )),
@@ -8180,8 +8214,8 @@ mod tests {
                 name: "photos".to_string(),
                 local: Some(recommendation(
                     crate::policy::ShapeRole::Local,
-                    shape(24, 30, 26, 12),
-                    shape(0, 14, 8, 6),
+                    shape(24, 30, 26, crate::types::MonthlyCount::Count(12), 0),
+                    shape(0, 14, 8, crate::types::MonthlyCount::Count(6), 0),
                     100_000_000_000,
                     30_000_000_000,
                 )),
@@ -8209,8 +8243,8 @@ mod tests {
                 name: "containers".to_string(),
                 local: Some(recommendation(
                     crate::policy::ShapeRole::Local,
-                    shape(24, 30, 26, 12),
-                    shape(0, 7, 4, 0),
+                    shape(24, 30, 26, crate::types::MonthlyCount::Count(12), 0),
+                    shape(0, 7, 4, crate::types::MonthlyCount::Count(0), 0),
                     200_000_000_000,
                     50_000_000_000,
                 )),
@@ -8257,6 +8291,120 @@ mod tests {
         assert_eq!(
             row.get("was_named_level").and_then(|v| v.as_str()),
             Some("sheltered")
+        );
+    }
+
+    // ── UPI 042 — MonthlyCount + yearly rendering ───────────────────
+
+    #[test]
+    fn render_shape_kv_renders_unlimited_monthly() {
+        let s = crate::types::ResolvedGraduatedRetention {
+            hourly: 24,
+            daily: 30,
+            weekly: 26,
+            monthly: crate::types::MonthlyCount::Unlimited,
+            yearly: 0,
+        };
+        let out = super::render_shape_kv(&s);
+        assert!(
+            out.contains("monthly=unlimited"),
+            "Unlimited should render as 'monthly=unlimited': {out}"
+        );
+    }
+
+    #[test]
+    fn render_shape_kv_renders_yearly() {
+        let s = crate::types::ResolvedGraduatedRetention {
+            hourly: 0,
+            daily: 7,
+            weekly: 4,
+            monthly: crate::types::MonthlyCount::Count(12),
+            yearly: 5,
+        };
+        let out = super::render_shape_kv(&s);
+        assert!(out.contains("yearly=5"), "yearly should render: {out}");
+    }
+
+    #[test]
+    fn render_shape_kv_omits_zero_yearly() {
+        let s = crate::types::ResolvedGraduatedRetention {
+            hourly: 0,
+            daily: 7,
+            weekly: 4,
+            monthly: crate::types::MonthlyCount::Count(12),
+            yearly: 0,
+        };
+        let out = super::render_shape_kv(&s);
+        assert!(!out.contains("yearly"), "yearly=0 should be omitted: {out}");
+    }
+
+    #[test]
+    fn render_shape_kv_omits_count_zero_monthly() {
+        // R7: Count(0) monthly produces no `monthly=...` token.
+        let s = crate::types::ResolvedGraduatedRetention {
+            hourly: 0,
+            daily: 7,
+            weekly: 4,
+            monthly: crate::types::MonthlyCount::Count(0),
+            yearly: 0,
+        };
+        let out = super::render_shape_kv(&s);
+        assert!(
+            !out.contains("monthly"),
+            "Count(0) monthly should produce no token: {out}"
+        );
+    }
+
+    // ── UPI 042 Branch G — Doctor schema deprecation notice ─────────
+
+    #[test]
+    fn doctor_emits_v1_schema_notice() {
+        let _color = color_guard(false);
+        let mut data = super::test_fixtures::test_doctor_output();
+        data.schema_status = Some(crate::output::SchemaStatus {
+            current: Some(1),
+            latest: 2,
+        });
+        let out = super::render_doctor(&data, crate::output::OutputMode::Interactive);
+        assert!(
+            out.contains("Schema: v1"),
+            "v1 schema notice missing: {out}"
+        );
+        assert!(
+            out.contains("urd migrate"),
+            "migration hint missing: {out}"
+        );
+    }
+
+    #[test]
+    fn doctor_emits_legacy_schema_notice() {
+        let _color = color_guard(false);
+        let mut data = super::test_fixtures::test_doctor_output();
+        data.schema_status = Some(crate::output::SchemaStatus {
+            current: None,
+            latest: 2,
+        });
+        let out = super::render_doctor(&data, crate::output::OutputMode::Interactive);
+        assert!(
+            out.contains("Schema: legacy"),
+            "legacy schema notice missing: {out}"
+        );
+        assert!(out.contains("urd migrate"));
+    }
+
+    #[test]
+    fn doctor_omits_schema_notice_for_v2() {
+        let _color = color_guard(false);
+        // Default test_doctor_output has schema_status = None (already-v2).
+        let data = super::test_fixtures::test_doctor_output();
+        let out = super::render_doctor(&data, crate::output::OutputMode::Interactive);
+        assert!(
+            !out.contains("Schema: v"),
+            "v2 should not show schema notice: {out}"
+        );
+        assert!(
+            !out.contains("Schema: legacy"),
+            "v2 should not show schema notice: {out}"
         );
     }
 }

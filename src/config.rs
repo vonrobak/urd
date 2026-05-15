@@ -7,7 +7,7 @@ use crate::error::UrdError;
 use crate::notify::NotificationConfig;
 use crate::types::{
     ByteSize, DriveRole, GraduatedRetention, Interval, LocalRetentionConfig, LocalRetentionPolicy,
-    ProtectionLevel, ResolvedGraduatedRetention, RunFrequency,
+    MonthlyCount, ProtectionLevel, ResolvedGraduatedRetention, RunFrequency,
 };
 
 // ── Top-level config ────────────────────────────────────────────────────
@@ -177,6 +177,7 @@ impl SubvolumeConfig {
                             daily: Some(policy.local_retention.daily),
                             weekly: Some(policy.local_retention.weekly),
                             monthly: Some(policy.local_retention.monthly),
+                            yearly: Some(policy.local_retention.yearly),
                         };
                         LocalRetentionPolicy::Graduated(
                             lr.merged_with(&derived_as_graduated).resolved(),
@@ -191,6 +192,7 @@ impl SubvolumeConfig {
                             daily: Some(policy.external_retention.daily),
                             weekly: Some(policy.external_retention.weekly),
                             monthly: Some(policy.external_retention.monthly),
+                            yearly: Some(policy.external_retention.yearly),
                         };
                         er.merged_with(&derived_as_graduated).resolved()
                     }
@@ -279,9 +281,11 @@ impl Config {
                 .map_err(|e| UrdError::Config(format!("{config_path:?}: {e}")))?,
             Some(1) => parse_v1(&contents)
                 .map_err(|e| UrdError::Config(format!("{config_path:?}: {e}")))?,
+            Some(2) => parse_v2(&contents)
+                .map_err(|e| UrdError::Config(format!("{config_path:?}: {e}")))?,
             Some(n) => {
                 return Err(UrdError::Config(format!(
-                    "{config_path:?}: unsupported config_version {n} (supported: 1)"
+                    "{config_path:?}: unsupported config_version {n} (supported: 1, 2)"
                 )));
             }
         };
@@ -300,7 +304,12 @@ impl Config {
         let mut config = match version {
             None => parse_legacy(raw)?,
             Some(1) => parse_v1(raw)?,
-            Some(n) => return Err(format!("unsupported config_version {n} (supported: 1)")),
+            Some(2) => parse_v2(raw)?,
+            Some(n) => {
+                return Err(format!(
+                    "unsupported config_version {n} (supported: 1, 2)"
+                ));
+            }
         };
         config.expand_paths();
         config.validate().map_err(|e| e.to_string())?;
@@ -519,6 +528,11 @@ impl Config {
 }
 
 // ── V1 config structs ──────────────────────────────────────────────────
+//
+// v1 reuses the shared `LocalRetentionConfig` / `GraduatedRetention` types.
+// The lenient `MonthlyCount::Deserialize` maps integer `0 → Unlimited`,
+// preserving the v1 wire semantic that `monthly = 0` means "unbounded".
+// (V2 boundary uses `deserialize_monthly_count_strict_opt` to reject `0`.)
 
 #[derive(Debug, Deserialize)]
 struct V1Config {
@@ -630,13 +644,15 @@ impl V1Config {
                 hourly: Some(24),
                 daily: Some(30),
                 weekly: Some(26),
-                monthly: Some(12),
+                monthly: Some(MonthlyCount::Count(12)),
+                yearly: None,
             },
             external_retention: GraduatedRetention {
                 hourly: None,
                 daily: Some(30),
                 weekly: Some(26),
-                monthly: Some(0),
+                monthly: Some(MonthlyCount::Unlimited),
+                yearly: None,
             },
         };
 
@@ -877,6 +893,358 @@ fn parse_v1(raw: &str) -> Result<Config, String> {
     Ok(v1.into_config())
 }
 
+// ── V2 wire types (UPI 042) ─────────────────────────────────────────────
+//
+// v2 closes the `monthly = 0` footgun: the v2 wire format uses strict
+// monthly deserialization (rejects integer `0`) via
+// `deserialize_monthly_count_strict_opt`. New `yearly: Option<u32>` field
+// on retention blocks. v2 also accepts `monthly = "unlimited"` (string)
+// for unbounded monthly retention.
+
+#[derive(Debug, Deserialize)]
+struct V2GraduatedRetention {
+    #[serde(default)]
+    hourly: Option<u32>,
+    #[serde(default)]
+    daily: Option<u32>,
+    #[serde(default)]
+    weekly: Option<u32>,
+    #[serde(
+        default,
+        deserialize_with = "crate::types::deserialize_monthly_count_strict_opt"
+    )]
+    monthly: Option<MonthlyCount>,
+    #[serde(default)]
+    yearly: Option<u32>,
+}
+
+#[derive(Debug)]
+enum V2LocalRetentionConfig {
+    Transient,
+    Graduated(V2GraduatedRetention),
+}
+
+impl<'de> Deserialize<'de> for V2LocalRetentionConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::{self, Visitor};
+        use std::fmt;
+
+        struct V2LocalRetentionVisitor;
+
+        impl<'de> Visitor<'de> for V2LocalRetentionVisitor {
+            type Value = V2LocalRetentionConfig;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str(
+                    "\"transient\" or a table with hourly/daily/weekly/monthly/yearly fields",
+                )
+            }
+
+            fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                if value == "transient" {
+                    Ok(V2LocalRetentionConfig::Transient)
+                } else {
+                    Err(de::Error::custom(format!(
+                        "unknown local_retention mode \"{value}\": expected \"transient\" or a retention table"
+                    )))
+                }
+            }
+
+            fn visit_map<M: de::MapAccess<'de>>(self, map: M) -> Result<Self::Value, M::Error> {
+                let g = V2GraduatedRetention::deserialize(
+                    de::value::MapAccessDeserializer::new(map),
+                )?;
+                Ok(V2LocalRetentionConfig::Graduated(g))
+            }
+        }
+
+        deserializer.deserialize_any(V2LocalRetentionVisitor)
+    }
+}
+
+impl V2GraduatedRetention {
+    fn into_graduated(self) -> GraduatedRetention {
+        GraduatedRetention {
+            hourly: self.hourly,
+            daily: self.daily,
+            weekly: self.weekly,
+            monthly: self.monthly,
+            yearly: self.yearly,
+        }
+    }
+}
+
+impl V2LocalRetentionConfig {
+    fn into_local_retention_config(self) -> LocalRetentionConfig {
+        match self {
+            V2LocalRetentionConfig::Transient => LocalRetentionConfig::Transient,
+            V2LocalRetentionConfig::Graduated(g) => {
+                LocalRetentionConfig::Graduated(g.into_graduated())
+            }
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct V2Config {
+    general: V2GeneralConfig,
+    #[serde(default)]
+    drives: Vec<DriveConfig>,
+    #[serde(rename = "subvolumes", alias = "subvolume")]
+    subvolumes: Vec<V2SubvolumeConfig>,
+    #[serde(default)]
+    notifications: NotificationConfig,
+}
+
+#[derive(Debug, Deserialize)]
+struct V2GeneralConfig {
+    config_version: u32,
+    #[serde(default = "default_run_frequency")]
+    run_frequency: RunFrequency,
+    #[serde(default = "default_v1_state_db")]
+    state_db: PathBuf,
+    #[serde(default = "default_v1_metrics_file")]
+    metrics_file: PathBuf,
+    #[serde(default = "default_v1_log_dir")]
+    log_dir: PathBuf,
+    #[serde(default = "default_btrfs_path")]
+    btrfs_path: String,
+    #[serde(default = "default_heartbeat_path")]
+    heartbeat_file: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+struct V2SubvolumeConfig {
+    name: String,
+    source: PathBuf,
+    snapshot_root: PathBuf,
+    #[serde(default)]
+    short_name: Option<String>,
+    #[serde(default = "default_priority")]
+    priority: u8,
+    #[serde(default)]
+    protection: Option<ProtectionLevel>,
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    drives: Option<Vec<String>>,
+    #[serde(default)]
+    min_free_bytes: Option<ByteSize>,
+    #[serde(default)]
+    snapshot_interval: Option<Interval>,
+    #[serde(default)]
+    send_interval: Option<Interval>,
+    #[serde(default)]
+    send_enabled: Option<bool>,
+    #[serde(default)]
+    local_snapshots: Option<bool>,
+    #[serde(default)]
+    local_retention: Option<V2LocalRetentionConfig>,
+    #[serde(default)]
+    external_retention: Option<V2GraduatedRetention>,
+}
+
+impl V2Config {
+    /// Convert v2 config into the internal Config representation. Mirrors
+    /// `V1Config::into_config()` shape.
+    fn into_config(self) -> Config {
+        let mut root_map: std::collections::BTreeMap<PathBuf, (Vec<String>, Option<ByteSize>)> =
+            std::collections::BTreeMap::new();
+        for sv in &self.subvolumes {
+            let entry = root_map
+                .entry(sv.snapshot_root.clone())
+                .or_insert_with(|| (Vec::new(), None));
+            entry.0.push(sv.name.clone());
+            if entry.1.is_none() {
+                entry.1 = sv.min_free_bytes;
+            }
+        }
+        let roots: Vec<SnapshotRoot> = root_map
+            .into_iter()
+            .map(|(path, (subvolumes, min_free_bytes))| SnapshotRoot {
+                path,
+                subvolumes,
+                min_free_bytes,
+            })
+            .collect();
+
+        // Fallback defaults for v2 Custom/unset protection levels. Values
+        // mirror full_retention / full_external_retention from derive_policy.
+        let defaults = DefaultsConfig {
+            snapshot_interval: Interval::days(1),
+            send_interval: Interval::days(1),
+            send_enabled: true,
+            enabled: true,
+            local_retention: GraduatedRetention {
+                hourly: Some(24),
+                daily: Some(30),
+                weekly: Some(26),
+                monthly: Some(MonthlyCount::Count(12)),
+                yearly: None,
+            },
+            external_retention: GraduatedRetention {
+                hourly: None,
+                daily: Some(30),
+                weekly: Some(26),
+                monthly: Some(MonthlyCount::Unlimited),
+                yearly: None,
+            },
+        };
+
+        let subvolumes: Vec<SubvolumeConfig> = self
+            .subvolumes
+            .into_iter()
+            .map(|sv| {
+                let local_retention = if sv.local_snapshots == Some(false) {
+                    Some(LocalRetentionConfig::Transient)
+                } else {
+                    sv.local_retention.map(V2LocalRetentionConfig::into_local_retention_config)
+                };
+                SubvolumeConfig {
+                    short_name: sv.short_name.unwrap_or_else(|| sv.name.clone()),
+                    name: sv.name,
+                    source: sv.source,
+                    priority: sv.priority,
+                    enabled: sv.enabled,
+                    snapshot_interval: sv.snapshot_interval,
+                    send_interval: sv.send_interval,
+                    send_enabled: sv.send_enabled,
+                    local_retention,
+                    external_retention: sv
+                        .external_retention
+                        .map(V2GraduatedRetention::into_graduated),
+                    protection_level: sv.protection,
+                    drives: sv.drives,
+                }
+            })
+            .collect();
+
+        Config {
+            general: GeneralConfig {
+                config_version: Some(self.general.config_version),
+                state_db: self.general.state_db,
+                metrics_file: self.general.metrics_file,
+                log_dir: self.general.log_dir,
+                btrfs_path: self.general.btrfs_path,
+                heartbeat_file: self.general.heartbeat_file,
+                run_frequency: self.general.run_frequency,
+            },
+            local_snapshots: LocalSnapshotsConfig { roots },
+            defaults,
+            drives: self.drives,
+            subvolumes,
+            notifications: self.notifications,
+        }
+    }
+
+    /// Validate v2-specific rules. Same shape as V1::validate_v1.
+    /// Per R6, the unlimited+yearly redundancy check lives in preflight.rs,
+    /// not here — validate_v2 stays `Result<(), String>`.
+    fn validate_v2(&self) -> Result<(), String> {
+        for sv in &self.subvolumes {
+            let level = sv.protection.unwrap_or(ProtectionLevel::Custom);
+
+            // Rule 1: Reject local_retention = "transient" universally
+            if matches!(sv.local_retention, Some(V2LocalRetentionConfig::Transient)) {
+                return Err(format!(
+                    "subvolume {:?}: local_retention = \"transient\" is not supported in v2 \
+                     — use local_snapshots = false instead.",
+                    sv.name
+                ));
+            }
+
+            // Rule 2: Mutual exclusion — local_snapshots = false + local_retention
+            if sv.local_snapshots == Some(false) && sv.local_retention.is_some() {
+                return Err(format!(
+                    "subvolume {:?}: local_snapshots = false and local_retention are mutually \
+                     exclusive — when local_snapshots is disabled, there is nothing to retain.",
+                    sv.name
+                ));
+            }
+
+            // Named levels must not have operational overrides
+            if level != ProtectionLevel::Custom {
+                let forbidden = [
+                    ("snapshot_interval", sv.snapshot_interval.is_some()),
+                    ("send_interval", sv.send_interval.is_some()),
+                    ("send_enabled", sv.send_enabled.is_some()),
+                    ("external_retention", sv.external_retention.is_some()),
+                ];
+                for (field, is_set) in &forbidden {
+                    if *is_set {
+                        return Err(format!(
+                            "subvolume {:?}: {field} cannot be set alongside \
+                             protection = \"{level}\" — the protection level controls this field. \
+                             Use protection = \"custom\" for manual control.",
+                            sv.name
+                        ));
+                    }
+                }
+
+                if sv.local_snapshots == Some(false) {
+                    return Err(format!(
+                        "subvolume {:?}: local_snapshots = false is incompatible with \
+                         protection = \"{level}\" — named levels require local snapshots. \
+                         Remove the protection field for custom configuration.",
+                        sv.name
+                    ));
+                }
+
+                if sv.local_retention.is_some() {
+                    return Err(format!(
+                        "subvolume {:?}: local_retention cannot be set alongside \
+                         protection = \"{level}\" — the protection level controls this field. \
+                         Use protection = \"custom\" for manual control.",
+                        sv.name
+                    ));
+                }
+            }
+
+            let has_any_drives = match sv.drives {
+                Some(ref d) => !d.is_empty(),
+                None => !self.drives.is_empty(),
+            };
+            if sv.local_snapshots == Some(false) && !has_any_drives {
+                return Err(format!(
+                    "subvolume {:?}: local_snapshots = false requires at least one drive \
+                     — without local snapshots or external sends, nothing is being backed up.",
+                    sv.name
+                ));
+            }
+
+            if let Some(ref d) = sv.drives
+                && d.is_empty()
+                && matches!(
+                    level,
+                    ProtectionLevel::Sheltered | ProtectionLevel::Fortified
+                )
+            {
+                return Err(format!(
+                    "subvolume {:?}: protection = \"{level}\" requires drives for \
+                     external backups, but drives is an empty list.",
+                    sv.name
+                ));
+            }
+
+            if level == ProtectionLevel::Sheltered && !has_any_drives {
+                return Err(format!(
+                    "subvolume {:?}: protection = \"sheltered\" requires at least one \
+                     configured drive for external backups.",
+                    sv.name
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Parse v2 config (config_version = 2).
+fn parse_v2(raw: &str) -> Result<Config, String> {
+    let v2: V2Config = toml::from_str(raw).map_err(|e| e.to_string())?;
+    v2.validate_v2()?;
+    Ok(v2.into_config())
+}
+
 // ── Utilities ───────────────────────────────────────────────────────────
 
 /// Expand `~` at the start of a path to the user's home directory.
@@ -1040,7 +1408,7 @@ send_interval = "2h"
         assert_eq!(resolved2.snapshot_interval, Interval::hours(1));
         let lr2 = resolved2.local_retention.as_graduated().unwrap();
         assert_eq!(lr2.weekly, 26);
-        assert_eq!(lr2.monthly, 12);
+        assert_eq!(lr2.monthly, MonthlyCount::Count(12));
 
         // Check that drop is ignored (suppresses warning about unused binding)
         let _ = toml_str;
@@ -1277,7 +1645,7 @@ local_retention = { daily = 7, weekly = 4 }
         assert_eq!(resolved.send_interval, Interval::hours(4));
         assert!(resolved.enabled);
         assert_eq!(lr.hourly, 24); // from defaults (not overridden)
-        assert_eq!(lr.monthly, 12); // from defaults (not overridden)
+        assert_eq!(lr.monthly, MonthlyCount::Count(12)); // from defaults (not overridden)
         assert_eq!(resolved.external_retention.daily, 30);
     }
 
@@ -1470,7 +1838,7 @@ local_retention = { daily = 7, weekly = 4 }
         assert_eq!(lr2.daily, 7);
         assert_eq!(lr2.weekly, 4);
         assert_eq!(lr2.hourly, 24); // from defaults
-        assert_eq!(lr2.monthly, 12); // from defaults
+        assert_eq!(lr2.monthly, MonthlyCount::Count(12)); // from defaults
     }
 
     #[test]
@@ -1517,7 +1885,7 @@ protection_level = "protected"
         assert_eq!(lr.hourly, 24);
         assert_eq!(lr.daily, 30);
         assert_eq!(lr.weekly, 26);
-        assert_eq!(lr.monthly, 12);
+        assert_eq!(lr.monthly, MonthlyCount::Count(12));
     }
 
     #[test]
@@ -1605,7 +1973,53 @@ local_retention = { daily = 60 }
         // Derived values fill in unspecified fields
         assert_eq!(lr.hourly, 24);
         assert_eq!(lr.weekly, 26);
-        assert_eq!(lr.monthly, 12);
+        assert_eq!(lr.monthly, MonthlyCount::Count(12));
+    }
+
+    #[test]
+    fn resolved_named_level_with_unlimited_external_monthly() {
+        // R2 synthesizer: Sheltered with no external override resolves to
+        // external_retention.monthly == Unlimited (preserves v1's external
+        // unlimited monthly semantic via the synthesizer path at lines
+        // 175–194). Confirms `Some(MonthlyCount)` flows through unchanged.
+        let config_str = r#"
+[general]
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp"
+
+[local_snapshots]
+roots = [{ path = "/snap", subvolumes = ["sv"] }]
+
+[defaults]
+snapshot_interval = "1h"
+send_interval = "1d"
+[defaults.local_retention]
+daily = 30
+[defaults.external_retention]
+daily = 30
+
+[[drives]]
+label = "D1"
+mount_path = "/mnt/d1"
+snapshot_root = ".snapshots"
+role = "primary"
+
+[[subvolumes]]
+name = "sv"
+short_name = "sv"
+source = "/sv"
+protection_level = "protected"
+"#;
+        let config: Config = toml::from_str(config_str).unwrap();
+        let resolved =
+            config.subvolumes[0].resolved(&config.defaults, config.general.run_frequency);
+        assert_eq!(
+            resolved.external_retention.monthly,
+            MonthlyCount::Unlimited,
+            "Sheltered external retention should resolve to Unlimited monthly"
+        );
+        assert_eq!(resolved.external_retention.yearly, 0);
     }
 
     #[test]
@@ -1857,6 +2271,453 @@ state_db = "/tmp/urd.db"
 config_version = 99
 "#;
         assert_eq!(extract_config_version(raw).unwrap(), Some(99));
+    }
+
+    // ── V2 (UPI 042) tests ─────────────────────────────────────────────
+
+    #[test]
+    fn extract_version_v2() {
+        let raw = r#"
+[general]
+config_version = 2
+state_db = "/tmp/urd.db"
+"#;
+        assert_eq!(extract_config_version(raw).unwrap(), Some(2));
+    }
+
+    fn v2_minimal_config_str() -> &'static str {
+        r#"
+[general]
+config_version = 2
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp"
+run_frequency = "daily"
+
+[[drives]]
+label = "D1"
+mount_path = "/mnt/d1"
+snapshot_root = ".snap"
+role = "primary"
+
+[[subvolumes]]
+name = "sv"
+source = "/data/sv"
+snapshot_root = "/snap"
+protection = "sheltered"
+"#
+    }
+
+    #[test]
+    fn parse_v2_minimal_config() {
+        let config = parse_v2(v2_minimal_config_str()).expect("v2 minimal parses");
+        assert_eq!(config.general.config_version, Some(2));
+        assert_eq!(config.subvolumes.len(), 1);
+    }
+
+    #[test]
+    fn parse_v2_rejects_monthly_zero() {
+        let raw = r#"
+[general]
+config_version = 2
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp"
+
+[[drives]]
+label = "D1"
+mount_path = "/mnt/d1"
+snapshot_root = ".snap"
+role = "primary"
+
+[[subvolumes]]
+name = "sv"
+source = "/data/sv"
+snapshot_root = "/snap"
+local_retention = { hourly = 0, daily = 7, weekly = 4, monthly = 0 }
+"#;
+        let err = parse_v2(raw).unwrap_err();
+        assert!(
+            err.contains("monthly = 0 is not allowed"),
+            "expected v2 rejection of monthly = 0, got: {err}"
+        );
+        assert!(err.contains("unlimited"));
+    }
+
+    #[test]
+    fn parse_v2_accepts_monthly_unlimited() {
+        let raw = r#"
+[general]
+config_version = 2
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp"
+
+[[drives]]
+label = "D1"
+mount_path = "/mnt/d1"
+snapshot_root = ".snap"
+role = "primary"
+
+[[subvolumes]]
+name = "sv"
+source = "/data/sv"
+snapshot_root = "/snap"
+local_retention = { daily = 7, weekly = 4, monthly = "unlimited" }
+"#;
+        let config = parse_v2(raw).expect("monthly = \"unlimited\" parses");
+        let sv = &config.subvolumes[0];
+        let lr = sv.local_retention.as_ref().unwrap();
+        match lr {
+            LocalRetentionConfig::Graduated(g) => {
+                assert_eq!(g.monthly, Some(MonthlyCount::Unlimited));
+            }
+            LocalRetentionConfig::Transient => panic!("expected Graduated"),
+        }
+    }
+
+    #[test]
+    fn parse_v2_accepts_monthly_positive_int() {
+        let raw = r#"
+[general]
+config_version = 2
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp"
+
+[[drives]]
+label = "D1"
+mount_path = "/mnt/d1"
+snapshot_root = ".snap"
+role = "primary"
+
+[[subvolumes]]
+name = "sv"
+source = "/data/sv"
+snapshot_root = "/snap"
+local_retention = { daily = 7, weekly = 4, monthly = 12 }
+"#;
+        let config = parse_v2(raw).expect("monthly = 12 parses");
+        let sv = &config.subvolumes[0];
+        let lr = sv.local_retention.as_ref().unwrap();
+        match lr {
+            LocalRetentionConfig::Graduated(g) => {
+                assert_eq!(g.monthly, Some(MonthlyCount::Count(12)));
+            }
+            LocalRetentionConfig::Transient => panic!("expected Graduated"),
+        }
+    }
+
+    #[test]
+    fn parse_v2_accepts_yearly_zero() {
+        let raw = r#"
+[general]
+config_version = 2
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp"
+
+[[drives]]
+label = "D1"
+mount_path = "/mnt/d1"
+snapshot_root = ".snap"
+role = "primary"
+
+[[subvolumes]]
+name = "sv"
+source = "/data/sv"
+snapshot_root = "/snap"
+local_retention = { daily = 7, weekly = 4, monthly = 12, yearly = 0 }
+"#;
+        let config = parse_v2(raw).expect("yearly = 0 parses");
+        let sv = &config.subvolumes[0];
+        let lr = sv.local_retention.as_ref().unwrap();
+        match lr {
+            LocalRetentionConfig::Graduated(g) => {
+                assert_eq!(g.yearly, Some(0));
+            }
+            LocalRetentionConfig::Transient => panic!("expected Graduated"),
+        }
+    }
+
+    #[test]
+    fn parse_v2_accepts_yearly_positive() {
+        let raw = r#"
+[general]
+config_version = 2
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp"
+
+[[drives]]
+label = "D1"
+mount_path = "/mnt/d1"
+snapshot_root = ".snap"
+role = "primary"
+
+[[subvolumes]]
+name = "sv"
+source = "/data/sv"
+snapshot_root = "/snap"
+local_retention = { daily = 7, weekly = 4, monthly = 12, yearly = 5 }
+"#;
+        let config = parse_v2(raw).expect("yearly = 5 parses");
+        let sv = &config.subvolumes[0];
+        let lr = sv.local_retention.as_ref().unwrap();
+        match lr {
+            LocalRetentionConfig::Graduated(g) => {
+                assert_eq!(g.yearly, Some(5));
+            }
+            LocalRetentionConfig::Transient => panic!("expected Graduated"),
+        }
+    }
+
+    #[test]
+    fn parse_v2_unlimited_plus_yearly_parses_clean() {
+        // R6: validate_v2 does NOT raise an error for unlimited+yearly.
+        // The advisory fires in preflight.rs (Step 2.10), not at parse time.
+        let raw = r#"
+[general]
+config_version = 2
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp"
+
+[[drives]]
+label = "D1"
+mount_path = "/mnt/d1"
+snapshot_root = ".snap"
+role = "primary"
+
+[[subvolumes]]
+name = "sv"
+source = "/data/sv"
+snapshot_root = "/snap"
+local_retention = { daily = 7, weekly = 4, monthly = "unlimited", yearly = 5 }
+"#;
+        let config = parse_v2(raw).expect("unlimited + yearly parses without validation error");
+        let sv = &config.subvolumes[0];
+        let lr = sv.local_retention.as_ref().unwrap();
+        match lr {
+            LocalRetentionConfig::Graduated(g) => {
+                assert_eq!(g.monthly, Some(MonthlyCount::Unlimited));
+                assert_eq!(g.yearly, Some(5));
+            }
+            LocalRetentionConfig::Transient => panic!("expected Graduated"),
+        }
+    }
+
+    #[test]
+    fn parse_v2_named_level_rejects_overrides() {
+        // Same Rules 1-4 from v1 apply in v2.
+        let raw = r#"
+[general]
+config_version = 2
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp"
+
+[[drives]]
+label = "D1"
+mount_path = "/mnt/d1"
+snapshot_root = ".snap"
+role = "primary"
+
+[[subvolumes]]
+name = "sv"
+source = "/data/sv"
+snapshot_root = "/snap"
+protection = "sheltered"
+snapshot_interval = "6h"
+"#;
+        let err = parse_v2(raw).unwrap_err();
+        assert!(err.contains("snapshot_interval"));
+        assert!(err.contains("custom"));
+    }
+
+    #[test]
+    fn dispatcher_rejects_v3() {
+        let raw = r#"
+[general]
+config_version = 3
+state_db = "/tmp/urd.db"
+"#;
+        let result = Config::from_str(raw);
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("unsupported config_version 3 (supported: 1, 2)"),
+            "got: {err}"
+        );
+    }
+
+    // ── R1 / Step 2.4 — V1 shim regression tests ───────────────────────
+
+    #[test]
+    fn parse_v1_monthly_zero_still_loads() {
+        // R1: v1 wire format must continue accepting monthly = 0 (legacy
+        // semantic: 0 = unlimited). Without the v1 shim's u32 deserialize +
+        // v1_monthly_to_monthly_count mapping, every existing v1 config
+        // would fail to load.
+        let raw = r#"
+[general]
+config_version = 1
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp"
+
+[[drives]]
+label = "D1"
+mount_path = "/mnt/d1"
+snapshot_root = ".snap"
+role = "primary"
+
+[[subvolumes]]
+name = "sv"
+source = "/data/sv"
+snapshot_root = "/snap"
+local_retention = { daily = 7, weekly = 4, monthly = 0 }
+"#;
+        let config = parse_v1(raw).expect("v1 monthly = 0 must continue loading");
+        let sv = &config.subvolumes[0];
+        let lr = sv.local_retention.as_ref().unwrap();
+        match lr {
+            LocalRetentionConfig::Graduated(g) => {
+                assert_eq!(
+                    g.monthly,
+                    Some(MonthlyCount::Unlimited),
+                    "v1 monthly = 0 must map to Unlimited"
+                );
+            }
+            LocalRetentionConfig::Transient => panic!("expected Graduated"),
+        }
+    }
+
+    #[test]
+    fn parse_v1_monthly_positive_round_trips() {
+        let raw = r#"
+[general]
+config_version = 1
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp"
+
+[[drives]]
+label = "D1"
+mount_path = "/mnt/d1"
+snapshot_root = ".snap"
+role = "primary"
+
+[[subvolumes]]
+name = "sv"
+source = "/data/sv"
+snapshot_root = "/snap"
+local_retention = { daily = 7, weekly = 4, monthly = 12 }
+"#;
+        let config = parse_v1(raw).expect("v1 monthly = 12 loads");
+        let sv = &config.subvolumes[0];
+        let lr = sv.local_retention.as_ref().unwrap();
+        match lr {
+            LocalRetentionConfig::Graduated(g) => {
+                assert_eq!(g.monthly, Some(MonthlyCount::Count(12)));
+            }
+            LocalRetentionConfig::Transient => panic!("expected Graduated"),
+        }
+    }
+
+    #[test]
+    fn parse_v1_external_retention_monthly_zero_is_unlimited() {
+        let raw = r#"
+[general]
+config_version = 1
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp"
+
+[[drives]]
+label = "D1"
+mount_path = "/mnt/d1"
+snapshot_root = ".snap"
+role = "primary"
+
+[[subvolumes]]
+name = "sv"
+source = "/data/sv"
+snapshot_root = "/snap"
+external_retention = { daily = 30, weekly = 26, monthly = 0 }
+"#;
+        let config = parse_v1(raw).expect("v1 external monthly = 0 loads");
+        let sv = &config.subvolumes[0];
+        let ext = sv.external_retention.as_ref().unwrap();
+        assert_eq!(ext.monthly, Some(MonthlyCount::Unlimited));
+    }
+
+    #[test]
+    fn parse_v1_synthesized_external_defaults_are_unlimited() {
+        // V1Config::into_config() synthesizes defaults: external monthly = Unlimited.
+        let raw = r#"
+[general]
+config_version = 1
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp"
+
+[[drives]]
+label = "D1"
+mount_path = "/mnt/d1"
+snapshot_root = ".snap"
+role = "primary"
+
+[[subvolumes]]
+name = "sv"
+source = "/data/sv"
+snapshot_root = "/snap"
+"#;
+        let config = parse_v1(raw).expect("v1 without external_retention loads");
+        assert_eq!(
+            config.defaults.external_retention.monthly,
+            Some(MonthlyCount::Unlimited)
+        );
+    }
+
+    #[test]
+    fn parse_legacy_still_loads_after_v2_added() {
+        // Regression: legacy schema still loadable after v2 addition.
+        let raw = r#"
+[general]
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp"
+
+[local_snapshots]
+roots = [{ path = "/snap", subvolumes = ["sv"] }]
+
+[defaults]
+snapshot_interval = "1h"
+send_interval = "1d"
+[defaults.local_retention]
+daily = 30
+[defaults.external_retention]
+daily = 30
+monthly = 0
+
+[[drives]]
+label = "D1"
+mount_path = "/mnt/d1"
+snapshot_root = ".snapshots"
+role = "primary"
+
+[[subvolumes]]
+name = "sv"
+short_name = "sv"
+source = "/data/sv"
+"#;
+        let config = parse_legacy(raw).expect("legacy still loads");
+        assert_eq!(config.general.config_version, None);
+        // Legacy monthly = 0 → Unlimited via the lenient MonthlyCount::Deserialize
+        assert_eq!(
+            config.defaults.external_retention.monthly,
+            Some(MonthlyCount::Unlimited)
+        );
     }
 
     #[test]
@@ -2902,5 +3763,47 @@ drives = []
         assert_eq!(config.general.config_version, Some(1));
         assert_eq!(config.subvolumes.len(), 5);
         assert_eq!(config.drives.len(), 2);
+    }
+
+    #[test]
+    fn v2_example_config_round_trips() {
+        let example = include_str!("../config/urd.toml.v2.example");
+        let result = Config::from_str(example);
+        assert!(
+            result.is_ok(),
+            "v2 example config should parse: {:?}",
+            result.err()
+        );
+        let config = result.unwrap();
+        assert_eq!(config.general.config_version, Some(2));
+
+        // Verify the archive subvolume has Unlimited monthly.
+        let archive = config
+            .subvolumes
+            .iter()
+            .find(|s| s.name == "subvol3-archive")
+            .expect("v2 example must include subvol3-archive");
+        let lr = archive.local_retention.as_ref().expect("local_retention");
+        match lr {
+            LocalRetentionConfig::Graduated(g) => {
+                assert_eq!(g.monthly, Some(MonthlyCount::Unlimited));
+            }
+            LocalRetentionConfig::Transient => panic!("expected Graduated"),
+        }
+
+        // Verify the projects subvolume has yearly = 5.
+        let projects = config
+            .subvolumes
+            .iter()
+            .find(|s| s.name == "subvol-projects")
+            .expect("v2 example must include subvol-projects");
+        let lr = projects.local_retention.as_ref().expect("local_retention");
+        match lr {
+            LocalRetentionConfig::Graduated(g) => {
+                assert_eq!(g.monthly, Some(MonthlyCount::Count(12)));
+                assert_eq!(g.yearly, Some(5));
+            }
+            LocalRetentionConfig::Transient => panic!("expected Graduated"),
+        }
     }
 }
