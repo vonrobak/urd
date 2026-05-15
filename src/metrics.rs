@@ -15,6 +15,22 @@ pub struct MetricsData {
     /// Counters derived from the events table at write time.
     /// Empty/zero when no state DB is available.
     pub event_counters: EventCounters,
+    /// UPI 043: per-pool metrics (source + destination). Empty for runs that
+    /// didn't gather pool observability.
+    pub pools: Vec<PoolMetric>,
+}
+
+/// UPI 043: one row per (uuid, role) feeding `backup_pool_free_bytes` and
+/// `backup_pool_metadata_utilization_ratio`. Source-pool `label` is the
+/// canonical (shortest) mountpoint string; destination-pool `label` is the
+/// configured drive label.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PoolMetric {
+    pub uuid: String,
+    pub role: String,
+    pub label: String,
+    pub free_bytes: Option<u64>,
+    pub metadata_utilization_ratio: Option<f64>,
 }
 
 /// Prometheus counter family derived from the events table by
@@ -47,6 +63,30 @@ pub struct SubvolumeMetrics {
     /// Bytes of the most recent in-window full send (UPI 030). Emitted only
     /// when `Some`. Absent for incremental-only and cold-start subvolumes.
     pub last_full_send_bytes: Option<u64>,
+    /// UPI 043: feeds `backup_subvolume_local_snapshot_count`. `Some(_)` when
+    /// local snapshots are configured for this subvolume; `None` otherwise.
+    /// Coexists with `local_snapshot_count: usize` (always-present, feeds the
+    /// legacy `backup_snapshot_count{location="local"}` per ADR-105).
+    pub local_snapshot_count_v4: Option<u32>,
+    /// UPI 043: feeds `backup_subvolume_estimated_local_pinned_delta_bytes`.
+    /// Emit policy: line absent when `None` (cold-start);
+    /// `Some(0)` is emitted (distinguishes "known zero" from "unknown").
+    pub estimated_local_pinned_delta_bytes: Option<u64>,
+}
+
+/// Escape `\` and `"` in a Prometheus label value per the exposition format.
+#[must_use]
+fn escape_label_value(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 // ── Writer ──────────────────────────────────────────────────────────────
@@ -304,6 +344,96 @@ fn format_metrics(data: &MetricsData) -> String {
         }
     }
 
+    // ── Pool observability (UPI 043) ──────────────────────────────
+
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "# HELP backup_pool_free_bytes Free bytes on a BTRFS pool. Snapshot at backup-run cadence; not a live signal."
+    )
+    .unwrap();
+    writeln!(out, "# TYPE backup_pool_free_bytes gauge").unwrap();
+    for pool in &data.pools {
+        if let Some(bytes) = pool.free_bytes {
+            writeln!(
+                out,
+                "backup_pool_free_bytes{{uuid=\"{}\",role=\"{}\",label=\"{}\"}} {}",
+                escape_label_value(&pool.uuid),
+                escape_label_value(&pool.role),
+                escape_label_value(&pool.label),
+                bytes
+            )
+            .unwrap();
+        }
+    }
+
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "# HELP backup_pool_metadata_utilization_ratio BTRFS metadata utilization (0.0–1.0); source or destination."
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "# TYPE backup_pool_metadata_utilization_ratio gauge"
+    )
+    .unwrap();
+    for pool in &data.pools {
+        if let Some(ratio) = pool.metadata_utilization_ratio {
+            writeln!(
+                out,
+                "backup_pool_metadata_utilization_ratio{{uuid=\"{}\",role=\"{}\",label=\"{}\"}} {}",
+                escape_label_value(&pool.uuid),
+                escape_label_value(&pool.role),
+                escape_label_value(&pool.label),
+                ratio
+            )
+            .unwrap();
+        }
+    }
+
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "# HELP backup_subvolume_local_snapshot_count Local snapshot count for a subvolume. Line absent when local snapshots are not configured for that subvolume."
+    )
+    .unwrap();
+    writeln!(out, "# TYPE backup_subvolume_local_snapshot_count gauge").unwrap();
+    for sv in &data.subvolumes {
+        if let Some(count) = sv.local_snapshot_count_v4 {
+            writeln!(
+                out,
+                "backup_subvolume_local_snapshot_count{{subvolume=\"{}\"}} {}",
+                escape_label_value(&sv.name),
+                count
+            )
+            .unwrap();
+        }
+    }
+
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "# HELP backup_subvolume_estimated_local_pinned_delta_bytes Estimated local pinned CoW delta; wire-bytes-derived (mean over incrementals). Understates active periods of bimodal subvolumes; overstates dormancy."
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "# TYPE backup_subvolume_estimated_local_pinned_delta_bytes gauge"
+    )
+    .unwrap();
+    for sv in &data.subvolumes {
+        if let Some(bytes) = sv.estimated_local_pinned_delta_bytes {
+            writeln!(
+                out,
+                "backup_subvolume_estimated_local_pinned_delta_bytes{{subvolume=\"{}\"}} {}",
+                escape_label_value(&sv.name),
+                bytes
+            )
+            .unwrap();
+        }
+    }
+
     // ── Structured event counters ─────────────────────────────────
 
     let counters = &data.event_counters;
@@ -402,6 +532,8 @@ mod tests {
                     send_type: 1,
                     churn_bytes_per_second: None,
                     last_full_send_bytes: None,
+                    local_snapshot_count_v4: None,
+                    estimated_local_pinned_delta_bytes: None,
                 },
                 SubvolumeMetrics {
                     name: "htpc-home".to_string(),
@@ -413,12 +545,15 @@ mod tests {
                     send_type: 2,
                     churn_bytes_per_second: None,
                     last_full_send_bytes: None,
+                    local_snapshot_count_v4: None,
+                    estimated_local_pinned_delta_bytes: None,
                 },
             ],
             external_drive_mounted: true,
             external_free_bytes: 4_400_000_000_000,
             script_last_run_timestamp: 1_711_100_120,
             event_counters: EventCounters::default(),
+            pools: Vec::new(),
         }
     }
 
@@ -502,6 +637,7 @@ mod tests {
             external_free_bytes: 0,
             script_last_run_timestamp: 1_711_100_000,
             event_counters: EventCounters::default(),
+            pools: Vec::new(),
         };
         let output = format_metrics(&data);
         assert!(output.contains("backup_external_drive_mounted 0"));
@@ -560,6 +696,8 @@ mod tests {
                 send_type: 1,
                 churn_bytes_per_second: None,
                 last_full_send_bytes: None,
+                local_snapshot_count_v4: None,
+                estimated_local_pinned_delta_bytes: None,
             },
             SubvolumeMetrics {
                 name: "sv-b".to_string(),
@@ -571,6 +709,8 @@ mod tests {
                 send_type: 2,
                 churn_bytes_per_second: None,
                 last_full_send_bytes: None,
+                local_snapshot_count_v4: None,
+                estimated_local_pinned_delta_bytes: None,
             },
             SubvolumeMetrics {
                 name: "sv-c".to_string(),
@@ -582,6 +722,8 @@ mod tests {
                 send_type: 2,
                 churn_bytes_per_second: None,
                 last_full_send_bytes: None,
+                local_snapshot_count_v4: None,
+                estimated_local_pinned_delta_bytes: None,
             },
         ];
 
@@ -613,11 +755,14 @@ mod tests {
                 send_type: 1,
                 churn_bytes_per_second: None,
                 last_full_send_bytes: None,
+                local_snapshot_count_v4: None,
+                estimated_local_pinned_delta_bytes: None,
             }],
             external_drive_mounted: true,
             external_free_bytes: 1_000_000,
             script_last_run_timestamp: 12345,
             event_counters: EventCounters::default(),
+            pools: Vec::new(),
         };
         write_metrics(&path, &data).unwrap();
 
@@ -633,6 +778,8 @@ mod tests {
             send_type: 2,
             churn_bytes_per_second: None,
             last_full_send_bytes: None,
+            local_snapshot_count_v4: None,
+            estimated_local_pinned_delta_bytes: None,
         }];
         apply_carried_forward_timestamps(&mut svs, &carried);
 
@@ -751,5 +898,166 @@ mod tests {
         assert!(output.contains("urd_planner_defers_total{scope=\"subvolume\"} 7"));
         assert!(output.contains("urd_planner_defers_total{scope=\"drive\"} 3"));
         assert!(output.contains("urd_circuit_breaker_trips_total 5"));
+    }
+
+    // ── UPI 043: pool + per-subvolume v4 gauges ───────────────────
+
+    fn pool(uuid: &str, role: &str, label: &str) -> PoolMetric {
+        PoolMetric {
+            uuid: uuid.to_string(),
+            role: role.to_string(),
+            label: label.to_string(),
+            free_bytes: None,
+            metadata_utilization_ratio: None,
+        }
+    }
+
+    #[test]
+    fn format_metrics_emits_pool_free_bytes_help_and_type() {
+        let data = sample_data();
+        let output = format_metrics(&data);
+        assert!(output.contains("# HELP backup_pool_free_bytes"));
+        assert!(output.contains("# TYPE backup_pool_free_bytes gauge"));
+    }
+
+    #[test]
+    fn format_metrics_emits_pool_free_bytes_value_when_some() {
+        let mut data = sample_data();
+        let mut p = pool("uuid-a", "source", "/home");
+        p.free_bytes = Some(1234);
+        data.pools.push(p);
+        let output = format_metrics(&data);
+        assert!(output.contains(
+            "backup_pool_free_bytes{uuid=\"uuid-a\",role=\"source\",label=\"/home\"} 1234"
+        ));
+    }
+
+    #[test]
+    fn format_metrics_omits_pool_free_bytes_value_when_none() {
+        let mut data = sample_data();
+        data.pools.push(pool("uuid-a", "source", "/home"));
+        let output = format_metrics(&data);
+        // HELP/TYPE still present.
+        assert!(output.contains("# HELP backup_pool_free_bytes"));
+        // No value line.
+        assert!(!output.contains("backup_pool_free_bytes{"));
+    }
+
+    #[test]
+    fn format_metrics_emits_pool_metadata_ratio_value_when_some() {
+        let mut data = sample_data();
+        let mut p = pool("uuid-a", "source", "/home");
+        p.metadata_utilization_ratio = Some(0.25);
+        data.pools.push(p);
+        let output = format_metrics(&data);
+        assert!(output.contains(
+            "backup_pool_metadata_utilization_ratio{uuid=\"uuid-a\",role=\"source\",label=\"/home\"} 0.25"
+        ));
+    }
+
+    #[test]
+    fn format_metrics_omits_pool_metadata_ratio_value_when_none() {
+        let mut data = sample_data();
+        data.pools.push(pool("uuid-a", "source", "/home"));
+        let output = format_metrics(&data);
+        assert!(output.contains("# HELP backup_pool_metadata_utilization_ratio"));
+        assert!(!output.contains("backup_pool_metadata_utilization_ratio{"));
+    }
+
+    #[test]
+    fn format_metrics_emits_local_snapshot_count_when_some() {
+        let mut data = sample_data();
+        data.subvolumes[0].local_snapshot_count_v4 = Some(7);
+        let output = format_metrics(&data);
+        assert!(output.contains(
+            "backup_subvolume_local_snapshot_count{subvolume=\"subvol3-opptak\"} 7"
+        ));
+    }
+
+    #[test]
+    fn format_metrics_omits_local_snapshot_count_when_none() {
+        let data = sample_data();
+        let output = format_metrics(&data);
+        assert!(output.contains("# HELP backup_subvolume_local_snapshot_count"));
+        assert!(!output.contains("backup_subvolume_local_snapshot_count{"));
+    }
+
+    #[test]
+    fn format_metrics_emits_local_snapshot_count_zero_when_some_zero() {
+        let mut data = sample_data();
+        data.subvolumes[0].local_snapshot_count_v4 = Some(0);
+        let output = format_metrics(&data);
+        assert!(output.contains(
+            "backup_subvolume_local_snapshot_count{subvolume=\"subvol3-opptak\"} 0"
+        ));
+    }
+
+    #[test]
+    fn format_metrics_emits_estimated_pinned_delta_when_some() {
+        let mut data = sample_data();
+        data.subvolumes[0].estimated_local_pinned_delta_bytes = Some(5_000_000);
+        let output = format_metrics(&data);
+        assert!(output.contains(
+            "backup_subvolume_estimated_local_pinned_delta_bytes{subvolume=\"subvol3-opptak\"} 5000000"
+        ));
+    }
+
+    #[test]
+    fn format_metrics_omits_estimated_pinned_delta_when_none() {
+        let data = sample_data();
+        let output = format_metrics(&data);
+        assert!(output.contains("# HELP backup_subvolume_estimated_local_pinned_delta_bytes"));
+        assert!(!output.contains("backup_subvolume_estimated_local_pinned_delta_bytes{"));
+    }
+
+    #[test]
+    fn format_metrics_emits_estimated_pinned_delta_zero_when_some_zero() {
+        let mut data = sample_data();
+        data.subvolumes[0].estimated_local_pinned_delta_bytes = Some(0);
+        let output = format_metrics(&data);
+        assert!(output.contains(
+            "backup_subvolume_estimated_local_pinned_delta_bytes{subvolume=\"subvol3-opptak\"} 0"
+        ));
+    }
+
+    #[test]
+    fn format_metrics_escapes_pool_label_quotes() {
+        let mut data = sample_data();
+        let mut p = pool("uuid-a", "source", "weird\"label");
+        p.free_bytes = Some(0);
+        data.pools.push(p);
+        let output = format_metrics(&data);
+        // Quote escaped to \".
+        assert!(
+            output.contains("label=\"weird\\\"label\""),
+            "expected escaped quote: {output}"
+        );
+    }
+
+    #[test]
+    fn format_metrics_emits_pool_role_label() {
+        let mut data = sample_data();
+        let mut src = pool("uuid-src", "source", "/home");
+        src.free_bytes = Some(10);
+        data.pools.push(src);
+        let mut dst = pool("uuid-dst", "destination", "WD-18TB");
+        dst.free_bytes = Some(20);
+        data.pools.push(dst);
+        let output = format_metrics(&data);
+        assert!(output.contains("role=\"source\""));
+        assert!(output.contains("role=\"destination\""));
+    }
+
+    #[test]
+    fn format_metrics_emits_source_pool_label_as_canonical_mountpoint() {
+        let mut data = sample_data();
+        // The caller of compute_pool_metrics_from is responsible for picking
+        // the canonical mountpoint as `label`; metrics.rs just renders what
+        // it gets. This test asserts the renderer doesn't mangle the label.
+        let mut p = pool("uuid-a", "source", "/bar");
+        p.free_bytes = Some(99);
+        data.pools.push(p);
+        let output = format_metrics(&data);
+        assert!(output.contains("label=\"/bar\""));
     }
 }

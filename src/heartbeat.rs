@@ -4,12 +4,17 @@
 // without requiring SQLite access. It bridges the backup command and future
 // consumers (Sentinel, tray icon, external scripts).
 //
-// Schema contract: consumers MUST check `schema_version` and refuse to interpret
-// fields from a higher version. The writer MUST NOT remove fields between
-// versions — only add. Additive changes bump the version.
+// Schema contract: consumers SHOULD check `schema_version`. Additive
+// version bumps (new fields with `#[serde(default, skip_serializing_if = …)]`)
+// are forward-compatible — older readers may parse newer payloads and will
+// see unknown fields as absent (serde default). Consumers MAY refuse a
+// payload from a higher version if they prefer strict semantics, but they
+// are not required to. The writer MUST NOT remove fields between minor
+// version bumps; field removal is a breaking change requiring an ADR-105
+// amendment and a major schema-version bump.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
@@ -18,10 +23,10 @@ use crate::awareness::SubvolAssessment;
 use crate::config::Config;
 use crate::error::UrdError;
 use crate::executor::{ExecutionResult, SendType};
-use crate::output::ChurnHeartbeatFields;
+use crate::output::{ChurnHeartbeatFields, SubvolumeExtras};
 
 /// Current schema version. Bump when adding fields (never remove fields).
-const SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION: u32 = 4;
 
 // ── Types ───────────────────────────────────────────────────────────────
 
@@ -39,6 +44,33 @@ pub struct Heartbeat {
     /// Defaults to true for backward compat with pre-notification heartbeats.
     #[serde(default = "default_true")]
     pub notifications_dispatched: bool,
+    /// UPI 043: detected BTRFS pools (source + mounted destinations).
+    /// Empty (and omitted from JSON) on v3-era heartbeats.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pools: Vec<PoolHeartbeat>,
+    /// UPI 043: configured destination drives, mounted or not.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub drives: Vec<DriveHeartbeat>,
+}
+
+/// UPI 043: per-pool view (one entry per deduplicated BTRFS UUID).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PoolHeartbeat {
+    pub uuid: String,
+    pub mountpoints: Vec<PathBuf>,
+    pub free_bytes: Option<u64>,
+    pub metadata_utilization_ratio: Option<f64>,
+}
+
+/// UPI 043: per-configured-drive view.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DriveHeartbeat {
+    pub label: String,
+    pub uuid: Option<String>,
+    /// "primary" | "offsite" | "test"
+    pub role: String,
+    pub mounted: bool,
+    pub pool_uuid: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -72,20 +104,42 @@ pub struct SubvolumeHeartbeat {
     /// cold-start subvolumes).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_full_send_bytes: Option<u64>,
+    /// UPI 043: pool UUID this subvolume's source resides on. `None` if
+    /// pool detection failed for this subvolume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_uuid: Option<String>,
+    /// UPI 043: count of local snapshots for this subvolume. `Some(_)` when
+    /// local snapshots are configured; `None` otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_snapshot_count: Option<u32>,
+    /// UPI 043: estimated local pinned CoW delta in bytes. `Some(0)` when
+    /// `local_snapshot_count` is `Some(0)` or `None`; `None` when cold-start
+    /// (`local_snapshot_count > 0` and `mean_incremental_bytes` unknown);
+    /// `Some(count × mean)` otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_local_pinned_delta_bytes: Option<u64>,
 }
 
 // ── Builder ─────────────────────────────────────────────────────────────
 
 /// Build a heartbeat from a completed backup run with awareness assessments.
+///
+/// If a future addition pushes this past 8 args, refactor to a
+/// `HeartbeatInputs { ... }` struct instead of growing the positional list.
 #[must_use]
+#[allow(clippy::too_many_arguments)]
 pub fn build_from_run(
     config: &Config,
     now: NaiveDateTime,
     result: &ExecutionResult,
     assessments: &[SubvolAssessment],
     churn_views: &HashMap<String, ChurnHeartbeatFields>,
+    pools: Vec<PoolHeartbeat>,
+    drives: Vec<DriveHeartbeat>,
+    subvol_extras: &HashMap<String, SubvolumeExtras>,
 ) -> Heartbeat {
-    let subvolumes = build_subvolume_entries(Some(result), assessments, churn_views);
+    let subvolumes =
+        build_subvolume_entries(Some(result), assessments, churn_views, subvol_extras);
 
     Heartbeat {
         schema_version: SCHEMA_VERSION,
@@ -97,18 +151,27 @@ pub fn build_from_run(
         run_id: result.run_id,
         subvolumes,
         notifications_dispatched: false,
+        pools,
+        drives,
     }
 }
 
 /// Build a heartbeat for an empty/skipped run (no execution result).
+///
+/// If a future addition pushes this past 8 args, refactor to a
+/// `HeartbeatInputs { ... }` struct instead of growing the positional list.
 #[must_use]
+#[allow(clippy::too_many_arguments)]
 pub fn build_empty(
     config: &Config,
     now: NaiveDateTime,
     assessments: &[SubvolAssessment],
     churn_views: &HashMap<String, ChurnHeartbeatFields>,
+    pools: Vec<PoolHeartbeat>,
+    drives: Vec<DriveHeartbeat>,
+    subvol_extras: &HashMap<String, SubvolumeExtras>,
 ) -> Heartbeat {
-    let subvolumes = build_subvolume_entries(None, assessments, churn_views);
+    let subvolumes = build_subvolume_entries(None, assessments, churn_views, subvol_extras);
 
     Heartbeat {
         schema_version: SCHEMA_VERSION,
@@ -120,6 +183,8 @@ pub fn build_empty(
         run_id: None,
         subvolumes,
         notifications_dispatched: false,
+        pools,
+        drives,
     }
 }
 
@@ -127,6 +192,7 @@ fn build_subvolume_entries(
     result: Option<&ExecutionResult>,
     assessments: &[SubvolAssessment],
     churn_views: &HashMap<String, ChurnHeartbeatFields>,
+    subvol_extras: &HashMap<String, SubvolumeExtras>,
 ) -> Vec<SubvolumeHeartbeat> {
     assessments
         .iter()
@@ -140,6 +206,7 @@ fn build_subvolume_entries(
             });
 
             let churn = churn_views.get(&a.name).copied().unwrap_or_default();
+            let extras = subvol_extras.get(&a.name).cloned().unwrap_or_default();
 
             SubvolumeHeartbeat {
                 name: a.name.clone(),
@@ -149,6 +216,9 @@ fn build_subvolume_entries(
                 send_completed,
                 churn_bytes_per_second: churn.churn_bytes_per_second,
                 last_full_send_bytes: churn.last_full_send_bytes,
+                pool_uuid: extras.pool_uuid,
+                local_snapshot_count: extras.local_snapshot_count,
+                estimated_local_pinned_delta_bytes: extras.estimated_local_pinned_delta_bytes,
             }
         })
         .collect()
@@ -394,11 +464,20 @@ mod tests {
         let assessments = test_assessments();
         let result = test_execution_result();
 
-        let heartbeat = build_from_run(&config, now, &result, &assessments, &HashMap::new());
+        let heartbeat = build_from_run(
+            &config,
+            now,
+            &result,
+            &assessments,
+            &HashMap::new(),
+            Vec::new(),
+            Vec::new(),
+            &HashMap::new(),
+        );
         let json = serde_json::to_string_pretty(&heartbeat).unwrap();
         let parsed: Heartbeat = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(parsed.schema_version, 3);
+        assert_eq!(parsed.schema_version, 4);
         assert_eq!(parsed.timestamp, "2026-03-24T02:05:00");
         assert_eq!(parsed.run_result, "partial");
         assert_eq!(parsed.run_id, Some(42));
@@ -451,7 +530,15 @@ mod tests {
             NaiveDateTime::parse_from_str("2026-03-24T02:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
         let assessments = test_assessments();
 
-        let heartbeat = build_empty(&config, now, &assessments, &HashMap::new());
+        let heartbeat = build_empty(
+            &config,
+            now,
+            &assessments,
+            &HashMap::new(),
+            Vec::new(),
+            Vec::new(),
+            &HashMap::new(),
+        );
 
         assert_eq!(heartbeat.run_result, "empty");
         assert_eq!(heartbeat.run_id, None);
@@ -476,14 +563,22 @@ mod tests {
             NaiveDateTime::parse_from_str("2026-03-24T02:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
         let assessments = test_assessments();
 
-        let heartbeat = build_empty(&config, now, &assessments, &HashMap::new());
+        let heartbeat = build_empty(
+            &config,
+            now,
+            &assessments,
+            &HashMap::new(),
+            Vec::new(),
+            Vec::new(),
+            &HashMap::new(),
+        );
         write(&path, &heartbeat).unwrap();
 
         // Temp file cleaned up
         assert!(!dir.path().join("heartbeat.json.tmp").exists());
         // File exists and is valid
         let read_back = read(&path).unwrap();
-        assert_eq!(read_back.schema_version, 3);
+        assert_eq!(read_back.schema_version, 4);
         assert_eq!(read_back.timestamp, "2026-03-24T02:00:00");
     }
 
@@ -495,7 +590,15 @@ mod tests {
         let config = test_config(&[("home", "1h")]);
         let now =
             NaiveDateTime::parse_from_str("2026-03-24T02:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
-        let heartbeat = build_empty(&config, now, &test_assessments(), &HashMap::new());
+        let heartbeat = build_empty(
+            &config,
+            now,
+            &test_assessments(),
+            &HashMap::new(),
+            Vec::new(),
+            Vec::new(),
+            &HashMap::new(),
+        );
         write(&path, &heartbeat).unwrap();
 
         assert!(path.exists());
@@ -504,12 +607,22 @@ mod tests {
     // ── UPI 030: schema v3 + churn / last-full-send fields ──────────────
 
     #[test]
-    fn heartbeat_serializes_at_schema_version_3() {
+    fn heartbeat_serializes_at_schema_version_4() {
         let config = test_config(&[("home", "1h")]);
         let now =
             NaiveDateTime::parse_from_str("2026-04-30T03:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
-        let heartbeat = build_empty(&config, now, &test_assessments(), &HashMap::new());
-        assert_eq!(heartbeat.schema_version, 3);
+        let heartbeat = build_empty(
+            &config,
+            now,
+            &test_assessments(),
+            &HashMap::new(),
+            Vec::new(),
+            Vec::new(),
+            &HashMap::new(),
+        );
+        assert_eq!(heartbeat.schema_version, 4);
+        let json = serde_json::to_string(&heartbeat).unwrap();
+        assert!(json.contains("\"schema_version\":4"));
     }
 
     #[test]
@@ -523,10 +636,19 @@ mod tests {
             ChurnHeartbeatFields {
                 churn_bytes_per_second: Some(1234.5),
                 last_full_send_bytes: None,
+                mean_incremental_bytes: None,
             },
         );
 
-        let hb = build_empty(&config, now, &test_assessments(), &churn);
+        let hb = build_empty(
+            &config,
+            now,
+            &test_assessments(),
+            &churn,
+            Vec::new(),
+            Vec::new(),
+            &HashMap::new(),
+        );
         let json = serde_json::to_string(&hb).unwrap();
         let parsed: Heartbeat = serde_json::from_str(&json).unwrap();
         let home = parsed.subvolumes.iter().find(|s| s.name == "home").unwrap();
@@ -545,10 +667,19 @@ mod tests {
             ChurnHeartbeatFields {
                 churn_bytes_per_second: None,
                 last_full_send_bytes: Some(12_000_000_000),
+                mean_incremental_bytes: None,
             },
         );
 
-        let hb = build_empty(&config, now, &test_assessments(), &churn);
+        let hb = build_empty(
+            &config,
+            now,
+            &test_assessments(),
+            &churn,
+            Vec::new(),
+            Vec::new(),
+            &HashMap::new(),
+        );
         let json = serde_json::to_string(&hb).unwrap();
         let parsed: Heartbeat = serde_json::from_str(&json).unwrap();
         let home = parsed.subvolumes.iter().find(|s| s.name == "home").unwrap();
@@ -587,7 +718,15 @@ mod tests {
         let config = test_config(&[("home", "1h")]);
         let now =
             NaiveDateTime::parse_from_str("2026-04-30T03:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
-        let hb = build_empty(&config, now, &test_assessments(), &HashMap::new());
+        let hb = build_empty(
+            &config,
+            now,
+            &test_assessments(),
+            &HashMap::new(),
+            Vec::new(),
+            Vec::new(),
+            &HashMap::new(),
+        );
         let json = serde_json::to_string(&hb).unwrap();
         assert!(
             !json.contains("churn_bytes_per_second"),
@@ -600,7 +739,15 @@ mod tests {
         let config = test_config(&[("home", "1h")]);
         let now =
             NaiveDateTime::parse_from_str("2026-04-30T03:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
-        let hb = build_empty(&config, now, &test_assessments(), &HashMap::new());
+        let hb = build_empty(
+            &config,
+            now,
+            &test_assessments(),
+            &HashMap::new(),
+            Vec::new(),
+            Vec::new(),
+            &HashMap::new(),
+        );
         let json = serde_json::to_string(&hb).unwrap();
         assert!(
             !json.contains("last_full_send_bytes"),
@@ -652,7 +799,16 @@ mod tests {
             run_id: Some(1),
         };
 
-        let hb = build_from_run(&config, now, &result, &assessments, &HashMap::new());
+        let hb = build_from_run(
+            &config,
+            now,
+            &result,
+            &assessments,
+            &HashMap::new(),
+            Vec::new(),
+            Vec::new(),
+            &HashMap::new(),
+        );
         assert!(hb.subvolumes[0].send_completed);
     }
 
@@ -680,7 +836,16 @@ mod tests {
             run_id: Some(1),
         };
 
-        let hb = build_from_run(&config, now, &result, &assessments, &HashMap::new());
+        let hb = build_from_run(
+            &config,
+            now,
+            &result,
+            &assessments,
+            &HashMap::new(),
+            Vec::new(),
+            Vec::new(),
+            &HashMap::new(),
+        );
         assert!(!hb.subvolumes[0].send_completed);
     }
 
@@ -708,7 +873,16 @@ mod tests {
             run_id: Some(1),
         };
 
-        let hb = build_from_run(&config, now, &result, &assessments, &HashMap::new());
+        let hb = build_from_run(
+            &config,
+            now,
+            &result,
+            &assessments,
+            &HashMap::new(),
+            Vec::new(),
+            Vec::new(),
+            &HashMap::new(),
+        );
         assert!(!hb.subvolumes[0].send_completed);
     }
 
@@ -736,5 +910,216 @@ mod tests {
             parsed.subvolumes[0].send_completed,
             "v1 heartbeat without send_completed should default to true"
         );
+    }
+
+    // ── UPI 043: schema v4 + pool/drive/subvol_extras fields ────────────
+
+    #[test]
+    fn heartbeat_v3_reader_tolerates_v4_unknown_fields() {
+        // Simulate a v3 reader: deserialize a v4-on-disk payload using the
+        // same `Heartbeat` type. Serde-default tolerance means new fields
+        // either parse as empty/None or are silently consumed.
+        let json = r#"{
+            "schema_version": 4,
+            "timestamp": "2026-05-15T02:00:00",
+            "stale_after": "2026-05-15T04:00:00",
+            "run_result": "success",
+            "run_id": 99,
+            "subvolumes": [
+                {
+                    "name": "home",
+                    "backup_success": true,
+                    "promise_status": "PROTECTED",
+                    "pin_failures": 0,
+                    "send_completed": true,
+                    "pool_uuid": "uuid-a",
+                    "local_snapshot_count": 7,
+                    "estimated_local_pinned_delta_bytes": 1234567
+                }
+            ],
+            "notifications_dispatched": true,
+            "pools": [
+                {
+                    "uuid": "uuid-a",
+                    "mountpoints": ["/home"],
+                    "free_bytes": 1000,
+                    "metadata_utilization_ratio": 0.25
+                }
+            ],
+            "drives": [
+                {
+                    "label": "WD-18TB",
+                    "uuid": "uuid-x",
+                    "role": "primary",
+                    "mounted": true,
+                    "pool_uuid": "uuid-x"
+                }
+            ],
+            "future_unknown_key": "v5-or-later"
+        }"#;
+        let parsed: Heartbeat = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.schema_version, 4);
+        assert_eq!(parsed.pools.len(), 1);
+        assert_eq!(parsed.drives.len(), 1);
+        assert_eq!(parsed.subvolumes[0].pool_uuid.as_deref(), Some("uuid-a"));
+        assert_eq!(parsed.subvolumes[0].local_snapshot_count, Some(7));
+    }
+
+    #[test]
+    fn heartbeat_v4_omits_empty_pools_and_drives_lists() {
+        let config = test_config(&[("home", "1h")]);
+        let now =
+            NaiveDateTime::parse_from_str("2026-05-15T03:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
+        let hb = build_empty(
+            &config,
+            now,
+            &test_assessments(),
+            &HashMap::new(),
+            Vec::new(),
+            Vec::new(),
+            &HashMap::new(),
+        );
+        let json = serde_json::to_string(&hb).unwrap();
+        assert!(!json.contains("\"pools\""), "pools should be omitted: {json}");
+        assert!(
+            !json.contains("\"drives\""),
+            "drives should be omitted: {json}"
+        );
+    }
+
+    #[test]
+    fn heartbeat_v4_serializes_pools_with_mountpoints_preserved() {
+        let config = test_config(&[("home", "1h")]);
+        let now =
+            NaiveDateTime::parse_from_str("2026-05-15T03:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
+        let pools = vec![PoolHeartbeat {
+            uuid: "uuid-a".to_string(),
+            mountpoints: vec![PathBuf::from("/b"), PathBuf::from("/a")],
+            free_bytes: Some(42),
+            metadata_utilization_ratio: Some(0.5),
+        }];
+        let hb = build_empty(
+            &config,
+            now,
+            &test_assessments(),
+            &HashMap::new(),
+            pools,
+            Vec::new(),
+            &HashMap::new(),
+        );
+        let json = serde_json::to_string(&hb).unwrap();
+        let parsed: Heartbeat = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.pools.len(), 1);
+        // Sorting is the caller's job, not serde's — round-trip preserves input order.
+        assert_eq!(
+            parsed.pools[0].mountpoints,
+            vec![PathBuf::from("/b"), PathBuf::from("/a")]
+        );
+    }
+
+    #[test]
+    fn subvolume_heartbeat_omits_pool_uuid_when_none() {
+        let config = test_config(&[("home", "1h")]);
+        let now =
+            NaiveDateTime::parse_from_str("2026-05-15T03:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
+        let hb = build_empty(
+            &config,
+            now,
+            &test_assessments(),
+            &HashMap::new(),
+            Vec::new(),
+            Vec::new(),
+            &HashMap::new(),
+        );
+        let json = serde_json::to_string(&hb).unwrap();
+        assert!(!json.contains("pool_uuid"), "pool_uuid omitted: {json}");
+    }
+
+    #[test]
+    fn subvolume_heartbeat_serializes_pool_uuid_when_some() {
+        let config = test_config(&[("home", "1h")]);
+        let now =
+            NaiveDateTime::parse_from_str("2026-05-15T03:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
+        let mut extras = HashMap::new();
+        extras.insert(
+            "home".to_string(),
+            SubvolumeExtras {
+                pool_uuid: Some("uuid-src".to_string()),
+                local_snapshot_count: Some(24),
+                estimated_local_pinned_delta_bytes: Some(1_000_000),
+            },
+        );
+        let hb = build_empty(
+            &config,
+            now,
+            &test_assessments(),
+            &HashMap::new(),
+            Vec::new(),
+            Vec::new(),
+            &extras,
+        );
+        let json = serde_json::to_string(&hb).unwrap();
+        let parsed: Heartbeat = serde_json::from_str(&json).unwrap();
+        let home = parsed.subvolumes.iter().find(|s| s.name == "home").unwrap();
+        assert_eq!(home.pool_uuid.as_deref(), Some("uuid-src"));
+        assert_eq!(home.local_snapshot_count, Some(24));
+        assert_eq!(home.estimated_local_pinned_delta_bytes, Some(1_000_000));
+    }
+
+    #[test]
+    fn drive_heartbeat_serializes_role_as_string() {
+        let config = test_config(&[("home", "1h")]);
+        let now =
+            NaiveDateTime::parse_from_str("2026-05-15T03:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
+        let drives = vec![DriveHeartbeat {
+            label: "WD-18TB".to_string(),
+            uuid: Some("uuid-x".to_string()),
+            role: DriveRole::Primary.to_string(),
+            mounted: true,
+            pool_uuid: Some("uuid-x".to_string()),
+        }];
+        let hb = build_empty(
+            &config,
+            now,
+            &test_assessments(),
+            &HashMap::new(),
+            Vec::new(),
+            drives,
+            &HashMap::new(),
+        );
+        let json = serde_json::to_string(&hb).unwrap();
+        // DriveRole::Primary renders as "primary" via Display.
+        assert!(
+            json.contains("\"role\":\"primary\""),
+            "role missing or wrong: {json}"
+        );
+    }
+
+    #[test]
+    fn drive_heartbeat_round_trip_mounted_false_pool_uuid_none() {
+        let drives = vec![DriveHeartbeat {
+            label: "OFFLINE".to_string(),
+            uuid: Some("uuid-z".to_string()),
+            role: DriveRole::Offsite.to_string(),
+            mounted: false,
+            pool_uuid: None,
+        }];
+        let config = test_config(&[("home", "1h")]);
+        let now =
+            NaiveDateTime::parse_from_str("2026-05-15T03:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
+        let hb = build_empty(
+            &config,
+            now,
+            &test_assessments(),
+            &HashMap::new(),
+            Vec::new(),
+            drives,
+            &HashMap::new(),
+        );
+        let json = serde_json::to_string(&hb).unwrap();
+        let parsed: Heartbeat = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.drives.len(), 1);
+        assert!(!parsed.drives[0].mounted);
+        assert_eq!(parsed.drives[0].pool_uuid, None);
     }
 }

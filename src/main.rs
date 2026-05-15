@@ -16,6 +16,7 @@ mod notify;
 mod output;
 mod plan;
 mod policy;
+mod pools;
 mod preflight;
 mod retention;
 mod sentinel;

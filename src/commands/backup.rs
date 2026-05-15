@@ -17,14 +17,16 @@ use crate::executor::{
 };
 use crate::heartbeat;
 use crate::lock;
-use crate::metrics::{self, MetricsData, SubvolumeMetrics};
+use crate::heartbeat::{DriveHeartbeat, PoolHeartbeat};
+use crate::metrics::{self, MetricsData, PoolMetric, SubvolumeMetrics};
 use crate::output::{
     BackupSummary, ChurnHeartbeatFields, ChurnRender, DeferredInfo, EmptyPlanExplanation,
     OutputMode, SendSummary, SkipCategory, SkippedSubvolume, StatusAssessment, StructuredError,
-    SubvolumeSummary, TransitionEvent,
+    SubvolumeExtras, SubvolumeSummary, TransitionEvent,
 };
 use crate::notify;
 use crate::plan::{self, FileSystemState, PlanFilters, RealFileSystemState};
+use crate::pools;
 use crate::sentinel_runner;
 use crate::preflight;
 use crate::state::StateDb;
@@ -119,11 +121,27 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
         }
         let heartbeat_now = chrono::Local::now().naive_local();
         let churn_views = build_churn_views(&config, state_db.as_ref(), heartbeat_now);
-        write_metrics_for_skipped(&config, &backup_plan, now, &fs_state, &churn_views)?;
+        let observability = gather_pool_observability(&config, &churn_views, &fs_state);
+        write_metrics_for_skipped(
+            &config,
+            &backup_plan,
+            now,
+            &fs_state,
+            &churn_views,
+            &observability,
+        )?;
         let previous_hb = heartbeat::read(&config.general.heartbeat_file);
         let mut assessments = awareness::assess(&config, heartbeat_now, &fs_state);
         awareness::overlay_offsite_freshness(&mut assessments, &config);
-        let hb = heartbeat::build_empty(&config, heartbeat_now, &assessments, &churn_views);
+        let hb = heartbeat::build_empty(
+            &config,
+            heartbeat_now,
+            &assessments,
+            &churn_views,
+            observability.pools_heartbeat,
+            observability.drives_heartbeat,
+            &observability.subvol_extras,
+        );
         if let Err(e) = heartbeat::write(&config.general.heartbeat_file, &hb) {
             log::warn!("Failed to write heartbeat: {e}");
         }
@@ -299,14 +317,32 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     // the same projection into both metrics and heartbeat (UPI 030).
     let heartbeat_now = chrono::Local::now().naive_local();
     let churn_views = build_churn_views(&config, state_db.as_ref(), heartbeat_now);
+    let observability = gather_pool_observability(&config, &churn_views, &fs_state);
 
     // Write metrics
-    write_metrics_after_execution(&config, &result, &backup_plan, now, &fs_state, &churn_views)?;
+    write_metrics_after_execution(
+        &config,
+        &result,
+        &backup_plan,
+        now,
+        &fs_state,
+        &churn_views,
+        &observability,
+    )?;
 
     // Write heartbeat (fresh timestamp — `now` is from before execution)
     let mut assessments = awareness::assess(&config, heartbeat_now, &fs_state);
     awareness::overlay_offsite_freshness(&mut assessments, &config);
-    let hb = heartbeat::build_from_run(&config, heartbeat_now, &result, &assessments, &churn_views);
+    let hb = heartbeat::build_from_run(
+        &config,
+        heartbeat_now,
+        &result,
+        &assessments,
+        &churn_views,
+        observability.pools_heartbeat,
+        observability.drives_heartbeat,
+        &observability.subvol_extras,
+    );
     if let Err(e) = heartbeat::write(&config.general.heartbeat_file, &hb) {
         log::warn!("Failed to write heartbeat: {e}");
     }
@@ -590,6 +626,7 @@ fn write_metrics_after_execution(
     now: chrono::NaiveDateTime,
     fs_state: &dyn FileSystemState,
     churn_views: &HashMap<String, ChurnHeartbeatFields>,
+    observability: &PoolObservability,
 ) -> anyhow::Result<()> {
     let now_ts = now.and_utc().timestamp();
     let mut subvolume_metrics = Vec::new();
@@ -606,6 +643,7 @@ fn write_metrics_after_execution(
         let local_count = count_local_snapshots(config, &sv_result.name, fs_state);
         let external_count = count_external_snapshots(config, &sv_result.name, fs_state);
         let churn = churn_views.get(&sv_result.name).copied().unwrap_or_default();
+        let extras = observability.subvol_extras.get(&sv_result.name);
 
         subvolume_metrics.push(SubvolumeMetrics {
             name: sv_result.name.clone(),
@@ -617,6 +655,9 @@ fn write_metrics_after_execution(
             send_type: sv_result.send_type.metric_value(),
             churn_bytes_per_second: churn.churn_bytes_per_second,
             last_full_send_bytes: churn.last_full_send_bytes,
+            local_snapshot_count_v4: extras.and_then(|e| e.local_snapshot_count),
+            estimated_local_pinned_delta_bytes: extras
+                .and_then(|e| e.estimated_local_pinned_delta_bytes),
         });
     }
 
@@ -633,13 +674,14 @@ fn write_metrics_after_execution(
         &mut subvolume_metrics,
         &already_emitted,
         churn_views,
+        observability,
     );
 
     // Carry forward last_success_timestamp from previous .prom file
     let carried = metrics::read_existing_timestamps(&config.general.metrics_file);
     metrics::apply_carried_forward_timestamps(&mut subvolume_metrics, &carried);
 
-    write_global_metrics(config, now_ts, subvolume_metrics)
+    write_global_metrics(config, now_ts, subvolume_metrics, observability.pool_metrics.clone())
 }
 
 fn write_metrics_for_skipped(
@@ -648,6 +690,7 @@ fn write_metrics_for_skipped(
     now: chrono::NaiveDateTime,
     fs_state: &dyn FileSystemState,
     churn_views: &HashMap<String, ChurnHeartbeatFields>,
+    observability: &PoolObservability,
 ) -> anyhow::Result<()> {
     let now_ts = now.and_utc().timestamp();
     let mut subvolume_metrics = Vec::new();
@@ -659,13 +702,14 @@ fn write_metrics_for_skipped(
         &mut subvolume_metrics,
         &HashSet::new(),
         churn_views,
+        observability,
     );
 
     // Carry forward last_success_timestamp from previous .prom file
     let carried = metrics::read_existing_timestamps(&config.general.metrics_file);
     metrics::apply_carried_forward_timestamps(&mut subvolume_metrics, &carried);
 
-    write_global_metrics(config, now_ts, subvolume_metrics)
+    write_global_metrics(config, now_ts, subvolume_metrics, observability.pool_metrics.clone())
 }
 
 /// Compute heartbeat / metrics churn projections for every configured
@@ -695,25 +739,190 @@ fn build_churn_views(
             rows.into_iter().map(StateDb::drift_row_to_sample).collect();
         let estimate =
             crate::drift::compute_rolling_churn(&samples, crate::drift::default_window(), now);
+        let mean_incremental_bytes = estimate.mean_incremental_bytes;
         let fields = match crate::output::render_churn(&estimate) {
-            ChurnRender::NotMeasured => ChurnHeartbeatFields::default(),
+            ChurnRender::NotMeasured => ChurnHeartbeatFields {
+                mean_incremental_bytes,
+                ..Default::default()
+            },
             ChurnRender::FirstMeasurement { bytes_per_second }
             | ChurnRender::Incremental { bytes_per_second } => ChurnHeartbeatFields {
                 churn_bytes_per_second: Some(bytes_per_second),
                 last_full_send_bytes: None,
+                mean_incremental_bytes,
             },
             ChurnRender::FullSendOnly { .. } => ChurnHeartbeatFields {
                 churn_bytes_per_second: None,
                 last_full_send_bytes: estimate.latest_full_bytes,
+                mean_incremental_bytes,
             },
             ChurnRender::FullSendOnlyFirst { bytes } => ChurnHeartbeatFields {
                 churn_bytes_per_second: None,
                 last_full_send_bytes: Some(bytes),
+                mean_incremental_bytes,
             },
         };
         out.insert(sv.name.clone(), fields);
     }
     out
+}
+
+/// UPI 043: bundled outputs from a single pool-observability pass. Threaded
+/// into both metrics emission (`write_metrics_after_execution` /
+/// `write_metrics_for_skipped`) and heartbeat construction
+/// (`heartbeat::build_from_run` / `heartbeat::build_empty`).
+struct PoolObservability {
+    pools_heartbeat: Vec<PoolHeartbeat>,
+    drives_heartbeat: Vec<DriveHeartbeat>,
+    subvol_extras: HashMap<String, SubvolumeExtras>,
+    pool_metrics: Vec<PoolMetric>,
+}
+
+/// UPI 043: detect source pools, resolve configured drives, and project both
+/// onto heartbeat + Prometheus surfaces. **Called exactly once per backup run**
+/// (M-4 acceptance) — the same snapshot of free-bytes / metadata / detection
+/// state must reach both surfaces so they don't drift between Prometheus and
+/// heartbeat for the same run.
+fn gather_pool_observability(
+    config: &Config,
+    churn_views: &HashMap<String, ChurnHeartbeatFields>,
+    fs_state: &dyn FileSystemState,
+) -> PoolObservability {
+    let source_pools = pools::detect_source_pools(config);
+
+    let mut drive_resolutions: Vec<pools::DriveResolution> = Vec::new();
+    let mut drives_heartbeat: Vec<DriveHeartbeat> = Vec::new();
+    for drive in &config.drives {
+        let mounted = drives::is_drive_mounted(drive);
+        let detected_uuid = if mounted {
+            drives::get_filesystem_uuid(&drive.mount_path).ok().flatten()
+        } else {
+            None
+        };
+        let resolved = pools::resolve_drive(drive, mounted, detected_uuid);
+        drives_heartbeat.push(DriveHeartbeat {
+            label: drive.label.clone(),
+            uuid: resolved.uuid.clone(),
+            role: drive.role.to_string(),
+            mounted,
+            pool_uuid: if mounted { resolved.uuid.clone() } else { None },
+        });
+        drive_resolutions.push(resolved);
+    }
+
+    let pool_metrics = pools::compute_pool_metrics_from(
+        &source_pools,
+        &drive_resolutions,
+        |mp| pools::pool_free_bytes(mp).ok(),
+        pools::metadata_utilization_ratio,
+    );
+
+    let mut pools_heartbeat: Vec<PoolHeartbeat> = Vec::new();
+    for pool in &source_pools {
+        let free = pool
+            .mountpoints
+            .first()
+            .and_then(|mp| pools::pool_free_bytes(mp).ok());
+        let meta = pools::metadata_utilization_ratio(&pool.uuid);
+        let mut mountpoints = pool.mountpoints.clone();
+        mountpoints.sort();
+        pools_heartbeat.push(PoolHeartbeat {
+            uuid: pool.uuid.clone(),
+            mountpoints,
+            free_bytes: free,
+            metadata_utilization_ratio: meta,
+        });
+    }
+    let source_uuids: HashSet<String> =
+        source_pools.iter().map(|p| p.uuid.clone()).collect();
+    let mut dest_seen: HashSet<String> = HashSet::new();
+    for drive_res in &drive_resolutions {
+        if !drive_res.mounted {
+            continue;
+        }
+        let Some(ref uuid) = drive_res.uuid else {
+            continue;
+        };
+        if source_uuids.contains(uuid) || !dest_seen.insert(uuid.clone()) {
+            continue;
+        }
+        let mp = drive_res.mountpoint.clone();
+        let free = mp.as_deref().and_then(|mp| pools::pool_free_bytes(mp).ok());
+        let meta = pools::metadata_utilization_ratio(uuid);
+        let mountpoints = mp.map(|p| vec![p]).unwrap_or_default();
+        pools_heartbeat.push(PoolHeartbeat {
+            uuid: uuid.clone(),
+            mountpoints,
+            free_bytes: free,
+            metadata_utilization_ratio: meta,
+        });
+    }
+
+    if pools_heartbeat.is_empty() && !config.subvolumes.is_empty() {
+        log::warn!(
+            "pool detection produced no source pools for {} configured subvolume(s); \
+             check findmnt availability and `/sys/fs/btrfs` mount",
+            config.subvolumes.len()
+        );
+    }
+
+    let pool_for_subvol: HashMap<String, String> = source_pools
+        .iter()
+        .flat_map(|p| {
+            p.subvolume_names
+                .iter()
+                .map(|n| (n.clone(), p.uuid.clone()))
+        })
+        .collect();
+    let mut subvol_extras: HashMap<String, SubvolumeExtras> = HashMap::new();
+    for sv in &config.subvolumes {
+        let pool_uuid = pool_for_subvol.get(&sv.name).cloned();
+        let configured = config.snapshot_root_for(&sv.name).is_some();
+        let local_snapshot_count = if configured {
+            let count = count_local_snapshots(config, &sv.name, fs_state);
+            Some(u32::try_from(count).unwrap_or(u32::MAX))
+        } else {
+            None
+        };
+        let mean_incremental_bytes = churn_views
+            .get(&sv.name)
+            .and_then(|c| c.mean_incremental_bytes);
+        let estimated_local_pinned_delta_bytes =
+            compute_pinned_delta(local_snapshot_count, mean_incremental_bytes);
+        subvol_extras.insert(
+            sv.name.clone(),
+            SubvolumeExtras {
+                pool_uuid,
+                local_snapshot_count,
+                estimated_local_pinned_delta_bytes,
+            },
+        );
+    }
+
+    PoolObservability {
+        pools_heartbeat,
+        drives_heartbeat,
+        subvol_extras,
+        pool_metrics,
+    }
+}
+
+/// UPI 043 R3 truth table — pure helper for the pinned-delta estimate.
+///
+/// | `local_snapshot_count` | `mean_incremental_bytes` | result   |
+/// |------------------------|--------------------------|----------|
+/// | `Some(0)`              | any                      | `Some(0)`|
+/// | `None`                 | any                      | `Some(0)`|
+/// | `Some(n>0)`            | `None`                   | `None`   |
+/// | `Some(n>0)`            | `Some(m)`                | `Some(n*m)` |
+#[must_use]
+fn compute_pinned_delta(count: Option<u32>, mean: Option<u64>) -> Option<u64> {
+    match (count, mean) {
+        (Some(0), _) => Some(0),
+        (None, _) => Some(0),
+        (Some(_), None) => None,
+        (Some(n), Some(m)) => Some(u64::from(n).saturating_mul(m)),
+    }
 }
 
 fn build_empty_plan_explanation(
@@ -793,6 +1002,7 @@ fn append_skipped_metrics(
     subvolume_metrics: &mut Vec<SubvolumeMetrics>,
     already_emitted: &HashSet<String>,
     churn_views: &HashMap<String, ChurnHeartbeatFields>,
+    observability: &PoolObservability,
 ) {
     let mut seen = already_emitted.clone();
 
@@ -804,6 +1014,7 @@ fn append_skipped_metrics(
         let local_count = count_local_snapshots(config, name, fs_state);
         let external_count = count_external_snapshots(config, name, fs_state);
         let churn = churn_views.get(name).copied().unwrap_or_default();
+        let extras = observability.subvol_extras.get(name);
 
         subvolume_metrics.push(SubvolumeMetrics {
             name: name.clone(),
@@ -815,6 +1026,9 @@ fn append_skipped_metrics(
             send_type: 2,
             churn_bytes_per_second: churn.churn_bytes_per_second,
             last_full_send_bytes: churn.last_full_send_bytes,
+            local_snapshot_count_v4: extras.and_then(|e| e.local_snapshot_count),
+            estimated_local_pinned_delta_bytes: extras
+                .and_then(|e| e.estimated_local_pinned_delta_bytes),
         });
     }
 }
@@ -823,6 +1037,7 @@ fn write_global_metrics(
     config: &Config,
     now_ts: i64,
     subvolume_metrics: Vec<SubvolumeMetrics>,
+    pool_metrics: Vec<PoolMetric>,
 ) -> anyhow::Result<()> {
     let (drive_mounted, free_bytes) = drives::first_mounted_drive_status(config);
 
@@ -844,6 +1059,7 @@ fn write_global_metrics(
         external_free_bytes: free_bytes,
         script_last_run_timestamp: now_ts,
         event_counters,
+        pools: pool_metrics,
     };
 
     metrics::write_metrics(&config.general.metrics_file, &data)?;
@@ -2939,5 +3155,42 @@ mod tests {
         );
 
         assert!(summary.subvolumes.is_empty());
+    }
+
+    // ── UPI 043: pinned-delta truth table ──────────────────────────
+
+    #[test]
+    fn pinned_delta_emit_policy_zero_when_no_local_snapshots_count_is_zero() {
+        // Some(0), any mean → Some(0). Known zero.
+        assert_eq!(compute_pinned_delta(Some(0), None), Some(0));
+        assert_eq!(compute_pinned_delta(Some(0), Some(123)), Some(0));
+    }
+
+    #[test]
+    fn pinned_delta_emit_policy_zero_when_local_snapshots_disabled() {
+        // None (htpc-root case): collapses to Some(0).
+        assert_eq!(compute_pinned_delta(None, None), Some(0));
+        assert_eq!(compute_pinned_delta(None, Some(123)), Some(0));
+    }
+
+    #[test]
+    fn pinned_delta_emit_policy_none_when_cold_start() {
+        // Snapshots exist but no mean → None (genuine uncertainty).
+        assert_eq!(compute_pinned_delta(Some(5), None), None);
+    }
+
+    #[test]
+    fn pinned_delta_emit_policy_product_when_both_some() {
+        assert_eq!(
+            compute_pinned_delta(Some(10), Some(1_000_000)),
+            Some(10_000_000)
+        );
+    }
+
+    #[test]
+    fn pinned_delta_saturates_on_overflow() {
+        // Defensive: u32::MAX × u64::MAX should saturate, not wrap.
+        let got = compute_pinned_delta(Some(u32::MAX), Some(u64::MAX));
+        assert_eq!(got, Some(u64::MAX));
     }
 }

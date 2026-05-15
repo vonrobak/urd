@@ -601,8 +601,13 @@ mod tests {
                     send_completed: true,
                     churn_bytes_per_second: None,
                     last_full_send_bytes: None,
+                    pool_uuid: None,
+                    local_snapshot_count: None,
+                    estimated_local_pinned_delta_bytes: None,
                 })
                 .collect(),
+            pools: vec![],
+            drives: vec![],
         }
     }
 

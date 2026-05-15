@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- UPI 043 — pool-level observability. Four new Prometheus gauges
+  (`backup_pool_free_bytes`, `backup_pool_metadata_utilization_ratio`,
+  `backup_subvolume_local_snapshot_count`,
+  `backup_subvolume_estimated_local_pinned_delta_bytes`), heartbeat
+  schema v4 with `pools`, `drives`, and per-subvolume `pool_uuid` /
+  `local_snapshot_count` / `estimated_local_pinned_delta_bytes` fields.
+  Source-pool detection via `findmnt --target`; metadata utilization
+  from BTRFS sysfs. Heartbeat schema contract softened to SHOULD/MAY
+  semantics (additive forward-compat by serde default). ADR-105 amended;
+  companion homelab ADR-021 update in `vonrobak/fedora-homelab-containers`.
+
 ## [0.17.0] - 2026-05-15
 
 ### Added

@@ -72,6 +72,7 @@ All backup logic flows through: config -> plan -> execute. No exceptions.
 | `notify.rs` | Compute and dispatch notifications | Decide promise states (uses awareness) |
 | `drift.rs` | Pure: rolling time-windowed churn aggregation from `drift_samples` (UPI 030) | Perform I/O or persist |
 | `drives.rs` | Detect mounted drives, UUID fingerprinting, check space | Mount/unmount drives |
+| `pools.rs` | Detect BTRFS pools (source + destination), group subvolumes by pool UUID, read sysfs metadata utilization and statvfs free bytes | Know about retention, plans, drive lifecycle, or notification policy |
 | `output.rs` | Define structured output types | Render text (voice.rs does that) |
 | `voice.rs` | Render structured output as text (mythic voice) | Perform I/O or compute state |
 | `voice_events.rs` | Per-variant `EventPayload` renderer (columnar + NDJSON) | Perform I/O or query state |

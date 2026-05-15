@@ -139,6 +139,88 @@ converted to `monthly = "unlimited"`. The original is preserved verbatim in a `.
 `.legacy`) backup file. See ADR-111 Amendment 2026-05-15 for the dispatcher and migration
 command details.
 
+## Amendment 2026-05-15 (UPI 043): pool-observability metrics + heartbeat v4 fields
+
+UPI 043 adds pool-level observability signals as new on-disk contracts.
+Four new Prometheus gauges and a heartbeat schema bump v3 → v4 (additive;
+softened contract — see "Heartbeat contract" below).
+
+### New Prometheus metrics (additive; existing metrics unchanged)
+
+- `backup_pool_free_bytes{uuid, role, label}` — free bytes on a BTRFS pool.
+  Snapshot at backup-run cadence; not a live signal. `role` is one of
+  `"source"` or `"destination"`. `label` is the configured drive label for
+  destinations; the canonical (shortest) mountpoint string for sources.
+  Identity is `uuid`; `label` is informational only.
+- `backup_pool_metadata_utilization_ratio{uuid, role, label}` — BTRFS
+  metadata utilization (0.0–1.0) read from
+  `/sys/fs/btrfs/<uuid>/allocation/metadata/`. Covers both source and
+  destination pools.
+- `backup_subvolume_local_snapshot_count{subvolume}` — local snapshot count
+  for a subvolume. Line **absent** when local snapshots are not configured
+  (matches `Option::None` semantics of the heartbeat field). Coexists with
+  the legacy `backup_snapshot_count{subvolume,location="local"}`, which
+  uses `usize` always-present semantics per this ADR (the two metrics carry
+  the same physical fact but different contract shapes).
+- `backup_subvolume_estimated_local_pinned_delta_bytes{subvolume}` —
+  wire-bytes-derived estimate; mean over in-window incrementals × local
+  snapshot count. Emit policy: `Some(0)` when local snapshots are disabled
+  or `local_snapshot_count == 0` (known zero); line **omitted** when cold-
+  start (`local_snapshot_count > 0` and `mean_incremental_bytes` unknown).
+  Understates active periods of bimodal subvolumes; overstates dormancy.
+
+The existing `backup_external_free_bytes` (single-drive, global) is
+unchanged — sacred under this ADR. New per-pool free-bytes is additive.
+
+### Heartbeat contract (softened)
+
+The heartbeat module's schema contract is amended in UPI 043 from "MUST
+refuse higher versions" to "SHOULD check version; MAY refuse." Additive
+bumps (new fields with `#[serde(default, skip_serializing_if)]`) are
+forward-compatible by serde default — older readers transparently see new
+fields as absent. Field removal remains a breaking change requiring an
+ADR-105 amendment and a major version bump. This brings the contract text
+into agreement with how serde-default tolerance actually works and makes
+cross-repo parser-tolerance interlocks (R7) contractually meaningful.
+
+### Heartbeat schema v4
+
+Strict additive over v3. New top-level fields:
+
+- `pools: Vec<PoolHeartbeat>` — deduplicated BTRFS pools (source + mounted
+  destinations).
+- `drives: Vec<DriveHeartbeat>` — configured destination drives, mounted
+  or not.
+
+New `SubvolumeHeartbeat` fields:
+
+- `pool_uuid: Option<String>` — joins to a `PoolHeartbeat` by UUID.
+  `None` when detection failed.
+- `local_snapshot_count: Option<u32>` — `Some(_)` when local snapshots are
+  configured for the subvolume; `None` otherwise. UPI 044 reads this field
+  to scope retention recommendations.
+- `estimated_local_pinned_delta_bytes: Option<u64>` — exhaustive emit policy:
+  `Some(0)` when `local_snapshot_count` is `Some(0)` or `None`; `None` when
+  `local_snapshot_count > 0` and `mean_incremental_bytes` is unknown
+  (cold-start); `Some(count × mean)` otherwise. The "configured-with-zero"
+  and "not-configured" cases collapse to the same logical answer
+  (both pin zero local delta).
+
+All new fields use `#[serde(default, skip_serializing_if = …)]`. A v3
+reader parsing a v4 heartbeat sees the new fields as unknown JSON keys
+and ignores them (serde default). A v4 reader parsing a v3 heartbeat
+gets empty vecs and `None` for the new fields.
+
+### Cross-repo coordination
+
+Per the homelab integration reference: a corresponding amendment to
+`vonrobak/fedora-homelab-containers` ADR-021 lists the four new metric
+names and heartbeat fields. The Urd PR for UPI 043 does not merge until
+the homelab ADR-021 amendment is **merged** on the homelab side and the
+homelab repo's parser-tolerance test (v3-reader on v4 heartbeat passes
+without erroring) is green. The tolerance test is now contractually
+correct under the softened heartbeat contract above.
+
 ## Related
 
 - ADR-020: Daily external backups (established the dual pin file format)
