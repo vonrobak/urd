@@ -238,7 +238,9 @@ mod tests {
     use crate::executor::{
         ExecutionResult, RunResult, SendType, SubvolumeResult, TransientCleanupOutcome,
     };
-    use crate::types::{DriveRole, GraduatedRetention, Interval, RunFrequency, SendKind};
+    use crate::types::{
+        DriveRole, GraduatedRetention, Interval, MonthlyCount, RunFrequency, SendKind,
+    };
     use std::path::PathBuf;
 
     fn test_config(intervals: &[(&str, &str)]) -> Config {
@@ -288,13 +290,15 @@ mod tests {
                     hourly: Some(24),
                     daily: Some(30),
                     weekly: Some(26),
-                    monthly: Some(12),
+                    monthly: Some(MonthlyCount::Count(12)),
+                    yearly: None,
                 },
                 external_retention: GraduatedRetention {
                     hourly: None,
                     daily: Some(30),
                     weekly: Some(26),
-                    monthly: Some(0),
+                    monthly: Some(MonthlyCount::Unlimited),
+                    yearly: None,
                 },
             },
             drives: vec![],

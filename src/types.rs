@@ -423,32 +423,41 @@ pub fn derive_policy(level: ProtectionLevel, freq: RunFrequency) -> Option<Deriv
         return None;
     }
 
+    // Recorded keeps one snapshot per calendar month indefinitely for local —
+    // matches the pre-UPI 042 behavior where `monthly = 0` was treated as
+    // unlimited. (External `recorded_external_retention` stays Count(0):
+    // recorded subvolumes don't send externally, so the external shape is
+    // unreachable in practice — Count(0) there is safe.)
     let recorded_retention = ResolvedGraduatedRetention {
         hourly: 0,
         daily: 7,
         weekly: 4,
-        monthly: 0,
+        monthly: MonthlyCount::Unlimited,
+        yearly: 0,
     };
 
     let full_retention = ResolvedGraduatedRetention {
         hourly: 24,
         daily: 30,
         weekly: 26,
-        monthly: 12,
+        monthly: MonthlyCount::Count(12),
+        yearly: 0,
     };
 
     let full_external_retention = ResolvedGraduatedRetention {
         hourly: 0,
         daily: 30,
         weekly: 26,
-        monthly: 0,
+        monthly: MonthlyCount::Unlimited,
+        yearly: 0,
     };
 
     let recorded_external_retention = ResolvedGraduatedRetention {
         hourly: 0,
         daily: 7,
         weekly: 4,
-        monthly: 0,
+        monthly: MonthlyCount::Count(0),
+        yearly: 0,
     };
 
     match (level, freq) {
@@ -509,12 +518,188 @@ pub fn derive_policy(level: ProtectionLevel, freq: RunFrequency) -> Option<Deriv
     }
 }
 
+// ── MonthlyCount ────────────────────────────────────────────────────────
+
+/// Monthly retention quantity: either a bounded count or unlimited.
+///
+/// `Count(N)` keeps one snapshot per calendar month for `N` months.
+/// `Count(0)` means "no monthly retention" (snapshots beyond the weekly
+/// window fall through to the yearly window or beyond-retention).
+/// `Unlimited` means "keep one snapshot per calendar month indefinitely"
+/// — used by v1 configs (the v1 `monthly = 0` semantic) and by v2 configs
+/// that write `monthly = "unlimited"` (UPI 042).
+///
+/// The v2 deserializer rejects integer `0` — see `Deserialize` impl.
+/// Internal construction of `Count(0)` (e.g. for `derive_policy`'s
+/// `recorded_external_retention`) is unaffected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MonthlyCount {
+    Count(u32),
+    Unlimited,
+}
+
+impl MonthlyCount {
+    /// Returns true if `self` provides strictly less retention than `base`.
+    /// Used by preflight's weakening-override check.
+    ///
+    /// Truth table:
+    ///   self            base            result
+    ///   Unlimited       *               false   (Unlimited is never weaker)
+    ///   Count(_)        Unlimited       true    (bounded < unlimited)
+    ///   Count(a)        Count(b)        a < b
+    #[must_use]
+    pub fn is_weaker_than(self, base: MonthlyCount) -> bool {
+        match (self, base) {
+            (MonthlyCount::Unlimited, _) => false,
+            (MonthlyCount::Count(_), MonthlyCount::Unlimited) => true,
+            (MonthlyCount::Count(a), MonthlyCount::Count(b)) => a < b,
+        }
+    }
+}
+
+impl Serialize for MonthlyCount {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            MonthlyCount::Count(n) => serializer.serialize_u32(*n),
+            MonthlyCount::Unlimited => serializer.serialize_str("unlimited"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for MonthlyCount {
+    /// Lenient deserialize used by legacy and v1 wire formats (and by the
+    /// runtime `GraduatedRetention` derive). Accepts:
+    ///  - integer `0` → `Unlimited` (legacy/v1 semantic: 0 = unlimited monthly)
+    ///  - integer `N > 0` → `Count(N)`
+    ///  - string `"unlimited"` → `Unlimited`
+    ///  - any other string → error
+    ///
+    /// V2 (UPI 042) closes the `monthly = 0` footgun via
+    /// `deserialize_monthly_count_strict_opt` — see `parse_v2` in config.rs.
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct MonthlyCountVisitor;
+
+        impl<'de> Visitor<'de> for MonthlyCountVisitor {
+            type Value = MonthlyCount;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("an integer or the string \"unlimited\"")
+            }
+
+            fn visit_u64<E: de::Error>(self, value: u64) -> Result<Self::Value, E> {
+                if value == 0 {
+                    return Ok(MonthlyCount::Unlimited);
+                }
+                let n = u32::try_from(value).map_err(|_| {
+                    de::Error::custom(format!("monthly value {value} exceeds u32 range"))
+                })?;
+                Ok(MonthlyCount::Count(n))
+            }
+
+            fn visit_i64<E: de::Error>(self, value: i64) -> Result<Self::Value, E> {
+                if value < 0 {
+                    return Err(de::Error::custom(format!(
+                        "monthly value {value} cannot be negative"
+                    )));
+                }
+                #[allow(clippy::cast_sign_loss)]
+                self.visit_u64(value as u64)
+            }
+
+            fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                if value == "unlimited" {
+                    Ok(MonthlyCount::Unlimited)
+                } else {
+                    Err(de::Error::custom(format!(
+                        "unknown monthly value \"{value}\": expected integer or \"unlimited\""
+                    )))
+                }
+            }
+        }
+
+        deserializer.deserialize_any(MonthlyCountVisitor)
+    }
+}
+
+/// Strict v2 deserialize for an optional MonthlyCount field. Used at the
+/// v2 boundary only — rejects integer `0` with the documented error.
+/// Accepts `"unlimited"` (string), positive integers, or absent (None).
+///
+/// Wire it up on V2 wire-format struct fields via
+/// `#[serde(deserialize_with = "deserialize_monthly_count_strict_opt")]`.
+pub fn deserialize_monthly_count_strict_opt<'de, D>(
+    deserializer: D,
+) -> Result<Option<MonthlyCount>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct StrictMonthlyCountOptVisitor;
+
+    impl<'de> Visitor<'de> for StrictMonthlyCountOptVisitor {
+        type Value = Option<MonthlyCount>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a positive integer or the string \"unlimited\"")
+        }
+
+        fn visit_u64<E: de::Error>(self, value: u64) -> Result<Self::Value, E> {
+            if value == 0 {
+                return Err(de::Error::custom(
+                    "monthly = 0 is not allowed in v2: omit the field for \"no monthly retention\" or write 'unlimited' for unbounded retention",
+                ));
+            }
+            let n = u32::try_from(value).map_err(|_| {
+                de::Error::custom(format!("monthly value {value} exceeds u32 range"))
+            })?;
+            Ok(Some(MonthlyCount::Count(n)))
+        }
+
+        fn visit_i64<E: de::Error>(self, value: i64) -> Result<Self::Value, E> {
+            if value < 0 {
+                return Err(de::Error::custom(format!(
+                    "monthly value {value} cannot be negative"
+                )));
+            }
+            #[allow(clippy::cast_sign_loss)]
+            self.visit_u64(value as u64)
+        }
+
+        fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+            if value == "unlimited" {
+                Ok(Some(MonthlyCount::Unlimited))
+            } else {
+                Err(de::Error::custom(format!(
+                    "unknown monthly value \"{value}\": expected integer or \"unlimited\""
+                )))
+            }
+        }
+
+        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+    }
+
+    deserializer.deserialize_any(StrictMonthlyCountOptVisitor)
+}
+
 // ── GraduatedRetention ──────────────────────────────────────────────────
 
 /// Graduated retention policy: keep snapshots at decreasing density over time.
 /// Each field specifies how many units of that granularity to keep.
 /// `None` means "not configured" (inherits from defaults).
-/// `Some(0)` means unlimited (keep all at that granularity).
+///
+/// `monthly` is a [`MonthlyCount`] — either `Count(N)` for N months or
+/// `Unlimited` for indefinite monthly retention. `Count(0)` is allowed
+/// internally (means "no monthly retention") but the v2 TOML parser
+/// rejects literal `monthly = 0`.
+///
+/// `yearly` is a plain `Option<u32>`. There is no `"unlimited"` variant —
+/// the asymmetry with `monthly` is deliberate (ADR-104 amendment
+/// 2026-05-15).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct GraduatedRetention {
     /// Hours to keep all snapshots (every snapshot in this window is kept)
@@ -523,8 +708,10 @@ pub struct GraduatedRetention {
     pub daily: Option<u32>,
     /// Weeks to keep one snapshot per ISO week
     pub weekly: Option<u32>,
-    /// Months to keep one snapshot per month (0 = unlimited)
-    pub monthly: Option<u32>,
+    /// Months to keep one snapshot per month
+    pub monthly: Option<MonthlyCount>,
+    /// Years to keep one snapshot per calendar year
+    pub yearly: Option<u32>,
 }
 
 impl GraduatedRetention {
@@ -536,17 +723,20 @@ impl GraduatedRetention {
             daily: self.daily.or(base.daily),
             weekly: self.weekly.or(base.weekly),
             monthly: self.monthly.or(base.monthly),
+            yearly: self.yearly.or(base.yearly),
         }
     }
 
-    /// Resolve all None fields to 0 (unlimited).
+    /// Resolve all None fields to defaults (0 for hourly/daily/weekly/yearly,
+    /// `MonthlyCount::Count(0)` for monthly = "no monthly retention").
     #[must_use]
     pub fn resolved(&self) -> ResolvedGraduatedRetention {
         ResolvedGraduatedRetention {
             hourly: self.hourly.unwrap_or(0),
             daily: self.daily.unwrap_or(0),
             weekly: self.weekly.unwrap_or(0),
-            monthly: self.monthly.unwrap_or(0),
+            monthly: self.monthly.unwrap_or(MonthlyCount::Count(0)),
+            yearly: self.yearly.unwrap_or(0),
         }
     }
 }
@@ -557,7 +747,8 @@ pub struct ResolvedGraduatedRetention {
     pub hourly: u32,
     pub daily: u32,
     pub weekly: u32,
-    pub monthly: u32,
+    pub monthly: MonthlyCount,
+    pub yearly: u32,
 }
 
 // ── LocalRetentionConfig / LocalRetentionPolicy ───────────────────────
@@ -1138,19 +1329,22 @@ mod tests {
             hourly: Some(24),
             daily: Some(30),
             weekly: Some(26),
-            monthly: Some(12),
+            monthly: Some(MonthlyCount::Count(12)),
+            yearly: Some(2),
         };
         let override_partial = GraduatedRetention {
             hourly: None,
             daily: Some(7),
             weekly: Some(4),
             monthly: None,
+            yearly: None,
         };
         let merged = override_partial.merged_with(&base);
         assert_eq!(merged.hourly, Some(24)); // from base
         assert_eq!(merged.daily, Some(7)); // overridden
         assert_eq!(merged.weekly, Some(4)); // overridden
-        assert_eq!(merged.monthly, Some(12)); // from base
+        assert_eq!(merged.monthly, Some(MonthlyCount::Count(12))); // from base
+        assert_eq!(merged.yearly, Some(2)); // from base
     }
 
     // ── PlanSummary tests ───────────────────────────────────────────
@@ -1287,6 +1481,50 @@ mod tests {
     }
 
     #[test]
+    fn derive_policy_recorded_external_no_monthly() {
+        // Branch E: recorded_external_retention.monthly is corrected to
+        // Count(0) (= no monthly), not Unlimited.
+        let daily = RunFrequency::Timer {
+            interval: Interval::days(1),
+        };
+        let p = derive_policy(ProtectionLevel::Recorded, daily).unwrap();
+        assert_eq!(p.external_retention.monthly, MonthlyCount::Count(0));
+        assert_eq!(p.external_retention.yearly, 0);
+    }
+
+    #[test]
+    fn derive_policy_full_external_unlimited_monthly_preserved() {
+        // Sheltered/Fortified external retention preserves the v1 "unlimited
+        // monthly" semantic via MonthlyCount::Unlimited.
+        let daily = RunFrequency::Timer {
+            interval: Interval::days(1),
+        };
+        let sheltered = derive_policy(ProtectionLevel::Sheltered, daily).unwrap();
+        assert_eq!(sheltered.external_retention.monthly, MonthlyCount::Unlimited);
+        let fortified = derive_policy(ProtectionLevel::Fortified, daily).unwrap();
+        assert_eq!(fortified.external_retention.monthly, MonthlyCount::Unlimited);
+    }
+
+    #[test]
+    fn derive_policy_all_levels_have_yearly_zero() {
+        // Named levels don't use yearly today; reserved for future tier
+        // graduation. UPI 042 keeps yearly = 0 across all derive_policy
+        // returns; user opts in via Custom or explicit override.
+        let daily = RunFrequency::Timer {
+            interval: Interval::days(1),
+        };
+        for level in [
+            ProtectionLevel::Recorded,
+            ProtectionLevel::Sheltered,
+            ProtectionLevel::Fortified,
+        ] {
+            let p = derive_policy(level, daily).unwrap();
+            assert_eq!(p.local_retention.yearly, 0, "{level:?} local yearly");
+            assert_eq!(p.external_retention.yearly, 0, "{level:?} external yearly");
+        }
+    }
+
+    #[test]
     fn derive_policy_recorded_timer() {
         let daily = RunFrequency::Timer {
             interval: Interval::days(1),
@@ -1313,7 +1551,7 @@ mod tests {
         assert_eq!(p.local_retention.hourly, 24);
         assert_eq!(p.local_retention.daily, 30);
         assert_eq!(p.local_retention.weekly, 26);
-        assert_eq!(p.local_retention.monthly, 12);
+        assert_eq!(p.local_retention.monthly, MonthlyCount::Count(12));
         assert_eq!(p.external_retention.daily, 30);
         assert_eq!(p.external_retention.weekly, 26);
     }
@@ -1399,6 +1637,7 @@ weekly = 4
                 assert_eq!(g.weekly, Some(4));
                 assert_eq!(g.hourly, None);
                 assert_eq!(g.monthly, None);
+                assert_eq!(g.yearly, None);
             }
             LocalRetentionConfig::Transient => panic!("expected Graduated"),
         }
@@ -1461,6 +1700,7 @@ weekly = 4
                 daily: Some(30),
                 weekly: None,
                 monthly: None,
+                yearly: None,
             }),
         };
         let toml_str = toml::to_string(&graduated).unwrap();
@@ -1496,7 +1736,8 @@ weekly = 4
             hourly: 24,
             daily: 30,
             weekly: 26,
-            monthly: 12,
+            monthly: MonthlyCount::Count(12),
+            yearly: 0,
         });
         assert!(graduated.as_graduated().is_some());
         assert!(!graduated.is_transient());
@@ -1504,5 +1745,182 @@ weekly = 4
         let transient = LocalRetentionPolicy::Transient;
         assert!(transient.as_graduated().is_none());
         assert!(transient.is_transient());
+    }
+
+    // ── MonthlyCount tests ─────────────────────────────────────────
+
+    #[test]
+    fn monthly_count_serializes_count_as_integer() {
+        #[derive(Serialize, Deserialize, PartialEq, Debug)]
+        struct Wrapper {
+            monthly: MonthlyCount,
+        }
+        let w = Wrapper {
+            monthly: MonthlyCount::Count(12),
+        };
+        let s = toml::to_string(&w).unwrap();
+        assert!(s.contains("monthly = 12"), "got: {s}");
+        let parsed: Wrapper = toml::from_str(&s).unwrap();
+        assert_eq!(parsed, w);
+    }
+
+    #[test]
+    fn monthly_count_serializes_unlimited_as_string() {
+        #[derive(Serialize, Deserialize, PartialEq, Debug)]
+        struct Wrapper {
+            monthly: MonthlyCount,
+        }
+        let w = Wrapper {
+            monthly: MonthlyCount::Unlimited,
+        };
+        let s = toml::to_string(&w).unwrap();
+        assert!(s.contains(r#"monthly = "unlimited""#), "got: {s}");
+        let parsed: Wrapper = toml::from_str(&s).unwrap();
+        assert_eq!(parsed, w);
+    }
+
+    #[test]
+    fn monthly_count_lenient_accepts_zero_as_unlimited() {
+        // Legacy/v1 wire semantic: 0 == Unlimited. The lenient
+        // MonthlyCount::Deserialize is used by GraduatedRetention's
+        // derive and preserves this behavior.
+        #[derive(Debug, Deserialize)]
+        struct Wrapper {
+            monthly: MonthlyCount,
+        }
+        let w: Wrapper = toml::from_str("monthly = 0").unwrap();
+        assert_eq!(w.monthly, MonthlyCount::Unlimited);
+    }
+
+    #[test]
+    fn monthly_count_strict_rejects_zero_in_toml() {
+        // The v2 boundary uses `deserialize_monthly_count_strict_opt`,
+        // which rejects integer 0 with the documented error.
+        #[derive(Debug, Deserialize)]
+        #[allow(dead_code)]
+        struct Wrapper {
+            #[serde(default, deserialize_with = "deserialize_monthly_count_strict_opt")]
+            monthly: Option<MonthlyCount>,
+        }
+        let result: Result<Wrapper, _> = toml::from_str("monthly = 0");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("monthly = 0 is not allowed"),
+            "expected rejection message, got: {err}"
+        );
+        assert!(err.contains("unlimited"), "should mention unlimited: {err}");
+    }
+
+    #[test]
+    fn monthly_count_strict_accepts_unlimited_and_positive() {
+        #[derive(Debug, Deserialize)]
+        struct Wrapper {
+            #[serde(default, deserialize_with = "deserialize_monthly_count_strict_opt")]
+            monthly: Option<MonthlyCount>,
+        }
+        let w: Wrapper = toml::from_str(r#"monthly = "unlimited""#).unwrap();
+        assert_eq!(w.monthly, Some(MonthlyCount::Unlimited));
+        let w2: Wrapper = toml::from_str("monthly = 12").unwrap();
+        assert_eq!(w2.monthly, Some(MonthlyCount::Count(12)));
+    }
+
+    #[test]
+    fn monthly_count_rejects_unknown_string() {
+        #[derive(Debug, Deserialize)]
+        #[allow(dead_code)]
+        struct Wrapper {
+            monthly: MonthlyCount,
+        }
+        let toml_str = r#"monthly = "max""#;
+        let result: Result<Wrapper, _> = toml::from_str(toml_str);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("expected integer or \"unlimited\"")
+                || err.contains("expected integer or `unlimited`"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn monthly_count_count_zero_constructs_internally() {
+        // Internal construction of Count(0) must remain valid (used by
+        // derive_policy for recorded_external_retention).
+        let zero = MonthlyCount::Count(0);
+        match zero {
+            MonthlyCount::Count(n) => assert_eq!(n, 0),
+            MonthlyCount::Unlimited => panic!("expected Count"),
+        }
+    }
+
+    #[test]
+    fn monthly_count_is_weaker_than_truth_table() {
+        // Unlimited vs Unlimited
+        assert!(!MonthlyCount::Unlimited.is_weaker_than(MonthlyCount::Unlimited));
+        // Unlimited vs Count
+        assert!(!MonthlyCount::Unlimited.is_weaker_than(MonthlyCount::Count(5)));
+        assert!(!MonthlyCount::Unlimited.is_weaker_than(MonthlyCount::Count(0)));
+        // Count vs Unlimited
+        assert!(MonthlyCount::Count(5).is_weaker_than(MonthlyCount::Unlimited));
+        assert!(MonthlyCount::Count(0).is_weaker_than(MonthlyCount::Unlimited));
+        // Count(a) vs Count(b)
+        assert!(MonthlyCount::Count(3).is_weaker_than(MonthlyCount::Count(5))); // a < b
+        assert!(!MonthlyCount::Count(5).is_weaker_than(MonthlyCount::Count(5))); // a == b
+        assert!(!MonthlyCount::Count(8).is_weaker_than(MonthlyCount::Count(5))); // a > b
+    }
+
+    #[test]
+    fn graduated_retention_merged_with_yearly() {
+        let base = GraduatedRetention {
+            hourly: None,
+            daily: None,
+            weekly: None,
+            monthly: None,
+            yearly: Some(5),
+        };
+        let override_partial = GraduatedRetention {
+            hourly: None,
+            daily: None,
+            weekly: None,
+            monthly: None,
+            yearly: None,
+        };
+        let merged = override_partial.merged_with(&base);
+        assert_eq!(merged.yearly, Some(5));
+
+        let override_with_yearly = GraduatedRetention {
+            hourly: None,
+            daily: None,
+            weekly: None,
+            monthly: None,
+            yearly: Some(2),
+        };
+        let merged2 = override_with_yearly.merged_with(&base);
+        assert_eq!(merged2.yearly, Some(2)); // overridden
+    }
+
+    #[test]
+    fn graduated_retention_resolved_yearly_defaults_to_zero() {
+        let g = GraduatedRetention {
+            hourly: None,
+            daily: None,
+            weekly: None,
+            monthly: None,
+            yearly: None,
+        };
+        assert_eq!(g.resolved().yearly, 0);
+    }
+
+    #[test]
+    fn graduated_retention_resolved_monthly_defaults_to_count_zero() {
+        let g = GraduatedRetention {
+            hourly: None,
+            daily: None,
+            weekly: None,
+            monthly: None,
+            yearly: None,
+        };
+        assert_eq!(g.resolved().monthly, MonthlyCount::Count(0));
     }
 }

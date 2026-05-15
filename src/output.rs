@@ -468,6 +468,11 @@ pub struct DoctorOutput {
     pub infra_checks: Vec<DoctorCheck>,
     pub data_safety: Vec<DoctorDataSafety>,
     pub sentinel: DoctorSentinelStatus,
+    /// Schema deprecation notice (UPI 042 Branch G). `Some(_)` when the
+    /// loaded config is legacy or v1; voice renders a single-line notice
+    /// suggesting `urd migrate`. `None` for v2.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema_status: Option<SchemaStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verify: Option<VerifyOutput>,
     /// Per-subvolume churn aggregates rendered under `urd doctor --thorough`.
@@ -479,6 +484,17 @@ pub struct DoctorOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recommendations: Option<DoctorRecommendationView>,
     pub verdict: DoctorVerdict,
+}
+
+/// Loaded-config schema state for the doctor deprecation notice.
+/// `current < latest` triggers the notice; equal means no notice.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct SchemaStatus {
+    /// Currently loaded schema. `None` = legacy (no config_version);
+    /// `Some(n)` = config_version = n.
+    pub current: Option<u32>,
+    /// Latest supported schema version. Always 2 today.
+    pub latest: u32,
 }
 
 // ── Recommendations (UPI 041, ADR-115) ─────────────────────────────────
@@ -2121,6 +2137,7 @@ source = "/data/sv2"
                 pid: None,
                 uptime: None,
             },
+            schema_status: None,
             verify: None,
             churn: None,
             recommendations: None,

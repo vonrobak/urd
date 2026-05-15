@@ -6,7 +6,9 @@ use crate::events::{Event, EventPayload, ProtectReason, PruneRule};
 use crate::output::{
     DiskEstimate, EstimateMethod, RecoveryWindow, RetentionPreview, TransientComparison,
 };
-use crate::types::{Interval, LocalRetentionPolicy, ResolvedGraduatedRetention, SnapshotName};
+use crate::types::{
+    Interval, LocalRetentionPolicy, MonthlyCount, ResolvedGraduatedRetention, SnapshotName,
+};
 
 /// The result of a retention computation.
 ///
@@ -48,7 +50,11 @@ fn protect_event(snap: &SnapshotName, reason: ProtectReason, now: NaiveDateTime)
 /// 1. Hourly: keep every snapshot from the last `hourly` hours
 /// 2. Daily: keep 1 per calendar day for the next `daily` days
 /// 3. Weekly: keep 1 per ISO week for the next `weekly` weeks
-/// 4. Monthly: keep 1 per year-month for the next `monthly` months (0 = unlimited)
+/// 4. Monthly: keep 1 per year-month — `Count(N)` for N months,
+///    `Count(0)` means "no monthly window" (drop straight to yearly/beyond),
+///    `Unlimited` means "keep per-month indefinitely" (subsumes yearly).
+/// 5. Yearly: keep 1 per calendar year for the next `yearly` years.
+///    Suppressed when monthly is `Unlimited`.
 ///
 /// Pinned snapshots are never deleted regardless of retention policy.
 /// If `space_pressure` is true, the hourly window is thinned to 1 per hour.
@@ -76,24 +82,42 @@ pub fn graduated_retention(
     let hourly_cutoff = now - chrono::Duration::hours(i64::from(config.hourly));
     let daily_cutoff = hourly_cutoff - chrono::Duration::days(i64::from(config.daily));
     let weekly_cutoff = daily_cutoff - chrono::Duration::weeks(i64::from(config.weekly));
-    let monthly_cutoff = if config.monthly == 0 {
-        None // unlimited
-    } else {
-        // Use calendar month subtraction for accurate window boundaries.
-        // Duration::days(n * 30) drifts ~5 days/year vs real calendar months.
-        // On overflow (unreachable for realistic configs), treat as unlimited
-        // rather than silently changing behavior.
-        Some(
-            weekly_cutoff
-                .checked_sub_months(Months::new(config.monthly))
-                .unwrap_or(NaiveDateTime::MIN),
-        )
+    let monthly_cutoff = match config.monthly {
+        MonthlyCount::Unlimited => None, // unlimited — no monthly cutoff
+        MonthlyCount::Count(0) => Some(weekly_cutoff), // no monthly window
+        MonthlyCount::Count(n) => {
+            // Use calendar month subtraction for accurate window boundaries.
+            // Duration::days(n * 30) drifts ~5 days/year vs real calendar months.
+            // On overflow (unreachable for realistic configs), treat as MIN
+            // rather than silently changing behavior.
+            Some(
+                weekly_cutoff
+                    .checked_sub_months(Months::new(n))
+                    .unwrap_or(NaiveDateTime::MIN),
+            )
+        }
     };
 
-    // Track which day/week/month slots are already filled
+    // Yearly window: skip when monthly is Unlimited (yearly subsumed) or yearly == 0.
+    let yearly_cutoff = match (config.monthly, config.yearly) {
+        (MonthlyCount::Unlimited, _) => None,
+        (_, 0) => None,
+        (_, y) => {
+            // Cutoff is monthly's cutoff minus y years. monthly_cutoff is
+            // guaranteed Some(_) here because Unlimited was matched above.
+            let base = monthly_cutoff.unwrap_or(weekly_cutoff);
+            Some(
+                base.checked_sub_months(Months::new(y.saturating_mul(12)))
+                    .unwrap_or(NaiveDateTime::MIN),
+            )
+        }
+    };
+
+    // Track which day/week/month/year slots are already filled
     let mut daily_slots: HashSet<NaiveDateTime> = HashSet::new(); // key: date at midnight
     let mut weekly_slots: HashSet<(i32, u32)> = HashSet::new(); // (iso_year, iso_week)
     let mut monthly_slots: HashSet<(i32, u32)> = HashSet::new(); // (year, month)
+    let mut yearly_slots: HashSet<i32> = HashSet::new(); // year
 
     // For space pressure: track hourly slots
     let mut hourly_slots: HashSet<(i32, u32, u32, u32)> = HashSet::new(); // (y, m, d, hour)
@@ -184,6 +208,19 @@ pub fn graduated_retention(
                 is_pinned,
                 PruneRule::GraduatedMonthly,
                 "graduated: monthly thinning",
+                &mut keep,
+                &mut delete,
+                &mut events,
+            );
+        } else if yearly_cutoff.is_some() && dt >= yearly_cutoff.unwrap() {
+            let year_key = dt.date().year();
+            let slot_was_empty = yearly_slots.insert(year_key);
+            apply_slot_thinning(
+                snap,
+                slot_was_empty,
+                is_pinned,
+                PruneRule::GraduatedYearly,
+                "graduated: yearly thinning",
                 &mut keep,
                 &mut delete,
                 &mut events,
@@ -462,29 +499,53 @@ fn compute_recovery_windows(
         });
     }
 
-    if config.monthly == 0 {
-        // monthly = 0 means unlimited — keep all monthly snapshots indefinitely.
-        // The actual retention engine (graduated_retention) treats this as no monthly cutoff.
-        windows.push(RecoveryWindow {
-            granularity: "monthly",
-            count: 0,
-            cumulative_days: f64::INFINITY,
-            cumulative_description: "monthly snapshots kept indefinitely".to_string(),
-        });
-    } else {
-        // Approximate months as 30.44 days (standard average). The actual retention engine
-        // uses calendar month subtraction (checked_sub_months), which can differ by ~3 days
-        // depending on which months are involved. This is within rounding tolerance.
-        let cumulative_days = cumulative_after_hourly_days
-            + f64::from(config.daily)
-            + f64::from(config.weekly) * 7.0
-            + f64::from(config.monthly) * 30.44;
+    let cumulative_after_weekly = cumulative_after_hourly_days
+        + f64::from(config.daily)
+        + f64::from(config.weekly) * 7.0;
+    let cumulative_after_monthly = match config.monthly {
+        MonthlyCount::Unlimited => {
+            // Unlimited — keep all monthly snapshots indefinitely.
+            // The actual retention engine treats this as no monthly cutoff.
+            windows.push(RecoveryWindow {
+                granularity: "monthly",
+                count: 0,
+                cumulative_days: f64::INFINITY,
+                cumulative_description: "monthly snapshots kept indefinitely".to_string(),
+            });
+            f64::INFINITY
+        }
+        MonthlyCount::Count(0) => {
+            // No monthly window — omit from the list (consistent with
+            // how hourly/daily/weekly = 0 are omitted).
+            cumulative_after_weekly
+        }
+        MonthlyCount::Count(n) => {
+            // Approximate months as 30.44 days (standard average). The actual retention engine
+            // uses calendar month subtraction (checked_sub_months), which can differ by ~3 days
+            // depending on which months are involved. This is within rounding tolerance.
+            let cumulative_days = cumulative_after_weekly + f64::from(n) * 30.44;
+            let desc = format_cumulative_days(cumulative_days);
+            windows.push(RecoveryWindow {
+                granularity: "monthly",
+                count: n,
+                cumulative_days,
+                cumulative_description: format!("monthly snapshots back {desc}"),
+            });
+            cumulative_days
+        }
+    };
+
+    // Yearly window: skip when yearly == 0 OR monthly is Unlimited
+    // (yearly is subsumed; the engine already treats it as 0 in that case,
+    // and the display must agree to avoid two ∞ rows).
+    if config.yearly > 0 && !matches!(config.monthly, MonthlyCount::Unlimited) {
+        let cumulative_days = cumulative_after_monthly + f64::from(config.yearly) * 365.25;
         let desc = format_cumulative_days(cumulative_days);
         windows.push(RecoveryWindow {
-            granularity: "monthly",
-            count: config.monthly,
+            granularity: "yearly",
+            count: config.yearly,
             cumulative_days,
-            cumulative_description: format!("monthly snapshots back {desc}"),
+            cumulative_description: format!("yearly snapshots back {desc}"),
         });
     }
 
@@ -514,10 +575,14 @@ fn format_cumulative_days(days: f64) -> String {
 }
 
 /// Total snapshot count for a graduated retention policy.
-/// When `monthly = 0` (unlimited), the monthly bucket is excluded from the count
+/// When `monthly = Unlimited`, the monthly bucket is excluded from the count
 /// since the actual number of monthly snapshots is unbounded.
 fn total_snapshot_count(config: &ResolvedGraduatedRetention) -> u32 {
-    config.hourly + config.daily + config.weekly + config.monthly
+    let monthly = match config.monthly {
+        MonthlyCount::Unlimited => 0,
+        MonthlyCount::Count(n) => n,
+    };
+    config.hourly + config.daily + config.weekly + monthly + config.yearly
 }
 
 /// Format the policy description for display.
@@ -536,10 +601,13 @@ fn format_graduated_policy(
     if config.weekly > 0 {
         parts.push(format!("weekly = {}", config.weekly));
     }
-    if config.monthly == 0 {
-        parts.push("monthly = unlimited".to_string());
-    } else {
-        parts.push(format!("monthly = {}", config.monthly));
+    match config.monthly {
+        MonthlyCount::Unlimited => parts.push("monthly = unlimited".to_string()),
+        MonthlyCount::Count(0) => {} // omit when zero, consistent with hourly/daily/weekly
+        MonthlyCount::Count(n) => parts.push(format!("monthly = {n}")),
+    }
+    if config.yearly > 0 {
+        parts.push(format!("yearly = {}", config.yearly));
     }
     format!("graduated ({})", parts.join(", "))
 }
@@ -614,7 +682,8 @@ mod tests {
             hourly: 24,
             daily: 30,
             weekly: 26,
-            monthly: 12,
+            monthly: MonthlyCount::Count(12),
+            yearly: 0,
         }
     }
 
@@ -659,7 +728,8 @@ mod tests {
             hourly: 24,
             daily: 7,
             weekly: 26,
-            monthly: 12,
+            monthly: MonthlyCount::Count(12),
+            yearly: 0,
         };
         // Snapshots from ~2 weeks ago (outside daily window, inside weekly)
         let snaps = vec![
@@ -777,7 +847,8 @@ mod tests {
             hourly: 0, // no hourly/daily/weekly windows — all snapshots land in monthly
             daily: 0,
             weekly: 0,
-            monthly: 12,
+            monthly: MonthlyCount::Count(12),
+            yearly: 0,
         };
         // now = 2026-03-22 15:00
         // monthly_cutoff with calendar months ≈ 2025-03-22
@@ -812,7 +883,8 @@ mod tests {
             hourly: 24,
             daily: 30,
             weekly: 26,
-            monthly: 12,
+            monthly: MonthlyCount::Count(12),
+            yearly: 0,
         };
         let policy = LocalRetentionPolicy::Graduated(config);
         let interval = Interval::hours(4); // sub-daily
@@ -846,7 +918,8 @@ mod tests {
             hourly: 0,
             daily: 30,
             weekly: 0,
-            monthly: 12,
+            monthly: MonthlyCount::Count(12),
+            yearly: 0,
         };
         let policy = LocalRetentionPolicy::Graduated(config);
         let interval = Interval::days(1);
@@ -877,7 +950,8 @@ mod tests {
             hourly: 24,
             daily: 7,
             weekly: 0,
-            monthly: 6,
+            monthly: MonthlyCount::Count(6),
+            yearly: 0,
         };
         let policy = LocalRetentionPolicy::Graduated(config);
         let interval = Interval::hours(1); // sub-daily
@@ -899,7 +973,8 @@ mod tests {
             hourly: 24,
             daily: 30,
             weekly: 26,
-            monthly: 0,
+            monthly: MonthlyCount::Unlimited,
+            yearly: 0,
         };
         let policy = LocalRetentionPolicy::Graduated(config);
         let interval = Interval::days(1); // >= 1 day → suppress hourly
@@ -931,7 +1006,8 @@ mod tests {
             hourly: 0,
             daily: 30,
             weekly: 0,
-            monthly: 0,
+            monthly: MonthlyCount::Unlimited,
+            yearly: 0,
         };
         let policy = LocalRetentionPolicy::Graduated(config);
         let interval = Interval::days(1);
@@ -951,7 +1027,8 @@ mod tests {
             hourly: 0,
             daily: 30,
             weekly: 0,
-            monthly: 0,
+            monthly: MonthlyCount::Unlimited,
+            yearly: 0,
         };
         let policy = LocalRetentionPolicy::Graduated(config);
         let interval = Interval::days(1);
@@ -967,7 +1044,8 @@ mod tests {
             hourly: 24,
             daily: 30,
             weekly: 26,
-            monthly: 12,
+            monthly: MonthlyCount::Count(12),
+            yearly: 0,
         };
         let interval = Interval::hours(4);
 
@@ -986,7 +1064,8 @@ mod tests {
             hourly: 0,
             daily: 30,
             weekly: 0,
-            monthly: 0,
+            monthly: MonthlyCount::Unlimited,
+            yearly: 0,
         };
         let interval = Interval::days(1);
 
@@ -1006,7 +1085,8 @@ mod tests {
             hourly: 0,
             daily: 0,
             weekly: 0,
-            monthly: 0,
+            monthly: MonthlyCount::Unlimited,
+            yearly: 0,
         };
         let policy = LocalRetentionPolicy::Graduated(config);
         let interval = Interval::days(1);
@@ -1026,7 +1106,8 @@ mod tests {
             hourly: 24,
             daily: 30,
             weekly: 26,
-            monthly: 12,
+            monthly: MonthlyCount::Count(12),
+            yearly: 0,
         };
         let interval = Interval::hours(4);
 
@@ -1056,7 +1137,8 @@ mod tests {
             hourly: 24,
             daily: 30,
             weekly: 26,
-            monthly: 12,
+            monthly: MonthlyCount::Count(12),
+            yearly: 0,
         };
         let policy = LocalRetentionPolicy::Graduated(config);
         let interval = Interval::hours(4);
@@ -1083,7 +1165,8 @@ mod tests {
             hourly: 24,
             daily: 30,
             weekly: 26,
-            monthly: 0, // unlimited
+            monthly: MonthlyCount::Unlimited, // unlimited
+            yearly: 0,
         };
         let policy = LocalRetentionPolicy::Graduated(config);
         let interval = Interval::hours(4);
@@ -1118,7 +1201,8 @@ mod tests {
             hourly: 0,
             daily: 30,
             weekly: 26,
-            monthly: 0, // unlimited
+            monthly: MonthlyCount::Unlimited, // unlimited
+            yearly: 0,
         };
         let policy = LocalRetentionPolicy::Graduated(config);
         let interval = Interval::days(1);
@@ -1271,7 +1355,8 @@ mod tests {
             hourly: 1,
             daily: 1,
             weekly: 1,
-            monthly: 1, // very narrow monthly so older snap falls beyond
+            monthly: MonthlyCount::Count(1), // very narrow monthly so older snap falls beyond
+            yearly: 0,
         };
         let very_old = make_daily_snap("20240101", "home"); // way past all windows
         let snaps = vec![make_snap("20260322", "1400", "home"), very_old.clone()];

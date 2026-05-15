@@ -113,6 +113,7 @@ pub enum PruneRule {
     GraduatedDaily,
     GraduatedWeekly,
     GraduatedMonthly,
+    GraduatedYearly,
     BeyondWindow,
     Emergency,
     SpacePressure,
@@ -399,6 +400,7 @@ mod tests {
             PruneRule::GraduatedDaily,
             PruneRule::GraduatedWeekly,
             PruneRule::GraduatedMonthly,
+            PruneRule::GraduatedYearly,
             PruneRule::BeyondWindow,
         ];
         for rule in info_rules {
@@ -596,6 +598,7 @@ mod tests {
             (PruneRule::GraduatedDaily, "graduated_daily"),
             (PruneRule::GraduatedWeekly, "graduated_weekly"),
             (PruneRule::GraduatedMonthly, "graduated_monthly"),
+            (PruneRule::GraduatedYearly, "graduated_yearly"),
             (PruneRule::BeyondWindow, "beyond_window"),
             (PruneRule::Emergency, "emergency"),
             (PruneRule::SpacePressure, "space_pressure"),

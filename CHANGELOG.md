@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **UPI 042 — Config schema v2 (`monthly = "unlimited"` + yearly tier).** v2
+  closes the `monthly = 0` footgun: written explicitly as `monthly =
+  "unlimited"` (string) for unbounded retention, or omitted for "no monthly
+  retention." A new optional `yearly: u32` retention tier (one snapshot per
+  calendar year for `yearly` years) lives alongside the four existing
+  granularities. `urd migrate` auto-targets the latest schema in a single
+  hop: legacy → v2 or v1 → v2 (replacing the legacy → v1 path). v1 reads
+  continue to interpret `monthly = 0` as unlimited indefinitely via a v1
+  wire-format shim. v2 rejects literal `monthly = 0` at parse time with an
+  actionable error message. `urd doctor` shows a one-line `Schema: v1
+  (current: v2; run urd migrate to upgrade)` notice for non-v2 configs.
+  `urd preflight` (advisory) flags the `monthly = "unlimited"` + `yearly >
+  0` redundancy. See ADR-104/105/110/111 amendments (2026-05-15).
+
+### Changed
+- `derive_policy()` switches `recorded_external_retention.monthly` from
+  unlimited to `Count(0)` (no monthly window). Behavior-neutral because
+  `send_enabled = false` for recorded subvolumes means
+  `plan_external_retention` is never invoked. Local `recorded` retention
+  keeps `monthly = Unlimited` (one snapshot per month indefinitely),
+  preserving pre-UPI 042 behavior (ADR-110 amendment).
+
 ## [0.16.2] - 2026-05-14
 
 ### Fixed

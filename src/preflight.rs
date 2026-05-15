@@ -43,6 +43,7 @@ pub fn preflight_checks(config: &Config) -> Vec<PreflightCheck> {
         check_retention_send_compatibility(subvol, &mut checks);
         check_transient_validity(subvol, &mut checks);
         check_promise_achievability(subvol, config, &mut checks);
+        check_redundant_yearly(subvol, &mut checks);
     }
 
     checks
@@ -275,7 +276,8 @@ fn check_promise_achievability(
         if local.hourly < derived_local.hourly
             || local.daily < derived_local.daily
             || local.weekly < derived_local.weekly
-            || (derived_local.monthly > 0 && local.monthly < derived_local.monthly)
+            || local.monthly.is_weaker_than(derived_local.monthly)
+            || (derived_local.yearly > 0 && local.yearly < derived_local.yearly)
         {
             checks.push(PreflightCheck {
                 name: "weakening-override",
@@ -285,6 +287,42 @@ fn check_promise_achievability(
                 ),
             });
         }
+    }
+}
+
+// ── Redundant-yearly check ─────────────────────────────────────────────
+//
+// When monthly is Unlimited, the engine treats yearly as 0 (yearly is
+// subsumed by unlimited monthly). Surface this redundancy as an advisory
+// so the user can either drop the yearly tier or bound monthly.
+fn check_redundant_yearly(
+    subvol: &crate::config::ResolvedSubvolume,
+    checks: &mut Vec<PreflightCheck>,
+) {
+    use crate::types::{LocalRetentionPolicy, MonthlyCount};
+
+    if let LocalRetentionPolicy::Graduated(local) = &subvol.local_retention
+        && matches!(local.monthly, MonthlyCount::Unlimited)
+        && local.yearly > 0
+    {
+        checks.push(PreflightCheck {
+            name: "redundant-yearly",
+            message: format!(
+                "{}: local_retention yearly is redundant when monthly is unlimited",
+                subvol.name,
+            ),
+        });
+    }
+
+    let ext = &subvol.external_retention;
+    if matches!(ext.monthly, MonthlyCount::Unlimited) && ext.yearly > 0 {
+        checks.push(PreflightCheck {
+            name: "redundant-yearly",
+            message: format!(
+                "{}: external_retention yearly is redundant when monthly is unlimited",
+                subvol.name,
+            ),
+        });
     }
 }
 
@@ -314,7 +352,8 @@ mod tests {
         SubvolumeConfig,
     };
     use crate::types::{
-        ByteSize, DriveRole, GraduatedRetention, Interval, LocalRetentionConfig, RunFrequency,
+        ByteSize, DriveRole, GraduatedRetention, Interval, LocalRetentionConfig, MonthlyCount,
+        RunFrequency,
     };
     use std::path::PathBuf;
 
@@ -358,7 +397,8 @@ mod tests {
             hourly: Some(24),
             daily: Some(7),
             weekly: Some(4),
-            monthly: Some(0),
+            monthly: Some(MonthlyCount::Count(0)),
+            yearly: None,
         }
     }
 
@@ -410,7 +450,8 @@ mod tests {
                 hourly: Some(hourly),
                 daily: Some(daily),
                 weekly: Some(0),
-                monthly: Some(0),
+                monthly: Some(MonthlyCount::Count(0)),
+                yearly: None,
             })),
             external_retention: None,
             protection_level: None,
@@ -646,7 +687,8 @@ mod tests {
             hourly: Some(6),
             daily: Some(7),
             weekly: Some(4),
-            monthly: Some(0),
+            monthly: Some(MonthlyCount::Count(0)),
+            yearly: None,
         }));
         let config = test_config(vec![sv], vec![test_drive()]);
         let results: Vec<_> = preflight_checks(&config)
@@ -695,6 +737,244 @@ mod tests {
             .collect();
 
         assert!(results.is_empty());
+    }
+
+    // ── R2 / Step 2.3 — Weakening check truth table ─────────────────
+
+    // Note: `weakening-override` on local_retention fires only on named
+    // levels (the derived baseline comes from `derive_policy`). The
+    // tests below use Sheltered, whose derive_policy gives:
+    //   local:    hourly=24, daily=30, weekly=26, monthly=Count(12), yearly=0
+    //   external: hourly=0,  daily=30, weekly=26, monthly=Unlimited,  yearly=0
+    //
+    // We construct subvolumes that override local_retention with a tighter
+    // monthly to exercise `is_weaker_than`.
+
+    fn sheltered_subvol_with_local_retention(
+        name: &str,
+        ret: GraduatedRetention,
+    ) -> SubvolumeConfig {
+        SubvolumeConfig {
+            name: name.to_string(),
+            short_name: name.to_string(),
+            source: PathBuf::from(format!("/{name}")),
+            priority: 1,
+            enabled: None,
+            snapshot_interval: None,
+            send_interval: None,
+            send_enabled: None,
+            local_retention: Some(LocalRetentionConfig::Graduated(ret)),
+            external_retention: None,
+            protection_level: Some(crate::types::ProtectionLevel::Sheltered),
+            drives: None,
+        }
+    }
+
+    #[test]
+    fn weakening_check_flags_bounded_against_unlimited() {
+        // Note: this test exercises is_weaker_than. derive_policy(Sheltered)
+        // gives local_retention.monthly = Count(12). User override with
+        // Count(3) is weaker → check fires.
+        let ret = GraduatedRetention {
+            hourly: Some(24),
+            daily: Some(30),
+            weekly: Some(26),
+            monthly: Some(MonthlyCount::Count(3)),
+            yearly: None,
+        };
+        let sv = sheltered_subvol_with_local_retention("sv1", ret);
+        let config = test_config(vec![sv], vec![test_drive()]);
+        let warnings: Vec<_> = preflight_checks(&config)
+            .into_iter()
+            .filter(|c| c.name == "weakening-override")
+            .collect();
+        assert!(
+            warnings.iter().any(|c| c.message.contains("local_retention")),
+            "expected weakening warning for tighter monthly"
+        );
+    }
+
+    #[test]
+    fn weakening_check_skips_count_zero_derived() {
+        // derive_policy(Sheltered) local monthly = Count(12). Override with
+        // Count(0) is weaker → check fires (Count(0) < Count(12)).
+        // This confirms the truth table works for the symmetric case.
+        let ret = GraduatedRetention {
+            hourly: Some(24),
+            daily: Some(30),
+            weekly: Some(26),
+            monthly: Some(MonthlyCount::Count(0)),
+            yearly: None,
+        };
+        let sv = sheltered_subvol_with_local_retention("sv1", ret);
+        let config = test_config(vec![sv], vec![test_drive()]);
+        let warnings: Vec<_> = preflight_checks(&config)
+            .into_iter()
+            .filter(|c| c.name == "weakening-override")
+            .collect();
+        assert!(
+            !warnings.is_empty(),
+            "Count(0) override against Count(12) baseline should fire weakening"
+        );
+    }
+
+    #[test]
+    fn weakening_check_unlimited_never_weaker() {
+        // is_weaker_than(Unlimited, anything) == false. Setting monthly =
+        // Unlimited on a subvolume with Sheltered baseline (Count(12))
+        // should NOT trigger weakening on monthly alone.
+        let ret = GraduatedRetention {
+            hourly: Some(24),
+            daily: Some(30),
+            weekly: Some(26),
+            monthly: Some(MonthlyCount::Unlimited),
+            yearly: None,
+        };
+        let sv = sheltered_subvol_with_local_retention("sv1", ret);
+        let config = test_config(vec![sv], vec![test_drive()]);
+        let warnings: Vec<_> = preflight_checks(&config)
+            .into_iter()
+            .filter(|c| c.name == "weakening-override")
+            .collect();
+        // No warnings — monthly Unlimited is never weaker than Count(12).
+        // (Other fields match the derived baseline exactly.)
+        assert!(
+            warnings.is_empty(),
+            "Unlimited monthly should not trigger weakening, got: {warnings:?}"
+        );
+    }
+
+    // ── R6 / Step 2.10 — Redundant-yearly check ─────────────────────
+
+    #[test]
+    fn redundant_yearly_check_fires_on_local_unlimited_plus_yearly() {
+        // Custom level, local_retention with monthly = Unlimited and yearly = 5
+        // → preflight emits a redundant-yearly advisory.
+        let ret = GraduatedRetention {
+            hourly: Some(0),
+            daily: Some(7),
+            weekly: Some(4),
+            monthly: Some(MonthlyCount::Unlimited),
+            yearly: Some(5),
+        };
+        let sv = SubvolumeConfig {
+            name: "sv1".to_string(),
+            short_name: "sv1".to_string(),
+            source: PathBuf::from("/sv1"),
+            priority: 1,
+            enabled: None,
+            snapshot_interval: None,
+            send_interval: None,
+            send_enabled: Some(false),
+            local_retention: Some(LocalRetentionConfig::Graduated(ret)),
+            external_retention: None,
+            protection_level: Some(crate::types::ProtectionLevel::Custom),
+            drives: None,
+        };
+        let config = test_config(vec![sv], vec![]);
+        let warnings: Vec<_> = preflight_checks(&config)
+            .into_iter()
+            .filter(|c| c.name == "redundant-yearly")
+            .collect();
+        assert_eq!(warnings.len(), 1, "expected one redundant-yearly warning");
+        assert!(warnings[0].message.contains("local_retention"));
+    }
+
+    #[test]
+    fn redundant_yearly_check_silent_when_monthly_bounded() {
+        // Count(N) + yearly = 5 is a legitimate combination → no warning.
+        let ret = GraduatedRetention {
+            hourly: Some(0),
+            daily: Some(7),
+            weekly: Some(4),
+            monthly: Some(MonthlyCount::Count(12)),
+            yearly: Some(5),
+        };
+        let sv = SubvolumeConfig {
+            name: "sv1".to_string(),
+            short_name: "sv1".to_string(),
+            source: PathBuf::from("/sv1"),
+            priority: 1,
+            enabled: None,
+            snapshot_interval: None,
+            send_interval: None,
+            send_enabled: Some(false),
+            local_retention: Some(LocalRetentionConfig::Graduated(ret)),
+            external_retention: None,
+            protection_level: Some(crate::types::ProtectionLevel::Custom),
+            drives: None,
+        };
+        let config = test_config(vec![sv], vec![]);
+        let warnings: Vec<_> = preflight_checks(&config)
+            .into_iter()
+            .filter(|c| c.name == "redundant-yearly")
+            .collect();
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn redundant_yearly_check_fires_on_external_unlimited_plus_yearly() {
+        // External retention with Unlimited monthly + yearly > 0 → advisory.
+        let ext = GraduatedRetention {
+            hourly: Some(0),
+            daily: Some(30),
+            weekly: Some(26),
+            monthly: Some(MonthlyCount::Unlimited),
+            yearly: Some(3),
+        };
+        let sv = SubvolumeConfig {
+            name: "sv1".to_string(),
+            short_name: "sv1".to_string(),
+            source: PathBuf::from("/sv1"),
+            priority: 1,
+            enabled: None,
+            snapshot_interval: None,
+            send_interval: None,
+            send_enabled: None,
+            local_retention: None,
+            external_retention: Some(ext),
+            protection_level: Some(crate::types::ProtectionLevel::Custom),
+            drives: None,
+        };
+        let config = test_config(vec![sv], vec![test_drive()]);
+        let warnings: Vec<_> = preflight_checks(&config)
+            .into_iter()
+            .filter(|c| c.name == "redundant-yearly")
+            .collect();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].message.contains("external_retention"));
+    }
+
+    #[test]
+    fn redundant_yearly_check_silent_when_yearly_zero() {
+        // Unlimited + yearly = 0 is fine → no warning.
+        let ret = GraduatedRetention {
+            hourly: Some(0),
+            daily: Some(7),
+            weekly: Some(4),
+            monthly: Some(MonthlyCount::Unlimited),
+            yearly: Some(0),
+        };
+        let sv = SubvolumeConfig {
+            name: "sv1".to_string(),
+            short_name: "sv1".to_string(),
+            source: PathBuf::from("/sv1"),
+            priority: 1,
+            enabled: None,
+            snapshot_interval: None,
+            send_interval: None,
+            send_enabled: Some(false),
+            local_retention: Some(LocalRetentionConfig::Graduated(ret)),
+            external_retention: None,
+            protection_level: Some(crate::types::ProtectionLevel::Custom),
+            drives: None,
+        };
+        let config = test_config(vec![sv], vec![]);
+        let warnings: Vec<_> = preflight_checks(&config)
+            .into_iter()
+            .filter(|c| c.name == "redundant-yearly")
+            .collect();
+        assert!(warnings.is_empty());
     }
 
     // ── Transient validity tests ───────────────────────────────────

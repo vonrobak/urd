@@ -4,62 +4,79 @@ use std::path::{Path, PathBuf};
 use crate::cli::MigrateArgs;
 use crate::types::{DerivedPolicy, Interval, ProtectionLevel, RunFrequency};
 
-/// Run the `urd migrate` command: transform legacy config to v1 schema.
+/// Run the `urd migrate` command: transform legacy/v1 config → v2 schema.
+///
+/// Auto-targets the latest schema version (v2). Single hop:
+///   - config_version absent → legacy → v2
+///   - config_version = 1    → v1 → v2
+///   - config_version = 2    → no-op
 pub fn run(config_path: Option<&Path>, args: &MigrateArgs) -> anyhow::Result<()> {
     let path = resolve_config_path(config_path)?;
 
     let raw = std::fs::read_to_string(&path).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
 
-    // Check if already v1
     let version = extract_version(&raw)?;
-    if version == Some(1) {
-        println!("  Config is already v1 schema. Nothing to migrate.");
-        return Ok(());
-    }
-    if let Some(n) = version {
-        anyhow::bail!("unsupported config_version {n} (supported: 1)");
-    }
+    let source_schema = match version {
+        Some(2) => {
+            println!("  Config is already v2 schema. Nothing to migrate.");
+            return Ok(());
+        }
+        Some(1) => "v1",
+        None => "legacy",
+        Some(n) => anyhow::bail!("unsupported config_version {n} (supported: 1, 2)"),
+    };
 
-    // Parse legacy config to extract structured data
-    let legacy: LegacyConfig = toml::from_str(&raw)
-        .map_err(|e| anyhow::anyhow!("failed to parse legacy config: {e}"))?;
+    // For both legacy and v1 sources, parse into the LegacyConfig shape and
+    // re-render as v2. The LegacyConfig fields are a superset that handles
+    // both schemas at the raw-TOML level (v1's per-subvolume snapshot_root
+    // is the only structural difference, and the renderer normalizes it).
+    //
+    // R3 architectural decision: structured parse-munge-render (loses
+    // comments, preserves semantics).
+    let legacy: LegacyConfig = if source_schema == "v1" {
+        // Parse v1 raw TOML through a LegacyConfig-shaped reader so the
+        // shared renderer works. v1's per-subvolume snapshot_root/min_free_bytes
+        // are read into a synthesized local_snapshots block by `legacy_from_v1`.
+        legacy_from_v1(&raw)?
+    } else {
+        toml::from_str(&raw)
+            .map_err(|e| anyhow::anyhow!("failed to parse legacy config: {e}"))?
+    };
 
-    // Build the migration result
     let result = build_migration(&legacy);
+    let v2_toml = render_v2(&legacy);
 
-    // Generate v1 TOML
-    let v1_toml = render_v1(&legacy);
+    let schema_label = format!("{source_schema} → v2");
 
     if args.dry_run {
         println!();
         println!("  urd migrate --dry-run");
         println!();
         println!("  Config: {}", path.display());
-        println!("  Schema: legacy → v1");
+        println!("  Schema: {schema_label}");
         println!();
         print_changes(&result);
         println!();
-        println!("  --- Generated v1 config ---");
+        println!("  --- Generated v2 config ---");
         println!();
-        print!("{v1_toml}");
+        print!("{v2_toml}");
         return Ok(());
     }
 
-    // Write backup
-    let backup_path = PathBuf::from(format!("{}.legacy", path.display()));
+    // Backup: .legacy for legacy → v2, .v1 for v1 → v2
+    let backup_suffix = if source_schema == "v1" { ".v1" } else { ".legacy" };
+    let backup_path = PathBuf::from(format!("{}{}", path.display(), backup_suffix));
     std::fs::copy(&path, &backup_path)
         .map_err(|e| anyhow::anyhow!("failed to create backup at {}: {e}", backup_path.display()))?;
 
-    // Write v1 config
-    std::fs::write(&path, &v1_toml)
-        .map_err(|e| anyhow::anyhow!("failed to write v1 config to {}: {e}", path.display()))?;
+    std::fs::write(&path, &v2_toml)
+        .map_err(|e| anyhow::anyhow!("failed to write v2 config to {}: {e}", path.display()))?;
 
-    // Print summary
     println!();
     println!("  urd migrate");
     println!();
     println!("  Config: {}", path.display());
-    println!("  Schema: legacy → v1");
+    println!("  Schema: {schema_label}");
     println!();
     print_changes(&result);
     println!();
@@ -98,7 +115,153 @@ fn extract_version(raw: &str) -> anyhow::Result<Option<u32>> {
     Ok(probe.general.and_then(|g| g.config_version))
 }
 
-// ── Legacy config structs (minimal, for migration) ─────────────────────
+// ── V1 raw config struct (for v1 → v2 path) ────────────────────────────
+
+#[derive(serde::Deserialize)]
+struct V1RawConfig {
+    general: V1RawGeneral,
+    #[serde(default)]
+    drives: Vec<LegacyDrive>,
+    #[serde(rename = "subvolumes", alias = "subvolume")]
+    subvolumes: Vec<V1RawSubvolume>,
+    #[serde(default)]
+    notifications: Option<toml::Value>,
+}
+
+#[derive(serde::Deserialize)]
+struct V1RawGeneral {
+    // config_version is read by extract_version() upstream and is silently
+    // ignored here (no deny_unknown_fields on this struct).
+    #[serde(default)]
+    state_db: Option<String>,
+    #[serde(default)]
+    metrics_file: Option<String>,
+    #[serde(default)]
+    log_dir: Option<String>,
+    #[serde(default)]
+    btrfs_path: Option<String>,
+    #[serde(default)]
+    heartbeat_file: Option<String>,
+    #[serde(default)]
+    run_frequency: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct V1RawSubvolume {
+    name: String,
+    #[serde(default)]
+    short_name: Option<String>,
+    source: String,
+    snapshot_root: String,
+    #[serde(default)]
+    min_free_bytes: Option<String>,
+    #[serde(default)]
+    priority: Option<u8>,
+    #[serde(default)]
+    protection: Option<String>,
+    #[serde(default)]
+    drives: Option<Vec<String>>,
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    snapshot_interval: Option<String>,
+    #[serde(default)]
+    send_interval: Option<String>,
+    #[serde(default)]
+    send_enabled: Option<bool>,
+    #[serde(default)]
+    local_snapshots: Option<bool>,
+    #[serde(default)]
+    local_retention: Option<toml::Value>,
+    #[serde(default)]
+    external_retention: Option<toml::Value>,
+}
+
+/// Read a v1 TOML config and reshape into LegacyConfig form so the v2
+/// renderer works uniformly. v1 carries `snapshot_root` per-subvolume; the
+/// returned LegacyConfig synthesizes a `local_snapshots.roots` list by
+/// grouping subvolumes by their `snapshot_root`.
+///
+/// `local_snapshots = false` on a v1 subvolume maps to `local_retention =
+/// "transient"` in the LegacyConfig view, since the v2 renderer already
+/// handles transient → `local_snapshots = false` in the output. Note that
+/// the v2 renderer doesn't need to know the source was v1.
+fn legacy_from_v1(raw: &str) -> anyhow::Result<LegacyConfig> {
+    let v1: V1RawConfig = toml::from_str(raw)
+        .map_err(|e| anyhow::anyhow!("failed to parse v1 config: {e}"))?;
+
+    // Group subvolumes by snapshot_root into LegacySnapshotRoot entries.
+    let mut roots_map: BTreeMap<String, (Vec<String>, Option<String>)> = BTreeMap::new();
+    for sv in &v1.subvolumes {
+        let entry = roots_map
+            .entry(sv.snapshot_root.clone())
+            .or_insert_with(|| (Vec::new(), None));
+        entry.0.push(sv.name.clone());
+        if entry.1.is_none() {
+            entry.1 = sv.min_free_bytes.clone();
+        }
+    }
+    let roots: Vec<LegacySnapshotRoot> = roots_map
+        .into_iter()
+        .map(|(path, (subvolumes, min_free_bytes))| LegacySnapshotRoot {
+            path,
+            subvolumes,
+            min_free_bytes,
+        })
+        .collect();
+
+    let subvolumes: Vec<LegacySubvolume> = v1
+        .subvolumes
+        .into_iter()
+        .map(|sv| {
+            // v1 `local_snapshots = false` → legacy "transient" via
+            // local_retention. The renderer downstream handles transient
+            // → `local_snapshots = false` on the v2 side.
+            let local_retention = if sv.local_snapshots == Some(false) {
+                Some(toml::Value::String("transient".to_string()))
+            } else {
+                sv.local_retention
+            };
+            LegacySubvolume {
+                name: sv.name,
+                short_name: sv.short_name,
+                source: sv.source,
+                priority: sv.priority,
+                protection_level: sv.protection,
+                drives: sv.drives,
+                enabled: sv.enabled,
+                snapshot_interval: sv.snapshot_interval,
+                send_interval: sv.send_interval,
+                send_enabled: sv.send_enabled,
+                local_retention,
+                external_retention: sv.external_retention,
+            }
+        })
+        .collect();
+
+    Ok(LegacyConfig {
+        general: LegacyGeneral {
+            state_db: v1.general.state_db,
+            metrics_file: v1.general.metrics_file,
+            log_dir: v1.general.log_dir,
+            btrfs_path: v1.general.btrfs_path,
+            heartbeat_file: v1.general.heartbeat_file,
+            run_frequency: v1.general.run_frequency,
+        },
+        local_snapshots: LegacyLocalSnapshots { roots },
+        defaults: None, // v1 has no [defaults] block — pull from synthesized v1 defaults
+        drives: v1.drives,
+        subvolumes,
+        notifications: v1.notifications,
+    })
+}
+
+// ── Migration source structs ───────────────────────────────────────────
+//
+// `LegacyConfig` is the raw-TOML view that the v2 renderer reads. It mirrors
+// the legacy schema (top-level `[local_snapshots]` + per-subvolume fields).
+// V1 input is reshaped into this form by `legacy_from_v1` before rendering,
+// so the same renderer handles both paths.
 
 #[derive(serde::Deserialize)]
 struct LegacyConfig {
@@ -443,13 +606,22 @@ fn retention_matches_resolved(
         let hourly = t.get("hourly").and_then(|v| v.as_integer()).unwrap_or(0) as u32;
         let daily = t.get("daily").and_then(|v| v.as_integer()).unwrap_or(0) as u32;
         let weekly = t.get("weekly").and_then(|v| v.as_integer()).unwrap_or(0) as u32;
-        let monthly = t.get("monthly").and_then(|v| v.as_integer()).unwrap_or(0) as u32;
+        let monthly_raw = t.get("monthly").and_then(|v| v.as_integer()).unwrap_or(0) as u32;
+        let monthly_mc = legacy_monthly_to_monthly_count(monthly_raw);
         hourly == resolved.hourly
             && daily == resolved.daily
             && weekly == resolved.weekly
-            && monthly == resolved.monthly
+            && monthly_mc == resolved.monthly
     } else {
         false
+    }
+}
+
+fn legacy_monthly_to_monthly_count(n: u32) -> crate::types::MonthlyCount {
+    if n == 0 {
+        crate::types::MonthlyCount::Unlimited
+    } else {
+        crate::types::MonthlyCount::Count(n)
     }
 }
 
@@ -489,9 +661,9 @@ fn has_operational_overrides(sv: &LegacySubvolume) -> bool {
         || sv.local_retention.is_some()
 }
 
-// ── Render v1 TOML ─────────────────────────────────────────────────────
+// ── Render v2 TOML ─────────────────────────────────────────────────────
 
-fn render_v1(legacy: &LegacyConfig) -> String {
+fn render_v2(legacy: &LegacyConfig) -> String {
     let mut out = String::new();
 
     // [general]
@@ -519,7 +691,7 @@ fn render_v1(legacy: &LegacyConfig) -> String {
 
 fn render_general(out: &mut String, general: &LegacyGeneral) {
     out.push_str("[general]\n");
-    out.push_str("config_version = 1\n");
+    out.push_str("config_version = 2\n");
 
     // run_frequency: always emit if present and not "daily" (the default)
     if let Some(ref freq) = general.run_frequency {
@@ -787,7 +959,10 @@ fn merge_retention_with_derived(
         hourly: get_u32(table, "hourly").unwrap_or(derived.hourly),
         daily: get_u32(table, "daily").unwrap_or(derived.daily),
         weekly: get_u32(table, "weekly").unwrap_or(derived.weekly),
-        monthly: get_u32(table, "monthly").unwrap_or(derived.monthly),
+        monthly: get_u32(table, "monthly")
+            .map(legacy_monthly_to_monthly_count)
+            .unwrap_or(derived.monthly),
+        yearly: get_u32(table, "yearly").unwrap_or(derived.yearly),
     }
 }
 
@@ -802,15 +977,31 @@ fn render_resolved_retention(
     field: &str,
     ret: &crate::types::ResolvedGraduatedRetention,
 ) {
-    // Always emit all four fields explicitly. In v1 custom subvolumes, missing
-    // fields merge with synthesized defaults (hourly=24, weekly=26), so omitting
-    // e.g. hourly=0 would silently inherit a non-zero value.
-    let parts = [
+    // Always emit hourly/daily/weekly explicitly. In v2 custom subvolumes,
+    // missing fields merge with synthesized defaults (hourly=24, weekly=26),
+    // so omitting e.g. hourly=0 would silently inherit a non-zero value.
+    //
+    // For monthly: v2 rejects literal `monthly = 0`, so when the value is
+    // Count(0) ("no monthly retention"), we OMIT the field — v2's parser
+    // defaults to Count(0). For Count(n>0) emit `monthly = n`. For
+    // Unlimited emit `monthly = "unlimited"`.
+    let mut parts = vec![
         format!("hourly = {}", ret.hourly),
         format!("daily = {}", ret.daily),
         format!("weekly = {}", ret.weekly),
-        format!("monthly = {}", ret.monthly),
     ];
+    // v2 rejects literal `monthly = 0`, so Count(0) ("no monthly retention")
+    // must be omitted — v2's parser defaults to Count(0).
+    match ret.monthly {
+        crate::types::MonthlyCount::Count(0) => {}
+        crate::types::MonthlyCount::Count(n) => parts.push(format!("monthly = {n}")),
+        crate::types::MonthlyCount::Unlimited => {
+            parts.push("monthly = \"unlimited\"".to_string());
+        }
+    }
+    if ret.yearly > 0 {
+        parts.push(format!("yearly = {}", ret.yearly));
+    }
     out.push_str(&format!("{field} = {{ {} }}\n", parts.join(", ")));
 }
 
@@ -821,8 +1012,28 @@ fn render_retention_field(out: &mut String, field: &str, value: &toml::Value) {
         }
         toml::Value::Table(t) => {
             // Inline table: { daily = 7, weekly = 4, ... }
-            let parts: Vec<String> = t.iter()
-                .map(|(k, v)| format!("{k} = {v}"))
+            // v2 semantic translation: `monthly = 0` (legacy/v1 semantic for
+            // "unlimited") is rewritten as `monthly = "unlimited"` (v2 syntax).
+            // Step 2.5 / R3: structured rewrite handles all v1 wire forms,
+            // including the inline-table case the regex approach would miss.
+            let parts: Vec<String> = t
+                .iter()
+                .map(|(k, v)| {
+                    if k == "monthly" {
+                        if let Some(i) = v.as_integer() {
+                            if i == 0 {
+                                return "monthly = \"unlimited\"".to_string();
+                            }
+                            return format!("monthly = {i}");
+                        }
+                        if let Some(s) = v.as_str()
+                            && s == "unlimited"
+                        {
+                            return "monthly = \"unlimited\"".to_string();
+                        }
+                    }
+                    format!("{k} = {v}")
+                })
                 .collect();
             out.push_str(&format!("{field} = {{ {} }}\n", parts.join(", ")));
         }
@@ -969,7 +1180,13 @@ drives = ["WD-18TB", "WD-18TB1"]
     }
 
     #[test]
-    fn migrate_detects_already_v1() {
+    fn migrate_detects_already_v2() {
+        let v2 = "[general]\nconfig_version = 2\n\n[[subvolumes]]\nname = \"test\"\nsource = \"/test\"\nsnapshot_root = \"/snap\"\n";
+        assert_eq!(extract_version(v2).unwrap(), Some(2));
+    }
+
+    #[test]
+    fn migrate_detects_v1_to_migrate() {
         let v1 = "[general]\nconfig_version = 1\n\n[[subvolumes]]\nname = \"test\"\nsource = \"/test\"\nsnapshot_root = \"/snap\"\n";
         assert_eq!(extract_version(v1).unwrap(), Some(1));
     }
@@ -1014,7 +1231,7 @@ drives = ["WD-18TB", "WD-18TB1"]
     fn migrate_inlines_snapshot_root() {
         let toml = example_legacy_toml();
         let legacy: LegacyConfig = toml::from_str(toml).unwrap();
-        let v1 = render_v1(&legacy);
+        let v1 = render_v2(&legacy);
 
         // All subvolumes should have snapshot_root
         assert!(v1.contains("snapshot_root = \"~/.snapshots\""));
@@ -1027,7 +1244,7 @@ drives = ["WD-18TB", "WD-18TB1"]
     fn migrate_inlines_min_free_bytes() {
         let toml = example_legacy_toml();
         let legacy: LegacyConfig = toml::from_str(toml).unwrap();
-        let v1 = render_v1(&legacy);
+        let v1 = render_v2(&legacy);
 
         assert!(v1.contains("min_free_bytes = \"10GB\""));
         assert!(v1.contains("min_free_bytes = \"50GB\""));
@@ -1063,7 +1280,7 @@ snapshot_interval = "1w"
 "#;
         let legacy: LegacyConfig = toml::from_str(toml).unwrap();
         let _result = build_migration(&legacy);
-        let v1 = render_v1(&legacy);
+        let v1 = render_v2(&legacy);
 
         // Should NOT have protection = "recorded"
         assert!(!v1.contains("protection = \"recorded\""), "should not keep named level with overrides");
@@ -1081,16 +1298,16 @@ snapshot_interval = "1w"
     fn migrate_output_has_config_version() {
         let toml = example_legacy_toml();
         let legacy: LegacyConfig = toml::from_str(toml).unwrap();
-        let v1 = render_v1(&legacy);
+        let v1 = render_v2(&legacy);
 
-        assert!(v1.contains("config_version = 1"));
+        assert!(v1.contains("config_version = 2"));
     }
 
     #[test]
     fn migrate_preserves_drives() {
         let toml = example_legacy_toml();
         let legacy: LegacyConfig = toml::from_str(toml).unwrap();
-        let v1 = render_v1(&legacy);
+        let v1 = render_v2(&legacy);
 
         assert!(v1.contains("label = \"WD-18TB\""));
         assert!(v1.contains("uuid = \"647693ed"));
@@ -1102,7 +1319,7 @@ snapshot_interval = "1w"
         // htpc-root has transient + send_interval, but no named level (custom)
         let toml = example_legacy_toml();
         let legacy: LegacyConfig = toml::from_str(toml).unwrap();
-        let v1 = render_v1(&legacy);
+        let v1 = render_v2(&legacy);
 
         assert!(!v1.contains("local_retention = \"transient\""),
             "transient should not appear in v1 output");
@@ -1114,7 +1331,7 @@ snapshot_interval = "1w"
     fn migrate_omits_default_priority() {
         let toml = example_legacy_toml();
         let legacy: LegacyConfig = toml::from_str(toml).unwrap();
-        let v1 = render_v1(&legacy);
+        let v1 = render_v2(&legacy);
 
         // "docs" has priority 2 (default) — should not appear
         // We need to check that the docs subvolume block doesn't have priority
@@ -1128,7 +1345,7 @@ snapshot_interval = "1w"
     fn migrate_keeps_non_default_priority() {
         let toml = example_legacy_toml();
         let legacy: LegacyConfig = toml::from_str(toml).unwrap();
-        let v1 = render_v1(&legacy);
+        let v1 = render_v2(&legacy);
 
         // "htpc-home" has priority 1 — should appear
         let home_block = v1.split("[[subvolumes]]")
@@ -1138,25 +1355,25 @@ snapshot_interval = "1w"
     }
 
     #[test]
-    fn migrate_roundtrip_v1_parses() {
+    fn migrate_roundtrip_v2_parses() {
         let toml = example_legacy_toml();
         let legacy: LegacyConfig = toml::from_str(toml).unwrap();
-        let v1_toml = render_v1(&legacy);
+        let v2_toml = render_v2(&legacy);
 
-        // The generated v1 should parse successfully as a v1 config
-        let version = extract_version(&v1_toml).unwrap();
-        assert_eq!(version, Some(1), "generated config should be v1");
+        // The generated config should parse successfully as v2
+        let version = extract_version(&v2_toml).unwrap();
+        assert_eq!(version, Some(2), "generated config should be v2");
 
         // Parse through the real config loader to verify structural validity
-        let result = crate::config::Config::from_str(&v1_toml);
-        assert!(result.is_ok(), "v1 config should parse: {}", result.unwrap_err());
+        let result = crate::config::Config::from_str(&v2_toml);
+        assert!(result.is_ok(), "v2 config should parse: {}", result.unwrap_err());
     }
 
     #[test]
     fn migrate_no_defaults_section() {
         let toml = example_legacy_toml();
         let legacy: LegacyConfig = toml::from_str(toml).unwrap();
-        let v1 = render_v1(&legacy);
+        let v1 = render_v2(&legacy);
 
         // Should not have [defaults] as a TOML section header (comments with "defaults" are ok)
         assert!(!v1.contains("\n[defaults]"), "v1 should not have [defaults] section");
@@ -1167,13 +1384,13 @@ snapshot_interval = "1w"
         let toml = example_legacy_toml();
         let legacy: LegacyConfig = toml::from_str(toml).unwrap();
         let _result = build_migration(&legacy);
-        let v1 = render_v1(&legacy);
+        let v1 = render_v2(&legacy);
 
         assert!(!v1.is_empty());
     }
 
     #[test]
-    fn migrate_writes_backup_and_v1() {
+    fn migrate_legacy_writes_backup_and_v2() {
         let dir = tempfile::TempDir::new().unwrap();
         let config_path = dir.path().join("urd.toml");
         let backup_path = dir.path().join("urd.toml.legacy");
@@ -1184,25 +1401,26 @@ snapshot_interval = "1w"
         let result = run(Some(config_path.as_path()), &args);
         assert!(result.is_ok(), "migrate should succeed: {:?}", result.err());
 
-        // Backup should exist with original content
+        // .legacy backup should exist with original content
         assert!(backup_path.exists(), "backup file should be created");
         let backup_content = std::fs::read_to_string(&backup_path).unwrap();
         assert!(backup_content.contains("[local_snapshots]"), "backup should be the original legacy");
 
-        // Main config should be v1
-        let v1_content = std::fs::read_to_string(&config_path).unwrap();
-        assert!(v1_content.contains("config_version = 1"), "main config should be v1");
-        assert!(!v1_content.contains("\n[local_snapshots]"), "v1 should not have local_snapshots");
+        // Main config should be v2
+        let v2_content = std::fs::read_to_string(&config_path).unwrap();
+        assert!(v2_content.contains("config_version = 2"), "main config should be v2");
+        assert!(!v2_content.contains("\n[local_snapshots]"), "v2 should not have local_snapshots section");
     }
 
     #[test]
-    fn migrate_already_v1_is_noop() {
+    fn migrate_already_v2_is_noop() {
         let dir = tempfile::TempDir::new().unwrap();
         let config_path = dir.path().join("urd.toml");
-        let v1_content = "[general]\nconfig_version = 1\n\n\
+        let v2_content = "[general]\nconfig_version = 2\n\
+             \n\
              [[drives]]\nlabel = \"D\"\nmount_path = \"/mnt/d\"\nsnapshot_root = \".snap\"\nrole = \"offsite\"\n\n\
              [[subvolumes]]\nname = \"test\"\nsource = \"/test\"\nsnapshot_root = \"/snap\"\n";
-        std::fs::write(&config_path, v1_content).unwrap();
+        std::fs::write(&config_path, v2_content).unwrap();
 
         let args = MigrateArgs { dry_run: false };
         let result = run(Some(config_path.as_path()), &args);
@@ -1210,11 +1428,98 @@ snapshot_interval = "1w"
 
         // Content should be unchanged
         let after = std::fs::read_to_string(&config_path).unwrap();
-        assert_eq!(after, v1_content, "v1 config should not be modified");
+        assert_eq!(after, v2_content, "v2 config should not be modified");
 
         // No backup should be created
-        let backup_path = dir.path().join("urd.toml.legacy");
-        assert!(!backup_path.exists(), "no backup for already-v1");
+        let backup_legacy = dir.path().join("urd.toml.legacy");
+        let backup_v1 = dir.path().join("urd.toml.v1");
+        assert!(!backup_legacy.exists(), "no .legacy backup for already-v2");
+        assert!(!backup_v1.exists(), "no .v1 backup for already-v2");
+    }
+
+    #[test]
+    fn migrate_v1_to_v2_replaces_monthly_zero_in_inline_table() {
+        // R3: structured rewrite handles inline-table v1 form
+        //   local_retention = { hourly = 24, daily = 30, weekly = 26, monthly = 0 }
+        // The dropped regex approach would have missed this; structured
+        // parse-munge-render handles it naturally via render_retention_field.
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_path = dir.path().join("urd.toml");
+        let v1_toml = r#"[general]
+config_version = 1
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp/logs"
+run_frequency = "daily"
+
+[[drives]]
+label = "D"
+mount_path = "/mnt/d"
+snapshot_root = ".snap"
+role = "primary"
+
+[[subvolumes]]
+name = "sv"
+source = "/sv"
+snapshot_root = "/snap"
+local_retention = { hourly = 24, daily = 30, weekly = 26, monthly = 0 }
+"#;
+        std::fs::write(&config_path, v1_toml).unwrap();
+
+        let args = MigrateArgs { dry_run: false };
+        run(Some(config_path.as_path()), &args).expect("migrate should succeed");
+
+        let v2_content = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            v2_content.contains("config_version = 2"),
+            "v2 output should have config_version = 2"
+        );
+        assert!(
+            v2_content.contains("monthly = \"unlimited\""),
+            "inline-table monthly = 0 should be rewritten as monthly = \"unlimited\":\n{v2_content}"
+        );
+        assert!(
+            !v2_content.contains("monthly = 0"),
+            "no literal monthly = 0 should remain"
+        );
+
+        // .v1 backup should exist
+        let backup_v1 = dir.path().join("urd.toml.v1");
+        assert!(backup_v1.exists(), ".v1 backup should be written for v1 → v2");
+        let backup_content = std::fs::read_to_string(&backup_v1).unwrap();
+        assert_eq!(backup_content, v1_toml, ".v1 backup must match input byte-for-byte");
+    }
+
+    #[test]
+    fn migrate_v1_to_v2_parses_clean_v2() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_path = dir.path().join("urd.toml");
+        let v1_toml = r#"[general]
+config_version = 1
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp/logs"
+run_frequency = "daily"
+
+[[drives]]
+label = "D"
+mount_path = "/mnt/d"
+snapshot_root = ".snap"
+role = "primary"
+
+[[subvolumes]]
+name = "sv"
+source = "/sv"
+snapshot_root = "/snap"
+protection = "sheltered"
+"#;
+        std::fs::write(&config_path, v1_toml).unwrap();
+        let args = MigrateArgs { dry_run: false };
+        run(Some(config_path.as_path()), &args).expect("migrate should succeed");
+
+        let v2_content = std::fs::read_to_string(&config_path).unwrap();
+        crate::config::Config::from_str(&v2_content)
+            .expect("migrated v2 must re-parse cleanly");
     }
 
     #[test]
@@ -1253,7 +1558,7 @@ snapshot_interval = "1w"
 "#;
         let legacy: LegacyConfig = toml::from_str(toml).unwrap();
         let _result = build_migration(&legacy);
-        let v1 = render_v1(&legacy);
+        let v1 = render_v2(&legacy);
 
         // Should have baked all operational fields since it's converted to custom
         let test_block = v1.split("[[subvolumes]]")
@@ -1277,7 +1582,7 @@ snapshot_interval = "1w"
         let legacy_resolved = legacy_config.resolved_subvolumes();
 
         let legacy: LegacyConfig = toml::from_str(toml_str).unwrap();
-        let v1_toml = render_v1(&legacy);
+        let v1_toml = render_v2(&legacy);
 
         let v1_config = crate::config::Config::from_str(&v1_toml)
             .expect("v1 config should parse");
@@ -1314,9 +1619,9 @@ snapshot_interval = "1w"
     #[test]
     fn migrate_partial_retention_override_bakes_all_fields() {
         // Regression: a subvolume with a named level and partial local_retention
-        // override (e.g., { daily = 7 } on recorded) must bake ALL four retention
+        // override (e.g., { daily = 30 } on sheltered) must bake ALL four retention
         // fields. Without this, missing fields (hourly, monthly) would inherit from
-        // v1's synthesized defaults instead of the derived level's values.
+        // synthesized defaults instead of the derived level's values.
         let toml = r#"
 [general]
 state_db = "~/.local/share/urd/urd.db"
@@ -1345,22 +1650,22 @@ role = "primary"
 name = "cache"
 short_name = "cache"
 source = "/cache"
-protection_level = "guarded"
-local_retention = { daily = 7 }
+protection_level = "protected"
+local_retention = { daily = 14 }
 "#;
-        // Legacy resolves: merge { daily = 7 } with derive_policy(Recorded, Daily)
-        // → { hourly: 0, daily: 7, weekly: 4, monthly: 0 }
+        // Legacy resolves: merge { daily = 14 } with derive_policy(Sheltered, Daily)
+        // → { hourly: 24, daily: 14, weekly: 26, monthly: Count(12), yearly: 0 }
         let legacy_config = crate::config::Config::from_str(toml)
             .expect("legacy config should parse");
         let legacy_resolved = legacy_config.resolved_subvolumes();
         let legacy_cache = legacy_resolved.iter().find(|s| s.name == "cache").unwrap();
         let legacy_lr = legacy_cache.local_retention.as_graduated().unwrap();
-        assert_eq!(legacy_lr.weekly, 4, "legacy should merge weekly from derived");
-        assert_eq!(legacy_lr.hourly, 0, "legacy should merge hourly from derived");
+        assert_eq!(legacy_lr.weekly, 26, "legacy should merge weekly from derived");
+        assert_eq!(legacy_lr.hourly, 24, "legacy should merge hourly from derived");
 
         // Migrate and check v1 resolves identically
         let legacy: LegacyConfig = toml::from_str(toml).unwrap();
-        let v1_toml = render_v1(&legacy);
+        let v1_toml = render_v2(&legacy);
 
         let v1_config = crate::config::Config::from_str(&v1_toml)
             .expect("v1 config should parse");
@@ -1404,7 +1709,7 @@ snapshot_interval = "1d"
 "#;
         let legacy: LegacyConfig = toml::from_str(toml).unwrap();
         let _result = build_migration(&legacy);
-        let v1 = render_v1(&legacy);
+        let v1 = render_v2(&legacy);
 
         // Should keep the named level (no conversion) since override matches derived
         assert!(v1.contains("protection = \"recorded\""),
@@ -1447,7 +1752,7 @@ local_retention = "transient"
 drives = ["D"]
 "#;
         let legacy: LegacyConfig = toml::from_str(toml).unwrap();
-        let v1 = render_v1(&legacy);
+        let v1 = render_v2(&legacy);
 
         assert!(v1.contains("local_snapshots = false"),
             "should have local_snapshots = false");
@@ -1493,7 +1798,7 @@ protection_level = "sheltered"
 local_retention = "transient"
 "#;
         let legacy: LegacyConfig = toml::from_str(toml).unwrap();
-        let v1 = render_v1(&legacy);
+        let v1 = render_v2(&legacy);
 
         let test_block = v1.split("[[subvolumes]]")
             .find(|block| block.contains("name = \"test\""))
@@ -1552,7 +1857,7 @@ local_retention = "transient"
 snapshot_interval = "1w"
 "#;
         let legacy: LegacyConfig = toml::from_str(toml).unwrap();
-        let v1 = render_v1(&legacy);
+        let v1 = render_v2(&legacy);
 
         let test_block = v1.split("[[subvolumes]]")
             .find(|block| block.contains("name = \"test\""))

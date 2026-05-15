@@ -159,6 +159,7 @@ fn prune_rule_phrase(rule: crate::events::PruneRule) -> &'static str {
         GraduatedDaily => "graduated: daily thinning",
         GraduatedWeekly => "graduated: weekly thinning",
         GraduatedMonthly => "graduated: monthly thinning",
+        GraduatedYearly => "graduated: yearly thinning",
         BeyondWindow => "beyond retention window",
         Emergency => "emergency: aggressive thinning",
         SpacePressure => "space pressure",

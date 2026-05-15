@@ -2502,7 +2502,7 @@ mod tests {
         use crate::config::{DefaultsConfig, GeneralConfig, LocalSnapshotsConfig};
         use crate::types::RunFrequency;
         use crate::notify::NotificationConfig;
-        use crate::types::{GraduatedRetention, Interval};
+        use crate::types::{GraduatedRetention, Interval, MonthlyCount};
 
         Config {
             general: GeneralConfig {
@@ -2527,13 +2527,15 @@ mod tests {
                     hourly: Some(24),
                     daily: Some(30),
                     weekly: Some(26),
-                    monthly: Some(12),
+                    monthly: Some(MonthlyCount::Count(12)),
+                    yearly: None,
                 },
                 external_retention: GraduatedRetention {
                     hourly: None,
                     daily: Some(30),
                     weekly: Some(26),
-                    monthly: Some(0),
+                    monthly: Some(MonthlyCount::Unlimited),
+                    yearly: None,
                 },
             },
             subvolumes: vec![],
