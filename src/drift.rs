@@ -48,6 +48,11 @@ pub struct ChurnEstimate {
     /// `None` when no in-window incremental has a usable interval
     /// (`incremental_count == 0`).
     pub mean_bytes_per_second: Option<f64>,
+    /// Arithmetic mean of `bytes_transferred` across in-window usable
+    /// incrementals (the same slice that feeds `mean_bytes_per_second`).
+    /// `None` when `incremental_count == 0`. Integer division (estimate).
+    /// Used by UPI 043's pinned-delta computation.
+    pub mean_incremental_bytes: Option<u64>,
     /// Count of in-window samples whose `send_kind` is `Incremental` and that
     /// have a usable (non-zero, non-None) `seconds_since_prev_send`.
     pub incremental_count: usize,
@@ -107,21 +112,23 @@ pub fn compute_rolling_churn(
         .collect();
 
     let incremental_count = usable_incrementals.len();
-    let mean_bytes_per_second = if usable_incrementals.is_empty() {
-        None
+    let (mean_bytes_per_second, mean_incremental_bytes) = if usable_incrementals.is_empty() {
+        (None, None)
     } else {
         let total_bytes: u64 = usable_incrementals.iter().map(|s| s.bytes_transferred).sum();
         let total_seconds: i64 = usable_incrementals
             .iter()
             .map(|s| s.seconds_since_prev_send.unwrap_or(0))
             .sum();
-        if total_seconds > 0 {
+        let mean_bps = if total_seconds > 0 {
             #[allow(clippy::cast_precision_loss)]
             let mean = total_bytes as f64 / total_seconds as f64;
             Some(mean)
         } else {
             None
-        }
+        };
+        let mean_bytes = total_bytes / incremental_count as u64;
+        (mean_bps, Some(mean_bytes))
     };
 
     // Step 4: full aggregation.
@@ -147,6 +154,7 @@ pub fn compute_rolling_churn(
 
     ChurnEstimate {
         mean_bytes_per_second,
+        mean_incremental_bytes,
         incremental_count,
         full_count,
         median_full_bytes,
@@ -379,5 +387,109 @@ mod tests {
         let est = compute_rolling_churn(&samples, default_window(), now);
         assert_eq!(est.incremental_count, 0);
         assert_eq!(est.mean_bytes_per_second, None);
+    }
+
+    // ── UPI 043: mean_incremental_bytes ────────────────────────────
+
+    #[test]
+    fn mean_incremental_bytes_none_when_no_incrementals() {
+        let now = dt(2026, 5, 1, 12, 0);
+        let s = dt(2026, 4, 30, 12, 0);
+
+        // Empty samples
+        let est = compute_rolling_churn(&[], default_window(), now);
+        assert_eq!(est.mean_incremental_bytes, None);
+
+        // Full-only
+        let samples = vec![sample(s, Some(86_400), 12_000_000_000, SendKind::Full)];
+        let est = compute_rolling_churn(&samples, default_window(), now);
+        assert_eq!(est.mean_incremental_bytes, None);
+
+        // Cold-start: incremental with `None` interval (not usable)
+        let samples = vec![sample(s, None, 86_400_000, SendKind::Incremental)];
+        let est = compute_rolling_churn(&samples, default_window(), now);
+        assert_eq!(est.mean_incremental_bytes, None);
+    }
+
+    #[test]
+    fn mean_incremental_bytes_single_incremental() {
+        let now = dt(2026, 5, 1, 12, 0);
+        let s = dt(2026, 4, 30, 12, 0);
+        let samples = vec![sample(s, Some(86_400), 86_400_000, SendKind::Incremental)];
+        let est = compute_rolling_churn(&samples, default_window(), now);
+        assert_eq!(est.mean_incremental_bytes, Some(86_400_000));
+    }
+
+    #[test]
+    fn mean_incremental_bytes_two_incrementals_arithmetic_mean() {
+        let now = dt(2026, 5, 1, 12, 0);
+        let s1 = dt(2026, 4, 29, 12, 0);
+        let s2 = dt(2026, 4, 30, 12, 0);
+        let samples = vec![
+            sample(s1, Some(86_400), 100_000_000, SendKind::Incremental),
+            sample(s2, Some(86_400), 200_000_000, SendKind::Incremental),
+        ];
+        let est = compute_rolling_churn(&samples, default_window(), now);
+        // (100M + 200M) / 2 = 150M
+        assert_eq!(est.mean_incremental_bytes, Some(150_000_000));
+    }
+
+    #[test]
+    fn mean_incremental_bytes_excludes_full_sends() {
+        let now = dt(2026, 5, 1, 12, 0);
+        let s1 = dt(2026, 4, 29, 12, 0);
+        let s2 = dt(2026, 4, 30, 12, 0);
+        let s3 = dt(2026, 4, 28, 12, 0);
+        let samples = vec![
+            sample(s1, Some(86_400), 100_000_000, SendKind::Incremental),
+            sample(s2, Some(86_400), 200_000_000, SendKind::Incremental),
+            sample(s3, Some(86_400), 9_999_999_999, SendKind::Full),
+        ];
+        let est = compute_rolling_churn(&samples, default_window(), now);
+        // Full excluded; mean over incrementals only
+        assert_eq!(est.mean_incremental_bytes, Some(150_000_000));
+    }
+
+    #[test]
+    fn mean_incremental_bytes_excludes_zero_interval_samples() {
+        let now = dt(2026, 5, 1, 12, 0);
+        let s1 = dt(2026, 4, 29, 12, 0);
+        let s2 = dt(2026, 4, 30, 12, 0);
+        let samples = vec![
+            sample(s1, Some(86_400), 100_000_000, SendKind::Incremental),
+            // zero-interval is filtered out of `usable_incrementals`
+            sample(s2, Some(0), 5_000_000_000, SendKind::Incremental),
+        ];
+        let est = compute_rolling_churn(&samples, default_window(), now);
+        assert_eq!(est.incremental_count, 1);
+        assert_eq!(est.mean_incremental_bytes, Some(100_000_000));
+    }
+
+    #[test]
+    fn mean_incremental_bytes_excludes_none_interval_samples() {
+        let now = dt(2026, 5, 1, 12, 0);
+        let s1 = dt(2026, 4, 29, 12, 0);
+        let s2 = dt(2026, 4, 30, 12, 0);
+        let samples = vec![
+            sample(s1, Some(86_400), 100_000_000, SendKind::Incremental),
+            sample(s2, None, 5_000_000_000, SendKind::Incremental),
+        ];
+        let est = compute_rolling_churn(&samples, default_window(), now);
+        assert_eq!(est.incremental_count, 1);
+        assert_eq!(est.mean_incremental_bytes, Some(100_000_000));
+    }
+
+    #[test]
+    fn mean_incremental_bytes_outside_window_excluded() {
+        let now = dt(2026, 5, 1, 12, 0);
+        let recent = dt(2026, 4, 30, 12, 0);
+        let old = dt(2026, 4, 1, 12, 0); // outside 7-day window
+        let samples = vec![
+            sample(recent, Some(86_400), 100_000_000, SendKind::Incremental),
+            sample(old, Some(86_400), 9_999_999_999, SendKind::Incremental),
+        ];
+        let est = compute_rolling_churn(&samples, default_window(), now);
+        assert_eq!(est.incremental_count, 1);
+        assert_eq!(est.mean_incremental_bytes, Some(100_000_000));
     }
 }

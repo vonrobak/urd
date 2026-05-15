@@ -253,6 +253,7 @@ mod tests {
     fn churn_with_mean(mean: Option<f64>) -> ChurnEstimate {
         ChurnEstimate {
             mean_bytes_per_second: mean,
+            mean_incremental_bytes: None,
             incremental_count: if mean.is_some() { 2 } else { 0 },
             full_count: 0,
             median_full_bytes: None,
@@ -264,6 +265,7 @@ mod tests {
     fn churn_with_counts(mean: Option<f64>, incremental: usize, full: usize) -> ChurnEstimate {
         ChurnEstimate {
             mean_bytes_per_second: mean,
+            mean_incremental_bytes: None,
             incremental_count: incremental,
             full_count: full,
             median_full_bytes: None,

@@ -1299,6 +1299,8 @@ mod tests {
             run_id: Some(1),
             notifications_dispatched: true,
             subvolumes: vec![],
+            pools: vec![],
+            drives: vec![],
         }
     }
 

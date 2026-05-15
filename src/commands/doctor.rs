@@ -427,6 +427,7 @@ fn compute_churn_for(
         })
         .unwrap_or(crate::drift::ChurnEstimate {
             mean_bytes_per_second: None,
+            mean_incremental_bytes: None,
             incremental_count: 0,
             full_count: 0,
             median_full_bytes: None,

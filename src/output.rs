@@ -603,6 +603,20 @@ pub fn render_churn(estimate: &crate::drift::ChurnEstimate) -> ChurnRender {
 pub struct ChurnHeartbeatFields {
     pub churn_bytes_per_second: Option<f64>,
     pub last_full_send_bytes: Option<u64>,
+    /// Arithmetic mean of `bytes_transferred` over in-window incrementals.
+    /// Used by UPI 043's pinned-delta computation in `gather_pool_observability`.
+    pub mean_incremental_bytes: Option<u64>,
+}
+
+/// Per-subvolume "extras" populated by `gather_pool_observability` and threaded
+/// to both `heartbeat::build_from_run` and `metrics::write_metrics_after_execution`
+/// so both surfaces share the same `pool_uuid`, `local_snapshot_count`, and
+/// `estimated_local_pinned_delta_bytes` values for a given run (UPI 043).
+#[derive(Debug, Clone, Default)]
+pub struct SubvolumeExtras {
+    pub pool_uuid: Option<String>,
+    pub local_snapshot_count: Option<u32>,
+    pub estimated_local_pinned_delta_bytes: Option<u64>,
 }
 
 /// A single diagnostic check result.
@@ -2032,6 +2046,7 @@ source = "/data/sv2"
     ) -> crate::drift::ChurnEstimate {
         crate::drift::ChurnEstimate {
             mean_bytes_per_second: mean,
+            mean_incremental_bytes: None,
             incremental_count: incr,
             full_count: full,
             median_full_bytes: median_full,
