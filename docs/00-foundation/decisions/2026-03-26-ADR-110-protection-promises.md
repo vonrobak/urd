@@ -389,8 +389,50 @@ This ADR is considered implemented when:
 - [x] Pin-protection safety tests pass with derived retention
 - [ ] Recommendation layer ships and surfaces per-subvolume shape advice (UPI 041 / ADR-115)
 
+## Amendment 2026-05-15: `recorded_external_retention.monthly` correction
+
+UPI 042 corrects an asymmetry in `derive_policy()` that was an oversight, not a designed
+behavior. Under v1 semantics, `monthly = 0` meant "unlimited"; under v2, internal
+construction of `MonthlyCount::Count(0)` means "no monthly retention." The four
+`ResolvedGraduatedRetention` literals in `derive_policy()` are corrected to express their
+*intent* in the new type system:
+
+| Field                                  | v1 literal | v2 type                       | Semantic       |
+|----------------------------------------|------------|-------------------------------|----------------|
+| `recorded_retention.monthly`           | `0`        | `MonthlyCount::Count(0)`      | no monthly     |
+| `full_retention.monthly`               | `12`       | `MonthlyCount::Count(12)`     | 12 months      |
+| `full_external_retention.monthly`      | `0`        | `MonthlyCount::Unlimited`     | unbounded      |
+| `recorded_external_retention.monthly`  | `0`        | `MonthlyCount::Count(0)`      | no monthly     |
+
+The fourth row is the **Branch E correction**. Under v1 semantics, this field rendered as
+"unlimited monthly," matching the third row by accident — not by design. The intent for
+`recorded` (the Recorded protection level) is "no monthly retention" both locally and
+externally; the v1 type system couldn't express that distinction, so the literal was forced
+to a value (`0`) that happened to mean "unlimited" externally.
+
+### Behavior-neutral today
+
+Verified at `plan.rs:470, 511`: when `send_enabled = false` (always true for `recorded`
+under any timer/sentinel mode), `plan_external_retention` is never invoked. The current
+value is dead code in steady state, so the correction is behavior-neutral today.
+
+### Forward-looking safety
+
+If any future variant ever gives Recorded an external send, the *correct* default lands
+("no monthly retention" matching local) rather than the historical accident ("unlimited
+monthly retention" via the v1 type ambiguity). Locking in the correction now avoids
+re-litigating it later under pressure.
+
+### Visible effect
+
+The only user-visible surface affected is `urd doctor --thorough`'s display of a Recorded
+subvolume's external policy shape: it now reads "no monthly" instead of "unlimited monthly."
+Display-only; no retention behavior changes.
+
 ## Related
 
+- ADR-104: Graduated retention (Amendment 2026-05-15 — yearly window, `MonthlyCount` semantics)
+- ADR-105: Backward-compatibility contracts (Amendment 2026-05-15 — `monthly = 0` semantic shift)
 - ADR-111: Config system architecture (governs config structure, versioning, validation)
 - Design: `docs/95-ideas/2026-03-26-design-protection-promises.md`
 - Design review: `docs/99-reports/2026-03-26-protection-promises-design-review.md`

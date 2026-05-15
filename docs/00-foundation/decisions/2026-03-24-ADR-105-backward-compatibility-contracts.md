@@ -91,9 +91,61 @@ are handled by `urd migrate`; data format changes require a migration plan and a
 - Legacy snapshot names will exist on disk indefinitely (old snapshots are not renamed).
   All code that handles snapshot names must support both formats permanently.
 
+## Amendment 2026-05-15: `monthly = 0` semantic shift handled via `urd migrate`
+
+UPI 042 closes the `monthly = 0 → "unlimited"` footgun (v1 silently interpreted `0` as
+unbounded retention, causing accumulation incidents — root cause confirmed in the design's
+arc proposal §I). The semantic shift from "unbounded" to "no monthly retention" is
+preserved by the migration command, not by silent reinterpretation in the parser.
+
+### v1 readers preserve v1 semantics indefinitely
+
+`parse_v1` continues to interpret `monthly = 0` as "unlimited monthly retention" for any
+config carrying `config_version = 1` or omitting the field (legacy). This is non-negotiable:
+breaking it would silently corrupt every existing user's retention behavior.
+
+Implementation: a v1-only shadow type (`V1GraduatedRetention`) keeps `monthly: Option<u32>`,
+and `V1Config::into_config()` performs the explicit mapping:
+
+| v1 input              | Internal representation             |
+|-----------------------|--------------------------------------|
+| `monthly = 0`         | `MonthlyCount::Unlimited`            |
+| `monthly = N` (N > 0) | `MonthlyCount::Count(N)`             |
+| `monthly` omitted     | `None`                               |
+
+The `MonthlyCount::Deserialize` impl introduced in v2 is **strict** (rejects `0` at parse
+time), but it is only invoked on the v2 boundary. The v1 path does not invoke it.
+
+### v2 readers reject `monthly = 0` at parse time
+
+For configs with `config_version = 2`, `monthly = 0` is a parse error (ADR-109 boundary
+validation). v2 users express "no monthly retention" by omitting the field, "unlimited
+retention" by writing `monthly = "unlimited"`, and "N months" by writing `monthly = N`.
+
+### On-disk contracts are unaffected
+
+The four on-disk contracts above — snapshot names, directory structure, pin files, and
+Prometheus metrics — are not touched by this amendment. No metric carries the `monthly`
+value as a label or gauge; no snapshot name format changes; no pin file format changes.
+
+Display strings (e.g., the policy summary rendered by `urd doctor`) are **not** load-bearing
+on-disk formats. The new `monthly = "unlimited"` rendering is a presentation-layer change
+and falls outside the scope of these contracts.
+
+### Migration command
+
+`urd migrate` performs the rewrite: read v1 (or legacy) → emit v2 with every `monthly = 0`
+converted to `monthly = "unlimited"`. The original is preserved verbatim in a `.v1` (or
+`.legacy`) backup file. See ADR-111 Amendment 2026-05-15 for the dispatcher and migration
+command details.
+
 ## Related
 
 - ADR-020: Daily external backups (established the dual pin file format)
+- ADR-104: Graduated retention (Amendment 2026-05-15 — yearly window)
+- ADR-109: Config-boundary validation (v2 rejects `monthly = 0` at parse time)
+- ADR-111: Config system architecture (Amendment 2026-05-15 — `config_version = 2`,
+  migration command, dual-parser dispatcher)
 - [Roadmap](../../96-project-supervisor/roadmap.md) §Backward Compatibility, §Prometheus Metrics
 - [Pre-cutover hardening journal](../../98-journals/2026-03-24-pre-cutover-hardening.md) —
   legacy pin handling refinement

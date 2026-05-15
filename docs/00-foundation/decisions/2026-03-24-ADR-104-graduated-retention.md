@@ -89,9 +89,57 @@ March 2. This prevents the slow drift that accumulates with day-based month appr
 - When `send_enabled` is true, snapshots newer than the oldest pin are protected from
   local retention — they may not have been sent to all drives yet.
 
+## Amendment 2026-05-15: Yearly window
+
+UPI 042 (config schema `v2`) extends the graduated retention stack with a `yearly` tier:
+
+```
+hourly → daily → weekly → monthly → yearly → beyond-window
+```
+
+### Slot key
+
+Yearly's slot key is the calendar year `(year)`. One snapshot survives per calendar year for
+`yearly` years past the monthly cutoff. Calendar-year semantics were chosen for symmetry
+with the calendar-month arithmetic already in `retention.rs` (`Months::new` in the monthly
+cutoff calculation). A snapshot from January 31, 2024 is "1 year old" on January 1, 2025 —
+not on January 31, 2025 — matching how a January-31 snapshot is "1 month old" on February 1.
+
+### Cutoff
+
+The yearly cutoff is computed from the monthly cutoff, subtracting `yearly` calendar years
+(implemented as `Months::new(yearly * 12)`), saturating to `NaiveDateTime::MIN` on overflow.
+
+When the monthly tier is `Unlimited` (see Amendment 2026-05-15 in ADR-105 and the
+`MonthlyCount` enum), the yearly window is **logically subsumed**: every snapshot newer than
+the (non-existent) monthly cutoff is already retained, so a yearly thinning rule has nothing
+left to thin. The retention engine treats yearly as `0` in that case, and `preflight` emits
+an advisory `redundant-yearly` warning so the user sees the redundancy explicitly. The
+recovery-window display likewise suppresses the yearly row when monthly is `Unlimited`, so
+the displayed shape agrees with the engine's behavior.
+
+### Bounded type
+
+`yearly` is `Option<u32>` with no `"unlimited"` variant. The asymmetry with `monthly` is
+deliberate: `monthly = "unlimited"` exists only to preserve a v1 contract (`monthly = 0`
+meant "unlimited" under v1 semantics) via migration. `yearly` is new in v2 and starts
+bounded. A `YearlyCount` enum can be added in a future UPI if evidence demands; today there
+is no v1 contract to preserve and no operational data to justify unbounded yearly retention.
+
+### Recommender scope
+
+The retention shape recommender (`policy::recommend_shape`, UPI 041 / ADR-115) stays
+**4-slot** in this amendment. Yearly is a v2 user opt-in only; the recommender does not
+emit yearly suggestions. A future UPI can expand the recommender to 5 slots with measured
+`RoleParams` once there is evidence of demand. This avoids silently changing UPI 041's
+already-shipped recommendation outputs.
+
 ## Related
 
 - ADR-020: Daily external backups (graduated retention enables quarterly offsite rotation)
 - ADR-103: Interval-based scheduling (frequent snapshots require graduated retention)
+- ADR-105: Backward-compatibility contracts (Amendment 2026-05-15 — `monthly = 0` semantic shift)
+- ADR-111: Config system architecture (Amendment 2026-05-15 — `config_version = 2`)
+- ADR-115: Retention shape symmetry and the recommendation layer (4-slot recommender scope)
 - [Phase 1 journal](../../98-journals/2026-03-22-urd-phase01.md) — retention redesign
 - [Roadmap](../../96-project-supervisor/roadmap.md) — original flat retention specification
