@@ -551,12 +551,99 @@ These govern future config system decisions:
 10. **Space constraints are per-subvolume, not per-filesystem.** Each block declares its own
     threshold. Self-describing over deduplicated.
 
+## Amendment 2026-05-15: `config_version = 2`
+
+UPI 042 extends the dual-parser architecture to a tri-parser dispatcher and introduces
+config schema v2. The schema delta is small (one type widening, one new optional field) but
+the migration is non-negotiable: the v1 `monthly = 0 → unlimited` footgun caused
+accumulation incidents, and v2 closes it at parse time.
+
+### Version dispatcher
+
+`Config::load()` pre-parses `config_version` from `[general]` and dispatches:
+
+| `config_version` | Parser         | Status                              |
+|------------------|----------------|--------------------------------------|
+| absent           | `parse_legacy` | Loadable, deprecated path            |
+| `1`              | `parse_v1`     | Loadable indefinitely                |
+| `2`              | `parse_v2`     | Current                              |
+| other            | error          | `unsupported config_version N (supported: 1, 2)` |
+
+`parse_v1` and `parse_legacy` are not removed. Old configs continue to load forever — the
+"one schema version at a time" principle (#9 above) governs *what `urd` writes*, not what
+it reads.
+
+### v2 schema delta from v1
+
+Two changes, both on retention blocks (`local_retention`, `external_retention`):
+
+1. **`monthly` accepts `u32 > 0` or `"unlimited"`.** `monthly = 0` is a parse error in v2.
+   The internal type is `Option<MonthlyCount>` where `MonthlyCount` is a tagged enum with
+   `Count(u32)` and `Unlimited` variants. See ADR-105 Amendment 2026-05-15 for v1
+   compatibility handling.
+2. **New optional `yearly: u32` field.** See ADR-104 Amendment 2026-05-15 for retention
+   semantics (calendar-year slot key, subsumed by `Unlimited` monthly).
+
+No other v2 deltas. All other v1 structure (named protection levels, `[[subvolumes]]`,
+inline `snapshot_root` / `min_free_bytes`, opaque named levels) carries forward unchanged.
+
+### Migration (`urd migrate`) auto-targets the latest version
+
+`urd migrate` performs a single hop to the latest supported version. Today: legacy → v2,
+v1 → v2, or no-op (already v2). The intermediate legacy → v1 CLI path is removed; users on
+legacy configs migrate directly to v2.
+
+`parse_v1` stays for hand-written configs that someone may still be authoring during the
+soft-deprecation window. The migration command's job is to *retire* v1 in the user's
+filesystem; the parser's job is to *read* whatever the user has.
+
+Migration architecture: **structured parse-munge-render** for both legacy → v2 and v1 → v2.
+The input is parsed into raw structs, the relevant fields are transformed
+(`monthly = 0 → "unlimited"`, `config_version` bumped), and a fresh v2 TOML document is
+emitted. Comments and original formatting are not preserved; the original is saved to a
+`.v1` or `.legacy` backup file verbatim.
+
+### v1 deprecation
+
+Soft notice in `urd doctor` only — one line near the top:
+
+```
+Schema: v1 (current: v2; run `urd migrate` to upgrade)
+```
+
+For legacy configs the line reads `Schema: legacy (current: v2; …)`. For v2 the line is
+suppressed. No stderr warning, no hard cutoff, no friction during automated runs. A future
+UPI may tighten the policy once v2 has soak time.
+
+### Validation
+
+`V2Config::validate_v2()` returns `Result<(), String>` with the same shape as
+`validate_v1`. Rules 1–4 (named-level rejection of `local_retention`,
+`external_retention`, `snapshot_root` and `min_free_bytes` overrides) and the
+Sheltered/Fortified drive checks are copied across to v2.
+
+The **unlimited + yearly redundancy warning** does not live in `validate_v2`. It is an
+advisory check in `preflight.rs` (which is already the advisory layer per the "structure
+at load time, isolate failures at runtime" principle), surfaced via `urd doctor`. This
+keeps `Config::load()`'s signature unchanged — no `Vec<String>` warnings side-channel — and
+avoids rippling call-sites in `main.rs`, `sentinel_runner.rs`, and `commands/default.rs`.
+
+### Implementation isolation
+
+The v2 boundary check (strict `Deserialize` on `MonthlyCount` rejecting `0`) is isolated to
+v2 alone. `parse_v1` uses a v1-only shim (`V1GraduatedRetention` keeps
+`monthly: Option<u32>`), and `V1Config::into_config()` maps to `MonthlyCount` explicitly.
+This is load-bearing: without the isolation, parse_v1 would reject every existing v1 config
+with `monthly = 0`, breaking ADR-105's backward-compatibility contract.
+
 ## Related
 
 - ADR-103: Interval scheduling (defaults inheritance removed)
-- ADR-104: Graduated retention (defaults inheritance removed)
-- ADR-105: Backward compatibility (scoped to data formats, not config schema)
-- ADR-109: Config boundary validation (extended with structural/runtime distinction)
-- ADR-110: Protection promises (override semantics superseded; maturity model added)
+- ADR-104: Graduated retention (defaults inheritance removed; Amendment 2026-05-15 — yearly window)
+- ADR-105: Backward compatibility (scoped to data formats, not config schema; Amendment 2026-05-15 — `monthly = 0` semantic shift)
+- ADR-109: Config boundary validation (extended with structural/runtime distinction; v2 rejects `monthly = 0` at parse time)
+- ADR-110: Protection promises (override semantics superseded; maturity model added; Amendment 2026-05-15 — `recorded_external_retention.monthly` correction)
 - Design: `docs/95-ideas/2026-04-03-design-010-config-schema-v1.md` — full v1 schema design
+- Design: `docs/95-ideas/2026-05-09-design-042-schema-evolution.md` — v2 schema evolution
+- Plan: `docs/97-plans/2026-05-15-plan-042-schema-evolution.md` — v2 implementation plan
 - Journal: `docs/98-journals/2026-03-27-config-design-review.md` — original design discussion

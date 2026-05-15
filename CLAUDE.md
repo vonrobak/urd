@@ -99,18 +99,26 @@ Each references an ADR in `docs/00-foundation/decisions/` with full rationale.
 
 ### Config System (ADR-111)
 
-Dual-parser architecture supporting **legacy** and **v1** schemas. `Config::load()` pre-parses
-`config_version` from `[general]`, then dispatches to `parse_legacy()` (absent) or `parse_v1()`
-(`config_version = 1`). Both produce the same internal `Config` struct — v1 synthesizes
-`LocalSnapshotsConfig` and `DefaultsConfig` so downstream code is schema-agnostic.
+Tri-parser architecture supporting **legacy**, **v1**, and **v2** schemas. `Config::load()`
+pre-parses `config_version` from `[general]`, then dispatches to `parse_legacy()` (absent),
+`parse_v1()` (`config_version = 1`), or `parse_v2()` (`config_version = 2`). All three
+produce the same internal `Config` struct — v1/v2 synthesize `LocalSnapshotsConfig` and
+`DefaultsConfig` so downstream code is schema-agnostic.
 
 - **Legacy:** `[defaults]`, `[local_snapshots]`, `protection_level`, `short_name` required.
 - **v1:** Self-describing `[[subvolumes]]` with inline `snapshot_root`/`min_free_bytes`,
   `protection` field (renamed), `short_name` optional (defaults to `name`), no `[defaults]`
   or `[local_snapshots]`. Named levels are opaque — no operational overrides.
-- **`urd migrate`:** Transforms legacy → v1. Reads raw TOML, builds v1 as string output.
-  Saves backup to `{path}.legacy`. Dispatched as Strategy A (before config load).
-- **Example configs:** `config/urd.toml.example` (legacy), `config/urd.toml.v1.example` (v1).
+  `monthly = 0` means "unlimited monthly retention" (v1 contract preserved indefinitely).
+- **v2:** As v1, plus explicit `monthly = "unlimited"` (string) for unbounded monthly
+  retention; new optional `yearly: u32` retention tier. `monthly = 0` is a parse error
+  (v2 closes the v1 footgun at the parse boundary).
+- **`urd migrate`:** Auto-targets latest version. Today: legacy → v2 or v1 → v2 (single
+  hop). Reads raw TOML, builds v2 as string output. Saves backup to `{path}.legacy` or
+  `{path}.v1`. Comments and original formatting are not preserved (`.v1` / `.legacy`
+  backup is the verbatim source of truth).
+- **Example configs:** `config/urd.toml.example` (legacy), `config/urd.toml.v1.example`
+  (v1), `config/urd.toml.v2.example` (v2).
 
 ### Error Handling
 
@@ -240,6 +248,7 @@ cargo run -- migrate                 # Migrate config to v1 schema
 - Heartbeat: `~/.local/share/urd/heartbeat.json`
 - Example (legacy): `config/urd.toml.example`
 - Example (v1): `config/urd.toml.v1.example`
+- Example (v2): `config/urd.toml.v2.example`
 
 ## ADR Index
 
@@ -249,14 +258,14 @@ cargo run -- migrate                 # Migrate config to v1 schema
 | 101 | BtrfsOps trait | Btrfs abstraction |
 | 102 | Filesystem truth, SQLite history | State management |
 | 103 | Interval-based scheduling | Snapshot/send timing |
-| 104 | Graduated retention | Snapshot lifecycle |
-| 105 | Backward compatibility contracts | On-disk data formats |
+| 104 | Graduated retention (amended 2026-05-15) | Snapshot lifecycle |
+| 105 | Backward compatibility contracts (amended 2026-05-15) | On-disk data formats |
 | 106 | Defense-in-depth data integrity | Pin protection layers |
 | 107 | Fail-open backups, fail-closed deletions | Error philosophy |
 | 108 | Pure-function module pattern | Module design |
 | 109 | Config-boundary validation | Security/correctness |
-| 110 | Protection promises | Promise semantics, maturity model |
-| 111 | Config system architecture | Config structure, versioning (target, not yet implemented) |
+| 110 | Protection promises (amended 2026-05-15) | Promise semantics, maturity model |
+| 111 | Config system architecture (amended 2026-05-15) | Config structure, versioning (target, not yet implemented) |
 | 112 | SemVer and release workflow | Versioning, CHANGELOG, git tags, /release skill |
 | 113 | The Do-No-Harm invariant | Layered, probabilistic defense against Urd-induced host burden |
 | 114 | Structured event log | Typed change-and-decision history; complement to Prometheus gauges and UPI 030 drift_samples |
