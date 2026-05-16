@@ -30,12 +30,28 @@ pub fn run(config: Config, args: DoctorArgs, output_mode: OutputMode) -> anyhow:
             .filter(|s| s.enabled.unwrap_or(true))
             .count();
         let drive_count = config.drives.len();
-        vec![DoctorCheck {
-            name: format!("{subvol_count} subvolumes, {drive_count} drives"),
-            status: DoctorCheckStatus::Ok,
-            detail: None,
-            suggestion: None,
-        }]
+        // UPI 045 R-10: a zero-subvolume config is not "All clear" — it has
+        // nothing to protect. Surface as a config warning so the verdict
+        // becomes Warnings rather than the misleading Healthy.
+        if subvol_count == 0 {
+            warn_count += 1;
+            vec![DoctorCheck {
+                name: "No subvolumes configured.".to_string(),
+                status: DoctorCheckStatus::Warn,
+                detail: Some(
+                    "Add a [[subvolumes]] entry to config.toml — Urd has nothing to back up."
+                        .to_string(),
+                ),
+                suggestion: Some("Edit ~/.config/urd/urd.toml.".to_string()),
+            }]
+        } else {
+            vec![DoctorCheck {
+                name: format!("{subvol_count} subvolumes, {drive_count} drives"),
+                status: DoctorCheckStatus::Ok,
+                detail: None,
+                suggestion: None,
+            }]
+        }
     } else {
         preflight_results
             .iter()

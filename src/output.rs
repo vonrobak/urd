@@ -666,6 +666,11 @@ pub struct DoctorSentinelStatus {
 
 /// Overall verdict from doctor.
 /// Serializes as `{ "status": "healthy", "count": 0 }` for uniform JSON shape.
+///
+/// `count` invariant (UPI 045 R-1 / Step 1.5): the count is a sum across
+/// contributing check categories, not filterable from any single field on
+/// `DoctorOutput`. Constructor signatures carry the count from the build
+/// site (`commands/doctor.rs`). `Healthy` always carries `count: 0`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DoctorVerdict {
     pub status: DoctorVerdictStatus,
@@ -1021,6 +1026,12 @@ pub struct PlanSummaryOutput {
     /// Aggregated estimated bytes across all sends with estimates.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub estimated_total_bytes: Option<u64>,
+    /// Count of enabled subvolumes in the config that produced this plan.
+    /// Used by the plan verdict line to distinguish "nothing to do because
+    /// all subvolumes are sealed" from "nothing to do because no subvolumes
+    /// are configured" (UPI 045 Finding 1).
+    #[serde(default)]
+    pub configured_subvolumes: usize,
 }
 
 // ── EmptyPlanExplanation ───────────────────────────────────────────────
@@ -1569,6 +1580,27 @@ mod tests {
         assert!(matches!(result, ChainHealth::Full(_)));
     }
 
+    // ── DoctorVerdict constructor invariants (UPI 045 R-1 / Step 1.5) ──
+    //
+    // Each variant carries the caller's count; Healthy is always 0. A
+    // future refactor that breaks the constructor signature trips this
+    // before the verdict line lies to a user.
+
+    #[test]
+    fn doctor_verdict_constructors_carry_status_and_count() {
+        use DoctorVerdictStatus::*;
+        let cases = [
+            (DoctorVerdict::healthy(), Healthy, 0),
+            (DoctorVerdict::warnings(3), Warnings, 3),
+            (DoctorVerdict::issues(7), Issues, 7),
+            (DoctorVerdict::degraded(2), Degraded, 2),
+        ];
+        for (verdict, status, count) in cases {
+            assert_eq!(verdict.status, status);
+            assert_eq!(verdict.count, count);
+        }
+    }
+
     // ── RedundancyAdvisory tests ────────────────────────────────────────
 
     #[test]
@@ -1895,6 +1927,7 @@ mod tests {
                 deletions: 0,
                 skipped: 2,
                 estimated_total_bytes: Some(10_000_500_000),
+                configured_subvolumes: 2,
             },
             warnings: vec![],
         };

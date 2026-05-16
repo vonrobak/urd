@@ -348,6 +348,36 @@ mod contract {
     }
 
     #[test]
+    fn rule1_status_recently_unplugged_with_stale_activity_does_not_render_17_days() {
+        // Issue #103 regression at the render layer: an unmounted drive whose
+        // most recent activity was 17 days ago but was physically unplugged
+        // 1h ago must render "1h"/"away" — never "17 days" or "away for 17".
+        // The render-layer cascade (unmounted_drive_label) consults
+        // absent_duration_secs first; this test pins that contract.
+        let _color = color_guard(false);
+        let mut data = test_status_output();
+        unmount_wd18tb(&mut data, Some(3600), Some(17 * 86400));
+        let output = render_status(&data, OutputMode::Interactive);
+        let stripped = helpers::strip_ansi(&output);
+        let drives_line = stripped
+            .lines()
+            .find(|l| l.contains("WD-18TB") && l.starts_with("Drives:"))
+            .unwrap_or_else(|| panic!("no Drives: line for WD-18TB in:\n{stripped}"));
+        assert!(
+            !drives_line.contains("17d") && !drives_line.contains("17 days"),
+            "physical-truth cascade must not surface stale-activity age (17d): {drives_line}"
+        );
+        assert!(
+            !drives_line.contains("away for 17"),
+            "must never render 'away for 17 …' — that's the #103 falsehood: {drives_line}"
+        );
+        assert!(
+            drives_line.contains("away"),
+            "expected 'away' label from the absent_duration_secs branch: {drives_line}"
+        );
+    }
+
+    #[test]
     fn rule1_status_no_data_renders_silent() {
         let _color = color_guard(false);
         let mut data = test_status_output();
@@ -589,16 +619,11 @@ mod contract {
         );
     }
 
-    /// FINDING (Rule 5 violation in current rendering): `render_plan`
-    /// emits "Urd backup plan for {timestamp}" as its first non-blank
-    /// line. The list of operations (or "Nothing to do.") only appears
-    /// after the header. Rule 5 demands the first non-blank line answer
-    /// the question. File as a fast-follow under the "Voice gravity
-    /// audit" UPI alongside the doctor finding (PD-3 / R4). Marked
-    /// `#[ignore]` so the contract is documented without breaking the
-    /// suite.
+    /// Rule 5: `render_plan` first non-blank line answers the question
+    /// ("N operations planned." / "All sealed." / "No backups planned…" /
+    /// "No subvolumes configured."). UPI 045 hoisted the verdict and
+    /// deleted the old "Urd backup plan for {ts}" header.
     #[test]
-    #[ignore = "finding: plan first non-blank line is 'Urd backup plan for {ts}' rather than the operation count or 'Nothing to do.'; fix in voice gravity audit UPI"]
     fn rule5_plan_first_line_contains_operations_or_sealed_or_no_backups() {
         let _color = color_guard(false);
         // Non-empty plan: lifted fixture has 2 operations, 1 send.
@@ -609,11 +634,14 @@ mod contract {
             .next()
             .unwrap_or_else(|| panic!("empty plan output:\n{output}"));
         assert!(
-            first.contains("operations") || first.contains("All sealed") || first.contains("No backups planned"),
-            "first non-blank line of `urd plan` must answer the question \
-             ('operations'/'All sealed'/'No backups planned'), got: {first}"
+            first.contains("operations")
+                || first.contains("All sealed")
+                || first.contains("No backups planned")
+                || first.contains("No subvolumes configured"),
+            "first non-blank line of `urd plan` must answer the question, got: {first}"
         );
-        // Empty plan branch.
+        // Empty plan branch — operations cleared, summary zeroed.
+        // (Zero-subvolume case has its own focused contract test below.)
         let mut empty = test_plan_output();
         empty.operations.clear();
         empty.summary = crate::output::PlanSummaryOutput {
@@ -622,6 +650,7 @@ mod contract {
             deletions: 0,
             skipped: 0,
             estimated_total_bytes: None,
+            configured_subvolumes: 2,
         };
         let output = render_plan(&empty, OutputMode::Interactive);
         let first = helpers::non_blank_lines(&output)
@@ -629,8 +658,8 @@ mod contract {
             .next()
             .unwrap_or_else(|| panic!("empty plan output:\n{output}"));
         assert!(
-            first.contains("operations") || first.contains("All sealed") || first.contains("No backups planned"),
-            "first non-blank line of empty `urd plan` must answer the question, got: {first}"
+            first.contains("All sealed") || first.contains("No backups planned"),
+            "first non-blank line of empty `urd plan` must be the All-sealed verdict, got: {first}"
         );
     }
 
@@ -648,16 +677,12 @@ mod contract {
         );
     }
 
-    /// FINDING (Rule 5 violation in current rendering): `render_doctor`
-    /// emits "Checking Urd health..." as its first non-blank line, then
-    /// the verdict line ("All clear." / "N warnings." / "N issues found.")
-    /// only at the END of the output. Rule 5 demands the first non-blank
-    /// line answer the question. File as a fast-follow under the
-    /// "Voice gravity audit" UPI (PD-3 / R4). Marked `#[ignore]` so the
-    /// contract is documented but the suite is green; remove the
-    /// `#[ignore]` once doctor's verdict is hoisted to the first line.
+    /// Rule 5: `render_doctor` first non-blank line answers the question
+    /// ("All clear." / "N warning(s)." / "N issue(s) found." /
+    /// "N subvolume(s) degraded…"). UPI 045 hoisted the verdict above the
+    /// section blocks; the singular-keyword assertions cover both 1-count
+    /// and N-count plurals via substring match.
     #[test]
-    #[ignore = "finding: doctor first non-blank line is 'Checking Urd health...' rather than the verdict; fix in voice gravity audit UPI"]
     fn rule5_doctor_first_line_is_verdict_or_check_count() {
         let _color = color_guard(false);
         let output = render_doctor(&test_doctor_output(), OutputMode::Interactive);
@@ -666,11 +691,97 @@ mod contract {
             .next()
             .unwrap_or_else(|| panic!("empty doctor output:\n{output}"));
         assert!(
-            first.contains("warnings")
-                || first.contains("checks")
-                || first.contains("All clear"),
+            first.contains("warning")
+                || first.contains("issue")
+                || first.contains("All clear")
+                || first.contains("degraded"),
             "first non-blank line of `urd doctor` must answer the question \
-             ('warnings'/'checks'/'All clear'), got: {first}"
+             ('warning'/'issue'/'All clear'/'degraded'), got: {first}"
+        );
+    }
+
+    #[test]
+    fn rule5_doctor_verdict_variants_render_on_first_line() {
+        use crate::output::DoctorVerdict;
+        let _color = color_guard(false);
+        let cases = [
+            (DoctorVerdict::warnings(3), "3 warning"),
+            (DoctorVerdict::issues(2), "2 issue"),
+            (DoctorVerdict::degraded(1), "degraded"),
+        ];
+        for (verdict, expected) in cases {
+            let mut data = test_doctor_output();
+            data.verdict = verdict;
+            let output = render_doctor(&data, OutputMode::Interactive);
+            let first = helpers::non_blank_lines(&output)
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| panic!("empty doctor output:\n{output}"));
+            assert!(
+                first.contains(expected),
+                "verdict variant must surface '{expected}' on first line, got: {first}"
+            );
+        }
+    }
+
+    #[test]
+    fn rule5_plan_no_backups_all_skipped_renders_verdict() {
+        let _color = color_guard(false);
+        let mut data = test_plan_output();
+        data.operations.clear();
+        // Keep `data.assessments` populated via the canonical fixture so
+        // configured_subvolumes > 0; force the ops-empty + skips-non-empty
+        // branch by leaving one skipped entry in place.
+        data.skipped = vec![crate::output::SkippedSubvolume {
+            name: "htpc-docs".to_string(),
+            reason: "interval not elapsed".to_string(),
+            category: crate::output::SkipCategory::IntervalNotElapsed,
+        }];
+        data.summary = crate::output::PlanSummaryOutput {
+            snapshots: 0,
+            sends: 0,
+            deletions: 0,
+            skipped: 1,
+            estimated_total_bytes: None,
+            configured_subvolumes: 2,
+        };
+        let output = render_plan(&data, OutputMode::Interactive);
+        let first = helpers::non_blank_lines(&output)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("plan output empty:\n{output}"));
+        assert!(
+            first.contains("No backups planned"),
+            "ops-empty + skips-non-empty must render the 'No backups planned' \
+             verdict on line 1, got: {first}"
+        );
+    }
+
+    #[test]
+    fn rule5_plan_zero_subvolumes_renders_no_subvolumes_configured() {
+        // Permanent contract for UPI 045 Finding 1. Without this test, a
+        // future refactor could silently re-introduce "All sealed." on a
+        // zero-subvolume config — a quiet but cardinal trust failure.
+        let _color = color_guard(false);
+        let mut data = test_plan_output();
+        data.operations.clear();
+        data.skipped.clear();
+        data.summary = crate::output::PlanSummaryOutput {
+            snapshots: 0,
+            sends: 0,
+            deletions: 0,
+            skipped: 0,
+            estimated_total_bytes: None,
+            configured_subvolumes: 0,
+        };
+        let output = render_plan(&data, OutputMode::Interactive);
+        let first = helpers::non_blank_lines(&output)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("zero-subvol plan output empty:\n{output}"));
+        assert!(
+            first.contains("No subvolumes configured"),
+            "zero-subvolume verdict must surface 'No subvolumes configured', got: {first}"
         );
     }
 
@@ -736,6 +847,15 @@ mod contract {
              (regression-prevention for UPI 026's false 'blocked' red on a \
              healthy drive); count_red parses both bare \\x1b[31m and \
              compound \\x1b[1;31m / \\x1b[31;1m. Got output:\n{output}"
+        );
+        // UPI 045 R5 extension: the ✗ glyph is itself a load-bearing red
+        // signal even with ANSI stripped — terminals or pipes may erase the
+        // colour. A sealed row must not surface the cross at all.
+        let stripped = helpers::strip_ansi(&output);
+        assert!(
+            !stripped.contains('\u{2717}'),
+            "fully-sealed status output must not surface the ✗ glyph \
+             (it reads as a problem mark even without colour). Got:\n{stripped}"
         );
     }
 
@@ -961,12 +1081,12 @@ mod contract {
         );
     }
 
-    // ── Deferred — Rules 3, 4-drive, 7 (UPI 024+ Voice Evolution) ─────
+    // ── Deferred — Rules 3, 4-drive, 7 (UPI 045-a Voice Evolution pt 2) ──
     //
     // These rules require primitives that don't ship yet (per-status
     // time-aware label tiers, sentinel→awareness→voice drive-event ack,
     // last-shown-N-runs-ago state). The stubs document the intended
-    // assertions so future-us can fill them in once UPI 024+ lands.
+    // assertions so future-us can fill them in once UPI 045-a lands.
     //
     // `unimplemented!()` is used over `todo!()` per F7 — same panic
     // semantics, but signals "this isn't on the current TODO list" more
@@ -974,26 +1094,26 @@ mod contract {
     // by design.
 
     #[test]
-    #[ignore = "Unblocked by UPI 024+ Voice Evolution (Phase 2: time-aware messaging)"]
+    #[ignore = "Unblocked by UPI 045-a Voice Evolution pt 2 (time-aware messaging)"]
     fn rule3_repeated_advisory_must_change_language_or_position() {
-        // When 024+ ships per-status time-aware label tiers, render two
+        // When 045-a ships per-status time-aware label tiers, render two
         // consecutive status outputs with the same advisory and assert
         // the second's wording differs from the first.
-        unimplemented!("UPI 024+ Voice Evolution — see voice_contract.rs header");
+        unimplemented!("UPI 045-a Voice Evolution pt 2 — see voice_contract.rs header");
     }
 
     #[test]
-    #[ignore = "Unblocked by UPI 024+ Voice Evolution (sentinel→awareness→voice path)"]
+    #[ignore = "Unblocked by UPI 045-a Voice Evolution pt 2 (sentinel→awareness→voice path)"]
     fn rule4_drive_reconnect_after_absence_acks_the_event() {
-        // When 024+ wires drive-event acknowledgement through awareness,
+        // When 045-a wires drive-event acknowledgement through awareness,
         // simulate a drive reconnect after absence and assert the next
         // backup summary calls out the reconnection (e.g. "WD-18TB
         // returned").
-        unimplemented!("UPI 024+ Voice Evolution — see voice_contract.rs header");
+        unimplemented!("UPI 045-a Voice Evolution pt 2 — see voice_contract.rs header");
     }
 
     #[test]
-    #[ignore = "Unblocked by UPI 024+ or beyond (last-shown N runs ago state)"]
+    #[ignore = "Unblocked by UPI 045-a or beyond (last-shown N runs ago state)"]
     fn rule7_repeated_advisory_must_be_suppressed_when_unchanged() {
         // When the last-shown-N-runs-ago state ships, render the same
         // advisory across multiple consecutive runs and assert it
