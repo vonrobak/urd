@@ -332,3 +332,196 @@ ADRs:
 - **Arc proposal:** `docs/95-ideas/2026-05-09-arc-proposal-retention-symmetry.md`
 - **X1 design:** `docs/95-ideas/2026-05-09-design-041-recommendation-mvp.md`
 - **Evidence base:** `docs/99-reports/2026-05-09-retention-tuning-from-real-world-data.md`
+
+## Amendment 2026-05-16 — Headroom-aware recommendations (UPI 044, X4)
+
+UPI 044 ships X4 of the retention-symmetry arc: when storage signals
+indicate the source pool is shrinking or a destination's metadata is
+pressured, the recommendation engine surfaces an **adjustment note** —
+and in the Pressure tier, also a **tightened shape** — alongside the
+original churn-fit suggestion. The output stays advisory; UPI 031 owns
+the imperative path. Per-subvolume per-role severity (Healthy / Caution
+/ Pressure / Critical) replaces the X1 single-shape output.
+
+### Scope clarification (D1)
+
+UPI 044 is **headroom-only**. The earlier "metadata cost model" framing
+in this ADR (lines 11, 106–107, 215–216, 308–309) is rescinded:
+
+- Lines 11 / 106–107 / 215–216 / 308–309 each describe UPI 044 as the
+  metadata-cost-model UPI. Replace with: "UPI 044 ships headroom-aware
+  recommendations. A separate UPI (TBD) ships the metadata cost model."
+
+The metadata cost model remains valuable future work — it just isn't UPI
+044. Today's pressure signal uses observed metadata utilization ratio
+directly, not a forward-projected metadata cost.
+
+### Headroom substance (D2–D18)
+
+**Severity classification (D7).** A pure function
+`classify_headroom_severity(HeadroomContext) -> HeadroomSeverity` takes
+three signals — source-pool free ratio, source-pool time-to-empty (from
+the 7-day shrink trend), destination-metadata utilization ratio — and
+returns the max-of-triggers severity. Healthy < Caution < Pressure <
+Critical. Critical is **not** in the classify domain; doctor.rs injects
+it externally (see D10/D14).
+
+**Thresholds (D5).** Committed in code, not config (per Invariant 3).
+
+| Signal                         | Caution     | Pressure    |
+|--------------------------------|-------------|-------------|
+| Source-pool free ratio         | `< 25%`     | `< 15%`     |
+| Source-pool time-to-empty      | `< 90 days` | `< 30 days` |
+| Destination metadata ratio     | `> 85%`     | `> 92%`     |
+
+The boundary is strict (`<` / `>`); exact-threshold values map to the
+lower tier.
+
+**Tightening rule (D6).** When severity is Pressure, the engine
+multiplies the recommended shape's hourly/daily/weekly/monthly slot
+counts by `HEADROOM_TIGHTEN_MULTIPLIER = 0.7` (floor-rounded, re-clamped
+to `[clamp_min, clamp_max]`). The result is exposed as the
+recommendation's `adjusted` field. Monthly stays `Count(n)`; yearly
+stays `0`. The tightened shape's cost projection (`adjusted_cost`) is
+emitted alongside so the voice layer's "recover ~X" tail matches what
+it renders (Rule 1).
+
+**AdjustmentReason taxonomy + priority tiebreak (D8).** When multiple
+signals fire at the same severity, the reason carried on the
+recommendation row resolves by priority:
+
+```
+DestinationMetadataPressure  >  SourcePoolLow  >  SourcePoolShrinking
+```
+
+Each variant embeds the numeric value that drove it (free_ratio,
+days_to_empty, ratio + drive_label). `StorageCritical` is its own
+variant injected when `is_storage_critical(name)` fires.
+
+**UPI 031 coordination contract (D10, refined D14).** UPI 044 ships
+`src/storage_critical.rs` with a stub
+`is_storage_critical(subvolume: &str) -> bool { false }`. UPI 031 will
+later replace the body with its chosen truth source (sentinel state,
+event log, or per-destination predicate). Doctor injects the predicate
+as a closure into `build_doctor_recommendation_view_inner` so tests can
+substitute, and so signature changes propagate to a single call site.
+The stub takes no `state_db` argument and no other state — the simplest
+possible shape that UPI 031 can widen without breaking callers.
+
+**Per-role placement (D18).** Severity, reason, and adjusted shape live
+on each `HeadroomAwareRecommendation` (one per role) — not on the row.
+Local and External roles see different `HeadroomContext` inputs (Local
+sees source-pool signals only; External sees both source-pool and
+destination-metadata signals — D15), so per-role placement is correct
+both modeling-wise and rendering-wise.
+
+**Trend computation (D17).** A pure function
+`drift::compute_pool_free_bytes_trend(samples, window, now, min_sample_days)`
+performs a linear regression on `source_free_bytes` across all samples
+from all subvolumes on a pool (the **union** is implicit — the caller
+passes samples from every subvol on the pool). Returns `Some(slope
+bytes/day)` when at least `min_sample_days` distinct calendar days are
+covered; `None` otherwise. No per-subvolume dedup — the noise from
+intra-day jitter is absorbed by the regression's slope estimator.
+
+**Role-conditional context (D15).** `HeadroomContext` is built per
+(subvolume, role) pair. Local row's context omits
+`destination_metadata_ratio` (the row is about source-pool retention,
+not destination). External row's context includes the max-of-mounted
+destination metadata ratio plus the corresponding drive label. (R4: the
+label is `DriveConfig.label` verbatim — matches what `urd status` and
+notifications surface.)
+
+**Silence interaction matrix (D16).** UPI 041 silenced rows where
+`suggested == current` and there was no headroom signal. UPI 044
+preserves that silence but escalates Pressure and Critical: even if the
+shape recommendation is silent, a row appears for those tiers to carry
+the adjustment note. Caution does not escalate (silence wins).
+
+| Shape-quiet (UPI 041) | Headroom severity | Row emitted? |
+|-----------------------|-------------------|--------------|
+| Yes                   | Healthy           | No           |
+| Yes                   | Caution           | No           |
+| Yes                   | Pressure          | **Yes** (synth) |
+| Yes                   | Critical          | **Yes** (synth) |
+| No                    | any               | Yes          |
+
+**`PoolSpace` helper (D13).** `pools.rs` exposes `PoolSpace { free_bytes,
+capacity_bytes }` and `pool_space(&Path) -> Result<PoolSpace>` — one
+statvfs call yielding both numbers. The pre-UPI-044 `pool_free_bytes()`
+becomes a thin wrapper. Capacity is the new dependency: the
+`source_pool_free_ratio` signal needs both numerator and denominator
+from the same syscall.
+
+### Critical / Pressure-at-MIN synth path (R1)
+
+When the churn-fit engine returns `None` (no churn signal — cold/
+transient subvolume), severity in `{Pressure, Critical}` requires a
+row anyway to surface the headroom message. Doctor.rs synthesizes a
+minimal `HeadroomAwareRecommendation` via
+`policy::headroom_aware_pointer_only(...)`: `suggested == current`,
+both `current_cost` and `suggested_cost` set to `CostProjection {
+data_bytes: 0, snapshot_count: 0 }`, `adjusted = None`,
+`adjusted_cost = None`. The voice renderer detects the synth shape
+(both costs zero AND suggested == current) and renders only the
+reason line — no numeric tail, no shape line. The same path handles
+**Pressure-at-MIN** (severity is Pressure but the engine couldn't
+tighten further because the shape was already at `clamp_min`): the
+renderer says "shape already at minimum; consider expanding storage."
+
+### Doctor JSON schema bump (R3)
+
+`urd doctor [--thorough] --json` output gains a top-level
+`schema_version: u32` field. v1 retroactively names the pre-UPI-044
+shape (rows' `local`/`external` typed as `ShapeRecommendation`); v2
+names the post-UPI-044 shape (typed as `HeadroomAwareRecommendation`
+with nested `.recommendation` plus new `severity`, `reason`,
+`adjusted`, `adjusted_cost` fields). Future breaking JSON shape
+changes bump `schema_version` and are CHANGELOG-noted.
+
+This formalizes `urd doctor` output alongside heartbeat
+(`heartbeat.json`) and Prometheus textfile contracts (ADR-105 §
+"Backward Compatibility"). `--json` consumers should read
+`schema_version` and either branch on it or pin a supported value.
+
+### Limitations and 30-day evidence checkpoint (R7)
+
+The threshold numbers (25%/15% free, 90/30 days time-to-empty,
+0.85/0.92 metadata, 0.7 tightening multiplier) are **N=1-calibrated**
+from the 2026-05-09 retention-tuning report. The post-UPI-044 30-day
+evidence checkpoint owns:
+
+1. **Threshold flap monitoring.** If the Caution/Healthy boundary
+   produces visible flapping under boundary conditions in
+   `urd doctor --thorough` runs (e.g., free ratio oscillating around
+   25%), the boundary needs hysteresis or widened spacing. Hysteresis
+   is the more honest fix and the natural home is UPI 031's state
+   machine, **not** `policy.rs` (policy.rs is pure; hysteresis is
+   stateful). UPI 031's predicate eventually owns "is this subvolume
+   currently in storage_critical?" — extending it to "is this
+   subvolume currently in headroom_pressure?" is the right next step
+   if flapping is observed.
+2. **Pressure tightening multiplier.** If Pressure recommendations
+   prove too aggressive (users dismiss them) or too conservative
+   (users still hit storage_critical), revise `0.7` upward or
+   downward respectively.
+3. **Metadata threshold revision.** If the 0.85/0.92 numbers fire
+   too often on healthy filesystems or too rarely on stressed ones,
+   revise. Cross-check against the future metadata cost model when
+   it ships.
+
+The checkpoint deliverable is an ADR-115 amendment, not a new ADR.
+
+### Not in scope for UPI 044
+
+- **Verdict coupling.** `urd doctor` verdict (`Ok` / `Warn` / `Fail`)
+  is unchanged by UPI 044. Headroom severity is presented per-row, not
+  rolled up. If the user wants the verdict to surface storage pressure,
+  the proper home is UPI 031's storage_critical bundle.
+- **Per-drive recommended shapes.** A subvolume sent to multiple drives
+  still gets one External recommendation, not one per drive. The
+  metadata ratio is max-of-mounted-drives; the drive label embedded in
+  the reason is the worst-offending drive.
+- **User-tunable thresholds.** Per Invariant 3 (no `[recommendations]`
+  config section). Friction floor remains "ignore the suggestion."
+- **Auto-apply.** Long-term north star; future arc.

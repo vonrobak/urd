@@ -147,8 +147,19 @@ pub fn group_subvolumes_by_pool(
     by_uuid.into_values().collect()
 }
 
-/// Free bytes on a BTRFS pool by mountpoint (statvfs). Returns `Err` on
-/// statvfs failure; caller maps `Err` → `None` for emission. Same pattern as
+/// Free and capacity bytes on a BTRFS pool by mountpoint (one statvfs
+/// call). Capacity is `blocks * fragment_size`; free is `blocks_available
+/// * fragment_size`. UPI 044 needs the ratio of the two; the pre-existing
+/// `pool_free_bytes()` is a thin wrapper.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PoolSpace {
+    pub free_bytes: u64,
+    pub capacity_bytes: u64,
+}
+
+/// Capacity + free bytes on a BTRFS pool by mountpoint (statvfs). One
+/// syscall, two numbers. Returns `Err` on statvfs failure; caller maps
+/// `Err` → `None` for emission. Same pattern as
 /// `drives::filesystem_free_bytes`.
 ///
 /// TOCTOU note (M-2): callers typically pair this with a prior
@@ -158,12 +169,22 @@ pub fn group_subvolumes_by_pool(
 /// filesystem. The race window is too narrow to justify re-verification
 /// complexity; downstream consumers (heartbeat, Prometheus) treat the
 /// snapshot as point-in-time and tolerate one-run discrepancies.
-pub fn pool_free_bytes(mountpoint: &Path) -> crate::error::Result<u64> {
+#[must_use = "PoolSpace carries both free and capacity; discard intentionally"]
+pub fn pool_space(mountpoint: &Path) -> crate::error::Result<PoolSpace> {
     let stat = nix::sys::statvfs::statvfs(mountpoint).map_err(|e| UrdError::Io {
         path: mountpoint.to_path_buf(),
         source: std::io::Error::other(e.to_string()),
     })?;
-    Ok(stat.blocks_available() * stat.fragment_size())
+    Ok(PoolSpace {
+        free_bytes: stat.blocks_available() * stat.fragment_size(),
+        capacity_bytes: stat.blocks() * stat.fragment_size(),
+    })
+}
+
+/// Free bytes on a BTRFS pool by mountpoint (statvfs). Thin wrapper around
+/// `pool_space()` preserved for callers that only need the free side.
+pub fn pool_free_bytes(mountpoint: &Path) -> crate::error::Result<u64> {
+    pool_space(mountpoint).map(|s| s.free_bytes)
 }
 
 /// Metadata utilization ratio (0.0–1.0) for a BTRFS filesystem, from sysfs
@@ -455,6 +476,52 @@ mod tests {
         }];
         let metrics = compute_pool_metrics_from(&[], &drives, |_| Some(0), |_| None);
         assert!(metrics.is_empty());
+    }
+
+    #[test]
+    fn pool_space_returns_struct_with_both_fields_from_statvfs() {
+        let tmp = TempDir::new().unwrap();
+        let space = pool_space(tmp.path()).expect("tmp dir filesystem must support statvfs");
+        // The host's /tmp filesystem must have some capacity and some free
+        // space. Both fields populated from the same syscall, so neither
+        // should be zero on a real system.
+        assert!(
+            space.capacity_bytes > 0,
+            "expected nonzero capacity_bytes, got {}",
+            space.capacity_bytes
+        );
+        assert!(
+            space.free_bytes <= space.capacity_bytes,
+            "free ({}) must be <= capacity ({})",
+            space.free_bytes,
+            space.capacity_bytes
+        );
+    }
+
+    #[test]
+    fn pool_free_bytes_wrapper_returns_pool_space_free() {
+        let tmp = TempDir::new().unwrap();
+        let space = pool_space(tmp.path()).expect("statvfs ok");
+        let free = pool_free_bytes(tmp.path()).expect("wrapper ok");
+        // Run back-to-back; tolerate tiny drift from concurrent writes by
+        // requiring the wrapper's number stay within 1% of the struct's
+        // free side. In practice on a quiet tmp dir they are identical.
+        let diff = space.free_bytes.abs_diff(free);
+        assert!(
+            diff < (space.free_bytes / 100).max(4096),
+            "pool_free_bytes ({free}) diverged from pool_space.free_bytes ({})",
+            space.free_bytes
+        );
+    }
+
+    #[test]
+    fn pool_space_errors_on_nonexistent_path() {
+        let bogus = Path::new("/no/such/path/should/exist/for/urd/tests");
+        let err = pool_space(bogus).expect_err("nonexistent path must fail");
+        match err {
+            UrdError::Io { path, .. } => assert_eq!(path, bogus.to_path_buf()),
+            other => panic!("expected Io error, got {other:?}"),
+        }
     }
 
     #[test]

@@ -969,7 +969,9 @@ mod contract {
     // ── Rule 1 / 5 / 7 — Recommendations section (UPI 041) ──────────────
 
     fn recommendation_row_with_recovery() -> crate::output::DoctorRecommendationRow {
-        use crate::policy::{CostProjection, ShapeRecommendation, ShapeRole};
+        use crate::policy::{
+            CostProjection, HeadroomAwareRecommendation, ShapeRecommendation, ShapeRole,
+        };
         use crate::types::ResolvedGraduatedRetention as Shape;
         let current = Shape {
             hourly: 24,
@@ -987,20 +989,22 @@ mod contract {
         };
         crate::output::DoctorRecommendationRow {
             name: "containers".to_string(),
-            local: Some(ShapeRecommendation {
-                role: ShapeRole::Local,
-                current,
-                suggested,
-                current_cost: CostProjection {
-                    data_bytes: 200_000_000_000,
-                    snapshot_count: 92,
+            local: Some(HeadroomAwareRecommendation::healthy_from(
+                ShapeRecommendation {
+                    role: ShapeRole::Local,
+                    current,
+                    suggested,
+                    current_cost: CostProjection {
+                        data_bytes: 200_000_000_000,
+                        snapshot_count: 92,
+                    },
+                    suggested_cost: CostProjection {
+                        data_bytes: 50_000_000_000,
+                        snapshot_count: 11,
+                    },
+                    note: None,
                 },
-                suggested_cost: CostProjection {
-                    data_bytes: 50_000_000_000,
-                    snapshot_count: 11,
-                },
-                note: None,
-            }),
+            )),
             external: None,
             note: None,
             was_named_level: None,
@@ -1078,6 +1082,312 @@ mod contract {
         assert!(
             !stripped.contains("Recommendations"),
             "Rule 7 violation: Recommendations header emitted with empty rows: {stripped}"
+        );
+    }
+
+    // ── UPI 044 — Rule 6 (gravity) + Rule 1 (no falsehoods) ──────────
+
+    fn critical_row(name: &str) -> crate::output::DoctorRecommendationRow {
+        use crate::policy::{
+            headroom_aware_pointer_only, AdjustmentReason, HeadroomSeverity, ShapeRole,
+        };
+        use crate::types::{MonthlyCount, ResolvedGraduatedRetention};
+        let cur = ResolvedGraduatedRetention {
+            hourly: 24,
+            daily: 60,
+            weekly: 52,
+            monthly: MonthlyCount::Count(24),
+            yearly: 0,
+        };
+        let h = headroom_aware_pointer_only(
+            &cur,
+            ShapeRole::Local,
+            HeadroomSeverity::Critical,
+            AdjustmentReason::StorageCritical,
+        );
+        crate::output::DoctorRecommendationRow {
+            name: name.to_string(),
+            local: Some(h),
+            external: None,
+            note: None,
+            was_named_level: None,
+        }
+    }
+
+    fn caution_row_low_free(name: &str, free_ratio: f64) -> crate::output::DoctorRecommendationRow {
+        use crate::policy::{
+            AdjustmentReason, CostProjection, HeadroomAwareRecommendation, HeadroomSeverity,
+            ShapeRecommendation, ShapeRole,
+        };
+        use crate::types::{MonthlyCount, ResolvedGraduatedRetention};
+        let current = ResolvedGraduatedRetention {
+            hourly: 24,
+            daily: 30,
+            weekly: 26,
+            monthly: MonthlyCount::Count(12),
+            yearly: 0,
+        };
+        let suggested = ResolvedGraduatedRetention {
+            hourly: 0,
+            daily: 7,
+            weekly: 4,
+            monthly: MonthlyCount::Count(0),
+            yearly: 0,
+        };
+        let h = HeadroomAwareRecommendation {
+            recommendation: ShapeRecommendation {
+                role: ShapeRole::Local,
+                current,
+                suggested,
+                current_cost: CostProjection {
+                    data_bytes: 200_000_000_000,
+                    snapshot_count: 92,
+                },
+                suggested_cost: CostProjection {
+                    data_bytes: 50_000_000_000,
+                    snapshot_count: 11,
+                },
+                note: None,
+            },
+            severity: HeadroomSeverity::Caution,
+            reason: Some(AdjustmentReason::SourcePoolLow { free_ratio }),
+            adjusted: None,
+            adjusted_cost: None,
+        };
+        crate::output::DoctorRecommendationRow {
+            name: name.to_string(),
+            local: Some(h),
+            external: None,
+            note: None,
+            was_named_level: None,
+        }
+    }
+
+    #[test]
+    fn rule6_critical_severity_row_renders_no_shape_and_no_red() {
+        // Rule 6: gravity calibration. A Critical recommendation row is a
+        // pointer to UPI 031's surface — it must not borrow alarm
+        // semantics (red text, ✗ glyphs) since the loud surface lives
+        // elsewhere.
+        let _color = color_guard(false);
+        let view = crate::output::DoctorRecommendationView {
+            header: "header".to_string(),
+            rows: vec![critical_row("crit-sv")],
+        };
+        let output = render_doctor(
+            &recommendations_doctor_output(view),
+            OutputMode::Interactive,
+        );
+        let stripped = helpers::strip_ansi(&output);
+        // No shape line on the row.
+        assert!(!stripped.contains("daily="), "Critical row leaked shape: {stripped}");
+        // No red SGR escapes on the row line.
+        for line in output.lines() {
+            if line.contains("crit-sv") || line.contains("storage critical") {
+                assert_eq!(
+                    helpers::count_red(line),
+                    0,
+                    "Rule 6 violation: Critical row line uses red: {line}"
+                );
+            }
+        }
+        // No ✗ glyph on the row.
+        for line in stripped.lines() {
+            if line.contains("crit-sv") || line.contains("storage critical") {
+                assert!(
+                    !line.contains('✗'),
+                    "Rule 6 violation: Critical row line uses ✗ glyph: {line}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rule6_caution_severity_does_not_borrow_pressure_or_critical_language() {
+        // Rule 6: A Caution row's prose must not borrow the louder tiers'
+        // language — no "tightened", no "critical" / "emergency" / "danger".
+        let _color = color_guard(false);
+        let view = crate::output::DoctorRecommendationView {
+            header: "header".to_string(),
+            rows: vec![caution_row_low_free("caut-sv", 0.20)],
+        };
+        let output = render_doctor(
+            &recommendations_doctor_output(view),
+            OutputMode::Interactive,
+        );
+        let stripped = helpers::strip_ansi(&output);
+        assert!(
+            stripped.contains("applying sooner"),
+            "Caution must use the recommended-action phrasing: {stripped}"
+        );
+        for forbidden in &["tightened", "critical", "emergency", "danger"] {
+            assert!(
+                !stripped.to_lowercase().contains(forbidden),
+                "Rule 6 violation: Caution row borrows '{forbidden}' from louder tier: {stripped}"
+            );
+        }
+        for line in output.lines() {
+            if line.contains("caut-sv") || line.contains("source pool") {
+                assert_eq!(
+                    helpers::count_red(line),
+                    0,
+                    "Rule 6: Caution row line uses red: {line}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rule7_all_healthy_aligned_shapes_keeps_section_omitted() {
+        // Regression: an empty `rows` vec produces no section. Mirrors
+        // existing Rule 7 test but reinforces the "all-Healthy" subcase.
+        let _color = color_guard(false);
+        let view = crate::output::DoctorRecommendationView {
+            header: "header".to_string(),
+            rows: vec![],
+        };
+        let output = render_doctor(
+            &recommendations_doctor_output(view),
+            OutputMode::Interactive,
+        );
+        let stripped = helpers::strip_ansi(&output);
+        assert!(
+            !stripped.contains("Recommendations"),
+            "All-Healthy / empty rows must omit section header: {stripped}"
+        );
+    }
+
+    #[test]
+    fn rule1_rendered_adjustment_numeric_values_match_reason_data() {
+        // Rule 1: the percentage shown in the reason line must reflect
+        // the embedded numeric (no inflation, no rounding to nearest tier).
+        let _color = color_guard(false);
+        let view = crate::output::DoctorRecommendationView {
+            header: "header".to_string(),
+            rows: vec![caution_row_low_free("ratio-sv", 0.18)],
+        };
+        let output = render_doctor(
+            &recommendations_doctor_output(view),
+            OutputMode::Interactive,
+        );
+        let stripped = helpers::strip_ansi(&output);
+        assert!(
+            stripped.contains("18%"),
+            "rendered reason must contain '18%' for free_ratio=0.18: {stripped}"
+        );
+    }
+
+    #[test]
+    fn rule1_rendered_adjustment_rounds_consistently_at_boundary() {
+        // Locks the {:.0} rounding behavior so format-spec drift is caught.
+        let _color = color_guard(false);
+        let view_low = crate::output::DoctorRecommendationView {
+            header: "header".to_string(),
+            rows: vec![caution_row_low_free("low-sv", 0.184)],
+        };
+        let view_high = crate::output::DoctorRecommendationView {
+            header: "header".to_string(),
+            rows: vec![caution_row_low_free("high-sv", 0.186)],
+        };
+        let low_out = render_doctor(
+            &recommendations_doctor_output(view_low),
+            OutputMode::Interactive,
+        );
+        let high_out = render_doctor(
+            &recommendations_doctor_output(view_high),
+            OutputMode::Interactive,
+        );
+        let low_stripped = helpers::strip_ansi(&low_out);
+        let high_stripped = helpers::strip_ansi(&high_out);
+        assert!(
+            low_stripped.contains("18%"),
+            "0.184 must round to 18%: {low_stripped}"
+        );
+        assert!(
+            high_stripped.contains("19%"),
+            "0.186 must round to 19%: {high_stripped}"
+        );
+    }
+
+    #[test]
+    fn rule1_pressure_recovery_delta_matches_rendered_shape() {
+        // R2: the rendered "recover ~..." must use the tightened-shape
+        // cost, not the suggested-shape cost. Otherwise the number lies
+        // about what shape is actually being shown.
+        use crate::policy::{
+            AdjustmentReason, CostProjection, HeadroomAwareRecommendation, HeadroomSeverity,
+            ShapeRecommendation, ShapeRole,
+        };
+        use crate::types::{MonthlyCount, ResolvedGraduatedRetention};
+        let _color = color_guard(false);
+        let current = ResolvedGraduatedRetention {
+            hourly: 24,
+            daily: 30,
+            weekly: 26,
+            monthly: MonthlyCount::Count(12),
+            yearly: 0,
+        };
+        let suggested = ResolvedGraduatedRetention {
+            hourly: 24,
+            daily: 60,
+            weekly: 52,
+            monthly: MonthlyCount::Count(24),
+            yearly: 0,
+        };
+        let adjusted = ResolvedGraduatedRetention {
+            hourly: 16,
+            daily: 42,
+            weekly: 36,
+            monthly: MonthlyCount::Count(16),
+            yearly: 0,
+        };
+        let h = HeadroomAwareRecommendation {
+            recommendation: ShapeRecommendation {
+                role: ShapeRole::Local,
+                current,
+                suggested,
+                current_cost: CostProjection {
+                    data_bytes: 200_000_000_000,
+                    snapshot_count: 92,
+                },
+                suggested_cost: CostProjection {
+                    data_bytes: 50_000_000_000,
+                    snapshot_count: 160,
+                },
+                note: None,
+            },
+            severity: HeadroomSeverity::Pressure,
+            reason: Some(AdjustmentReason::SourcePoolLow { free_ratio: 0.10 }),
+            adjusted: Some(adjusted),
+            adjusted_cost: Some(CostProjection {
+                data_bytes: 25_000_000_000,
+                snapshot_count: 110,
+            }),
+        };
+        let row = crate::output::DoctorRecommendationRow {
+            name: "x".to_string(),
+            local: Some(h),
+            external: None,
+            note: None,
+            was_named_level: None,
+        };
+        let view = crate::output::DoctorRecommendationView {
+            header: "header".to_string(),
+            rows: vec![row],
+        };
+        let output = render_doctor(
+            &recommendations_doctor_output(view),
+            OutputMode::Interactive,
+        );
+        let stripped = helpers::strip_ansi(&output);
+        // current=200 GB, adjusted=25 GB → 175 GB recovered.
+        assert!(
+            stripped.contains("175.0GB") || stripped.contains("175 GB"),
+            "Rule 1 violation: recovery must match rendered (tightened) shape (~175 GB): {stripped}"
+        );
+        assert!(
+            !stripped.contains("150.0GB") && !stripped.contains("150 GB"),
+            "Rule 1 violation: recovery used suggested_cost (~150 GB) instead of adjusted_cost: {stripped}"
         );
     }
 

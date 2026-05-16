@@ -24,6 +24,127 @@ use serde::Serialize;
 use crate::drift::ChurnEstimate;
 use crate::types::ResolvedGraduatedRetention;
 
+// ── UPI 044 thresholds (ADR-115 amendment 2026-05-16) ─────────────────
+// N=1-calibrated from the 2026-05-09 retention-tuning report. Soft —
+// post-UPI-044 30-day checkpoint revises (ADR amendment, not new ADR).
+// Boundaries are strict (`<` / `>`): exact-threshold values land in the
+// lower tier (e.g., free_ratio == 0.25 → Healthy).
+
+const FREE_RATIO_CAUTION: f64 = 0.25;
+const FREE_RATIO_PRESSURE: f64 = 0.15;
+const TIME_TO_EMPTY_CAUTION_DAYS: f64 = 90.0;
+const TIME_TO_EMPTY_PRESSURE_DAYS: f64 = 30.0;
+const METADATA_CAUTION: f64 = 0.85;
+const METADATA_PRESSURE: f64 = 0.92;
+
+/// Pressure-tier multiplier for the tightened shape (UPI 044). Floor-
+/// rounded and re-clamped to `[clamp_min, clamp_max]` after multiplication.
+pub const HEADROOM_TIGHTEN_MULTIPLIER: f64 = 0.7;
+
+/// Inputs to the headroom severity classifier (UPI 044). Local rows carry
+/// source-pool signals only (`destination_metadata_ratio = None`);
+/// External rows carry the max-of-mounted destination metadata ratio in
+/// addition (D15).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct HeadroomContext {
+    pub source_pool_free_bytes: Option<u64>,
+    pub source_pool_capacity_bytes: Option<u64>,
+    pub source_pool_trend_bytes_per_day: Option<i64>,
+    pub destination_metadata_ratio: Option<f64>,
+}
+
+/// Per-(subvolume, role) headroom severity (UPI 044). Ordering is
+/// load-bearing: `.iter().max()` yields the dominant tier when multiple
+/// signals fire. Critical is **not** in the classifier's output domain
+/// — doctor.rs injects it externally based on
+/// `storage_critical::is_storage_critical`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HeadroomSeverity {
+    Healthy,
+    Caution,
+    Pressure,
+    Critical,
+}
+
+/// Compute the headroom severity from a `HeadroomContext`. Returns only
+/// `Healthy | Caution | Pressure` — Critical is injected externally by
+/// doctor.rs. Three signals (free ratio, time-to-empty, metadata) are
+/// classified independently and the max is returned.
+#[must_use]
+pub fn classify_headroom_severity(ctx: HeadroomContext) -> HeadroomSeverity {
+    let free_ratio_sev = classify_free_ratio(
+        ctx.source_pool_free_bytes,
+        ctx.source_pool_capacity_bytes,
+    );
+    let time_to_empty_sev = classify_time_to_empty(
+        ctx.source_pool_free_bytes,
+        ctx.source_pool_trend_bytes_per_day,
+    );
+    let metadata_sev = classify_metadata(ctx.destination_metadata_ratio);
+
+    [free_ratio_sev, time_to_empty_sev, metadata_sev]
+        .into_iter()
+        .max()
+        .unwrap_or(HeadroomSeverity::Healthy)
+}
+
+fn classify_free_ratio(free: Option<u64>, capacity: Option<u64>) -> HeadroomSeverity {
+    let (Some(free), Some(capacity)) = (free, capacity) else {
+        return HeadroomSeverity::Healthy;
+    };
+    if capacity == 0 {
+        return HeadroomSeverity::Healthy;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let ratio = free as f64 / capacity as f64;
+    if !ratio.is_finite() {
+        return HeadroomSeverity::Healthy;
+    }
+    if ratio < FREE_RATIO_PRESSURE {
+        HeadroomSeverity::Pressure
+    } else if ratio < FREE_RATIO_CAUTION {
+        HeadroomSeverity::Caution
+    } else {
+        HeadroomSeverity::Healthy
+    }
+}
+
+fn classify_time_to_empty(free: Option<u64>, trend: Option<i64>) -> HeadroomSeverity {
+    let (Some(free), Some(trend)) = (free, trend) else {
+        return HeadroomSeverity::Healthy;
+    };
+    if trend >= 0 {
+        // Growing or static pool — no time-to-empty.
+        return HeadroomSeverity::Healthy;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let days = free as f64 / (-trend) as f64;
+    if !days.is_finite() {
+        return HeadroomSeverity::Healthy;
+    }
+    if days < TIME_TO_EMPTY_PRESSURE_DAYS {
+        HeadroomSeverity::Pressure
+    } else if days < TIME_TO_EMPTY_CAUTION_DAYS {
+        HeadroomSeverity::Caution
+    } else {
+        HeadroomSeverity::Healthy
+    }
+}
+
+fn classify_metadata(ratio: Option<f64>) -> HeadroomSeverity {
+    let Some(ratio) = ratio else {
+        return HeadroomSeverity::Healthy;
+    };
+    if ratio > METADATA_PRESSURE {
+        HeadroomSeverity::Pressure
+    } else if ratio > METADATA_CAUTION {
+        HeadroomSeverity::Caution
+    } else {
+        HeadroomSeverity::Healthy
+    }
+}
+
 /// Which role a retention shape plays — Local (on-host) vs External (sent drive).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -59,6 +180,65 @@ pub struct ShapeRecommendation {
     pub current_cost: CostProjection,
     pub suggested_cost: CostProjection,
     pub note: Option<RecommendationNote>,
+}
+
+/// Why a headroom-aware recommendation was adjusted (UPI 044). Variants
+/// embed the numeric value that drove them so the renderer can produce
+/// honest text without re-reading the context. `StorageCritical` is
+/// injected externally by doctor.rs when `is_storage_critical(name)`
+/// fires.
+///
+/// Priority tiebreak when multiple signals fire at the same severity:
+/// `DestinationMetadataPressure > SourcePoolLow > SourcePoolShrinking`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AdjustmentReason {
+    SourcePoolLow { free_ratio: f64 },
+    SourcePoolShrinking { days_to_empty: f64 },
+    DestinationMetadataPressure { drive_label: String, ratio: f64 },
+    StorageCritical,
+}
+
+impl HeadroomAwareRecommendation {
+    /// Test/fixture helper: wrap a plain `ShapeRecommendation` as a
+    /// Healthy `HeadroomAwareRecommendation` (no adjustment, no
+    /// tightening). Used by voice tests that pre-date UPI 044, and by
+    /// doctor.rs when no headroom signal is observed.
+    #[must_use]
+    #[allow(dead_code)]
+    pub fn healthy_from(rec: ShapeRecommendation) -> Self {
+        Self {
+            recommendation: rec,
+            severity: HeadroomSeverity::Healthy,
+            reason: None,
+            adjusted: None,
+            adjusted_cost: None,
+        }
+    }
+}
+
+/// One (subvolume, role) headroom-aware recommendation. Wraps the
+/// UPI-041 `ShapeRecommendation` and carries the UPI-044 headroom
+/// fields. `adjusted` and `adjusted_cost` are paired: both `Some` (the
+/// tightened shape and its cost projection) or both `None`. Voice
+/// renders `adjusted_cost` (not `suggested_cost`) for the "recover ~X"
+/// tail whenever `adjusted.is_some()` so the numeric matches the
+/// rendered shape (Rule 1).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct HeadroomAwareRecommendation {
+    pub recommendation: ShapeRecommendation,
+    pub severity: HeadroomSeverity,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<AdjustmentReason>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub adjusted: Option<ResolvedGraduatedRetention>,
+    /// Cost projection of `adjusted` under the same churn as
+    /// `recommendation.suggested_cost`. `Some(_)` whenever `adjusted` is
+    /// `Some(_)`. Voice uses this — **not** `recommendation.suggested_cost`
+    /// — for the "recover ~X" tail when rendering the tightened shape.
+    /// Voice contract Rule 1.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub adjusted_cost: Option<CostProjection>,
 }
 
 // ── Internal model parameters (ADR-115 §"Internal model parameters") ──
@@ -161,6 +341,202 @@ pub fn project_cost(
 }
 
 /// Recommend a retention shape for the given role under observed `churn`.
+/// Thin wrapper around `recommend_shape_with_headroom` with an empty
+/// `HeadroomContext` — when no headroom signals are available, the result
+/// is the UPI-041 churn-fit recommendation unchanged. Retained for tests
+/// that pre-date UPI 044 and for external callers that don't need the
+/// headroom decoration.
+#[must_use]
+#[allow(dead_code)]
+pub fn recommend_shape(
+    current: &ResolvedGraduatedRetention,
+    churn: &ChurnEstimate,
+    role: ShapeRole,
+) -> Option<ShapeRecommendation> {
+    recommend_shape_with_headroom(current, churn, role, HeadroomContext::default(), None)
+        .map(|h| h.recommendation)
+}
+
+/// Headroom-aware recommendation engine (UPI 044). Inner call:
+/// the UPI-041 churn-fit `recommend_shape_inner`. When that returns
+/// `Some(rec)`, we classify severity from `ctx`, derive an adjustment
+/// reason if any signal fires, and — at Pressure — tighten the suggested
+/// shape by `HEADROOM_TIGHTEN_MULTIPLIER` and project its cost.
+///
+/// Returns `None` whenever the churn-fit engine returns `None`. The
+/// caller (doctor.rs) handles cold-churn-but-pressured subvolumes via
+/// `headroom_aware_pointer_only` separately (R1 synth path).
+#[must_use]
+pub fn recommend_shape_with_headroom(
+    current: &ResolvedGraduatedRetention,
+    churn: &ChurnEstimate,
+    role: ShapeRole,
+    ctx: HeadroomContext,
+    drive_label_for_metadata: Option<&str>,
+) -> Option<HeadroomAwareRecommendation> {
+    let rec = recommend_shape_inner(current, churn, role)?;
+    let severity = classify_headroom_severity(ctx);
+    let reason = pick_reason(ctx, severity, drive_label_for_metadata);
+
+    let (adjusted, adjusted_cost) = if severity == HeadroomSeverity::Pressure {
+        let tightened = tighten(&rec.suggested, role);
+        if tightened == rec.suggested {
+            // At-MIN: tightening produced no change → drop adjusted.
+            (None, None)
+        } else {
+            let cost = project_cost(&tightened, churn);
+            (Some(tightened), Some(cost))
+        }
+    } else {
+        (None, None)
+    };
+
+    Some(HeadroomAwareRecommendation {
+        recommendation: rec,
+        severity,
+        reason,
+        adjusted,
+        adjusted_cost,
+    })
+}
+
+/// Apply `HEADROOM_TIGHTEN_MULTIPLIER` (0.7) to each slot count, floor-
+/// round, and re-clamp to `[clamp_min, clamp_max]` for the role.
+/// Monthly stays `Count(n)` (UPI 041 R4 invariant); yearly stays 0.
+fn tighten(
+    shape: &ResolvedGraduatedRetention,
+    role: ShapeRole,
+) -> ResolvedGraduatedRetention {
+    let p = params(role);
+
+    let monthly_count = match shape.monthly {
+        crate::types::MonthlyCount::Count(n) => n,
+        crate::types::MonthlyCount::Unlimited => {
+            // Recommender invariant: suggested.monthly is never Unlimited.
+            // Defensive fallthrough: cap at clamp_max[3] before tightening.
+            p.clamp_max[3]
+        }
+    };
+
+    let slots_in = [shape.hourly, shape.daily, shape.weekly, monthly_count];
+    let mut slots_out = [0_u32; 4];
+    for idx in 0..4 {
+        #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let scaled = (f64::from(slots_in[idx]) * HEADROOM_TIGHTEN_MULTIPLIER).floor() as u32;
+        let clamped = scaled.clamp(p.clamp_min[idx], p.clamp_max[idx]);
+        slots_out[idx] = clamped;
+    }
+
+    ResolvedGraduatedRetention {
+        hourly: slots_out[0],
+        daily: slots_out[1],
+        weekly: slots_out[2],
+        monthly: crate::types::MonthlyCount::Count(slots_out[3]),
+        yearly: 0,
+    }
+}
+
+/// Synthesize a "pointer-only" recommendation for doctor.rs when severity
+/// is `Pressure` or `Critical` and the churn-fit engine returned `None`
+/// (cold/transient subvolume). The renderer detects the synth shape via
+/// `suggested == current && both costs zero` and emits only the reason
+/// line — no shape, no recovery tail.
+///
+/// Severity is restricted to `Pressure | Critical`; Healthy/Caution synth
+/// is meaningless and would represent a doctor.rs bug.
+#[must_use]
+pub fn headroom_aware_pointer_only(
+    current: &ResolvedGraduatedRetention,
+    role: ShapeRole,
+    severity: HeadroomSeverity,
+    reason: AdjustmentReason,
+) -> HeadroomAwareRecommendation {
+    debug_assert!(
+        matches!(severity, HeadroomSeverity::Pressure | HeadroomSeverity::Critical),
+        "headroom_aware_pointer_only is only valid for Pressure or Critical severity, got {severity:?}",
+    );
+    let zero_cost = CostProjection {
+        data_bytes: 0,
+        snapshot_count: 0,
+    };
+    HeadroomAwareRecommendation {
+        recommendation: ShapeRecommendation {
+            role,
+            current: *current,
+            suggested: *current,
+            current_cost: zero_cost,
+            suggested_cost: zero_cost,
+            note: None,
+        },
+        severity,
+        reason: Some(reason),
+        adjusted: None,
+        adjusted_cost: None,
+    }
+}
+
+/// Pick the dominant adjustment reason for a context at a given severity.
+/// Priority: `DestinationMetadataPressure > SourcePoolLow >
+/// SourcePoolShrinking`. Returns `None` at Healthy. Caller passes the
+/// drive label to embed (for the External role's metadata-pressure
+/// reason); Local role passes `None`.
+#[must_use]
+pub fn pick_reason(
+    ctx: HeadroomContext,
+    severity: HeadroomSeverity,
+    drive_label_for_metadata: Option<&str>,
+) -> Option<AdjustmentReason> {
+    if severity == HeadroomSeverity::Healthy {
+        return None;
+    }
+
+    // Metadata first (highest priority).
+    if let (Some(ratio), Some(label)) = (ctx.destination_metadata_ratio, drive_label_for_metadata) {
+        // The signal fired (Caution or Pressure) at the row level only
+        // if it independently classifies above Healthy.
+        if classify_metadata(Some(ratio)) != HeadroomSeverity::Healthy {
+            return Some(AdjustmentReason::DestinationMetadataPressure {
+                drive_label: label.to_string(),
+                ratio,
+            });
+        }
+    }
+
+    // Source-pool free ratio second.
+    if let (Some(free), Some(capacity)) = (
+        ctx.source_pool_free_bytes,
+        ctx.source_pool_capacity_bytes,
+    ) && capacity > 0
+    {
+        #[allow(clippy::cast_precision_loss)]
+        let ratio = free as f64 / capacity as f64;
+        if classify_free_ratio(Some(free), Some(capacity)) != HeadroomSeverity::Healthy {
+            return Some(AdjustmentReason::SourcePoolLow { free_ratio: ratio });
+        }
+    }
+
+    // Source-pool shrinking trend last.
+    if let (Some(free), Some(trend)) = (
+        ctx.source_pool_free_bytes,
+        ctx.source_pool_trend_bytes_per_day,
+    ) && trend < 0
+    {
+        #[allow(clippy::cast_precision_loss)]
+        let days = free as f64 / (-trend) as f64;
+        if classify_time_to_empty(Some(free), Some(trend)) != HeadroomSeverity::Healthy {
+            return Some(AdjustmentReason::SourcePoolShrinking {
+                days_to_empty: days,
+            });
+        }
+    }
+
+    None
+}
+
+/// Inner churn-fit recommendation engine (UPI 041). Returns the basic
+/// `ShapeRecommendation` without headroom decoration. Called by both
+/// `recommend_shape` (thin wrapper) and `recommend_shape_with_headroom`
+/// (the headroom-aware wrapper).
 ///
 /// Returns `None` whenever `churn.mean_bytes_per_second.is_none()` — this
 /// is stricter than just `(incremental_count == 0, full_count == 0)`. It
@@ -172,8 +548,7 @@ pub fn project_cost(
 /// When a recommendation fires, the four slot counts are computed by
 /// `slots = clamp(budget_w / r / w_step, clamp_min, clamp_max)`. NaN /
 /// infinity are caught explicitly and routed to `clamp_max`.
-#[must_use]
-pub fn recommend_shape(
+fn recommend_shape_inner(
     current: &ResolvedGraduatedRetention,
     churn: &ChurnEstimate,
     role: ShapeRole,
@@ -603,5 +978,415 @@ mod tests {
         let est = churn_with_mean(Some(100.0));
         let cost = project_cost(&s, &est);
         assert_eq!(cost.snapshot_count, 5);
+    }
+
+    // ── UPI 044: classify_headroom_severity ────────────────────────
+
+    fn ctx_free(free: u64, capacity: u64) -> HeadroomContext {
+        HeadroomContext {
+            source_pool_free_bytes: Some(free),
+            source_pool_capacity_bytes: Some(capacity),
+            source_pool_trend_bytes_per_day: None,
+            destination_metadata_ratio: None,
+        }
+    }
+
+    fn ctx_trend(free: u64, trend: i64) -> HeadroomContext {
+        HeadroomContext {
+            source_pool_free_bytes: Some(free),
+            source_pool_capacity_bytes: None,
+            source_pool_trend_bytes_per_day: Some(trend),
+            destination_metadata_ratio: None,
+        }
+    }
+
+    fn ctx_meta(ratio: f64) -> HeadroomContext {
+        HeadroomContext {
+            source_pool_free_bytes: None,
+            source_pool_capacity_bytes: None,
+            source_pool_trend_bytes_per_day: None,
+            destination_metadata_ratio: Some(ratio),
+        }
+    }
+
+    #[test]
+    fn classify_free_ratio_exact_25_pct_is_healthy() {
+        // 0.25 == FREE_RATIO_CAUTION; strict `<` means equal → Healthy.
+        let ctx = ctx_free(25, 100);
+        assert_eq!(classify_headroom_severity(ctx), HeadroomSeverity::Healthy);
+    }
+
+    #[test]
+    fn classify_free_ratio_just_below_25_pct_is_caution() {
+        let ctx = ctx_free(24, 100);
+        assert_eq!(classify_headroom_severity(ctx), HeadroomSeverity::Caution);
+    }
+
+    #[test]
+    fn classify_free_ratio_exact_15_pct_is_caution() {
+        // 0.15 == FREE_RATIO_PRESSURE; strict `<` → not Pressure → Caution.
+        let ctx = ctx_free(15, 100);
+        assert_eq!(classify_headroom_severity(ctx), HeadroomSeverity::Caution);
+    }
+
+    #[test]
+    fn classify_free_ratio_just_below_15_pct_is_pressure() {
+        let ctx = ctx_free(14, 100);
+        assert_eq!(classify_headroom_severity(ctx), HeadroomSeverity::Pressure);
+    }
+
+    #[test]
+    fn classify_time_to_empty_exact_90_days_is_healthy() {
+        // free=900, trend=-10/day → 90 days exactly → Healthy (strict <).
+        let ctx = ctx_trend(900, -10);
+        assert_eq!(classify_headroom_severity(ctx), HeadroomSeverity::Healthy);
+    }
+
+    #[test]
+    fn classify_time_to_empty_just_under_90_days_is_caution() {
+        // free=899, trend=-10/day → 89.9 days → Caution.
+        let ctx = ctx_trend(899, -10);
+        assert_eq!(classify_headroom_severity(ctx), HeadroomSeverity::Caution);
+    }
+
+    #[test]
+    fn classify_time_to_empty_just_under_30_days_is_pressure() {
+        // free=299, trend=-10/day → 29.9 days → Pressure.
+        let ctx = ctx_trend(299, -10);
+        assert_eq!(classify_headroom_severity(ctx), HeadroomSeverity::Pressure);
+    }
+
+    #[test]
+    fn classify_metadata_exact_85_pct_is_healthy() {
+        // 0.85 == METADATA_CAUTION; strict `>` → not Caution → Healthy.
+        assert_eq!(classify_headroom_severity(ctx_meta(0.85)), HeadroomSeverity::Healthy);
+    }
+
+    #[test]
+    fn classify_metadata_just_above_85_pct_is_caution() {
+        assert_eq!(classify_headroom_severity(ctx_meta(0.86)), HeadroomSeverity::Caution);
+    }
+
+    #[test]
+    fn classify_metadata_exact_92_pct_is_caution() {
+        assert_eq!(classify_headroom_severity(ctx_meta(0.92)), HeadroomSeverity::Caution);
+    }
+
+    #[test]
+    fn classify_metadata_just_above_92_pct_is_pressure() {
+        assert_eq!(classify_headroom_severity(ctx_meta(0.93)), HeadroomSeverity::Pressure);
+    }
+
+    #[test]
+    fn classify_returns_healthy_when_all_signals_none() {
+        let ctx = HeadroomContext::default();
+        assert_eq!(classify_headroom_severity(ctx), HeadroomSeverity::Healthy);
+    }
+
+    #[test]
+    fn classify_returns_max_when_multiple_signals_fire() {
+        // Free at Caution (20%), metadata at Pressure (93%) → Pressure.
+        let ctx = HeadroomContext {
+            source_pool_free_bytes: Some(20),
+            source_pool_capacity_bytes: Some(100),
+            source_pool_trend_bytes_per_day: None,
+            destination_metadata_ratio: Some(0.93),
+        };
+        assert_eq!(classify_headroom_severity(ctx), HeadroomSeverity::Pressure);
+    }
+
+    #[test]
+    fn classify_ignores_positive_trend() {
+        // Positive trend → no time-to-empty → Healthy.
+        let ctx = ctx_trend(1_000_000_000, 50_000_000_000);
+        assert_eq!(classify_headroom_severity(ctx), HeadroomSeverity::Healthy);
+    }
+
+    #[test]
+    fn classify_handles_zero_capacity_as_healthy() {
+        // capacity=0 → free/capacity not meaningful → Healthy.
+        let ctx = ctx_free(0, 0);
+        assert_eq!(classify_headroom_severity(ctx), HeadroomSeverity::Healthy);
+    }
+
+    #[test]
+    fn classify_never_returns_critical() {
+        // Critical is not in the classifier's output domain. Even with
+        // every signal maxed, the result tops out at Pressure.
+        let ctx = HeadroomContext {
+            source_pool_free_bytes: Some(1),
+            source_pool_capacity_bytes: Some(100),
+            source_pool_trend_bytes_per_day: Some(-1_000_000),
+            destination_metadata_ratio: Some(0.999),
+        };
+        let sev = classify_headroom_severity(ctx);
+        assert_ne!(sev, HeadroomSeverity::Critical);
+        assert_eq!(sev, HeadroomSeverity::Pressure);
+    }
+
+    #[test]
+    fn severity_variant_ordering_is_load_bearing() {
+        // Healthy < Caution < Pressure < Critical via PartialOrd, Ord.
+        // Guards against accidental reorder (alphabetical, etc.) that
+        // would break `.iter().max()` semantics in classify.
+        assert!(HeadroomSeverity::Healthy < HeadroomSeverity::Caution);
+        assert!(HeadroomSeverity::Caution < HeadroomSeverity::Pressure);
+        assert!(HeadroomSeverity::Pressure < HeadroomSeverity::Critical);
+    }
+
+    // ── UPI 044: recommend_shape_with_headroom + tighten + synth ───
+
+    #[test]
+    fn recommend_with_headroom_default_ctx_matches_recommend_shape() {
+        // UPI 041 backward-compat regression: empty HeadroomContext →
+        // unchanged ShapeRecommendation.
+        let cur = shape(24, 60, 52, crate::types::MonthlyCount::Count(24), 0);
+        let est = churn_with_mean(Some(31_250.0));
+        let plain = recommend_shape(&cur, &est, ShapeRole::Local).expect("plain");
+        let with_hr = recommend_shape_with_headroom(
+            &cur,
+            &est,
+            ShapeRole::Local,
+            HeadroomContext::default(),
+            None,
+        )
+        .expect("hr");
+        assert_eq!(with_hr.recommendation, plain);
+        assert_eq!(with_hr.severity, HeadroomSeverity::Healthy);
+        assert!(with_hr.reason.is_none());
+        assert!(with_hr.adjusted.is_none());
+        assert!(with_hr.adjusted_cost.is_none());
+    }
+
+    #[test]
+    fn recommend_with_headroom_pressure_tier_emits_tightened_shape() {
+        // Cold churn → cold-engine recommends MAX clamp everywhere
+        // (24, 60, 52, 24). Pressure → tighten to (16, 42, 36, 16).
+        let cur = shape(0, 7, 4, crate::types::MonthlyCount::Count(0), 0);
+        let est = churn_with_mean(Some(81.0));
+        let ctx = HeadroomContext {
+            source_pool_free_bytes: Some(10),
+            source_pool_capacity_bytes: Some(100),
+            source_pool_trend_bytes_per_day: None,
+            destination_metadata_ratio: None,
+        };
+        let hr = recommend_shape_with_headroom(&cur, &est, ShapeRole::Local, ctx, None)
+            .expect("rec");
+        assert_eq!(hr.severity, HeadroomSeverity::Pressure);
+        let adjusted = hr.adjusted.expect("adjusted Some at Pressure");
+        // 24 * 0.7 = 16.8 → 16; 60 * 0.7 = 42; 52 * 0.7 = 36.4 → 36;
+        // 24 * 0.7 = 16.8 → 16.
+        assert_eq!(adjusted.hourly, 16);
+        assert_eq!(adjusted.daily, 42);
+        assert_eq!(adjusted.weekly, 36);
+        match adjusted.monthly {
+            crate::types::MonthlyCount::Count(n) => assert_eq!(n, 16),
+            crate::types::MonthlyCount::Unlimited => panic!("must not emit Unlimited"),
+        }
+        assert_eq!(adjusted.yearly, 0);
+    }
+
+    #[test]
+    fn recommend_with_headroom_pressure_emits_paired_adjusted_and_adjusted_cost() {
+        // R2 invariant: adjusted.is_some() <=> adjusted_cost.is_some(),
+        // AND adjusted_cost matches project_cost(adjusted, churn).
+        let cur = shape(0, 7, 4, crate::types::MonthlyCount::Count(0), 0);
+        let est = churn_with_mean(Some(81.0));
+        let ctx = HeadroomContext {
+            source_pool_free_bytes: Some(10),
+            source_pool_capacity_bytes: Some(100),
+            source_pool_trend_bytes_per_day: None,
+            destination_metadata_ratio: None,
+        };
+        let hr = recommend_shape_with_headroom(&cur, &est, ShapeRole::Local, ctx, None)
+            .expect("rec");
+        let adjusted = hr.adjusted.expect("adjusted");
+        let adjusted_cost = hr.adjusted_cost.expect("adjusted_cost");
+        let expected = project_cost(&adjusted, &est);
+        assert_eq!(adjusted_cost, expected);
+    }
+
+    #[test]
+    fn recommend_with_headroom_at_min_keeps_adjusted_and_cost_both_none() {
+        // R2 invariant: when current is at clamp_min everywhere AND
+        // Pressure fires, tighten produces no change → adjusted=None
+        // AND adjusted_cost=None in lockstep.
+        // Build a shape such that the engine's suggestion equals
+        // clamp_min after the cold-engine MAX clamp, then re-feed through
+        // a tight churn. Actually easier: construct the situation where
+        // recommend_shape produces a shape that tightens to itself.
+        // We do this by handcrafting a shape at clamp_min and ensuring
+        // recommend produces something that, post-tighten, is identical.
+        //
+        // Direct approach: drive the engine to clamp_min then force pressure.
+        // Hot churn -> tight clamp. Specifically:
+        // 50 GB budget / huge mean = tiny per-window seconds → clamp_min
+        // for all slots. Use a very high mean.
+        let cur = shape(24, 60, 52, crate::types::MonthlyCount::Count(24), 0);
+        let est = churn_with_mean(Some(1_000_000_000_000.0)); // 1 TB/s — absurd, forces clamp_min
+        let ctx = HeadroomContext {
+            source_pool_free_bytes: Some(10),
+            source_pool_capacity_bytes: Some(100),
+            source_pool_trend_bytes_per_day: None,
+            destination_metadata_ratio: None,
+        };
+        let hr = recommend_shape_with_headroom(&cur, &est, ShapeRole::Local, ctx, None)
+            .expect("rec");
+        // At extreme churn, every slot lands at clamp_min: (0, 3, 0, 0)
+        // for Local. tighten of that is (0, 3*0.7=2 → clamp to 3, 0, 0) = same.
+        assert_eq!(hr.severity, HeadroomSeverity::Pressure);
+        assert_eq!(hr.adjusted, None);
+        assert_eq!(hr.adjusted_cost, None);
+    }
+
+    #[test]
+    fn recommend_with_headroom_caution_tier_emits_no_adjusted() {
+        let cur = shape(0, 7, 4, crate::types::MonthlyCount::Count(0), 0);
+        let est = churn_with_mean(Some(81.0));
+        // 20% free → Caution (not Pressure).
+        let ctx = HeadroomContext {
+            source_pool_free_bytes: Some(20),
+            source_pool_capacity_bytes: Some(100),
+            source_pool_trend_bytes_per_day: None,
+            destination_metadata_ratio: None,
+        };
+        let hr = recommend_shape_with_headroom(&cur, &est, ShapeRole::Local, ctx, None)
+            .expect("rec");
+        assert_eq!(hr.severity, HeadroomSeverity::Caution);
+        assert_eq!(hr.adjusted, None);
+        assert_eq!(hr.adjusted_cost, None);
+        assert!(matches!(
+            hr.reason,
+            Some(AdjustmentReason::SourcePoolLow { .. })
+        ));
+    }
+
+    #[test]
+    fn recommend_with_headroom_reason_priority_tiebreak() {
+        // Both free_ratio (Pressure) and metadata (Pressure) fire →
+        // DestinationMetadataPressure wins.
+        let cur = shape(0, 7, 4, crate::types::MonthlyCount::Count(0), 0);
+        let est = churn_with_mean(Some(81.0));
+        let ctx = HeadroomContext {
+            source_pool_free_bytes: Some(10),
+            source_pool_capacity_bytes: Some(100),
+            source_pool_trend_bytes_per_day: None,
+            destination_metadata_ratio: Some(0.95),
+        };
+        let hr = recommend_shape_with_headroom(
+            &cur,
+            &est,
+            ShapeRole::External,
+            ctx,
+            Some("WD-18TB"),
+        )
+        .expect("rec");
+        match hr.reason {
+            Some(AdjustmentReason::DestinationMetadataPressure { ref drive_label, ratio }) => {
+                assert_eq!(drive_label, "WD-18TB");
+                assert!((ratio - 0.95).abs() < 1e-9);
+            }
+            other => panic!("expected metadata-pressure reason, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recommend_with_headroom_reason_none_when_healthy() {
+        let cur = shape(0, 7, 4, crate::types::MonthlyCount::Count(0), 0);
+        let est = churn_with_mean(Some(81.0));
+        let ctx = HeadroomContext {
+            source_pool_free_bytes: Some(80),
+            source_pool_capacity_bytes: Some(100),
+            source_pool_trend_bytes_per_day: None,
+            destination_metadata_ratio: None,
+        };
+        let hr = recommend_shape_with_headroom(&cur, &est, ShapeRole::Local, ctx, None)
+            .expect("rec");
+        assert_eq!(hr.severity, HeadroomSeverity::Healthy);
+        assert!(hr.reason.is_none());
+    }
+
+    #[test]
+    fn tighten_respects_clamp_min() {
+        // Local clamp_min for daily=3; tightening daily=4 → 4*0.7=2.8 →
+        // floor 2 → clamp to 3.
+        let s = shape(0, 4, 0, crate::types::MonthlyCount::Count(0), 0);
+        let t = tighten(&s, ShapeRole::Local);
+        assert_eq!(t.daily, 3);
+    }
+
+    #[test]
+    fn tighten_never_emits_unlimited_monthly() {
+        // Even if input is Unlimited, output is Count(_).
+        let s = shape(24, 60, 52, crate::types::MonthlyCount::Unlimited, 0);
+        let t = tighten(&s, ShapeRole::Local);
+        assert!(matches!(t.monthly, crate::types::MonthlyCount::Count(_)));
+    }
+
+    #[test]
+    fn tighten_never_emits_nonzero_yearly() {
+        let s = shape(24, 60, 52, crate::types::MonthlyCount::Count(24), 5);
+        let t = tighten(&s, ShapeRole::Local);
+        assert_eq!(t.yearly, 0);
+    }
+
+    #[test]
+    fn tighten_at_clamp_max_for_local() {
+        // Risk flag R8: produce the exact (16, 42, 36, 16) for Local
+        // tightened from clamp_max.
+        let s = shape(24, 60, 52, crate::types::MonthlyCount::Count(24), 0);
+        let t = tighten(&s, ShapeRole::Local);
+        assert_eq!(t.hourly, 16);
+        assert_eq!(t.daily, 42);
+        assert_eq!(t.weekly, 36);
+        match t.monthly {
+            crate::types::MonthlyCount::Count(n) => assert_eq!(n, 16),
+            crate::types::MonthlyCount::Unlimited => panic!("must not emit Unlimited"),
+        }
+    }
+
+    #[test]
+    fn headroom_aware_pointer_only_zero_cost_invariant() {
+        let cur = shape(24, 60, 52, crate::types::MonthlyCount::Count(24), 0);
+        let h = headroom_aware_pointer_only(
+            &cur,
+            ShapeRole::Local,
+            HeadroomSeverity::Pressure,
+            AdjustmentReason::StorageCritical,
+        );
+        assert_eq!(h.recommendation.suggested, h.recommendation.current);
+        assert_eq!(h.recommendation.current, cur);
+        assert_eq!(h.recommendation.current_cost.data_bytes, 0);
+        assert_eq!(h.recommendation.suggested_cost.data_bytes, 0);
+        assert_eq!(h.recommendation.current_cost.snapshot_count, 0);
+        assert_eq!(h.recommendation.suggested_cost.snapshot_count, 0);
+        assert!(h.adjusted.is_none());
+        assert!(h.adjusted_cost.is_none());
+        assert_eq!(h.severity, HeadroomSeverity::Pressure);
+        assert!(matches!(h.reason, Some(AdjustmentReason::StorageCritical)));
+    }
+
+    #[test]
+    #[should_panic]
+    fn headroom_aware_pointer_only_panics_on_healthy() {
+        let cur = shape(24, 60, 52, crate::types::MonthlyCount::Count(24), 0);
+        let _ = headroom_aware_pointer_only(
+            &cur,
+            ShapeRole::Local,
+            HeadroomSeverity::Healthy,
+            AdjustmentReason::StorageCritical,
+        );
+    }
+
+    #[test]
+    #[should_panic]
+    fn headroom_aware_pointer_only_panics_on_caution() {
+        let cur = shape(24, 60, 52, crate::types::MonthlyCount::Count(24), 0);
+        let _ = headroom_aware_pointer_only(
+            &cur,
+            ShapeRole::Local,
+            HeadroomSeverity::Caution,
+            AdjustmentReason::StorageCritical,
+        );
     }
 }

@@ -1036,6 +1036,63 @@ impl StateDb {
         Ok(out)
     }
 
+    /// Batched variant of `drift_samples_for_subvolume`: query a set of
+    /// subvolume names in one statement, ordered newest first. Empty
+    /// `subvolumes` slice short-circuits to `Ok(vec![])` (avoids the
+    /// `IN ()` SQL syntax error).
+    ///
+    /// SQL shape: manually built `WHERE subvolume IN (?, ?, ..., ?)` with
+    /// `N` placeholders matching slice length; parameters bound via
+    /// `rusqlite::params_from_iter` for names plus a separate bind for
+    /// `since`. Mirrors `drift_samples_for_subvolume` parameterization
+    /// style (UPI 044, R6).
+    pub fn drift_samples_for_subvolumes(
+        &self,
+        subvolumes: &[String],
+        since: chrono::NaiveDateTime,
+    ) -> crate::error::Result<Vec<DriftSampleRow>> {
+        if subvolumes.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let placeholders = std::iter::repeat_n("?", subvolumes.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT run_id, subvolume, sampled_at, seconds_since_prev_send,
+                    bytes_transferred, source_free_bytes, send_type
+             FROM drift_samples
+             WHERE subvolume IN ({placeholders}) AND sampled_at >= ?
+             ORDER BY sampled_at DESC"
+        );
+        let since_str = since.format("%Y-%m-%dT%H:%M:%S").to_string();
+
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .map_err(|e| UrdError::State(format!("query failed: {e}")))?;
+
+        let mut params: Vec<&dyn rusqlite::ToSql> = subvolumes
+            .iter()
+            .map(|s| s as &dyn rusqlite::ToSql)
+            .collect();
+        params.push(&since_str as &dyn rusqlite::ToSql);
+
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(params), Self::map_drift_sample_row)
+            .map_err(|e| UrdError::State(format!("query failed: {e}")))?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            match row {
+                Ok(Some(r)) => out.push(r),
+                Ok(None) => continue,
+                Err(e) => return Err(UrdError::State(format!("read drift row: {e}"))),
+            }
+        }
+        Ok(out)
+    }
+
     fn map_drift_sample_row(row: &rusqlite::Row) -> rusqlite::Result<Option<DriftSampleRow>> {
         let run_id: Option<i64> = row.get(0)?;
         let subvolume: String = row.get(1)?;
@@ -2807,6 +2864,104 @@ mod tests {
             .drift_samples_for_subvolume("nope", drift_dt("2026-01-01T00:00:00"))
             .unwrap();
         assert!(result.is_empty());
+    }
+
+    // ── UPI 044: drift_samples_for_subvolumes (batched) ──────────────
+
+    #[test]
+    fn drift_samples_for_subvolumes_returns_union_across_names() {
+        let db = StateDb::open_memory().unwrap();
+        let run_id = db.begin_run("full").unwrap();
+        // 2 samples for "a", 1 for "b", 1 for "c".
+        for (name, ts) in [
+            ("a", "2026-04-30T04:00:00"),
+            ("a", "2026-04-29T04:00:00"),
+            ("b", "2026-04-30T05:00:00"),
+            ("c", "2026-04-30T06:00:00"),
+        ] {
+            db.record_drift_sample_best_effort(&make_drift_row(
+                Some(run_id),
+                name,
+                ts,
+                Some(86_400),
+                1_000_000,
+                None,
+                crate::types::SendKind::Incremental,
+            ));
+        }
+        let names = vec!["a".to_string(), "b".to_string()];
+        let result = db
+            .drift_samples_for_subvolumes(&names, drift_dt("2026-01-01T00:00:00"))
+            .unwrap();
+        assert_eq!(result.len(), 3, "expected union of a (2) + b (1) = 3 rows");
+        // c is filtered out.
+        assert!(result.iter().all(|r| r.subvolume == "a" || r.subvolume == "b"));
+    }
+
+    #[test]
+    fn drift_samples_for_subvolumes_filters_since() {
+        let db = StateDb::open_memory().unwrap();
+        let run_id = db.begin_run("full").unwrap();
+        for ts in ["2026-04-15T00:00:00", "2026-04-20T00:00:00", "2026-04-25T00:00:00"] {
+            db.record_drift_sample_best_effort(&make_drift_row(
+                Some(run_id),
+                "home",
+                ts,
+                Some(86_400),
+                1_000_000,
+                None,
+                crate::types::SendKind::Incremental,
+            ));
+        }
+        // since=2026-04-20T00:00:00 (inclusive) → expect 2 rows.
+        let result = db
+            .drift_samples_for_subvolumes(
+                &["home".to_string()],
+                drift_dt("2026-04-20T00:00:00"),
+            )
+            .unwrap();
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn drift_samples_for_subvolumes_empty_input_returns_empty_vec() {
+        let db = StateDb::open_memory().unwrap();
+        let run_id = db.begin_run("full").unwrap();
+        db.record_drift_sample_best_effort(&make_drift_row(
+            Some(run_id),
+            "home",
+            "2026-04-30T04:00:00",
+            Some(86_400),
+            1_000_000,
+            None,
+            crate::types::SendKind::Incremental,
+        ));
+        // Empty slice → empty result, no `IN ()` SQL error.
+        let result = db
+            .drift_samples_for_subvolumes(&[], drift_dt("2026-01-01T00:00:00"))
+            .unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn drift_samples_for_subvolumes_ignores_unknown_names() {
+        let db = StateDb::open_memory().unwrap();
+        let run_id = db.begin_run("full").unwrap();
+        db.record_drift_sample_best_effort(&make_drift_row(
+            Some(run_id),
+            "home",
+            "2026-04-30T04:00:00",
+            Some(86_400),
+            1_000_000,
+            None,
+            crate::types::SendKind::Incremental,
+        ));
+        let names = vec!["home".to_string(), "nope".to_string()];
+        let result = db
+            .drift_samples_for_subvolumes(&names, drift_dt("2026-01-01T00:00:00"))
+            .unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].subvolume, "home");
     }
 
     #[test]

@@ -2618,26 +2618,155 @@ fn render_cost_delta(
     }
 }
 
+/// Detect a "synth" headroom-aware recommendation: a `HeadroomAwareRecommendation`
+/// whose inner shape recommendation has `suggested == current` AND both
+/// cost projections are zero. Doctor.rs builds these for cold subvolumes
+/// at Pressure/Critical severity (R1) — they carry only the reason line,
+/// no shape line.
+fn is_synth_pointer(rec: &crate::policy::HeadroomAwareRecommendation) -> bool {
+    rec.recommendation.suggested == rec.recommendation.current
+        && rec.recommendation.current_cost.data_bytes == 0
+        && rec.recommendation.suggested_cost.data_bytes == 0
+}
+
+/// Render the reason line for one role at the given severity. Returns
+/// an empty string if there's nothing to render.
+///
+/// `has_adjusted` distinguishes Pressure-with-tightened-shape from
+/// Pressure-at-MIN (the synth path collapses both `adjusted` and
+/// `adjusted_cost` to `None` when the engine couldn't tighten further).
+/// The `_is_synth` parameter is kept on the signature for symmetry with
+/// the renderer's input pipeline but not currently branched on — synth
+/// and at-MIN share the "shape already at minimum" line.
+fn render_reason_line(
+    severity: crate::policy::HeadroomSeverity,
+    reason: &Option<crate::policy::AdjustmentReason>,
+    has_adjusted: bool,
+    _is_synth: bool,
+) -> String {
+    use crate::policy::AdjustmentReason::*;
+    use crate::policy::HeadroomSeverity::*;
+    let Some(reason) = reason.as_ref() else {
+        return String::new();
+    };
+    match reason {
+        SourcePoolLow { free_ratio } => {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let pct = (free_ratio * 100.0).round() as i64;
+            match severity {
+                Caution => format!("source pool at {pct}% — applying sooner is recommended"),
+                Pressure if has_adjusted => format!("source pool at {pct}% — shape tightened"),
+                Pressure => format!(
+                    "source pool at {pct}% — shape already at minimum; consider expanding storage or reducing subvolume count"
+                ),
+                _ => String::new(),
+            }
+        }
+        SourcePoolShrinking { days_to_empty } => match severity {
+            Caution => format!(
+                "source pool shrinking; ~{days_to_empty:.0} days to empty — applying sooner is recommended"
+            ),
+            Pressure if has_adjusted => format!(
+                "source pool shrinking; ~{days_to_empty:.0} days to empty — shape tightened"
+            ),
+            Pressure => format!(
+                "source pool shrinking; ~{days_to_empty:.0} days to empty — shape already at minimum"
+            ),
+            _ => String::new(),
+        },
+        DestinationMetadataPressure { drive_label, ratio } => {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let pct = (ratio * 100.0).round() as i64;
+            match severity {
+                Caution => format!(
+                    "{drive_label} metadata at {pct}% — applying sooner is recommended"
+                ),
+                Pressure => format!("{drive_label} metadata at {pct}% — shape tightened"),
+                _ => String::new(),
+            }
+        }
+        StorageCritical => String::new(), // pointer line handled at row level
+    }
+}
+
 /// Render one Recommendations-section row: subvolume name + up-to-two
 /// role lines (`local:` / `external:`) + optional bursty/named-level
-/// hint lines.
+/// hint lines. Per UPI 044, each role carries severity, an optional
+/// adjustment reason, and an optional tightened shape (`adjusted`).
+/// Critical severity (injected by doctor.rs) suppresses the shape and
+/// hint lines in favor of a single pointer (R9).
 fn format_recommendation_row(row: &crate::output::DoctorRecommendationRow) -> String {
+    use crate::policy::HeadroomSeverity;
+
     let mut out = String::new();
     writeln!(out, "    {}", row.name).ok();
 
-    let mut role_line = |label: &str, rec: &crate::policy::ShapeRecommendation| {
-        let kv = render_shape_kv(&rec.suggested);
-        let tail = render_cost_delta(
-            rec.current_cost.data_bytes,
-            rec.suggested_cost.data_bytes,
-            &rec.suggested,
-        );
-        let line = if tail.is_empty() {
-            format!("      {label:9} {kv}")
-        } else {
-            format!("      {label:9} {kv}   {}", tail.dimmed())
+    // R9: if either role is Critical, render only the pointer line.
+    let any_critical = matches!(
+        row.local.as_ref().map(|h| h.severity),
+        Some(HeadroomSeverity::Critical)
+    ) || matches!(
+        row.external.as_ref().map(|h| h.severity),
+        Some(HeadroomSeverity::Critical)
+    );
+    if any_critical {
+        writeln!(
+            out,
+            "      {}",
+            "storage critical — see `urd doctor` for current actions".dimmed()
+        )
+        .ok();
+        return out;
+    }
+
+    let mut role_line = |label: &str, h: &crate::policy::HeadroomAwareRecommendation| {
+        let synth = is_synth_pointer(h);
+        let rec = &h.recommendation;
+
+        // Decide what shape to render (if any) and what cost projection to
+        // use for the recovery tail.
+        let (shape_to_render, recovery_target): (
+            Option<&crate::types::ResolvedGraduatedRetention>,
+            u64,
+        ) = match h.severity {
+            HeadroomSeverity::Pressure if h.adjusted.is_some() => {
+                // R2: tail uses adjusted_cost, not suggested_cost.
+                let adj = h.adjusted.as_ref().expect("paired with adjusted_cost");
+                let adj_cost = h
+                    .adjusted_cost
+                    .expect("adjusted_cost paired with adjusted (R2 invariant)");
+                (Some(adj), adj_cost.data_bytes)
+            }
+            HeadroomSeverity::Pressure if synth => {
+                // Synth row at Pressure: skip shape line; reason carries it.
+                (None, 0)
+            }
+            HeadroomSeverity::Pressure => {
+                // True at-MIN: render suggested as the shape, but the
+                // reason line will say "shape already at minimum".
+                (Some(&rec.suggested), rec.suggested_cost.data_bytes)
+            }
+            _ => (Some(&rec.suggested), rec.suggested_cost.data_bytes),
         };
-        writeln!(out, "{line}").ok();
+
+        if let Some(shape) = shape_to_render {
+            let kv = render_shape_kv(shape);
+            let tail = render_cost_delta(rec.current_cost.data_bytes, recovery_target, shape);
+            let line = if tail.is_empty() {
+                format!("      {label:9} {kv}")
+            } else {
+                format!("      {label:9} {kv}   {}", tail.dimmed())
+            };
+            writeln!(out, "{line}").ok();
+        }
+
+        // Reason line (dimmed) — non-Healthy severities only.
+        if h.severity != HeadroomSeverity::Healthy {
+            let msg = render_reason_line(h.severity, &h.reason, h.adjusted.is_some(), synth);
+            if !msg.is_empty() {
+                writeln!(out, "      {label:9} {}", msg.dimmed()).ok();
+            }
+        }
     };
     if let Some(ref rec) = row.local {
         role_line("local:", rec);
@@ -3438,6 +3567,7 @@ pub(crate) mod test_fixtures {
 
     pub(crate) fn test_doctor_output() -> DoctorOutput {
         DoctorOutput {
+            schema_version: crate::output::DOCTOR_OUTPUT_SCHEMA_VERSION,
             config_checks: vec![DoctorCheck {
                 name: "9 subvolumes, 3 drives".to_string(),
                 status: DoctorCheckStatus::Ok,
@@ -7935,8 +8065,8 @@ mod tests {
         suggested: crate::types::ResolvedGraduatedRetention,
         current_bytes: u64,
         suggested_bytes: u64,
-    ) -> crate::policy::ShapeRecommendation {
-        use crate::policy::{CostProjection, ShapeRecommendation};
+    ) -> crate::policy::HeadroomAwareRecommendation {
+        use crate::policy::{CostProjection, HeadroomAwareRecommendation, ShapeRecommendation};
         let total = |s: crate::types::ResolvedGraduatedRetention| {
             let m = match s.monthly {
                 crate::types::MonthlyCount::Unlimited => 0,
@@ -7944,7 +8074,7 @@ mod tests {
             };
             s.hourly + s.daily + s.weekly + m + s.yearly
         };
-        ShapeRecommendation {
+        HeadroomAwareRecommendation::healthy_from(ShapeRecommendation {
             role,
             current,
             suggested,
@@ -7957,7 +8087,7 @@ mod tests {
                 snapshot_count: total(suggested),
             },
             note: None,
-        }
+        })
     }
 
     #[test]
@@ -8287,25 +8417,35 @@ mod tests {
         let row = &rows[0];
         assert_eq!(row.get("name").and_then(|v| v.as_str()), Some("containers"));
         let local = row.get("local").expect("local recommendation");
+        // UPI 044 schema v2: HeadroomAwareRecommendation wraps ShapeRecommendation.
+        // ShapeRecommendation fields now live under `.recommendation`.
+        let rec = local
+            .get("recommendation")
+            .expect("HeadroomAwareRecommendation.recommendation missing from JSON");
         assert!(
-            local.get("role").is_some(),
-            "ShapeRecommendation.role missing from JSON"
+            rec.get("role").is_some(),
+            "ShapeRecommendation.role missing from JSON (under .recommendation)"
         );
         assert!(
-            local.get("current").is_some(),
+            rec.get("current").is_some(),
             "ShapeRecommendation.current missing from JSON"
         );
         assert!(
-            local.get("suggested").is_some(),
+            rec.get("suggested").is_some(),
             "ShapeRecommendation.suggested missing from JSON"
         );
         assert!(
-            local.get("current_cost").is_some(),
+            rec.get("current_cost").is_some(),
             "ShapeRecommendation.current_cost missing from JSON"
         );
         assert!(
-            local.get("suggested_cost").is_some(),
+            rec.get("suggested_cost").is_some(),
             "ShapeRecommendation.suggested_cost missing from JSON"
+        );
+        // UPI 044: severity is at the top level of HeadroomAwareRecommendation.
+        assert!(
+            local.get("severity").is_some(),
+            "HeadroomAwareRecommendation.severity missing from JSON"
         );
         assert_eq!(
             row.get("note").and_then(|v| v.as_str()),
@@ -8315,6 +8455,373 @@ mod tests {
             row.get("was_named_level").and_then(|v| v.as_str()),
             Some("sheltered")
         );
+    }
+
+    // ── UPI 044 Recommendations section: headroom severity rendering ──
+
+    #[allow(clippy::too_many_arguments)]
+    fn ha_rec(
+        role: crate::policy::ShapeRole,
+        current: crate::types::ResolvedGraduatedRetention,
+        suggested: crate::types::ResolvedGraduatedRetention,
+        current_bytes: u64,
+        suggested_bytes: u64,
+        severity: crate::policy::HeadroomSeverity,
+        reason: Option<crate::policy::AdjustmentReason>,
+        adjusted: Option<crate::types::ResolvedGraduatedRetention>,
+        adjusted_bytes: Option<u64>,
+    ) -> crate::policy::HeadroomAwareRecommendation {
+        use crate::policy::{CostProjection, HeadroomAwareRecommendation, ShapeRecommendation};
+        let total = |s: crate::types::ResolvedGraduatedRetention| {
+            let m = match s.monthly {
+                crate::types::MonthlyCount::Unlimited => 0,
+                crate::types::MonthlyCount::Count(n) => n,
+            };
+            s.hourly + s.daily + s.weekly + m + s.yearly
+        };
+        let adjusted_cost = adjusted.zip(adjusted_bytes).map(|(s, b)| CostProjection {
+            data_bytes: b,
+            snapshot_count: total(s),
+        });
+        HeadroomAwareRecommendation {
+            recommendation: ShapeRecommendation {
+                role,
+                current,
+                suggested,
+                current_cost: CostProjection {
+                    data_bytes: current_bytes,
+                    snapshot_count: total(current),
+                },
+                suggested_cost: CostProjection {
+                    data_bytes: suggested_bytes,
+                    snapshot_count: total(suggested),
+                },
+                note: None,
+            },
+            severity,
+            reason,
+            adjusted,
+            adjusted_cost,
+        }
+    }
+
+    #[test]
+    fn format_row_healthy_renders_existing_shape_only() {
+        // Regression: UPI 041 behavior unchanged at Healthy severity.
+        let _color = color_guard(false);
+        let view = crate::output::DoctorRecommendationView {
+            header: "h".to_string(),
+            rows: vec![crate::output::DoctorRecommendationRow {
+                name: "containers".to_string(),
+                local: Some(recommendation(
+                    crate::policy::ShapeRole::Local,
+                    shape(24, 30, 26, crate::types::MonthlyCount::Count(12), 0),
+                    shape(0, 7, 4, crate::types::MonthlyCount::Count(0), 0),
+                    200_000_000_000,
+                    50_000_000_000,
+                )),
+                external: None,
+                note: None,
+                was_named_level: None,
+            }],
+        };
+        let out = render_doctor(&recommendations_doctor_output(view), OutputMode::Interactive);
+        assert!(out.contains("daily=7"), "shape line missing: {out}");
+        assert!(!out.contains("applying sooner"), "no reason line at Healthy: {out}");
+        assert!(!out.contains("tightened"), "no tightened text at Healthy: {out}");
+    }
+
+    #[test]
+    fn format_row_caution_renders_shape_plus_dimmed_note() {
+        let _color = color_guard(false);
+        let h = ha_rec(
+            crate::policy::ShapeRole::Local,
+            shape(24, 30, 26, crate::types::MonthlyCount::Count(12), 0),
+            shape(0, 7, 4, crate::types::MonthlyCount::Count(0), 0),
+            200_000_000_000,
+            50_000_000_000,
+            crate::policy::HeadroomSeverity::Caution,
+            Some(crate::policy::AdjustmentReason::SourcePoolLow { free_ratio: 0.20 }),
+            None,
+            None,
+        );
+        let view = crate::output::DoctorRecommendationView {
+            header: "h".to_string(),
+            rows: vec![crate::output::DoctorRecommendationRow {
+                name: "containers".to_string(),
+                local: Some(h),
+                external: None,
+                note: None,
+                was_named_level: None,
+            }],
+        };
+        let out = render_doctor(&recommendations_doctor_output(view), OutputMode::Interactive);
+        assert!(out.contains("daily=7"), "shape line still present at Caution: {out}");
+        assert!(
+            out.contains("applying sooner is recommended"),
+            "Caution reason missing: {out}"
+        );
+        assert!(out.contains("20%"), "free ratio value missing: {out}");
+    }
+
+    #[test]
+    fn format_row_pressure_renders_tightened_shape_plus_dimmed_note() {
+        let _color = color_guard(false);
+        let h = ha_rec(
+            crate::policy::ShapeRole::Local,
+            shape(24, 30, 26, crate::types::MonthlyCount::Count(12), 0),
+            shape(24, 60, 52, crate::types::MonthlyCount::Count(24), 0),
+            200_000_000_000,
+            50_000_000_000,
+            crate::policy::HeadroomSeverity::Pressure,
+            Some(crate::policy::AdjustmentReason::SourcePoolLow { free_ratio: 0.10 }),
+            Some(shape(16, 42, 36, crate::types::MonthlyCount::Count(16), 0)),
+            Some(25_000_000_000),
+        );
+        let view = crate::output::DoctorRecommendationView {
+            header: "h".to_string(),
+            rows: vec![crate::output::DoctorRecommendationRow {
+                name: "containers".to_string(),
+                local: Some(h),
+                external: None,
+                note: None,
+                was_named_level: None,
+            }],
+        };
+        let out = render_doctor(&recommendations_doctor_output(view), OutputMode::Interactive);
+        // Tightened shape renders, not the suggested.
+        assert!(out.contains("daily=42"), "tightened daily missing: {out}");
+        assert!(!out.contains("daily=60"), "suggested daily must not appear: {out}");
+        assert!(out.contains("shape tightened"), "tightened reason missing: {out}");
+    }
+
+    #[test]
+    fn format_row_pressure_recovery_uses_adjusted_cost_not_suggested_cost() {
+        // R2: rendered "recover ~..." must reflect tightened-shape cost,
+        // not the (cheaper, but not rendered) suggested cost.
+        let _color = color_guard(false);
+        let h = ha_rec(
+            crate::policy::ShapeRole::Local,
+            shape(24, 30, 26, crate::types::MonthlyCount::Count(12), 0),
+            shape(24, 60, 52, crate::types::MonthlyCount::Count(24), 0),
+            200_000_000_000,
+            50_000_000_000,
+            crate::policy::HeadroomSeverity::Pressure,
+            Some(crate::policy::AdjustmentReason::SourcePoolLow { free_ratio: 0.10 }),
+            Some(shape(16, 42, 36, crate::types::MonthlyCount::Count(16), 0)),
+            Some(25_000_000_000),
+        );
+        let view = crate::output::DoctorRecommendationView {
+            header: "h".to_string(),
+            rows: vec![crate::output::DoctorRecommendationRow {
+                name: "containers".to_string(),
+                local: Some(h),
+                external: None,
+                note: None,
+                was_named_level: None,
+            }],
+        };
+        let out = render_doctor(&recommendations_doctor_output(view), OutputMode::Interactive);
+        // current=200 GB, adjusted=25 GB → recover 175 GB.
+        // Not current=200 GB - suggested=50 GB = 150 GB.
+        assert!(
+            out.contains("175.0GB") || out.contains("175 GB"),
+            "recovery delta must use adjusted_cost (~175 GB): {out}"
+        );
+        assert!(
+            !out.contains("150.0GB") && !out.contains("150 GB"),
+            "recovery delta must not use suggested_cost (150 GB): {out}"
+        );
+    }
+
+    #[test]
+    fn format_row_pressure_at_min_renders_minimum_message() {
+        // Pressure severity with adjusted=None AND suggested==current
+        // (synth path / true at-MIN): no shape line, only "minimum" reason.
+        let _color = color_guard(false);
+        let cur = shape(0, 3, 0, crate::types::MonthlyCount::Count(0), 0);
+        // Use the policy helper to construct the synth-shape directly.
+        let h = crate::policy::headroom_aware_pointer_only(
+            &cur,
+            crate::policy::ShapeRole::Local,
+            crate::policy::HeadroomSeverity::Pressure,
+            crate::policy::AdjustmentReason::SourcePoolLow { free_ratio: 0.10 },
+        );
+        let view = crate::output::DoctorRecommendationView {
+            header: "h".to_string(),
+            rows: vec![crate::output::DoctorRecommendationRow {
+                name: "transient".to_string(),
+                local: Some(h),
+                external: None,
+                note: None,
+                was_named_level: None,
+            }],
+        };
+        let out = render_doctor(&recommendations_doctor_output(view), OutputMode::Interactive);
+        assert!(
+            !out.contains("daily="),
+            "synth must omit shape line: {out}"
+        );
+        assert!(
+            out.contains("shape already at minimum"),
+            "at-MIN message missing: {out}"
+        );
+    }
+
+    #[test]
+    fn format_row_critical_renders_pointer_only() {
+        let _color = color_guard(false);
+        let cur = shape(24, 60, 52, crate::types::MonthlyCount::Count(24), 0);
+        let h = crate::policy::headroom_aware_pointer_only(
+            &cur,
+            crate::policy::ShapeRole::Local,
+            crate::policy::HeadroomSeverity::Critical,
+            crate::policy::AdjustmentReason::StorageCritical,
+        );
+        let view = crate::output::DoctorRecommendationView {
+            header: "h".to_string(),
+            rows: vec![crate::output::DoctorRecommendationRow {
+                name: "containers".to_string(),
+                local: Some(h),
+                external: None,
+                note: None,
+                was_named_level: None,
+            }],
+        };
+        let out = render_doctor(&recommendations_doctor_output(view), OutputMode::Interactive);
+        assert!(
+            out.contains("storage critical"),
+            "Critical pointer line missing: {out}"
+        );
+        assert!(!out.contains("daily="), "no shape at Critical: {out}");
+    }
+
+    #[test]
+    fn format_row_critical_suppresses_bursty_and_named_level_hints() {
+        // R9: Critical severity suppresses both bursty pattern and
+        // was_named_level hints.
+        let _color = color_guard(false);
+        let cur = shape(24, 60, 52, crate::types::MonthlyCount::Count(24), 0);
+        let h = crate::policy::headroom_aware_pointer_only(
+            &cur,
+            crate::policy::ShapeRole::Local,
+            crate::policy::HeadroomSeverity::Critical,
+            crate::policy::AdjustmentReason::StorageCritical,
+        );
+        let view = crate::output::DoctorRecommendationView {
+            header: "h".to_string(),
+            rows: vec![crate::output::DoctorRecommendationRow {
+                name: "containers".to_string(),
+                local: Some(h),
+                external: None,
+                note: Some(crate::policy::RecommendationNote::BurstyPattern),
+                was_named_level: Some(crate::types::ProtectionLevel::Sheltered),
+            }],
+        };
+        let out = render_doctor(&recommendations_doctor_output(view), OutputMode::Interactive);
+        assert!(
+            !out.contains("bursty pattern"),
+            "bursty hint must be suppressed at Critical: {out}"
+        );
+        assert!(
+            !out.contains("applying switches to custom"),
+            "named-level hint must be suppressed at Critical: {out}"
+        );
+    }
+
+    #[test]
+    fn format_row_per_role_independent_severity() {
+        // Local Healthy, External Pressure → Local renders bare,
+        // External renders the adjustment.
+        let _color = color_guard(false);
+        let local_healthy = recommendation(
+            crate::policy::ShapeRole::Local,
+            shape(24, 30, 26, crate::types::MonthlyCount::Count(12), 0),
+            shape(0, 7, 4, crate::types::MonthlyCount::Count(0), 0),
+            200_000_000_000,
+            50_000_000_000,
+        );
+        let external_pressure = ha_rec(
+            crate::policy::ShapeRole::External,
+            shape(0, 30, 26, crate::types::MonthlyCount::Count(12), 0),
+            shape(0, 60, 52, crate::types::MonthlyCount::Count(24), 0),
+            400_000_000_000,
+            100_000_000_000,
+            crate::policy::HeadroomSeverity::Pressure,
+            Some(crate::policy::AdjustmentReason::DestinationMetadataPressure {
+                drive_label: "WD-18TB".to_string(),
+                ratio: 0.95,
+            }),
+            Some(shape(0, 42, 36, crate::types::MonthlyCount::Count(16), 0)),
+            Some(50_000_000_000),
+        );
+        let view = crate::output::DoctorRecommendationView {
+            header: "h".to_string(),
+            rows: vec![crate::output::DoctorRecommendationRow {
+                name: "containers".to_string(),
+                local: Some(local_healthy),
+                external: Some(external_pressure),
+                note: None,
+                was_named_level: None,
+            }],
+        };
+        let out = render_doctor(&recommendations_doctor_output(view), OutputMode::Interactive);
+        // Local has no reason line; External has the WD-18TB note.
+        assert!(out.contains("WD-18TB metadata"), "metadata reason missing: {out}");
+        // External tightened shape rendered.
+        assert!(out.contains("daily=42"), "tightened daily missing: {out}");
+    }
+
+    #[test]
+    fn format_row_synth_pressure_emits_at_min_message_with_no_shape_line() {
+        // R1: cold subvolume with Pressure severity gets a synth-pointer
+        // row. Renderer emits no shape, only the at-MIN message.
+        let _color = color_guard(false);
+        let cur = shape(0, 3, 0, crate::types::MonthlyCount::Count(0), 0);
+        let h = crate::policy::headroom_aware_pointer_only(
+            &cur,
+            crate::policy::ShapeRole::Local,
+            crate::policy::HeadroomSeverity::Pressure,
+            crate::policy::AdjustmentReason::SourcePoolLow { free_ratio: 0.10 },
+        );
+        let view = crate::output::DoctorRecommendationView {
+            header: "h".to_string(),
+            rows: vec![crate::output::DoctorRecommendationRow {
+                name: "transient".to_string(),
+                local: Some(h),
+                external: None,
+                note: None,
+                was_named_level: None,
+            }],
+        };
+        let out = render_doctor(&recommendations_doctor_output(view), OutputMode::Interactive);
+        assert!(!out.contains("daily="), "synth must omit shape: {out}");
+        assert!(out.contains("shape already at minimum"), "at-MIN message missing: {out}");
+    }
+
+    #[test]
+    fn format_row_synth_critical_emits_pointer_only() {
+        let _color = color_guard(false);
+        let cur = shape(0, 3, 0, crate::types::MonthlyCount::Count(0), 0);
+        let h = crate::policy::headroom_aware_pointer_only(
+            &cur,
+            crate::policy::ShapeRole::Local,
+            crate::policy::HeadroomSeverity::Critical,
+            crate::policy::AdjustmentReason::StorageCritical,
+        );
+        let view = crate::output::DoctorRecommendationView {
+            header: "h".to_string(),
+            rows: vec![crate::output::DoctorRecommendationRow {
+                name: "transient".to_string(),
+                local: Some(h),
+                external: None,
+                note: None,
+                was_named_level: None,
+            }],
+        };
+        let out = render_doctor(&recommendations_doctor_output(view), OutputMode::Interactive);
+        assert!(out.contains("storage critical"), "pointer line missing: {out}");
+        assert!(!out.contains("daily="), "no shape: {out}");
     }
 
     // ── UPI 042 — MonthlyCount + yearly rendering ───────────────────

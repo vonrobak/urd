@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Headroom-aware recommendations** (UPI 044, ADR-115 amendment 2026-05-16).
+  `urd doctor --thorough` now adjusts retention recommendations when the
+  source pool is shrinking or destination metadata is pressured: Caution
+  surfaces an adjustment note ("source pool at N% — applying sooner is
+  recommended"); Pressure also tightens the recommended shape (×0.7
+  re-clamped); Critical defers to UPI 031's future storage_critical surface.
+  Thresholds (25%/15% free, 90/30 days time-to-empty, 0.85/0.92 metadata)
+  and the 0.7 tightening multiplier are committed in `src/policy.rs` and
+  N=1-calibrated; the post-UPI-044 30-day evidence checkpoint owns
+  revision. Recommendation severity is classified per (subvolume, role)
+  pair; the storage_critical stub in `src/storage_critical.rs` returns
+  `false` and is replaced by UPI 031 when it ships.
+
+### Changed
+- **`urd doctor --json` schema bumped to v2** (UPI 044, R3). Adds a
+  top-level `schema_version: u32` field and restructures recommendation
+  rows: `recommendations.rows[].local` and `.external` changed type from
+  `ShapeRecommendation` to `HeadroomAwareRecommendation` (the original
+  shape is now nested under `.recommendation`, alongside new `severity`,
+  `reason`, `adjusted`, and `adjusted_cost` fields). Consumers reading
+  `row.local.role` should migrate to `row.local.recommendation.role`.
+  ADR-115 amendment formalizes the schema commitment alongside heartbeat
+  and Prometheus contracts (ADR-105).
+
 ## [0.19.0] - 2026-05-16
 
 ### Fixed
