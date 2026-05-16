@@ -27,7 +27,7 @@ pub fn run(config: Config, args: PlanArgs, mode: OutputMode) -> anyhow::Result<(
     };
     let backup_plan = plan::plan(&config, now, &filters, &fs_state)?;
 
-    let mut output = build_plan_output(&backup_plan, &fs_state);
+    let mut output = build_plan_output(&backup_plan, &fs_state, &config);
     populate_token_warnings(&mut output, state_db.as_ref(), &config);
     print!("{}", voice::render_plan(&output, mode));
 
@@ -39,6 +39,7 @@ pub fn run(config: Config, args: PlanArgs, mode: OutputMode) -> anyhow::Result<(
 pub fn build_plan_output(
     backup_plan: &crate::types::BackupPlan,
     fs_state: &dyn FileSystemState,
+    config: &Config,
 ) -> PlanOutput {
     let summary = backup_plan.summary();
 
@@ -69,6 +70,12 @@ pub fn build_plan_output(
         None
     };
 
+    let configured_subvolumes = config
+        .subvolumes
+        .iter()
+        .filter(|s| s.enabled.unwrap_or(true))
+        .count();
+
     PlanOutput {
         timestamp: backup_plan.timestamp.format("%Y-%m-%d %H:%M").to_string(),
         operations,
@@ -79,6 +86,7 @@ pub fn build_plan_output(
             deletions: summary.deletions,
             skipped: summary.skipped,
             estimated_total_bytes,
+            configured_subvolumes,
         },
         warnings: Vec::new(),
     }
@@ -220,6 +228,52 @@ mod tests {
 
     fn dummy_snap(subvol: &str) -> SnapshotName {
         SnapshotName::parse(&format!("20260329-0404-{subvol}")).unwrap()
+    }
+
+    fn test_config() -> Config {
+        let toml_str = r#"
+[general]
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp"
+
+[local_snapshots]
+roots = [
+  { path = "/snap", subvolumes = ["htpc-home", "htpc-docs"] }
+]
+
+[defaults]
+snapshot_interval = "1h"
+send_interval = "1d"
+send_enabled = true
+enabled = true
+[defaults.local_retention]
+hourly = 24
+daily = 30
+weekly = 26
+monthly = 12
+[defaults.external_retention]
+daily = 30
+weekly = 26
+monthly = 0
+
+[[drives]]
+label = "WD-18TB"
+mount_path = "/mnt/wd"
+snapshot_root = ".snapshots"
+role = "primary"
+
+[[subvolumes]]
+name = "htpc-home"
+short_name = "htpc-home"
+source = "/data/htpc-home"
+
+[[subvolumes]]
+name = "htpc-docs"
+short_name = "htpc-docs"
+source = "/data/htpc-docs"
+"#;
+        toml::from_str(toml_str).expect("test config should parse")
     }
 
     fn mock_send_full(subvol: &str, drive: &str) -> PlannedOperation {
@@ -378,7 +432,7 @@ mod tests {
             skipped: vec![],
             events: Vec::new(),
         };
-        let output = build_plan_output(&plan, &fs);
+        let output = build_plan_output(&plan, &fs, &test_config());
         assert_eq!(output.summary.estimated_total_bytes, Some(54_200_000_000));
     }
 
@@ -398,7 +452,7 @@ mod tests {
             skipped: vec![],
             events: Vec::new(),
         };
-        let output = build_plan_output(&plan, &fs);
+        let output = build_plan_output(&plan, &fs, &test_config());
         assert_eq!(output.summary.estimated_total_bytes, Some(53_000_000_000));
     }
 
@@ -411,7 +465,7 @@ mod tests {
             skipped: vec![],
             events: Vec::new(),
         };
-        let output = build_plan_output(&plan, &fs);
+        let output = build_plan_output(&plan, &fs, &test_config());
         assert_eq!(output.summary.estimated_total_bytes, None);
     }
 }

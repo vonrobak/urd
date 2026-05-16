@@ -41,6 +41,31 @@ const SPACE_TIGHT_MARGIN_PERCENT: u64 = 20;
 /// Operational health: an unmounted drive degrades health after this many days.
 const DRIVE_AWAY_DEGRADED_DAYS: i64 = 7;
 
+/// Cascade between physical-absence truth and an ops-log fallback age.
+///
+/// Returns `(age_secs, source_word)` where:
+/// - `Some((absent, "away"))` when `absent_duration_secs` is set — physical
+///   `Unmount` truth wins.
+/// - `Some((fallback.max(0), "last backup"))` when only the fallback is set —
+///   negatives clamp to 0 to guard against clock skew.
+/// - `None` when neither is set — caller must stay silent (Rule 1).
+///
+/// The fallback field is **per-caller**, not baked in: voice uses
+/// `last_activity_age_secs` (broader "when was this drive last active?");
+/// awareness uses `last_send_age` (narrower "when did the backup last
+/// succeed?"). The cascade *decision* is singular; the *fallback semantic*
+/// belongs to each consumer. See ADR-110 amendment / UPI 045 plan R4.
+pub(crate) fn cascade_age_source(
+    absent_duration_secs: Option<i64>,
+    fallback_secs: Option<i64>,
+) -> Option<(i64, &'static str)> {
+    match (absent_duration_secs, fallback_secs) {
+        (Some(absent), _) => Some((absent, "away")),
+        (None, Some(fallback)) => Some((fallback.max(0), "last backup")),
+        (None, None) => None,
+    }
+}
+
 // ── Types ──────────────────────────────────────────────────────────────
 
 /// Promise status for a subvolume or assessment dimension.
@@ -1124,15 +1149,19 @@ fn compute_health(
     for da in drive_assessments {
         if !da.mounted
             && !da.source_unchanged
-            && let Some(age) = da.last_send_age
-            && age.num_days() > DRIVE_AWAY_DEGRADED_DAYS
+            && let Some((age_secs, source_word)) = cascade_age_source(
+                da.absent_duration_secs,
+                da.last_send_age.map(|d| d.num_seconds()),
+            )
         {
-            reasons.push(format!(
-                "{} away for {} days",
-                da.drive_label,
-                age.num_days()
-            ));
-            worst = worst.min(OperationalHealth::Degraded);
+            let age_days = age_secs / 86400;
+            if age_days > DRIVE_AWAY_DEGRADED_DAYS {
+                reasons.push(format!(
+                    "{} {source_word} for {age_days} days",
+                    da.drive_label,
+                ));
+                worst = worst.min(OperationalHealth::Degraded);
+            }
         }
     }
 
@@ -3220,6 +3249,106 @@ send_enabled = false
             "should not produce an 'away for N days' reason when source is unchanged. reasons: {:?}",
             results[0].health_reasons,
         );
+    }
+
+    #[test]
+    fn health_drive_recently_unplugged_but_stale_send_does_not_label_away_17_days() {
+        // Issue #103 regression: when a drive was unplugged 1h ago but its
+        // last send was 17 days ago, awareness must label health from physical
+        // truth ("away 0d" — under the 7d threshold → no reason emitted), not
+        // from the stale send age ("away 17 days" — false statement that the
+        // drive has been *physically* gone for 17 days).
+        use crate::types::{DriveEvent, DriveEventKind};
+        let config = test_config_two_drives();
+        let now = dt(2026, 3, 23, 14, 0);
+        let mut fs = MockFileSystemState::new();
+
+        let pin_snap = snap(dt(2026, 3, 23, 12, 0), "sv1");
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![pin_snap.clone()]);
+
+        // D1 mounted & healthy so we isolate D2's degradation contribution.
+        fs.mounted_drives.insert("D1".to_string());
+        fs.external_snapshots
+            .insert(("D1".to_string(), "sv1".to_string()), vec![pin_snap.clone()]);
+        fs.pin_files.insert(
+            (std::path::PathBuf::from("/snap/sv1"), "D1".to_string()),
+            pin_snap.clone(),
+        );
+        fs.send_times.insert(
+            ("sv1".to_string(), "D1".to_string()),
+            dt(2026, 3, 23, 12, 0),
+        );
+        fs.free_bytes
+            .insert(std::path::PathBuf::from("/mnt/d1"), 1_000_000_000_000);
+
+        // D2: unmounted, Unmount event 1h ago → absent_duration_secs = 3600.
+        // Send 17 days ago → last_send_age = 17d. Source NOT unchanged (no
+        // matching generations), so the source_unchanged suppression doesn't
+        // mask the bug. Without #103's fix, awareness would emit
+        // "D2 away for 17 days" — with it, the cascade picks absent_duration
+        // (3600s → 0 days), which is under the 7d threshold → no reason.
+        fs.drive_events.insert(
+            "D2".to_string(),
+            DriveEvent {
+                kind: DriveEventKind::Unmount,
+                at: dt(2026, 3, 23, 13, 0),
+            },
+        );
+        fs.send_times.insert(
+            ("sv1".to_string(), "D2".to_string()),
+            dt(2026, 3, 6, 14, 0), // 17 days ago
+        );
+
+        let results = assess(&config, now, &fs);
+        assert!(
+            !results[0]
+                .health_reasons
+                .iter()
+                .any(|r| r.contains("17 days")),
+            "must not emit any '17 days' reason — physical absence wins. reasons: {:?}",
+            results[0].health_reasons,
+        );
+        assert!(
+            !results[0]
+                .health_reasons
+                .iter()
+                .any(|r| r.contains("D2 away")),
+            "1h absence is under the 7d threshold — no away reason should fire. reasons: {:?}",
+            results[0].health_reasons,
+        );
+    }
+
+    #[test]
+    fn cascade_age_source_absent_wins_over_fallback() {
+        // Physical truth wins over ops-log fallback when both are present.
+        let r = cascade_age_source(Some(3600), Some(17 * 86400));
+        assert_eq!(r, Some((3600, "away")));
+    }
+
+    #[test]
+    fn cascade_age_source_absent_alone() {
+        let r = cascade_age_source(Some(3600), None);
+        assert_eq!(r, Some((3600, "away")));
+    }
+
+    #[test]
+    fn cascade_age_source_fallback_alone() {
+        let r = cascade_age_source(None, Some(2 * 86400));
+        assert_eq!(r, Some((2 * 86400, "last backup")));
+    }
+
+    #[test]
+    fn cascade_age_source_fallback_negative_clamps_to_zero() {
+        // Clock skew or arithmetic glitches must not surface as negative ages.
+        let r = cascade_age_source(None, Some(-5));
+        assert_eq!(r, Some((0, "last backup")));
+    }
+
+    #[test]
+    fn cascade_age_source_both_none_stays_silent() {
+        let r = cascade_age_source(None, None);
+        assert_eq!(r, None);
     }
 
     #[test]

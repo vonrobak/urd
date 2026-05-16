@@ -1073,12 +1073,22 @@ pub fn render_plan(data: &PlanOutput, mode: OutputMode) -> String {
 fn render_plan_interactive(data: &PlanOutput) -> String {
     let mut out = String::new();
 
-    writeln!(
-        out,
-        "{}",
-        format!("Urd backup plan for {}", data.timestamp).bold()
-    )
-    .ok();
+    // Verdict line first (UPI 045 Rule 5 — first line is the answer).
+    // 4-arm match per Finding 1: the zero-subvolume arm prevents a
+    // trust failure where "no subvolumes configured" rendered as
+    // "All sealed." (same well-meaning lie as Finding 1's plan analogue
+    // for `urd doctor` — see R-10).
+    let configured = data.summary.configured_subvolumes;
+    let ops_empty = data.operations.is_empty();
+    let skips_len = data.skipped.len();
+    let op_count = data.operations.len();
+    let verdict_line = match (configured, ops_empty, skips_len) {
+        (0, _, _) => "No subvolumes configured.".dimmed().to_string(),
+        (_, true, 0) => "All sealed.".green().bold().to_string(),
+        (_, true, _) => "No backups planned (all skipped \u{2014} see below).".yellow().to_string(),
+        (_, false, _) => format!("{op_count} operations planned.").bold().to_string(),
+    };
+    writeln!(out, "{verdict_line}").ok();
     writeln!(out).ok();
 
     // === Warnings ===
@@ -1089,8 +1099,7 @@ fn render_plan_interactive(data: &PlanOutput) -> String {
         writeln!(out).ok();
     }
 
-    if data.operations.is_empty() && data.skipped.is_empty() {
-        writeln!(out, "{}", "Nothing to do.".dimmed()).ok();
+    if ops_empty && skips_len == 0 {
         return out;
     }
 
@@ -1120,9 +1129,6 @@ fn render_plan_interactive(data: &PlanOutput) -> String {
             };
             writeln!(out, "  {:<10} {}{}", label, entry.detail, size_annotation.dimmed()).ok();
         }
-        writeln!(out).ok();
-    } else {
-        writeln!(out, "{}", "No operations planned.".dimmed()).ok();
         writeln!(out).ok();
     }
 
@@ -2247,7 +2253,27 @@ pub fn render_doctor(data: &DoctorOutput, mode: OutputMode) -> String {
 fn render_doctor_interactive(data: &DoctorOutput) -> String {
     let mut out = String::new();
 
-    writeln!(out, "{}", "Checking Urd health...".bold()).ok();
+    // Verdict line first (UPI 045 Rule 5 — first line is the answer).
+    let verdict_line = match data.verdict.status {
+        DoctorVerdictStatus::Healthy => "All clear.".green().bold().to_string(),
+        DoctorVerdictStatus::Warnings => {
+            format!("{}.", pluralize(data.verdict.count, "warning", "warnings"))
+                .yellow()
+                .to_string()
+        }
+        DoctorVerdictStatus::Issues => {
+            format!("{} found.", pluralize(data.verdict.count, "issue", "issues"))
+                .red()
+                .to_string()
+        }
+        DoctorVerdictStatus::Degraded => format!(
+            "{} degraded. Data is safe \u{2014} drives are absent.",
+            pluralize(data.verdict.count, "subvolume", "subvolumes")
+        )
+        .yellow()
+        .to_string(),
+    };
+    writeln!(out, "{verdict_line}").ok();
     writeln!(out).ok();
 
     // UPI 042 Branch G: schema deprecation notice. Emitted near the top so
@@ -2447,43 +2473,8 @@ fn render_doctor_interactive(data: &DoctorOutput) -> String {
         }
     }
 
-    // Verdict
-    writeln!(out).ok();
-    match data.verdict.status {
-        DoctorVerdictStatus::Healthy => {
-            writeln!(out, "{}", "All clear.".green().bold()).ok();
-        }
-        DoctorVerdictStatus::Warnings => {
-            writeln!(
-                out,
-                "{}",
-                format!("{}.", pluralize(data.verdict.count, "warning", "warnings")).yellow()
-            )
-            .ok();
-        }
-        DoctorVerdictStatus::Issues => {
-            writeln!(
-                out,
-                "{}",
-                format!("{} found.", pluralize(data.verdict.count, "issue", "issues")).red()
-            )
-            .ok();
-        }
-        DoctorVerdictStatus::Degraded => {
-            writeln!(
-                out,
-                "{}",
-                format!(
-                    "{} degraded. Data is safe \u{2014} drives are absent.",
-                    pluralize(data.verdict.count, "subvolume", "subvolumes")
-                )
-                .yellow()
-            )
-            .ok();
-        }
-    }
-
-    // Doctor verdict already provides guidance; suggestion is always None.
+    // Doctor verdict already provides guidance (rendered at the top now);
+    // suggestion is always None.
     append_suggestion(&SuggestionContext::Doctor, &mut out);
 
     out
@@ -2967,10 +2958,14 @@ fn unmounted_drive_label(
     last_activity_age_secs: Option<i64>,
     worst_status: &str,
 ) -> String {
-    match (absent_duration_secs, last_activity_age_secs) {
-        (Some(d), _) => format_drive_age_label(drive_label, d, worst_status, "away"),
-        (None, Some(a)) => format_drive_age_label(drive_label, a, worst_status, "last backup"),
-        (None, None) => format!("{} {}", drive_label.bold(), "disconnected".dimmed()),
+    // Fallback field is `last_activity_age_secs` (broader: any activity)
+    // rather than `last_send_age` (awareness's narrower backup-only signal).
+    // Shared cascade primitive — divergent fallback semantic. See UPI 045 R4.
+    match crate::awareness::cascade_age_source(absent_duration_secs, last_activity_age_secs) {
+        Some((age_secs, phrase)) => {
+            format_drive_age_label(drive_label, age_secs, worst_status, phrase)
+        }
+        None => format!("{} {}", drive_label.bold(), "disconnected".dimmed()),
     }
 }
 
@@ -3555,6 +3550,7 @@ pub(crate) mod test_fixtures {
                 deletions: 0,
                 skipped: 0,
                 estimated_total_bytes: None,
+                configured_subvolumes: 2,
             },
             warnings: vec![],
         }
@@ -4356,6 +4352,7 @@ mod tests {
                 deletions: 0,
                 skipped: 0,
                 estimated_total_bytes: None,
+                configured_subvolumes: 2,
             },
             warnings: vec![],
         };
@@ -4377,6 +4374,7 @@ mod tests {
                 deletions: 0,
                 skipped: 0,
                 estimated_total_bytes: None,
+                configured_subvolumes: 2,
             },
             warnings: vec![],
         };
@@ -4412,6 +4410,7 @@ mod tests {
                 deletions: 0,
                 skipped: 1,
                 estimated_total_bytes: None,
+                configured_subvolumes: 2,
             },
             warnings: vec![],
         };
@@ -4440,13 +4439,18 @@ mod tests {
                 deletions: 0,
                 skipped: 1,
                 estimated_total_bytes: None,
+                configured_subvolumes: 2,
             },
             warnings: vec![],
         };
         let output = render_plan(&data, OutputMode::Interactive);
+        // UPI 045: the ops-empty+skips-non-empty branch now renders the
+        // verdict "No backups planned (all skipped — see below)." on line 1
+        // and lets the Skipped section carry the detail. The old
+        // "No operations planned." string is deleted.
         assert!(
-            output.contains("No operations planned."),
-            "missing no-ops message"
+            output.contains("No backups planned"),
+            "missing no-backups verdict line: {output}"
         );
         assert!(
             !output.contains("=== Planned operations ==="),
@@ -4483,6 +4487,7 @@ mod tests {
                 deletions: 0,
                 skipped: 3,
                 estimated_total_bytes: None,
+                configured_subvolumes: 2,
             },
             warnings: vec![],
         };
@@ -4537,6 +4542,7 @@ mod tests {
                 deletions: 0,
                 skipped: 3,
                 estimated_total_bytes: None,
+                configured_subvolumes: 2,
             },
             warnings: vec![],
         };
@@ -4580,6 +4586,7 @@ mod tests {
                 deletions: 0,
                 skipped: 2,
                 estimated_total_bytes: None,
+                configured_subvolumes: 2,
             },
             warnings: vec![],
         };
@@ -4620,6 +4627,7 @@ mod tests {
                 deletions: 0,
                 skipped: 3,
                 estimated_total_bytes: None,
+                configured_subvolumes: 2,
             },
             warnings: vec![],
         };
@@ -4664,6 +4672,7 @@ mod tests {
                 deletions: 0,
                 skipped: 1,
                 estimated_total_bytes: None,
+                configured_subvolumes: 2,
             },
             warnings: vec![],
         };
@@ -4695,6 +4704,7 @@ mod tests {
                 deletions: 0,
                 skipped: 1,
                 estimated_total_bytes: None,
+                configured_subvolumes: 2,
             },
             warnings: vec![],
         };
@@ -4762,6 +4772,7 @@ mod tests {
                 deletions: 0,
                 skipped: 3,
                 estimated_total_bytes: None,
+                configured_subvolumes: 2,
             },
             warnings: vec![],
         };
@@ -4795,6 +4806,7 @@ mod tests {
                 deletions: 0,
                 skipped: 1,
                 estimated_total_bytes: None,
+                configured_subvolumes: 2,
             },
             warnings: vec![],
         };
@@ -4840,6 +4852,7 @@ mod tests {
                 deletions: 0,
                 skipped: 0,
                 estimated_total_bytes: Some(54_200_000_000),
+                configured_subvolumes: 2,
             },
             warnings: vec![],
         };
@@ -4876,6 +4889,7 @@ mod tests {
                 deletions: 0,
                 skipped: 0,
                 estimated_total_bytes: Some(5_500_000),
+                configured_subvolumes: 2,
             },
             warnings: vec![],
         };
@@ -4918,6 +4932,7 @@ mod tests {
                 deletions: 0,
                 skipped: 0,
                 estimated_total_bytes: Some(53_000_000_000),
+                configured_subvolumes: 2,
             },
             warnings: vec![],
         };
@@ -4949,6 +4964,7 @@ mod tests {
                 deletions: 0,
                 skipped: 0,
                 estimated_total_bytes: None,
+                configured_subvolumes: 2,
             },
             warnings: vec![],
         };
@@ -4983,6 +4999,7 @@ mod tests {
                 deletions: 0,
                 skipped: 0,
                 estimated_total_bytes: Some(53_000_000_000),
+                configured_subvolumes: 2,
             },
             warnings: vec![],
         };
@@ -5018,6 +5035,7 @@ mod tests {
                 deletions: 0,
                 skipped: 0,
                 estimated_total_bytes: None,
+                configured_subvolumes: 2,
             },
             warnings: vec![],
         };
@@ -5051,6 +5069,7 @@ mod tests {
                 deletions: 0,
                 skipped: 0,
                 estimated_total_bytes: None,
+                configured_subvolumes: 2,
             },
             warnings: vec![
                 "Drive WD-18TB token mismatch \u{2014} possible drive swap. Sends blocked."
@@ -5080,6 +5099,7 @@ mod tests {
                 deletions: 0,
                 skipped: 0,
                 estimated_total_bytes: None,
+                configured_subvolumes: 2,
             },
             warnings: vec![],
         };
@@ -5103,6 +5123,7 @@ mod tests {
                 deletions: 0,
                 skipped: 0,
                 estimated_total_bytes: None,
+                configured_subvolumes: 2,
             },
             warnings: vec!["Drive X identity suspect".to_string()],
         };
@@ -5173,6 +5194,7 @@ mod tests {
                 deletions: 0,
                 skipped: 1,
                 estimated_total_bytes: None,
+                configured_subvolumes: 2,
             },
             warnings: vec![],
         };
@@ -7533,6 +7555,7 @@ mod tests {
                 deletions: 0,
                 skipped: 1,
                 estimated_total_bytes: None,
+                configured_subvolumes: 2,
             },
             warnings: vec![],
         };

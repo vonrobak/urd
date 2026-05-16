@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- UPI 045 — Voice evolution pt 1. `urd doctor` and `urd plan` now lead with
+  the verdict ("All clear." / "N warnings." / "All sealed." / "N operations
+  planned." / "No subvolumes configured.") instead of "Checking Urd health…"
+  / "Urd backup plan for {ts}" (Rule 5 contract). The new four-arm plan
+  verdict closes Finding 1: a zero-subvolume config no longer renders as
+  "All sealed.", and `urd doctor` on a zero-subvolume config surfaces a
+  Warning rather than the misleading "All clear." (R-10).
+- Issue [#103] — `awareness.rs` no longer labels a recently-unplugged drive
+  as "away for N days" when N is the stale-send age. A shared
+  `cascade_age_source` primitive consults physical `Unmount` truth first
+  (`absent_duration_secs`) and only falls back to the per-caller ops-log
+  age, with the source word ("away" vs "last backup") matching the source.
+
+### Changed
+- Two `#[ignore]`'d Rule 5 contract stubs in `voice_contract.rs` are now
+  active and passing. Three deferred stubs (rule3 / rule4-drive / rule7)
+  now point at UPI 045-a as the next owner.
+
 ## [0.18.0] - 2026-05-16
 
 ### Added

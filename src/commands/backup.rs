@@ -79,7 +79,7 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     // Dry run: print plan and exit (no lock needed)
     if args.dry_run {
         let mut plan_output =
-            crate::commands::plan_cmd::build_plan_output(&backup_plan, &fs_state);
+            crate::commands::plan_cmd::build_plan_output(&backup_plan, &fs_state, &config);
         crate::commands::plan_cmd::populate_token_warnings(
             &mut plan_output,
             state_db.as_ref(),
@@ -169,7 +169,7 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     // Pre-action briefing for manual TTY runs
     if !args.auto && std::io::stdout().is_terminal() {
         let plan_output =
-            crate::commands::plan_cmd::build_plan_output(&backup_plan, &fs_state);
+            crate::commands::plan_cmd::build_plan_output(&backup_plan, &fs_state, &config);
         let pre_filters = crate::output::PreActionFilters {
             local_only: filters.local_only,
             external_only: filters.external_only,
