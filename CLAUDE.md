@@ -142,6 +142,10 @@ produce the same internal `Config` struct — v1/v2 synthesize `LocalSnapshotsCo
 - **The Sentinel is the integration layer.** Event-driven state machine that reacts to
   drive events, updates promise states, and drives notifications. Deployed as a systemd
   user service.
+- **Capture real CLI output during drive operations.** Snapshot, send, swap, fail — saved
+  transcripts of what the user actually sees are the highest-value input to `/steve` and
+  to product-level critique generally. Reviewing strings the user encountered beats
+  reviewing strings the designer hopes the user will encounter.
 
 ## Coding Conventions
 
@@ -272,6 +276,13 @@ cargo run -- migrate                 # Migrate config to v1 schema
 | 114 | Structured event log | Typed change-and-decision history; complement to Prometheus gauges and UPI 030 drift_samples |
 | 115 | Retention shape symmetry and the recommendation layer | Symmetric data-cost model + advisory recommendation surface; amends ADR-110 |
 
+**ADR gating criteria.** An entry earns ADR status when all three of these hold:
+(1) the decision is hard to reverse, (2) the rationale would surprise a reader without
+context, (3) it is the result of a real trade-off among considered alternatives. If a
+decision fails any of the three, it belongs in CLAUDE.md, the design doc, or a journal —
+not in the ADR series. (Adopted from Matt Pocock's `ADR-FORMAT.md`; see
+`docs/99-reports/2026-05-16-skill-ecosystem-review.md` §5 and Doc-1.)
+
 ## Development Workflow
 
 Three tiers based on scope. Use the lightest tier that fits — but when in doubt, tier up.
@@ -316,6 +327,13 @@ systematic-debugging → build → /check → /commit-push-pr → /session-close
 | `/journal` | Any time | Focused journal entry about a specific topic or lesson learned |
 | `/session-close` | Session close | Comprehensive journal + status.md + registry.md updates (always last) |
 | `/release` | Release | SemVer bump, CHANGELOG, tag (user pushes manually) |
+
+**Arc-level grilling for multi-UPI work.** For an arc that will be implemented across
+several UPIs, run a `/grill-me` session against the arc *before* per-UPI design work
+begins. The arc-level grill pins format, naming, and cross-UPI sequencing once;
+subsequent per-UPI grills go faster because the cross-cutting decisions are already
+resolved. Use letters or descriptive names (Branch A, "drive-detection step") for
+to-be-designed pieces — UPI numbers belong to `/design`, not to the grill (lessons §8.6, §8.7).
 
 ## Project State
 
