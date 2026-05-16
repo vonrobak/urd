@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-05-16
+
 ### Fixed
 - UPI 045 — Voice evolution pt 1. `urd doctor` and `urd plan` now lead with
   the verdict ("All clear." / "N warnings." / "All sealed." / "N operations
