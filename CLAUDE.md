@@ -79,6 +79,7 @@ All backup logic flows through: config -> plan -> execute. No exceptions.
 | `events.rs` | Pure: `Event`, `EventKind`, `EventPayload`, `Severity`, typed payload enums (UPI 036) | Perform I/O |
 | `lock.rs` | Shared advisory lock with metadata (PID, trigger source) | Decide whether to proceed (caller's job) |
 | `sentinel.rs` | Pure state machine for Sentinel daemon (events, actions, circuit breaker) | Perform I/O (sentinel_runner.rs does that) |
+| `storage_critical.rs` | Stub predicate `is_storage_critical(subvolume)` — false in UPI 044; replaced by UPI 031 with its chosen truth source (ADR-115 amendment 2026-05-16) | Decide on critical state (UPI 031's job) |
 | `error.rs` | Error types, `translate_btrfs_error()` for actionable messages | Recovery logic |
 | `commands/` | CLI subcommand handlers (wire pure modules to I/O) | Core logic (delegate to above) |
 

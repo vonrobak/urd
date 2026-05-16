@@ -461,9 +461,20 @@ pub struct EmergencyResult {
 
 // ── DoctorOutput ──────────────────────────────────────────────────────
 
+/// Schema version for the `urd doctor [--thorough] --json` output shape.
+/// Started at 2 with UPI 044 (which retroactively names the pre-UPI-044
+/// shape v1). v1 had row-level `local: Option<ShapeRecommendation>`;
+/// v2 has `local: Option<HeadroomAwareRecommendation>` (nested
+/// `.recommendation` plus headroom fields). Bump for any future
+/// breaking JSON shape change; document in CHANGELOG and ADR-115.
+pub const DOCTOR_OUTPUT_SCHEMA_VERSION: u32 = 2;
+
 /// Full output for the `urd doctor` command.
 #[derive(Debug, Serialize)]
 pub struct DoctorOutput {
+    /// JSON schema version. See `DOCTOR_OUTPUT_SCHEMA_VERSION`. Always
+    /// present (not skipped) so `--json` consumers can branch on it.
+    pub schema_version: u32,
     pub config_checks: Vec<DoctorCheck>,
     pub infra_checks: Vec<DoctorCheck>,
     pub data_safety: Vec<DoctorDataSafety>,
@@ -515,13 +526,19 @@ pub struct DoctorRecommendationView {
 /// One row of the Recommendations section — at most one suggestion per
 /// role. At least one of `local` / `external` is `Some` (rows with
 /// nothing to say are omitted by the builder).
+///
+/// UPI 044 (`local`/`external` type change): each role now carries a
+/// `HeadroomAwareRecommendation`, which wraps the UPI-041
+/// `ShapeRecommendation` (under `.recommendation`) and adds per-role
+/// `severity`, optional `reason`, and an optional `adjusted` shape
+/// (with paired `adjusted_cost`). This is JSON schema v2.
 #[derive(Debug, Clone, Serialize)]
 pub struct DoctorRecommendationRow {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub local: Option<crate::policy::ShapeRecommendation>,
+    pub local: Option<crate::policy::HeadroomAwareRecommendation>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub external: Option<crate::policy::ShapeRecommendation>,
+    pub external: Option<crate::policy::HeadroomAwareRecommendation>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<crate::policy::RecommendationNote>,
     /// `Some(level)` only when (a) the subvolume's `protection_level` is
@@ -2177,6 +2194,7 @@ source = "/data/sv2"
     #[test]
     fn doctor_output_serializes_with_omitted_churn_when_none() {
         let output = DoctorOutput {
+            schema_version: DOCTOR_OUTPUT_SCHEMA_VERSION,
             config_checks: vec![],
             infra_checks: vec![],
             data_safety: vec![],
@@ -2193,5 +2211,154 @@ source = "/data/sv2"
         };
         let json = serde_json::to_string(&output).unwrap();
         assert!(!json.contains("\"churn\""), "churn should be omitted when None: {json}");
+    }
+
+    // ── UPI 044 (R3): schema_version + headroom-aware row JSON ────────
+
+    #[test]
+    fn doctor_output_schema_version_emitted_at_top_level() {
+        let output = DoctorOutput {
+            schema_version: DOCTOR_OUTPUT_SCHEMA_VERSION,
+            config_checks: vec![],
+            infra_checks: vec![],
+            data_safety: vec![],
+            sentinel: DoctorSentinelStatus {
+                running: false,
+                pid: None,
+                uptime: None,
+            },
+            schema_status: None,
+            verify: None,
+            churn: None,
+            recommendations: None,
+            verdict: DoctorVerdict::healthy(),
+        };
+        let value = serde_json::to_value(&output).unwrap();
+        assert_eq!(value.get("schema_version"), Some(&serde_json::Value::from(2)));
+    }
+
+    #[test]
+    fn doctor_recommendation_row_serializes_per_role_severity() {
+        use crate::policy::{
+            AdjustmentReason, CostProjection, HeadroomAwareRecommendation, HeadroomSeverity,
+            ShapeRecommendation, ShapeRole,
+        };
+        use crate::types::{MonthlyCount, ResolvedGraduatedRetention};
+
+        let shape = ResolvedGraduatedRetention {
+            hourly: 0,
+            daily: 7,
+            weekly: 4,
+            monthly: MonthlyCount::Count(0),
+            yearly: 0,
+        };
+        let zero = CostProjection {
+            data_bytes: 0,
+            snapshot_count: 0,
+        };
+        let healthy = HeadroomAwareRecommendation {
+            recommendation: ShapeRecommendation {
+                role: ShapeRole::Local,
+                current: shape,
+                suggested: shape,
+                current_cost: zero,
+                suggested_cost: zero,
+                note: None,
+            },
+            severity: HeadroomSeverity::Healthy,
+            reason: None,
+            adjusted: None,
+            adjusted_cost: None,
+        };
+        let pressure = HeadroomAwareRecommendation {
+            recommendation: ShapeRecommendation {
+                role: ShapeRole::External,
+                current: shape,
+                suggested: shape,
+                current_cost: zero,
+                suggested_cost: zero,
+                note: None,
+            },
+            severity: HeadroomSeverity::Pressure,
+            reason: Some(AdjustmentReason::DestinationMetadataPressure {
+                drive_label: "WD-18TB".to_string(),
+                ratio: 0.95,
+            }),
+            adjusted: None,
+            adjusted_cost: None,
+        };
+
+        let row = DoctorRecommendationRow {
+            name: "subv".to_string(),
+            local: Some(healthy),
+            external: Some(pressure),
+            note: None,
+            was_named_level: None,
+        };
+        let value = serde_json::to_value(&row).unwrap();
+        assert_eq!(
+            value["local"]["severity"],
+            serde_json::Value::String("healthy".to_string())
+        );
+        assert_eq!(
+            value["external"]["severity"],
+            serde_json::Value::String("pressure".to_string())
+        );
+        assert_eq!(
+            value["external"]["reason"]["kind"],
+            serde_json::Value::String("destination_metadata_pressure".to_string())
+        );
+        assert_eq!(
+            value["external"]["reason"]["drive_label"],
+            serde_json::Value::String("WD-18TB".to_string())
+        );
+    }
+
+    #[test]
+    fn doctor_recommendation_row_omits_adjusted_when_none() {
+        use crate::policy::{
+            CostProjection, HeadroomAwareRecommendation, HeadroomSeverity, ShapeRecommendation,
+            ShapeRole,
+        };
+        use crate::types::{MonthlyCount, ResolvedGraduatedRetention};
+
+        let shape = ResolvedGraduatedRetention {
+            hourly: 0,
+            daily: 7,
+            weekly: 4,
+            monthly: MonthlyCount::Count(0),
+            yearly: 0,
+        };
+        let zero = CostProjection {
+            data_bytes: 0,
+            snapshot_count: 0,
+        };
+        let h = HeadroomAwareRecommendation {
+            recommendation: ShapeRecommendation {
+                role: ShapeRole::Local,
+                current: shape,
+                suggested: shape,
+                current_cost: zero,
+                suggested_cost: zero,
+                note: None,
+            },
+            severity: HeadroomSeverity::Caution,
+            reason: None,
+            adjusted: None,
+            adjusted_cost: None,
+        };
+        let row = DoctorRecommendationRow {
+            name: "subv".to_string(),
+            local: Some(h),
+            external: None,
+            note: None,
+            was_named_level: None,
+        };
+        let json = serde_json::to_string(&row).unwrap();
+        assert!(!json.contains("\"adjusted\""), "adjusted omitted when None: {json}");
+        assert!(
+            !json.contains("\"adjusted_cost\""),
+            "adjusted_cost omitted when None: {json}"
+        );
     }
 }

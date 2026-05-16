@@ -163,6 +163,88 @@ pub fn compute_rolling_churn(
     }
 }
 
+/// Pool-pressure trend (UPI 044): linear regression of `source_free_bytes`
+/// over time, returning bytes/day. Negative slope = shrinking pool.
+///
+/// Caller passes samples from **every subvolume on the pool** — this
+/// function does not deduplicate by name, by design. Intra-day jitter
+/// across subvolumes is absorbed by the regression's slope estimator.
+///
+/// Returns `None` when fewer than `min_sample_days` distinct calendar days
+/// are covered, or when the regression has zero x-variance (all in-window
+/// samples at one instant → slope undefined → NaN → `None`).
+///
+/// Numerical note: f64 mantissa precision (~15–16 sig figs) is sufficient
+/// for realistic inputs (pool sizes ~1e13 bytes × 7-day window seconds
+/// ~6e5 → centered products ~6e18, within f64 range). Centered values
+/// reduce magnitude further. If pool sizes ever exceed ~10 EiB or windows
+/// extend to ~1 year, revisit the formulation (e.g., recenter or use i128
+/// intermediate).
+#[must_use]
+pub fn compute_pool_free_bytes_trend(
+    samples: &[DriftSample],
+    window: Duration,
+    now: NaiveDateTime,
+    min_sample_days: u32,
+) -> Option<i64> {
+    let window_start = now - window;
+
+    // Step 1: filter to in-window samples with a `source_free_bytes` reading.
+    let in_window: Vec<(&DriftSample, u64)> = samples
+        .iter()
+        .filter(|s| s.sampled_at >= window_start && s.sampled_at <= now)
+        .filter_map(|s| s.source_free_bytes.map(|fb| (s, fb)))
+        .collect();
+
+    // Step 2: distinct calendar days covered.
+    let mut days: Vec<chrono::NaiveDate> = in_window.iter().map(|(s, _)| s.sampled_at.date()).collect();
+    days.sort_unstable();
+    days.dedup();
+    if days.len() < min_sample_days as usize {
+        return None;
+    }
+
+    // Step 3: linear regression. x in seconds from window_start; y in bytes.
+    #[allow(clippy::cast_precision_loss)]
+    let (xs, ys): (Vec<f64>, Vec<f64>) = in_window
+        .iter()
+        .map(|(s, fb)| {
+            (
+                (s.sampled_at - window_start).num_seconds() as f64,
+                *fb as f64,
+            )
+        })
+        .unzip();
+
+    #[allow(clippy::cast_precision_loss)]
+    let n = xs.len() as f64;
+    let x_mean = xs.iter().sum::<f64>() / n;
+    let y_mean = ys.iter().sum::<f64>() / n;
+
+    let mut num = 0.0_f64;
+    let mut den = 0.0_f64;
+    for (&x, &y) in xs.iter().zip(ys.iter()) {
+        let dx = x - x_mean;
+        let dy = y - y_mean;
+        num += dx * dy;
+        den += dx * dx;
+    }
+
+    if den == 0.0 {
+        return None;
+    }
+
+    let slope_per_second = num / den;
+    let slope_per_day = slope_per_second * 86_400.0;
+    if !slope_per_day.is_finite() {
+        return None;
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    let truncated = slope_per_day as i64;
+    Some(truncated)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -491,5 +573,147 @@ mod tests {
         let est = compute_rolling_churn(&samples, default_window(), now);
         assert_eq!(est.incremental_count, 1);
         assert_eq!(est.mean_incremental_bytes, Some(100_000_000));
+    }
+
+    // ── UPI 044: compute_pool_free_bytes_trend ────────────────────────
+
+    fn sample_with_free(
+        sampled_at: NaiveDateTime,
+        source_free_bytes: Option<u64>,
+    ) -> DriftSample {
+        DriftSample {
+            sampled_at,
+            seconds_since_prev_send: Some(86_400),
+            bytes_transferred: 1_000_000,
+            source_free_bytes,
+            send_kind: SendKind::Incremental,
+        }
+    }
+
+    #[test]
+    fn pool_trend_returns_none_when_too_few_distinct_days() {
+        let now = dt(2026, 5, 7, 12, 0);
+        // 3 distinct calendar days × multiple subvolumes.
+        let samples = vec![
+            sample_with_free(dt(2026, 5, 5, 9, 0), Some(1_000_000_000_000)),
+            sample_with_free(dt(2026, 5, 5, 18, 0), Some(990_000_000_000)),
+            sample_with_free(dt(2026, 5, 6, 9, 0), Some(980_000_000_000)),
+            sample_with_free(dt(2026, 5, 7, 9, 0), Some(970_000_000_000)),
+        ];
+        // min=4 distinct days → None.
+        let trend = compute_pool_free_bytes_trend(&samples, default_window(), now, 4);
+        assert_eq!(trend, None);
+    }
+
+    #[test]
+    fn pool_trend_negative_for_shrinking_pool() {
+        let now = dt(2026, 5, 7, 12, 0);
+        // 7 daily samples, free decreasing by 10 GB/day (~10_000_000_000).
+        let start_free = 1_000_000_000_000_u64;
+        let samples: Vec<DriftSample> = (0..7)
+            .map(|i| {
+                let day = dt(2026, 5, 1 + i, 12, 0);
+                let free = start_free - (i as u64) * 10_000_000_000;
+                sample_with_free(day, Some(free))
+            })
+            .collect();
+        let trend = compute_pool_free_bytes_trend(&samples, default_window(), now, 3)
+            .expect("trend computable");
+        // Expected ~ -10_000_000_000 bytes/day; allow ±5% tolerance.
+        let expected = -10_000_000_000_i64;
+        let rel = (trend - expected).abs() as f64 / expected.unsigned_abs() as f64;
+        assert!(
+            rel < 0.05,
+            "expected trend ~{expected} bytes/day, got {trend} (rel err {rel})"
+        );
+        assert!(trend < 0, "shrinking pool must yield negative trend, got {trend}");
+    }
+
+    #[test]
+    fn pool_trend_positive_for_growing_pool() {
+        let now = dt(2026, 5, 7, 12, 0);
+        let start_free = 500_000_000_000_u64;
+        let samples: Vec<DriftSample> = (0..7)
+            .map(|i| {
+                let day = dt(2026, 5, 1 + i, 12, 0);
+                let free = start_free + (i as u64) * 5_000_000_000;
+                sample_with_free(day, Some(free))
+            })
+            .collect();
+        let trend = compute_pool_free_bytes_trend(&samples, default_window(), now, 3)
+            .expect("trend computable");
+        let expected = 5_000_000_000_i64;
+        let rel = (trend - expected).abs() as f64 / expected as f64;
+        assert!(rel < 0.05, "expected ~{expected} bytes/day, got {trend}");
+        assert!(trend > 0);
+    }
+
+    #[test]
+    fn pool_trend_handles_within_jitter_intra_day() {
+        let now = dt(2026, 5, 7, 12, 0);
+        // Same calendar day, three subvolumes, slightly different free values.
+        // Then steady decline over the rest of the week.
+        let samples = vec![
+            sample_with_free(dt(2026, 5, 1, 9, 0), Some(1_000_000_000_000)),
+            sample_with_free(dt(2026, 5, 1, 9, 5), Some(1_000_000_001_000)),
+            sample_with_free(dt(2026, 5, 1, 9, 10), Some(999_999_999_000)),
+            sample_with_free(dt(2026, 5, 2, 9, 0), Some(990_000_000_000)),
+            sample_with_free(dt(2026, 5, 3, 9, 0), Some(980_000_000_000)),
+            sample_with_free(dt(2026, 5, 4, 9, 0), Some(970_000_000_000)),
+        ];
+        let trend = compute_pool_free_bytes_trend(&samples, default_window(), now, 3)
+            .expect("trend computable");
+        // Intra-day jitter (~1KB) is dwarfed by daily decline (~10GB).
+        assert!(trend < 0, "expected negative trend despite jitter, got {trend}");
+    }
+
+    #[test]
+    fn pool_trend_excludes_samples_outside_window() {
+        let now = dt(2026, 5, 7, 12, 0);
+        let window = default_window();
+        // window starts 2026-04-30 12:00. Old sample is from 2026-04-01.
+        let old = dt(2026, 4, 1, 12, 0);
+        let samples = vec![
+            sample_with_free(old, Some(2_000_000_000_000)),
+            sample_with_free(dt(2026, 5, 1, 9, 0), Some(1_000_000_000_000)),
+            sample_with_free(dt(2026, 5, 3, 9, 0), Some(990_000_000_000)),
+            sample_with_free(dt(2026, 5, 5, 9, 0), Some(980_000_000_000)),
+        ];
+        let trend = compute_pool_free_bytes_trend(&samples, window, now, 3)
+            .expect("trend computable");
+        // If `old` had been included, slope would have been wildly positive.
+        // With it excluded, the slope must reflect the in-window decline.
+        assert!(trend < 0, "expected negative trend after exclusion, got {trend}");
+    }
+
+    #[test]
+    fn pool_trend_ignores_none_source_free_bytes() {
+        let now = dt(2026, 5, 7, 12, 0);
+        // Mix of Some + None — the None samples are filtered before regression.
+        let samples = vec![
+            sample_with_free(dt(2026, 5, 1, 9, 0), Some(1_000_000_000_000)),
+            sample_with_free(dt(2026, 5, 2, 9, 0), None), // backfilled full send
+            sample_with_free(dt(2026, 5, 3, 9, 0), Some(990_000_000_000)),
+            sample_with_free(dt(2026, 5, 4, 9, 0), Some(980_000_000_000)),
+        ];
+        let trend = compute_pool_free_bytes_trend(&samples, default_window(), now, 3)
+            .expect("trend computable from 3 Some samples");
+        assert!(trend < 0);
+    }
+
+    #[test]
+    fn pool_trend_none_when_zero_variance_in_x() {
+        let now = dt(2026, 5, 7, 12, 0);
+        // All samples at the same instant — distinct days = 1, but if we
+        // relax min_sample_days to 1 we still want None because x-variance
+        // is zero (slope undefined).
+        let instant = dt(2026, 5, 5, 12, 0);
+        let samples = vec![
+            sample_with_free(instant, Some(1_000_000_000_000)),
+            sample_with_free(instant, Some(990_000_000_000)),
+            sample_with_free(instant, Some(995_000_000_000)),
+        ];
+        let trend = compute_pool_free_bytes_trend(&samples, default_window(), now, 1);
+        assert_eq!(trend, None);
     }
 }
