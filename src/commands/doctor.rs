@@ -400,7 +400,6 @@ fn build_doctor_recommendation_view_inner(
     pool_trend_resolver: impl Fn(&str) -> Option<i64>,
 ) -> DoctorRecommendationView {
     let window = crate::drift::default_window();
-    let since = now - window;
     let header = format!(
         "based on {}-day churn observation; apply by editing ~/.config/urd/urd.toml",
         window.num_days()
@@ -462,7 +461,7 @@ fn build_doctor_recommendation_view_inner(
     let mut rows: Vec<DoctorRecommendationRow> = Vec::new();
 
     for sv in resolved.iter().filter(|sv| sv.enabled) {
-        let churn = compute_churn_for(state_db, &sv.name, since, window, now);
+        let churn = compute_churn_for(state_db, &sv.name, window, now);
 
         // Source-pool signals for this subvolume.
         let source_signals = subvol_pool.get(&sv.name).map(|(mp, uuid)| {
@@ -649,25 +648,10 @@ fn recovery_bytes(row: &DoctorRecommendationRow) -> u64 {
 fn compute_churn_for(
     state_db: Option<&StateDb>,
     name: &str,
-    since: chrono::NaiveDateTime,
     window: chrono::Duration,
     now: chrono::NaiveDateTime,
 ) -> crate::drift::ChurnEstimate {
-    state_db
-        .and_then(|db| db.drift_samples_for_subvolume(name, since).ok())
-        .map(|rows| {
-            let samples: Vec<_> = rows.into_iter().map(StateDb::drift_row_to_sample).collect();
-            crate::drift::compute_rolling_churn(&samples, window, now)
-        })
-        .unwrap_or(crate::drift::ChurnEstimate {
-            mean_bytes_per_second: None,
-            mean_incremental_bytes: None,
-            incremental_count: 0,
-            full_count: 0,
-            median_full_bytes: None,
-            latest_full_bytes: None,
-            latest_full_interval_secs: None,
-        })
+    crate::state_views::ChurnView::for_subvolume(state_db, name, window, now)
 }
 
 /// Pure-ish core (still does DB I/O via `state_db`) — extracted so unit tests
@@ -679,27 +663,16 @@ fn build_doctor_churn_view_inner(
 ) -> crate::output::DoctorChurnView {
     use crate::output::{DoctorChurnRow, DoctorChurnView};
 
-    let since = now - crate::drift::default_window();
     let rows: Vec<DoctorChurnRow> = config
         .subvolumes
         .iter()
         .map(|sv| {
-            let state = state_db
-                .and_then(|db| db.drift_samples_for_subvolume(&sv.name, since).ok())
-                .map(|rows| {
-                    let samples: Vec<crate::drift::DriftSample> =
-                        rows.into_iter().map(StateDb::drift_row_to_sample).collect();
-                    let estimate = crate::drift::compute_rolling_churn(
-                        &samples,
-                        crate::drift::default_window(),
-                        now,
-                    );
-                    crate::output::render_churn(&estimate)
-                })
-                .unwrap_or(crate::output::ChurnRender::NotMeasured);
+            let estimate = crate::state_views::ChurnView::for_subvolume_default_window(
+                state_db, &sv.name, now,
+            );
             DoctorChurnRow {
                 name: sv.name.clone(),
-                state,
+                state: crate::output::render_churn(&estimate),
             }
         })
         .collect();

@@ -725,20 +725,13 @@ fn build_churn_views(
     now: chrono::NaiveDateTime,
 ) -> HashMap<String, ChurnHeartbeatFields> {
     let mut out: HashMap<String, ChurnHeartbeatFields> = HashMap::new();
-    let Some(db) = state_db else { return out };
-    let since = now - crate::drift::default_window();
+    if state_db.is_none() {
+        return out;
+    }
     for sv in config.subvolumes.iter() {
-        let rows = match db.drift_samples_for_subvolume(&sv.name, since) {
-            Ok(r) => r,
-            Err(e) => {
-                log::warn!("drift query failed for {}: {e}", sv.name);
-                continue;
-            }
-        };
-        let samples: Vec<crate::drift::DriftSample> =
-            rows.into_iter().map(StateDb::drift_row_to_sample).collect();
-        let estimate =
-            crate::drift::compute_rolling_churn(&samples, crate::drift::default_window(), now);
+        let estimate = crate::state_views::ChurnView::for_subvolume_default_window(
+            state_db, &sv.name, now,
+        );
         let mean_incremental_bytes = estimate.mean_incremental_bytes;
         let fields = match crate::output::render_churn(&estimate) {
             ChurnRender::NotMeasured => ChurnHeartbeatFields {

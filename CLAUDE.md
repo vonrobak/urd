@@ -65,7 +65,8 @@ All backup logic flows through: config -> plan -> execute. No exceptions.
 | `retention.rs` | Compute which snapshots to keep/delete (pure) | Delete anything (returns lists) |
 | `awareness.rs` | Compute promise states per subvolume (pure) | Perform I/O |
 | `chain.rs` | Track incremental chain parents (pin files) | Send snapshots |
-| `state.rs` | Record history in SQLite | Influence backup decisions |
+| `state.rs` | Record history in SQLite — granular SQL wrappers (one method per query) | Influence backup decisions; compose domain-shaped answers (`state_views.rs` does that) |
+| `state_views.rs` | Composed read views over `StateDb` — turn row-shapes into domain shapes callers actually want (`ChurnView::for_subvolume` etc.). Best-effort per ADR-102. | Hold writers; bypass `StateDb` for SQL access |
 | `preflight.rs` | Validate config achievability (pure) | Block backups (advisory only) |
 | `heartbeat.rs` | Write JSON health signal after each run | Block backups on failure |
 | `metrics.rs` | Write Prometheus `.prom` files | Read metrics |

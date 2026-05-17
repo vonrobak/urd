@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **New `state_views` module** — composed read views over `StateDb`
+  (`ChurnView::for_subvolume` and `::for_subvolume_default_window`). Three
+  inline `drift_samples_for_subvolume` → `drift_row_to_sample` →
+  `compute_rolling_churn` dances in `commands/doctor.rs` (×2) and
+  `commands/backup.rs` (×1) now call the view directly. Internal refactor;
+  no behaviour change. Best-effort per ADR-102 — empty estimate on `None`
+  db or query failure.
+
 ## [0.20.0] - 2026-05-17
 
 ### Added
