@@ -2604,7 +2604,7 @@ fn render_cost_delta(
     match suggested.cmp(&current) {
         Ordering::Less => format!("(recover ~{})", ByteSize(current - suggested)),
         Ordering::Greater => {
-            let secs = crate::policy::chain_span_seconds(suggested_shape);
+            let secs = crate::recommendation::chain_span_seconds(suggested_shape);
             let (n, unit) = if secs <= 60 * 86_400 {
                 (secs / 86_400, "days")
             } else if secs <= 364 * 86_400 {
@@ -2623,7 +2623,7 @@ fn render_cost_delta(
 /// cost projections are zero. Doctor.rs builds these for cold subvolumes
 /// at Pressure/Critical severity (R1) — they carry only the reason line,
 /// no shape line.
-fn is_synth_pointer(rec: &crate::policy::HeadroomAwareRecommendation) -> bool {
+fn is_synth_pointer(rec: &crate::recommendation::HeadroomAwareRecommendation) -> bool {
     rec.recommendation.suggested == rec.recommendation.current
         && rec.recommendation.current_cost.data_bytes == 0
         && rec.recommendation.suggested_cost.data_bytes == 0
@@ -2639,13 +2639,13 @@ fn is_synth_pointer(rec: &crate::policy::HeadroomAwareRecommendation) -> bool {
 /// the renderer's input pipeline but not currently branched on — synth
 /// and at-MIN share the "shape already at minimum" line.
 fn render_reason_line(
-    severity: crate::policy::HeadroomSeverity,
-    reason: &Option<crate::policy::AdjustmentReason>,
+    severity: crate::recommendation::HeadroomSeverity,
+    reason: &Option<crate::recommendation::AdjustmentReason>,
     has_adjusted: bool,
     _is_synth: bool,
 ) -> String {
-    use crate::policy::AdjustmentReason::*;
-    use crate::policy::HeadroomSeverity::*;
+    use crate::recommendation::AdjustmentReason::*;
+    use crate::recommendation::HeadroomSeverity::*;
     let Some(reason) = reason.as_ref() else {
         return String::new();
     };
@@ -2696,7 +2696,7 @@ fn render_reason_line(
 /// Critical severity (injected by doctor.rs) suppresses the shape and
 /// hint lines in favor of a single pointer (R9).
 fn format_recommendation_row(row: &crate::output::DoctorRecommendationRow) -> String {
-    use crate::policy::HeadroomSeverity;
+    use crate::recommendation::HeadroomSeverity;
 
     let mut out = String::new();
     writeln!(out, "    {}", row.name).ok();
@@ -2719,7 +2719,7 @@ fn format_recommendation_row(row: &crate::output::DoctorRecommendationRow) -> St
         return out;
     }
 
-    let mut role_line = |label: &str, h: &crate::policy::HeadroomAwareRecommendation| {
+    let mut role_line = |label: &str, h: &crate::recommendation::HeadroomAwareRecommendation| {
         let synth = is_synth_pointer(h);
         let rec = &h.recommendation;
 
@@ -2774,7 +2774,7 @@ fn format_recommendation_row(row: &crate::output::DoctorRecommendationRow) -> St
     if let Some(ref rec) = row.external {
         role_line("external:", rec);
     }
-    if matches!(row.note, Some(crate::policy::RecommendationNote::BurstyPattern)) {
+    if matches!(row.note, Some(crate::recommendation::RecommendationNote::BurstyPattern)) {
         writeln!(out, "      {}", "bursty pattern — frequent full sends".dimmed()).ok();
     }
     if let Some(level) = row.was_named_level {
@@ -8060,13 +8060,13 @@ mod tests {
     }
 
     fn recommendation(
-        role: crate::policy::ShapeRole,
+        role: crate::recommendation::ShapeRole,
         current: crate::types::ResolvedGraduatedRetention,
         suggested: crate::types::ResolvedGraduatedRetention,
         current_bytes: u64,
         suggested_bytes: u64,
-    ) -> crate::policy::HeadroomAwareRecommendation {
-        use crate::policy::{CostProjection, HeadroomAwareRecommendation, ShapeRecommendation};
+    ) -> crate::recommendation::HeadroomAwareRecommendation {
+        use crate::recommendation::{CostProjection, HeadroomAwareRecommendation, ShapeRecommendation};
         let total = |s: crate::types::ResolvedGraduatedRetention| {
             let m = match s.monthly {
                 crate::types::MonthlyCount::Unlimited => 0,
@@ -8099,7 +8099,7 @@ mod tests {
             rows: vec![crate::output::DoctorRecommendationRow {
                 name: "containers".to_string(),
                 local: Some(recommendation(
-                    crate::policy::ShapeRole::Local,
+                    crate::recommendation::ShapeRole::Local,
                     shape(24, 30, 26, crate::types::MonthlyCount::Count(12), 0),
                     shape(0, 7, 4, crate::types::MonthlyCount::Count(0), 0),
                     200_000_000_000,
@@ -8132,14 +8132,14 @@ mod tests {
             rows: vec![crate::output::DoctorRecommendationRow {
                 name: "containers".to_string(),
                 local: Some(recommendation(
-                    crate::policy::ShapeRole::Local,
+                    crate::recommendation::ShapeRole::Local,
                     shape(24, 30, 26, crate::types::MonthlyCount::Count(12), 0),
                     shape(0, 7, 4, crate::types::MonthlyCount::Count(0), 0),
                     200_000_000_000,
                     50_000_000_000,
                 )),
                 external: Some(recommendation(
-                    crate::policy::ShapeRole::External,
+                    crate::recommendation::ShapeRole::External,
                     shape(0, 30, 26, crate::types::MonthlyCount::Count(12), 0),
                     shape(0, 14, 8, crate::types::MonthlyCount::Count(6), 0),
                     400_000_000_000,
@@ -8167,7 +8167,7 @@ mod tests {
             rows: vec![crate::output::DoctorRecommendationRow {
                 name: "containers".to_string(),
                 local: Some(recommendation(
-                    crate::policy::ShapeRole::Local,
+                    crate::recommendation::ShapeRole::Local,
                     shape(24, 30, 26, crate::types::MonthlyCount::Count(12), 0),
                     shape(0, 7, 4, crate::types::MonthlyCount::Count(0), 0),
                     200_000_000_000,
@@ -8197,7 +8197,7 @@ mod tests {
             rows: vec![crate::output::DoctorRecommendationRow {
                 name: "containers".to_string(),
                 local: Some(recommendation(
-                    crate::policy::ShapeRole::Local,
+                    crate::recommendation::ShapeRole::Local,
                     shape(24, 30, 26, crate::types::MonthlyCount::Count(12), 0),
                     shape(0, 7, 4, crate::types::MonthlyCount::Count(0), 0),
                     200_000_000_000,
@@ -8229,7 +8229,7 @@ mod tests {
                 name: "docs".to_string(),
                 local: None,
                 external: Some(recommendation(
-                    crate::policy::ShapeRole::External,
+                    crate::recommendation::ShapeRole::External,
                     shape(0, 30, 0, crate::types::MonthlyCount::Count(0), 0),
                     shape(0, 30, 0, crate::types::MonthlyCount::Count(0), 0), // 30 days chain
                     1_000_000_000,
@@ -8255,7 +8255,7 @@ mod tests {
                 name: "docs".to_string(),
                 local: None,
                 external: Some(recommendation(
-                    crate::policy::ShapeRole::External,
+                    crate::recommendation::ShapeRole::External,
                     shape(0, 30, 0, crate::types::MonthlyCount::Count(0), 0),
                     shape(0, 0, 24, crate::types::MonthlyCount::Count(0), 0), // 24 weeks chain
                     1_000_000_000,
@@ -8281,7 +8281,7 @@ mod tests {
                 name: "docs".to_string(),
                 local: None,
                 external: Some(recommendation(
-                    crate::policy::ShapeRole::External,
+                    crate::recommendation::ShapeRole::External,
                     shape(0, 30, 0, crate::types::MonthlyCount::Count(0), 0),
                     shape(0, 0, 0, crate::types::MonthlyCount::Count(24), 0), // 24 months chain
                     1_000_000_000,
@@ -8310,14 +8310,14 @@ mod tests {
             rows: vec![crate::output::DoctorRecommendationRow {
                 name: "containers".to_string(),
                 local: Some(recommendation(
-                    crate::policy::ShapeRole::Local,
+                    crate::recommendation::ShapeRole::Local,
                     shape(24, 30, 26, crate::types::MonthlyCount::Count(12), 0),
                     shape(0, 7, 4, crate::types::MonthlyCount::Count(0), 0),
                     200_000_000_000,
                     50_000_000_000,
                 )),
                 external: None,
-                note: Some(crate::policy::RecommendationNote::BurstyPattern),
+                note: Some(crate::recommendation::RecommendationNote::BurstyPattern),
                 was_named_level: None,
             }],
         };
@@ -8339,7 +8339,7 @@ mod tests {
             rows: vec![crate::output::DoctorRecommendationRow {
                 name: "photos".to_string(),
                 local: Some(recommendation(
-                    crate::policy::ShapeRole::Local,
+                    crate::recommendation::ShapeRole::Local,
                     shape(24, 30, 26, crate::types::MonthlyCount::Count(12), 0),
                     shape(0, 14, 8, crate::types::MonthlyCount::Count(6), 0),
                     100_000_000_000,
@@ -8366,7 +8366,7 @@ mod tests {
             rows: vec![crate::output::DoctorRecommendationRow {
                 name: "photos".to_string(),
                 local: Some(recommendation(
-                    crate::policy::ShapeRole::Local,
+                    crate::recommendation::ShapeRole::Local,
                     shape(24, 30, 26, crate::types::MonthlyCount::Count(12), 0),
                     shape(0, 14, 8, crate::types::MonthlyCount::Count(6), 0),
                     100_000_000_000,
@@ -8395,14 +8395,14 @@ mod tests {
             rows: vec![crate::output::DoctorRecommendationRow {
                 name: "containers".to_string(),
                 local: Some(recommendation(
-                    crate::policy::ShapeRole::Local,
+                    crate::recommendation::ShapeRole::Local,
                     shape(24, 30, 26, crate::types::MonthlyCount::Count(12), 0),
                     shape(0, 7, 4, crate::types::MonthlyCount::Count(0), 0),
                     200_000_000_000,
                     50_000_000_000,
                 )),
                 external: None,
-                note: Some(crate::policy::RecommendationNote::BurstyPattern),
+                note: Some(crate::recommendation::RecommendationNote::BurstyPattern),
                 was_named_level: Some(crate::types::ProtectionLevel::Sheltered),
             }],
         };
@@ -8461,17 +8461,17 @@ mod tests {
 
     #[allow(clippy::too_many_arguments)]
     fn ha_rec(
-        role: crate::policy::ShapeRole,
+        role: crate::recommendation::ShapeRole,
         current: crate::types::ResolvedGraduatedRetention,
         suggested: crate::types::ResolvedGraduatedRetention,
         current_bytes: u64,
         suggested_bytes: u64,
-        severity: crate::policy::HeadroomSeverity,
-        reason: Option<crate::policy::AdjustmentReason>,
+        severity: crate::recommendation::HeadroomSeverity,
+        reason: Option<crate::recommendation::AdjustmentReason>,
         adjusted: Option<crate::types::ResolvedGraduatedRetention>,
         adjusted_bytes: Option<u64>,
-    ) -> crate::policy::HeadroomAwareRecommendation {
-        use crate::policy::{CostProjection, HeadroomAwareRecommendation, ShapeRecommendation};
+    ) -> crate::recommendation::HeadroomAwareRecommendation {
+        use crate::recommendation::{CostProjection, HeadroomAwareRecommendation, ShapeRecommendation};
         let total = |s: crate::types::ResolvedGraduatedRetention| {
             let m = match s.monthly {
                 crate::types::MonthlyCount::Unlimited => 0,
@@ -8514,7 +8514,7 @@ mod tests {
             rows: vec![crate::output::DoctorRecommendationRow {
                 name: "containers".to_string(),
                 local: Some(recommendation(
-                    crate::policy::ShapeRole::Local,
+                    crate::recommendation::ShapeRole::Local,
                     shape(24, 30, 26, crate::types::MonthlyCount::Count(12), 0),
                     shape(0, 7, 4, crate::types::MonthlyCount::Count(0), 0),
                     200_000_000_000,
@@ -8535,13 +8535,13 @@ mod tests {
     fn format_row_caution_renders_shape_plus_dimmed_note() {
         let _color = color_guard(false);
         let h = ha_rec(
-            crate::policy::ShapeRole::Local,
+            crate::recommendation::ShapeRole::Local,
             shape(24, 30, 26, crate::types::MonthlyCount::Count(12), 0),
             shape(0, 7, 4, crate::types::MonthlyCount::Count(0), 0),
             200_000_000_000,
             50_000_000_000,
-            crate::policy::HeadroomSeverity::Caution,
-            Some(crate::policy::AdjustmentReason::SourcePoolLow { free_ratio: 0.20 }),
+            crate::recommendation::HeadroomSeverity::Caution,
+            Some(crate::recommendation::AdjustmentReason::SourcePoolLow { free_ratio: 0.20 }),
             None,
             None,
         );
@@ -8568,13 +8568,13 @@ mod tests {
     fn format_row_pressure_renders_tightened_shape_plus_dimmed_note() {
         let _color = color_guard(false);
         let h = ha_rec(
-            crate::policy::ShapeRole::Local,
+            crate::recommendation::ShapeRole::Local,
             shape(24, 30, 26, crate::types::MonthlyCount::Count(12), 0),
             shape(24, 60, 52, crate::types::MonthlyCount::Count(24), 0),
             200_000_000_000,
             50_000_000_000,
-            crate::policy::HeadroomSeverity::Pressure,
-            Some(crate::policy::AdjustmentReason::SourcePoolLow { free_ratio: 0.10 }),
+            crate::recommendation::HeadroomSeverity::Pressure,
+            Some(crate::recommendation::AdjustmentReason::SourcePoolLow { free_ratio: 0.10 }),
             Some(shape(16, 42, 36, crate::types::MonthlyCount::Count(16), 0)),
             Some(25_000_000_000),
         );
@@ -8601,13 +8601,13 @@ mod tests {
         // not the (cheaper, but not rendered) suggested cost.
         let _color = color_guard(false);
         let h = ha_rec(
-            crate::policy::ShapeRole::Local,
+            crate::recommendation::ShapeRole::Local,
             shape(24, 30, 26, crate::types::MonthlyCount::Count(12), 0),
             shape(24, 60, 52, crate::types::MonthlyCount::Count(24), 0),
             200_000_000_000,
             50_000_000_000,
-            crate::policy::HeadroomSeverity::Pressure,
-            Some(crate::policy::AdjustmentReason::SourcePoolLow { free_ratio: 0.10 }),
+            crate::recommendation::HeadroomSeverity::Pressure,
+            Some(crate::recommendation::AdjustmentReason::SourcePoolLow { free_ratio: 0.10 }),
             Some(shape(16, 42, 36, crate::types::MonthlyCount::Count(16), 0)),
             Some(25_000_000_000),
         );
@@ -8641,11 +8641,11 @@ mod tests {
         let _color = color_guard(false);
         let cur = shape(0, 3, 0, crate::types::MonthlyCount::Count(0), 0);
         // Use the policy helper to construct the synth-shape directly.
-        let h = crate::policy::headroom_aware_pointer_only(
+        let h = crate::recommendation::headroom_aware_pointer_only(
             &cur,
-            crate::policy::ShapeRole::Local,
-            crate::policy::HeadroomSeverity::Pressure,
-            crate::policy::AdjustmentReason::SourcePoolLow { free_ratio: 0.10 },
+            crate::recommendation::ShapeRole::Local,
+            crate::recommendation::HeadroomSeverity::Pressure,
+            crate::recommendation::AdjustmentReason::SourcePoolLow { free_ratio: 0.10 },
         );
         let view = crate::output::DoctorRecommendationView {
             header: "h".to_string(),
@@ -8672,11 +8672,11 @@ mod tests {
     fn format_row_critical_renders_pointer_only() {
         let _color = color_guard(false);
         let cur = shape(24, 60, 52, crate::types::MonthlyCount::Count(24), 0);
-        let h = crate::policy::headroom_aware_pointer_only(
+        let h = crate::recommendation::headroom_aware_pointer_only(
             &cur,
-            crate::policy::ShapeRole::Local,
-            crate::policy::HeadroomSeverity::Critical,
-            crate::policy::AdjustmentReason::StorageCritical,
+            crate::recommendation::ShapeRole::Local,
+            crate::recommendation::HeadroomSeverity::Critical,
+            crate::recommendation::AdjustmentReason::StorageCritical,
         );
         let view = crate::output::DoctorRecommendationView {
             header: "h".to_string(),
@@ -8702,11 +8702,11 @@ mod tests {
         // was_named_level hints.
         let _color = color_guard(false);
         let cur = shape(24, 60, 52, crate::types::MonthlyCount::Count(24), 0);
-        let h = crate::policy::headroom_aware_pointer_only(
+        let h = crate::recommendation::headroom_aware_pointer_only(
             &cur,
-            crate::policy::ShapeRole::Local,
-            crate::policy::HeadroomSeverity::Critical,
-            crate::policy::AdjustmentReason::StorageCritical,
+            crate::recommendation::ShapeRole::Local,
+            crate::recommendation::HeadroomSeverity::Critical,
+            crate::recommendation::AdjustmentReason::StorageCritical,
         );
         let view = crate::output::DoctorRecommendationView {
             header: "h".to_string(),
@@ -8714,7 +8714,7 @@ mod tests {
                 name: "containers".to_string(),
                 local: Some(h),
                 external: None,
-                note: Some(crate::policy::RecommendationNote::BurstyPattern),
+                note: Some(crate::recommendation::RecommendationNote::BurstyPattern),
                 was_named_level: Some(crate::types::ProtectionLevel::Sheltered),
             }],
         };
@@ -8735,20 +8735,20 @@ mod tests {
         // External renders the adjustment.
         let _color = color_guard(false);
         let local_healthy = recommendation(
-            crate::policy::ShapeRole::Local,
+            crate::recommendation::ShapeRole::Local,
             shape(24, 30, 26, crate::types::MonthlyCount::Count(12), 0),
             shape(0, 7, 4, crate::types::MonthlyCount::Count(0), 0),
             200_000_000_000,
             50_000_000_000,
         );
         let external_pressure = ha_rec(
-            crate::policy::ShapeRole::External,
+            crate::recommendation::ShapeRole::External,
             shape(0, 30, 26, crate::types::MonthlyCount::Count(12), 0),
             shape(0, 60, 52, crate::types::MonthlyCount::Count(24), 0),
             400_000_000_000,
             100_000_000_000,
-            crate::policy::HeadroomSeverity::Pressure,
-            Some(crate::policy::AdjustmentReason::DestinationMetadataPressure {
+            crate::recommendation::HeadroomSeverity::Pressure,
+            Some(crate::recommendation::AdjustmentReason::DestinationMetadataPressure {
                 drive_label: "WD-18TB".to_string(),
                 ratio: 0.95,
             }),
@@ -8778,11 +8778,11 @@ mod tests {
         // row. Renderer emits no shape, only the at-MIN message.
         let _color = color_guard(false);
         let cur = shape(0, 3, 0, crate::types::MonthlyCount::Count(0), 0);
-        let h = crate::policy::headroom_aware_pointer_only(
+        let h = crate::recommendation::headroom_aware_pointer_only(
             &cur,
-            crate::policy::ShapeRole::Local,
-            crate::policy::HeadroomSeverity::Pressure,
-            crate::policy::AdjustmentReason::SourcePoolLow { free_ratio: 0.10 },
+            crate::recommendation::ShapeRole::Local,
+            crate::recommendation::HeadroomSeverity::Pressure,
+            crate::recommendation::AdjustmentReason::SourcePoolLow { free_ratio: 0.10 },
         );
         let view = crate::output::DoctorRecommendationView {
             header: "h".to_string(),
@@ -8803,11 +8803,11 @@ mod tests {
     fn format_row_synth_critical_emits_pointer_only() {
         let _color = color_guard(false);
         let cur = shape(0, 3, 0, crate::types::MonthlyCount::Count(0), 0);
-        let h = crate::policy::headroom_aware_pointer_only(
+        let h = crate::recommendation::headroom_aware_pointer_only(
             &cur,
-            crate::policy::ShapeRole::Local,
-            crate::policy::HeadroomSeverity::Critical,
-            crate::policy::AdjustmentReason::StorageCritical,
+            crate::recommendation::ShapeRole::Local,
+            crate::recommendation::HeadroomSeverity::Critical,
+            crate::recommendation::AdjustmentReason::StorageCritical,
         );
         let view = crate::output::DoctorRecommendationView {
             header: "h".to_string(),

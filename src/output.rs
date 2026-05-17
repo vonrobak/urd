@@ -536,11 +536,11 @@ pub struct DoctorRecommendationView {
 pub struct DoctorRecommendationRow {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub local: Option<crate::policy::HeadroomAwareRecommendation>,
+    pub local: Option<crate::recommendation::HeadroomAwareRecommendation>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub external: Option<crate::policy::HeadroomAwareRecommendation>,
+    pub external: Option<crate::recommendation::HeadroomAwareRecommendation>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub note: Option<crate::policy::RecommendationNote>,
+    pub note: Option<crate::recommendation::RecommendationNote>,
     /// `Some(level)` only when (a) the subvolume's `protection_level` is
     /// non-Custom AND (b) at least one role's recommendation differs from
     /// current. Voice renders the dimmed hint unconditionally on
@@ -2239,7 +2239,7 @@ source = "/data/sv2"
 
     #[test]
     fn doctor_recommendation_row_serializes_per_role_severity() {
-        use crate::policy::{
+        use crate::recommendation::{
             AdjustmentReason, CostProjection, HeadroomAwareRecommendation, HeadroomSeverity,
             ShapeRecommendation, ShapeRole,
         };
@@ -2316,7 +2316,7 @@ source = "/data/sv2"
 
     #[test]
     fn doctor_recommendation_row_omits_adjusted_when_none() {
-        use crate::policy::{
+        use crate::recommendation::{
             CostProjection, HeadroomAwareRecommendation, HeadroomSeverity, ShapeRecommendation,
             ShapeRole,
         };
