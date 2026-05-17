@@ -63,7 +63,8 @@ All backup logic flows through: config -> plan -> execute. No exceptions.
 | `executor.rs` | Execute planned operations, error isolation | Decide what to do (planner's job) |
 | `btrfs.rs` | Wrap `sudo btrfs` subprocess calls via `BtrfsOps` trait | Know about retention, plans, config |
 | `retention.rs` | Compute which snapshots to keep/delete (pure) | Delete anything (returns lists) |
-| `awareness.rs` | Compute promise states per subvolume (pure) | Perform I/O |
+| `awareness.rs` | Pure: assess promise state (PROTECTED / AT RISK / UNPROTECTED) and compute actionable advice for the current backup state | Perform I/O; recommend retention shapes (`recommendation.rs` does that) |
+| `recommendation.rs` | Pure: head-room-aware retention-shape recommendations and cost projections — the advisory layer that translates drift signals + headroom into a recommended shape with reasons (ADR-115, UPI 041) | Perform I/O; assess promise state (`awareness.rs` does that); mutate config; run in the backup hot path |
 | `chain.rs` | Track incremental chain parents (pin files) | Send snapshots |
 | `state.rs` | Record history in SQLite — granular SQL wrappers (one method per query) | Influence backup decisions; compose domain-shaped answers (`state_views.rs` does that) |
 | `state_views.rs` | Composed read views over `StateDb` — turn row-shapes into domain shapes callers actually want (`ChurnView::for_subvolume` etc.). Best-effort per ADR-102. | Hold writers; bypass `StateDb` for SQL access |

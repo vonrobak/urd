@@ -233,6 +233,53 @@ identity, the other is the on-disk filename token kept short for terminal width.
 Both are ADR-105 contracts: changing them on an existing host requires a migration
 plan because pin files and monitoring scrape them.
 
+## Cluster: Recommendation
+
+The advisory layer (ADR-115, UPI 041 / UPI 044) computes a per-subvolume retention
+shape that fits the observed drift signal under a destination's available headroom.
+It lives in `recommendation.rs` and is surfaced through `urd doctor --thorough`.
+The recommendation engine is purely advisory — it never mutates config and never
+runs in the backup hot path.
+
+| Term | Meaning |
+|------|---------|
+| `shape` | A graduated retention configuration — the set of slot counts per tier, e.g. `{hourly, daily, weekly, monthly, yearly}`. The thing the user writes in `urd.toml` under a `*_retention` key, and the thing the recommendation engine returns. |
+| `inter-slot delta` | The wire bytes between a retained slot and the next-newer slot. The unit of data cost in the symmetric cost model — what each retained slot pins. |
+| `outer-edge span` | The time span from the *outer* edge of a tier's window back to its inner edge — the only thing that changes total data cost as the shape changes. Slot density inside a window does not. |
+| `drift signal` | The rolling churn rate computed by `drift.rs` (UPI 030) from `drift_samples`. The input the recommendation engine projects cost against. |
+| `symmetric data-cost model` | ADR-115's claim: two shapes with the same outer-edge span over the same drift signal cost the same in retained data bytes, regardless of how many slots populate the interior. Metadata cost is separate and is not modelled by X1. |
+| `headroom` | Destination free-space context (`HeadroomContext`) used to scale the recommended shape. `HeadroomSeverity` is one of `Comfortable / Pressure / Critical`. Pressure and Critical produce a tightened companion shape under `HEADROOM_TIGHTEN_MULTIPLIER`. |
+| `recommended shape` | The shape returned by `recommend_shape*()` — a `ResolvedGraduatedRetention`-shaped suggestion paired with a `CostProjection` and the `AdjustmentReason`s that explain why it differs from what the user has today. |
+
+Source: `recommendation.rs`, ADR-115.
+
+### `derive_policy()` vs `recommend_shape()`
+
+Two different functions answer two different questions. Keep them straight:
+
+| Function | Lives in | Question answered | Inputs | Output |
+|----------|----------|-------------------|--------|--------|
+| `derive_policy()` | `types.rs` | "Given this protection level, what operational params should the planner use?" | Protection level + config fields | Mechanical: intervals, retention floor |
+| `recommend_shape*()` | `recommendation.rs` | "Given observed drift and headroom, what retention shape should the user adopt?" | Drift signal + headroom + current shape | Advisory: a `ShapeRecommendation` with reasons and cost projection |
+
+`derive_policy()` runs on every config load and is part of the planner's input.
+`recommend_shape*()` runs only on `urd doctor --thorough` and never affects the
+backup hot path. The names look similar; the seams are not.
+
+**In context (`urd doctor --thorough` recommendation row):**
+
+```
+subvol3-opptak  headroom: Pressure (12% free on WD-18TB)
+  current   daily=30 weekly=8 monthly=12        ~ 18.4 GB / 365d span
+  suggested daily=14 weekly=4 monthly=12        ~ 11.2 GB / 365d span
+  tightened daily=10 weekly=3 monthly=8         ~  7.8 GB / 244d span (headroom-aware)
+  reasons   drift-up (+38% vs 30d baseline); destination Pressure
+```
+
+The suggested shape preserves the outer-edge span (365 days) while thinning the
+interior — same data cost, fewer pins to manage. The tightened shape shortens
+the outer edge in response to destination pressure; that does reduce data cost.
+
 ## Flagged Ambiguities
 
 Terms in transition, or with a known gap between their canonical definition and
@@ -247,14 +294,6 @@ without re-deriving the context.
   when the recommendation engine's outputs consistently match a level's derived
   shape across representative hosts. Until then, expect that named-level shapes
   may be replaced with `custom` recommendations under `urd doctor --thorough`.
-
-- **The recommendation layer is new vocabulary.** ADR-115 (Phase D-2 / UPI 041)
-  introduces a per-subvolume *retention shape recommendation* surfaced through
-  `urd doctor --thorough`. The terms **shape**, **inter-slot delta**, **drift
-  signal**, **outer-edge span**, and **symmetric data-cost model** are
-  load-bearing for that work but are not yet glossary-anchored here. When UPI 041
-  ships, an eighth cluster ("Recommendation") should be added with the
-  corresponding `derive_policy()` / `recommend_shape()` distinction.
 
 - **`hold` vs `unbroken` vs `intact`.** All three describe a healthy thread, but
   they appear in different surfaces: `hold` and `intact` in transition summaries

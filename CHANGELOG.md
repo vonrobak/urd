@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Renamed `policy` module to `recommendation`** (internal). The module
+  introduced for UPI 041 / ADR-115 is the advisory retention-shape
+  recommendation engine, not a "policy" derivation — `types.rs::derive_policy()`
+  is the latter. The new name matches the glossary's "recommendation layer"
+  vocabulary and removes the conflation. No behaviour change, no public
+  CLI / config / on-disk surface affected.
+- **Glossary: added a Recommendation cluster** in
+  `docs/00-foundation/glossary.md` defining `shape`, `inter-slot delta`,
+  `outer-edge span`, `drift signal`, `symmetric data-cost model`, `headroom`,
+  and `recommended shape`, plus a `derive_policy()` vs `recommend_shape()`
+  comparison. Closes the doc-debt the glossary itself flagged after UPI 041
+  shipped.
 - **New `state_views` module** — composed read views over `StateDb`
   (`ChurnView::for_subvolume` and `::for_subvolume_default_window`). Three
   inline `drift_samples_for_subvolume` → `drift_row_to_sample` →
