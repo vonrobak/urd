@@ -11,7 +11,7 @@ use crate::output::{
     SchemaStatus,
 };
 use crate::plan::RealFileSystemState;
-use crate::policy::{
+use crate::recommendation::{
     self, AdjustmentReason, HeadroomAwareRecommendation, HeadroomContext, HeadroomSeverity,
     ShapeRole,
 };
@@ -492,7 +492,7 @@ fn build_doctor_recommendation_view_inner(
             LocalRetentionPolicy::Transient => (None, None),
             LocalRetentionPolicy::Graduated(g) => (
                 Some(*g),
-                policy::recommend_shape_with_headroom(
+                recommendation::recommend_shape_with_headroom(
                     g,
                     &churn,
                     ShapeRole::Local,
@@ -507,7 +507,7 @@ fn build_doctor_recommendation_view_inner(
         let (external_current_shape, external_rec) = if sv.send_enabled {
             (
                 Some(sv.external_retention),
-                policy::recommend_shape_with_headroom(
+                recommendation::recommend_shape_with_headroom(
                     &sv.external_retention,
                     &churn,
                     ShapeRole::External,
@@ -526,16 +526,16 @@ fn build_doctor_recommendation_view_inner(
         let external_rec = external_rec.filter(|h| h.recommendation.suggested != h.recommendation.current);
 
         // R1 synth path for cold-churn-but-pressured subvolumes.
-        let severity_local = policy::classify_headroom_severity(ctx_local);
-        let severity_external = policy::classify_headroom_severity(ctx_external);
+        let severity_local = recommendation::classify_headroom_severity(ctx_local);
+        let severity_external = recommendation::classify_headroom_severity(ctx_external);
 
         let mut local = match (local_rec, severity_local, local_current_shape) {
             (Some(r), _, _) => Some(r),
             (None, HeadroomSeverity::Pressure, Some(cur))
             | (None, HeadroomSeverity::Critical, Some(cur)) => {
-                let reason = policy::pick_reason(ctx_local, severity_local, None)
+                let reason = recommendation::pick_reason(ctx_local, severity_local, None)
                     .unwrap_or(AdjustmentReason::StorageCritical);
-                Some(policy::headroom_aware_pointer_only(
+                Some(recommendation::headroom_aware_pointer_only(
                     &cur,
                     ShapeRole::Local,
                     severity_local,
@@ -548,13 +548,13 @@ fn build_doctor_recommendation_view_inner(
             (Some(r), _, _) => Some(r),
             (None, HeadroomSeverity::Pressure, Some(cur))
             | (None, HeadroomSeverity::Critical, Some(cur)) => {
-                let reason = policy::pick_reason(
+                let reason = recommendation::pick_reason(
                     ctx_external,
                     severity_external,
                     max_metadata_label.as_deref(),
                 )
                 .unwrap_or(AdjustmentReason::StorageCritical);
-                Some(policy::headroom_aware_pointer_only(
+                Some(recommendation::headroom_aware_pointer_only(
                     &cur,
                     ShapeRole::External,
                     severity_external,
@@ -584,7 +584,7 @@ fn build_doctor_recommendation_view_inner(
             // each role that's actually used (Some current_shape).
             if local.is_none() && external.is_none() {
                 if let Some(cur) = local_current_shape {
-                    local = Some(policy::headroom_aware_pointer_only(
+                    local = Some(recommendation::headroom_aware_pointer_only(
                         &cur,
                         ShapeRole::Local,
                         HeadroomSeverity::Critical,
@@ -592,7 +592,7 @@ fn build_doctor_recommendation_view_inner(
                     ));
                 }
                 if let Some(cur) = external_current_shape {
-                    external = Some(policy::headroom_aware_pointer_only(
+                    external = Some(recommendation::headroom_aware_pointer_only(
                         &cur,
                         ShapeRole::External,
                         HeadroomSeverity::Critical,
@@ -632,7 +632,7 @@ fn build_doctor_recommendation_view_inner(
 
 /// Per-role recovery bytes. Prefers `adjusted_cost` over `suggested_cost`
 /// so the sort order matches what the user sees rendered (R2).
-fn role_recovery_bytes(h: &policy::HeadroomAwareRecommendation) -> u64 {
+fn role_recovery_bytes(h: &recommendation::HeadroomAwareRecommendation) -> u64 {
     let saved_to = h.adjusted_cost.unwrap_or(h.recommendation.suggested_cost);
     h.recommendation
         .current_cost
@@ -1464,7 +1464,7 @@ source = "/data/cold"
     fn recovery_bytes_uses_adjusted_cost_when_present() {
         // R2: recovery_bytes prefers adjusted_cost over suggested_cost
         // so sort order matches what voice renders.
-        use crate::policy::{
+        use crate::recommendation::{
             CostProjection, HeadroomAwareRecommendation, ShapeRecommendation, ShapeRole,
         };
         use crate::types::{MonthlyCount, ResolvedGraduatedRetention};
@@ -1512,7 +1512,7 @@ source = "/data/cold"
     #[test]
     fn recovery_bytes_uses_inner_shape_recommendation_when_no_adjusted() {
         // When adjusted_cost is None, fall back to suggested_cost.
-        use crate::policy::{
+        use crate::recommendation::{
             CostProjection, HeadroomAwareRecommendation, ShapeRecommendation, ShapeRole,
         };
         use crate::types::{MonthlyCount, ResolvedGraduatedRetention};

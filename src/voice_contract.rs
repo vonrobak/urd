@@ -969,7 +969,7 @@ mod contract {
     // ── Rule 1 / 5 / 7 — Recommendations section (UPI 041) ──────────────
 
     fn recommendation_row_with_recovery() -> crate::output::DoctorRecommendationRow {
-        use crate::policy::{
+        use crate::recommendation::{
             CostProjection, HeadroomAwareRecommendation, ShapeRecommendation, ShapeRole,
         };
         use crate::types::ResolvedGraduatedRetention as Shape;
@@ -1088,7 +1088,7 @@ mod contract {
     // ── UPI 044 — Rule 6 (gravity) + Rule 1 (no falsehoods) ──────────
 
     fn critical_row(name: &str) -> crate::output::DoctorRecommendationRow {
-        use crate::policy::{
+        use crate::recommendation::{
             headroom_aware_pointer_only, AdjustmentReason, HeadroomSeverity, ShapeRole,
         };
         use crate::types::{MonthlyCount, ResolvedGraduatedRetention};
@@ -1115,7 +1115,7 @@ mod contract {
     }
 
     fn caution_row_low_free(name: &str, free_ratio: f64) -> crate::output::DoctorRecommendationRow {
-        use crate::policy::{
+        use crate::recommendation::{
             AdjustmentReason, CostProjection, HeadroomAwareRecommendation, HeadroomSeverity,
             ShapeRecommendation, ShapeRole,
         };
@@ -1314,7 +1314,7 @@ mod contract {
         // R2: the rendered "recover ~..." must use the tightened-shape
         // cost, not the suggested-shape cost. Otherwise the number lies
         // about what shape is actually being shown.
-        use crate::policy::{
+        use crate::recommendation::{
             AdjustmentReason, CostProjection, HeadroomAwareRecommendation, HeadroomSeverity,
             ShapeRecommendation, ShapeRole,
         };
