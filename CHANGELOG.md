@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.2] - 2026-05-19
+
 ### Fixed
 - **`--subvolume NAME` now errors on unknown names** (#134). `urd plan
   --subvolume FOO` and `urd backup --subvolume FOO` previously responded
@@ -576,7 +578,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Defense-in-depth pin file protection for unsent snapshots
 - Per-subvolume error isolation in executor
 
-[Unreleased]: https://github.com/vonrobak/urd/compare/v0.20.1...HEAD
+[Unreleased]: https://github.com/vonrobak/urd/compare/v0.20.2...HEAD
+[0.20.2]: https://github.com/vonrobak/urd/compare/v0.20.1...v0.20.2
 [0.20.1]: https://github.com/vonrobak/urd/compare/v0.20.0...v0.20.1
 [0.20.0]: https://github.com/vonrobak/urd/compare/v0.19.0...v0.20.0
 [0.19.0]: https://github.com/vonrobak/urd/compare/v0.18.0...v0.19.0
