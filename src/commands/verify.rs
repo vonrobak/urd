@@ -9,6 +9,8 @@ use crate::plan::{FileSystemState, RealFileSystemState};
 use crate::voice;
 
 pub fn run(config: Config, args: VerifyArgs, mode: OutputMode) -> anyhow::Result<()> {
+    crate::cli_validation::require_known_subvolume(&config, args.subvolume.as_deref())?;
+
     let data = collect_verify_output(&config, &args);
 
     print!("{}", voice::render_verify(&data, mode, args.detail));

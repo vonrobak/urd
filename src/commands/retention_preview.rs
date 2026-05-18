@@ -7,6 +7,8 @@ use crate::types::LocalRetentionPolicy;
 use crate::voice;
 
 pub fn run(config: Config, args: RetentionPreviewArgs, mode: OutputMode) -> anyhow::Result<()> {
+    crate::cli_validation::require_known_subvolume(&config, args.subvolume.as_deref())?;
+
     let resolved = config.resolved_subvolumes();
 
     // Determine which subvolumes to preview
@@ -16,7 +18,7 @@ pub fn run(config: Config, args: RetentionPreviewArgs, mode: OutputMode) -> anyh
         let sv = resolved
             .iter()
             .find(|sv| sv.name == *name)
-            .ok_or_else(|| anyhow::anyhow!("unknown subvolume: {name}"))?;
+            .expect("validated by require_known_subvolume");
         vec![sv]
     } else if resolved.len() == 1 {
         vec![&resolved[0]]

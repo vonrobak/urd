@@ -7,6 +7,8 @@ use crate::state::StateDb;
 use crate::voice;
 
 pub fn run(config: Config, args: CalibrateArgs, mode: OutputMode) -> anyhow::Result<()> {
+    crate::cli_validation::require_known_subvolume(&config, args.subvolume.as_deref())?;
+
     let state_db = StateDb::open(&config.general.state_db)?;
     let resolved = config.resolved_subvolumes();
 

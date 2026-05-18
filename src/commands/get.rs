@@ -12,6 +12,8 @@ use crate::types::SnapshotName;
 use crate::voice;
 
 pub fn run(config: Config, args: GetArgs, output_mode: OutputMode) -> anyhow::Result<()> {
+    crate::cli_validation::require_known_subvolume(&config, args.subvolume.as_deref())?;
+
     // 1. Resolve input path to absolute and normalize
     let path = resolve_path(&args.path)?;
 
@@ -21,7 +23,7 @@ pub fn run(config: Config, args: GetArgs, output_mode: OutputMode) -> anyhow::Re
             .subvolumes
             .iter()
             .find(|sv| sv.name == *name)
-            .ok_or_else(|| anyhow!("no subvolume named {name:?} in config"))?,
+            .expect("validated by require_known_subvolume"),
         None => find_subvolume_for_path(&path, &config.subvolumes).ok_or_else(|| {
             let sources: Vec<_> = config
                 .subvolumes

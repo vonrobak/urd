@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`--subvolume NAME` now errors on unknown names** (#134). `urd plan
+  --subvolume FOO` and `urd backup --subvolume FOO` previously responded
+  with a falsely-reassuring `All sealed.` / `Nothing to do.` when `FOO`
+  didn't match any configured subvolume — the silent empty-set result of
+  the planner's filter. Validation now runs at the CLI boundary across
+  all 8 `--subvolume`-accepting commands (`plan`, `backup`, `history`,
+  `calibrate`, `verify`, `events`, `get`, `retention-preview`) and exits
+  non-zero with the configured-names listing and a Levenshtein-based
+  "Did you mean: …?" suggestion. Two pre-existing ad-hoc validators
+  (`get`, `retention-preview`) are unified on the shared helper for
+  consistent phrasing.
+
+### Changed
+- **`urd retention-preview --all --subvolume BOGUS` now errors** instead
+  of silently ignoring the unknown name and running `--all`. A valid
+  `--subvolume` name combined with `--all` is unchanged (`--all` still
+  wins). Script callers templating in a subvolume name with `--all` will
+  now see a hard failure on typos rather than a silent success.
+
 ## [0.20.1] - 2026-05-17
 
 ### Changed
