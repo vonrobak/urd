@@ -18,6 +18,8 @@ use crate::voice;
 const LIMIT_MAX: usize = 1000;
 
 pub fn run(config: Config, args: EventsArgs, output_mode: OutputMode) -> anyhow::Result<()> {
+    crate::cli_validation::require_known_subvolume(&config, args.subvolume.as_deref())?;
+
     let db = StateDb::open(&config.general.state_db).with_context(|| {
         format!(
             "failed to open state DB at {}",

@@ -2,6 +2,7 @@ mod awareness;
 mod btrfs;
 mod chain;
 mod cli;
+mod cli_validation;
 mod commands;
 mod config;
 mod drift;

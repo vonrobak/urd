@@ -8,6 +8,8 @@ use crate::state::StateDb;
 use crate::voice;
 
 pub fn run(config: Config, args: HistoryArgs, mode: OutputMode) -> anyhow::Result<()> {
+    crate::cli_validation::require_known_subvolume(&config, args.subvolume.as_deref())?;
+
     let db = match StateDb::open(&config.general.state_db) {
         Ok(db) => db,
         Err(_) => {

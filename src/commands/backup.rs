@@ -33,6 +33,8 @@ use crate::state::StateDb;
 use crate::types::{BackupPlan, ByteSize, PlannedOperation, ProtectionLevel, SendKind};
 
 pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
+    crate::cli_validation::require_known_subvolume(&config, args.subvolume.as_deref())?;
+
     let now = chrono::Local::now().naive_local();
     let filters = PlanFilters {
         priority: args.priority,

@@ -11,6 +11,8 @@ use crate::types::PlannedOperation;
 use crate::voice;
 
 pub fn run(config: Config, args: PlanArgs, mode: OutputMode) -> anyhow::Result<()> {
+    crate::cli_validation::require_known_subvolume(&config, args.subvolume.as_deref())?;
+
     let now = chrono::Local::now().naive_local();
     let filters = PlanFilters {
         priority: args.priority,
