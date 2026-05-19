@@ -7,10 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.3] - 2026-05-19
+
 ### Fixed
 - **Retention thinning no longer silently skipped after the first delete per
-  location.** The executor's space-recovery short-circuit (introduced with
-  UPI 016) was applied to every delete, including policy-driven graduated
+  location** (#137). The executor's space-recovery short-circuit (introduced
+  with UPI 016) was applied to every delete, including policy-driven graduated
   retention. Because the `space_recovered` map is keyed by location (drive
   label or local snapshot-root path) and shared across subvolumes, on a
   filesystem with comfortable free space the very first delete at a location
@@ -597,7 +599,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Defense-in-depth pin file protection for unsent snapshots
 - Per-subvolume error isolation in executor
 
-[Unreleased]: https://github.com/vonrobak/urd/compare/v0.20.2...HEAD
+[Unreleased]: https://github.com/vonrobak/urd/compare/v0.20.3...HEAD
+[0.20.3]: https://github.com/vonrobak/urd/compare/v0.20.2...v0.20.3
 [0.20.2]: https://github.com/vonrobak/urd/compare/v0.20.1...v0.20.2
 [0.20.1]: https://github.com/vonrobak/urd/compare/v0.20.0...v0.20.1
 [0.20.0]: https://github.com/vonrobak/urd/compare/v0.19.0...v0.20.0
