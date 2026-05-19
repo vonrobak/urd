@@ -63,7 +63,8 @@ All backup logic flows through: config -> plan -> execute. No exceptions.
 | `executor.rs` | Execute planned operations, error isolation | Decide what to do (planner's job) |
 | `btrfs.rs` | Wrap `sudo btrfs` subprocess calls via `BtrfsOps` trait | Know about retention, plans, config |
 | `retention.rs` | Compute which snapshots to keep/delete (pure) | Delete anything (returns lists) |
-| `awareness.rs` | Pure: assess promise state (PROTECTED / AT RISK / UNPROTECTED) and compute actionable advice for the current backup state | Perform I/O; recommend retention shapes (`recommendation.rs` does that) |
+| `awareness.rs` | Pure: observe promise state (PROTECTED / AT RISK / UNPROTECTED) from config + filesystem + history. The "is my data safe right now?" surface | Perform I/O; translate observations into advice (`advice.rs` does that); recommend retention shapes (`recommendation.rs` does that) |
+| `advice.rs` | Pure: translate `SubvolAssessment` into actionable advice (issue/command/reason) and structured redundancy advisories. The "what should the user do?" surface — rule-based, the volatile layer where product refinements land | Perform I/O; assess promise state (`awareness.rs` does that) |
 | `recommendation.rs` | Pure: head-room-aware retention-shape recommendations and cost projections — the advisory layer that translates drift signals + headroom into a recommended shape with reasons (ADR-115, UPI 041) | Perform I/O; assess promise state (`awareness.rs` does that); mutate config; run in the backup hot path |
 | `chain.rs` | Track incremental chain parents (pin files) | Send snapshots |
 | `state.rs` | Record history in SQLite — granular SQL wrappers (one method per query) | Influence backup decisions; compose domain-shaped answers (`state_views.rs` does that) |

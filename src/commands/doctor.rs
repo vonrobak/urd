@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use crate::advice;
 use crate::awareness::{self, PromiseStatus};
 use crate::cli::{DoctorArgs, VerifyArgs};
 use crate::config::Config;
@@ -166,10 +167,10 @@ pub fn run(config: Config, args: DoctorArgs, output_mode: OutputMode) -> anyhow:
             let sv_config = resolved.iter().find(|sv| sv.name == a.name);
             let send_enabled = sv_config.is_none_or(|sv| sv.send_enabled);
             let external_only = sv_config.is_some_and(|sv| sv.local_retention.is_transient());
-            let advice = awareness::compute_advice(a, send_enabled, external_only);
+            let advice = advice::compute_advice(a, send_enabled, external_only);
 
             // Extract structured advice into doctor display fields.
-            let unpack = |adv: &awareness::ActionableAdvice| {
+            let unpack = |adv: &advice::ActionableAdvice| {
                 (
                     Some(adv.issue.clone()),
                     adv.command.as_ref().map(|c| format!("Run `{c}`.")),
