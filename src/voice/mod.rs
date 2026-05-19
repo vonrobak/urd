@@ -12,283 +12,74 @@ use std::fmt::Write;
 use colored::Colorize;
 
 use crate::output::{
-    AdoptAction, BackupSummary, CalibrateOutput, CalibrateResult, ChainHealth,
-    DefaultStatusOutput, DoctorCheck, DoctorCheckStatus, DoctorOutput, DoctorVerdictStatus,
+    AdoptAction, BackupSummary, CalibrateOutput, CalibrateResult,
+    DefaultStatusOutput,
     DriveAdoptOutput, DriveStatus, DrivesListOutput, EmergencyOutput, EmergencyResult,
     FailuresOutput, GetOutput, HistoryOutput, InitOutput, InitStatus, OutputMode, PlanOutput,
     PreActionSummary, RecoveryWindow, RetentionPreviewOutput,
-    SentinelStatusOutput, SkipCategory, SkippedSubvolume, StatusAssessment, StatusOutput,
+    SentinelStatusOutput, SkipCategory, SkippedSubvolume, StatusAssessment,
     SubvolumeHistoryOutput, TokenState, VerifyCheck, VerifyOutput, parse_duration_to_minutes,
 };
-use crate::advice::RedundancyAdvisoryKind;
+// Test-only imports — moved-renderer types still referenced by parent tests
+// (status/doctor renderer extraction to UPI 050).
+#[cfg(test)]
+use crate::output::{
+    ChainHealth, DoctorCheck, DoctorCheckStatus, DoctorOutput, StatusOutput,
+};
 use crate::plan::format_duration_short;
 use crate::types::{ByteSize, DriveRole};
 
-// ── Status ──────────────────────────────────────────────────────────────
+// ── Sub-modules (per-command renderers; UPI 050) ──────────────────────
 
-/// Render status output according to the given mode.
-#[must_use]
-pub fn render_status(data: &StatusOutput, mode: OutputMode) -> String {
-    match mode {
-        OutputMode::Interactive => render_status_interactive(data),
-        OutputMode::Daemon => render_status_daemon(data),
-    }
-}
+mod doctor;
+mod status;
 
-fn render_status_daemon(data: &StatusOutput) -> String {
-    serde_json::to_string_pretty(data).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
-}
+pub use doctor::render_doctor;
+pub use status::render_status;
 
-fn render_status_interactive(data: &StatusOutput) -> String {
-    let mut out = String::new();
+// ── Cross-renderer helpers ────────────────────────────────────────────
 
-    // ── Summary line ────────────────────────────────────────────────
-    render_summary_line(data, &mut out);
+/// Classify verify checks into findings (real problems) and expected
+/// conditions (absent drives). Used by both `render_verify` and
+/// `render_doctor` (doctor renders verify findings within its --thorough
+/// view).
+pub(super) fn classify_verify_checks(
+    verify: &VerifyOutput,
+) -> (Vec<(&str, &str, &VerifyCheck)>, Vec<&str>) {
+    let mut findings: Vec<(&str, &str, &VerifyCheck)> = Vec::new();
+    let mut absent_drives: Vec<&str> = Vec::new();
 
-    // ── Per-subvolume table ──────────────────────────────────────────
-    render_subvolume_table(data, &mut out);
-
-    // ── Advisories and errors from awareness model ─────────────────
-    render_advisories(data, &mut out);
-
-    // ── Redundancy advisories ───────────────────────────────────────
-    render_redundancy_advisories(data, &mut out);
-
-    // ── Drive summary ───────────────────────────────────────────────
-    writeln!(out).ok();
-    render_drive_summary(data, &mut out);
-
-    // ── Last run ────────────────────────────────────────────────────
-    render_last_run(data, &mut out);
-
-    // ── Pin summary ─────────────────────────────────────────────────
-    if data.total_pins > 0 {
-        writeln!(
-            out,
-            "Pinned snapshots: {} across subvolumes",
-            data.total_pins
-        )
-        .ok();
-    }
-
-    // ── Next-action suggestion ──────────────────────────────────────
-    if !data.advice.is_empty() {
-        writeln!(out).ok();
-        if data.advice.len() == 1 {
-            let a = &data.advice[0];
-            if let Some(ref cmd) = a.command {
-                writeln!(out, "{}", format!("{} — run `{cmd}` to fix.", a.subvolume).dimmed()).ok();
-            } else if let Some(ref reason) = a.reason {
-                writeln!(out, "{}", format!("{} — {}.", a.subvolume, reason).dimmed()).ok();
-            }
-        } else {
-            writeln!(out, "{}", format!("{} subvolumes need attention — run `urd doctor` for details.", data.advice.len()).dimmed()).ok();
-        }
-    }
-
-    out
-}
-
-fn render_summary_line(data: &StatusOutput, out: &mut String) {
-    if data.assessments.is_empty() {
-        return;
-    }
-
-    let total = data.assessments.len();
-    let safe_count = data
-        .assessments
-        .iter()
-        .filter(|a| a.status == "PROTECTED")
-        .count();
-    let has_health_issues = data.assessments.iter().any(|a| a.health != "healthy");
-
-    let safety_part = if safe_count == total {
-        "All sealed.".green().to_string()
-    } else {
-        let exposed_names: Vec<&str> = data
-            .assessments
-            .iter()
-            .filter(|a| a.status == "UNPROTECTED")
-            .map(|a| a.name.as_str())
-            .collect();
-        let waning_names: Vec<&str> = data
-            .assessments
-            .iter()
-            .filter(|a| a.status == "AT RISK")
-            .map(|a| a.name.as_str())
-            .collect();
-        let mut parts = vec![format!("{} of {} sealed.", safe_count, total)];
-        if !exposed_names.is_empty() {
-            parts.push(format!("{} exposed.", exposed_names.join(", ")));
-        }
-        if !waning_names.is_empty() {
-            parts.push(format!("{} waning.", waning_names.join(", ")));
-        }
-        parts.join(" ").yellow().to_string()
-    };
-
-    let health_part = if has_health_issues {
-        let blocked_count = data
-            .assessments
-            .iter()
-            .filter(|a| a.health == "blocked")
-            .count();
-        let degraded_count = data
-            .assessments
-            .iter()
-            .filter(|a| a.health == "degraded")
-            .count();
-        // Collect all unique health reasons across degraded/blocked assessments.
-        // awareness.rs guarantees health_reasons is non-empty for non-healthy
-        // assessments; if violated, reasons_part is safely empty.
-        let unique_reasons: Vec<&str> = data
-            .assessments
-            .iter()
-            .filter(|a| a.health != "healthy")
-            .flat_map(|a| a.health_reasons.iter().map(String::as_str))
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .collect();
-        let reasons_part = if unique_reasons.is_empty() {
-            String::new()
-        } else if unique_reasons.len() <= 3 {
-            format!(" \u{2014} {}", unique_reasons.join(", "))
-        } else {
-            let shown = &unique_reasons[..3];
-            let remaining = unique_reasons.len() - 3;
-            format!(" \u{2014} {}, and {remaining} more", shown.join(", "))
-        };
-        let mut parts = Vec::new();
-        if blocked_count > 0 {
-            parts.push(format!("{blocked_count} blocked"));
-        }
-        if degraded_count > 0 {
-            parts.push(format!("{degraded_count} degraded"));
-        }
-        format!(" {}{reasons_part}.", parts.join(", "))
-    } else {
-        String::new()
-    };
-
-    writeln!(out, "{safety_part}{health_part}").ok();
-}
-
-fn render_subvolume_table(data: &StatusOutput, out: &mut String) {
-    if data.assessments.is_empty() {
-        writeln!(out, "{}", "No subvolumes configured.".dimmed()).ok();
-        return;
-    }
-
-    // Only show connected drives in the table — absent drives are in the drive summary below.
-    let visible_drives: Vec<_> = data.drives.iter().filter(|d| d.mounted).collect();
-    let drive_labels: Vec<String> = visible_drives
-        .iter()
-        .map(|d| {
-            if d.role == DriveRole::Offsite {
-                format!("{} (offsite)", d.label)
-            } else {
-                d.label.clone()
-            }
-        })
-        .collect();
-
-    // Show PROTECTION only when exposure conflicts with promise (sealed but degraded, waning, exposed)
-    let show_protection = data.assessments.iter().any(|a| {
-        a.promise_level.is_some() && a.status != "PROTECTED"
-    });
-    // Only show HEALTH column when at least one subvolume is non-healthy
-    let show_health = data.assessments.iter().any(|a| a.health != "healthy");
-
-    // Build headers: EXPOSURE  [HEALTH]  [PROTECTION]  SUBVOLUME  LOCAL  [DRIVES...]  THREAD
-    let mut headers: Vec<String> = vec!["EXPOSURE".to_string()];
-    if show_health {
-        headers.push("HEALTH".to_string());
-    }
-    if show_protection {
-        headers.push("PROTECTION".to_string());
-    }
-    headers.push("SUBVOLUME".to_string());
-    headers.push("LOCAL".to_string());
-    for label in &drive_labels {
-        headers.push(label.to_string());
-    }
-    headers.push("THREAD".to_string());
-
-    // Track which columns need coloring
-    let safety_col = Some(0usize);
-    let health_col = if show_health { Some(1usize) } else { None };
-
-    // Build rows
-    let mut rows: Vec<Vec<String>> = Vec::new();
-    for assessment in &data.assessments {
-        // Safety column — new vocabulary
-        let safety = exposure_label(&assessment.status);
-        let mut row = vec![safety];
-
-        if show_health {
-            row.push(assessment.health.clone());
-        }
-        if show_protection {
-            row.push(
-                assessment
-                    .promise_level
-                    .clone()
-                    .unwrap_or_else(|| "\u{2014}".to_string()),
-            );
-        }
-        row.push(assessment.name.clone());
-
-        // LOCAL column with temporal context
-        let local_cell = if assessment.external_only {
-            "\u{2014}".to_string() // em-dash, same as absent drives
-        } else {
-            format_count_with_age(
-                assessment.local_snapshot_count,
-                assessment.local_newest_age_secs,
-            )
-        };
-        row.push(local_cell);
-
-        // Per-drive columns (connected drives only)
-        for drive in &visible_drives {
-            let ext = assessment
-                .external
-                .iter()
-                .find(|e| e.drive_label == drive.label);
-            let cell = match ext {
-                Some(e) if e.mounted => {
-                    let count = e.snapshot_count.unwrap_or(0);
-                    if count > 0 {
-                        format_count_with_age(count, e.last_send_age_secs)
-                    } else {
-                        "\u{2014}".to_string()
-                    }
+    for sv in &verify.subvolumes {
+        for drive in &sv.drives {
+            for check in &drive.checks {
+                if check.status == "ok" {
+                    continue;
                 }
-                _ => "\u{2014}".to_string(),
-            };
-            row.push(cell);
+                if check.is_expected_condition() {
+                    if !absent_drives.contains(&drive.label.as_str()) {
+                        absent_drives.push(&drive.label);
+                    }
+                } else {
+                    findings.push((&sv.name, &drive.label, check));
+                }
+            }
         }
-
-        // Thread health (interactive rendering — Display impl feeds daemon JSON, do not change it)
-        let thread = if assessment.external_only {
-            "drive-only".dimmed().to_string()
-        } else {
-            data.chain_health
-                .iter()
-                .find(|c| c.subvolume == assessment.name)
-                .map(|c| render_thread_status(&c.health))
-                .unwrap_or_else(|| "\u{2014}".to_string())
-        };
-        row.push(thread);
-
-        rows.push(row);
     }
 
-    format_status_table(&headers, &rows, safety_col, health_col, out);
+    (findings, absent_drives)
 }
 
-/// Map promise status to exposure vocabulary.
-fn exposure_label(status: &str) -> String {
+/// Singular/plural noun selector. Shared because many renderers (verify,
+/// doctor, retention) emit counts.
+pub(super) fn pluralize(count: usize, singular: &str, plural: &str) -> String {
+    if count == 1 {
+        format!("{count} {singular}")
+    } else {
+        format!("{count} {plural}")
+    }
+}
+
+pub(super) fn exposure_label(status: &str) -> String {
     match status {
         "PROTECTED" => "sealed".to_string(),
         "AT RISK" => "waning".to_string(),
@@ -297,26 +88,9 @@ fn exposure_label(status: &str) -> String {
     }
 }
 
-/// Render chain health for interactive display.
-/// The `Display` impl on `ChainHealth` feeds daemon JSON and must not change.
-fn render_thread_status(health: &ChainHealth) -> String {
-    match health {
-        ChainHealth::NoDriveData => "\u{2014}".to_string(),
-        ChainHealth::Incremental(_) => "unbroken".to_string(),
-        ChainHealth::Full(reason) => format!("broken \u{2014} full send ({reason})"),
-    }
-}
 
-/// Format a snapshot count with optional age: "10 (2h)" or just "10".
-fn format_count_with_age(count: usize, age_secs: Option<i64>) -> String {
-    match age_secs {
-        Some(secs) if secs >= 0 => format!("{} ({})", count, humanize_duration(secs)),
-        _ => count.to_string(),
-    }
-}
-
-/// Humanize seconds into a compact duration string.
-fn humanize_duration(secs: i64) -> String {
+/// Humanize seconds into a compact duration string. Cross-renderer helper.
+pub(super) fn humanize_duration(secs: i64) -> String {
     if secs <= 0 {
         "<1s".to_string()
     } else if secs < 60 {
@@ -330,141 +104,6 @@ fn humanize_duration(secs: i64) -> String {
     }
 }
 
-fn render_advisories(data: &StatusOutput, out: &mut String) {
-    let mut any = false;
-    for assessment in &data.assessments {
-        for error in &assessment.errors {
-            writeln!(out, "  {} {}: {}", "ERROR".red(), assessment.name, error).ok();
-            any = true;
-        }
-        for advisory in &assessment.advisories {
-            writeln!(
-                out,
-                "  {} {}: {}",
-                "NOTE".dimmed(),
-                assessment.name,
-                advisory
-            )
-            .ok();
-        }
-    }
-    if any {
-        writeln!(out).ok();
-    }
-}
-
-fn render_redundancy_advisories(data: &StatusOutput, out: &mut String) {
-    if data.redundancy_advisories.is_empty() {
-        return;
-    }
-
-    writeln!(out).ok();
-    writeln!(out, "{}", "REDUNDANCY".dimmed()).ok();
-
-    for advisory in &data.redundancy_advisories {
-        let (observation, suggestion) = match advisory.kind {
-            RedundancyAdvisoryKind::NoOffsiteProtection => (
-                format!(
-                    "{} seeks resilience, but all drives share the same fate.",
-                    advisory.subvolume,
-                ),
-                "Consider designating a drive as offsite to protect against site loss.".to_string(),
-            ),
-            RedundancyAdvisoryKind::OffsiteDriveStale => (
-                format!(
-                    "The offsite copy on {} has aged.",
-                    advisory
-                        .drive
-                        .as_deref()
-                        .unwrap_or("unknown"),
-                ),
-                "Cycle the offsite drive to refresh your off-site copy.".to_string(),
-            ),
-            RedundancyAdvisoryKind::SinglePointOfFailure => (
-                format!(
-                    "{} rests on a single external drive.",
-                    advisory.subvolume,
-                ),
-                "A second drive would guard against the failure of one.".to_string(),
-            ),
-            RedundancyAdvisoryKind::TransientNoLocalRecovery => (
-                format!(
-                    "{} lives only on external drives \u{2014} local snapshots are disabled.",
-                    advisory.subvolume,
-                ),
-                "Recovery requires a connected drive.".to_string(),
-            ),
-        };
-
-        if advisory.kind == RedundancyAdvisoryKind::TransientNoLocalRecovery {
-            // Informational — lighter treatment
-            writeln!(out, "  {} {}", "\u{2139}".dimmed(), observation.dimmed()).ok();
-            writeln!(out, "    {}", suggestion.dimmed()).ok();
-        } else {
-            writeln!(out, "  {} {}", "\u{26a0}".yellow(), observation).ok();
-            writeln!(out, "    \u{2192} {}", suggestion).ok();
-        }
-    }
-}
-
-fn render_drive_summary(data: &StatusOutput, out: &mut String) {
-    if data.drives.is_empty() {
-        writeln!(out, "{}", "Drives: none configured".dimmed()).ok();
-        return;
-    }
-
-    for drive in &data.drives {
-        if drive.mounted {
-            let free_str = drive
-                .free_bytes
-                .map(|b| format!(" ({} free)", ByteSize(b)))
-                .unwrap_or_default();
-            writeln!(
-                out,
-                "Drives: {} {}{}",
-                drive.label.bold(),
-                "connected".green(),
-                free_str,
-            )
-            .ok();
-        } else {
-            let agg = aggregate_drive_info(&data.assessments, &drive.label);
-            let line = unmounted_drive_label(
-                &drive.label,
-                agg.absent_duration_secs,
-                agg.last_activity_age_secs,
-                agg.worst_status,
-            );
-            writeln!(out, "Drives: {line}").ok();
-        }
-    }
-}
-
-fn render_last_run(data: &StatusOutput, out: &mut String) {
-    match &data.last_run {
-        Some(run) => {
-            let result_colored = color_result(&run.result);
-            let duration_str = run
-                .duration
-                .as_ref()
-                .map(|d| format!(", {d}"))
-                .unwrap_or_default();
-            let time_str = data
-                .last_run_age_secs
-                .map(|secs| format!("{} ago", humanize_duration(secs)))
-                .unwrap_or_else(|| run.started_at.clone());
-            writeln!(
-                out,
-                "Last backup: {} ({}{}) [#{}]",
-                time_str, result_colored, duration_str, run.id,
-            )
-            .ok();
-        }
-        None => {
-            writeln!(out, "{}", "Last backup: no runs recorded".dimmed()).ok();
-        }
-    }
-}
 
 // ── Table formatter ─────────────────────────────────────────────────────
 
@@ -565,7 +204,7 @@ fn color_health_str(health: &str) -> String {
     }
 }
 
-fn color_result(result: &str) -> String {
+pub(super) fn color_result(result: &str) -> String {
     match result {
         "success" => "success".green().to_string(),
         "partial" => "partial".yellow().to_string(),
@@ -2239,578 +1878,6 @@ fn render_emergency_result_interactive(data: &EmergencyResult) -> String {
     out
 }
 
-// ── Doctor ────────────────────────────────────────────────────────────
-
-/// Render doctor output.
-#[must_use]
-pub fn render_doctor(data: &DoctorOutput, mode: OutputMode) -> String {
-    match mode {
-        OutputMode::Interactive => render_doctor_interactive(data),
-        OutputMode::Daemon => serde_json::to_string_pretty(data)
-            .unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}")),
-    }
-}
-
-fn render_doctor_interactive(data: &DoctorOutput) -> String {
-    let mut out = String::new();
-
-    // Verdict line first (UPI 045 Rule 5 — first line is the answer).
-    let verdict_line = match data.verdict.status {
-        DoctorVerdictStatus::Healthy => "All clear.".green().bold().to_string(),
-        DoctorVerdictStatus::Warnings => {
-            format!("{}.", pluralize(data.verdict.count, "warning", "warnings"))
-                .yellow()
-                .to_string()
-        }
-        DoctorVerdictStatus::Issues => {
-            format!("{} found.", pluralize(data.verdict.count, "issue", "issues"))
-                .red()
-                .to_string()
-        }
-        DoctorVerdictStatus::Degraded => format!(
-            "{} degraded. Data is safe \u{2014} drives are absent.",
-            pluralize(data.verdict.count, "subvolume", "subvolumes")
-        )
-        .yellow()
-        .to_string(),
-    };
-    writeln!(out, "{verdict_line}").ok();
-    writeln!(out).ok();
-
-    // UPI 042 Branch G: schema deprecation notice. Emitted near the top so
-    // it's the first thing the user sees when their config is older than v2.
-    if let Some(status) = data.schema_status {
-        let label = match status.current {
-            None => "legacy".to_string(),
-            Some(n) => format!("v{n}"),
-        };
-        writeln!(
-            out,
-            "  Schema: {} (current: v{}; run `urd migrate` to upgrade)",
-            label.dimmed(),
-            status.latest
-        )
-        .ok();
-        writeln!(out).ok();
-    }
-
-    // Config section
-    render_doctor_check_section(&mut out, "Config", &data.config_checks);
-
-    // Infrastructure section
-    writeln!(out).ok();
-    render_doctor_check_section(&mut out, "Infrastructure", &data.infra_checks);
-
-    // Data safety section
-    writeln!(out).ok();
-    writeln!(out, "  {}", "Data safety".bold()).ok();
-    let sealed_count = data
-        .data_safety
-        .iter()
-        .filter(|d| d.status == "PROTECTED")
-        .count();
-    let total = data.data_safety.len();
-    if sealed_count == total {
-        writeln!(
-            out,
-            "    {} {} of {} sealed",
-            "\u{2713}".green(),
-            sealed_count,
-            total
-        )
-        .ok();
-    } else {
-        writeln!(
-            out,
-            "    {} {} of {} sealed",
-            if data.data_safety.iter().any(|d| d.status == "UNPROTECTED") {
-                "\u{2717}".red().to_string()
-            } else {
-                "\u{26a0}".yellow().to_string()
-            },
-            sealed_count,
-            total
-        )
-        .ok();
-        for ds in &data.data_safety {
-            if let Some(ref issue) = ds.issue {
-                writeln!(out, "    \u{2717} {} {}", ds.name, issue.red()).ok();
-                if let Some(ref suggestion) = ds.suggestion {
-                    writeln!(out, "      \u{2192} {suggestion}").ok();
-                }
-                if let Some(ref reason) = ds.reason {
-                    writeln!(out, "      {}", reason.dimmed()).ok();
-                }
-            }
-        }
-    }
-
-    // Sentinel section
-    writeln!(out).ok();
-    writeln!(out, "  {}", "Sentinel".bold()).ok();
-    if data.sentinel.running {
-        let pid_info = data
-            .sentinel
-            .pid
-            .map(|p| format!(" (PID {p})"))
-            .unwrap_or_default();
-        let uptime_info = data
-            .sentinel
-            .uptime
-            .as_ref()
-            .map(|u| format!(", uptime {u}"))
-            .unwrap_or_default();
-        writeln!(
-            out,
-            "    {} Sentinel running{pid_info}{uptime_info}",
-            "\u{2713}".green()
-        )
-        .ok();
-    } else {
-        writeln!(
-            out,
-            "    {} Sentinel not running",
-            "\u{26a0}".yellow()
-        )
-        .ok();
-        writeln!(
-            out,
-            "      \u{2192} Start with `systemctl --user start urd-sentinel`"
-        )
-        .ok();
-    }
-
-    // Verify section (--thorough)
-    writeln!(out).ok();
-    if let Some(ref verify) = data.verify {
-        writeln!(out, "  {}", "Threads".bold()).ok();
-        if verify.fail_count == 0 && verify.warn_count == 0 {
-            writeln!(
-                out,
-                "    {} All threads intact ({} checks OK)",
-                "\u{2713}".green(),
-                verify.ok_count
-            )
-            .ok();
-        } else {
-            let (findings, absent_drives) = classify_verify_checks(verify);
-
-            // Render findings
-            for (sv_name, drive_label, check) in &findings {
-                let icon = match check.status.as_str() {
-                    "warn" => "\u{26a0}".yellow().to_string(),
-                    _ => "\u{2717}".red().to_string(),
-                };
-                let detail = check.detail.as_deref().unwrap_or(&check.name);
-                writeln!(out, "    {icon} {sv_name}/{drive_label}: {detail}").ok();
-                if let Some(ref suggestion) = check.suggestion {
-                    writeln!(out, "      \u{2192} {suggestion}").ok();
-                }
-            }
-
-            // Summary line
-            let mut summary_parts = Vec::new();
-            if verify.ok_count > 0 {
-                summary_parts.push(format!(
-                    "{} OK",
-                    pluralize(verify.ok_count as usize, "check", "checks")
-                ));
-            }
-            if !absent_drives.is_empty() {
-                summary_parts.push(format!(
-                    "{} not mounted ({}) \u{2014} skipped",
-                    pluralize(absent_drives.len(), "drive", "drives"),
-                    absent_drives.join(", ")
-                ));
-            }
-            if !summary_parts.is_empty() {
-                writeln!(out, "    {}", summary_parts.join(". ").dimmed()).ok();
-            }
-        }
-    } else {
-        writeln!(
-            out,
-            "  {}",
-            "[Threads \u{2014} run with --thorough]".dimmed()
-        )
-        .ok();
-    }
-
-    // Churn section (--thorough only). UPI 030.
-    if let Some(ref churn) = data.churn {
-        writeln!(out).ok();
-        let header = format!("Churn ({})", churn.window_label);
-        writeln!(out, "  {}", header.bold()).ok();
-
-        if churn.rows.is_empty() {
-            writeln!(out, "    {}", "(no subvolumes)".dimmed()).ok();
-        } else {
-            let name_width = churn
-                .rows
-                .iter()
-                .map(|r| r.name.len())
-                .max()
-                .unwrap_or(8)
-                .max(8);
-            for row in &churn.rows {
-                writeln!(out, "    {}", format_churn_row(&row.name, &row.state, name_width)).ok();
-            }
-        }
-    }
-
-    // Recommendations section (--thorough only). UPI 041, ADR-115.
-    if let Some(ref recs) = data.recommendations
-        && !recs.rows.is_empty()
-    {
-        writeln!(out).ok();
-        writeln!(out, "  {}", "Recommendations".bold()).ok();
-        writeln!(out, "    {}", recs.header.dimmed()).ok();
-        writeln!(out).ok();
-        for (i, row) in recs.rows.iter().enumerate() {
-            if i > 0 {
-                writeln!(out).ok();
-            }
-            write!(out, "{}", format_recommendation_row(row)).ok();
-        }
-    }
-
-    // Doctor verdict already provides guidance (rendered at the top now);
-    // suggestion is always None.
-    append_suggestion(&SuggestionContext::Doctor, &mut out);
-
-    out
-}
-
-/// Classify verify checks into findings (real problems) and expected conditions (absent drives).
-fn classify_verify_checks(
-    verify: &VerifyOutput,
-) -> (Vec<(&str, &str, &VerifyCheck)>, Vec<&str>) {
-    let mut findings: Vec<(&str, &str, &VerifyCheck)> = Vec::new();
-    let mut absent_drives: Vec<&str> = Vec::new();
-
-    for sv in &verify.subvolumes {
-        for drive in &sv.drives {
-            for check in &drive.checks {
-                if check.status == "ok" {
-                    continue;
-                }
-                if check.is_expected_condition() {
-                    if !absent_drives.contains(&drive.label.as_str()) {
-                        absent_drives.push(&drive.label);
-                    }
-                } else {
-                    findings.push((&sv.name, &drive.label, check));
-                }
-            }
-        }
-    }
-
-    (findings, absent_drives)
-}
-
-fn pluralize(count: usize, singular: &str, plural: &str) -> String {
-    if count == 1 {
-        format!("{count} {singular}")
-    } else {
-        format!("{count} {plural}")
-    }
-}
-
-/// Render one Churn-section row: padded name + per-state body.
-/// Helper for `render_doctor_interactive`'s --thorough Churn block (UPI 030).
-fn format_churn_row(
-    name: &str,
-    state: &crate::output::ChurnRender,
-    name_width: usize,
-) -> String {
-    use crate::output::ChurnRender::*;
-    use crate::types::ByteSize;
-    let pad = format!("{:width$}", name, width = name_width);
-    match state {
-        NotMeasured => format!("{pad}    {}", "not yet measured".dimmed()),
-        FirstMeasurement { bytes_per_second } => {
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let per_day = (*bytes_per_second * 86_400.0) as u64;
-            format!(
-                "{pad}    ~{}/day        {}",
-                ByteSize(per_day),
-                "(first measurement, no trend yet)".dimmed()
-            )
-        }
-        Incremental { bytes_per_second } => {
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let per_day = (*bytes_per_second * 86_400.0) as u64;
-            format!(
-                "{pad}    ~{}/day        {}",
-                ByteSize(per_day),
-                "(incremental)".dimmed()
-            )
-        }
-        FullSendOnly {
-            bytes_per_send,
-            seconds_between,
-        } => format!(
-            "{pad}    ~{}/full-send   {}",
-            ByteSize(*bytes_per_send),
-            format!("(every ~{})", format_duration_short(*seconds_between / 60)).dimmed()
-        ),
-        FullSendOnlyFirst { bytes } => format!(
-            "{pad}    ~{} recorded     {}",
-            ByteSize(*bytes),
-            "(one full send so far, no trend yet)".dimmed()
-        ),
-    }
-}
-
-
-// ── Recommendations (UPI 041, ADR-115) ────────────────────────────────
-
-/// Render one role-line of a Recommendations-section row: a key=value
-/// list of non-zero slots ("daily=7  weekly=4") followed by the
-/// dimmed framing tail ("(recover ~135 GB)" / "(extends chain to
-/// ~N {unit})").
-fn render_shape_kv(shape: &crate::types::ResolvedGraduatedRetention) -> String {
-    let mut parts: Vec<String> = Vec::with_capacity(4);
-    if shape.hourly != 0 {
-        parts.push(format!("hourly={}", shape.hourly));
-    }
-    if shape.daily != 0 {
-        parts.push(format!("daily={}", shape.daily));
-    }
-    if shape.weekly != 0 {
-        parts.push(format!("weekly={}", shape.weekly));
-    }
-    match shape.monthly {
-        crate::types::MonthlyCount::Unlimited => parts.push("monthly=unlimited".to_string()),
-        crate::types::MonthlyCount::Count(0) => {} // omit, consistent with hourly/daily/weekly
-        crate::types::MonthlyCount::Count(n) => parts.push(format!("monthly={n}")),
-    }
-    if shape.yearly != 0 {
-        parts.push(format!("yearly={}", shape.yearly));
-    }
-    parts.join("  ")
-}
-
-/// Recovery-or-extends-chain framing for one role-line, based on the
-/// cost delta between current and suggested. Returns an empty string
-/// when the costs are equal (which should not happen — the builder
-/// suppresses aligned rows).
-fn render_cost_delta(
-    current: u64,
-    suggested: u64,
-    suggested_shape: &crate::types::ResolvedGraduatedRetention,
-) -> String {
-    use std::cmp::Ordering;
-    use crate::types::ByteSize;
-    match suggested.cmp(&current) {
-        Ordering::Less => format!("(recover ~{})", ByteSize(current - suggested)),
-        Ordering::Greater => {
-            let secs = crate::recommendation::chain_span_seconds(suggested_shape);
-            let (n, unit) = if secs <= 60 * 86_400 {
-                (secs / 86_400, "days")
-            } else if secs <= 364 * 86_400 {
-                (secs / (7 * 86_400), "weeks")
-            } else {
-                (secs / (365 * 86_400), "years")
-            };
-            format!("(extends chain to ~{n} {unit})")
-        }
-        Ordering::Equal => String::new(),
-    }
-}
-
-/// Detect a "synth" headroom-aware recommendation: a `HeadroomAwareRecommendation`
-/// whose inner shape recommendation has `suggested == current` AND both
-/// cost projections are zero. Doctor.rs builds these for cold subvolumes
-/// at Pressure/Critical severity (R1) — they carry only the reason line,
-/// no shape line.
-fn is_synth_pointer(rec: &crate::recommendation::HeadroomAwareRecommendation) -> bool {
-    rec.recommendation.suggested == rec.recommendation.current
-        && rec.recommendation.current_cost.data_bytes == 0
-        && rec.recommendation.suggested_cost.data_bytes == 0
-}
-
-/// Render the reason line for one role at the given severity. Returns
-/// an empty string if there's nothing to render.
-///
-/// `has_adjusted` distinguishes Pressure-with-tightened-shape from
-/// Pressure-at-MIN (the synth path collapses both `adjusted` and
-/// `adjusted_cost` to `None` when the engine couldn't tighten further).
-/// The `_is_synth` parameter is kept on the signature for symmetry with
-/// the renderer's input pipeline but not currently branched on — synth
-/// and at-MIN share the "shape already at minimum" line.
-fn render_reason_line(
-    severity: crate::recommendation::HeadroomSeverity,
-    reason: &Option<crate::recommendation::AdjustmentReason>,
-    has_adjusted: bool,
-    _is_synth: bool,
-) -> String {
-    use crate::recommendation::AdjustmentReason::*;
-    use crate::recommendation::HeadroomSeverity::*;
-    let Some(reason) = reason.as_ref() else {
-        return String::new();
-    };
-    match reason {
-        SourcePoolLow { free_ratio } => {
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let pct = (free_ratio * 100.0).round() as i64;
-            match severity {
-                Caution => format!("source pool at {pct}% — applying sooner is recommended"),
-                Pressure if has_adjusted => format!("source pool at {pct}% — shape tightened"),
-                Pressure => format!(
-                    "source pool at {pct}% — shape already at minimum; consider expanding storage or reducing subvolume count"
-                ),
-                _ => String::new(),
-            }
-        }
-        SourcePoolShrinking { days_to_empty } => match severity {
-            Caution => format!(
-                "source pool shrinking; ~{days_to_empty:.0} days to empty — applying sooner is recommended"
-            ),
-            Pressure if has_adjusted => format!(
-                "source pool shrinking; ~{days_to_empty:.0} days to empty — shape tightened"
-            ),
-            Pressure => format!(
-                "source pool shrinking; ~{days_to_empty:.0} days to empty — shape already at minimum"
-            ),
-            _ => String::new(),
-        },
-        DestinationMetadataPressure { drive_label, ratio } => {
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let pct = (ratio * 100.0).round() as i64;
-            match severity {
-                Caution => format!(
-                    "{drive_label} metadata at {pct}% — applying sooner is recommended"
-                ),
-                Pressure => format!("{drive_label} metadata at {pct}% — shape tightened"),
-                _ => String::new(),
-            }
-        }
-        StorageCritical => String::new(), // pointer line handled at row level
-    }
-}
-
-/// Render one Recommendations-section row: subvolume name + up-to-two
-/// role lines (`local:` / `external:`) + optional bursty/named-level
-/// hint lines. Per UPI 044, each role carries severity, an optional
-/// adjustment reason, and an optional tightened shape (`adjusted`).
-/// Critical severity (injected by doctor.rs) suppresses the shape and
-/// hint lines in favor of a single pointer (R9).
-fn format_recommendation_row(row: &crate::output::DoctorRecommendationRow) -> String {
-    use crate::recommendation::HeadroomSeverity;
-
-    let mut out = String::new();
-    writeln!(out, "    {}", row.name).ok();
-
-    // R9: if either role is Critical, render only the pointer line.
-    let any_critical = matches!(
-        row.local.as_ref().map(|h| h.severity),
-        Some(HeadroomSeverity::Critical)
-    ) || matches!(
-        row.external.as_ref().map(|h| h.severity),
-        Some(HeadroomSeverity::Critical)
-    );
-    if any_critical {
-        writeln!(
-            out,
-            "      {}",
-            "storage critical — see `urd doctor` for current actions".dimmed()
-        )
-        .ok();
-        return out;
-    }
-
-    let mut role_line = |label: &str, h: &crate::recommendation::HeadroomAwareRecommendation| {
-        let synth = is_synth_pointer(h);
-        let rec = &h.recommendation;
-
-        // Decide what shape to render (if any) and what cost projection to
-        // use for the recovery tail.
-        let (shape_to_render, recovery_target): (
-            Option<&crate::types::ResolvedGraduatedRetention>,
-            u64,
-        ) = match h.severity {
-            HeadroomSeverity::Pressure if h.adjusted.is_some() => {
-                // R2: tail uses adjusted_cost, not suggested_cost.
-                let adj = h.adjusted.as_ref().expect("paired with adjusted_cost");
-                let adj_cost = h
-                    .adjusted_cost
-                    .expect("adjusted_cost paired with adjusted (R2 invariant)");
-                (Some(adj), adj_cost.data_bytes)
-            }
-            HeadroomSeverity::Pressure if synth => {
-                // Synth row at Pressure: skip shape line; reason carries it.
-                (None, 0)
-            }
-            HeadroomSeverity::Pressure => {
-                // True at-MIN: render suggested as the shape, but the
-                // reason line will say "shape already at minimum".
-                (Some(&rec.suggested), rec.suggested_cost.data_bytes)
-            }
-            _ => (Some(&rec.suggested), rec.suggested_cost.data_bytes),
-        };
-
-        if let Some(shape) = shape_to_render {
-            let kv = render_shape_kv(shape);
-            let tail = render_cost_delta(rec.current_cost.data_bytes, recovery_target, shape);
-            let line = if tail.is_empty() {
-                format!("      {label:9} {kv}")
-            } else {
-                format!("      {label:9} {kv}   {}", tail.dimmed())
-            };
-            writeln!(out, "{line}").ok();
-        }
-
-        // Reason line (dimmed) — non-Healthy severities only.
-        if h.severity != HeadroomSeverity::Healthy {
-            let msg = render_reason_line(h.severity, &h.reason, h.adjusted.is_some(), synth);
-            if !msg.is_empty() {
-                writeln!(out, "      {label:9} {}", msg.dimmed()).ok();
-            }
-        }
-    };
-    if let Some(ref rec) = row.local {
-        role_line("local:", rec);
-    }
-    if let Some(ref rec) = row.external {
-        role_line("external:", rec);
-    }
-    if matches!(row.note, Some(crate::recommendation::RecommendationNote::BurstyPattern)) {
-        writeln!(out, "      {}", "bursty pattern — frequent full sends".dimmed()).ok();
-    }
-    if let Some(level) = row.was_named_level {
-        writeln!(
-            out,
-            "      {}",
-            format!("currently {level} — applying switches to custom").dimmed()
-        )
-        .ok();
-    }
-    out
-}
-
-fn render_doctor_check_section(out: &mut String, title: &str, checks: &[DoctorCheck]) {
-    writeln!(out, "  {}", title.bold()).ok();
-    for check in checks {
-        let (icon, style) = check_icon_style(check.status);
-        let line = format!("    {icon} {}", check.name);
-        writeln!(out, "{}", style(&line)).ok();
-        if let Some(ref detail) = check.detail {
-            writeln!(out, "      {}", detail.dimmed()).ok();
-        }
-        if let Some(ref suggestion) = check.suggestion {
-            writeln!(out, "      \u{2192} {suggestion}").ok();
-        }
-    }
-}
-
-fn check_icon_style(status: DoctorCheckStatus) -> (&'static str, fn(&str) -> String) {
-    match status {
-        DoctorCheckStatus::Ok => ("\u{2713}", |s: &str| s.green().to_string()),
-        DoctorCheckStatus::Warn => ("\u{26a0}", |s: &str| s.yellow().to_string()),
-        DoctorCheckStatus::Error => ("\u{2717}", |s: &str| s.red().to_string()),
-    }
-}
 
 // ── Retention Preview ─────────────────────────────────────────────────
 
@@ -3024,7 +2091,7 @@ pub fn render_first_time(mode: OutputMode) -> String {
 // ── Staleness Escalation (4a) ──────────────────────────────────────────
 
 /// Severity ranking for promise status strings (higher = worse).
-fn status_severity(status: &str) -> u8 {
+pub(super) fn status_severity(status: &str) -> u8 {
     match status {
         "UNPROTECTED" => 2,
         "AT RISK" => 1,
@@ -3037,13 +2104,13 @@ fn status_severity(status: &str) -> u8 {
 /// all subvolume `DriveAssessment` entries on the same drive, so we take the
 /// first populated value we see; they are invariant per drive. The worst
 /// promise status across subvolumes drives the gravity escalation.
-struct DriveAggregate<'a> {
+pub(super) struct DriveAggregate<'a> {
     worst_status: &'a str,
     absent_duration_secs: Option<i64>,
     last_activity_age_secs: Option<i64>,
 }
 
-fn aggregate_drive_info<'a>(
+pub(super) fn aggregate_drive_info<'a>(
     assessments: &'a [StatusAssessment],
     drive_label: &str,
 ) -> DriveAggregate<'a> {
@@ -3082,7 +2149,7 @@ fn aggregate_drive_info<'a>(
 /// Never mix sources for a single drive — mixing produces confidently-wrong
 /// labels (e.g. "away 30d" when the drive was only just unplugged but
 /// hadn't backed up recently).
-fn unmounted_drive_label(
+pub(super) fn unmounted_drive_label(
     drive_label: &str,
     absent_duration_secs: Option<i64>,
     last_activity_age_secs: Option<i64>,
@@ -3107,7 +2174,7 @@ fn unmounted_drive_label(
 ///   UNPROTECTED → bold + "protection aging"
 ///   AT RISK     → yellow age + "consider connecting"
 ///   PROTECTED   → dimmed age
-fn format_drive_age_label(
+pub(super) fn format_drive_age_label(
     drive_label: &str,
     age_secs: i64,
     worst_status: &str,
@@ -5828,13 +4895,13 @@ mod tests {
 
     #[test]
     fn render_thread_status_maps_all_variants() {
-        assert_eq!(render_thread_status(&ChainHealth::NoDriveData), "\u{2014}");
+        assert_eq!(status::render_thread_status(&ChainHealth::NoDriveData), "\u{2014}");
         assert_eq!(
-            render_thread_status(&ChainHealth::Incremental("pin".to_string())),
+            status::render_thread_status(&ChainHealth::Incremental("pin".to_string())),
             "unbroken"
         );
         assert_eq!(
-            render_thread_status(&ChainHealth::Full("no pin".to_string())),
+            status::render_thread_status(&ChainHealth::Full("no pin".to_string())),
             "broken \u{2014} full send (no pin)"
         );
     }
@@ -8836,7 +7903,7 @@ mod tests {
             monthly: crate::types::MonthlyCount::Unlimited,
             yearly: 0,
         };
-        let out = super::render_shape_kv(&s);
+        let out = super::doctor::render_shape_kv(&s);
         assert!(
             out.contains("monthly=unlimited"),
             "Unlimited should render as 'monthly=unlimited': {out}"
@@ -8852,7 +7919,7 @@ mod tests {
             monthly: crate::types::MonthlyCount::Count(12),
             yearly: 5,
         };
-        let out = super::render_shape_kv(&s);
+        let out = super::doctor::render_shape_kv(&s);
         assert!(out.contains("yearly=5"), "yearly should render: {out}");
     }
 
@@ -8865,7 +7932,7 @@ mod tests {
             monthly: crate::types::MonthlyCount::Count(12),
             yearly: 0,
         };
-        let out = super::render_shape_kv(&s);
+        let out = super::doctor::render_shape_kv(&s);
         assert!(!out.contains("yearly"), "yearly=0 should be omitted: {out}");
     }
 
@@ -8879,7 +7946,7 @@ mod tests {
             monthly: crate::types::MonthlyCount::Count(0),
             yearly: 0,
         };
-        let out = super::render_shape_kv(&s);
+        let out = super::doctor::render_shape_kv(&s);
         assert!(
             !out.contains("monthly"),
             "Count(0) monthly should produce no token: {out}"
