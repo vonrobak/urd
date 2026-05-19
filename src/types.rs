@@ -8,6 +8,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::error::UrdError;
 
+pub use crate::retention::DeleteKind;
+
 // ── Interval ────────────────────────────────────────────────────────────
 
 /// A duration parsed from human-readable strings like "15m", "1h", "1d", "1w".
@@ -903,6 +905,10 @@ pub enum PlannedOperation {
         path: PathBuf,
         reason: String,
         subvolume_name: String,
+        /// Distinguishes policy-driven retention from space-pressure-driven retention.
+        /// The executor's space-recovery short-circuit applies only to `SpacePressure`
+        /// deletes; `Policy` deletes always execute (subject to pin re-check).
+        kind: DeleteKind,
     },
 }
 
@@ -1362,11 +1368,13 @@ mod tests {
                     path: PathBuf::from("/snap/old"),
                     reason: "expired".to_string(),
                     subvolume_name: "htpc-home".to_string(),
+                    kind: DeleteKind::Policy,
                 },
                 PlannedOperation::DeleteSnapshot {
                     path: PathBuf::from("/snap/old2"),
                     reason: "expired".to_string(),
                     subvolume_name: "htpc-home".to_string(),
+                    kind: DeleteKind::Policy,
                 },
             ],
             timestamp: NaiveDate::from_ymd_opt(2026, 3, 22)

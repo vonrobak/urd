@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Retention thinning no longer silently skipped after the first delete per
+  location.** The executor's space-recovery short-circuit (introduced with
+  UPI 016) was applied to every delete, including policy-driven graduated
+  retention. Because the `space_recovered` map is keyed by location (drive
+  label or local snapshot-root path) and shared across subvolumes, on a
+  filesystem with comfortable free space the very first delete at a location
+  tipped recovery to "satisfied" and every subsequent delete — across all
+  subvolumes sharing that location — was skipped with
+  `space recovered, deletion skipped`. Symptom: snapshot counts grew unbounded
+  even though `urd plan` reported correct retention targets (e.g. 61 local
+  snapshots for a `daily=7, weekly=4` policy that targets ~11).
+  Fix: introduced `DeleteKind { Policy, SpacePressure }` derived from
+  `PruneRule` at the retention boundary; the short-circuit now only applies
+  to `SpacePressure` deletes (hourly thinning under pressure, space-governed
+  extras, emergency reclaim). `Policy` deletes always execute, subject to
+  the unchanged pin re-check (ADR-106 layer 3). Pin protection invariants
+  preserved; no on-disk format changes; `urd plan` output unchanged.
+
 ## [0.20.2] - 2026-05-19
 
 ### Fixed

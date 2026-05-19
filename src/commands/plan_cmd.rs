@@ -206,6 +206,7 @@ fn build_operation_entry(
             path,
             reason,
             subvolume_name,
+            kind: _,
         } => {
             let snap_name = path.file_name().unwrap_or_default().to_string_lossy();
             PlanOperationEntry {
@@ -225,7 +226,7 @@ fn build_operation_entry(
 mod tests {
     use super::*;
     use crate::plan::MockFileSystemState;
-    use crate::types::{SendKind, SnapshotName};
+    use crate::types::{BackupPlan, SendKind, SnapshotName};
     use std::path::PathBuf;
 
     fn dummy_snap(subvol: &str) -> SnapshotName {
@@ -469,5 +470,65 @@ source = "/data/htpc-docs"
         };
         let output = build_plan_output(&plan, &fs, &test_config());
         assert_eq!(output.summary.estimated_total_bytes, None);
+    }
+
+    #[test]
+    fn delete_kind_is_invariant_across_render_surfaces() {
+        // The user-visible output of every render surface must NOT change based on
+        // `DeleteKind`. Two plans identical except for `kind` should produce
+        // byte-identical Display output and byte-identical PlanOperationEntry.
+        // This guards the on-disk / monitoring contract (ADR-105) against
+        // accidental kind-leaks via Display, plan_cmd, or downstream renderers.
+        use crate::types::DeleteKind;
+
+        let make_plan = |kind: DeleteKind| BackupPlan {
+            operations: vec![PlannedOperation::DeleteSnapshot {
+                path: PathBuf::from("/snap/htpc-home/20260329-0404-htpc-home"),
+                reason: "graduated: weekly thinning".to_string(),
+                subvolume_name: "htpc-home".to_string(),
+                kind,
+            }],
+            timestamp: chrono::NaiveDate::from_ymd_opt(2026, 3, 22)
+                .unwrap()
+                .and_hms_opt(14, 30, 0)
+                .unwrap(),
+            skipped: vec![],
+            events: Vec::new(),
+        };
+
+        let policy_plan = make_plan(DeleteKind::Policy);
+        let pressure_plan = make_plan(DeleteKind::SpacePressure);
+
+        // Surface 1: PlannedOperation::Display (the operation-level format used by
+        // logs, voice helpers, and any consumer of `to_string()`).
+        let policy_display = format!("{}", policy_plan.operations[0]);
+        let pressure_display = format!("{}", pressure_plan.operations[0]);
+        assert_eq!(policy_display, pressure_display);
+
+        // Surface 2: build_plan_output produces PlanOperationEntry for voice::render_plan
+        // and any JSON/structured consumer.
+        let fs = MockFileSystemState::new();
+        let config = test_config();
+        let policy_out = build_plan_output(&policy_plan, &fs, &config);
+        let pressure_out = build_plan_output(&pressure_plan, &fs, &config);
+
+        assert_eq!(policy_out.operations.len(), 1);
+        assert_eq!(pressure_out.operations.len(), 1);
+        let p_entry = &policy_out.operations[0];
+        let s_entry = &pressure_out.operations[0];
+        assert_eq!(p_entry.subvolume, s_entry.subvolume);
+        assert_eq!(p_entry.operation, s_entry.operation);
+        assert_eq!(p_entry.detail, s_entry.detail);
+        assert_eq!(p_entry.drive_label, s_entry.drive_label);
+        assert_eq!(p_entry.estimated_bytes, s_entry.estimated_bytes);
+        assert_eq!(p_entry.is_full_send, s_entry.is_full_send);
+        assert_eq!(p_entry.full_send_reason, s_entry.full_send_reason);
+
+        // Surface 3: PlanSummaryOutput — the counter that drives `urd plan` summary
+        // and downstream metrics. Deletions count must be identical.
+        assert_eq!(
+            policy_out.summary.deletions,
+            pressure_out.summary.deletions,
+        );
     }
 }

@@ -173,8 +173,8 @@ pub fn run(config: Config, output_mode: OutputMode) -> anyhow::Result<()> {
                 chrono::Local::now().naive_local(),
             );
 
-            for (snap, _reason) in &result.delete {
-                let snap_path = local_dir.join(snap.as_str());
+            for rd in &result.delete {
+                let snap_path = local_dir.join(rd.snapshot.as_str());
 
                 // Defense-in-depth (ADR-106 layer 3): shared re-check
                 if chain::is_pinned_at_delete_time(&snap_path, &detail.name, &config) {

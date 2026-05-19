@@ -11,8 +11,8 @@ use crate::error::UrdError;
 use crate::events::{DeferScope, Event, EventPayload};
 use crate::retention;
 use crate::types::{
-    BackupPlan, DriveEvent, DriveEventKind, FullSendReason, LocalRetentionPolicy, PlannedOperation,
-    SendKind, SnapshotName,
+    BackupPlan, DeleteKind, DriveEvent, DriveEventKind, FullSendReason, LocalRetentionPolicy,
+    PlannedOperation, SendKind, SnapshotName,
 };
 
 // ── Audit helpers ──────────────────────────────────────────────────────
@@ -779,12 +779,14 @@ fn plan_local_retention(
     match &subvol.local_retention {
         LocalRetentionPolicy::Transient => {
             // Transient: delete everything not in the protected set (pins + unsent).
+            // Transient lifecycle is policy-driven — always execute.
             for snap in local_snaps {
                 if !protected.contains(snap) {
                     operations.push(PlannedOperation::DeleteSnapshot {
                         path: local_dir.join(snap.as_str()),
                         reason: "transient: not pinned".to_string(),
                         subvolume_name: subvol.name.clone(),
+                        kind: DeleteKind::Policy,
                     });
                 }
             }
@@ -803,11 +805,12 @@ fn plan_local_retention(
                 space_pressure,
             );
 
-            for (snap, reason) in result.delete {
+            for rd in result.delete {
                 operations.push(PlannedOperation::DeleteSnapshot {
-                    path: local_dir.join(snap.as_str()),
-                    reason,
+                    path: local_dir.join(rd.snapshot.as_str()),
+                    reason: rd.reason,
                     subvolume_name: subvol.name.clone(),
+                    kind: rd.kind,
                 });
             }
 
@@ -1270,11 +1273,12 @@ fn plan_external_retention(
         min_free,
     );
 
-    for (snap, reason) in result.delete {
+    for rd in result.delete {
         operations.push(PlannedOperation::DeleteSnapshot {
-            path: ext_dir.join(snap.as_str()),
-            reason,
+            path: ext_dir.join(rd.snapshot.as_str()),
+            reason: rd.reason,
             subvolume_name: subvol.name.clone(),
+            kind: rd.kind,
         });
     }
 
