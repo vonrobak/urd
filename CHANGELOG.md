@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Per-delete `btrfs subvolume sync` removed for policy-driven retention deletes**
+  (#138). The executor previously called `sudo btrfs subvolume sync` after every
+  successful delete to refresh free-space before the post-delete
+  `space_recovered` check. On a busy pool the sync blocks for 7–140 s while the
+  BTRFS cleaner thread drains queued cleanup, which made catch-up runs take
+  hours where they should take minutes (measured: 30 deletes in 39 minutes on
+  a 12 TB pool; median per-delete 75–120 s entirely inside the sync). After
+  v0.20.3 the `space_recovered` check applies only to `SpacePressure` deletes,
+  so the sync is now also scoped to `SpacePressure`. `Policy` deletes return
+  immediately; the BTRFS cleaner runs asynchronously regardless. Trade-off
+  (bounded): a `Policy` delete followed by `SpacePressure` deletes on the same
+  location won't have published recovery — the first trailing `SpacePressure`
+  delete will execute (then sync + check + publish, re-engaging the
+  short-circuit for any further pressure deletes). New
+  `policy_deletes_do_not_sync` test pins this contract.
+
 ## [0.20.3] - 2026-05-19
 
 ### Fixed
