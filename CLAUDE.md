@@ -77,7 +77,7 @@ All backup logic flows through: config -> plan -> execute. No exceptions.
 | `drives.rs` | Detect mounted drives, UUID fingerprinting, check space | Mount/unmount drives |
 | `pools.rs` | Detect BTRFS pools (source + destination), group subvolumes by pool UUID, read sysfs metadata utilization and statvfs free bytes | Know about retention, plans, drive lifecycle, or notification policy |
 | `output.rs` | Define structured output types | Render text (voice.rs does that) |
-| `voice.rs` | Render structured output as text (mythic voice) | Perform I/O or compute state |
+| `voice/` | Render structured output as text (mythic voice). Per-command sub-modules under `voice/` (currently `doctor.rs`, `status.rs`; remaining renderers still in `voice/mod.rs` pending UPI 050 phase 2). Cross-renderer helpers (`humanize_duration`, `exposure_label`, `color_*`, `pluralize`, `classify_verify_checks`, `append_suggestion`) live in `voice/mod.rs` and are `pub(super)` so sub-modules can use them | Perform I/O or compute state |
 | `voice_events.rs` | Per-variant `EventPayload` renderer (columnar + NDJSON) | Perform I/O or query state |
 | `events.rs` | Pure: `Event`, `EventKind`, `EventPayload`, `Severity`, typed payload enums (UPI 036) | Perform I/O |
 | `lock.rs` | Shared advisory lock with metadata (PID, trigger source) | Decide whether to proceed (caller's job) |

@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Internal refactor: voice.rs decomposition phase 1** (UPI 050). Converted
+  `src/voice.rs` to a `src/voice/` directory with the parent `voice/mod.rs`
+  and two extracted sub-modules: `voice/doctor.rs` (render_doctor + private
+  recommendation/churn/check-section helpers, 555 lines) and
+  `voice/status.rs` (render_status + private summary/table/advisory/drive
+  helpers, 436 lines). Cross-renderer helpers (`humanize_duration`,
+  `exposure_label`, `format_status_table`, `color_*`, `pluralize`,
+  `classify_verify_checks`, `aggregate_drive_info`, `unmounted_drive_label`,
+  `append_suggestion`) stay in `voice/mod.rs` as `pub(super)` for sub-module
+  access. Public surface unchanged (`pub use doctor::render_doctor;
+  pub use status::render_status;`). Voice Contract suite (44 tests) green
+  pre- and post-split — no rendered text change.
 - **Internal refactor: split advice surface out of `awareness.rs` into a new
   `src/advice.rs` module** (UPI 049). `awareness.rs` now owns observation
   (assess promise state) only; the new `advice.rs` owns translation
