@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.5] - 2026-05-20
+
 ### Changed
 - **Internal refactor: voice.rs decomposition phase 2** (UPI 050 follow-up).
   Extracted the remaining 13 per-command renderers from `voice/mod.rs` into
@@ -680,7 +682,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Defense-in-depth pin file protection for unsent snapshots
 - Per-subvolume error isolation in executor
 
-[Unreleased]: https://github.com/vonrobak/urd/compare/v0.20.4...HEAD
+[Unreleased]: https://github.com/vonrobak/urd/compare/v0.20.5...HEAD
+[0.20.5]: https://github.com/vonrobak/urd/compare/v0.20.4...v0.20.5
 [0.20.4]: https://github.com/vonrobak/urd/compare/v0.20.3...v0.20.4
 [0.20.3]: https://github.com/vonrobak/urd/compare/v0.20.2...v0.20.3
 [0.20.2]: https://github.com/vonrobak/urd/compare/v0.20.1...v0.20.2
