@@ -731,10 +731,19 @@ fn build_churn_views(
     if state_db.is_none() {
         return out;
     }
+    let window = crate::drift::default_window();
     for sv in config.subvolumes.iter() {
-        let estimate = crate::state_views::ChurnView::for_subvolume_default_window(
-            state_db, &sv.name, now,
-        );
+        // ADR-102 best-effort: a failed drift_samples query yields the safe-empty
+        // estimate so heartbeat fields stay populated (with `None` placeholders)
+        // and a backup never fails because state observability didn't.
+        let estimate = state_db
+            .and_then(|db| db.drift_samples_for_subvolume(&sv.name, now - window).ok())
+            .map(|rows| {
+                let samples: Vec<crate::drift::DriftSample> =
+                    rows.into_iter().map(StateDb::drift_row_to_sample).collect();
+                crate::drift::compute_rolling_churn(&samples, window, now)
+            })
+            .unwrap_or_default();
         let mean_incremental_bytes = estimate.mean_incremental_bytes;
         let fields = match crate::output::render_churn(&estimate) {
             ChurnRender::NotMeasured => ChurnHeartbeatFields {

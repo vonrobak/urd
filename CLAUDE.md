@@ -67,8 +67,7 @@ All backup logic flows through: config -> plan -> execute. No exceptions.
 | `advice.rs` | Pure: translate `SubvolAssessment` into actionable advice (issue/command/reason) and structured redundancy advisories. The "what should the user do?" surface — rule-based, the volatile layer where product refinements land | Perform I/O; assess promise state (`awareness.rs` does that) |
 | `recommendation.rs` | Pure: head-room-aware retention-shape recommendations and cost projections — the advisory layer that translates drift signals + headroom into a recommended shape with reasons (ADR-115, UPI 041) | Perform I/O; assess promise state (`awareness.rs` does that); mutate config; run in the backup hot path |
 | `chain.rs` | Track incremental chain parents (pin files) | Send snapshots |
-| `state.rs` | Record history in SQLite — granular SQL wrappers (one method per query) | Influence backup decisions; compose domain-shaped answers (`state_views.rs` does that) |
-| `state_views.rs` | Composed read views over `StateDb` — turn row-shapes into domain shapes callers actually want (`ChurnView::for_subvolume` etc.). Best-effort per ADR-102. | Hold writers; bypass `StateDb` for SQL access |
+| `state.rs` | Record history in SQLite — granular SQL wrappers (one method per query). Also hosts `drift_row_to_sample` (row → `drift::DriftSample` conversion) as a small, shared boundary helper. | Influence backup decisions; compose domain-shaped answers (callers compose primitives inline — see `commands/doctor.rs::compute_churn_for` and `commands/backup.rs::build_churn_views`) |
 | `preflight.rs` | Validate config achievability (pure) | Block backups (advisory only) |
 | `heartbeat.rs` | Write JSON health signal after each run | Block backups on failure |
 | `metrics.rs` | Write Prometheus `.prom` files | Read metrics |

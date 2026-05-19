@@ -42,7 +42,12 @@ pub struct DriftSample {
 
 /// Raw aggregates over an in-window slice of drift samples.
 /// No presentation labels — `output::render_churn` maps this to `ChurnRender`.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `Default` yields the safe-empty estimate (all-`None`, counts `0`) — used by
+/// callers that compose `StateDb::drift_samples_for_subvolume` +
+/// `compute_rolling_churn` and need an ADR-102-style fallback when the db is
+/// absent or the query fails.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct ChurnEstimate {
     /// Time-weighted mean over in-window incrementals: `sum(bytes) / sum(intervals)`.
     /// `None` when no in-window incremental has a usable interval

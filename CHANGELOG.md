@@ -8,6 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Internal refactor: fold `state_views.rs`** back into its callers per the
+  2026-05-19 citizenship decision. `ChurnView::for_subvolume` and
+  `::for_subvolume_default_window` had only one citizen (`ChurnView`) by the
+  end of the UPI 049 + UPI 050 phase 1 probation window; no second view
+  materialized from real call-site composition pain. The composition
+  (optional `StateDb` → `drift_samples_for_subvolume` → `drift_row_to_sample`
+  map → `compute_rolling_churn`) is now inlined into the two substantive
+  caller sites: a single private `compute_churn_for` helper in
+  `commands/doctor.rs` (used by both `compute_churn_for` callers and by
+  `build_doctor_churn_view_inner`) and one inlined block in
+  `commands/backup.rs::build_churn_views`. `drift::ChurnEstimate` now derives
+  `Default` (safe-empty estimate is the ADR-102 fallback). `src/state_views.rs`
+  deleted, `mod state_views;` removed from `src/main.rs`, CLAUDE.md
+  module-table row removed (the row-conversion helper
+  `StateDb::drift_row_to_sample` already lived in `state.rs`). 4 tests removed
+  with the module (`compute_rolling_churn` and `drift_samples_for_subvolume`
+  both have their own coverage; the inlined fallback is exercised by the
+  existing `build_doctor_churn_view_inner` test).
 - **Internal refactor: voice.rs decomposition phase 1** (UPI 050). Converted
   `src/voice.rs` to a `src/voice/` directory with the parent `voice/mod.rs`
   and two extracted sub-modules: `voice/doctor.rs` (render_doctor + private
