@@ -10,12 +10,12 @@ use std::fmt::Write;
 use colored::Colorize;
 
 use crate::advice::RedundancyAdvisoryKind;
-use crate::output::{ChainHealth, OutputMode, StatusOutput};
+use crate::output::{ChainHealth, DefaultStatusOutput, OutputMode, StatusOutput};
 use crate::types::{ByteSize, DriveRole};
 
 use super::{
-    aggregate_drive_info, color_result, exposure_label, format_status_table,
-    humanize_duration, unmounted_drive_label,
+    SuggestionContext, aggregate_drive_info, append_suggestion, color_result, exposure_label,
+    format_status_table, humanize_duration, unmounted_drive_label,
 };
 
 // ── Status ──────────────────────────────────────────────────────────────
@@ -432,5 +432,89 @@ pub(super) fn render_last_run(data: &StatusOutput, out: &mut String) {
         None => {
             writeln!(out, "{}", "Last backup: no runs recorded".dimmed()).ok();
         }
+    }
+}
+
+// ── Default status (bare `urd`) ────────────────────────────────────────
+
+/// Render bare `urd` one-sentence status.
+#[must_use]
+pub fn render_default_status(data: &DefaultStatusOutput, mode: OutputMode) -> String {
+    match mode {
+        OutputMode::Interactive => render_default_status_interactive(data),
+        OutputMode::Daemon => render_default_status_daemon(data),
+    }
+}
+
+fn render_default_status_daemon(data: &DefaultStatusOutput) -> String {
+    serde_json::to_string_pretty(data).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
+}
+
+fn render_default_status_interactive(data: &DefaultStatusOutput) -> String {
+    let mut out = String::new();
+
+    // Safety line
+    if data.sealed_count() == data.total {
+        write!(out, "{}", "All connected drives are sealed.".green()).ok();
+    } else {
+        write!(out, "{} of {} sealed.", data.sealed_count(), data.total).ok();
+        if !data.exposed_names.is_empty() {
+            write!(out, " {} {}.", data.exposed_names.join(", "), "exposed".red()).ok();
+        }
+        if !data.waning_names.is_empty() {
+            write!(out, " {} waning.", data.waning_names.join(", ")).ok();
+        }
+    }
+
+    // Health degradation
+    let health_issues = data.degraded_count + data.blocked_count;
+    if health_issues > 0 {
+        let mut parts = Vec::new();
+        if data.blocked_count > 0 {
+            parts.push(format!("{} blocked", data.blocked_count));
+        }
+        if data.degraded_count > 0 {
+            parts.push(format!("{} degraded", data.degraded_count));
+        }
+        write!(out, " {}.", parts.join(", ")).ok();
+    }
+
+    // Last backup age (pre-computed by command handler to keep voice pure)
+    if let Some(age_secs) = data.last_run_age_secs {
+        write!(out, " Last backup {} ago.", humanize_duration(age_secs)).ok();
+    }
+
+    writeln!(out).ok();
+
+    // Next-action suggestion
+    if let Some(ref advice) = data.best_advice {
+        if data.total_needing_attention == 1 {
+            if let Some(ref cmd) = advice.command {
+                writeln!(out, "{}", format!("Run `{cmd}`.").dimmed()).ok();
+            } else if let Some(ref reason) = advice.reason {
+                writeln!(out, "{}", reason.dimmed()).ok();
+            }
+        } else {
+            writeln!(out, "{}", format!("{} subvolumes need attention — run `urd status` for details.", data.total_needing_attention).dimmed()).ok();
+        }
+    } else if data.sealed_count() < data.total || health_issues > 0 {
+        append_suggestion(&SuggestionContext::Default { has_issues: true }, &mut out);
+    } else {
+        writeln!(out, "{}", "Run `urd status` for details, `urd --help` for commands.".dimmed())
+            .ok();
+    }
+
+    out
+}
+
+/// Render first-time message (no config found).
+#[must_use]
+pub fn render_first_time(mode: OutputMode) -> String {
+    match mode {
+        OutputMode::Interactive => {
+            "Urd is not configured yet.\nRun `urd init` to get started, or see `urd --help`.\n"
+                .to_string()
+        }
+        OutputMode::Daemon => r#"{"status":"not_configured"}"#.to_string(),
     }
 }
