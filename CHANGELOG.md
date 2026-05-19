@@ -7,9 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.4] - 2026-05-19
+
 ### Fixed
 - **Per-delete `btrfs subvolume sync` removed for policy-driven retention deletes**
-  (#138). The executor previously called `sudo btrfs subvolume sync` after every
+  (#138, #139). The executor previously called `sudo btrfs subvolume sync` after every
   successful delete to refresh free-space before the post-delete
   `space_recovered` check. On a busy pool the sync blocks for 7–140 s while the
   BTRFS cleaner thread drains queued cleanup, which made catch-up runs take
@@ -616,7 +618,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Defense-in-depth pin file protection for unsent snapshots
 - Per-subvolume error isolation in executor
 
-[Unreleased]: https://github.com/vonrobak/urd/compare/v0.20.3...HEAD
+[Unreleased]: https://github.com/vonrobak/urd/compare/v0.20.4...HEAD
+[0.20.4]: https://github.com/vonrobak/urd/compare/v0.20.3...v0.20.4
 [0.20.3]: https://github.com/vonrobak/urd/compare/v0.20.2...v0.20.3
 [0.20.2]: https://github.com/vonrobak/urd/compare/v0.20.1...v0.20.2
 [0.20.1]: https://github.com/vonrobak/urd/compare/v0.20.0...v0.20.1
