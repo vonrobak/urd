@@ -652,7 +652,17 @@ fn compute_churn_for(
     window: chrono::Duration,
     now: chrono::NaiveDateTime,
 ) -> crate::drift::ChurnEstimate {
-    crate::state_views::ChurnView::for_subvolume(state_db, name, window, now)
+    // ADR-102 best-effort: a missing db or a failed query yields a safe-empty
+    // estimate, never an error that could propagate into a backup decision.
+    let Some(db) = state_db else {
+        return crate::drift::ChurnEstimate::default();
+    };
+    let Ok(rows) = db.drift_samples_for_subvolume(name, now - window) else {
+        return crate::drift::ChurnEstimate::default();
+    };
+    let samples: Vec<crate::drift::DriftSample> =
+        rows.into_iter().map(StateDb::drift_row_to_sample).collect();
+    crate::drift::compute_rolling_churn(&samples, window, now)
 }
 
 /// Pure-ish core (still does DB I/O via `state_db`) — extracted so unit tests
@@ -664,13 +674,12 @@ fn build_doctor_churn_view_inner(
 ) -> crate::output::DoctorChurnView {
     use crate::output::{DoctorChurnRow, DoctorChurnView};
 
+    let window = crate::drift::default_window();
     let rows: Vec<DoctorChurnRow> = config
         .subvolumes
         .iter()
         .map(|sv| {
-            let estimate = crate::state_views::ChurnView::for_subvolume_default_window(
-                state_db, &sv.name, now,
-            );
+            let estimate = compute_churn_for(state_db, &sv.name, window, now);
             DoctorChurnRow {
                 name: sv.name.clone(),
                 state: crate::output::render_churn(&estimate),

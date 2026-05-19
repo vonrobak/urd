@@ -24,7 +24,6 @@ mod retention;
 mod sentinel;
 mod sentinel_runner;
 mod state;
-mod state_views;
 mod storage_critical;
 mod types;
 mod voice;
