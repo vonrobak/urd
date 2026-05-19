@@ -904,43 +904,58 @@ impl<'a> Executor<'a> {
 
         match self.btrfs.delete_subvolume(path) {
             Ok(()) => {
-                // Sync pending deletions so freed space is visible to the space check.
-                // Fail-open (ADR-107): sync failure leaves behavior identical to today.
-                if let Some(snapshot_root) = path.parent()
-                    && let Err(e) = self.btrfs.sync_subvolumes(snapshot_root)
-                {
-                    log::warn!(
-                        "btrfs subvolume sync failed for {}: {e} — space check may be pessimistic",
-                        snapshot_root.display()
-                    );
-                }
-
-                // After deletion, check if min_free_bytes is now satisfied.
-                // Applies to both external drives and local snapshot roots.
-                if let Some(ref key) = recovery_key {
-                    let (check_path, min_free) = if self.is_external_path(path) {
-                        // External: check drive's mount path and min_free_bytes
-                        self.drive_for_path(path)
-                            .and_then(|d| d.min_free_bytes.map(|m| (d.mount_path.clone(), m.bytes())))
-                            .unwrap_or_default()
-                    } else {
-                        // Local: check snapshot root's min_free_bytes
-                        let min = self.config.root_min_free_bytes(subvolume_name).unwrap_or(0);
-                        let root = self.config.snapshot_root_for(subvolume_name)
-                            .unwrap_or_default();
-                        (root, min)
-                    };
-
-                    if min_free > 0
-                        && let Ok(free) = self.btrfs.filesystem_free_bytes(&check_path)
-                        && free >= min_free
+                // `btrfs subvolume sync` blocks while the BTRFS cleaner thread drains
+                // queued cleanup — seconds for small snapshots, minutes for large ones
+                // on a busy pool. It is only needed for `SpacePressure` deletes, where
+                // the post-delete free-space check drives the executor's space-recovery
+                // short-circuit. `Policy` deletes return without syncing; the cleaner
+                // thread runs asynchronously regardless. This is the difference between
+                // a catch-up run taking 5 hours vs ~5 minutes on a large pool. See #138.
+                //
+                // Trade-off: a Policy delete followed by SpacePressure deletes on the
+                // same location won't have published `space_recovered`, so the first
+                // trailing SpacePressure delete will execute (then sync, then publish,
+                // then subsequent SpacePressure deletes short-circuit re-engages).
+                // Bounded over-delete by 1 per location — acceptable.
+                if kind == DeleteKind::SpacePressure {
+                    // Sync pending deletions so freed space is visible to the space check.
+                    // Fail-open (ADR-107): sync failure leaves behavior identical to today.
+                    if let Some(snapshot_root) = path.parent()
+                        && let Err(e) = self.btrfs.sync_subvolumes(snapshot_root)
                     {
-                        log::info!(
-                            "Free space on {key} is now {} (>= {}), stopping further deletions",
-                            crate::types::ByteSize(free),
-                            crate::types::ByteSize(min_free),
+                        log::warn!(
+                            "btrfs subvolume sync failed for {}: {e} — space check may be pessimistic",
+                            snapshot_root.display()
                         );
-                        space_recovered.insert(key.clone(), true);
+                    }
+
+                    // After deletion, check if min_free_bytes is now satisfied.
+                    // Applies to both external drives and local snapshot roots.
+                    if let Some(ref key) = recovery_key {
+                        let (check_path, min_free) = if self.is_external_path(path) {
+                            // External: check drive's mount path and min_free_bytes
+                            self.drive_for_path(path)
+                                .and_then(|d| d.min_free_bytes.map(|m| (d.mount_path.clone(), m.bytes())))
+                                .unwrap_or_default()
+                        } else {
+                            // Local: check snapshot root's min_free_bytes
+                            let min = self.config.root_min_free_bytes(subvolume_name).unwrap_or(0);
+                            let root = self.config.snapshot_root_for(subvolume_name)
+                                .unwrap_or_default();
+                            (root, min)
+                        };
+
+                        if min_free > 0
+                            && let Ok(free) = self.btrfs.filesystem_free_bytes(&check_path)
+                            && free >= min_free
+                        {
+                            log::info!(
+                                "Free space on {key} is now {} (>= {}), stopping further deletions",
+                                crate::types::ByteSize(free),
+                                crate::types::ByteSize(min_free),
+                            );
+                            space_recovered.insert(key.clone(), true);
+                        }
                     }
                 }
 
@@ -1346,11 +1361,12 @@ source = "/data/b"
         assert_eq!(result.subvolume_results[0].send_type, SendType::Incremental);
 
         let calls = mock.calls();
-        assert_eq!(calls.len(), 4);
+        // 3 calls: create, send, delete. No sync — `simple_plan()` constructs a
+        // `Policy` delete, and Policy deletes skip the per-delete sync (issue #138).
+        assert_eq!(calls.len(), 3);
         assert!(matches!(calls[0], MockBtrfsCall::CreateSnapshot { .. }));
         assert!(matches!(calls[1], MockBtrfsCall::SendReceive { .. }));
         assert!(matches!(calls[2], MockBtrfsCall::DeleteSubvolume { .. }));
-        assert!(matches!(calls[3], MockBtrfsCall::SyncSubvolumes { .. }));
     }
 
     #[test]
@@ -1789,11 +1805,16 @@ source = "/data/b"
     fn mixed_kinds_in_same_run() {
         // Policy deletes interleaved with SpacePressure deletes for one subvolume on the
         // same drive. Free space already above min_free_bytes — so:
-        //   - Policy deletes (first two) execute and publish space-recovered.
-        //   - SpacePressure deletes (third) short-circuit because the location is
-        //     above threshold by then.
-        // Pins down the kind-discrimination contract and the observation order:
-        // mock receives exactly the Policy-delete paths, in plan order, then nothing.
+        //   - Policy deletes (first two) execute. They do NOT sync and do NOT publish
+        //     `space_recovered` (issue #138 — sync only runs for SpacePressure kind).
+        //   - The first trailing SpacePressure delete (third) therefore sees no prior
+        //     publication and executes; it then syncs, checks free space, and publishes.
+        //     If there were a fourth SpacePressure delete it would short-circuit;
+        //     `space_recovered_shared_across_subvolumes_for_space_pressure_kind`
+        //     pins that path.
+        // Pins down the kind-discrimination contract and the observation order: mock
+        // receives all three delete paths in plan order, and exactly one `sync_subvolumes`
+        // call (for the SpacePressure delete only).
         let mock = MockBtrfs::new();
         *mock.free_bytes.borrow_mut() = 200_000_000_000;
 
@@ -1839,13 +1860,9 @@ source = "/data/b"
         let ops = &result.subvolume_results[0].operations;
         assert_eq!(ops[0].result, OpResult::Success);
         assert_eq!(ops[1].result, OpResult::Success);
-        assert_eq!(ops[2].result, OpResult::Skipped);
-        assert_eq!(
-            ops[2].error.as_deref(),
-            Some("space recovered, deletion skipped"),
-        );
+        assert_eq!(ops[2].result, OpResult::Success);
 
-        // Mock observation: exactly the two Policy paths, in plan order, no pressure path.
+        // All three delete paths observed in plan order.
         let deleted: Vec<PathBuf> = mock
             .calls()
             .iter()
@@ -1854,7 +1871,73 @@ source = "/data/b"
                 _ => None,
             })
             .collect();
-        assert_eq!(deleted, vec![policy_a, policy_b]);
+        assert_eq!(deleted, vec![policy_a, policy_b, pressure_c]);
+
+        // Exactly one sync — for the SpacePressure delete. Policy deletes do not sync.
+        let sync_count = mock
+            .calls()
+            .iter()
+            .filter(|c| matches!(c, MockBtrfsCall::SyncSubvolumes { .. }))
+            .count();
+        assert_eq!(sync_count, 1, "Policy deletes must not call sync_subvolumes");
+    }
+
+    #[test]
+    fn policy_deletes_do_not_sync() {
+        // Issue #138: per-delete `btrfs subvolume sync` makes catch-up runs take hours.
+        // Policy deletes have no downstream consumer of fresh free-space data — the
+        // sync is overhead and must be skipped.
+        let mock = MockBtrfs::new();
+        *mock.free_bytes.borrow_mut() = 200_000_000_000;
+
+        let config = test_config();
+        let shutdown = no_shutdown();
+        let executor = Executor::new(&mock, None, &config, &shutdown);
+
+        let ts = NaiveDate::from_ymd_opt(2026, 3, 22)
+            .unwrap()
+            .and_hms_opt(14, 30, 0)
+            .unwrap();
+        // 10 Policy deletes — a small catch-up batch. Use parseable snapshot names
+        // (`YYYYMMDD-shortname`) so the executor's pin re-check doesn't fail-closed.
+        let mut ops = Vec::new();
+        for day in 1..=10 {
+            ops.push(PlannedOperation::DeleteSnapshot {
+                path: PathBuf::from(format!("/mnt/test/.snapshots/sv-a/202601{:02}-a", day)),
+                reason: "graduated: weekly thinning".to_string(),
+                subvolume_name: "sv-a".to_string(),
+                kind: DeleteKind::Policy,
+            });
+        }
+        let plan = BackupPlan {
+            operations: ops,
+            timestamp: ts,
+            skipped: vec![],
+            events: Vec::new(),
+        };
+
+        let result = executor.execute(&plan, "full");
+
+        // All ten succeed.
+        for op in &result.subvolume_results[0].operations {
+            assert_eq!(op.result, OpResult::Success);
+        }
+        assert_eq!(
+            mock.calls()
+                .iter()
+                .filter(|c| matches!(c, MockBtrfsCall::DeleteSubvolume { .. }))
+                .count(),
+            10
+        );
+        // Zero syncs — the entire point.
+        assert_eq!(
+            mock.calls()
+                .iter()
+                .filter(|c| matches!(c, MockBtrfsCall::SyncSubvolumes { .. }))
+                .count(),
+            0,
+            "Policy deletes must not call sync_subvolumes (issue #138)"
+        );
     }
 
     fn test_config_with_local_min_free() -> Config {
@@ -3151,7 +3234,9 @@ local_retention = "transient"
     }
 
     #[test]
-    fn sync_called_after_delete() {
+    fn sync_called_after_space_pressure_delete() {
+        // SpacePressure deletes sync after each one so the post-delete free-space
+        // check is honest. Policy deletes don't sync — see `policy_deletes_do_not_sync`.
         let mock = MockBtrfs::new();
         let config = test_config();
         let shutdown = no_shutdown();
@@ -3165,15 +3250,15 @@ local_retention = "transient"
             operations: vec![
                 PlannedOperation::DeleteSnapshot {
                     path: PathBuf::from("/snap/sv-a/20260301-a"),
-                    reason: "expired".to_string(),
+                    reason: "space pressure: expired".to_string(),
                     subvolume_name: "sv-a".to_string(),
-                    kind: DeleteKind::Policy,
+                    kind: DeleteKind::SpacePressure,
                 },
                 PlannedOperation::DeleteSnapshot {
                     path: PathBuf::from("/snap/sv-a/20260302-a"),
-                    reason: "expired".to_string(),
+                    reason: "space pressure: expired".to_string(),
                     subvolume_name: "sv-a".to_string(),
-                    kind: DeleteKind::Policy,
+                    kind: DeleteKind::SpacePressure,
                 },
             ],
             timestamp: ts,
@@ -3231,11 +3316,12 @@ local_retention = "transient"
             .unwrap();
         let plan = BackupPlan {
             operations: vec![
+                // SpacePressure kind so the sync path runs (and is configured to fail).
                 PlannedOperation::DeleteSnapshot {
                     path: PathBuf::from("/snap/sv-a/20260301-a"),
-                    reason: "expired".to_string(),
+                    reason: "space pressure: expired".to_string(),
                     subvolume_name: "sv-a".to_string(),
-                    kind: DeleteKind::Policy,
+                    kind: DeleteKind::SpacePressure,
                 },
                 PlannedOperation::CreateSnapshot {
                     source: PathBuf::from("/data/a"),
@@ -3257,7 +3343,10 @@ local_retention = "transient"
     }
 
     #[test]
-    fn sync_called_for_external_deletes() {
+    fn sync_called_for_external_space_pressure_deletes() {
+        // SpacePressure deletes on an external drive must sync the external snapshot
+        // root so the post-delete free-space check on the drive is honest. Policy
+        // deletes don't sync — that's `policy_deletes_do_not_sync`'s contract.
         let mock = MockBtrfs::new();
         let config = test_config();
         let shutdown = no_shutdown();
@@ -3270,9 +3359,9 @@ local_retention = "transient"
         let plan = BackupPlan {
             operations: vec![PlannedOperation::DeleteSnapshot {
                 path: PathBuf::from("/mnt/test/.snapshots/sv-a/20260301-a"),
-                reason: "expired".to_string(),
+                reason: "space pressure: expired".to_string(),
                 subvolume_name: "sv-a".to_string(),
-                kind: DeleteKind::Policy,
+                kind: DeleteKind::SpacePressure,
             }],
             timestamp: ts,
             skipped: vec![],
