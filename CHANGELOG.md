@@ -8,6 +8,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Internal refactor: voice.rs decomposition phase 2** (UPI 050 follow-up).
+  Extracted the remaining 13 per-command renderers from `voice/mod.rs` into
+  sibling sub-modules: `voice/backup.rs` (render_backup_summary +
+  render_pre_action + transitions/skipped-block/assessment-table helpers),
+  `voice/plan.rs` (render_plan + render_empty_plan + skip-group helpers),
+  `voice/verify.rs` (render_verify + render_failures), `voice/history.rs`
+  (render_history + render_subvolume_history + render_events),
+  `voice/init.rs`, `voice/calibrate.rs`, `voice/sentinel.rs`,
+  `voice/emergency.rs` (assessment + result), `voice/retention.rs`,
+  `voice/drives.rs` (list + adopt), `voice/get.rs`, `voice/chooser.rs`, and
+  extended `voice/status.rs` with `render_default_status` + `render_first_time`.
+  `voice/mod.rs` shrank from 8008 lines (post-phase-1) to ~6000 lines,
+  containing only the cross-renderer helpers (`humanize_duration`,
+  `exposure_label`, `color_*`, `pluralize`, `classify_verify_checks`,
+  `SuggestionContext`/`append_suggestion`, `format_history_table`,
+  `truncate_str`, `skip_tag`, `aggregate_drive_info`,
+  `unmounted_drive_label`, `format_drive_age_label`, `status_severity`,
+  test fixtures) and the parent's test suite. Public surface unchanged
+  (`pub use status::{...}`, `pub use backup::{...}`, etc.) — zero changes
+  at 23 caller sites in `src/commands/`. Voice Contract suite (44 tests)
+  green pre- and post-split; full suite 1435 passing. Closes UPI 050.
 - **Internal refactor: fold `state_views.rs`** back into its callers per the
   2026-05-19 citizenship decision. `ChurnView::for_subvolume` and
   `::for_subvolume_default_window` had only one citizen (`ChurnView`) by the
