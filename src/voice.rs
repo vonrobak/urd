@@ -16,10 +16,11 @@ use crate::output::{
     DefaultStatusOutput, DoctorCheck, DoctorCheckStatus, DoctorOutput, DoctorVerdictStatus,
     DriveAdoptOutput, DriveStatus, DrivesListOutput, EmergencyOutput, EmergencyResult,
     FailuresOutput, GetOutput, HistoryOutput, InitOutput, InitStatus, OutputMode, PlanOutput,
-    PreActionSummary, RecoveryWindow, RedundancyAdvisoryKind, RetentionPreviewOutput,
+    PreActionSummary, RecoveryWindow, RetentionPreviewOutput,
     SentinelStatusOutput, SkipCategory, SkippedSubvolume, StatusAssessment, StatusOutput,
     SubvolumeHistoryOutput, TokenState, VerifyCheck, VerifyOutput, parse_duration_to_minutes,
 };
+use crate::advice::RedundancyAdvisoryKind;
 use crate::plan::format_duration_short;
 use crate::types::{ByteSize, DriveRole};
 
@@ -3701,7 +3702,7 @@ pub(crate) mod test_fixtures {
 mod tests {
     use super::*;
     use super::test_fixtures::*;
-    use crate::awareness::ActionableAdvice;
+    use crate::advice::ActionableAdvice;
     use crate::output::{
         BackupSummary, CalibrateEntry, CalibrateOutput, CalibrateResult, ChainHealth,
         DeferredInfo, DisconnectedDrive, DriveInfo, EmergencyRootAssessment,
@@ -4074,7 +4075,7 @@ mod tests {
 
     #[test]
     fn render_redundancy_section_with_advisories() {
-        use crate::output::{RedundancyAdvisory, RedundancyAdvisoryKind};
+        use crate::advice::{RedundancyAdvisory, RedundancyAdvisoryKind};
 
         let _color = color_guard(false);
         let mut data = test_status_output();
@@ -6038,8 +6039,8 @@ mod tests {
         let _color = color_guard(false);
         let mut data = test_status_output();
         data.redundancy_advisories
-            .push(crate::output::RedundancyAdvisory {
-            kind: crate::output::RedundancyAdvisoryKind::TransientNoLocalRecovery,
+            .push(crate::advice::RedundancyAdvisory {
+            kind: crate::advice::RedundancyAdvisoryKind::TransientNoLocalRecovery,
             subvolume: "htpc-root".to_string(),
             drive: None,
             detail: "htpc-root lives only on external drives \u{2014} local snapshots are disabled"

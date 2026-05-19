@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use crate::advice;
 use crate::awareness;
 use crate::config;
 use crate::error::UrdError;
@@ -32,7 +33,7 @@ pub fn run(config_path: Option<&Path>, output_mode: OutputMode) -> anyhow::Resul
     // Awareness assessment — lighter than status (no chain health, no drive info, no pins)
     let now = chrono::Local::now().naive_local();
     let mut assessments = awareness::assess(&config, now, &fs_state);
-    awareness::overlay_offsite_freshness(&mut assessments, &config);
+    advice::overlay_offsite_freshness(&mut assessments, &config);
 
     let last_run = state_db.as_ref().and_then(|db| db.last_run_info());
 
@@ -59,11 +60,11 @@ pub fn run(config_path: Option<&Path>, output_mode: OutputMode) -> anyhow::Resul
 
     // Compute actionable advice
     let resolved = config.resolved_subvolumes();
-    let advice_items: Vec<awareness::ActionableAdvice> = assessments
+    let advice_items: Vec<advice::ActionableAdvice> = assessments
         .iter()
         .filter_map(|a| {
             let sv = resolved.iter().find(|sv| sv.name == a.name)?;
-            awareness::compute_advice(a, sv.send_enabled, sv.local_retention.is_transient())
+            advice::compute_advice(a, sv.send_enabled, sv.local_retention.is_transient())
         })
         .collect();
 

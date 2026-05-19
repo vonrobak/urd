@@ -16,6 +16,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use chrono::NaiveDateTime;
 
+use crate::advice;
 use crate::awareness::{self, PromiseStatus, SubvolAssessment};
 use crate::config::Config;
 use crate::drives::{self, DriveAvailability};
@@ -377,7 +378,7 @@ impl SentinelRunner {
         };
 
         let mut assessments = awareness::assess(&self.config, now, &fs);
-        awareness::overlay_offsite_freshness(&mut assessments, &self.config);
+        advice::overlay_offsite_freshness(&mut assessments, &self.config);
 
         // Emit promise-transition events when the originating event was
         // Tick/DriveMounted/ConfigChanged. On BackupCompleted the backup
@@ -515,7 +516,7 @@ impl SentinelRunner {
 
         // Compute redundancy advisory summary for state file.
         let redundancy_advisories =
-            awareness::compute_redundancy_advisories(&self.config, &assessments);
+            advice::compute_redundancy_advisories(&self.config, &assessments);
         let advisory_summary =
             crate::output::AdvisorySummary::from_advisories(&redundancy_advisories);
 
@@ -1119,7 +1120,8 @@ mod tests {
 
     #[test]
     fn state_file_v3_with_advisory_summary() {
-        use crate::output::{AdvisorySummary, RedundancyAdvisoryKind};
+        use crate::advice::RedundancyAdvisoryKind;
+        use crate::output::AdvisorySummary;
 
         let state = SentinelStateFile {
             schema_version: 3,

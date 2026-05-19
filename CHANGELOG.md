@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Internal refactor: split advice surface out of `awareness.rs` into a new
+  `src/advice.rs` module** (UPI 049). `awareness.rs` now owns observation
+  (assess promise state) only; the new `advice.rs` owns translation
+  (`compute_advice`, `compute_redundancy_advisories`, `overlay_offsite_freshness`,
+  `ActionableAdvice`, `RedundancyAdvisory`, `RedundancyAdvisoryKind`). Shared
+  test fixtures (`dt`, `snap`, `test_config`, `offsite_test_config`) live in a
+  new `awareness::test_support` module imported by both modules' tests. No
+  behavior change, no on-disk contract change. Pure-function invariant
+  (ADR-108) and module-table option-C symmetry preserved.
+
 ## [0.20.4] - 2026-05-19
 
 ### Fixed

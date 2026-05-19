@@ -7,7 +7,8 @@ use std::io::IsTerminal;
 
 use serde::{Deserialize, Serialize};
 
-use crate::awareness::{ActionableAdvice, DriveAssessment, SubvolAssessment};
+use crate::advice::{ActionableAdvice, RedundancyAdvisory, RedundancyAdvisoryKind};
+use crate::awareness::{DriveAssessment, SubvolAssessment};
 use crate::types::{ByteSize, DriveRole};
 
 // ── OutputMode ──────────────────────────────────────────────────────────
@@ -77,33 +78,7 @@ impl std::fmt::Display for ChainHealth {
     }
 }
 
-// ── Redundancy Advisories ──────────────────────────────────────────────
-
-/// Redundancy advisory kind, ordered worst-first so `min()` yields most severe.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RedundancyAdvisoryKind {
-    /// All drives are local for a resilient subvolume — no offsite protection.
-    NoOffsiteProtection,
-    /// Offsite drive not seen in > threshold days.
-    OffsiteDriveStale,
-    /// Single external drive for a protected/resilient subvolume.
-    SinglePointOfFailure,
-    /// Informational: transient subvolume with all drives unmounted.
-    TransientNoLocalRecovery,
-}
-
-/// A structured redundancy advisory produced by `compute_redundancy_advisories()`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct RedundancyAdvisory {
-    pub kind: RedundancyAdvisoryKind,
-    pub subvolume: String,
-    /// Affected drive label (for offsite-stale and single-point advisories).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub drive: Option<String>,
-    /// Human-readable detail for voice rendering.
-    pub detail: String,
-}
+// ── Redundancy Advisory Summary ────────────────────────────────────────
 
 /// Summary of redundancy advisories for the sentinel state file.
 /// `None` in the state file means "unknown, not zero" (backward compat with v2).

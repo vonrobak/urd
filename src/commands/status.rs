@@ -1,3 +1,4 @@
+use crate::advice;
 use crate::awareness::{self, ChainBreakReason, ChainStatus};
 use crate::chain;
 use crate::config::Config;
@@ -25,7 +26,7 @@ pub fn run(config: Config, output_mode: OutputMode) -> anyhow::Result<()> {
     // ── Awareness model ─────────────────────────────────────────────
     let now = chrono::Local::now().naive_local();
     let mut assessments = awareness::assess(&config, now, &fs_state);
-    awareness::overlay_offsite_freshness(&mut assessments, &config);
+    advice::overlay_offsite_freshness(&mut assessments, &config);
 
     // ── Chain health per subvolume (derived from awareness assessment) ──
     let chain_health_entries: Vec<ChainHealthEntry> = assessments
@@ -89,7 +90,7 @@ pub fn run(config: Config, output_mode: OutputMode) -> anyhow::Result<()> {
 
     // ── Redundancy advisories ──────────────────────────────────────
     let redundancy_advisories =
-        awareness::compute_redundancy_advisories(&config, &assessments);
+        advice::compute_redundancy_advisories(&config, &assessments);
 
     // ── Assemble and render ─────────────────────────────────────────
     // Thread protection_level from resolved config into status assessments
@@ -110,11 +111,11 @@ pub fn run(config: Config, output_mode: OutputMode) -> anyhow::Result<()> {
         })
         .collect();
 
-    let advice: Vec<awareness::ActionableAdvice> = assessments
+    let advice: Vec<advice::ActionableAdvice> = assessments
         .iter()
         .filter_map(|a| {
             let sv = resolved.iter().find(|sv| sv.name == a.name)?;
-            awareness::compute_advice(a, sv.send_enabled, sv.local_retention.is_transient())
+            advice::compute_advice(a, sv.send_enabled, sv.local_retention.is_transient())
         })
         .collect();
 

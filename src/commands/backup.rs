@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use colored::Colorize;
 
+use crate::advice;
 use crate::awareness::{self, ChainStatus, PromiseStatus, SubvolAssessment};
 use crate::btrfs::{BtrfsOps, RealBtrfs};
 use crate::cli::BackupArgs;
@@ -134,7 +135,7 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
         )?;
         let previous_hb = heartbeat::read(&config.general.heartbeat_file);
         let mut assessments = awareness::assess(&config, heartbeat_now, &fs_state);
-        awareness::overlay_offsite_freshness(&mut assessments, &config);
+        advice::overlay_offsite_freshness(&mut assessments, &config);
         let hb = heartbeat::build_empty(
             &config,
             heartbeat_now,
@@ -272,7 +273,7 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     let pre_assessments = {
         let pre_now = chrono::Local::now().naive_local();
         let mut pre = awareness::assess(&config, pre_now, &fs_state);
-        awareness::overlay_offsite_freshness(&mut pre, &config);
+        advice::overlay_offsite_freshness(&mut pre, &config);
         pre
     };
 
@@ -334,7 +335,7 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
 
     // Write heartbeat (fresh timestamp — `now` is from before execution)
     let mut assessments = awareness::assess(&config, heartbeat_now, &fs_state);
-    awareness::overlay_offsite_freshness(&mut assessments, &config);
+    advice::overlay_offsite_freshness(&mut assessments, &config);
     let hb = heartbeat::build_from_run(
         &config,
         heartbeat_now,

@@ -1,3 +1,4 @@
+mod advice;
 mod awareness;
 mod btrfs;
 mod chain;
