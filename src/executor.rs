@@ -13,7 +13,7 @@ use crate::config::Config;
 use crate::drives;
 use crate::error::BtrfsOperation;
 use crate::state::{DriftSampleRow, OperationRecord, StateDb};
-use crate::types::{BackupPlan, FullSendReason, PlannedOperation, SendKind};
+use crate::types::{BackupPlan, DeleteKind, FullSendReason, PlannedOperation, SendKind};
 
 // ── Types ───────────────────────────────────────────────────────────────
 
@@ -453,8 +453,9 @@ impl<'a> Executor<'a> {
                 PlannedOperation::DeleteSnapshot {
                     path,
                     subvolume_name,
+                    kind,
                     ..
-                } => self.execute_delete(path, subvolume_name, space_recovered),
+                } => self.execute_delete(path, subvolume_name, *kind, space_recovered),
             };
 
             if outcome.result == OpResult::Failure {
@@ -846,15 +847,22 @@ impl<'a> Executor<'a> {
         &self,
         path: &Path,
         subvolume_name: &str,
+        kind: DeleteKind,
         space_recovered: &mut HashMap<String, bool>,
     ) -> OperationOutcome {
         let start = Instant::now();
 
-        // Space recovery re-check: if space has already been recovered for this
-        // location (external drive or local snapshot root), skip further deletes.
-        // Prevents over-deletion when only a few deletes were needed to free space.
+        // Space recovery re-check: if this is a `SpacePressure` delete and space has
+        // already been recovered for this location, skip further deletes. Prevents
+        // over-deletion when only a few deletes were needed to free space.
+        //
+        // `Policy` deletes are not subject to this short-circuit — the user's declared
+        // retention policy is the contract, and graduated/transient retention must run
+        // regardless of whether space is currently abundant. The post-delete update
+        // (below) still publishes recovery so any trailing SpacePressure deletes honor it.
         let recovery_key = self.space_recovery_key(path, subvolume_name);
-        if let Some(ref key) = recovery_key
+        if kind == DeleteKind::SpacePressure
+            && let Some(ref key) = recovery_key
             && *space_recovered.get(key).unwrap_or(&false)
         {
             log::info!(
@@ -1313,6 +1321,7 @@ source = "/data/b"
                     path: PathBuf::from("/snap/sv-a/20260310-a"),
                     reason: "expired".to_string(),
                     subvolume_name: "sv-a".to_string(),
+                    kind: DeleteKind::Policy,
                 },
             ],
             timestamp: ts,
@@ -1562,16 +1571,19 @@ source = "/data/b"
                     path: PathBuf::from("/mnt/test/.snapshots/sv-a/20260301-a"),
                     reason: "expired".to_string(),
                     subvolume_name: "sv-a".to_string(),
+                    kind: DeleteKind::SpacePressure,
                 },
                 PlannedOperation::DeleteSnapshot {
                     path: PathBuf::from("/mnt/test/.snapshots/sv-a/20260302-a"),
                     reason: "expired".to_string(),
                     subvolume_name: "sv-a".to_string(),
+                    kind: DeleteKind::SpacePressure,
                 },
                 PlannedOperation::DeleteSnapshot {
                     path: PathBuf::from("/mnt/test/.snapshots/sv-a/20260303-a"),
                     reason: "expired".to_string(),
                     subvolume_name: "sv-a".to_string(),
+                    kind: DeleteKind::SpacePressure,
                 },
             ],
             timestamp: ts,
@@ -1643,7 +1655,7 @@ source = "/data/b"
     }
 
     #[test]
-    fn space_recovered_shared_across_subvolumes() {
+    fn space_recovered_shared_across_subvolumes_for_space_pressure_kind() {
         let mock = MockBtrfs::new();
         // Free space is above threshold — after first delete, space is recovered
         *mock.free_bytes.borrow_mut() = 200_000_000_000; // 200GB > 100GB threshold
@@ -1656,19 +1668,21 @@ source = "/data/b"
             .unwrap()
             .and_hms_opt(14, 30, 0)
             .unwrap();
-        // sv-a deletes on external drive, recovers space.
-        // sv-b's deletions on the SAME drive should be skipped.
+        // sv-a's SpacePressure delete on external drive recovers space.
+        // sv-b's SpacePressure deletion on the SAME drive should be skipped.
         let plan = BackupPlan {
             operations: vec![
                 PlannedOperation::DeleteSnapshot {
                     path: PathBuf::from("/mnt/test/.snapshots/sv-a/20260301-a"),
-                    reason: "expired".to_string(),
+                    reason: "space pressure: expired".to_string(),
                     subvolume_name: "sv-a".to_string(),
+                    kind: DeleteKind::SpacePressure,
                 },
                 PlannedOperation::DeleteSnapshot {
                     path: PathBuf::from("/mnt/test/.snapshots/sv-b/20260301-b"),
-                    reason: "expired".to_string(),
+                    reason: "space pressure: expired".to_string(),
                     subvolume_name: "sv-b".to_string(),
+                    kind: DeleteKind::SpacePressure,
                 },
             ],
             timestamp: ts,
@@ -1696,6 +1710,151 @@ source = "/data/b"
             .filter(|c| matches!(c, MockBtrfsCall::DeleteSubvolume { .. }))
             .count();
         assert_eq!(delete_count, 1);
+    }
+
+    #[test]
+    fn policy_deletes_do_not_share_space_recovery() {
+        // Inverse of space_recovered_shared_across_subvolumes_for_space_pressure_kind:
+        // two subvolumes share the same external drive, both with Policy-kind deletes,
+        // free space already above min_free_bytes. The short-circuit must NOT engage —
+        // every delete executes because policy is the user's declared contract.
+        let mock = MockBtrfs::new();
+        *mock.free_bytes.borrow_mut() = 200_000_000_000; // 200GB > 100GB threshold
+
+        let config = test_config();
+        let shutdown = no_shutdown();
+        let executor = Executor::new(&mock, None, &config, &shutdown);
+
+        let ts = NaiveDate::from_ymd_opt(2026, 3, 22)
+            .unwrap()
+            .and_hms_opt(14, 30, 0)
+            .unwrap();
+        let plan = BackupPlan {
+            operations: vec![
+                PlannedOperation::DeleteSnapshot {
+                    path: PathBuf::from("/mnt/test/.snapshots/sv-a/20260301-a"),
+                    reason: "graduated: weekly thinning".to_string(),
+                    subvolume_name: "sv-a".to_string(),
+                    kind: DeleteKind::Policy,
+                },
+                PlannedOperation::DeleteSnapshot {
+                    path: PathBuf::from("/mnt/test/.snapshots/sv-a/20260302-a"),
+                    reason: "graduated: weekly thinning".to_string(),
+                    subvolume_name: "sv-a".to_string(),
+                    kind: DeleteKind::Policy,
+                },
+                PlannedOperation::DeleteSnapshot {
+                    path: PathBuf::from("/mnt/test/.snapshots/sv-b/20260301-b"),
+                    reason: "graduated: weekly thinning".to_string(),
+                    subvolume_name: "sv-b".to_string(),
+                    kind: DeleteKind::Policy,
+                },
+                PlannedOperation::DeleteSnapshot {
+                    path: PathBuf::from("/mnt/test/.snapshots/sv-b/20260302-b"),
+                    reason: "graduated: weekly thinning".to_string(),
+                    subvolume_name: "sv-b".to_string(),
+                    kind: DeleteKind::Policy,
+                },
+            ],
+            timestamp: ts,
+            skipped: vec![],
+            events: Vec::new(),
+        };
+
+        let result = executor.execute(&plan, "full");
+
+        // Every operation across both subvolumes should succeed — no short-circuit.
+        for sv in &result.subvolume_results {
+            for op in &sv.operations {
+                assert_eq!(
+                    op.result,
+                    OpResult::Success,
+                    "policy delete for {} unexpectedly skipped (error: {:?})",
+                    sv.name,
+                    op.error,
+                );
+            }
+        }
+
+        // Mock should record all four delete calls (one per planned op).
+        let delete_count = mock
+            .calls()
+            .iter()
+            .filter(|c| matches!(c, MockBtrfsCall::DeleteSubvolume { .. }))
+            .count();
+        assert_eq!(delete_count, 4);
+    }
+
+    #[test]
+    fn mixed_kinds_in_same_run() {
+        // Policy deletes interleaved with SpacePressure deletes for one subvolume on the
+        // same drive. Free space already above min_free_bytes — so:
+        //   - Policy deletes (first two) execute and publish space-recovered.
+        //   - SpacePressure deletes (third) short-circuit because the location is
+        //     above threshold by then.
+        // Pins down the kind-discrimination contract and the observation order:
+        // mock receives exactly the Policy-delete paths, in plan order, then nothing.
+        let mock = MockBtrfs::new();
+        *mock.free_bytes.borrow_mut() = 200_000_000_000;
+
+        let config = test_config();
+        let shutdown = no_shutdown();
+        let executor = Executor::new(&mock, None, &config, &shutdown);
+
+        let ts = NaiveDate::from_ymd_opt(2026, 3, 22)
+            .unwrap()
+            .and_hms_opt(14, 30, 0)
+            .unwrap();
+        let policy_a = PathBuf::from("/mnt/test/.snapshots/sv-a/20260301-policy-a");
+        let policy_b = PathBuf::from("/mnt/test/.snapshots/sv-a/20260302-policy-b");
+        let pressure_c = PathBuf::from("/mnt/test/.snapshots/sv-a/20260303-pressure-c");
+        let plan = BackupPlan {
+            operations: vec![
+                PlannedOperation::DeleteSnapshot {
+                    path: policy_a.clone(),
+                    reason: "graduated: weekly thinning".to_string(),
+                    subvolume_name: "sv-a".to_string(),
+                    kind: DeleteKind::Policy,
+                },
+                PlannedOperation::DeleteSnapshot {
+                    path: policy_b.clone(),
+                    reason: "graduated: weekly thinning".to_string(),
+                    subvolume_name: "sv-a".to_string(),
+                    kind: DeleteKind::Policy,
+                },
+                PlannedOperation::DeleteSnapshot {
+                    path: pressure_c.clone(),
+                    reason: "space pressure: hourly thinning".to_string(),
+                    subvolume_name: "sv-a".to_string(),
+                    kind: DeleteKind::SpacePressure,
+                },
+            ],
+            timestamp: ts,
+            skipped: vec![],
+            events: Vec::new(),
+        };
+
+        let result = executor.execute(&plan, "full");
+
+        let ops = &result.subvolume_results[0].operations;
+        assert_eq!(ops[0].result, OpResult::Success);
+        assert_eq!(ops[1].result, OpResult::Success);
+        assert_eq!(ops[2].result, OpResult::Skipped);
+        assert_eq!(
+            ops[2].error.as_deref(),
+            Some("space recovered, deletion skipped"),
+        );
+
+        // Mock observation: exactly the two Policy paths, in plan order, no pressure path.
+        let deleted: Vec<PathBuf> = mock
+            .calls()
+            .iter()
+            .filter_map(|c| match c {
+                MockBtrfsCall::DeleteSubvolume { path } => Some(path.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deleted, vec![policy_a, policy_b]);
     }
 
     fn test_config_with_local_min_free() -> Config {
@@ -1739,7 +1898,7 @@ source = "/data/b"
     }
 
     #[test]
-    fn local_space_recovery_stops_further_deletes() {
+    fn local_space_recovery_stops_further_deletes_for_space_pressure_kind() {
         let mock = MockBtrfs::new();
         // Free space is above threshold — after first delete, space is recovered
         *mock.free_bytes.borrow_mut() = 200_000_000_000; // 200GB > 100GB threshold
@@ -1758,16 +1917,19 @@ source = "/data/b"
                     path: PathBuf::from("/snap/sv-a/20260301-a"),
                     reason: "space pressure".to_string(),
                     subvolume_name: "sv-a".to_string(),
+                    kind: DeleteKind::SpacePressure,
                 },
                 PlannedOperation::DeleteSnapshot {
                     path: PathBuf::from("/snap/sv-a/20260302-a"),
                     reason: "space pressure".to_string(),
                     subvolume_name: "sv-a".to_string(),
+                    kind: DeleteKind::SpacePressure,
                 },
                 PlannedOperation::DeleteSnapshot {
                     path: PathBuf::from("/snap/sv-a/20260303-a"),
                     reason: "space pressure".to_string(),
                     subvolume_name: "sv-a".to_string(),
+                    kind: DeleteKind::SpacePressure,
                 },
             ],
             timestamp: ts,
@@ -1848,6 +2010,7 @@ source = "/data/b"
                 path: PathBuf::from("/snap/a/old"),
                 reason: "expired".to_string(),
                 subvolume_name: "sv-a".to_string(),
+                kind: DeleteKind::Policy,
             },
         ];
 
@@ -3004,11 +3167,13 @@ local_retention = "transient"
                     path: PathBuf::from("/snap/sv-a/20260301-a"),
                     reason: "expired".to_string(),
                     subvolume_name: "sv-a".to_string(),
+                    kind: DeleteKind::Policy,
                 },
                 PlannedOperation::DeleteSnapshot {
                     path: PathBuf::from("/snap/sv-a/20260302-a"),
                     reason: "expired".to_string(),
                     subvolume_name: "sv-a".to_string(),
+                    kind: DeleteKind::Policy,
                 },
             ],
             timestamp: ts,
@@ -3070,6 +3235,7 @@ local_retention = "transient"
                     path: PathBuf::from("/snap/sv-a/20260301-a"),
                     reason: "expired".to_string(),
                     subvolume_name: "sv-a".to_string(),
+                    kind: DeleteKind::Policy,
                 },
                 PlannedOperation::CreateSnapshot {
                     source: PathBuf::from("/data/a"),
@@ -3106,6 +3272,7 @@ local_retention = "transient"
                 path: PathBuf::from("/mnt/test/.snapshots/sv-a/20260301-a"),
                 reason: "expired".to_string(),
                 subvolume_name: "sv-a".to_string(),
+                kind: DeleteKind::Policy,
             }],
             timestamp: ts,
             skipped: vec![],

@@ -1538,7 +1538,8 @@ fn run_emergency_preflight(
 
             // Map snap → its emitted event (by snapshot name) so we can
             // persist only events whose underlying delete succeeded.
-            for (snap, _reason) in &result.delete {
+            for rd in &result.delete {
+                let snap = &rd.snapshot;
                 let snap_path = local_dir.join(snap.as_str());
 
                 // Defense-in-depth (ADR-106 layer 3)
@@ -1738,7 +1739,7 @@ mod tests {
         TransientCleanupOutcome,
     };
     use crate::types::Interval;
-    use crate::types::{FullSendReason, PlannedOperation};
+    use crate::types::{DeleteKind, FullSendReason, PlannedOperation};
     use std::path::PathBuf;
 
     fn make_outcome(
@@ -1968,11 +1969,13 @@ mod tests {
                     path: PathBuf::from("/snaps/sv1/20260320-0400-sv1"),
                     reason: "retention".to_string(),
                     subvolume_name: "sv1".to_string(),
+                    kind: DeleteKind::Policy,
                 },
                 PlannedOperation::DeleteSnapshot {
                     path: PathBuf::from("/snaps/sv1/20260319-0400-sv1"),
                     reason: "retention".to_string(),
                     subvolume_name: "sv1".to_string(),
+                    kind: DeleteKind::Policy,
                 },
             ],
             timestamp: chrono::NaiveDateTime::default(),

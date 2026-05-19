@@ -10,6 +10,45 @@ use crate::types::{
     Interval, LocalRetentionPolicy, MonthlyCount, ResolvedGraduatedRetention, SnapshotName,
 };
 
+/// Classifies a delete by what motivates it. Carried from `retention.rs` through
+/// `PlannedOperation::DeleteSnapshot` to the executor, where it controls whether the
+/// space-recovery short-circuit applies. `Policy` deletes always execute; `SpacePressure`
+/// deletes stop once the location's `min_free_bytes` is satisfied to avoid over-deletion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteKind {
+    /// Policy-driven retention (graduated tiers, beyond-window, transient lifecycle).
+    /// The user's declared retention policy is the contract — always executed.
+    Policy,
+    /// Space-pressure-driven (hourly thinning under pressure, space-governed extras,
+    /// emergency reclaim). Subject to the executor's space-recovery short-circuit.
+    SpacePressure,
+}
+
+impl DeleteKind {
+    /// Map a `PruneRule` to its delete kind. The single source of truth for the
+    /// policy/pressure split — change here, not at construction sites.
+    #[must_use]
+    pub const fn from_rule(rule: PruneRule) -> Self {
+        match rule {
+            PruneRule::GraduatedHourly
+            | PruneRule::GraduatedDaily
+            | PruneRule::GraduatedWeekly
+            | PruneRule::GraduatedMonthly
+            | PruneRule::GraduatedYearly
+            | PruneRule::BeyondWindow => Self::Policy,
+            PruneRule::Emergency | PruneRule::SpacePressure => Self::SpacePressure,
+        }
+    }
+}
+
+/// A planned retention deletion, with the reason and kind the executor needs.
+#[derive(Debug, Clone)]
+pub struct RetentionDelete {
+    pub snapshot: SnapshotName,
+    pub reason: String,
+    pub kind: DeleteKind,
+}
+
 /// The result of a retention computation.
 ///
 /// `events` carries rationale for the planner's audit log. Pure modules
@@ -19,7 +58,7 @@ use crate::types::{
 #[derive(Debug, Clone, Default)]
 pub struct RetentionResult {
     pub keep: Vec<SnapshotName>,
-    pub delete: Vec<(SnapshotName, String)>,
+    pub delete: Vec<RetentionDelete>,
     pub events: Vec<Event>,
 }
 
@@ -129,7 +168,7 @@ pub fn graduated_retention(
          rule: PruneRule,
          delete_reason: &str,
          keep: &mut Vec<SnapshotName>,
-         delete: &mut Vec<(SnapshotName, String)>,
+         delete: &mut Vec<RetentionDelete>,
          events: &mut Vec<Event>| {
             if slot_was_empty {
                 keep.push(snap.clone());
@@ -137,7 +176,11 @@ pub fn graduated_retention(
                 keep.push(snap.clone());
                 events.push(protect_event(snap, ProtectReason::PinOverrodeThinning, now));
             } else {
-                delete.push((snap.clone(), delete_reason.to_string()));
+                delete.push(RetentionDelete {
+                    snapshot: snap.clone(),
+                    reason: delete_reason.to_string(),
+                    kind: DeleteKind::from_rule(rule),
+                });
                 events.push(prune_event(snap, rule, now));
             }
         };
@@ -229,10 +272,11 @@ pub fn graduated_retention(
             keep.push(snap.clone());
             events.push(protect_event(snap, ProtectReason::PinOverrodeWindow, now));
         } else {
-            delete.push((
-                snap.clone(),
-                "graduated: beyond retention window".to_string(),
-            ));
+            delete.push(RetentionDelete {
+                snapshot: snap.clone(),
+                reason: "graduated: beyond retention window".to_string(),
+                kind: DeleteKind::from_rule(PruneRule::BeyondWindow),
+            });
             events.push(prune_event(snap, PruneRule::BeyondWindow, now));
         }
     }
@@ -278,7 +322,11 @@ pub fn emergency_retention(
         if snap == latest || pinned.contains(snap) {
             keep.push(snap.clone());
         } else {
-            delete.push((snap.clone(), "emergency: aggressive thinning".to_string()));
+            delete.push(RetentionDelete {
+                snapshot: snap.clone(),
+                reason: "emergency: aggressive thinning".to_string(),
+                kind: DeleteKind::from_rule(PruneRule::Emergency),
+            });
             events.push(prune_event(snap, PruneRule::Emergency, now));
         }
     }
@@ -315,7 +363,7 @@ pub fn space_governed_retention(
         let mut keep_sorted = result.keep.clone();
         keep_sorted.sort(); // oldest first
 
-        let mut additional_deletes = Vec::new();
+        let mut additional_deletes: Vec<RetentionDelete> = Vec::new();
         let mut additional_events = Vec::new();
         for snap in &keep_sorted {
             if pinned.contains(snap) {
@@ -325,12 +373,19 @@ pub fn space_governed_retention(
             if keep_sorted.len() - additional_deletes.len() <= 1 {
                 break;
             }
-            additional_deletes.push((snap.clone(), "space pressure: freeing space".to_string()));
+            additional_deletes.push(RetentionDelete {
+                snapshot: snap.clone(),
+                reason: "space pressure: freeing space".to_string(),
+                kind: DeleteKind::from_rule(PruneRule::SpacePressure),
+            });
             additional_events.push(prune_event(snap, PruneRule::SpacePressure, now));
         }
 
         // Remove additional deletes from keep, add to delete
-        let delete_set: HashSet<_> = additional_deletes.iter().map(|(s, _)| s.clone()).collect();
+        let delete_set: HashSet<_> = additional_deletes
+            .iter()
+            .map(|rd| rd.snapshot.clone())
+            .collect();
         result.keep.retain(|s| !delete_set.contains(s));
         result.delete.extend(additional_deletes);
         result.events.extend(additional_events);
@@ -742,7 +797,7 @@ mod tests {
         // Week 9: keep 20260301
         assert_eq!(result.keep.len(), 2);
         assert_eq!(result.delete.len(), 1);
-        assert_eq!(result.delete[0].0.as_str(), "20260307-home");
+        assert_eq!(result.delete[0].snapshot.as_str(), "20260307-home");
     }
 
     #[test]
@@ -870,7 +925,7 @@ mod tests {
             "Snapshot at calendar-month boundary (2025-03-25) should be kept with 12-month retention"
         );
         assert!(
-            result.delete.iter().any(|(s, _)| s == &old_snap),
+            result.delete.iter().any(|rd| rd.snapshot == old_snap),
             "Snapshot from 14+ months ago should be beyond retention window"
         );
     }
@@ -1252,8 +1307,8 @@ mod tests {
         assert!(result.keep.contains(&latest));
         assert!(result.keep.contains(&snaps[2]));
         assert!(result.keep.contains(&snaps[6]));
-        for (_, reason) in &result.delete {
-            assert_eq!(reason, "emergency: aggressive thinning");
+        for rd in &result.delete {
+            assert_eq!(rd.reason, "emergency: aggressive thinning");
         }
     }
 
