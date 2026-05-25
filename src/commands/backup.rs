@@ -622,6 +622,26 @@ fn build_backup_summary(
     }
 }
 
+/// Names of subvolumes with an external destination configured: sends enabled
+/// and at least one configured drive in scope (`drives = None` means all
+/// drives). Config-derived; mirrors the planner's send gate
+/// (`plan::is_drive_in_scope`). Feeds `backup_external_expected`.
+fn externally_expected_subvolumes(config: &Config) -> HashSet<String> {
+    config
+        .resolved_subvolumes()
+        .into_iter()
+        .filter(|sv| {
+            sv.send_enabled
+                && config.drives.iter().any(|d| {
+                    sv.drives
+                        .as_ref()
+                        .is_none_or(|allowed| allowed.iter().any(|a| a == &d.label))
+                })
+        })
+        .map(|sv| sv.name)
+        .collect()
+}
+
 fn write_metrics_after_execution(
     config: &Config,
     result: &crate::executor::ExecutionResult,
@@ -632,6 +652,7 @@ fn write_metrics_after_execution(
     observability: &PoolObservability,
 ) -> anyhow::Result<()> {
     let now_ts = now.and_utc().timestamp();
+    let external_expected = externally_expected_subvolumes(config);
     let mut subvolume_metrics = Vec::new();
 
     // Metrics for executed subvolumes
@@ -656,6 +677,7 @@ fn write_metrics_after_execution(
             local_snapshot_count: local_count,
             external_snapshot_count: external_count,
             send_type: sv_result.send_type.metric_value(),
+            external_expected: external_expected.contains(&sv_result.name),
             churn_bytes_per_second: churn.churn_bytes_per_second,
             last_full_send_bytes: churn.last_full_send_bytes,
             local_snapshot_count_v4: extras.and_then(|e| e.local_snapshot_count),
@@ -818,7 +840,7 @@ fn gather_pool_observability(
     let pool_metrics = pools::compute_pool_metrics_from(
         &source_pools,
         &drive_resolutions,
-        |mp| pools::pool_free_bytes(mp).ok(),
+        |mp| pools::pool_space(mp).ok(),
         pools::metadata_utilization_ratio,
     );
 
@@ -1009,6 +1031,7 @@ fn append_skipped_metrics(
     churn_views: &HashMap<String, ChurnHeartbeatFields>,
     observability: &PoolObservability,
 ) {
+    let external_expected = externally_expected_subvolumes(config);
     let mut seen = already_emitted.clone();
 
     for (name, _reason) in &plan.skipped {
@@ -1029,6 +1052,7 @@ fn append_skipped_metrics(
             local_snapshot_count: local_count,
             external_snapshot_count: external_count,
             send_type: 2,
+            external_expected: external_expected.contains(name),
             churn_bytes_per_second: churn.churn_bytes_per_second,
             last_full_send_bytes: churn.last_full_send_bytes,
             local_snapshot_count_v4: extras.and_then(|e| e.local_snapshot_count),

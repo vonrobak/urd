@@ -30,6 +30,11 @@ pub struct PoolMetric {
     pub role: String,
     pub label: String,
     pub free_bytes: Option<u64>,
+    /// Total capacity bytes (statvfs `blocks * fragment_size`). Feeds
+    /// `backup_pool_total_bytes`. `None` when the pool's mountpoint couldn't be
+    /// statvfs'd; paired with `free_bytes` from the same syscall so the two
+    /// never skew within a run.
+    pub capacity_bytes: Option<u64>,
     pub metadata_utilization_ratio: Option<f64>,
 }
 
@@ -56,6 +61,13 @@ pub struct SubvolumeMetrics {
     pub external_snapshot_count: usize,
     /// 0 = full, 1 = incremental, 2 = no send
     pub send_type: u8,
+    /// True when the subvolume has an external destination configured (sends
+    /// enabled and ≥1 configured drive in scope). Config-derived, independent
+    /// of this run's outcome. Feeds `backup_external_expected` — emitted only
+    /// when true, so consumers can join `... == 0 and on(subvolume)
+    /// backup_external_expected == 1` to distinguish a missing offsite copy
+    /// from an intentionally local-only subvolume.
+    pub external_expected: bool,
     /// Rolling time-windowed churn rate (UPI 030). Emitted only when `Some`.
     /// Absent for cold-start subvolumes and for subvolumes whose latest
     /// in-window send was a full send (use `last_full_send_bytes` instead).
@@ -253,6 +265,25 @@ fn format_metrics(data: &MetricsData) -> String {
         .unwrap();
     }
 
+    // backup_external_expected
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "# HELP backup_external_expected 1 if the subvolume has an external destination configured (sends enabled and at least one drive in scope). Line absent otherwise."
+    )
+    .unwrap();
+    writeln!(out, "# TYPE backup_external_expected gauge").unwrap();
+    for sv in &data.subvolumes {
+        if sv.external_expected {
+            writeln!(
+                out,
+                "backup_external_expected{{subvolume=\"{}\"}} 1",
+                escape_label_value(&sv.name)
+            )
+            .unwrap();
+        }
+    }
+
     // backup_external_drive_mounted
     writeln!(out).unwrap();
     writeln!(
@@ -358,6 +389,27 @@ fn format_metrics(data: &MetricsData) -> String {
             writeln!(
                 out,
                 "backup_pool_free_bytes{{uuid=\"{}\",role=\"{}\",label=\"{}\"}} {}",
+                escape_label_value(&pool.uuid),
+                escape_label_value(&pool.role),
+                escape_label_value(&pool.label),
+                bytes
+            )
+            .unwrap();
+        }
+    }
+
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "# HELP backup_pool_total_bytes Total capacity bytes of a BTRFS pool (statvfs). Snapshot at backup-run cadence; not a live signal."
+    )
+    .unwrap();
+    writeln!(out, "# TYPE backup_pool_total_bytes gauge").unwrap();
+    for pool in &data.pools {
+        if let Some(bytes) = pool.capacity_bytes {
+            writeln!(
+                out,
+                "backup_pool_total_bytes{{uuid=\"{}\",role=\"{}\",label=\"{}\"}} {}",
                 escape_label_value(&pool.uuid),
                 escape_label_value(&pool.role),
                 escape_label_value(&pool.label),
@@ -530,6 +582,7 @@ mod tests {
                     local_snapshot_count: 15,
                     external_snapshot_count: 14,
                     send_type: 1,
+                    external_expected: false,
                     churn_bytes_per_second: None,
                     last_full_send_bytes: None,
                     local_snapshot_count_v4: None,
@@ -543,6 +596,7 @@ mod tests {
                     local_snapshot_count: 20,
                     external_snapshot_count: 18,
                     send_type: 2,
+                    external_expected: false,
                     churn_bytes_per_second: None,
                     last_full_send_bytes: None,
                     local_snapshot_count_v4: None,
@@ -694,6 +748,7 @@ mod tests {
                 local_snapshot_count: 5,
                 external_snapshot_count: 3,
                 send_type: 1,
+                external_expected: false,
                 churn_bytes_per_second: None,
                 last_full_send_bytes: None,
                 local_snapshot_count_v4: None,
@@ -707,6 +762,7 @@ mod tests {
                 local_snapshot_count: 5,
                 external_snapshot_count: 3,
                 send_type: 2,
+                external_expected: false,
                 churn_bytes_per_second: None,
                 last_full_send_bytes: None,
                 local_snapshot_count_v4: None,
@@ -720,6 +776,7 @@ mod tests {
                 local_snapshot_count: 5,
                 external_snapshot_count: 3,
                 send_type: 2,
+                external_expected: false,
                 churn_bytes_per_second: None,
                 last_full_send_bytes: None,
                 local_snapshot_count_v4: None,
@@ -753,6 +810,7 @@ mod tests {
                 local_snapshot_count: 5,
                 external_snapshot_count: 3,
                 send_type: 1,
+                external_expected: false,
                 churn_bytes_per_second: None,
                 last_full_send_bytes: None,
                 local_snapshot_count_v4: None,
@@ -776,6 +834,7 @@ mod tests {
             local_snapshot_count: 5,
             external_snapshot_count: 3,
             send_type: 2,
+            external_expected: false,
             churn_bytes_per_second: None,
             last_full_send_bytes: None,
             local_snapshot_count_v4: None,
@@ -908,6 +967,7 @@ mod tests {
             role: role.to_string(),
             label: label.to_string(),
             free_bytes: None,
+            capacity_bytes: None,
             metadata_utilization_ratio: None,
         }
     }
@@ -1059,5 +1119,52 @@ mod tests {
         data.pools.push(p);
         let output = format_metrics(&data);
         assert!(output.contains("label=\"/bar\""));
+    }
+
+    // ── backup_external_expected ──────────────────────────────────
+
+    #[test]
+    fn format_metrics_emits_external_expected_when_true() {
+        let mut data = sample_data();
+        data.subvolumes[0].external_expected = true;
+        let output = format_metrics(&data);
+        assert!(output.contains("# HELP backup_external_expected"));
+        assert!(output.contains("# TYPE backup_external_expected gauge"));
+        assert!(output.contains("backup_external_expected{subvolume=\"subvol3-opptak\"} 1"));
+    }
+
+    #[test]
+    fn format_metrics_omits_external_expected_when_false() {
+        let data = sample_data(); // all external_expected: false
+        let output = format_metrics(&data);
+        // HELP/TYPE still present unconditionally.
+        assert!(output.contains("# HELP backup_external_expected"));
+        // No value line for a local-only subvolume.
+        assert!(!output.contains("backup_external_expected{"));
+    }
+
+    // ── backup_pool_total_bytes ───────────────────────────────────
+
+    #[test]
+    fn format_metrics_emits_pool_total_bytes_when_some() {
+        let mut data = sample_data();
+        let mut p = pool("uuid-a", "destination", "WD-18TB");
+        p.capacity_bytes = Some(18_000_191_160_320);
+        data.pools.push(p);
+        let output = format_metrics(&data);
+        assert!(output.contains("# HELP backup_pool_total_bytes"));
+        assert!(output.contains("# TYPE backup_pool_total_bytes gauge"));
+        assert!(output.contains(
+            "backup_pool_total_bytes{uuid=\"uuid-a\",role=\"destination\",label=\"WD-18TB\"} 18000191160320"
+        ));
+    }
+
+    #[test]
+    fn format_metrics_omits_pool_total_bytes_when_none() {
+        let mut data = sample_data();
+        data.pools.push(pool("uuid-a", "source", "/home")); // capacity None
+        let output = format_metrics(&data);
+        assert!(output.contains("# HELP backup_pool_total_bytes"));
+        assert!(!output.contains("backup_pool_total_bytes{"));
     }
 }
