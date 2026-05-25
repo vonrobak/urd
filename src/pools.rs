@@ -320,6 +320,17 @@ mod tests {
         std::fs::write(dir.join("total_bytes"), total).unwrap();
     }
 
+    /// A `space_resolver` that ignores the path and always reports the same
+    /// free/capacity. For "no rows emitted" tests the values are irrelevant.
+    fn fixed_space(free: u64, capacity: u64) -> impl Fn(&Path) -> Option<PoolSpace> {
+        move |_| {
+            Some(PoolSpace {
+                free_bytes: free,
+                capacity_bytes: capacity,
+            })
+        }
+    }
+
     #[test]
     fn metadata_utilization_ratio_returns_none_when_sysfs_missing() {
         let tmp = TempDir::new().unwrap();
@@ -449,14 +460,8 @@ mod tests {
             mountpoint: Some(PathBuf::from("/mnt/wd")),
         }];
 
-        let space = |_: &Path| {
-            Some(PoolSpace {
-                free_bytes: 42,
-                capacity_bytes: 100,
-            })
-        };
         let meta = |_: &str| Some(0.25_f64);
-        let metrics = compute_pool_metrics_from(&pools, &drives, space, meta);
+        let metrics = compute_pool_metrics_from(&pools, &drives, fixed_space(42, 100), meta);
 
         assert_eq!(metrics.len(), 2);
         assert_eq!(metrics[0].uuid, "uuid-src");
@@ -478,17 +483,7 @@ mod tests {
             mounted: false,
             mountpoint: None,
         }];
-        let metrics = compute_pool_metrics_from(
-            &[],
-            &drives,
-            |_| {
-                Some(PoolSpace {
-                    free_bytes: 0,
-                    capacity_bytes: 0,
-                })
-            },
-            |_| None,
-        );
+        let metrics = compute_pool_metrics_from(&[], &drives, fixed_space(0, 0), |_| None);
         assert!(metrics.is_empty());
     }
 
@@ -546,17 +541,7 @@ mod tests {
             mounted: true,
             mountpoint: Some(PathBuf::from("/mnt/wd")),
         }];
-        let metrics = compute_pool_metrics_from(
-            &[],
-            &drives,
-            |_| {
-                Some(PoolSpace {
-                    free_bytes: 0,
-                    capacity_bytes: 0,
-                })
-            },
-            |_| None,
-        );
+        let metrics = compute_pool_metrics_from(&[], &drives, fixed_space(0, 0), |_| None);
         assert!(metrics.is_empty());
     }
 }

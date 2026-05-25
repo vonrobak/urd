@@ -623,20 +623,15 @@ fn build_backup_summary(
 }
 
 /// Names of subvolumes with an external destination configured: sends enabled
-/// and at least one configured drive in scope (`drives = None` means all
-/// drives). Config-derived; mirrors the planner's send gate
-/// (`plan::is_drive_in_scope`). Feeds `backup_external_expected`.
+/// and at least one configured drive in scope. Uses the same
+/// `ResolvedSubvolume::accepts_drive` predicate as the planner's send gate, so
+/// `backup_external_expected` cannot drift from what actually gets sent.
 fn externally_expected_subvolumes(config: &Config) -> HashSet<String> {
     config
         .resolved_subvolumes()
         .into_iter()
         .filter(|sv| {
-            sv.send_enabled
-                && config.drives.iter().any(|d| {
-                    sv.drives
-                        .as_ref()
-                        .is_none_or(|allowed| allowed.iter().any(|a| a == &d.label))
-                })
+            sv.send_enabled && config.drives.iter().any(|d| sv.accepts_drive(&d.label))
         })
         .map(|sv| sv.name)
         .collect()

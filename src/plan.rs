@@ -181,14 +181,6 @@ pub struct PlanFilters {
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
-/// Check if a drive is in scope for a subvolume (respects `drives` field).
-fn is_drive_in_scope(subvol: &ResolvedSubvolume, drive_label: &str) -> bool {
-    subvol
-        .drives
-        .as_ref()
-        .is_none_or(|allowed| allowed.iter().any(|a| a == drive_label))
-}
-
 /// Check if a drive can receive sends. Returns true if available, false (with
 /// skip reason emitted) if not. Handles all DriveAvailability variants.
 fn check_drive_availability(
@@ -375,7 +367,7 @@ pub fn plan(
         let usable_drives: Vec<&DriveConfig> = config
             .drives
             .iter()
-            .filter(|d| is_drive_in_scope(subvol, &d.label))
+            .filter(|d| subvol.accepts_drive(&d.label))
             .filter(|d| {
                 matches!(
                     fs.drive_availability(d),
@@ -469,7 +461,7 @@ pub fn plan(
         // ── External operations ─────────────────────────────────────
         if !filters.local_only && subvol.send_enabled {
             for drive in &config.drives {
-                if !is_drive_in_scope(subvol, &drive.label) {
+                if !subvol.accepts_drive(&drive.label) {
                     continue;
                 }
 
@@ -854,7 +846,7 @@ fn plan_transient_lifecycle(
     let mut any_send_due = false;
 
     for drive in &config.drives {
-        if !is_drive_in_scope(subvol, &drive.label) {
+        if !subvol.accepts_drive(&drive.label) {
             continue;
         }
         if !check_drive_availability(&subvol.name, drive, fs, skipped, events, now) {
