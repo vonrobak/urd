@@ -224,14 +224,15 @@ pub(crate) fn metadata_utilization_ratio_from(sysfs_root: &Path, uuid: &str) -> 
 /// `role` label. A UUID that is both a source and a configured drive gets one
 /// row per role.
 ///
-/// `free_bytes_resolver` and `metadata_resolver` are accepted as closures so
-/// tests can substitute pure stand-ins; production callers pass
-/// `pool_free_bytes` / `metadata_utilization_ratio`.
+/// `space_resolver` and `metadata_resolver` are accepted as closures so tests
+/// can substitute pure stand-ins; production callers pass `pool_space` /
+/// `metadata_utilization_ratio`. `space_resolver` returns free + capacity from
+/// a single statvfs so the two never skew within a run.
 #[must_use]
 pub fn compute_pool_metrics_from(
     detected_pools: &[SourcePool],
     drives: &[DriveResolution],
-    mut free_bytes_resolver: impl FnMut(&Path) -> Option<u64>,
+    mut space_resolver: impl FnMut(&Path) -> Option<PoolSpace>,
     mut metadata_resolver: impl FnMut(&str) -> Option<f64>,
 ) -> Vec<PoolMetric> {
     let mut out: Vec<PoolMetric> = Vec::new();
@@ -239,16 +240,14 @@ pub fn compute_pool_metrics_from(
     // Sources first — sorted by uuid for stable output.
     for pool in detected_pools {
         let label = canonical_mountpoint_label(&pool.mountpoints);
-        let free = pool
-            .mountpoints
-            .first()
-            .and_then(|mp| free_bytes_resolver(mp));
+        let space = pool.mountpoints.first().and_then(|mp| space_resolver(mp));
         let meta = metadata_resolver(&pool.uuid);
         out.push(PoolMetric {
             uuid: pool.uuid.clone(),
             role: "source".to_string(),
             label,
-            free_bytes: free,
+            free_bytes: space.map(|s| s.free_bytes),
+            capacity_bytes: space.map(|s| s.capacity_bytes),
             metadata_utilization_ratio: meta,
         });
     }
@@ -261,16 +260,14 @@ pub fn compute_pool_metrics_from(
         if !drive.mounted {
             continue;
         }
-        let free = drive
-            .mountpoint
-            .as_deref()
-            .and_then(&mut free_bytes_resolver);
+        let space = drive.mountpoint.as_deref().and_then(&mut space_resolver);
         let meta = metadata_resolver(uuid);
         out.push(PoolMetric {
             uuid: uuid.clone(),
             role: "destination".to_string(),
             label: drive.label.clone(),
-            free_bytes: free,
+            free_bytes: space.map(|s| s.free_bytes),
+            capacity_bytes: space.map(|s| s.capacity_bytes),
             metadata_utilization_ratio: meta,
         });
     }
@@ -321,6 +318,17 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("bytes_used"), used).unwrap();
         std::fs::write(dir.join("total_bytes"), total).unwrap();
+    }
+
+    /// A `space_resolver` that ignores the path and always reports the same
+    /// free/capacity. For "no rows emitted" tests the values are irrelevant.
+    fn fixed_space(free: u64, capacity: u64) -> impl Fn(&Path) -> Option<PoolSpace> {
+        move |_| {
+            Some(PoolSpace {
+                free_bytes: free,
+                capacity_bytes: capacity,
+            })
+        }
     }
 
     #[test]
@@ -452,18 +460,19 @@ mod tests {
             mountpoint: Some(PathBuf::from("/mnt/wd")),
         }];
 
-        let free = |_: &Path| Some(42_u64);
         let meta = |_: &str| Some(0.25_f64);
-        let metrics = compute_pool_metrics_from(&pools, &drives, free, meta);
+        let metrics = compute_pool_metrics_from(&pools, &drives, fixed_space(42, 100), meta);
 
         assert_eq!(metrics.len(), 2);
         assert_eq!(metrics[0].uuid, "uuid-src");
         assert_eq!(metrics[0].role, "source");
         assert_eq!(metrics[0].label, "/home");
         assert_eq!(metrics[0].free_bytes, Some(42));
+        assert_eq!(metrics[0].capacity_bytes, Some(100));
         assert_eq!(metrics[1].uuid, "uuid-dst");
         assert_eq!(metrics[1].role, "destination");
         assert_eq!(metrics[1].label, "WD-18TB");
+        assert_eq!(metrics[1].capacity_bytes, Some(100));
     }
 
     #[test]
@@ -474,7 +483,7 @@ mod tests {
             mounted: false,
             mountpoint: None,
         }];
-        let metrics = compute_pool_metrics_from(&[], &drives, |_| Some(0), |_| None);
+        let metrics = compute_pool_metrics_from(&[], &drives, fixed_space(0, 0), |_| None);
         assert!(metrics.is_empty());
     }
 
@@ -532,7 +541,7 @@ mod tests {
             mounted: true,
             mountpoint: Some(PathBuf::from("/mnt/wd")),
         }];
-        let metrics = compute_pool_metrics_from(&[], &drives, |_| Some(0), |_| None);
+        let metrics = compute_pool_metrics_from(&[], &drives, fixed_space(0, 0), |_| None);
         assert!(metrics.is_empty());
     }
 }

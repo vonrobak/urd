@@ -144,6 +144,19 @@ pub struct ResolvedSubvolume {
     pub min_free_bytes: Option<u64>,
 }
 
+impl ResolvedSubvolume {
+    /// True if `drive_label` is in scope for this subvolume's external sends.
+    /// `drives = None` means all configured drives are in scope; `Some(list)`
+    /// restricts to the listed labels. Shared by the planner's send gate and
+    /// the `backup_external_expected` metric so the two cannot drift.
+    #[must_use]
+    pub fn accepts_drive(&self, drive_label: &str) -> bool {
+        self.drives
+            .as_ref()
+            .is_none_or(|allowed| allowed.iter().any(|a| a == drive_label))
+    }
+}
+
 impl SubvolumeConfig {
     /// Resolve this subvolume config against the provided defaults and run frequency.
     ///

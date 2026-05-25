@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Prometheus metric `backup_external_expected{subvolume}`** — emits `1` for each
+  subvolume that has an external destination configured (sends enabled and at least one
+  drive in scope); the line is absent otherwise. Lets monitoring distinguish a genuinely
+  missing offsite copy from an intentionally local-only subvolume (e.g. `send_enabled =
+  false`), via `backup_snapshot_count{location="external"} == 0 and on(subvolume)
+  backup_external_expected == 1`.
+- **Prometheus metric `backup_pool_total_bytes{uuid,role,label}`** — total BTRFS pool
+  capacity (statvfs), alongside the existing `backup_pool_free_bytes`. Enables a
+  destination free-% alert for offsite drives that `node_exporter` does not scrape. Free
+  and capacity are read from a single statvfs call so they never skew within a run.
+
 ## [0.20.5] - 2026-05-20
 
 ### Changed
