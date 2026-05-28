@@ -11,7 +11,7 @@ use crate::output::{
     DoctorRecommendationView, DoctorSentinelStatus, DoctorVerdict, InitStatus, OutputMode,
     SchemaStatus,
 };
-use crate::plan::RealFileSystemState;
+use crate::plan::{Observation, RealFileSystemState};
 use crate::recommendation::{
     self, AdjustmentReason, HeadroomAwareRecommendation, HeadroomContext, HeadroomSeverity,
     ShapeRole,
@@ -157,8 +157,14 @@ pub fn run(config: Config, args: DoctorArgs, output_mode: OutputMode) -> anyhow:
     let fs_state = RealFileSystemState {
         state: state_db.as_ref(),
     };
+    let assess_btrfs = crate::btrfs::RealBtrfs::for_reads(&config.general.btrfs_path);
+    let observation = Observation {
+        fs: &fs_state,
+        history: &fs_state,
+        btrfs: &assess_btrfs,
+    };
     let now = chrono::Local::now().naive_local();
-    let assessments = awareness::assess(&config, now, &fs_state);
+    let assessments = awareness::assess(&config, now, &observation);
 
     let resolved = config.resolved_subvolumes();
     let data_safety: Vec<DoctorDataSafety> = assessments

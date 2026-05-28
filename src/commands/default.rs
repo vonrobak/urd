@@ -5,7 +5,7 @@ use crate::awareness;
 use crate::config;
 use crate::error::UrdError;
 use crate::output::{DefaultStatusOutput, OutputMode};
-use crate::plan::RealFileSystemState;
+use crate::plan::{Observation, RealFileSystemState};
 use crate::state::StateDb;
 use crate::voice;
 
@@ -29,10 +29,16 @@ pub fn run(config_path: Option<&Path>, output_mode: OutputMode) -> anyhow::Resul
     let fs_state = RealFileSystemState {
         state: state_db.as_ref(),
     };
+    let assess_btrfs = crate::btrfs::RealBtrfs::for_reads(&config.general.btrfs_path);
+    let observation = Observation {
+        fs: &fs_state,
+        history: &fs_state,
+        btrfs: &assess_btrfs,
+    };
 
     // Awareness assessment — lighter than status (no chain health, no drive info, no pins)
     let now = chrono::Local::now().naive_local();
-    let mut assessments = awareness::assess(&config, now, &fs_state);
+    let mut assessments = awareness::assess(&config, now, &observation);
     advice::overlay_offsite_freshness(&mut assessments, &config);
 
     let last_run = state_db.as_ref().and_then(|db| db.last_run_info());

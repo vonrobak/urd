@@ -67,7 +67,16 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     let fs_state = RealFileSystemState {
         state: state_db.as_ref(),
     };
-    let mut backup_plan = plan::plan(&config, now, &filters, &fs_state)?;
+    // Near-unit btrfs handle for plan/assess generation reads (UPI 052):
+    // a generation read needs no live byte counter and no compression
+    // negotiation. The executor builds its own full RealBtrfs at send time.
+    let plan_btrfs = RealBtrfs::for_reads(&config.general.btrfs_path);
+    let observation = plan::Observation {
+        fs: &fs_state,
+        history: &fs_state,
+        btrfs: &plan_btrfs,
+    };
+    let mut backup_plan = plan::plan(&config, now, &filters, &observation)?;
 
     // ADR-107: fail-closed for retention on promise-level subvolumes.
     // If a subvolume has a protection_level, skip retention deletions unless
@@ -105,7 +114,7 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
 
     // Re-plan if emergency freed space — plan may have different space_pressure decisions
     if emergency_ran {
-        backup_plan = plan::plan(&config, now, &filters, &fs_state)?;
+        backup_plan = plan::plan(&config, now, &filters, &observation)?;
         if !args.confirm_retention_change {
             filter_promise_retention(&config, &mut backup_plan);
         }
@@ -134,7 +143,7 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
             &observability,
         )?;
         let previous_hb = heartbeat::read(&config.general.heartbeat_file);
-        let mut assessments = awareness::assess(&config, heartbeat_now, &fs_state);
+        let mut assessments = awareness::assess(&config, heartbeat_now, &observation);
         advice::overlay_offsite_freshness(&mut assessments, &config);
         let hb = heartbeat::build_empty(
             &config,
@@ -272,7 +281,7 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     // (thread restored, promise recovered, etc.) by diffing with post-backup state.
     let pre_assessments = {
         let pre_now = chrono::Local::now().naive_local();
-        let mut pre = awareness::assess(&config, pre_now, &fs_state);
+        let mut pre = awareness::assess(&config, pre_now, &observation);
         advice::overlay_offsite_freshness(&mut pre, &config);
         pre
     };
@@ -334,7 +343,7 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     )?;
 
     // Write heartbeat (fresh timestamp — `now` is from before execution)
-    let mut assessments = awareness::assess(&config, heartbeat_now, &fs_state);
+    let mut assessments = awareness::assess(&config, heartbeat_now, &observation);
     advice::overlay_offsite_freshness(&mut assessments, &config);
     let hb = heartbeat::build_from_run(
         &config,

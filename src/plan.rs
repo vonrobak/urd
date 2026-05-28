@@ -59,7 +59,7 @@ fn stamp_context(events: &mut [Event], subvolume: Option<&str>, drive_label: Opt
 // the ADR-102 axis (filesystem is truth, SQLite is history). Re-exported here
 // so existing `crate::plan::{FileSystemState, ..}` import paths keep resolving
 // while the seam is narrowed incrementally (UPI 052).
-pub use crate::observation::{FileSystemState, FilesystemQuery, HistoryQuery};
+pub use crate::observation::{FileSystemState, FilesystemQuery, HistoryQuery, Observation};
 
 // ── Size estimation helper ──────────────────────────────────────────────
 
@@ -73,7 +73,7 @@ pub use crate::observation::{FileSystemState, FilesystemQuery, HistoryQuery};
 /// as not-a-constraint rather than substituting calibrated.
 #[must_use]
 pub fn estimated_send_size(
-    fs: &dyn FileSystemState,
+    history: &dyn HistoryQuery,
     subvol_name: &str,
     drive_label: &str,
     needs_full: bool,
@@ -83,11 +83,12 @@ pub fn estimated_send_size(
     } else {
         SendKind::Incremental
     };
-    fs.last_send_size(subvol_name, drive_label, send_kind)
-        .or_else(|| fs.last_send_size_any_drive(subvol_name, send_kind))
+    history
+        .last_send_size(subvol_name, drive_label, send_kind)
+        .or_else(|| history.last_send_size_any_drive(subvol_name, send_kind))
         .or_else(|| {
             if needs_full {
-                fs.calibrated_size(subvol_name).map(|(bytes, _)| bytes)
+                history.calibrated_size(subvol_name).map(|(bytes, _)| bytes)
             } else {
                 None
             }
@@ -116,12 +117,12 @@ pub struct PlanFilters {
 fn check_drive_availability(
     subvol_name: &str,
     drive: &DriveConfig,
-    fs: &dyn FileSystemState,
+    obs: &Observation,
     skipped: &mut Vec<(String, String)>,
     events: &mut Vec<Event>,
     now: NaiveDateTime,
 ) -> bool {
-    match fs.drive_availability(drive) {
+    match obs.fs.drive_availability(drive) {
         DriveAvailability::Available => true,
         DriveAvailability::NotMounted => {
             record_defer(
@@ -226,7 +227,7 @@ pub fn plan(
     config: &Config,
     now: NaiveDateTime,
     filters: &PlanFilters,
-    fs: &dyn FileSystemState,
+    obs: &Observation,
 ) -> crate::error::Result<BackupPlan> {
     let mut operations = Vec::new();
     // Skip reason strings are classified by output::SkipCategory::from_reason().
@@ -284,12 +285,13 @@ pub fn plan(
         let local_dir = snapshot_root.join(&subvol.name);
 
         // Get existing local snapshots
-        let local_snaps = fs
+        let local_snaps = obs
+            .fs
             .local_snapshots(snapshot_root, &subvol.name)
             .unwrap_or_default();
 
         // Get pinned snapshots
-        let pinned = fs.pinned_snapshots(&local_dir, &drive_labels);
+        let pinned = obs.fs.pinned_snapshots(&local_dir, &drive_labels);
 
         // Drives in scope for this subvolume that can currently receive sends.
         // Include TokenMissing: those drives proceed with sends (line ~308),
@@ -300,7 +302,7 @@ pub fn plan(
             .filter(|d| subvol.accepts_drive(&d.label))
             .filter(|d| {
                 matches!(
-                    fs.drive_availability(d),
+                    obs.fs.drive_availability(d),
                     DriveAvailability::Available | DriveAvailability::TokenMissing
                 )
             })
@@ -309,7 +311,7 @@ pub fn plan(
         // Mounted-only pins for transient retention scoping.
         let mounted_pins: HashSet<SnapshotName> = usable_drives
             .iter()
-            .filter_map(|d| match fs.read_pin_file(&local_dir, &d.label) {
+            .filter_map(|d| match obs.fs.read_pin_file(&local_dir, &d.label) {
                 Ok(Some(snap)) => Some(snap),
                 Ok(None) => None,
                 Err(e) => {
@@ -327,7 +329,7 @@ pub fn plan(
         if subvol.local_retention.is_transient() && subvol.send_enabled {
             plan_transient_lifecycle(
                 subvol, config, &local_dir, &local_snaps, now, force, filters,
-                &pinned, &mounted_pins, fs, &mut operations, &mut skipped, &mut events,
+                &pinned, &mounted_pins, obs, &mut operations, &mut skipped, &mut events,
             );
             continue; // skip the normal two-phase flow
         }
@@ -346,7 +348,7 @@ pub fn plan(
                 force,
                 filters,
                 min_free,
-                fs,
+                obs,
                 &mut operations,
                 &mut skipped,
                 &mut events,
@@ -358,7 +360,7 @@ pub fn plan(
                 now,
                 &pinned,
                 &mounted_pins,
-                fs,
+                obs,
                 &mut operations,
                 &mut events,
             );
@@ -398,7 +400,7 @@ pub fn plan(
                 if !check_drive_availability(
                     &subvol.name,
                     drive,
-                    fs,
+                    obs,
                     &mut skipped,
                     &mut events,
                     now,
@@ -414,7 +416,7 @@ pub fn plan(
                     now,
                     force,
                     filters.skip_intervals,
-                    fs,
+                    obs,
                     &mut operations,
                     &mut skipped,
                     &mut events,
@@ -424,7 +426,7 @@ pub fn plan(
                     subvol,
                     drive,
                     now,
-                    fs,
+                    obs,
                     &pinned,
                     &mut operations,
                     &mut events,
@@ -494,7 +496,7 @@ fn plan_local_snapshot(
     force: bool,
     filters: &PlanFilters,
     min_free: u64,
-    fs: &dyn FileSystemState,
+    obs: &Observation,
     operations: &mut Vec<PlannedOperation>,
     skipped: &mut Vec<(String, String)>,
     events: &mut Vec<Event>,
@@ -504,7 +506,7 @@ fn plan_local_snapshot(
     // filesystem. force does NOT override — a forced snapshot on a full filesystem is still
     // catastrophic. See 2026-03-24-local-space-exhaustion-postmortem.md.
     if min_free > 0 {
-        let free = fs.filesystem_free_bytes(local_dir).unwrap_or(u64::MAX);
+        let free = obs.fs.filesystem_free_bytes(local_dir).unwrap_or(u64::MAX);
         if free < min_free {
             use crate::types::ByteSize;
             record_defer(
@@ -557,8 +559,8 @@ fn plan_local_snapshot(
         {
             let snap_path = local_dir.join(newest.as_str());
             match (
-                fs.subvolume_generation(&subvol.source),
-                fs.subvolume_generation(&snap_path),
+                obs.btrfs.subvolume_generation(&subvol.source),
+                obs.btrfs.subvolume_generation(&snap_path),
             ) {
                 (Ok(sg), Ok(ng)) if sg == ng => {
                     let elapsed = now.signed_duration_since(newest.datetime());
@@ -652,7 +654,7 @@ fn plan_local_retention(
     now: NaiveDateTime,
     pinned: &HashSet<SnapshotName>,
     mounted_pins: &HashSet<SnapshotName>,
-    fs: &dyn FileSystemState,
+    obs: &Observation,
     operations: &mut Vec<PlannedOperation>,
     events: &mut Vec<Event>,
 ) {
@@ -716,7 +718,7 @@ fn plan_local_retention(
         LocalRetentionPolicy::Graduated(retention_config) => {
             // Check space pressure
             let min_free = subvol.min_free_bytes.unwrap_or(0);
-            let free_bytes = fs.filesystem_free_bytes(local_dir).unwrap_or(u64::MAX);
+            let free_bytes = obs.fs.filesystem_free_bytes(local_dir).unwrap_or(u64::MAX);
             let space_pressure = min_free > 0 && free_bytes < min_free;
 
             let mut result = retention::graduated_retention(
@@ -765,7 +767,7 @@ fn plan_transient_lifecycle(
     filters: &PlanFilters,
     pinned: &HashSet<SnapshotName>,
     mounted_pins: &HashSet<SnapshotName>,
-    fs: &dyn FileSystemState,
+    obs: &Observation,
     operations: &mut Vec<PlannedOperation>,
     skipped: &mut Vec<(String, String)>,
     events: &mut Vec<Event>,
@@ -779,7 +781,7 @@ fn plan_transient_lifecycle(
         if !subvol.accepts_drive(&drive.label) {
             continue;
         }
-        if !check_drive_availability(&subvol.name, drive, fs, skipped, events, now) {
+        if !check_drive_availability(&subvol.name, drive, obs, skipped, events, now) {
             continue; // skip reason already emitted
         }
 
@@ -788,7 +790,7 @@ fn plan_transient_lifecycle(
             sendable_drives.push((drive, None));
             any_send_due = true;
         } else {
-            let ext_snaps = fs.external_snapshots(drive, &subvol.name).unwrap_or_default();
+            let ext_snaps = obs.fs.external_snapshots(drive, &subvol.name).unwrap_or_default();
             let newest_ext = ext_snaps.iter().max().map(|s| s.datetime());
             let send_due = match newest_ext {
                 Some(newest_dt) => {
@@ -825,7 +827,7 @@ fn plan_transient_lifecycle(
             now,
             pinned,
             mounted_pins,
-            fs,
+            obs,
             operations,
             events,
         );
@@ -868,7 +870,7 @@ fn plan_transient_lifecycle(
             now,
             pinned,
             mounted_pins,
-            fs,
+            obs,
             operations,
             events,
         );
@@ -880,7 +882,7 @@ fn plan_transient_lifecycle(
         let min_free = subvol.min_free_bytes.unwrap_or(0);
         plan_local_snapshot(
             subvol, local_dir, local_snaps, now, force, filters,
-            min_free, fs, operations, skipped, events,
+            min_free, obs, operations, skipped, events,
         )
     } else {
         None
@@ -895,7 +897,7 @@ fn plan_transient_lifecycle(
             now,
             pinned,
             mounted_pins,
-            fs,
+            obs,
             operations,
             events,
         );
@@ -924,9 +926,9 @@ fn plan_transient_lifecycle(
     for (drive, _) in &sendable_drives {
         plan_external_send(
             subvol, drive, local_dir, effective_local_snaps, now, force,
-            filters.skip_intervals, fs, operations, skipped, events,
+            filters.skip_intervals, obs, operations, skipped, events,
         );
-        plan_external_retention(subvol, drive, now, fs, pinned, operations, events);
+        plan_external_retention(subvol, drive, now, obs, pinned, operations, events);
     }
 
     // ── Phase 4: Plan transient retention ─────────────────────────
@@ -938,7 +940,7 @@ fn plan_transient_lifecycle(
         now,
         pinned,
         mounted_pins,
-        fs,
+        obs,
         operations,
         events,
     );
@@ -953,13 +955,14 @@ fn plan_external_send(
     now: NaiveDateTime,
     force: bool,
     skip_intervals: bool,
-    fs: &dyn FileSystemState,
+    obs: &Observation,
     operations: &mut Vec<PlannedOperation>,
     skipped: &mut Vec<(String, String)>,
     events: &mut Vec<Event>,
 ) {
     let ext_dir = crate::drives::external_snapshot_dir(drive, &subvol.name);
-    let ext_snaps = fs
+    let ext_snaps = obs
+        .fs
         .external_snapshots(drive, &subvol.name)
         .unwrap_or_default();
 
@@ -1032,7 +1035,7 @@ fn plan_external_send(
     let snap_path = local_dir.join(snap_to_send.as_str());
 
     // Resolve parent for incremental send
-    let pin = fs.read_pin_file(local_dir, &drive.label).unwrap_or(None);
+    let pin = obs.fs.read_pin_file(local_dir, &drive.label).unwrap_or(None);
     let is_incremental = if let Some(ref parent_name) = pin {
         // Parent must exist both locally and on the external drive
         let parent_exists_local = local_snaps
@@ -1051,13 +1054,14 @@ fn plan_external_send(
     } else {
         SendKind::Full
     };
-    if let Some(last_size) = fs
+    if let Some(last_size) = obs
+        .history
         .last_send_size(&subvol.name, &drive.label, send_kind)
-        .or_else(|| fs.last_send_size_any_drive(&subvol.name, send_kind))
+        .or_else(|| obs.history.last_send_size_any_drive(&subvol.name, send_kind))
     {
         // Tier 1/2: historical data from same drive or cross-drive fallback
         if let Some((estimated, available, free, min_free)) =
-            exceeds_available_space(last_size, &ext_dir, drive, fs)
+            exceeds_available_space(last_size, &ext_dir, drive, obs)
         {
             use crate::types::ByteSize;
             record_defer(
@@ -1080,7 +1084,7 @@ fn plan_external_send(
         }
     } else if !is_incremental {
         // Tier 3: Calibrated size from `urd calibrate` (only for full sends)
-        if let Some((cal_bytes, measured_at)) = fs.calibrated_size(&subvol.name) {
+        if let Some((cal_bytes, measured_at)) = obs.history.calibrated_size(&subvol.name) {
             let age_days = calibration_age_days(&measured_at);
             let staleness = if age_days > 30 {
                 format!(
@@ -1092,7 +1096,7 @@ fn plan_external_send(
             };
 
             if let Some((estimated, available, _, _)) =
-                exceeds_available_space(cal_bytes, &ext_dir, drive, fs)
+                exceeds_available_space(cal_bytes, &ext_dir, drive, obs)
             {
                 use crate::types::ByteSize;
                 record_defer(
@@ -1169,13 +1173,14 @@ fn plan_external_retention(
     subvol: &ResolvedSubvolume,
     drive: &DriveConfig,
     now: NaiveDateTime,
-    fs: &dyn FileSystemState,
+    obs: &Observation,
     pinned: &HashSet<SnapshotName>,
     operations: &mut Vec<PlannedOperation>,
     events: &mut Vec<Event>,
 ) {
     let ext_dir = crate::drives::external_snapshot_dir(drive, &subvol.name);
-    let ext_snaps = fs
+    let ext_snaps = obs
+        .fs
         .external_snapshots(drive, &subvol.name)
         .unwrap_or_default();
 
@@ -1183,7 +1188,7 @@ fn plan_external_retention(
         return;
     }
 
-    let free_bytes = fs.filesystem_free_bytes(&ext_dir).unwrap_or(u64::MAX);
+    let free_bytes = obs.fs.filesystem_free_bytes(&ext_dir).unwrap_or(u64::MAX);
     let min_free = drive.min_free_bytes.map(|b| b.bytes()).unwrap_or(0);
 
     let mut result = retention::space_governed_retention(
@@ -1233,10 +1238,11 @@ fn exceeds_available_space(
     raw_bytes: u64,
     _ext_dir: &Path,
     drive: &DriveConfig,
-    fs: &dyn FileSystemState,
+    obs: &Observation,
 ) -> Option<(u64, u64, u64, u64)> {
     let estimated = (raw_bytes as f64 * 1.2) as u64; // 20% safety margin
-    let free = fs
+    let free = obs
+        .fs
         .filesystem_free_bytes(&drive.mount_path)
         .unwrap_or(u64::MAX);
     let min_free = drive.min_free_bytes.map(|b| b.bytes()).unwrap_or(0);
@@ -1299,10 +1305,6 @@ impl FilesystemQuery for RealFileSystemState<'_> {
 
     fn pinned_snapshots(&self, local_dir: &Path, drive_labels: &[String]) -> HashSet<SnapshotName> {
         crate::chain::find_pinned_snapshots(local_dir, drive_labels)
-    }
-
-    fn subvolume_generation(&self, path: &Path) -> crate::error::Result<u64> {
-        crate::btrfs::subvolume_generation(path)
     }
 }
 
@@ -1450,10 +1452,6 @@ pub struct MockFileSystemState {
     pub fail_local_snapshots: HashSet<String>,
     /// (local_dir, drive_label) pairs for which read_pin_file() should return an error.
     pub fail_pin_reads: HashSet<(PathBuf, String)>,
-    /// Generation counters for subvolume/snapshot paths.
-    pub generations: std::collections::HashMap<PathBuf, u64>,
-    /// Paths for which subvolume_generation() should return an error.
-    pub fail_generations: HashSet<PathBuf>,
 }
 
 #[cfg(test)]
@@ -1473,8 +1471,6 @@ impl MockFileSystemState {
             last_successful_ops: std::collections::HashMap::new(),
             fail_local_snapshots: HashSet::new(),
             fail_pin_reads: HashSet::new(),
-            generations: std::collections::HashMap::new(),
-            fail_generations: HashSet::new(),
         }
     }
 }
@@ -1561,25 +1557,6 @@ impl FilesystemQuery for MockFileSystemState {
         }
         pinned
     }
-
-    fn subvolume_generation(&self, path: &Path) -> crate::error::Result<u64> {
-        if self.fail_generations.contains(path) {
-            return Err(crate::error::UrdError::Io {
-                path: path.to_path_buf(),
-                source: std::io::Error::other("mock: generation query failed"),
-            });
-        }
-        self.generations
-            .get(path)
-            .copied()
-            .ok_or_else(|| crate::error::UrdError::Io {
-                path: path.to_path_buf(),
-                source: std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "mock: no generation configured",
-                ),
-            })
-    }
 }
 
 #[cfg(test)]
@@ -1638,6 +1615,7 @@ impl HistoryQuery for MockFileSystemState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::btrfs::MockBtrfs;
     use chrono::NaiveDate;
 
     fn test_config() -> Config {
@@ -1778,7 +1756,7 @@ priority = 2
         fs.local_snapshots
             .insert("sv1".to_string(), vec![snap("20260322-1440-one")]);
 
-        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
         let creates: Vec<_> = result
             .operations
             .iter()
@@ -1795,7 +1773,7 @@ priority = 2
         fs.local_snapshots
             .insert("sv1".to_string(), vec![snap("20260322-1455-one")]);
 
-        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
         let creates: Vec<_> = result
             .operations
             .iter()
@@ -1869,7 +1847,7 @@ priority = 2
         fs.local_snapshots
             .insert("sv1".to_string(), vec![snap("20260321-1502-one")]);
 
-        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
         let creates: Vec<_> = result
             .operations
             .iter()
@@ -1884,7 +1862,7 @@ priority = 2
         let fs = MockFileSystemState::new();
         // No snapshots exist at all
 
-        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
         let creates: Vec<_> = result
             .operations
             .iter()
@@ -1906,7 +1884,7 @@ priority = 2
             subvolume: Some("sv1".to_string()),
             ..PlanFilters::default()
         };
-        let result = plan(&config, now(), &filters, &fs).unwrap();
+        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
         let creates: Vec<_> = result
             .operations
             .iter()
@@ -1925,7 +1903,7 @@ priority = 2
             priority: Some(1),
             ..PlanFilters::default()
         };
-        let result = plan(&config, now(), &filters, &fs).unwrap();
+        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
         // Only sv1 (priority 1), not sv2 (priority 2)
         let creates: Vec<_> = result
             .operations
@@ -1956,7 +1934,7 @@ priority = 2
             subvolume: Some("sv1".to_string()),
             ..PlanFilters::default()
         };
-        let result = plan(&config, now(), &filters, &fs).unwrap();
+        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
         let sends: Vec<_> = result
             .operations
             .iter()
@@ -1977,7 +1955,7 @@ priority = 2
             subvolume: Some("sv1".to_string()),
             ..PlanFilters::default()
         };
-        let result = plan(&config, now(), &filters, &fs).unwrap();
+        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
         let sends: Vec<_> = result
             .operations
             .iter()
@@ -2010,7 +1988,7 @@ priority = 2
             subvolume: Some("sv1".to_string()),
             ..PlanFilters::default()
         };
-        let result = plan(&config, now(), &filters, &fs).unwrap();
+        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
         let sends: Vec<_> = result
             .operations
             .iter()
@@ -2043,7 +2021,7 @@ priority = 2
             subvolume: Some("sv1".to_string()),
             ..PlanFilters::default()
         };
-        let result = plan(&config, now(), &filters, &fs).unwrap();
+        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
         let send = result
             .operations
             .iter()
@@ -2070,7 +2048,7 @@ priority = 2
             .insert("sv1".to_string(), vec![snap("20260322-1500-one")]);
         // Drive NOT mounted
 
-        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
         assert!(
             result
                 .skipped
@@ -2128,7 +2106,7 @@ send_enabled = false
             .insert("sv".to_string(), vec![snap("20260322-1400-sv")]);
         fs.mounted_drives.insert("D1".to_string());
 
-        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
         assert!(
             result
                 .skipped
@@ -2147,7 +2125,7 @@ send_enabled = false
             local_only: true,
             ..PlanFilters::default()
         };
-        let result = plan(&config, now(), &filters, &fs).unwrap();
+        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
         let sends: Vec<_> = result
             .operations
             .iter()
@@ -2170,7 +2148,7 @@ send_enabled = false
             external_only: true,
             ..PlanFilters::default()
         };
-        let result = plan(&config, now(), &filters, &fs).unwrap();
+        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
         let creates: Vec<_> = result
             .operations
             .iter()
@@ -2191,7 +2169,7 @@ send_enabled = false
             subvolume: Some("sv1".to_string()),
             ..PlanFilters::default()
         };
-        let result = plan(&config, now(), &filters, &fs).unwrap();
+        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
         let sends_with_pin: Vec<_> = result
             .operations
             .iter()
@@ -2237,7 +2215,7 @@ send_enabled = false
             local_only: true,
             ..PlanFilters::default()
         };
-        let result = plan(&config, now(), &filters, &fs).unwrap();
+        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
         // All snapshots newer than the pin should be protected (not deleted)
         let deletes: Vec<_> = result
             .operations
@@ -2274,7 +2252,7 @@ send_enabled = false
             local_only: true,
             ..PlanFilters::default()
         };
-        let result = plan(&config, now(), &filters, &fs).unwrap();
+        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
         let deletes: Vec<_> = result
             .operations
             .iter()
@@ -2333,7 +2311,7 @@ send_enabled = false
             ],
         );
 
-        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
         let deletes: Vec<_> = result
             .operations
             .iter()
@@ -2364,7 +2342,7 @@ send_enabled = false
         fs.free_bytes
             .insert(PathBuf::from("/mnt/d1"), 150_000_000_000);
 
-        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
         let sends: Vec<_> = result
             .operations
             .iter()
@@ -2400,7 +2378,7 @@ send_enabled = false
         fs.free_bytes
             .insert(PathBuf::from("/mnt/d1"), 500_000_000_000);
 
-        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
         let sends: Vec<_> = result
             .operations
             .iter()
@@ -2424,7 +2402,7 @@ send_enabled = false
         // Tiny free space — but no history means we can't estimate, so proceed
         fs.free_bytes.insert(PathBuf::from("/mnt/d1"), 1_000_000);
 
-        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
         let sends: Vec<_> = result
             .operations
             .iter()
@@ -2453,7 +2431,7 @@ send_enabled = false
         fs.free_bytes
             .insert(PathBuf::from("/mnt/d1"), 500_000_000_000);
 
-        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
         let sends: Vec<_> = result
             .operations
             .iter()
@@ -2494,7 +2472,7 @@ send_enabled = false
         fs.free_bytes
             .insert(PathBuf::from("/mnt/d1"), 500_000_000_000);
 
-        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
         let sends: Vec<_> = result
             .operations
             .iter()
@@ -2517,7 +2495,7 @@ send_enabled = false
         // No send_sizes, no calibrated_sizes — fail open
         fs.free_bytes.insert(PathBuf::from("/mnt/d1"), 1_000_000);
 
-        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
         let sends: Vec<_> = result
             .operations
             .iter()
@@ -2546,7 +2524,7 @@ send_enabled = false
         fs.free_bytes
             .insert(PathBuf::from("/mnt/d1"), 500_000_000_000);
 
-        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
         let sends: Vec<_> = result
             .operations
             .iter()
@@ -2576,7 +2554,7 @@ send_enabled = false
             vec![snap("20260322-1600-one")], // now() is 15:00, this is 16:00
         );
 
-        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
         let creates: Vec<_> = result
             .operations
             .iter()
@@ -2612,7 +2590,7 @@ send_enabled = false
             },
         );
 
-        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
         assert!(
             result
                 .skipped
@@ -2649,7 +2627,7 @@ send_enabled = false
             DriveAvailability::UuidCheckFailed("findmnt not found".to_string()),
         );
 
-        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
         assert!(
             result
                 .skipped
@@ -2669,7 +2647,7 @@ send_enabled = false
         fs.drive_availability_overrides
             .insert("D1".to_string(), DriveAvailability::Available);
 
-        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
         let sends: Vec<_> = result
             .operations
             .iter()
@@ -2695,7 +2673,7 @@ send_enabled = false
             .insert("sv1".to_string(), vec![snap("20260322-1300-one")]);
         fs.mounted_drives.insert("D1".to_string());
 
-        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
         let sends: Vec<_> = result
             .operations
             .iter()
@@ -2728,7 +2706,7 @@ send_enabled = false
             },
         );
 
-        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
         assert!(
             result
                 .skipped
@@ -2762,7 +2740,7 @@ send_enabled = false
         fs.drive_availability_overrides
             .insert("D1".to_string(), DriveAvailability::TokenMissing);
 
-        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
         let sends: Vec<_> = result
             .operations
             .iter()
@@ -2788,7 +2766,7 @@ send_enabled = false
         fs.drive_availability_overrides
             .insert("D1".to_string(), DriveAvailability::TokenExpectedButMissing);
 
-        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
         assert!(
             result
                 .skipped
@@ -2821,7 +2799,7 @@ send_enabled = false
         fs.drive_availability_overrides
             .insert("D1".to_string(), DriveAvailability::TokenExpectedButMissing);
 
-        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
         let creates: Vec<_> = result
             .operations
             .iter()
@@ -2845,7 +2823,7 @@ send_enabled = false
         fs.free_bytes
             .insert(PathBuf::from("/snap/sv1"), 5_000_000_000);
 
-        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
 
         // No snapshot should be created for sv1
         let creates: Vec<_> = result
@@ -2881,7 +2859,7 @@ send_enabled = false
         fs.free_bytes
             .insert(PathBuf::from("/snap/sv1"), 50_000_000_000);
 
-        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
 
         let creates: Vec<_> = result
             .operations
@@ -2909,7 +2887,7 @@ send_enabled = false
             subvolume: Some("sv1".to_string()),
             ..PlanFilters::default()
         };
-        let result = plan(&config, now(), &filters, &fs).unwrap();
+        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
 
         let creates: Vec<_> = result
             .operations
@@ -2950,11 +2928,12 @@ send_enabled = false
 
         // Source generation differs from the snapshot's, so the
         // "unchanged" generation check at plan_local_snapshot does NOT fire.
-        fs.generations.insert(PathBuf::from("/data/sv1"), 100);
-        fs.generations
+        let mb = MockBtrfs::new();
+        mb.generations.borrow_mut().insert(PathBuf::from("/data/sv1"), 100);
+        mb.generations.borrow_mut()
             .insert(PathBuf::from("/snap/sv1").join(s1.as_str()), 50);
 
-        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &mb }).unwrap();
 
         let creates: Vec<_> = result
             .operations
@@ -2995,7 +2974,7 @@ send_enabled = false
             .insert("sv1".to_string(), vec![snap("20260322-1440-one")]);
         // Note: no fs.free_bytes entry for /snap/sv1
 
-        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
 
         let creates: Vec<_> = result
             .operations
@@ -3070,7 +3049,7 @@ drives = ["D1"]
         fs.mounted_drives.insert("D1".to_string());
         fs.mounted_drives.insert("D2".to_string());
 
-        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
 
         // Should only have send operations for D1, not D2
         let sends: Vec<_> = result
@@ -3182,7 +3161,7 @@ local_retention = "transient"
             vec![snap("20260320-1000-one")],
         );
 
-        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
         let deletes: Vec<_> = result
             .operations
             .iter()
@@ -3226,7 +3205,7 @@ local_retention = "transient"
             ],
         );
 
-        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
         let deletes: Vec<_> = result
             .operations
             .iter()
@@ -3267,7 +3246,7 @@ local_retention = "transient"
         // No pin files — nothing has ever been sent
         fs.mounted_drives.insert("D1".to_string());
 
-        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
         let deletes: Vec<_> = result
             .operations
             .iter()
@@ -3295,7 +3274,7 @@ local_retention = "transient"
         let fs = MockFileSystemState::new();
         // No local snapshots, no drives mounted
 
-        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
         let creates: Vec<_> = result
             .operations
             .iter()
@@ -3410,7 +3389,7 @@ local_retention = "transient"
             vec![snap("20260320-1000-one")],
         );
 
-        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
         let deletes: Vec<_> = result
             .operations
             .iter()
@@ -3448,7 +3427,7 @@ local_retention = "transient"
         // Drive NOT mounted — transient should skip snapshot creation
         // (no drive to send to, creating a snapshot is pointless)
 
-        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
 
         let creates: Vec<_> = result
             .operations
@@ -3475,7 +3454,7 @@ local_retention = "transient"
         // No local snapshots, no drives mounted.
         // Transient: no snapshot created — can't be sent, would be orphaned.
 
-        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
 
         let creates: Vec<_> = result
             .operations
@@ -3516,7 +3495,7 @@ local_retention = "transient"
             vec![snap("20260322-1400-one")],
         );
 
-        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
         let deletes: Vec<_> = result
             .operations
             .iter()
@@ -3555,7 +3534,7 @@ local_retention = "transient"
             snap("20260320-1000-one"),
         );
 
-        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
         let deletes: Vec<_> = result
             .operations
             .iter()
@@ -3610,7 +3589,7 @@ local_retention = "transient"
             vec![snap("20260320-1000-one")],
         );
 
-        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
         let deletes: Vec<_> = result
             .operations
             .iter()
@@ -3704,7 +3683,7 @@ priority = 1
         fs.mounted_drives.insert("D1".to_string());
         // D2 NOT mounted
 
-        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
         let deletes: Vec<_> = result
             .operations
             .iter()
@@ -3742,7 +3721,7 @@ priority = 1
         );
         // No pin files, no drives mounted
 
-        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
         let deletes: Vec<_> = result
             .operations
             .iter()
@@ -3787,7 +3766,7 @@ priority = 1
             vec![snap("20260321-1000-one")],
         );
 
-        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
         let deletes: Vec<_> = result
             .operations
             .iter()
@@ -3823,7 +3802,7 @@ priority = 1
             skip_intervals: true,
             ..PlanFilters::default()
         };
-        let result = plan(&config, now(), &filters, &fs).unwrap();
+        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
         let creates: Vec<_> = result
             .operations
             .iter()
@@ -3850,7 +3829,7 @@ priority = 1
             skip_intervals: true,
             ..PlanFilters::default()
         };
-        let result = plan(&config, now(), &filters, &fs).unwrap();
+        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
         let sends: Vec<_> = result
             .operations
             .iter()
@@ -3881,7 +3860,7 @@ priority = 1
             skip_intervals: true,
             ..PlanFilters::default()
         };
-        let result = plan(&config, now(), &filters, &fs).unwrap();
+        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
         let creates: Vec<_> = result
             .operations
             .iter()
@@ -3930,7 +3909,7 @@ priority = 1
             skip_intervals: true,
             ..PlanFilters::default()
         };
-        let result = plan(&config, now(), &filters, &fs).unwrap();
+        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
         let deletes: Vec<_> = result
             .operations
             .iter()
@@ -3958,7 +3937,7 @@ priority = 1
             local_only: true,
             ..PlanFilters::default()
         };
-        let result = plan(&config, now(), &filters, &fs).unwrap();
+        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
         let creates: Vec<_> = result
             .operations
             .iter()
@@ -3987,7 +3966,7 @@ priority = 1
         let mut fs = MockFileSystemState::new();
         fs.mounted_drives.insert("D1".to_string());
 
-        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
 
         let creates: Vec<_> = result
             .operations
@@ -4010,7 +3989,7 @@ priority = 1
         let config = transient_config();
         let fs = MockFileSystemState::new();
 
-        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
 
         assert!(
             result.operations.is_empty(),
@@ -4037,7 +4016,7 @@ priority = 1
             ],
         );
 
-        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
 
         let creates: Vec<_> = result
             .operations
@@ -4076,7 +4055,7 @@ priority = 1
             skip_intervals: false,
             ..Default::default()
         };
-        let result = plan(&config, now(), &filters, &fs).unwrap();
+        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
 
         let creates: Vec<_> = result
             .operations
@@ -4115,12 +4094,13 @@ priority = 1
             vec![snap("20260322-1400-one")],
         );
         // Same generation → unchanged
-        fs.generations
+        let mb = MockBtrfs::new();
+        mb.generations.borrow_mut()
             .insert(PathBuf::from("/data/sv1"), 500);
-        fs.generations
+        mb.generations.borrow_mut()
             .insert(PathBuf::from("/snap/sv1/20260322-1400-one"), 500);
 
-        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &mb }).unwrap();
 
         let creates: Vec<_> = result
             .operations
@@ -4195,7 +4175,7 @@ local_retention = "transient"
         fs.free_bytes
             .insert(PathBuf::from("/snap/sv1"), 1_000_000_000);
 
-        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
 
         let creates: Vec<_> = result
             .operations
@@ -4217,7 +4197,7 @@ local_retention = "transient"
         let mut fs = MockFileSystemState::new();
         fs.mounted_drives.insert("D1".to_string());
 
-        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
 
         let creates: Vec<_> = result
             .operations
@@ -4259,12 +4239,13 @@ local_retention = "transient"
             vec![snap("20260321-1000-one")],
         );
         // Different generation so a new snapshot is created
-        fs.generations
+        let mb = MockBtrfs::new();
+        mb.generations.borrow_mut()
             .insert(PathBuf::from("/data/sv1"), 600);
-        fs.generations
+        mb.generations.borrow_mut()
             .insert(PathBuf::from("/snap/sv1/20260321-1000-one"), 500);
 
-        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &mb }).unwrap();
 
         let creates: Vec<_> = result
             .operations
@@ -4300,7 +4281,7 @@ local_retention = "transient"
             skip_intervals: false,
             ..Default::default()
         };
-        let result = plan(&config, now(), &filters, &fs).unwrap();
+        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
 
         let creates: Vec<_> = result
             .operations
@@ -4333,12 +4314,13 @@ local_retention = "transient"
         fs.local_snapshots
             .insert("sv1".to_string(), vec![snap("20260322-1440-one")]);
         // Source and snapshot have same generation → skip
-        fs.generations
+        let mb = MockBtrfs::new();
+        mb.generations.borrow_mut()
             .insert(PathBuf::from("/data/sv1"), 500);
-        fs.generations
+        mb.generations.borrow_mut()
             .insert(PathBuf::from("/snap/sv1/20260322-1440-one"), 500);
 
-        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &mb }).unwrap();
         let creates: Vec<_> = result
             .operations
             .iter()
@@ -4361,12 +4343,13 @@ local_retention = "transient"
         fs.local_snapshots
             .insert("sv1".to_string(), vec![snap("20260322-1440-one")]);
         // Source gen differs from snapshot gen → create
-        fs.generations
+        let mb = MockBtrfs::new();
+        mb.generations.borrow_mut()
             .insert(PathBuf::from("/data/sv1"), 501);
-        fs.generations
+        mb.generations.borrow_mut()
             .insert(PathBuf::from("/snap/sv1/20260322-1440-one"), 500);
 
-        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &mb }).unwrap();
         let creates: Vec<_> = result
             .operations
             .iter()
@@ -4381,7 +4364,7 @@ local_retention = "transient"
         let fs = MockFileSystemState::new();
         // No existing snapshots → create (no generation to compare)
 
-        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
         let creates: Vec<_> = result
             .operations
             .iter()
@@ -4397,12 +4380,13 @@ local_retention = "transient"
         fs.local_snapshots
             .insert("sv1".to_string(), vec![snap("20260322-1440-one")]);
         // Source generation fails, snapshot has generation → fail open, create
-        fs.fail_generations
+        let mb = MockBtrfs::new();
+        mb.fail_generations.borrow_mut()
             .insert(PathBuf::from("/data/sv1"));
-        fs.generations
+        mb.generations.borrow_mut()
             .insert(PathBuf::from("/snap/sv1/20260322-1440-one"), 500);
 
-        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &mb }).unwrap();
         let creates: Vec<_> = result
             .operations
             .iter()
@@ -4418,12 +4402,13 @@ local_retention = "transient"
         fs.local_snapshots
             .insert("sv1".to_string(), vec![snap("20260322-1440-one")]);
         // Source has generation, snapshot generation fails → fail open, create
-        fs.generations
+        let mb = MockBtrfs::new();
+        mb.generations.borrow_mut()
             .insert(PathBuf::from("/data/sv1"), 500);
-        fs.fail_generations
+        mb.fail_generations.borrow_mut()
             .insert(PathBuf::from("/snap/sv1/20260322-1440-one"));
 
-        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &mb }).unwrap();
         let creates: Vec<_> = result
             .operations
             .iter()
@@ -4439,12 +4424,13 @@ local_retention = "transient"
         fs.local_snapshots
             .insert("sv1".to_string(), vec![snap("20260322-1440-one")]);
         // Both fail → fail open, create
-        fs.fail_generations
+        let mb = MockBtrfs::new();
+        mb.fail_generations.borrow_mut()
             .insert(PathBuf::from("/data/sv1"));
-        fs.fail_generations
+        mb.fail_generations.borrow_mut()
             .insert(PathBuf::from("/snap/sv1/20260322-1440-one"));
 
-        let result = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &mb }).unwrap();
         let creates: Vec<_> = result
             .operations
             .iter()
@@ -4460,16 +4446,17 @@ local_retention = "transient"
         fs.local_snapshots
             .insert("sv1".to_string(), vec![snap("20260322-1440-one")]);
         // Same generation, but force_snapshot → create anyway
-        fs.generations
+        let mb = MockBtrfs::new();
+        mb.generations.borrow_mut()
             .insert(PathBuf::from("/data/sv1"), 500);
-        fs.generations
+        mb.generations.borrow_mut()
             .insert(PathBuf::from("/snap/sv1/20260322-1440-one"), 500);
 
         let filters = PlanFilters {
             force_snapshot: true,
             ..PlanFilters::default()
         };
-        let result = plan(&config, now(), &filters, &fs).unwrap();
+        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &mb }).unwrap();
         let creates: Vec<_> = result
             .operations
             .iter()
@@ -4485,16 +4472,17 @@ local_retention = "transient"
         fs.local_snapshots
             .insert("sv1".to_string(), vec![snap("20260322-1440-one")]);
         // Same generation, but --subvolume filter → force, skip gen check
-        fs.generations
+        let mb = MockBtrfs::new();
+        mb.generations.borrow_mut()
             .insert(PathBuf::from("/data/sv1"), 500);
-        fs.generations
+        mb.generations.borrow_mut()
             .insert(PathBuf::from("/snap/sv1/20260322-1440-one"), 500);
 
         let filters = PlanFilters {
             subvolume: Some("sv1".to_string()),
             ..PlanFilters::default()
         };
-        let result = plan(&config, now(), &filters, &fs).unwrap();
+        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &mb }).unwrap();
         let creates: Vec<_> = result
             .operations
             .iter()
@@ -4510,16 +4498,17 @@ local_retention = "transient"
         fs.local_snapshots
             .insert("sv1".to_string(), vec![snap("20260322-1440-one")]);
         // Same generation + skip_intervals (manual run) → still skip unchanged
-        fs.generations
+        let mb = MockBtrfs::new();
+        mb.generations.borrow_mut()
             .insert(PathBuf::from("/data/sv1"), 500);
-        fs.generations
+        mb.generations.borrow_mut()
             .insert(PathBuf::from("/snap/sv1/20260322-1440-one"), 500);
 
         let filters = PlanFilters {
             skip_intervals: true,
             ..PlanFilters::default()
         };
-        let result = plan(&config, now(), &filters, &fs).unwrap();
+        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &mb }).unwrap();
         let creates: Vec<_> = result
             .operations
             .iter()
@@ -4578,7 +4567,7 @@ local_retention = "transient"
         fs.external_snapshots
             .insert(("D1".to_string(), "sv1".to_string()), vec![]);
 
-        let plan = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let plan = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
         let saw_first_send = plan.events.iter().any(|e| {
             matches!(
                 &e.payload,
@@ -4620,7 +4609,7 @@ local_retention = "transient"
         fs.pin_files
             .insert((PathBuf::from("/snap/sv1"), "D1".to_string()), parent.clone());
 
-        let plan = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let plan = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
         // Sanity: ensure an incremental was actually chosen (else the test is moot).
         let any_incremental = plan
             .operations
@@ -4641,7 +4630,7 @@ local_retention = "transient"
             }
         }
         let fs = MockFileSystemState::new();
-        let plan = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let plan = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
         let saw_disabled_defer = plan.events.iter().any(|e| match &e.payload {
             EventPayload::PlannerDefer { reason, scope } => {
                 reason == "disabled" && *scope == DeferScope::Subvolume
@@ -4665,7 +4654,7 @@ local_retention = "transient"
             .insert("sv1".to_string(), vec![snap("20260322-1455-one")]);
         // Drive D1 not mounted.
 
-        let plan = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let plan = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
         let saw_drive_defer = plan.events.iter().any(|e| match &e.payload {
             EventPayload::PlannerDefer { reason, scope } => {
                 reason.contains("not mounted") && *scope == DeferScope::Drive
@@ -4687,7 +4676,7 @@ local_retention = "transient"
             }
         }
         let fs = MockFileSystemState::new();
-        let plan = plan(&config, now(), &PlanFilters::default(), &fs).unwrap();
+        let plan = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
         let sv2_defers: Vec<_> = plan
             .events
             .iter()

@@ -56,9 +56,6 @@ pub trait FilesystemQuery {
 
     /// Collect all pinned snapshot names for a subvolume across all drives.
     fn pinned_snapshots(&self, local_dir: &Path, drive_labels: &[String]) -> HashSet<SnapshotName>;
-
-    /// Get the BTRFS generation counter for a subvolume or snapshot path.
-    fn subvolume_generation(&self, path: &Path) -> crate::error::Result<u64>;
 }
 
 // ── HistoryQuery (SQLite is history) ──────────────────────────────────────
@@ -110,3 +107,19 @@ pub trait HistoryQuery {
 pub trait FileSystemState: FilesystemQuery + HistoryQuery {}
 
 impl<T: FilesystemQuery + HistoryQuery + ?Sized> FileSystemState for T {}
+
+// ── Observation ───────────────────────────────────────────────────────────
+
+/// The read-only world a pure decision function observes: the filesystem of
+/// truth, the SQLite history, and the btrfs generation-read seam. Threaded as
+/// `&Observation` through `plan::plan` and `awareness::assess` so those
+/// functions read state through three narrow, non-mutating trait objects
+/// rather than a single wide one (ADR-100, ADR-101, UPI 052).
+pub struct Observation<'a> {
+    /// Filesystem of truth: snapshot dirs, pin files, mounts, free space.
+    pub fs: &'a dyn FilesystemQuery,
+    /// SQLite history: send sizes, calibration, send/drive timestamps.
+    pub history: &'a dyn HistoryQuery,
+    /// Read-only btrfs generation counter access.
+    pub btrfs: &'a dyn crate::btrfs::BtrfsRead,
+}

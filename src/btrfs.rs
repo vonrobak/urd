@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -16,9 +16,18 @@ pub struct SendResult {
     pub bytes_transferred: Option<u64>,
 }
 
+/// Read-only btrfs queries. Split out of `BtrfsOps` so the planner and
+/// awareness can read generation counters through a non-mutating seam
+/// (ADR-100, ADR-101): `&dyn BtrfsRead` cannot upcast to `&dyn BtrfsOps`,
+/// so a read-only caller gets no mutators at the type level.
+pub trait BtrfsRead {
+    /// Query the BTRFS generation counter for a subvolume or snapshot.
+    fn subvolume_generation(&self, path: &Path) -> crate::error::Result<u64>;
+}
+
 /// Trait abstracting btrfs operations. `RealBtrfs` calls the btrfs binary;
 /// `MockBtrfs` records calls for testing.
-pub trait BtrfsOps {
+pub trait BtrfsOps: BtrfsRead {
     fn create_readonly_snapshot(&self, source: &Path, dest: &Path) -> crate::error::Result<()>;
     fn send_receive(
         &self,
@@ -93,6 +102,15 @@ impl RealBtrfs {
             bytes_counter,
             supports_compressed_data,
         }
+    }
+
+    /// Build a handle for read-only use (`BtrfsRead` generation queries).
+    /// A generation read needs no live byte counter and no compression
+    /// negotiation, so both are defaulted (UPI 052). Used by `plan`/`assess`
+    /// call sites that read generations but never send.
+    #[must_use]
+    pub fn for_reads(btrfs_path: &str) -> Self {
+        Self::new(btrfs_path, Arc::new(AtomicU64::new(0)), false)
     }
 }
 
@@ -410,7 +428,7 @@ impl BtrfsOps for RealBtrfs {
     }
 }
 
-// ── Standalone generation query ────────────────────────────────────────
+// ── Generation query (BtrfsRead) ───────────────────────────────────────
 
 /// Parse the `Generation:` field from `btrfs subvolume show` output.
 #[must_use]
@@ -424,48 +442,48 @@ pub fn parse_generation(output: &str) -> Option<u64> {
     None
 }
 
-/// Query the BTRFS generation counter for a subvolume or snapshot.
-///
-/// Standalone function (not on `BtrfsOps` trait) — same pattern as
-/// `crate::drives::filesystem_free_bytes`. All btrfs subprocess calls
-/// remain in `btrfs.rs` (invariant #2).
-pub fn subvolume_generation(path: &Path) -> crate::error::Result<u64> {
-    let output = Command::new("sudo")
-        .env("LC_ALL", "C")
-        .arg("btrfs")
-        .args(["subvolume", "show"])
-        .arg(path)
-        .output()
-        .map_err(|e| UrdError::Btrfs {
+impl BtrfsRead for RealBtrfs {
+    /// Query the BTRFS generation counter for a subvolume or snapshot.
+    ///
+    /// All btrfs subprocess calls remain in `btrfs.rs` (invariant #2).
+    fn subvolume_generation(&self, path: &Path) -> crate::error::Result<u64> {
+        let output = Command::new("sudo")
+            .env("LC_ALL", "C")
+            .arg("btrfs")
+            .args(["subvolume", "show"])
+            .arg(path)
+            .output()
+            .map_err(|e| UrdError::Btrfs {
+                context: BtrfsErrorContext {
+                    operation: BtrfsOperation::Show,
+                    exit_code: None,
+                    stderr: e.to_string(),
+                    bytes_transferred: None,
+                },
+            })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            return Err(UrdError::Btrfs {
+                context: BtrfsErrorContext {
+                    operation: BtrfsOperation::Show,
+                    exit_code: output.status.code(),
+                    stderr,
+                    bytes_transferred: None,
+                },
+            });
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        parse_generation(&stdout).ok_or_else(|| UrdError::Btrfs {
             context: BtrfsErrorContext {
                 operation: BtrfsOperation::Show,
                 exit_code: None,
-                stderr: e.to_string(),
+                stderr: "Generation field not found in btrfs subvolume show output".to_string(),
                 bytes_transferred: None,
             },
-        })?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        return Err(UrdError::Btrfs {
-            context: BtrfsErrorContext {
-                operation: BtrfsOperation::Show,
-                exit_code: output.status.code(),
-                stderr,
-                bytes_transferred: None,
-            },
-        });
+        })
     }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    parse_generation(&stdout).ok_or_else(|| UrdError::Btrfs {
-        context: BtrfsErrorContext {
-            operation: BtrfsOperation::Show,
-            exit_code: None,
-            stderr: "Generation field not found in btrfs subvolume show output".to_string(),
-            bytes_transferred: None,
-        },
-    })
 }
 
 // ── MockBtrfs ───────────────────────────────────────────────────────────
@@ -504,6 +522,10 @@ pub struct MockBtrfs {
     pub mock_bytes_transferred: RefCell<Option<u64>>,
     /// Partial bytes to report when a send fails (simulates partial transfer)
     pub mock_fail_send_bytes: RefCell<Option<u64>>,
+    /// Generation counters for subvolume/snapshot paths.
+    pub generations: RefCell<HashMap<PathBuf, u64>>,
+    /// Paths for which subvolume_generation() should return an error.
+    pub fail_generations: RefCell<HashSet<PathBuf>>,
 }
 
 #[allow(dead_code)]
@@ -520,6 +542,8 @@ impl MockBtrfs {
             free_bytes: RefCell::new(1_000_000_000_000), // 1TB default
             mock_bytes_transferred: RefCell::new(None),
             mock_fail_send_bytes: RefCell::new(None),
+            generations: RefCell::new(HashMap::new()),
+            fail_generations: RefCell::new(HashSet::new()),
         }
     }
 
@@ -532,6 +556,28 @@ impl MockBtrfs {
 impl Default for MockBtrfs {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl BtrfsRead for MockBtrfs {
+    fn subvolume_generation(&self, path: &Path) -> crate::error::Result<u64> {
+        if self.fail_generations.borrow().contains(path) {
+            return Err(UrdError::Io {
+                path: path.to_path_buf(),
+                source: std::io::Error::other("mock: generation query failed"),
+            });
+        }
+        self.generations
+            .borrow()
+            .get(path)
+            .copied()
+            .ok_or_else(|| UrdError::Io {
+                path: path.to_path_buf(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "mock: no generation configured",
+                ),
+            })
     }
 }
 
@@ -664,6 +710,25 @@ mod tests {
                 .to_string()
                 .contains("mock: create snapshot failed")
         );
+    }
+
+    #[test]
+    fn mock_subvolume_generation_lookup_and_failure() {
+        let mock = MockBtrfs::new();
+        let path = PathBuf::from("/data/sv1");
+        let missing = PathBuf::from("/data/sv2");
+        let failing = PathBuf::from("/data/sv3");
+
+        mock.generations.borrow_mut().insert(path.clone(), 42);
+        mock.fail_generations.borrow_mut().insert(failing.clone());
+
+        // Configured generation returns the value.
+        assert_eq!(mock.subvolume_generation(&path).unwrap(), 42);
+        // Unconfigured path errors (caller falls open).
+        assert!(mock.subvolume_generation(&missing).is_err());
+        // Injected failure errors (caller falls open). fail_generations is
+        // checked before the lookup, so it wins even if also present.
+        assert!(mock.subvolume_generation(&failing).is_err());
     }
 
     #[test]

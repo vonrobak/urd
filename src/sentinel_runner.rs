@@ -23,7 +23,7 @@ use crate::drives::{self, DriveAvailability};
 use crate::heartbeat;
 use crate::notify::{self, Notification, NotificationEvent, Urgency};
 use crate::output::{SentinelCircuitState, SentinelPromiseState, SentinelStateFile};
-use crate::plan::RealFileSystemState;
+use crate::plan::{Observation, RealFileSystemState};
 use crate::sentinel::{
     self, CircuitBreakerConfig, PromiseSnapshot, SentinelAction, SentinelEvent, SentinelState,
     TransitionResult,
@@ -376,8 +376,14 @@ impl SentinelRunner {
         let fs = RealFileSystemState {
             state: state_db.as_ref(),
         };
+        let assess_btrfs = crate::btrfs::RealBtrfs::for_reads(&self.config.general.btrfs_path);
+        let observation = Observation {
+            fs: &fs,
+            history: &fs,
+            btrfs: &assess_btrfs,
+        };
 
-        let mut assessments = awareness::assess(&self.config, now, &fs);
+        let mut assessments = awareness::assess(&self.config, now, &observation);
         advice::overlay_offsite_freshness(&mut assessments, &self.config);
 
         // Emit promise-transition events when the originating event was
