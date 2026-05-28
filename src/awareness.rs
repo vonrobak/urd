@@ -7,7 +7,7 @@
 // command, heartbeat, sentinel, and (future) visual feedback model.
 //
 // Design: follows the planner pattern — pure function, no I/O, all external
-// data flows through the `FileSystemState` trait.
+// data flows through the `Observation` query traits.
 
 use chrono::{Duration, NaiveDateTime};
 
@@ -865,7 +865,7 @@ fn compute_overall_status(local: &LocalAssessment, drives: &[DriveAssessment]) -
 
 /// Compute chain health for a subvolume on a specific drive.
 ///
-/// Pure function: uses already-fetched snapshot lists and `FileSystemState`
+/// Pure function: uses already-fetched snapshot lists and `FilesystemQuery`
 /// for pin file reads. No direct filesystem I/O.
 fn assess_chain_health(
     obs: &Observation,

@@ -5,7 +5,7 @@ use crate::output::{
     OutputMode, PlanOperationEntry, PlanOutput, PlanSummaryOutput, SkipCategory,
     SkippedSubvolume,
 };
-use crate::plan::{self, FileSystemState, Observation, PlanFilters, RealFileSystemState};
+use crate::plan::{self, HistoryQuery, Observation, PlanFilters, RealFileSystemState};
 use crate::state::StateDb;
 use crate::types::PlannedOperation;
 use crate::voice;
@@ -46,7 +46,7 @@ pub fn run(config: Config, args: PlanArgs, mode: OutputMode) -> anyhow::Result<(
 #[must_use]
 pub fn build_plan_output(
     backup_plan: &crate::types::BackupPlan,
-    fs_state: &dyn FileSystemState,
+    fs_state: &dyn HistoryQuery,
     config: &Config,
 ) -> PlanOutput {
     let summary = backup_plan.summary();
@@ -131,7 +131,7 @@ pub fn populate_token_warnings(
 
 fn build_operation_entry(
     op: &PlannedOperation,
-    fs_state: &dyn FileSystemState,
+    fs_state: &dyn HistoryQuery,
 ) -> PlanOperationEntry {
     match op {
         PlannedOperation::CreateSnapshot {

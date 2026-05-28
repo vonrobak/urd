@@ -5,7 +5,7 @@ use crate::cli::VerifyArgs;
 use crate::config::Config;
 use crate::drives;
 use crate::output::{OutputMode, VerifyCheck, VerifyDrive, VerifyOutput, VerifySubvolume};
-use crate::plan::{FileSystemState, FilesystemQuery, RealFileSystemState};
+use crate::plan::{FilesystemQuery, RealFileSystemState};
 use crate::voice;
 
 pub fn run(config: Config, args: VerifyArgs, mode: OutputMode) -> anyhow::Result<()> {
@@ -277,7 +277,7 @@ pub(crate) fn collect_verify_output(config: &Config, args: &VerifyArgs) -> Verif
 }
 
 fn collect_orphan_checks(
-    fs_state: &dyn FileSystemState,
+    fs_state: &dyn FilesystemQuery,
     drive: &crate::config::DriveConfig,
     subvol_name: &str,
     pin: &crate::types::SnapshotName,

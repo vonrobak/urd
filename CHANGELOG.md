@@ -24,6 +24,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`BtrfsOps: BtrfsRead`), so pure planners read generations through a non-mutating
   seam that cannot upcast to the mutating ops. Fail-open generation semantics
   preserved verbatim. No behavior, on-disk, or config-schema change.
+- **Internal refactor: command-layer tail narrowing + bridge removal, PR 3 (final)**
+  (UPI 052). Narrowed the 13 remaining `&dyn FileSystemState` command-layer
+  signatures (in `init`, `verify`, `plan_cmd`, `backup`) to the single query half
+  each uses, then deleted the now-callerless `FileSystemState` bridge supertrait,
+  its blanket impl, and the `plan` re-export. Completes the UPI 052 arc:
+  `FileSystemState` no longer exists in the source tree. No behavior, on-disk, or
+  config-schema change; zero test edits.
 
 ## [0.21.0] - 2026-05-25
 
