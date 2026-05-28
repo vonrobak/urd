@@ -4,9 +4,8 @@
 //! [`FilesystemQuery`] is the filesystem-of-truth + drive-availability
 //! surface (snapshot dirs, pin files, mounts, free space). [`HistoryQuery`]
 //! is the SQLite-history surface (send sizes, calibration, send/drive
-//! timestamps). The [`FileSystemState`] bridge supertrait + blanket impl
-//! preserve every existing `&dyn FileSystemState` caller while the seam is
-//! narrowed incrementally (UPI 052).
+//! timestamps). Each command-layer caller depends on exactly the half it
+//! uses (UPI 052).
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -96,17 +95,6 @@ pub trait HistoryQuery {
     /// None when no successful send has ever completed for this drive.
     fn last_successful_operation_at(&self, drive_label: &str) -> Option<NaiveDateTime>;
 }
-
-// ── FileSystemState bridge ────────────────────────────────────────────────
-
-/// Bridge supertrait uniting both query halves. Preserves every existing
-/// `&dyn FileSystemState` caller and `MockFileSystemState` setup unchanged
-/// while the seam is narrowed incrementally (UPI 052). The blanket impl
-/// means any type implementing both halves is automatically a
-/// `FileSystemState`.
-pub trait FileSystemState: FilesystemQuery + HistoryQuery {}
-
-impl<T: FilesystemQuery + HistoryQuery + ?Sized> FileSystemState for T {}
 
 // ── Observation ───────────────────────────────────────────────────────────
 

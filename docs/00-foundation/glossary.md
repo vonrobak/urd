@@ -293,7 +293,7 @@ reads, rather than on the full fused surface.
 | `HistoryQuery` | The SQLite-history half: last send sizes (same-drive and cross-drive), calibrated size, and send/drive timestamps. Answers "what happened before?" Lives in `observation.rs`. SQLite failures here never block backups (ADR-102). |
 | `BtrfsRead` | The read-only btrfs seam: `subvolume_generation(path)`. Supertrait of `BtrfsOps` (`BtrfsOps: BtrfsRead`), so a read-only caller takes `&dyn BtrfsRead` and cannot upcast to the mutating `BtrfsOps` (ADR-100, ADR-101). `RealBtrfs` runs `sudo btrfs subvolume show`; `MockBtrfs` looks up injected generations. Lives in `btrfs.rs`. |
 | `Observation` | The read-only world a pure decision function observes: `{ fs: &dyn FilesystemQuery, history: &dyn HistoryQuery, btrfs: &dyn BtrfsRead }`. Threaded as `&Observation` through `plan::plan` and `awareness::assess` (UPI 052) so they read state through three narrow, non-mutating trait objects. Lives in `observation.rs`. |
-| `FileSystemState` | Bridge supertrait (`FilesystemQuery + HistoryQuery`) with a blanket impl. Preserves every pre-split `&dyn FileSystemState` caller and mock while the seam is narrowed incrementally; slated for removal once no caller needs both halves. |
+| `FileSystemState` | **Retired (UPI 052, 2026-05-29).** Was a bridge supertrait (`FilesystemQuery + HistoryQuery`) with a blanket impl, kept to preserve pre-split callers while the seam was narrowed. Every command-layer caller now depends on exactly the half it uses, so the bridge was deleted. Use `FilesystemQuery` / `HistoryQuery` / `Observation` instead. The concrete `RealFileSystemState` / `MockFileSystemState` types (which impl both halves) are unaffected. |
 
 Source: `observation.rs`, `btrfs.rs`, ADR-100, ADR-101, ADR-102.
 

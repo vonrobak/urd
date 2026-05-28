@@ -57,9 +57,9 @@ fn stamp_context(events: &mut [Event], subvolume: Option<&str>, drive_label: Opt
 
 // The read-side query traits now live in `crate::observation`, split along
 // the ADR-102 axis (filesystem is truth, SQLite is history). Re-exported here
-// so existing `crate::plan::{FileSystemState, ..}` import paths keep resolving
-// while the seam is narrowed incrementally (UPI 052).
-pub use crate::observation::{FileSystemState, FilesystemQuery, HistoryQuery, Observation};
+// so existing `crate::plan::{FilesystemQuery, HistoryQuery, ..}` import paths
+// keep resolving (UPI 052).
+pub use crate::observation::{FilesystemQuery, HistoryQuery, Observation};
 
 // ── Size estimation helper ──────────────────────────────────────────────
 

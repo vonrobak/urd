@@ -26,7 +26,7 @@ use crate::output::{
     SubvolumeExtras, SubvolumeSummary, TransitionEvent,
 };
 use crate::notify;
-use crate::plan::{self, FileSystemState, PlanFilters, RealFileSystemState};
+use crate::plan::{self, FilesystemQuery, HistoryQuery, PlanFilters, RealFileSystemState};
 use crate::pools;
 use crate::sentinel_runner;
 use crate::preflight;
@@ -651,7 +651,7 @@ fn write_metrics_after_execution(
     result: &crate::executor::ExecutionResult,
     plan: &crate::types::BackupPlan,
     now: chrono::NaiveDateTime,
-    fs_state: &dyn FileSystemState,
+    fs_state: &dyn FilesystemQuery,
     churn_views: &HashMap<String, ChurnHeartbeatFields>,
     observability: &PoolObservability,
 ) -> anyhow::Result<()> {
@@ -717,7 +717,7 @@ fn write_metrics_for_skipped(
     config: &Config,
     plan: &crate::types::BackupPlan,
     now: chrono::NaiveDateTime,
-    fs_state: &dyn FileSystemState,
+    fs_state: &dyn FilesystemQuery,
     churn_views: &HashMap<String, ChurnHeartbeatFields>,
     observability: &PoolObservability,
 ) -> anyhow::Result<()> {
@@ -817,7 +817,7 @@ struct PoolObservability {
 fn gather_pool_observability(
     config: &Config,
     churn_views: &HashMap<String, ChurnHeartbeatFields>,
-    fs_state: &dyn FileSystemState,
+    fs_state: &dyn FilesystemQuery,
 ) -> PoolObservability {
     let source_pools = pools::detect_source_pools(config);
 
@@ -1029,7 +1029,7 @@ fn build_empty_plan_explanation(
 fn append_skipped_metrics(
     config: &Config,
     plan: &crate::types::BackupPlan,
-    fs_state: &dyn FileSystemState,
+    fs_state: &dyn FilesystemQuery,
     subvolume_metrics: &mut Vec<SubvolumeMetrics>,
     already_emitted: &HashSet<String>,
     churn_views: &HashMap<String, ChurnHeartbeatFields>,
@@ -1102,7 +1102,7 @@ fn write_global_metrics(
 fn count_local_snapshots(
     config: &Config,
     subvol_name: &str,
-    fs_state: &dyn FileSystemState,
+    fs_state: &dyn FilesystemQuery,
 ) -> usize {
     if let Some(root) = config.snapshot_root_for(subvol_name) {
         fs_state
@@ -1117,7 +1117,7 @@ fn count_local_snapshots(
 fn count_external_snapshots(
     config: &Config,
     subvol_name: &str,
-    fs_state: &dyn FileSystemState,
+    fs_state: &dyn FilesystemQuery,
 ) -> usize {
     // First mounted drive's count (for bash compat)
     for drive in &config.drives {
@@ -1159,7 +1159,7 @@ pub(crate) type SizeEstimates = HashMap<(String, String), Option<u64>>;
 /// sends; same-drive > cross-drive for incrementals).
 fn build_size_estimates(
     plan: &BackupPlan,
-    fs_state: &dyn FileSystemState,
+    fs_state: &dyn HistoryQuery,
 ) -> SizeEstimates {
     let mut estimates = HashMap::new();
     for op in &plan.operations {

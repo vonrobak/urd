@@ -8,7 +8,7 @@ use crate::output::{
     InitCheck, InitDriveStatus, InitIncomplete, InitOutput, InitPinFile, InitSnapshotCount,
     InitStatus, OutputMode,
 };
-use crate::plan::{FileSystemState, RealFileSystemState};
+use crate::plan::{FilesystemQuery, RealFileSystemState};
 use crate::state::StateDb;
 
 pub fn run(config: Config) -> anyhow::Result<()> {
@@ -40,7 +40,7 @@ pub fn run(config: Config) -> anyhow::Result<()> {
 }
 
 /// Collect all init check data. Pure-ish (does I/O for checks, but produces structured output).
-fn collect_init_data(config: &Config, fs_state: &dyn FileSystemState) -> InitOutput {
+fn collect_init_data(config: &Config, fs_state: &dyn FilesystemQuery) -> InitOutput {
     let infrastructure = collect_infrastructure_checks(config);
     let subvolume_sources = collect_subvolume_sources(config);
     let snapshot_roots = collect_snapshot_roots(config);
@@ -288,7 +288,7 @@ fn collect_pin_files(config: &Config) -> Vec<InitPinFile> {
 
 fn collect_incomplete_snapshots(
     config: &Config,
-    fs_state: &dyn FileSystemState,
+    fs_state: &dyn FilesystemQuery,
 ) -> Vec<InitIncomplete> {
     let mut incompletes = Vec::new();
 
@@ -342,7 +342,7 @@ fn collect_incomplete_snapshots(
 
 fn collect_snapshot_counts(
     config: &Config,
-    fs_state: &dyn FileSystemState,
+    fs_state: &dyn FilesystemQuery,
 ) -> Vec<InitSnapshotCount> {
     config
         .subvolumes
