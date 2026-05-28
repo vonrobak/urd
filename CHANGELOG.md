@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Internal refactor: `FileSystemState` read-side split, PR 1** (UPI 052).
+  Split the 14-method `plan::FileSystemState` trait into two narrow query traits
+  along the ADR-102 axis — `FilesystemQuery` (filesystem-of-truth + drive
+  availability) and `HistoryQuery` (SQLite history) — in a new `observation.rs`
+  module. A `FileSystemState` bridge supertrait + blanket impl keeps every
+  existing caller and mock compiling unchanged while the seam is narrowed
+  incrementally in later PRs. No behavior, on-disk, or config-schema change.
+
 ## [0.21.0] - 2026-05-25
 
 ### Added

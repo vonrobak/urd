@@ -1,8 +1,7 @@
 use crate::cli::CalibrateArgs;
 use crate::config::Config;
 use crate::output::{CalibrateEntry, CalibrateOutput, CalibrateResult, OutputMode};
-use crate::plan::FileSystemState;
-use crate::plan::RealFileSystemState;
+use crate::plan::{FilesystemQuery, RealFileSystemState};
 use crate::state::StateDb;
 use crate::voice;
 

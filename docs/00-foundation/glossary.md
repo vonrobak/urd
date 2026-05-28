@@ -280,6 +280,21 @@ The suggested shape preserves the outer-edge span (365 days) while thinning the
 interior — same data cost, fewer pins to manage. The tightened shape shortens
 the outer edge in response to destination pressure; that does reduce data cost.
 
+## Cluster: Read-side query seams (ADR-102)
+
+The read side of the backup pipeline is split along the ADR-102 axis —
+*filesystem is truth, SQLite is history* — into two narrow query traits in
+`observation.rs` (UPI 052). A caller depends only on the half it actually
+reads, rather than on the full fused surface.
+
+| Term | Meaning |
+|------|---------|
+| `FilesystemQuery` | The filesystem-of-truth + drive-availability half: local/external snapshot listings, pin files, mount/availability, free space, and the BTRFS generation counter. Answers "what is on disk right now?" Lives in `observation.rs`. |
+| `HistoryQuery` | The SQLite-history half: last send sizes (same-drive and cross-drive), calibrated size, and send/drive timestamps. Answers "what happened before?" Lives in `observation.rs`. SQLite failures here never block backups (ADR-102). |
+| `FileSystemState` | Bridge supertrait (`FilesystemQuery + HistoryQuery`) with a blanket impl. Preserves every pre-split `&dyn FileSystemState` caller and mock while the seam is narrowed incrementally; slated for removal once no caller needs both halves. |
+
+Source: `observation.rs`, ADR-102.
+
 ## Flagged Ambiguities
 
 Terms in transition, or with a known gap between their canonical definition and

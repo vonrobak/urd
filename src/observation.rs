@@ -1,0 +1,112 @@
+//! Read-side query traits, split along the ADR-102 axis
+//! (*filesystem is truth, SQLite is history*).
+//!
+//! [`FilesystemQuery`] is the filesystem-of-truth + drive-availability
+//! surface (snapshot dirs, pin files, mounts, free space). [`HistoryQuery`]
+//! is the SQLite-history surface (send sizes, calibration, send/drive
+//! timestamps). The [`FileSystemState`] bridge supertrait + blanket impl
+//! preserve every existing `&dyn FileSystemState` caller while the seam is
+//! narrowed incrementally (UPI 052).
+
+use std::collections::HashSet;
+use std::path::Path;
+
+use chrono::NaiveDateTime;
+
+use crate::config::DriveConfig;
+use crate::drives::DriveAvailability;
+use crate::types::{DriveEvent, SendKind, SnapshotName};
+
+// ── FilesystemQuery (filesystem is truth) ─────────────────────────────────
+
+/// Filesystem-of-truth and drive-availability queries: snapshot directories,
+/// pin files, mounts, and free space. The "what is on disk right now?" half.
+pub trait FilesystemQuery {
+    /// List snapshot names in a local snapshot directory.
+    fn local_snapshots(
+        &self,
+        root: &Path,
+        subvol_name: &str,
+    ) -> crate::error::Result<Vec<SnapshotName>>;
+
+    /// List snapshot names on an external drive for a subvolume.
+    fn external_snapshots(
+        &self,
+        drive: &DriveConfig,
+        subvol_name: &str,
+    ) -> crate::error::Result<Vec<SnapshotName>>;
+
+    /// Check if a drive is currently mounted.
+    fn is_drive_mounted(&self, drive: &DriveConfig) -> bool {
+        self.drive_availability(drive) == DriveAvailability::Available
+    }
+
+    /// Check if a drive is mounted and UUID-verified.
+    fn drive_availability(&self, drive: &DriveConfig) -> DriveAvailability;
+
+    /// Get free bytes on the filesystem containing the given path.
+    fn filesystem_free_bytes(&self, path: &Path) -> crate::error::Result<u64>;
+
+    /// Read the pin file for a specific drive from a local snapshot directory.
+    fn read_pin_file(
+        &self,
+        local_dir: &Path,
+        drive_label: &str,
+    ) -> crate::error::Result<Option<SnapshotName>>;
+
+    /// Collect all pinned snapshot names for a subvolume across all drives.
+    fn pinned_snapshots(&self, local_dir: &Path, drive_labels: &[String]) -> HashSet<SnapshotName>;
+
+    /// Get the BTRFS generation counter for a subvolume or snapshot path.
+    fn subvolume_generation(&self, path: &Path) -> crate::error::Result<u64>;
+}
+
+// ── HistoryQuery (SQLite is history) ──────────────────────────────────────
+
+/// SQLite-history queries: send sizes, calibration, and send/drive
+/// timestamps. The "what happened before?" half.
+pub trait HistoryQuery {
+    /// Get the bytes_transferred from the most recent successful send of a given kind.
+    /// Returns None if no history exists (e.g., first-ever send).
+    fn last_send_size(
+        &self,
+        subvol_name: &str,
+        drive_label: &str,
+        send_kind: SendKind,
+    ) -> Option<u64>;
+
+    /// Get the bytes_transferred from the most recent successful send of a given kind
+    /// across **all** drives. Cross-drive fallback for drive swap scenarios.
+    fn last_send_size_any_drive(&self, subvol_name: &str, send_kind: SendKind) -> Option<u64>;
+
+    /// Get a calibrated size estimate for a subvolume (from `urd calibrate`).
+    /// Returns `(estimated_bytes, measured_at)` or None if not calibrated.
+    fn calibrated_size(&self, subvol_name: &str) -> Option<(u64, String)>;
+
+    /// Get the timestamp of the most recent successful send (full or incremental)
+    /// for a subvolume to a specific drive. Returns None if no send history exists.
+    fn last_successful_send_time(
+        &self,
+        subvol_name: &str,
+        drive_label: &str,
+    ) -> Option<NaiveDateTime>;
+
+    /// Most recent mount/unmount event for a drive from `drive_connections`.
+    /// None if no event recorded (drive never seen by sentinel).
+    fn last_drive_event(&self, drive_label: &str) -> Option<DriveEvent>;
+
+    /// Most recent successful send timestamp for this drive (any subvolume).
+    /// None when no successful send has ever completed for this drive.
+    fn last_successful_operation_at(&self, drive_label: &str) -> Option<NaiveDateTime>;
+}
+
+// ── FileSystemState bridge ────────────────────────────────────────────────
+
+/// Bridge supertrait uniting both query halves. Preserves every existing
+/// `&dyn FileSystemState` caller and `MockFileSystemState` setup unchanged
+/// while the seam is narrowed incrementally (UPI 052). The blanket impl
+/// means any type implementing both halves is automatically a
+/// `FileSystemState`.
+pub trait FileSystemState: FilesystemQuery + HistoryQuery {}
+
+impl<T: FilesystemQuery + HistoryQuery + ?Sized> FileSystemState for T {}

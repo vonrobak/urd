@@ -55,81 +55,11 @@ fn stamp_context(events: &mut [Event], subvolume: Option<&str>, drive_label: Opt
     }
 }
 
-// ── FileSystemState trait ───────────────────────────────────────────────
-
-/// Abstraction over filesystem state for testing.
-pub trait FileSystemState {
-    /// List snapshot names in a local snapshot directory.
-    fn local_snapshots(
-        &self,
-        root: &Path,
-        subvol_name: &str,
-    ) -> crate::error::Result<Vec<SnapshotName>>;
-
-    /// List snapshot names on an external drive for a subvolume.
-    fn external_snapshots(
-        &self,
-        drive: &DriveConfig,
-        subvol_name: &str,
-    ) -> crate::error::Result<Vec<SnapshotName>>;
-
-    /// Check if a drive is currently mounted.
-    fn is_drive_mounted(&self, drive: &DriveConfig) -> bool {
-        self.drive_availability(drive) == DriveAvailability::Available
-    }
-
-    /// Check if a drive is mounted and UUID-verified.
-    fn drive_availability(&self, drive: &DriveConfig) -> DriveAvailability;
-
-    /// Get free bytes on the filesystem containing the given path.
-    fn filesystem_free_bytes(&self, path: &Path) -> crate::error::Result<u64>;
-
-    /// Read the pin file for a specific drive from a local snapshot directory.
-    fn read_pin_file(
-        &self,
-        local_dir: &Path,
-        drive_label: &str,
-    ) -> crate::error::Result<Option<SnapshotName>>;
-
-    /// Collect all pinned snapshot names for a subvolume across all drives.
-    fn pinned_snapshots(&self, local_dir: &Path, drive_labels: &[String]) -> HashSet<SnapshotName>;
-
-    /// Get the bytes_transferred from the most recent successful send of a given kind.
-    /// Returns None if no history exists (e.g., first-ever send).
-    fn last_send_size(
-        &self,
-        subvol_name: &str,
-        drive_label: &str,
-        send_kind: SendKind,
-    ) -> Option<u64>;
-
-    /// Get the bytes_transferred from the most recent successful send of a given kind
-    /// across **all** drives. Cross-drive fallback for drive swap scenarios.
-    fn last_send_size_any_drive(&self, subvol_name: &str, send_kind: SendKind) -> Option<u64>;
-
-    /// Get a calibrated size estimate for a subvolume (from `urd calibrate`).
-    /// Returns `(estimated_bytes, measured_at)` or None if not calibrated.
-    fn calibrated_size(&self, subvol_name: &str) -> Option<(u64, String)>;
-
-    /// Get the BTRFS generation counter for a subvolume or snapshot path.
-    fn subvolume_generation(&self, path: &Path) -> crate::error::Result<u64>;
-
-    /// Get the timestamp of the most recent successful send (full or incremental)
-    /// for a subvolume to a specific drive. Returns None if no send history exists.
-    fn last_successful_send_time(
-        &self,
-        subvol_name: &str,
-        drive_label: &str,
-    ) -> Option<NaiveDateTime>;
-
-    /// Most recent mount/unmount event for a drive from `drive_connections`.
-    /// None if no event recorded (drive never seen by sentinel).
-    fn last_drive_event(&self, drive_label: &str) -> Option<DriveEvent>;
-
-    /// Most recent successful send timestamp for this drive (any subvolume).
-    /// None when no successful send has ever completed for this drive.
-    fn last_successful_operation_at(&self, drive_label: &str) -> Option<NaiveDateTime>;
-}
+// The read-side query traits now live in `crate::observation`, split along
+// the ADR-102 axis (filesystem is truth, SQLite is history). Re-exported here
+// so existing `crate::plan::{FileSystemState, ..}` import paths keep resolving
+// while the seam is narrowed incrementally (UPI 052).
+pub use crate::observation::{FileSystemState, FilesystemQuery, HistoryQuery};
 
 // ── Size estimation helper ──────────────────────────────────────────────
 
@@ -1333,7 +1263,7 @@ pub struct RealFileSystemState<'a> {
     pub state: Option<&'a crate::state::StateDb>,
 }
 
-impl FileSystemState for RealFileSystemState<'_> {
+impl FilesystemQuery for RealFileSystemState<'_> {
     fn local_snapshots(
         &self,
         root: &Path,
@@ -1371,6 +1301,12 @@ impl FileSystemState for RealFileSystemState<'_> {
         crate::chain::find_pinned_snapshots(local_dir, drive_labels)
     }
 
+    fn subvolume_generation(&self, path: &Path) -> crate::error::Result<u64> {
+        crate::btrfs::subvolume_generation(path)
+    }
+}
+
+impl HistoryQuery for RealFileSystemState<'_> {
     fn last_send_size(
         &self,
         subvol_name: &str,
@@ -1415,10 +1351,6 @@ impl FileSystemState for RealFileSystemState<'_> {
     fn calibrated_size(&self, subvol_name: &str) -> Option<(u64, String)> {
         self.state
             .and_then(|db| db.calibrated_size(subvol_name).ok().flatten())
-    }
-
-    fn subvolume_generation(&self, path: &Path) -> crate::error::Result<u64> {
-        crate::btrfs::subvolume_generation(path)
     }
 
     fn last_successful_send_time(
@@ -1548,7 +1480,7 @@ impl MockFileSystemState {
 }
 
 #[cfg(test)]
-impl FileSystemState for MockFileSystemState {
+impl FilesystemQuery for MockFileSystemState {
     fn local_snapshots(
         &self,
         _root: &Path,
@@ -1630,6 +1562,28 @@ impl FileSystemState for MockFileSystemState {
         pinned
     }
 
+    fn subvolume_generation(&self, path: &Path) -> crate::error::Result<u64> {
+        if self.fail_generations.contains(path) {
+            return Err(crate::error::UrdError::Io {
+                path: path.to_path_buf(),
+                source: std::io::Error::other("mock: generation query failed"),
+            });
+        }
+        self.generations
+            .get(path)
+            .copied()
+            .ok_or_else(|| crate::error::UrdError::Io {
+                path: path.to_path_buf(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "mock: no generation configured",
+                ),
+            })
+    }
+}
+
+#[cfg(test)]
+impl HistoryQuery for MockFileSystemState {
     fn last_send_size(
         &self,
         subvol_name: &str,
@@ -1654,25 +1608,6 @@ impl FileSystemState for MockFileSystemState {
             .filter(|((sv, _, st), _)| sv == subvol_name && *st == send_kind)
             .map(|(_, &bytes)| bytes)
             .max()
-    }
-
-    fn subvolume_generation(&self, path: &Path) -> crate::error::Result<u64> {
-        if self.fail_generations.contains(path) {
-            return Err(crate::error::UrdError::Io {
-                path: path.to_path_buf(),
-                source: std::io::Error::other("mock: generation query failed"),
-            });
-        }
-        self.generations
-            .get(path)
-            .copied()
-            .ok_or_else(|| crate::error::UrdError::Io {
-                path: path.to_path_buf(),
-                source: std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "mock: no generation configured",
-                ),
-            })
     }
 
     fn calibrated_size(&self, subvol_name: &str) -> Option<(u64, String)> {
