@@ -5,7 +5,7 @@ use crate::cli::VerifyArgs;
 use crate::config::Config;
 use crate::drives;
 use crate::output::{OutputMode, VerifyCheck, VerifyDrive, VerifyOutput, VerifySubvolume};
-use crate::plan::{FileSystemState, RealFileSystemState};
+use crate::plan::{FileSystemState, FilesystemQuery, RealFileSystemState};
 use crate::voice;
 
 pub fn run(config: Config, args: VerifyArgs, mode: OutputMode) -> anyhow::Result<()> {

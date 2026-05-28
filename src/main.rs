@@ -15,6 +15,7 @@ mod heartbeat;
 mod lock;
 mod metrics;
 mod notify;
+mod observation;
 mod output;
 mod plan;
 mod pools;
