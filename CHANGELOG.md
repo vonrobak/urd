@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.1] - 2026-05-29
+
 ### Changed
 - **Internal refactor: `FileSystemState` read-side split, PR 1** (UPI 052).
   Split the 14-method `plan::FileSystemState` trait into two narrow query traits
@@ -721,7 +723,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Defense-in-depth pin file protection for unsent snapshots
 - Per-subvolume error isolation in executor
 
-[Unreleased]: https://github.com/vonrobak/urd/compare/v0.21.0...HEAD
+[Unreleased]: https://github.com/vonrobak/urd/compare/v0.21.1...HEAD
+[0.21.1]: https://github.com/vonrobak/urd/compare/v0.21.0...v0.21.1
 [0.21.0]: https://github.com/vonrobak/urd/compare/v0.20.5...v0.21.0
 [0.20.5]: https://github.com/vonrobak/urd/compare/v0.20.4...v0.20.5
 [0.20.4]: https://github.com/vonrobak/urd/compare/v0.20.3...v0.20.4
