@@ -5,7 +5,7 @@ use crate::output::{
     OutputMode, PlanOperationEntry, PlanOutput, PlanSummaryOutput, SkipCategory,
     SkippedSubvolume,
 };
-use crate::plan::{self, FileSystemState, PlanFilters, RealFileSystemState};
+use crate::plan::{self, FileSystemState, Observation, PlanFilters, RealFileSystemState};
 use crate::state::StateDb;
 use crate::types::PlannedOperation;
 use crate::voice;
@@ -27,7 +27,13 @@ pub fn run(config: Config, args: PlanArgs, mode: OutputMode) -> anyhow::Result<(
     let fs_state = RealFileSystemState {
         state: state_db.as_ref(),
     };
-    let backup_plan = plan::plan(&config, now, &filters, &fs_state)?;
+    let plan_btrfs = crate::btrfs::RealBtrfs::for_reads(&config.general.btrfs_path);
+    let observation = Observation {
+        fs: &fs_state,
+        history: &fs_state,
+        btrfs: &plan_btrfs,
+    };
+    let backup_plan = plan::plan(&config, now, &filters, &observation)?;
 
     let mut output = build_plan_output(&backup_plan, &fs_state, &config);
     populate_token_warnings(&mut output, state_db.as_ref(), &config);

@@ -13,7 +13,8 @@ use chrono::{Duration, NaiveDateTime};
 
 use crate::advice::RedundancyAdvisory;
 use crate::config::{Config, DriveConfig};
-use crate::plan::{self, FileSystemState};
+use crate::observation::Observation;
+use crate::plan;
 use crate::types::{
     DriveEventKind, DriveRole, Interval, LocalRetentionPolicy, SnapshotName,
 };
@@ -391,7 +392,7 @@ pub fn diff_promise_states(
 pub fn assess(
     config: &Config,
     now: NaiveDateTime,
-    fs: &dyn FileSystemState,
+    obs: &Observation,
 ) -> Vec<SubvolAssessment> {
     let resolved = config.resolved_subvolumes();
     let mut assessments = Vec::new();
@@ -402,17 +403,17 @@ pub fn assess(
         .drives
         .iter()
         .map(|d| {
-            let signal = if fs.is_drive_mounted(d) {
+            let signal = if obs.fs.is_drive_mounted(d) {
                 (None, None)
             } else {
-                match fs.last_drive_event(&d.label) {
+                match obs.history.last_drive_event(&d.label) {
                     Some(event) => match event.kind {
                         DriveEventKind::Unmount => {
                             (Some((now - event.at).num_seconds()), None)
                         }
                         DriveEventKind::Mount => (None, None),
                     },
-                    None => match fs.last_successful_operation_at(&d.label) {
+                    None => match obs.history.last_successful_operation_at(&d.label) {
                         Some(op_time) => (None, Some((now - op_time).num_seconds())),
                         None => (None, None),
                     },
@@ -456,7 +457,7 @@ pub fn assess(
 
         // ── Local assessment ────────────────────────────────────────
         let mut advisories = Vec::new();
-        let local_snaps = match fs.local_snapshots(snapshot_root, &subvol.name) {
+        let local_snaps = match obs.fs.local_snapshots(snapshot_root, &subvol.name) {
             Ok(snaps) => snaps,
             Err(e) => {
                 errors.push(format!("failed to read local snapshots: {e}"));
@@ -467,7 +468,7 @@ pub fn assess(
         // Query the source generation once per subvolume and pass to both
         // local and per-drive source-unchanged checks. Fail-open: any error
         // becomes None, which falls back to age-based assessment.
-        let source_gen = fs.subvolume_generation(&subvol.source).ok();
+        let source_gen = obs.btrfs.subvolume_generation(&subvol.source).ok();
 
         // Transient subvolumes return Protected unconditionally from
         // assess_local; skip the generation query for the newest local
@@ -475,7 +476,7 @@ pub fn assess(
         let local_unchanged = !subvol.local_retention.is_transient()
             && local_snaps.iter().max().is_some_and(|newest| {
                 let snap_path = local_dir.join(newest.as_str());
-                local_source_unchanged(fs, source_gen, &snap_path)
+                local_source_unchanged(obs, source_gen, &snap_path)
             });
 
         let local = {
@@ -513,10 +514,10 @@ pub fn assess(
             };
 
             for drive in &effective_drives {
-                let mounted = fs.is_drive_mounted(drive);
+                let mounted = obs.fs.is_drive_mounted(drive);
 
                 let ext_snaps = if mounted {
-                    match fs.external_snapshots(drive, &subvol.name) {
+                    match obs.fs.external_snapshots(drive, &subvol.name) {
                         Ok(snaps) => Some(snaps),
                         Err(e) => {
                             errors.push(format!(
@@ -534,7 +535,7 @@ pub fn assess(
 
                 if let Some(ref ext) = ext_snaps {
                     chain_health_entries.push(assess_chain_health(
-                        fs,
+                        obs,
                         &local_dir,
                         drive,
                         &local_snaps,
@@ -542,11 +543,11 @@ pub fn assess(
                     ));
                 }
 
-                let last_send_time = fs.last_successful_send_time(&subvol.name, &drive.label);
+                let last_send_time = obs.history.last_successful_send_time(&subvol.name, &drive.label);
                 let last_send_age = last_send_time.map(|t| clamp_age(now - t));
 
                 let source_unchanged = external_source_unchanged(
-                    fs,
+                    obs,
                     source_gen,
                     &local_dir,
                     &drive.label,
@@ -608,7 +609,7 @@ pub fn assess(
             .filter(|&min_free| min_free > 0)
             .and_then(|min_free| {
                 let local_dir = snapshot_root.join(&subvol.name);
-                fs.filesystem_free_bytes(&local_dir).ok().and_then(|free| {
+                obs.fs.filesystem_free_bytes(&local_dir).ok().and_then(|free| {
                     let tight_threshold = min_free + min_free / (100 / SPACE_TIGHT_MARGIN_PERCENT);
                     if free < tight_threshold {
                         Some(free)
@@ -623,7 +624,7 @@ pub fn assess(
             &chain_health_entries,
             &drive_assessments,
             &config.drives,
-            fs,
+            obs,
             &subvol.name,
             local_space_tight.is_some(),
             subvol.local_retention.is_transient(),
@@ -766,7 +767,7 @@ fn assess_external_status(
 ///   appear in the list — otherwise the drive's copy is gone and the override
 ///   must not apply (drive is in a chain-broken state).
 fn external_source_unchanged(
-    fs: &dyn FileSystemState,
+    obs: &Observation,
     source_gen: Option<u64>,
     local_dir: &std::path::Path,
     drive_label: &str,
@@ -775,7 +776,7 @@ fn external_source_unchanged(
     let Some(source_gen) = source_gen else {
         return false;
     };
-    let Ok(Some(pin)) = fs.read_pin_file(local_dir, drive_label) else {
+    let Ok(Some(pin)) = obs.fs.read_pin_file(local_dir, drive_label) else {
         return false;
     };
     // Drive is mounted and we can see its snapshots — require the pin to be
@@ -788,7 +789,7 @@ fn external_source_unchanged(
         return false;
     }
     let pin_path = local_dir.join(pin.as_str());
-    match fs.subvolume_generation(&pin_path) {
+    match obs.btrfs.subvolume_generation(&pin_path) {
         Ok(pin_gen) => source_gen == pin_gen,
         Err(_) => false,
     }
@@ -797,14 +798,14 @@ fn external_source_unchanged(
 /// Compare BTRFS generations: is the source unchanged since the newest local
 /// snapshot? Mirrors the planner's snapshot-skip logic. Fails open.
 fn local_source_unchanged(
-    fs: &dyn FileSystemState,
+    obs: &Observation,
     source_gen: Option<u64>,
     newest_local_snap_path: &std::path::Path,
 ) -> bool {
     let Some(source_gen) = source_gen else {
         return false;
     };
-    match fs.subvolume_generation(newest_local_snap_path) {
+    match obs.btrfs.subvolume_generation(newest_local_snap_path) {
         Ok(snap_gen) => source_gen == snap_gen,
         Err(_) => false,
     }
@@ -867,7 +868,7 @@ fn compute_overall_status(local: &LocalAssessment, drives: &[DriveAssessment]) -
 /// Pure function: uses already-fetched snapshot lists and `FileSystemState`
 /// for pin file reads. No direct filesystem I/O.
 fn assess_chain_health(
-    fs: &dyn FileSystemState,
+    obs: &Observation,
     local_dir: &std::path::Path,
     drive: &DriveConfig,
     local_snaps: &[SnapshotName],
@@ -879,7 +880,7 @@ fn assess_chain_health(
             pin_parent: None,
         }
     } else {
-        match fs.read_pin_file(local_dir, &drive.label) {
+        match obs.fs.read_pin_file(local_dir, &drive.label) {
             Ok(Some(pin)) => {
                 let pin_str = pin.as_str();
                 let parent_local = local_snaps.iter().any(|s| s.as_str() == pin_str);
@@ -937,7 +938,7 @@ fn compute_health(
     chain_health: &[DriveChainHealth],
     drive_assessments: &[DriveAssessment],
     drives_config: &[DriveConfig],
-    fs: &dyn FileSystemState,
+    obs: &Observation,
     subvol_name: &str,
     local_space_tight: bool,
     is_transient: bool,
@@ -974,7 +975,7 @@ fn compute_health(
                 continue;
             };
 
-            let free = fs.filesystem_free_bytes(&cfg.mount_path).unwrap_or(u64::MAX);
+            let free = obs.fs.filesystem_free_bytes(&cfg.mount_path).unwrap_or(u64::MAX);
             let min_free = cfg.min_free_bytes.map(|b| b.bytes()).unwrap_or(0);
 
             // Check if chain is broken on this drive (full send will be needed)
@@ -987,7 +988,7 @@ fn compute_health(
 
             // Calibrated size is the full-subvolume footprint; estimated_send_size
             // only returns it when a full send is needed (chain broken).
-            let est_size = plan::estimated_send_size(fs, subvol_name, &da.drive_label, chain_broken);
+            let est_size = plan::estimated_send_size(obs.history, subvol_name, &da.drive_label, chain_broken);
 
             match est_size {
                 Some(size) if free.saturating_sub(min_free) < size => {
@@ -1025,7 +1026,7 @@ fn compute_health(
 
             // Surface uncertainty: chain broken means full send, but no size estimate
             let has_estimate =
-                plan::estimated_send_size(fs, subvol_name, &ch.drive_label, true).is_some();
+                plan::estimated_send_size(obs.history, subvol_name, &ch.drive_label, true).is_some();
             if !has_estimate {
                 reasons.push(format!(
                     "full send size unknown for {} \u{2014} space check unavailable",
@@ -1042,7 +1043,7 @@ fn compute_health(
         {
             let min_free = min_free_bytes.bytes();
             if min_free > 0 {
-                let free = fs.filesystem_free_bytes(&cfg.mount_path).unwrap_or(u64::MAX);
+                let free = obs.fs.filesystem_free_bytes(&cfg.mount_path).unwrap_or(u64::MAX);
                 let tight_threshold =
                     min_free + min_free / (100 / SPACE_TIGHT_MARGIN_PERCENT);
                 if free < tight_threshold {
@@ -1086,6 +1087,7 @@ fn compute_health(
 mod tests {
     use super::*;
     use super::test_support::{dt, offsite_test_config, snap, test_config};
+    use crate::btrfs::MockBtrfs;
     use crate::plan::MockFileSystemState;
     use crate::types::SnapshotName;
     use chrono::NaiveDate;
@@ -1212,7 +1214,7 @@ source = "/data/sv1"
 
         fs.mounted_drives.insert("WD-18TB".to_string());
 
-        let results = assess(&config, now, &fs);
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].status, PromiseStatus::Protected);
         assert_eq!(results[1].status, PromiseStatus::Protected);
@@ -1237,7 +1239,7 @@ source = "/data/sv1"
         );
         fs.mounted_drives.insert("WD-18TB".to_string());
 
-        let results = assess(&config, now, &fs);
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
         assert_eq!(results[0].local.status, PromiseStatus::AtRisk);
         assert_eq!(results[0].status, PromiseStatus::AtRisk);
     }
@@ -1255,7 +1257,7 @@ source = "/data/sv1"
             .insert("sv1".to_string(), vec![snap(dt(2026, 3, 23, 8, 0), "sv1")]);
         fs.mounted_drives.insert("WD-18TB".to_string());
 
-        let results = assess(&config, now, &fs);
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
         assert_eq!(results[0].local.status, PromiseStatus::Unprotected);
     }
 
@@ -1267,7 +1269,7 @@ source = "/data/sv1"
         let now = dt(2026, 3, 23, 14, 0);
         let fs = MockFileSystemState::new();
 
-        let results = assess(&config, now, &fs);
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
         assert_eq!(results[0].local.status, PromiseStatus::Unprotected);
         assert_eq!(results[0].local.snapshot_count, 0);
     }
@@ -1294,7 +1296,7 @@ source = "/data/sv1"
         );
         fs.mounted_drives.insert("WD-18TB".to_string());
 
-        let results = assess(&config, now, &fs);
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
         assert_eq!(results[0].external[0].status, PromiseStatus::AtRisk);
     }
 
@@ -1319,7 +1321,7 @@ source = "/data/sv1"
         );
         fs.mounted_drives.insert("WD-18TB".to_string());
 
-        let results = assess(&config, now, &fs);
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
         assert_eq!(results[0].external[0].status, PromiseStatus::Unprotected);
     }
 
@@ -1338,7 +1340,7 @@ source = "/data/sv1"
         fs.mounted_drives.insert("WD-18TB".to_string());
         // No send_times entry
 
-        let results = assess(&config, now, &fs);
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
         assert_eq!(results[0].external[0].status, PromiseStatus::Unprotected);
     }
 
@@ -1385,7 +1387,7 @@ send_enabled = false
             vec![snap(dt(2026, 3, 23, 13, 30), "sv1")],
         );
 
-        let results = assess(&config, now, &fs);
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
         assert_eq!(results[0].external.len(), 0);
         assert_eq!(results[0].status, PromiseStatus::Protected);
     }
@@ -1410,7 +1412,7 @@ send_enabled = false
         );
         // Drive NOT in mounted_drives
 
-        let results = assess(&config, now, &fs);
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
         assert!(!results[0].external[0].mounted);
         assert_eq!(results[0].external[0].status, PromiseStatus::Protected);
         assert_eq!(results[0].external[0].snapshot_count, None);
@@ -1477,7 +1479,7 @@ source = "/data/sv1"
 
         fs.mounted_drives.insert("primary".to_string());
 
-        let results = assess(&config, now, &fs);
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
 
         // Primary drive is PROTECTED
         let primary = &results[0]
@@ -1519,7 +1521,7 @@ source = "/data/sv1"
         );
         fs.mounted_drives.insert("WD-18TB".to_string());
 
-        let results = assess(&config, now, &fs);
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
         assert_eq!(results[0].local.status, PromiseStatus::AtRisk);
         assert_eq!(results[0].external[0].status, PromiseStatus::Protected);
         // min(AT_RISK, PROTECTED) = AT_RISK
@@ -1569,7 +1571,7 @@ enabled = false
         let now = dt(2026, 3, 23, 14, 0);
         let fs = MockFileSystemState::new();
 
-        let results = assess(&config, now, &fs);
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "sv1");
     }
@@ -1586,7 +1588,7 @@ enabled = false
         fs.local_snapshots
             .insert("sv1".to_string(), vec![snap(dt(2026, 3, 23, 12, 0), "sv1")]);
 
-        let results = assess(&config, now, &fs);
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
         assert_eq!(results[0].local.status, PromiseStatus::Protected);
 
         // 2h + 1min ago → AT_RISK (> 2×)
@@ -1595,7 +1597,7 @@ enabled = false
             vec![snap(dt(2026, 3, 23, 11, 59), "sv1")],
         );
 
-        let results = assess(&config, now, &fs);
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
         assert_eq!(results[0].local.status, PromiseStatus::AtRisk);
     }
 
@@ -1609,14 +1611,14 @@ enabled = false
         fs.local_snapshots
             .insert("sv1".to_string(), vec![snap(dt(2026, 3, 23, 9, 0), "sv1")]);
 
-        let results = assess(&config, now, &fs);
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
         assert_eq!(results[0].local.status, PromiseStatus::AtRisk);
 
         // 5h + 1min ago → UNPROTECTED (> 5×)
         fs.local_snapshots
             .insert("sv1".to_string(), vec![snap(dt(2026, 3, 23, 8, 59), "sv1")]);
 
-        let results = assess(&config, now, &fs);
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
         assert_eq!(results[0].local.status, PromiseStatus::Unprotected);
     }
 
@@ -1666,7 +1668,7 @@ source = "/data/sv1"
             .insert(("sv1".to_string(), "WD-18TB".to_string()), two_days_ago);
         fs.mounted_drives.insert("WD-18TB".to_string());
 
-        let results = assess(&config, now, &fs);
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
         // Local: 2d / 1d = 2× → PROTECTED (≤ 2×)
         assert_eq!(results[0].local.status, PromiseStatus::Protected);
         // External: 2d / 1d = 2× → AT_RISK (> 1.5×)
@@ -1728,7 +1730,7 @@ source = "/data/sv1"
         );
         fs.mounted_drives.insert("WD-18TB".to_string());
 
-        let results = assess(&config, now, &fs);
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
         assert!(results[0].errors.is_empty());
     }
 
@@ -1754,7 +1756,7 @@ source = "/data/sv1"
             dt(2026, 3, 13, 8, 0),
         );
 
-        let results = assess(&config, now, &fs);
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
         assert!(
             !results[0]
                 .advisories
@@ -1782,7 +1784,7 @@ source = "/data/sv1"
             dt(2026, 3, 13, 8, 0),
         );
 
-        let results = assess(&config, now, &fs);
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
         assert!(
             results[0].advisories.is_empty(),
             "primary drive should not get advisories: {:?}",
@@ -1877,7 +1879,7 @@ source = "/data/sv1"
         );
         fs.mounted_drives.insert("WD-18TB".to_string());
 
-        let results = assess(&config, now, &fs);
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
         // Age clamped to zero → evaluates as "just created" → PROTECTED
         // (not falsely PROTECTED from negative duration)
         assert_eq!(results[0].local.status, PromiseStatus::Protected);
@@ -1909,7 +1911,7 @@ source = "/data/sv1"
         );
         fs.mounted_drives.insert("WD-18TB".to_string());
 
-        let results = assess(&config, now, &fs);
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
         // Send age clamped to zero → PROTECTED (not false PROTECTED from negative)
         assert_eq!(results[0].external[0].status, PromiseStatus::Protected);
         assert_eq!(results[0].external[0].last_send_age, Some(Duration::zero()));
@@ -1936,7 +1938,7 @@ source = "/data/sv1"
         );
         fs.mounted_drives.insert("WD-18TB".to_string());
 
-        let results = assess(&config, now, &fs);
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
         assert_eq!(results.len(), 2);
 
         // sv1: error captured, status UNPROTECTED
@@ -2015,7 +2017,7 @@ source = "/data/sv1"
             dt(2026, 3, 29, 10, 0),
         );
 
-        let results = assess(&config, now, &fs);
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
         let sv = &results[0];
         assert_eq!(sv.chain_health.len(), 1);
         assert_eq!(
@@ -2048,7 +2050,7 @@ source = "/data/sv1"
             dt(2026, 3, 28, 10, 0),
         );
 
-        let results = assess(&config, now, &fs);
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
         let ch = &results[0].chain_health[0];
         assert!(matches!(
             ch.status,
@@ -2081,7 +2083,7 @@ source = "/data/sv1"
             dt(2026, 3, 29, 10, 0),
         );
 
-        let results = assess(&config, now, &fs);
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
         let ch = &results[0].chain_health[0];
         assert!(matches!(
             ch.status,
@@ -2111,7 +2113,7 @@ source = "/data/sv1"
             dt(2026, 3, 29, 10, 0),
         );
 
-        let results = assess(&config, now, &fs);
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
         let ch = &results[0].chain_health[0];
         assert_eq!(
             ch.status,
@@ -2135,7 +2137,7 @@ source = "/data/sv1"
             .insert(("D1".to_string(), "sv1".to_string()), vec![]);
         fs.mounted_drives.insert("D1".to_string());
 
-        let results = assess(&config, now, &fs);
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
         let ch = &results[0].chain_health[0];
         assert!(matches!(
             ch.status,
@@ -2156,7 +2158,7 @@ source = "/data/sv1"
             .insert("sv1".to_string(), vec![parse_snap("20260329-1100-s1")]);
         // Drive NOT mounted — no chain health entries
 
-        let results = assess(&config, now, &fs);
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
         assert!(
             results[0].chain_health.is_empty(),
             "unmounted drives should not produce chain health entries"
@@ -2204,7 +2206,7 @@ source = "/data/sv1"
             .insert("sv1".to_string(), vec![parse_snap("20260329-1100-s1")]);
         fs.mounted_drives.insert("D1".to_string());
 
-        let results = assess(&config, now, &fs);
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
         assert!(
             results[0].chain_health.is_empty(),
             "send_disabled subvolumes should have no chain health"
@@ -2230,7 +2232,7 @@ source = "/data/sv1"
             "D1".to_string(),
         ));
 
-        let results = assess(&config, now, &fs);
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
         let ch = &results[0].chain_health[0];
         assert_eq!(
             ch.status,
@@ -2279,7 +2281,7 @@ source = "/data/sv1"
         fs.free_bytes
             .insert(std::path::PathBuf::from("/mnt/wd"), 1_000_000_000_000);
 
-        let results = assess(&config, now, &fs);
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
         assert_eq!(results[0].health, OperationalHealth::Healthy);
         assert!(results[0].health_reasons.is_empty());
     }
@@ -2307,7 +2309,7 @@ source = "/data/sv1"
         fs.free_bytes
             .insert(std::path::PathBuf::from("/mnt/wd"), 1_000_000_000_000);
 
-        let results = assess(&config, now, &fs);
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
         assert_eq!(results[0].health, OperationalHealth::Degraded);
         assert!(results[0].health_reasons[0].contains("chain broken"));
         assert!(results[0].health_reasons[0].contains("WD-18TB"));
@@ -2325,7 +2327,7 @@ source = "/data/sv1"
         );
         // No drives mounted, send_enabled=true (default in test config)
 
-        let results = assess(&config, now, &fs);
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
         assert_eq!(results[0].health, OperationalHealth::Blocked);
         assert!(results[0].health_reasons[0].contains("no backup drives connected"));
     }
@@ -2380,7 +2382,7 @@ send_enabled = false
         );
         // No drives mounted — but send_enabled=false, so health should be Healthy
 
-        let results = assess(&config, now, &fs);
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
         assert_eq!(results[0].health, OperationalHealth::Healthy);
     }
 
@@ -2414,7 +2416,7 @@ send_enabled = false
         fs.free_bytes
             .insert(std::path::PathBuf::from("/mnt/wd"), 105_000_000_000);
 
-        let results = assess(&config, now, &fs);
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
         assert_eq!(results[0].health, OperationalHealth::Degraded);
         assert!(results[0].health_reasons.iter().any(|r| r.contains("space tight")));
     }
@@ -2455,7 +2457,7 @@ send_enabled = false
             60_000_000_000,
         );
 
-        let results = assess(&config, now, &fs);
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
         assert_eq!(results[0].health, OperationalHealth::Blocked);
         assert!(results[0].health_reasons.iter().any(|r| r.contains("insufficient space")));
     }
@@ -2492,7 +2494,7 @@ send_enabled = false
             5_000_000_000,
         );
 
-        let results = assess(&config, now, &fs);
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
         assert_ne!(
             results[0].health,
             OperationalHealth::Blocked,
@@ -2526,7 +2528,7 @@ send_enabled = false
         fs.free_bytes
             .insert(std::path::PathBuf::from("/mnt/wd"), 200_000_000_000);
 
-        let results = assess(&config, now, &fs);
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
         assert_ne!(
             results[0].health,
             OperationalHealth::Blocked,
@@ -2568,7 +2570,7 @@ send_enabled = false
             50_000_000_000,
         );
 
-        let results = assess(&config, now, &fs);
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
         assert_ne!(
             results[0].health,
             OperationalHealth::Blocked,
@@ -2595,7 +2597,7 @@ send_enabled = false
             },
         );
 
-        let results = assess(&config, now, &fs);
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
         let drive = &results[0].external[0];
         assert_eq!(
             drive.absent_duration_secs,
@@ -2629,7 +2631,7 @@ send_enabled = false
         fs.last_successful_ops
             .insert("WD-18TB".to_string(), dt(2026, 3, 22, 12, 0));
 
-        let results = assess(&config, now, &fs);
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
         let drive = &results[0].external[0];
         assert_eq!(drive.absent_duration_secs, None);
         assert_eq!(drive.last_activity_age_secs, None);
@@ -2657,7 +2659,7 @@ send_enabled = false
         fs.last_successful_ops
             .insert("WD-18TB".to_string(), dt(2026, 3, 22, 10, 0));
 
-        let results = assess(&config, now, &fs);
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
         let drive = &results[0].external[0];
         assert_eq!(drive.absent_duration_secs, None);
         assert_eq!(
@@ -2678,7 +2680,7 @@ send_enabled = false
         fs.last_successful_ops
             .insert("WD-18TB".to_string(), dt(2026, 3, 20, 14, 0));
 
-        let results = assess(&config, now, &fs);
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
         let drive = &results[0].external[0];
         assert_eq!(drive.absent_duration_secs, None);
         assert_eq!(
@@ -2708,7 +2710,7 @@ send_enabled = false
         fs.last_successful_ops
             .insert("WD-18TB".to_string(), dt(2026, 3, 20, 10, 0));
 
-        let results = assess(&config, now, &fs);
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
         let drive = &results[0].external[0];
         assert_eq!(drive.absent_duration_secs, Some(4 * 3600));
         assert_eq!(
@@ -2726,7 +2728,7 @@ send_enabled = false
         fs.local_snapshots
             .insert("sv1".to_string(), vec![snap(dt(2026, 3, 23, 13, 30), "sv1")]);
 
-        let results = assess(&config, now, &fs);
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
         let drive = &results[0].external[0];
         assert_eq!(drive.absent_duration_secs, None);
         assert_eq!(drive.last_activity_age_secs, None);
@@ -2748,7 +2750,7 @@ send_enabled = false
             dt(2026, 3, 10, 12, 0), // 13 days ago
         );
 
-        let results = assess(&config, now, &fs);
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
         assert_eq!(results[0].health, OperationalHealth::Blocked);
         // Blocked because no drives mounted (primary check), plus degraded for away >7d
         assert!(results[0].health_reasons.iter().any(|r| r.contains("no backup drives connected")));
@@ -2790,7 +2792,7 @@ send_enabled = false
         fs.free_bytes
             .insert(std::path::PathBuf::from("/mnt/d1"), 1_000_000_000_000);
 
-        let results = assess(&config, now, &fs);
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
         assert_eq!(results[0].health, OperationalHealth::Healthy, "health_reasons: {:?}", results[0].health_reasons);
         assert!(results[0].health_reasons.is_empty());
     }
@@ -2837,14 +2839,15 @@ send_enabled = false
             ("sv1".to_string(), "D2".to_string()),
             dt(2026, 3, 10, 12, 0),
         );
-        fs.generations
+        let mb = MockBtrfs::new();
+        mb.generations.borrow_mut()
             .insert(std::path::PathBuf::from("/data/sv1"), 42);
-        fs.generations.insert(
+        mb.generations.borrow_mut().insert(
             std::path::PathBuf::from(format!("/snap/sv1/{}", pin_snap.as_str())),
             42,
         );
 
-        let results = assess(&config, now, &fs);
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &mb });
         assert_eq!(
             results[0].health,
             OperationalHealth::Healthy,
@@ -2910,7 +2913,7 @@ send_enabled = false
             dt(2026, 3, 6, 14, 0), // 17 days ago
         );
 
-        let results = assess(&config, now, &fs);
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
         assert!(
             !results[0]
                 .health_reasons
@@ -2991,7 +2994,7 @@ send_enabled = false
             dt(2026, 3, 10, 12, 0),
         );
 
-        let results = assess(&config, now, &fs);
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
         assert_eq!(results[0].health, OperationalHealth::Degraded);
         assert!(results[0].health_reasons.len() >= 2, "expected multiple reasons, got: {:?}", results[0].health_reasons);
         assert!(results[0].health_reasons.iter().any(|r| r.contains("chain broken")));
@@ -3061,7 +3064,7 @@ send_enabled = false
         fs.free_bytes
             .insert(std::path::PathBuf::from("/snap/sv1"), 11_000_000_000);
 
-        let results = assess(&config, now, &fs);
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
         assert_eq!(results[0].health, OperationalHealth::Degraded);
         assert!(results[0].health_reasons.iter().any(|r| r.contains("local snapshot space tight")));
     }
@@ -3089,7 +3092,7 @@ send_enabled = false
         fs.free_bytes
             .insert(std::path::PathBuf::from("/mnt/wd"), 1_000_000_000_000);
 
-        let results = assess(&config, now, &fs);
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
         assert_eq!(results[0].health, OperationalHealth::Degraded);
         assert!(
             results[0].health_reasons.iter().any(|r| r.contains("full send size unknown")),
@@ -3156,7 +3159,7 @@ local_retention = "transient"
         );
         fs.mounted_drives.insert("WD-18TB".to_string());
 
-        let results = assess(&config, now, &fs);
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
         assert_eq!(results[0].name, "sv-transient");
         assert_eq!(results[0].local.status, PromiseStatus::Protected);
         assert_eq!(results[0].local.snapshot_count, 0);
@@ -3176,7 +3179,7 @@ local_retention = "transient"
         );
         fs.mounted_drives.insert("WD-18TB".to_string());
 
-        let results = assess(&config, now, &fs);
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
         assert_eq!(results[0].local.status, PromiseStatus::Protected);
         // Overall dragged down by external, not local
         assert_eq!(results[0].status, PromiseStatus::AtRisk);
@@ -3195,7 +3198,7 @@ local_retention = "transient"
         );
         fs.mounted_drives.insert("WD-18TB".to_string());
 
-        let results = assess(&config, now, &fs);
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
         assert_eq!(results[0].local.status, PromiseStatus::Protected);
         assert_eq!(results[0].status, PromiseStatus::Unprotected);
     }
@@ -3219,7 +3222,7 @@ local_retention = "transient"
         );
         fs.mounted_drives.insert("WD-18TB".to_string());
 
-        let results = assess(&config, now, &fs);
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
         assert_eq!(results[0].local.status, PromiseStatus::Protected);
         assert_eq!(results[0].local.snapshot_count, 1);
         assert!(results[0].local.newest_age.is_some());
@@ -3235,7 +3238,7 @@ local_retention = "transient"
         // No local snapshots, no external sends, drive mounted
         fs.mounted_drives.insert("WD-18TB".to_string());
 
-        let results = assess(&config, now, &fs);
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
         assert_eq!(results[0].local.status, PromiseStatus::Protected);
         // External: never sent → UNPROTECTED
         assert_eq!(results[0].external[0].status, PromiseStatus::Unprotected);
@@ -3290,7 +3293,7 @@ send_enabled = false
         let now = dt(2026, 3, 23, 14, 0);
         let fs = MockFileSystemState::new();
 
-        let results = assess(&config, now, &fs);
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
         assert_eq!(results[0].name, "sv-nosend");
         // Local returns Protected (transient branch), but overall must be Unprotected
         // because there is no external safety mechanism.
@@ -3319,7 +3322,7 @@ send_enabled = false
         fs.free_bytes
             .insert(std::path::PathBuf::from("/mnt/wd"), 1_000_000_000_000);
 
-        let results = assess(&config, now, &fs);
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
         assert_eq!(
             results[0].health,
             OperationalHealth::Healthy,
@@ -3354,7 +3357,7 @@ send_enabled = false
         fs.free_bytes
             .insert(std::path::PathBuf::from("/mnt/wd"), 1_000_000_000_000);
 
-        let results = assess(&config, now, &fs);
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
         assert_eq!(
             results[0].health,
             OperationalHealth::Healthy,
@@ -3395,7 +3398,7 @@ send_enabled = false
         fs.free_bytes
             .insert(std::path::PathBuf::from("/mnt/wd"), 1_000_000_000_000);
 
-        let results = assess(&config, now, &fs);
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
         assert_eq!(
             results[0].health,
             OperationalHealth::Degraded,
@@ -3426,7 +3429,7 @@ send_enabled = false
         fs.free_bytes
             .insert(std::path::PathBuf::from("/mnt/wd"), 1_000_000_000_000);
 
-        let results = assess(&config, now, &fs);
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
         assert_eq!(
             results[0].health,
             OperationalHealth::Degraded,
@@ -3453,7 +3456,7 @@ send_enabled = false
         fs.free_bytes
             .insert(std::path::PathBuf::from("/mnt/wd"), 1_000_000_000_000);
 
-        let results = assess(&config, now, &fs);
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
         // Should not contain "full send size unknown" — chain treated as intact for transient
         assert!(
             !results[0]
@@ -3536,7 +3539,7 @@ drives = ["D1"]
         // D2 is NOT mounted — but sv1 is scoped to D1 only,
         // so D2 absence should NOT affect sv1's status.
 
-        let assessments = assess(&config, now, &fs);
+        let assessments = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
         let sv1 = assessments.iter().find(|a| a.name == "sv1").unwrap();
 
         assert_eq!(
@@ -3566,7 +3569,7 @@ drives = ["D1"]
 
         // D2 is NOT mounted and has no send history
 
-        let assessments = assess(&config, now, &fs);
+        let assessments = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
         let sv1 = assessments.iter().find(|a| a.name == "sv1").unwrap();
 
         // Without per-subvolume drives scoping, all configured drives appear in assessments
@@ -3592,7 +3595,7 @@ drives = ["D1"]
             dt(2026, 4, 1, 10, 0),
         );
 
-        let assessments = assess(&config, now, &fs);
+        let assessments = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
         let sv1 = assessments.iter().find(|a| a.name == "sv1").unwrap();
 
         assert_eq!(
@@ -3631,7 +3634,7 @@ drives = ["D1"]
         // D2 would have a broken chain if assessed, but it's out of scope
         // (sv1 is scoped to D1 only). Verify health is not degraded.
 
-        let assessments = assess(&config, now, &fs);
+        let assessments = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
         let sv1 = assessments.iter().find(|a| a.name == "sv1").unwrap();
 
         assert_eq!(
@@ -3674,14 +3677,15 @@ drives = ["D1"]
         );
 
         // Generations match — source unchanged since the pin snapshot.
-        fs.generations
+        let mb = MockBtrfs::new();
+        mb.generations.borrow_mut()
             .insert(std::path::PathBuf::from("/data/sv1"), 42);
-        fs.generations.insert(
+        mb.generations.borrow_mut().insert(
             std::path::PathBuf::from(format!("/snap/sv1/{}", pin_snap.as_str())),
             42,
         );
 
-        let r = &assess(&config, now, &fs)[0];
+        let r = &assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &mb })[0];
         assert_eq!(r.external[0].status, PromiseStatus::Protected);
         // Advisory explains why the old age is still PROTECTED.
         assert!(
@@ -3719,14 +3723,15 @@ drives = ["D1"]
             dt(2026, 3, 13, 10, 0),
         );
 
-        fs.generations
+        let mb = MockBtrfs::new();
+        mb.generations.borrow_mut()
             .insert(std::path::PathBuf::from("/data/sv1"), 99);
-        fs.generations.insert(
+        mb.generations.borrow_mut().insert(
             std::path::PathBuf::from(format!("/snap/sv1/{}", pin_snap.as_str())),
             42,
         );
 
-        let r = &assess(&config, now, &fs)[0];
+        let r = &assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &mb })[0];
         assert_eq!(r.external[0].status, PromiseStatus::Unprotected);
     }
 
@@ -3756,7 +3761,7 @@ drives = ["D1"]
         );
 
         // No generations configured — queries will fail.
-        let r = &assess(&config, now, &fs)[0];
+        let r = &assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() })[0];
         assert_eq!(r.external[0].status, PromiseStatus::Unprotected);
     }
 
@@ -3778,10 +3783,11 @@ drives = ["D1"]
             ("sv1".to_string(), "WD-18TB".to_string()),
             dt(2026, 3, 13, 10, 0),
         );
-        fs.generations
+        let mb = MockBtrfs::new();
+        mb.generations.borrow_mut()
             .insert(std::path::PathBuf::from("/data/sv1"), 42);
 
-        let r = &assess(&config, now, &fs)[0];
+        let r = &assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &mb })[0];
         assert_eq!(r.external[0].status, PromiseStatus::Unprotected);
     }
 
@@ -3800,15 +3806,16 @@ drives = ["D1"]
             .insert("sv1".to_string(), vec![newest.clone()]);
 
         // Generations match — source unchanged since newest snapshot.
-        fs.generations
+        let mb = MockBtrfs::new();
+        mb.generations.borrow_mut()
             .insert(std::path::PathBuf::from("/data/sv1"), 100);
-        fs.generations.insert(
+        mb.generations.borrow_mut().insert(
             std::path::PathBuf::from(format!("/snap/sv1/{}", newest.as_str())),
             100,
         );
 
         // No drive mounted — isolate the local assessment.
-        let r = &assess(&config, now, &fs)[0];
+        let r = &assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &mb })[0];
         assert_eq!(r.local.status, PromiseStatus::Protected);
     }
 
@@ -3839,14 +3846,15 @@ drives = ["D1"]
             ("sv1".to_string(), "WD-18TB".to_string()),
             dt(2026, 3, 13, 10, 0),
         );
-        fs.generations
+        let mb = MockBtrfs::new();
+        mb.generations.borrow_mut()
             .insert(std::path::PathBuf::from("/data/sv1"), 42);
-        fs.generations.insert(
+        mb.generations.borrow_mut().insert(
             std::path::PathBuf::from(format!("/snap/sv1/{}", pin_snap.as_str())),
             42,
         );
 
-        let r = &assess(&config, now, &fs)[0];
+        let r = &assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &mb })[0];
         // 10 days since send > 3× 1d → UNPROTECTED under age-based rules.
         assert_eq!(
             r.external[0].status,
@@ -3877,14 +3885,15 @@ drives = ["D1"]
             ("sv1".to_string(), "WD-18TB".to_string()),
             dt(2026, 3, 13, 10, 0),
         );
-        fs.generations
+        let mb = MockBtrfs::new();
+        mb.generations.borrow_mut()
             .insert(std::path::PathBuf::from("/data/sv1"), 42);
-        fs.generations.insert(
+        mb.generations.borrow_mut().insert(
             std::path::PathBuf::from(format!("/snap/sv1/{}", pin_snap.as_str())),
             42,
         );
 
-        let r = &assess(&config, now, &fs)[0];
+        let r = &assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &mb })[0];
         assert_eq!(r.external[0].status, PromiseStatus::Protected);
         assert!(!r.external[0].mounted, "drive should be reported unmounted");
     }
@@ -3940,7 +3949,8 @@ source = "/data/sv1"
         // transient path is computing source_unchanged, it would hit these
         // and we'd notice via logs. The test primarily asserts assess
         // doesn't error and reports Protected for transient local.
-        fs.fail_generations
+        let mb = MockBtrfs::new();
+        mb.fail_generations.borrow_mut()
             .insert(std::path::PathBuf::from("/data/sv1"));
 
         fs.local_snapshots.insert(
@@ -3953,7 +3963,7 @@ source = "/data/sv1"
             dt(2026, 3, 23, 13, 30),
         );
 
-        let r = &assess(&config, now, &fs)[0];
+        let r = &assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &mb })[0];
         // Transient local returns Protected regardless of age.
         assert_eq!(r.local.status, PromiseStatus::Protected);
     }
@@ -3985,14 +3995,15 @@ source = "/data/sv1"
             dt(2026, 3, 23, 8, 0),
         );
 
-        fs.generations
+        let mb = MockBtrfs::new();
+        mb.generations.borrow_mut()
             .insert(std::path::PathBuf::from("/data/sv1"), 42);
-        fs.generations.insert(
+        mb.generations.borrow_mut().insert(
             std::path::PathBuf::from(format!("/snap/sv1/{}", pin_snap.as_str())),
             42,
         );
 
-        let r = &assess(&config, now, &fs)[0];
+        let r = &assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &mb })[0];
         assert!(
             r.advisories
                 .iter()

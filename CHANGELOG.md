@@ -15,6 +15,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   module. A `FileSystemState` bridge supertrait + blanket impl keeps every
   existing caller and mock compiling unchanged while the seam is narrowed
   incrementally in later PRs. No behavior, on-disk, or config-schema change.
+- **Internal refactor: `Observation` cutover + ADR-101 generation-read fix, PR 2**
+  (UPI 052). Introduced `Observation<'a>` — a `{ fs, history, btrfs }` bundle of
+  read-only seams — and threaded it through `plan::plan` and `awareness::assess`,
+  replacing the wide `&dyn FileSystemState` parameter. Closed the ADR-101 loophole
+  where `subvolume_generation` ran a `sudo btrfs` subprocess from a free function
+  outside `BtrfsOps`: it now lives on a new read-only `BtrfsRead` trait
+  (`BtrfsOps: BtrfsRead`), so pure planners read generations through a non-mutating
+  seam that cannot upcast to the mutating ops. Fail-open generation semantics
+  preserved verbatim. No behavior, on-disk, or config-schema change.
 
 ## [0.21.0] - 2026-05-25
 

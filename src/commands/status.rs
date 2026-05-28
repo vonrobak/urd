@@ -7,7 +7,7 @@ use crate::output::{
     ChainHealth, ChainHealthEntry, DriveInfo, OutputMode, StatusAssessment,
     StatusOutput,
 };
-use crate::plan::RealFileSystemState;
+use crate::plan::{Observation, RealFileSystemState};
 use crate::retention;
 use crate::state::StateDb;
 use crate::voice;
@@ -21,11 +21,17 @@ pub fn run(config: Config, output_mode: OutputMode) -> anyhow::Result<()> {
     let fs_state = RealFileSystemState {
         state: state_db.as_ref(),
     };
+    let assess_btrfs = crate::btrfs::RealBtrfs::for_reads(&config.general.btrfs_path);
+    let observation = Observation {
+        fs: &fs_state,
+        history: &fs_state,
+        btrfs: &assess_btrfs,
+    };
     let drive_labels: Vec<String> = config.drives.iter().map(|d| d.label.clone()).collect();
 
     // ── Awareness model ─────────────────────────────────────────────
     let now = chrono::Local::now().naive_local();
-    let mut assessments = awareness::assess(&config, now, &fs_state);
+    let mut assessments = awareness::assess(&config, now, &observation);
     advice::overlay_offsite_freshness(&mut assessments, &config);
 
     // ── Chain health per subvolume (derived from awareness assessment) ──

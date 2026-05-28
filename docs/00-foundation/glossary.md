@@ -289,11 +289,13 @@ reads, rather than on the full fused surface.
 
 | Term | Meaning |
 |------|---------|
-| `FilesystemQuery` | The filesystem-of-truth + drive-availability half: local/external snapshot listings, pin files, mount/availability, free space, and the BTRFS generation counter. Answers "what is on disk right now?" Lives in `observation.rs`. |
+| `FilesystemQuery` | The filesystem-of-truth + drive-availability half: local/external snapshot listings, pin files, mount/availability, and free space. Answers "what is on disk right now?" Lives in `observation.rs`. (The BTRFS generation counter moved to `BtrfsRead` in PR 2.) |
 | `HistoryQuery` | The SQLite-history half: last send sizes (same-drive and cross-drive), calibrated size, and send/drive timestamps. Answers "what happened before?" Lives in `observation.rs`. SQLite failures here never block backups (ADR-102). |
+| `BtrfsRead` | The read-only btrfs seam: `subvolume_generation(path)`. Supertrait of `BtrfsOps` (`BtrfsOps: BtrfsRead`), so a read-only caller takes `&dyn BtrfsRead` and cannot upcast to the mutating `BtrfsOps` (ADR-100, ADR-101). `RealBtrfs` runs `sudo btrfs subvolume show`; `MockBtrfs` looks up injected generations. Lives in `btrfs.rs`. |
+| `Observation` | The read-only world a pure decision function observes: `{ fs: &dyn FilesystemQuery, history: &dyn HistoryQuery, btrfs: &dyn BtrfsRead }`. Threaded as `&Observation` through `plan::plan` and `awareness::assess` (UPI 052) so they read state through three narrow, non-mutating trait objects. Lives in `observation.rs`. |
 | `FileSystemState` | Bridge supertrait (`FilesystemQuery + HistoryQuery`) with a blanket impl. Preserves every pre-split `&dyn FileSystemState` caller and mock while the seam is narrowed incrementally; slated for removal once no caller needs both halves. |
 
-Source: `observation.rs`, ADR-102.
+Source: `observation.rs`, `btrfs.rs`, ADR-100, ADR-101, ADR-102.
 
 ## Flagged Ambiguities
 
