@@ -518,6 +518,22 @@ pub(super) fn format_recommendation_row(row: &crate::output::DoctorRecommendatio
     if let Some(ref rec) = row.external {
         role_line("external:", rec);
     }
+    // UPI 031: row-level storage-critical advisory. STAKES, NOT ACTION — it
+    // names the structural fact (the source lives on the host root
+    // filesystem, so pressure here threatens the host, not just retention)
+    // and carries no action verb. The action ("expand storage / reduce
+    // subvolumes") stays on the role reason line, so this complements rather
+    // than duplicates the at-MIN tail. Never reached when severity is
+    // Critical (the R9 pointer path returns first).
+    if row.storage_critical {
+        writeln!(
+            out,
+            "      {}",
+            "storage critical — source is on the host root filesystem; pressure here risks the host itself"
+                .dimmed()
+        )
+        .ok();
+    }
     if matches!(row.note, Some(crate::recommendation::RecommendationNote::BurstyPattern)) {
         writeln!(out, "      {}", "bursty pattern — frequent full sends".dimmed()).ok();
     }

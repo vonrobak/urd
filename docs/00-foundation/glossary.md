@@ -248,7 +248,7 @@ runs in the backup hot path.
 | `outer-edge span` | The time span from the *outer* edge of a tier's window back to its inner edge — the only thing that changes total data cost as the shape changes. Slot density inside a window does not. |
 | `drift signal` | The rolling churn rate computed by `drift.rs` (UPI 030) from `drift_samples`. The input the recommendation engine projects cost against. |
 | `symmetric data-cost model` | ADR-115's claim: two shapes with the same outer-edge span over the same drift signal cost the same in retained data bytes, regardless of how many slots populate the interior. Metadata cost is separate and is not modelled by X1. |
-| `headroom` | Destination free-space context (`HeadroomContext`) used to scale the recommended shape. `HeadroomSeverity` is one of `Comfortable / Pressure / Critical`. Pressure and Critical produce a tightened companion shape under `HEADROOM_TIGHTEN_MULTIPLIER`. |
+| `headroom` | Destination free-space context (`HeadroomContext`) used to scale the recommended shape. `HeadroomSeverity` is one of `Healthy / Caution / Pressure / Critical` (recommendation.rs). The classifier emits `Healthy / Caution / Pressure`; Pressure produces a tightened companion shape under `HEADROOM_TIGHTEN_MULTIPLIER`. (`Critical` is dormant in production since UPI 031 — kept for the UPI 032/033 bundle.) |
 | `recommended shape` | The shape returned by `recommend_shape*()` — a `ResolvedGraduatedRetention`-shaped suggestion paired with a `CostProjection` and the `AdjustmentReason`s that explain why it differs from what the user has today. |
 
 Source: `recommendation.rs`, ADR-115.
@@ -279,6 +279,29 @@ subvol3-opptak  headroom: Pressure (12% free on WD-18TB)
 The suggested shape preserves the outer-edge span (365 days) while thinning the
 interior — same data cost, fewer pins to manage. The tightened shape shortens
 the outer edge in response to destination pressure; that does reduce data cost.
+
+### `storage_critical` (UPI 031)
+
+Distinct from `headroom`, which is a *momentary* "is this pool tight now?" signal,
+`storage_critical` is a **structural** property of where the data lives. A subvolume
+is storage-critical when **all three** hold:
+
+1. its source sits on the host's **root-filesystem pool** (the BTRFS pool UUID matches
+   `/`'s pool — caught even for a `/home`-only config whose pool mountpoints omit `/`);
+2. an **enabled** subvolume entrusts `/` itself to Urd (`source == "/"`); and
+3. that pool is **critically tight right now** (free-ratio ≥ `Pressure`, reusing
+   `recommendation::classify_free_ratio` — no new threshold).
+
+The point of the intersection is non-redundancy with headroom: only data that is *both*
+structurally fragile (pressure here threatens the **host**, not just retention) *and*
+genuinely tight is storage-critical. The rule lives in `storage_critical.rs` (pure); the
+doctor wiring resolves `/`'s pool UUID at the boundary. It surfaces as a dimmed,
+stakes-not-action advisory on the offending `urd doctor --thorough` row (and a
+`storage_critical: true` field, omitted-when-false in JSON). The **behavioral** half
+(ephemeral lifecycle, conservative intervals) is deferred to the UPI 032/033 bundle
+(ADR-113 increment 2).
+
+Source: `storage_critical.rs`, ADR-113.
 
 ## Cluster: Read-side query seams (ADR-102)
 

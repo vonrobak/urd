@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Storage-critical advisory in `urd doctor --thorough`** (UPI 031). Retires the
+  `storage_critical` stub for a pure structural rule: a subvolume is flagged when its
+  source sits on the host's root-filesystem pool (BTRFS pool UUID matches `/`'s), an
+  *enabled* subvolume entrusts `/` itself to Urd, *and* that pool is critically tight
+  now (free-ratio ≥ Pressure). The offending row gains a dimmed, stakes-not-action
+  advisory — pressure here threatens the host, not just retention — alongside (not
+  replacing) the existing retention-tightening suggestion, plus an additive
+  `storage_critical: true` field on recommendation rows (omitted-when-false; no JSON
+  schema bump). Distinct from momentary headroom pressure; behavior deferred to the
+  032/033 bundle (ADR-113 increment 2). No metric, heartbeat, on-disk, or config-schema
+  change.
+
 ## [0.21.2] - 2026-05-29
 
 ### Changed
