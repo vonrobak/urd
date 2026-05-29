@@ -8,7 +8,7 @@ use std::io::IsTerminal;
 use serde::{Deserialize, Serialize};
 
 use crate::advice::{ActionableAdvice, RedundancyAdvisory, RedundancyAdvisoryKind};
-use crate::awareness::{DriveAssessment, SubvolAssessment};
+use crate::awareness::{DriveAssessment, PromiseStatus, SubvolAssessment};
 use crate::types::{ByteSize, DriveRole};
 
 // ── OutputMode ──────────────────────────────────────────────────────────
@@ -138,7 +138,8 @@ pub struct StatusOutput {
 #[derive(Debug, Serialize)]
 pub struct StatusAssessment {
     pub name: String,
-    pub status: String,
+    /// Promise status (serializes SCREAMING: "PROTECTED" / "AT RISK" / "UNPROTECTED").
+    pub status: PromiseStatus,
     /// Operational health: "healthy", "degraded", or "blocked".
     pub health: String,
     /// Reasons for non-healthy operational health (empty when healthy).
@@ -151,7 +152,7 @@ pub struct StatusAssessment {
     /// Age of newest local snapshot in seconds, if available.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub local_newest_age_secs: Option<i64>,
-    pub local_status: String,
+    pub local_status: PromiseStatus,
     pub external: Vec<StatusDriveAssessment>,
     pub advisories: Vec<String>,
     /// Structured redundancy advisories (e.g., no offsite, single point of failure).
@@ -171,13 +172,13 @@ impl StatusAssessment {
     pub fn from_assessment(a: &SubvolAssessment) -> Self {
         Self {
             name: a.name.clone(),
-            status: a.status.to_string(),
+            status: a.status,
             health: a.health.to_string(),
             health_reasons: a.health_reasons.clone(),
             promise_level: None,
             local_snapshot_count: a.local.snapshot_count,
             local_newest_age_secs: a.local.newest_age.map(|d| d.num_seconds()),
-            local_status: a.local.status.to_string(),
+            local_status: a.local.status,
             external: a
                 .external
                 .iter()
@@ -196,7 +197,8 @@ impl StatusAssessment {
 #[derive(Debug, Serialize)]
 pub struct StatusDriveAssessment {
     pub drive_label: String,
-    pub status: String,
+    /// Promise status (serializes SCREAMING: "PROTECTED" / "AT RISK" / "UNPROTECTED").
+    pub status: PromiseStatus,
     pub mounted: bool,
     pub snapshot_count: Option<usize>,
     /// Age of last send in seconds, if available (even when unmounted).
@@ -220,7 +222,7 @@ impl StatusDriveAssessment {
     pub fn from_assessment(a: &DriveAssessment) -> Self {
         Self {
             drive_label: a.drive_label.clone(),
-            status: a.status.to_string(),
+            status: a.status,
             mounted: a.mounted,
             snapshot_count: a.snapshot_count,
             last_send_age_secs: a.last_send_age.map(|d| d.num_seconds()),
@@ -635,7 +637,8 @@ pub enum DoctorCheckStatus {
 #[derive(Debug, Clone, Serialize)]
 pub struct DoctorDataSafety {
     pub name: String,
-    pub status: String,
+    /// Promise status (serializes SCREAMING: "PROTECTED" / "AT RISK" / "UNPROTECTED").
+    pub status: PromiseStatus,
     pub health: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub issue: Option<String>,
@@ -816,8 +819,8 @@ pub enum TransitionEvent {
     /// A subvolume's promise status improved (e.g., Unprotected → Protected).
     PromiseRecovered {
         subvolume: String,
-        from: String,
-        to: String,
+        from: PromiseStatus,
+        to: PromiseStatus,
     },
 }
 
@@ -1380,7 +1383,12 @@ pub struct HealthCounts {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VisualState {
     pub icon: VisualIcon,
-    pub worst_safety: String,
+    /// Worst promise status across subvolumes (serializes SCREAMING).
+    pub worst_safety: PromiseStatus,
+    /// Worst operational health across subvolumes. Stays `String`:
+    /// `OperationalHealth` has no SCREAMING serde form and is out of scope for
+    /// UPI 053 — the `worst_safety: PromiseStatus` / `worst_health: String`
+    /// asymmetry is deliberate, not an omission.
     pub worst_health: String,
     pub safety_counts: SafetyCounts,
     pub health_counts: HealthCounts,
@@ -1414,7 +1422,11 @@ pub struct SentinelStateFile {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SentinelPromiseState {
     pub name: String,
-    pub status: String,
+    /// Promise status (serializes SCREAMING: "PROTECTED" / "AT RISK" / "UNPROTECTED").
+    /// Deserialization accepts the closed `PromiseStatus` set plus legacy
+    /// `snake_case` aliases; an out-of-set value fails the whole state-file
+    /// parse, which the reader treats as absent (fail-open via `.ok()`).
+    pub status: PromiseStatus,
     /// Operational health (VFM-B, schema v2+). Defaults to "healthy" for v1 files.
     #[serde(default = "default_healthy")]
     pub health: String,

@@ -2632,6 +2632,41 @@ mod tests {
         }
     }
 
+    #[test]
+    fn legacy_snake_case_promise_transition_decodes_via_alias() {
+        // ADR-114 amendment 2026-05-29 back-compat guard: event rows written
+        // before the SCREAMING unification carry `snake_case` promise-status
+        // spellings (e.g. "at_risk"). Events are append-only, so those rows
+        // live indefinitely. The serde `alias` must keep decoding them.
+        let db = StateDb::open_memory().unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO events (kind, occurred_at, payload)
+                 VALUES (?1, ?2, ?3)",
+                rusqlite::params![
+                    EventKind::Promise.as_str(),
+                    "2026-04-30T03:00:00",
+                    r#"{"type":"PromiseTransition","from":"protected","to":"at_risk","trigger":"run"}"#,
+                ],
+            )
+            .unwrap();
+        let rows = db
+            .query_events(&EventQueryFilter {
+                kind: Some(EventKind::Promise),
+                limit: 1,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        match &rows[0].payload {
+            EventPayload::PromiseTransition { from, to, .. } => {
+                assert_eq!(*from, crate::awareness::PromiseStatus::Protected);
+                assert_eq!(*to, crate::awareness::PromiseStatus::AtRisk);
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
+    }
+
     // ── Drift sample tests (UPI 030) ─────────────────────────────────
 
     fn drift_dt(s: &str) -> chrono::NaiveDateTime {

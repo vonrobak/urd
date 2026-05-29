@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
 
-use crate::awareness::SubvolAssessment;
+use crate::awareness::{PromiseStatus, SubvolAssessment};
 use crate::config::Config;
 use crate::error::UrdError;
 use crate::executor::{ExecutionResult, SendType};
@@ -83,8 +83,12 @@ pub struct SubvolumeHeartbeat {
     pub name: String,
     /// `None` if not attempted (empty/skipped run), `Some(true/false)` if attempted.
     pub backup_success: Option<bool>,
-    /// Promise status from the awareness model: "PROTECTED", "AT RISK", "UNPROTECTED".
-    pub promise_status: String,
+    /// Promise status from the awareness model. Serializes SCREAMING
+    /// ("PROTECTED" / "AT RISK" / "UNPROTECTED"); deserialization accepts the
+    /// closed set plus legacy `snake_case` aliases. An out-of-set value fails
+    /// the whole heartbeat parse, which the reader treats as absent
+    /// (fail-open via `.ok()` — see `read`).
+    pub promise_status: PromiseStatus,
     /// Number of sends that succeeded but whose pin file write failed.
     /// Defaults to 0 for backward compat with pre-pin-tracking heartbeats.
     #[serde(default)]
@@ -211,7 +215,7 @@ fn build_subvolume_entries(
             SubvolumeHeartbeat {
                 name: a.name.clone(),
                 backup_success: sv_result.map(|sv| sv.success),
-                promise_status: a.status.to_string(),
+                promise_status: a.status,
                 pin_failures: sv_result.map(|sv| sv.pin_failures).unwrap_or(0),
                 send_completed,
                 churn_bytes_per_second: churn.churn_bytes_per_second,
@@ -485,12 +489,12 @@ mod tests {
         assert_eq!(parsed.subvolumes.len(), 2);
         assert_eq!(parsed.subvolumes[0].name, "home");
         assert_eq!(parsed.subvolumes[0].backup_success, Some(true));
-        assert_eq!(parsed.subvolumes[0].promise_status, "PROTECTED");
+        assert_eq!(parsed.subvolumes[0].promise_status, PromiseStatus::Protected);
         // "home" has send_type: Incremental → send_completed: true
         assert!(parsed.subvolumes[0].send_completed);
         assert_eq!(parsed.subvolumes[1].name, "docs");
         assert_eq!(parsed.subvolumes[1].backup_success, Some(false));
-        assert_eq!(parsed.subvolumes[1].promise_status, "AT RISK");
+        assert_eq!(parsed.subvolumes[1].promise_status, PromiseStatus::AtRisk);
         // "docs" has send_type: NoSend → send_completed: false
         assert!(!parsed.subvolumes[1].send_completed);
     }
@@ -547,8 +551,8 @@ mod tests {
             assert_eq!(sv.backup_success, None);
         }
         // Promise statuses still present
-        assert_eq!(heartbeat.subvolumes[0].promise_status, "PROTECTED");
-        assert_eq!(heartbeat.subvolumes[1].promise_status, "AT RISK");
+        assert_eq!(heartbeat.subvolumes[0].promise_status, PromiseStatus::Protected);
+        assert_eq!(heartbeat.subvolumes[1].promise_status, PromiseStatus::AtRisk);
     }
 
     // ── Atomic write ────────────────────────────────────────────────────
@@ -758,6 +762,38 @@ mod tests {
     #[test]
     fn read_nonexistent_returns_none() {
         assert!(read(Path::new("/tmp/nonexistent-heartbeat-test.json")).is_none());
+    }
+
+    #[test]
+    fn read_out_of_set_promise_status_fails_open_to_none() {
+        // UPI 053 F1 contract lock: `promise_status` deserialization now
+        // narrows from "any string" to the closed `PromiseStatus` set (+
+        // legacy aliases). An out-of-set value must make `read` return `None`
+        // (file treated as absent, rebuilt on next run) — never panic, never
+        // propagate an error. This guards against a future `.ok()` → `?` /
+        // `.expect()` "cleanup" that would turn a benign garbage file into a
+        // hard failure on the read path.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("heartbeat.json");
+        let json = r#"{
+            "schema_version": 4,
+            "timestamp": "2026-03-24T02:00:00",
+            "stale_after": "2026-03-24T04:00:00",
+            "run_result": "success",
+            "run_id": 1,
+            "subvolumes": [
+                {
+                    "name": "home",
+                    "backup_success": true,
+                    "promise_status": "DEGRADED",
+                    "pin_failures": 0,
+                    "send_completed": true
+                }
+            ],
+            "notifications_dispatched": true
+        }"#;
+        std::fs::write(&path, json).unwrap();
+        assert!(read(&path).is_none());
     }
 
     // ── send_completed tests ───────────────────────────────────────────

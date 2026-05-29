@@ -14,6 +14,7 @@ use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
+use crate::awareness::PromiseStatus;
 use crate::heartbeat::Heartbeat;
 
 // ── Event types ────────────────────────────────────────────────────────
@@ -204,12 +205,12 @@ pub fn compute_notifications(
                 .find(|s| s.name == current_sv.name)
                 .filter(|prev_sv| prev_sv.promise_status != current_sv.promise_status)
             {
-                if is_degradation(&prev_sv.promise_status, &current_sv.promise_status) {
+                if is_degradation(prev_sv.promise_status, current_sv.promise_status) {
                     notifications.push(Notification {
                         event: NotificationEvent::PromiseDegraded {
                             subvolume: current_sv.name.clone(),
-                            from: prev_sv.promise_status.clone(),
-                            to: current_sv.promise_status.clone(),
+                            from: prev_sv.promise_status.to_string(),
+                            to: current_sv.promise_status.to_string(),
                         },
                         urgency: Urgency::Warning,
                         title: format!(
@@ -226,8 +227,8 @@ pub fn compute_notifications(
                     notifications.push(Notification {
                         event: NotificationEvent::PromiseRecovered {
                             subvolume: current_sv.name.clone(),
-                            from: prev_sv.promise_status.clone(),
-                            to: current_sv.promise_status.clone(),
+                            from: prev_sv.promise_status.to_string(),
+                            to: current_sv.promise_status.to_string(),
                         },
                         urgency: Urgency::Info,
                         title: format!(
@@ -249,7 +250,7 @@ pub fn compute_notifications(
         && current
             .subvolumes
             .iter()
-            .all(|sv| sv.promise_status == "UNPROTECTED");
+            .all(|sv| sv.promise_status == PromiseStatus::Unprotected);
 
     if all_unprotected {
         notifications.push(Notification {
@@ -319,18 +320,11 @@ pub fn compute_notifications(
     notifications
 }
 
-/// Status ordering for degradation detection: PROTECTED > AT RISK > UNPROTECTED.
-fn status_rank(status: &str) -> u8 {
-    match status {
-        "PROTECTED" => 2,
-        "AT RISK" => 1,
-        "UNPROTECTED" => 0,
-        _ => 0,
-    }
-}
-
-fn is_degradation(from: &str, to: &str) -> bool {
-    status_rank(from) > status_rank(to)
+/// True when the promise status worsened. `PromiseStatus`'s `Ord` is
+/// worst-to-best (`Unprotected < AtRisk < Protected`), so a degradation is
+/// `to < from`. Named helper documents direction; mirrors `events.rs`.
+fn is_degradation(from: PromiseStatus, to: PromiseStatus) -> bool {
+    to < from
 }
 
 // ── Drive reconnection notifications ──────────────────────────────────
@@ -576,12 +570,12 @@ mod tests {
     use super::*;
     use crate::heartbeat::{Heartbeat, SubvolumeHeartbeat};
 
-    fn make_heartbeat(statuses: &[(&str, &str, Option<bool>)]) -> Heartbeat {
+    fn make_heartbeat(statuses: &[(&str, PromiseStatus, Option<bool>)]) -> Heartbeat {
         make_heartbeat_with_pins(statuses, 0)
     }
 
     fn make_heartbeat_with_pins(
-        statuses: &[(&str, &str, Option<bool>)],
+        statuses: &[(&str, PromiseStatus, Option<bool>)],
         pin_failures: u32,
     ) -> Heartbeat {
         Heartbeat {
@@ -595,7 +589,7 @@ mod tests {
                 .iter()
                 .map(|(name, status, success)| SubvolumeHeartbeat {
                     name: name.to_string(),
-                    promise_status: status.to_string(),
+                    promise_status: *status,
                     backup_success: *success,
                     pin_failures,
                     send_completed: true,
@@ -615,8 +609,8 @@ mod tests {
 
     #[test]
     fn degraded_generates_notification() {
-        let prev = make_heartbeat(&[("home", "PROTECTED", Some(true))]);
-        let curr = make_heartbeat(&[("home", "AT RISK", Some(true))]);
+        let prev = make_heartbeat(&[("home", PromiseStatus::Protected, Some(true))]);
+        let curr = make_heartbeat(&[("home", PromiseStatus::AtRisk, Some(true))]);
 
         let notifications = compute_notifications(Some(&prev), &curr);
 
@@ -631,8 +625,8 @@ mod tests {
 
     #[test]
     fn recovered_generates_notification() {
-        let prev = make_heartbeat(&[("home", "AT RISK", Some(true))]);
-        let curr = make_heartbeat(&[("home", "PROTECTED", Some(true))]);
+        let prev = make_heartbeat(&[("home", PromiseStatus::AtRisk, Some(true))]);
+        let curr = make_heartbeat(&[("home", PromiseStatus::Protected, Some(true))]);
 
         let notifications = compute_notifications(Some(&prev), &curr);
 
@@ -647,8 +641,8 @@ mod tests {
 
     #[test]
     fn no_change_no_notification() {
-        let prev = make_heartbeat(&[("home", "PROTECTED", Some(true))]);
-        let curr = make_heartbeat(&[("home", "PROTECTED", Some(true))]);
+        let prev = make_heartbeat(&[("home", PromiseStatus::Protected, Some(true))]);
+        let curr = make_heartbeat(&[("home", PromiseStatus::Protected, Some(true))]);
 
         let notifications = compute_notifications(Some(&prev), &curr);
 
@@ -667,7 +661,7 @@ mod tests {
 
     #[test]
     fn first_heartbeat_no_degradation() {
-        let curr = make_heartbeat(&[("home", "AT RISK", Some(true))]);
+        let curr = make_heartbeat(&[("home", PromiseStatus::AtRisk, Some(true))]);
 
         let notifications = compute_notifications(None, &curr);
 
@@ -689,8 +683,8 @@ mod tests {
     #[test]
     fn all_unprotected_is_critical() {
         let curr = make_heartbeat(&[
-            ("home", "UNPROTECTED", Some(true)),
-            ("docs", "UNPROTECTED", Some(true)),
+            ("home", PromiseStatus::Unprotected, Some(true)),
+            ("docs", PromiseStatus::Unprotected, Some(true)),
         ]);
 
         let notifications = compute_notifications(None, &curr);
@@ -706,8 +700,8 @@ mod tests {
     #[test]
     fn partial_unprotected_not_all_unprotected() {
         let curr = make_heartbeat(&[
-            ("home", "UNPROTECTED", Some(true)),
-            ("docs", "PROTECTED", Some(true)),
+            ("home", PromiseStatus::Unprotected, Some(true)),
+            ("docs", PromiseStatus::Protected, Some(true)),
         ]);
 
         let notifications = compute_notifications(None, &curr);
@@ -724,8 +718,8 @@ mod tests {
     #[test]
     fn partial_failures_generate_warning() {
         let curr = make_heartbeat(&[
-            ("home", "PROTECTED", Some(true)),
-            ("docs", "AT RISK", Some(false)),
+            ("home", PromiseStatus::Protected, Some(true)),
+            ("docs", PromiseStatus::AtRisk, Some(false)),
         ]);
 
         let notifications = compute_notifications(None, &curr);
@@ -742,8 +736,8 @@ mod tests {
     #[test]
     fn all_failures_is_critical() {
         let curr = make_heartbeat(&[
-            ("home", "AT RISK", Some(false)),
-            ("docs", "AT RISK", Some(false)),
+            ("home", PromiseStatus::AtRisk, Some(false)),
+            ("docs", PromiseStatus::AtRisk, Some(false)),
         ]);
 
         let notifications = compute_notifications(None, &curr);
@@ -759,8 +753,8 @@ mod tests {
     #[test]
     fn no_failures_no_notification() {
         let curr = make_heartbeat(&[
-            ("home", "PROTECTED", Some(true)),
-            ("docs", "PROTECTED", Some(true)),
+            ("home", PromiseStatus::Protected, Some(true)),
+            ("docs", PromiseStatus::Protected, Some(true)),
         ]);
 
         let notifications = compute_notifications(None, &curr);
@@ -775,7 +769,7 @@ mod tests {
     #[test]
     fn empty_run_no_failure_notification() {
         // backup_success = None means not attempted (empty run)
-        let curr = make_heartbeat(&[("home", "PROTECTED", None)]);
+        let curr = make_heartbeat(&[("home", PromiseStatus::Protected, None)]);
 
         let notifications = compute_notifications(None, &curr);
 
@@ -791,7 +785,7 @@ mod tests {
     #[test]
     fn pin_failures_generate_warning() {
         let curr = make_heartbeat_with_pins(
-            &[("home", "PROTECTED", Some(true))],
+            &[("home", PromiseStatus::Protected, Some(true))],
             2,
         );
 
@@ -808,7 +802,7 @@ mod tests {
 
     #[test]
     fn no_pin_failures_no_notification() {
-        let curr = make_heartbeat(&[("home", "PROTECTED", Some(true))]);
+        let curr = make_heartbeat(&[("home", PromiseStatus::Protected, Some(true))]);
 
         let notifications = compute_notifications(None, &curr);
 
@@ -828,12 +822,27 @@ mod tests {
         assert!(Urgency::Info < Urgency::Critical);
     }
 
-    // ── Status ranking ─────────────────────────────────────────────
+    // ── Degradation direction ──────────────────────────────────────
 
     #[test]
-    fn status_rank_ordering() {
-        assert!(status_rank("PROTECTED") > status_rank("AT RISK"));
-        assert!(status_rank("AT RISK") > status_rank("UNPROTECTED"));
+    fn is_degradation_follows_ord() {
+        // Worsening (to < from) is a degradation; improving is not.
+        assert!(is_degradation(
+            PromiseStatus::Protected,
+            PromiseStatus::AtRisk
+        ));
+        assert!(is_degradation(
+            PromiseStatus::AtRisk,
+            PromiseStatus::Unprotected
+        ));
+        assert!(!is_degradation(
+            PromiseStatus::AtRisk,
+            PromiseStatus::Protected
+        ));
+        assert!(!is_degradation(
+            PromiseStatus::Protected,
+            PromiseStatus::Protected
+        ));
     }
 
     // ── Multiple events in one transition ──────────────────────────
@@ -841,12 +850,12 @@ mod tests {
     #[test]
     fn multiple_degradations_produce_multiple_notifications() {
         let prev = make_heartbeat(&[
-            ("home", "PROTECTED", Some(true)),
-            ("docs", "PROTECTED", Some(true)),
+            ("home", PromiseStatus::Protected, Some(true)),
+            ("docs", PromiseStatus::Protected, Some(true)),
         ]);
         let curr = make_heartbeat(&[
-            ("home", "AT RISK", Some(true)),
-            ("docs", "UNPROTECTED", Some(false)),
+            ("home", PromiseStatus::AtRisk, Some(true)),
+            ("docs", PromiseStatus::Unprotected, Some(false)),
         ]);
 
         let notifications = compute_notifications(Some(&prev), &curr);
@@ -868,8 +877,8 @@ mod tests {
             channels: vec![NotificationChannel::Log],
         };
 
-        let prev = make_heartbeat(&[("home", "PROTECTED", Some(true))]);
-        let curr = make_heartbeat(&[("home", "AT RISK", Some(true))]);
+        let prev = make_heartbeat(&[("home", PromiseStatus::Protected, Some(true))]);
+        let curr = make_heartbeat(&[("home", PromiseStatus::AtRisk, Some(true))]);
 
         let notifications = compute_notifications(Some(&prev), &curr);
         // Warning-level notification should not fire through Critical-minimum config

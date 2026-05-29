@@ -8,7 +8,8 @@
 > data-driven development possible.
 
 **Date:** 2026-04-30
-**Status:** Accepted (principle); implementation pending UPI 036
+**Status:** Accepted (principle); implementation pending UPI 036 (`PromiseStatus`
+serialized-form amendment 2026-05-29 — see [Amendment 2026-05-29](#amendment-2026-05-29-promisestatus-serialized-form))
 **Complements:** UPI 030 (drift_samples — quantitative per-run signal)
 
 ## Context
@@ -220,3 +221,36 @@ These are deliberately deferred to `/design` (UPI 036):
   analysis that motivated this ADR.
 - **Handoff:** `docs/98-journals/2026-04-30-data-driven-development-handoff.md`
   — design session brief for UPI 036.
+
+## Amendment 2026-05-29 (`PromiseStatus` serialized form)
+
+UPI 053 threads the `PromiseStatus` enum (`awareness.rs`) through the structured
+output boundary instead of flattening it to `String` at each surface. Two facts
+about wire format are load-bearing for this event log and must be recorded here.
+
+**Serialized form is unchanged on every surface; read-tolerance narrows.** Before
+UPI 053, `PromiseStatus` carried `#[serde(rename_all = "snake_case")]`, so its
+`Serialize` form (`at_risk`) disagreed with its `Display` form (`AT RISK`). The
+`PromiseTransition` event payload — the one place this enum reaches the SQLite
+`events` table — therefore persisted `snake_case`. UPI 053 replaces the container
+rename with per-variant `#[serde(rename = "AT RISK", alias = "at_risk")]` (and the
+PROTECTED/UNPROTECTED equivalents). The serialized form is now SCREAMING on every
+surface — heartbeat JSON, `status`/`backup`/`doctor --json`, the sentinel state
+file, the `events`-table payload, and the `urd events --format ndjson` render —
+matching `Display` and the glossary's "SCREAMING on every machine surface,
+including NDJSON" rule. On the **read** side, deserialization of `promise_status` /
+`status` / `worst_safety` is now restricted to the closed `PromiseStatus` set plus
+the `at_risk` (etc.) aliases — an unknown value causes the containing
+heartbeat/sentinel-state file to be treated as absent (fail-open via `.ok()`), not
+retained. The ephemeral self-rebuilding files (heartbeat, sentinel state) are
+unaffected in practice; the **events table is the surface this ADR governs**.
+
+**The legacy `snake_case` alias is permanent.** Events are append-only and
+immutable (this ADR's core property), so `PromiseTransition` rows written before
+2026-05-29 carry `from`/`to` values like `"at_risk"` and live indefinitely. The
+serde `alias` on each variant reads them back to the correct enum value forever;
+it must not be removed. The internal `events`-table payload value form is the only
+thing that changes (`at_risk` → `AT RISK` for new rows) — no external consumer
+reads the events payload (design Assumption #4), and the `urd events --format
+ndjson` sibling render is documented internal-only. No `schema_version` bump: the
+sentinel state file and heartbeat **write-forms are byte-identical** to before.
