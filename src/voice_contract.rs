@@ -1009,6 +1009,7 @@ mod contract {
             external: None,
             note: None,
             was_named_level: None,
+            storage_critical: false,
         }
     }
 
@@ -1112,6 +1113,7 @@ mod contract {
             external: None,
             note: None,
             was_named_level: None,
+            storage_critical: false,
         }
     }
 
@@ -1161,6 +1163,7 @@ mod contract {
             external: None,
             note: None,
             was_named_level: None,
+            storage_critical: false,
         }
     }
 
@@ -1371,6 +1374,7 @@ mod contract {
             external: None,
             note: None,
             was_named_level: None,
+            storage_critical: false,
         };
         let view = crate::output::DoctorRecommendationView {
             header: "header".to_string(),

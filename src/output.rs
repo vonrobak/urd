@@ -525,6 +525,12 @@ pub struct DoctorRecommendationRow {
     /// gate.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub was_named_level: Option<crate::types::ProtectionLevel>,
+    /// UPI 031: the subvolume's source is on the host's root-filesystem pool
+    /// (entrusted to Urd) and that pool is critically tight. A structural
+    /// property distinct from momentary headroom pressure. Renders a dimmed
+    /// advisory; omitted from JSON when false (additive, no schema bump).
+    #[serde(skip_serializing_if = "is_false")]
+    pub storage_critical: bool,
 }
 
 // ── Churn (UPI 030) ────────────────────────────────────────────────────
@@ -2281,6 +2287,7 @@ source = "/data/sv2"
             external: Some(pressure),
             note: None,
             was_named_level: None,
+            storage_critical: false,
         };
         let value = serde_json::to_value(&row).unwrap();
         assert_eq!(
@@ -2340,6 +2347,7 @@ source = "/data/sv2"
             external: None,
             note: None,
             was_named_level: None,
+            storage_critical: false,
         };
         let json = serde_json::to_string(&row).unwrap();
         assert!(!json.contains("\"adjusted\""), "adjusted omitted when None: {json}");

@@ -5185,6 +5185,7 @@ mod tests {
                 external: None,
                 note: None,
                 was_named_level: None,
+                storage_critical: false,
             }],
         };
         let output = render_doctor(
@@ -5224,6 +5225,7 @@ mod tests {
                 )),
                 note: None,
                 was_named_level: None,
+                storage_critical: false,
             }],
         };
         let output = render_doctor(
@@ -5253,6 +5255,7 @@ mod tests {
                 external: None,
                 note: None,
                 was_named_level: None,
+                storage_critical: false,
             }],
         };
         let output = render_doctor(
@@ -5283,6 +5286,7 @@ mod tests {
                 external: None,
                 note: None,
                 was_named_level: None,
+                storage_critical: false,
             }],
         };
         let output = render_doctor(
@@ -5314,6 +5318,7 @@ mod tests {
                 )),
                 note: None,
                 was_named_level: None,
+                storage_critical: false,
             }],
         };
         let days_out = render_doctor(
@@ -5340,6 +5345,7 @@ mod tests {
                 )),
                 note: None,
                 was_named_level: None,
+                storage_critical: false,
             }],
         };
         let weeks_out = render_doctor(
@@ -5366,6 +5372,7 @@ mod tests {
                 )),
                 note: None,
                 was_named_level: None,
+                storage_critical: false,
             }],
         };
         let years_out = render_doctor(
@@ -5396,6 +5403,7 @@ mod tests {
                 external: None,
                 note: Some(crate::recommendation::RecommendationNote::BurstyPattern),
                 was_named_level: None,
+                storage_critical: false,
             }],
         };
         let output = render_doctor(
@@ -5425,6 +5433,7 @@ mod tests {
                 external: None,
                 note: None,
                 was_named_level: Some(crate::types::ProtectionLevel::Sheltered),
+                storage_critical: false,
             }],
         };
         let with_level = render_doctor(
@@ -5452,6 +5461,7 @@ mod tests {
                 external: None,
                 note: None,
                 was_named_level: None,
+                storage_critical: false,
             }],
         };
         let no_level = render_doctor(
@@ -5481,6 +5491,7 @@ mod tests {
                 external: None,
                 note: Some(crate::recommendation::RecommendationNote::BurstyPattern),
                 was_named_level: Some(crate::types::ProtectionLevel::Sheltered),
+                storage_critical: false,
             }],
         };
         let output = render_doctor(&recommendations_doctor_output(view), OutputMode::Daemon);
@@ -5600,6 +5611,7 @@ mod tests {
                 external: None,
                 note: None,
                 was_named_level: None,
+                storage_critical: false,
             }],
         };
         let out = render_doctor(&recommendations_doctor_output(view), OutputMode::Interactive);
@@ -5630,6 +5642,7 @@ mod tests {
                 external: None,
                 note: None,
                 was_named_level: None,
+                storage_critical: false,
             }],
         };
         let out = render_doctor(&recommendations_doctor_output(view), OutputMode::Interactive);
@@ -5663,6 +5676,7 @@ mod tests {
                 external: None,
                 note: None,
                 was_named_level: None,
+                storage_critical: false,
             }],
         };
         let out = render_doctor(&recommendations_doctor_output(view), OutputMode::Interactive);
@@ -5696,6 +5710,7 @@ mod tests {
                 external: None,
                 note: None,
                 was_named_level: None,
+                storage_critical: false,
             }],
         };
         let out = render_doctor(&recommendations_doctor_output(view), OutputMode::Interactive);
@@ -5732,6 +5747,7 @@ mod tests {
                 external: None,
                 note: None,
                 was_named_level: None,
+                storage_critical: false,
             }],
         };
         let out = render_doctor(&recommendations_doctor_output(view), OutputMode::Interactive);
@@ -5763,6 +5779,7 @@ mod tests {
                 external: None,
                 note: None,
                 was_named_level: None,
+                storage_critical: false,
             }],
         };
         let out = render_doctor(&recommendations_doctor_output(view), OutputMode::Interactive);
@@ -5793,6 +5810,7 @@ mod tests {
                 external: None,
                 note: Some(crate::recommendation::RecommendationNote::BurstyPattern),
                 was_named_level: Some(crate::types::ProtectionLevel::Sheltered),
+                storage_critical: false,
             }],
         };
         let out = render_doctor(&recommendations_doctor_output(view), OutputMode::Interactive);
@@ -5840,6 +5858,7 @@ mod tests {
                 external: Some(external_pressure),
                 note: None,
                 was_named_level: None,
+                storage_critical: false,
             }],
         };
         let out = render_doctor(&recommendations_doctor_output(view), OutputMode::Interactive);
@@ -5869,6 +5888,7 @@ mod tests {
                 external: None,
                 note: None,
                 was_named_level: None,
+                storage_critical: false,
             }],
         };
         let out = render_doctor(&recommendations_doctor_output(view), OutputMode::Interactive);
@@ -5894,11 +5914,159 @@ mod tests {
                 external: None,
                 note: None,
                 was_named_level: None,
+                storage_critical: false,
             }],
         };
         let out = render_doctor(&recommendations_doctor_output(view), OutputMode::Interactive);
         assert!(out.contains("storage critical"), "pointer line missing: {out}");
         assert!(!out.contains("daily="), "no shape: {out}");
+    }
+
+    // ── UPI 031 — storage-critical advisory ─────────────────────────
+
+    #[test]
+    fn storage_critical_advisory_rendered_and_complements_shape() {
+        // A tightenable Pressure row that is also storage_critical renders the
+        // tightened shape, the tightening reason, AND the host-stakes advisory
+        // — the advisory is purely additive (stakes, not action).
+        let _color = color_guard(false);
+        let h = ha_rec(
+            crate::recommendation::ShapeRole::Local,
+            shape(24, 30, 26, crate::types::MonthlyCount::Count(12), 0),
+            shape(24, 60, 52, crate::types::MonthlyCount::Count(24), 0),
+            200_000_000_000,
+            50_000_000_000,
+            crate::recommendation::HeadroomSeverity::Pressure,
+            Some(crate::recommendation::AdjustmentReason::SourcePoolLow { free_ratio: 0.10 }),
+            Some(shape(16, 42, 36, crate::types::MonthlyCount::Count(16), 0)),
+            Some(25_000_000_000),
+        );
+        let view = crate::output::DoctorRecommendationView {
+            header: "h".to_string(),
+            rows: vec![crate::output::DoctorRecommendationRow {
+                name: "root".to_string(),
+                local: Some(h),
+                external: None,
+                note: None,
+                was_named_level: None,
+                storage_critical: true,
+            }],
+        };
+        let out = render_doctor(&recommendations_doctor_output(view), OutputMode::Interactive);
+        assert!(out.contains("daily=42"), "tightened shape missing: {out}");
+        assert!(out.contains("shape tightened"), "tightening reason missing: {out}");
+        assert!(
+            out.contains("risks the host itself"),
+            "storage-critical advisory missing: {out}"
+        );
+    }
+
+    #[test]
+    fn storage_critical_at_min_combined_render_no_double_action() {
+        // M3: an at-MIN Pressure row (synth, no adjusted) that is also
+        // storage_critical. The action ("expanding storage") must appear at
+        // most once — on the at-MIN reason line, not duplicated by the
+        // advisory, which supplies only the host stakes.
+        let _color = color_guard(false);
+        let cur = shape(0, 3, 0, crate::types::MonthlyCount::Count(0), 0);
+        let h = crate::recommendation::headroom_aware_pointer_only(
+            &cur,
+            crate::recommendation::ShapeRole::Local,
+            crate::recommendation::HeadroomSeverity::Pressure,
+            crate::recommendation::AdjustmentReason::SourcePoolLow { free_ratio: 0.10 },
+        );
+        let view = crate::output::DoctorRecommendationView {
+            header: "h".to_string(),
+            rows: vec![crate::output::DoctorRecommendationRow {
+                name: "root".to_string(),
+                local: Some(h),
+                external: None,
+                note: None,
+                was_named_level: None,
+                storage_critical: true,
+            }],
+        };
+        let out = render_doctor(&recommendations_doctor_output(view), OutputMode::Interactive);
+        assert!(
+            out.contains("shape already at minimum"),
+            "at-MIN guidance missing: {out}"
+        );
+        assert!(
+            out.contains("risks the host itself"),
+            "storage-critical advisory missing: {out}"
+        );
+        assert!(
+            out.matches("expanding storage").count() <= 1,
+            "action verb must not be duplicated (action + stakes, not two exhortations): {out}"
+        );
+    }
+
+    #[test]
+    fn storage_critical_advisory_absent_when_flag_false() {
+        // A Pressure row without the flag renders no host-stakes advisory.
+        let _color = color_guard(false);
+        let h = ha_rec(
+            crate::recommendation::ShapeRole::Local,
+            shape(24, 30, 26, crate::types::MonthlyCount::Count(12), 0),
+            shape(24, 60, 52, crate::types::MonthlyCount::Count(24), 0),
+            200_000_000_000,
+            50_000_000_000,
+            crate::recommendation::HeadroomSeverity::Pressure,
+            Some(crate::recommendation::AdjustmentReason::SourcePoolLow { free_ratio: 0.10 }),
+            Some(shape(16, 42, 36, crate::types::MonthlyCount::Count(16), 0)),
+            Some(25_000_000_000),
+        );
+        let view = crate::output::DoctorRecommendationView {
+            header: "h".to_string(),
+            rows: vec![crate::output::DoctorRecommendationRow {
+                name: "containers".to_string(),
+                local: Some(h),
+                external: None,
+                note: None,
+                was_named_level: None,
+                storage_critical: false,
+            }],
+        };
+        let out = render_doctor(&recommendations_doctor_output(view), OutputMode::Interactive);
+        assert!(
+            !out.contains("risks the host itself"),
+            "advisory must be absent when flag false: {out}"
+        );
+    }
+
+    #[test]
+    fn storage_critical_advisory_not_emitted_on_dormant_critical_path() {
+        // Dormant-path guard: a Critical-severity row (032/033 hook) takes the
+        // R9 pointer-only early return, so the additive advisory is NOT also
+        // emitted — only the single pointer line.
+        let _color = color_guard(false);
+        let cur = shape(24, 60, 52, crate::types::MonthlyCount::Count(24), 0);
+        let h = crate::recommendation::headroom_aware_pointer_only(
+            &cur,
+            crate::recommendation::ShapeRole::Local,
+            crate::recommendation::HeadroomSeverity::Critical,
+            crate::recommendation::AdjustmentReason::StorageCritical,
+        );
+        let view = crate::output::DoctorRecommendationView {
+            header: "h".to_string(),
+            rows: vec![crate::output::DoctorRecommendationRow {
+                name: "root".to_string(),
+                local: Some(h),
+                external: None,
+                note: None,
+                was_named_level: None,
+                storage_critical: true,
+            }],
+        };
+        let out = render_doctor(&recommendations_doctor_output(view), OutputMode::Interactive);
+        assert!(
+            out.contains("see `urd doctor`"),
+            "R9 pointer line expected: {out}"
+        );
+        assert!(
+            !out.contains("risks the host itself"),
+            "additive advisory must not also fire on the Critical path: {out}"
+        );
     }
 
     // ── UPI 042 — MonthlyCount + yearly rendering ───────────────────

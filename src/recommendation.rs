@@ -55,15 +55,24 @@ pub struct HeadroomContext {
 
 /// Per-(subvolume, role) headroom severity (UPI 044). Ordering is
 /// load-bearing: `.iter().max()` yields the dominant tier when multiple
-/// signals fire. Critical is **not** in the classifier's output domain
-/// — doctor.rs injects it externally based on
-/// `storage_critical::is_storage_critical`.
+/// signals fire. Critical is **not** in the classifier's output domain.
+///
+/// UPI 031 retired the doctor-side Critical *injection* (the old
+/// force-Critical path), so as of this UPI nothing in production constructs
+/// `Critical` — the tier, the voice R9 pointer path, and
+/// `headroom_aware_pointer_only(.., Critical, ..)` are reachable only from
+/// tests. This is the intentional hook for the behavioral bundle (UPIs
+/// 032/033), time-boxed to that horizon; if the bundle slips, reconsider
+/// whether the tier should be deleted rather than maintained unused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HeadroomSeverity {
     Healthy,
     Caution,
     Pressure,
+    /// Dormant in production since UPI 031 (see the type doc). Kept alive for
+    /// the UPI 032/033 bundle and exercised by tests.
+    #[allow(dead_code)]
     Critical,
 }
 
@@ -89,7 +98,14 @@ pub fn classify_headroom_severity(ctx: HeadroomContext) -> HeadroomSeverity {
         .unwrap_or(HeadroomSeverity::Healthy)
 }
 
-fn classify_free_ratio(free: Option<u64>, capacity: Option<u64>) -> HeadroomSeverity {
+/// Classify pool tightness from free/capacity by free-ratio alone.
+///
+/// Reused by the storage-critical wiring (UPI 031) as the free-ratio-only
+/// tightness gate (Branch E) — no trend or metadata signal, no new constant.
+/// Unmeasurable inputs (either `None`, zero capacity, non-finite ratio) fail
+/// toward `Healthy`.
+#[must_use]
+pub fn classify_free_ratio(free: Option<u64>, capacity: Option<u64>) -> HeadroomSeverity {
     let (Some(free), Some(capacity)) = (free, capacity) else {
         return HeadroomSeverity::Healthy;
     };
@@ -1107,6 +1123,31 @@ mod tests {
         // capacity=0 → free/capacity not meaningful → Healthy.
         let ctx = ctx_free(0, 0);
         assert_eq!(classify_headroom_severity(ctx), HeadroomSeverity::Healthy);
+    }
+
+    #[test]
+    fn classify_free_ratio_pub_threshold() {
+        // Direct check of the now-public free-ratio gate (UPI 031 reuse).
+        assert_eq!(
+            classify_free_ratio(Some(10), Some(100)),
+            HeadroomSeverity::Pressure,
+            "10% free → Pressure"
+        );
+        assert_eq!(
+            classify_free_ratio(Some(20), Some(100)),
+            HeadroomSeverity::Caution,
+            "20% free → Caution"
+        );
+        assert_eq!(
+            classify_free_ratio(Some(50), Some(100)),
+            HeadroomSeverity::Healthy,
+            "50% free → Healthy"
+        );
+        assert_eq!(
+            classify_free_ratio(None, Some(100)),
+            HeadroomSeverity::Healthy,
+            "unmeasurable free → Healthy"
+        );
     }
 
     #[test]
