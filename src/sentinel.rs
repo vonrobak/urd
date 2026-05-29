@@ -736,7 +736,7 @@ pub fn compute_visual_state(assessments: &[SubvolAssessment]) -> crate::output::
 
     VisualState {
         icon,
-        worst_safety: worst_safety.to_string(),
+        worst_safety,
         worst_health: worst_health.to_string(),
         safety_counts,
         health_counts,
@@ -1864,7 +1864,7 @@ mod tests {
         let vs = compute_visual_state(&assessments);
         assert_eq!(vs.icon, crate::output::VisualIcon::Warning);
         assert_eq!(vs.safety_counts.aging, 1);
-        assert_eq!(vs.worst_safety, "AT RISK");
+        assert_eq!(vs.worst_safety, PromiseStatus::AtRisk);
     }
 
     #[test]

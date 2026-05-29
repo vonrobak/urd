@@ -1745,8 +1745,8 @@ fn detect_transitions(
         if post_a.status > pre_a.status {
             transitions.push(TransitionEvent::PromiseRecovered {
                 subvolume: post_a.name.clone(),
-                from: format!("{}", pre_a.status),
-                to: format!("{}", post_a.status),
+                from: pre_a.status,
+                to: post_a.status,
             });
         }
     }
@@ -2197,7 +2197,7 @@ mod tests {
 
         assert_eq!(summary.assessments.len(), 1);
         assert_eq!(summary.assessments[0].name, "htpc-home");
-        assert_eq!(summary.assessments[0].status, "PROTECTED");
+        assert_eq!(summary.assessments[0].status, PromiseStatus::Protected);
     }
 
     #[test]
@@ -2928,8 +2928,8 @@ mod tests {
         let transitions = detect_transitions(&pre, &post);
         assert!(transitions.contains(&TransitionEvent::PromiseRecovered {
             subvolume: "htpc-home".to_string(),
-            from: "UNPROTECTED".to_string(),
-            to: "PROTECTED".to_string(),
+            from: PromiseStatus::Unprotected,
+            to: PromiseStatus::Protected,
         }));
     }
 

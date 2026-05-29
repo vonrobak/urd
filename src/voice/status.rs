@@ -10,6 +10,7 @@ use std::fmt::Write;
 use colored::Colorize;
 
 use crate::advice::RedundancyAdvisoryKind;
+use crate::awareness::PromiseStatus;
 use crate::output::{ChainHealth, DefaultStatusOutput, OutputMode, StatusOutput};
 use crate::types::{ByteSize, DriveRole};
 
@@ -92,7 +93,7 @@ pub(super) fn render_summary_line(data: &StatusOutput, out: &mut String) {
     let safe_count = data
         .assessments
         .iter()
-        .filter(|a| a.status == "PROTECTED")
+        .filter(|a| a.status == PromiseStatus::Protected)
         .count();
     let has_health_issues = data.assessments.iter().any(|a| a.health != "healthy");
 
@@ -102,13 +103,13 @@ pub(super) fn render_summary_line(data: &StatusOutput, out: &mut String) {
         let exposed_names: Vec<&str> = data
             .assessments
             .iter()
-            .filter(|a| a.status == "UNPROTECTED")
+            .filter(|a| a.status == PromiseStatus::Unprotected)
             .map(|a| a.name.as_str())
             .collect();
         let waning_names: Vec<&str> = data
             .assessments
             .iter()
-            .filter(|a| a.status == "AT RISK")
+            .filter(|a| a.status == PromiseStatus::AtRisk)
             .map(|a| a.name.as_str())
             .collect();
         let mut parts = vec![format!("{} of {} sealed.", safe_count, total)];
@@ -188,7 +189,7 @@ pub(super) fn render_subvolume_table(data: &StatusOutput, out: &mut String) {
 
     // Show PROTECTION only when exposure conflicts with promise (sealed but degraded, waning, exposed)
     let show_protection = data.assessments.iter().any(|a| {
-        a.promise_level.is_some() && a.status != "PROTECTED"
+        a.promise_level.is_some() && a.status != PromiseStatus::Protected
     });
     // Only show HEALTH column when at least one subvolume is non-healthy
     let show_health = data.assessments.iter().any(|a| a.health != "healthy");
@@ -216,7 +217,7 @@ pub(super) fn render_subvolume_table(data: &StatusOutput, out: &mut String) {
     let mut rows: Vec<Vec<String>> = Vec::new();
     for assessment in &data.assessments {
         // Safety column — new vocabulary
-        let safety = exposure_label(&assessment.status);
+        let safety = exposure_label(assessment.status);
         let mut row = vec![safety];
 
         if show_health {

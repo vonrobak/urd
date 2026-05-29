@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Internal refactor: thread `PromiseStatus` through the output boundary** (UPI 053).
+  Typed all eight structured-output promise-status fields (`status`, `local_status`,
+  `worst_safety`, heartbeat `promise_status`, the sentinel state file, `doctor`/`backup
+  --json`) as the `PromiseStatus` enum instead of `String`, and deleted the
+  `notify::status_rank` / `voice::status_severity` re-derivation in favor of the enum's
+  `Ord`. Unified `PromiseStatus`'s serde form on SCREAMING (matching `Display`) via
+  per-variant `rename` + permanent legacy `snake_case` `alias`. No external contract
+  change: every write-form is byte-identical, except the internal `events`-table payload
+  (`at_risk` → `AT RISK`), which is read-compatible via the alias (see ADR-114 amendment
+  2026-05-29). Closes the "Status string fragility" known issue.
+
 ## [0.21.1] - 2026-05-29
 
 ### Changed

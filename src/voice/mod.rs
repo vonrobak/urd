@@ -11,6 +11,7 @@ use std::fmt::Write;
 
 use colored::Colorize;
 
+use crate::awareness::PromiseStatus;
 use crate::output::{SkipCategory, StatusAssessment, VerifyCheck, VerifyOutput};
 // Test-only imports — moved-renderer types still referenced by parent tests
 // (renderer extractions per UPI 050 phases 1 + 2).
@@ -98,12 +99,11 @@ pub(super) fn pluralize(count: usize, singular: &str, plural: &str) -> String {
     }
 }
 
-pub(super) fn exposure_label(status: &str) -> String {
+pub(super) fn exposure_label(status: PromiseStatus) -> String {
     match status {
-        "PROTECTED" => "sealed".to_string(),
-        "AT RISK" => "waning".to_string(),
-        "UNPROTECTED" => "exposed".to_string(),
-        other => other.to_string(),
+        PromiseStatus::Protected => "sealed".to_string(),
+        PromiseStatus::AtRisk => "waning".to_string(),
+        PromiseStatus::Unprotected => "exposed".to_string(),
     }
 }
 
@@ -318,39 +318,33 @@ pub(super) fn truncate_str(s: &str, max_len: usize) -> String {
 
 // ── Staleness Escalation (4a) ──────────────────────────────────────────
 
-/// Severity ranking for promise status strings (higher = worse).
-pub(super) fn status_severity(status: &str) -> u8 {
-    match status {
-        "UNPROTECTED" => 2,
-        "AT RISK" => 1,
-        _ => 0,
-    }
-}
-
 /// Single-pass aggregation of per-drive presentation fields. The drive-level
 /// fields (`absent_duration_secs`, `last_activity_age_secs`) co-travel across
 /// all subvolume `DriveAssessment` entries on the same drive, so we take the
 /// first populated value we see; they are invariant per drive. The worst
 /// promise status across subvolumes drives the gravity escalation.
-pub(super) struct DriveAggregate<'a> {
-    worst_status: &'a str,
+pub(super) struct DriveAggregate {
+    worst_status: PromiseStatus,
     absent_duration_secs: Option<i64>,
     last_activity_age_secs: Option<i64>,
 }
 
-pub(super) fn aggregate_drive_info<'a>(
-    assessments: &'a [StatusAssessment],
+pub(super) fn aggregate_drive_info(
+    assessments: &[StatusAssessment],
     drive_label: &str,
-) -> DriveAggregate<'a> {
-    let mut worst: &str = "PROTECTED";
+) -> DriveAggregate {
+    // `PromiseStatus`'s `Ord` is worst-to-best (`Unprotected < AtRisk <
+    // Protected`), so "worst" is the minimum: start at the best (`Protected`)
+    // and keep any status that compares `<`.
+    let mut worst = PromiseStatus::Protected;
     let mut absent_duration_secs: Option<i64> = None;
     let mut last_activity_age_secs: Option<i64> = None;
 
     for assessment in assessments {
         for ext in &assessment.external {
             if ext.drive_label == drive_label {
-                if status_severity(&ext.status) > status_severity(worst) {
-                    worst = &ext.status;
+                if ext.status < worst {
+                    worst = ext.status;
                 }
                 if absent_duration_secs.is_none() {
                     absent_duration_secs = ext.absent_duration_secs;
@@ -381,7 +375,7 @@ pub(super) fn unmounted_drive_label(
     drive_label: &str,
     absent_duration_secs: Option<i64>,
     last_activity_age_secs: Option<i64>,
-    worst_status: &str,
+    worst_status: PromiseStatus,
 ) -> String {
     // Fallback field is `last_activity_age_secs` (broader: any activity)
     // rather than `last_send_age` (awareness's narrower backup-only signal).
@@ -405,21 +399,23 @@ pub(super) fn unmounted_drive_label(
 pub(super) fn format_drive_age_label(
     drive_label: &str,
     age_secs: i64,
-    worst_status: &str,
+    worst_status: PromiseStatus,
     phrase: &str,
 ) -> String {
     let age_str = humanize_duration(age_secs);
     match worst_status {
-        "UNPROTECTED" => format!(
+        PromiseStatus::Unprotected => format!(
             "{} {phrase} {age_str} — protection aging",
             drive_label.bold(),
         ),
-        "AT RISK" => format!(
+        PromiseStatus::AtRisk => format!(
             "{} {phrase} {} — consider connecting",
             drive_label.bold(),
             age_str.yellow(),
         ),
-        _ => format!("{} {phrase} — {}", drive_label.bold(), age_str.dimmed()),
+        PromiseStatus::Protected => {
+            format!("{} {phrase} — {}", drive_label.bold(), age_str.dimmed())
+        }
     }
 }
 
@@ -520,16 +516,16 @@ pub(crate) mod test_fixtures {
             assessments: vec![
                 StatusAssessment {
                     name: "htpc-home".to_string(),
-                    status: "PROTECTED".to_string(),
+                    status: PromiseStatus::Protected,
                     health: "healthy".to_string(),
                     health_reasons: vec![],
                     promise_level: None,
                     local_snapshot_count: 47,
                     local_newest_age_secs: Some(1800),
-                    local_status: "PROTECTED".to_string(),
+                    local_status: PromiseStatus::Protected,
                     external: vec![StatusDriveAssessment {
                         drive_label: "WD-18TB".to_string(),
-                        status: "PROTECTED".to_string(),
+                        status: PromiseStatus::Protected,
                         mounted: true,
                         snapshot_count: Some(12),
                         last_send_age_secs: Some(7200),
@@ -545,7 +541,7 @@ pub(crate) mod test_fixtures {
                 },
                 StatusAssessment {
                     name: "htpc-docs".to_string(),
-                    status: "AT RISK".to_string(),
+                    status: PromiseStatus::AtRisk,
                     health: "degraded".to_string(),
                     health_reasons: vec![
                         "chain broken on WD-18TB \u{2014} next send will be full".to_string(),
@@ -553,10 +549,10 @@ pub(crate) mod test_fixtures {
                     promise_level: None,
                     local_snapshot_count: 5,
                     local_newest_age_secs: Some(10800),
-                    local_status: "AT RISK".to_string(),
+                    local_status: PromiseStatus::AtRisk,
                     external: vec![StatusDriveAssessment {
                         drive_label: "WD-18TB".to_string(),
-                        status: "UNPROTECTED".to_string(),
+                        status: PromiseStatus::Unprotected,
                         mounted: true,
                         snapshot_count: Some(0),
                         last_send_age_secs: None,
@@ -651,13 +647,13 @@ pub(crate) mod test_fixtures {
             ],
             assessments: vec![StatusAssessment {
                 name: "htpc-home".to_string(),
-                status: "PROTECTED".to_string(),
+                status: PromiseStatus::Protected,
                 health: "healthy".to_string(),
                 health_reasons: vec![],
                 promise_level: None,
                 local_snapshot_count: 12,
                 local_newest_age_secs: None,
-                local_status: "PROTECTED".to_string(),
+                local_status: PromiseStatus::Protected,
                 external: vec![],
                 advisories: vec![],
                 redundancy_advisories: vec![],
@@ -697,7 +693,7 @@ pub(crate) mod test_fixtures {
             data_safety: vec![
                 DoctorDataSafety {
                     name: "htpc-home".to_string(),
-                    status: "PROTECTED".to_string(),
+                    status: PromiseStatus::Protected,
                     health: "healthy".to_string(),
                     issue: None,
                     suggestion: None,
@@ -705,7 +701,7 @@ pub(crate) mod test_fixtures {
                 },
                 DoctorDataSafety {
                     name: "htpc-docs".to_string(),
-                    status: "PROTECTED".to_string(),
+                    status: PromiseStatus::Protected,
                     health: "healthy".to_string(),
                     issue: None,
                     suggestion: None,
@@ -852,7 +848,7 @@ mod tests {
         let mut data = test_status_output();
         // Set a promise level but all statuses are PROTECTED — no conflict
         data.assessments[0].promise_level = Some("sheltered".to_string());
-        data.assessments[1].status = "PROTECTED".to_string();
+        data.assessments[1].status = PromiseStatus::Protected;
         data.assessments[1].promise_level = Some("fortified".to_string());
         let output = render_status(&data, OutputMode::Interactive);
         assert!(
@@ -901,7 +897,7 @@ mod tests {
         });
         data.assessments[0].external.push(StatusDriveAssessment {
             drive_label: "Backup-2TB".to_string(),
-            status: "AT RISK".to_string(),
+            status: PromiseStatus::AtRisk,
             mounted: false,
             snapshot_count: None,
             last_send_age_secs: Some(604800), // 7 days
@@ -1312,7 +1308,7 @@ mod tests {
     fn backup_interactive_shows_table_when_at_risk() {
         let _color = color_guard(false);
         let mut data = test_backup_summary();
-        data.assessments[0].status = "AT RISK".to_string();
+        data.assessments[0].status = PromiseStatus::AtRisk;
         let output = render_backup_summary(&data, OutputMode::Interactive);
         assert!(
             output.contains("SUBVOLUME"),
@@ -2812,7 +2808,7 @@ mod tests {
                 tick_interval_secs: 900,
                 promise_states: vec![SentinelPromiseState {
                     name: "home".to_string(),
-                    status: "PROTECTED".to_string(),
+                    status: PromiseStatus::Protected,
                     health: "healthy".to_string(),
                     health_reasons: vec![],
                 }],
@@ -2893,7 +2889,7 @@ mod tests {
         let mut data = test_status_output();
         // Make all assessments safe and healthy
         for a in &mut data.assessments {
-            a.status = "PROTECTED".to_string();
+            a.status = PromiseStatus::Protected;
             a.health = "healthy".to_string();
             a.health_reasons = vec![];
         }
@@ -2925,10 +2921,11 @@ mod tests {
 
     #[test]
     fn exposure_label_maps_all_statuses() {
-        assert_eq!(exposure_label("PROTECTED"), "sealed");
-        assert_eq!(exposure_label("AT RISK"), "waning");
-        assert_eq!(exposure_label("UNPROTECTED"), "exposed");
-        assert_eq!(exposure_label("UNKNOWN"), "UNKNOWN");
+        // Match is exhaustive over the closed `PromiseStatus` set — no
+        // pass-through arm remains (UPI 053).
+        assert_eq!(exposure_label(PromiseStatus::Protected), "sealed");
+        assert_eq!(exposure_label(PromiseStatus::AtRisk), "waning");
+        assert_eq!(exposure_label(PromiseStatus::Unprotected), "exposed");
     }
 
     #[test]
@@ -2988,8 +2985,8 @@ mod tests {
     fn summary_line_differentiates_exposed_and_waning() {
         let _color = color_guard(false);
         let mut data = test_status_output();
-        data.assessments[0].status = "UNPROTECTED".to_string();
-        data.assessments[1].status = "AT RISK".to_string();
+        data.assessments[0].status = PromiseStatus::Unprotected;
+        data.assessments[1].status = PromiseStatus::AtRisk;
         let output = render_status(&data, OutputMode::Interactive);
         assert!(output.contains("exposed"), "missing exposed in summary");
         assert!(output.contains("waning"), "missing waning in summary");
@@ -3003,7 +3000,7 @@ mod tests {
         // Add an unmounted Primary drive with send history
         data.assessments[0].external.push(StatusDriveAssessment {
             drive_label: "Test-Drive".to_string(),
-            status: "PROTECTED".to_string(),
+            status: PromiseStatus::Protected,
             mounted: false,
             snapshot_count: None,
             last_send_age_secs: Some(86400),
@@ -3072,7 +3069,7 @@ mod tests {
         // Add an unmounted drive with send history to one assessment
         data.assessments[0].external.push(StatusDriveAssessment {
             drive_label: "Offsite-4TB".to_string(),
-            status: "PROTECTED".to_string(),
+            status: PromiseStatus::Protected,
             mounted: false,
             snapshot_count: None,
             last_send_age_secs: Some(172800), // 2 days
@@ -3418,7 +3415,7 @@ mod tests {
         let mut data = test_doctor_output();
         data.data_safety[1] = DoctorDataSafety {
             name: "htpc-docs".to_string(),
-            status: "UNPROTECTED".to_string(),
+            status: PromiseStatus::Unprotected,
             health: "blocked".to_string(),
             issue: Some("exposed — data may not be recoverable".to_string()),
             suggestion: Some("Run `urd backup` or connect a drive.".to_string()),
@@ -3714,7 +3711,7 @@ mod tests {
     fn doctor_verdict_singular_issue() {
         let _color = color_guard(false);
         let mut data = test_doctor_output();
-        data.data_safety[0].status = "UNPROTECTED".to_string();
+        data.data_safety[0].status = PromiseStatus::Unprotected;
         data.data_safety[0].health = "blocked".to_string();
         data.data_safety[0].issue = Some("exposed".to_string());
         data.verdict = DoctorVerdict::issues(1);
@@ -3790,7 +3787,7 @@ mod tests {
         let mut data = test_doctor_output();
         data.data_safety[0] = DoctorDataSafety {
             name: "htpc-home".to_string(),
-            status: "AT RISK".to_string(),
+            status: PromiseStatus::AtRisk,
             health: "degraded".to_string(),
             issue: Some("waning — last backup 48 hours ago".to_string()),
             suggestion: Some("Run `urd backup --force-full --subvolume htpc-home`.".to_string()),
@@ -3814,7 +3811,7 @@ mod tests {
         let mut data = test_doctor_output();
         data.data_safety[0] = DoctorDataSafety {
             name: "htpc-home".to_string(),
-            status: "UNPROTECTED".to_string(),
+            status: PromiseStatus::Unprotected,
             health: "blocked".to_string(),
             issue: Some("exposed — all drives disconnected".to_string()),
             suggestion: None,
@@ -3983,33 +3980,35 @@ mod tests {
     // ── 4a: Staleness Escalation Tests ────────────────────────────────
 
     #[test]
-    fn status_severity_ordering() {
-        assert!(status_severity("UNPROTECTED") > status_severity("AT RISK"));
-        assert!(status_severity("AT RISK") > status_severity("PROTECTED"));
-        assert_eq!(status_severity("PROTECTED"), 0);
-        assert_eq!(status_severity("unknown"), 0);
+    fn promise_status_ord_is_worst_to_best() {
+        // The `status_severity` helper was deleted in UPI 053; gravity now
+        // rides `PromiseStatus`'s `Ord`. Worst-to-best means the worst status
+        // is the minimum — `aggregate_drive_info`/`compute_visual_state` rely
+        // on this for their `.min()`/`<` selection.
+        assert!(PromiseStatus::Unprotected < PromiseStatus::AtRisk);
+        assert!(PromiseStatus::AtRisk < PromiseStatus::Protected);
     }
 
     // ── Unmounted-drive cascade: unmounted_drive_label + aggregate_drive_info ───
 
     fn drive_aggregate_assessment(
         drive_label: &str,
-        status: &str,
+        status: PromiseStatus,
         absent: Option<i64>,
         last_activity: Option<i64>,
     ) -> StatusAssessment {
         StatusAssessment {
             name: "sv1".to_string(),
-            status: status.to_string(),
+            status,
             health: "healthy".to_string(),
             health_reasons: vec![],
             promise_level: None,
             local_snapshot_count: 10,
             local_newest_age_secs: Some(3600),
-            local_status: "PROTECTED".to_string(),
+            local_status: PromiseStatus::Protected,
             external: vec![StatusDriveAssessment {
                 drive_label: drive_label.to_string(),
-                status: status.to_string(),
+                status,
                 mounted: false,
                 snapshot_count: None,
                 last_send_age_secs: None,
@@ -4027,18 +4026,21 @@ mod tests {
 
     #[test]
     fn aggregate_drive_info_picks_worst_status() {
+        // Ord-inversion guard: "worst" is the MIN under `PromiseStatus`'s
+        // worst-to-best `Ord`. One AtRisk + one Unprotected must yield
+        // Unprotected; a stray `max`/`>` would yield AtRisk and fail here.
         let assessments = vec![
-            drive_aggregate_assessment("WD-18TB", "PROTECTED", Some(86400), None),
-            drive_aggregate_assessment("WD-18TB", "UNPROTECTED", Some(86400), None),
+            drive_aggregate_assessment("WD-18TB", PromiseStatus::AtRisk, Some(86400), None),
+            drive_aggregate_assessment("WD-18TB", PromiseStatus::Unprotected, Some(86400), None),
         ];
         let agg = aggregate_drive_info(&assessments, "WD-18TB");
-        assert_eq!(agg.worst_status, "UNPROTECTED");
+        assert_eq!(agg.worst_status, PromiseStatus::Unprotected);
     }
 
     #[test]
     fn aggregate_drive_info_propagates_absent_duration() {
         let assessments =
-            vec![drive_aggregate_assessment("WD-18TB", "AT RISK", Some(604800), None)];
+            vec![drive_aggregate_assessment("WD-18TB", PromiseStatus::AtRisk, Some(604800), None)];
         let agg = aggregate_drive_info(&assessments, "WD-18TB");
         assert_eq!(agg.absent_duration_secs, Some(604800));
         assert_eq!(agg.last_activity_age_secs, None);
@@ -4047,7 +4049,7 @@ mod tests {
     #[test]
     fn aggregate_drive_info_propagates_last_activity() {
         let assessments =
-            vec![drive_aggregate_assessment("WD-18TB", "AT RISK", None, Some(86400))];
+            vec![drive_aggregate_assessment("WD-18TB", PromiseStatus::AtRisk, None, Some(86400))];
         let agg = aggregate_drive_info(&assessments, "WD-18TB");
         assert_eq!(agg.absent_duration_secs, None);
         assert_eq!(agg.last_activity_age_secs, Some(86400));
@@ -4055,10 +4057,14 @@ mod tests {
 
     #[test]
     fn aggregate_drive_info_no_match_defaults_protected_and_none() {
-        let assessments =
-            vec![drive_aggregate_assessment("WD-18TB", "UNPROTECTED", Some(86400), None)];
+        let assessments = vec![drive_aggregate_assessment(
+            "WD-18TB",
+            PromiseStatus::Unprotected,
+            Some(86400),
+            None,
+        )];
         let agg = aggregate_drive_info(&assessments, "MISSING-DRIVE");
-        assert_eq!(agg.worst_status, "PROTECTED");
+        assert_eq!(agg.worst_status, PromiseStatus::Protected);
         assert_eq!(agg.absent_duration_secs, None);
         assert_eq!(agg.last_activity_age_secs, None);
     }
@@ -4066,7 +4072,7 @@ mod tests {
     #[test]
     fn unmounted_with_physical_event_renders_away() {
         let _color = color_guard(false);
-        let label = unmounted_drive_label("WD-18TB", Some(259200), None, "PROTECTED");
+        let label = unmounted_drive_label("WD-18TB", Some(259200), None, PromiseStatus::Protected);
         assert!(label.contains("WD-18TB"), "missing label: {label}");
         assert!(label.contains("away"), "missing 'away': {label}");
         assert!(label.contains("3d"), "missing age: {label}");
@@ -4075,7 +4081,7 @@ mod tests {
     #[test]
     fn unmounted_without_event_with_ops_renders_last_backup() {
         let _color = color_guard(false);
-        let label = unmounted_drive_label("WD-18TB", None, Some(259200), "PROTECTED");
+        let label = unmounted_drive_label("WD-18TB", None, Some(259200), PromiseStatus::Protected);
         assert!(label.contains("WD-18TB"), "missing label: {label}");
         assert!(label.contains("last backup"), "missing 'last backup': {label}");
         assert!(label.contains("3d"), "missing age: {label}");
@@ -4084,7 +4090,7 @@ mod tests {
     #[test]
     fn unmounted_no_data_renders_disconnected_silent() {
         let _color = color_guard(false);
-        let label = unmounted_drive_label("WD-18TB", None, None, "PROTECTED");
+        let label = unmounted_drive_label("WD-18TB", None, None, PromiseStatus::Protected);
         assert!(label.contains("WD-18TB"), "missing label: {label}");
         assert!(
             label.contains("disconnected"),
@@ -4103,7 +4109,7 @@ mod tests {
         // (sentinel-missed-unmount case, verified by awareness tests), voice
         // must stay silent — no "away" or "last backup".
         let _color = color_guard(false);
-        let label = unmounted_drive_label("WD-18TB", None, None, "AT RISK");
+        let label = unmounted_drive_label("WD-18TB", None, None, PromiseStatus::AtRisk);
         assert!(label.contains("disconnected"), "must be silent: {label}");
         assert!(!label.contains("away"));
         assert!(!label.contains("last backup"));
@@ -4112,7 +4118,7 @@ mod tests {
     #[test]
     fn at_risk_escalation_away() {
         let _color = color_guard(false);
-        let label = unmounted_drive_label("WD-18TB", Some(604800), None, "AT RISK");
+        let label = unmounted_drive_label("WD-18TB", Some(604800), None, PromiseStatus::AtRisk);
         assert!(label.contains("away"), "missing 'away': {label}");
         assert!(label.contains("7d"), "missing age: {label}");
         assert!(
@@ -4124,7 +4130,7 @@ mod tests {
     #[test]
     fn at_risk_escalation_last_backup() {
         let _color = color_guard(false);
-        let label = unmounted_drive_label("WD-18TB", None, Some(604800), "AT RISK");
+        let label = unmounted_drive_label("WD-18TB", None, Some(604800), PromiseStatus::AtRisk);
         assert!(label.contains("last backup"), "missing 'last backup': {label}");
         assert!(label.contains("7d"), "missing age: {label}");
         assert!(
@@ -4136,7 +4142,7 @@ mod tests {
     #[test]
     fn unprotected_escalation_away() {
         let _color = color_guard(false);
-        let label = unmounted_drive_label("WD-18TB1", Some(2592000), None, "UNPROTECTED");
+        let label = unmounted_drive_label("WD-18TB1", Some(2592000), None, PromiseStatus::Unprotected);
         assert!(label.contains("WD-18TB1"), "missing label: {label}");
         assert!(label.contains("away"), "missing 'away': {label}");
         assert!(label.contains("30d"), "missing age: {label}");
@@ -4154,7 +4160,7 @@ mod tests {
     #[test]
     fn unprotected_escalation_last_backup() {
         let _color = color_guard(false);
-        let label = unmounted_drive_label("WD-18TB", None, Some(2592000), "UNPROTECTED");
+        let label = unmounted_drive_label("WD-18TB", None, Some(2592000), PromiseStatus::Unprotected);
         assert!(label.contains("last backup"), "missing 'last backup': {label}");
         assert!(label.contains("30d"), "missing age: {label}");
         assert!(
@@ -4168,7 +4174,7 @@ mod tests {
         // Voice-Contract-Rule-1 seed test: absent_duration_secs wins over
         // last_activity_age_secs; the right field drives the right label.
         let _color = color_guard(false);
-        let label = unmounted_drive_label("WD-18TB", Some(15 * 60), Some(7 * 86400), "PROTECTED");
+        let label = unmounted_drive_label("WD-18TB", Some(15 * 60), Some(7 * 86400), PromiseStatus::Protected);
         assert!(label.contains("15m"), "should render 15m: {label}");
         assert!(
             !label.contains("7d"),
@@ -4331,8 +4337,8 @@ mod tests {
             },
             TransitionEvent::PromiseRecovered {
                 subvolume: "htpc-home".to_string(),
-                from: "UNPROTECTED".to_string(),
-                to: "PROTECTED".to_string(),
+                from: PromiseStatus::Unprotected,
+                to: PromiseStatus::Protected,
             },
             TransitionEvent::AllSealed,
         ];

@@ -6,6 +6,7 @@ use std::fmt::Write;
 
 use colored::Colorize;
 
+use crate::awareness::PromiseStatus;
 use crate::output::{OutputMode, SentinelStatusOutput};
 
 /// Render sentinel status output according to the given mode.
@@ -74,21 +75,13 @@ fn format_tick_description(tick_secs: u64, promise_states: &[crate::output::Sent
         format!("{tick_secs}s")
     };
 
-    let worst = promise_states
-        .iter()
-        .map(|p| p.status.as_str())
-        .min_by_key(|s| match *s {
-            "UNPROTECTED" => 0,
-            "AT RISK" => 1,
-            "PROTECTED" => 2,
-            _ => 0,
-        });
+    // `PromiseStatus`'s `Ord` is worst-to-best, so `.min()` yields the worst.
+    let worst = promise_states.iter().map(|p| p.status).min();
 
     let state_desc = match worst {
-        Some("PROTECTED") | None => "all promises held",
-        Some("AT RISK") => "promises at risk",
-        Some("UNPROTECTED") => "promises broken",
-        Some(_) => "assessing",
+        Some(PromiseStatus::Protected) | None => "all promises held",
+        Some(PromiseStatus::AtRisk) => "promises at risk",
+        Some(PromiseStatus::Unprotected) => "promises broken",
     };
 
     format!("{tick_str} — {state_desc}")

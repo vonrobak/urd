@@ -188,10 +188,19 @@ pub(crate) fn cascade_age_source(
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
 )]
-#[serde(rename_all = "snake_case")]
 pub enum PromiseStatus {
+    // Serialized form is SCREAMING on every surface, matching `Display` and the
+    // glossary's "SCREAMING on every machine surface, including NDJSON" rule
+    // (UPI 053, ADR-114 amendment 2026-05-29). The lower-case `alias` reads
+    // legacy `snake_case` rows written before the unification — events are
+    // append-only, so those rows live indefinitely; the alias is permanent.
+    // Variant order is worst-to-best so `min()`/`<` yields the worst status —
+    // do not reorder.
+    #[serde(rename = "UNPROTECTED", alias = "unprotected")]
     Unprotected,
+    #[serde(rename = "AT RISK", alias = "at_risk")]
     AtRisk,
+    #[serde(rename = "PROTECTED", alias = "protected")]
     Protected,
 }
 
@@ -1859,6 +1868,49 @@ source = "/data/sv1"
         assert_eq!(PromiseStatus::Protected.to_string(), "PROTECTED");
         assert_eq!(PromiseStatus::AtRisk.to_string(), "AT RISK");
         assert_eq!(PromiseStatus::Unprotected.to_string(), "UNPROTECTED");
+    }
+
+    #[test]
+    fn promise_status_serializes_screaming() {
+        // Serialized form must match `Display` (SCREAMING) on every wire surface
+        // (UPI 053). This is the write-form byte-identity guarantee.
+        assert_eq!(
+            serde_json::to_string(&PromiseStatus::Protected).unwrap(),
+            "\"PROTECTED\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PromiseStatus::AtRisk).unwrap(),
+            "\"AT RISK\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PromiseStatus::Unprotected).unwrap(),
+            "\"UNPROTECTED\""
+        );
+    }
+
+    #[test]
+    fn promise_status_deserializes_screaming_and_legacy_alias() {
+        // Both the current SCREAMING form and the legacy snake_case alias must
+        // decode to the same variant — the permanent back-compat contract for
+        // append-only event rows (ADR-114 amendment 2026-05-29).
+        for json in ["\"PROTECTED\"", "\"protected\""] {
+            assert_eq!(
+                serde_json::from_str::<PromiseStatus>(json).unwrap(),
+                PromiseStatus::Protected
+            );
+        }
+        for json in ["\"AT RISK\"", "\"at_risk\""] {
+            assert_eq!(
+                serde_json::from_str::<PromiseStatus>(json).unwrap(),
+                PromiseStatus::AtRisk
+            );
+        }
+        for json in ["\"UNPROTECTED\"", "\"unprotected\""] {
+            assert_eq!(
+                serde_json::from_str::<PromiseStatus>(json).unwrap(),
+                PromiseStatus::Unprotected
+            );
+        }
     }
 
     // ── Clock skew tests ───────────────────────────────────────────

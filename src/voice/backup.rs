@@ -9,6 +9,7 @@ use std::fmt::Write;
 
 use colored::Colorize;
 
+use crate::awareness::PromiseStatus;
 use crate::output::{BackupSummary, OutputMode, PreActionSummary, SkipCategory};
 use crate::types::{ByteSize, DriveRole};
 
@@ -130,7 +131,7 @@ fn render_backup_interactive(data: &BackupSummary) -> String {
     render_skipped_block(&data.skipped, &mut out);
 
     // ── Awareness table ──────────────────────────────────────────────
-    let any_not_protected = data.assessments.iter().any(|a| a.status != "PROTECTED");
+    let any_not_protected = data.assessments.iter().any(|a| a.status != PromiseStatus::Protected);
     if any_not_protected {
         writeln!(out).ok();
         render_assessment_table(data, &mut out);
@@ -197,8 +198,8 @@ fn render_transitions(transitions: &[crate::output::TransitionEvent], out: &mut 
                     out,
                     "  {}: {} \u{2192} {}.",
                     subvolume,
-                    exposure_label(from),
-                    exposure_label(to),
+                    exposure_label(*from),
+                    exposure_label(*to),
                 )
                 .ok();
             }
@@ -319,7 +320,7 @@ fn render_assessment_table(data: &BackupSummary, out: &mut String) {
     // Build rows
     let mut rows: Vec<Vec<String>> = Vec::new();
     for assessment in &data.assessments {
-        let mut row = vec![exposure_label(&assessment.status)];
+        let mut row = vec![exposure_label(assessment.status)];
         if has_promises {
             row.push(
                 assessment

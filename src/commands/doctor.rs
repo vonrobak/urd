@@ -212,7 +212,7 @@ pub fn run(config: Config, args: DoctorArgs, output_mode: OutputMode) -> anyhow:
             };
             DoctorDataSafety {
                 name: a.name.clone(),
-                status: a.status.to_string(),
+                status: a.status,
                 health: a.health.to_string(),
                 issue,
                 suggestion,
@@ -291,7 +291,7 @@ pub fn run(config: Config, args: DoctorArgs, output_mode: OutputMode) -> anyhow:
     // ── 6. Verdict ────────────────────────────────────────────────
     let degraded_count = data_safety
         .iter()
-        .filter(|d| d.status == "PROTECTED" && d.health != "healthy")
+        .filter(|d| d.status == PromiseStatus::Protected && d.health != "healthy")
         .count();
 
     // NOTE: When --thorough is used, verify's drive-mounted warnings inflate warn_count.

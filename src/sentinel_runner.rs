@@ -654,7 +654,7 @@ impl SentinelRunner {
                         .find(|h| h.name == p.name);
                     SentinelPromiseState {
                         name: p.name.clone(),
-                        status: p.status.to_string(),
+                        status: p.status,
                         health: health_snap
                             .map(|h| h.health.to_string())
                             .unwrap_or_else(|| "healthy".to_string()),
@@ -983,7 +983,7 @@ mod tests {
             tick_interval_secs: 900,
             promise_states: vec![SentinelPromiseState {
                 name: "home".to_string(),
-                status: "PROTECTED".to_string(),
+                status: PromiseStatus::Protected,
                 health: "degraded".to_string(),
                 health_reasons: vec!["chain broken on WD-18TB".to_string()],
             }],
@@ -993,7 +993,7 @@ mod tests {
             },
             visual_state: Some(crate::output::VisualState {
                 icon: crate::output::VisualIcon::Warning,
-                worst_safety: "PROTECTED".to_string(),
+                worst_safety: PromiseStatus::Protected,
                 worst_health: "degraded".to_string(),
                 safety_counts: crate::output::SafetyCounts {
                     ok: 1,
@@ -1041,6 +1041,32 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sentinel-state.json");
         std::fs::write(&path, "not json").unwrap();
+        assert!(read_sentinel_state_file(&path).is_none());
+    }
+
+    #[test]
+    fn state_file_read_out_of_set_status_fails_open_to_none() {
+        // UPI 053 F1 contract lock: `promise_states[].status` and
+        // `visual_state.worst_safety` deserialization now narrow from "any
+        // string" to the closed `PromiseStatus` set (+ legacy aliases). An
+        // out-of-set value must make `read_sentinel_state_file` return `None`
+        // (state file treated as absent, rebuilt on next tick) — never panic,
+        // never propagate. Guards against a future `.ok()` → `?` regression.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sentinel-state.json");
+        let json = r#"{
+            "schema_version": 2,
+            "pid": 1,
+            "started": "2026-03-27T10:00:00",
+            "last_assessment": null,
+            "mounted_drives": [],
+            "tick_interval_secs": 120,
+            "promise_states": [
+                { "name": "home", "status": "DEGRADED", "health": "healthy" }
+            ],
+            "circuit_breaker": { "state": "closed", "failure_count": 0 }
+        }"#;
+        std::fs::write(&path, json).unwrap();
         assert!(read_sentinel_state_file(&path).is_none());
     }
 
@@ -1106,7 +1132,7 @@ mod tests {
             tick_interval_secs: 120,
             promise_states: vec![SentinelPromiseState {
                 name: "home".to_string(),
-                status: "PROTECTED".to_string(),
+                status: PromiseStatus::Protected,
                 health: "healthy".to_string(),
                 health_reasons: vec![],
             }],

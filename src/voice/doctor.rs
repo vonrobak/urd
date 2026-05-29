@@ -11,6 +11,7 @@ use std::fmt::Write;
 
 use colored::Colorize;
 
+use crate::awareness::PromiseStatus;
 use crate::output::{DoctorCheck, DoctorCheckStatus, DoctorOutput, DoctorVerdictStatus, OutputMode};
 use crate::plan::format_duration_short;
 
@@ -84,7 +85,7 @@ fn render_doctor_interactive(data: &DoctorOutput) -> String {
     let sealed_count = data
         .data_safety
         .iter()
-        .filter(|d| d.status == "PROTECTED")
+        .filter(|d| d.status == PromiseStatus::Protected)
         .count();
     let total = data.data_safety.len();
     if sealed_count == total {
@@ -100,7 +101,7 @@ fn render_doctor_interactive(data: &DoctorOutput) -> String {
         writeln!(
             out,
             "    {} {} of {} sealed",
-            if data.data_safety.iter().any(|d| d.status == "UNPROTECTED") {
+            if data.data_safety.iter().any(|d| d.status == PromiseStatus::Unprotected) {
                 "\u{2717}".red().to_string()
             } else {
                 "\u{26a0}".yellow().to_string()

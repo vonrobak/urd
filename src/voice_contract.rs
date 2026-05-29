@@ -36,6 +36,7 @@
 
 #[cfg(test)]
 mod contract {
+    use crate::awareness::PromiseStatus;
     use crate::output::{BackupSummary, OutputMode, TransitionEvent};
     use crate::voice::test_fixtures::{
         color_guard, recommendations_doctor_output, test_backup_summary,
@@ -550,8 +551,8 @@ mod contract {
         let _color = color_guard(false);
         let s = backup_with_transitions(vec![TransitionEvent::PromiseRecovered {
             subvolume: "htpc-home".to_string(),
-            from: "UNPROTECTED".to_string(),
-            to: "PROTECTED".to_string(),
+            from: PromiseStatus::Unprotected,
+            to: PromiseStatus::Protected,
         }]);
         let output = render_backup_summary(&s, OutputMode::Interactive);
         // The recovered transition uses exposure vocabulary, not raw promise strings.
@@ -808,12 +809,12 @@ mod contract {
     fn all_sealed_status() -> crate::output::StatusOutput {
         let mut data = test_status_output();
         for a in &mut data.assessments {
-            a.status = "PROTECTED".to_string();
+            a.status = PromiseStatus::Protected;
             a.health = "healthy".to_string();
             a.health_reasons.clear();
-            a.local_status = "PROTECTED".to_string();
+            a.local_status = PromiseStatus::Protected;
             for e in a.external.iter_mut() {
-                e.status = "PROTECTED".to_string();
+                e.status = PromiseStatus::Protected;
                 e.mounted = true;
                 if e.snapshot_count.is_none() {
                     e.snapshot_count = Some(12);
@@ -863,7 +864,7 @@ mod contract {
     fn rule6_unprotected_row_emits_red_on_exposure_cell() {
         let _color = color_guard(true);
         let mut data = test_status_output();
-        data.assessments[1].status = "UNPROTECTED".to_string();
+        data.assessments[1].status = PromiseStatus::Unprotected;
         let output = render_status(&data, OutputMode::Interactive);
         assert!(
             helpers::count_red(&output) >= 1,
@@ -890,7 +891,7 @@ mod contract {
     fn rule6_blocked_health_emits_red_only_on_health_cell() {
         let _color = color_guard(true);
         let mut data = test_status_output();
-        data.assessments[0].status = "PROTECTED".to_string();
+        data.assessments[0].status = PromiseStatus::Protected;
         data.assessments[0].health = "blocked".to_string();
         data.assessments[0].health_reasons = vec!["chain broken on WD-18TB".to_string()];
         let output = render_status(&data, OutputMode::Interactive);
@@ -918,7 +919,7 @@ mod contract {
         let mut data = test_status_output();
         // Promote the AT RISK assessment to UNPROTECTED so the exposure
         // label becomes "exposed" — earned-red territory.
-        data.assessments[1].status = "UNPROTECTED".to_string();
+        data.assessments[1].status = PromiseStatus::Unprotected;
         let output = render_status(&data, OutputMode::Interactive);
         let rows = helpers::data_rows_by_exposure(&output);
         let exposed = rows
