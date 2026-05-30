@@ -10,6 +10,7 @@ use crate::advice;
 use crate::awareness::{self, ChainStatus, PromiseStatus, SubvolAssessment};
 use crate::btrfs::{BtrfsOps, RealBtrfs};
 use crate::cli::BackupArgs;
+use crate::commands::storage_signals;
 use crate::config::Config;
 use crate::drives;
 use crate::executor::{
@@ -143,7 +144,15 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
             &observability,
         )?;
         let previous_hb = heartbeat::read(&config.general.heartbeat_file);
-        let mut assessments = awareness::assess(&config, heartbeat_now, &observation);
+        // Empty-plan path: storage posture is not surfaced here (the heartbeat
+        // projection carries no posture — S4), so skip the findmnt sweep and
+        // pass an empty signal map.
+        let mut assessments = awareness::assess(
+            &config,
+            heartbeat_now,
+            &observation,
+            &awareness::StorageSignalMap::new(),
+        );
         advice::overlay_offsite_freshness(&mut assessments, &config);
         let hb = heartbeat::build_empty(
             &config,
@@ -281,7 +290,14 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     // (thread restored, promise recovered, etc.) by diffing with post-backup state.
     let pre_assessments = {
         let pre_now = chrono::Local::now().naive_local();
-        let mut pre = awareness::assess(&config, pre_now, &observation);
+        // Pre-execution snapshot is used only to diff promise-state transitions;
+        // posture is not a promise state, so an empty signal map suffices.
+        let mut pre = awareness::assess(
+            &config,
+            pre_now,
+            &observation,
+            &awareness::StorageSignalMap::new(),
+        );
         advice::overlay_offsite_freshness(&mut pre, &config);
         pre
     };
@@ -342,8 +358,13 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
         &observability,
     )?;
 
-    // Write heartbeat (fresh timestamp — `now` is from before execution)
-    let mut assessments = awareness::assess(&config, heartbeat_now, &observation);
+    // Write heartbeat (fresh timestamp — `now` is from before execution).
+    // Gather storage signals once: the post-execution assess reflects the
+    // current tier, then `advance_and_writeback` persists it and surfaces
+    // escalation transitions for the notification path (D6).
+    let signals = storage_signals::gather(&config, state_db.as_ref());
+    let mut assessments =
+        awareness::assess(&config, heartbeat_now, &observation, &signals.by_subvol);
     advice::overlay_offsite_freshness(&mut assessments, &config);
     let hb = heartbeat::build_from_run(
         &config,
@@ -357,6 +378,29 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     );
     if let Err(e) = heartbeat::write(&config.general.heartbeat_file, &hb) {
         log::warn!("Failed to write heartbeat: {e}");
+    }
+
+    // ── Storage posture (UPI 031-a) ─────────────────────────────────
+    // Persist the hysteresis-stabilized armed tier per UUID-resolvable pool and
+    // dispatch a best-effort notification for each escalation. The sentinel is
+    // blind to posture (D6), so backup is the sole dispatcher — this is separate
+    // from the heartbeat-driven promise notifications below and runs regardless
+    // of whether the sentinel is up. Best-effort throughout: never blocks a run.
+    if let Some(ref db) = state_db {
+        let escalations = storage_signals::advance_and_writeback(db, heartbeat_now, &signals);
+        let notes: Vec<notify::Notification> = escalations
+            .iter()
+            .map(|e| {
+                notify::build_storage_pressure_notification(
+                    &e.pool_label,
+                    e.transition,
+                    e.host_root,
+                )
+            })
+            .collect();
+        if !notes.is_empty() {
+            notify::dispatch(&notes, &config.notifications);
+        }
     }
 
     // Dispatch notifications for promise state changes (unless Sentinel handles it).
@@ -1838,6 +1882,7 @@ mod tests {
             advisories: vec![],
             redundancy_advisories: vec![],
             errors: vec![],
+            storage_posture: None,
         }]
     }
 
@@ -2819,6 +2864,7 @@ mod tests {
             advisories: vec![],
             redundancy_advisories: vec![],
             errors: vec![],
+            storage_posture: None,
         }
     }
 

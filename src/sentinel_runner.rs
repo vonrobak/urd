@@ -383,7 +383,16 @@ impl SentinelRunner {
             btrfs: &assess_btrfs,
         };
 
-        let mut assessments = awareness::assess(&self.config, now, &observation);
+        // The sentinel is deliberately blind to storage posture (D6 — it reacts
+        // to the heartbeat, which carries no posture). Pass an empty signal map
+        // so `assess()` computes no posture on this path; on-demand `status` and
+        // `backup` runs are where posture is gathered and surfaced.
+        let mut assessments = awareness::assess(
+            &self.config,
+            now,
+            &observation,
+            &awareness::StorageSignalMap::new(),
+        );
         advice::overlay_offsite_freshness(&mut assessments, &self.config);
 
         // Emit promise-transition events when the originating event was
@@ -967,6 +976,7 @@ mod tests {
             advisories: vec![],
             redundancy_advisories: vec![],
             errors: vec![],
+            storage_posture: None,
         }
     }
 

@@ -256,7 +256,38 @@ pub struct SubvolAssessment {
     pub redundancy_advisories: Vec<RedundancyAdvisory>,
     /// Per-subvolume assessment failures (e.g., can't read snapshot directory).
     pub errors: Vec<String>,
+    /// Source-pool storage posture (UPI 031-a): the hysteresis-stabilized
+    /// tightness tier + host-root flag for this subvolume's source pool.
+    /// `Some` only when the pool is at least `Tight` (a Roomy pool is silent).
+    /// A separate presentation axis from `status`/`health` (ADR-110 R4): it
+    /// reflects Urd's posture toward a tight pool, not the data-safety promise.
+    pub storage_posture: Option<crate::storage_critical::StoragePosture>,
 }
+
+/// Per-subvolume raw storage signal fed into `assess()` (UPI 031-a). Resolved
+/// by the command layer (`commands/storage_signals.rs`) from `pools::pool_space`
+/// (free-ratio), `findmnt /` (host-root), and the persisted prior armed tier;
+/// `assess()` consumes it purely (ADR-108) — it performs no I/O of its own.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ResolvedStorageSignal {
+    /// Source pool free / capacity ratio; `None` when unmeasurable (holds the
+    /// prior armed tier rather than silently disarming).
+    pub free_ratio: Option<f64>,
+    /// This subvolume's source is on the host-root pool and `/` is entrusted.
+    pub host_root: bool,
+    /// The hysteresis-stabilized armed tier read back from `pool_armed_tier`
+    /// (defaults to `Roomy` for an untracked / UUID-less pool).
+    pub prior_armed_tier: crate::storage_critical::TightnessTier,
+    /// When the armed tier last changed (the "flagged since" timestamp).
+    pub prior_since: Option<NaiveDateTime>,
+}
+
+/// Per-subvolume storage signals keyed by subvolume name (UPI 031-a). Built at
+/// the command boundary; threaded into `assess()` as a pure input so the query
+/// seams stay narrow (parallels the 032 churn-map decision, arc R8). Subvolumes
+/// absent from the map get no posture.
+pub type StorageSignalMap =
+    std::collections::HashMap<String, ResolvedStorageSignal>;
 
 /// Chain health for a single subvolume/drive pair.
 ///
@@ -402,6 +433,7 @@ pub fn assess(
     config: &Config,
     now: NaiveDateTime,
     obs: &Observation,
+    storage_signals: &StorageSignalMap,
 ) -> Vec<SubvolAssessment> {
     let resolved = config.resolved_subvolumes();
     let mut assessments = Vec::new();
@@ -457,6 +489,7 @@ pub fn assess(
                     "no snapshot root configured for subvolume {:?}",
                     subvol.name
                 )],
+                storage_posture: None,
             });
             continue;
         };
@@ -639,6 +672,19 @@ pub fn assess(
             subvol.local_retention.is_transient(),
         );
 
+        // ── Storage posture (UPI 031-a) ──────────────────────────────
+        // Pure: resolve the hysteresis-stabilized armed tier from the
+        // command-supplied signal, then derive the posture. No I/O, no
+        // write-back (the backup boundary advances state — read paths
+        // only reflect). Subvolumes with no signal get no posture.
+        let storage_posture = storage_signals.get(&subvol.name).and_then(|sig| {
+            let armed = crate::storage_critical::resolve_armed_tier(
+                sig.prior_armed_tier,
+                sig.free_ratio,
+            );
+            crate::storage_critical::derive_posture(armed, sig.host_root)
+        });
+
         assessments.push(SubvolAssessment {
             name: subvol.name.clone(),
             status: overall,
@@ -650,6 +696,7 @@ pub fn assess(
             advisories,
             redundancy_advisories: Vec::new(),
             errors,
+            storage_posture,
         });
     }
 
@@ -1223,10 +1270,178 @@ source = "/data/sv1"
 
         fs.mounted_drives.insert("WD-18TB".to_string());
 
-        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].status, PromiseStatus::Protected);
         assert_eq!(results[1].status, PromiseStatus::Protected);
+    }
+
+    // ── UPI 031-a: storage posture from the signal map ──────────────
+
+    /// Build a healthy two-subvol fixture; callers inject the signal map.
+    fn posture_fixture() -> (Config, NaiveDateTime, MockFileSystemState) {
+        let config = test_config();
+        let now = dt(2026, 3, 23, 14, 0);
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap(dt(2026, 3, 23, 13, 30), "sv1")]);
+        fs.local_snapshots
+            .insert("sv2".to_string(), vec![snap(dt(2026, 3, 23, 13, 30), "sv2")]);
+        fs.mounted_drives.insert("WD-18TB".to_string());
+        (config, now, fs)
+    }
+
+    fn posture_of(
+        results: &[SubvolAssessment],
+        name: &str,
+    ) -> Option<crate::storage_critical::StoragePosture> {
+        results.iter().find(|a| a.name == name).unwrap().storage_posture
+    }
+
+    #[test]
+    fn storage_posture_populated_when_tight() {
+        use crate::storage_critical::TightnessTier;
+        let (config, now, fs) = posture_fixture();
+        let mut signals = crate::awareness::StorageSignalMap::new();
+        signals.insert(
+            "sv1".to_string(),
+            ResolvedStorageSignal {
+                free_ratio: Some(0.20), // < 0.25 → Tight
+                host_root: false,
+                prior_armed_tier: TightnessTier::Roomy,
+                prior_since: None,
+            },
+        );
+
+        let results = assess(
+            &config,
+            now,
+            &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() },
+            &signals,
+        );
+        let posture = posture_of(&results, "sv1").expect("sv1 should have posture");
+        assert_eq!(posture.tier, TightnessTier::Tight);
+        assert!(!posture.host_root);
+    }
+
+    #[test]
+    fn storage_posture_critical_carries_host_root() {
+        use crate::storage_critical::TightnessTier;
+        let (config, now, fs) = posture_fixture();
+        let mut signals = crate::awareness::StorageSignalMap::new();
+        signals.insert(
+            "sv1".to_string(),
+            ResolvedStorageSignal {
+                free_ratio: Some(0.05), // < 0.15 → Critical
+                host_root: true,
+                prior_armed_tier: TightnessTier::Roomy,
+                prior_since: None,
+            },
+        );
+
+        let results = assess(
+            &config,
+            now,
+            &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() },
+            &signals,
+        );
+        let posture = posture_of(&results, "sv1").expect("sv1 should have posture");
+        assert_eq!(posture.tier, TightnessTier::Critical);
+        assert!(posture.host_root);
+    }
+
+    #[test]
+    fn storage_posture_none_when_roomy() {
+        use crate::storage_critical::TightnessTier;
+        let (config, now, fs) = posture_fixture();
+        let mut signals = crate::awareness::StorageSignalMap::new();
+        signals.insert(
+            "sv1".to_string(),
+            ResolvedStorageSignal {
+                free_ratio: Some(0.50), // roomy
+                host_root: true,
+                prior_armed_tier: TightnessTier::Roomy,
+                prior_since: None,
+            },
+        );
+
+        let results = assess(
+            &config,
+            now,
+            &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() },
+            &signals,
+        );
+        // Roomy → no posture even though host_root is true (Urd stays silent).
+        assert_eq!(posture_of(&results, "sv1"), None);
+    }
+
+    #[test]
+    fn storage_posture_none_when_signal_absent() {
+        let (config, now, fs) = posture_fixture();
+        // Empty map: no subvolume has a signal.
+        let results = assess(
+            &config,
+            now,
+            &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() },
+            &crate::awareness::StorageSignalMap::new(),
+        );
+        assert_eq!(posture_of(&results, "sv1"), None);
+        assert_eq!(posture_of(&results, "sv2"), None);
+    }
+
+    #[test]
+    fn storage_posture_signal_less_subvol_unaffected() {
+        use crate::storage_critical::TightnessTier;
+        let (config, now, fs) = posture_fixture();
+        let mut signals = crate::awareness::StorageSignalMap::new();
+        // Only sv1 has a signal; sv2 must stay posture-free.
+        signals.insert(
+            "sv1".to_string(),
+            ResolvedStorageSignal {
+                free_ratio: Some(0.10),
+                host_root: false,
+                prior_armed_tier: TightnessTier::Roomy,
+                prior_since: None,
+            },
+        );
+
+        let results = assess(
+            &config,
+            now,
+            &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() },
+            &signals,
+        );
+        assert!(posture_of(&results, "sv1").is_some());
+        assert_eq!(posture_of(&results, "sv2"), None);
+    }
+
+    #[test]
+    fn storage_posture_stale_divergence_escalates_immediately() {
+        // Min2: prior armed Roomy, current ratio Tight ⇒ the pure derivation
+        // escalates immediately to Tight inside assess(). assess() takes no
+        // StateDb, so it cannot (and must not) mutate persisted state — this
+        // is a read-path reflection only.
+        use crate::storage_critical::TightnessTier;
+        let (config, now, fs) = posture_fixture();
+        let mut signals = crate::awareness::StorageSignalMap::new();
+        signals.insert(
+            "sv1".to_string(),
+            ResolvedStorageSignal {
+                free_ratio: Some(0.18), // classifies Tight; prior was Roomy
+                host_root: false,
+                prior_armed_tier: TightnessTier::Roomy,
+                prior_since: None,
+            },
+        );
+
+        let results = assess(
+            &config,
+            now,
+            &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() },
+            &signals,
+        );
+        let posture = posture_of(&results, "sv1").expect("sv1 should have posture");
+        assert_eq!(posture.tier, TightnessTier::Tight);
     }
 
     // ── Test 2: Local stale → AT_RISK ──────────────────────────────
@@ -1248,7 +1463,7 @@ source = "/data/sv1"
         );
         fs.mounted_drives.insert("WD-18TB".to_string());
 
-        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         assert_eq!(results[0].local.status, PromiseStatus::AtRisk);
         assert_eq!(results[0].status, PromiseStatus::AtRisk);
     }
@@ -1266,7 +1481,7 @@ source = "/data/sv1"
             .insert("sv1".to_string(), vec![snap(dt(2026, 3, 23, 8, 0), "sv1")]);
         fs.mounted_drives.insert("WD-18TB".to_string());
 
-        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         assert_eq!(results[0].local.status, PromiseStatus::Unprotected);
     }
 
@@ -1278,7 +1493,7 @@ source = "/data/sv1"
         let now = dt(2026, 3, 23, 14, 0);
         let fs = MockFileSystemState::new();
 
-        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         assert_eq!(results[0].local.status, PromiseStatus::Unprotected);
         assert_eq!(results[0].local.snapshot_count, 0);
     }
@@ -1305,7 +1520,7 @@ source = "/data/sv1"
         );
         fs.mounted_drives.insert("WD-18TB".to_string());
 
-        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         assert_eq!(results[0].external[0].status, PromiseStatus::AtRisk);
     }
 
@@ -1330,7 +1545,7 @@ source = "/data/sv1"
         );
         fs.mounted_drives.insert("WD-18TB".to_string());
 
-        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         assert_eq!(results[0].external[0].status, PromiseStatus::Unprotected);
     }
 
@@ -1349,7 +1564,7 @@ source = "/data/sv1"
         fs.mounted_drives.insert("WD-18TB".to_string());
         // No send_times entry
 
-        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         assert_eq!(results[0].external[0].status, PromiseStatus::Unprotected);
     }
 
@@ -1396,7 +1611,7 @@ send_enabled = false
             vec![snap(dt(2026, 3, 23, 13, 30), "sv1")],
         );
 
-        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         assert_eq!(results[0].external.len(), 0);
         assert_eq!(results[0].status, PromiseStatus::Protected);
     }
@@ -1421,7 +1636,7 @@ send_enabled = false
         );
         // Drive NOT in mounted_drives
 
-        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         assert!(!results[0].external[0].mounted);
         assert_eq!(results[0].external[0].status, PromiseStatus::Protected);
         assert_eq!(results[0].external[0].snapshot_count, None);
@@ -1488,7 +1703,7 @@ source = "/data/sv1"
 
         fs.mounted_drives.insert("primary".to_string());
 
-        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
 
         // Primary drive is PROTECTED
         let primary = &results[0]
@@ -1530,7 +1745,7 @@ source = "/data/sv1"
         );
         fs.mounted_drives.insert("WD-18TB".to_string());
 
-        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         assert_eq!(results[0].local.status, PromiseStatus::AtRisk);
         assert_eq!(results[0].external[0].status, PromiseStatus::Protected);
         // min(AT_RISK, PROTECTED) = AT_RISK
@@ -1580,7 +1795,7 @@ enabled = false
         let now = dt(2026, 3, 23, 14, 0);
         let fs = MockFileSystemState::new();
 
-        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "sv1");
     }
@@ -1597,7 +1812,7 @@ enabled = false
         fs.local_snapshots
             .insert("sv1".to_string(), vec![snap(dt(2026, 3, 23, 12, 0), "sv1")]);
 
-        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         assert_eq!(results[0].local.status, PromiseStatus::Protected);
 
         // 2h + 1min ago → AT_RISK (> 2×)
@@ -1606,7 +1821,7 @@ enabled = false
             vec![snap(dt(2026, 3, 23, 11, 59), "sv1")],
         );
 
-        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         assert_eq!(results[0].local.status, PromiseStatus::AtRisk);
     }
 
@@ -1620,14 +1835,14 @@ enabled = false
         fs.local_snapshots
             .insert("sv1".to_string(), vec![snap(dt(2026, 3, 23, 9, 0), "sv1")]);
 
-        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         assert_eq!(results[0].local.status, PromiseStatus::AtRisk);
 
         // 5h + 1min ago → UNPROTECTED (> 5×)
         fs.local_snapshots
             .insert("sv1".to_string(), vec![snap(dt(2026, 3, 23, 8, 59), "sv1")]);
 
-        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         assert_eq!(results[0].local.status, PromiseStatus::Unprotected);
     }
 
@@ -1677,7 +1892,7 @@ source = "/data/sv1"
             .insert(("sv1".to_string(), "WD-18TB".to_string()), two_days_ago);
         fs.mounted_drives.insert("WD-18TB".to_string());
 
-        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         // Local: 2d / 1d = 2× → PROTECTED (≤ 2×)
         assert_eq!(results[0].local.status, PromiseStatus::Protected);
         // External: 2d / 1d = 2× → AT_RISK (> 1.5×)
@@ -1739,7 +1954,7 @@ source = "/data/sv1"
         );
         fs.mounted_drives.insert("WD-18TB".to_string());
 
-        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         assert!(results[0].errors.is_empty());
     }
 
@@ -1765,7 +1980,7 @@ source = "/data/sv1"
             dt(2026, 3, 13, 8, 0),
         );
 
-        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         assert!(
             !results[0]
                 .advisories
@@ -1793,7 +2008,7 @@ source = "/data/sv1"
             dt(2026, 3, 13, 8, 0),
         );
 
-        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         assert!(
             results[0].advisories.is_empty(),
             "primary drive should not get advisories: {:?}",
@@ -1931,7 +2146,7 @@ source = "/data/sv1"
         );
         fs.mounted_drives.insert("WD-18TB".to_string());
 
-        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         // Age clamped to zero → evaluates as "just created" → PROTECTED
         // (not falsely PROTECTED from negative duration)
         assert_eq!(results[0].local.status, PromiseStatus::Protected);
@@ -1963,7 +2178,7 @@ source = "/data/sv1"
         );
         fs.mounted_drives.insert("WD-18TB".to_string());
 
-        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         // Send age clamped to zero → PROTECTED (not false PROTECTED from negative)
         assert_eq!(results[0].external[0].status, PromiseStatus::Protected);
         assert_eq!(results[0].external[0].last_send_age, Some(Duration::zero()));
@@ -1990,7 +2205,7 @@ source = "/data/sv1"
         );
         fs.mounted_drives.insert("WD-18TB".to_string());
 
-        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         assert_eq!(results.len(), 2);
 
         // sv1: error captured, status UNPROTECTED
@@ -2069,7 +2284,7 @@ source = "/data/sv1"
             dt(2026, 3, 29, 10, 0),
         );
 
-        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         let sv = &results[0];
         assert_eq!(sv.chain_health.len(), 1);
         assert_eq!(
@@ -2102,7 +2317,7 @@ source = "/data/sv1"
             dt(2026, 3, 28, 10, 0),
         );
 
-        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         let ch = &results[0].chain_health[0];
         assert!(matches!(
             ch.status,
@@ -2135,7 +2350,7 @@ source = "/data/sv1"
             dt(2026, 3, 29, 10, 0),
         );
 
-        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         let ch = &results[0].chain_health[0];
         assert!(matches!(
             ch.status,
@@ -2165,7 +2380,7 @@ source = "/data/sv1"
             dt(2026, 3, 29, 10, 0),
         );
 
-        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         let ch = &results[0].chain_health[0];
         assert_eq!(
             ch.status,
@@ -2189,7 +2404,7 @@ source = "/data/sv1"
             .insert(("D1".to_string(), "sv1".to_string()), vec![]);
         fs.mounted_drives.insert("D1".to_string());
 
-        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         let ch = &results[0].chain_health[0];
         assert!(matches!(
             ch.status,
@@ -2210,7 +2425,7 @@ source = "/data/sv1"
             .insert("sv1".to_string(), vec![parse_snap("20260329-1100-s1")]);
         // Drive NOT mounted — no chain health entries
 
-        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         assert!(
             results[0].chain_health.is_empty(),
             "unmounted drives should not produce chain health entries"
@@ -2258,7 +2473,7 @@ source = "/data/sv1"
             .insert("sv1".to_string(), vec![parse_snap("20260329-1100-s1")]);
         fs.mounted_drives.insert("D1".to_string());
 
-        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         assert!(
             results[0].chain_health.is_empty(),
             "send_disabled subvolumes should have no chain health"
@@ -2284,7 +2499,7 @@ source = "/data/sv1"
             "D1".to_string(),
         ));
 
-        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         let ch = &results[0].chain_health[0];
         assert_eq!(
             ch.status,
@@ -2333,7 +2548,7 @@ source = "/data/sv1"
         fs.free_bytes
             .insert(std::path::PathBuf::from("/mnt/wd"), 1_000_000_000_000);
 
-        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         assert_eq!(results[0].health, OperationalHealth::Healthy);
         assert!(results[0].health_reasons.is_empty());
     }
@@ -2361,7 +2576,7 @@ source = "/data/sv1"
         fs.free_bytes
             .insert(std::path::PathBuf::from("/mnt/wd"), 1_000_000_000_000);
 
-        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         assert_eq!(results[0].health, OperationalHealth::Degraded);
         assert!(results[0].health_reasons[0].contains("chain broken"));
         assert!(results[0].health_reasons[0].contains("WD-18TB"));
@@ -2379,7 +2594,7 @@ source = "/data/sv1"
         );
         // No drives mounted, send_enabled=true (default in test config)
 
-        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         assert_eq!(results[0].health, OperationalHealth::Blocked);
         assert!(results[0].health_reasons[0].contains("no backup drives connected"));
     }
@@ -2434,7 +2649,7 @@ send_enabled = false
         );
         // No drives mounted — but send_enabled=false, so health should be Healthy
 
-        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         assert_eq!(results[0].health, OperationalHealth::Healthy);
     }
 
@@ -2468,7 +2683,7 @@ send_enabled = false
         fs.free_bytes
             .insert(std::path::PathBuf::from("/mnt/wd"), 105_000_000_000);
 
-        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         assert_eq!(results[0].health, OperationalHealth::Degraded);
         assert!(results[0].health_reasons.iter().any(|r| r.contains("space tight")));
     }
@@ -2509,7 +2724,7 @@ send_enabled = false
             60_000_000_000,
         );
 
-        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         assert_eq!(results[0].health, OperationalHealth::Blocked);
         assert!(results[0].health_reasons.iter().any(|r| r.contains("insufficient space")));
     }
@@ -2546,7 +2761,7 @@ send_enabled = false
             5_000_000_000,
         );
 
-        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         assert_ne!(
             results[0].health,
             OperationalHealth::Blocked,
@@ -2580,7 +2795,7 @@ send_enabled = false
         fs.free_bytes
             .insert(std::path::PathBuf::from("/mnt/wd"), 200_000_000_000);
 
-        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         assert_ne!(
             results[0].health,
             OperationalHealth::Blocked,
@@ -2622,7 +2837,7 @@ send_enabled = false
             50_000_000_000,
         );
 
-        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         assert_ne!(
             results[0].health,
             OperationalHealth::Blocked,
@@ -2649,7 +2864,7 @@ send_enabled = false
             },
         );
 
-        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         let drive = &results[0].external[0];
         assert_eq!(
             drive.absent_duration_secs,
@@ -2683,7 +2898,7 @@ send_enabled = false
         fs.last_successful_ops
             .insert("WD-18TB".to_string(), dt(2026, 3, 22, 12, 0));
 
-        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         let drive = &results[0].external[0];
         assert_eq!(drive.absent_duration_secs, None);
         assert_eq!(drive.last_activity_age_secs, None);
@@ -2711,7 +2926,7 @@ send_enabled = false
         fs.last_successful_ops
             .insert("WD-18TB".to_string(), dt(2026, 3, 22, 10, 0));
 
-        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         let drive = &results[0].external[0];
         assert_eq!(drive.absent_duration_secs, None);
         assert_eq!(
@@ -2732,7 +2947,7 @@ send_enabled = false
         fs.last_successful_ops
             .insert("WD-18TB".to_string(), dt(2026, 3, 20, 14, 0));
 
-        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         let drive = &results[0].external[0];
         assert_eq!(drive.absent_duration_secs, None);
         assert_eq!(
@@ -2762,7 +2977,7 @@ send_enabled = false
         fs.last_successful_ops
             .insert("WD-18TB".to_string(), dt(2026, 3, 20, 10, 0));
 
-        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         let drive = &results[0].external[0];
         assert_eq!(drive.absent_duration_secs, Some(4 * 3600));
         assert_eq!(
@@ -2780,7 +2995,7 @@ send_enabled = false
         fs.local_snapshots
             .insert("sv1".to_string(), vec![snap(dt(2026, 3, 23, 13, 30), "sv1")]);
 
-        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         let drive = &results[0].external[0];
         assert_eq!(drive.absent_duration_secs, None);
         assert_eq!(drive.last_activity_age_secs, None);
@@ -2802,7 +3017,7 @@ send_enabled = false
             dt(2026, 3, 10, 12, 0), // 13 days ago
         );
 
-        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         assert_eq!(results[0].health, OperationalHealth::Blocked);
         // Blocked because no drives mounted (primary check), plus degraded for away >7d
         assert!(results[0].health_reasons.iter().any(|r| r.contains("no backup drives connected")));
@@ -2844,7 +3059,7 @@ send_enabled = false
         fs.free_bytes
             .insert(std::path::PathBuf::from("/mnt/d1"), 1_000_000_000_000);
 
-        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         assert_eq!(results[0].health, OperationalHealth::Healthy, "health_reasons: {:?}", results[0].health_reasons);
         assert!(results[0].health_reasons.is_empty());
     }
@@ -2899,7 +3114,7 @@ send_enabled = false
             42,
         );
 
-        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &mb });
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &mb }, &crate::awareness::StorageSignalMap::new());
         assert_eq!(
             results[0].health,
             OperationalHealth::Healthy,
@@ -2965,7 +3180,7 @@ send_enabled = false
             dt(2026, 3, 6, 14, 0), // 17 days ago
         );
 
-        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         assert!(
             !results[0]
                 .health_reasons
@@ -3046,7 +3261,7 @@ send_enabled = false
             dt(2026, 3, 10, 12, 0),
         );
 
-        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         assert_eq!(results[0].health, OperationalHealth::Degraded);
         assert!(results[0].health_reasons.len() >= 2, "expected multiple reasons, got: {:?}", results[0].health_reasons);
         assert!(results[0].health_reasons.iter().any(|r| r.contains("chain broken")));
@@ -3116,7 +3331,7 @@ send_enabled = false
         fs.free_bytes
             .insert(std::path::PathBuf::from("/snap/sv1"), 11_000_000_000);
 
-        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         assert_eq!(results[0].health, OperationalHealth::Degraded);
         assert!(results[0].health_reasons.iter().any(|r| r.contains("local snapshot space tight")));
     }
@@ -3144,7 +3359,7 @@ send_enabled = false
         fs.free_bytes
             .insert(std::path::PathBuf::from("/mnt/wd"), 1_000_000_000_000);
 
-        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         assert_eq!(results[0].health, OperationalHealth::Degraded);
         assert!(
             results[0].health_reasons.iter().any(|r| r.contains("full send size unknown")),
@@ -3211,7 +3426,7 @@ local_retention = "transient"
         );
         fs.mounted_drives.insert("WD-18TB".to_string());
 
-        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         assert_eq!(results[0].name, "sv-transient");
         assert_eq!(results[0].local.status, PromiseStatus::Protected);
         assert_eq!(results[0].local.snapshot_count, 0);
@@ -3231,7 +3446,7 @@ local_retention = "transient"
         );
         fs.mounted_drives.insert("WD-18TB".to_string());
 
-        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         assert_eq!(results[0].local.status, PromiseStatus::Protected);
         // Overall dragged down by external, not local
         assert_eq!(results[0].status, PromiseStatus::AtRisk);
@@ -3250,7 +3465,7 @@ local_retention = "transient"
         );
         fs.mounted_drives.insert("WD-18TB".to_string());
 
-        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         assert_eq!(results[0].local.status, PromiseStatus::Protected);
         assert_eq!(results[0].status, PromiseStatus::Unprotected);
     }
@@ -3274,7 +3489,7 @@ local_retention = "transient"
         );
         fs.mounted_drives.insert("WD-18TB".to_string());
 
-        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         assert_eq!(results[0].local.status, PromiseStatus::Protected);
         assert_eq!(results[0].local.snapshot_count, 1);
         assert!(results[0].local.newest_age.is_some());
@@ -3290,7 +3505,7 @@ local_retention = "transient"
         // No local snapshots, no external sends, drive mounted
         fs.mounted_drives.insert("WD-18TB".to_string());
 
-        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         assert_eq!(results[0].local.status, PromiseStatus::Protected);
         // External: never sent → UNPROTECTED
         assert_eq!(results[0].external[0].status, PromiseStatus::Unprotected);
@@ -3345,7 +3560,7 @@ send_enabled = false
         let now = dt(2026, 3, 23, 14, 0);
         let fs = MockFileSystemState::new();
 
-        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         assert_eq!(results[0].name, "sv-nosend");
         // Local returns Protected (transient branch), but overall must be Unprotected
         // because there is no external safety mechanism.
@@ -3374,7 +3589,7 @@ send_enabled = false
         fs.free_bytes
             .insert(std::path::PathBuf::from("/mnt/wd"), 1_000_000_000_000);
 
-        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         assert_eq!(
             results[0].health,
             OperationalHealth::Healthy,
@@ -3409,7 +3624,7 @@ send_enabled = false
         fs.free_bytes
             .insert(std::path::PathBuf::from("/mnt/wd"), 1_000_000_000_000);
 
-        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         assert_eq!(
             results[0].health,
             OperationalHealth::Healthy,
@@ -3450,7 +3665,7 @@ send_enabled = false
         fs.free_bytes
             .insert(std::path::PathBuf::from("/mnt/wd"), 1_000_000_000_000);
 
-        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         assert_eq!(
             results[0].health,
             OperationalHealth::Degraded,
@@ -3481,7 +3696,7 @@ send_enabled = false
         fs.free_bytes
             .insert(std::path::PathBuf::from("/mnt/wd"), 1_000_000_000_000);
 
-        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         assert_eq!(
             results[0].health,
             OperationalHealth::Degraded,
@@ -3508,7 +3723,7 @@ send_enabled = false
         fs.free_bytes
             .insert(std::path::PathBuf::from("/mnt/wd"), 1_000_000_000_000);
 
-        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         // Should not contain "full send size unknown" — chain treated as intact for transient
         assert!(
             !results[0]
@@ -3591,7 +3806,7 @@ drives = ["D1"]
         // D2 is NOT mounted — but sv1 is scoped to D1 only,
         // so D2 absence should NOT affect sv1's status.
 
-        let assessments = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let assessments = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         let sv1 = assessments.iter().find(|a| a.name == "sv1").unwrap();
 
         assert_eq!(
@@ -3621,7 +3836,7 @@ drives = ["D1"]
 
         // D2 is NOT mounted and has no send history
 
-        let assessments = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let assessments = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         let sv1 = assessments.iter().find(|a| a.name == "sv1").unwrap();
 
         // Without per-subvolume drives scoping, all configured drives appear in assessments
@@ -3647,7 +3862,7 @@ drives = ["D1"]
             dt(2026, 4, 1, 10, 0),
         );
 
-        let assessments = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let assessments = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         let sv1 = assessments.iter().find(|a| a.name == "sv1").unwrap();
 
         assert_eq!(
@@ -3686,7 +3901,7 @@ drives = ["D1"]
         // D2 would have a broken chain if assessed, but it's out of scope
         // (sv1 is scoped to D1 only). Verify health is not degraded.
 
-        let assessments = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let assessments = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         let sv1 = assessments.iter().find(|a| a.name == "sv1").unwrap();
 
         assert_eq!(
@@ -3737,7 +3952,7 @@ drives = ["D1"]
             42,
         );
 
-        let r = &assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &mb })[0];
+        let r = &assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &mb }, &crate::awareness::StorageSignalMap::new())[0];
         assert_eq!(r.external[0].status, PromiseStatus::Protected);
         // Advisory explains why the old age is still PROTECTED.
         assert!(
@@ -3783,7 +3998,7 @@ drives = ["D1"]
             42,
         );
 
-        let r = &assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &mb })[0];
+        let r = &assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &mb }, &crate::awareness::StorageSignalMap::new())[0];
         assert_eq!(r.external[0].status, PromiseStatus::Unprotected);
     }
 
@@ -3813,7 +4028,7 @@ drives = ["D1"]
         );
 
         // No generations configured — queries will fail.
-        let r = &assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() })[0];
+        let r = &assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new())[0];
         assert_eq!(r.external[0].status, PromiseStatus::Unprotected);
     }
 
@@ -3839,7 +4054,7 @@ drives = ["D1"]
         mb.generations.borrow_mut()
             .insert(std::path::PathBuf::from("/data/sv1"), 42);
 
-        let r = &assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &mb })[0];
+        let r = &assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &mb }, &crate::awareness::StorageSignalMap::new())[0];
         assert_eq!(r.external[0].status, PromiseStatus::Unprotected);
     }
 
@@ -3867,7 +4082,7 @@ drives = ["D1"]
         );
 
         // No drive mounted — isolate the local assessment.
-        let r = &assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &mb })[0];
+        let r = &assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &mb }, &crate::awareness::StorageSignalMap::new())[0];
         assert_eq!(r.local.status, PromiseStatus::Protected);
     }
 
@@ -3906,7 +4121,7 @@ drives = ["D1"]
             42,
         );
 
-        let r = &assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &mb })[0];
+        let r = &assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &mb }, &crate::awareness::StorageSignalMap::new())[0];
         // 10 days since send > 3× 1d → UNPROTECTED under age-based rules.
         assert_eq!(
             r.external[0].status,
@@ -3945,7 +4160,7 @@ drives = ["D1"]
             42,
         );
 
-        let r = &assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &mb })[0];
+        let r = &assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &mb }, &crate::awareness::StorageSignalMap::new())[0];
         assert_eq!(r.external[0].status, PromiseStatus::Protected);
         assert!(!r.external[0].mounted, "drive should be reported unmounted");
     }
@@ -4015,7 +4230,7 @@ source = "/data/sv1"
             dt(2026, 3, 23, 13, 30),
         );
 
-        let r = &assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &mb })[0];
+        let r = &assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &mb }, &crate::awareness::StorageSignalMap::new())[0];
         // Transient local returns Protected regardless of age.
         assert_eq!(r.local.status, PromiseStatus::Protected);
     }
@@ -4055,7 +4270,7 @@ source = "/data/sv1"
             42,
         );
 
-        let r = &assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &mb })[0];
+        let r = &assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &mb }, &crate::awareness::StorageSignalMap::new())[0];
         assert!(
             r.advisories
                 .iter()
@@ -4084,6 +4299,7 @@ source = "/data/sv1"
             advisories: vec![],
             redundancy_advisories: vec![],
             errors: vec![],
+            storage_posture: None,
         }
     }
 

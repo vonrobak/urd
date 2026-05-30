@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::advice::{ActionableAdvice, RedundancyAdvisory, RedundancyAdvisoryKind};
 use crate::awareness::{DriveAssessment, PromiseStatus, SubvolAssessment};
+use crate::storage_critical::{StoragePosture, TightnessTier};
 use crate::types::{ByteSize, DriveRole};
 
 // ── OutputMode ──────────────────────────────────────────────────────────
@@ -108,6 +109,27 @@ impl AdvisorySummary {
     }
 }
 
+// ── PoolPostureSummary ──────────────────────────────────────────────────
+
+/// One per-pool storage-posture display line (UPI 031-a, D1). The
+/// drive-level fact stated once: a tight pool and how many subvolumes it
+/// affects. Aggregated from per-subvolume `StoragePosture` by
+/// `commands::storage_signals::aggregate`. No `transition` field — the
+/// "just noticed" prose lives in the backup-time notification (S1).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PoolPostureSummary {
+    /// Display label for the pool (its source mountpoint, e.g. `/` or `/mnt/data`).
+    pub pool_label: String,
+    pub tier: TightnessTier,
+    /// Pressure here risks the host itself (root pool + `/` entrusted).
+    pub host_root: bool,
+    /// Enabled subvolumes whose source resolves to this pool (Min1).
+    pub affected_count: usize,
+    /// Seconds since the pool was flagged at its current tier, if known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub since_secs: Option<i64>,
+}
+
 // ── StatusOutput ────────────────────────────────────────────────────────
 
 /// Structured output for the `urd status` command.
@@ -132,6 +154,10 @@ pub struct StatusOutput {
     /// Actionable advice for subvolumes needing attention (omitted from JSON when empty).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub advice: Vec<ActionableAdvice>,
+    /// Per-pool storage-posture lines (UPI 031-a). Omitted from JSON when all
+    /// pools are Roomy, so roomy systems stay silent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub storage_postures: Vec<PoolPostureSummary>,
 }
 
 /// Serializable wrapper around SubvolAssessment data.
@@ -165,6 +191,10 @@ pub struct StatusAssessment {
     #[serde(default, skip_serializing_if = "is_false")]
     pub external_only: bool,
     pub errors: Vec<String>,
+    /// Per-subvolume storage posture (UPI 031-a) for `--json` and 032/033.
+    /// Omitted when the subvolume's pool is Roomy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_posture: Option<StoragePosture>,
 }
 
 impl StatusAssessment {
@@ -189,6 +219,7 @@ impl StatusAssessment {
             retention_summary: None,
             external_only: false,
             errors: a.errors.clone(),
+            storage_posture: a.storage_posture,
         }
     }
 }
@@ -295,6 +326,10 @@ pub struct DefaultStatusOutput {
     /// How many subvolumes need attention total.
     #[serde(skip_serializing_if = "is_zero")]
     pub total_needing_attention: usize,
+    /// The worst tight pool's posture (UPI 031-a) — drives the compact
+    /// bare-`urd` clause. Omitted when all pools are Roomy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_posture: Option<PoolPostureSummary>,
 }
 
 fn is_zero(n: &usize) -> bool {
@@ -525,12 +560,6 @@ pub struct DoctorRecommendationRow {
     /// gate.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub was_named_level: Option<crate::types::ProtectionLevel>,
-    /// UPI 031: the subvolume's source is on the host's root-filesystem pool
-    /// (entrusted to Urd) and that pool is critically tight. A structural
-    /// property distinct from momentary headroom pressure. Renders a dimmed
-    /// advisory; omitted from JSON when false (additive, no schema bump).
-    #[serde(skip_serializing_if = "is_false")]
-    pub storage_critical: bool,
 }
 
 // ── Churn (UPI 030) ────────────────────────────────────────────────────
@@ -653,6 +682,11 @@ pub struct DoctorDataSafety {
     /// Why this command is suggested, or what physical action to take.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Source-pool storage posture (UPI 031-a). Diagnostic: `doctor --thorough`
+    /// renders a tightness line here, with `urd status` as the primary surface.
+    /// Omitted when the subvolume's pool is Roomy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_posture: Option<StoragePosture>,
 }
 
 /// Sentinel daemon status for doctor output.
@@ -1642,6 +1676,7 @@ mod tests {
             advisories: vec![],
             redundancy_advisories: vec![advisory.clone()],
             errors: vec![],
+            storage_posture: None,
         };
 
         let sa = StatusAssessment::from_assessment(&assessment);
@@ -2287,7 +2322,6 @@ source = "/data/sv2"
             external: Some(pressure),
             note: None,
             was_named_level: None,
-            storage_critical: false,
         };
         let value = serde_json::to_value(&row).unwrap();
         assert_eq!(
@@ -2347,7 +2381,6 @@ source = "/data/sv2"
             external: None,
             note: None,
             was_named_level: None,
-            storage_critical: false,
         };
         let json = serde_json::to_string(&row).unwrap();
         assert!(!json.contains("\"adjusted\""), "adjusted omitted when None: {json}");

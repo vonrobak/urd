@@ -879,6 +879,7 @@ mod tests {
             advisories: vec![],
             redundancy_advisories: vec![],
             errors: vec![],
+            storage_posture: None,
         }
     }
 
@@ -915,6 +916,7 @@ mod tests {
             advisories: vec![],
             redundancy_advisories: vec![],
             errors: vec![],
+            storage_posture: None,
         }
     }
 
@@ -1536,6 +1538,7 @@ mod tests {
             advisories: vec![],
             redundancy_advisories: vec![],
             errors: vec![],
+            storage_posture: None,
         }
     }
 

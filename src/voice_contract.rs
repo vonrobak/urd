@@ -1009,7 +1009,6 @@ mod contract {
             external: None,
             note: None,
             was_named_level: None,
-            storage_critical: false,
         }
     }
 
@@ -1105,7 +1104,7 @@ mod contract {
             &cur,
             ShapeRole::Local,
             HeadroomSeverity::Critical,
-            AdjustmentReason::StorageCritical,
+            AdjustmentReason::SourcePoolLow { free_ratio: 0.1 },
         );
         crate::output::DoctorRecommendationRow {
             name: name.to_string(),
@@ -1113,7 +1112,6 @@ mod contract {
             external: None,
             note: None,
             was_named_level: None,
-            storage_critical: false,
         }
     }
 
@@ -1163,7 +1161,6 @@ mod contract {
             external: None,
             note: None,
             was_named_level: None,
-            storage_critical: false,
         }
     }
 
@@ -1374,7 +1371,6 @@ mod contract {
             external: None,
             note: None,
             was_named_level: None,
-            storage_critical: false,
         };
         let view = crate::output::DoctorRecommendationView {
             header: "header".to_string(),

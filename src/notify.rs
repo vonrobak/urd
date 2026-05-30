@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::awareness::PromiseStatus;
 use crate::heartbeat::Heartbeat;
+use crate::storage_critical::{TightnessTier, Transition};
 
 // ── Event types ────────────────────────────────────────────────────────
 
@@ -91,6 +92,15 @@ pub enum NotificationEvent {
         root: String,
         freed_bytes: u64,
         deleted_count: usize,
+    },
+    /// A source pool's tightness tier escalated (UPI 031-a). Dispatched
+    /// best-effort by `urd backup` only — the told-not-silent "just noticed"
+    /// surface (D6). `from`/`to` are tier labels (`roomy`/`tight`/`critical`).
+    StoragePressureRising {
+        pool_label: String,
+        from: String,
+        to: String,
+        host_root: bool,
     },
 }
 
@@ -350,6 +360,58 @@ pub fn build_drive_reconnected_notification(
         urgency: Urgency::Info,
         title: format!("{label} is back"),
         body,
+    }
+}
+
+// ── Storage-pressure notifications (UPI 031-a) ────────────────────────
+
+/// Build a best-effort notification for a source pool whose tightness tier
+/// escalated (D6). Urgency scales with severity: `Critical` tier or a
+/// host-root pool fires at `Critical`; a plain `Tight` escalation fires at
+/// `Warning`. The host-root case carries the relocated 031 stakes prose.
+#[must_use]
+pub fn build_storage_pressure_notification(
+    pool_label: &str,
+    transition: Transition,
+    host_root: bool,
+) -> Notification {
+    let to_label = tier_word(transition.to);
+    let urgency = if transition.to == TightnessTier::Critical || host_root {
+        Urgency::Critical
+    } else {
+        Urgency::Warning
+    };
+
+    let mut body = format!(
+        "{pool_label} is now {to_label} on free space \
+         ({} → {to_label}). Consider freeing space or tightening retention.",
+        tier_word(transition.from),
+    );
+    if host_root {
+        body.push_str(
+            " This is your host root, so pressure here risks the machine itself.",
+        );
+    }
+
+    Notification {
+        event: NotificationEvent::StoragePressureRising {
+            pool_label: pool_label.to_string(),
+            from: transition.from.as_db_str().to_string(),
+            to: transition.to.as_db_str().to_string(),
+            host_root,
+        },
+        urgency,
+        title: format!("Storage running {to_label}: {pool_label}"),
+        body,
+    }
+}
+
+/// User-facing word for a tightness tier in notification prose.
+fn tier_word(tier: TightnessTier) -> &'static str {
+    match tier {
+        TightnessTier::Roomy => "roomy",
+        TightnessTier::Tight => "tight",
+        TightnessTier::Critical => "critically tight",
     }
 }
 
@@ -1053,5 +1115,68 @@ mod tests {
             "event: {:?}",
             n.event
         );
+    }
+
+    // ── UPI 031-a: storage-pressure notifications ───────────────────
+
+    fn trans(from: TightnessTier, to: TightnessTier) -> Transition {
+        Transition { from, to }
+    }
+
+    #[test]
+    fn storage_pressure_tight_is_warning() {
+        let n = build_storage_pressure_notification(
+            "/data",
+            trans(TightnessTier::Roomy, TightnessTier::Tight),
+            false,
+        );
+        assert_eq!(n.urgency, Urgency::Warning);
+        assert!(n.title.contains("/data"), "title: {}", n.title);
+        assert!(n.body.contains("tight"), "body: {}", n.body);
+        assert!(
+            !n.body.contains("host root"),
+            "non-host-root body must not mention host root: {}",
+            n.body
+        );
+        assert!(matches!(
+            n.event,
+            NotificationEvent::StoragePressureRising {
+                from,
+                to,
+                host_root: false,
+                ..
+            } if from == "roomy" && to == "tight"
+        ));
+    }
+
+    #[test]
+    fn storage_pressure_critical_is_critical_urgency() {
+        let n = build_storage_pressure_notification(
+            "/data",
+            trans(TightnessTier::Tight, TightnessTier::Critical),
+            false,
+        );
+        assert_eq!(n.urgency, Urgency::Critical);
+        assert!(n.body.contains("critically tight"), "body: {}", n.body);
+    }
+
+    #[test]
+    fn storage_pressure_host_root_escalates_urgency_and_prose() {
+        // A mere Tight escalation, but on the host root → Critical + stakes prose.
+        let n = build_storage_pressure_notification(
+            "/",
+            trans(TightnessTier::Roomy, TightnessTier::Tight),
+            true,
+        );
+        assert_eq!(n.urgency, Urgency::Critical);
+        assert!(
+            n.body.contains("host root") && n.body.contains("machine itself"),
+            "host-root body must carry the stakes prose: {}",
+            n.body
+        );
+        assert!(matches!(
+            n.event,
+            NotificationEvent::StoragePressureRising { host_root: true, .. }
+        ));
     }
 }

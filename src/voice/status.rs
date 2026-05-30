@@ -11,12 +11,15 @@ use colored::Colorize;
 
 use crate::advice::RedundancyAdvisoryKind;
 use crate::awareness::PromiseStatus;
-use crate::output::{ChainHealth, DefaultStatusOutput, OutputMode, StatusOutput};
+use crate::output::{
+    ChainHealth, DefaultStatusOutput, OutputMode, PoolPostureSummary, StatusOutput,
+};
+use crate::storage_critical::TightnessTier;
 use crate::types::{ByteSize, DriveRole};
 
 use super::{
     SuggestionContext, aggregate_drive_info, append_suggestion, color_result, exposure_label,
-    format_status_table, humanize_duration, unmounted_drive_label,
+    format_status_table, humanize_duration, pluralize, unmounted_drive_label,
 };
 
 // ── Status ──────────────────────────────────────────────────────────────
@@ -39,6 +42,11 @@ pub(super) fn render_status_interactive(data: &StatusOutput) -> String {
 
     // ── Summary line ────────────────────────────────────────────────
     render_summary_line(data, &mut out);
+
+    // ── Storage posture (UPI 031-a) ─────────────────────────────────
+    // Told-not-silent: a tight pool is surfaced high, right under the safety
+    // summary. Silent when every pool is Roomy.
+    render_storage_postures(data, &mut out);
 
     // ── Per-subvolume table ──────────────────────────────────────────
     render_subvolume_table(data, &mut out);
@@ -166,6 +174,47 @@ pub(super) fn render_summary_line(data: &StatusOutput, out: &mut String) {
     };
 
     writeln!(out, "{safety_part}{health_part}").ok();
+}
+
+/// Render the per-pool storage-posture lines (UPI 031-a). One line per tight
+/// pool: the state ("runs tight" / "critically tight"), the affected-subvolume
+/// count, the host-root stakes escalation, and "flagged ... ago" when known.
+/// Silent when no pool is tight (a Roomy system says nothing here).
+pub(super) fn render_storage_postures(data: &StatusOutput, out: &mut String) {
+    if data.storage_postures.is_empty() {
+        return;
+    }
+    for p in &data.storage_postures {
+        writeln!(out, "{}", storage_posture_line(p)).ok();
+    }
+}
+
+/// Compose a single posture line. Extracted (pure, `String`-returning) so both
+/// the full `status` surface and the compact bare-`urd` clause can reuse the
+/// state wording.
+fn storage_posture_line(p: &PoolPostureSummary) -> colored::ColoredString {
+    let state = match p.tier {
+        TightnessTier::Critical => "critically tight",
+        // Roomy never reaches here (aggregate emits Tight+ only).
+        _ => "runs tight",
+    };
+    let mut line = format!(
+        "Watching {}: {state} \u{2014} {} affected",
+        p.pool_label,
+        pluralize(p.affected_count, "subvolume", "subvolumes"),
+    );
+    if p.host_root {
+        line.push_str(
+            " \u{2014} this is your host root, so pressure here risks the machine itself",
+        );
+    }
+    if let Some(secs) = p.since_secs.filter(|s| *s >= 0) {
+        write!(line, " (flagged {} ago)", humanize_duration(secs)).ok();
+    }
+    match p.tier {
+        TightnessTier::Critical => line.red(),
+        _ => line.yellow(),
+    }
 }
 
 pub(super) fn render_subvolume_table(data: &StatusOutput, out: &mut String) {
@@ -478,6 +527,24 @@ fn render_default_status_interactive(data: &DefaultStatusOutput) -> String {
             parts.push(format!("{} degraded", data.degraded_count));
         }
         write!(out, " {}.", parts.join(", ")).ok();
+    }
+
+    // Storage posture (UPI 031-a): compact worst-pool clause.
+    if let Some(ref posture) = data.storage_posture {
+        let state = match posture.tier {
+            TightnessTier::Critical => "critically tight",
+            _ => "tight",
+        };
+        let clause = if posture.host_root {
+            format!(" Storage on {} is {state} (host root).", posture.pool_label)
+        } else {
+            format!(" Storage on {} is {state}.", posture.pool_label)
+        };
+        let colored = match posture.tier {
+            TightnessTier::Critical => clause.red(),
+            _ => clause.yellow(),
+        };
+        write!(out, "{colored}").ok();
     }
 
     // Last backup age (pre-computed by command handler to keep voice pure)

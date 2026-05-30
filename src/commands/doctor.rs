@@ -19,7 +19,6 @@ use crate::pools::{self, PoolSpace};
 use crate::preflight;
 use crate::sentinel_runner;
 use crate::state::StateDb;
-use crate::storage_critical;
 use crate::types::{LocalRetentionPolicy, ProtectionLevel};
 use crate::voice;
 
@@ -163,7 +162,10 @@ pub fn run(config: Config, args: DoctorArgs, output_mode: OutputMode) -> anyhow:
         btrfs: &assess_btrfs,
     };
     let now = chrono::Local::now().naive_local();
-    let assessments = awareness::assess(&config, now, &observation);
+    // Read-only gather: thread storage posture into the data-safety section.
+    let signals = crate::commands::storage_signals::gather(&config, state_db.as_ref());
+    let assessments =
+        awareness::assess(&config, now, &observation, &signals.by_subvol);
 
     let resolved = config.resolved_subvolumes();
     let data_safety: Vec<DoctorDataSafety> = assessments
@@ -216,6 +218,7 @@ pub fn run(config: Config, args: DoctorArgs, output_mode: OutputMode) -> anyhow:
                 issue,
                 suggestion,
                 reason,
+                storage_posture: a.storage_posture,
             }
         })
         .collect();
@@ -368,18 +371,11 @@ fn build_doctor_recommendation_view(
         .collect();
     let since = now - window;
 
-    // UPI 031: resolve the BTRFS pool hosting "/" once (one `findmnt /`). Only
-    // `--thorough` reaches here; no autonomous/nightly consumer calls this.
-    let root_pool_uuid = pools::pool_uuid_for_path(std::path::Path::new("/"))
-        .ok()
-        .flatten();
-
     build_doctor_recommendation_view_inner(
         config,
         state_db,
         now,
         &pools_grouped,
-        root_pool_uuid.as_deref(),
         |mp: &Path| pools::pool_space(mp).ok(),
         |uuid: &str| pools::metadata_utilization_ratio(uuid),
         |uuid: &str| {
@@ -406,7 +402,6 @@ fn build_doctor_recommendation_view_inner(
     state_db: Option<&StateDb>,
     now: chrono::NaiveDateTime,
     pools_grouped: &[pools::SourcePool],
-    root_pool_uuid: Option<&str>,
     pool_space_resolver: impl Fn(&Path) -> Option<PoolSpace>,
     metadata_resolver: impl Fn(&str) -> Option<f64>,
     pool_trend_resolver: impl Fn(&str) -> Option<i64>,
@@ -470,13 +465,6 @@ fn build_doctor_recommendation_view_inner(
         };
 
     let resolved = config.resolved_subvolumes();
-
-    // UPI 031 (M1): the storage-critical gate. `/` is entrusted to Urd only
-    // when an *enabled* subvolume has `source == "/"`. A disabled root subvol
-    // does not extend structural fragility to its enabled pool siblings.
-    let root_subvol_configured = resolved
-        .iter()
-        .any(|s| s.enabled && s.source.as_path() == std::path::Path::new("/"));
 
     let mut rows: Vec<DoctorRecommendationRow> = Vec::new();
 
@@ -548,12 +536,22 @@ fn build_doctor_recommendation_view_inner(
         let severity_local = recommendation::classify_headroom_severity(ctx_local);
         let severity_external = recommendation::classify_headroom_severity(ctx_external);
 
+        // Synth-path fallback reason (M3): the Pressure/Critical branch is only
+        // reached when the source pool is genuinely low, so `SourcePoolLow` is
+        // the honest reason when `pick_reason` returns None (it renders prose;
+        // the retired `StorageCritical` reason rendered blank). Unmeasurable
+        // free-ratio falls back to `0.0` — only ever read on the genuinely-low
+        // branch, where most-tight is the safe direction.
+        let source_free_ratio = source_space.and_then(PoolSpace::free_ratio).unwrap_or(0.0);
+
         let local = match (local_rec, severity_local, local_current_shape) {
             (Some(r), _, _) => Some(r),
             (None, HeadroomSeverity::Pressure, Some(cur))
             | (None, HeadroomSeverity::Critical, Some(cur)) => {
                 let reason = recommendation::pick_reason(ctx_local, severity_local, None)
-                    .unwrap_or(AdjustmentReason::StorageCritical);
+                    .unwrap_or(AdjustmentReason::SourcePoolLow {
+                        free_ratio: source_free_ratio,
+                    });
                 Some(recommendation::headroom_aware_pointer_only(
                     &cur,
                     ShapeRole::Local,
@@ -572,7 +570,9 @@ fn build_doctor_recommendation_view_inner(
                     severity_external,
                     max_metadata_label.as_deref(),
                 )
-                .unwrap_or(AdjustmentReason::StorageCritical);
+                .unwrap_or(AdjustmentReason::SourcePoolLow {
+                    free_ratio: source_free_ratio,
+                });
                 Some(recommendation::headroom_aware_pointer_only(
                     &cur,
                     ShapeRole::External,
@@ -586,24 +586,6 @@ fn build_doctor_recommendation_view_inner(
         if local.is_none() && external.is_none() {
             continue;
         }
-
-        // UPI 031: storage-critical is a pool-level structural fact, computed
-        // once per subvolume (role-agnostic). It reads the SOURCE free-ratio
-        // only — deliberately not the combined `severity_*`, which folds in
-        // trend and destination-metadata signals. The pure rule owns the UUID
-        // comparison and the `root_subvol_configured` gate.
-        let source_free_ratio_severity = recommendation::classify_free_ratio(
-            source_space.map(|s| s.free_bytes),
-            source_space.map(|s| s.capacity_bytes),
-        );
-        let subvol_pool_uuid = subvol_pool.get(&sv.name).map(|(_, uuid)| uuid.as_str());
-        let storage_critical =
-            storage_critical::is_storage_critical(storage_critical::StorageCriticalInput {
-                subvol_pool_uuid,
-                root_pool_uuid,
-                root_subvol_configured,
-                source_free_ratio_severity,
-            });
 
         let note = local
             .as_ref()
@@ -620,7 +602,6 @@ fn build_doctor_recommendation_view_inner(
             external,
             note,
             was_named_level,
-            storage_critical,
         });
     }
 
@@ -888,7 +869,6 @@ source = "/data/docs"
             state_db,
             now,
             &[],
-            None,
             |_| None,
             |_| None,
             |_| None,
@@ -1249,93 +1229,6 @@ source = "/data/cold"
         }
     }
 
-    /// UPI 031: a config with a single enabled `root` subvolume whose
-    /// `source = "/"`. Defaults supply Graduated local retention so the row
-    /// reaches the synth path under Pressure.
-    fn root_cfg() -> Config {
-        let toml_str = r#"
-drives = []
-
-[general]
-state_db = "/tmp/urd-doctor-031/urd.db"
-metrics_file = "/tmp/urd-doctor-031/backup.prom"
-log_dir = "/tmp/urd-doctor-031"
-heartbeat_file = "/tmp/urd-doctor-031/heartbeat.json"
-
-[local_snapshots]
-roots = [
-  { path = "/snap", subvolumes = ["root"] }
-]
-
-[defaults]
-snapshot_interval = "1h"
-send_interval = "4h"
-[defaults.local_retention]
-hourly = 24
-daily = 60
-weekly = 52
-monthly = 24
-[defaults.external_retention]
-hourly = 0
-daily = 60
-weekly = 52
-monthly = 24
-
-[[subvolumes]]
-name = "root"
-short_name = "root"
-source = "/"
-"#;
-        toml::from_str(toml_str).unwrap()
-    }
-
-    /// UPI 031 (M1): a disabled `source = "/"` subvolume alongside an enabled
-    /// sibling `data` on the same pool. Verifies a disabled root does not
-    /// entrust `/`, so the sibling stays unflagged.
-    fn root_disabled_with_sibling_cfg() -> Config {
-        let toml_str = r#"
-drives = []
-
-[general]
-state_db = "/tmp/urd-doctor-031b/urd.db"
-metrics_file = "/tmp/urd-doctor-031b/backup.prom"
-log_dir = "/tmp/urd-doctor-031b"
-heartbeat_file = "/tmp/urd-doctor-031b/heartbeat.json"
-
-[local_snapshots]
-roots = [
-  { path = "/snap", subvolumes = ["root", "data"] }
-]
-
-[defaults]
-snapshot_interval = "1h"
-send_interval = "4h"
-[defaults.local_retention]
-hourly = 24
-daily = 60
-weekly = 52
-monthly = 24
-[defaults.external_retention]
-hourly = 0
-daily = 60
-weekly = 52
-monthly = 24
-
-[[subvolumes]]
-name = "root"
-short_name = "root"
-source = "/"
-enabled = false
-
-[[subvolumes]]
-name = "data"
-short_name = "data"
-source = "/data"
-enabled = true
-"#;
-        toml::from_str(toml_str).unwrap()
-    }
-
     /// Tight PoolSpace resolver (~10% free → Pressure), ignoring mountpoint.
     fn tight_pool_resolver(_mp: &Path) -> Option<PoolSpace> {
         Some(PoolSpace {
@@ -1359,7 +1252,6 @@ enabled = true
             Some(&db),
             now,
             &pools,
-            None,
             |_mp| Some(PoolSpace { free_bytes: 500_000_000_000, capacity_bytes: 1_000_000_000_000 }),
             |_uuid| None,
             |_uuid| None,
@@ -1384,7 +1276,6 @@ enabled = true
             Some(&db),
             now,
             &pools,
-            None,
             |_mp| Some(PoolSpace { free_bytes: 200_000_000_000, capacity_bytes: 1_000_000_000_000 }),
             |_uuid| None,
             |_uuid| None,
@@ -1409,7 +1300,6 @@ enabled = true
             Some(&db),
             now,
             &pools,
-            None,
             |_mp| Some(PoolSpace { free_bytes: 100_000_000_000, capacity_bytes: 1_000_000_000_000 }),
             |_uuid| None,
             |_uuid| None,
@@ -1442,7 +1332,6 @@ enabled = true
             Some(&db),
             now,
             &pools,
-            None,
             // 20% free → Caution.
             |_mp| Some(PoolSpace { free_bytes: 200_000_000_000, capacity_bytes: 1_000_000_000_000 }),
             |_uuid| None,
@@ -1451,195 +1340,6 @@ enabled = true
         assert!(
             !view.rows.iter().any(|r| r.name == "cold"),
             "Caution must not synthesize for cold subvol"
-        );
-    }
-
-    #[test]
-    fn storage_critical_flag_set_and_row_present() {
-        // M2: enabled `source = "/"` subvol on the root pool + tight pool →
-        // the row IS present (fallback-deletion invariant lock), the flag is
-        // set, and severity stays Pressure (NOT forced Critical).
-        let config = root_cfg();
-        let db = StateDb::open_memory().unwrap();
-        let now = now_fixed();
-        // No churn seeded → synth path; Pressure from the tight pool.
-        let pools = vec![pool_for_subvols(&["root"])];
-        let view = build_doctor_recommendation_view_inner(
-            &config,
-            Some(&db),
-            now,
-            &pools,
-            Some("pool-uuid-test"),
-            tight_pool_resolver,
-            |_uuid| None,
-            |_uuid| None,
-        );
-        let row = view
-            .rows
-            .iter()
-            .find(|r| r.name == "root")
-            .expect("storage_critical row must be present");
-        assert!(row.storage_critical, "flag must be set");
-        let local = row.local.as_ref().expect("local synth");
-        assert_eq!(
-            local.severity,
-            HeadroomSeverity::Pressure,
-            "severity stays Pressure, not forced Critical"
-        );
-        assert!(matches!(
-            local.reason,
-            Some(AdjustmentReason::SourcePoolLow { .. })
-        ));
-    }
-
-    #[test]
-    fn storage_critical_flag_clear_when_no_root_subvol_configured() {
-        // Gate off: no subvol has `source = "/"`. The cold subvol still
-        // synthesizes a Pressure row, but the flag is clear.
-        let config = upi044_cfg_with_pool();
-        let db = StateDb::open_memory().unwrap();
-        let now = now_fixed();
-        let pools = vec![pool_for_subvols(&["cold"])];
-        let view = build_doctor_recommendation_view_inner(
-            &config,
-            Some(&db),
-            now,
-            &pools,
-            Some("pool-uuid-test"),
-            tight_pool_resolver,
-            |_uuid| None,
-            |_uuid| None,
-        );
-        let row = view
-            .rows
-            .iter()
-            .find(|r| r.name == "cold")
-            .expect("cold Pressure synth row present");
-        assert!(
-            !row.storage_critical,
-            "no source=\"/\" subvol → flag clear"
-        );
-    }
-
-    #[test]
-    fn storage_critical_flag_clear_when_root_subvol_disabled() {
-        // M1: `root` (source "/") is disabled, so it does not entrust "/".
-        // The enabled sibling `data` on the same root pool stays unflagged.
-        let config = root_disabled_with_sibling_cfg();
-        let db = StateDb::open_memory().unwrap();
-        let now = now_fixed();
-        let pools = vec![pool_for_subvols(&["root", "data"])];
-        let view = build_doctor_recommendation_view_inner(
-            &config,
-            Some(&db),
-            now,
-            &pools,
-            Some("pool-uuid-test"),
-            tight_pool_resolver,
-            |_uuid| None,
-            |_uuid| None,
-        );
-        // The disabled root produces no row at all.
-        assert!(
-            !view.rows.iter().any(|r| r.name == "root"),
-            "disabled subvol is skipped"
-        );
-        let data = view
-            .rows
-            .iter()
-            .find(|r| r.name == "data")
-            .expect("enabled sibling row present");
-        assert!(
-            !data.storage_critical,
-            "disabled root must not flag an enabled sibling"
-        );
-    }
-
-    #[test]
-    fn storage_critical_flag_clear_on_pool_uuid_mismatch() {
-        // The subvol's pool UUID differs from `/`'s pool → not on the root
-        // pool → flag clear (row still present from Pressure).
-        let config = root_cfg();
-        let db = StateDb::open_memory().unwrap();
-        let now = now_fixed();
-        let pools = vec![pool_for_subvols(&["root"])]; // uuid "pool-uuid-test"
-        let view = build_doctor_recommendation_view_inner(
-            &config,
-            Some(&db),
-            now,
-            &pools,
-            Some("a-different-pool-uuid"),
-            tight_pool_resolver,
-            |_uuid| None,
-            |_uuid| None,
-        );
-        let row = view
-            .rows
-            .iter()
-            .find(|r| r.name == "root")
-            .expect("row present");
-        assert!(!row.storage_critical, "UUID mismatch → flag clear");
-    }
-
-    #[test]
-    fn storage_critical_flag_clear_when_root_pool_uuid_unresolved() {
-        // `findmnt /` failed → root_pool_uuid None → detection disabled.
-        let config = root_cfg();
-        let db = StateDb::open_memory().unwrap();
-        let now = now_fixed();
-        let pools = vec![pool_for_subvols(&["root"])];
-        let view = build_doctor_recommendation_view_inner(
-            &config,
-            Some(&db),
-            now,
-            &pools,
-            None,
-            tight_pool_resolver,
-            |_uuid| None,
-            |_uuid| None,
-        );
-        let row = view
-            .rows
-            .iter()
-            .find(|r| r.name == "root")
-            .expect("row present");
-        assert!(!row.storage_critical, "unresolved root pool → flag clear");
-    }
-
-    #[test]
-    fn storage_critical_preserves_tightened_adjusted_shape() {
-        // Inverse of the old `critical_injection_clears_*`: a storage_critical
-        // Pressure row keeps its tightened `adjusted`/`adjusted_cost` (Branch
-        // D) — the flag is purely additive, it does not force Critical or
-        // clear the role recommendation.
-        let config = root_cfg();
-        let db = StateDb::open_memory().unwrap();
-        let now = now_fixed();
-        // Hot churn so the engine produces a tightenable shape.
-        seed_incremental(&db, "root", now - chrono::Duration::hours(12), 2_700_000_000);
-        let pools = vec![pool_for_subvols(&["root"])];
-        let view = build_doctor_recommendation_view_inner(
-            &config,
-            Some(&db),
-            now,
-            &pools,
-            Some("pool-uuid-test"),
-            tight_pool_resolver,
-            |_uuid| None,
-            |_uuid| None,
-        );
-        let row = view
-            .rows
-            .iter()
-            .find(|r| r.name == "root")
-            .expect("row present");
-        assert!(row.storage_critical, "flag set");
-        let local = row.local.as_ref().expect("local");
-        assert_eq!(local.severity, HeadroomSeverity::Pressure);
-        assert!(local.adjusted.is_some(), "tightened shape preserved");
-        assert!(
-            local.adjusted_cost.is_some(),
-            "adjusted_cost preserved in lockstep"
         );
     }
 
@@ -1687,7 +1387,6 @@ enabled = true
             external: Some(h),
             note: None,
             was_named_level: None,
-            storage_critical: false,
         };
         // current=200, adjusted=25 → recovery = 175 GB (not 150 GB from suggested).
         assert_eq!(recovery_bytes(&row), 175_000_000_000);
@@ -1733,7 +1432,6 @@ enabled = true
             external: None,
             note: None,
             was_named_level: None,
-            storage_critical: false,
         };
         assert_eq!(recovery_bytes(&row), 150_000_000_000);
     }
@@ -1755,7 +1453,6 @@ enabled = true
             Some(&db),
             now,
             &pools,
-            None,
             tight_pool_resolver,
             |_| None,
             |_| None,

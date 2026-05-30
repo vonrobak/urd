@@ -15,4 +15,5 @@ pub mod plan_cmd;
 pub mod retention_preview;
 pub mod status;
 pub mod sentinel;
+pub mod storage_signals;
 pub mod verify;

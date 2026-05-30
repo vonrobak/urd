@@ -280,28 +280,42 @@ The suggested shape preserves the outer-edge span (365 days) while thinning the
 interior — same data cost, fewer pins to manage. The tightened shape shortens
 the outer edge in response to destination pressure; that does reduce data cost.
 
-### `storage_critical` (UPI 031)
+## Cluster: Storage pressure (ADR-113 Do-No-Harm)
 
-Distinct from `headroom`, which is a *momentary* "is this pool tight now?" signal,
-`storage_critical` is a **structural** property of where the data lives. A subvolume
-is storage-critical when **all three** hold:
+The source-pool tightness surface (UPI 031-a). It reworks UPI 031's single
+`is_storage_critical` predicate — which conflated *host-root-ness* with *current
+pressure* and inverted the severity/response ladder — into two orthogonal axes plus a
+persisted, hysteresis-stabilized state. Lives in `storage_critical.rs` (pure derivation)
+with I/O at the command boundary (`commands/storage_signals.rs`). It surfaces
+**told-not-silent** in `urd status` and bare `urd`, notifies on backup escalations, and
+appears as a diagnostic line in `doctor --thorough`'s data-safety section. The
+**behavioral** half (defer, ephemeral lifecycle, mid-op watchdog) is deferred to the UPI
+032/033 bundle (ADR-113 increment 2).
 
-1. its source sits on the host's **root-filesystem pool** (the BTRFS pool UUID matches
-   `/`'s pool — caught even for a `/home`-only config whose pool mountpoints omit `/`);
-2. an **enabled** subvolume entrusts `/` itself to Urd (`source == "/"`); and
-3. that pool is **critically tight right now** (free-ratio ≥ `Pressure`, reusing
-   `recommendation::classify_free_ratio` — no new threshold).
+| Term | Meaning |
+|------|---------|
+| `tightness tier` | Source-pool free-space tier, **free-ratio only**: `TightnessTier { Roomy, Tight, Critical }` (`storage_critical.rs`). Boundaries reuse `recommendation::classify_free_ratio_value` (`< 0.25` → Tight, `< 0.15` → Critical) — the single source of truth, **no new threshold**. The imperative-bundle axis the Do-No-Harm response climbs with. |
+| `tight` / `critical` | User-facing names for the `Tight` / `Critical` tiers (state vocabulary). `Roomy` is silent — Urd says nothing about a roomy pool. |
+| `host-root axis` | The structural escalation flag (`storage_critical::host_root`): the subvolume's source is on the pool hosting `/` (UUID match) **and** an *enabled* subvolume entrusts `/` itself (`source == "/"`). Orthogonal to the tier — pressure on the host-root pool risks the **machine itself**, not just retention. This is the relocated home of UPI 031's stakes-not-action advisory prose. |
+| `storage posture` | The per-subvolume `StoragePosture { tier, host_root }` carried on `SubvolAssessment` — `Some` only when `tier >= Tight`. A separate presentation axis from the data-safety `PromiseStatus` (ADR-110 R4): "Urd is watching a tight pool," not "your data is unsafe." |
+| `watching` | The posture verb: Urd is *watching* a tight pool (told-not-silent), as distinct from a data-safety promise degradation. |
+| `armed tier` / `operational-adaptation state` | The persisted, hysteresis-stabilized tier per pool (`pool_armed_tier` table: `pool_uuid → (armed_tier, since)`). Best-effort SQLite (ADR-102) — never blocks a run; if lost, Urd re-derives statelessly (degraded, never unsafe). The seed of the future managed-config/autonomy layer; lives in Urd's state, **never** in `urd.toml`. |
+| `hysteresis band` | `HYSTERESIS_BAND_PP = 0.05` — escalate immediately when the current ratio classifies worse than the armed tier; de-escalate only once free recovers to `arm_threshold + 5pp` (Critical→Tight at `> 0.20`, Tight→Roomy at `> 0.30`). Anti-flap: stops a pool hovering at a boundary from re-notifying every run. 031-a's one new constant; revisited at the ADR-113 30-day checkpoint. |
+| `transition` | A change in armed tier, computed **only** at the backup boundary (`advance_and_writeback`). Escalations dispatch a best-effort `notify.rs` notification; de-escalation is silent (status reflects recovery). Read paths (`status`, bare `urd`, `doctor`) reflect the stabilized tier and **never** fire a transition (S1). |
 
-The point of the intersection is non-redundancy with headroom: only data that is *both*
-structurally fragile (pressure here threatens the **host**, not just retention) *and*
-genuinely tight is storage-critical. The rule lives in `storage_critical.rs` (pure); the
-doctor wiring resolves `/`'s pool UUID at the boundary. It surfaces as a dimmed,
-stakes-not-action advisory on the offending `urd doctor --thorough` row (and a
-`storage_critical: true` field, omitted-when-false in JSON). The **behavioral** half
-(ephemeral lifecycle, conservative intervals) is deferred to the UPI 032/033 bundle
-(ADR-113 increment 2).
+**`headroom` vs `tightness tier` (do not confuse).** `headroom` (recommendation.rs) is a
+*composite* `HeadroomSeverity` — free-ratio **+** time-to-empty trend **+** destination
+metadata — that scales retention-shape advice. The `tightness tier` is **free-ratio only**
+on the *source* pool: trend is handled separately in 032's projection, destination metadata
+is irrelevant to source-pool tightness. Same free-ratio boundaries, different composites and
+different jobs.
 
-Source: `storage_critical.rs`, ADR-113.
+> **Note.** `constrained` (`tier >= Tight && Urd writes to that pool`) is a **UPI 032**
+> term — deferred, not part of 031-a. 031-a's surface gates inline on `tier >= Tight`.
+
+Source: `storage_critical.rs`, `commands/storage_signals.rs`, `state.rs` (`pool_armed_tier`),
+ADR-113. See also the user-facing rename `drift` → "churn" on the Recommendation cluster's
+`drift signal`.
 
 ## Cluster: Read-side query seams (ADR-102)
 

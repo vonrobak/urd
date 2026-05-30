@@ -8,17 +8,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- **Storage-critical advisory in `urd doctor --thorough`** (UPI 031). Retires the
-  `storage_critical` stub for a pure structural rule: a subvolume is flagged when its
-  source sits on the host's root-filesystem pool (BTRFS pool UUID matches `/`'s), an
-  *enabled* subvolume entrusts `/` itself to Urd, *and* that pool is critically tight
-  now (free-ratio ≥ Pressure). The offending row gains a dimmed, stakes-not-action
-  advisory — pressure here threatens the host, not just retention — alongside (not
-  replacing) the existing retention-tightening suggestion, plus an additive
-  `storage_critical: true` field on recommendation rows (omitted-when-false; no JSON
-  schema bump). Distinct from momentary headroom pressure; behavior deferred to the
-  032/033 bundle (ADR-113 increment 2). No metric, heartbeat, on-disk, or config-schema
-  change.
+- **Storage-pressure state in `urd status`** (UPI 031-a, reworks the unreleased UPI 031).
+  Splits 031's single `is_storage_critical` predicate — which conflated host-root-ness
+  with current pressure and inverted the severity/response ladder — into two orthogonal
+  axes: a **tightness tier** (`Roomy / Tight / Critical`, free-ratio only on the source
+  pool) and a **host-root** escalation flag. The tier is now surfaced **told-not-silent**
+  in `urd status` and bare `urd` (per-pool: "your `/data` runs tight — N subvolumes
+  affected"; host-root pressure adds "…pressure here risks the machine itself"), backed
+  by a persisted, best-effort, hysteresis-stabilized per-pool armed tier
+  (`pool_armed_tier` SQLite table) so the state survives runs and does not flap. Backup
+  runs dispatch a best-effort `notify.rs` notification on escalation (status-only when no
+  channel is configured); de-escalation is silent. The inverted `doctor --thorough` row
+  advisory and its `storage_critical` field are removed — the posture now appears in the
+  `doctor` data-safety section instead, and the recommendation row returns to pure
+  retention-shape advice. The detection + state foundation that UPIs 032 (predictive
+  guards) and 033 (mid-op watchdog) build behavior on; ships with them as ADR-113
+  increment 2. No metric or heartbeat schema change (Cross-Repo Impact: None); no on-disk
+  or config-schema change.
 
 ## [0.21.2] - 2026-05-29
 

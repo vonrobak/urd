@@ -14,6 +14,7 @@ use colored::Colorize;
 use crate::awareness::PromiseStatus;
 use crate::output::{DoctorCheck, DoctorCheckStatus, DoctorOutput, DoctorVerdictStatus, OutputMode};
 use crate::plan::format_duration_short;
+use crate::storage_critical::TightnessTier;
 
 use super::{SuggestionContext, append_suggestion, classify_verify_checks, pluralize};
 
@@ -119,6 +120,20 @@ fn render_doctor_interactive(data: &DoctorOutput) -> String {
                 if let Some(ref reason) = ds.reason {
                     writeln!(out, "      {}", reason.dimmed()).ok();
                 }
+            }
+            // UPI 031-a: diagnostic storage-posture line. Renders for any tight
+            // pool independent of promise issues (a Protected subvolume can still
+            // sit on a tight pool); `urd status` remains the primary surface.
+            if let Some(posture) = ds.storage_posture {
+                let state = match posture.tier {
+                    TightnessTier::Critical => "critically tight",
+                    _ => "runs tight",
+                };
+                let mut line = format!("{} \u{2014} source pool {state}", ds.name);
+                if posture.host_root {
+                    line.push_str("; host root, so pressure here risks the machine itself");
+                }
+                writeln!(out, "    {}", line.dimmed()).ok();
             }
         }
     }
@@ -429,7 +444,6 @@ pub(super) fn render_reason_line(
                 _ => String::new(),
             }
         }
-        StorageCritical => String::new(), // pointer line handled at row level
     }
 }
 
@@ -518,22 +532,9 @@ pub(super) fn format_recommendation_row(row: &crate::output::DoctorRecommendatio
     if let Some(ref rec) = row.external {
         role_line("external:", rec);
     }
-    // UPI 031: row-level storage-critical advisory. STAKES, NOT ACTION — it
-    // names the structural fact (the source lives on the host root
-    // filesystem, so pressure here threatens the host, not just retention)
-    // and carries no action verb. The action ("expand storage / reduce
-    // subvolumes") stays on the role reason line, so this complements rather
-    // than duplicates the at-MIN tail. Never reached when severity is
-    // Critical (the R9 pointer path returns first).
-    if row.storage_critical {
-        writeln!(
-            out,
-            "      {}",
-            "storage critical — source is on the host root filesystem; pressure here risks the host itself"
-                .dimmed()
-        )
-        .ok();
-    }
+    // UPI 031-a relocated the host-root stakes advisory out of this row and
+    // into the `urd status` posture surface + the `doctor` data-safety
+    // section; the recommendation row is once again pure retention-shape advice.
     if matches!(row.note, Some(crate::recommendation::RecommendationNote::BurstyPattern)) {
         writeln!(out, "      {}", "bursty pattern — frequent full sends".dimmed()).ok();
     }
