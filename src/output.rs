@@ -195,6 +195,15 @@ pub struct StatusAssessment {
     /// Omitted when the subvolume's pool is Roomy.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub storage_posture: Option<StoragePosture>,
+    /// UPI 031-b: `true` when the AT RISK promise reflects a deliberate Critical
+    /// cadence (adaptation), not a failure. The signal voice reads to lead with
+    /// adaptation prose instead of a failure line. Additive to `--json`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub cadence_adapted: bool,
+    /// UPI 031-b: the effective send interval in seconds when adapted
+    /// (`armed != Roomy`); `None` at Roomy. Lets voice name the cadence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_send_interval_secs: Option<i64>,
 }
 
 impl StatusAssessment {
@@ -220,6 +229,8 @@ impl StatusAssessment {
             external_only: false,
             errors: a.errors.clone(),
             storage_posture: a.storage_posture,
+            cadence_adapted: a.cadence_adapted,
+            effective_send_interval_secs: a.effective_send_interval.map(|i| i.as_secs()),
         }
     }
 }
@@ -1677,6 +1688,8 @@ mod tests {
             redundancy_advisories: vec![advisory.clone()],
             errors: vec![],
             storage_posture: None,
+            cadence_adapted: false,
+            effective_send_interval: None,
         };
 
         let sa = StatusAssessment::from_assessment(&assessment);

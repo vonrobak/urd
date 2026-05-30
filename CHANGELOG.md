@@ -8,6 +8,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Tier-graded ephemeral footprint-cap** (UPI 031-b, ADR-113 increment 2). Makes the
+  storage tightness tier from 031-a *act* on Urd's own footprint instead of merely
+  reporting it. The armed tier is now resolved once pre-plan and threaded into the
+  planner, executor, and awareness, so a tight source pool automatically sheds Urd's
+  local footprint: **Tight** → retain-one parent (incremental sends) plus a modest 1.5×
+  send-interval stretch; **Critical** → clear-all (drop the pin, full sends, ≈0 steady
+  footprint) plus a weekly send-interval floor so the forced full sends stay rare.
+  Awareness judges staleness against the *effective* (adapted) interval and caps the
+  promise at AT RISK while Critical — surfaced told-not-silent in `urd status` as
+  deliberate care ("tight drive — backing up every 7d to spare it. Reads AT RISK by
+  design, not a failure."), not a failure. The clear-all deletion path routes through the
+  existing executor gate (all-sends-succeeded + no-pin-failure + fail-closed re-read,
+  ADR-106/107), removing the pin before the re-read so the just-sent snapshot can be
+  cleared; a pin-removal failure fails open (skips the clear, retries next run). Both
+  `urd plan` and `backup --dry-run` now gather signals and show the storage-adapted plan.
+  Carries two in-place ADR amendments — ADR-113 (four→three defensive layers, predictive
+  guards retired) and ADR-110 (the AT-RISK cap overturns arc decision R4) — and deletes
+  the now-confirmed-dead `HeadroomSeverity::Critical` machinery (AB5). No metric,
+  heartbeat, on-disk, or config-schema change (Cross-Repo Impact: None).
 - **Storage-pressure state in `urd status`** (UPI 031-a, reworks the unreleased UPI 031).
   Splits 031's single `is_storage_critical` predicate — which conflated host-root-ness
   with current pressure and inverted the severity/response ladder — into two orthogonal

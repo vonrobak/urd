@@ -6,8 +6,8 @@
 > earn opaque status through operational track record. Current taxonomy:
 > recorded/sheltered/fortified (renamed 2026-04-03 from guarded/protected/resilient).
 
-**Date:** 2026-03-26 (revised 2026-03-27, addendum 2026-03-31, vocabulary 2026-04-03, amendment 2026-05-09)
-**Status:** Accepted (taxonomy renamed 2026-04-03 — see Maturity Model; recommendation-layer amendment 2026-05-09 — see [Amendment 2026-05-09](#amendment-2026-05-09-recommendation-layer-as-graduation-evidence-path-adr-115))
+**Date:** 2026-03-26 (revised 2026-03-27, addendum 2026-03-31, vocabulary 2026-04-03, amendments 2026-05-09 / 2026-05-15 / 2026-05-30)
+**Status:** Accepted (taxonomy renamed 2026-04-03 — see Maturity Model; recommendation-layer amendment 2026-05-09 — see [Amendment 2026-05-09](#amendment-2026-05-09-recommendation-layer-as-graduation-evidence-path-adr-115); AT-RISK cap at Critical overturns R4 2026-05-30 — see [Amendment 2026-05-30](#amendment-2026-05-30-at-risk-cap-at-the-critical-tier-upi-031-b--overturns-r4))
 **Depends on:** ADR-100 (planner/executor separation), ADR-108 (pure function modules),
 ADR-109 (config boundary validation), ADR-111 (config system architecture)
 **Amended by:** ADR-115 (Retention shape symmetry and the recommendation layer)
@@ -428,6 +428,36 @@ re-litigating it later under pressure.
 The only user-visible surface affected is `urd doctor --thorough`'s display of a Recorded
 subvolume's external policy shape: it now reads "no monthly" instead of "unlimited monthly."
 Display-only; no retention behavior changes.
+
+## Amendment 2026-05-30: AT-RISK cap at the Critical tier (UPI 031-b — overturns R4)
+
+The Do-No-Harm arc decision **R4** (recorded in the 031-a journal and the arc-regrill
+doc) held that *"the promise degrades only via honest staleness"* — i.e. storage posture
+(`TightnessTier`) was a presentation axis strictly **separate** from `PromiseStatus`, and
+a tight pool could never, by itself, move the promise. UPI 031-b **overturns R4,
+eyes-open.**
+
+**The change.** At the **Critical** tier, the tier-graded ephemeral spine deliberately
+slows Urd's send cadence (clear-all + a weekly interval floor) to bound Urd's local
+footprint on a dangerously tight pool. Judged honestly, the subvolume *is* less protected
+than its declared cadence promised — a fresh-but-weekly external copy is genuinely a
+weaker guarantee than a fresh-but-daily one. So `awareness::assess` now **caps the promise
+at AT RISK while the pool is Critical**: `overall = overall.min(AtRisk)` (never PROTECTED
+at Critical; AT RISK / UNPROTECTED are unchanged).
+
+**Why this is honest, not synthetic.** The cap is not an alarm bolted onto a healthy
+subvolume. It records a real reduction in protection that Urd chose on the host's behalf.
+The distinction between *this deliberate cap* and a *genuine failure* is carried by a new
+`cadence_adapted` signal (`true` only when the pre-cap status was PROTECTED), which the
+voice layer reads to lead with adaptation prose ("tight drive — backing up weekly to spare
+it … reads AT RISK by design, not a failure") rather than a failure line. The status **word
+stays `AT RISK`** — no new sub-state token (AB3.1), preserving the R4-era trim of promise
+proliferation.
+
+**Scope.** The cap fires **only at Critical**. **Tight** lengthens the cadence but does
+**not** cap the promise (it is lengthened-but-honest). Roomy is unchanged. This is a
+one-notch, bounded, recorded override of R4 — "less protected than declared," surfaced in
+plain language, not a synthetic alarm.
 
 ## Related
 

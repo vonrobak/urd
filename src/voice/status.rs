@@ -43,6 +43,13 @@ pub(super) fn render_status_interactive(data: &StatusOutput) -> String {
     // ── Summary line ────────────────────────────────────────────────
     render_summary_line(data, &mut out);
 
+    // ── Storage adaptation prose (UPI 031-b AB3.1) ──────────────────
+    // Rendered HIGH (right under the summary, ahead of any routine staleness
+    // line) so a deliberately-slowed Critical subvolume does not read as broken
+    // at 2am. Only adaptation (capped-by-design / honest Tight) speaks here; a
+    // genuine failure is left to lead via the summary and advisories.
+    render_storage_adaptations(data, &mut out);
+
     // ── Storage posture (UPI 031-a) ─────────────────────────────────
     // Told-not-silent: a tight pool is surfaced high, right under the safety
     // summary. Silent when every pool is Roomy.
@@ -174,6 +181,58 @@ pub(super) fn render_summary_line(data: &StatusOutput, out: &mut String) {
     };
 
     writeln!(out, "{safety_part}{health_part}").ok();
+}
+
+/// Render per-subvolume storage-adaptation prose (UPI 031-b AB3.1). When a tight
+/// pool has slowed Urd's cadence (`effective_send_interval_secs` set), explain
+/// it told-not-silent so the slowdown reads as deliberate care, not failure:
+///
+/// - **Critical capped (`cadence_adapted`)** — the promise was dropped to AT RISK
+///   *by design*; say so explicitly, naming the cadence. This is the user-facing
+///   acceptance criterion for the R4 overturn (the 2am golden test).
+/// - **Honest Tight (still `Protected`)** — an informational lengthened-cadence
+///   note; the promise is untouched.
+/// - **Genuine failure** (AT RISK *without* `cadence_adapted`, or UNPROTECTED) —
+///   say nothing here; the failure is the more urgent truth and leads via the
+///   summary/advisories.
+///
+/// A declared-Graduated subvolume (`!external_only`) additionally notes that its
+/// local history was reduced/cleared — full history lives on the drive.
+pub(super) fn render_storage_adaptations(data: &StatusOutput, out: &mut String) {
+    for a in &data.assessments {
+        let Some(secs) = a.effective_send_interval_secs else {
+            continue; // Roomy — declared cadence, nothing to explain.
+        };
+        let cadence = humanize_duration(secs);
+        // Declared-Graduated subvols had graduated local history; the tier
+        // reduced it to retain-one (Tight) or cleared it (Critical).
+        let history = if a.external_only {
+            ""
+        } else {
+            " local history reduced \u{2014} full history is on the drive;"
+        };
+        // Capped-by-design (Critical) appends an explicit "by design"
+        // reassurance; honest Tight (still Protected) gets the bare note; a
+        // genuine failure / UNPROTECTED says nothing here and leads via the
+        // summary instead.
+        let suffix = if a.status == PromiseStatus::AtRisk && a.cadence_adapted {
+            " Reads AT RISK by design, not a failure."
+        } else if a.status == PromiseStatus::Protected {
+            ""
+        } else {
+            continue;
+        };
+        writeln!(
+            out,
+            "{}",
+            format!(
+                "  {}: tight drive \u{2014}{history} backing up every {cadence} to spare it.{suffix}",
+                a.name,
+            )
+            .yellow()
+        )
+        .ok();
+    }
 }
 
 /// Render the per-pool storage-posture lines (UPI 031-a). One line per tight

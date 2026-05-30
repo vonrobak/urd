@@ -38,6 +38,15 @@ impl Interval {
         self.0
     }
 
+    /// Wrap a `chrono::Duration` directly. Used by `storage_critical` to build
+    /// the tier-scaled Tight send interval (declared × factor), where the
+    /// duration is computed rather than parsed from a unit string. The tuple
+    /// field is private, so this is the only seam for a computed `Interval`.
+    #[must_use]
+    pub fn from_chrono(d: chrono::Duration) -> Self {
+        Self(d)
+    }
+
     #[must_use]
     pub fn as_secs(&self) -> i64 {
         self.0.num_seconds()

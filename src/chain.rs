@@ -147,6 +147,24 @@ pub fn write_pin_file(
     Ok(())
 }
 
+/// Remove a drive's pin file, if present. Idempotent — a missing pin file is
+/// success (`NotFound` → `Ok`). Used by the executor's clear-all cleanup
+/// (UPI 031-b): the pin is dropped *before* the fail-closed re-read so the
+/// just-sent snapshot (and any surviving Tight-era parent) can then be deleted,
+/// leaving zero local snapshots between runs. Owns the same
+/// `.last-external-parent-{label}` filename format as `write_pin_file`.
+pub fn remove_pin_file(
+    local_snapshot_dir: &Path,
+    drive_label: &str,
+) -> crate::error::Result<()> {
+    let path = local_snapshot_dir.join(format!(".last-external-parent-{drive_label}"));
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(UrdError::Io { path, source: e }),
+    }
+}
+
 fn try_read_pin(path: &Path) -> crate::error::Result<Option<SnapshotName>> {
     match std::fs::read_to_string(path) {
         Ok(content) => {

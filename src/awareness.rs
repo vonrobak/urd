@@ -262,6 +262,18 @@ pub struct SubvolAssessment {
     /// A separate presentation axis from `status`/`health` (ADR-110 R4): it
     /// reflects Urd's posture toward a tight pool, not the data-safety promise.
     pub storage_posture: Option<crate::storage_critical::StoragePosture>,
+    /// UPI 031-b (AB3.1): `true` only when the promise was capped to AT RISK
+    /// *solely* because the pool is Critical — i.e. the pre-cap status was
+    /// Protected. A deliberate slowed cadence ("less protected than declared"),
+    /// NOT a failure. Voice reads it to render adaptation prose ahead of any
+    /// routine staleness line; it is never serialized as a status token (the
+    /// word stays `AT RISK` — ADR-110 amendment overturning R4).
+    pub cadence_adapted: bool,
+    /// UPI 031-b: the *effective* send interval the planner timed against and
+    /// awareness judged staleness against, when adapted (`armed != Roomy`).
+    /// `None` at Roomy (the declared interval governs). Lets voice name the
+    /// cadence ("backing up weekly to spare it").
+    pub effective_send_interval: Option<Interval>,
 }
 
 /// Per-subvolume raw storage signal fed into `assess()` (UPI 031-a). Resolved
@@ -490,12 +502,34 @@ pub fn assess(
                     subvol.name
                 )],
                 storage_posture: None,
+                cadence_adapted: false,
+                effective_send_interval: None,
             });
             continue;
         };
 
         let mut errors = Vec::new();
         let local_dir = snapshot_root.join(&subvol.name);
+
+        // ── Tier-adapted effective policy (UPI 031-b) ────────────────
+        // Resolve the armed tier once (Roomy default when no signal), then
+        // derive the effective policy. The SAME armed tier feeds the planner
+        // (via backup.rs's single pre-plan gather), so the effective send
+        // interval awareness judges staleness against agrees with what the
+        // planner timed against — no false AT RISK for a correctly-adapting
+        // subvolume. `armed` also drives the posture and the AT-RISK cap below.
+        let armed = storage_signals
+            .get(&subvol.name)
+            .map(|sig| {
+                crate::storage_critical::resolve_armed_tier(sig.prior_armed_tier, sig.free_ratio)
+            })
+            .unwrap_or_default();
+        let eff = crate::storage_critical::derive_effective_policy(
+            &subvol.local_retention,
+            subvol.send_interval,
+            subvol.send_enabled,
+            armed,
+        );
 
         // ── Local assessment ────────────────────────────────────────
         let mut advisories = Vec::new();
@@ -595,14 +629,17 @@ pub fn assess(
                     &drive.label,
                     ext_snaps.as_deref(),
                 );
+                // Judge staleness against the EFFECTIVE interval (031-b): a
+                // Critical subvol on a weekly cadence must not read AT RISK at
+                // day 2. eff.send_interval == declared at Roomy (no change).
                 let status =
-                    assess_external_status(last_send_age, subvol.send_interval, source_unchanged);
+                    assess_external_status(last_send_age, eff.send_interval, source_unchanged);
 
                 if source_unchanged
                     && let Some(age) = last_send_age
                     && status == PromiseStatus::Protected
                     && age.num_seconds() as f64
-                        > subvol.send_interval.as_secs() as f64 * EXTERNAL_AT_RISK_MULTIPLIER
+                        > eff.send_interval.as_secs() as f64 * EXTERNAL_AT_RISK_MULTIPLIER
                 {
                     let secs = age.num_seconds();
                     let coarse = if secs >= 86400 {
@@ -644,6 +681,23 @@ pub fn assess(
             overall = PromiseStatus::Unprotected;
         }
 
+        // ── AT-RISK cap at Critical (UPI 031-b AB3, overturns R4) ────
+        // A Critical pool's lifecycle is the deliberately slowed clear-all
+        // cadence; the honest promise is "less protected than declared". Cap at
+        // AT RISK — `PromiseStatus` is worst-to-best so `.min(AtRisk)` is exactly
+        // "never Protected at Critical" (leaves AtRisk/Unprotected unchanged).
+        // `cadence_adapted` distinguishes this deliberate cap (pre-cap was
+        // Protected) from a genuine failure (pre-cap already AtRisk/Unprotected)
+        // — the signal voice reads to lead with adaptation prose vs a failure line.
+        let pre_cap = overall;
+        if armed == crate::storage_critical::TightnessTier::Critical {
+            overall = overall.min(PromiseStatus::AtRisk);
+        }
+        let cadence_adapted = pre_cap == PromiseStatus::Protected
+            && armed == crate::storage_critical::TightnessTier::Critical;
+        let effective_send_interval =
+            (armed != crate::storage_critical::TightnessTier::Roomy).then_some(eff.send_interval);
+
         // ── Operational health ─────────────────────────────────────
         // Pre-compute local space pressure (needs config access not available in compute_health)
         let local_space_tight = subvol
@@ -673,17 +727,13 @@ pub fn assess(
         );
 
         // ── Storage posture (UPI 031-a) ──────────────────────────────
-        // Pure: resolve the hysteresis-stabilized armed tier from the
-        // command-supplied signal, then derive the posture. No I/O, no
-        // write-back (the backup boundary advances state — read paths
-        // only reflect). Subvolumes with no signal get no posture.
-        let storage_posture = storage_signals.get(&subvol.name).and_then(|sig| {
-            let armed = crate::storage_critical::resolve_armed_tier(
-                sig.prior_armed_tier,
-                sig.free_ratio,
-            );
-            crate::storage_critical::derive_posture(armed, sig.host_root)
-        });
+        // Pure: derive the posture from the SAME armed tier resolved at the top
+        // of the loop (single source of truth) + the signal's host-root flag.
+        // No I/O, no write-back (the backup boundary advances state — read paths
+        // only reflect). Subvolumes with no signal get no posture (Roomy).
+        let storage_posture = storage_signals
+            .get(&subvol.name)
+            .and_then(|sig| crate::storage_critical::derive_posture(armed, sig.host_root));
 
         assessments.push(SubvolAssessment {
             name: subvol.name.clone(),
@@ -697,6 +747,8 @@ pub fn assess(
             redundancy_advisories: Vec::new(),
             errors,
             storage_posture,
+            cadence_adapted,
+            effective_send_interval,
         });
     }
 
@@ -1442,6 +1494,134 @@ source = "/data/sv1"
         );
         let posture = posture_of(&results, "sv1").expect("sv1 should have posture");
         assert_eq!(posture.tier, TightnessTier::Tight);
+    }
+
+    // ── UPI 031-b: effective interval + AT-RISK cap (AB3/AB3.1) ──────
+
+    /// A fully-Protected `sv1`: fresh local + a send `send_ago` before `now`,
+    /// plus a `free_ratio` signal. `test_config` declares `send_interval = 1d`.
+    fn capped_fixture(
+        send_at: NaiveDateTime,
+        free_ratio: f64,
+    ) -> (Config, NaiveDateTime, MockFileSystemState, StorageSignalMap) {
+        use crate::storage_critical::TightnessTier;
+        let config = test_config();
+        let now = dt(2026, 3, 23, 14, 0);
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap(dt(2026, 3, 23, 13, 30), "sv1")]);
+        fs.send_times
+            .insert(("sv1".to_string(), "WD-18TB".to_string()), send_at);
+        fs.mounted_drives.insert("WD-18TB".to_string());
+        let mut signals = StorageSignalMap::new();
+        signals.insert(
+            "sv1".to_string(),
+            ResolvedStorageSignal {
+                free_ratio: Some(free_ratio),
+                host_root: false,
+                prior_armed_tier: TightnessTier::Roomy,
+                prior_since: None,
+            },
+        );
+        (config, now, fs, signals)
+    }
+
+    #[test]
+    fn critical_caps_protected_to_at_risk_with_adapted_flag() {
+        // Critical, last send 3 days ago, declared DAILY. Judged against the
+        // EFFECTIVE weekly interval, 3d is fresh → pre-cap Protected. The
+        // Critical cap drops it to AT RISK with cadence_adapted=true. (Against
+        // the declared 1d, pre-cap would be AtRisk and cadence_adapted false —
+        // so this also proves the effective interval is what's judged.)
+        let (config, now, fs, signals) = capped_fixture(dt(2026, 3, 20, 14, 0), 0.05);
+        let results = assess(
+            &config,
+            now,
+            &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() },
+            &signals,
+        );
+        let sv1 = results.iter().find(|a| a.name == "sv1").unwrap();
+        assert_eq!(sv1.status, PromiseStatus::AtRisk, "Critical caps Protected → AT RISK");
+        assert!(sv1.cadence_adapted, "deliberate cadence, not a failure");
+        assert_eq!(sv1.effective_send_interval, Some(Interval::days(7)));
+    }
+
+    #[test]
+    fn critical_genuinely_stale_is_at_risk_not_adapted() {
+        // Last send 14 days ago — beyond even the weekly effective AT-RISK
+        // threshold (7d × 1.5). Genuine staleness: AT RISK, but cadence_adapted
+        // is FALSE so voice leads with the failure, not adaptation prose.
+        let (config, now, fs, signals) = capped_fixture(dt(2026, 3, 9, 14, 0), 0.05);
+        let results = assess(
+            &config,
+            now,
+            &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() },
+            &signals,
+        );
+        let sv1 = results.iter().find(|a| a.name == "sv1").unwrap();
+        assert_eq!(sv1.status, PromiseStatus::AtRisk);
+        assert!(!sv1.cadence_adapted, "genuine staleness is not a deliberate cadence");
+    }
+
+    #[test]
+    fn tight_is_lengthened_but_not_capped() {
+        // Tight lengthens the cadence (declared 1d → 36h) but never caps the
+        // promise — Tight is honest, not deliberately degraded.
+        let (config, now, fs, signals) = capped_fixture(dt(2026, 3, 23, 8, 0), 0.20);
+        let results = assess(
+            &config,
+            now,
+            &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() },
+            &signals,
+        );
+        let sv1 = results.iter().find(|a| a.name == "sv1").unwrap();
+        assert_eq!(sv1.status, PromiseStatus::Protected, "Tight does not cap");
+        assert!(!sv1.cadence_adapted);
+        assert_eq!(sv1.effective_send_interval, Some(Interval::hours(36)));
+    }
+
+    #[test]
+    fn roomy_subvol_has_no_cap_and_no_effective_interval() {
+        let (config, now, fs, signals) = capped_fixture(dt(2026, 3, 23, 8, 0), 0.50);
+        let results = assess(
+            &config,
+            now,
+            &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() },
+            &signals,
+        );
+        let sv1 = results.iter().find(|a| a.name == "sv1").unwrap();
+        assert_eq!(sv1.status, PromiseStatus::Protected);
+        assert!(!sv1.cadence_adapted);
+        assert_eq!(sv1.effective_send_interval, None, "Roomy uses the declared interval");
+    }
+
+    #[test]
+    fn coherence_awareness_and_planner_share_effective_interval() {
+        // S2 coherence: the interval awareness judges staleness against MUST
+        // equal the one the planner times against, for the same armed tier —
+        // both route through `derive_effective_policy`. A future re-gather that
+        // desynced the tier would break this (false AT RISK).
+        let (config, now, fs, signals) = capped_fixture(dt(2026, 3, 22, 14, 0), 0.05);
+        let results = assess(
+            &config,
+            now,
+            &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() },
+            &signals,
+        );
+        let sv1 = results.iter().find(|a| a.name == "sv1").unwrap();
+        let resolved = config.resolved_subvolumes();
+        let sv = resolved.iter().find(|s| s.name == "sv1").unwrap();
+        let planner_eff = crate::storage_critical::derive_effective_policy(
+            &sv.local_retention,
+            sv.send_interval,
+            sv.send_enabled,
+            crate::storage_critical::TightnessTier::Critical,
+        );
+        assert_eq!(
+            sv1.effective_send_interval,
+            Some(planner_eff.send_interval),
+            "awareness and planner judge the SAME effective interval"
+        );
     }
 
     // ── Test 2: Local stale → AT_RISK ──────────────────────────────
@@ -4300,6 +4480,8 @@ source = "/data/sv1"
             redundancy_advisories: vec![],
             errors: vec![],
             storage_posture: None,
+            cadence_adapted: false,
+            effective_send_interval: None,
         }
     }
 

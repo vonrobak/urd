@@ -77,7 +77,23 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
         history: &fs_state,
         btrfs: &plan_btrfs,
     };
-    let mut backup_plan = plan::plan(&config, now, &filters, &observation)?;
+
+    // ── Single pre-plan storage gather (UPI 031-b AB1/S2 — INVARIANT) ──
+    // ONE gather of storage signals, resolved ONCE here pre-plan, feeds the
+    // planner (and the emergency re-plan), the executor's clear-all gate, the
+    // post-exec awareness assess, and the armed-tier writeback. Do NOT add a
+    // second gather for the post-exec assess: clear-all frees space mid-run, so
+    // a re-gather would see a higher free-ratio and falsely de-escalate
+    // Critical→Tight — desyncing the effective send interval the planner timed
+    // against from the one awareness judges staleness against, surfacing a
+    // correctly-adapting subvolume as false AT RISK. The coherence guard is
+    // THIS single gather (Risk 4 / S2), enforced by the awareness coherence
+    // test, not by `derive_effective_policy` alone.
+    let signals = storage_signals::gather(&config, state_db.as_ref());
+    let resolved = storage_signals::resolve_armed_tiers(&signals);
+
+    let mut backup_plan =
+        plan::plan(&config, now, &filters, &observation, &resolved.armed_tier_map)?;
 
     // ADR-107: fail-closed for retention on promise-level subvolumes.
     // If a subvolume has a protection_level, skip retention deletions unless
@@ -113,9 +129,12 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     // Runs under the lock because it performs destructive btrfs deletions.
     let emergency_ran = run_emergency_preflight(&config, state_db.as_ref())?;
 
-    // Re-plan if emergency freed space — plan may have different space_pressure decisions
+    // Re-plan if emergency freed space — plan may have different space_pressure
+    // decisions. Reuses the SAME pre-plan `resolved` armed tiers (AB1: never
+    // re-resolve mid-run, even though emergency just freed space).
     if emergency_ran {
-        backup_plan = plan::plan(&config, now, &filters, &observation)?;
+        backup_plan =
+            plan::plan(&config, now, &filters, &observation, &resolved.armed_tier_map)?;
         if !args.confirm_retention_change {
             filter_promise_retention(&config, &mut backup_plan);
         }
@@ -207,6 +226,11 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     let btrfs = RealBtrfs::new(&config.general.btrfs_path, bytes_counter.clone(), sys.supports_compressed_data);
 
     let mut executor = Executor::new(&btrfs, state_db.as_ref(), &config, &shutdown);
+
+    // Thread the pre-plan armed tiers (031-b) so the executor's clear-all gate
+    // derives the SAME effective lifecycle the planner used (the single-gather
+    // invariant). Critical subvolumes clear the just-sent snapshot + pin.
+    executor.set_armed_tiers(resolved.armed_tier_map.clone());
 
     // In autonomous mode (systemd), gate chain-break full sends unless --force-full.
     if !args.force_full && std::env::var("INVOCATION_ID").is_ok() {
@@ -359,10 +383,11 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     )?;
 
     // Write heartbeat (fresh timestamp — `now` is from before execution).
-    // Gather storage signals once: the post-execution assess reflects the
-    // current tier, then `advance_and_writeback` persists it and surfaces
-    // escalation transitions for the notification path (D6).
-    let signals = storage_signals::gather(&config, state_db.as_ref());
+    // Reuse the SINGLE pre-plan `signals`/`resolved` (the AB1/S2 invariant
+    // above) — do NOT re-gather. The post-execution assess reflects the
+    // pre-plan tier (so the effective send interval matches what the planner
+    // used), then `advance_and_writeback` persists the pre-resolved tier and
+    // surfaces escalation transitions for the notification path (D6).
     let mut assessments =
         awareness::assess(&config, heartbeat_now, &observation, &signals.by_subvol);
     advice::overlay_offsite_freshness(&mut assessments, &config);
@@ -387,7 +412,7 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     // from the heartbeat-driven promise notifications below and runs regardless
     // of whether the sentinel is up. Best-effort throughout: never blocks a run.
     if let Some(ref db) = state_db {
-        let escalations = storage_signals::advance_and_writeback(db, heartbeat_now, &signals);
+        let escalations = storage_signals::advance_and_writeback(db, heartbeat_now, &resolved);
         let notes: Vec<notify::Notification> = escalations
             .iter()
             .map(|e| {
@@ -1883,6 +1908,8 @@ mod tests {
             redundancy_advisories: vec![],
             errors: vec![],
             storage_posture: None,
+            cadence_adapted: false,
+            effective_send_interval: None,
         }]
     }
 
@@ -2865,6 +2892,8 @@ mod tests {
             redundancy_advisories: vec![],
             errors: vec![],
             storage_posture: None,
+            cadence_adapted: false,
+            effective_send_interval: None,
         }
     }
 
