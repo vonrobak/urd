@@ -1088,33 +1088,6 @@ mod contract {
 
     // ── UPI 044 — Rule 6 (gravity) + Rule 1 (no falsehoods) ──────────
 
-    fn critical_row(name: &str) -> crate::output::DoctorRecommendationRow {
-        use crate::recommendation::{
-            headroom_aware_pointer_only, AdjustmentReason, HeadroomSeverity, ShapeRole,
-        };
-        use crate::types::{MonthlyCount, ResolvedGraduatedRetention};
-        let cur = ResolvedGraduatedRetention {
-            hourly: 24,
-            daily: 60,
-            weekly: 52,
-            monthly: MonthlyCount::Count(24),
-            yearly: 0,
-        };
-        let h = headroom_aware_pointer_only(
-            &cur,
-            ShapeRole::Local,
-            HeadroomSeverity::Critical,
-            AdjustmentReason::SourcePoolLow { free_ratio: 0.1 },
-        );
-        crate::output::DoctorRecommendationRow {
-            name: name.to_string(),
-            local: Some(h),
-            external: None,
-            note: None,
-            was_named_level: None,
-        }
-    }
-
     fn caution_row_low_free(name: &str, free_ratio: f64) -> crate::output::DoctorRecommendationRow {
         use crate::recommendation::{
             AdjustmentReason, CostProjection, HeadroomAwareRecommendation, HeadroomSeverity,
@@ -1161,45 +1134,6 @@ mod contract {
             external: None,
             note: None,
             was_named_level: None,
-        }
-    }
-
-    #[test]
-    fn rule6_critical_severity_row_renders_no_shape_and_no_red() {
-        // Rule 6: gravity calibration. A Critical recommendation row is a
-        // pointer to UPI 031's surface — it must not borrow alarm
-        // semantics (red text, ✗ glyphs) since the loud surface lives
-        // elsewhere.
-        let _color = color_guard(false);
-        let view = crate::output::DoctorRecommendationView {
-            header: "header".to_string(),
-            rows: vec![critical_row("crit-sv")],
-        };
-        let output = render_doctor(
-            &recommendations_doctor_output(view),
-            OutputMode::Interactive,
-        );
-        let stripped = helpers::strip_ansi(&output);
-        // No shape line on the row.
-        assert!(!stripped.contains("daily="), "Critical row leaked shape: {stripped}");
-        // No red SGR escapes on the row line.
-        for line in output.lines() {
-            if line.contains("crit-sv") || line.contains("storage critical") {
-                assert_eq!(
-                    helpers::count_red(line),
-                    0,
-                    "Rule 6 violation: Critical row line uses red: {line}"
-                );
-            }
-        }
-        // No ✗ glyph on the row.
-        for line in stripped.lines() {
-            if line.contains("crit-sv") || line.contains("storage critical") {
-                assert!(
-                    !line.contains('✗'),
-                    "Rule 6 violation: Critical row line uses ✗ glyph: {line}"
-                );
-            }
         }
     }
 

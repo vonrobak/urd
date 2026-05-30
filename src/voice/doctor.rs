@@ -451,31 +451,15 @@ pub(super) fn render_reason_line(
 /// role lines (`local:` / `external:`) + optional bursty/named-level
 /// hint lines. Per UPI 044, each role carries severity, an optional
 /// adjustment reason, and an optional tightened shape (`adjusted`).
-/// Critical severity (injected by doctor.rs) suppresses the shape and
-/// hint lines in favor of a single pointer (R9).
+///
+/// (UPI 031-b, AB5: the R9 Critical-pointer branch was deleted with the
+/// dormant `HeadroomSeverity::Critical` variant — `Pressure` pointer-only
+/// recommendations still render via the synth path below.)
 pub(super) fn format_recommendation_row(row: &crate::output::DoctorRecommendationRow) -> String {
     use crate::recommendation::HeadroomSeverity;
 
     let mut out = String::new();
     writeln!(out, "    {}", row.name).ok();
-
-    // R9: if either role is Critical, render only the pointer line.
-    let any_critical = matches!(
-        row.local.as_ref().map(|h| h.severity),
-        Some(HeadroomSeverity::Critical)
-    ) || matches!(
-        row.external.as_ref().map(|h| h.severity),
-        Some(HeadroomSeverity::Critical)
-    );
-    if any_critical {
-        writeln!(
-            out,
-            "      {}",
-            "storage critical — see `urd doctor` for current actions".dimmed()
-        )
-        .ok();
-        return out;
-    }
 
     let mut role_line = |label: &str, h: &crate::recommendation::HeadroomAwareRecommendation| {
         let synth = is_synth_pointer(h);

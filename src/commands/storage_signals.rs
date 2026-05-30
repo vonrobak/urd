@@ -24,7 +24,7 @@ use crate::config::Config;
 use crate::output::PoolPostureSummary;
 use crate::pools::{self, PoolSpace};
 use crate::state::StateDb;
-use crate::storage_critical::{self, TightnessTier, Transition};
+use crate::storage_critical::{self, ArmedTierMap, TightnessTier, Transition};
 
 /// Per-pool resolved signal (UPI 031-a). The command-layer view that backs
 /// both `aggregate()` (display) and `advance_and_writeback()` (persistence).
@@ -182,27 +182,86 @@ fn gather_with(
     StorageSignals { by_subvol, pools }
 }
 
-/// Re-run the hysteresis per UUID-resolvable pool, persist `(armed_tier,
-/// since)` best-effort, and return the **escalation** transitions (backup
-/// path only — read paths must never call this). `since` advances to `now`
-/// only when the tier changes; otherwise the prior `since` is preserved so
-/// the "flagged since" timestamp stays stable. UUID-less pools are skipped
+/// A pool's armed tier resolved once, pre-plan (UPI 031-b AB1). Carries
+/// everything `advance_and_writeback` needs to persist the transition without
+/// re-resolving from a (possibly clear-all-freed) post-exec free-ratio.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedPoolTier {
+    /// Pool UUID when resolvable; `None` for a pool keyed only by mount/name —
+    /// surfaced status-only, never persisted (S5).
+    pub uuid: Option<String>,
+    pub label: String,
+    pub host_root: bool,
+    pub prior_armed_tier: TightnessTier,
+    pub prior_since: Option<NaiveDateTime>,
+    /// The tier resolved from `(prior_armed_tier, free_ratio)` at gather time.
+    pub new_tier: TightnessTier,
+}
+
+/// The armed tier resolved once for the backup run (UPI 031-b AB1). Carries the
+/// planner/executor/awareness-facing `armed_tier_map` (subvol → tier) AND the
+/// per-pool rows the post-exec writeback persists — one resolution, two
+/// consumers, so "resolve once" stays literal.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedArmedTiers {
+    pub armed_tier_map: ArmedTierMap,
+    pub pools: Vec<ResolvedPoolTier>,
+}
+
+/// Resolve each pool's armed tier from the gathered signals exactly once,
+/// pre-plan (UPI 031-b AB1). Fans the per-pool tier out to every subvolume on
+/// the pool to build the `armed_tier_map`, and carries the per-pool rows the
+/// writeback needs. The SAME values are persisted post-exec — never
+/// re-resolved: clear-all frees space mid-run, and a re-resolve would see the
+/// higher free-ratio and falsely de-escalate Critical→Tight, defeating the
+/// hysteresis that stops lifecycle flapping.
+#[must_use]
+pub fn resolve_armed_tiers(signals: &StorageSignals) -> ResolvedArmedTiers {
+    let mut armed_tier_map = ArmedTierMap::new();
+    let mut pools = Vec::with_capacity(signals.pools.len());
+    for pool in &signals.pools {
+        let new_tier = storage_critical::resolve_armed_tier(
+            pool.prior_armed_tier,
+            pool.free_ratio,
+        );
+        for name in &pool.subvol_names {
+            armed_tier_map.insert(name.clone(), new_tier);
+        }
+        pools.push(ResolvedPoolTier {
+            uuid: pool.uuid.clone(),
+            label: pool.label.clone(),
+            host_root: pool.host_root,
+            prior_armed_tier: pool.prior_armed_tier,
+            prior_since: pool.prior_since,
+            new_tier,
+        });
+    }
+    ResolvedArmedTiers {
+        armed_tier_map,
+        pools,
+    }
+}
+
+/// Persist the pre-resolved armed tier per UUID-resolvable pool best-effort and
+/// return the **escalation** transitions (backup path only — read paths must
+/// never call this). Consumes the `ResolvedArmedTiers` from
+/// [`resolve_armed_tiers`]: it does **not** re-resolve (AB1 — clear-all frees
+/// space mid-run; a re-resolve would falsely de-escalate). `since` advances to
+/// `now` only when the tier changes; otherwise the prior `since` is preserved
+/// so the "flagged since" timestamp stays stable. UUID-less pools are skipped
 /// (S5) — no persist, no notification, status-only degrade.
 #[must_use]
 pub fn advance_and_writeback(
     state_db: &StateDb,
     now: NaiveDateTime,
-    signals: &StorageSignals,
+    resolved: &ResolvedArmedTiers,
 ) -> Vec<PostureEscalation> {
     let mut escalations = Vec::new();
-    for pool in &signals.pools {
+    for pool in &resolved.pools {
         let Some(uuid) = pool.uuid.as_deref() else {
             continue; // UUID-less: status-only (S5)
         };
-        let new = storage_critical::resolve_armed_tier(
-            pool.prior_armed_tier,
-            pool.free_ratio,
-        );
+        let new = pool.new_tier; // pre-resolved (AB1: never re-resolve)
         let since = if new == pool.prior_armed_tier {
             pool.prior_since.unwrap_or(now)
         } else {
@@ -413,7 +472,7 @@ source = "/"
         let signals =
             gather_with(&cfg(), &HashMap::new(), Some("root-uuid"), resolver, space_tight);
 
-        let transitions = advance_and_writeback(&db, now, &signals);
+        let transitions = advance_and_writeback(&db, now, &resolve_armed_tiers(&signals));
         // Both pools start Roomy; data escalates to Tight, root stays Roomy.
         assert_eq!(transitions.len(), 1);
         assert_eq!(transitions[0].pool_label, "/data");
@@ -421,7 +480,7 @@ source = "/"
         assert!(!transitions[0].host_root);
 
         // Persisted.
-        let stored = db.armed_tier_for_pool("data-uuid").unwrap();
+        let stored = db.all_armed_tiers().unwrap().get("data-uuid").copied();
         assert_eq!(stored.map(|(t, _)| t), Some(TightnessTier::Tight));
         // `since` was set to `now` (tier changed).
         assert_eq!(stored.map(|(_, s)| s), Some(now));
@@ -438,9 +497,9 @@ source = "/"
             gather_with(&cfg(), &prior, Some("root-uuid"), resolver, space_tight);
         let now = dt("2026-05-30T04:00:00");
 
-        let transitions = advance_and_writeback(&db, now, &signals);
+        let transitions = advance_and_writeback(&db, now, &resolve_armed_tiers(&signals));
         assert!(transitions.is_empty()); // no escalation on steady state
-        let stored = db.armed_tier_for_pool("data-uuid").unwrap();
+        let stored = db.all_armed_tiers().unwrap().get("data-uuid").copied();
         assert_eq!(stored, Some((TightnessTier::Tight, prior_since)));
     }
 
@@ -457,11 +516,11 @@ source = "/"
             gather_with(&cfg(), &prior, Some("root-uuid"), resolver, space_full);
         let now = dt("2026-05-30T04:00:00");
 
-        let escalations = advance_and_writeback(&db, now, &signals);
+        let escalations = advance_and_writeback(&db, now, &resolve_armed_tiers(&signals));
         // De-escalation is silent — no notification.
         assert!(escalations.is_empty());
         // But the recovery IS persisted, with `since` advanced to now.
-        let stored = db.armed_tier_for_pool("data-uuid").unwrap();
+        let stored = db.all_armed_tiers().unwrap().get("data-uuid").copied();
         assert_eq!(stored, Some((TightnessTier::Roomy, now)));
     }
 
@@ -477,7 +536,8 @@ source = "/"
             resolver_no_uuid,
             space_tight,
         );
-        let transitions = advance_and_writeback(&db, dt("2026-05-30T04:00:00"), &signals);
+        let transitions =
+            advance_and_writeback(&db, dt("2026-05-30T04:00:00"), &resolve_armed_tiers(&signals));
         assert!(transitions.is_empty());
         // Nothing written.
         assert!(db.all_armed_tiers().unwrap().is_empty());
@@ -519,6 +579,56 @@ source = "/"
         assert_eq!(s.since_secs, Some(86_400)); // one day
     }
 
+    // ── resolve_armed_tiers (UPI 031-b AB1) ──────────────────────────────
+
+    #[test]
+    fn resolve_armed_tiers_fans_pool_tier_to_subvols() {
+        // /data is Tight (20% free) → both subvols on it get Tight; root (50%
+        // free) gets Roomy. One resolution per pool, fanned to subvolumes.
+        let signals =
+            gather_with(&cfg(), &HashMap::new(), Some("root-uuid"), resolver, space_tight);
+        let resolved = resolve_armed_tiers(&signals);
+        assert_eq!(resolved.armed_tier_map.get("alpha"), Some(&TightnessTier::Tight));
+        assert_eq!(resolved.armed_tier_map.get("beta"), Some(&TightnessTier::Tight));
+        assert_eq!(resolved.armed_tier_map.get("root"), Some(&TightnessTier::Roomy));
+    }
+
+    #[test]
+    fn persisted_tier_is_pre_resolved_never_re_resolved() {
+        // AB1 de-escalation-defeat guard. Resolve the tier ONCE pre-plan from a
+        // Critical free-ratio, then persist. advance_and_writeback consumes the
+        // pre-resolved tier and must NOT re-resolve — a re-resolve from the
+        // higher free-ratio clear-all produces mid-run would falsely
+        // de-escalate Critical→Tight. Critical must persist as Critical.
+        let db = StateDb::open_memory().unwrap();
+        let now = dt("2026-05-30T04:00:00");
+        let space_critical = |mp: &Path| {
+            if mp == Path::new("/data") {
+                Some(PoolSpace { free_bytes: 5, capacity_bytes: 100 }) // 5% → Critical
+            } else {
+                Some(PoolSpace { free_bytes: 50, capacity_bytes: 100 })
+            }
+        };
+        let signals = gather_with(
+            &cfg(),
+            &HashMap::new(),
+            Some("root-uuid"),
+            resolver,
+            space_critical,
+        );
+        let resolved = resolve_armed_tiers(&signals);
+        let data = resolved
+            .pools
+            .iter()
+            .find(|p| p.uuid.as_deref() == Some("data-uuid"))
+            .unwrap();
+        assert_eq!(data.new_tier, TightnessTier::Critical);
+
+        let _ = advance_and_writeback(&db, now, &resolved);
+        let stored = db.all_armed_tiers().unwrap().get("data-uuid").copied();
+        assert_eq!(stored.map(|(t, _)| t), Some(TightnessTier::Critical));
+    }
+
     fn mk_assess(name: &str, posture: Option<StoragePosture>) -> SubvolAssessment {
         use crate::awareness::{LocalAssessment, OperationalHealth, PromiseStatus};
         use crate::types::Interval;
@@ -539,6 +649,8 @@ source = "/"
             redundancy_advisories: vec![],
             errors: vec![],
             storage_posture: posture,
+            cadence_adapted: false,
+            effective_send_interval: None,
         }
     }
 }

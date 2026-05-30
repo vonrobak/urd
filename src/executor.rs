@@ -13,6 +13,7 @@ use crate::config::Config;
 use crate::drives;
 use crate::error::BtrfsOperation;
 use crate::state::{DriftSampleRow, OperationRecord, StateDb};
+use crate::storage_critical::{self, ArmedTierMap};
 use crate::types::{BackupPlan, DeleteKind, FullSendReason, PlannedOperation, SendKind};
 
 // ── Types ───────────────────────────────────────────────────────────────
@@ -116,16 +117,24 @@ pub enum TransientCleanupOutcome {
     SkippedPartialSends,
     /// Cleanup skipped: pin write failure made chain state ambiguous.
     SkippedPinFailure,
+    /// Clear-all skipped (UPI 031-b m2): removing the pin file failed, so the
+    /// run refused to delete anything — never leave a half-cleared state
+    /// (snapshot gone, pin lingering). Fail-open: next run retries the whole
+    /// clear-all. No data loss — the data is on the drive.
+    SkippedPinRemovalFailure,
     /// Attempted but delete failed (non-fatal, next run handles it).
     DeleteFailed { path: String, error: String },
 }
 
 /// Context about a subvolume passed to the per-subvolume executor.
-/// Constructed from config lookup in `execute()`.
+/// Constructed from config lookup + the armed tier in `execute()`.
 #[derive(Debug)]
 struct SubvolumeContext {
     name: String,
     is_transient: bool,
+    /// Critical tier (UPI 031-b): after the gated cleanup, also delete the
+    /// just-sent snapshot(s) and remove the pin, leaving zero local snapshots.
+    clear_all: bool,
 }
 
 #[derive(Debug)]
@@ -146,6 +155,11 @@ pub struct Executor<'a> {
     progress_context: Option<Arc<Mutex<ProgressContext>>>,
     size_estimates: Option<SizeEstimates>,
     full_send_policy: FullSendPolicy,
+    /// Per-subvolume armed tier (UPI 031-b). Default empty → every subvolume
+    /// resolves to its declared policy (Roomy), so existing `.execute()` test
+    /// sites need no change (mirrors `full_send_policy`). The backup path sets
+    /// the real map via `set_armed_tiers` before `execute`.
+    armed_tiers: ArmedTierMap,
 }
 
 impl<'a> Executor<'a> {
@@ -164,12 +178,20 @@ impl<'a> Executor<'a> {
             progress_context: None,
             size_estimates: None,
             full_send_policy: FullSendPolicy::Allow,
+            armed_tiers: ArmedTierMap::new(),
         }
     }
 
     /// Set the full-send policy for chain-break gating.
     pub fn set_full_send_policy(&mut self, policy: FullSendPolicy) {
         self.full_send_policy = policy;
+    }
+
+    /// Set the per-subvolume armed tier map (UPI 031-b). The executor derives
+    /// each subvolume's effective lifecycle (`is_transient`) and clear-all
+    /// signal from this + the declared config. Default empty → declared policy.
+    pub fn set_armed_tiers(&mut self, armed_tiers: ArmedTierMap) {
+        self.armed_tiers = armed_tiers;
     }
 
     /// Set progress context for rich progress display.
@@ -216,6 +238,14 @@ impl<'a> Executor<'a> {
         // Per-drive space recovery tracking (shared across subvolumes)
         let mut space_recovered: HashMap<String, bool> = HashMap::new();
 
+        // Resolve effective policies once (UPI 031-b). With the default empty
+        // armed-tier map every subvolume resolves to Roomy → its declared
+        // policy, so `is_transient` is byte-identical to the previous raw-config
+        // check (proven by the equivalence test, incl. the named-level +
+        // explicit-transient case). A Tight/Critical send-enabled subvolume
+        // resolves to Transient; Critical additionally sets `clear_all`.
+        let resolved_subvols = self.config.resolved_subvolumes();
+
         let mut subvolume_results = Vec::new();
 
         for (subvol_name, ops) in &groups {
@@ -223,23 +253,28 @@ impl<'a> Executor<'a> {
                 log::warn!("Shutdown signal received, skipping remaining subvolumes");
                 break;
             }
-            // Raw field check: named protection levels never derive transient
-            // retention (derive_policy returns Graduated for all named levels).
-            // If this changes, switch to sv.resolved(...).local_retention.is_transient().
-            let is_transient = self
-                .config
-                .subvolumes
+            let armed = self
+                .armed_tiers
+                .get(subvol_name)
+                .copied()
+                .unwrap_or_default();
+            let (is_transient, clear_all) = resolved_subvols
                 .iter()
-                .find(|sv| sv.name == *subvol_name)
-                .is_some_and(|sv| {
-                    matches!(
-                        sv.local_retention,
-                        Some(crate::types::LocalRetentionConfig::Transient)
-                    )
-                });
+                .find(|sv| &sv.name == subvol_name)
+                .map(|sv| {
+                    let eff = storage_critical::derive_effective_policy(
+                        &sv.local_retention,
+                        sv.send_interval,
+                        sv.send_enabled,
+                        armed,
+                    );
+                    (eff.local_retention.is_transient(), eff.clear_all)
+                })
+                .unwrap_or((false, false));
             let context = SubvolumeContext {
                 name: subvol_name.clone(),
                 is_transient,
+                clear_all,
             };
             let result = self.execute_subvolume(
                 &context,
@@ -304,6 +339,10 @@ impl<'a> Executor<'a> {
 
         // Transient cleanup tracking: old pin parents from incremental sends
         let mut old_pin_parents: HashMap<String, std::path::PathBuf> = HashMap::new();
+        // Clear-all tracking (UPI 031-b): the just-sent snapshot per drive,
+        // deleted after the all-sends-succeeded gate for Critical subvolumes so
+        // zero local snapshots survive between runs.
+        let mut sent_snapshots: HashMap<String, std::path::PathBuf> = HashMap::new();
         let mut sends_succeeded: HashSet<String> = HashSet::new();
         let mut planned_send_drives: HashSet<String> = HashSet::new();
 
@@ -381,6 +420,8 @@ impl<'a> Executor<'a> {
                         sends_succeeded.insert(drive_label.clone());
                         // Track old pin parent for transient cleanup
                         old_pin_parents.insert(drive_label.clone(), parent.clone());
+                        // Track the just-sent snapshot for clear-all (031-b).
+                        sent_snapshots.insert(drive_label.clone(), snapshot.clone());
                     }
                     if pin_failed {
                         pin_failures += 1;
@@ -443,6 +484,8 @@ impl<'a> Executor<'a> {
                         if result.result == OpResult::Success {
                             send_type = SendType::Full;
                             sends_succeeded.insert(drive_label.clone());
+                            // Track the just-sent snapshot for clear-all (031-b).
+                            sent_snapshots.insert(drive_label.clone(), snapshot.clone());
                         }
                         if pin_failed {
                             pin_failures += 1;
@@ -473,6 +516,7 @@ impl<'a> Executor<'a> {
         let transient_cleanup = self.attempt_transient_cleanup(
             context,
             &old_pin_parents,
+            &sent_snapshots,
             &sends_succeeded,
             &planned_send_drives,
             pin_failures,
@@ -1021,13 +1065,25 @@ impl<'a> Executor<'a> {
         self.drive_for_path(path).map(|d| d.label.clone())
     }
 
-    /// Attempt transient immediate cleanup: delete old pin parents after all
-    /// sends succeed for a transient subvolume.
+    /// Attempt transient immediate cleanup after all sends succeed for a
+    /// transient subvolume.
     ///
-    /// This is a timing optimization for an operation the planner would produce
-    /// on the next run. The executor does not make retention decisions — it
-    /// accelerates a deletion the planner has already endorsed by construction
-    /// (transient mode deletes all non-pinned snapshots).
+    /// **Retain-one (Tight / all transient):** delete the *old* pin parent the
+    /// send advanced past — a timing optimization for a deletion the planner
+    /// would produce next run anyway (transient mode deletes all non-pinned
+    /// snapshots). One local snapshot (the new pin) survives.
+    ///
+    /// **Clear-all (Critical, UPI 031-b):** additionally remove the pin file and
+    /// delete the *just-sent* snapshot, leaving **zero** local snapshots between
+    /// runs. This is the footprint-cap the htpc pool needs — but it is also a
+    /// new deletion path on the data-loss axis, so it routes through the SAME
+    /// gate (all-sends-succeeded + no-pin-failure + fail-closed re-read), never
+    /// the planner's unconditional `DeleteSnapshot`. A 3am send failure → gate
+    /// fails → nothing is deleted (ADR-107). Order is load-bearing:
+    /// **remove pin → re-read → delete** (a surviving pin would make the
+    /// fail-closed re-read refuse to delete the old parent). If pin removal
+    /// fails, the whole clear-all is skipped this run (m2) — never a half-cleared
+    /// state.
     ///
     /// Safety: relies on the advisory lock preventing concurrent backup runs.
     /// The TOCTOU window between pin re-read and delete is not independently
@@ -1037,6 +1093,7 @@ impl<'a> Executor<'a> {
         &self,
         context: &SubvolumeContext,
         old_pin_parents: &HashMap<String, std::path::PathBuf>,
+        sent_snapshots: &HashMap<String, std::path::PathBuf>,
         sends_succeeded: &HashSet<String>,
         planned_send_drives: &HashSet<String>,
         pin_failures: u32,
@@ -1046,12 +1103,18 @@ impl<'a> Executor<'a> {
             return TransientCleanupOutcome::NotApplicable;
         }
 
-        // No incremental sends means no old parents to clean up
-        if old_pin_parents.is_empty() {
+        // Is there any cleanup work? Retain-one: an old pin parent to delete.
+        // Clear-all (Critical): additionally the just-sent snapshot(s) + pin —
+        // even in the steady-state full-send case where there is NO old parent.
+        let clear_all = context.clear_all;
+        let has_old_parents = !old_pin_parents.is_empty();
+        let has_sent_to_clear = clear_all && !sent_snapshots.is_empty();
+        if !has_old_parents && !has_sent_to_clear {
             return TransientCleanupOutcome::NotApplicable;
         }
 
-        // Condition 3: no pin write failures
+        // ── The ADR-107 firewall: gate runs BEFORE any deletion ────────
+        // Condition 3: no pin write failures (chain state ambiguous).
         if pin_failures > 0 {
             log::info!(
                 "Transient cleanup skipped for {}: pin write failure makes chain state ambiguous",
@@ -1059,8 +1122,7 @@ impl<'a> Executor<'a> {
             );
             return TransientCleanupOutcome::SkippedPinFailure;
         }
-
-        // Condition 2: all configured drives with planned sends succeeded
+        // Condition 2: all configured drives with planned sends succeeded.
         if sends_succeeded != planned_send_drives {
             log::info!(
                 "Transient cleanup skipped for {}: not all drives succeeded",
@@ -1069,34 +1131,57 @@ impl<'a> Executor<'a> {
             return TransientCleanupOutcome::SkippedPartialSends;
         }
 
-        // Collect unique old parent paths (multiple drives may share the same parent)
-        let unique_parents: HashSet<&std::path::PathBuf> =
-            old_pin_parents.values().collect();
+        let local_dir = self.config.local_snapshot_dir(&context.name);
 
-        // Condition 4 (early): if no old parent still exists, skip pin I/O
-        let existing_parents: Vec<&&std::path::PathBuf> = unique_parents
-            .iter()
-            .filter(|p| p.exists())
-            .collect();
-        if existing_parents.is_empty() {
-            return TransientCleanupOutcome::NotApplicable;
+        // ── Clear-all: drop the pin file(s) FIRST (031-b) ──────────────
+        // The planner wrote no pin for a clear-all subvol; the only pin on disk
+        // is a surviving Tight-era one (first-Critical-run). Removing it before
+        // the fail-closed re-read is what lets the old parent be deleted. m2: if
+        // removal fails, refuse ALL clear-all deletions this run — never leave a
+        // half-cleared state (snapshot gone, pin lingering). Fail-open; next run
+        // retries. `remove_pin_file` is idempotent (absent pin → Ok).
+        if clear_all && let Some(ref dir) = local_dir {
+            for drive_label in sends_succeeded {
+                if let Err(e) = chain::remove_pin_file(dir, drive_label) {
+                    log::warn!(
+                        "Transient clear-all for {}: pin removal failed for {drive_label}: {e} \
+                         — refusing all clear-all deletions this run (next run retries)",
+                        context.name,
+                    );
+                    return TransientCleanupOutcome::SkippedPinRemovalFailure;
+                }
+            }
         }
 
-        // Condition 5: re-read pin files to verify old parents are no longer pinned
+        // Condition 5: re-read pin files AFTER any clear-all removal, so the
+        // fail-closed check below reflects the post-removal pin state.
         let drive_labels = self.config.drive_labels();
-        let local_dir = self.config.local_snapshot_dir(&context.name);
         let current_pinned = local_dir
             .as_ref()
             .map(|dir| chain::find_pinned_snapshots(dir, &drive_labels))
             .unwrap_or_default();
 
+        // Build the deletion set: old pin parents (retain-one + Critical entry),
+        // plus — for clear-all — the just-sent snapshot(s), leaving zero locals.
+        // Unique (drives may share a parent) and existing-on-disk only.
+        let mut targets: HashSet<std::path::PathBuf> =
+            old_pin_parents.values().cloned().collect();
+        if clear_all {
+            targets.extend(sent_snapshots.values().cloned());
+        }
+        let existing: Vec<std::path::PathBuf> =
+            targets.into_iter().filter(|p| p.exists()).collect();
+        if existing.is_empty() {
+            return TransientCleanupOutcome::NotApplicable;
+        }
+
         let mut deleted_count = 0;
         let mut first_failure: Option<(String, String)> = None;
 
-        for parent_path in existing_parents {
-            // Condition 5: fail-closed — only delete if we can verify it's NOT pinned.
-            // Unparseable names default to "don't delete" (ADR-107: fail-closed for deletions).
-            let is_safe_to_delete = parent_path
+        for path in &existing {
+            // Condition 5: fail-closed — only delete if we can verify it's NOT
+            // pinned. Unparseable names default to "don't delete" (ADR-107).
+            let is_safe_to_delete = path
                 .file_name()
                 .and_then(|name| {
                     crate::types::SnapshotName::parse(&name.to_string_lossy()).ok()
@@ -1107,29 +1192,22 @@ impl<'a> Executor<'a> {
             if !is_safe_to_delete {
                 log::warn!(
                     "Transient cleanup: refusing to delete {} (still pinned or unparseable)",
-                    parent_path.display(),
+                    path.display(),
                 );
                 continue;
             }
 
-            // Delete the old parent. Continue through all parents on failure
-            // (consistent with executor error isolation — ADR-100 invariant 4).
-            match self.btrfs.delete_subvolume(parent_path) {
+            // Delete. Continue through all targets on failure (executor error
+            // isolation — ADR-100 invariant 4).
+            match self.btrfs.delete_subvolume(path) {
                 Ok(()) => {
-                    log::info!(
-                        "Transient cleanup: deleted old pin parent {}",
-                        parent_path.display(),
-                    );
+                    log::info!("Transient cleanup: deleted {}", path.display());
                     deleted_count += 1;
                 }
                 Err(e) => {
-                    log::warn!(
-                        "Transient cleanup: failed to delete {}: {e}",
-                        parent_path.display(),
-                    );
+                    log::warn!("Transient cleanup: failed to delete {}: {e}", path.display());
                     if first_failure.is_none() {
-                        first_failure =
-                            Some((parent_path.display().to_string(), e.to_string()));
+                        first_failure = Some((path.display().to_string(), e.to_string()));
                     }
                 }
             }
@@ -3718,5 +3796,424 @@ local_retention = "transient"
             )
             .unwrap();
         assert_eq!(bytes, 2_000_000);
+    }
+
+    // ── UPI 031-b: Critical clear-all gate (the data-loss firewall) ─────
+
+    fn armed_map(tier: storage_critical::TightnessTier) -> ArmedTierMap {
+        let mut m = ArmedTierMap::new();
+        m.insert("sv-t".to_string(), tier);
+        m
+    }
+
+    fn delete_calls(mock: &MockBtrfs) -> Vec<PathBuf> {
+        mock.calls()
+            .iter()
+            .filter_map(|c| match c {
+                MockBtrfsCall::DeleteSubvolume { path } => Some(path.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn clear_all_send_failure_deletes_nothing_3am_gate() {
+        // THE data-loss firewall (write-first). Critical clear-all + a SendFull
+        // that FAILS at 3am → the just-created snapshot is never tracked as sent,
+        // so the executor deletes nothing. The snapshot survives for next run's
+        // retry. To reach data loss you'd have to break this AND the gate AND the
+        // fail-closed re-read (ADR-107).
+        let snap_dir = tempfile::TempDir::new().unwrap();
+        let drive_dir = tempfile::TempDir::new().unwrap();
+        let sv_dir = snap_dir.path().join("sv-t");
+        std::fs::create_dir_all(&sv_dir).unwrap();
+        let snap = sv_dir.join("20260322-1430-t");
+        std::fs::create_dir(&snap).unwrap();
+
+        let config = transient_config_n_drives(
+            snap_dir.path(),
+            &[("DRIVE-A", drive_dir.path(), "primary")],
+        );
+        let mock = MockBtrfs::new();
+        mock.fail_sends.borrow_mut().insert(snap.clone()); // 3am: the send fails
+        let shutdown = no_shutdown();
+        let mut executor = Executor::new(&mock, None, &config, &shutdown);
+        executor.set_armed_tiers(armed_map(storage_critical::TightnessTier::Critical));
+
+        let plan = BackupPlan {
+            operations: vec![PlannedOperation::SendFull {
+                snapshot: snap.clone(),
+                dest_dir: drive_dir.path().join(".snapshots/sv-t"),
+                drive_label: "DRIVE-A".to_string(),
+                subvolume_name: "sv-t".to_string(),
+                pin_on_success: None, // Critical writes no pin
+                reason: FullSendReason::FirstSend,
+                token_verified: false,
+            }],
+            timestamp: test_ts(),
+            skipped: vec![],
+            events: Vec::new(),
+        };
+
+        let result = executor.execute(&plan, "full");
+        assert!(!result.subvolume_results[0].success, "send failed");
+        assert_eq!(
+            result.subvolume_results[0].transient_cleanup,
+            TransientCleanupOutcome::NotApplicable,
+            "nothing tracked as sent → no clear-all work"
+        );
+        assert!(snap.exists(), "unsent snapshot must survive a failed send");
+        assert!(delete_calls(&mock).is_empty(), "no deletions on send failure");
+    }
+
+    #[test]
+    fn clear_all_critical_steady_clears_just_sent_snapshot() {
+        // Steady Critical: full send succeeds, no old parent, no pin → the
+        // just-sent snapshot is deleted, leaving zero local snapshots.
+        let snap_dir = tempfile::TempDir::new().unwrap();
+        let drive_dir = tempfile::TempDir::new().unwrap();
+        let sv_dir = snap_dir.path().join("sv-t");
+        std::fs::create_dir_all(&sv_dir).unwrap();
+        let snap = sv_dir.join("20260322-1430-t");
+        std::fs::create_dir(&snap).unwrap();
+
+        let config = transient_config_n_drives(
+            snap_dir.path(),
+            &[("DRIVE-A", drive_dir.path(), "primary")],
+        );
+        let mock = MockBtrfs::new();
+        let shutdown = no_shutdown();
+        let mut executor = Executor::new(&mock, None, &config, &shutdown);
+        executor.set_armed_tiers(armed_map(storage_critical::TightnessTier::Critical));
+
+        let plan = BackupPlan {
+            operations: vec![PlannedOperation::SendFull {
+                snapshot: snap.clone(),
+                dest_dir: drive_dir.path().join(".snapshots/sv-t"),
+                drive_label: "DRIVE-A".to_string(),
+                subvolume_name: "sv-t".to_string(),
+                pin_on_success: None,
+                reason: FullSendReason::FirstSend,
+                token_verified: false,
+            }],
+            timestamp: test_ts(),
+            skipped: vec![],
+            events: Vec::new(),
+        };
+
+        let result = executor.execute(&plan, "full");
+        assert!(result.subvolume_results[0].success);
+        assert_eq!(
+            result.subvolume_results[0].transient_cleanup,
+            TransientCleanupOutcome::Cleaned { deleted_count: 1 },
+        );
+        assert!(delete_calls(&mock).contains(&snap), "sent snapshot cleared");
+        assert!(
+            !sv_dir.join(".last-external-parent-DRIVE-A").exists(),
+            "no pin left behind"
+        );
+    }
+
+    #[test]
+    fn clear_all_critical_entry_clears_parent_and_sent_removes_pin() {
+        // First Critical run: a Tight-era pin + old parent survive. The run takes
+        // one cheap incremental, then clears BOTH the old parent and the sent
+        // snapshot and removes the pin — zero locals. The pin-remove-FIRST order
+        // is what lets the fail-closed re-read approve the old-parent delete.
+        let snap_dir = tempfile::TempDir::new().unwrap();
+        let drive_dir = tempfile::TempDir::new().unwrap();
+        let sv_dir = snap_dir.path().join("sv-t");
+        std::fs::create_dir_all(&sv_dir).unwrap();
+        let old_parent = sv_dir.join("20260321-t");
+        std::fs::create_dir(&old_parent).unwrap();
+        let snap = sv_dir.join("20260322-1430-t");
+        std::fs::create_dir(&snap).unwrap();
+        chain::write_pin_file(&sv_dir, "DRIVE-A", &SnapshotName::parse("20260321-t").unwrap())
+            .unwrap();
+        let pin_path = sv_dir.join(".last-external-parent-DRIVE-A");
+        assert!(pin_path.exists());
+
+        let config = transient_config_n_drives(
+            snap_dir.path(),
+            &[("DRIVE-A", drive_dir.path(), "primary")],
+        );
+        let mock = MockBtrfs::new();
+        let shutdown = no_shutdown();
+        let mut executor = Executor::new(&mock, None, &config, &shutdown);
+        executor.set_armed_tiers(armed_map(storage_critical::TightnessTier::Critical));
+
+        let plan = BackupPlan {
+            operations: vec![PlannedOperation::SendIncremental {
+                parent: old_parent.clone(),
+                snapshot: snap.clone(),
+                dest_dir: drive_dir.path().join(".snapshots/sv-t"),
+                drive_label: "DRIVE-A".to_string(),
+                subvolume_name: "sv-t".to_string(),
+                pin_on_success: None, // Critical writes no pin
+            }],
+            timestamp: test_ts(),
+            skipped: vec![],
+            events: Vec::new(),
+        };
+
+        let result = executor.execute(&plan, "full");
+        assert!(result.subvolume_results[0].success);
+        assert_eq!(
+            result.subvolume_results[0].transient_cleanup,
+            TransientCleanupOutcome::Cleaned { deleted_count: 2 },
+        );
+        let deletes = delete_calls(&mock);
+        assert!(deletes.contains(&old_parent), "old Tight-era parent cleared");
+        assert!(deletes.contains(&snap), "just-sent snapshot cleared");
+        assert!(!pin_path.exists(), "pin removed (first) → zero locals");
+    }
+
+    #[test]
+    fn clear_all_pin_removal_failure_skips_all_deletions() {
+        // m2: if removing the pin fails, refuse ALL clear-all deletions this run
+        // (fail-open, next run retries) — never a half-cleared state. Force the
+        // failure by making the pin path a directory (remove_file errors, and the
+        // error is not NotFound).
+        let snap_dir = tempfile::TempDir::new().unwrap();
+        let drive_dir = tempfile::TempDir::new().unwrap();
+        let sv_dir = snap_dir.path().join("sv-t");
+        std::fs::create_dir_all(&sv_dir).unwrap();
+        let old_parent = sv_dir.join("20260321-t");
+        std::fs::create_dir(&old_parent).unwrap();
+        let snap = sv_dir.join("20260322-1430-t");
+        std::fs::create_dir(&snap).unwrap();
+        // Pin path is a DIRECTORY → remove_file fails (not NotFound).
+        std::fs::create_dir(sv_dir.join(".last-external-parent-DRIVE-A")).unwrap();
+
+        let config = transient_config_n_drives(
+            snap_dir.path(),
+            &[("DRIVE-A", drive_dir.path(), "primary")],
+        );
+        let mock = MockBtrfs::new();
+        let shutdown = no_shutdown();
+        let mut executor = Executor::new(&mock, None, &config, &shutdown);
+        executor.set_armed_tiers(armed_map(storage_critical::TightnessTier::Critical));
+
+        let plan = BackupPlan {
+            operations: vec![PlannedOperation::SendIncremental {
+                parent: old_parent.clone(),
+                snapshot: snap.clone(),
+                dest_dir: drive_dir.path().join(".snapshots/sv-t"),
+                drive_label: "DRIVE-A".to_string(),
+                subvolume_name: "sv-t".to_string(),
+                pin_on_success: None,
+            }],
+            timestamp: test_ts(),
+            skipped: vec![],
+            events: Vec::new(),
+        };
+
+        let result = executor.execute(&plan, "full");
+        assert_eq!(
+            result.subvolume_results[0].transient_cleanup,
+            TransientCleanupOutcome::SkippedPinRemovalFailure,
+        );
+        assert!(delete_calls(&mock).is_empty(), "fail-open: nothing deleted");
+        assert!(old_parent.exists());
+        assert!(snap.exists());
+    }
+
+    #[test]
+    fn clear_all_multi_drive_partial_keeps_everything() {
+        // Critical clear-all, two drives: A succeeds, B fails. The all-sends-
+        // succeeded gate blocks ALL clear-all deletions — A's sent snapshot and
+        // the old parent survive for next run's retry.
+        let snap_dir = tempfile::TempDir::new().unwrap();
+        let drive_a = tempfile::TempDir::new().unwrap();
+        let drive_b = tempfile::TempDir::new().unwrap();
+        let sv_dir = snap_dir.path().join("sv-t");
+        std::fs::create_dir_all(&sv_dir).unwrap();
+        let old_parent = sv_dir.join("20260321-t");
+        std::fs::create_dir(&old_parent).unwrap();
+        let snap = sv_dir.join("20260322-1430-t");
+        std::fs::create_dir(&snap).unwrap();
+        let snap_b = sv_dir.join("20260322-1430-t-b");
+        std::fs::create_dir(&snap_b).unwrap();
+
+        let config = transient_config_n_drives(
+            snap_dir.path(),
+            &[
+                ("DRIVE-A", drive_a.path(), "primary"),
+                ("DRIVE-B", drive_b.path(), "offsite"),
+            ],
+        );
+        let mock = MockBtrfs::new();
+        mock.fail_sends.borrow_mut().insert(snap_b.clone()); // B fails
+        let shutdown = no_shutdown();
+        let mut executor = Executor::new(&mock, None, &config, &shutdown);
+        executor.set_armed_tiers(armed_map(storage_critical::TightnessTier::Critical));
+
+        let plan = BackupPlan {
+            operations: vec![
+                PlannedOperation::SendIncremental {
+                    parent: old_parent.clone(),
+                    snapshot: snap.clone(),
+                    dest_dir: drive_a.path().join(".snapshots/sv-t"),
+                    drive_label: "DRIVE-A".to_string(),
+                    subvolume_name: "sv-t".to_string(),
+                    pin_on_success: None,
+                },
+                PlannedOperation::SendIncremental {
+                    parent: old_parent.clone(),
+                    snapshot: snap_b.clone(),
+                    dest_dir: drive_b.path().join(".snapshots/sv-t"),
+                    drive_label: "DRIVE-B".to_string(),
+                    subvolume_name: "sv-t".to_string(),
+                    pin_on_success: None,
+                },
+            ],
+            timestamp: test_ts(),
+            skipped: vec![],
+            events: Vec::new(),
+        };
+
+        let result = executor.execute(&plan, "full");
+        assert_eq!(
+            result.subvolume_results[0].transient_cleanup,
+            TransientCleanupOutcome::SkippedPartialSends,
+        );
+        assert!(delete_calls(&mock).is_empty(), "partial success → no clear-all");
+        assert!(old_parent.exists());
+        assert!(snap.exists());
+    }
+
+    #[test]
+    fn tight_retain_one_keeps_new_pin_clears_old_parent() {
+        // Tight (clear_all = false): retain-one, unchanged. Old parent cleaned,
+        // the just-sent snapshot becomes the new pin and survives.
+        let snap_dir = tempfile::TempDir::new().unwrap();
+        let drive_dir = tempfile::TempDir::new().unwrap();
+        let sv_dir = snap_dir.path().join("sv-t");
+        std::fs::create_dir_all(&sv_dir).unwrap();
+        let old_parent = sv_dir.join("20260321-t");
+        std::fs::create_dir(&old_parent).unwrap();
+        let snap = sv_dir.join("20260322-1430-t");
+        std::fs::create_dir(&snap).unwrap();
+        chain::write_pin_file(&sv_dir, "DRIVE-A", &SnapshotName::parse("20260321-t").unwrap())
+            .unwrap();
+
+        let config = transient_config_n_drives(
+            snap_dir.path(),
+            &[("DRIVE-A", drive_dir.path(), "primary")],
+        );
+        let mock = MockBtrfs::new();
+        let shutdown = no_shutdown();
+        let mut executor = Executor::new(&mock, None, &config, &shutdown);
+        executor.set_armed_tiers(armed_map(storage_critical::TightnessTier::Tight));
+
+        let new_pin_path = sv_dir.join(".last-external-parent-DRIVE-A");
+        let plan = BackupPlan {
+            operations: vec![PlannedOperation::SendIncremental {
+                parent: old_parent.clone(),
+                snapshot: snap.clone(),
+                dest_dir: drive_dir.path().join(".snapshots/sv-t"),
+                drive_label: "DRIVE-A".to_string(),
+                subvolume_name: "sv-t".to_string(),
+                pin_on_success: Some((
+                    new_pin_path.clone(),
+                    SnapshotName::parse("20260322-1430-t").unwrap(),
+                )),
+            }],
+            timestamp: test_ts(),
+            skipped: vec![],
+            events: Vec::new(),
+        };
+
+        let result = executor.execute(&plan, "full");
+        assert_eq!(
+            result.subvolume_results[0].transient_cleanup,
+            TransientCleanupOutcome::Cleaned { deleted_count: 1 },
+        );
+        let deletes = delete_calls(&mock);
+        assert!(deletes.contains(&old_parent), "old parent cleaned");
+        assert!(!deletes.contains(&snap), "new pin (retain-one) survives at Tight");
+        let pin = std::fs::read_to_string(&new_pin_path).unwrap();
+        assert_eq!(pin.trim(), "20260322-1430-t", "pin advanced to new snapshot");
+    }
+
+    #[test]
+    fn is_transient_resolution_behavior_neutral_named_level_explicit_transient() {
+        // M3: the executor derives is_transient via derive_effective_policy
+        // (empty map → Roomy → declared) instead of a raw-config check. Prove the
+        // two agree on the non-obvious case — a NAMED level + explicit transient
+        // resolves to Transient (config.rs:182-184), while a named level alone
+        // never does — so the switch is behavior-neutral for every config.
+        use crate::storage_critical::{derive_effective_policy, TightnessTier};
+        let config_str = r#"
+drives = []
+
+[general]
+state_db = "/tmp/urd-test/urd.db"
+metrics_file = "/tmp/urd-test/backup.prom"
+log_dir = "/tmp/urd-test"
+
+[local_snapshots]
+roots = [ { path = "/snap", subvolumes = ["named-transient", "named-graduated"] } ]
+
+[defaults]
+snapshot_interval = "1h"
+send_interval = "4h"
+send_enabled = true
+enabled = true
+[defaults.local_retention]
+hourly = 24
+[defaults.external_retention]
+daily = 30
+
+[[subvolumes]]
+name = "named-transient"
+short_name = "nt"
+source = "/data/nt"
+protection_level = "sheltered"
+local_retention = "transient"
+
+[[subvolumes]]
+name = "named-graduated"
+short_name = "ng"
+source = "/data/ng"
+protection_level = "sheltered"
+"#;
+        let config: Config = toml::from_str(config_str).unwrap();
+        let resolved = config.resolved_subvolumes();
+
+        // Named level + explicit transient → resolves Transient; Roomy derive agrees.
+        let nt = resolved.iter().find(|s| s.name == "named-transient").unwrap();
+        assert!(matches!(
+            config.subvolumes.iter().find(|s| s.name == "named-transient").unwrap().local_retention,
+            Some(crate::types::LocalRetentionConfig::Transient)
+        ));
+        assert!(
+            derive_effective_policy(
+                &nt.local_retention,
+                nt.send_interval,
+                nt.send_enabled,
+                TightnessTier::Roomy,
+            )
+            .local_retention
+            .is_transient(),
+            "named-level + explicit transient is_transient at Roomy"
+        );
+
+        // Named level ALONE never resolves to transient.
+        let ng = resolved.iter().find(|s| s.name == "named-graduated").unwrap();
+        assert!(
+            config.subvolumes.iter().find(|s| s.name == "named-graduated").unwrap().local_retention.is_none()
+        );
+        assert!(
+            !derive_effective_policy(
+                &ng.local_retention,
+                ng.send_interval,
+                ng.send_enabled,
+                TightnessTier::Roomy,
+            )
+            .local_retention
+            .is_transient(),
+            "named level alone is NOT transient"
+        );
     }
 }

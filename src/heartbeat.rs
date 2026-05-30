@@ -411,6 +411,8 @@ mod tests {
                 redundancy_advisories: vec![],
                 errors: vec![],
                 storage_posture: None,
+                cadence_adapted: false,
+                effective_send_interval: None,
             },
             SubvolAssessment {
                 name: "docs".to_string(),
@@ -429,6 +431,8 @@ mod tests {
                 redundancy_advisories: vec![],
                 errors: vec![],
                 storage_posture: None,
+                cadence_adapted: false,
+                effective_send_interval: None,
             },
         ]
     }

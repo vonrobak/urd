@@ -10,6 +10,7 @@ use crate::drives::DriveAvailability;
 use crate::error::UrdError;
 use crate::events::{DeferScope, Event, EventPayload};
 use crate::retention;
+use crate::storage_critical::{self, ArmedTierMap, EffectivePolicy};
 use crate::types::{
     BackupPlan, DeleteKind, DriveEvent, DriveEventKind, FullSendReason, LocalRetentionPolicy,
     PlannedOperation, SendKind, SnapshotName,
@@ -223,11 +224,20 @@ fn interval_elapsed(elapsed: chrono::Duration, interval: chrono::Duration) -> bo
 // ── Planner ─────────────────────────────────────────────────────────────
 
 /// Generate a backup plan based on config, current time, filters, and filesystem state.
+///
+/// `armed_tiers` maps subvolume name → its source pool's armed `TightnessTier`
+/// (UPI 031-b). An absent key defaults to `Roomy` → declared behavior, so a
+/// read-only caller without storage signals passes an empty map and gets
+/// byte-identical plans (the regression firewall). The backup path supplies the
+/// real map (resolved once pre-plan, AB1) so a tight pool sheds Urd's footprint:
+/// Tight/Critical send-enabled subvolumes route through the transient lifecycle
+/// and Critical writes no pin (`derive_effective_policy`).
 pub fn plan(
     config: &Config,
     now: NaiveDateTime,
     filters: &PlanFilters,
     obs: &Observation,
+    armed_tiers: &ArmedTierMap,
 ) -> crate::error::Result<BackupPlan> {
     let mut operations = Vec::new();
     // Skip reason strings are classified by output::SkipCategory::from_reason().
@@ -325,10 +335,26 @@ pub fn plan(
             })
             .collect();
 
+        // ── Tier-adapted effective policy (UPI 031-b) ──────────────
+        // Resolve the source pool's armed tier (Roomy default for an absent
+        // key → declared behavior) and derive the effective lifecycle / send
+        // interval / clear-all signal. Planner and awareness both derive from
+        // the SAME armed tier (the single pre-plan gather in backup.rs), so the
+        // effective send interval they judge against agrees.
+        let armed = armed_tiers.get(&subvol.name).copied().unwrap_or_default();
+        let eff = storage_critical::derive_effective_policy(
+            &subvol.local_retention,
+            subvol.send_interval,
+            subvol.send_enabled,
+            armed,
+        );
+
         // ── Transient subvolumes: atomic lifecycle planning ────────
-        if subvol.local_retention.is_transient() && subvol.send_enabled {
+        // Dispatch on the EFFECTIVE lifecycle: a Tight/Critical declared-Graduated
+        // send-enabled subvolume now routes through the transient path.
+        if eff.local_retention.is_transient() && subvol.send_enabled {
             plan_transient_lifecycle(
-                subvol, config, &local_dir, &local_snaps, now, force, filters,
+                subvol, &eff, config, &local_dir, &local_snaps, now, force, filters,
                 &pinned, &mounted_pins, obs, &mut operations, &mut skipped, &mut events,
             );
             continue; // skip the normal two-phase flow
@@ -355,6 +381,7 @@ pub fn plan(
             );
             plan_local_retention(
                 subvol,
+                &eff,
                 &local_dir,
                 &local_snaps,
                 now,
@@ -410,6 +437,7 @@ pub fn plan(
 
                 plan_external_send(
                     subvol,
+                    &eff,
                     drive,
                     &local_dir,
                     effective_local_snaps,
@@ -445,9 +473,18 @@ pub fn plan(
         }
     }
 
-    // Transient invariant: CreateSnapshot without Send is an orphan.
+    // Transient invariant: CreateSnapshot without Send is an orphan. Keyed on
+    // the EFFECTIVE lifecycle (031-b): a Tight/Critical Graduated subvol routed
+    // through the transient path is subject to the same invariant.
     for subvol in &resolved {
-        if !subvol.local_retention.is_transient() || !subvol.send_enabled {
+        let armed = armed_tiers.get(&subvol.name).copied().unwrap_or_default();
+        let eff = storage_critical::derive_effective_policy(
+            &subvol.local_retention,
+            subvol.send_interval,
+            subvol.send_enabled,
+            armed,
+        );
+        if !eff.local_retention.is_transient() || !subvol.send_enabled {
             continue;
         }
         let has_create = operations.iter().any(|op| {
@@ -649,6 +686,7 @@ fn plan_local_snapshot(
 #[allow(clippy::too_many_arguments)]
 fn plan_local_retention(
     subvol: &ResolvedSubvolume,
+    eff: &EffectivePolicy,
     local_dir: &Path,
     local_snaps: &[SnapshotName],
     now: NaiveDateTime,
@@ -668,7 +706,7 @@ fn plan_local_retention(
     // causes space exhaustion on constrained filesystems.
     // For graduated subvolumes, protect ALL pins (conservative default).
     let protected = if subvol.send_enabled {
-        let effective_pinned = if subvol.local_retention.is_transient() {
+        let effective_pinned = if eff.local_retention.is_transient() {
             mounted_pins.clone()
         } else {
             pinned.clone()
@@ -683,7 +721,7 @@ fn plan_local_retention(
                     }
                 }
             }
-            None if subvol.local_retention.is_transient() => {
+            None if eff.local_retention.is_transient() => {
                 // Transient + no mounted pins = nothing to protect.
                 // Full sends when drives return.
             }
@@ -700,7 +738,7 @@ fn plan_local_retention(
         pinned.clone()
     };
 
-    match &subvol.local_retention {
+    match &eff.local_retention {
         LocalRetentionPolicy::Transient => {
             // Transient: delete everything not in the protected set (pins + unsent).
             // Transient lifecycle is policy-driven — always execute.
@@ -759,6 +797,7 @@ fn plan_local_retention(
 #[allow(clippy::too_many_arguments)]
 fn plan_transient_lifecycle(
     subvol: &ResolvedSubvolume,
+    eff: &EffectivePolicy,
     config: &Config,
     local_dir: &Path,
     local_snaps: &[SnapshotName],
@@ -795,7 +834,7 @@ fn plan_transient_lifecycle(
             let send_due = match newest_ext {
                 Some(newest_dt) => {
                     let elapsed = now.signed_duration_since(newest_dt);
-                    interval_elapsed(elapsed, subvol.send_interval.as_chrono())
+                    interval_elapsed(elapsed, eff.send_interval.as_chrono())
                 }
                 None => true, // No external snapshots — first send
             };
@@ -822,6 +861,7 @@ fn plan_transient_lifecycle(
         // Phase 4 only: retention on leftovers
         plan_local_retention(
             subvol,
+            eff,
             local_dir,
             local_snaps,
             now,
@@ -839,7 +879,7 @@ fn plan_transient_lifecycle(
             .iter()
             .filter_map(|(drive, newest_ext)| {
                 let newest_dt = (*newest_ext)?;
-                let next_in = subvol.send_interval.as_chrono()
+                let next_in = eff.send_interval.as_chrono()
                     - now.signed_duration_since(newest_dt);
                 Some(format!(
                     "send to {} not due (next in ~{})",
@@ -865,6 +905,7 @@ fn plan_transient_lifecycle(
         // Phase 4 only: retention on leftovers
         plan_local_retention(
             subvol,
+            eff,
             local_dir,
             local_snaps,
             now,
@@ -878,6 +919,14 @@ fn plan_transient_lifecycle(
     }
 
     // ── Phase 2: Plan snapshot creation (only if a send will happen) ──
+    // LOAD-BEARING INVARIANT (031-b M1): snapshot creation is gated on a send
+    // being due (Phase 1 set `any_send_due`). This is why lengthening
+    // `eff.send_interval` at Critical is sufficient to bound footprint — it
+    // lengthens *creation* too, so clear-all's "≈0 between-run footprint" holds
+    // without accumulation. Do NOT decouple creation from the send-due gate in
+    // the transient path (e.g. "keep a fresher local for restores"): a weekly
+    // Critical send with daily creation would strand 7 unsent snapshots and
+    // reproduce the htpc catastrophe this UPI exists to prevent.
     let planned_snap = if !filters.external_only {
         let min_free = subvol.min_free_bytes.unwrap_or(0);
         plan_local_snapshot(
@@ -892,6 +941,7 @@ fn plan_transient_lifecycle(
         // No planned snapshot and no existing snapshots — nothing to send.
         plan_local_retention(
             subvol,
+            eff,
             local_dir,
             local_snaps,
             now,
@@ -925,7 +975,7 @@ fn plan_transient_lifecycle(
 
     for (drive, _) in &sendable_drives {
         plan_external_send(
-            subvol, drive, local_dir, effective_local_snaps, now, force,
+            subvol, eff, drive, local_dir, effective_local_snaps, now, force,
             filters.skip_intervals, obs, operations, skipped, events,
         );
         plan_external_retention(subvol, drive, now, obs, pinned, operations, events);
@@ -935,6 +985,7 @@ fn plan_transient_lifecycle(
     // Use original local_snaps — retention only operates on existing-on-disk snapshots.
     plan_local_retention(
         subvol,
+        eff,
         local_dir,
         local_snaps,
         now,
@@ -949,6 +1000,7 @@ fn plan_transient_lifecycle(
 #[allow(clippy::too_many_arguments)]
 fn plan_external_send(
     subvol: &ResolvedSubvolume,
+    eff: &EffectivePolicy,
     drive: &DriveConfig,
     local_dir: &Path,
     local_snaps: &[SnapshotName],
@@ -972,13 +1024,13 @@ fn plan_external_send(
         true
     } else if let Some(newest) = newest_ext {
         let elapsed = now.signed_duration_since(newest.datetime());
-        interval_elapsed(elapsed, subvol.send_interval.as_chrono())
+        interval_elapsed(elapsed, eff.send_interval.as_chrono())
     } else {
         true // No external snapshots — send first one
     };
 
     if !should_send {
-        let next_in = subvol.send_interval.as_chrono()
+        let next_in = eff.send_interval.as_chrono()
             - now.signed_duration_since(newest_ext.unwrap().datetime());
         record_defer(
             skipped,
@@ -998,7 +1050,7 @@ fn plan_external_send(
 
     // Find the snapshot to send (newest local)
     let Some(snap_to_send) = local_snaps.iter().max() else {
-        let reason = if subvol.local_retention.is_transient() {
+        let reason = if eff.local_retention.is_transient() {
             "external-only \u{2014} sends on next backup".to_string()
         } else {
             "no local snapshots to send".to_string()
@@ -1119,10 +1171,21 @@ fn plan_external_send(
         }
     }
 
-    let pin_info = Some((
-        local_dir.join(format!(".last-external-parent-{}", drive.label)),
-        snap_to_send.clone(),
-    ));
+    // Critical (clear_all) writes NO pin: the executor deletes the just-sent
+    // snapshot + pin after the gated all-sends-succeeded check (031-b), leaving
+    // zero local snapshots between runs. A surviving pin would make the
+    // fail-closed re-read refuse to clear, so the planner withholds it here.
+    // On the FIRST Critical run a Tight-era pin may still be present on disk,
+    // so this run takes one cheap incremental against it before the executor
+    // clears both; steady-state Critical (no pin) falls through to SendFull.
+    let pin_info = if eff.clear_all {
+        None
+    } else {
+        Some((
+            local_dir.join(format!(".last-external-parent-{}", drive.label)),
+            snap_to_send.clone(),
+        ))
+    };
 
     if is_incremental {
         let parent_name = pin.unwrap();
@@ -1756,7 +1819,7 @@ priority = 2
         fs.local_snapshots
             .insert("sv1".to_string(), vec![snap("20260322-1440-one")]);
 
-        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
         let creates: Vec<_> = result
             .operations
             .iter()
@@ -1773,7 +1836,7 @@ priority = 2
         fs.local_snapshots
             .insert("sv1".to_string(), vec![snap("20260322-1455-one")]);
 
-        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
         let creates: Vec<_> = result
             .operations
             .iter()
@@ -1847,7 +1910,7 @@ priority = 2
         fs.local_snapshots
             .insert("sv1".to_string(), vec![snap("20260321-1502-one")]);
 
-        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
         let creates: Vec<_> = result
             .operations
             .iter()
@@ -1862,7 +1925,7 @@ priority = 2
         let fs = MockFileSystemState::new();
         // No snapshots exist at all
 
-        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
         let creates: Vec<_> = result
             .operations
             .iter()
@@ -1884,7 +1947,7 @@ priority = 2
             subvolume: Some("sv1".to_string()),
             ..PlanFilters::default()
         };
-        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
         let creates: Vec<_> = result
             .operations
             .iter()
@@ -1903,7 +1966,7 @@ priority = 2
             priority: Some(1),
             ..PlanFilters::default()
         };
-        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
         // Only sv1 (priority 1), not sv2 (priority 2)
         let creates: Vec<_> = result
             .operations
@@ -1934,7 +1997,7 @@ priority = 2
             subvolume: Some("sv1".to_string()),
             ..PlanFilters::default()
         };
-        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
         let sends: Vec<_> = result
             .operations
             .iter()
@@ -1955,7 +2018,7 @@ priority = 2
             subvolume: Some("sv1".to_string()),
             ..PlanFilters::default()
         };
-        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
         let sends: Vec<_> = result
             .operations
             .iter()
@@ -1988,7 +2051,7 @@ priority = 2
             subvolume: Some("sv1".to_string()),
             ..PlanFilters::default()
         };
-        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
         let sends: Vec<_> = result
             .operations
             .iter()
@@ -2021,7 +2084,7 @@ priority = 2
             subvolume: Some("sv1".to_string()),
             ..PlanFilters::default()
         };
-        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
         let send = result
             .operations
             .iter()
@@ -2048,7 +2111,7 @@ priority = 2
             .insert("sv1".to_string(), vec![snap("20260322-1500-one")]);
         // Drive NOT mounted
 
-        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
         assert!(
             result
                 .skipped
@@ -2106,7 +2169,7 @@ send_enabled = false
             .insert("sv".to_string(), vec![snap("20260322-1400-sv")]);
         fs.mounted_drives.insert("D1".to_string());
 
-        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
         assert!(
             result
                 .skipped
@@ -2125,7 +2188,7 @@ send_enabled = false
             local_only: true,
             ..PlanFilters::default()
         };
-        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
         let sends: Vec<_> = result
             .operations
             .iter()
@@ -2148,7 +2211,7 @@ send_enabled = false
             external_only: true,
             ..PlanFilters::default()
         };
-        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
         let creates: Vec<_> = result
             .operations
             .iter()
@@ -2169,7 +2232,7 @@ send_enabled = false
             subvolume: Some("sv1".to_string()),
             ..PlanFilters::default()
         };
-        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
         let sends_with_pin: Vec<_> = result
             .operations
             .iter()
@@ -2215,7 +2278,7 @@ send_enabled = false
             local_only: true,
             ..PlanFilters::default()
         };
-        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
         // All snapshots newer than the pin should be protected (not deleted)
         let deletes: Vec<_> = result
             .operations
@@ -2252,7 +2315,7 @@ send_enabled = false
             local_only: true,
             ..PlanFilters::default()
         };
-        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
         let deletes: Vec<_> = result
             .operations
             .iter()
@@ -2311,7 +2374,7 @@ send_enabled = false
             ],
         );
 
-        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
         let deletes: Vec<_> = result
             .operations
             .iter()
@@ -2342,7 +2405,7 @@ send_enabled = false
         fs.free_bytes
             .insert(PathBuf::from("/mnt/d1"), 150_000_000_000);
 
-        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
         let sends: Vec<_> = result
             .operations
             .iter()
@@ -2378,7 +2441,7 @@ send_enabled = false
         fs.free_bytes
             .insert(PathBuf::from("/mnt/d1"), 500_000_000_000);
 
-        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
         let sends: Vec<_> = result
             .operations
             .iter()
@@ -2402,7 +2465,7 @@ send_enabled = false
         // Tiny free space — but no history means we can't estimate, so proceed
         fs.free_bytes.insert(PathBuf::from("/mnt/d1"), 1_000_000);
 
-        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
         let sends: Vec<_> = result
             .operations
             .iter()
@@ -2431,7 +2494,7 @@ send_enabled = false
         fs.free_bytes
             .insert(PathBuf::from("/mnt/d1"), 500_000_000_000);
 
-        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
         let sends: Vec<_> = result
             .operations
             .iter()
@@ -2472,7 +2535,7 @@ send_enabled = false
         fs.free_bytes
             .insert(PathBuf::from("/mnt/d1"), 500_000_000_000);
 
-        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
         let sends: Vec<_> = result
             .operations
             .iter()
@@ -2495,7 +2558,7 @@ send_enabled = false
         // No send_sizes, no calibrated_sizes — fail open
         fs.free_bytes.insert(PathBuf::from("/mnt/d1"), 1_000_000);
 
-        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
         let sends: Vec<_> = result
             .operations
             .iter()
@@ -2524,7 +2587,7 @@ send_enabled = false
         fs.free_bytes
             .insert(PathBuf::from("/mnt/d1"), 500_000_000_000);
 
-        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
         let sends: Vec<_> = result
             .operations
             .iter()
@@ -2554,7 +2617,7 @@ send_enabled = false
             vec![snap("20260322-1600-one")], // now() is 15:00, this is 16:00
         );
 
-        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
         let creates: Vec<_> = result
             .operations
             .iter()
@@ -2590,7 +2653,7 @@ send_enabled = false
             },
         );
 
-        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
         assert!(
             result
                 .skipped
@@ -2627,7 +2690,7 @@ send_enabled = false
             DriveAvailability::UuidCheckFailed("findmnt not found".to_string()),
         );
 
-        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
         assert!(
             result
                 .skipped
@@ -2647,7 +2710,7 @@ send_enabled = false
         fs.drive_availability_overrides
             .insert("D1".to_string(), DriveAvailability::Available);
 
-        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
         let sends: Vec<_> = result
             .operations
             .iter()
@@ -2673,7 +2736,7 @@ send_enabled = false
             .insert("sv1".to_string(), vec![snap("20260322-1300-one")]);
         fs.mounted_drives.insert("D1".to_string());
 
-        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
         let sends: Vec<_> = result
             .operations
             .iter()
@@ -2706,7 +2769,7 @@ send_enabled = false
             },
         );
 
-        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
         assert!(
             result
                 .skipped
@@ -2740,7 +2803,7 @@ send_enabled = false
         fs.drive_availability_overrides
             .insert("D1".to_string(), DriveAvailability::TokenMissing);
 
-        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
         let sends: Vec<_> = result
             .operations
             .iter()
@@ -2766,7 +2829,7 @@ send_enabled = false
         fs.drive_availability_overrides
             .insert("D1".to_string(), DriveAvailability::TokenExpectedButMissing);
 
-        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
         assert!(
             result
                 .skipped
@@ -2799,7 +2862,7 @@ send_enabled = false
         fs.drive_availability_overrides
             .insert("D1".to_string(), DriveAvailability::TokenExpectedButMissing);
 
-        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
         let creates: Vec<_> = result
             .operations
             .iter()
@@ -2823,7 +2886,7 @@ send_enabled = false
         fs.free_bytes
             .insert(PathBuf::from("/snap/sv1"), 5_000_000_000);
 
-        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
 
         // No snapshot should be created for sv1
         let creates: Vec<_> = result
@@ -2859,7 +2922,7 @@ send_enabled = false
         fs.free_bytes
             .insert(PathBuf::from("/snap/sv1"), 50_000_000_000);
 
-        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
 
         let creates: Vec<_> = result
             .operations
@@ -2887,7 +2950,7 @@ send_enabled = false
             subvolume: Some("sv1".to_string()),
             ..PlanFilters::default()
         };
-        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
 
         let creates: Vec<_> = result
             .operations
@@ -2933,7 +2996,7 @@ send_enabled = false
         mb.generations.borrow_mut()
             .insert(PathBuf::from("/snap/sv1").join(s1.as_str()), 50);
 
-        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &mb }).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &mb }, &ArmedTierMap::new()).unwrap();
 
         let creates: Vec<_> = result
             .operations
@@ -2974,7 +3037,7 @@ send_enabled = false
             .insert("sv1".to_string(), vec![snap("20260322-1440-one")]);
         // Note: no fs.free_bytes entry for /snap/sv1
 
-        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
 
         let creates: Vec<_> = result
             .operations
@@ -3049,7 +3112,7 @@ drives = ["D1"]
         fs.mounted_drives.insert("D1".to_string());
         fs.mounted_drives.insert("D2".to_string());
 
-        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
 
         // Should only have send operations for D1, not D2
         let sends: Vec<_> = result
@@ -3161,7 +3224,7 @@ local_retention = "transient"
             vec![snap("20260320-1000-one")],
         );
 
-        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
         let deletes: Vec<_> = result
             .operations
             .iter()
@@ -3205,7 +3268,7 @@ local_retention = "transient"
             ],
         );
 
-        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
         let deletes: Vec<_> = result
             .operations
             .iter()
@@ -3246,7 +3309,7 @@ local_retention = "transient"
         // No pin files — nothing has ever been sent
         fs.mounted_drives.insert("D1".to_string());
 
-        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
         let deletes: Vec<_> = result
             .operations
             .iter()
@@ -3274,7 +3337,7 @@ local_retention = "transient"
         let fs = MockFileSystemState::new();
         // No local snapshots, no drives mounted
 
-        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
         let creates: Vec<_> = result
             .operations
             .iter()
@@ -3389,7 +3452,7 @@ local_retention = "transient"
             vec![snap("20260320-1000-one")],
         );
 
-        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
         let deletes: Vec<_> = result
             .operations
             .iter()
@@ -3427,7 +3490,7 @@ local_retention = "transient"
         // Drive NOT mounted — transient should skip snapshot creation
         // (no drive to send to, creating a snapshot is pointless)
 
-        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
 
         let creates: Vec<_> = result
             .operations
@@ -3454,7 +3517,7 @@ local_retention = "transient"
         // No local snapshots, no drives mounted.
         // Transient: no snapshot created — can't be sent, would be orphaned.
 
-        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
 
         let creates: Vec<_> = result
             .operations
@@ -3495,7 +3558,7 @@ local_retention = "transient"
             vec![snap("20260322-1400-one")],
         );
 
-        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
         let deletes: Vec<_> = result
             .operations
             .iter()
@@ -3534,7 +3597,7 @@ local_retention = "transient"
             snap("20260320-1000-one"),
         );
 
-        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
         let deletes: Vec<_> = result
             .operations
             .iter()
@@ -3589,7 +3652,7 @@ local_retention = "transient"
             vec![snap("20260320-1000-one")],
         );
 
-        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
         let deletes: Vec<_> = result
             .operations
             .iter()
@@ -3683,7 +3746,7 @@ priority = 1
         fs.mounted_drives.insert("D1".to_string());
         // D2 NOT mounted
 
-        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
         let deletes: Vec<_> = result
             .operations
             .iter()
@@ -3721,7 +3784,7 @@ priority = 1
         );
         // No pin files, no drives mounted
 
-        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
         let deletes: Vec<_> = result
             .operations
             .iter()
@@ -3766,7 +3829,7 @@ priority = 1
             vec![snap("20260321-1000-one")],
         );
 
-        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
         let deletes: Vec<_> = result
             .operations
             .iter()
@@ -3802,7 +3865,7 @@ priority = 1
             skip_intervals: true,
             ..PlanFilters::default()
         };
-        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
         let creates: Vec<_> = result
             .operations
             .iter()
@@ -3829,7 +3892,7 @@ priority = 1
             skip_intervals: true,
             ..PlanFilters::default()
         };
-        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
         let sends: Vec<_> = result
             .operations
             .iter()
@@ -3860,7 +3923,7 @@ priority = 1
             skip_intervals: true,
             ..PlanFilters::default()
         };
-        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
         let creates: Vec<_> = result
             .operations
             .iter()
@@ -3909,7 +3972,7 @@ priority = 1
             skip_intervals: true,
             ..PlanFilters::default()
         };
-        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
         let deletes: Vec<_> = result
             .operations
             .iter()
@@ -3937,7 +4000,7 @@ priority = 1
             local_only: true,
             ..PlanFilters::default()
         };
-        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
         let creates: Vec<_> = result
             .operations
             .iter()
@@ -3966,7 +4029,7 @@ priority = 1
         let mut fs = MockFileSystemState::new();
         fs.mounted_drives.insert("D1".to_string());
 
-        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
 
         let creates: Vec<_> = result
             .operations
@@ -3989,7 +4052,7 @@ priority = 1
         let config = transient_config();
         let fs = MockFileSystemState::new();
 
-        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
 
         assert!(
             result.operations.is_empty(),
@@ -4016,7 +4079,7 @@ priority = 1
             ],
         );
 
-        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
 
         let creates: Vec<_> = result
             .operations
@@ -4055,7 +4118,7 @@ priority = 1
             skip_intervals: false,
             ..Default::default()
         };
-        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
 
         let creates: Vec<_> = result
             .operations
@@ -4100,7 +4163,7 @@ priority = 1
         mb.generations.borrow_mut()
             .insert(PathBuf::from("/snap/sv1/20260322-1400-one"), 500);
 
-        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &mb }).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &mb }, &ArmedTierMap::new()).unwrap();
 
         let creates: Vec<_> = result
             .operations
@@ -4175,7 +4238,7 @@ local_retention = "transient"
         fs.free_bytes
             .insert(PathBuf::from("/snap/sv1"), 1_000_000_000);
 
-        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
 
         let creates: Vec<_> = result
             .operations
@@ -4197,7 +4260,7 @@ local_retention = "transient"
         let mut fs = MockFileSystemState::new();
         fs.mounted_drives.insert("D1".to_string());
 
-        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
 
         let creates: Vec<_> = result
             .operations
@@ -4245,7 +4308,7 @@ local_retention = "transient"
         mb.generations.borrow_mut()
             .insert(PathBuf::from("/snap/sv1/20260321-1000-one"), 500);
 
-        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &mb }).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &mb }, &ArmedTierMap::new()).unwrap();
 
         let creates: Vec<_> = result
             .operations
@@ -4281,7 +4344,7 @@ local_retention = "transient"
             skip_intervals: false,
             ..Default::default()
         };
-        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
 
         let creates: Vec<_> = result
             .operations
@@ -4320,7 +4383,7 @@ local_retention = "transient"
         mb.generations.borrow_mut()
             .insert(PathBuf::from("/snap/sv1/20260322-1440-one"), 500);
 
-        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &mb }).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &mb }, &ArmedTierMap::new()).unwrap();
         let creates: Vec<_> = result
             .operations
             .iter()
@@ -4349,7 +4412,7 @@ local_retention = "transient"
         mb.generations.borrow_mut()
             .insert(PathBuf::from("/snap/sv1/20260322-1440-one"), 500);
 
-        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &mb }).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &mb }, &ArmedTierMap::new()).unwrap();
         let creates: Vec<_> = result
             .operations
             .iter()
@@ -4364,7 +4427,7 @@ local_retention = "transient"
         let fs = MockFileSystemState::new();
         // No existing snapshots → create (no generation to compare)
 
-        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
         let creates: Vec<_> = result
             .operations
             .iter()
@@ -4386,7 +4449,7 @@ local_retention = "transient"
         mb.generations.borrow_mut()
             .insert(PathBuf::from("/snap/sv1/20260322-1440-one"), 500);
 
-        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &mb }).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &mb }, &ArmedTierMap::new()).unwrap();
         let creates: Vec<_> = result
             .operations
             .iter()
@@ -4408,7 +4471,7 @@ local_retention = "transient"
         mb.fail_generations.borrow_mut()
             .insert(PathBuf::from("/snap/sv1/20260322-1440-one"));
 
-        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &mb }).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &mb }, &ArmedTierMap::new()).unwrap();
         let creates: Vec<_> = result
             .operations
             .iter()
@@ -4430,7 +4493,7 @@ local_retention = "transient"
         mb.fail_generations.borrow_mut()
             .insert(PathBuf::from("/snap/sv1/20260322-1440-one"));
 
-        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &mb }).unwrap();
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &mb }, &ArmedTierMap::new()).unwrap();
         let creates: Vec<_> = result
             .operations
             .iter()
@@ -4456,7 +4519,7 @@ local_retention = "transient"
             force_snapshot: true,
             ..PlanFilters::default()
         };
-        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &mb }).unwrap();
+        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &mb }, &ArmedTierMap::new()).unwrap();
         let creates: Vec<_> = result
             .operations
             .iter()
@@ -4482,7 +4545,7 @@ local_retention = "transient"
             subvolume: Some("sv1".to_string()),
             ..PlanFilters::default()
         };
-        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &mb }).unwrap();
+        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &mb }, &ArmedTierMap::new()).unwrap();
         let creates: Vec<_> = result
             .operations
             .iter()
@@ -4508,7 +4571,7 @@ local_retention = "transient"
             skip_intervals: true,
             ..PlanFilters::default()
         };
-        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &mb }).unwrap();
+        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &mb }, &ArmedTierMap::new()).unwrap();
         let creates: Vec<_> = result
             .operations
             .iter()
@@ -4567,7 +4630,7 @@ local_retention = "transient"
         fs.external_snapshots
             .insert(("D1".to_string(), "sv1".to_string()), vec![]);
 
-        let plan = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let plan = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
         let saw_first_send = plan.events.iter().any(|e| {
             matches!(
                 &e.payload,
@@ -4609,7 +4672,7 @@ local_retention = "transient"
         fs.pin_files
             .insert((PathBuf::from("/snap/sv1"), "D1".to_string()), parent.clone());
 
-        let plan = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let plan = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
         // Sanity: ensure an incremental was actually chosen (else the test is moot).
         let any_incremental = plan
             .operations
@@ -4630,7 +4693,7 @@ local_retention = "transient"
             }
         }
         let fs = MockFileSystemState::new();
-        let plan = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let plan = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
         let saw_disabled_defer = plan.events.iter().any(|e| match &e.payload {
             EventPayload::PlannerDefer { reason, scope } => {
                 reason == "disabled" && *scope == DeferScope::Subvolume
@@ -4654,7 +4717,7 @@ local_retention = "transient"
             .insert("sv1".to_string(), vec![snap("20260322-1455-one")]);
         // Drive D1 not mounted.
 
-        let plan = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let plan = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
         let saw_drive_defer = plan.events.iter().any(|e| match &e.payload {
             EventPayload::PlannerDefer { reason, scope } => {
                 reason.contains("not mounted") && *scope == DeferScope::Drive
@@ -4676,7 +4739,7 @@ local_retention = "transient"
             }
         }
         let fs = MockFileSystemState::new();
-        let plan = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }).unwrap();
+        let plan = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
         let sv2_defers: Vec<_> = plan
             .events
             .iter()
@@ -4686,6 +4749,318 @@ local_retention = "transient"
         assert!(
             !sv2_defers.is_empty(),
             "PlannerDefer for sv2 should carry subvolume='sv2'"
+        );
+    }
+
+    // ── UPI 031-b: tier-graded lifecycle in the planner ─────────────────
+
+    /// A send-enabled, declared-GRADUATED subvolume on drive D1 (no
+    /// `local_retention = "transient"`). Used to prove the tier reroutes a
+    /// graduated subvol through the transient path at Tight/Critical.
+    fn graduated_send_config() -> Config {
+        let toml_str = r#"
+[general]
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp"
+
+[local_snapshots]
+roots = [
+  { path = "/snap", subvolumes = ["sv1"] }
+]
+
+[defaults]
+snapshot_interval = "1h"
+send_interval = "1d"
+send_enabled = true
+enabled = true
+
+[defaults.local_retention]
+hourly = 24
+daily = 30
+weekly = 26
+monthly = 12
+
+[defaults.external_retention]
+daily = 30
+weekly = 26
+monthly = 0
+
+[[drives]]
+label = "D1"
+mount_path = "/mnt/d1"
+snapshot_root = ".snapshots"
+role = "test"
+
+[[subvolumes]]
+name = "sv1"
+short_name = "one"
+source = "/data/sv1"
+priority = 1
+"#;
+        toml::from_str(toml_str).unwrap()
+    }
+
+    fn armed_map(name: &str, tier: crate::storage_critical::TightnessTier) -> ArmedTierMap {
+        let mut m = ArmedTierMap::new();
+        m.insert(name.to_string(), tier);
+        m
+    }
+
+    fn count_creates(plan: &BackupPlan, subvol: &str) -> usize {
+        plan.operations
+            .iter()
+            .filter(|op| {
+                matches!(op, PlannedOperation::CreateSnapshot { subvolume_name, .. } if subvolume_name == subvol)
+            })
+            .count()
+    }
+
+    fn count_transient_deletes(plan: &BackupPlan) -> usize {
+        plan.operations
+            .iter()
+            .filter(|op| {
+                matches!(op, PlannedOperation::DeleteSnapshot { reason, .. } if reason.contains("transient"))
+            })
+            .count()
+    }
+
+    /// `Some(true)` = a send op with a pin write; `Some(false)` = send op with
+    /// no pin; `None` = no send op for the subvolume.
+    fn send_has_pin(plan: &BackupPlan, subvol: &str) -> Option<bool> {
+        plan.operations.iter().find_map(|op| match op {
+            PlannedOperation::SendFull { subvolume_name, pin_on_success, .. }
+            | PlannedOperation::SendIncremental { subvolume_name, pin_on_success, .. }
+                if subvolume_name == subvol =>
+            {
+                Some(pin_on_success.is_some())
+            }
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn tight_routes_graduated_subvol_to_transient_retention() {
+        use crate::storage_critical::TightnessTier;
+        let config = graduated_send_config();
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots.insert(
+            "sv1".to_string(),
+            vec![
+                snap("20260320-1000-one"),
+                snap("20260321-1000-one"),
+                snap("20260322-1400-one"),
+            ],
+        );
+        // Pin at the newest; all three already on the drive (send not due).
+        fs.pin_files.insert(
+            (PathBuf::from("/snap/sv1"), "D1".to_string()),
+            snap("20260322-1400-one"),
+        );
+        fs.mounted_drives.insert("D1".to_string());
+        fs.external_snapshots.insert(
+            ("D1".to_string(), "sv1".to_string()),
+            vec![
+                snap("20260320-1000-one"),
+                snap("20260321-1000-one"),
+                snap("20260322-1400-one"),
+            ],
+        );
+
+        // Roomy (empty map): declared graduated keeps each daily rep → 0 deletes.
+        let roomy = plan(
+            &config,
+            now(),
+            &PlanFilters::default(),
+            &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() },
+            &ArmedTierMap::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            count_transient_deletes(&roomy),
+            0,
+            "Roomy: graduated retention, no transient deletes"
+        );
+
+        // Tight: routes through the transient path → the two pre-pin snapshots
+        // are pruned to retain-one.
+        let tight = plan(
+            &config,
+            now(),
+            &PlanFilters::default(),
+            &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() },
+            &armed_map("sv1", TightnessTier::Tight),
+        )
+        .unwrap();
+        assert_eq!(
+            count_transient_deletes(&tight),
+            2,
+            "Tight: graduated subvol routed to transient retention (retain-one)"
+        );
+    }
+
+    #[test]
+    fn empty_map_equals_explicit_roomy() {
+        // The regression firewall in miniature: an absent key and an explicit
+        // Roomy tier produce byte-identical operations (Roomy == declared).
+        use crate::storage_critical::TightnessTier;
+        let config = graduated_send_config();
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap("20260322-1400-one")]);
+        fs.mounted_drives.insert("D1".to_string());
+
+        let empty = plan(
+            &config,
+            now(),
+            &PlanFilters::default(),
+            &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() },
+            &ArmedTierMap::new(),
+        )
+        .unwrap();
+        let roomy = plan(
+            &config,
+            now(),
+            &PlanFilters::default(),
+            &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() },
+            &armed_map("sv1", TightnessTier::Roomy),
+        )
+        .unwrap();
+        assert_eq!(empty.operations, roomy.operations);
+    }
+
+    #[test]
+    fn critical_writes_no_pin_tight_does() {
+        // The clear_all flip within one run: Tight writes a pin on the send;
+        // Critical (clear_all) writes none — the executor clears the just-sent
+        // snapshot post-send-success instead.
+        use crate::storage_critical::TightnessTier;
+        let config = graduated_send_config();
+        let mut fs = MockFileSystemState::new();
+        // One recent local snapshot; nothing on the drive yet → first send.
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap("20260322-1400-one")]);
+        fs.mounted_drives.insert("D1".to_string());
+        fs.external_snapshots
+            .insert(("D1".to_string(), "sv1".to_string()), vec![]);
+
+        let tight = plan(
+            &config,
+            now(),
+            &PlanFilters::default(),
+            &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() },
+            &armed_map("sv1", TightnessTier::Tight),
+        )
+        .unwrap();
+        assert_eq!(
+            send_has_pin(&tight, "sv1"),
+            Some(true),
+            "Tight (retain-one) writes a pin on the send"
+        );
+
+        let critical = plan(
+            &config,
+            now(),
+            &PlanFilters::default(),
+            &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() },
+            &armed_map("sv1", TightnessTier::Critical),
+        )
+        .unwrap();
+        assert_eq!(
+            send_has_pin(&critical, "sv1"),
+            Some(false),
+            "Critical (clear_all) writes no pin"
+        );
+    }
+
+    /// Daily declared snapshot + send intervals — used to show the M1
+    /// send-gated-creation invariant at Critical (floored to weekly).
+    fn m1_daily_config() -> Config {
+        let toml_str = r#"
+[general]
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp"
+
+[local_snapshots]
+roots = [
+  { path = "/snap", subvolumes = ["sv1"] }
+]
+
+[defaults]
+snapshot_interval = "1d"
+send_interval = "1d"
+send_enabled = true
+enabled = true
+
+[defaults.local_retention]
+hourly = 0
+daily = 30
+weekly = 26
+monthly = 12
+
+[defaults.external_retention]
+daily = 30
+weekly = 26
+monthly = 0
+
+[[drives]]
+label = "D1"
+mount_path = "/mnt/d1"
+snapshot_root = ".snapshots"
+role = "test"
+
+[[subvolumes]]
+name = "sv1"
+short_name = "one"
+source = "/data/sv1"
+priority = 1
+"#;
+        toml::from_str(toml_str).unwrap()
+    }
+
+    #[test]
+    fn critical_creation_is_gated_on_send_due_not_snapshot_interval() {
+        // M1 invariant: at Critical the send interval is floored to weekly, and
+        // snapshot CREATION is gated on a send being due (plan.rs Phase 2). With
+        // the last send only ~2 days old (< the weekly floor), NO snapshot is
+        // created this run even though the declared DAILY snapshot_interval has
+        // elapsed — so locals can't accumulate seven-deep between weekly sends.
+        // A Roomy graduated subvol, by contrast, creates regardless of send timing.
+        use crate::storage_critical::TightnessTier;
+        let config = m1_daily_config();
+        let mut fs = MockFileSystemState::new();
+        fs.mounted_drives.insert("D1".to_string());
+        // Steady Critical state: zero local snapshots, last send ~2 days ago.
+        fs.external_snapshots
+            .insert(("D1".to_string(), "sv1".to_string()), vec![snap("20260320-1400-one")]);
+
+        let critical = plan(
+            &config,
+            now(),
+            &PlanFilters::default(),
+            &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() },
+            &armed_map("sv1", TightnessTier::Critical),
+        )
+        .unwrap();
+        assert_eq!(
+            count_creates(&critical, "sv1"),
+            0,
+            "Critical: creation suppressed — the weekly send is not due"
+        );
+
+        let roomy = plan(
+            &config,
+            now(),
+            &PlanFilters::default(),
+            &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() },
+            &ArmedTierMap::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            count_creates(&roomy, "sv1"),
+            1,
+            "Roomy graduated: creates the daily snapshot regardless of send timing"
         );
     }
 }

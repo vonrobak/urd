@@ -34,18 +34,55 @@
 //! *not* shipped here — it belongs with UPIs 032/033 where the safety
 //! scaffolding lands and has a consumer.
 
+use std::collections::HashMap;
+
 use serde::Serialize;
 
 use crate::recommendation::{
     self, FREE_RATIO_CAUTION, FREE_RATIO_PRESSURE, HeadroomSeverity,
 };
+use crate::types::{Interval, LocalRetentionPolicy};
 
 /// Hysteresis level-band (UPI 031-a, D4). A pool de-escalates only once free
 /// recovers to its arm threshold **plus** this band, so a pool hovering at a
 /// tier boundary does not re-notify every run. Crude/load-bearing — revisited
 /// at the ADR-113 30-day checkpoint. Arm thresholds reuse
 /// `FREE_RATIO_PRESSURE` / `FREE_RATIO_CAUTION`; this is the only new constant.
+///
+/// Used for the Tight→Roomy de-escalation step; the Critical→Tight step uses
+/// the wider [`CRITICAL_DEESCALATION_BAND_PP`] (UPI 031-b S1).
 pub const HYSTERESIS_BAND_PP: f64 = 0.05;
+
+/// Wider Critical→Tight de-escalation band (UPI 031-b S1, 2026-05-30 amendment
+/// to 031-a's hysteresis). The clear-all control action at Critical *moves the
+/// controlled variable* (it frees Urd's own footprint), so the +0.05 level band
+/// cannot damp a Critical↔Tight limit cycle when Urd's footprint is the swing
+/// factor (the htpc case). A pool therefore leaves Critical only once free
+/// recovers to the **Caution line** (`FREE_RATIO_PRESSURE + 0.10 = 0.25`, where
+/// the classifier stops calling it tight at all) before shedding the
+/// footprint-cap — the conservative "host wins" bias of the north star. The
+/// deeper dwell-time / `cleanup_budget` treatment is 033 scope.
+pub const CRITICAL_DEESCALATION_BAND_PP: f64 = 0.10;
+
+/// Tight send-interval multiplier (UPI 031-b). At Tight the retain-one pin
+/// survives the whole interval, so a longer interval *increases* footprint;
+/// the factor stays modest so the scaled interval does not eat the 18–30 GB
+/// headroom that makes retain-one safe. Declared-daily → ~36h.
+pub const TIGHT_INTERVAL_FACTOR: f64 = 1.5;
+
+/// Critical send-interval floor in days (UPI 031-b). At Critical clear-all
+/// zeroes between-run footprint, so a weekly full send amortizes cheaply; the
+/// floor is `max(declared, 7d)` so it never *shortens* an already-sparse
+/// subvolume. Built via `Interval::days(7)` (the `Interval` ctors are not
+/// `const fn`).
+pub const CRITICAL_INTERVAL_FLOOR_DAYS: i64 = 7;
+
+/// Planner/executor/awareness-facing map: subvolume name → armed tier (UPI
+/// 031-b). Resolved once pre-plan (`commands/storage_signals::resolve_armed_tiers`)
+/// and threaded into `plan::plan`, the executor, and `awareness::assess`. An
+/// absent key defaults to `Roomy` (`get(..).copied().unwrap_or_default()`) →
+/// declared behavior → zero behavior change (the regression firewall).
+pub type ArmedTierMap = HashMap<String, TightnessTier>;
 
 /// Source-pool tightness, free-ratio only (UPI 031-a). Distinct from
 /// `recommendation::HeadroomSeverity` (a *composite* of free-ratio + trend +
@@ -93,16 +130,14 @@ impl TightnessTier {
 }
 
 impl From<HeadroomSeverity> for TightnessTier {
-    /// `Healthy → Roomy`, `Caution → Tight`, `Pressure`/`Critical → Critical`.
-    /// The composite severity collapses to the free-ratio-only tier; the
-    /// dormant composite `Critical` maps to the tier `Critical`.
+    /// `Healthy → Roomy`, `Caution → Tight`, `Pressure → Critical`.
+    /// The composite severity collapses to the free-ratio-only tier. (The
+    /// composite `Critical` variant was deleted in UPI 031-b, AB5.)
     fn from(sev: HeadroomSeverity) -> Self {
         match sev {
             HeadroomSeverity::Healthy => TightnessTier::Roomy,
             HeadroomSeverity::Caution => TightnessTier::Tight,
-            HeadroomSeverity::Pressure | HeadroomSeverity::Critical => {
-                TightnessTier::Critical
-            }
+            HeadroomSeverity::Pressure => TightnessTier::Critical,
         }
     }
 }
@@ -164,10 +199,11 @@ pub fn host_root(
 ///   than the armed tier (no hysteresis on the way up — danger is surfaced
 ///   at once). The escalation target comes from
 ///   `classify_free_ratio_value` (single source of truth for boundaries — M2).
-/// - **De-escalate stickily**: drop one level at a time, each gated by that
-///   level's arm threshold **+ `HYSTERESIS_BAND_PP`** (Critical→Tight at free
-///   `> 0.20`, Tight→Roomy at free `> 0.30`). A pool can fall two levels in
-///   one run when free recovers past both bands.
+/// - **De-escalate stickily**: drop one level at a time. Critical→Tight is
+///   gated by `FREE_RATIO_PRESSURE + CRITICAL_DEESCALATION_BAND_PP` (free
+///   `> 0.25`, the Caution line — UPI 031-b S1); Tight→Roomy by
+///   `FREE_RATIO_CAUTION + HYSTERESIS_BAND_PP` (free `> 0.30`). A pool can fall
+///   two levels in one run when free recovers past both bands.
 /// - **Unmeasurable** free-ratio (`None`) holds the prior armed tier unchanged.
 #[must_use]
 pub fn resolve_armed_tier(
@@ -189,9 +225,12 @@ pub fn resolve_armed_tier(
 
     // current <= prior_armed: sticky de-escalation, one level at a time, each
     // gated by `arm_threshold + band`. Strict `>` so exactly-at-band holds.
+    // Critical→Tight uses the wider band (031-b S1): clear-all moves the
+    // controlled variable, so the pool must recover to the Caution line before
+    // shedding the footprint-cap, damping the limit cycle toward the safe state.
     let mut armed = prior_armed;
     if armed == TightnessTier::Critical
-        && ratio > FREE_RATIO_PRESSURE + HYSTERESIS_BAND_PP
+        && ratio > FREE_RATIO_PRESSURE + CRITICAL_DEESCALATION_BAND_PP
     {
         armed = TightnessTier::Tight;
     }
@@ -234,6 +273,97 @@ pub fn derive_posture(
     })
 }
 
+/// The tier-adapted operational policy the planner, executor, and awareness all
+/// act on, derived from a subvolume's declared intent and the armed tier (UPI
+/// 031-b, AB2). Carries exactly the three knobs the tier changes (all consumed
+/// this UPI). Paralleling `types::derive_policy`/`DerivedPolicy`, the same tier
+/// in always yields the same policy out — coherence between planner and
+/// awareness rests on both deriving from the *same* armed tier (the single
+/// pre-plan gather, `commands/backup.rs`), not on this function alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EffectivePolicy {
+    /// Lifecycle the planner dispatches on. Tight/Critical → `Transient`
+    /// (retain-one). The clear-all delta (Critical) is the separate `clear_all`
+    /// flag — it is NOT a lifecycle the planner can express alone (clear-all's
+    /// same-run deletion of the just-sent snapshot is executor-gated for
+    /// ADR-107).
+    pub local_retention: LocalRetentionPolicy,
+    /// Send cadence the planner times against AND awareness judges staleness
+    /// against — they MUST agree or a correctly-adapting subvol shows false
+    /// AT RISK.
+    pub send_interval: Interval,
+    /// Critical only: the subvolume keeps zero local snapshots between runs.
+    /// The planner writes no pin (`pin_on_success: None`); the executor deletes
+    /// the just-sent snapshot + pin after confirming the send (gated).
+    pub clear_all: bool,
+}
+
+/// Derive the tier-adapted [`EffectivePolicy`] from a subvolume's *declared*
+/// intent and the armed tier (UPI 031-b, AB2). Pure — no I/O, no clock (ADR-108).
+///
+/// Takes the three declared fields (not the whole `ResolvedSubvolume`) to keep
+/// `storage_critical` a leaf module and honor the scalar precedent of
+/// `types::derive_policy` (M2).
+///
+/// - `!send_enabled` → declared passes through unchanged (a local-only
+///   subvolume has no ephemeral lifecycle — arc R6).
+/// - **Roomy** → declared lifecycle + declared interval + `clear_all: false`.
+/// - **Tight** → `Transient` (retain-one) + interval × [`TIGHT_INTERVAL_FACTOR`]
+///   + `clear_all: false`.
+/// - **Critical** → `Transient` + `max(declared, CRITICAL_INTERVAL_FLOOR)` +
+///   `clear_all: true`. The floor never *shortens* an already-sparse subvolume.
+#[must_use]
+pub fn derive_effective_policy(
+    declared_retention: &LocalRetentionPolicy,
+    declared_send_interval: Interval,
+    send_enabled: bool,
+    armed: TightnessTier,
+) -> EffectivePolicy {
+    // Local-only: no send, no ephemeral lifecycle. Declared passthrough.
+    if !send_enabled {
+        return EffectivePolicy {
+            local_retention: *declared_retention,
+            send_interval: declared_send_interval,
+            clear_all: false,
+        };
+    }
+
+    match armed {
+        TightnessTier::Roomy => EffectivePolicy {
+            local_retention: *declared_retention,
+            send_interval: declared_send_interval,
+            clear_all: false,
+        },
+        TightnessTier::Tight => EffectivePolicy {
+            local_retention: LocalRetentionPolicy::Transient,
+            send_interval: scale_interval(declared_send_interval, TIGHT_INTERVAL_FACTOR),
+            clear_all: false,
+        },
+        TightnessTier::Critical => {
+            let floor = Interval::days(CRITICAL_INTERVAL_FLOOR_DAYS);
+            // max(declared, floor) — never shorten an already-sparse subvol.
+            let send_interval = if declared_send_interval.as_secs() >= floor.as_secs() {
+                declared_send_interval
+            } else {
+                floor
+            };
+            EffectivePolicy {
+                local_retention: LocalRetentionPolicy::Transient,
+                send_interval,
+                clear_all: true,
+            }
+        }
+    }
+}
+
+/// Scale an interval by a factor, rounding to whole seconds. The tuple field is
+/// private to `Interval`, so the scaled duration is built via `from_chrono`.
+fn scale_interval(interval: Interval, factor: f64) -> Interval {
+    #[allow(clippy::cast_possible_truncation)]
+    let scaled_secs = (interval.as_secs() as f64 * factor) as i64;
+    Interval::from_chrono(chrono::Duration::seconds(scaled_secs))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,10 +382,6 @@ mod tests {
         );
         assert_eq!(
             TightnessTier::from(HeadroomSeverity::Pressure),
-            TightnessTier::Critical
-        );
-        assert_eq!(
-            TightnessTier::from(HeadroomSeverity::Critical),
             TightnessTier::Critical
         );
     }
@@ -330,19 +456,24 @@ mod tests {
     #[test]
     fn sticky_hold_critical_below_disarm_band() {
         // Armed Critical, free recovered to 0.18 (classifies Tight) but not
-        // past 0.20 → holds Critical (anti-flap).
+        // past the 0.25 Caution-line band (031-b S1) → holds Critical (anti-flap).
         assert_eq!(
             resolve_armed_tier(TightnessTier::Critical, Some(0.18)),
+            TightnessTier::Critical
+        );
+        // Even at 0.22 — past the old 0.20 band but below the new 0.25 — it holds.
+        assert_eq!(
+            resolve_armed_tier(TightnessTier::Critical, Some(0.22)),
             TightnessTier::Critical
         );
     }
 
     #[test]
     fn disarm_critical_to_tight_above_band() {
-        // Free recovered to 0.22 (> 0.20) → Critical disarms to Tight, but
-        // 0.22 < 0.30 so it stays Tight.
+        // Free recovered to 0.26 (> 0.25 Caution line, 031-b S1) → Critical
+        // disarms to Tight; 0.26 < 0.30 so it stays Tight.
         assert_eq!(
-            resolve_armed_tier(TightnessTier::Critical, Some(0.22)),
+            resolve_armed_tier(TightnessTier::Critical, Some(0.26)),
             TightnessTier::Tight
         );
     }
@@ -408,15 +539,16 @@ mod tests {
     }
 
     #[test]
-    fn boundary_0_20_critical_disarm_is_strict() {
-        // Exactly 0.20 does NOT clear the Critical→Tight band (strict `>`).
+    fn boundary_0_25_critical_disarm_is_strict() {
+        // Exactly 0.25 does NOT clear the Critical→Tight band (strict `>`,
+        // 031-b S1 wider band).
         assert_eq!(
-            resolve_armed_tier(TightnessTier::Critical, Some(0.20)),
+            resolve_armed_tier(TightnessTier::Critical, Some(0.25)),
             TightnessTier::Critical
         );
         // Just past it disarms.
         assert_eq!(
-            resolve_armed_tier(TightnessTier::Critical, Some(0.2001)),
+            resolve_armed_tier(TightnessTier::Critical, Some(0.2501)),
             TightnessTier::Tight
         );
     }
@@ -499,5 +631,100 @@ mod tests {
                 host_root: true,
             })
         );
+    }
+
+    // ── S1: Critical↔Tight limit-cycle regression (031-b) ────────────────
+
+    #[test]
+    fn critical_held_through_clear_all_until_caution_line() {
+        // S1 limit-cycle guard. A pool entered Critical because of Urd's own
+        // retain-one footprint (the htpc case). clear-all frees that footprint,
+        // lifting free-ratio from ~0.14 (Critical) to ~0.21 — PAST the old 0.20
+        // Critical→Tight band but NOT the new 0.25 Caution-line band. It must
+        // HOLD Critical, or de-escalating to Tight/retain-one re-grows the
+        // footprint and re-escalates (the flap), paying a full send each cycle.
+        assert_eq!(
+            resolve_armed_tier(TightnessTier::Critical, Some(0.21)),
+            TightnessTier::Critical,
+        );
+        // Only once it clears the Caution line (0.25 free) does it shed the cap.
+        assert_eq!(
+            resolve_armed_tier(TightnessTier::Critical, Some(0.26)),
+            TightnessTier::Tight,
+        );
+    }
+
+    // ── derive_effective_policy matrix (031-b AB2) ───────────────────────
+
+    fn grad() -> LocalRetentionPolicy {
+        LocalRetentionPolicy::Graduated(crate::types::ResolvedGraduatedRetention {
+            hourly: 24,
+            daily: 30,
+            weekly: 26,
+            monthly: crate::types::MonthlyCount::Count(12),
+            yearly: 0,
+        })
+    }
+
+    #[test]
+    fn effective_policy_roomy_is_declared_passthrough() {
+        let eff = derive_effective_policy(&grad(), Interval::days(1), true, TightnessTier::Roomy);
+        assert_eq!(eff.local_retention, grad());
+        assert_eq!(eff.send_interval.as_secs(), Interval::days(1).as_secs());
+        assert!(!eff.clear_all);
+    }
+
+    #[test]
+    fn effective_policy_tight_is_transient_with_scaled_interval() {
+        let eff = derive_effective_policy(&grad(), Interval::days(1), true, TightnessTier::Tight);
+        assert!(eff.local_retention.is_transient());
+        // daily × 1.5 = 36h.
+        assert_eq!(eff.send_interval.as_secs(), 36 * 3600);
+        assert_eq!(eff.send_interval.to_string(), "36h");
+        assert!(!eff.clear_all);
+    }
+
+    #[test]
+    fn effective_policy_critical_is_clear_all_with_floor() {
+        let eff = derive_effective_policy(&grad(), Interval::days(1), true, TightnessTier::Critical);
+        assert!(eff.local_retention.is_transient());
+        // declared daily < 7d floor → floored to weekly.
+        assert_eq!(eff.send_interval.as_secs(), Interval::days(7).as_secs());
+        assert!(eff.clear_all);
+    }
+
+    #[test]
+    fn effective_policy_critical_floor_never_shortens() {
+        // A declared-fortnightly subvol at Critical keeps its 2w interval
+        // (max(declared, 7d) = declared), and still clears all.
+        let declared = "2w".parse::<Interval>().unwrap();
+        let eff = derive_effective_policy(&grad(), declared, true, TightnessTier::Critical);
+        assert_eq!(eff.send_interval.as_secs(), declared.as_secs());
+        assert!(eff.clear_all);
+    }
+
+    #[test]
+    fn effective_policy_declared_transient_at_tight_is_lifecycle_noop_but_lengthens() {
+        // A subvol already Transient stays Transient at Tight (lifecycle no-op)
+        // but the interval is still scaled — Tight always lengthens the cadence.
+        let eff = derive_effective_policy(
+            &LocalRetentionPolicy::Transient,
+            Interval::hours(4),
+            true,
+            TightnessTier::Tight,
+        );
+        assert!(eff.local_retention.is_transient());
+        assert_eq!(eff.send_interval.as_secs(), 6 * 3600); // 4h × 1.5
+        assert!(!eff.clear_all);
+    }
+
+    #[test]
+    fn effective_policy_local_only_is_full_noop_at_every_tier() {
+        for tier in [TightnessTier::Roomy, TightnessTier::Tight, TightnessTier::Critical] {
+            let eff = derive_effective_policy(&grad(), Interval::days(1), false, tier);
+            assert_eq!(eff.local_retention, grad());
+            assert_eq!(eff.send_interval.as_secs(), Interval::days(1).as_secs());
+            assert!(!eff.clear_all, "local-only never clears at {tier:?}");
+        }
     }
 }

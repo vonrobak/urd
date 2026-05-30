@@ -174,7 +174,7 @@ produce the same internal `Config` struct — v1/v2 synthesize `LocalSnapshotsCo
 - Test retention logic exhaustively — it protects against data loss
 - When building features, use vertical slicing: write one test, implement to pass, repeat. Never write all tests first then all implementation.
 - **Symmetric fixes need symmetric reviews.** When a bug is rooted in a shared planning or rendering pattern (e.g. "augment local_snaps with planned_snap" in plan.rs), grep for the pattern in adjacent code paths before closing the fix. The May 2 stranded-snapshots incident: commit `0f52555` correctly fixed the transient planner branch in April; the symmetric bug in the non-transient branch went unnoticed for nearly a month. See [2026-05-02-stranded-snapshots-non-transient-planner.md](docs/98-journals/2026-05-02-stranded-snapshots-non-transient-planner.md).
-- 521+ tests, all passing, clippy clean
+- 1520+ tests, all passing, clippy clean
 
 ## Backward Compatibility (ADR-105)
 
@@ -238,7 +238,7 @@ Consult when working on code that directly uses these APIs (especially `state.rs
 ```bash
 cargo build                          # Debug
 cargo build --release                # Release
-cargo test                           # Unit tests (931+ tests)
+cargo test                           # Unit tests (1520+ tests)
 cargo test -- --ignored              # Integration tests (needs drives)
 cargo clippy --all-targets -- -D warnings   # Lint (covers test code too)
 cargo check --all-targets            # Fast type-check after mass edits (covers test code; bare `cargo check` does not)

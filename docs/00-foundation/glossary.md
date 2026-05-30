@@ -248,7 +248,7 @@ runs in the backup hot path.
 | `outer-edge span` | The time span from the *outer* edge of a tier's window back to its inner edge — the only thing that changes total data cost as the shape changes. Slot density inside a window does not. |
 | `drift signal` | The rolling churn rate computed by `drift.rs` (UPI 030) from `drift_samples`. The input the recommendation engine projects cost against. |
 | `symmetric data-cost model` | ADR-115's claim: two shapes with the same outer-edge span over the same drift signal cost the same in retained data bytes, regardless of how many slots populate the interior. Metadata cost is separate and is not modelled by X1. |
-| `headroom` | Destination free-space context (`HeadroomContext`) used to scale the recommended shape. `HeadroomSeverity` is one of `Healthy / Caution / Pressure / Critical` (recommendation.rs). The classifier emits `Healthy / Caution / Pressure`; Pressure produces a tightened companion shape under `HEADROOM_TIGHTEN_MULTIPLIER`. (`Critical` is dormant in production since UPI 031 — kept for the UPI 032/033 bundle.) |
+| `headroom` | Destination free-space context (`HeadroomContext`) used to scale the recommended shape. `HeadroomSeverity` is one of `Healthy / Caution / Pressure` (recommendation.rs) — the classifier emits all three, and Pressure produces a tightened companion shape under `HEADROOM_TIGHTEN_MULTIPLIER`. (The dormant `Critical` variant and its dead voice/recommendation paths were deleted in UPI 031-b, AB5 — the behavioral bundle keys on `TightnessTier`, not this severity ladder.) |
 | `recommended shape` | The shape returned by `recommend_shape*()` — a `ResolvedGraduatedRetention`-shaped suggestion paired with a `CostProjection` and the `AdjustmentReason`s that explain why it differs from what the user has today. |
 
 Source: `recommendation.rs`, ADR-115.
@@ -289,18 +289,25 @@ persisted, hysteresis-stabilized state. Lives in `storage_critical.rs` (pure der
 with I/O at the command boundary (`commands/storage_signals.rs`). It surfaces
 **told-not-silent** in `urd status` and bare `urd`, notifies on backup escalations, and
 appears as a diagnostic line in `doctor --thorough`'s data-safety section. The
-**behavioral** half (defer, ephemeral lifecycle, mid-op watchdog) is deferred to the UPI
-032/033 bundle (ADR-113 increment 2).
+**behavioral** half — the tier-graded ephemeral lifecycle (retain-one @ Tight, clear-all
+@ Critical) plus the AT-RISK cap — shipped in **UPI 031-b** (ADR-113 Layer 1). The mid-op
+watchdog (033) and emergency eject (034) remain ahead; predictive guards (the old UPI 032)
+were retired in the 2026-05-30 re-grill.
 
 | Term | Meaning |
 |------|---------|
 | `tightness tier` | Source-pool free-space tier, **free-ratio only**: `TightnessTier { Roomy, Tight, Critical }` (`storage_critical.rs`). Boundaries reuse `recommendation::classify_free_ratio_value` (`< 0.25` → Tight, `< 0.15` → Critical) — the single source of truth, **no new threshold**. The imperative-bundle axis the Do-No-Harm response climbs with. |
 | `tight` / `critical` | User-facing names for the `Tight` / `Critical` tiers (state vocabulary). `Roomy` is silent — Urd says nothing about a roomy pool. |
 | `host-root axis` | The structural escalation flag (`storage_critical::host_root`): the subvolume's source is on the pool hosting `/` (UUID match) **and** an *enabled* subvolume entrusts `/` itself (`source == "/"`). Orthogonal to the tier — pressure on the host-root pool risks the **machine itself**, not just retention. This is the relocated home of UPI 031's stakes-not-action advisory prose. |
-| `storage posture` | The per-subvolume `StoragePosture { tier, host_root }` carried on `SubvolAssessment` — `Some` only when `tier >= Tight`. A separate presentation axis from the data-safety `PromiseStatus` (ADR-110 R4): "Urd is watching a tight pool," not "your data is unsafe." |
+| `storage posture` | The per-subvolume `StoragePosture { tier, host_root }` carried on `SubvolAssessment` — `Some` only when `tier >= Tight`. A presentation axis distinct from the data-safety `PromiseStatus`: "Urd is watching a tight pool." **Mostly** separate (ADR-110 R4) — **but** UPI 031-b's AT-RISK cap is the one recorded coupling: at **Critical**, the deliberate clear-all cadence is an honest reduction in protection, so the promise is capped at AT RISK (ADR-110 amendment 2026-05-30, overturning R4 at Critical only). Tight/Roomy stay fully separate. |
 | `watching` | The posture verb: Urd is *watching* a tight pool (told-not-silent), as distinct from a data-safety promise degradation. |
 | `armed tier` / `operational-adaptation state` | The persisted, hysteresis-stabilized tier per pool (`pool_armed_tier` table: `pool_uuid → (armed_tier, since)`). Best-effort SQLite (ADR-102) — never blocks a run; if lost, Urd re-derives statelessly (degraded, never unsafe). The seed of the future managed-config/autonomy layer; lives in Urd's state, **never** in `urd.toml`. |
-| `hysteresis band` | `HYSTERESIS_BAND_PP = 0.05` — escalate immediately when the current ratio classifies worse than the armed tier; de-escalate only once free recovers to `arm_threshold + 5pp` (Critical→Tight at `> 0.20`, Tight→Roomy at `> 0.30`). Anti-flap: stops a pool hovering at a boundary from re-notifying every run. 031-a's one new constant; revisited at the ADR-113 30-day checkpoint. |
+| `hysteresis band` | Escalate immediately when the current ratio classifies worse than the armed tier; de-escalate stickily. Tight→Roomy uses `HYSTERESIS_BAND_PP = 0.05` (free `> 0.30`). Critical→Tight uses the **wider** `CRITICAL_DEESCALATION_BAND_PP = 0.10` (free `> 0.25`, the Caution line — UPI 031-b S1): clear-all moves the controlled variable, so a pool must recover to where the classifier stops calling it tight at all before shedding the footprint-cap, damping a Critical↔Tight limit cycle toward the safe (capped) state. Anti-flap; revisited at the ADR-113 30-day checkpoint. |
+| `tier-graded ephemeral lifecycle` | The UPI 031-b behavioral spine (ADR-113 Layer 1): the armed `TightnessTier` selects how much local footprint Urd sheds. **Roomy** → declared policy. **Tight** → `retain-one` + a modest interval stretch (`TIGHT_INTERVAL_FACTOR = 1.5`). **Critical** → `clear-all` + a weekly interval floor (`CRITICAL_INTERVAL_FLOOR = 7d`). Derived purely by `storage_critical::derive_effective_policy`. |
+| `retain-one` | The Tight lifecycle: keep exactly **one** local snapshot (the pin parent) for incremental sends; the executor deletes the *old* parent after the send advances the pin. It is the `Transient` retention policy — there is no separate variant. |
+| `clear-all` | The Critical lifecycle: keep **zero** local snapshots between runs. The planner writes no pin (`pin_on_success: None`); after confirming all sends succeeded, the executor (gated, ADR-107) removes the pin and deletes the just-sent snapshot. Steady-state Critical is therefore full sends. Modeled as `Transient` + the executor `clear_all` signal — **not** a new `LocalRetentionPolicy` variant. |
+| `effective policy` / `declared intent` | `declared intent` = what the user's config says (`ResolvedSubvolume.local_retention` / `send_interval`). `effective policy` = `EffectivePolicy { local_retention, send_interval, clear_all }`, the tier-adapted operational policy the planner, executor, **and** awareness all act on. The planner and awareness MUST derive the same effective policy from the **same** armed tier (the single pre-plan gather, `backup.rs`) or a correctly-adapting subvolume shows false AT RISK. |
+| `cadence_adapted` | The signal (`SubvolAssessment.cadence_adapted`) that distinguishes a **deliberate** AT-RISK cap (the pre-cap status was PROTECTED; a slowed Critical cadence — "less protected than declared") from a **genuine** failure (drive absent, chain broken, stale beyond the effective interval). `true` only in the deliberate case. Voice reads it to lead with adaptation prose rather than a failure line. Never serialized as a status token — the word stays `AT RISK` (AB3.1). |
 | `transition` | A change in armed tier, computed **only** at the backup boundary (`advance_and_writeback`). Escalations dispatch a best-effort `notify.rs` notification; de-escalation is silent (status reflects recovery). Read paths (`status`, bare `urd`, `doctor`) reflect the stabilized tier and **never** fire a transition (S1). |
 
 **`headroom` vs `tightness tier` (do not confuse).** `headroom` (recommendation.rs) is a
@@ -310,8 +317,9 @@ on the *source* pool: trend is handled separately in 032's projection, destinati
 is irrelevant to source-pool tightness. Same free-ratio boundaries, different composites and
 different jobs.
 
-> **Note.** `constrained` (`tier >= Tight && Urd writes to that pool`) is a **UPI 032**
-> term — deferred, not part of 031-a. 031-a's surface gates inline on `tier >= Tight`.
+> **Note.** `constrained` (`tier >= Tight && Urd writes to that pool`) was a **UPI 032**
+> term. UPI 032 (predictive guards) was **retired** in the 2026-05-30 re-grill, so
+> `constrained` did not ship. Urd's lifecycle gates directly on the armed `tier` (031-b).
 
 Source: `storage_critical.rs`, `commands/storage_signals.rs`, `state.rs` (`pool_armed_tier`),
 ADR-113. See also the user-facing rename `drift` → "churn" on the Recommendation cluster's

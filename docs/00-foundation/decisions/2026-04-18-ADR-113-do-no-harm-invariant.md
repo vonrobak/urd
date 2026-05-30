@@ -10,8 +10,33 @@
 > it prefers host survival over backup-chain continuity.
 
 **Date:** 2026-04-18
-**Status:** Accepted
+**Status:** Accepted (amended 2026-05-30, UPI 031-b)
 **Supersedes:** UPI 011 (hard-cap of 1 local snapshot for transient subvolumes)
+
+> **Amendment — 2026-05-30 (UPI 031-b, the tier-graded ephemeral spine).**
+> The probabilistic defense stack goes from **four layers to three**, and Layer 1
+> is refined:
+>
+> - **Layer 2 (predictive guards) is retired.** UPI 032 collapsed in the
+>   2026-05-30 arc re-grill: with an ephemeral-by-default footprint-cap actually
+>   acting on the armed tier, a proactive *defer* was redundant in the case it
+>   could catch and **net-negative** in the common case — HELDing a run while
+>   ambient host churn fills the disk anyway is the inaction-is-harm trap
+>   (`[[project_adr113_realignment_flagged]]`). The arc's real protection is the
+>   ephemeral lifecycle *itself*, not a guard in front of it.
+> - **Layer 1 is refined from unconditional ephemeral to tier-graded**:
+>   retain-one @ **Tight**, clear-all (zero steady local footprint) @ **Critical**,
+>   keyed on the per-pool armed `TightnessTier` (031-a detection, 031-b action).
+>   The behavioral half lands here, not via the doctor severity ladder — so the
+>   dormant `HeadroomSeverity::Critical` machinery was deleted (AB5).
+>
+> **Amended stack:** (1) reactive host-survival floor (`min_free` space guard +
+> emergency retention, no config override) → (2) **tier-graded ephemeral
+> footprint-cap** (this spine, 031-b) → (3) in-flight watchdog (033) →
+> (4) emergency eject (034). The **invariant and the probabilistic contract are
+> unchanged** — only the layer *mechanism* evolves (matching the in-place-amendment
+> precedent of ADR-104/105/110/111). See the layer table below for the per-layer
+> detail.
 
 ## Context
 
@@ -57,14 +82,19 @@ extends naturally to the other burden categories when they arise.
 Urd applies **multiple independent mechanisms**, each with a distinct failure mode,
 such that the probability of all layers failing together is vanishingly small.
 
-For storage pressure, the four layers are:
+For storage pressure, the three layers are (amended 2026-05-30, UPI 031-b —
+predictive guards retired; see the amendment block above):
 
 | Layer | Prevents | Failure mode | Caught by |
 |-------|----------|--------------|-----------|
-| 1. Ephemeral lifecycle (snapshot → send → delete) on storage_critical subvolumes | Steady-state delta drift in the 24h pin window | N/A (structural) | — |
-| 2. Predictive guards (drift projection + defer) | Sends starting in risky conditions | Prediction too optimistic | Layer 3 |
-| 3. Mid-op watchdog (free-space polling + write-rate sensing during send) | Sends that went bad in-flight | Watchdog loses the race | Layer 4 |
-| 4. Emergency eject (sentinel drops Urd-owned snapshots to reclaim space) | Residual pressure after prediction and watchdog both failed | BTRFS itself failed (ENOSPC mid-transaction, read-only FS) | Outside Urd's domain |
+| 1. **Tier-graded ephemeral footprint-cap** — retain-one @ Tight / clear-all @ Critical, keyed on the per-pool armed `TightnessTier` (031-a/031-b) | Steady-state delta drift in the pin window; at Critical, *any* steady local footprint | N/A (structural) | — |
+| 2. Mid-op watchdog (free-space polling + write-rate sensing during send) | Sends that went bad in-flight | Watchdog loses the race | Layer 3 |
+| 3. Emergency eject (sentinel drops Urd-owned snapshots to reclaim space) | Residual pressure after the footprint-cap and watchdog both failed | BTRFS itself failed (ENOSPC mid-transaction, read-only FS) | Outside Urd's domain |
+
+*Retired (2026-05-30):* **Predictive guards (drift projection + defer).** UPI 032
+collapsed — a proactive defer was redundant where the footprint-cap already acts
+and net-negative otherwise (inaction-is-harm). The `min_free` space guard +
+emergency retention remain as the reactive host-survival floor beneath Layer 1.
 
 Each layer's failure is caught by the next. Each layer has a distinct probabilistic
 profile — they fail under different conditions, so their combined failure probability
@@ -136,9 +166,10 @@ prefer host survival under catastrophic conditions.
 
 ### Negative
 
-- **More moving parts.** Four defensive layers plus telemetry is substantially more
-  machinery than the current reactive guard. Each layer has test surface, tuning
-  parameters, and failure modes of its own.
+- **More moving parts.** Three defensive layers plus telemetry (was four before the
+  2026-05-30 amendment retired predictive guards) is substantially more machinery than
+  the current reactive guard. Each layer has test surface, tuning parameters, and
+  failure modes of its own.
 - **Performance cost.** Watchdog polling during sends adds overhead. Reserve file
   consumes disk space. Telemetry writes to the state DB on every run.
 - **Full sends on storage_critical subvolumes.** Ephemeral lifecycle means no
@@ -170,26 +201,26 @@ prefer host survival under catastrophic conditions.
 
 ## Implementation
 
-The Do-No-Harm arc spans 5 UPIs (030-034), sequenced as dependencies require:
+The Do-No-Harm arc (amended 2026-05-30 — UPI 032 retired, see the amendment block):
 
 1. **UPI 030 — Drift Telemetry.** Foundation. Per-subvolume write-rate history in
-   `state.rs`, surfaced in `awareness.rs` and heartbeat. Blocks everything else.
-2. **UPI 031 — storage_critical Bundle.** New config concept with auto-detection
-   (`source = "/"`, FS usage ≥ 70%, known heavy-write paths). Ephemeral lifecycle
-   for critical subvolumes. Conservative interval defaults. Supersedes UPI 011.
-3. **UPI 032 — Predictive Guards.** Pre-flight drift projection. Defers sends when
-   projected drift would cross threshold. Uses telemetry from UPI 030.
-4. **UPI 033 — Mid-op Watchdog + Reserve File.** Trigger-with-cleanup-budget + reserve
-   file + write-rate sensing during sends. Runs inside `executor.rs` or extracted into
-   a `guard.rs` module.
-5. **UPI 034 — Emergency Eject.** Sentinel extension. Drops Urd-owned snapshots when
-   pressure crosses catastrophic floor outside of an active send.
+   `state.rs`, surfaced in `awareness.rs` and heartbeat. Blocks everything else. *(Shipped.)*
+2. **UPI 031-a — Tightness detection.** Split the storage-critical predicate into a
+   per-pool armed `TightnessTier` (Roomy/Tight/Critical, free-ratio only) + a host-root
+   flag, surfaced told-not-silent in `urd status`. Persisted, hysteresis-stabilized.
+   Supersedes UPI 011. *(Shipped.)*
+3. **UPI 031-b — Tier-graded ephemeral spine.** Threads the armed tier into the planner,
+   executor, and awareness: Tight → retain-one + modest interval stretch; Critical →
+   clear-all (executor-gated) + weekly interval floor; awareness caps the promise at
+   AT RISK while Critical. This is the behavioral Layer 1. *(This UPI.)*
+4. ~~**UPI 032 — Predictive Guards.**~~ **Retired** (2026-05-30 re-grill): redundant where
+   the footprint-cap acts, net-negative otherwise (inaction-is-harm).
+5. **UPI 033 — Mid-op Watchdog + Reserve File.** Trigger-with-cleanup-budget + reserve
+   file + write-rate sensing during sends. Runs inside `executor.rs` or a `guard.rs` module.
+6. **UPI 034 — Emergency Eject.** Sentinel extension. Drops Urd-owned snapshots when
+   pressure crosses the catastrophic floor outside of an active send.
 
-Shippable increments:
-- **Increment 1:** UPI 030 alone (observability, no behavior change).
-- **Increment 2:** UPIs 031+032+033 together (the safety harness — coherent behavior
-  change).
-- **Increment 3:** UPI 034 (last-ditch layer).
+Arc sequence beyond this UPI: **031-b → 033 → 034**.
 
 Each increment is independently testable and independently deployable. `/design` is
 run per UPI. Adversary review and post-review apply to each.

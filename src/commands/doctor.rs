@@ -546,8 +546,7 @@ fn build_doctor_recommendation_view_inner(
 
         let local = match (local_rec, severity_local, local_current_shape) {
             (Some(r), _, _) => Some(r),
-            (None, HeadroomSeverity::Pressure, Some(cur))
-            | (None, HeadroomSeverity::Critical, Some(cur)) => {
+            (None, HeadroomSeverity::Pressure, Some(cur)) => {
                 let reason = recommendation::pick_reason(ctx_local, severity_local, None)
                     .unwrap_or(AdjustmentReason::SourcePoolLow {
                         free_ratio: source_free_ratio,
@@ -563,8 +562,7 @@ fn build_doctor_recommendation_view_inner(
         };
         let external = match (external_rec, severity_external, external_current_shape) {
             (Some(r), _, _) => Some(r),
-            (None, HeadroomSeverity::Pressure, Some(cur))
-            | (None, HeadroomSeverity::Critical, Some(cur)) => {
+            (None, HeadroomSeverity::Pressure, Some(cur)) => {
                 let reason = recommendation::pick_reason(
                     ctx_external,
                     severity_external,

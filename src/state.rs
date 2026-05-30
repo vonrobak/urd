@@ -1154,40 +1154,6 @@ impl StateDb {
     // Best-effort (ADR-102) — never blocks a backup; if lost, Urd
     // re-derives the current tier statelessly (degraded, never unsafe).
 
-    /// Read the armed tier + `since` for one pool. `None` when the pool has
-    /// no row (never tracked) or the stored tier string is unparseable
-    /// (skip, do not guess — fail toward stateless).
-    ///
-    /// The single-pool granular accessor; 031-a's hot path reads the batched
-    /// `all_armed_tiers` instead. Kept as the per-query primitive (CLAUDE.md
-    /// `state.rs` guidance) and the 032/033 single-pool read hook — exercised
-    /// by tests, no 031-a production caller yet.
-    #[allow(dead_code)]
-    pub fn armed_tier_for_pool(
-        &self,
-        pool_uuid: &str,
-    ) -> crate::error::Result<
-        Option<(crate::storage_critical::TightnessTier, chrono::NaiveDateTime)>,
-    > {
-        let row = self
-            .conn
-            .query_row(
-                "SELECT armed_tier, since FROM pool_armed_tier WHERE pool_uuid = ?1",
-                rusqlite::params![pool_uuid],
-                |row| {
-                    let tier_s: String = row.get(0)?;
-                    let since_s: String = row.get(1)?;
-                    Ok((tier_s, since_s))
-                },
-            )
-            .ok();
-
-        let Some((tier_s, since_s)) = row else {
-            return Ok(None);
-        };
-        Ok(Self::parse_armed_tier_row(&tier_s, &since_s))
-    }
-
     /// Batched read of every tracked pool's armed tier (for `gather()`).
     /// Unparseable rows are skipped (logged), not surfaced.
     pub fn all_armed_tiers(
@@ -3330,7 +3296,7 @@ mod tests {
         let since = drift_dt("2026-05-20T04:00:00");
         db.upsert_armed_tier_best_effort("pool-A", TightnessTier::Tight, since);
 
-        let got = db.armed_tier_for_pool("pool-A").unwrap();
+        let got = db.all_armed_tiers().unwrap().get("pool-A").copied();
         assert_eq!(got, Some((TightnessTier::Tight, since)));
     }
 
@@ -3352,7 +3318,7 @@ mod tests {
             .unwrap();
         assert_eq!(count, 1);
         assert_eq!(
-            db.armed_tier_for_pool("pool-A").unwrap(),
+            db.all_armed_tiers().unwrap().get("pool-A").copied(),
             Some((TightnessTier::Critical, bumped))
         );
     }
@@ -3360,7 +3326,7 @@ mod tests {
     #[test]
     fn armed_tier_unknown_pool_is_none() {
         let db = StateDb::open_memory().unwrap();
-        assert_eq!(db.armed_tier_for_pool("nope").unwrap(), None);
+        assert_eq!(db.all_armed_tiers().unwrap().get("nope").copied(), None);
     }
 
     #[test]
@@ -3408,7 +3374,7 @@ mod tests {
                 [],
             )
             .unwrap();
-        assert_eq!(db.armed_tier_for_pool("pool-A").unwrap(), None);
+        assert_eq!(db.all_armed_tiers().unwrap().get("pool-A").copied(), None);
         assert!(db.all_armed_tiers().unwrap().is_empty());
     }
 }

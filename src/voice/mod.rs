@@ -539,6 +539,8 @@ pub(crate) mod test_fixtures {
                     external_only: false,
                     errors: vec![],
                     storage_posture: None,
+                    cadence_adapted: false,
+                    effective_send_interval_secs: None,
                 },
                 StatusAssessment {
                     name: "htpc-docs".to_string(),
@@ -567,6 +569,8 @@ pub(crate) mod test_fixtures {
                     external_only: false,
                     errors: vec![],
                     storage_posture: None,
+                    cadence_adapted: false,
+                    effective_send_interval_secs: None,
                 },
             ],
             chain_health: vec![
@@ -664,6 +668,8 @@ pub(crate) mod test_fixtures {
                 external_only: false,
                 errors: vec![],
                 storage_posture: None,
+                cadence_adapted: false,
+                effective_send_interval_secs: None,
             }],
             transitions: vec![],
             warnings: vec![],
@@ -925,6 +931,56 @@ mod tests {
             head.contains("critically tight"),
             "tight state not in first lines: {head}"
         );
+    }
+
+    #[test]
+    fn status_2am_golden_critical_adapted_reads_as_care_not_failure() {
+        // The 031-b half of the 2am golden test (AB3.1, the R4-overturn
+        // acceptance criterion). A Critical pool slowed Urd to a weekly cadence,
+        // capping the promise to AT RISK *by design*. The first lines must read
+        // as deliberate care — naming the cadence — NOT as a broken backup.
+        use crate::storage_critical::TightnessTier;
+        let _color = color_guard(false);
+        let mut data = test_status_output();
+        data.assessments.truncate(1); // keep only htpc-home (healthy, Protected)
+        data.storage_postures = vec![posture("/", TightnessTier::Critical, true, 1, Some(3600))];
+        let h = &mut data.assessments[0];
+        h.status = PromiseStatus::AtRisk; // capped from Protected
+        h.cadence_adapted = true;
+        h.effective_send_interval_secs = Some(7 * 86400); // weekly
+        // declared-Graduated (external_only stays false) → history-reduced clause.
+
+        let out = render_status(&data, OutputMode::Interactive);
+        let head = out.lines().take(4).collect::<Vec<_>>().join("\n");
+        assert!(head.contains("by design"), "adaptation framing missing from head: {head}");
+        assert!(head.contains("7d"), "named cadence missing from head: {head}");
+        assert!(head.contains("to spare"), "spare-the-drive prose missing: {head}");
+        assert!(
+            !head.contains("chain broken"),
+            "an adapted-but-healthy subvol must not read as a failure: {head}"
+        );
+    }
+
+    #[test]
+    fn status_2am_golden_critical_failing_leads_with_failure_not_adaptation() {
+        // Sibling case: a Critical-pool subvolume that is genuinely failing
+        // (cadence_adapted == false) must NOT get the reassuring "by design"
+        // prose — the failure is the more urgent truth and leads.
+        let _color = color_guard(false);
+        let mut data = test_status_output();
+        // htpc-docs (assessments[1]) is AT RISK + degraded (chain broken) in the
+        // fixture. Give it an adapted interval but leave cadence_adapted false.
+        let d = &mut data.assessments[1];
+        d.effective_send_interval_secs = Some(7 * 86400);
+        d.cadence_adapted = false;
+
+        let out = render_status(&data, OutputMode::Interactive);
+        assert!(
+            !out.contains("by design"),
+            "a genuine failure must not be reassured as 'by design': {out}"
+        );
+        let head = out.lines().take(4).collect::<Vec<_>>().join("\n");
+        assert!(head.contains("chain broken"), "failure reason must lead: {head}");
     }
 
     #[test]
@@ -4136,6 +4192,8 @@ mod tests {
             external_only: false,
             errors: vec![],
             storage_posture: None,
+            cadence_adapted: false,
+            effective_send_interval_secs: None,
         }
     }
 
@@ -5861,67 +5919,6 @@ mod tests {
     }
 
     #[test]
-    fn format_row_critical_renders_pointer_only() {
-        let _color = color_guard(false);
-        let cur = shape(24, 60, 52, crate::types::MonthlyCount::Count(24), 0);
-        let h = crate::recommendation::headroom_aware_pointer_only(
-            &cur,
-            crate::recommendation::ShapeRole::Local,
-            crate::recommendation::HeadroomSeverity::Critical,
-            crate::recommendation::AdjustmentReason::SourcePoolLow { free_ratio: 0.1 },
-        );
-        let view = crate::output::DoctorRecommendationView {
-            header: "h".to_string(),
-            rows: vec![crate::output::DoctorRecommendationRow {
-                name: "containers".to_string(),
-                local: Some(h),
-                external: None,
-                note: None,
-                was_named_level: None,
-            }],
-        };
-        let out = render_doctor(&recommendations_doctor_output(view), OutputMode::Interactive);
-        assert!(
-            out.contains("storage critical"),
-            "Critical pointer line missing: {out}"
-        );
-        assert!(!out.contains("daily="), "no shape at Critical: {out}");
-    }
-
-    #[test]
-    fn format_row_critical_suppresses_bursty_and_named_level_hints() {
-        // R9: Critical severity suppresses both bursty pattern and
-        // was_named_level hints.
-        let _color = color_guard(false);
-        let cur = shape(24, 60, 52, crate::types::MonthlyCount::Count(24), 0);
-        let h = crate::recommendation::headroom_aware_pointer_only(
-            &cur,
-            crate::recommendation::ShapeRole::Local,
-            crate::recommendation::HeadroomSeverity::Critical,
-            crate::recommendation::AdjustmentReason::SourcePoolLow { free_ratio: 0.1 },
-        );
-        let view = crate::output::DoctorRecommendationView {
-            header: "h".to_string(),
-            rows: vec![crate::output::DoctorRecommendationRow {
-                name: "containers".to_string(),
-                local: Some(h),
-                external: None,
-                note: Some(crate::recommendation::RecommendationNote::BurstyPattern),
-                was_named_level: Some(crate::types::ProtectionLevel::Sheltered),
-            }],
-        };
-        let out = render_doctor(&recommendations_doctor_output(view), OutputMode::Interactive);
-        assert!(
-            !out.contains("bursty pattern"),
-            "bursty hint must be suppressed at Critical: {out}"
-        );
-        assert!(
-            !out.contains("applying switches to custom"),
-            "named-level hint must be suppressed at Critical: {out}"
-        );
-    }
-
-    #[test]
     fn format_row_per_role_independent_severity() {
         // Local Healthy, External Pressure → Local renders bare,
         // External renders the adjustment.
@@ -5989,31 +5986,6 @@ mod tests {
         let out = render_doctor(&recommendations_doctor_output(view), OutputMode::Interactive);
         assert!(!out.contains("daily="), "synth must omit shape: {out}");
         assert!(out.contains("shape already at minimum"), "at-MIN message missing: {out}");
-    }
-
-    #[test]
-    fn format_row_synth_critical_emits_pointer_only() {
-        let _color = color_guard(false);
-        let cur = shape(0, 3, 0, crate::types::MonthlyCount::Count(0), 0);
-        let h = crate::recommendation::headroom_aware_pointer_only(
-            &cur,
-            crate::recommendation::ShapeRole::Local,
-            crate::recommendation::HeadroomSeverity::Critical,
-            crate::recommendation::AdjustmentReason::SourcePoolLow { free_ratio: 0.1 },
-        );
-        let view = crate::output::DoctorRecommendationView {
-            header: "h".to_string(),
-            rows: vec![crate::output::DoctorRecommendationRow {
-                name: "transient".to_string(),
-                local: Some(h),
-                external: None,
-                note: None,
-                was_named_level: None,
-            }],
-        };
-        let out = render_doctor(&recommendations_doctor_output(view), OutputMode::Interactive);
-        assert!(out.contains("storage critical"), "pointer line missing: {out}");
-        assert!(!out.contains("daily="), "no shape: {out}");
     }
 
     // ── UPI 042 — MonthlyCount + yearly rendering ───────────────────

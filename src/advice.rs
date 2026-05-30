@@ -532,6 +532,8 @@ drives = ["primary-drive", "offsite-drive"]
             redundancy_advisories: vec![],
             errors: vec![],
             storage_posture: None,
+            cadence_adapted: false,
+            effective_send_interval: None,
         }
     }
 
@@ -1153,6 +1155,8 @@ local_retention = "transient"
             redundancy_advisories: vec![],
             errors: vec![],
             storage_posture: None,
+            cadence_adapted: false,
+            effective_send_interval: None,
         }
     }
 

@@ -55,31 +55,25 @@ pub struct HeadroomContext {
 
 /// Per-(subvolume, role) headroom severity (UPI 044). Ordering is
 /// load-bearing: `.iter().max()` yields the dominant tier when multiple
-/// signals fire. Critical is **not** in the classifier's output domain.
+/// signals fire.
 ///
-/// UPI 031 retired the doctor-side Critical *injection* (the old
-/// force-Critical path), so as of this UPI nothing in production constructs
-/// `Critical` — the tier, the voice R9 pointer path, and
-/// `headroom_aware_pointer_only(.., Critical, ..)` are reachable only from
-/// tests. This is the intentional hook for the behavioral bundle (UPIs
-/// 032/033), time-boxed to that horizon; if the bundle slips, reconsider
-/// whether the tier should be deleted rather than maintained unused.
+/// UPI 031 retired the doctor-side Critical *injection*; UPI 031-b's
+/// tier-graded ephemeral spine confirmed the behavioral bundle keys on
+/// `TightnessTier`, not this severity ladder, so the dormant `Critical`
+/// variant (and its dead voice/recommendation paths) were deleted (AB5).
+/// `classify_headroom_severity` emits only `Healthy | Caution | Pressure`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HeadroomSeverity {
     Healthy,
     Caution,
     Pressure,
-    /// Dormant in production since UPI 031 (see the type doc). Kept alive for
-    /// the UPI 032/033 bundle and exercised by tests.
-    #[allow(dead_code)]
-    Critical,
 }
 
-/// Compute the headroom severity from a `HeadroomContext`. Returns only
-/// `Healthy | Caution | Pressure` — Critical is injected externally by
-/// doctor.rs. Three signals (free ratio, time-to-empty, metadata) are
-/// classified independently and the max is returned.
+/// Compute the headroom severity from a `HeadroomContext`. Returns
+/// `Healthy | Caution | Pressure` (the full domain since UPI 031-b deleted the
+/// dormant Critical variant). Three signals (free ratio, time-to-empty,
+/// metadata) are classified independently and the max is returned.
 #[must_use]
 pub fn classify_headroom_severity(ctx: HeadroomContext) -> HeadroomSeverity {
     let free_ratio_sev = classify_free_ratio(
@@ -461,13 +455,13 @@ fn tighten(
 }
 
 /// Synthesize a "pointer-only" recommendation for doctor.rs when severity
-/// is `Pressure` or `Critical` and the churn-fit engine returned `None`
-/// (cold/transient subvolume). The renderer detects the synth shape via
+/// is `Pressure` and the churn-fit engine returned `None` (cold/transient
+/// subvolume). The renderer detects the synth shape via
 /// `suggested == current && both costs zero` and emits only the reason
 /// line — no shape, no recovery tail.
 ///
-/// Severity is restricted to `Pressure | Critical`; Healthy/Caution synth
-/// is meaningless and would represent a doctor.rs bug.
+/// Severity is restricted to `Pressure`; Healthy/Caution synth is meaningless
+/// and would represent a doctor.rs bug.
 #[must_use]
 pub fn headroom_aware_pointer_only(
     current: &ResolvedGraduatedRetention,
@@ -476,8 +470,8 @@ pub fn headroom_aware_pointer_only(
     reason: AdjustmentReason,
 ) -> HeadroomAwareRecommendation {
     debug_assert!(
-        matches!(severity, HeadroomSeverity::Pressure | HeadroomSeverity::Critical),
-        "headroom_aware_pointer_only is only valid for Pressure or Critical severity, got {severity:?}",
+        matches!(severity, HeadroomSeverity::Pressure),
+        "headroom_aware_pointer_only is only valid for Pressure severity, got {severity:?}",
     );
     let zero_cost = CostProjection {
         data_bytes: 0,
@@ -1159,9 +1153,10 @@ mod tests {
     }
 
     #[test]
-    fn classify_never_returns_critical() {
-        // Critical is not in the classifier's output domain. Even with
-        // every signal maxed, the result tops out at Pressure.
+    fn classify_tops_out_at_pressure() {
+        // Pressure is the top of the classifier's output domain. Even with
+        // every signal maxed, the result tops out at Pressure (the dormant
+        // Critical variant was deleted in UPI 031-b, AB5).
         let ctx = HeadroomContext {
             source_pool_free_bytes: Some(1),
             source_pool_capacity_bytes: Some(100),
@@ -1169,18 +1164,16 @@ mod tests {
             destination_metadata_ratio: Some(0.999),
         };
         let sev = classify_headroom_severity(ctx);
-        assert_ne!(sev, HeadroomSeverity::Critical);
         assert_eq!(sev, HeadroomSeverity::Pressure);
     }
 
     #[test]
     fn severity_variant_ordering_is_load_bearing() {
-        // Healthy < Caution < Pressure < Critical via PartialOrd, Ord.
-        // Guards against accidental reorder (alphabetical, etc.) that
-        // would break `.iter().max()` semantics in classify.
+        // Healthy < Caution < Pressure via PartialOrd, Ord. Guards against an
+        // accidental reorder (alphabetical, etc.) that would break
+        // `.iter().max()` semantics in classify.
         assert!(HeadroomSeverity::Healthy < HeadroomSeverity::Caution);
         assert!(HeadroomSeverity::Caution < HeadroomSeverity::Pressure);
-        assert!(HeadroomSeverity::Pressure < HeadroomSeverity::Critical);
     }
 
     // ── UPI 044: recommend_shape_with_headroom + tighten + synth ───
