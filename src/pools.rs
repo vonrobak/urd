@@ -52,10 +52,68 @@ pub fn pool_uuid_for_path(path: &Path) -> crate::error::Result<Option<String>> {
     findmnt_target(path, "UUID")
 }
 
-/// Resolve the mountpoint of the filesystem hosting `path`.
-/// `findmnt -n -o TARGET --target <path>`. `Ok(None)` if unmounted.
-pub fn pool_mountpoint_for_path(path: &Path) -> crate::error::Result<Option<PathBuf>> {
-    findmnt_target(path, "TARGET").map(|opt| opt.map(PathBuf::from))
+/// Resolve a source path's pool UUID **and** mountpoint in a **single**
+/// `findmnt` call (UPI 031-a, S3). Replaces the prior pair of calls
+/// (`pool_uuid_for_path` + `pool_mountpoint_for_path`) on the hot path,
+/// halving the per-subvolume fork count.
+///
+/// Both columns are returned independently: a non-BTRFS or UUID-less mount
+/// still yields its `TARGET` (so storage-signal gathering can read free-ratio
+/// for a pool it cannot key to a UUID — S5). `Err` only on a findmnt I/O
+/// failure with stderr content; a missing/unmounted path → `Ok((None, None))`.
+pub fn resolve_source_pool(
+    path: &Path,
+) -> crate::error::Result<(Option<String>, Option<PathBuf>)> {
+    let path_str = path.to_str().ok_or_else(|| UrdError::Io {
+        path: path.to_path_buf(),
+        source: std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path is not valid UTF-8",
+        ),
+    })?;
+
+    let output = Command::new("findmnt")
+        .env("LC_ALL", "C")
+        .args(["-n", "-P", "-o", "UUID,TARGET", "--target", path_str])
+        .output()
+        .map_err(|e| UrdError::Io {
+            path: PathBuf::from("findmnt"),
+            source: e,
+        })?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !output.status.success() {
+        if stdout.trim().is_empty() {
+            // findmnt complained about a missing path; treat as "unresolved".
+            return Ok((None, None));
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(UrdError::Io {
+            path: path.to_path_buf(),
+            source: std::io::Error::other(format!("findmnt failed: {}", stderr.trim())),
+        });
+    }
+
+    Ok(parse_findmnt_uuid_target(&stdout))
+}
+
+/// Pure parse of `findmnt -P -o UUID,TARGET` output:
+/// `UUID="6c1…" TARGET="/"`. Empty quoted values map to `None`. Tolerates
+/// either ordering and surrounding whitespace. Extracted for unit testing
+/// (the subprocess wrapper above stays a thin I/O shim).
+#[must_use]
+fn parse_findmnt_uuid_target(stdout: &str) -> (Option<String>, Option<PathBuf>) {
+    let extract = |key: &str| -> Option<String> {
+        let needle = format!("{key}=\"");
+        let start = stdout.find(&needle)? + needle.len();
+        let rest = &stdout[start..];
+        let end = rest.find('"')?;
+        let val = &rest[..end];
+        (!val.is_empty()).then(|| val.to_string())
+    };
+    let uuid = extract("UUID");
+    let target = extract("TARGET").map(PathBuf::from);
+    (uuid, target)
 }
 
 fn findmnt_target(path: &Path, column: &str) -> crate::error::Result<Option<String>> {
@@ -106,8 +164,9 @@ pub fn detect_source_pools(config: &Config) -> Vec<SourcePool> {
         .subvolumes
         .iter()
         .map(|sv| {
-            let uuid = pool_uuid_for_path(&sv.source).ok().flatten();
-            let mp = pool_mountpoint_for_path(&sv.source).ok().flatten();
+            // One findmnt for both columns (S3): halves the per-subvolume fork
+            // count vs. the prior `pool_uuid_for_path` + `pool_mountpoint_for_path`.
+            let (uuid, mp) = resolve_source_pool(&sv.source).unwrap_or((None, None));
             (sv.name.clone(), uuid, mp)
         })
         .collect();
@@ -318,6 +377,42 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("bytes_used"), used).unwrap();
         std::fs::write(dir.join("total_bytes"), total).unwrap();
+    }
+
+    // ── UPI 031-a: combined findmnt parser ──────────────────────────
+
+    #[test]
+    fn parse_findmnt_uuid_target_both_present() {
+        let (uuid, target) =
+            parse_findmnt_uuid_target("UUID=\"6c1a-1234\" TARGET=\"/\"\n");
+        assert_eq!(uuid.as_deref(), Some("6c1a-1234"));
+        assert_eq!(target, Some(PathBuf::from("/")));
+    }
+
+    #[test]
+    fn parse_findmnt_uuid_target_empty_uuid_is_none() {
+        // Non-BTRFS mount: TARGET resolves, UUID is empty → mountpoint still
+        // surfaces so storage-signal gathering can read free-ratio (S5).
+        let (uuid, target) =
+            parse_findmnt_uuid_target("UUID=\"\" TARGET=\"/boot\"");
+        assert_eq!(uuid, None);
+        assert_eq!(target, Some(PathBuf::from("/boot")));
+    }
+
+    #[test]
+    fn parse_findmnt_uuid_target_empty_output_is_none_none() {
+        let (uuid, target) = parse_findmnt_uuid_target("");
+        assert_eq!(uuid, None);
+        assert_eq!(target, None);
+    }
+
+    #[test]
+    fn parse_findmnt_uuid_target_tolerates_target_with_space() {
+        let (uuid, target) = parse_findmnt_uuid_target(
+            "UUID=\"abcd\" TARGET=\"/mnt/my drive\"",
+        );
+        assert_eq!(uuid.as_deref(), Some("abcd"));
+        assert_eq!(target, Some(PathBuf::from("/mnt/my drive")));
     }
 
     /// A `space_resolver` that ignores the path and always reports the same

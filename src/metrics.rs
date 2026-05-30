@@ -356,7 +356,7 @@ fn format_metrics(data: &MetricsData) -> String {
     writeln!(out).unwrap();
     writeln!(
         out,
-        "# HELP backup_subvolume_last_full_send_bytes Bytes of the most recent in-window full send for subvolumes whose latest send was a full send (e.g., transient/storage_critical subvolumes). Absent for incremental-only and cold-start subvolumes."
+        "# HELP backup_subvolume_last_full_send_bytes Bytes of the most recent in-window full send for subvolumes whose latest send was a full send (e.g., transient subvolumes). Absent for incremental-only and cold-start subvolumes."
     )
     .unwrap();
     writeln!(

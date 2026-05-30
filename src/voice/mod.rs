@@ -538,6 +538,7 @@ pub(crate) mod test_fixtures {
                     retention_summary: None,
                     external_only: false,
                     errors: vec![],
+                    storage_posture: None,
                 },
                 StatusAssessment {
                     name: "htpc-docs".to_string(),
@@ -565,6 +566,7 @@ pub(crate) mod test_fixtures {
                     retention_summary: None,
                     external_only: false,
                     errors: vec![],
+                    storage_posture: None,
                 },
             ],
             chain_health: vec![
@@ -601,6 +603,7 @@ pub(crate) mod test_fixtures {
             total_pins: 3,
             redundancy_advisories: vec![],
             advice: vec![],
+            storage_postures: Vec::new(),
         }
     }
 
@@ -660,6 +663,7 @@ pub(crate) mod test_fixtures {
                 retention_summary: None,
                 external_only: false,
                 errors: vec![],
+                storage_posture: None,
             }],
             transitions: vec![],
             warnings: vec![],
@@ -698,6 +702,7 @@ pub(crate) mod test_fixtures {
                     issue: None,
                     suggestion: None,
                     reason: None,
+                    storage_posture: None,
                 },
                 DoctorDataSafety {
                     name: "htpc-docs".to_string(),
@@ -706,6 +711,7 @@ pub(crate) mod test_fixtures {
                     issue: None,
                     suggestion: None,
                     reason: None,
+                    storage_posture: None,
                 },
             ],
             sentinel: DoctorSentinelStatus {
@@ -737,6 +743,7 @@ pub(crate) mod test_fixtures {
             last_run_age_secs: Some(25200), // 7 hours
             best_advice: None,
             total_needing_attention: 0,
+            storage_posture: None,
         }
     }
 
@@ -820,6 +827,104 @@ mod tests {
         let output = render_status(&test_status_output(), OutputMode::Interactive);
         assert!(output.contains("htpc-home"), "missing htpc-home");
         assert!(output.contains("htpc-docs"), "missing htpc-docs");
+    }
+
+    // ── UPI 031-a: storage-posture rendering ────────────────────────
+
+    fn posture(
+        label: &str,
+        tier: crate::storage_critical::TightnessTier,
+        host_root: bool,
+        affected: usize,
+        since: Option<i64>,
+    ) -> crate::output::PoolPostureSummary {
+        crate::output::PoolPostureSummary {
+            pool_label: label.to_string(),
+            tier,
+            host_root,
+            affected_count: affected,
+            since_secs: since,
+        }
+    }
+
+    #[test]
+    fn storage_posture_tight_line_present() {
+        use crate::storage_critical::TightnessTier;
+        let _color = color_guard(false);
+        let mut data = test_status_output();
+        data.storage_postures = vec![posture("/data", TightnessTier::Tight, false, 2, None)];
+        let out = render_status(&data, OutputMode::Interactive);
+        assert!(out.contains("runs tight"), "tight state missing: {out}");
+        assert!(out.contains("/data"), "pool label missing: {out}");
+        assert!(out.contains("2 subvolumes"), "affected count missing: {out}");
+    }
+
+    #[test]
+    fn storage_posture_critical_host_root_escalation() {
+        use crate::storage_critical::TightnessTier;
+        let _color = color_guard(false);
+        let mut data = test_status_output();
+        data.storage_postures = vec![posture("/", TightnessTier::Critical, true, 1, None)];
+        let out = render_status(&data, OutputMode::Interactive);
+        assert!(out.contains("critically tight"), "critical state missing: {out}");
+        assert!(
+            out.contains("machine itself"),
+            "host-root escalation missing: {out}"
+        );
+    }
+
+    #[test]
+    fn storage_posture_flagged_since_present() {
+        use crate::storage_critical::TightnessTier;
+        let _color = color_guard(false);
+        let mut data = test_status_output();
+        data.storage_postures =
+            vec![posture("/data", TightnessTier::Tight, false, 1, Some(7200))];
+        let out = render_status(&data, OutputMode::Interactive);
+        assert!(out.contains("flagged"), "flagged-since clause missing: {out}");
+    }
+
+    #[test]
+    fn storage_posture_silent_when_roomy() {
+        let _color = color_guard(false);
+        // test_status_output has empty storage_postures (all Roomy).
+        let out = render_status(&test_status_output(), OutputMode::Interactive);
+        assert!(!out.contains("runs tight"), "must be silent when roomy: {out}");
+        assert!(
+            !out.contains("critically tight"),
+            "must be silent when roomy: {out}"
+        );
+    }
+
+    #[test]
+    fn default_status_worst_pool_clause() {
+        use crate::storage_critical::TightnessTier;
+        let _color = color_guard(false);
+        let mut data = test_default_status_output();
+        data.storage_posture = Some(posture("/data", TightnessTier::Tight, false, 3, None));
+        let out = render_default_status(&data, OutputMode::Interactive);
+        assert!(out.contains("tight"), "bare-`urd` tight clause missing: {out}");
+        assert!(out.contains("/data"), "bare-`urd` pool label missing: {out}");
+    }
+
+    #[test]
+    fn status_2am_golden_shows_tight_state_and_safety() {
+        // The 031-a half of the 2am golden test: the first lines of `urd status`
+        // surface the tight state alongside the "is my data safe?" summary.
+        use crate::storage_critical::TightnessTier;
+        let _color = color_guard(false);
+        let mut data = test_status_output();
+        data.storage_postures = vec![posture("/", TightnessTier::Critical, true, 1, Some(3600))];
+        let out = render_status(&data, OutputMode::Interactive);
+        let head = out.lines().take(4).collect::<Vec<_>>().join("\n");
+        assert!(
+            head.contains("sealed"),
+            "safety summary not in first lines: {head}"
+        );
+        assert!(
+            head.contains("critically tight"),
+            "tight state not in first lines: {head}"
+        );
     }
 
     #[test]
@@ -968,6 +1073,7 @@ mod tests {
             total_pins: 0,
             redundancy_advisories: vec![],
             advice: vec![],
+            storage_postures: Vec::new(),
         };
         let output = render_status(&data, OutputMode::Interactive);
         assert!(
@@ -1042,6 +1148,7 @@ mod tests {
             total_pins: 0,
             redundancy_advisories: vec![],
             advice: vec![],
+            storage_postures: Vec::new(),
         };
         let output = render_status(&data, OutputMode::Interactive);
         assert!(
@@ -3189,6 +3296,7 @@ mod tests {
             last_run_age_secs: None,
             best_advice: None,
             total_needing_attention: 0,
+            storage_posture: None,
         };
         let output = render_default_status(&data, OutputMode::Interactive);
         assert!(
@@ -3222,6 +3330,7 @@ mod tests {
             last_run_age_secs: None,
             best_advice: None,
             total_needing_attention: 0,
+            storage_posture: None,
         };
         let output = render_default_status(&data, OutputMode::Interactive);
         assert!(
@@ -3277,6 +3386,7 @@ mod tests {
             last_run_age_secs: None,
             best_advice: None,
             total_needing_attention: 0,
+            storage_posture: None,
         };
         let output = render_default_status(&data, OutputMode::Interactive);
         assert!(
@@ -3297,6 +3407,7 @@ mod tests {
             last_run_age_secs: None,
             best_advice: None,
             total_needing_attention: 0,
+            storage_posture: None,
         };
         let output = render_default_status(&data, OutputMode::Daemon);
         let parsed: serde_json::Value =
@@ -3420,6 +3531,7 @@ mod tests {
             issue: Some("exposed — data may not be recoverable".to_string()),
             suggestion: Some("Run `urd backup` or connect a drive.".to_string()),
             reason: None,
+            storage_posture: None,
         };
         data.verdict = DoctorVerdict::issues(1);
         let output = render_doctor(&data, OutputMode::Interactive);
@@ -3792,6 +3904,7 @@ mod tests {
             issue: Some("waning — last backup 48 hours ago".to_string()),
             suggestion: Some("Run `urd backup --force-full --subvolume htpc-home`.".to_string()),
             reason: Some("thread to WD-18TB broken (pin missing locally)".to_string()),
+            storage_posture: None,
         };
         data.verdict = DoctorVerdict::warnings(1);
         let output = render_doctor(&data, OutputMode::Interactive);
@@ -3816,6 +3929,7 @@ mod tests {
             issue: Some("exposed — all drives disconnected".to_string()),
             suggestion: None,
             reason: Some("Connect WD-18TB to restore protection".to_string()),
+            storage_posture: None,
         };
         data.verdict = DoctorVerdict::issues(1);
         let output = render_doctor(&data, OutputMode::Interactive);
@@ -4021,6 +4135,7 @@ mod tests {
             retention_summary: None,
             external_only: false,
             errors: vec![],
+            storage_posture: None,
         }
     }
 
@@ -5185,7 +5300,6 @@ mod tests {
                 external: None,
                 note: None,
                 was_named_level: None,
-                storage_critical: false,
             }],
         };
         let output = render_doctor(
@@ -5225,7 +5339,6 @@ mod tests {
                 )),
                 note: None,
                 was_named_level: None,
-                storage_critical: false,
             }],
         };
         let output = render_doctor(
@@ -5255,7 +5368,6 @@ mod tests {
                 external: None,
                 note: None,
                 was_named_level: None,
-                storage_critical: false,
             }],
         };
         let output = render_doctor(
@@ -5286,7 +5398,6 @@ mod tests {
                 external: None,
                 note: None,
                 was_named_level: None,
-                storage_critical: false,
             }],
         };
         let output = render_doctor(
@@ -5318,7 +5429,6 @@ mod tests {
                 )),
                 note: None,
                 was_named_level: None,
-                storage_critical: false,
             }],
         };
         let days_out = render_doctor(
@@ -5345,7 +5455,6 @@ mod tests {
                 )),
                 note: None,
                 was_named_level: None,
-                storage_critical: false,
             }],
         };
         let weeks_out = render_doctor(
@@ -5372,7 +5481,6 @@ mod tests {
                 )),
                 note: None,
                 was_named_level: None,
-                storage_critical: false,
             }],
         };
         let years_out = render_doctor(
@@ -5403,7 +5511,6 @@ mod tests {
                 external: None,
                 note: Some(crate::recommendation::RecommendationNote::BurstyPattern),
                 was_named_level: None,
-                storage_critical: false,
             }],
         };
         let output = render_doctor(
@@ -5433,7 +5540,6 @@ mod tests {
                 external: None,
                 note: None,
                 was_named_level: Some(crate::types::ProtectionLevel::Sheltered),
-                storage_critical: false,
             }],
         };
         let with_level = render_doctor(
@@ -5461,7 +5567,6 @@ mod tests {
                 external: None,
                 note: None,
                 was_named_level: None,
-                storage_critical: false,
             }],
         };
         let no_level = render_doctor(
@@ -5491,7 +5596,6 @@ mod tests {
                 external: None,
                 note: Some(crate::recommendation::RecommendationNote::BurstyPattern),
                 was_named_level: Some(crate::types::ProtectionLevel::Sheltered),
-                storage_critical: false,
             }],
         };
         let output = render_doctor(&recommendations_doctor_output(view), OutputMode::Daemon);
@@ -5611,7 +5715,6 @@ mod tests {
                 external: None,
                 note: None,
                 was_named_level: None,
-                storage_critical: false,
             }],
         };
         let out = render_doctor(&recommendations_doctor_output(view), OutputMode::Interactive);
@@ -5642,7 +5745,6 @@ mod tests {
                 external: None,
                 note: None,
                 was_named_level: None,
-                storage_critical: false,
             }],
         };
         let out = render_doctor(&recommendations_doctor_output(view), OutputMode::Interactive);
@@ -5676,7 +5778,6 @@ mod tests {
                 external: None,
                 note: None,
                 was_named_level: None,
-                storage_critical: false,
             }],
         };
         let out = render_doctor(&recommendations_doctor_output(view), OutputMode::Interactive);
@@ -5710,7 +5811,6 @@ mod tests {
                 external: None,
                 note: None,
                 was_named_level: None,
-                storage_critical: false,
             }],
         };
         let out = render_doctor(&recommendations_doctor_output(view), OutputMode::Interactive);
@@ -5747,7 +5847,6 @@ mod tests {
                 external: None,
                 note: None,
                 was_named_level: None,
-                storage_critical: false,
             }],
         };
         let out = render_doctor(&recommendations_doctor_output(view), OutputMode::Interactive);
@@ -5769,7 +5868,7 @@ mod tests {
             &cur,
             crate::recommendation::ShapeRole::Local,
             crate::recommendation::HeadroomSeverity::Critical,
-            crate::recommendation::AdjustmentReason::StorageCritical,
+            crate::recommendation::AdjustmentReason::SourcePoolLow { free_ratio: 0.1 },
         );
         let view = crate::output::DoctorRecommendationView {
             header: "h".to_string(),
@@ -5779,7 +5878,6 @@ mod tests {
                 external: None,
                 note: None,
                 was_named_level: None,
-                storage_critical: false,
             }],
         };
         let out = render_doctor(&recommendations_doctor_output(view), OutputMode::Interactive);
@@ -5800,7 +5898,7 @@ mod tests {
             &cur,
             crate::recommendation::ShapeRole::Local,
             crate::recommendation::HeadroomSeverity::Critical,
-            crate::recommendation::AdjustmentReason::StorageCritical,
+            crate::recommendation::AdjustmentReason::SourcePoolLow { free_ratio: 0.1 },
         );
         let view = crate::output::DoctorRecommendationView {
             header: "h".to_string(),
@@ -5810,7 +5908,6 @@ mod tests {
                 external: None,
                 note: Some(crate::recommendation::RecommendationNote::BurstyPattern),
                 was_named_level: Some(crate::types::ProtectionLevel::Sheltered),
-                storage_critical: false,
             }],
         };
         let out = render_doctor(&recommendations_doctor_output(view), OutputMode::Interactive);
@@ -5858,7 +5955,6 @@ mod tests {
                 external: Some(external_pressure),
                 note: None,
                 was_named_level: None,
-                storage_critical: false,
             }],
         };
         let out = render_doctor(&recommendations_doctor_output(view), OutputMode::Interactive);
@@ -5888,7 +5984,6 @@ mod tests {
                 external: None,
                 note: None,
                 was_named_level: None,
-                storage_critical: false,
             }],
         };
         let out = render_doctor(&recommendations_doctor_output(view), OutputMode::Interactive);
@@ -5904,7 +5999,7 @@ mod tests {
             &cur,
             crate::recommendation::ShapeRole::Local,
             crate::recommendation::HeadroomSeverity::Critical,
-            crate::recommendation::AdjustmentReason::StorageCritical,
+            crate::recommendation::AdjustmentReason::SourcePoolLow { free_ratio: 0.1 },
         );
         let view = crate::output::DoctorRecommendationView {
             header: "h".to_string(),
@@ -5914,159 +6009,11 @@ mod tests {
                 external: None,
                 note: None,
                 was_named_level: None,
-                storage_critical: false,
             }],
         };
         let out = render_doctor(&recommendations_doctor_output(view), OutputMode::Interactive);
         assert!(out.contains("storage critical"), "pointer line missing: {out}");
         assert!(!out.contains("daily="), "no shape: {out}");
-    }
-
-    // ── UPI 031 — storage-critical advisory ─────────────────────────
-
-    #[test]
-    fn storage_critical_advisory_rendered_and_complements_shape() {
-        // A tightenable Pressure row that is also storage_critical renders the
-        // tightened shape, the tightening reason, AND the host-stakes advisory
-        // — the advisory is purely additive (stakes, not action).
-        let _color = color_guard(false);
-        let h = ha_rec(
-            crate::recommendation::ShapeRole::Local,
-            shape(24, 30, 26, crate::types::MonthlyCount::Count(12), 0),
-            shape(24, 60, 52, crate::types::MonthlyCount::Count(24), 0),
-            200_000_000_000,
-            50_000_000_000,
-            crate::recommendation::HeadroomSeverity::Pressure,
-            Some(crate::recommendation::AdjustmentReason::SourcePoolLow { free_ratio: 0.10 }),
-            Some(shape(16, 42, 36, crate::types::MonthlyCount::Count(16), 0)),
-            Some(25_000_000_000),
-        );
-        let view = crate::output::DoctorRecommendationView {
-            header: "h".to_string(),
-            rows: vec![crate::output::DoctorRecommendationRow {
-                name: "root".to_string(),
-                local: Some(h),
-                external: None,
-                note: None,
-                was_named_level: None,
-                storage_critical: true,
-            }],
-        };
-        let out = render_doctor(&recommendations_doctor_output(view), OutputMode::Interactive);
-        assert!(out.contains("daily=42"), "tightened shape missing: {out}");
-        assert!(out.contains("shape tightened"), "tightening reason missing: {out}");
-        assert!(
-            out.contains("risks the host itself"),
-            "storage-critical advisory missing: {out}"
-        );
-    }
-
-    #[test]
-    fn storage_critical_at_min_combined_render_no_double_action() {
-        // M3: an at-MIN Pressure row (synth, no adjusted) that is also
-        // storage_critical. The action ("expanding storage") must appear at
-        // most once — on the at-MIN reason line, not duplicated by the
-        // advisory, which supplies only the host stakes.
-        let _color = color_guard(false);
-        let cur = shape(0, 3, 0, crate::types::MonthlyCount::Count(0), 0);
-        let h = crate::recommendation::headroom_aware_pointer_only(
-            &cur,
-            crate::recommendation::ShapeRole::Local,
-            crate::recommendation::HeadroomSeverity::Pressure,
-            crate::recommendation::AdjustmentReason::SourcePoolLow { free_ratio: 0.10 },
-        );
-        let view = crate::output::DoctorRecommendationView {
-            header: "h".to_string(),
-            rows: vec![crate::output::DoctorRecommendationRow {
-                name: "root".to_string(),
-                local: Some(h),
-                external: None,
-                note: None,
-                was_named_level: None,
-                storage_critical: true,
-            }],
-        };
-        let out = render_doctor(&recommendations_doctor_output(view), OutputMode::Interactive);
-        assert!(
-            out.contains("shape already at minimum"),
-            "at-MIN guidance missing: {out}"
-        );
-        assert!(
-            out.contains("risks the host itself"),
-            "storage-critical advisory missing: {out}"
-        );
-        assert!(
-            out.matches("expanding storage").count() <= 1,
-            "action verb must not be duplicated (action + stakes, not two exhortations): {out}"
-        );
-    }
-
-    #[test]
-    fn storage_critical_advisory_absent_when_flag_false() {
-        // A Pressure row without the flag renders no host-stakes advisory.
-        let _color = color_guard(false);
-        let h = ha_rec(
-            crate::recommendation::ShapeRole::Local,
-            shape(24, 30, 26, crate::types::MonthlyCount::Count(12), 0),
-            shape(24, 60, 52, crate::types::MonthlyCount::Count(24), 0),
-            200_000_000_000,
-            50_000_000_000,
-            crate::recommendation::HeadroomSeverity::Pressure,
-            Some(crate::recommendation::AdjustmentReason::SourcePoolLow { free_ratio: 0.10 }),
-            Some(shape(16, 42, 36, crate::types::MonthlyCount::Count(16), 0)),
-            Some(25_000_000_000),
-        );
-        let view = crate::output::DoctorRecommendationView {
-            header: "h".to_string(),
-            rows: vec![crate::output::DoctorRecommendationRow {
-                name: "containers".to_string(),
-                local: Some(h),
-                external: None,
-                note: None,
-                was_named_level: None,
-                storage_critical: false,
-            }],
-        };
-        let out = render_doctor(&recommendations_doctor_output(view), OutputMode::Interactive);
-        assert!(
-            !out.contains("risks the host itself"),
-            "advisory must be absent when flag false: {out}"
-        );
-    }
-
-    #[test]
-    fn storage_critical_advisory_not_emitted_on_dormant_critical_path() {
-        // Dormant-path guard: a Critical-severity row (032/033 hook) takes the
-        // R9 pointer-only early return, so the additive advisory is NOT also
-        // emitted — only the single pointer line.
-        let _color = color_guard(false);
-        let cur = shape(24, 60, 52, crate::types::MonthlyCount::Count(24), 0);
-        let h = crate::recommendation::headroom_aware_pointer_only(
-            &cur,
-            crate::recommendation::ShapeRole::Local,
-            crate::recommendation::HeadroomSeverity::Critical,
-            crate::recommendation::AdjustmentReason::StorageCritical,
-        );
-        let view = crate::output::DoctorRecommendationView {
-            header: "h".to_string(),
-            rows: vec![crate::output::DoctorRecommendationRow {
-                name: "root".to_string(),
-                local: Some(h),
-                external: None,
-                note: None,
-                was_named_level: None,
-                storage_critical: true,
-            }],
-        };
-        let out = render_doctor(&recommendations_doctor_output(view), OutputMode::Interactive);
-        assert!(
-            out.contains("see `urd doctor`"),
-            "R9 pointer line expected: {out}"
-        );
-        assert!(
-            !out.contains("risks the host itself"),
-            "additive advisory must not also fire on the Critical path: {out}"
-        );
     }
 
     // ── UPI 042 — MonthlyCount + yearly rendering ───────────────────

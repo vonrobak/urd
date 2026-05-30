@@ -1,159 +1,503 @@
-//! Storage-critical predicate (ADR-113 Layer 1, UPI 044 stub → UPI 031 rule).
+//! Storage-state detection (ADR-113 Layer 1, UPI 031-a).
 //!
-//! UPI 044 shipped this as a stub returning `false`. UPI 031 retires the stub
-//! and replaces it with a **pure structural rule**: a subvolume is
-//! storage-critical when its source lives on the host's root-filesystem pool
-//! (UUID match), an *enabled* subvolume entrusts `/` itself to Urd, *and* that
-//! pool is genuinely tight right now (free-ratio ≥ Pressure).
+//! UPI 044 shipped a stub `is_storage_critical` returning `false`. UPI 031
+//! replaced it with a single conjunction (`host_root && tier >= Pressure`)
+//! whose only surface was a dimmed `doctor --thorough` footnote — which
+//! *inverted* the severity/response ladder (the most dangerous state produced
+//! the quietest surface) and delivered no told-not-silent state in
+//! `urd status`. UPI 031-a un-conflates that predicate into the two orthogonal
+//! axes the Do-No-Harm arc needs:
 //!
-//! This is distinct from momentary headroom pressure: headroom answers "is this
-//! pool tight now?"; `storage_critical` adds the structural dimension — pressure
-//! here threatens the *host*, not just retention. Only the intersection
-//! (structurally fragile **and** tight) is critical.
+//! - **Tightness tier** — `TightnessTier { Roomy, Tight, Critical }`, derived
+//!   from the source pool's free-ratio alone (via
+//!   `recommendation::classify_free_ratio_value`, the single source of truth
+//!   for the boundaries). Drives the response tier for *any* tight pool Urd
+//!   snapshots to.
+//! - **Host-root flag** — `host_root()`: the source lives on the pool hosting
+//!   `/` *and* an enabled subvolume entrusts `/` itself to Urd. Escalates the
+//!   voice/stakes orthogonally (pressure here risks the host, not just
+//!   retention).
 //!
-//! Purity (ADR-108): this module takes resolved inputs and performs no I/O. The
-//! doctor wiring (`src/commands/doctor.rs`) resolves the one I/O-bound input
-//! (`root_pool_uuid`, one `findmnt /`) at the boundary and feeds it in; the
-//! per-subvolume pool UUID, the `root_subvol_configured` gate, and the
-//! free-ratio severity are all computed there from already-available data.
+//! A persisted per-pool **armed tier** (`state.rs`) plus the pure hysteresis in
+//! `resolve_armed_tier` give told-not-silent *transitions* and anti-flap
+//! stability. The posture (`StoragePosture`) is the per-subvolume cell the
+//! awareness surface carries; transitions are computed **only** at the backup
+//! boundary (never on read paths — there is no transition in the posture to
+//! fire).
 //!
-//! The behavioral half (ephemeral lifecycle, conservative intervals) is
-//! deliberately *not* shipped here — per ADR-113's increment-2 sequencing it
-//! belongs with UPIs 032/033 where the safety scaffolding lands.
+//! Purity (ADR-108): every fn here takes resolved inputs and performs no I/O.
+//! The command layer resolves the I/O-bound signals (pool free-ratio, `findmnt
+//! /`, persisted prior tier) at the boundary and feeds them in.
+//!
+//! The behavioral half (ephemeral lifecycle, conservative intervals, the
+//! `constrained` arming signal that adds `urd_writes_to_pool`) is deliberately
+//! *not* shipped here — it belongs with UPIs 032/033 where the safety
+//! scaffolding lands and has a consumer.
 
-use crate::recommendation::HeadroomSeverity;
+use serde::Serialize;
 
-/// Resolved inputs to the storage-critical structural rule (UPI 031). All
-/// fields are pre-resolved by the doctor wiring; the rule itself is pure.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct StorageCriticalInput<'a> {
-    /// The BTRFS pool UUID hosting this subvolume's source, if resolvable.
-    pub subvol_pool_uuid: Option<&'a str>,
-    /// The BTRFS pool UUID hosting `/`, if resolvable.
-    pub root_pool_uuid: Option<&'a str>,
-    /// True when an **enabled** configured subvolume has `source == "/"`,
-    /// i.e. the user has actively entrusted the root filesystem to Urd.
-    pub root_subvol_configured: bool,
-    /// Tightness of the source pool by free-ratio only (Branch E): reuses
-    /// `recommendation::classify_free_ratio`, no trend/metadata, no new
-    /// constant. `Pressure` (or the dormant `Critical`) means genuinely tight.
-    pub source_free_ratio_severity: HeadroomSeverity,
+use crate::recommendation::{
+    self, FREE_RATIO_CAUTION, FREE_RATIO_PRESSURE, HeadroomSeverity,
+};
+
+/// Hysteresis level-band (UPI 031-a, D4). A pool de-escalates only once free
+/// recovers to its arm threshold **plus** this band, so a pool hovering at a
+/// tier boundary does not re-notify every run. Crude/load-bearing — revisited
+/// at the ADR-113 30-day checkpoint. Arm thresholds reuse
+/// `FREE_RATIO_PRESSURE` / `FREE_RATIO_CAUTION`; this is the only new constant.
+pub const HYSTERESIS_BAND_PP: f64 = 0.05;
+
+/// Source-pool tightness, free-ratio only (UPI 031-a). Distinct from
+/// `recommendation::HeadroomSeverity` (a *composite* of free-ratio + trend +
+/// destination metadata): the tier is the imperative-bundle axis that drives
+/// Do-No-Harm response. Ordering is load-bearing (`Roomy < Tight < Critical`):
+/// hysteresis and aggregation compare and `.max()` tiers.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum TightnessTier {
+    /// Roomy enough that Urd says nothing.
+    #[default]
+    Roomy,
+    /// "tight" — below the caution threshold (< 25% free). Watch it.
+    Tight,
+    /// "critical" — below the pressure threshold (< 15% free).
+    Critical,
 }
 
-/// True iff the subvolume is storage-critical under the structural rule.
+impl TightnessTier {
+    /// Canonical string form persisted in `pool_armed_tier.armed_tier`.
+    /// Parallels `SendKind::as_db_str`.
+    #[must_use]
+    pub const fn as_db_str(self) -> &'static str {
+        match self {
+            TightnessTier::Roomy => "roomy",
+            TightnessTier::Tight => "tight",
+            TightnessTier::Critical => "critical",
+        }
+    }
+
+    /// Parse the canonical DB form. Returns `None` for any string that does
+    /// not match `as_db_str()` exactly (an unparseable row is skipped, not
+    /// guessed — best-effort, fail toward stateless).
+    #[must_use]
+    pub fn from_db_str(s: &str) -> Option<Self> {
+        match s {
+            "roomy" => Some(TightnessTier::Roomy),
+            "tight" => Some(TightnessTier::Tight),
+            "critical" => Some(TightnessTier::Critical),
+            _ => None,
+        }
+    }
+}
+
+impl From<HeadroomSeverity> for TightnessTier {
+    /// `Healthy → Roomy`, `Caution → Tight`, `Pressure`/`Critical → Critical`.
+    /// The composite severity collapses to the free-ratio-only tier; the
+    /// dormant composite `Critical` maps to the tier `Critical`.
+    fn from(sev: HeadroomSeverity) -> Self {
+        match sev {
+            HeadroomSeverity::Healthy => TightnessTier::Roomy,
+            HeadroomSeverity::Caution => TightnessTier::Tight,
+            HeadroomSeverity::Pressure | HeadroomSeverity::Critical => {
+                TightnessTier::Critical
+            }
+        }
+    }
+}
+
+/// Per-subvolume storage posture (UPI 031-a). Carried on `SubvolAssessment`
+/// and surfaced told-not-silent. Constructed **only** when `tier >= Tight`
+/// (a Roomy pool has no posture — Urd stays silent). No `transition` field:
+/// read paths reflect the stabilized tier and cannot fire a "just noticed"
+/// (that prose lives in the backup-boundary notification).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct StoragePosture {
+    pub tier: TightnessTier,
+    /// True when this subvolume's source is on the host-root pool and an
+    /// enabled subvolume entrusts `/` — escalates the voice/stakes.
+    pub host_root: bool,
+}
+
+/// A change in armed tier (UPI 031-a). Computed only at the backup boundary
+/// (`advance_and_writeback`); consumed only by the notify path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Transition {
+    pub from: TightnessTier,
+    pub to: TightnessTier,
+}
+
+impl Transition {
+    /// True when the tier worsened (`to > from`). Only escalations notify;
+    /// de-escalation is silent (status reflects recovery).
+    #[must_use]
+    pub fn is_escalation(self) -> bool {
+        self.to > self.from
+    }
+}
+
+/// Host-root structural flag (UPI 031-a — the structural half of the retired
+/// `is_storage_critical`, with the `>= Pressure` tightness check removed).
 ///
-/// ```text
-/// storage_critical =
-///       subvol_pool_uuid == root_pool_uuid     // on the pool hosting "/"
-///   AND root_subvol_configured                  // an ENABLED subvol has source == "/"
-///   AND source_free_ratio_severity >= Pressure  // genuinely tight NOW (<15% free)
-/// ```
-///
-/// Fails toward *not*-critical for every unmeasurable input (unresolved pool
-/// UUID, unmeasurable free-ratio → `Healthy`) — this is an advisory surface.
+/// True iff this subvolume's source pool is the pool hosting `/` (UUID match)
+/// **and** an enabled configured subvolume has `source == "/"`. Fails toward
+/// `false` for every unresolved UUID — pressure on a pool Urd cannot tie to
+/// `/` makes no host-stakes claim.
 #[must_use]
-pub fn is_storage_critical(input: StorageCriticalInput<'_>) -> bool {
+pub fn host_root(
+    subvol_pool_uuid: Option<&str>,
+    root_pool_uuid: Option<&str>,
+    root_subvol_configured: bool,
+) -> bool {
     let on_root_pool = matches!(
-        (input.subvol_pool_uuid, input.root_pool_uuid),
+        (subvol_pool_uuid, root_pool_uuid),
         (Some(a), Some(b)) if a == b
     );
-    on_root_pool
-        && input.root_subvol_configured
-        && input.source_free_ratio_severity >= HeadroomSeverity::Pressure
+    on_root_pool && root_subvol_configured
+}
+
+/// Resolve the new armed tier from the prior armed tier and the current
+/// free-ratio (UPI 031-a hysteresis, D4). Pure — no I/O, no clock.
+///
+/// - **Escalate immediately** when the current free-ratio classifies worse
+///   than the armed tier (no hysteresis on the way up — danger is surfaced
+///   at once). The escalation target comes from
+///   `classify_free_ratio_value` (single source of truth for boundaries — M2).
+/// - **De-escalate stickily**: drop one level at a time, each gated by that
+///   level's arm threshold **+ `HYSTERESIS_BAND_PP`** (Critical→Tight at free
+///   `> 0.20`, Tight→Roomy at free `> 0.30`). A pool can fall two levels in
+///   one run when free recovers past both bands.
+/// - **Unmeasurable** free-ratio (`None`) holds the prior armed tier unchanged.
+#[must_use]
+pub fn resolve_armed_tier(
+    prior_armed: TightnessTier,
+    free_ratio: Option<f64>,
+) -> TightnessTier {
+    let Some(ratio) = free_ratio else {
+        // Cannot measure → hold the prior state (never silently disarms).
+        return prior_armed;
+    };
+
+    let current = TightnessTier::from(
+        recommendation::classify_free_ratio_value(ratio),
+    );
+    if current > prior_armed {
+        // Worse than armed → escalate immediately to the classified tier.
+        return current;
+    }
+
+    // current <= prior_armed: sticky de-escalation, one level at a time, each
+    // gated by `arm_threshold + band`. Strict `>` so exactly-at-band holds.
+    let mut armed = prior_armed;
+    if armed == TightnessTier::Critical
+        && ratio > FREE_RATIO_PRESSURE + HYSTERESIS_BAND_PP
+    {
+        armed = TightnessTier::Tight;
+    }
+    if armed == TightnessTier::Tight
+        && ratio > FREE_RATIO_CAUTION + HYSTERESIS_BAND_PP
+    {
+        armed = TightnessTier::Roomy;
+    }
+    armed
+}
+
+/// The transition between a prior and new armed tier, if any (UPI 031-a).
+/// `None` when the tier is unchanged.
+#[must_use]
+pub fn transition(
+    prior: TightnessTier,
+    new: TightnessTier,
+) -> Option<Transition> {
+    if prior == new {
+        None
+    } else {
+        Some(Transition {
+            from: prior,
+            to: new,
+        })
+    }
+}
+
+/// Derive the per-subvolume posture from the armed tier and host-root flag
+/// (UPI 031-a). `Some` iff `armed >= Tight` — a Roomy pool has no posture, so
+/// Urd stays silent on it.
+#[must_use]
+pub fn derive_posture(
+    armed: TightnessTier,
+    host_root: bool,
+) -> Option<StoragePosture> {
+    (armed >= TightnessTier::Tight).then_some(StoragePosture {
+        tier: armed,
+        host_root,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Build an input with the structural gate satisfied; callers override
-    /// the field under test.
-    fn on_root(severity: HeadroomSeverity) -> StorageCriticalInput<'static> {
-        StorageCriticalInput {
-            subvol_pool_uuid: Some("root-pool"),
-            root_pool_uuid: Some("root-pool"),
-            root_subvol_configured: true,
-            source_free_ratio_severity: severity,
+    // ── From<HeadroomSeverity> matrix ────────────────────────────────────
+
+    #[test]
+    fn tier_from_severity_matrix() {
+        assert_eq!(
+            TightnessTier::from(HeadroomSeverity::Healthy),
+            TightnessTier::Roomy
+        );
+        assert_eq!(
+            TightnessTier::from(HeadroomSeverity::Caution),
+            TightnessTier::Tight
+        );
+        assert_eq!(
+            TightnessTier::from(HeadroomSeverity::Pressure),
+            TightnessTier::Critical
+        );
+        assert_eq!(
+            TightnessTier::from(HeadroomSeverity::Critical),
+            TightnessTier::Critical
+        );
+    }
+
+    #[test]
+    fn tier_ordering_is_roomy_tight_critical() {
+        assert!(TightnessTier::Roomy < TightnessTier::Tight);
+        assert!(TightnessTier::Tight < TightnessTier::Critical);
+    }
+
+    #[test]
+    fn tier_db_str_round_trip() {
+        for tier in [
+            TightnessTier::Roomy,
+            TightnessTier::Tight,
+            TightnessTier::Critical,
+        ] {
+            assert_eq!(TightnessTier::from_db_str(tier.as_db_str()), Some(tier));
         }
+        assert_eq!(TightnessTier::from_db_str("garbage"), None);
+        assert_eq!(TightnessTier::from_db_str(""), None);
+    }
+
+    // ── host_root gates ──────────────────────────────────────────────────
+
+    #[test]
+    fn host_root_uuid_match_and_configured() {
+        assert!(host_root(Some("root-pool"), Some("root-pool"), true));
     }
 
     #[test]
-    fn root_pool_match_configured_and_pressure_is_critical() {
-        assert!(is_storage_critical(on_root(HeadroomSeverity::Pressure)));
+    fn host_root_uuid_mismatch_is_false() {
+        assert!(!host_root(Some("other-pool"), Some("root-pool"), true));
     }
 
     #[test]
-    fn htpc_root_archetype_is_critical() {
-        // Source `/` on a tight root NVMe (~6% free → Pressure), `/` entrusted.
-        let input = StorageCriticalInput {
-            subvol_pool_uuid: Some("nvme-root"),
-            root_pool_uuid: Some("nvme-root"),
-            root_subvol_configured: true,
-            source_free_ratio_severity: HeadroomSeverity::Pressure,
-        };
-        assert!(is_storage_critical(input));
+    fn host_root_subvol_uuid_none_is_false() {
+        assert!(!host_root(None, Some("root-pool"), true));
     }
 
     #[test]
-    fn caution_is_not_critical() {
-        // Branch E: only Pressure+ qualifies; Caution is below the gate.
-        assert!(!is_storage_critical(on_root(HeadroomSeverity::Caution)));
+    fn host_root_root_uuid_none_is_false() {
+        assert!(!host_root(Some("root-pool"), None, true));
     }
 
     #[test]
-    fn healthy_is_not_critical() {
-        assert!(!is_storage_critical(on_root(HeadroomSeverity::Healthy)));
+    fn host_root_not_configured_is_false() {
+        // UUID match but no enabled `source == "/"` subvolume.
+        assert!(!host_root(Some("root-pool"), Some("root-pool"), false));
+    }
+
+    // ── resolve_armed_tier: escalate / hold / disarm ─────────────────────
+
+    #[test]
+    fn escalate_immediate_roomy_to_tight() {
+        // 0.20 free → Caution → Tight; jumps up at once.
+        assert_eq!(
+            resolve_armed_tier(TightnessTier::Roomy, Some(0.20)),
+            TightnessTier::Tight
+        );
     }
 
     #[test]
-    fn critical_severity_is_critical() {
-        // Defensive: `>=` accepts the dormant Critical tier.
-        assert!(is_storage_critical(on_root(HeadroomSeverity::Critical)));
+    fn escalate_immediate_two_step_to_critical() {
+        // 0.05 free → Pressure → Critical; two-step jump up, no hysteresis.
+        assert_eq!(
+            resolve_armed_tier(TightnessTier::Roomy, Some(0.05)),
+            TightnessTier::Critical
+        );
     }
 
     #[test]
-    fn not_configured_is_not_critical() {
-        // Gate: no enabled `source == "/"` subvolume entrusts `/`.
-        let mut input = on_root(HeadroomSeverity::Pressure);
-        input.root_subvol_configured = false;
-        assert!(!is_storage_critical(input));
+    fn sticky_hold_critical_below_disarm_band() {
+        // Armed Critical, free recovered to 0.18 (classifies Tight) but not
+        // past 0.20 → holds Critical (anti-flap).
+        assert_eq!(
+            resolve_armed_tier(TightnessTier::Critical, Some(0.18)),
+            TightnessTier::Critical
+        );
     }
 
     #[test]
-    fn uuid_mismatch_is_not_critical() {
-        // Tight + configured, but this subvol is on a different pool.
-        let input = StorageCriticalInput {
-            subvol_pool_uuid: Some("other-pool"),
-            root_pool_uuid: Some("root-pool"),
-            root_subvol_configured: true,
-            source_free_ratio_severity: HeadroomSeverity::Pressure,
-        };
-        assert!(!is_storage_critical(input));
+    fn disarm_critical_to_tight_above_band() {
+        // Free recovered to 0.22 (> 0.20) → Critical disarms to Tight, but
+        // 0.22 < 0.30 so it stays Tight.
+        assert_eq!(
+            resolve_armed_tier(TightnessTier::Critical, Some(0.22)),
+            TightnessTier::Tight
+        );
     }
 
     #[test]
-    fn subvol_pool_uuid_none_is_not_critical() {
-        let mut input = on_root(HeadroomSeverity::Pressure);
-        input.subvol_pool_uuid = None;
-        assert!(!is_storage_critical(input));
+    fn sticky_hold_tight_below_disarm_band() {
+        // Armed Tight, free recovered to 0.28 (classifies Roomy) but not past
+        // 0.30 → holds Tight.
+        assert_eq!(
+            resolve_armed_tier(TightnessTier::Tight, Some(0.28)),
+            TightnessTier::Tight
+        );
     }
 
     #[test]
-    fn root_pool_uuid_none_is_not_critical() {
-        // Root not btrfs / unresolved findmnt → no structural claim.
-        let mut input = on_root(HeadroomSeverity::Pressure);
-        input.root_pool_uuid = None;
-        assert!(!is_storage_critical(input));
+    fn disarm_tight_to_roomy_above_band() {
+        assert_eq!(
+            resolve_armed_tier(TightnessTier::Tight, Some(0.31)),
+            TightnessTier::Roomy
+        );
     }
 
     #[test]
-    fn both_uuids_none_is_not_critical() {
-        let input = StorageCriticalInput {
-            subvol_pool_uuid: None,
-            root_pool_uuid: None,
-            root_subvol_configured: true,
-            source_free_ratio_severity: HeadroomSeverity::Pressure,
-        };
-        assert!(!is_storage_critical(input));
+    fn two_step_disarm_at_high_ratio() {
+        // Armed Critical, free recovered well past both bands (0.35) → drops
+        // two levels to Roomy in one run.
+        assert_eq!(
+            resolve_armed_tier(TightnessTier::Critical, Some(0.35)),
+            TightnessTier::Roomy
+        );
+    }
+
+    #[test]
+    fn unmeasurable_ratio_holds_prior() {
+        assert_eq!(
+            resolve_armed_tier(TightnessTier::Critical, None),
+            TightnessTier::Critical
+        );
+        assert_eq!(
+            resolve_armed_tier(TightnessTier::Tight, None),
+            TightnessTier::Tight
+        );
+        assert_eq!(
+            resolve_armed_tier(TightnessTier::Roomy, None),
+            TightnessTier::Roomy
+        );
+    }
+
+    // ── exact boundaries: 0.15 / 0.20 / 0.25 / 0.30 (M2) ─────────────────
+
+    #[test]
+    fn boundary_0_15_classifies_tight_not_critical() {
+        // classify_free_ratio_value is strict `<`: 0.15 is NOT < 0.15, so it
+        // lands in Caution → Tight. Just inside (0.149) is Critical.
+        assert_eq!(
+            resolve_armed_tier(TightnessTier::Roomy, Some(0.15)),
+            TightnessTier::Tight
+        );
+        assert_eq!(
+            resolve_armed_tier(TightnessTier::Roomy, Some(0.149)),
+            TightnessTier::Critical
+        );
+    }
+
+    #[test]
+    fn boundary_0_20_critical_disarm_is_strict() {
+        // Exactly 0.20 does NOT clear the Critical→Tight band (strict `>`).
+        assert_eq!(
+            resolve_armed_tier(TightnessTier::Critical, Some(0.20)),
+            TightnessTier::Critical
+        );
+        // Just past it disarms.
+        assert_eq!(
+            resolve_armed_tier(TightnessTier::Critical, Some(0.2001)),
+            TightnessTier::Tight
+        );
+    }
+
+    #[test]
+    fn boundary_0_25_classifies_roomy() {
+        // Escalation classifier is strict `<`: 0.25 is NOT < 0.25 → Roomy.
+        assert_eq!(
+            resolve_armed_tier(TightnessTier::Roomy, Some(0.25)),
+            TightnessTier::Roomy
+        );
+        // Just inside is Tight.
+        assert_eq!(
+            resolve_armed_tier(TightnessTier::Roomy, Some(0.249)),
+            TightnessTier::Tight
+        );
+    }
+
+    #[test]
+    fn boundary_0_30_tight_disarm_is_strict() {
+        // Exactly 0.30 does NOT clear the Tight→Roomy band (strict `>`).
+        assert_eq!(
+            resolve_armed_tier(TightnessTier::Tight, Some(0.30)),
+            TightnessTier::Tight
+        );
+        assert_eq!(
+            resolve_armed_tier(TightnessTier::Tight, Some(0.3001)),
+            TightnessTier::Roomy
+        );
+    }
+
+    // ── transition + is_escalation ───────────────────────────────────────
+
+    #[test]
+    fn transition_some_on_change_none_on_steady() {
+        assert_eq!(
+            transition(TightnessTier::Roomy, TightnessTier::Tight),
+            Some(Transition {
+                from: TightnessTier::Roomy,
+                to: TightnessTier::Tight,
+            })
+        );
+        assert_eq!(transition(TightnessTier::Tight, TightnessTier::Tight), None);
+    }
+
+    #[test]
+    fn is_escalation_distinguishes_direction() {
+        assert!(
+            transition(TightnessTier::Roomy, TightnessTier::Critical)
+                .unwrap()
+                .is_escalation()
+        );
+        assert!(
+            !transition(TightnessTier::Critical, TightnessTier::Roomy)
+                .unwrap()
+                .is_escalation()
+        );
+    }
+
+    // ── derive_posture ───────────────────────────────────────────────────
+
+    #[test]
+    fn derive_posture_none_below_tight() {
+        assert_eq!(derive_posture(TightnessTier::Roomy, true), None);
+    }
+
+    #[test]
+    fn derive_posture_some_at_tight_and_critical() {
+        assert_eq!(
+            derive_posture(TightnessTier::Tight, false),
+            Some(StoragePosture {
+                tier: TightnessTier::Tight,
+                host_root: false,
+            })
+        );
+        assert_eq!(
+            derive_posture(TightnessTier::Critical, true),
+            Some(StoragePosture {
+                tier: TightnessTier::Critical,
+                host_root: true,
+            })
+        );
     }
 }

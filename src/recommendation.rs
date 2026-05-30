@@ -30,8 +30,8 @@ use crate::types::ResolvedGraduatedRetention;
 // Boundaries are strict (`<` / `>`): exact-threshold values land in the
 // lower tier (e.g., free_ratio == 0.25 → Healthy).
 
-const FREE_RATIO_CAUTION: f64 = 0.25;
-const FREE_RATIO_PRESSURE: f64 = 0.15;
+pub const FREE_RATIO_CAUTION: f64 = 0.25;
+pub const FREE_RATIO_PRESSURE: f64 = 0.15;
 const TIME_TO_EMPTY_CAUTION_DAYS: f64 = 90.0;
 const TIME_TO_EMPTY_PRESSURE_DAYS: f64 = 30.0;
 const METADATA_CAUTION: f64 = 0.85;
@@ -114,6 +114,17 @@ pub fn classify_free_ratio(free: Option<u64>, capacity: Option<u64>) -> Headroom
     }
     #[allow(clippy::cast_precision_loss)]
     let ratio = free as f64 / capacity as f64;
+    classify_free_ratio_value(ratio)
+}
+
+/// Classify a pre-computed free-ratio by free-ratio alone. Boundaries are
+/// strict (`<`): exact-threshold values land in the lower (roomier) tier
+/// (e.g. `0.25` → `Healthy`). Non-finite ratios fail toward `Healthy`.
+///
+/// Shared with `storage_critical::resolve_armed_tier` (UPI 031-a) so the
+/// tightness-tier boundaries have a single source of truth.
+#[must_use]
+pub fn classify_free_ratio_value(ratio: f64) -> HeadroomSeverity {
     if !ratio.is_finite() {
         return HeadroomSeverity::Healthy;
     }
@@ -200,9 +211,7 @@ pub struct ShapeRecommendation {
 
 /// Why a headroom-aware recommendation was adjusted (UPI 044). Variants
 /// embed the numeric value that drove them so the renderer can produce
-/// honest text without re-reading the context. `StorageCritical` is
-/// injected externally by doctor.rs when `is_storage_critical(name)`
-/// fires.
+/// honest text without re-reading the context.
 ///
 /// Priority tiebreak when multiple signals fire at the same severity:
 /// `DestinationMetadataPressure > SourcePoolLow > SourcePoolShrinking`.
@@ -212,7 +221,6 @@ pub enum AdjustmentReason {
     SourcePoolLow { free_ratio: f64 },
     SourcePoolShrinking { days_to_empty: f64 },
     DestinationMetadataPressure { drive_label: String, ratio: f64 },
-    StorageCritical,
 }
 
 impl HeadroomAwareRecommendation {
@@ -1393,7 +1401,7 @@ mod tests {
             &cur,
             ShapeRole::Local,
             HeadroomSeverity::Pressure,
-            AdjustmentReason::StorageCritical,
+            AdjustmentReason::SourcePoolLow { free_ratio: 0.1 },
         );
         assert_eq!(h.recommendation.suggested, h.recommendation.current);
         assert_eq!(h.recommendation.current, cur);
@@ -1404,7 +1412,7 @@ mod tests {
         assert!(h.adjusted.is_none());
         assert!(h.adjusted_cost.is_none());
         assert_eq!(h.severity, HeadroomSeverity::Pressure);
-        assert!(matches!(h.reason, Some(AdjustmentReason::StorageCritical)));
+        assert!(matches!(h.reason, Some(AdjustmentReason::SourcePoolLow { .. })));
     }
 
     #[test]
@@ -1415,7 +1423,7 @@ mod tests {
             &cur,
             ShapeRole::Local,
             HeadroomSeverity::Healthy,
-            AdjustmentReason::StorageCritical,
+            AdjustmentReason::SourcePoolLow { free_ratio: 0.1 },
         );
     }
 
@@ -1427,7 +1435,7 @@ mod tests {
             &cur,
             ShapeRole::Local,
             HeadroomSeverity::Caution,
-            AdjustmentReason::StorageCritical,
+            AdjustmentReason::SourcePoolLow { free_ratio: 0.1 },
         );
     }
 }

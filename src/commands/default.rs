@@ -2,6 +2,7 @@ use std::path::Path;
 
 use crate::advice;
 use crate::awareness;
+use crate::commands::storage_signals;
 use crate::config;
 use crate::error::UrdError;
 use crate::output::{DefaultStatusOutput, OutputMode};
@@ -38,7 +39,9 @@ pub fn run(config_path: Option<&Path>, output_mode: OutputMode) -> anyhow::Resul
 
     // Awareness assessment — lighter than status (no chain health, no drive info, no pins)
     let now = chrono::Local::now().naive_local();
-    let mut assessments = awareness::assess(&config, now, &observation);
+    let signals = storage_signals::gather(&config, state_db.as_ref());
+    let mut assessments =
+        awareness::assess(&config, now, &observation, &signals.by_subvol);
     advice::overlay_offsite_freshness(&mut assessments, &config);
 
     let last_run = state_db.as_ref().and_then(|db| db.last_run_info());
@@ -77,6 +80,11 @@ pub fn run(config_path: Option<&Path>, output_mode: OutputMode) -> anyhow::Resul
     let total_needing_attention = advice_items.len();
     let best_advice = advice_items.into_iter().next();
 
+    // Worst tight pool drives the compact bare-`urd` clause.
+    let storage_posture = storage_signals::aggregate(&assessments, &signals, now)
+        .into_iter()
+        .max_by(|a, b| a.tier.cmp(&b.tier).then(a.host_root.cmp(&b.host_root)));
+
     let output = DefaultStatusOutput {
         total,
         waning_names,
@@ -87,6 +95,7 @@ pub fn run(config_path: Option<&Path>, output_mode: OutputMode) -> anyhow::Resul
         last_run_age_secs,
         best_advice,
         total_needing_attention,
+        storage_posture,
     };
 
     let rendered = voice::render_default_status(&output, output_mode);

@@ -8,6 +8,7 @@ use crate::output::{
     StatusOutput,
 };
 use crate::plan::{Observation, RealFileSystemState};
+use crate::commands::storage_signals;
 use crate::retention;
 use crate::state::StateDb;
 use crate::voice;
@@ -31,8 +32,13 @@ pub fn run(config: Config, output_mode: OutputMode) -> anyhow::Result<()> {
 
     // ── Awareness model ─────────────────────────────────────────────
     let now = chrono::Local::now().naive_local();
-    let mut assessments = awareness::assess(&config, now, &observation);
+    // Gather storage signals (read-only) and thread the per-subvol map into
+    // assess(); status reflects the stabilized tier but never advances it (S1).
+    let signals = storage_signals::gather(&config, state_db.as_ref());
+    let mut assessments =
+        awareness::assess(&config, now, &observation, &signals.by_subvol);
     advice::overlay_offsite_freshness(&mut assessments, &config);
+    let storage_postures = storage_signals::aggregate(&assessments, &signals, now);
 
     // ── Chain health per subvolume (derived from awareness assessment) ──
     let chain_health_entries: Vec<ChainHealthEntry> = assessments
@@ -134,6 +140,7 @@ pub fn run(config: Config, output_mode: OutputMode) -> anyhow::Result<()> {
         total_pins,
         redundancy_advisories,
         advice,
+        storage_postures,
     };
 
     let rendered = voice::render_status(&status_output, output_mode);

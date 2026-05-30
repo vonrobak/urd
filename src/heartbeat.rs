@@ -410,6 +410,7 @@ mod tests {
                 advisories: vec![],
                 redundancy_advisories: vec![],
                 errors: vec![],
+                storage_posture: None,
             },
             SubvolAssessment {
                 name: "docs".to_string(),
@@ -427,6 +428,7 @@ mod tests {
                 advisories: vec![],
                 redundancy_advisories: vec![],
                 errors: vec![],
+                storage_posture: None,
             },
         ]
     }
@@ -497,6 +499,45 @@ mod tests {
         assert_eq!(parsed.subvolumes[1].promise_status, PromiseStatus::AtRisk);
         // "docs" has send_type: NoSend → send_completed: false
         assert!(!parsed.subvolumes[1].send_completed);
+    }
+
+    /// S4 guard (UPI 031-a): the heartbeat projection (`SubvolumeHeartbeat`) is
+    /// a fixed shape, so a per-subvolume `storage_posture` must NOT leak into
+    /// the heartbeat JSON — the posture is a `urd status`/notify surface only
+    /// (D6, Cross-Repo Impact: None). Construct a Tight + Critical posture and
+    /// assert no posture field/substring survives serialization.
+    #[test]
+    fn storage_posture_never_leaks_into_heartbeat() {
+        use crate::storage_critical::{StoragePosture, TightnessTier};
+        let config = test_config(&[("home", "1h"), ("docs", "1h")]);
+        let now =
+            NaiveDateTime::parse_from_str("2026-03-24T02:05:00", "%Y-%m-%dT%H:%M:%S").unwrap();
+        let mut assessments = test_assessments();
+        assessments[0].storage_posture = Some(StoragePosture {
+            tier: TightnessTier::Critical,
+            host_root: true,
+        });
+        assessments[1].storage_posture = Some(StoragePosture {
+            tier: TightnessTier::Tight,
+            host_root: false,
+        });
+        let result = test_execution_result();
+
+        let heartbeat = build_from_run(
+            &config,
+            now,
+            &result,
+            &assessments,
+            &HashMap::new(),
+            Vec::new(),
+            Vec::new(),
+            &HashMap::new(),
+        );
+        let json = serde_json::to_string(&heartbeat).unwrap();
+        assert!(
+            !json.contains("storage_posture") && !json.contains("posture"),
+            "posture must not leak into the heartbeat JSON: {json}"
+        );
     }
 
     // ── stale_after ─────────────────────────────────────────────────────

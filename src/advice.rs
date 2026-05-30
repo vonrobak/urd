@@ -531,6 +531,7 @@ drives = ["primary-drive", "offsite-drive"]
             advisories: vec![],
             redundancy_advisories: vec![],
             errors: vec![],
+            storage_posture: None,
         }
     }
 
@@ -786,7 +787,7 @@ drives = ["drive-a", "drive-b"]
             .insert("sv1".to_string(), vec![snap(dt(2026, 4, 1, 11, 0), "sv1")]);
         fs.mounted_drives.insert("drive-a".to_string());
 
-        let assessments = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let assessments = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         let advisories = compute_redundancy_advisories(&config, &assessments);
 
         assert_eq!(advisories.len(), 1);
@@ -810,7 +811,7 @@ drives = ["drive-a", "drive-b"]
             dt(2026, 3, 1, 12, 0),
         );
 
-        let assessments = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let assessments = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         let advisories = compute_redundancy_advisories(&config, &assessments);
 
         assert_eq!(advisories.len(), 1);
@@ -832,7 +833,7 @@ drives = ["drive-a", "drive-b"]
             dt(2026, 3, 3, 12, 0),
         );
 
-        let assessments = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let assessments = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         let advisories = compute_redundancy_advisories(&config, &assessments);
 
         assert!(
@@ -850,7 +851,7 @@ drives = ["drive-a", "drive-b"]
             .insert("sv1".to_string(), vec![snap(dt(2026, 4, 1, 11, 0), "sv1")]);
         fs.mounted_drives.insert("primary-drive".to_string());
 
-        let assessments = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let assessments = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         let advisories = compute_redundancy_advisories(&config, &assessments);
 
         assert!(
@@ -917,7 +918,7 @@ protection_level = "protected"
             dt(2026, 4, 1, 8, 0),
         );
 
-        let assessments = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let assessments = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         let advisories = compute_redundancy_advisories(&config, &assessments);
 
         assert_eq!(advisories.len(), 1);
@@ -936,7 +937,7 @@ protection_level = "protected"
         fs.mounted_drives.insert("drive-a".to_string());
         fs.mounted_drives.insert("drive-b".to_string());
 
-        let assessments = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let assessments = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         let advisories = compute_redundancy_advisories(&config, &assessments);
 
         // Should have NoOffsiteProtection but NOT SinglePointOfFailure
@@ -996,7 +997,7 @@ protection_level = "guarded"
         fs.local_snapshots
             .insert("sv1".to_string(), vec![snap(dt(2026, 4, 1, 11, 0), "sv1")]);
 
-        let assessments = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let assessments = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         let advisories = compute_redundancy_advisories(&config, &assessments);
 
         assert!(
@@ -1062,7 +1063,7 @@ local_retention = "transient"
             dt(2026, 3, 30, 12, 0),
         );
 
-        let assessments = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let assessments = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         let advisories = compute_redundancy_advisories(&config, &assessments);
 
         assert!(
@@ -1086,7 +1087,7 @@ local_retention = "transient"
             dt(2026, 4, 1, 8, 0),
         );
 
-        let assessments = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let assessments = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         let advisories = compute_redundancy_advisories(&config, &assessments);
 
         assert!(
@@ -1108,7 +1109,7 @@ local_retention = "transient"
             dt(2026, 3, 30, 12, 0),
         );
 
-        let assessments = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() });
+        let assessments = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         let advisories = compute_redundancy_advisories(&config, &assessments);
 
         let advisory = advisories
@@ -1151,6 +1152,7 @@ local_retention = "transient"
             advisories: vec![],
             redundancy_advisories: vec![],
             errors: vec![],
+            storage_posture: None,
         }
     }
 
