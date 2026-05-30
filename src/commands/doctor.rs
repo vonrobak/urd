@@ -539,19 +539,10 @@ fn build_doctor_recommendation_view_inner(
         // Synth-path fallback reason (M3): the Pressure/Critical branch is only
         // reached when the source pool is genuinely low, so `SourcePoolLow` is
         // the honest reason when `pick_reason` returns None (it renders prose;
-        // the retired `StorageCritical` reason rendered blank).
-        let source_free_ratio = match (
-            source_space.map(|s| s.free_bytes),
-            source_space.map(|s| s.capacity_bytes),
-        ) {
-            (Some(free), Some(cap)) if cap > 0 => {
-                #[allow(clippy::cast_precision_loss)]
-                {
-                    free as f64 / cap as f64
-                }
-            }
-            _ => 0.0,
-        };
+        // the retired `StorageCritical` reason rendered blank). Unmeasurable
+        // free-ratio falls back to `0.0` — only ever read on the genuinely-low
+        // branch, where most-tight is the safe direction.
+        let source_free_ratio = source_space.and_then(PoolSpace::free_ratio).unwrap_or(0.0);
 
         let local = match (local_rec, severity_local, local_current_shape) {
             (Some(r), _, _) => Some(r),

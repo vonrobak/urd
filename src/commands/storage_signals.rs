@@ -67,14 +67,15 @@ pub struct PostureEscalation {
     pub transition: Transition,
 }
 
-/// Free/capacity ratio from a `PoolSpace`; `None` on zero/garbage capacity.
-fn pool_free_ratio(space: PoolSpace) -> Option<f64> {
-    if space.capacity_bytes == 0 {
-        return None;
-    }
-    #[allow(clippy::cast_precision_loss)]
-    let ratio = space.free_bytes as f64 / space.capacity_bytes as f64;
-    ratio.is_finite().then_some(ratio)
+/// How distinct pools are grouped within `gather_with`: by UUID when known,
+/// else by mountpoint (so UUID-less subvols on one mount still aggregate),
+/// else by name (degenerate). A typed key — never persisted or displayed —
+/// so the grouping can't collide the way prefixed strings could.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum PoolKey {
+    Uuid(String),
+    Mount(PathBuf),
+    Subvol(String),
 }
 
 /// Gather storage signals for all enabled subvolumes (read-only). One
@@ -109,29 +110,29 @@ fn gather_with(
         .iter()
         .any(|sv| sv.enabled && sv.source.as_path() == Path::new("/"));
 
-    // Accumulate distinct pools (insertion-ordered) and the subvol→pool map.
-    let mut order: Vec<String> = Vec::new();
-    let mut by_key: HashMap<String, PoolSignal> = HashMap::new();
-    let mut subvol_key: Vec<(String, String)> = Vec::new();
+    // Accumulate distinct pools (insertion-ordered) and the per-subvol map in
+    // one pass: every field `by_subvol` reads is fixed when the pool is first
+    // inserted, so it can be mirrored inline rather than in a second loop.
+    let mut order: Vec<PoolKey> = Vec::new();
+    let mut by_key: HashMap<PoolKey, PoolSignal> = HashMap::new();
+    let mut by_subvol = StorageSignalMap::new();
 
     for sv in &resolved {
         if !sv.enabled {
             continue;
         }
         let (uuid, mountpoint) = resolve(&sv.source);
-        // Key pools by UUID when known; otherwise by mountpoint (so UUID-less
-        // subvols on one mount still aggregate), else by name (degenerate).
         let key = match (&uuid, &mountpoint) {
-            (Some(u), _) => format!("uuid:{u}"),
-            (None, Some(mp)) => format!("mp:{}", mp.display()),
-            (None, None) => format!("sv:{}", sv.name),
+            (Some(u), _) => PoolKey::Uuid(u.clone()),
+            (None, Some(mp)) => PoolKey::Mount(mp.clone()),
+            (None, None) => PoolKey::Subvol(sv.name.clone()),
         };
 
         if !by_key.contains_key(&key) {
             let free_ratio = mountpoint
                 .as_deref()
                 .and_then(&mut space)
-                .and_then(pool_free_ratio);
+                .and_then(PoolSpace::free_ratio);
             let host_root = storage_critical::host_root(
                 uuid.as_deref(),
                 root_pool_uuid,
@@ -162,16 +163,8 @@ fn gather_with(
         }
         if let Some(pool) = by_key.get_mut(&key) {
             pool.subvol_names.push(sv.name.clone());
-        }
-        subvol_key.push((sv.name.clone(), key));
-    }
-
-    // Per-subvolume signals reflect the pool each subvol lives on.
-    let mut by_subvol = StorageSignalMap::new();
-    for (name, key) in &subvol_key {
-        if let Some(pool) = by_key.get(key) {
             by_subvol.insert(
-                name.clone(),
+                sv.name.clone(),
                 ResolvedStorageSignal {
                     free_ratio: pool.free_ratio,
                     host_root: pool.host_root,

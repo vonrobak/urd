@@ -216,6 +216,23 @@ pub struct PoolSpace {
     pub capacity_bytes: u64,
 }
 
+impl PoolSpace {
+    /// Free / capacity as a ratio; `None` on zero (or otherwise unmeasurable)
+    /// capacity — `0` free-ratio is in-range but meaningless, so absence is an
+    /// `Option`, not a plausible-looking number. The single owner of the
+    /// free-ratio arithmetic for the two callers that hold a `PoolSpace`
+    /// (`commands::storage_signals`, `commands::doctor`).
+    #[must_use]
+    pub fn free_ratio(self) -> Option<f64> {
+        if self.capacity_bytes == 0 {
+            return None;
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let ratio = self.free_bytes as f64 / self.capacity_bytes as f64;
+        ratio.is_finite().then_some(ratio)
+    }
+}
+
 /// Capacity + free bytes on a BTRFS pool by mountpoint (statvfs). One
 /// syscall, two numbers. Returns `Err` on statvfs failure; caller maps
 /// `Err` → `None` for emission. Same pattern as
