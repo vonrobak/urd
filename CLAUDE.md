@@ -302,13 +302,13 @@ systematic-debugging → build → /check → /commit-push-pr → /session-close
 ### Standard — medium features, clear scope, no new modules
 
 ```
-/design → /grill-me → /prepare → arch-adversary → /post-review → build → /simplify → /check → /commit-push-pr → /session-close
+/design → /grill-me → /prepare → arch-adversary → /post-review → build → /tidy → /check → /commit-push-pr → /session-close
 ```
 
 ### Full — new modules, architectural changes, ADR gates
 
 ```
-/brainstorm → /design → /grill-me → [/sequence] → /prepare → arch-adversary → /post-review → build → /simplify → /check → /commit-push-pr → /session-close
+/brainstorm → /design → /grill-me → [/sequence] → /prepare → arch-adversary → /post-review → build → /tidy → /check → /commit-push-pr → /session-close
 ```
 
 ### Tool reference
@@ -323,7 +323,7 @@ systematic-debugging → build → /check → /commit-push-pr → /session-close
 | `arch-adversary` | Plan review | Severity-ranked findings on the implementation plan |
 | `/post-review` | Plan revision | Revise the plan to address adversary findings |
 | `build` | Implementation | Execute the reviewed plan |
-| `/simplify` | Post-build | Simplification pass: abstractions, types, control flow |
+| `/tidy` | Post-build | Rust simplification pass: module boundaries, strong types, idiom, control flow (renamed from `/simplify` to avoid the built-in skill) |
 | `test-team` | Testing | Risk-proportional coverage analysis and gap identification |
 | `systematic-debugging` | Diagnosis | Four-phase root cause investigation (any tier, especially patch) |
 | `/check` | Quality gate | `cargo clippy` + `cargo test` + `cargo build --release` |
