@@ -8,6 +8,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Mid-op watchdog + reserve file** (UPI 033, ADR-113 Layer 2). Closes the
+  in-flight blind spot: between "send started" and "send finished" nothing watched
+  the host, yet a long send holds its source snapshot the whole transfer while live
+  `/` churns CoW into it. An in-process sibling thread now polls each armed source
+  pool's free level **and** drop-rate during sends (pure decision core in the new
+  `guard.rs`; reserve I/O in the new `reserve.rs`). On a floor (`min_free +
+  cleanup_budget`) or cliff (free falling > 100 MB/s) trigger it first deletes a
+  pre-allocated 1 GiB `.urd-emergency-reserve` — the fast bridge, freed on the
+  watchdog thread so it fires even if the copy thread is wedged — then, if still
+  tripping, cancels the in-flight send via a flag in the copy loop. Because
+  cancelling a send frees no source space on its own, once the send exits the
+  executor's new `emergency_reclaim_pool` clears the **triggering pool's** local
+  snapshots (the just-aborted snapshot *and* its pin parent), reusing the 031-b
+  fail-closed clear-all ordering: host survival over chain continuity, the next send
+  becomes full (an ADR-106-scoped exception authorized by ADR-113's catastrophic-floor
+  doctrine; the live subvolume is untouched and falls back to its prior offsite copy).
+  Adds the optional per-`snapshot_root` `cleanup_budget` config field (additive across
+  legacy/v1/v2, no `urd migrate` step; defaults to 1.5 % of pool capacity) and the
+  `WatchdogAbort` ADR-114 event with a `Critical`-urgency notification. The watchdog
+  arms only on Tight/Critical source pools with a send-enabled subvolume and is **not**
+  TTY-gated (autonomous runs need it most); a reserve is pre-positioned at the first
+  Tight (or roomy-with-room) run so it exists before a pool jumps to Critical. The
+  reserve is `fallocate`d (real extents, exempt from transparent compression) — never
+  zero-byte-written, which would free nothing on a `compress` mount. Event-only surface:
+  no metric, heartbeat, on-disk, or config-schema-version change (Cross-Repo Impact: None).
 - **Tier-graded ephemeral footprint-cap** (UPI 031-b, ADR-113 increment 2). Makes the
   storage tightness tier from 031-a *act* on Urd's own footprint instead of merely
   reporting it. The armed tier is now resolved once pre-plan and threaded into the

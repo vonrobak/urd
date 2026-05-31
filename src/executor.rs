@@ -126,6 +126,34 @@ pub enum TransientCleanupOutcome {
     DeleteFailed { path: String, error: String },
 }
 
+/// Outcome of a pool-scoped emergency abort-reclaim (UPI 033, Step 5b).
+/// Reported on the `WatchdogAbort` event so the notification can say what was
+/// actually reclaimed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReclaimOutcome {
+    /// Local snapshots on the triggering pool were deleted to free space.
+    Reclaimed { deleted: u32 },
+    /// Nothing to reclaim (no local snapshots present, or every subvol's pin
+    /// removal was refused).
+    Nothing,
+    /// At least one deletion failed; carries how many succeeded and the first
+    /// error (ADR-100 isolation — the reclaim continues through failures).
+    Failed { deleted: u32, first_error: String },
+}
+
+impl ReclaimOutcome {
+    /// How many local snapshots were deleted (0 for `Nothing`).
+    #[must_use]
+    pub fn deleted(&self) -> u32 {
+        match self {
+            ReclaimOutcome::Reclaimed { deleted } | ReclaimOutcome::Failed { deleted, .. } => {
+                *deleted
+            }
+            ReclaimOutcome::Nothing => 0,
+        }
+    }
+}
+
 /// Context about a subvolume passed to the per-subvolume executor.
 /// Constructed from config lookup + the armed tier in `execute()`.
 #[derive(Debug)]
@@ -1221,6 +1249,121 @@ impl<'a> Executor<'a> {
             TransientCleanupOutcome::Cleaned { deleted_count }
         } else {
             TransientCleanupOutcome::NotApplicable
+        }
+    }
+
+    /// Pool-scoped emergency reclaim after a mid-op watchdog abort (UPI 033,
+    /// Step 5b — the definitive source-pool reclaim).
+    ///
+    /// Cancelling a `btrfs send` frees **no** source-pool space on its own: the
+    /// pressure comes from the retained read-only snapshot's CoW growth as live
+    /// `/` diverges plus ambient host writes, neither stopped by aborting the
+    /// transfer (the partial *destination* snapshot is cleaned in `btrfs.rs`,
+    /// the wrong pool for host survival). The only space Urd can return to the
+    /// source pool is its own footprint — so this clears the triggering pool's
+    /// local snapshots: the just-aborted snapshot **and** any pin parent(s).
+    ///
+    /// Reuses the 031-b clear-all ordering so the fail-closed logic has one
+    /// home (symmetric-fix discipline): for each subvol, (1) drop every drive's
+    /// pin file first — if any removal fails, refuse that subvol's deletions
+    /// this pass (never a half-cleared state); (2) re-read pins fail-closed;
+    /// (3) delete every on-disk snapshot not in the (now-empty) pinned set,
+    /// continuing through failures (ADR-100 isolation). Syncs the affected
+    /// roots so freed space commits promptly (T4: btrfs async-cleaner lag).
+    ///
+    /// Dropping the pin means the next send becomes a full one — the documented
+    /// acceptable cost (ADR-113 catastrophic-floor doctrine: host survival >
+    /// chain continuity; an ADR-106-scoped exception authorized by it). The
+    /// live subvolume is never touched; it falls back to its prior offsite copy.
+    /// `emergency_retention` is deliberately NOT reused — it *keeps* `latest`
+    /// and `pinned`, i.e. exactly the snapshot + pin we must shed.
+    #[must_use]
+    pub fn emergency_reclaim_pool(&self, subvol_names: &[String]) -> ReclaimOutcome {
+        let drive_labels = self.config.drive_labels();
+        let mut deleted: u32 = 0;
+        let mut first_error: Option<String> = None;
+        let mut roots_to_sync: HashSet<PathBuf> = HashSet::new();
+
+        for name in subvol_names {
+            let Some(local_dir) = self.config.local_snapshot_dir(name) else {
+                continue;
+            };
+
+            // (1) Drop pins FIRST (031-b ordering). If any removal fails, refuse
+            // THIS subvol's deletions this pass — never a half-cleared state.
+            let mut pin_removal_failed = false;
+            for label in &drive_labels {
+                if let Err(e) = chain::remove_pin_file(&local_dir, label) {
+                    log::warn!(
+                        "Emergency reclaim for {name}: pin removal failed for {label}: {e} \
+                         — refusing this subvol's deletions this pass",
+                    );
+                    pin_removal_failed = true;
+                    break;
+                }
+            }
+            if pin_removal_failed {
+                continue;
+            }
+
+            // (2) Re-read pins AFTER removal (fail-closed: the set should now be
+            // empty, but never delete something we can still see pinned).
+            let pinned = chain::find_pinned_snapshots(&local_dir, &drive_labels);
+
+            // (3) Delete every on-disk snapshot not in the pinned set. Names that
+            // do not parse are skipped by `read_snapshot_dir` (fail-closed). The
+            // SnapshotName preserves its raw on-disk name, so the join is exact.
+            let snapshots = match crate::plan::read_snapshot_dir(&local_dir) {
+                Ok(s) => s,
+                Err(e) => {
+                    log::warn!(
+                        "Emergency reclaim for {name}: cannot list {}: {e}",
+                        local_dir.display()
+                    );
+                    continue;
+                }
+            };
+            for snap in snapshots {
+                if pinned.contains(&snap) {
+                    continue;
+                }
+                let path = local_dir.join(snap.as_str());
+                match self.btrfs.delete_subvolume(&path) {
+                    Ok(()) => {
+                        log::info!("Emergency reclaim: deleted {}", path.display());
+                        deleted += 1;
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "Emergency reclaim: failed to delete {}: {e}",
+                            path.display()
+                        );
+                        if first_error.is_none() {
+                            first_error = Some(e.to_string());
+                        }
+                    }
+                }
+            }
+
+            if let Some(root) = self.config.snapshot_root_for(name) {
+                roots_to_sync.insert(root);
+            }
+        }
+
+        // Commit the freed space promptly (T4: mitigate async-cleaner lag).
+        for root in &roots_to_sync {
+            if let Err(e) = self.btrfs.sync_subvolumes(root) {
+                log::warn!("Emergency reclaim: sync failed for {}: {e}", root.display());
+            }
+        }
+
+        match first_error {
+            Some(first_error) => ReclaimOutcome::Failed {
+                deleted,
+                first_error,
+            },
+            None if deleted == 0 => ReclaimOutcome::Nothing,
+            None => ReclaimOutcome::Reclaimed { deleted },
         }
     }
 
@@ -3814,6 +3957,134 @@ local_retention = "transient"
                 _ => None,
             })
             .collect()
+    }
+
+    fn sync_calls(mock: &MockBtrfs) -> Vec<PathBuf> {
+        mock.calls()
+            .iter()
+            .filter_map(|c| match c {
+                MockBtrfsCall::SyncSubvolumes { path } => Some(path.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    // ── emergency_reclaim_pool (UPI 033, Step 5b) ─────────────────────────
+
+    #[test]
+    fn emergency_reclaim_clears_aborted_snapshot_and_pin_parent() {
+        // The watchdog aborted a send; the pool must shed Urd's footprint. Both
+        // the just-aborted snapshot AND the pin parent are deleted, the pin is
+        // removed (zero locals), the root is synced, and the outcome reports the
+        // count.
+        let snap_dir = tempfile::TempDir::new().unwrap();
+        let drive_dir = tempfile::TempDir::new().unwrap();
+        let sv_dir = snap_dir.path().join("sv-t");
+        std::fs::create_dir_all(&sv_dir).unwrap();
+        let parent = sv_dir.join("20260321-t");
+        std::fs::create_dir(&parent).unwrap();
+        let aborted = sv_dir.join("20260322-1430-t");
+        std::fs::create_dir(&aborted).unwrap();
+        chain::write_pin_file(&sv_dir, "DRIVE-A", &SnapshotName::parse("20260321-t").unwrap())
+            .unwrap();
+        let pin_path = sv_dir.join(".last-external-parent-DRIVE-A");
+        assert!(pin_path.exists());
+
+        let config = transient_config_n_drives(
+            snap_dir.path(),
+            &[("DRIVE-A", drive_dir.path(), "primary")],
+        );
+        let mock = MockBtrfs::new();
+        let shutdown = no_shutdown();
+        let executor = Executor::new(&mock, None, &config, &shutdown);
+
+        let outcome = executor.emergency_reclaim_pool(&["sv-t".to_string()]);
+
+        assert_eq!(outcome, ReclaimOutcome::Reclaimed { deleted: 2 });
+        let deletes = delete_calls(&mock);
+        assert!(deletes.contains(&parent), "pin parent cleared");
+        assert!(deletes.contains(&aborted), "aborted snapshot cleared");
+        assert!(!pin_path.exists(), "pin removed → zero locals");
+        assert!(
+            sync_calls(&mock).contains(&snap_dir.path().to_path_buf()),
+            "root synced so freed space commits promptly"
+        );
+    }
+
+    #[test]
+    fn emergency_reclaim_pin_removal_failure_refuses_that_subvol() {
+        // If a pin file cannot be removed (here: it is a directory, so remove_file
+        // errors non-NotFound), refuse that subvol's deletions — never a
+        // half-cleared state. Nothing deleted → Nothing.
+        let snap_dir = tempfile::TempDir::new().unwrap();
+        let drive_dir = tempfile::TempDir::new().unwrap();
+        let sv_dir = snap_dir.path().join("sv-t");
+        std::fs::create_dir_all(&sv_dir).unwrap();
+        let snap = sv_dir.join("20260322-1430-t");
+        std::fs::create_dir(&snap).unwrap();
+        // Make the pin path a directory so remove_file fails (not NotFound).
+        std::fs::create_dir(sv_dir.join(".last-external-parent-DRIVE-A")).unwrap();
+
+        let config = transient_config_n_drives(
+            snap_dir.path(),
+            &[("DRIVE-A", drive_dir.path(), "primary")],
+        );
+        let mock = MockBtrfs::new();
+        let shutdown = no_shutdown();
+        let executor = Executor::new(&mock, None, &config, &shutdown);
+
+        let outcome = executor.emergency_reclaim_pool(&["sv-t".to_string()]);
+
+        assert_eq!(outcome, ReclaimOutcome::Nothing);
+        assert!(delete_calls(&mock).is_empty(), "no deletions when pin removal fails");
+    }
+
+    #[test]
+    fn emergency_reclaim_empty_dir_is_nothing() {
+        let snap_dir = tempfile::TempDir::new().unwrap();
+        let drive_dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(snap_dir.path().join("sv-t")).unwrap();
+
+        let config = transient_config_n_drives(
+            snap_dir.path(),
+            &[("DRIVE-A", drive_dir.path(), "primary")],
+        );
+        let mock = MockBtrfs::new();
+        let shutdown = no_shutdown();
+        let executor = Executor::new(&mock, None, &config, &shutdown);
+
+        let outcome = executor.emergency_reclaim_pool(&["sv-t".to_string()]);
+        assert_eq!(outcome, ReclaimOutcome::Nothing);
+        assert!(delete_calls(&mock).is_empty());
+    }
+
+    #[test]
+    fn emergency_reclaim_skips_unparseable_names() {
+        // A stray non-snapshot directory must never be deleted (fail-closed).
+        let snap_dir = tempfile::TempDir::new().unwrap();
+        let drive_dir = tempfile::TempDir::new().unwrap();
+        let sv_dir = snap_dir.path().join("sv-t");
+        std::fs::create_dir_all(&sv_dir).unwrap();
+        std::fs::create_dir(sv_dir.join("not-a-snapshot")).unwrap();
+        let snap = sv_dir.join("20260322-1430-t");
+        std::fs::create_dir(&snap).unwrap();
+
+        let config = transient_config_n_drives(
+            snap_dir.path(),
+            &[("DRIVE-A", drive_dir.path(), "primary")],
+        );
+        let mock = MockBtrfs::new();
+        let shutdown = no_shutdown();
+        let executor = Executor::new(&mock, None, &config, &shutdown);
+
+        let outcome = executor.emergency_reclaim_pool(&["sv-t".to_string()]);
+        assert_eq!(outcome, ReclaimOutcome::Reclaimed { deleted: 1 });
+        let deletes = delete_calls(&mock);
+        assert!(deletes.contains(&snap));
+        assert!(
+            !deletes.iter().any(|p| p.ends_with("not-a-snapshot")),
+            "unparseable name must not be deleted"
+        );
     }
 
     #[test]

@@ -15,6 +15,7 @@ use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
 
 use crate::awareness::PromiseStatus;
+use crate::guard::WatchdogReason;
 use crate::sentinel::CircuitState;
 use crate::state::DriveEventSource;
 use crate::types::{FullSendReason, SendKind};
@@ -32,6 +33,7 @@ pub enum EventKind {
     Sentinel,
     Config,
     Drive,
+    Watchdog,
 }
 
 impl EventKind {
@@ -45,6 +47,7 @@ impl EventKind {
             Self::Sentinel => "sentinel",
             Self::Config => "config",
             Self::Drive => "drive",
+            Self::Watchdog => "watchdog",
         }
     }
 
@@ -60,6 +63,7 @@ impl EventKind {
             "sentinel" => Some(Self::Sentinel),
             "config" => Some(Self::Config),
             "drive" => Some(Self::Drive),
+            "watchdog" => Some(Self::Watchdog),
             _ => None,
         }
     }
@@ -189,6 +193,16 @@ pub enum EventPayload {
     DriveUnmounted {
         detected_by: DriveEventSource,
     },
+    /// The mid-op watchdog aborted an in-flight send to protect the host
+    /// (UPI 033, ADR-113 Layer 2). `freed_reserve` records whether the fast
+    /// bridge (the reserve file) was deleted; `snapshots_reclaimed` is how many
+    /// local snapshots the abort-reclaim shed on the triggering pool.
+    WatchdogAbort {
+        pool_label: String,
+        reason: WatchdogReason,
+        freed_reserve: bool,
+        snapshots_reclaimed: u32,
+    },
 }
 
 impl EventPayload {
@@ -202,6 +216,7 @@ impl EventPayload {
             Self::SentinelCircuitBreak { .. } | Self::SentinelAnomaly { .. } => EventKind::Sentinel,
             Self::ConfigReloaded { .. } | Self::ConfigReloadFailed { .. } => EventKind::Config,
             Self::DriveMounted { .. } | Self::DriveUnmounted { .. } => EventKind::Drive,
+            Self::WatchdogAbort { .. } => EventKind::Watchdog,
         }
     }
 
@@ -233,6 +248,8 @@ impl EventPayload {
             Self::ConfigReloaded { .. } => Severity::Info,
             Self::ConfigReloadFailed { .. } => Severity::Warn,
             Self::DriveMounted { .. } | Self::DriveUnmounted { .. } => Severity::Info,
+            // An aborted send is a host-survival action the user should see.
+            Self::WatchdogAbort { .. } => Severity::Warn,
         }
     }
 }
@@ -384,6 +401,15 @@ mod tests {
                     detected_by: DriveEventSource::Sentinel,
                 },
                 EventKind::Drive,
+            ),
+            (
+                EventPayload::WatchdogAbort {
+                    pool_label: "/data".into(),
+                    reason: WatchdogReason::FloorCrossed,
+                    freed_reserve: true,
+                    snapshots_reclaimed: 3,
+                },
+                EventKind::Watchdog,
             ),
         ];
         for (payload, expected) in cases {
@@ -568,6 +594,36 @@ mod tests {
         roundtrip(&EventPayload::DriveUnmounted {
             detected_by: DriveEventSource::Backup,
         });
+        roundtrip(&EventPayload::WatchdogAbort {
+            pool_label: "/data".into(),
+            reason: WatchdogReason::FloorCrossed,
+            freed_reserve: true,
+            snapshots_reclaimed: 2,
+        });
+        roundtrip(&EventPayload::WatchdogAbort {
+            pool_label: "/".into(),
+            reason: WatchdogReason::CliffExceeded,
+            freed_reserve: false,
+            snapshots_reclaimed: 0,
+        });
+    }
+
+    #[test]
+    fn watchdog_abort_is_warn_and_reason_wire_form_is_snake_case() {
+        for (reason, expected) in [
+            (WatchdogReason::FloorCrossed, "floor_crossed"),
+            (WatchdogReason::CliffExceeded, "cliff_exceeded"),
+        ] {
+            let payload = EventPayload::WatchdogAbort {
+                pool_label: "/data".into(),
+                reason,
+                freed_reserve: true,
+                snapshots_reclaimed: 1,
+            };
+            assert_eq!(payload.severity(), Severity::Warn);
+            let json = serde_json::to_value(&payload).unwrap();
+            assert_eq!(json.get("reason").and_then(|v| v.as_str()), Some(expected));
+        }
     }
 
     // ── Wire-form goldens (these are the metric-label contract per R15) ──
@@ -664,6 +720,7 @@ mod tests {
             EventKind::Sentinel,
             EventKind::Config,
             EventKind::Drive,
+            EventKind::Watchdog,
         ] {
             assert_eq!(EventKind::from_str(kind.as_str()), Some(kind));
         }

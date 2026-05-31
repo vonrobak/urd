@@ -65,7 +65,18 @@ pub struct SnapshotRoot {
     pub subvolumes: Vec<String>,
     #[serde(default)]
     pub min_free_bytes: Option<ByteSize>,
+    /// Working room the mid-op watchdog (UPI 033) keeps free above `min_free`
+    /// on the source pool: `floor = min_free + cleanup_budget`. Source-side
+    /// only (a destination concept has no `cleanup_budget`). When unset, the
+    /// watchdog defaults it to 1.5 % of pool capacity at setup time — the
+    /// default needs the pool capacity, so it is not baked here.
+    #[serde(default)]
+    pub cleanup_budget: Option<ByteSize>,
 }
+
+/// Per-root grouping accumulator for the v1/v2 parsers: `(subvolume names,
+/// first-non-None min_free_bytes, first-non-None cleanup_budget)`.
+type RootGrouping = (Vec<String>, Option<ByteSize>, Option<ByteSize>);
 
 #[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[allow(dead_code)]
@@ -364,6 +375,20 @@ impl Config {
         None
     }
 
+    /// Get the configured `cleanup_budget` for the root containing this
+    /// subvolume (UPI 033). Returns the configured value or `None` — the
+    /// capacity-relative default (1.5 %) is applied by the watchdog at setup,
+    /// where the pool capacity is in scope. Mirrors `root_min_free_bytes`.
+    #[must_use]
+    pub fn root_cleanup_budget(&self, subvol_name: &str) -> Option<u64> {
+        for root in &self.local_snapshots.roots {
+            if root.subvolumes.iter().any(|s| s == subvol_name) {
+                return root.cleanup_budget.map(|b| b.bytes());
+            }
+        }
+        None
+    }
+
     /// Resolve all subvolumes against defaults, sorted by priority.
     ///
     /// Enriches each `ResolvedSubvolume` with `snapshot_root` and `min_free_bytes`
@@ -605,6 +630,8 @@ struct V1SubvolumeConfig {
     #[serde(default)]
     min_free_bytes: Option<ByteSize>,
     #[serde(default)]
+    cleanup_budget: Option<ByteSize>,
+    #[serde(default)]
     snapshot_interval: Option<Interval>,
     #[serde(default)]
     send_interval: Option<Interval>,
@@ -625,24 +652,30 @@ impl V1Config {
     /// code (executor, chain, commands) continues working without changes.
     fn into_config(self) -> Config {
         // Build LocalSnapshotsConfig by grouping subvolumes by snapshot_root.
-        // BTreeMap gives deterministic root ordering.
-        let mut root_map: std::collections::BTreeMap<PathBuf, (Vec<String>, Option<ByteSize>)> =
+        // BTreeMap gives deterministic root ordering. The tuple carries the
+        // first-non-None min_free_bytes and cleanup_budget for the root (UPI
+        // 033 adds the latter, mirroring the former).
+        let mut root_map: std::collections::BTreeMap<PathBuf, RootGrouping> =
             std::collections::BTreeMap::new();
         for sv in &self.subvolumes {
             let entry = root_map
                 .entry(sv.snapshot_root.clone())
-                .or_insert_with(|| (Vec::new(), None));
+                .or_insert_with(|| (Vec::new(), None, None));
             entry.0.push(sv.name.clone());
             if entry.1.is_none() {
                 entry.1 = sv.min_free_bytes;
             }
+            if entry.2.is_none() {
+                entry.2 = sv.cleanup_budget;
+            }
         }
         let roots: Vec<SnapshotRoot> = root_map
             .into_iter()
-            .map(|(path, (subvolumes, min_free_bytes))| SnapshotRoot {
+            .map(|(path, (subvolumes, min_free_bytes, cleanup_budget))| SnapshotRoot {
                 path,
                 subvolumes,
                 min_free_bytes,
+                cleanup_budget,
             })
             .collect();
 
@@ -869,6 +902,32 @@ impl V1Config {
             }
         }
 
+        // Reject conflicting cleanup_budget on subvolumes sharing a snapshot_root
+        // (UPI 033, symmetric with min_free_bytes above — the root carries one
+        // budget, so two subvolumes cannot declare different ones).
+        let mut root_budgets: std::collections::HashMap<&Path, (Option<ByteSize>, &str)> =
+            std::collections::HashMap::new();
+        for sv in &self.subvolumes {
+            let entry = root_budgets
+                .entry(&sv.snapshot_root)
+                .or_insert((sv.cleanup_budget, &sv.name));
+            if let (Some(existing), Some(new)) = (entry.0, sv.cleanup_budget)
+                && existing != new
+            {
+                return Err(format!(
+                    "subvolumes {:?} and {:?} share snapshot_root {:?} but declare \
+                     different cleanup_budget ({existing} vs {new}). \
+                     Use the same value or move them to separate roots.",
+                    entry.1,
+                    sv.name,
+                    sv.snapshot_root.display()
+                ));
+            }
+            if entry.0.is_none() && sv.cleanup_budget.is_some() {
+                entry.0 = sv.cleanup_budget;
+            }
+        }
+
         Ok(())
     }
 }
@@ -1044,6 +1103,8 @@ struct V2SubvolumeConfig {
     #[serde(default)]
     min_free_bytes: Option<ByteSize>,
     #[serde(default)]
+    cleanup_budget: Option<ByteSize>,
+    #[serde(default)]
     snapshot_interval: Option<Interval>,
     #[serde(default)]
     send_interval: Option<Interval>,
@@ -1061,23 +1122,29 @@ impl V2Config {
     /// Convert v2 config into the internal Config representation. Mirrors
     /// `V1Config::into_config()` shape.
     fn into_config(self) -> Config {
-        let mut root_map: std::collections::BTreeMap<PathBuf, (Vec<String>, Option<ByteSize>)> =
+        // Mirrors V1::into_config: first-non-None min_free_bytes + cleanup_budget
+        // per root (UPI 033 adds the latter).
+        let mut root_map: std::collections::BTreeMap<PathBuf, RootGrouping> =
             std::collections::BTreeMap::new();
         for sv in &self.subvolumes {
             let entry = root_map
                 .entry(sv.snapshot_root.clone())
-                .or_insert_with(|| (Vec::new(), None));
+                .or_insert_with(|| (Vec::new(), None, None));
             entry.0.push(sv.name.clone());
             if entry.1.is_none() {
                 entry.1 = sv.min_free_bytes;
             }
+            if entry.2.is_none() {
+                entry.2 = sv.cleanup_budget;
+            }
         }
         let roots: Vec<SnapshotRoot> = root_map
             .into_iter()
-            .map(|(path, (subvolumes, min_free_bytes))| SnapshotRoot {
+            .map(|(path, (subvolumes, min_free_bytes, cleanup_budget))| SnapshotRoot {
                 path,
                 subvolumes,
                 min_free_bytes,
+                cleanup_budget,
             })
             .collect();
 
@@ -3508,6 +3575,127 @@ source = "/docs"
 snapshot_root = "/snap"
 "#;
         parse_v1(config_str).unwrap();
+    }
+
+    // ── cleanup_budget (UPI 033) parse + resolve + conflict ─────────────
+
+    #[test]
+    fn v1_parses_cleanup_budget() {
+        let config_str = r#"
+[general]
+config_version = 1
+
+[[subvolumes]]
+name = "home"
+source = "/home"
+snapshot_root = "/snap"
+min_free_bytes = "10GB"
+cleanup_budget = "2GB"
+"#;
+        let config = parse_v1(config_str).unwrap();
+        assert_eq!(config.root_cleanup_budget("home"), Some(2_000_000_000));
+        // min_free_bytes is unaffected by the new field.
+        assert_eq!(config.root_min_free_bytes("home"), Some(10_000_000_000));
+    }
+
+    #[test]
+    fn v1_cleanup_budget_absent_is_none() {
+        let config_str = r#"
+[general]
+config_version = 1
+
+[[subvolumes]]
+name = "home"
+source = "/home"
+snapshot_root = "/snap"
+min_free_bytes = "10GB"
+"#;
+        let config = parse_v1(config_str).unwrap();
+        assert_eq!(config.root_cleanup_budget("home"), None);
+    }
+
+    #[test]
+    fn v1_rejects_conflicting_cleanup_budget_in_same_root() {
+        let config_str = r#"
+[general]
+config_version = 1
+
+[[subvolumes]]
+name = "home"
+source = "/home"
+snapshot_root = "/snap"
+cleanup_budget = "2GB"
+
+[[subvolumes]]
+name = "docs"
+source = "/docs"
+snapshot_root = "/snap"
+cleanup_budget = "5GB"
+"#;
+        let err = parse_v1(config_str).unwrap_err();
+        assert!(err.contains("different cleanup_budget"));
+    }
+
+    #[test]
+    fn v2_parses_cleanup_budget() {
+        let config_str = r#"
+[general]
+config_version = 2
+
+[[subvolumes]]
+name = "home"
+source = "/home"
+snapshot_root = "/snap"
+cleanup_budget = "2GB"
+protection = "fortified"
+drives = ["D1"]
+
+[[drives]]
+label = "D1"
+mount_path = "/mnt/d1"
+snapshot_root = ".snapshots"
+role = "offsite"
+"#;
+        let config = parse_v2(config_str).unwrap();
+        assert_eq!(config.root_cleanup_budget("home"), Some(2_000_000_000));
+    }
+
+    #[test]
+    fn legacy_cleanup_budget_absent_is_none() {
+        // A legacy config (no config_version) has no cleanup_budget anywhere →
+        // the resolver returns None and the watchdog applies its default.
+        let config_str = r#"
+[general]
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp"
+
+[local_snapshots]
+roots = [
+  { path = "/snap", subvolumes = ["home"] }
+]
+
+[defaults]
+snapshot_interval = "1h"
+send_interval = "4h"
+[defaults.local_retention]
+hourly = 24
+[defaults.external_retention]
+daily = 30
+
+[[drives]]
+label = "D1"
+mount_path = "/mnt/d1"
+snapshot_root = ".snapshots"
+role = "offsite"
+
+[[subvolumes]]
+name = "home"
+short_name = "home"
+source = "/home"
+"#;
+        let config: Config = toml::from_str(config_str).unwrap();
+        assert_eq!(config.root_cleanup_budget("home"), None);
     }
 
     // ── V1 full validation chain tests ────────────────────────────────

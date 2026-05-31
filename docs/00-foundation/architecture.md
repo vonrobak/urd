@@ -154,7 +154,7 @@ the documentation convention in `contributing-internal.md`).
 | `cli_validation.rs` | CLI-boundary guards: resolve a user string to a known config name before the planner, or refuse with help | Run core logic; let unvalidated input reach the planner |
 | `types.rs` | Domain types, parsing, `Display`, `derive_policy()` | Contain business logic |
 | `plan.rs` | Decide what operations to run (pure function) | Execute anything or call btrfs |
-| `executor.rs` | Execute planned operations, isolate errors per subvolume | Decide what to do (the planner's job) |
+| `executor.rs` | Execute planned operations, isolate errors per subvolume; host the gated clear-all and the mid-op `emergency_reclaim_pool` abort-reclaim (ADR-113 Layer 2) | Decide what to do (the planner's job) |
 | `btrfs.rs` | Wrap `sudo btrfs` calls via `BtrfsOps`; read-only reads via the `BtrfsRead` supertrait (`BtrfsOps: BtrfsRead`) | Know about retention, plans, config |
 | `observation.rs` | Define read-side query traits on the ADR-102 axis: `FilesystemQuery` (filesystem of truth) + `HistoryQuery` (SQLite history), bundled as `Observation` | Perform I/O (traits only); decide anything |
 | `retention.rs` | Compute which snapshots to keep/delete (pure) | Delete anything (returns lists) |
@@ -162,6 +162,8 @@ the documentation convention in `contributing-internal.md`).
 | `advice.rs` | Pure: translate an assessment into actionable advice (issue/command/reason) and redundancy advisories — the "what should the user do?" surface; the volatile product layer | Perform I/O; assess promise state |
 | `recommendation.rs` | Pure: headroom-aware retention-shape recommendations and cost projections (ADR-115) | Perform I/O; assess promise state; mutate config; run in the backup hot path |
 | `storage_critical.rs` | Pure: storage-state detection for the Do-No-Harm arc (ADR-113) — tightness tier, host-root flag, hysteresis tier resolution, per-subvolume posture, effective-policy derivation | Perform I/O (the command layer resolves the signals at the boundary) |
+| `guard.rs` | Pure: the mid-op watchdog decision (ADR-113 Layer 2) — `evaluate(sample, thresholds, reserve_present) -> WatchdogAction` over a free-space level/drop-rate sample | Perform I/O; poll (the watchdog thread in `commands/backup.rs` samples and acts) |
+| `reserve.rs` | I/O leaf: the emergency reserve-file lifecycle (ADR-113 Layer 2) — `ensure_reserve` (`fallocate`, real extents), `delete_reserve`, presence/path helpers | Decide when to free it (`guard.rs` decides; `backup.rs` wires) |
 | `chain.rs` | Track incremental chain parents (pin files) | Send snapshots |
 | `state.rs` | Record history in SQLite — granular SQL wrappers (one method per query) | Influence backup decisions; compose domain-shaped answers (callers compose primitives) |
 | `preflight.rs` | Validate config achievability (pure, advisory) | Block backups |

@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -13,9 +14,14 @@ use crate::cli::BackupArgs;
 use crate::commands::storage_signals;
 use crate::config::Config;
 use crate::drives;
+use crate::events::{Event, EventPayload};
 use crate::executor::{
     ExecutionResult, Executor, FullSendPolicy, OpResult, RunResult, SendType,
     TransientCleanupOutcome,
+};
+use crate::guard::{
+    self, WatchdogAction, WatchdogReason, WatchdogSample, WatchdogThresholds,
+    CLEANUP_BUDGET_CAPACITY_FRACTION, CLIFF_BYTES_PER_SEC, WATCHDOG_POLL_MS,
 };
 use crate::heartbeat;
 use crate::lock;
@@ -28,8 +34,10 @@ use crate::output::{
 };
 use crate::notify;
 use crate::plan::{self, FilesystemQuery, HistoryQuery, PlanFilters, RealFileSystemState};
-use crate::pools;
+use crate::pools::{self, PoolSpace};
+use crate::reserve;
 use crate::sentinel_runner;
+use crate::storage_critical::TightnessTier;
 use crate::preflight;
 use crate::state::StateDb;
 use crate::types::{BackupPlan, ByteSize, PlannedOperation, ProtectionLevel, SendKind};
@@ -220,10 +228,22 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
         print!("{}", crate::voice::render_pre_action(&summary));
     }
 
+    // ── Mid-op watchdog arming (UPI 033, ADR-113 Layer 2) ─────────────
+    // Build the armed-pool list (Tight/Critical source pools with a send-enabled
+    // subvolume) from the SINGLE pre-plan gather — no second findmnt sweep, and
+    // it includes UUID-less pools (which `detect_source_pools` drops) so a tight
+    // UUID-less pool still arms (M8). The watchdog's own abort flag is distinct
+    // from the operator `shutdown` above, so a user Ctrl-C is never mistaken for
+    // a host-survival abort; it is shared into the btrfs copy loop via
+    // `with_cancel`.
+    let watchdog_abort = Arc::new(AtomicBool::new(false));
+    let armed_pools = arm_watchdog_pools(&config, &signals, &resolved.armed_tier_map);
+
     // Set up executor with live byte counter for progress display
     let bytes_counter = Arc::new(AtomicU64::new(0));
     let sys = crate::btrfs::SystemBtrfs::probe(&config.general.btrfs_path);
-    let btrfs = RealBtrfs::new(&config.general.btrfs_path, bytes_counter.clone(), sys.supports_compressed_data);
+    let btrfs = RealBtrfs::new(&config.general.btrfs_path, bytes_counter.clone(), sys.supports_compressed_data)
+        .with_cancel(watchdog_abort.clone());
 
     let mut executor = Executor::new(&btrfs, state_db.as_ref(), &config, &shutdown);
 
@@ -351,6 +371,25 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
         None
     };
 
+    // Spawn the mid-op watchdog (UPI 033). NOT TTY-gated — autonomous systemd
+    // runs are exactly when the host is unattended and most needs the guard.
+    // Spawned only when at least one pool armed (Roomy-only run → no thread, no
+    // overhead, byte-identical output to before).
+    let watchdog_shutdown = Arc::new(AtomicBool::new(false));
+    let firing: Arc<Mutex<Option<WatchdogFiring>>> = Arc::new(Mutex::new(None));
+    let watchdog_handle = if armed_pools.is_empty() {
+        None
+    } else {
+        let pools = armed_pools.clone();
+        let abort = watchdog_abort.clone();
+        let exec_shutdown = shutdown.clone();
+        let wd_shutdown = watchdog_shutdown.clone();
+        let firing_slot = firing.clone();
+        Some(std::thread::spawn(move || {
+            watchdog_loop(&pools, &abort, &exec_shutdown, &wd_shutdown, &firing_slot);
+        }))
+    };
+
     executor.set_progress(progress_ctx, size_estimates);
     let exec_start = Instant::now();
     let result = executor.execute(&backup_plan, mode);
@@ -360,6 +399,45 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     progress_shutdown.store(true, Ordering::SeqCst);
     if let Some(h) = progress_handle {
         h.join().ok();
+    }
+
+    // ── Mid-op watchdog teardown + abort-reclaim (UPI 033, Step 5b) ────
+    watchdog_shutdown.store(true, Ordering::SeqCst);
+    if let Some(h) = watchdog_handle {
+        h.join().ok();
+    }
+    // If the watchdog fired, the send was cancelled but the source pool is not
+    // yet relieved — cancelling a send frees no source space (C1). Shed the
+    // triggering pool's local snapshots now that the send has exited (execution
+    // is sequential, so no snapshot is busy), then surface it told-not-silent.
+    // Gated on a firing record — an operator Ctrl-C (no firing) never reclaims.
+    let watchdog_firing = firing.lock().ok().and_then(|mut f| f.take());
+    let watchdog_fired = watchdog_firing.is_some();
+    if let Some(fire) = watchdog_firing {
+        let reclaimed = executor.emergency_reclaim_pool(&fire.subvol_names).deleted();
+        log::warn!(
+            "Watchdog aborted send on {} ({:?}); reclaimed {reclaimed} snapshot(s), reserve freed: {}",
+            fire.pool_label,
+            fire.reason,
+            fire.freed_reserve,
+        );
+        if let Some(ref db) = state_db {
+            let mut ev = Event::pure(
+                chrono::Local::now().naive_local(),
+                EventPayload::WatchdogAbort {
+                    pool_label: fire.pool_label.clone(),
+                    reason: fire.reason,
+                    freed_reserve: fire.freed_reserve,
+                    snapshots_reclaimed: reclaimed,
+                },
+            );
+            ev.run_id = result.run_id;
+            db.record_events_best_effort(&[ev]);
+        }
+        notify::dispatch(
+            &[notify::build_watchdog_abort_notification(&fire.pool_label, reclaimed)],
+            &config.notifications,
+        );
     }
 
     // Read previous heartbeat BEFORE writing the new one (notification comparison).
@@ -480,12 +558,290 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     );
     println!("{preamble}{rendered}");
 
+    // ── Reserve-create-on-idle (UPI 033, S3) ──────────────────────────
+    // Pre-position the fast-bridge reserve on Tight (and Roomy-with-room) source
+    // pools after a clean run, so it pre-exists when a pool jumps to Critical.
+    // Skip when the watchdog just fired (we would re-add the footprint we shed).
+    if result.overall == RunResult::Success && !watchdog_fired {
+        establish_reserves(&config, &signals, &resolved.armed_tier_map);
+    }
+
     // Exit with appropriate code
     if result.overall != RunResult::Success {
         std::process::exit(1);
     }
 
     Ok(())
+}
+
+// ── Mid-op watchdog wiring (UPI 033, ADR-113 Layer 2) ────────────────────
+
+/// A source pool the watchdog guards during this run. Built pre-execution from
+/// the single pre-plan storage gather; only Tight/Critical pools with a
+/// send-enabled subvolume are armed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ArmedPool {
+    /// Source-pool path the watchdog polls — the snapshot root, on the same
+    /// filesystem as the reserve and the local snapshots (all on the source
+    /// pool), so its statvfs free bytes are the source pool's.
+    poll_path: PathBuf,
+    /// Where the fast-bridge reserve lives for this pool.
+    reserve_path: PathBuf,
+    /// `min_free + cleanup_budget` — the absolute floor (M5).
+    floor_bytes: u64,
+    /// User-facing pool label for the abort event/notification.
+    label: String,
+    /// Send-enabled subvolumes on this pool, for the Step-5b abort-reclaim.
+    subvol_names: Vec<String>,
+}
+
+/// Thread→main record written when the watchdog aborts a send (UPI 033). Carries
+/// everything the abort-reclaim, event, and notification need.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WatchdogFiring {
+    pool_label: String,
+    reason: WatchdogReason,
+    freed_reserve: bool,
+    subvol_names: Vec<String>,
+}
+
+/// Build the armed-pool list from the pre-plan gather (UPI 033). Production
+/// wrapper: resolves free/capacity via `pools::pool_space`.
+#[must_use]
+fn arm_watchdog_pools(
+    config: &Config,
+    signals: &storage_signals::StorageSignals,
+    armed: &crate::storage_critical::ArmedTierMap,
+) -> Vec<ArmedPool> {
+    arm_watchdog_pools_with(config, signals, armed, |p| pools::pool_space(p).ok())
+}
+
+/// A source pool resolved for the watchdog/reserve walk (UPI 033): the
+/// send-enabled subvolumes on it, a representative snapshot root, the root's
+/// freshly-measured space, and the display label — everything both arming and
+/// reserve-creation need *after* the tier filter. (The tier itself is consumed
+/// by the `tier_ok` predicate in `resolve_pool_targets`, so it is not carried.)
+struct PoolTarget {
+    send_subvols: Vec<String>,
+    root: PathBuf,
+    space: PoolSpace,
+    label: String,
+}
+
+/// Walk source pools and resolve the per-pool bits both watchdog arming and
+/// reserve-creation need (UPI 033). The `tier_ok` predicate filters **before**
+/// the `space` statvfs, so each caller only measures the pools it cares about
+/// (arming skips Roomy entirely). Tier is read from the armed map via ANY subvol
+/// on the pool — resolve fans one tier to every member (M8 join by membership,
+/// not UUID, so a UUID-less tight pool still resolves). Skips pools with no
+/// send-enabled subvolume, no resolvable root, or unmeasurable space.
+fn resolve_pool_targets(
+    config: &Config,
+    signals: &storage_signals::StorageSignals,
+    armed: &crate::storage_critical::ArmedTierMap,
+    tier_ok: impl Fn(TightnessTier) -> bool,
+    mut space: impl FnMut(&std::path::Path) -> Option<PoolSpace>,
+) -> Vec<PoolTarget> {
+    let send_enabled: HashSet<String> = config
+        .resolved_subvolumes()
+        .into_iter()
+        .filter(|sv| sv.enabled && sv.send_enabled)
+        .map(|sv| sv.name)
+        .collect();
+
+    let mut out = Vec::new();
+    for pool in &signals.pools {
+        let tier = pool
+            .subvol_names
+            .iter()
+            .find_map(|n| armed.get(n).copied())
+            .unwrap_or_default();
+        if !tier_ok(tier) {
+            continue;
+        }
+        let send_subvols: Vec<String> = pool
+            .subvol_names
+            .iter()
+            .filter(|n| send_enabled.contains(*n))
+            .cloned()
+            .collect();
+        if send_subvols.is_empty() {
+            continue; // local-only pool → no ephemeral lifecycle, no guard
+        }
+        let Some(root) = config.snapshot_root_for(&send_subvols[0]) else {
+            continue;
+        };
+        let Some(space) = space(&root) else {
+            log::warn!("Watchdog: cannot measure {} — skipping this run", root.display());
+            continue;
+        };
+        out.push(PoolTarget {
+            send_subvols,
+            root,
+            space,
+            label: pool.label.clone(),
+        });
+    }
+    out
+}
+
+/// Testable core of [`arm_watchdog_pools`]: the per-pool `PoolSpace` lookup is
+/// injected. A pool arms iff its tier is Tight/Critical (the `tier_ok` filter
+/// runs before any statvfs) AND it has a send-enabled subvolume AND its snapshot
+/// root's space is measurable (needed for the floor's capacity-relative default).
+#[must_use]
+fn arm_watchdog_pools_with(
+    config: &Config,
+    signals: &storage_signals::StorageSignals,
+    armed: &crate::storage_critical::ArmedTierMap,
+    space: impl FnMut(&std::path::Path) -> Option<PoolSpace>,
+) -> Vec<ArmedPool> {
+    resolve_pool_targets(config, signals, armed, |t| t >= TightnessTier::Tight, space)
+        .into_iter()
+        .map(|t| {
+            let first = &t.send_subvols[0];
+            let floor_bytes = config.root_min_free_bytes(first).unwrap_or(0)
+                + config
+                    .root_cleanup_budget(first)
+                    .unwrap_or_else(|| default_cleanup_budget(t.space.capacity_bytes));
+            ArmedPool {
+                reserve_path: reserve::reserve_path(&t.root),
+                poll_path: t.root,
+                floor_bytes,
+                label: t.label,
+                subvol_names: t.send_subvols,
+            }
+        })
+        .collect()
+}
+
+/// The capacity-relative `cleanup_budget` default (UPI 033): 1.5 % of pool
+/// capacity, applied when the operator did not configure one.
+#[must_use]
+fn default_cleanup_budget(capacity_bytes: u64) -> u64 {
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    let budget = (capacity_bytes as f64 * CLEANUP_BUDGET_CAPACITY_FRACTION) as u64;
+    budget
+}
+
+/// The watchdog thread body (UPI 033). Polls each armed pool's source-pool free
+/// space every `WATCHDOG_POLL_MS`; on a floor/cliff trigger it first frees the
+/// reserve (fast bridge, here on the watchdog thread so it fires even if the
+/// copy thread is wedged — S4), and on a still-triggering sample with no reserve
+/// it sets the cancel flag (abort the in-flight send) and the executor shutdown
+/// flag (stop new sends), records the firing, and stops polling.
+fn watchdog_loop(
+    pools: &[ArmedPool],
+    abort: &AtomicBool,
+    executor_shutdown: &AtomicBool,
+    watchdog_shutdown: &AtomicBool,
+    firing: &Mutex<Option<WatchdogFiring>>,
+) {
+    let mut prev: HashMap<PathBuf, (u64, Instant)> = HashMap::new();
+    let mut freed: HashSet<PathBuf> = HashSet::new();
+    loop {
+        if watchdog_shutdown.load(Ordering::Relaxed) {
+            return;
+        }
+        for pool in pools {
+            let Ok(space) = pools::pool_space(&pool.poll_path) else {
+                continue; // unmeasurable this tick — try again next poll
+            };
+            let now = Instant::now();
+            let (prev_free, elapsed) = match prev.get(&pool.poll_path) {
+                Some((pf, t)) => (Some(*pf), now.duration_since(*t)),
+                None => (None, Duration::ZERO),
+            };
+            prev.insert(pool.poll_path.clone(), (space.free_bytes, now));
+
+            let sample = WatchdogSample {
+                free_bytes: space.free_bytes,
+                prev_free_bytes: prev_free,
+                elapsed_since_prev: elapsed,
+            };
+            let thresholds = WatchdogThresholds {
+                floor_bytes: pool.floor_bytes,
+                cliff_bytes_per_sec: CLIFF_BYTES_PER_SEC,
+            };
+            match guard::evaluate(sample, thresholds, reserve::reserve_present(&pool.reserve_path))
+            {
+                WatchdogAction::Continue => {}
+                WatchdogAction::ReclaimReserve(reason) => {
+                    log::warn!(
+                        "Watchdog: {} {reason:?} — freeing reserve to buy runway",
+                        pool.label
+                    );
+                    if reserve::delete_reserve(&pool.reserve_path).is_ok() {
+                        freed.insert(pool.poll_path.clone());
+                    }
+                }
+                WatchdogAction::Abort(reason) => {
+                    log::warn!(
+                        "Watchdog: {} {reason:?} — aborting in-flight send (host survival)",
+                        pool.label
+                    );
+                    abort.store(true, Ordering::SeqCst);
+                    executor_shutdown.store(true, Ordering::SeqCst);
+                    if let Ok(mut slot) = firing.lock() {
+                        *slot = Some(WatchdogFiring {
+                            pool_label: pool.label.clone(),
+                            reason,
+                            freed_reserve: freed.contains(&pool.poll_path),
+                            subvol_names: pool.subvol_names.clone(),
+                        });
+                    }
+                    return; // abort is in motion — stop polling
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(WATCHDOG_POLL_MS));
+    }
+}
+
+/// Pre-position the fast-bridge reserve (UPI 033, S3). Production wrapper.
+fn establish_reserves(
+    config: &Config,
+    signals: &storage_signals::StorageSignals,
+    armed: &crate::storage_critical::ArmedTierMap,
+) {
+    establish_reserves_with(
+        config,
+        signals,
+        armed,
+        |p| pools::pool_space(p).ok(),
+        reserve::ensure_reserve,
+    );
+}
+
+/// Testable core of [`establish_reserves`]: space + reserve-creation are
+/// injected. Establishes a reserve on every non-Critical source pool with a
+/// send-enabled subvolume that has clear room to spare it (free > 2× the reserve
+/// size), so the bridge pre-exists when a pool later jumps to Critical. Never on
+/// a Critical pool (no room) and never on a pool too tight to spare the reserve.
+fn establish_reserves_with(
+    config: &Config,
+    signals: &storage_signals::StorageSignals,
+    armed: &crate::storage_critical::ArmedTierMap,
+    space: impl FnMut(&std::path::Path) -> Option<PoolSpace>,
+    mut ensure: impl FnMut(&std::path::Path, u64) -> std::io::Result<()>,
+) {
+    // Non-Critical pools only (Critical has no room to spare the reserve).
+    let targets =
+        resolve_pool_targets(config, signals, armed, |t| t != TightnessTier::Critical, space);
+    for t in targets {
+        // Only when the 1 GiB reserve clearly won't itself cause pressure.
+        if t.space.free_bytes <= reserve::RESERVE_SIZE_BYTES.saturating_mul(2) {
+            continue;
+        }
+        let path = reserve::reserve_path(&t.root);
+        if let Err(e) = ensure(&path, reserve::RESERVE_SIZE_BYTES) {
+            log::warn!("Watchdog: could not establish reserve at {}: {e}", path.display());
+        }
+    }
 }
 
 // ── Summary builder ─────────────────────────────────────────────────────
@@ -1848,6 +2204,305 @@ mod tests {
     use crate::types::Interval;
     use crate::types::{DeleteKind, FullSendReason, PlannedOperation};
     use std::path::PathBuf;
+
+    // ── Mid-op watchdog arming + reserve-create (UPI 033) ──────────────
+
+    fn wd_config() -> Config {
+        let toml_str = r#"
+drives = []
+
+[general]
+state_db = "/tmp/urd-wd/urd.db"
+metrics_file = "/tmp/urd-wd/m.prom"
+log_dir = "/tmp/urd-wd"
+heartbeat_file = "/tmp/urd-wd/hb.json"
+
+[local_snapshots]
+roots = [
+  { path = "/snap", subvolumes = ["alpha", "beta"] }
+]
+
+[defaults]
+snapshot_interval = "1h"
+send_interval = "4h"
+[defaults.local_retention]
+hourly = 24
+[defaults.external_retention]
+daily = 30
+
+[[subvolumes]]
+name = "alpha"
+short_name = "alpha"
+source = "/data/alpha"
+
+[[subvolumes]]
+name = "beta"
+short_name = "beta"
+source = "/data/beta"
+"#;
+        toml::from_str(toml_str).unwrap()
+    }
+
+    fn wd_signals(subvols: &[&str]) -> storage_signals::StorageSignals {
+        storage_signals::StorageSignals {
+            by_subvol: crate::awareness::StorageSignalMap::new(),
+            pools: vec![storage_signals::PoolSignal {
+                uuid: Some("pool-uuid".to_string()),
+                label: "/data".to_string(),
+                subvol_names: subvols.iter().map(|s| s.to_string()).collect(),
+                free_ratio: None,
+                host_root: false,
+                prior_armed_tier: TightnessTier::Roomy,
+                prior_since: None,
+            }],
+        }
+    }
+
+    fn tier_map(pairs: &[(&str, TightnessTier)]) -> crate::storage_critical::ArmedTierMap {
+        let mut m = crate::storage_critical::ArmedTierMap::new();
+        for (n, t) in pairs {
+            m.insert((*n).to_string(), *t);
+        }
+        m
+    }
+
+    fn space_cap(capacity: u64, free: u64) -> impl FnMut(&std::path::Path) -> Option<PoolSpace> {
+        move |_| {
+            Some(PoolSpace {
+                free_bytes: free,
+                capacity_bytes: capacity,
+            })
+        }
+    }
+
+    #[test]
+    fn arm_skips_roomy_pools() {
+        let config = wd_config();
+        let signals = wd_signals(&["alpha", "beta"]);
+        // No tier in the map → Roomy default → no arming, no thread spawned.
+        let armed = arm_watchdog_pools_with(&config, &signals, &tier_map(&[]), space_cap(100, 50));
+        assert!(armed.is_empty());
+    }
+
+    #[test]
+    fn arm_selects_tight_send_enabled_pool() {
+        let config = wd_config();
+        let signals = wd_signals(&["alpha", "beta"]);
+        let map = tier_map(&[
+            ("alpha", TightnessTier::Tight),
+            ("beta", TightnessTier::Tight),
+        ]);
+        let armed = arm_watchdog_pools_with(&config, &signals, &map, space_cap(100, 50));
+        assert_eq!(armed.len(), 1);
+        assert_eq!(armed[0].poll_path, PathBuf::from("/snap"));
+        assert_eq!(
+            armed[0].reserve_path,
+            PathBuf::from("/snap/.urd-emergency-reserve")
+        );
+        assert_eq!(
+            armed[0].subvol_names,
+            vec!["alpha".to_string(), "beta".to_string()]
+        );
+        assert_eq!(armed[0].label, "/data");
+    }
+
+    #[test]
+    fn arm_uuidless_tight_pool_still_arms() {
+        let config = wd_config();
+        let mut signals = wd_signals(&["alpha", "beta"]);
+        signals.pools[0].uuid = None; // join is by subvol membership, not UUID (M8)
+        let map = tier_map(&[("alpha", TightnessTier::Tight)]);
+        let armed = arm_watchdog_pools_with(&config, &signals, &map, space_cap(100, 50));
+        assert_eq!(armed.len(), 1);
+    }
+
+    #[test]
+    fn arm_floor_is_cleanup_budget_default_when_min_free_unset() {
+        let config = wd_config();
+        let signals = wd_signals(&["alpha"]);
+        let map = tier_map(&[("alpha", TightnessTier::Tight)]);
+        // capacity 100 GB → 1.5% default = 1.5 GB; min_free unset → floor == default.
+        let cap = 100_000_000_000;
+        let armed =
+            arm_watchdog_pools_with(&config, &signals, &map, space_cap(cap, 40_000_000_000));
+        assert_eq!(armed.len(), 1);
+        assert_eq!(armed[0].floor_bytes, default_cleanup_budget(cap));
+        assert_eq!(armed[0].floor_bytes, 1_500_000_000);
+    }
+
+    #[test]
+    fn arm_skips_local_only_pool() {
+        // A pool whose subvols are not send-enabled has no ephemeral lifecycle.
+        let mut config = wd_config();
+        for sv in &mut config.subvolumes {
+            sv.send_enabled = Some(false);
+        }
+        let signals = wd_signals(&["alpha", "beta"]);
+        let map = tier_map(&[("alpha", TightnessTier::Tight)]);
+        let armed = arm_watchdog_pools_with(&config, &signals, &map, space_cap(100, 50));
+        assert!(armed.is_empty());
+    }
+
+    #[test]
+    fn arm_unmeasurable_pool_not_armed() {
+        let config = wd_config();
+        let signals = wd_signals(&["alpha"]);
+        let map = tier_map(&[("alpha", TightnessTier::Tight)]);
+        let armed = arm_watchdog_pools_with(&config, &signals, &map, |_| None);
+        assert!(armed.is_empty());
+    }
+
+    #[test]
+    fn establish_reserves_skips_critical_creates_on_tight() {
+        use std::cell::RefCell;
+        let config = wd_config();
+        let signals = wd_signals(&["alpha"]);
+
+        // Critical pool: no reserve created (no room to add footprint).
+        let created: RefCell<Vec<PathBuf>> = RefCell::new(Vec::new());
+        establish_reserves_with(
+            &config,
+            &signals,
+            &tier_map(&[("alpha", TightnessTier::Critical)]),
+            space_cap(100_000_000_000, 40_000_000_000),
+            |p, _| {
+                created.borrow_mut().push(p.to_path_buf());
+                Ok(())
+            },
+        );
+        assert!(created.borrow().is_empty(), "no reserve on a Critical pool");
+
+        // Tight pool with ample room: reserve created at the snapshot root.
+        let created2: RefCell<Vec<PathBuf>> = RefCell::new(Vec::new());
+        establish_reserves_with(
+            &config,
+            &signals,
+            &tier_map(&[("alpha", TightnessTier::Tight)]),
+            space_cap(100_000_000_000, 40_000_000_000),
+            |p, _| {
+                created2.borrow_mut().push(p.to_path_buf());
+                Ok(())
+            },
+        );
+        assert_eq!(
+            created2.borrow().as_slice(),
+            &[PathBuf::from("/snap/.urd-emergency-reserve")]
+        );
+    }
+
+    // ── watchdog_loop firing + escalation (UPI 033, Step 7 glue) ──────
+    // Runnable composition tests for the watchdog thread body: real statvfs on a
+    // tempdir + a floor of u64::MAX (so any free level trips FloorCrossed at
+    // once). The live `btrfs send` cancel path is covered by btrfs::pump_* tests
+    // and the source reclaim by executor::emergency_reclaim_pool tests; the full
+    // real-drive end-to-end (live send abort + cross-pool space recovery) is
+    // hardware-gated and verified manually per plan-033 Step 7.
+
+    #[test]
+    fn watchdog_loop_aborts_immediately_below_floor() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let pool = ArmedPool {
+            poll_path: dir.path().to_path_buf(),
+            reserve_path: dir.path().join(".urd-emergency-reserve"), // absent → no bridge
+            floor_bytes: u64::MAX, // any free level is below → FloorCrossed at once
+            label: "/data".to_string(),
+            subvol_names: vec!["alpha".to_string()],
+        };
+        let abort = AtomicBool::new(false);
+        let exec_shutdown = AtomicBool::new(false);
+        let wd_shutdown = AtomicBool::new(false);
+        let firing = Mutex::new(None);
+
+        watchdog_loop(&[pool], &abort, &exec_shutdown, &wd_shutdown, &firing);
+
+        assert!(abort.load(Ordering::SeqCst), "in-flight send cancel flag set");
+        assert!(exec_shutdown.load(Ordering::SeqCst), "new-send shutdown set");
+        let fire = firing.lock().unwrap().clone().expect("firing recorded");
+        assert_eq!(fire.reason, WatchdogReason::FloorCrossed);
+        assert_eq!(fire.subvol_names, vec!["alpha".to_string()]);
+        assert!(!fire.freed_reserve, "no reserve existed to free");
+    }
+
+    #[test]
+    fn watchdog_loop_frees_reserve_then_aborts() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let reserve_path = dir.path().join(".urd-emergency-reserve");
+        std::fs::write(&reserve_path, b"reserve").unwrap(); // reserve present
+        let pool = ArmedPool {
+            poll_path: dir.path().to_path_buf(),
+            reserve_path: reserve_path.clone(),
+            floor_bytes: u64::MAX, // always below floor
+            label: "/data".to_string(),
+            subvol_names: vec!["alpha".to_string()],
+        };
+        let abort = AtomicBool::new(false);
+        let exec_shutdown = AtomicBool::new(false);
+        let wd_shutdown = AtomicBool::new(false);
+        let firing = Mutex::new(None);
+
+        watchdog_loop(&[pool], &abort, &exec_shutdown, &wd_shutdown, &firing);
+
+        // First poll frees the reserve (fast bridge); the next poll, with no
+        // reserve, escalates to abort carrying freed_reserve = true.
+        assert!(!reserve_path.exists(), "reserve freed as the fast bridge");
+        let fire = firing.lock().unwrap().clone().expect("firing recorded");
+        assert!(fire.freed_reserve, "freed_reserve carried into the abort");
+        assert!(abort.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn watchdog_loop_stops_on_shutdown_without_firing() {
+        // Roomy/healthy: a high enough floor of 0 never trips; the loop exits
+        // cleanly when watchdog_shutdown is set, recording no firing.
+        let dir = tempfile::TempDir::new().unwrap();
+        let pool = ArmedPool {
+            poll_path: dir.path().to_path_buf(),
+            reserve_path: dir.path().join(".urd-emergency-reserve"),
+            floor_bytes: 0, // free is always >= 0, never below → no floor trip
+            label: "/data".to_string(),
+            subvol_names: vec!["alpha".to_string()],
+        };
+        let abort = AtomicBool::new(false);
+        let exec_shutdown = AtomicBool::new(false);
+        let wd_shutdown = Arc::new(AtomicBool::new(false));
+        let firing = Arc::new(Mutex::new(None));
+
+        let wd = wd_shutdown.clone();
+        let fire = firing.clone();
+        let handle = std::thread::spawn(move || {
+            let abort = AtomicBool::new(false);
+            let exec = AtomicBool::new(false);
+            watchdog_loop(&[pool], &abort, &exec, &wd, &fire);
+        });
+        // Let it poll at least once, then signal teardown.
+        std::thread::sleep(Duration::from_millis(50));
+        wd_shutdown.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
+
+        assert!(!abort.load(Ordering::SeqCst));
+        assert!(!exec_shutdown.load(Ordering::SeqCst));
+        assert!(firing.lock().unwrap().is_none(), "no firing on a healthy pool");
+    }
+
+    #[test]
+    fn establish_reserves_skips_when_no_room() {
+        use std::cell::RefCell;
+        let config = wd_config();
+        let signals = wd_signals(&["alpha"]);
+        let created: RefCell<Vec<PathBuf>> = RefCell::new(Vec::new());
+        // free <= 2× reserve → too tight to spare it; skip even though Tight.
+        establish_reserves_with(
+            &config,
+            &signals,
+            &tier_map(&[("alpha", TightnessTier::Tight)]),
+            space_cap(100_000_000_000, reserve::RESERVE_SIZE_BYTES),
+            |p, _| {
+                created.borrow_mut().push(p.to_path_buf());
+                Ok(())
+            },
+        );
+        assert!(created.borrow().is_empty());
+    }
 
     fn make_outcome(
         operation: &str,

@@ -10,6 +10,7 @@ use std::fmt::Write as _;
 use colored::Colorize;
 
 use crate::events::{EventPayload, Severity};
+use crate::guard::WatchdogReason;
 use crate::output::{EventRow, EventsView};
 
 /// Render the events view as a columnar listing for interactive use.
@@ -148,6 +149,22 @@ fn summary_for(payload: &EventPayload) -> String {
         }
         EventPayload::DriveUnmounted { detected_by } => {
             format!("drive unmounted  ({})", detected_by.as_str())
+        }
+        EventPayload::WatchdogAbort {
+            pool_label,
+            reason,
+            freed_reserve,
+            snapshots_reclaimed,
+        } => {
+            let cause = match reason {
+                WatchdogReason::FloorCrossed => "floor crossed",
+                WatchdogReason::CliffExceeded => "rapid fill",
+            };
+            let bridge = if *freed_reserve { "reserve freed" } else { "no reserve" };
+            format!(
+                "guard stopped send on {pool_label}  ({cause}; {bridge}; \
+                 reclaimed {snapshots_reclaimed} snapshot(s))"
+            )
         }
     }
 }

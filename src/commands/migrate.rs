@@ -786,7 +786,11 @@ fn render_subvolume(out: &mut String, sv: &LegacySubvolume, legacy: &LegacyConfi
     out.push_str(&format!("name = \"{}\"\n", sv.name));
     out.push_str(&format!("source = \"{}\"\n", sv.source));
 
-    // snapshot_root from local_snapshots lookup
+    // snapshot_root from local_snapshots lookup.
+    // cleanup_budget (UPI 033) is intentionally NOT emitted here: it is an
+    // additive-optional field with a computed default (1.5% of pool capacity),
+    // so a migrated config that never declared one keeps the default — there is
+    // nothing to carry forward from a legacy/v1 source.
     if let Some(r) = root {
         out.push_str(&format!("snapshot_root = \"{}\"\n", r.path));
         if let Some(ref mfb) = r.min_free_bytes {

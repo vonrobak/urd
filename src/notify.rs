@@ -102,6 +102,14 @@ pub enum NotificationEvent {
         to: String,
         host_root: bool,
     },
+    /// The mid-op watchdog aborted an in-flight send to protect the host
+    /// (UPI 033, ADR-113 Layer 2). Dispatched best-effort by `urd backup` after
+    /// the abort-reclaim. `snapshots_reclaimed` distinguishes the
+    /// reclaimed-prose path from the could-not-reclaim degrade (S4).
+    WatchdogAborted {
+        pool_label: String,
+        snapshots_reclaimed: u32,
+    },
 }
 
 // ── Urgency ────────────────────────────────────────────────────────────
@@ -406,6 +414,41 @@ pub fn build_storage_pressure_notification(
     }
 }
 
+/// Build a notification for a mid-op watchdog abort (UPI 033). Prose is aligned
+/// to what was **actually** reclaimed: when snapshots were freed, reassure that
+/// the offsite copy is safe and the next send will be full; when nothing could
+/// be reclaimed (wedged receive / no reserve — S4), ask the user to check free
+/// space. `Critical` urgency: an aborted backup to save the host is a serious,
+/// user-visible event.
+#[must_use]
+pub fn build_watchdog_abort_notification(
+    pool_label: &str,
+    snapshots_reclaimed: u32,
+) -> Notification {
+    let body = if snapshots_reclaimed > 0 {
+        format!(
+            "Stopped this backup — {pool_label} got tight, so I freed Urd's own \
+             snapshots to protect it. The previous offsite copy is still safe; \
+             the next backup will be a full one."
+        )
+    } else {
+        format!(
+            "Stopped this backup — {pool_label} got tight. I couldn't fully reclaim \
+             space this run; please check free space on the source drive."
+        )
+    };
+
+    Notification {
+        event: NotificationEvent::WatchdogAborted {
+            pool_label: pool_label.to_string(),
+            snapshots_reclaimed,
+        },
+        urgency: Urgency::Critical,
+        title: format!("Backup stopped to protect {pool_label}"),
+        body,
+    }
+}
+
 /// User-facing word for a tightness tier in notification prose.
 fn tier_word(tier: TightnessTier) -> &'static str {
     match tier {
@@ -665,6 +708,32 @@ mod tests {
             pools: vec![],
             drives: vec![],
         }
+    }
+
+    // ── Watchdog abort notification (UPI 033) ──────────────────────
+
+    #[test]
+    fn watchdog_abort_reclaimed_prose() {
+        let n = build_watchdog_abort_notification("/data", 3);
+        assert_eq!(n.urgency, Urgency::Critical);
+        assert!(n.title.contains("/data"));
+        assert!(n.body.contains("freed Urd's own snapshots"));
+        assert!(n.body.contains("offsite copy is still safe"));
+        assert!(matches!(
+            n.event,
+            NotificationEvent::WatchdogAborted { snapshots_reclaimed: 3, .. }
+        ));
+    }
+
+    #[test]
+    fn watchdog_abort_zero_reclaim_prose() {
+        let n = build_watchdog_abort_notification("/", 0);
+        assert_eq!(n.urgency, Urgency::Critical);
+        assert!(n.body.contains("couldn't fully reclaim"));
+        assert!(matches!(
+            n.event,
+            NotificationEvent::WatchdogAborted { snapshots_reclaimed: 0, .. }
+        ));
     }
 
     // ── Promise state transitions ──────────────────────────────────
