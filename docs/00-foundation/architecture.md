@@ -1,14 +1,14 @@
 # Architecture at a Glance
 
 > **TL;DR:** Urd is a strict pipeline — *config → plan → execute → btrfs* — with a
-> ring of read-only observers (awareness, retention, drift, preflight) and a small
-> set of surfaces (voice, heartbeat, Prometheus, notifications). The planner is
-> pure; the executor is the only place state mutates; every btrfs call funnels
-> through one trait. This page is the orientation diagram and short prose; the
-> module-responsibility table in `CLAUDE.md` and the ADRs in `decisions/` are
-> authoritative for the why.
+> ring of read-only observers (awareness, retention, drift, preflight,
+> recommendation) and a small set of surfaces (voice, heartbeat, Prometheus,
+> notifications). The planner is pure; the executor is the only place state
+> mutates; every btrfs call funnels through one trait. This page is the
+> orientation diagram, the prose that explains it, and the **authoritative
+> module-responsibility table**. The ADRs in `decisions/` are authoritative for
+> the *why*; the ten architectural invariants live in `CLAUDE.md`.
 
-**Date:** 2026-05-02
 **Audience:** Both human readers and Claude sessions. One screen of orientation
 before reading specific modules or ADRs.
 
@@ -18,7 +18,7 @@ before reading specific modules or ADRs.
 flowchart LR
     %% Sources
     cfg["config.rs<br/>parse + validate TOML"]
-    fsstate["FileSystemState<br/>(snapshots, free space, mounts)"]
+    obs["observation.rs<br/>FilesystemQuery + HistoryQuery<br/>(bundled as Observation)"]
     db[("state.rs<br/>SQLite history")]
 
     %% Pure core
@@ -26,10 +26,14 @@ flowchart LR
         direction TB
         plan["plan.rs<br/>decide operations"]
         awareness["awareness.rs<br/>compute promise states"]
+        advice["advice.rs<br/>assessment → advice"]
         retention["retention.rs<br/>which snapshots to drop"]
+        recommendation["recommendation.rs<br/>retention-shape advice"]
         drift["drift.rs<br/>churn aggregation"]
         preflight["preflight.rs<br/>achievability advisories"]
+        storagecrit["storage_critical.rs<br/>storage-state / tier"]
         evpure["events.rs<br/>typed event payloads"]
+        output["output.rs<br/>structured output types"]
     end
 
     %% I/O boundary
@@ -44,7 +48,7 @@ flowchart LR
     %% Surfaces
     subgraph surfaces["Surfaces"]
         direction TB
-        voice["voice.rs<br/>render text (mythic)"]
+        voice["voice/<br/>render text (mythic)"]
         notify["notify.rs<br/>dispatch alerts"]
         heartbeat["heartbeat.rs<br/>JSON health"]
         metrics["metrics.rs<br/>Prometheus .prom"]
@@ -60,7 +64,7 @@ flowchart LR
 
     %% Edges — main pipeline
     cfg --> plan
-    fsstate --> plan
+    obs --> plan
     db --> plan
     plan --> executor
     retention -.consult.-> executor
@@ -71,11 +75,17 @@ flowchart LR
     evpure --> db
 
     %% Edges — observers
-    fsstate --> awareness
+    obs --> awareness
     db --> awareness
     drift --> awareness
     db --> drift
-    awareness --> voice
+    storagecrit --> awareness
+    awareness --> advice
+    awareness --> recommendation
+    advice --> output
+    recommendation --> output
+    awareness --> output
+    output --> voice
     awareness --> notify
     awareness --> heartbeat
     awareness --> metrics
@@ -92,37 +102,87 @@ flowchart LR
 ## How to read it
 
 The diagram is shaped by three architectural rules. Each is load-bearing — the
-ADR in parentheses is the canonical statement.
+ADR in parentheses is the canonical statement (full list of invariants in
+`CLAUDE.md`).
 
-1. **The planner never modifies anything (ADR-100).** `plan.rs` is a pure function
-   from `(config, FileSystemState, history)` to `Vec<PlannedOperation>`. Every
-   skip/proceed decision lives there. The executor trusts the plan — it does not
-   reconsider, only acts. This is why retention, drift, awareness, and preflight
-   sit in the pure box: they feed the planner or the surfaces, but never mutate.
+1. **The planner never modifies anything (ADR-100).** `plan.rs` is a pure
+   function from `(config, Observation)` to `Vec<PlannedOperation>`, where
+   `Observation` bundles the filesystem-of-truth and SQLite-history query traits.
+   Every skip/proceed decision lives there. The executor trusts the plan — it
+   does not reconsider, only acts. This is why retention, drift, awareness,
+   preflight, recommendation, and storage_critical sit in the pure box: they feed
+   the planner or the surfaces, but never mutate.
 
 2. **Every btrfs call goes through one trait (ADR-101).** `BtrfsOps` is the only
-   path to `sudo btrfs`. No other module spawns subprocesses. Tests inject
-   `MockBtrfs`; production injects the real wrapper. The trait is a hard boundary
-   — it makes the executor's blast radius auditable in one file.
+   path to `sudo btrfs`. No other module spawns subprocesses. Read-only
+   generation reads go through the `BtrfsRead` supertrait (`BtrfsOps: BtrfsRead`)
+   so pure planners get a non-mutating seam. Tests inject `MockBtrfs`; production
+   injects the real wrapper. The trait is a hard boundary — it makes the
+   executor's blast radius auditable in one file.
 
 3. **Filesystem is truth, SQLite is history (ADR-102).** Pin files and snapshot
    directories are authoritative for "what exists." The state DB records what
    happened, but a SQLite failure never blocks a backup. This is why `state.rs`
    appears as both an input and an output of the pipeline: callers persist
    best-effort records, and readers (awareness, drift, sentinel) consult them
-   knowing the data may be incomplete.
+   knowing the data may be incomplete. The read-side split lives in
+   `observation.rs`: `FilesystemQuery` for the filesystem-of-truth surface,
+   `HistoryQuery` for the SQLite-history surface.
 
 The ring of pure observers feeds the surfaces without ever touching btrfs.
-`awareness.rs` answers "is my data safe?"; `drift.rs` (UPI 030) aggregates churn
-for the Do-No-Harm arc (ADR-113); `preflight.rs` issues advisories for
+`awareness.rs` answers "is my data safe?"; `advice.rs` answers "what should I do?";
+`recommendation.rs` answers "what retention shape fits my headroom?"; `drift.rs`
+aggregates churn for the Do-No-Harm arc (ADR-113); `storage_critical.rs` derives
+storage-state tiers for the same arc; `preflight.rs` issues advisories for
 unachievable promises. None of them block — they describe.
 
 The sentinel runs as a separate user-space systemd service. Its state machine is
-pure; the runner around it is the only I/O surface. Sentinel does not race with
-the timer-driven backup — the executor takes a shared advisory lock with metadata
-(`lock.rs`) and the sentinel honors it.
+pure (`sentinel.rs`); the runner around it (`sentinel_runner.rs`) is the only I/O
+surface. Sentinel does not race with the timer-driven backup — the executor takes
+a shared advisory lock with metadata (`lock.rs`) and the sentinel honors it.
 
-## What the events table is for (UPI 036, ADR-114)
+## Module responsibilities
+
+The authoritative one-line-per-module reference. Describes each module's *role
+and boundaries* — the code is the source of truth for its function inventory (see
+the documentation convention in `contributing-internal.md`).
+
+| Module | Does | Does NOT |
+|--------|------|----------|
+| `config.rs` | Parse TOML, validate, expand paths, resolve subvolumes | Touch filesystem beyond path checks |
+| `cli.rs` | Define the `clap` command surface (argument parsing) | Contain command logic (`commands/` does that) |
+| `cli_validation.rs` | CLI-boundary guards: resolve a user string to a known config name before the planner, or refuse with help | Run core logic; let unvalidated input reach the planner |
+| `types.rs` | Domain types, parsing, `Display`, `derive_policy()` | Contain business logic |
+| `plan.rs` | Decide what operations to run (pure function) | Execute anything or call btrfs |
+| `executor.rs` | Execute planned operations, isolate errors per subvolume | Decide what to do (the planner's job) |
+| `btrfs.rs` | Wrap `sudo btrfs` calls via `BtrfsOps`; read-only reads via the `BtrfsRead` supertrait (`BtrfsOps: BtrfsRead`) | Know about retention, plans, config |
+| `observation.rs` | Define read-side query traits on the ADR-102 axis: `FilesystemQuery` (filesystem of truth) + `HistoryQuery` (SQLite history), bundled as `Observation` | Perform I/O (traits only); decide anything |
+| `retention.rs` | Compute which snapshots to keep/delete (pure) | Delete anything (returns lists) |
+| `awareness.rs` | Pure: observe promise state (PROTECTED / AT RISK / UNPROTECTED) — the "is my data safe right now?" surface | Perform I/O; translate to advice (`advice.rs`) or recommend shapes (`recommendation.rs`) |
+| `advice.rs` | Pure: translate an assessment into actionable advice (issue/command/reason) and redundancy advisories — the "what should the user do?" surface; the volatile product layer | Perform I/O; assess promise state |
+| `recommendation.rs` | Pure: headroom-aware retention-shape recommendations and cost projections (ADR-115) | Perform I/O; assess promise state; mutate config; run in the backup hot path |
+| `storage_critical.rs` | Pure: storage-state detection for the Do-No-Harm arc (ADR-113) — tightness tier, host-root flag, hysteresis tier resolution, per-subvolume posture, effective-policy derivation | Perform I/O (the command layer resolves the signals at the boundary) |
+| `chain.rs` | Track incremental chain parents (pin files) | Send snapshots |
+| `state.rs` | Record history in SQLite — granular SQL wrappers (one method per query) | Influence backup decisions; compose domain-shaped answers (callers compose primitives) |
+| `preflight.rs` | Validate config achievability (pure, advisory) | Block backups |
+| `heartbeat.rs` | Write JSON health signal after each run | Block backups on failure |
+| `metrics.rs` | Write Prometheus `.prom` files | Read metrics |
+| `notify.rs` | Compute and dispatch notifications (consumes awareness) | Decide promise states |
+| `drift.rs` | Pure: rolling time-windowed churn aggregation from `drift_samples` | Perform I/O or persist |
+| `drives.rs` | Detect mounted drives, UUID fingerprinting, check space | Mount/unmount drives |
+| `pools.rs` | Detect BTRFS pools, group subvolumes by pool UUID, read sysfs/statvfs utilization | Know about retention, plans, drive lifecycle, or notification policy |
+| `output.rs` | Define structured output types | Render text (`voice/` does that) |
+| `voice/` | Render structured output as mythic-voice text; per-command sub-modules, with cross-renderer helpers in `voice/mod.rs` exposed `pub(super)` | Perform I/O or compute state |
+| `voice_events.rs` | Per-variant `EventPayload` renderer (columnar + NDJSON) | Perform I/O or query state |
+| `voice_contract.rs` | Encode the seven-rule voice contract as in-tree tests | Render or compute (test-only) |
+| `events.rs` | Pure: `Event`, `EventKind`, `EventPayload`, `Severity`, typed payload enums | Perform I/O |
+| `lock.rs` | Shared advisory lock with metadata (PID, trigger source) | Decide whether to proceed (the caller's job) |
+| `sentinel.rs` | Pure state machine for the Sentinel daemon (events, actions, circuit breaker) | Perform I/O (`sentinel_runner.rs` does that) |
+| `sentinel_runner.rs` | I/O wrapper around the Sentinel state machine — the daemon's only I/O surface | Make state-machine decisions (`sentinel.rs` does that) |
+| `error.rs` | Error types; `translate_btrfs_error()` for actionable messages | Recovery logic |
+| `commands/` | CLI subcommand handlers (wire pure modules to I/O) | Core logic (delegate to the modules above) |
+
+## What the events table is for (ADR-114)
 
 Prometheus owns gauges (current state over time). The `events` table in SQLite
 owns typed state changes and decisions with rationale: *"retention pruned snapshot
@@ -139,15 +199,13 @@ schema changes never break older readers.
 - **Error translation** (`error.rs::translate_btrfs_error`): turns btrfs stderr
   into actionable `BtrfsErrorDetail`. Sits between btrfs.rs and the surfaces.
 - **Migration** (`urd migrate`): a separate strategy that runs *before* config
-  load (ADR-111). It transforms legacy TOML to v1 TOML; downstream code remains
+  load (ADR-111). It transforms legacy/v1 TOML to v2 TOML; downstream code remains
   schema-agnostic.
 
 ## See also
 
-- **Module responsibilities table:** `CLAUDE.md` "Module Responsibilities" — the
-  authoritative one-line-per-module reference.
-- **Architectural invariants:** `CLAUDE.md` "Architectural Invariants" — the
-  ten load-bearing rules with ADR references.
+- **Architectural invariants:** `CLAUDE.md` "Architectural Invariants" — the ten
+  load-bearing rules with ADR references.
 - **Glossary:** `glossary.md` (this directory) — promise states, voice labels,
   protection levels, retention tiers, identifiers.
-- **ADRs:** `decisions/ADR-100..ADR-114` — the why behind every box and edge.
+- **ADRs:** `decisions/` — the why behind every box and edge.

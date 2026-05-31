@@ -9,8 +9,9 @@
 **Date:** 2026-03-27
 **Revised:** 2026-04-03 (v1 schema specification, vocabulary alignment, field tables,
 migration spec, validation messages)
-**Status:** Accepted — sessions 1-2 implemented (P6a rename, P6b serialize), sessions 3-4
-pending (v1 parser, `urd migrate`)
+**Status:** Accepted — fully implemented. The tri-parser (`parse_legacy` / `parse_v1` /
+`parse_v2` in `config.rs`) and `urd migrate` all ship; see the 2026-05-15 amendment for v2
+(`config_version = 2`).
 **Depends on:** ADR-108 (pure function modules), ADR-109 (config boundary validation)
 **Partially supersedes:** ADR-110 (override semantics replaced; see ADR-110 revision)
 **Modifies:** ADR-103 (defaults inheritance removed), ADR-104 (defaults inheritance removed)
