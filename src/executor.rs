@@ -1289,6 +1289,26 @@ impl<'a> Executor<'a> {
                 continue;
             };
 
+            // (0) Offsite gate — never delete the only stored copy. A subvolume
+            // with no pin has never had a send confirmed to any drive, so its
+            // local snapshots are its sole stored backup; clearing them would
+            // destroy that history (the live subvolume survives, but the only
+            // *recorded* copy would not). 031-b's clear-all is gated on
+            // `sends_succeeded` for exactly this reason; this reactive path must
+            // honor the same rule. Read pins BEFORE removing them: an empty set
+            // means no confirmed offsite copy → preserve this subvol's snapshots
+            // (the host-survival cost is one subvol's footprint). Subvols that
+            // ARE backed up offsite are cleared below — so the abort
+            // notification's "already-offsite copies are safe" claim holds.
+            let pinned_before = chain::find_pinned_snapshots(&local_dir, &drive_labels);
+            if pinned_before.is_empty() {
+                log::warn!(
+                    "Emergency reclaim: {name} has no confirmed offsite copy (no pin) \
+                     — preserving its local snapshots (never delete the only copy)",
+                );
+                continue;
+            }
+
             // (1) Drop pins FIRST (031-b ordering). If any removal fails, refuse
             // THIS subvol's deletions this pass — never a half-cleared state.
             let mut pin_removal_failed = false;
@@ -4012,17 +4032,20 @@ local_retention = "transient"
     }
 
     #[test]
-    fn emergency_reclaim_pin_removal_failure_refuses_that_subvol() {
-        // If a pin file cannot be removed (here: it is a directory, so remove_file
-        // errors non-NotFound), refuse that subvol's deletions — never a
-        // half-cleared state. Nothing deleted → Nothing.
+    fn emergency_reclaim_unreadable_pin_preserves_subvol() {
+        // A pin that cannot even be read (here: it is a directory) yields no
+        // confirmed offsite copy, so the offsite gate preserves the subvol's
+        // snapshots rather than risking the only stored copy. (The pin-removal
+        // refusal remains as defense-in-depth for a readable-but-unremovable pin;
+        // its logic is shared with 031-b's clear-all, covered by
+        // `clear_all_pin_removal_failure_skips_all_deletions`.)
         let snap_dir = tempfile::TempDir::new().unwrap();
         let drive_dir = tempfile::TempDir::new().unwrap();
         let sv_dir = snap_dir.path().join("sv-t");
         std::fs::create_dir_all(&sv_dir).unwrap();
         let snap = sv_dir.join("20260322-1430-t");
         std::fs::create_dir(&snap).unwrap();
-        // Make the pin path a directory so remove_file fails (not NotFound).
+        // An unreadable pin (a directory) → find_pinned_snapshots sees no pin.
         std::fs::create_dir(sv_dir.join(".last-external-parent-DRIVE-A")).unwrap();
 
         let config = transient_config_n_drives(
@@ -4036,7 +4059,35 @@ local_retention = "transient"
         let outcome = executor.emergency_reclaim_pool(&["sv-t".to_string()]);
 
         assert_eq!(outcome, ReclaimOutcome::Nothing);
-        assert!(delete_calls(&mock).is_empty(), "no deletions when pin removal fails");
+        assert!(delete_calls(&mock).is_empty(), "no deletions without a confirmed offsite copy");
+    }
+
+    #[test]
+    fn emergency_reclaim_preserves_subvol_with_no_offsite_copy() {
+        // Finding A: a subvol that has never been sent offsite (no pin) keeps ALL
+        // its local snapshots — they are its only stored copy, and the reactive
+        // reclaim must honor 031-b's "never delete the last copy" rule.
+        let snap_dir = tempfile::TempDir::new().unwrap();
+        let drive_dir = tempfile::TempDir::new().unwrap();
+        let sv_dir = snap_dir.path().join("sv-t");
+        std::fs::create_dir_all(&sv_dir).unwrap();
+        let only_copy = sv_dir.join("20260322-1430-t");
+        std::fs::create_dir(&only_copy).unwrap();
+        // No pin file at all → no confirmed offsite copy.
+
+        let config = transient_config_n_drives(
+            snap_dir.path(),
+            &[("DRIVE-A", drive_dir.path(), "primary")],
+        );
+        let mock = MockBtrfs::new();
+        let shutdown = no_shutdown();
+        let executor = Executor::new(&mock, None, &config, &shutdown);
+
+        let outcome = executor.emergency_reclaim_pool(&["sv-t".to_string()]);
+
+        assert_eq!(outcome, ReclaimOutcome::Nothing, "never-offsite subvol is preserved");
+        assert!(delete_calls(&mock).is_empty(), "the only stored copy must not be deleted");
+        assert!(only_copy.exists(), "the only local snapshot survives the reclaim");
     }
 
     #[test]
@@ -4068,6 +4119,9 @@ local_retention = "transient"
         std::fs::create_dir(sv_dir.join("not-a-snapshot")).unwrap();
         let snap = sv_dir.join("20260322-1430-t");
         std::fs::create_dir(&snap).unwrap();
+        // A pin → confirmed offsite copy, so the offsite gate lets the clear-all proceed.
+        chain::write_pin_file(&sv_dir, "DRIVE-A", &SnapshotName::parse("20260322-1430-t").unwrap())
+            .unwrap();
 
         let config = transient_config_n_drives(
             snap_dir.path(),

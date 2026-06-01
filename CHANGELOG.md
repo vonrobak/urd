@@ -24,6 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fail-closed clear-all ordering: host survival over chain continuity, the next send
   becomes full (an ADR-106-scoped exception authorized by ADR-113's catastrophic-floor
   doctrine; the live subvolume is untouched and falls back to its prior offsite copy).
+  Only subvolumes with a confirmed offsite copy are cleared — a subvolume that has never
+  been sent keeps its local snapshots (never delete the only stored copy) — and a run that
+  began below the watchdog floor (a pre-flight condition) is not self-aborted; the watchdog
+  watches for in-flight free-fall instead.
   Adds the optional per-`snapshot_root` `cleanup_budget` config field (additive across
   legacy/v1/v2, no `urd migrate` step; defaults to 1.5 % of pool capacity) and the
   `WatchdogAbort` ADR-114 event with a `Critical`-urgency notification. The watchdog

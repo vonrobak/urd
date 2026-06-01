@@ -728,12 +728,39 @@ fn default_cleanup_budget(capacity_bytes: u64) -> u64 {
     budget
 }
 
+/// Pure per-pool watchdog decision (UPI 033). Suppresses the **absolute floor**
+/// for a pool that *started* below it: a pool whose free was already under
+/// `min_free + cleanup_budget` when the run began is a pre-flight condition (the
+/// planner's space guard owns "too tight to start"), not an in-flight failure —
+/// firing the floor on it would immediately self-abort a run the planner already
+/// allowed, making no backup progress (round-2 adversary Finding B). The **cliff**
+/// (rate) trigger stays active regardless, so a genuine in-flight free-fall is
+/// still caught on such a pool. A pool that started above the floor keeps both
+/// triggers. Delegates the level/rate logic to `guard::evaluate`.
+fn watchdog_step(
+    sample: WatchdogSample,
+    floor_bytes: u64,
+    started_below_floor: bool,
+    reserve_present: bool,
+) -> WatchdogAction {
+    let effective_floor = if started_below_floor { 0 } else { floor_bytes };
+    guard::evaluate(
+        sample,
+        WatchdogThresholds {
+            floor_bytes: effective_floor,
+            cliff_bytes_per_sec: CLIFF_BYTES_PER_SEC,
+        },
+        reserve_present,
+    )
+}
+
 /// The watchdog thread body (UPI 033). Polls each armed pool's source-pool free
 /// space every `WATCHDOG_POLL_MS`; on a floor/cliff trigger it first frees the
 /// reserve (fast bridge, here on the watchdog thread so it fires even if the
 /// copy thread is wedged — S4), and on a still-triggering sample with no reserve
 /// it sets the cancel flag (abort the in-flight send) and the executor shutdown
-/// flag (stop new sends), records the firing, and stops polling.
+/// flag (stop new sends), records the firing, and stops polling. The absolute
+/// floor is suppressed for a pool that started below it (see `watchdog_step`).
 fn watchdog_loop(
     pools: &[ArmedPool],
     abort: &AtomicBool,
@@ -743,6 +770,7 @@ fn watchdog_loop(
 ) {
     let mut prev: HashMap<PathBuf, (u64, Instant)> = HashMap::new();
     let mut freed: HashSet<PathBuf> = HashSet::new();
+    let mut started_below: HashMap<PathBuf, bool> = HashMap::new();
     loop {
         if watchdog_shutdown.load(Ordering::Relaxed) {
             return;
@@ -751,6 +779,21 @@ fn watchdog_loop(
             let Ok(space) = pools::pool_space(&pool.poll_path) else {
                 continue; // unmeasurable this tick — try again next poll
             };
+            // Capture the start-of-run below-floor state once (first sample for
+            // this pool), then reuse it for the whole run (Finding B).
+            let below = *started_below.entry(pool.poll_path.clone()).or_insert_with(|| {
+                let b = space.free_bytes < pool.floor_bytes;
+                if b {
+                    log::warn!(
+                        "Watchdog: {} started below floor ({} < {}) — a tight run the planner \
+                         allowed; watching for cliffs only this run",
+                        pool.label,
+                        space.free_bytes,
+                        pool.floor_bytes,
+                    );
+                }
+                b
+            });
             let now = Instant::now();
             let (prev_free, elapsed) = match prev.get(&pool.poll_path) {
                 Some((pf, t)) => (Some(*pf), now.duration_since(*t)),
@@ -763,12 +806,12 @@ fn watchdog_loop(
                 prev_free_bytes: prev_free,
                 elapsed_since_prev: elapsed,
             };
-            let thresholds = WatchdogThresholds {
-                floor_bytes: pool.floor_bytes,
-                cliff_bytes_per_sec: CLIFF_BYTES_PER_SEC,
-            };
-            match guard::evaluate(sample, thresholds, reserve::reserve_present(&pool.reserve_path))
-            {
+            match watchdog_step(
+                sample,
+                pool.floor_bytes,
+                below,
+                reserve::reserve_present(&pool.reserve_path),
+            ) {
                 WatchdogAction::Continue => {}
                 WatchdogAction::ReclaimReserve(reason) => {
                     log::warn!(
@@ -2390,64 +2433,128 @@ source = "/data/beta"
         );
     }
 
-    // ── watchdog_loop firing + escalation (UPI 033, Step 7 glue) ──────
-    // Runnable composition tests for the watchdog thread body: real statvfs on a
-    // tempdir + a floor of u64::MAX (so any free level trips FloorCrossed at
-    // once). The live `btrfs send` cancel path is covered by btrfs::pump_* tests
-    // and the source reclaim by executor::emergency_reclaim_pool tests; the full
-    // real-drive end-to-end (live send abort + cross-pool space recovery) is
-    // hardware-gated and verified manually per plan-033 Step 7.
+    // ── watchdog decision + loop (UPI 033, Step 7 glue) ───────────────
+    // `watchdog_step` is the pure decision (trigger/suppress/escalate) — tested
+    // deterministically. The loop tests cover the started-below suppression at
+    // the thread level on a static tempdir. The live `btrfs send` cancel path is
+    // covered by btrfs::pump_* tests and the source reclaim by
+    // executor::emergency_reclaim_pool tests; the full real-drive end-to-end
+    // (live send abort + cross-pool space recovery) is hardware-gated.
 
-    #[test]
-    fn watchdog_loop_aborts_immediately_below_floor() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let pool = ArmedPool {
-            poll_path: dir.path().to_path_buf(),
-            reserve_path: dir.path().join(".urd-emergency-reserve"), // absent → no bridge
-            floor_bytes: u64::MAX, // any free level is below → FloorCrossed at once
-            label: "/data".to_string(),
-            subvol_names: vec!["alpha".to_string()],
-        };
-        let abort = AtomicBool::new(false);
-        let exec_shutdown = AtomicBool::new(false);
-        let wd_shutdown = AtomicBool::new(false);
-        let firing = Mutex::new(None);
+    const GB: u64 = 1024 * 1024 * 1024;
 
-        watchdog_loop(&[pool], &abort, &exec_shutdown, &wd_shutdown, &firing);
-
-        assert!(abort.load(Ordering::SeqCst), "in-flight send cancel flag set");
-        assert!(exec_shutdown.load(Ordering::SeqCst), "new-send shutdown set");
-        let fire = firing.lock().unwrap().clone().expect("firing recorded");
-        assert_eq!(fire.reason, WatchdogReason::FloorCrossed);
-        assert_eq!(fire.subvol_names, vec!["alpha".to_string()]);
-        assert!(!fire.freed_reserve, "no reserve existed to free");
+    fn wd_sample(free: u64, prev: u64) -> WatchdogSample {
+        WatchdogSample {
+            free_bytes: free,
+            prev_free_bytes: Some(prev),
+            elapsed_since_prev: Duration::from_millis(WATCHDOG_POLL_MS),
+        }
     }
 
     #[test]
-    fn watchdog_loop_frees_reserve_then_aborts() {
+    fn watchdog_step_started_above_floor_fires_on_floor() {
+        // Started above floor: a below-floor sample fires. Reserve present →
+        // reclaim the bridge first; absent → abort.
+        let s = wd_sample(GB, GB); // below a 2 GB floor, no fast drop
+        assert_eq!(
+            watchdog_step(s, 2 * GB, false, true),
+            WatchdogAction::ReclaimReserve(WatchdogReason::FloorCrossed)
+        );
+        assert_eq!(
+            watchdog_step(s, 2 * GB, false, false),
+            WatchdogAction::Abort(WatchdogReason::FloorCrossed)
+        );
+    }
+
+    #[test]
+    fn watchdog_step_started_below_floor_suppresses_floor() {
+        // Finding B: started below floor → the absolute floor is suppressed, so a
+        // quiet below-floor sample is Continue (the run the planner allowed
+        // proceeds), regardless of reserve presence.
+        let s = wd_sample(GB, GB); // below the 2 GB floor, no fast drop
+        assert_eq!(watchdog_step(s, 2 * GB, true, false), WatchdogAction::Continue);
+        assert_eq!(watchdog_step(s, 2 * GB, true, true), WatchdogAction::Continue);
+    }
+
+    #[test]
+    fn watchdog_step_cliff_fires_even_when_started_below_floor() {
+        // The cliff stays active on a started-below pool: 50 MB lost in 250 ms =
+        // 200 MB/s > the 100 MB/s cliff → abort despite floor suppression.
+        let dropped = 50 * 1024 * 1024;
+        let s = wd_sample(GB, GB + dropped);
+        assert_eq!(
+            watchdog_step(s, 2 * GB, true, false),
+            WatchdogAction::Abort(WatchdogReason::CliffExceeded)
+        );
+    }
+
+    #[test]
+    fn watchdog_loop_started_below_floor_does_not_abort() {
+        // Finding B at the loop level: floor=u64::MAX guarantees "started below"
+        // on a static tempdir. With the floor suppressed and no cliff, the loop
+        // neither aborts nor fires — it just keeps watching until shutdown.
         let dir = tempfile::TempDir::new().unwrap();
-        let reserve_path = dir.path().join(".urd-emergency-reserve");
-        std::fs::write(&reserve_path, b"reserve").unwrap(); // reserve present
         let pool = ArmedPool {
             poll_path: dir.path().to_path_buf(),
-            reserve_path: reserve_path.clone(),
-            floor_bytes: u64::MAX, // always below floor
+            reserve_path: dir.path().join(".urd-emergency-reserve"), // absent
+            floor_bytes: u64::MAX,
             label: "/data".to_string(),
             subvol_names: vec!["alpha".to_string()],
         };
-        let abort = AtomicBool::new(false);
-        let exec_shutdown = AtomicBool::new(false);
-        let wd_shutdown = AtomicBool::new(false);
-        let firing = Mutex::new(None);
+        let abort = Arc::new(AtomicBool::new(false));
+        let exec_shutdown = Arc::new(AtomicBool::new(false));
+        let wd_shutdown = Arc::new(AtomicBool::new(false));
+        let firing = Arc::new(Mutex::new(None));
 
-        watchdog_loop(&[pool], &abort, &exec_shutdown, &wd_shutdown, &firing);
+        let (a, e, wd, f) = (
+            abort.clone(),
+            exec_shutdown.clone(),
+            wd_shutdown.clone(),
+            firing.clone(),
+        );
+        let handle = std::thread::spawn(move || watchdog_loop(&[pool], &a, &e, &wd, &f));
+        std::thread::sleep(Duration::from_millis(50)); // ≥1 poll
+        wd_shutdown.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
 
-        // First poll frees the reserve (fast bridge); the next poll, with no
-        // reserve, escalates to abort carrying freed_reserve = true.
-        assert!(!reserve_path.exists(), "reserve freed as the fast bridge");
-        let fire = firing.lock().unwrap().clone().expect("firing recorded");
-        assert!(fire.freed_reserve, "freed_reserve carried into the abort");
-        assert!(abort.load(Ordering::SeqCst));
+        assert!(!abort.load(Ordering::SeqCst), "started-below floor must not abort");
+        assert!(!exec_shutdown.load(Ordering::SeqCst));
+        assert!(firing.lock().unwrap().is_none(), "no firing — floor suppressed, no cliff");
+    }
+
+    #[test]
+    fn watchdog_loop_started_below_floor_keeps_reserve() {
+        // Floor suppression holds even with a reserve present: a started-below
+        // pool with no cliff neither frees the reserve nor aborts.
+        let dir = tempfile::TempDir::new().unwrap();
+        let reserve_path = dir.path().join(".urd-emergency-reserve");
+        std::fs::write(&reserve_path, b"reserve").unwrap();
+        let pool = ArmedPool {
+            poll_path: dir.path().to_path_buf(),
+            reserve_path: reserve_path.clone(),
+            floor_bytes: u64::MAX,
+            label: "/data".to_string(),
+            subvol_names: vec!["alpha".to_string()],
+        };
+        let abort = Arc::new(AtomicBool::new(false));
+        let exec_shutdown = Arc::new(AtomicBool::new(false));
+        let wd_shutdown = Arc::new(AtomicBool::new(false));
+        let firing = Arc::new(Mutex::new(None));
+
+        let (a, e, wd, f) = (
+            abort.clone(),
+            exec_shutdown.clone(),
+            wd_shutdown.clone(),
+            firing.clone(),
+        );
+        let handle = std::thread::spawn(move || watchdog_loop(&[pool], &a, &e, &wd, &f));
+        std::thread::sleep(Duration::from_millis(50));
+        wd_shutdown.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
+
+        assert!(reserve_path.exists(), "floor suppressed → reserve not freed");
+        assert!(!abort.load(Ordering::SeqCst));
+        assert!(firing.lock().unwrap().is_none());
     }
 
     #[test]
