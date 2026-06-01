@@ -154,7 +154,7 @@ the documentation convention in `contributing-internal.md`).
 | `cli_validation.rs` | CLI-boundary guards: resolve a user string to a known config name before the planner, or refuse with help | Run core logic; let unvalidated input reach the planner |
 | `types.rs` | Domain types, parsing, `Display`, `derive_policy()` | Contain business logic |
 | `plan.rs` | Decide what operations to run (pure function) | Execute anything or call btrfs |
-| `executor.rs` | Execute planned operations, isolate errors per subvolume; host the gated clear-all and the mid-op `emergency_reclaim_pool` abort-reclaim (ADR-113 Layer 2) | Decide what to do (the planner's job) |
+| `executor.rs` | Execute planned operations, isolate errors per subvolume; host the gated clear-all and the `emergency_reclaim_pool` never-the-only-copy reclaim that both the watchdog abort (ADR-113 Layer 2) and the idle eject (Layer 3) reuse | Decide what to do (the planner's job) |
 | `btrfs.rs` | Wrap `sudo btrfs` calls via `BtrfsOps`; read-only reads via the `BtrfsRead` supertrait (`BtrfsOps: BtrfsRead`) | Know about retention, plans, config |
 | `observation.rs` | Define read-side query traits on the ADR-102 axis: `FilesystemQuery` (filesystem of truth) + `HistoryQuery` (SQLite history), bundled as `Observation` | Perform I/O (traits only); decide anything |
 | `retention.rs` | Compute which snapshots to keep/delete (pure) | Delete anything (returns lists) |
@@ -162,7 +162,7 @@ the documentation convention in `contributing-internal.md`).
 | `advice.rs` | Pure: translate an assessment into actionable advice (issue/command/reason) and redundancy advisories — the "what should the user do?" surface; the volatile product layer | Perform I/O; assess promise state |
 | `recommendation.rs` | Pure: headroom-aware retention-shape recommendations and cost projections (ADR-115) | Perform I/O; assess promise state; mutate config; run in the backup hot path |
 | `storage_critical.rs` | Pure: storage-state detection for the Do-No-Harm arc (ADR-113) — tightness tier, host-root flag, hysteresis tier resolution, per-subvolume posture, effective-policy derivation | Perform I/O (the command layer resolves the signals at the boundary) |
-| `guard.rs` | Pure: the mid-op watchdog decision (ADR-113 Layer 2) — `evaluate(sample, thresholds, reserve_present) -> WatchdogAction` over a free-space level/drop-rate sample | Perform I/O; poll (the watchdog thread in `commands/backup.rs` samples and acts) |
+| `guard.rs` | Pure do-no-harm decision cores: the mid-op watchdog (ADR-113 Layer 2) `evaluate(sample, thresholds, reserve_present) -> WatchdogAction`, and the idle emergency-eject (Layer 3) `evaluate_idle_eject(samples) -> pools below the floor`, over the shared `source_floor_bytes` floor both layers compute | Perform I/O; poll (the watchdog thread in `commands/backup.rs` and the sentinel runner sample and act) |
 | `reserve.rs` | I/O leaf: the emergency reserve-file lifecycle (ADR-113 Layer 2) — `ensure_reserve` (`fallocate`, real extents), `delete_reserve`, presence/path helpers | Decide when to free it (`guard.rs` decides; `backup.rs` wires) |
 | `chain.rs` | Track incremental chain parents (pin files) | Send snapshots |
 | `state.rs` | Record history in SQLite — granular SQL wrappers (one method per query) | Influence backup decisions; compose domain-shaped answers (callers compose primitives) |
@@ -180,7 +180,7 @@ the documentation convention in `contributing-internal.md`).
 | `events.rs` | Pure: `Event`, `EventKind`, `EventPayload`, `Severity`, typed payload enums | Perform I/O |
 | `lock.rs` | Shared advisory lock with metadata (PID, trigger source) | Decide whether to proceed (the caller's job) |
 | `sentinel.rs` | Pure state machine for the Sentinel daemon (events, actions, circuit breaker) | Perform I/O (`sentinel_runner.rs` does that) |
-| `sentinel_runner.rs` | I/O wrapper around the Sentinel state machine — the daemon's only I/O surface | Make state-machine decisions (`sentinel.rs` does that) |
+| `sentinel_runner.rs` | I/O wrapper around the Sentinel state machine — the daemon's only I/O surface; also drives the idle emergency-eject poll (ADR-113 Layer 3, `maybe_emergency_reclaim`), the daemon's sole filesystem-mutating action, as a side-path outside the state machine | Make state-machine decisions (`sentinel.rs` does that) |
 | `error.rs` | Error types; `translate_btrfs_error()` for actionable messages | Recovery logic |
 | `commands/` | CLI subcommand handlers (wire pure modules to I/O) | Core logic (delegate to the modules above) |
 
