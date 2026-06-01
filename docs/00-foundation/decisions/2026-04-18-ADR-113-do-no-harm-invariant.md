@@ -229,9 +229,14 @@ The Do-No-Harm arc (amended 2026-05-30 — UPI 032 retired, see the amendment bl
    just-aborted (in-flight-casualty) snapshot and its pin parent, bypassing
    unsent-protection. This is the catastrophic-floor doctrine applied reactively (host
    survival > chain continuity; the next send is full); the live subvolume is untouched
-   and falls back to its prior offsite copy. *(Shipped.)*
+   and falls back to its prior offsite copy. **Never the only copy:** a subvolume with no
+   confirmed offsite copy (no pin) is *skipped* — its local snapshots are its sole stored
+   backup, so clearing them is forbidden even under the catastrophic floor (the live
+   subvolume survives, but its recorded history would not). *(Shipped.)*
 6. **UPI 034 — Emergency Eject.** Layer 3. Sentinel extension. Drops Urd-owned snapshots
-   when pressure crosses the catastrophic floor outside of an active send.
+   when pressure crosses the catastrophic floor outside of an active send. Inherits the
+   **never-the-only-copy** rule above: it may shed snapshots that exist offsite, never a
+   subvolume's sole stored copy.
 
 Arc sequence beyond this UPI: **031-b → 033 → 034**.
 
