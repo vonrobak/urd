@@ -1,10 +1,10 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::io::{Read as _, Write as _};
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::error::{BtrfsErrorContext, BtrfsOperation, SendReceiveErrorContext, UrdError};
 
@@ -91,6 +91,13 @@ pub struct RealBtrfs {
     /// this to display transfer progress. Not part of the `BtrfsOps` trait —
     /// progress display is a presentation concern, not a correctness contract.
     bytes_counter: Arc<AtomicU64>,
+    /// Mid-op watchdog cancel flag (UPI 033). When set true during a
+    /// `send_receive`, the copy loop drops the receive pipe and the send fails
+    /// like any other — an aborted send is a normal failure (ADR-100/107).
+    /// `new` installs a private never-set flag; `with_cancel` shares the
+    /// watchdog's real one. Carried on `RealBtrfs` (not the `BtrfsOps` trait,
+    /// like `bytes_counter`) so no trait/Mock/executor cascade.
+    cancel: Arc<AtomicBool>,
     supports_compressed_data: bool,
 }
 
@@ -100,8 +107,18 @@ impl RealBtrfs {
         Self {
             btrfs_path: btrfs_path.to_string(),
             bytes_counter,
+            cancel: Arc::new(AtomicBool::new(false)),
             supports_compressed_data,
         }
+    }
+
+    /// Share the mid-op watchdog's cancel flag with this handle (UPI 033).
+    /// Builder, mirroring how `bytes_counter` is injected — set once before the
+    /// run; the watchdog thread stores `true` to abort the in-flight send.
+    #[must_use]
+    pub fn with_cancel(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.cancel = flag;
+        self
     }
 
     /// Build a handle for read-only use (`BtrfsRead` generation queries).
@@ -254,21 +271,13 @@ impl BtrfsOps for RealBtrfs {
             },
         })?;
 
-        // Copy send stdout → receive stdin in a thread, counting bytes.
+        // Copy send stdout → receive stdin in a thread, counting bytes. The
+        // pump loop is extracted (`pump_with_cancel`) so the byte-counting +
+        // mid-op cancel logic is unit-testable against in-memory pipes (UPI 033).
         let counter = self.bytes_counter.clone();
-        counter.store(0, Ordering::Relaxed);
+        let cancel = self.cancel.clone();
         let copy_thread = std::thread::spawn(move || -> std::io::Result<u64> {
-            let mut buf = [0u8; 128 * 1024]; // 128KB chunks
-            let mut total: u64 = 0;
-            loop {
-                let n = send_stdout.read(&mut buf)?;
-                if n == 0 {
-                    break;
-                }
-                recv_stdin.write_all(&buf[..n])?;
-                total += n as u64;
-                counter.store(total, Ordering::Relaxed);
-            }
+            let total = pump_with_cancel(&mut send_stdout, &mut recv_stdin, &counter, &cancel)?;
             drop(recv_stdin); // close pipe to signal EOF to receive
             Ok(total)
         });
@@ -484,6 +493,42 @@ impl BtrfsRead for RealBtrfs {
             },
         })
     }
+}
+
+// ── Copy pump (UPI 033) ───────────────────────────────────────────────────
+
+/// Pump `reader` → `writer` in 128 KB chunks, updating `counter` with the
+/// running byte total and honoring the mid-op watchdog `cancel` flag.
+///
+/// On cancel the loop breaks *before* writing the pending chunk and returns the
+/// bytes copied so far; the caller closes the receive pipe, which surfaces the
+/// abort as an ordinary `btrfs receive` failure (no new error variant — an
+/// aborted send is a normal send failure, ADR-100/107). The cancel is checked
+/// once per chunk; at realistic throughput the latency is ≪ 1 s. Extracted from
+/// `send_receive` so the cancel + counting path is unit-testable without
+/// spawning btrfs.
+fn pump_with_cancel<R: std::io::Read, W: std::io::Write>(
+    reader: &mut R,
+    writer: &mut W,
+    counter: &AtomicU64,
+    cancel: &AtomicBool,
+) -> std::io::Result<u64> {
+    let mut buf = [0u8; 128 * 1024]; // 128KB chunks
+    let mut total: u64 = 0;
+    counter.store(0, Ordering::Relaxed);
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        writer.write_all(&buf[..n])?;
+        total += n as u64;
+        counter.store(total, Ordering::Relaxed);
+    }
+    Ok(total)
 }
 
 // ── MockBtrfs ───────────────────────────────────────────────────────────
@@ -889,5 +934,48 @@ mod tests {
     fn parse_generation_malformed_value() {
         let output = "\tGeneration: \t\tabc\n";
         assert_eq!(parse_generation(output), None);
+    }
+
+    // ── pump_with_cancel (UPI 033) ──────────────────────────────────────
+
+    #[test]
+    fn pump_copies_all_when_not_cancelled() {
+        let data = vec![0xABu8; 300 * 1024]; // > 2 chunks
+        let mut reader = std::io::Cursor::new(data.clone());
+        let mut writer: Vec<u8> = Vec::new();
+        let counter = AtomicU64::new(0);
+        let cancel = AtomicBool::new(false);
+
+        let total = pump_with_cancel(&mut reader, &mut writer, &counter, &cancel).unwrap();
+
+        assert_eq!(total, data.len() as u64);
+        assert_eq!(writer, data);
+        assert_eq!(counter.load(Ordering::Relaxed), data.len() as u64);
+    }
+
+    #[test]
+    fn pump_breaks_immediately_when_cancel_preset() {
+        let data = vec![0u8; 300 * 1024];
+        let mut reader = std::io::Cursor::new(data);
+        let mut writer: Vec<u8> = Vec::new();
+        let counter = AtomicU64::new(0);
+        let cancel = AtomicBool::new(true); // cancelled before the first chunk
+
+        let total = pump_with_cancel(&mut reader, &mut writer, &counter, &cancel).unwrap();
+
+        // The first chunk is read but the cancel breaks before writing it.
+        assert_eq!(total, 0);
+        assert!(writer.is_empty());
+    }
+
+    #[test]
+    fn with_cancel_shares_the_flag() {
+        // The builder installs the watchdog's real flag in place of the
+        // private never-set default. (Behavioral proof of the cancel path is
+        // the pump tests above + the Step-7 #[ignore] real-drive test.)
+        let flag = Arc::new(AtomicBool::new(false));
+        let btrfs = RealBtrfs::for_reads("/usr/sbin/btrfs").with_cancel(flag.clone());
+        flag.store(true, Ordering::Relaxed);
+        assert!(btrfs.cancel.load(Ordering::Relaxed));
     }
 }

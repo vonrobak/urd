@@ -88,7 +88,7 @@ predictive guards retired; see the amendment block above):
 | Layer | Prevents | Failure mode | Caught by |
 |-------|----------|--------------|-----------|
 | 1. **Tier-graded ephemeral footprint-cap** — retain-one @ Tight / clear-all @ Critical, keyed on the per-pool armed `TightnessTier` (031-a/031-b) | Steady-state delta drift in the pin window; at Critical, *any* steady local footprint | N/A (structural) | — |
-| 2. Mid-op watchdog (free-space polling + write-rate sensing during send) | Sends that went bad in-flight | Watchdog loses the race | Layer 3 |
+| 2. Mid-op watchdog (free-space polling + write-rate sensing during send, UPI 033) | Sends that went bad in-flight | Watchdog loses the race | Layer 3 |
 | 3. Emergency eject (sentinel drops Urd-owned snapshots to reclaim space) | Residual pressure after the footprint-cap and watchdog both failed | BTRFS itself failed (ENOSPC mid-transaction, read-only FS) | Outside Urd's domain |
 
 *Retired (2026-05-30):* **Predictive guards (drift projection + defer).** UPI 032
@@ -215,10 +215,23 @@ The Do-No-Harm arc (amended 2026-05-30 — UPI 032 retired, see the amendment bl
    AT RISK while Critical. This is the behavioral Layer 1. *(This UPI.)*
 4. ~~**UPI 032 — Predictive Guards.**~~ **Retired** (2026-05-30 re-grill): redundant where
    the footprint-cap acts, net-negative otherwise (inaction-is-harm).
-5. **UPI 033 — Mid-op Watchdog + Reserve File.** Trigger-with-cleanup-budget + reserve
-   file + write-rate sensing during sends. Runs inside `executor.rs` or a `guard.rs` module.
-6. **UPI 034 — Emergency Eject.** Sentinel extension. Drops Urd-owned snapshots when
-   pressure crosses the catastrophic floor outside of an active send.
+5. **UPI 033 — Mid-op Watchdog + Reserve File.** Layer 2. An in-process sibling thread
+   polls source-pool free level **and** drop-rate during sends; on trigger it frees a
+   pre-allocated `.urd-emergency-reserve` (fast bridge) and, if still tripping, sets a
+   cancel flag that aborts the in-flight send. Pure decision core in `guard.rs`
+   (`evaluate → WatchdogAction`); reserve I/O in `reserve.rs`; the thread, cancel
+   plumbing, and abort-reclaim wire in `commands/backup.rs`. Introduces the
+   `cleanup_budget` config field (`floor = min_free + cleanup_budget`, default 1.5 % of
+   capacity). Event-only surface (`WatchdogAbort`, ADR-114) — no cross-repo change.
+   **ADR-106-scoped exception (authorized here, not a new ADR):** because cancelling a
+   send frees no source space on its own, the watchdog's `emergency_reclaim_pool` clears
+   the *triggering pool's* local snapshots after the send exits — including the
+   just-aborted (in-flight-casualty) snapshot and its pin parent, bypassing
+   unsent-protection. This is the catastrophic-floor doctrine applied reactively (host
+   survival > chain continuity; the next send is full); the live subvolume is untouched
+   and falls back to its prior offsite copy. *(Shipped.)*
+6. **UPI 034 — Emergency Eject.** Layer 3. Sentinel extension. Drops Urd-owned snapshots
+   when pressure crosses the catastrophic floor outside of an active send.
 
 Arc sequence beyond this UPI: **031-b → 033 → 034**.
 

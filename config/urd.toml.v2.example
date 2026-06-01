@@ -63,6 +63,12 @@ min_free_bytes = "500GB"
 # In v2, snapshot_root and min_free_bytes are inlined on each subvolume.
 # Each block is self-describing — no [local_snapshots] or [defaults].
 #
+# Optional: cleanup_budget = "2GB"
+#   Working room the mid-op watchdog keeps free above min_free_bytes on the
+#   source pool while a backup is sending (floor = min_free_bytes + cleanup_budget).
+#   Omit it and Urd defaults to 1.5% of the pool's capacity. Subvolumes sharing a
+#   snapshot_root must declare the same value (or leave it unset).
+#
 # Retention schema:
 #   monthly = 12          one per calendar month, 12 months
 #   monthly = "unlimited" one per calendar month, indefinitely
@@ -78,6 +84,7 @@ name = "htpc-home"
 source = "/home"
 snapshot_root = "~/.snapshots"
 min_free_bytes = "10GB"
+# cleanup_budget = "2GB"   # optional; defaults to 1.5% of pool capacity
 priority = 1
 protection = "fortified"
 drives = ["WD-18TB", "WD-18TB1"]   # Active workstation — keep off small test drive
