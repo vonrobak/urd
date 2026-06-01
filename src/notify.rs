@@ -110,6 +110,16 @@ pub enum NotificationEvent {
         pool_label: String,
         snapshots_reclaimed: u32,
     },
+    /// The always-on sentinel shed Urd-owned local snapshots while idle to keep a
+    /// source pool above the host-survival floor (UPI 034, ADR-113 Layer 3).
+    /// Dispatched best-effort by the sentinel only when at least one snapshot was
+    /// actually reclaimed.
+    EmergencyEjected {
+        pool_label: String,
+        snapshots_reclaimed: u32,
+        free_bytes_before: u64,
+        floor_bytes: u64,
+    },
 }
 
 // ── Urgency ────────────────────────────────────────────────────────────
@@ -449,6 +459,37 @@ pub fn build_watchdog_abort_notification(
     }
 }
 
+/// Build the notification for an idle emergency eject (UPI 034, ADR-113 Layer 3).
+/// The sentinel sheds Urd-owned local snapshots while no backup runs to keep a
+/// source pool above the host-survival floor. Dispatched only when at least one
+/// snapshot was reclaimed (`snapshots_reclaimed > 0`). Body uses the sever
+/// register and mirrors `build_watchdog_abort_notification`'s careful "still
+/// safe" claim — it does not say "nothing is lost" (the local restore points are
+/// gone until the next, full, send).
+#[must_use]
+pub fn build_emergency_eject_notification(
+    pool_label: &str,
+    snapshots_reclaimed: u32,
+    free_bytes_before: u64,
+    floor_bytes: u64,
+) -> Notification {
+    Notification {
+        event: NotificationEvent::EmergencyEjected {
+            pool_label: pool_label.to_string(),
+            snapshots_reclaimed,
+            free_bytes_before,
+            floor_bytes,
+        },
+        urgency: Urgency::Critical,
+        title: format!("{pool_label} nearly full — Urd freed space"),
+        body: format!(
+            "{pool_label} is nearly full — Urd severed {snapshots_reclaimed} local thread(s) to \
+             protect it. The offsite copy of each is still safe; the next backup of these will be \
+             a full send."
+        ),
+    }
+}
+
 /// User-facing word for a tightness tier in notification prose.
 fn tier_word(tier: TightnessTier) -> &'static str {
     match tier {
@@ -733,6 +774,28 @@ mod tests {
         assert!(matches!(
             n.event,
             NotificationEvent::WatchdogAborted { snapshots_reclaimed: 0, .. }
+        ));
+    }
+
+    // ── Emergency eject notification (UPI 034) ─────────────────────
+
+    #[test]
+    fn emergency_eject_notification_sever_prose() {
+        let n = build_emergency_eject_notification("/data", 2, 3_800_000_000, 4_000_000_000);
+        assert_eq!(n.urgency, Urgency::Critical);
+        assert!(n.title.contains("/data"));
+        assert!(n.body.contains("severed 2 local thread(s)"));
+        // Honesty (S1): mirrors the watchdog's "still safe", not "nothing is lost".
+        assert!(n.body.contains("still safe"));
+        assert!(!n.body.contains("nothing is lost"));
+        assert!(matches!(
+            n.event,
+            NotificationEvent::EmergencyEjected {
+                snapshots_reclaimed: 2,
+                free_bytes_before: 3_800_000_000,
+                floor_bytes: 4_000_000_000,
+                ..
+            }
         ));
     }
 

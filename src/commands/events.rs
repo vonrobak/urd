@@ -37,7 +37,7 @@ pub fn run(config: Config, args: EventsArgs, output_mode: OutputMode) -> anyhow:
     let kind = match args.kind.as_deref() {
         Some(s) => Some(EventKind::from_str(s).with_context(|| {
             format!(
-                "unknown --kind {s:?}; supported: retention | planner | promise | sentinel | config | drive"
+                "unknown --kind {s:?}; supported: retention | planner | promise | sentinel | config | drive | watchdog | emergency_eject"
             )
         })?),
         None => None,

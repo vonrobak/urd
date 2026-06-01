@@ -34,6 +34,11 @@ pub enum EventKind {
     Config,
     Drive,
     Watchdog,
+    /// First multi-word kind: the serde `rename_all = "lowercase"` would give
+    /// `"emergencyeject"`, so pin the wire form to match `as_str()` / the SQL
+    /// `kind` column / the `--kind` filter (UPI 034, M1).
+    #[serde(rename = "emergency_eject")]
+    EmergencyEject,
 }
 
 impl EventKind {
@@ -48,6 +53,7 @@ impl EventKind {
             Self::Config => "config",
             Self::Drive => "drive",
             Self::Watchdog => "watchdog",
+            Self::EmergencyEject => "emergency_eject",
         }
     }
 
@@ -64,6 +70,7 @@ impl EventKind {
             "config" => Some(Self::Config),
             "drive" => Some(Self::Drive),
             "watchdog" => Some(Self::Watchdog),
+            "emergency_eject" => Some(Self::EmergencyEject),
             _ => None,
         }
     }
@@ -203,6 +210,17 @@ pub enum EventPayload {
         freed_reserve: bool,
         snapshots_reclaimed: u32,
     },
+    /// The always-on sentinel shed Urd-owned local snapshots while idle to keep a
+    /// source pool above the host-survival floor (UPI 034, ADR-113 Layer 3). No
+    /// `reason` field — idle eject has no floor/cliff classification (the absolute
+    /// level is the only signal). Wire tag is PascalCase `EmergencyEject` (the
+    /// enum has no `rename_all`, matching `WatchdogAbort`).
+    EmergencyEject {
+        pool_label: String,
+        free_bytes_before: u64,
+        floor_bytes: u64,
+        snapshots_reclaimed: u32,
+    },
 }
 
 impl EventPayload {
@@ -217,6 +235,7 @@ impl EventPayload {
             Self::ConfigReloaded { .. } | Self::ConfigReloadFailed { .. } => EventKind::Config,
             Self::DriveMounted { .. } | Self::DriveUnmounted { .. } => EventKind::Drive,
             Self::WatchdogAbort { .. } => EventKind::Watchdog,
+            Self::EmergencyEject { .. } => EventKind::EmergencyEject,
         }
     }
 
@@ -250,6 +269,8 @@ impl EventPayload {
             Self::DriveMounted { .. } | Self::DriveUnmounted { .. } => Severity::Info,
             // An aborted send is a host-survival action the user should see.
             Self::WatchdogAbort { .. } => Severity::Warn,
+            // Shedding local snapshots while idle is a host-survival action too.
+            Self::EmergencyEject { .. } => Severity::Warn,
         }
     }
 }
@@ -410,6 +431,15 @@ mod tests {
                     snapshots_reclaimed: 3,
                 },
                 EventKind::Watchdog,
+            ),
+            (
+                EventPayload::EmergencyEject {
+                    pool_label: "/data".into(),
+                    free_bytes_before: 1_000,
+                    floor_bytes: 2_000,
+                    snapshots_reclaimed: 1,
+                },
+                EventKind::EmergencyEject,
             ),
         ];
         for (payload, expected) in cases {
@@ -606,6 +636,37 @@ mod tests {
             freed_reserve: false,
             snapshots_reclaimed: 0,
         });
+        roundtrip(&EventPayload::EmergencyEject {
+            pool_label: "/data".into(),
+            free_bytes_before: 3_800_000_000,
+            floor_bytes: 4_000_000_000,
+            snapshots_reclaimed: 1,
+        });
+    }
+
+    #[test]
+    fn emergency_eject_payload_wire_tag_is_pascal_case() {
+        // The enum has no `rename_all`, so the tag mirrors `WatchdogAbort`'s
+        // PascalCase form (UPI 034, M1).
+        let payload = EventPayload::EmergencyEject {
+            pool_label: "/data".into(),
+            free_bytes_before: 1_000,
+            floor_bytes: 2_000,
+            snapshots_reclaimed: 1,
+        };
+        let json = serde_json::to_value(&payload).unwrap();
+        assert_eq!(json["type"], "EmergencyEject");
+        assert_eq!(payload.severity(), Severity::Warn);
+    }
+
+    #[test]
+    fn emergency_eject_kind_serde_form_matches_as_str() {
+        // M1 contract lock: the first multi-word EventKind. `EventRow` serializes
+        // `kind` via serde; it must equal `as_str()` / the SQL column / `--kind`.
+        let json = serde_json::to_value(EventKind::EmergencyEject).unwrap();
+        assert_eq!(json, serde_json::json!("emergency_eject"));
+        assert_eq!(EventKind::EmergencyEject.as_str(), "emergency_eject");
+        assert_eq!(EventKind::from_str("emergency_eject"), Some(EventKind::EmergencyEject));
     }
 
     #[test]
@@ -721,6 +782,7 @@ mod tests {
             EventKind::Config,
             EventKind::Drive,
             EventKind::Watchdog,
+            EventKind::EmergencyEject,
         ] {
             assert_eq!(EventKind::from_str(kind.as_str()), Some(kind));
         }
