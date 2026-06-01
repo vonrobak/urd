@@ -4091,6 +4091,92 @@ local_retention = "transient"
     }
 
     #[test]
+    fn emergency_reclaim_multi_subvol_isolates_pinned_from_no_pin() {
+        // UPI 034: the idle eject passes ALL send-enabled subvols on a pool in
+        // one call, so the never-the-only-copy gate must act per-subvol — shed the
+        // offsite-confirmed subvol, preserve the never-sent one. (The CI-runnable
+        // stand-in for the deferred real-loopback test: a real-btrfs harness does
+        // not yet exist in the repo; the gate's behavior is exercised here with
+        // MockBtrfs + tempdir, and the send-enabled pre-filter is covered by
+        // `sentinel_runner::tests::pressure_samples_filter_to_send_enabled_*`.)
+        let snap_dir = tempfile::TempDir::new().unwrap();
+        let drive_dir = tempfile::TempDir::new().unwrap();
+
+        // pinned-sv: a snapshot with a confirmed offsite pin → shed.
+        let pinned_dir = snap_dir.path().join("pinned-sv");
+        std::fs::create_dir_all(&pinned_dir).unwrap();
+        let pinned_snap = pinned_dir.join("20260322-1430-p");
+        std::fs::create_dir(&pinned_snap).unwrap();
+        chain::write_pin_file(
+            &pinned_dir,
+            "DRIVE-A",
+            &SnapshotName::parse("20260322-1430-p").unwrap(),
+        )
+        .unwrap();
+
+        // nopin-sv: a snapshot with no pin → its only copy, preserved.
+        let nopin_dir = snap_dir.path().join("nopin-sv");
+        std::fs::create_dir_all(&nopin_dir).unwrap();
+        let nopin_snap = nopin_dir.join("20260322-1430-n");
+        std::fs::create_dir(&nopin_snap).unwrap();
+
+        let config_str = format!(
+            r#"
+[general]
+state_db = "/tmp/urd-test/urd.db"
+metrics_file = "/tmp/urd-test/backup.prom"
+log_dir = "/tmp/urd-test"
+
+[local_snapshots]
+roots = [
+  {{ path = "{snap_root}", subvolumes = ["pinned-sv", "nopin-sv"] }}
+]
+
+[defaults]
+snapshot_interval = "1h"
+send_interval = "4h"
+[defaults.local_retention]
+hourly = 24
+[defaults.external_retention]
+daily = 30
+
+[[drives]]
+label = "DRIVE-A"
+mount_path = "{drive}"
+snapshot_root = ".snapshots"
+role = "primary"
+
+[[subvolumes]]
+name = "pinned-sv"
+short_name = "p"
+source = "/data/p"
+local_retention = "transient"
+
+[[subvolumes]]
+name = "nopin-sv"
+short_name = "n"
+source = "/data/n"
+local_retention = "transient"
+"#,
+            snap_root = snap_dir.path().display(),
+            drive = drive_dir.path().display(),
+        );
+        let config: Config = toml::from_str(&config_str).unwrap();
+        let mock = MockBtrfs::new();
+        let shutdown = no_shutdown();
+        let executor = Executor::new(&mock, None, &config, &shutdown);
+
+        let outcome = executor
+            .emergency_reclaim_pool(&["pinned-sv".to_string(), "nopin-sv".to_string()]);
+
+        assert_eq!(outcome, ReclaimOutcome::Reclaimed { deleted: 1 });
+        let deletes = delete_calls(&mock);
+        assert!(deletes.contains(&pinned_snap), "pinned subvol's snapshot is shed");
+        assert!(!deletes.contains(&nopin_snap), "no-pin subvol's snapshot is preserved");
+        assert!(nopin_snap.exists(), "the no-pin subvol's only copy survives");
+    }
+
+    #[test]
     fn emergency_reclaim_empty_dir_is_nothing() {
         let snap_dir = tempfile::TempDir::new().unwrap();
         let drive_dir = tempfile::TempDir::new().unwrap();

@@ -20,8 +20,8 @@ use crate::executor::{
     TransientCleanupOutcome,
 };
 use crate::guard::{
-    self, WatchdogAction, WatchdogReason, WatchdogSample, WatchdogThresholds,
-    CLEANUP_BUDGET_CAPACITY_FRACTION, CLIFF_BYTES_PER_SEC, WATCHDOG_POLL_MS,
+    self, WatchdogAction, WatchdogReason, WatchdogSample, WatchdogThresholds, CLIFF_BYTES_PER_SEC,
+    WATCHDOG_POLL_MS,
 };
 use crate::heartbeat;
 use crate::lock;
@@ -700,10 +700,11 @@ fn arm_watchdog_pools_with(
         .into_iter()
         .map(|t| {
             let first = &t.send_subvols[0];
-            let floor_bytes = config.root_min_free_bytes(first).unwrap_or(0)
-                + config
-                    .root_cleanup_budget(first)
-                    .unwrap_or_else(|| default_cleanup_budget(t.space.capacity_bytes));
+            let floor_bytes = guard::source_floor_bytes(
+                config.root_min_free_bytes(first).unwrap_or(0),
+                config.root_cleanup_budget(first),
+                t.space.capacity_bytes,
+            );
             ArmedPool {
                 reserve_path: reserve::reserve_path(&t.root),
                 poll_path: t.root,
@@ -713,19 +714,6 @@ fn arm_watchdog_pools_with(
             }
         })
         .collect()
-}
-
-/// The capacity-relative `cleanup_budget` default (UPI 033): 1.5 % of pool
-/// capacity, applied when the operator did not configure one.
-#[must_use]
-fn default_cleanup_budget(capacity_bytes: u64) -> u64 {
-    #[allow(
-        clippy::cast_precision_loss,
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss
-    )]
-    let budget = (capacity_bytes as f64 * CLEANUP_BUDGET_CAPACITY_FRACTION) as u64;
-    budget
 }
 
 /// Pure per-pool watchdog decision (UPI 033). Suppresses the **absolute floor**
@@ -2369,7 +2357,7 @@ source = "/data/beta"
         let armed =
             arm_watchdog_pools_with(&config, &signals, &map, space_cap(cap, 40_000_000_000));
         assert_eq!(armed.len(), 1);
-        assert_eq!(armed[0].floor_bytes, default_cleanup_budget(cap));
+        assert_eq!(armed[0].floor_bytes, guard::source_floor_bytes(0, None, cap));
         assert_eq!(armed[0].floor_bytes, 1_500_000_000);
     }
 

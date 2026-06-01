@@ -27,6 +27,7 @@
 //! commits faster than btrfs's async subvolume-delete cleaner) to buy runway; a
 //! still-triggering sample escalates to abort, carrying the reason forward.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -122,6 +123,58 @@ pub fn evaluate(
     } else {
         WatchdogAction::Abort(reason)
     }
+}
+
+/// The source-pool host-survival floor shared by Layer 2 (the mid-op watchdog,
+/// UPI 033) and Layer 3 (idle emergency eject, UPI 034): `min_free +
+/// cleanup_budget`, where an unset `cleanup_budget` defaults to
+/// [`CLEANUP_BUDGET_CAPACITY_FRACTION`] of pool capacity (resolved here because
+/// the fraction needs the capacity in scope). Both layers call this so the floor
+/// cannot drift between them — partitioned by send-state, one number, two actors.
+#[must_use]
+pub fn source_floor_bytes(min_free: u64, cleanup_budget: Option<u64>, capacity_bytes: u64) -> u64 {
+    let budget = cleanup_budget.unwrap_or_else(|| {
+        #[allow(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss
+        )]
+        let b = (capacity_bytes as f64 * CLEANUP_BUDGET_CAPACITY_FRACTION) as u64;
+        b
+    });
+    min_free + budget
+}
+
+// ── Idle emergency eject (ADR-113 Layer 3, UPI 034) ────────────────────
+
+/// One source pool's free-space observation at an idle sentinel poll (UPI 034).
+/// Pure input to [`evaluate_idle_eject`], which also returns the subset that
+/// should eject (the type carries no decision state of its own, so input and
+/// "pool to relieve" are one shape). The sentinel runner builds it from a
+/// `pools::pool_space` read and the [`source_floor_bytes`] floor. `subvol_names`
+/// is the pool's **send-enabled** subvolumes only (mirroring the watchdog's
+/// scope — a send-disabled or local-only subvol is left alone).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoolPressureSample {
+    pub pool_uuid: String,
+    pub mountpoint: PathBuf,
+    pub free_bytes: u64,
+    pub floor_bytes: u64,
+    pub subvol_names: Vec<String>,
+}
+
+/// Which idle pools have crossed the host-survival floor (UPI 034). Pure
+/// (ADR-108): a pool ejects iff `free_bytes < floor_bytes` — the absolute level
+/// is the trustworthy signal idle (no active writer whose rate we are racing, so
+/// no cliff term, unlike the in-send watchdog). Boundary: `free == floor` does
+/// **not** eject.
+#[must_use]
+pub fn evaluate_idle_eject(samples: &[PoolPressureSample]) -> Vec<PoolPressureSample> {
+    samples
+        .iter()
+        .filter(|s| s.free_bytes < s.floor_bytes)
+        .cloned()
+        .collect()
 }
 
 /// The trigger reason for a sample, or `None` when neither threshold is crossed.
@@ -293,6 +346,86 @@ mod tests {
         // prev < current: saturating_sub → 0 drop → no cliff. Level fine.
         let s = sample_dropping(20 * GB, 5 * GB);
         assert_eq!(evaluate(s, thresholds(), true), WatchdogAction::Continue);
+    }
+
+    #[test]
+    fn source_floor_unset_min_free_is_just_budget() {
+        // min_free 0, explicit budget 500 MB, capacity irrelevant → floor == budget.
+        assert_eq!(source_floor_bytes(0, Some(500 * 1024 * 1024), 100 * GB), 500 * 1024 * 1024);
+    }
+
+    #[test]
+    fn source_floor_unset_budget_uses_capacity_fraction() {
+        // min_free 2 GB, budget unset → 2 GB + 1.5% of 100 GB capacity.
+        let cap = 100 * GB;
+        #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let expected_budget = (cap as f64 * CLEANUP_BUDGET_CAPACITY_FRACTION) as u64;
+        assert_eq!(source_floor_bytes(2 * GB, None, cap), 2 * GB + expected_budget);
+    }
+
+    #[test]
+    fn source_floor_both_set_is_exact_sum() {
+        // Both explicit → capacity ignored, exact sum.
+        assert_eq!(source_floor_bytes(2 * GB, Some(GB), 999 * GB), 3 * GB);
+    }
+
+    // ── evaluate_idle_eject (UPI 034) ──────────────────────────────
+
+    fn sample(uuid: &str, free: u64, floor: u64) -> PoolPressureSample {
+        PoolPressureSample {
+            pool_uuid: uuid.to_string(),
+            mountpoint: PathBuf::from(format!("/mnt/{uuid}")),
+            free_bytes: free,
+            floor_bytes: floor,
+            subvol_names: vec![format!("{uuid}-sv")],
+        }
+    }
+
+    #[test]
+    fn idle_eject_empty_input_yields_none() {
+        assert!(evaluate_idle_eject(&[]).is_empty());
+    }
+
+    #[test]
+    fn idle_eject_all_roomy_yields_none() {
+        let samples = [sample("a", 10 * GB, 2 * GB), sample("b", 5 * GB, 2 * GB)];
+        assert!(evaluate_idle_eject(&samples).is_empty());
+    }
+
+    #[test]
+    fn idle_eject_one_under_floor() {
+        let samples = [sample("a", GB, 2 * GB)];
+        let out = evaluate_idle_eject(&samples);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].pool_uuid, "a");
+        assert_eq!(out[0].free_bytes, GB);
+        assert_eq!(out[0].floor_bytes, 2 * GB);
+        assert_eq!(out[0].subvol_names, vec!["a-sv".to_string()]);
+    }
+
+    #[test]
+    fn idle_eject_mixed_returns_only_under() {
+        let samples = [
+            sample("roomy", 10 * GB, 2 * GB),
+            sample("tight", GB, 2 * GB),
+        ];
+        let out = evaluate_idle_eject(&samples);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].pool_uuid, "tight");
+    }
+
+    #[test]
+    fn idle_eject_multiple_under() {
+        let samples = [sample("a", GB, 2 * GB), sample("b", 0, GB)];
+        let out = evaluate_idle_eject(&samples);
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn idle_eject_exactly_at_floor_does_not_eject() {
+        // free == floor is not below the floor → no eject (boundary).
+        let samples = [sample("a", 2 * GB, 2 * GB)];
+        assert!(evaluate_idle_eject(&samples).is_empty());
     }
 
     #[test]

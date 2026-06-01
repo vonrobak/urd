@@ -12,6 +12,7 @@ use colored::Colorize;
 use crate::events::{EventPayload, Severity};
 use crate::guard::WatchdogReason;
 use crate::output::{EventRow, EventsView};
+use crate::types::ByteSize;
 
 /// Render the events view as a columnar listing for interactive use.
 #[must_use]
@@ -164,6 +165,19 @@ fn summary_for(payload: &EventPayload) -> String {
             format!(
                 "guard stopped send on {pool_label}  ({cause}; {bridge}; \
                  reclaimed {snapshots_reclaimed} snapshot(s))"
+            )
+        }
+        EventPayload::EmergencyEject {
+            pool_label,
+            free_bytes_before,
+            floor_bytes,
+            snapshots_reclaimed,
+        } => {
+            format!(
+                "severed {snapshots_reclaimed} thread(s) on {pool_label}  \
+                 (host nearly full: {} free, floor {})",
+                ByteSize(*free_bytes_before),
+                ByteSize(*floor_bytes),
             )
         }
     }
@@ -434,6 +448,25 @@ mod tests {
             None,
         );
         assert!(format_row(&fail).contains("config reload failed"));
+    }
+
+    #[test]
+    fn render_emergency_eject_uses_sever_verb_and_byte_sizes() {
+        let _color = setup();
+        let row = make_row(
+            EventPayload::EmergencyEject {
+                pool_label: "/data".into(),
+                free_bytes_before: 3_800_000_000,
+                floor_bytes: 4_000_000_000,
+                snapshots_reclaimed: 2,
+            },
+            None,
+            None,
+        );
+        let rendered = format_row(&row);
+        assert!(rendered.contains("severed 2 thread(s) on /data"));
+        assert!(rendered.contains("free"));
+        assert!(rendered.contains("floor"));
     }
 
     #[test]

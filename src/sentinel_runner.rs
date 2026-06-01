@@ -8,9 +8,9 @@
 // Design: docs/95-ideas/2026-03-27-design-sentinel-session2.md
 // Review: docs/99-reports/2026-03-27-sentinel-session2-design-review.md
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -36,6 +36,12 @@ const POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// Minimum interval between BackupOverdue notifications (M2 debounce).
 const OVERDUE_DEBOUNCE: Duration = Duration::from_secs(4 * 3600);
 
+/// Dedicated cadence for the idle emergency-eject space check (UPI 034). Its own
+/// fixed ~60 s timer, independent of the adaptive assessment tick: a slow idle
+/// fill (pin CoW delta, ambient host data) develops over hours, so 60 s is ample,
+/// and it avoids both 5 s-loop `findmnt` churn and a pool-map cache.
+const SPACE_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+
 pub struct SentinelRunner {
     config: Config,
     state: SentinelState,
@@ -53,6 +59,8 @@ pub struct SentinelRunner {
     config_path: PathBuf,
     /// Last observed config file mtime (for change detection).
     last_config_mtime: Option<SystemTime>,
+    /// When the idle emergency-eject space check last ran (UPI 034 timer gate).
+    last_space_check: Option<Instant>,
 }
 
 impl SentinelRunner {
@@ -90,6 +98,7 @@ impl SentinelRunner {
             last_overdue_notified: None,
             config_path,
             last_config_mtime,
+            last_space_check: None,
         })
     }
 
@@ -124,6 +133,12 @@ impl SentinelRunner {
             if !events.is_empty() {
                 self.process_events(events);
             }
+
+            // UPI 034: idle emergency-eject poll (own ~60 s timer gate inside).
+            // Runner side-path — not routed through the SentinelEvent/Action state
+            // machine: the decision is stateless per-tick and needs config + live
+            // statvfs the pure transition does not (and should not) receive.
+            self.maybe_emergency_reclaim();
 
             std::thread::sleep(POLL_INTERVAL);
         }
@@ -636,6 +651,159 @@ impl SentinelRunner {
         notify::dispatch(&[notification], &self.config.notifications);
     }
 
+    // ── Idle emergency eject (UPI 034, ADR-113 Layer 3) ──────────────────
+
+    /// Idle emergency-eject poll. On its own ~60 s timer (gate below), measures
+    /// each source pool's free space and, when a pool has crossed the
+    /// host-survival floor **with no backup running**, sheds the pool's
+    /// send-enabled, offsite-confirmed local snapshots via
+    /// `executor::emergency_reclaim_pool`. The sentinel's first
+    /// filesystem-mutating action.
+    ///
+    /// Safety is delegated to `emergency_reclaim_pool`'s never-the-only-copy
+    /// gate: it sheds only subvols with a confirmed pin and preserves any whose
+    /// snapshots are their sole stored copy. 034 trusts a confirmed pin as proof
+    /// of the offsite copy (ADR-113 catastrophic-floor) — it does not re-verify
+    /// against the (often absent) drive.
+    fn maybe_emergency_reclaim(&mut self) {
+        // 1. Timer gate — run at most once per SPACE_CHECK_INTERVAL. Stamp the
+        //    attempt regardless of outcome.
+        if let Some(last) = self.last_space_check
+            && last.elapsed() < SPACE_CHECK_INTERVAL
+        {
+            return;
+        }
+        self.last_space_check = Some(Instant::now());
+
+        // 2. Gather samples — scope to send-enabled subvols, mirroring the
+        //    watchdog (C2): the floor is keyed on the same representative subvol
+        //    and a send-disabled / local-only subvol is left alone.
+        let send_enabled: HashSet<String> = self
+            .config
+            .resolved_subvolumes()
+            .into_iter()
+            .filter(|sv| sv.enabled && sv.send_enabled)
+            .map(|sv| sv.name)
+            .collect();
+
+        let samples = pressure_samples_from(
+            crate::pools::detect_source_pools(&self.config),
+            &send_enabled,
+            |mp| match crate::pools::pool_space(mp) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    log::warn!("Emergency eject: cannot measure {}: {e}", mp.display());
+                    None
+                }
+            },
+            |first, capacity| {
+                crate::guard::source_floor_bytes(
+                    self.config.root_min_free_bytes(first).unwrap_or(0),
+                    self.config.root_cleanup_budget(first),
+                    capacity,
+                )
+            },
+        );
+
+        // 3. Decide (pure).
+        let ejects = crate::guard::evaluate_idle_eject(&samples);
+        if ejects.is_empty() {
+            return;
+        }
+
+        // 4. Lock — defer silently to a running backup (the watchdog owns space
+        //    mid-send). Same lock path `urd backup` takes, so the two are
+        //    mutually exclusive. Held across the whole reclaim.
+        let lock_path = self.config.general.state_db.with_extension("lock");
+        let _guard = match crate::lock::try_acquire_lock(&lock_path, "sentinel-eject") {
+            Ok(Some(g)) => g,
+            Ok(None) => return,
+            Err(e) => {
+                log::warn!("Emergency eject: could not acquire lock: {e}");
+                return;
+            }
+        };
+
+        // Delete-capable btrfs handle. No send happens, so no capability probe
+        // and the byte counter is an unused placeholder (M2).
+        let btrfs = crate::btrfs::RealBtrfs::new(
+            &self.config.general.btrfs_path,
+            Arc::new(AtomicU64::new(0)),
+            false,
+        );
+
+        let now = chrono::Local::now().naive_local();
+        let mut audit_events: Vec<crate::events::Event> = Vec::new();
+        let mut notifications = Vec::new();
+
+        for eject in &ejects {
+            // 5. Re-confirm under the lock — a just-finished backup may have
+            //    relieved the pressure the pre-lock sample saw.
+            match crate::pools::pool_space(&eject.mountpoint) {
+                Ok(s) if s.free_bytes < eject.floor_bytes => {}
+                Ok(_) => continue,
+                Err(e) => {
+                    log::warn!(
+                        "Emergency eject: re-confirm failed for {}: {e}",
+                        eject.mountpoint.display()
+                    );
+                    continue;
+                }
+            }
+
+            // 6. Reclaim — emergency_reclaim_pool reads no SQLite, so state=None.
+            let executor =
+                crate::executor::Executor::new(&btrfs, None, &self.config, &self.shutdown);
+            let outcome = executor.emergency_reclaim_pool(&eject.subvol_names);
+
+            // 7. Surface.
+            let pool_label =
+                crate::pools::canonical_mountpoint_label(std::slice::from_ref(&eject.mountpoint));
+            let deleted = outcome.deleted();
+            if let crate::executor::ReclaimOutcome::Failed { first_error, .. } = &outcome {
+                log::warn!(
+                    "Emergency eject: reclaim on {pool_label} hit a failure \
+                     (deleted {deleted}): {first_error}"
+                );
+            }
+            if deleted > 0 {
+                log::warn!(
+                    "Emergency eject: severed {deleted} local snapshot(s) on {pool_label} \
+                     (free {} < floor {})",
+                    eject.free_bytes,
+                    eject.floor_bytes
+                );
+                audit_events.push(crate::events::Event::pure(
+                    now,
+                    crate::events::EventPayload::EmergencyEject {
+                        pool_label: pool_label.clone(),
+                        free_bytes_before: eject.free_bytes,
+                        floor_bytes: eject.floor_bytes,
+                        snapshots_reclaimed: deleted,
+                    },
+                ));
+                notifications.push(notify::build_emergency_eject_notification(
+                    &pool_label,
+                    deleted,
+                    eject.free_bytes,
+                    eject.floor_bytes,
+                ));
+            }
+            // deleted == 0 && Nothing → silent (natural debounce: idle, nothing
+            // creates new snapshots, so after one shed there is nothing left).
+        }
+
+        // 8. Persist + dispatch best-effort (ADR-102), then release the lock.
+        if !audit_events.is_empty()
+            && let Ok(db) = StateDb::open(&self.config.general.state_db)
+        {
+            db.record_events_best_effort(&audit_events);
+        }
+        if !notifications.is_empty() {
+            notify::dispatch(&notifications, &self.config.notifications);
+        }
+    }
+
     // ── State file I/O ──────────────────────────────────────────────────
 
     fn write_state_file(
@@ -908,6 +1076,48 @@ pub fn build_health_notifications(
     }
 
     notifications
+}
+
+/// Pure core of `maybe_emergency_reclaim`'s sample-gathering (UPI 034): filter
+/// each detected pool to its send-enabled subvols, **drop pools with none**, and
+/// build one `PoolPressureSample` per surviving pool. `space` resolves a
+/// mountpoint's free/capacity (`None` skips the pool); `floor` computes the
+/// host-survival floor from the first send-enabled subvol and the pool capacity.
+/// Extracted so the send-enabled filter and floor-keying are unit-testable
+/// without live statvfs (C2 regression guard).
+fn pressure_samples_from(
+    pools: Vec<crate::pools::SourcePool>,
+    send_enabled: &HashSet<String>,
+    mut space: impl FnMut(&Path) -> Option<crate::pools::PoolSpace>,
+    mut floor: impl FnMut(&str, u64) -> u64,
+) -> Vec<crate::guard::PoolPressureSample> {
+    let mut samples = Vec::new();
+    for pool in pools {
+        let send_subvols: Vec<String> = pool
+            .subvolume_names
+            .iter()
+            .filter(|n| send_enabled.contains(*n))
+            .cloned()
+            .collect();
+        if send_subvols.is_empty() {
+            continue; // local-only pool — nothing 034 can shed
+        }
+        let Some(mountpoint) = pool.mountpoints.first() else {
+            continue;
+        };
+        let Some(sp) = space(mountpoint) else {
+            continue;
+        };
+        let floor_bytes = floor(&send_subvols[0], sp.capacity_bytes);
+        samples.push(crate::guard::PoolPressureSample {
+            pool_uuid: pool.uuid,
+            mountpoint: mountpoint.clone(),
+            free_bytes: sp.free_bytes,
+            floor_bytes,
+            subvol_names: send_subvols,
+        });
+    }
+    samples
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────
@@ -1655,5 +1865,82 @@ protection = "recorded"
             label: "WD-18TB".into(),
         }];
         assert_eq!(pick_transition_trigger(&events), None);
+    }
+
+    // ── Emergency eject: sample gathering (UPI 034) ────────────────────
+
+    #[test]
+    fn pressure_samples_filter_to_send_enabled_and_key_floor_on_first_sent() {
+        use crate::pools::{PoolSpace, SourcePool};
+
+        let pools = vec![
+            // Mixed pool: a local-only subvol listed first, then a send-enabled one.
+            SourcePool {
+                uuid: "mixed".into(),
+                mountpoints: vec![PathBuf::from("/data")],
+                subvolume_names: vec!["local-only".into(), "sent".into()],
+            },
+            // Pool with no send-enabled subvol — must be dropped.
+            SourcePool {
+                uuid: "all-local".into(),
+                mountpoints: vec![PathBuf::from("/scratch")],
+                subvolume_names: vec!["scratch-sv".into()],
+            },
+        ];
+        let send_enabled: HashSet<String> = ["sent".to_string()].into_iter().collect();
+
+        let samples = pressure_samples_from(
+            pools,
+            &send_enabled,
+            |_mp| Some(PoolSpace { free_bytes: 1_000, capacity_bytes: 100_000 }),
+            // Floor depends on the keyed subvol so the test can prove which one
+            // it used: "sent" → 5_000, anything else (e.g. "local-only") → 9_999.
+            |first, _cap| if first == "sent" { 5_000 } else { 9_999 },
+        );
+
+        assert_eq!(samples.len(), 1, "the all-local pool must be dropped");
+        let s = &samples[0];
+        assert_eq!(s.pool_uuid, "mixed");
+        assert_eq!(s.subvol_names, vec!["sent".to_string()]);
+        assert_eq!(s.free_bytes, 1_000);
+        assert_eq!(
+            s.floor_bytes, 5_000,
+            "floor must be keyed on the first send-enabled subvol, not the local-only one"
+        );
+    }
+
+    #[test]
+    fn pressure_samples_skip_pool_when_space_unavailable() {
+        use crate::pools::SourcePool;
+
+        let pools = vec![SourcePool {
+            uuid: "p".into(),
+            mountpoints: vec![PathBuf::from("/data")],
+            subvolume_names: vec!["sent".into()],
+        }];
+        let send_enabled: HashSet<String> = ["sent".to_string()].into_iter().collect();
+
+        let samples =
+            pressure_samples_from(pools, &send_enabled, |_mp| None, |_first, _cap| 5_000);
+        assert!(samples.is_empty(), "a pool whose space can't be read is skipped");
+    }
+
+    #[test]
+    fn emergency_reclaim_timer_gate_stamps_and_throttles() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("urd.toml");
+        write_test_config(&config_path, dir.path());
+        let mut runner = make_test_runner(&config_path);
+
+        assert!(runner.last_space_check.is_none());
+
+        // First call stamps the timer (the test config's source is a temp dir, so
+        // no real eject occurs — this only exercises the gate).
+        runner.maybe_emergency_reclaim();
+        let first = runner.last_space_check.expect("stamped after first run");
+
+        // An immediate second call is throttled — the stamp does not advance.
+        runner.maybe_emergency_reclaim();
+        assert_eq!(runner.last_space_check, Some(first));
     }
 }
