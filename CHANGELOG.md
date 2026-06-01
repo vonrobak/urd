@@ -7,7 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-06-02
+
 ### Added
+- **Idle emergency eject** (UPI 034, ADR-113 Layer 3). Closes the last do-no-harm gap —
+  the idle window between runs. Layers 1 (031-b) and 2 (033) are both run-coupled, so a
+  source pool filling while Urd sat idle (pin CoW delta, ambient host writes) could slide
+  toward a full disk with no Urd code able to reclaim. The always-on sentinel now polls each
+  source pool on a dedicated ~60 s timer and, when a pool crosses the host-survival floor
+  (`min_free + cleanup_budget` — the *same* `source_floor_bytes` the watchdog uses, extracted
+  so the two layers cannot drift) with **no backup running**, sheds the pool's send-enabled,
+  offsite-confirmed local snapshots by reusing 033's `emergency_reclaim_pool` (never-the-only-copy
+  gate, fail-closed pin-drop ordering, per-subvol isolation — zero new shedding logic). It is the
+  sentinel's **first filesystem-mutating action**; blast radius is bounded by sudoers (btrfs-only)
+  and the never-the-only-copy rule. It defers to a running backup via a try-lock on the backup lock
+  path (mutually exclusive with the watchdog) and re-confirms free space under the lock before
+  acting. A confirmed pin is trusted as proof of the offsite copy — idle eject does **not**
+  re-verify against the (usually absent) drive, the deliberate trade that keeps the drive-absent
+  case covered (ADR-113 catastrophic-floor doctrine). Adds the distinct `EmergencyEject` ADR-114
+  event (`EventKind::EmergencyEject`, filterable via `urd events --kind emergency_eject`) and a
+  `Critical`-urgency "severed … thread(s)" notification on an actual reclaim — the notification
+  says the offsite copy is still safe, not that nothing is lost. No new ADR, no config field, no
+  metric/heartbeat/on-disk/config-schema change (Cross-Repo Impact: None).
 - **Mid-op watchdog + reserve file** (UPI 033, ADR-113 Layer 2). Closes the
   in-flight blind spot: between "send started" and "send finished" nothing watched
   the host, yet a long send holds its source snapshot the whole transfer while live
@@ -804,7 +825,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Defense-in-depth pin file protection for unsent snapshots
 - Per-subvolume error isolation in executor
 
-[Unreleased]: https://github.com/vonrobak/urd/compare/v0.21.2...HEAD
+[Unreleased]: https://github.com/vonrobak/urd/compare/v0.22.0...HEAD
+[0.22.0]: https://github.com/vonrobak/urd/compare/v0.21.2...v0.22.0
 [0.21.2]: https://github.com/vonrobak/urd/compare/v0.21.1...v0.21.2
 [0.21.1]: https://github.com/vonrobak/urd/compare/v0.21.0...v0.21.1
 [0.21.0]: https://github.com/vonrobak/urd/compare/v0.20.5...v0.21.0
