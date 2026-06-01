@@ -148,7 +148,9 @@ pub fn source_floor_bytes(min_free: u64, cleanup_budget: Option<u64>, capacity_b
 // ── Idle emergency eject (ADR-113 Layer 3, UPI 034) ────────────────────
 
 /// One source pool's free-space observation at an idle sentinel poll (UPI 034).
-/// Pure input to [`evaluate_idle_eject`]; the sentinel runner builds it from a
+/// Pure input to [`evaluate_idle_eject`], which also returns the subset that
+/// should eject (the type carries no decision state of its own, so input and
+/// "pool to relieve" are one shape). The sentinel runner builds it from a
 /// `pools::pool_space` read and the [`source_floor_bytes`] floor. `subvol_names`
 /// is the pool's **send-enabled** subvolumes only (mirroring the watchdog's
 /// scope — a send-disabled or local-only subvol is left alone).
@@ -161,34 +163,17 @@ pub struct PoolPressureSample {
     pub subvol_names: Vec<String>,
 }
 
-/// A source pool the sentinel should attempt to relieve (UPI 034): its free
-/// space has crossed below the host-survival floor while idle.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PoolEject {
-    pub pool_uuid: String,
-    pub mountpoint: PathBuf,
-    pub subvol_names: Vec<String>,
-    pub free_bytes: u64,
-    pub floor_bytes: u64,
-}
-
 /// Which idle pools have crossed the host-survival floor (UPI 034). Pure
 /// (ADR-108): a pool ejects iff `free_bytes < floor_bytes` — the absolute level
 /// is the trustworthy signal idle (no active writer whose rate we are racing, so
 /// no cliff term, unlike the in-send watchdog). Boundary: `free == floor` does
 /// **not** eject.
 #[must_use]
-pub fn evaluate_idle_eject(samples: &[PoolPressureSample]) -> Vec<PoolEject> {
+pub fn evaluate_idle_eject(samples: &[PoolPressureSample]) -> Vec<PoolPressureSample> {
     samples
         .iter()
         .filter(|s| s.free_bytes < s.floor_bytes)
-        .map(|s| PoolEject {
-            pool_uuid: s.pool_uuid.clone(),
-            mountpoint: s.mountpoint.clone(),
-            subvol_names: s.subvol_names.clone(),
-            free_bytes: s.free_bytes,
-            floor_bytes: s.floor_bytes,
-        })
+        .cloned()
         .collect()
 }
 
