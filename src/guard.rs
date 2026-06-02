@@ -27,10 +27,13 @@
 //! commits faster than btrfs's async subvolume-delete cleaner) to buy runway; a
 //! still-triggering sample escalates to abort, carrying the reason forward.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+
+use crate::types::SnapshotName;
 
 /// Differential trigger: free space falling faster than this is a cliff. 100
 /// MB/s — at the 250 ms poll cadence that is ~25 MB lost between samples, well
@@ -143,6 +146,63 @@ pub fn source_floor_bytes(min_free: u64, cleanup_budget: Option<u64>, capacity_b
         b
     });
     min_free + budget
+}
+
+// ── Presence-aware pin shedding (ADR-116, UPI 058) ─────────────────────
+
+/// One drive's scope for a subvolume: whether it is **usable for a send right
+/// now** and its current pin, if any (UPI 058). The single shape the presence
+/// predicate is computed from. "Mounted" here is the planner's `usable_drives`
+/// predicate — `accepts_drive` AND `drive_availability ∈ {Available,
+/// TokenMissing}` — i.e. a drive whose incremental chain *can* continue this
+/// run. An away (`!mounted`) drive is one that cannot: physically absent, UUID
+/// mismatch, token-blocked. The `pin` is the drive's last external parent.
+///
+/// The I/O (reading availability + pin files) stays in the caller — the shared
+/// `plan::drive_scopes` helper builds these so the planner and the executor's
+/// away-shed compute the presence predicate from the *same* source (ADR-108,
+/// UPI 058 R1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DriveScope {
+    /// Drive label (the `.last-external-parent-{label}` key).
+    pub label: String,
+    /// True iff usable for a send now (the planner's `usable_drives` predicate).
+    /// `false` == "away" for shedding purposes.
+    pub mounted: bool,
+    /// The drive's current pin (last external parent), if any.
+    pub pin: Option<SnapshotName>,
+}
+
+/// The away-drive pins that are **safe to shed** under storage pressure
+/// (ADR-116 Consequence 1, UPI 058). Pure (ADR-108).
+///
+/// **Snapshot-level, not drive-level.** An away drive's pin is sheddable iff its
+/// pinned snapshot is **not** also pinned by any *mounted* drive — i.e. the
+/// snapshot is away-*only*-pinned. Shedding it frees the snapshot (no mounted
+/// drive needs it as a parent) and breaks only the offsite chain (recoverable by
+/// a full send on return). A snapshot shared by a connected drive (the
+/// just-after-rotation shared incremental parent) is **not** sheddable: shedding
+/// the away pin would break the offsite chain for **zero** space gain, since the
+/// connected pin still holds the snapshot. In that case `clear-all` (which sheds
+/// the connected pin) is the correct reclaim, not retain-one (UPI 058 F1).
+///
+/// Returns the **away drive labels** whose pin is away-only — the pins the
+/// executor removes before the (already-planned) delete of that snapshot. An
+/// empty result means no presence-aware shed applies (`has_away_pin = false`).
+#[must_use]
+pub fn away_sheddable_pins(scopes: &[DriveScope]) -> Vec<String> {
+    // Snapshots pinned by any mounted drive — never sheddable (shared-parent).
+    let mounted_pins: HashSet<&SnapshotName> = scopes
+        .iter()
+        .filter(|s| s.mounted)
+        .filter_map(|s| s.pin.as_ref())
+        .collect();
+    scopes
+        .iter()
+        .filter(|s| !s.mounted)
+        .filter(|s| s.pin.as_ref().is_some_and(|p| !mounted_pins.contains(p)))
+        .map(|s| s.label.clone())
+        .collect()
 }
 
 // ── Idle emergency eject (ADR-113 Layer 3, UPI 034) ────────────────────
@@ -439,5 +499,86 @@ mod tests {
             let back: WatchdogReason = serde_json::from_str(expected).unwrap();
             assert_eq!(back, reason);
         }
+    }
+
+    // ── away_sheddable_pins (UPI 058) ─────────────────────────────────
+
+    fn scope(label: &str, mounted: bool, pin: Option<&str>) -> DriveScope {
+        DriveScope {
+            label: label.to_string(),
+            mounted,
+            pin: pin.map(|p| SnapshotName::parse(p).unwrap()),
+        }
+    }
+
+    #[test]
+    fn away_sheddable_away_only_sheds() {
+        // A single away drive with an away-only pin → its label sheds.
+        let scopes = [scope("OFFSITE", false, Some("20260322-1400-opptak"))];
+        assert_eq!(away_sheddable_pins(&scopes), vec!["OFFSITE".to_string()]);
+    }
+
+    #[test]
+    fn away_sheddable_connected_only_is_empty() {
+        // Mounted drive with a pin → nothing away to shed.
+        let scopes = [scope("PRIMARY", true, Some("20260322-1400-opptak"))];
+        assert!(away_sheddable_pins(&scopes).is_empty());
+    }
+
+    #[test]
+    fn away_sheddable_shared_parent_not_sheddable() {
+        // F1 shared-parent: connected + away pin the SAME snapshot A. The away
+        // pin is NOT sheddable — shedding it frees nothing (A is held by the
+        // connected pin) and breaks the offsite chain for zero gain. clear-all
+        // is the right reclaim here, so has_away_pin must be false.
+        let scopes = [
+            scope("PRIMARY", true, Some("20260322-1400-opptak")),
+            scope("OFFSITE", false, Some("20260322-1400-opptak")),
+        ];
+        assert!(
+            away_sheddable_pins(&scopes).is_empty(),
+            "a snapshot shared with a connected drive is not away-only-pinned"
+        );
+    }
+
+    #[test]
+    fn away_sheddable_mixed_sheds_only_away_only() {
+        // One away drive shares the connected parent (A); a second away drive
+        // pins an older, away-only snapshot (B). Only B's drive sheds.
+        let scopes = [
+            scope("PRIMARY", true, Some("20260322-1400-opptak")),
+            scope("OFFSITE-SHARED", false, Some("20260322-1400-opptak")),
+            scope("OFFSITE-OLD", false, Some("20260101-0900-opptak")),
+        ];
+        assert_eq!(
+            away_sheddable_pins(&scopes),
+            vec!["OFFSITE-OLD".to_string()],
+            "only the away-only pin sheds; the shared one is preserved"
+        );
+    }
+
+    #[test]
+    fn away_sheddable_two_away_same_snapshot_both_shed() {
+        // Two away drives pinning the same away-only snapshot (no mounted drive
+        // holds it) → both shed (the snapshot is away-only across both).
+        let scopes = [
+            scope("OFFSITE-A", false, Some("20260101-0900-opptak")),
+            scope("OFFSITE-B", false, Some("20260101-0900-opptak")),
+        ];
+        let mut shed = away_sheddable_pins(&scopes);
+        shed.sort();
+        assert_eq!(shed, vec!["OFFSITE-A".to_string(), "OFFSITE-B".to_string()]);
+    }
+
+    #[test]
+    fn away_sheddable_away_without_pin_is_empty() {
+        // An away drive that was never sent to (no pin) has nothing to shed.
+        let scopes = [scope("OFFSITE", false, None)];
+        assert!(away_sheddable_pins(&scopes).is_empty());
+    }
+
+    #[test]
+    fn away_sheddable_empty_scopes_is_empty() {
+        assert!(away_sheddable_pins(&[]).is_empty());
     }
 }

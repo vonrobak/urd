@@ -529,6 +529,11 @@ pub fn assess(
             subvol.send_interval,
             subvol.send_enabled,
             armed,
+            // Awareness consumes `eff` ONLY for `eff.send_interval` (never
+            // clear_all/local_retention), and A1 leaves send_interval invariant
+            // under has_away_pin (UPI 058), so `false` keeps the single-gather
+            // coherence with the planner trivially intact.
+            false,
         );
 
         // ── Local assessment ────────────────────────────────────────
@@ -1616,6 +1621,9 @@ source = "/data/sv1"
             sv.send_interval,
             sv.send_enabled,
             crate::storage_critical::TightnessTier::Critical,
+            // send_interval is invariant under has_away_pin, so this coherence
+            // check holds for either value; awareness itself passes false.
+            false,
         );
         assert_eq!(
             sv1.effective_send_interval,

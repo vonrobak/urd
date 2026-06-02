@@ -163,6 +163,13 @@ struct SubvolumeContext {
     /// Critical tier (UPI 031-b): after the gated cleanup, also delete the
     /// just-sent snapshot(s) and remove the pin, leaving zero local snapshots.
     clear_all: bool,
+    /// Away drives whose away-*only* pin to shed in-run before the ops loop
+    /// (UPI 058 B-keep). Populated from the threaded away-shed map ONLY at
+    /// Critical (Tight holds the away pin; Roomy has no shed). Removing the pin
+    /// first lets the planner's already-planned away-snapshot delete pass the
+    /// presence-blind re-check and reclaim the same run. Empty when `clear_all`
+    /// is true (no away pin) or below Critical.
+    shed_away_drives: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -188,6 +195,13 @@ pub struct Executor<'a> {
     /// sites need no change (mirrors `full_send_policy`). The backup path sets
     /// the real map via `set_armed_tiers` before `execute`.
     armed_tiers: ArmedTierMap,
+    /// Per-subvolume away-sheddable pins (UPI 058): subvol name → away drive
+    /// labels whose pin is away-*only*. Built pre-execution by
+    /// `commands/backup.rs` from the SAME `plan::drive_scopes` the planner used,
+    /// so the executor's `has_away_pin` (and the in-run away-shed) match the
+    /// planner's `clear_all` decision (R1 — coherence by construction). Default
+    /// empty → no away-shed → pre-058 behavior.
+    away_shed_pins: HashMap<String, Vec<String>>,
 }
 
 impl<'a> Executor<'a> {
@@ -207,12 +221,22 @@ impl<'a> Executor<'a> {
             size_estimates: None,
             full_send_policy: FullSendPolicy::Allow,
             armed_tiers: ArmedTierMap::new(),
+            away_shed_pins: HashMap::new(),
         }
     }
 
     /// Set the full-send policy for chain-break gating.
     pub fn set_full_send_policy(&mut self, policy: FullSendPolicy) {
         self.full_send_policy = policy;
+    }
+
+    /// Set the per-subvolume away-sheddable pin map (UPI 058). The executor
+    /// derives `has_away_pin` from it (so its `clear_all` matches the planner's)
+    /// and, at Critical, sheds those away pin files in-run so the planner's
+    /// already-planned away-only snapshot delete reclaims the same run. Default
+    /// empty → pre-058 behavior (mirrors `set_armed_tiers`).
+    pub fn set_away_shed_pins(&mut self, away_shed_pins: HashMap<String, Vec<String>>) {
+        self.away_shed_pins = away_shed_pins;
     }
 
     /// Set the per-subvolume armed tier map (UPI 031-b). The executor derives
@@ -286,6 +310,15 @@ impl<'a> Executor<'a> {
                 .get(subvol_name)
                 .copied()
                 .unwrap_or_default();
+            // Away-only pins for this subvol (UPI 058), from the threaded map the
+            // planner's scopes also produced → `has_away_pin` matches the
+            // planner's, so `clear_all` cannot diverge (R1).
+            let away_shed: Vec<String> = self
+                .away_shed_pins
+                .get(subvol_name)
+                .cloned()
+                .unwrap_or_default();
+            let has_away_pin = !away_shed.is_empty();
             let (is_transient, clear_all) = resolved_subvols
                 .iter()
                 .find(|sv| &sv.name == subvol_name)
@@ -295,14 +328,25 @@ impl<'a> Executor<'a> {
                         sv.send_interval,
                         sv.send_enabled,
                         armed,
+                        has_away_pin,
                     );
                     (eff.local_retention.is_transient(), eff.clear_all)
                 })
                 .unwrap_or((false, false));
+            // Shed the away-only pins in-run ONLY at Critical (UPI 058 B-keep):
+            // Tight holds the away pin (retain-one), Roomy has no shed. The flip
+            // to retain-one (clear_all=false above) and the shed are one decision
+            // (F2 — no half-state).
+            let shed_away_drives = if armed == storage_critical::TightnessTier::Critical {
+                away_shed
+            } else {
+                Vec::new()
+            };
             let context = SubvolumeContext {
                 name: subvol_name.clone(),
                 is_transient,
                 clear_all,
+                shed_away_drives,
             };
             let result = self.execute_subvolume(
                 &context,
@@ -411,6 +455,34 @@ impl<'a> Executor<'a> {
                     send_plan_order.push((drive_label.clone(), SendKind::Full));
                 }
                 _ => {}
+            }
+        }
+
+        // ── UPI 058 B-keep: shed away-only pins BEFORE the ops loop ─────
+        // At Critical with an away-only pin the planner set clear_all=false
+        // (retain-one for the connected chain) AND planned the delete of the
+        // away-only snapshot (it is not a mounted pin). The only thing holding
+        // that delete is the presence-blind `is_pinned_at_delete_time` re-check
+        // (`execute_delete`) seeing the away pin file. Remove it first so the
+        // planned DeleteSnapshot reclaims the away snapshot THIS run. Fail-closed
+        // (F2): a removal error leaves the pin (the re-check then refuses the
+        // delete → the away snapshot is held) and is NOT fatal — the subvol's
+        // sends/retain-one continue, and next run the still-present pin
+        // re-derives has_away_pin=true and retries (a one-run, self-correcting
+        // footprint suboptimality). A *persistent* `remove_pin_file` failure is
+        // pre-existing (031-b clear-all + emergency reclaim both depend on it) —
+        // out of 058's scope.
+        if !context.shed_away_drives.is_empty()
+            && let Some(local_dir) = self.config.local_snapshot_dir(subvol_name)
+        {
+            for drive_label in &context.shed_away_drives {
+                if let Err(e) = chain::remove_pin_file(&local_dir, drive_label) {
+                    log::warn!(
+                        "UPI 058 away-shed for {subvol_name}: pin removal failed for \
+                         {drive_label}: {e} — holding the away snapshot (fail-closed); \
+                         next run retries",
+                    );
+                }
             }
         }
 
@@ -1253,130 +1325,213 @@ impl<'a> Executor<'a> {
     }
 
     /// Pool-scoped emergency reclaim after a mid-op watchdog abort (UPI 033,
-    /// Step 5b — the definitive source-pool reclaim).
+    /// Step 5b) or an idle eject (UPI 034) — the definitive source-pool reclaim,
+    /// now **two-tier and presence-aware** (UPI 058, ADR-116 Consequence 1).
     ///
     /// Cancelling a `btrfs send` frees **no** source-pool space on its own: the
     /// pressure comes from the retained read-only snapshot's CoW growth as live
     /// `/` diverges plus ambient host writes, neither stopped by aborting the
     /// transfer (the partial *destination* snapshot is cleaned in `btrfs.rs`,
     /// the wrong pool for host survival). The only space Urd can return to the
-    /// source pool is its own footprint — so this clears the triggering pool's
-    /// local snapshots: the just-aborted snapshot **and** any pin parent(s).
+    /// source pool is its own footprint.
     ///
-    /// Reuses the 031-b clear-all ordering so the fail-closed logic has one
-    /// home (symmetric-fix discipline): for each subvol, (1) drop every drive's
-    /// pin file first — if any removal fails, refuse that subvol's deletions
-    /// this pass (never a half-cleared state); (2) re-read pins fail-closed;
-    /// (3) delete every on-disk snapshot not in the (now-empty) pinned set,
-    /// continuing through failures (ADR-100 isolation). Syncs the affected
-    /// roots so freed space commits promptly (T4: btrfs async-cleaner lag).
+    /// **Tier 1 (graceful, away-first):** shed only the `away_sheddable` pins —
+    /// away drives whose pinned snapshot is away-*only* (computed by the caller
+    /// from the shared `plan::drive_scopes`, so a snapshot shared with a
+    /// connected drive is NOT shed here). Delete the now-unpinned away snapshots,
+    /// sync once, then `measure_free()`. If free has reached `floor_bytes`, stop
+    /// — the connected incremental chains survive. A single below-floor reading,
+    /// an unavailable probe, or a Tier 1 with nothing to shed all escalate: at
+    /// the catastrophic floor ADR-113 ranks host survival above chain continuity,
+    /// so over-reclaim (a recoverable full send) is the safe error direction
+    /// (bias to escalate, F3).
     ///
-    /// Dropping the pin means the next send becomes a full one — the documented
-    /// acceptable cost (ADR-113 catastrophic-floor doctrine: host survival >
-    /// chain continuity; an ADR-106-scoped exception authorized by it). The
-    /// live subvolume is never touched; it falls back to its prior offsite copy.
-    /// `emergency_retention` is deliberately NOT reused — it *keeps* `latest`
-    /// and `pinned`, i.e. exactly the snapshot + pin we must shed.
+    /// **Tier 2 (blanket, host-survival guarantee):** shed **every** drive's pin
+    /// (the pre-058 behavior, incl. the connected pins and any shared snapshot
+    /// Tier 1 left), delete unpinned, sync. This is what frees a shared snapshot.
+    ///
+    /// Both tiers reuse the 031-b fail-closed ordering (drop pin → re-read →
+    /// delete) and the **never-the-only-copy** gate: a subvolume with no pin at
+    /// all has never had a send confirmed offsite, so its local snapshots are its
+    /// sole stored backup and are preserved even under the catastrophic floor
+    /// (ADR-106/107). Dropping a pin makes the next send full — the documented
+    /// acceptable cost. The live subvolume is never touched.
+    ///
+    /// `measure_free` is **injected** (the caller keeps the `pools::pool_space`
+    /// I/O) so the Tier-1/Tier-2 branch is deterministic in tests (F3). An empty
+    /// `away_sheddable` map → Tier 1 sheds nothing → Tier 2 blanket = pre-058
+    /// behavior (safe degradation for a caller that cannot compute presence, R3).
+    ///
+    /// Safety: relies on the advisory lock preventing concurrent backup runs.
     #[must_use]
-    pub fn emergency_reclaim_pool(&self, subvol_names: &[String]) -> ReclaimOutcome {
+    pub fn emergency_reclaim_pool(
+        &self,
+        subvol_names: &[String],
+        away_sheddable: &HashMap<String, Vec<String>>,
+        floor_bytes: u64,
+        measure_free: impl Fn() -> Option<u64>,
+    ) -> ReclaimOutcome {
         let drive_labels = self.config.drive_labels();
         let mut deleted: u32 = 0;
         let mut first_error: Option<String> = None;
-        let mut roots_to_sync: HashSet<PathBuf> = HashSet::new();
 
+        // ── Tier 1: graceful, away-only pins ───────────────────────────
+        let mut tier1_roots: HashSet<PathBuf> = HashSet::new();
+        let mut shed_any_away = false;
+        for name in subvol_names {
+            let away = away_sheddable.get(name).map(Vec::as_slice).unwrap_or(&[]);
+            if away.is_empty() {
+                continue;
+            }
+            let Some(local_dir) = self.config.local_snapshot_dir(name) else {
+                continue;
+            };
+            shed_any_away = true;
+            let (d, e, root) =
+                self.shed_and_delete_unpinned(name, &local_dir, &drive_labels, away);
+            deleted += d;
+            if first_error.is_none() {
+                first_error = e;
+            }
+            if let Some(r) = root {
+                tier1_roots.insert(r);
+            }
+        }
+        // Commit Tier 1's freed space promptly (T4: btrfs async-cleaner lag).
+        for root in &tier1_roots {
+            if let Err(e) = self.btrfs.sync_subvolumes(root) {
+                log::warn!(
+                    "Emergency reclaim (Tier 1): sync failed for {}: {e}",
+                    root.display()
+                );
+            }
+        }
+
+        // Stop if Tier 1 alone brought free at/above the floor. Bias to escalate
+        // (F3): escalate unless Tier 1 actually shed something AND the injected
+        // probe confirms recovery — an unavailable probe (None) or a no-op Tier 1
+        // (empty away map / no away pins) falls through to the blanket Tier 2.
+        let tier1_sufficient =
+            shed_any_away && matches!(measure_free(), Some(free) if free >= floor_bytes);
+        if tier1_sufficient {
+            return Self::reclaim_outcome(deleted, first_error);
+        }
+
+        // ── Tier 2: blanket (every pin) ────────────────────────────────
+        let mut tier2_roots: HashSet<PathBuf> = HashSet::new();
         for name in subvol_names {
             let Some(local_dir) = self.config.local_snapshot_dir(name) else {
                 continue;
             };
-
-            // (0) Offsite gate — never delete the only stored copy. A subvolume
-            // with no pin has never had a send confirmed to any drive, so its
-            // local snapshots are its sole stored backup; clearing them would
-            // destroy that history (the live subvolume survives, but the only
-            // *recorded* copy would not). 031-b's clear-all is gated on
-            // `sends_succeeded` for exactly this reason; this reactive path must
-            // honor the same rule. Read pins BEFORE removing them: an empty set
-            // means no confirmed offsite copy → preserve this subvol's snapshots
-            // (the host-survival cost is one subvol's footprint). Subvols that
-            // ARE backed up offsite are cleared below — so the abort
-            // notification's "already-offsite copies are safe" claim holds.
-            let pinned_before = chain::find_pinned_snapshots(&local_dir, &drive_labels);
-            if pinned_before.is_empty() {
-                log::warn!(
-                    "Emergency reclaim: {name} has no confirmed offsite copy (no pin) \
-                     — preserving its local snapshots (never delete the only copy)",
-                );
-                continue;
+            let (d, e, root) =
+                self.shed_and_delete_unpinned(name, &local_dir, &drive_labels, &drive_labels);
+            deleted += d;
+            if first_error.is_none() {
+                first_error = e;
             }
-
-            // (1) Drop pins FIRST (031-b ordering). If any removal fails, refuse
-            // THIS subvol's deletions this pass — never a half-cleared state.
-            let mut pin_removal_failed = false;
-            for label in &drive_labels {
-                if let Err(e) = chain::remove_pin_file(&local_dir, label) {
-                    log::warn!(
-                        "Emergency reclaim for {name}: pin removal failed for {label}: {e} \
-                         — refusing this subvol's deletions this pass",
-                    );
-                    pin_removal_failed = true;
-                    break;
-                }
-            }
-            if pin_removal_failed {
-                continue;
-            }
-
-            // (2) Re-read pins AFTER removal (fail-closed: the set should now be
-            // empty, but never delete something we can still see pinned).
-            let pinned = chain::find_pinned_snapshots(&local_dir, &drive_labels);
-
-            // (3) Delete every on-disk snapshot not in the pinned set. Names that
-            // do not parse are skipped by `read_snapshot_dir` (fail-closed). The
-            // SnapshotName preserves its raw on-disk name, so the join is exact.
-            let snapshots = match crate::plan::read_snapshot_dir(&local_dir) {
-                Ok(s) => s,
-                Err(e) => {
-                    log::warn!(
-                        "Emergency reclaim for {name}: cannot list {}: {e}",
-                        local_dir.display()
-                    );
-                    continue;
-                }
-            };
-            for snap in snapshots {
-                if pinned.contains(&snap) {
-                    continue;
-                }
-                let path = local_dir.join(snap.as_str());
-                match self.btrfs.delete_subvolume(&path) {
-                    Ok(()) => {
-                        log::info!("Emergency reclaim: deleted {}", path.display());
-                        deleted += 1;
-                    }
-                    Err(e) => {
-                        log::warn!(
-                            "Emergency reclaim: failed to delete {}: {e}",
-                            path.display()
-                        );
-                        if first_error.is_none() {
-                            first_error = Some(e.to_string());
-                        }
-                    }
-                }
-            }
-
-            if let Some(root) = self.config.snapshot_root_for(name) {
-                roots_to_sync.insert(root);
+            if let Some(r) = root {
+                tier2_roots.insert(r);
             }
         }
-
-        // Commit the freed space promptly (T4: mitigate async-cleaner lag).
-        for root in &roots_to_sync {
+        for root in &tier2_roots {
             if let Err(e) = self.btrfs.sync_subvolumes(root) {
-                log::warn!("Emergency reclaim: sync failed for {}: {e}", root.display());
+                log::warn!(
+                    "Emergency reclaim (Tier 2): sync failed for {}: {e}",
+                    root.display()
+                );
             }
         }
 
+        Self::reclaim_outcome(deleted, first_error)
+    }
+
+    /// Shed a chosen subset of a subvolume's pins, then delete the now-unpinned
+    /// local snapshots — the shared inner pass of the two-tier
+    /// [`Self::emergency_reclaim_pool`] (UPI 058). Tier 1 passes the away-only
+    /// pins; Tier 2 passes every drive label. Preserves the never-the-only-copy
+    /// gate and the fail-closed re-read in **both**. Returns
+    /// `(deleted, first_error, root_to_sync)`; the caller batches the sync.
+    /// `emergency_retention` is deliberately NOT reused — it *keeps* `latest` and
+    /// `pinned`, i.e. exactly the snapshot + pin we must shed.
+    fn shed_and_delete_unpinned(
+        &self,
+        name: &str,
+        local_dir: &Path,
+        drive_labels: &[String],
+        pins_to_remove: &[String],
+    ) -> (u32, Option<String>, Option<PathBuf>) {
+        // (0) Never-the-only-copy gate — a subvol with NO pin has never had a
+        // send confirmed offsite, so its local snapshots are its sole stored
+        // backup; clearing them is forbidden even at the catastrophic floor
+        // (ADR-106/107). Read pins BEFORE removing any.
+        let pinned_before = chain::find_pinned_snapshots(local_dir, drive_labels);
+        if pinned_before.is_empty() {
+            log::warn!(
+                "Emergency reclaim: {name} has no confirmed offsite copy (no pin) \
+                 — preserving its local snapshots (never delete the only copy)",
+            );
+            return (0, None, None);
+        }
+        if pins_to_remove.is_empty() {
+            return (0, None, None);
+        }
+
+        // (1) Drop the chosen pins FIRST (031-b ordering). If any removal fails,
+        // refuse THIS subvol's deletions this pass — never a half-cleared state.
+        for label in pins_to_remove {
+            if let Err(e) = chain::remove_pin_file(local_dir, label) {
+                log::warn!(
+                    "Emergency reclaim for {name}: pin removal failed for {label}: {e} \
+                     — refusing this subvol's deletions this pass",
+                );
+                return (0, None, None);
+            }
+        }
+
+        // (2) Re-read pins AFTER removal (fail-closed: never delete something we
+        // can still see pinned — e.g. a connected pin Tier 1 deliberately kept).
+        let pinned = chain::find_pinned_snapshots(local_dir, drive_labels);
+
+        // (3) Delete every on-disk snapshot not in the pinned set. Names that do
+        // not parse are skipped by `read_snapshot_dir` (fail-closed). The
+        // SnapshotName preserves its raw on-disk name, so the join is exact.
+        let snapshots = match crate::plan::read_snapshot_dir(local_dir) {
+            Ok(s) => s,
+            Err(e) => {
+                log::warn!(
+                    "Emergency reclaim for {name}: cannot list {}: {e}",
+                    local_dir.display()
+                );
+                return (0, None, None);
+            }
+        };
+        let mut deleted = 0;
+        let mut first_error = None;
+        for snap in snapshots {
+            if pinned.contains(&snap) {
+                continue;
+            }
+            let path = local_dir.join(snap.as_str());
+            match self.btrfs.delete_subvolume(&path) {
+                Ok(()) => {
+                    log::info!("Emergency reclaim: deleted {}", path.display());
+                    deleted += 1;
+                }
+                Err(e) => {
+                    log::warn!("Emergency reclaim: failed to delete {}: {e}", path.display());
+                    if first_error.is_none() {
+                        first_error = Some(e.to_string());
+                    }
+                }
+            }
+        }
+
+        (deleted, first_error, self.config.snapshot_root_for(name))
+    }
+
+    /// Map an accumulated `(deleted, first_error)` to a [`ReclaimOutcome`]
+    /// (UPI 058 — shared by both tiers of [`Self::emergency_reclaim_pool`]).
+    fn reclaim_outcome(deleted: u32, first_error: Option<String>) -> ReclaimOutcome {
         match first_error {
             Some(first_error) => ReclaimOutcome::Failed {
                 deleted,
@@ -3989,6 +4144,15 @@ local_retention = "transient"
             .collect()
     }
 
+    /// Pre-058 blanket reclaim: an empty away map sends every subvol straight to
+    /// Tier 2 (the injected probe is never consulted, since Tier 1 sheds
+    /// nothing) — the behavior these tests were written against, now expressed
+    /// through the two-tier signature. The `away` + probe path is exercised by
+    /// the dedicated UPI 058 tests below.
+    fn reclaim_blanket(executor: &Executor, subvols: &[String]) -> ReclaimOutcome {
+        executor.emergency_reclaim_pool(subvols, &HashMap::new(), 0, || None)
+    }
+
     // ── emergency_reclaim_pool (UPI 033, Step 5b) ─────────────────────────
 
     #[test]
@@ -4018,7 +4182,7 @@ local_retention = "transient"
         let shutdown = no_shutdown();
         let executor = Executor::new(&mock, None, &config, &shutdown);
 
-        let outcome = executor.emergency_reclaim_pool(&["sv-t".to_string()]);
+        let outcome = reclaim_blanket(&executor, &["sv-t".to_string()]);
 
         assert_eq!(outcome, ReclaimOutcome::Reclaimed { deleted: 2 });
         let deletes = delete_calls(&mock);
@@ -4056,7 +4220,7 @@ local_retention = "transient"
         let shutdown = no_shutdown();
         let executor = Executor::new(&mock, None, &config, &shutdown);
 
-        let outcome = executor.emergency_reclaim_pool(&["sv-t".to_string()]);
+        let outcome = reclaim_blanket(&executor, &["sv-t".to_string()]);
 
         assert_eq!(outcome, ReclaimOutcome::Nothing);
         assert!(delete_calls(&mock).is_empty(), "no deletions without a confirmed offsite copy");
@@ -4083,7 +4247,7 @@ local_retention = "transient"
         let shutdown = no_shutdown();
         let executor = Executor::new(&mock, None, &config, &shutdown);
 
-        let outcome = executor.emergency_reclaim_pool(&["sv-t".to_string()]);
+        let outcome = reclaim_blanket(&executor, &["sv-t".to_string()]);
 
         assert_eq!(outcome, ReclaimOutcome::Nothing, "never-offsite subvol is preserved");
         assert!(delete_calls(&mock).is_empty(), "the only stored copy must not be deleted");
@@ -4166,8 +4330,8 @@ local_retention = "transient"
         let shutdown = no_shutdown();
         let executor = Executor::new(&mock, None, &config, &shutdown);
 
-        let outcome = executor
-            .emergency_reclaim_pool(&["pinned-sv".to_string(), "nopin-sv".to_string()]);
+        let outcome =
+            reclaim_blanket(&executor, &["pinned-sv".to_string(), "nopin-sv".to_string()]);
 
         assert_eq!(outcome, ReclaimOutcome::Reclaimed { deleted: 1 });
         let deletes = delete_calls(&mock);
@@ -4190,7 +4354,7 @@ local_retention = "transient"
         let shutdown = no_shutdown();
         let executor = Executor::new(&mock, None, &config, &shutdown);
 
-        let outcome = executor.emergency_reclaim_pool(&["sv-t".to_string()]);
+        let outcome = reclaim_blanket(&executor, &["sv-t".to_string()]);
         assert_eq!(outcome, ReclaimOutcome::Nothing);
         assert!(delete_calls(&mock).is_empty());
     }
@@ -4217,7 +4381,7 @@ local_retention = "transient"
         let shutdown = no_shutdown();
         let executor = Executor::new(&mock, None, &config, &shutdown);
 
-        let outcome = executor.emergency_reclaim_pool(&["sv-t".to_string()]);
+        let outcome = reclaim_blanket(&executor, &["sv-t".to_string()]);
         assert_eq!(outcome, ReclaimOutcome::Reclaimed { deleted: 1 });
         let deletes = delete_calls(&mock);
         assert!(deletes.contains(&snap));
@@ -4225,6 +4389,216 @@ local_retention = "transient"
             !deletes.iter().any(|p| p.ends_with("not-a-snapshot")),
             "unparseable name must not be deleted"
         );
+    }
+
+    // ── UPI 058: two-tier presence-aware emergency reclaim ──────────────
+
+    /// Two-drive config (connected PRIMARY + away OFFSITE, both accepted by
+    /// `sv-t`) holding a connected snapshot (pinned by PRIMARY) and an older
+    /// away-only snapshot (pinned by OFFSITE). Returns the kept temp dirs and
+    /// the paths the tests assert against.
+    fn away_shed_fixture() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        tempfile::TempDir,
+        Config,
+        PathBuf, // connected snapshot dir
+        PathBuf, // away-only snapshot dir
+        PathBuf, // PRIMARY pin file
+        PathBuf, // OFFSITE pin file
+    ) {
+        let snap_dir = tempfile::TempDir::new().unwrap();
+        let primary_dir = tempfile::TempDir::new().unwrap();
+        let offsite_dir = tempfile::TempDir::new().unwrap();
+        let sv_dir = snap_dir.path().join("sv-t");
+        std::fs::create_dir_all(&sv_dir).unwrap();
+        let connected = sv_dir.join("20260322-1430-t");
+        std::fs::create_dir(&connected).unwrap();
+        let away = sv_dir.join("20260101-0900-t");
+        std::fs::create_dir(&away).unwrap();
+        chain::write_pin_file(&sv_dir, "PRIMARY", &SnapshotName::parse("20260322-1430-t").unwrap())
+            .unwrap();
+        chain::write_pin_file(&sv_dir, "OFFSITE", &SnapshotName::parse("20260101-0900-t").unwrap())
+            .unwrap();
+        let primary_pin = sv_dir.join(".last-external-parent-PRIMARY");
+        let offsite_pin = sv_dir.join(".last-external-parent-OFFSITE");
+        let config = transient_config_n_drives(
+            snap_dir.path(),
+            &[
+                ("PRIMARY", primary_dir.path(), "primary"),
+                ("OFFSITE", offsite_dir.path(), "offsite"),
+            ],
+        );
+        (
+            snap_dir,
+            primary_dir,
+            offsite_dir,
+            config,
+            connected,
+            away,
+            primary_pin,
+            offsite_pin,
+        )
+    }
+
+    fn away_map(subvol: &str, labels: &[&str]) -> HashMap<String, Vec<String>> {
+        let mut m = HashMap::new();
+        m.insert(
+            subvol.to_string(),
+            labels.iter().map(|s| s.to_string()).collect(),
+        );
+        m
+    }
+
+    #[test]
+    fn emergency_reclaim_tier1_away_only_preserves_connected_chain() {
+        // Tier 1 sheds the away-only snapshot; the probe reports recovery → STOP.
+        // The connected snapshot AND its pin survive (the incremental chain
+        // lives), and the away pin is gone. Tier 2 never runs.
+        let (_snap, _p, _o, config, connected, away, primary_pin, offsite_pin) =
+            away_shed_fixture();
+        let mock = MockBtrfs::new();
+        let shutdown = no_shutdown();
+        let executor = Executor::new(&mock, None, &config, &shutdown);
+
+        let floor = 100;
+        let outcome = executor.emergency_reclaim_pool(
+            &["sv-t".to_string()],
+            &away_map("sv-t", &["OFFSITE"]),
+            floor,
+            || Some(floor), // free == floor → at/above → Tier 1 sufficient
+        );
+
+        assert_eq!(outcome, ReclaimOutcome::Reclaimed { deleted: 1 });
+        let deletes = delete_calls(&mock);
+        assert!(deletes.contains(&away), "away-only snapshot shed");
+        assert!(!deletes.contains(&connected), "connected chain preserved");
+        assert!(connected.exists(), "connected snapshot survives on disk");
+        assert!(primary_pin.exists(), "connected pin survives (chain intact)");
+        assert!(!offsite_pin.exists(), "away pin shed");
+    }
+
+    #[test]
+    fn emergency_reclaim_tier1_insufficient_escalates_to_blanket() {
+        // Tier 1 sheds the away snapshot but the probe is still below floor →
+        // escalate to Tier 2, which sheds the connected pin + snapshot too.
+        let (_snap, _p, _o, config, connected, away, primary_pin, offsite_pin) =
+            away_shed_fixture();
+        let mock = MockBtrfs::new();
+        let shutdown = no_shutdown();
+        let executor = Executor::new(&mock, None, &config, &shutdown);
+
+        let floor = 100;
+        let outcome = executor.emergency_reclaim_pool(
+            &["sv-t".to_string()],
+            &away_map("sv-t", &["OFFSITE"]),
+            floor,
+            || Some(floor - 1), // still below floor → escalate
+        );
+
+        // MockBtrfs records deletes but does not physically remove the dir, so
+        // Tier 2's `read_snapshot_dir` re-lists the away snapshot Tier 1 already
+        // deleted (real btrfs would have removed it → 2). Assert the meaningful
+        // invariant — both snapshots shed across the two tiers — not the
+        // mock-inflated count.
+        assert!(matches!(outcome, ReclaimOutcome::Reclaimed { .. }));
+        let deletes = delete_calls(&mock);
+        assert!(deletes.contains(&away), "away snapshot shed in Tier 1");
+        assert!(deletes.contains(&connected), "connected snapshot shed in Tier 2");
+        assert!(!primary_pin.exists(), "connected pin shed (blanket)");
+        assert!(!offsite_pin.exists(), "away pin shed");
+    }
+
+    #[test]
+    fn emergency_reclaim_probe_none_escalates_to_blanket() {
+        // A free-probe that cannot read (None) biases to escalate (F3): Tier 1
+        // sheds away, then Tier 2 blanket-sheds the rest.
+        let (_snap, _p, _o, config, connected, away, _pp, _op) = away_shed_fixture();
+        let mock = MockBtrfs::new();
+        let shutdown = no_shutdown();
+        let executor = Executor::new(&mock, None, &config, &shutdown);
+
+        let outcome = executor.emergency_reclaim_pool(
+            &["sv-t".to_string()],
+            &away_map("sv-t", &["OFFSITE"]),
+            100,
+            || None, // probe unavailable → escalate
+        );
+
+        // (Count is mock-inflated — see the Tier-1-insufficient test; assert the
+        // set: both shed across the escalation.)
+        assert!(matches!(outcome, ReclaimOutcome::Reclaimed { .. }));
+        let deletes = delete_calls(&mock);
+        assert!(deletes.contains(&away) && deletes.contains(&connected));
+    }
+
+    #[test]
+    fn emergency_reclaim_shared_parent_freed_only_by_blanket() {
+        // F1 shared-parent: connected + away pin the SAME snapshot. The caller's
+        // away map is EMPTY (away_sheddable returns nothing for a shared pin), so
+        // Tier 1 is a no-op → straight to Tier 2 blanket, which frees the shared
+        // snapshot (the only path that can, since the connected pin holds it).
+        let snap_dir = tempfile::TempDir::new().unwrap();
+        let primary_dir = tempfile::TempDir::new().unwrap();
+        let offsite_dir = tempfile::TempDir::new().unwrap();
+        let sv_dir = snap_dir.path().join("sv-t");
+        std::fs::create_dir_all(&sv_dir).unwrap();
+        let shared = sv_dir.join("20260322-1430-t");
+        std::fs::create_dir(&shared).unwrap();
+        chain::write_pin_file(&sv_dir, "PRIMARY", &SnapshotName::parse("20260322-1430-t").unwrap())
+            .unwrap();
+        chain::write_pin_file(&sv_dir, "OFFSITE", &SnapshotName::parse("20260322-1430-t").unwrap())
+            .unwrap();
+        let config = transient_config_n_drives(
+            snap_dir.path(),
+            &[
+                ("PRIMARY", primary_dir.path(), "primary"),
+                ("OFFSITE", offsite_dir.path(), "offsite"),
+            ],
+        );
+        let mock = MockBtrfs::new();
+        let shutdown = no_shutdown();
+        let executor = Executor::new(&mock, None, &config, &shutdown);
+
+        // Even a probe that would say "above floor" must not gate Tier 2 here:
+        // shed_any_away is false (empty map), so the probe is never consulted.
+        let outcome = executor.emergency_reclaim_pool(
+            &["sv-t".to_string()],
+            &HashMap::new(),
+            100,
+            || Some(1_000_000),
+        );
+
+        assert_eq!(outcome, ReclaimOutcome::Reclaimed { deleted: 1 });
+        assert!(delete_calls(&mock).contains(&shared), "blanket frees the shared snapshot");
+        assert!(
+            !sv_dir.join(".last-external-parent-OFFSITE").exists(),
+            "blanket sheds the offsite pin too"
+        );
+    }
+
+    #[test]
+    fn emergency_reclaim_no_away_pin_goes_straight_to_blanket() {
+        // No away entry for this subvol → Tier 1 no-op → Tier 2 blanket sheds the
+        // connected chain (pre-058 behavior / safe degradation). The probe is not
+        // consulted because Tier 1 shed nothing.
+        let (_snap, _p, _o, config, connected, away, primary_pin, offsite_pin) =
+            away_shed_fixture();
+        let mock = MockBtrfs::new();
+        let shutdown = no_shutdown();
+        let executor = Executor::new(&mock, None, &config, &shutdown);
+
+        let outcome = executor.emergency_reclaim_pool(
+            &["sv-t".to_string()],
+            &HashMap::new(),
+            100,
+            || Some(1_000_000), // would say "recovered" — but never consulted
+        );
+
+        assert_eq!(outcome, ReclaimOutcome::Reclaimed { deleted: 2 });
+        let deletes = delete_calls(&mock);
+        assert!(deletes.contains(&connected) && deletes.contains(&away));
+        assert!(!primary_pin.exists() && !offsite_pin.exists(), "all pins shed");
     }
 
     #[test]
@@ -4604,6 +4978,7 @@ protection_level = "sheltered"
                 nt.send_interval,
                 nt.send_enabled,
                 TightnessTier::Roomy,
+                false,
             )
             .local_retention
             .is_transient(),
@@ -4621,10 +4996,224 @@ protection_level = "sheltered"
                 ng.send_interval,
                 ng.send_enabled,
                 TightnessTier::Roomy,
+                false,
             )
             .local_retention
             .is_transient(),
             "named level alone is NOT transient"
         );
+    }
+
+    // ── UPI 058: presence-aware per-run away-shed (A1 + B-keep) ─────────
+
+    #[test]
+    fn upi058_critical_away_only_sheds_away_keeps_connected_chain() {
+        // F2 no-half-state: Critical + away-only pin + a connected drive, all in
+        // ONE run — (1) connected retain-one (incremental send, pin advanced,
+        // snapshot kept); (2) away pin file removed; (3) away snapshot reclaimed.
+        let snap_dir = tempfile::TempDir::new().unwrap();
+        let primary_dir = tempfile::TempDir::new().unwrap();
+        let offsite_dir = tempfile::TempDir::new().unwrap();
+        let sv_dir = snap_dir.path().join("sv-t");
+        std::fs::create_dir_all(&sv_dir).unwrap();
+        let old_parent = sv_dir.join("20260320-t");
+        std::fs::create_dir(&old_parent).unwrap();
+        let connected_new = sv_dir.join("20260322-1430-t");
+        std::fs::create_dir(&connected_new).unwrap();
+        let away_snap = sv_dir.join("20260101-0900-t");
+        std::fs::create_dir(&away_snap).unwrap();
+        chain::write_pin_file(&sv_dir, "PRIMARY", &SnapshotName::parse("20260320-t").unwrap())
+            .unwrap();
+        chain::write_pin_file(&sv_dir, "OFFSITE", &SnapshotName::parse("20260101-0900-t").unwrap())
+            .unwrap();
+        let primary_pin = sv_dir.join(".last-external-parent-PRIMARY");
+        let offsite_pin = sv_dir.join(".last-external-parent-OFFSITE");
+
+        let config = transient_config_n_drives(
+            snap_dir.path(),
+            &[
+                ("PRIMARY", primary_dir.path(), "primary"),
+                ("OFFSITE", offsite_dir.path(), "offsite"),
+            ],
+        );
+        let mock = MockBtrfs::new();
+        let shutdown = no_shutdown();
+        let mut executor = Executor::new(&mock, None, &config, &shutdown);
+        executor.set_armed_tiers(armed_map(storage_critical::TightnessTier::Critical));
+        executor.set_away_shed_pins(away_map("sv-t", &["OFFSITE"]));
+
+        let plan = BackupPlan {
+            operations: vec![
+                // Connected retain-one send (clear_all=false → pin written).
+                PlannedOperation::SendIncremental {
+                    parent: old_parent.clone(),
+                    snapshot: connected_new.clone(),
+                    dest_dir: primary_dir.path().join(".snapshots/sv-t"),
+                    drive_label: "PRIMARY".to_string(),
+                    subvolume_name: "sv-t".to_string(),
+                    pin_on_success: Some((
+                        primary_pin.clone(),
+                        SnapshotName::parse("20260322-1430-t").unwrap(),
+                    )),
+                },
+                // The away-only snapshot the planner planned to delete (it is not
+                // a mounted pin). Held today only by the OFFSITE pin file.
+                PlannedOperation::DeleteSnapshot {
+                    path: away_snap.clone(),
+                    reason: "transient: not pinned".to_string(),
+                    subvolume_name: "sv-t".to_string(),
+                    kind: DeleteKind::Policy,
+                },
+            ],
+            timestamp: test_ts(),
+            skipped: vec![],
+            events: Vec::new(),
+        };
+
+        let result = executor.execute(&plan, "full");
+        assert!(result.subvolume_results[0].success);
+        let deletes = delete_calls(&mock);
+        // (3) away snapshot reclaimed in-run (the shed unblocked the re-check).
+        assert!(deletes.contains(&away_snap), "away-only snapshot reclaimed in-run");
+        // (1) connected chain preserved: snapshot kept, pin advanced.
+        assert!(!deletes.contains(&connected_new), "connected just-sent snapshot kept");
+        assert!(connected_new.exists(), "connected snapshot survives on disk");
+        assert_eq!(
+            std::fs::read_to_string(&primary_pin).unwrap().trim(),
+            "20260322-1430-t",
+            "connected pin advanced (incremental chain intact)",
+        );
+        // (2) away pin shed.
+        assert!(!offsite_pin.exists(), "away pin file removed");
+        // Retain-one also cleared the old connected parent.
+        assert!(deletes.contains(&old_parent), "old connected parent cleaned (retain-one)");
+    }
+
+    #[test]
+    fn upi058_away_shed_failure_holds_away_snapshot_fail_closed() {
+        // F2 fail-closed: if the away pin cannot be removed (here: its parent dir
+        // is read-only, so the file persists and stays readable), the planned
+        // away-snapshot delete is REFUSED by the unchanged presence-blind re-check
+        // → the away snapshot is held, retried next run. The connected snapshot is
+        // untouched. (Non-root assumption — the project test suite runs unprivileged.)
+        use std::os::unix::fs::PermissionsExt;
+        let snap_dir = tempfile::TempDir::new().unwrap();
+        let primary_dir = tempfile::TempDir::new().unwrap();
+        let offsite_dir = tempfile::TempDir::new().unwrap();
+        let sv_dir = snap_dir.path().join("sv-t");
+        std::fs::create_dir_all(&sv_dir).unwrap();
+        let connected = sv_dir.join("20260322-1430-t");
+        std::fs::create_dir(&connected).unwrap();
+        let away_snap = sv_dir.join("20260101-0900-t");
+        std::fs::create_dir(&away_snap).unwrap();
+        chain::write_pin_file(&sv_dir, "PRIMARY", &SnapshotName::parse("20260322-1430-t").unwrap())
+            .unwrap();
+        chain::write_pin_file(&sv_dir, "OFFSITE", &SnapshotName::parse("20260101-0900-t").unwrap())
+            .unwrap();
+        let offsite_pin = sv_dir.join(".last-external-parent-OFFSITE");
+
+        let config = transient_config_n_drives(
+            snap_dir.path(),
+            &[
+                ("PRIMARY", primary_dir.path(), "primary"),
+                ("OFFSITE", offsite_dir.path(), "offsite"),
+            ],
+        );
+        let mock = MockBtrfs::new();
+        let shutdown = no_shutdown();
+        let mut executor = Executor::new(&mock, None, &config, &shutdown);
+        executor.set_armed_tiers(armed_map(storage_critical::TightnessTier::Critical));
+        executor.set_away_shed_pins(away_map("sv-t", &["OFFSITE"]));
+
+        // Make remove_pin_file(OFFSITE) fail by making the dir read-only — the pin
+        // file stays present AND readable.
+        std::fs::set_permissions(&sv_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let plan = BackupPlan {
+            operations: vec![PlannedOperation::DeleteSnapshot {
+                path: away_snap.clone(),
+                reason: "transient: not pinned".to_string(),
+                subvolume_name: "sv-t".to_string(),
+                kind: DeleteKind::Policy,
+            }],
+            timestamp: test_ts(),
+            skipped: vec![],
+            events: Vec::new(),
+        };
+        let result = executor.execute(&plan, "full");
+
+        // Restore perms so the TempDir can be cleaned up + assertions can read.
+        std::fs::set_permissions(&sv_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // The away pin removal failed but did not abort the subvol.
+        assert!(result.subvolume_results[0].success);
+        assert!(offsite_pin.exists(), "unremovable away pin persists (fail-closed)");
+        // The still-present pin makes the re-check refuse the planned delete.
+        assert!(
+            !delete_calls(&mock).contains(&away_snap),
+            "away snapshot held — re-check refused the delete (B-keep, unchanged)",
+        );
+        assert!(away_snap.exists(), "away snapshot survives for next run's retry");
+        assert!(connected.exists(), "connected snapshot untouched");
+    }
+
+    #[test]
+    fn upi058_empty_away_map_is_031b_clear_all() {
+        // No away entry (a single connected drive, OR the shared-parent case whose
+        // away_sheddable set is empty — see the guard + coherence tests) → the
+        // executor's away-shed is a no-op and Critical clear-all is unchanged
+        // (031-b parity). A present offsite pin is NOT touched by the 058 shed.
+        let snap_dir = tempfile::TempDir::new().unwrap();
+        let primary_dir = tempfile::TempDir::new().unwrap();
+        let offsite_dir = tempfile::TempDir::new().unwrap();
+        let sv_dir = snap_dir.path().join("sv-t");
+        std::fs::create_dir_all(&sv_dir).unwrap();
+        let shared = sv_dir.join("20260322-1430-t");
+        std::fs::create_dir(&shared).unwrap();
+        // Shared parent: pinned by BOTH the connected and the away drive.
+        chain::write_pin_file(&sv_dir, "PRIMARY", &SnapshotName::parse("20260322-1430-t").unwrap())
+            .unwrap();
+        chain::write_pin_file(&sv_dir, "OFFSITE", &SnapshotName::parse("20260322-1430-t").unwrap())
+            .unwrap();
+        let primary_pin = sv_dir.join(".last-external-parent-PRIMARY");
+        let offsite_pin = sv_dir.join(".last-external-parent-OFFSITE");
+        let new_snap = sv_dir.join("20260323-1430-t");
+        std::fs::create_dir(&new_snap).unwrap();
+
+        let config = transient_config_n_drives(
+            snap_dir.path(),
+            &[
+                ("PRIMARY", primary_dir.path(), "primary"),
+                ("OFFSITE", offsite_dir.path(), "offsite"),
+            ],
+        );
+        let mock = MockBtrfs::new();
+        let shutdown = no_shutdown();
+        let mut executor = Executor::new(&mock, None, &config, &shutdown);
+        executor.set_armed_tiers(armed_map(storage_critical::TightnessTier::Critical));
+        // Empty away map → has_away_pin=false → clear_all=true; shed_away empty.
+        executor.set_away_shed_pins(HashMap::new());
+
+        let plan = BackupPlan {
+            operations: vec![PlannedOperation::SendIncremental {
+                parent: shared.clone(),
+                snapshot: new_snap.clone(),
+                dest_dir: primary_dir.path().join(".snapshots/sv-t"),
+                drive_label: "PRIMARY".to_string(),
+                subvolume_name: "sv-t".to_string(),
+                pin_on_success: None, // Critical clear-all writes no pin
+            }],
+            timestamp: test_ts(),
+            skipped: vec![],
+            events: Vec::new(),
+        };
+        let result = executor.execute(&plan, "full");
+        assert!(result.subvolume_results[0].success);
+        // Clear-all sheds the CONNECTED pin (sends_succeeded) ...
+        assert!(!primary_pin.exists(), "clear-all removed the connected pin (031-b)");
+        // ... but the 058 away-shed never ran, so the offsite pin is untouched —
+        // the shared snapshot stays protected by it (no needless offsite break).
+        assert!(offsite_pin.exists(), "offsite pin not removed by the away-shed (empty map)");
+        assert!(shared.exists(), "shared snapshot held by the surviving offsite pin");
     }
 }

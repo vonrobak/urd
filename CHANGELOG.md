@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Presence-aware graduated pin shedding** (UPI 058, new ADR-116 "Offsite rotation is
+  expected absence"). Under storage pressure Urd now sheds an **away** offsite drive's pin
+  first — the old, large-CoW pin for a drive that isn't even here — and preserves the
+  **connected** drive's cheap incremental chain; a full send is only the fallback. Fixes two
+  paths that handled the multi-drive (connected primary + away offsite) case backwards. The
+  Critical `clear-all` lifecycle is now **presence-conditional**: with an away-*only* pin Urd
+  retains-one for the connected chain and sheds the away pin in-run, escalating statelessly next
+  run if pressure persists (byte-identical to v0.22.0 when no away pin exists). The emergency
+  reclaim (the watchdog abort-reclaim / idle eject backstop) is now **two-tier** — shed away
+  pins, re-measure against the host-survival floor, blanket-clear only if the floor still demands
+  it (the connected chains survive when the away shed alone relieves the pressure). Shedding an
+  offsite pin loses no data — a pin proves a completed offsite copy, so only the incremental
+  *chain* breaks (next send full), the cost the user explicitly tolerates. The presence predicate
+  is snapshot-level (a snapshot a connected drive still needs is never shed) and computed from a
+  single shared scope helper, so the planner's and executor's decisions cannot diverge. All
+  ADR-106/107 data-loss gates are preserved (the presence-blind pre-delete re-check,
+  never-the-only-copy, fail-closed pin handling). Amends v0.22.0's unconditional Critical
+  clear-all. No metric/heartbeat/on-disk/config-schema change (Cross-Repo Impact: None).
+
 ## [0.22.0] - 2026-06-02
 
 ### Added

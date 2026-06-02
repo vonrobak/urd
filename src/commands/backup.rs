@@ -252,6 +252,13 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     // invariant). Critical subvolumes clear the just-sent snapshot + pin.
     executor.set_armed_tiers(resolved.armed_tier_map.clone());
 
+    // Thread the away-sheddable pin map (UPI 058) computed from the SAME shared
+    // scope helper the planner used (`plan::drive_scopes`), so the executor's
+    // has_away_pin matches the planner's clear_all decision (R1) and, at
+    // Critical, it sheds the away-only pins in-run while preserving the
+    // connected chain. Computed under the lock from the in-run FS state.
+    executor.set_away_shed_pins(plan::away_shed_map(&config, &fs_state));
+
     // In autonomous mode (systemd), gate chain-break full sends unless --force-full.
     if !args.force_full && std::env::var("INVOCATION_ID").is_ok() {
         executor.set_full_send_policy(FullSendPolicy::SkipAndNotify);
@@ -414,7 +421,19 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     let watchdog_firing = firing.lock().ok().and_then(|mut f| f.take());
     let watchdog_fired = watchdog_firing.is_some();
     if let Some(fire) = watchdog_firing {
-        let reclaimed = executor.emergency_reclaim_pool(&fire.subvol_names).deleted();
+        // Two-tier graduated reclaim (UPI 058): shed away-only pins first and
+        // re-measure; the connected chains survive if that clears the floor,
+        // else escalate to the blanket. Presence is recomputed fresh from the
+        // post-abort FS state via the same shared scope helper the planner uses.
+        let away = plan::away_shed_map(&config, &fs_state);
+        let reclaimed = executor
+            .emergency_reclaim_pool(
+                &fire.subvol_names,
+                &away,
+                fire.floor_bytes,
+                || pools::pool_free_bytes(&fire.mountpoint).ok(),
+            )
+            .deleted();
         log::warn!(
             "Watchdog aborted send on {} ({:?}); reclaimed {reclaimed} snapshot(s), reserve freed: {}",
             fire.pool_label,
@@ -603,6 +622,12 @@ struct WatchdogFiring {
     reason: WatchdogReason,
     freed_reserve: bool,
     subvol_names: Vec<String>,
+    /// Source-pool mountpoint for the two-tier abort-reclaim's free-probe
+    /// (UPI 058 — the watchdog thread already holds it as `ArmedPool.poll_path`).
+    mountpoint: PathBuf,
+    /// Host-survival floor the Tier-1 reclaim must clear before it can stop
+    /// (UPI 058 — `ArmedPool.floor_bytes`, the watchdog's own floor).
+    floor_bytes: u64,
 }
 
 /// Build the armed-pool list from the pre-plan gather (UPI 033). Production
@@ -823,6 +848,8 @@ fn watchdog_loop(
                             reason,
                             freed_reserve: freed.contains(&pool.poll_path),
                             subvol_names: pool.subvol_names.clone(),
+                            mountpoint: pool.poll_path.clone(),
+                            floor_bytes: pool.floor_bytes,
                         });
                     }
                     return; // abort is in motion — stop polling
