@@ -732,6 +732,15 @@ impl SentinelRunner {
             false,
         );
 
+        // Presence map for the two-tier reclaim (UPI 058): away-only pins shed
+        // first, connected chains preserved if that clears the floor. Computed
+        // once under the lock via the same shared scope helper the planner uses
+        // (filesystem reads only — no SQLite needed). If a presence read fails,
+        // the subvol simply has no away entry → Tier-1 no-op → Tier-2 blanket
+        // (safe degradation, R3).
+        let fs = RealFileSystemState { state: None };
+        let away = crate::plan::away_shed_map(&self.config, &fs);
+
         let now = chrono::Local::now().naive_local();
         let mut audit_events: Vec<crate::events::Event> = Vec::new();
         let mut notifications = Vec::new();
@@ -754,7 +763,12 @@ impl SentinelRunner {
             // 6. Reclaim — emergency_reclaim_pool reads no SQLite, so state=None.
             let executor =
                 crate::executor::Executor::new(&btrfs, None, &self.config, &self.shutdown);
-            let outcome = executor.emergency_reclaim_pool(&eject.subvol_names);
+            let outcome = executor.emergency_reclaim_pool(
+                &eject.subvol_names,
+                &away,
+                eject.floor_bytes,
+                || crate::pools::pool_free_bytes(&eject.mountpoint).ok(),
+            );
 
             // 7. Surface.
             let pool_label =

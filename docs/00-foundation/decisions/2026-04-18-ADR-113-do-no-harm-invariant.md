@@ -135,6 +135,14 @@ snapshots to reclaim space. External backup chains are preserved where possible;
 the pin parent must go, the next send becomes a full send. That is an acceptable cost
 — the alternative is host crash or data loss at the filesystem level.
 
+> **Refined by ADR-116 (2026-06-02, UPI 058).** This doctrine is now **presence-aware
+> and graduated**. "Preserved where possible" is made concrete: under pressure Urd sheds
+> an **away** drive's pin before it breaks a **connected** drive's chain — away-first,
+> connected only if the floor still demands it. This refines both the per-run Critical
+> reclaim (`clear-all`, now presence-conditional — amending UPI 031-b) and the emergency
+> reclaim (`emergency_reclaim_pool`, now two-tier). See ADR-116 "Offsite rotation is
+> expected absence," Consequence 1.
+
 ### Scope: storage first, pattern extensible
 
 This ADR codifies the invariant and its layered-defense pattern for **storage pressure
@@ -195,6 +203,9 @@ prefer host survival under catastrophic conditions.
 - **ADR-108** — pure-function module pattern; drift modeling and prediction are pure
   functions.
 - **ADR-110** — protection promises; "deferred" may need a new promise state.
+- **ADR-116** — offsite rotation is expected absence; **refines** this ADR's
+  catastrophic-floor / reclaim doctrine into presence-aware graduated shedding (away-drive
+  pins shed before connected chains), and amends UPI 031-b's unconditional Critical clear-all.
 - **Brainstorm** — `docs/95-ideas/2026-04-18-brainstorm-storage-pressure-safe-by-construction.md`
 - **Steve review** — `docs/99-reports/2026-04-18-steve-jobs-000-urd-does-no-harm.md`
 - **Supersedes UPI 011** — transient hard-cap-of-1 design (`docs/95-ideas/2026-04-03-design-011-transient-space-safety.md`).

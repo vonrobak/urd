@@ -311,13 +311,27 @@ pub struct EffectivePolicy {
 /// - **Tight** → `Transient` (retain-one) + interval × [`TIGHT_INTERVAL_FACTOR`]
 ///   + `clear_all: false`.
 /// - **Critical** → `Transient` + `max(declared, CRITICAL_INTERVAL_FLOOR)` +
-///   `clear_all: true`. The floor never *shortens* an already-sparse subvolume.
+///   `clear_all: !has_away_pin`. The floor never *shortens* an already-sparse
+///   subvolume.
+///
+/// `has_away_pin` (UPI 058, ADR-116 Consequence 1) makes the Critical clear-all
+/// **presence-conditional**: when an away drive holds an away-*only* pin (a
+/// snapshot no connected drive needs), Urd sheds *that* pin and retains-one for
+/// the connected chain (`clear_all = false`) rather than clear-alling the
+/// connected chain while the expensive away pin lingers. The single field flip
+/// keeps the Critical `send_interval` floor and the Critical tier, so the AT-RISK
+/// promise cap and the awareness-coherence invariant are untouched. With no away
+/// pin the behavior is byte-identical to 031-b (`clear_all = true`). The
+/// escalation is stateless: next run, the away pin gone, `has_away_pin` is false
+/// and clear-all resumes. The flag is **only** consulted at Critical — Roomy /
+/// Tight / local-only ignore it.
 #[must_use]
 pub fn derive_effective_policy(
     declared_retention: &LocalRetentionPolicy,
     declared_send_interval: Interval,
     send_enabled: bool,
     armed: TightnessTier,
+    has_away_pin: bool,
 ) -> EffectivePolicy {
     // Local-only: no send, no ephemeral lifecycle. Declared passthrough.
     if !send_enabled {
@@ -350,7 +364,9 @@ pub fn derive_effective_policy(
             EffectivePolicy {
                 local_retention: LocalRetentionPolicy::Transient,
                 send_interval,
-                clear_all: true,
+                // Presence-conditional (UPI 058): retain-one for the connected
+                // chain when an away-only pin can be shed instead.
+                clear_all: !has_away_pin,
             }
         }
     }
@@ -668,7 +684,8 @@ mod tests {
 
     #[test]
     fn effective_policy_roomy_is_declared_passthrough() {
-        let eff = derive_effective_policy(&grad(), Interval::days(1), true, TightnessTier::Roomy);
+        let eff =
+            derive_effective_policy(&grad(), Interval::days(1), true, TightnessTier::Roomy, false);
         assert_eq!(eff.local_retention, grad());
         assert_eq!(eff.send_interval.as_secs(), Interval::days(1).as_secs());
         assert!(!eff.clear_all);
@@ -676,7 +693,8 @@ mod tests {
 
     #[test]
     fn effective_policy_tight_is_transient_with_scaled_interval() {
-        let eff = derive_effective_policy(&grad(), Interval::days(1), true, TightnessTier::Tight);
+        let eff =
+            derive_effective_policy(&grad(), Interval::days(1), true, TightnessTier::Tight, false);
         assert!(eff.local_retention.is_transient());
         // daily × 1.5 = 36h.
         assert_eq!(eff.send_interval.as_secs(), 36 * 3600);
@@ -686,7 +704,13 @@ mod tests {
 
     #[test]
     fn effective_policy_critical_is_clear_all_with_floor() {
-        let eff = derive_effective_policy(&grad(), Interval::days(1), true, TightnessTier::Critical);
+        let eff = derive_effective_policy(
+            &grad(),
+            Interval::days(1),
+            true,
+            TightnessTier::Critical,
+            false,
+        );
         assert!(eff.local_retention.is_transient());
         // declared daily < 7d floor → floored to weekly.
         assert_eq!(eff.send_interval.as_secs(), Interval::days(7).as_secs());
@@ -698,7 +722,8 @@ mod tests {
         // A declared-fortnightly subvol at Critical keeps its 2w interval
         // (max(declared, 7d) = declared), and still clears all.
         let declared = "2w".parse::<Interval>().unwrap();
-        let eff = derive_effective_policy(&grad(), declared, true, TightnessTier::Critical);
+        let eff =
+            derive_effective_policy(&grad(), declared, true, TightnessTier::Critical, false);
         assert_eq!(eff.send_interval.as_secs(), declared.as_secs());
         assert!(eff.clear_all);
     }
@@ -712,6 +737,7 @@ mod tests {
             Interval::hours(4),
             true,
             TightnessTier::Tight,
+            false,
         );
         assert!(eff.local_retention.is_transient());
         assert_eq!(eff.send_interval.as_secs(), 6 * 3600); // 4h × 1.5
@@ -721,10 +747,77 @@ mod tests {
     #[test]
     fn effective_policy_local_only_is_full_noop_at_every_tier() {
         for tier in [TightnessTier::Roomy, TightnessTier::Tight, TightnessTier::Critical] {
-            let eff = derive_effective_policy(&grad(), Interval::days(1), false, tier);
-            assert_eq!(eff.local_retention, grad());
-            assert_eq!(eff.send_interval.as_secs(), Interval::days(1).as_secs());
-            assert!(!eff.clear_all, "local-only never clears at {tier:?}");
+            // has_away_pin is irrelevant for a local-only subvol — assert both.
+            for has_away in [false, true] {
+                let eff =
+                    derive_effective_policy(&grad(), Interval::days(1), false, tier, has_away);
+                assert_eq!(eff.local_retention, grad());
+                assert_eq!(eff.send_interval.as_secs(), Interval::days(1).as_secs());
+                assert!(!eff.clear_all, "local-only never clears at {tier:?}");
+            }
+        }
+    }
+
+    // ── UPI 058: presence-conditional Critical clear-all (A1) ────────────
+
+    #[test]
+    fn effective_policy_critical_with_away_pin_retains_one() {
+        // Critical + an away-only pin → clear_all flips OFF (retain-one for the
+        // connected chain), but the lifecycle stays Transient and the send
+        // interval stays the Critical weekly floor — the single field flip that
+        // keeps the AT-RISK cap and awareness coherence untouched.
+        let eff = derive_effective_policy(
+            &grad(),
+            Interval::days(1),
+            true,
+            TightnessTier::Critical,
+            true,
+        );
+        assert!(!eff.clear_all, "away-only pin → retain-one, not clear-all");
+        assert!(eff.local_retention.is_transient(), "still Transient (retain-one)");
+        assert_eq!(
+            eff.send_interval.as_secs(),
+            Interval::days(7).as_secs(),
+            "Critical weekly floor is unchanged by has_away_pin",
+        );
+    }
+
+    #[test]
+    fn effective_policy_critical_no_away_pin_is_031b_parity() {
+        // Critical + no away pin → clear_all stays ON (byte-identical to 031-b).
+        let eff = derive_effective_policy(
+            &grad(),
+            Interval::days(1),
+            true,
+            TightnessTier::Critical,
+            false,
+        );
+        assert!(eff.clear_all, "no away pin → unconditional clear-all (031-b parity)");
+        assert!(eff.local_retention.is_transient());
+    }
+
+    #[test]
+    fn effective_policy_send_interval_invariant_under_has_away_pin() {
+        // A1 rests on the send interval being invariant under has_away_pin at
+        // EVERY tier — otherwise awareness (which passes false) would judge
+        // staleness against a different interval than the planner timed against.
+        for tier in [TightnessTier::Roomy, TightnessTier::Tight, TightnessTier::Critical] {
+            let off = derive_effective_policy(&grad(), Interval::days(1), true, tier, false);
+            let on = derive_effective_policy(&grad(), Interval::days(1), true, tier, true);
+            assert_eq!(
+                off.send_interval.as_secs(),
+                on.send_interval.as_secs(),
+                "send_interval must not vary with has_away_pin at {tier:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn effective_policy_tight_and_roomy_ignore_has_away_pin() {
+        // Only Critical consults the flag; Tight/Roomy clear_all stays false.
+        for tier in [TightnessTier::Roomy, TightnessTier::Tight] {
+            let eff = derive_effective_policy(&grad(), Interval::days(1), true, tier, true);
+            assert!(!eff.clear_all, "{tier:?} ignores has_away_pin");
         }
     }
 }

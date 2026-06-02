@@ -303,36 +303,18 @@ pub fn plan(
         // Get pinned snapshots
         let pinned = obs.fs.pinned_snapshots(&local_dir, &drive_labels);
 
-        // Drives in scope for this subvolume that can currently receive sends.
-        // Include TokenMissing: those drives proceed with sends (line ~308),
-        // so their pins represent valid chain parents that must be protected.
-        let usable_drives: Vec<&DriveConfig> = config
-            .drives
+        // Per-drive scope: the single source of the presence predicate (UPI 058
+        // F5/R1). `mounted_pins` (transient retention scope) is derived from the
+        // SAME scopes the executor's away-shed map is built from
+        // (`commands/backup.rs`), so the executor's `has_away_pin` cannot diverge
+        // from the planner's `clear_all` decision. Mounted-only pins scope
+        // transient retention — an absent drive's pin is not protected
+        // indefinitely (that is what causes space exhaustion on a tight pool).
+        let scopes = drive_scopes(subvol, &config.drives, &local_dir, obs.fs);
+        let mounted_pins: HashSet<SnapshotName> = scopes
             .iter()
-            .filter(|d| subvol.accepts_drive(&d.label))
-            .filter(|d| {
-                matches!(
-                    obs.fs.drive_availability(d),
-                    DriveAvailability::Available | DriveAvailability::TokenMissing
-                )
-            })
-            .collect();
-
-        // Mounted-only pins for transient retention scoping.
-        let mounted_pins: HashSet<SnapshotName> = usable_drives
-            .iter()
-            .filter_map(|d| match obs.fs.read_pin_file(&local_dir, &d.label) {
-                Ok(Some(snap)) => Some(snap),
-                Ok(None) => None,
-                Err(e) => {
-                    log::warn!(
-                        "Failed to read pin file for drive {:?} in {}: {e}",
-                        d.label,
-                        local_dir.display()
-                    );
-                    None
-                }
-            })
+            .filter(|s| s.mounted)
+            .filter_map(|s| s.pin.clone())
             .collect();
 
         // ── Tier-adapted effective policy (UPI 031-b) ──────────────
@@ -342,11 +324,17 @@ pub fn plan(
         // the SAME armed tier (the single pre-plan gather in backup.rs), so the
         // effective send interval they judge against agrees.
         let armed = armed_tiers.get(&subvol.name).copied().unwrap_or_default();
+        // Presence-conditional Critical clear-all (UPI 058 A1, ADR-116): an
+        // away-*only* pin flips clear_all to retain-one so the connected chain
+        // survives. Derived from the SAME `scopes` the executor's away-shed map
+        // is built from (R1 — planner/executor coherence by construction).
+        let has_away_pin = !crate::guard::away_sheddable_pins(&scopes).is_empty();
         let eff = storage_critical::derive_effective_policy(
             &subvol.local_retention,
             subvol.send_interval,
             subvol.send_enabled,
             armed,
+            has_away_pin,
         );
 
         // ── Transient subvolumes: atomic lifecycle planning ────────
@@ -483,6 +471,10 @@ pub fn plan(
             subvol.send_interval,
             subvol.send_enabled,
             armed,
+            // This check reads only `eff.local_retention.is_transient()`, which
+            // `has_away_pin` never affects (it gates `clear_all` alone) — so
+            // `false` is correct here permanently, not just as the Step-4 stub.
+            false,
         );
         if !eff.local_retention.is_transient() || !subvol.send_enabled {
             continue;
@@ -522,6 +514,83 @@ pub fn plan(
         skipped,
         events,
     })
+}
+
+/// Compute the per-drive [`crate::guard::DriveScope`]s for a subvolume from the
+/// in-run filesystem state (UPI 058 F5). The **single source** of the presence
+/// predicate: a drive is in scope iff the subvolume `accepts_drive` it, and
+/// `mounted` iff it is usable for a send now (`drive_availability ∈ {Available,
+/// TokenMissing}` — the same `usable_drives` filter the planner scopes transient
+/// retention against). The pin is read for **every** in-scope drive (mounted and
+/// away) so away-only pins can be detected by [`crate::guard::away_sheddable_pins`].
+///
+/// Called by the planner (to derive `mounted_pins`) **and** by [`away_shed_map`]
+/// (which `commands/backup.rs` and the sentinel use to build the executor's
+/// away-shed map), so the executor's `has_away_pin` cannot diverge from the
+/// planner's `clear_all` decision — coherence by construction, not discipline
+/// (R1). A pin-read error is logged and treated as "no pin" (the same fail-soft
+/// the inline `mounted_pins` derivation used pre-058).
+fn drive_scopes(
+    subvol: &ResolvedSubvolume,
+    drives: &[DriveConfig],
+    local_dir: &Path,
+    fs: &dyn FilesystemQuery,
+) -> Vec<crate::guard::DriveScope> {
+    drives
+        .iter()
+        .filter(|d| subvol.accepts_drive(&d.label))
+        .map(|d| {
+            let mounted = matches!(
+                fs.drive_availability(d),
+                DriveAvailability::Available | DriveAvailability::TokenMissing
+            );
+            let pin = match fs.read_pin_file(local_dir, &d.label) {
+                Ok(pin) => pin,
+                Err(e) => {
+                    log::warn!(
+                        "Failed to read pin file for drive {:?} in {}: {e}",
+                        d.label,
+                        local_dir.display()
+                    );
+                    None
+                }
+            };
+            crate::guard::DriveScope {
+                label: d.label.clone(),
+                mounted,
+                pin,
+            }
+        })
+        .collect()
+}
+
+/// Build the per-subvolume away-sheddable pin map (UPI 058): subvol name → the
+/// away drive labels whose pin is **away-only** ([`crate::guard::away_sheddable_pins`]).
+/// Computed from the SAME [`drive_scopes`] source the planner derives
+/// `mounted_pins` from, so the executor's `has_away_pin` and away-shed cannot
+/// diverge from the planner's `clear_all` decision (R1). Only subvolumes with at
+/// least one away-only pin appear — an absent key means "no presence-aware shed."
+///
+/// Threaded to the executor (`set_away_shed_pins`) and passed to
+/// `emergency_reclaim_pool` so both read one in-run computation rather than each
+/// recomputing presence.
+#[must_use]
+pub(crate) fn away_shed_map(
+    config: &Config,
+    fs: &dyn FilesystemQuery,
+) -> std::collections::HashMap<String, Vec<String>> {
+    let mut map = std::collections::HashMap::new();
+    for sv in config.resolved_subvolumes() {
+        let Some(local_dir) = config.local_snapshot_dir(&sv.name) else {
+            continue;
+        };
+        let scopes = drive_scopes(&sv, &config.drives, &local_dir, fs);
+        let away = crate::guard::away_sheddable_pins(&scopes);
+        if !away.is_empty() {
+            map.insert(sv.name.clone(), away);
+        }
+    }
+    map
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1744,6 +1813,140 @@ priority = 2
 
     fn snap(s: &str) -> SnapshotName {
         SnapshotName::parse(s).unwrap()
+    }
+
+    // ── drive_scopes (UPI 058 F5) ──────────────────────────────────────
+
+    /// A primary (always present) + an offsite (rotates away); `sv1` accepts
+    /// both. `restrict_to` optionally pins `sv1` to a single drive label.
+    fn two_drive_config(restrict_to: Option<&str>) -> Config {
+        let drives_filter = match restrict_to {
+            Some(label) => format!("drives = [\"{label}\"]\n"),
+            None => String::new(),
+        };
+        let toml_str = format!(
+            r#"
+[general]
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp"
+
+[local_snapshots]
+roots = [ {{ path = "/snap", subvolumes = ["sv1"] }} ]
+
+[defaults]
+snapshot_interval = "1h"
+send_interval = "4h"
+send_enabled = true
+enabled = true
+[defaults.local_retention]
+hourly = 24
+[defaults.external_retention]
+daily = 30
+
+[[drives]]
+label = "PRIMARY"
+mount_path = "/mnt/primary"
+snapshot_root = ".snapshots"
+role = "primary"
+
+[[drives]]
+label = "OFFSITE"
+mount_path = "/mnt/offsite"
+snapshot_root = ".snapshots"
+role = "offsite"
+
+[[subvolumes]]
+name = "sv1"
+short_name = "one"
+source = "/data/sv1"
+local_retention = "transient"
+{drives_filter}"#,
+        );
+        toml::from_str(&toml_str).unwrap()
+    }
+
+    #[test]
+    fn drive_scopes_classifies_presence_and_reads_all_pins() {
+        let config = two_drive_config(None);
+        let resolved = config.resolved_subvolumes();
+        let sv = resolved.iter().find(|s| s.name == "sv1").unwrap();
+        let local_dir = config.local_snapshot_dir("sv1").unwrap();
+
+        let mut fs = MockFileSystemState::new();
+        fs.drive_availability_overrides
+            .insert("PRIMARY".into(), DriveAvailability::Available);
+        fs.drive_availability_overrides
+            .insert("OFFSITE".into(), DriveAvailability::NotMounted);
+        // Both have a pin on disk — the away one must still be read so that
+        // away_sheddable_pins can reason about it.
+        fs.pin_files
+            .insert((local_dir.clone(), "PRIMARY".into()), snap("20260322-1400-one"));
+        fs.pin_files
+            .insert((local_dir.clone(), "OFFSITE".into()), snap("20260101-0900-one"));
+
+        let scopes = drive_scopes(sv, &config.drives, &local_dir, &fs);
+        let primary = scopes.iter().find(|s| s.label == "PRIMARY").unwrap();
+        let offsite = scopes.iter().find(|s| s.label == "OFFSITE").unwrap();
+        assert!(primary.mounted, "PRIMARY Available → mounted");
+        assert!(!offsite.mounted, "OFFSITE NotMounted → away");
+        assert_eq!(primary.pin, Some(snap("20260322-1400-one")));
+        assert_eq!(
+            offsite.pin,
+            Some(snap("20260101-0900-one")),
+            "the away drive's pin is still read"
+        );
+    }
+
+    #[test]
+    fn drive_scopes_token_missing_counts_as_mounted() {
+        // TokenMissing is in the planner's usable set (sends proceed), so it is
+        // "mounted" for presence — its incremental chain can continue.
+        let config = two_drive_config(None);
+        let resolved = config.resolved_subvolumes();
+        let sv = resolved.iter().find(|s| s.name == "sv1").unwrap();
+        let local_dir = config.local_snapshot_dir("sv1").unwrap();
+        let mut fs = MockFileSystemState::new();
+        fs.drive_availability_overrides
+            .insert("PRIMARY".into(), DriveAvailability::TokenMissing);
+        fs.drive_availability_overrides
+            .insert("OFFSITE".into(), DriveAvailability::NotMounted);
+        let scopes = drive_scopes(sv, &config.drives, &local_dir, &fs);
+        assert!(
+            scopes.iter().find(|s| s.label == "PRIMARY").unwrap().mounted,
+            "TokenMissing is usable → mounted"
+        );
+    }
+
+    #[test]
+    fn drive_scopes_respects_accepts_drive_filter() {
+        // A subvol restricted to PRIMARY excludes OFFSITE from scope entirely.
+        let config = two_drive_config(Some("PRIMARY"));
+        let resolved = config.resolved_subvolumes();
+        let sv = resolved.iter().find(|s| s.name == "sv1").unwrap();
+        let local_dir = config.local_snapshot_dir("sv1").unwrap();
+        let fs = MockFileSystemState::new();
+        let scopes = drive_scopes(sv, &config.drives, &local_dir, &fs);
+        assert_eq!(scopes.len(), 1);
+        assert_eq!(scopes[0].label, "PRIMARY");
+    }
+
+    #[test]
+    fn drive_scopes_pin_read_error_is_no_pin() {
+        // A pin-read failure is logged and treated as "no pin" (fail-soft —
+        // identical to the inline mounted_pins derivation pre-058).
+        let config = two_drive_config(None);
+        let resolved = config.resolved_subvolumes();
+        let sv = resolved.iter().find(|s| s.name == "sv1").unwrap();
+        let local_dir = config.local_snapshot_dir("sv1").unwrap();
+        let mut fs = MockFileSystemState::new();
+        fs.drive_availability_overrides
+            .insert("PRIMARY".into(), DriveAvailability::Available);
+        fs.fail_pin_reads
+            .insert((local_dir.clone(), "PRIMARY".into()));
+        let scopes = drive_scopes(sv, &config.drives, &local_dir, &fs);
+        let primary = scopes.iter().find(|s| s.label == "PRIMARY").unwrap();
+        assert_eq!(primary.pin, None, "unreadable pin → None, not an abort");
     }
 
     // ── estimated_send_size tests ──────────────────────────────────────
@@ -4970,6 +5173,73 @@ priority = 1
             send_has_pin(&critical, "sv1"),
             Some(false),
             "Critical (clear_all) writes no pin"
+        );
+    }
+
+    #[test]
+    fn upi058_planner_and_executor_agree_on_away_shed() {
+        // R1 coherence: at Critical with an away-only pin, the planner must
+        // choose RETAIN-ONE (writes a pin → clear_all=false) AND `away_shed_map`
+        // (what the executor reads) must name the SAME away drive — both derive
+        // from the one shared `drive_scopes`, so they cannot diverge.
+        use crate::storage_critical::TightnessTier;
+        let config = transient_multi_drive_config(); // D1 primary, D2 offsite
+        let mut fs = MockFileSystemState::new();
+        // One recent local snapshot; D1 has nothing yet → a (first) send is due.
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap("20260322-1400-one")]);
+        // D2 away (unmounted) with an away-only pin (D1 has no pin → mounted_pins
+        // is empty → D2's pin is away-only).
+        fs.pin_files.insert(
+            (PathBuf::from("/snap/sv1"), "D2".to_string()),
+            snap("20260101-0900-one"),
+        );
+        fs.mounted_drives.insert("D1".to_string()); // D2 NOT mounted → away
+        fs.external_snapshots
+            .insert(("D1".to_string(), "sv1".to_string()), vec![]);
+
+        let planned = plan(
+            &config,
+            now(),
+            &PlanFilters::default(),
+            &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() },
+            &armed_map("sv1", TightnessTier::Critical),
+        )
+        .unwrap();
+
+        // Planner chose retain-one for the connected drive (clear_all=false).
+        assert_eq!(
+            send_has_pin(&planned, "sv1"),
+            Some(true),
+            "Critical + away-only pin → planner retains-one for the connected chain",
+        );
+        // The executor would shed exactly the away drive — same scopes, no drift.
+        let map = away_shed_map(&config, &fs);
+        assert_eq!(
+            map.get("sv1").map(Vec::as_slice),
+            Some(["D2".to_string()].as_slice()),
+            "away_shed_map names the away drive the planner's predicate keyed on",
+        );
+
+        // Contrast: with D2 also mounted there is no away pin → the planner
+        // clear-alls (no pin) and away_shed_map is empty (coherent the other way).
+        fs.mounted_drives.insert("D2".to_string());
+        let planned2 = plan(
+            &config,
+            now(),
+            &PlanFilters::default(),
+            &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() },
+            &armed_map("sv1", TightnessTier::Critical),
+        )
+        .unwrap();
+        assert_eq!(
+            send_has_pin(&planned2, "sv1"),
+            Some(false),
+            "no away pin → Critical clear-all (031-b parity)",
+        );
+        assert!(
+            !away_shed_map(&config, &fs).contains_key("sv1"),
+            "no away pin → nothing to shed",
         );
     }
 
