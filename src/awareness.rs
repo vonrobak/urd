@@ -476,6 +476,23 @@ pub fn assess(
         })
         .collect();
 
+    // Per-offsite-drive freshness window (UPI 055, ADR-116), computed once.
+    // An offsite drive's absence is expected — judged against its rotation
+    // cadence (declared `rotation_interval` PRIMARY, observed cadence fallback,
+    // 30d default), not the send interval. This is the only new `obs.history`
+    // call in `assess()`; the function stays pure (ADR-108).
+    let offsite_windows: std::collections::HashMap<String, crate::rotation::OffsiteWindow> = config
+        .drives
+        .iter()
+        .filter(|d| d.role == DriveRole::Offsite)
+        .map(|d| {
+            let observed =
+                crate::rotation::observed_cadence(&obs.history.drive_mount_history(&d.label), now);
+            let window = crate::rotation::resolve_offsite_window(d.rotation_interval, observed);
+            (d.label.clone(), window)
+        })
+        .collect();
+
     for subvol in &resolved {
         if !subvol.enabled {
             continue;
@@ -594,6 +611,19 @@ pub fn assess(
                 None => config.drives.iter().collect(),
             };
 
+            // Present-peer guard for the offsite rotation relaxation (F1, UPI
+            // 055). The relaxation that lets an away offsite copy read PROTECTED
+            // is a property of the redundancy *strategy* (ADR-116: offsite is
+            // the second line behind a continuously-present primary), so it
+            // fires only when some other real copy is accessible right now.
+            // Exclude Test drives — a mounted test drive is not a real copy
+            // (matches advice's `role != Test` redundancy filter). Since the
+            // override only fires on a `!mounted` offsite drive, "any non-test
+            // drive in the set mounted" == "a redundancy peer is present".
+            let any_peer_mounted = effective_drives
+                .iter()
+                .any(|d| d.role != DriveRole::Test && obs.fs.is_drive_mounted(d));
+
             for drive in &effective_drives {
                 let mounted = obs.fs.is_drive_mounted(drive);
 
@@ -637,7 +667,7 @@ pub fn assess(
                 // Judge staleness against the EFFECTIVE interval (031-b): a
                 // Critical subvol on a weekly cadence must not read AT RISK at
                 // day 2. eff.send_interval == declared at Roomy (no change).
-                let status =
+                let mut status =
                     assess_external_status(last_send_age, eff.send_interval, source_unchanged);
 
                 if source_unchanged
@@ -656,6 +686,26 @@ pub fn assess(
                         "{}: source unchanged since last send — {coarse} age is expected",
                         drive.label,
                     ));
+                }
+
+                // Offsite rotation relaxation (UPI 055, ADR-116). An offsite
+                // drive away on its normal rhythm is expected absence — judge
+                // its copy against the rotation window on the **data-age** clock
+                // (`last_send_age`, G3), not the send interval. Gated on a
+                // present redundancy peer (F1, R6): without one this offsite is
+                // the only external copy and its absence is genuinely exposing,
+                // so it keeps today's send-interval judgment (→ eventually
+                // Unprotected). Using data-age — not presence-age — keeps a
+                // drive that was briefly home but never refreshed honestly stale
+                // (R3). `source_unchanged` / mounted / never-sent are untouched.
+                if drive.role == DriveRole::Offsite
+                    && !mounted
+                    && !source_unchanged
+                    && any_peer_mounted
+                    && let Some(window) = offsite_windows.get(&drive.label)
+                    && let Some(age) = last_send_age
+                {
+                    status = crate::rotation::classify(age, window).to_promise_status();
                 }
 
                 let (absent_duration_secs, last_activity_age_secs) =
@@ -729,6 +779,7 @@ pub fn assess(
             &subvol.name,
             local_space_tight.is_some(),
             subvol.local_retention.is_transient(),
+            &offsite_windows,
         );
 
         // ── Storage posture (UPI 031-a) ──────────────────────────────
@@ -1055,6 +1106,7 @@ fn compute_health(
     subvol_name: &str,
     local_space_tight: bool,
     is_transient: bool,
+    offsite_windows: &std::collections::HashMap<String, crate::rotation::OffsiteWindow>,
 ) -> (OperationalHealth, Vec<String>) {
     let mut reasons: Vec<String> = Vec::new();
     let mut worst = OperationalHealth::Healthy;
@@ -1167,11 +1219,24 @@ fn compute_health(
         }
     }
 
-    // ── Degraded: configured drive unmounted >7 days ───────────────
+    // ── Degraded: configured drive unmounted too long ──────────────
     // Suppressed when `source_unchanged` for the drive: if the pin generation
     // matches the live source, there is nothing pending to send and the
     // drive's absence is not an operational concern. Mirrors the planner's
     // skip-when-source-unchanged behavior (see issue #120, defect 1).
+    //
+    // The threshold is role-aware (UPI 055, ADR-116): a primary/test drive
+    // still nags after the fixed 7-day wall, but an offsite drive is judged
+    // against its rotation window's overdue threshold — its absence is
+    // expected, not a degradation, until it is genuinely overdue. The nag is
+    // NOT gated on a present peer: an away offsite past *its* window is a
+    // legitimate health signal regardless of redundancy.
+    //
+    // F6 — clock caveat: `cascade_age_source` returns presence-age only when an
+    // `Unmount` event exists, and falls back to data-age (`last_send_age`)
+    // otherwise (an offsite drive carried off without a recorded unmount). The
+    // generous offsite window keeps that fallback safe; the "presence-age for
+    // the nag" framing is the common case, not an absolute.
     for da in drive_assessments {
         if !da.mounted
             && !da.source_unchanged
@@ -1181,7 +1246,17 @@ fn compute_health(
             )
         {
             let age_days = age_secs / 86400;
-            if age_days > DRIVE_AWAY_DEGRADED_DAYS {
+            let threshold = if da.role == DriveRole::Offsite {
+                // Every offsite drive is in the map (built from the same
+                // config.drives); the 30-day default is dead-defensive.
+                offsite_windows
+                    .get(&da.drive_label)
+                    .map(|w| w.overdue_days())
+                    .unwrap_or(30)
+            } else {
+                DRIVE_AWAY_DEGRADED_DAYS
+            };
+            if age_days > threshold {
                 reasons.push(format!(
                     "{} {source_word} for {age_days} days",
                     da.drive_label,
@@ -1830,10 +1905,16 @@ send_enabled = false
         assert_eq!(results[0].external[0].snapshot_count, None);
     }
 
-    // ── Test 10: Multiple drives, best wins ────────────────────────
+    // ── Test 10: Multiple drives, away offsite on schedule (UPI 055) ──
+    // Re-anchored from the pre-055 `multiple_drives_best_wins`: an offsite
+    // drive away 8 days with a present primary peer now reads on-schedule
+    // PROTECTED (within the default 30-day window), not UNPROTECTED. The
+    // max()-across-drives "best wins" reduction is proven by the overdue/stale
+    // siblings below, where the offsite is AtRisk/Unprotected yet overall stays
+    // PROTECTED via the present primary.
 
     #[test]
-    fn multiple_drives_best_wins() {
+    fn offsite_away_within_window_with_peer_reads_protected() {
         let toml_str = r#"
 [general]
 state_db = "/tmp/urd.db"
@@ -1883,7 +1964,7 @@ source = "/data/sv1"
             ("sv1".to_string(), "primary".to_string()),
             dt(2026, 3, 23, 8, 0),
         );
-        // Offsite: old send → UNPROTECTED
+        // Offsite: send 8 days ago — within the default 30-day rotation window.
         fs.send_times.insert(
             ("sv1".to_string(), "offsite".to_string()),
             dt(2026, 3, 15, 8, 0),
@@ -1901,17 +1982,333 @@ source = "/data/sv1"
             .unwrap();
         assert_eq!(primary.status, PromiseStatus::Protected);
 
-        // Offsite is UNPROTECTED
+        // Offsite away 8d with a present peer → on-schedule → PROTECTED
+        // (pre-055 this read UNPROTECTED on the send interval).
         let offsite = &results[0]
             .external
             .iter()
             .find(|d| d.drive_label == "offsite")
             .unwrap();
-        assert_eq!(offsite.status, PromiseStatus::Unprotected);
+        assert_eq!(offsite.status, PromiseStatus::Protected);
 
-        // Overall: max(PROTECTED, UNPROTECTED) = PROTECTED for external,
+        // Overall: max(PROTECTED, PROTECTED) = PROTECTED for external,
         // then min(local=PROTECTED, external=PROTECTED) = PROTECTED
         assert_eq!(results[0].status, PromiseStatus::Protected);
+    }
+
+    // ── UPI 055: role-aware offsite rotation model ─────────────────────
+
+    /// Primary ("primary") + offsite ("offsite") config; the offsite drive
+    /// carries `rotation_interval` when `offsite_rotation` is Some.
+    fn primary_plus_offsite_config(offsite_rotation: Option<&str>) -> Config {
+        let ri = offsite_rotation
+            .map(|r| format!("rotation_interval = \"{r}\"\n"))
+            .unwrap_or_default();
+        let toml_str = format!(
+            r#"
+[general]
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp"
+
+[local_snapshots]
+roots = [{{ path = "/snap", subvolumes = ["sv1"] }}]
+
+[defaults]
+snapshot_interval = "1h"
+send_interval = "1d"
+send_enabled = true
+[defaults.local_retention]
+hourly = 24
+[defaults.external_retention]
+daily = 30
+
+[[drives]]
+label = "primary"
+mount_path = "/mnt/primary"
+snapshot_root = ".snapshots"
+role = "primary"
+
+[[drives]]
+label = "offsite"
+mount_path = "/mnt/offsite"
+snapshot_root = ".snapshots"
+role = "offsite"
+{ri}
+[[subvolumes]]
+name = "sv1"
+short_name = "sv1"
+source = "/data/sv1"
+"#
+        );
+        toml::from_str(&toml_str).expect("primary+offsite config parses")
+    }
+
+    #[test]
+    fn offsite_away_overdue_with_peer_at_risk_overall_protected() {
+        // Offsite away 45 days (past the 30d default overdue, within 60d stale)
+        // with a present primary peer → AtRisk per-copy, but overall stays
+        // PROTECTED via the fresh primary — the max()-across-drives best-wins
+        // reduction is preserved.
+        let config = primary_plus_offsite_config(None);
+        let now = dt(2026, 5, 1, 12, 0);
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap(dt(2026, 5, 1, 11, 30), "sv1")]);
+        fs.mounted_drives.insert("primary".to_string());
+        fs.send_times
+            .insert(("sv1".to_string(), "primary".to_string()), dt(2026, 5, 1, 8, 0));
+        fs.send_times.insert(
+            ("sv1".to_string(), "offsite".to_string()),
+            dt(2026, 3, 17, 12, 0), // 45 days before now
+        );
+
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
+        let offsite = results[0].external.iter().find(|d| d.drive_label == "offsite").unwrap();
+        assert_eq!(offsite.status, PromiseStatus::AtRisk);
+        assert_eq!(results[0].status, PromiseStatus::Protected);
+    }
+
+    #[test]
+    fn offsite_away_stale_with_peer_unprotected_overall_protected() {
+        // Offsite away 90 days (past the 60d stale) → Unprotected per-copy;
+        // overall still PROTECTED via the present primary (best wins).
+        let config = primary_plus_offsite_config(None);
+        let now = dt(2026, 6, 1, 12, 0);
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap(dt(2026, 6, 1, 11, 30), "sv1")]);
+        fs.mounted_drives.insert("primary".to_string());
+        fs.send_times
+            .insert(("sv1".to_string(), "primary".to_string()), dt(2026, 6, 1, 8, 0));
+        fs.send_times.insert(
+            ("sv1".to_string(), "offsite".to_string()),
+            dt(2026, 3, 3, 12, 0), // 90 days before now
+        );
+
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
+        let offsite = results[0].external.iter().find(|d| d.drive_label == "offsite").unwrap();
+        assert_eq!(offsite.status, PromiseStatus::Unprotected);
+        assert_eq!(results[0].status, PromiseStatus::Protected);
+    }
+
+    #[test]
+    fn single_offsite_away_changed_source_not_protected() {
+        // F1/R6 — the catastrophic-mode guard. A subvolume whose ONLY external
+        // drive is an away offsite, with a changed source, must NOT read
+        // PROTECTED: no present peer → the rotation relaxation is suppressed and
+        // the copy keeps today's send-interval judgment (UNPROTECTED). Contrast
+        // with `offsite_away_within_window_with_peer_reads_protected`, where the
+        // identical 8-day absence reads PROTECTED *because* a primary is present.
+        let config = offsite_test_config(); // single offsite drive "offsite-drive"
+        let now = dt(2026, 3, 23, 14, 0);
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap(dt(2026, 3, 23, 13, 30), "sv1")]);
+        // Offsite away (not mounted), sent 8 days ago — inside a rotation
+        // window, but with no peer present there is no relaxation.
+        fs.send_times.insert(
+            ("sv1".to_string(), "offsite-drive".to_string()),
+            dt(2026, 3, 15, 8, 0),
+        );
+
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
+        let offsite = results[0].external.iter().find(|d| d.drive_label == "offsite-drive").unwrap();
+        assert_ne!(offsite.status, PromiseStatus::Protected);
+        assert_eq!(offsite.status, PromiseStatus::Unprotected);
+        // The only external copy is exposed → overall UNPROTECTED.
+        assert_eq!(results[0].status, PromiseStatus::Unprotected);
+    }
+
+    #[test]
+    fn source_unchanged_offsite_protected_at_any_age_even_without_peer() {
+        // Regression guard: the source_unchanged override is load-bearing and
+        // untouched. An unchanged offsite copy reads PROTECTED at any age, even
+        // with no present peer (the subvol5-music case) — the rotation override
+        // carries !source_unchanged, so it never overrides this.
+        let config = offsite_test_config();
+        let now = dt(2026, 6, 1, 12, 0);
+        let mut fs = MockFileSystemState::new();
+        let pin_snap = snap(dt(2026, 1, 1, 0, 0), "sv1");
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![pin_snap.clone()]);
+        // Offsite away, last send 150 days ago — but the source is unchanged.
+        fs.send_times.insert(
+            ("sv1".to_string(), "offsite-drive".to_string()),
+            dt(2026, 1, 2, 0, 0),
+        );
+        fs.pin_files.insert(
+            (std::path::PathBuf::from("/snap/sv1"), "offsite-drive".to_string()),
+            pin_snap.clone(),
+        );
+        let mb = MockBtrfs::new();
+        mb.generations
+            .borrow_mut()
+            .insert(std::path::PathBuf::from("/data/sv1"), 42);
+        mb.generations.borrow_mut().insert(
+            std::path::PathBuf::from(format!("/snap/sv1/{}", pin_snap.as_str())),
+            42,
+        );
+
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &mb }, &crate::awareness::StorageSignalMap::new());
+        let offsite = results[0].external.iter().find(|d| d.drive_label == "offsite-drive").unwrap();
+        assert!(offsite.source_unchanged, "pin generation matches source");
+        assert_eq!(offsite.status, PromiseStatus::Protected);
+    }
+
+    #[test]
+    fn never_sent_offsite_unprotected_even_with_peer() {
+        // Regression guard: a never-sent offsite copy stays UNPROTECTED — the
+        // override requires last_send_age.is_some(), so it cannot manufacture a
+        // PROTECTED for a copy that was never created, even with a peer present.
+        let config = primary_plus_offsite_config(None);
+        let now = dt(2026, 3, 23, 14, 0);
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap(dt(2026, 3, 23, 13, 30), "sv1")]);
+        fs.mounted_drives.insert("primary".to_string());
+        fs.send_times
+            .insert(("sv1".to_string(), "primary".to_string()), dt(2026, 3, 23, 8, 0));
+        // No send to offsite ever.
+
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
+        let offsite = results[0].external.iter().find(|d| d.drive_label == "offsite").unwrap();
+        assert_eq!(offsite.status, PromiseStatus::Unprotected);
+    }
+
+    #[test]
+    fn failed_home_window_uses_data_age_not_presence_age() {
+        // R3/G3 — per-copy status keys on DATA-age, not presence-age. An offsite
+        // drive physically here as recently as 1h ago (tiny presence-age) but
+        // whose copy was last refreshed 90 days ago (large data-age) must read
+        // UNPROTECTED: the override classifies on last_send_age.
+        use crate::types::{DriveEvent, DriveEventKind};
+        let config = primary_plus_offsite_config(None);
+        let now = dt(2026, 6, 1, 12, 0);
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap(dt(2026, 6, 1, 11, 30), "sv1")]);
+        fs.mounted_drives.insert("primary".to_string());
+        fs.send_times
+            .insert(("sv1".to_string(), "primary".to_string()), dt(2026, 6, 1, 8, 0));
+        // Offsite unmounted 1h ago (presence-age tiny) but last send 90d ago.
+        fs.drive_events.insert(
+            "offsite".to_string(),
+            DriveEvent { kind: DriveEventKind::Unmount, at: dt(2026, 6, 1, 11, 0) },
+        );
+        fs.send_times.insert(
+            ("sv1".to_string(), "offsite".to_string()),
+            dt(2026, 3, 3, 12, 0), // 90 days
+        );
+
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
+        let offsite = results[0].external.iter().find(|d| d.drive_label == "offsite").unwrap();
+        assert_eq!(
+            offsite.status,
+            PromiseStatus::Unprotected,
+            "data-age (90d) must govern the per-copy status, not the 1h presence-age"
+        );
+    }
+
+    #[test]
+    fn offsite_away_within_window_health_stays_healthy() {
+        // compute_health: an offsite drive away *within* its window does NOT
+        // degrade health — this is the collapse of the 7-subvolume "degraded —
+        // away" wall. Models `health_drive_away_recent_other_mounted` but pushes
+        // D2 (offsite) to 20 days, still inside the 30-day default window.
+        let config = test_config_two_drives(); // D1 primary, D2 offsite
+        let now = dt(2026, 3, 23, 14, 0);
+        let mut fs = MockFileSystemState::new();
+        let pin_snap = snap(dt(2026, 3, 23, 12, 0), "sv1");
+        fs.local_snapshots.insert(
+            "sv1".to_string(),
+            vec![pin_snap.clone(), snap(dt(2026, 3, 23, 13, 30), "sv1")],
+        );
+        fs.mounted_drives.insert("D1".to_string());
+        fs.external_snapshots
+            .insert(("D1".to_string(), "sv1".to_string()), vec![pin_snap.clone()]);
+        fs.pin_files.insert(
+            (std::path::PathBuf::from("/snap/sv1"), "D1".to_string()),
+            pin_snap,
+        );
+        fs.send_times
+            .insert(("sv1".to_string(), "D1".to_string()), dt(2026, 3, 23, 12, 0));
+        fs.free_bytes
+            .insert(std::path::PathBuf::from("/mnt/d1"), 1_000_000_000_000);
+        // D2 offsite, away 20 days (< 30d default window).
+        fs.send_times
+            .insert(("sv1".to_string(), "D2".to_string()), dt(2026, 3, 3, 12, 0));
+
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
+        assert_eq!(
+            results[0].health,
+            OperationalHealth::Healthy,
+            "reasons: {:?}",
+            results[0].health_reasons
+        );
+        assert!(!results[0].health_reasons.iter().any(|r| r.contains("D2")));
+    }
+
+    #[test]
+    fn offsite_away_past_window_health_degrades() {
+        // compute_health: an offsite drive away *past* its window degrades
+        // health (just later than the 7-day primary wall). D2 (offsite) at 45
+        // days exceeds the 30-day default → "away" reason fires.
+        let config = test_config_two_drives();
+        let now = dt(2026, 5, 1, 12, 0);
+        let mut fs = MockFileSystemState::new();
+        let pin_snap = snap(dt(2026, 5, 1, 10, 0), "sv1");
+        fs.local_snapshots.insert(
+            "sv1".to_string(),
+            vec![pin_snap.clone(), snap(dt(2026, 5, 1, 11, 30), "sv1")],
+        );
+        fs.mounted_drives.insert("D1".to_string());
+        fs.external_snapshots
+            .insert(("D1".to_string(), "sv1".to_string()), vec![pin_snap.clone()]);
+        fs.pin_files.insert(
+            (std::path::PathBuf::from("/snap/sv1"), "D1".to_string()),
+            pin_snap,
+        );
+        fs.send_times
+            .insert(("sv1".to_string(), "D1".to_string()), dt(2026, 5, 1, 10, 0));
+        fs.free_bytes
+            .insert(std::path::PathBuf::from("/mnt/d1"), 1_000_000_000_000);
+        // D2 offsite, away 45 days (> 30d default window).
+        fs.send_times
+            .insert(("sv1".to_string(), "D2".to_string()), dt(2026, 3, 17, 12, 0));
+
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
+        assert_eq!(results[0].health, OperationalHealth::Degraded);
+        assert!(
+            results[0].health_reasons.iter().any(|r| r.contains("D2") && r.contains("45 days")),
+            "expected a D2 away-45-days reason, got: {:?}",
+            results[0].health_reasons
+        );
+    }
+
+    #[test]
+    fn declared_rotation_interval_widens_window() {
+        // The declared rotation_interval governs (RD1): a quarterly drive away
+        // 100 days is still on-schedule (overdue ≈ 112d) → PROTECTED, where the
+        // 30-day default would have read it Unprotected.
+        let config = primary_plus_offsite_config(Some("3mo"));
+        let now = dt(2026, 6, 1, 12, 0);
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap(dt(2026, 6, 1, 11, 30), "sv1")]);
+        fs.mounted_drives.insert("primary".to_string());
+        fs.send_times
+            .insert(("sv1".to_string(), "primary".to_string()), dt(2026, 6, 1, 8, 0));
+        // Offsite last sent 100 days ago — past the 30d default, but inside the
+        // declared quarterly window (overdue ≈ 112d).
+        fs.send_times.insert(
+            ("sv1".to_string(), "offsite".to_string()),
+            dt(2026, 2, 21, 12, 0), // 100 days before now
+        );
+
+        let results = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
+        let offsite = results[0].external.iter().find(|d| d.drive_label == "offsite").unwrap();
+        assert_eq!(offsite.status, PromiseStatus::Protected);
     }
 
     // ── Test 11: Overall min of local and best external ────────────
@@ -3443,7 +3840,11 @@ send_enabled = false
         // Space tight: 105GB free, 100GB min
         fs.free_bytes
             .insert(std::path::PathBuf::from("/mnt/d1"), 105_000_000_000);
-        // D2 unmounted, >7 days
+        // D2 (offsite) unmounted, last send 13 days ago. Post-UPI-055 this is
+        // *within* the 30-day default rotation window, so it no longer
+        // contributes an "away" reason — the >= 2 reasons below come from the
+        // chain-broken + space-tight conditions on D1, which is what this test
+        // is really about (multiple reasons collected, not the away nag).
         fs.send_times.insert(
             ("sv1".to_string(), "D2".to_string()),
             dt(2026, 3, 10, 12, 0),
@@ -3453,7 +3854,8 @@ send_enabled = false
         assert_eq!(results[0].health, OperationalHealth::Degraded);
         assert!(results[0].health_reasons.len() >= 2, "expected multiple reasons, got: {:?}", results[0].health_reasons);
         assert!(results[0].health_reasons.iter().any(|r| r.contains("chain broken")));
-        // Either space tight or drive away, depending on config
+        // The two reasons are chain-broken on D1 and space-tight on D1 (the
+        // D2-away reason no longer fires at 13 days < 30-day window).
     }
 
     #[test]

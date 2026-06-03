@@ -1503,23 +1503,22 @@ impl HistoryQuery for RealFileSystemState<'_> {
         let record = self
             .state
             .and_then(|db| db.last_drive_connection(drive_label).ok().flatten())?;
-        let kind = match record.event_type.as_str() {
-            "mounted" => DriveEventKind::Mount,
-            "unmounted" => DriveEventKind::Unmount,
-            other => {
-                log::warn!("unknown drive_connections.event_type {other:?} — ignoring");
-                return None;
-            }
+        drive_record_to_event(&record)
+    }
+
+    fn drive_mount_history(&self, drive_label: &str) -> Vec<DriveEvent> {
+        // No state DB (e.g. SQLite open failed) → empty history, never blocks
+        // (ADR-102). Unparseable rows are dropped by `drive_record_to_event`.
+        let Some(db) = self.state else {
+            return Vec::new();
         };
-        let at = chrono::NaiveDateTime::parse_from_str(&record.timestamp, "%Y-%m-%dT%H:%M:%S")
-            .inspect_err(|e| {
-                log::warn!(
-                    "failed to parse drive_connections.timestamp {:?}: {e}",
-                    record.timestamp
-                );
-            })
-            .ok()?;
-        Some(DriveEvent { kind, at })
+        match db.drive_connection_history(drive_label) {
+            Ok(records) => records.iter().filter_map(drive_record_to_event).collect(),
+            Err(e) => {
+                log::warn!("drive_connection_history failed for {drive_label}: {e}");
+                Vec::new()
+            }
+        }
     }
 
     fn last_successful_operation_at(&self, drive_label: &str) -> Option<NaiveDateTime> {
@@ -1529,6 +1528,30 @@ impl HistoryQuery for RealFileSystemState<'_> {
                 .flatten()
         })
     }
+}
+
+/// Map a persisted `DriveConnectionRecord` to a `DriveEvent`, or `None` for an
+/// unknown event type / unparseable timestamp (logged). Shared by
+/// `last_drive_event` (one row) and `drive_mount_history` (all rows). The parse
+/// format matches the sentinel's write format (`%Y-%m-%dT%H:%M:%S`).
+fn drive_record_to_event(record: &crate::state::DriveConnectionRecord) -> Option<DriveEvent> {
+    let kind = match record.event_type.as_str() {
+        "mounted" => DriveEventKind::Mount,
+        "unmounted" => DriveEventKind::Unmount,
+        other => {
+            log::warn!("unknown drive_connections.event_type {other:?} — ignoring");
+            return None;
+        }
+    };
+    let at = chrono::NaiveDateTime::parse_from_str(&record.timestamp, "%Y-%m-%dT%H:%M:%S")
+        .inspect_err(|e| {
+            log::warn!(
+                "failed to parse drive_connections.timestamp {:?}: {e}",
+                record.timestamp
+            );
+        })
+        .ok()?;
+    Some(DriveEvent { kind, at })
 }
 
 pub(crate) fn read_snapshot_dir(dir: &Path) -> crate::error::Result<Vec<SnapshotName>> {
@@ -1579,6 +1602,10 @@ pub struct MockFileSystemState {
     pub calibrated_sizes: std::collections::HashMap<String, (u64, String)>,
     pub send_times: std::collections::HashMap<(String, String), NaiveDateTime>,
     pub drive_events: std::collections::HashMap<String, DriveEvent>,
+    /// Full ordered mount/unmount history per drive (UPI 055). Additive
+    /// alongside the single-event `drive_events` so existing `last_drive_event`
+    /// tests are untouched; injected only by rotation-aware tests.
+    pub drive_event_history: std::collections::HashMap<String, Vec<DriveEvent>>,
     pub last_successful_ops: std::collections::HashMap<String, NaiveDateTime>,
     /// Subvolume names for which local_snapshots() should return an error.
     pub fail_local_snapshots: HashSet<String>,
@@ -1600,6 +1627,7 @@ impl MockFileSystemState {
             calibrated_sizes: std::collections::HashMap::new(),
             send_times: std::collections::HashMap::new(),
             drive_events: std::collections::HashMap::new(),
+            drive_event_history: std::collections::HashMap::new(),
             last_successful_ops: std::collections::HashMap::new(),
             fail_local_snapshots: HashSet::new(),
             fail_pin_reads: HashSet::new(),
@@ -1735,6 +1763,13 @@ impl HistoryQuery for MockFileSystemState {
 
     fn last_drive_event(&self, drive_label: &str) -> Option<DriveEvent> {
         self.drive_events.get(drive_label).cloned()
+    }
+
+    fn drive_mount_history(&self, drive_label: &str) -> Vec<DriveEvent> {
+        self.drive_event_history
+            .get(drive_label)
+            .cloned()
+            .unwrap_or_default()
     }
 
     fn last_successful_operation_at(&self, drive_label: &str) -> Option<NaiveDateTime> {
@@ -4805,6 +4840,40 @@ local_retention = "transient"
             .last_drive_event("D1")
             .expect("round-trip must yield an event — guards schema/parser drift");
         assert!(matches!(event.kind, DriveEventKind::Unmount));
+    }
+
+    #[test]
+    fn real_file_system_state_drive_mount_history_full_ordered_round_trip() {
+        // UPI 055: the rotation view consumes the full ordered stream. This
+        // round-trips real sentinel-written rows (whose timestamps the parser
+        // must accept) through `drive_mount_history`, oldest-first.
+        use crate::state::{DriveEventSource, DriveEventType, StateDb};
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let db = StateDb::open(&dir.path().join("urd.db")).unwrap();
+        db.record_drive_event("D1", DriveEventType::Mounted, DriveEventSource::Sentinel)
+            .unwrap();
+        db.record_drive_event("D1", DriveEventType::Unmounted, DriveEventSource::Sentinel)
+            .unwrap();
+        db.record_drive_event("D1", DriveEventType::Mounted, DriveEventSource::Sentinel)
+            .unwrap();
+
+        let fs = RealFileSystemState { state: Some(&db) };
+        let history = fs.drive_mount_history("D1");
+        let kinds: Vec<DriveEventKind> = history.iter().map(|e| e.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                DriveEventKind::Mount,
+                DriveEventKind::Unmount,
+                DriveEventKind::Mount,
+            ],
+            "history must be oldest-first (ORDER BY id ASC) and complete"
+        );
+
+        // Unknown drive → empty (never blocks).
+        assert!(fs.drive_mount_history("nope").is_empty());
     }
 
     // ── Planner event-emission tests ───────────────────────────────────

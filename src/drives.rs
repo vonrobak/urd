@@ -395,6 +395,7 @@ mod tests {
             role: DriveRole::Primary,
             max_usage_percent: Some(90),
             min_free_bytes: None,
+            rotation_interval: None,
         }
     }
 
@@ -436,6 +437,7 @@ mod tests {
             role: DriveRole::Test,
             max_usage_percent: None,
             min_free_bytes: None,
+            rotation_interval: None,
         };
         assert_eq!(drive_availability(&drive), DriveAvailability::Available);
     }
@@ -451,6 +453,7 @@ mod tests {
             role: DriveRole::Test,
             max_usage_percent: None,
             min_free_bytes: None,
+            rotation_interval: None,
         };
         match drive_availability(&drive) {
             DriveAvailability::UuidMismatch { expected, found } => {
@@ -474,6 +477,7 @@ mod tests {
                 role: DriveRole::Test,
                 max_usage_percent: None,
                 min_free_bytes: None,
+                rotation_interval: None,
             };
             assert_eq!(drive_availability(&drive), DriveAvailability::Available);
         }
@@ -492,6 +496,7 @@ mod tests {
                 role: DriveRole::Test,
                 max_usage_percent: None,
                 min_free_bytes: None,
+                rotation_interval: None,
             };
             assert_eq!(drive_availability(&drive), DriveAvailability::Available);
         }
@@ -511,6 +516,7 @@ mod tests {
             role: DriveRole::Test,
             max_usage_percent: None,
             min_free_bytes: None,
+            rotation_interval: None,
         }
     }
 
@@ -570,6 +576,7 @@ mod tests {
             role: DriveRole::Test,
             max_usage_percent: None,
             min_free_bytes: None,
+            rotation_interval: None,
         };
 
         write_drive_token(&drive, "tok-123").unwrap();
@@ -667,6 +674,7 @@ mod tests {
                 role: DriveRole::Primary,
                 max_usage_percent: None,
                 min_free_bytes: None,
+                rotation_interval: None,
             },
             DriveConfig {
                 label: "WD-18TB1".to_string(),
@@ -676,6 +684,7 @@ mod tests {
                 role: DriveRole::Primary,
                 max_usage_percent: None,
                 min_free_bytes: None,
+                rotation_interval: None,
             },
         ];
 
@@ -699,6 +708,7 @@ mod tests {
                 role: DriveRole::Primary,
                 max_usage_percent: None,
                 min_free_bytes: None,
+                rotation_interval: None,
             },
             DriveConfig {
                 label: "2TB-backup".to_string(),
@@ -708,6 +718,7 @@ mod tests {
                 role: DriveRole::Primary,
                 max_usage_percent: None,
                 min_free_bytes: None,
+                rotation_interval: None,
             },
         ];
 
