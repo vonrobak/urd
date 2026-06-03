@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Role-aware offsite freshness model + rotation view** (UPI 055, ADR-116). Urd's strongest
+  tier (multi-drive + offsite) no longer reads chronically degraded while an offsite drive is
+  away on its normal rotation rhythm. An offsite drive's absence is now judged against its
+  **rotation cadence** — declared via a new optional `rotation_interval` on the drive block
+  (e.g. `"3mo"`; PRIMARY), the observed median homecoming gap (fallback, ≥3 homecomings), or a
+  30-day default — instead of the send interval. Away **on schedule** → PROTECTED and silent;
+  only a genuinely **overdue** copy degrades health and re-arms the `OffsiteDriveStale`
+  advisory. Introduces the two-clocks distinction: the per-copy promise keys on **data-age**
+  (time since last send), while the health "away" nag keys on **presence-age** (time since the
+  drive was here). The relaxation fires only when a real redundancy peer is currently mounted —
+  a subvolume whose only external drive is an away offsite keeps the honest send-interval
+  judgment, so a missing sole copy is never falsely reported PROTECTED. `Interval` gains `mo`
+  (30d) and `y` (365d) units. No metric/heartbeat field changes, but existing promise/advisory
+  *values* shift (the intended flattened sawtooth) — verify against the homelab's ADR-021 if any
+  alert is calibrated to the old offsite-away-degrades behavior.
+
 ## [0.23.0] - 2026-06-02
 
 ### Added

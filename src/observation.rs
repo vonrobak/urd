@@ -91,6 +91,12 @@ pub trait HistoryQuery {
     /// None if no event recorded (drive never seen by sentinel).
     fn last_drive_event(&self, drive_label: &str) -> Option<DriveEvent>;
 
+    /// Full ordered (oldest-first) mount/unmount history for a drive, from the
+    /// `events` table (`kind='drive'`). The rotation view (UPI 055) derives the
+    /// observed cadence from this stream. Empty when no events exist or the
+    /// query fails — never blocks assessment (ADR-102).
+    fn drive_mount_history(&self, drive_label: &str) -> Vec<DriveEvent>;
+
     /// Most recent successful send timestamp for this drive (any subvolume).
     /// None when no successful send has ever completed for this drive.
     fn last_successful_operation_at(&self, drive_label: &str) -> Option<NaiveDateTime>;

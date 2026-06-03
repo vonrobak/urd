@@ -91,6 +91,14 @@ pub struct DriveConfig {
     pub max_usage_percent: Option<u8>,
     #[serde(default)]
     pub min_free_bytes: Option<ByteSize>,
+    /// How often this offsite drive comes home (UPI 055, ADR-116). The
+    /// declared rotation cadence — judged against, not the send interval — so
+    /// an offsite drive away on its normal rhythm reads on-schedule, not
+    /// "exposed". Additive-optional (no `urd migrate`): legacy/v1/v2 all accept
+    /// its absence, mirroring `min_free_bytes`. Meaningful only for
+    /// `role = "offsite"`; on other roles preflight warns and it is ignored.
+    #[serde(default)]
+    pub rotation_interval: Option<Interval>,
 }
 
 #[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -1401,6 +1409,56 @@ mod tests {
     fn expand_tilde_absolute() {
         let expanded = expand_tilde(Path::new("/usr/bin/btrfs"));
         assert_eq!(expanded, PathBuf::from("/usr/bin/btrfs"));
+    }
+
+    // ── rotation_interval (UPI 055) ──────────────────────────────────────
+
+    /// `DriveConfig` is the single struct shared by the legacy, V1, and V2
+    /// parsers (`Config.drives`, `V1Config.drives`, `V2Config.drives` are all
+    /// `Vec<DriveConfig>`), so a `#[serde(default)]` optional field is accepted
+    /// — present or absent — across every schema. This test exercises both the
+    /// parsed-value and the absent-defaults-to-None paths on a legacy config.
+    #[test]
+    fn rotation_interval_parses_when_present_and_defaults_to_none() {
+        let with_field = r#"
+[general]
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp"
+
+[local_snapshots]
+roots = [{ path = "/snap", subvolumes = ["sv1"] }]
+
+[defaults]
+snapshot_interval = "1h"
+send_interval = "1d"
+[defaults.local_retention]
+hourly = 24
+[defaults.external_retention]
+daily = 30
+
+[[drives]]
+label = "offsite"
+mount_path = "/mnt/offsite"
+snapshot_root = ".snapshots"
+role = "offsite"
+rotation_interval = "3mo"
+
+[[subvolumes]]
+name = "sv1"
+short_name = "sv1"
+source = "/data/sv1"
+"#;
+        let config: Config = toml::from_str(with_field).expect("parse with field");
+        assert_eq!(
+            config.drives[0].rotation_interval,
+            Some("3mo".parse().unwrap())
+        );
+
+        // Same config without the field → None (additive-optional default).
+        let without_field = with_field.replace("rotation_interval = \"3mo\"\n", "");
+        let config: Config = toml::from_str(&without_field).expect("parse without field");
+        assert_eq!(config.drives[0].rotation_interval, None);
     }
 
     #[test]

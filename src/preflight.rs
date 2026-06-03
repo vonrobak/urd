@@ -33,6 +33,7 @@ pub fn preflight_checks(config: &Config) -> Vec<PreflightCheck> {
 
     // Global checks (not per-subvolume)
     check_send_without_drives(&resolved, config, &mut checks);
+    check_rotation_interval_on_offsite(config, &mut checks);
 
     // Per-subvolume checks
     for subvol in &resolved {
@@ -326,6 +327,29 @@ fn check_redundant_yearly(
     }
 }
 
+// ── Rotation-interval-on-non-offsite check ─────────────────────────────
+//
+// `rotation_interval` (UPI 055) declares an offsite drive's homecoming
+// cadence — meaningful only for `role = "offsite"`. On a primary or test
+// drive it has nothing to govern and is ignored downstream, so surface the
+// likely misconfiguration as an advisory. Per ADR-109, refusal is reserved
+// for structural errors; this is a warning, not a hard error. Mirrors
+// `check_redundant_yearly`'s "harmless-but-probably-unintended" stance.
+fn check_rotation_interval_on_offsite(config: &Config, checks: &mut Vec<PreflightCheck>) {
+    for drive in &config.drives {
+        if drive.rotation_interval.is_some() && drive.role != DriveRole::Offsite {
+            checks.push(PreflightCheck {
+                name: "rotation-interval-non-offsite",
+                message: format!(
+                    "drive {}: rotation_interval is only meaningful for offsite drives \
+                     (role is {:?}) — it will be ignored",
+                    drive.label, drive.role,
+                ),
+            });
+        }
+    }
+}
+
 // ── Helpers ────────────────────────────────────────────────────────────
 
 /// Format hours into a human-readable duration string.
@@ -412,6 +436,7 @@ mod tests {
             role: DriveRole::Primary,
             max_usage_percent: Some(90),
             min_free_bytes: None,
+            rotation_interval: None,
         }
     }
 
@@ -1052,6 +1077,7 @@ mod tests {
             role: DriveRole::Offsite,
             max_usage_percent: Some(90),
             min_free_bytes: None,
+            rotation_interval: None,
         }
     }
 
@@ -1107,6 +1133,36 @@ mod tests {
         let results: Vec<_> = preflight_checks(&config)
             .into_iter()
             .filter(|c| c.name == "fortified-without-offsite")
+            .collect();
+
+        assert!(results.is_empty());
+    }
+
+    // ── rotation_interval-on-non-offsite (UPI 055) ───────────────────────
+
+    #[test]
+    fn rotation_interval_on_primary_warns() {
+        // A rotation_interval on a primary drive has nothing to govern.
+        let mut primary = test_drive(); // role = Primary
+        primary.rotation_interval = Some("3mo".parse().unwrap());
+        let config = test_config(vec![test_subvolume("docs")], vec![primary]);
+        let results: Vec<_> = preflight_checks(&config)
+            .into_iter()
+            .filter(|c| c.name == "rotation-interval-non-offsite")
+            .collect();
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].message.contains("test-drive"));
+    }
+
+    #[test]
+    fn rotation_interval_on_offsite_silent() {
+        let mut offsite = offsite_drive(); // role = Offsite
+        offsite.rotation_interval = Some("3mo".parse().unwrap());
+        let config = test_config(vec![test_subvolume("docs")], vec![test_drive(), offsite]);
+        let results: Vec<_> = preflight_checks(&config)
+            .into_iter()
+            .filter(|c| c.name == "rotation-interval-non-offsite")
             .collect();
 
         assert!(results.is_empty());

@@ -47,6 +47,11 @@ snapshot_root = ".snapshots"
 role = "offsite"
 max_usage_percent = 90
 min_free_bytes = "500GB"
+# rotation_interval = "3mo"                      # How often this drive comes home
+#   (offsite only). Urd judges its freshness against this cadence, not the send
+#   interval — so a drive away on its normal rhythm reads on-schedule, not
+#   "exposed". Accepts m/h/d/w/mo/y. Omit to use the observed cadence (≥3
+#   homecomings) or a 30-day default.
 
 # ── Protection Promises ──────────────────────────────────────────────────
 #

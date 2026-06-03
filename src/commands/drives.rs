@@ -210,6 +210,7 @@ mod tests {
             role: DriveRole::Test,
             max_usage_percent: None,
             min_free_bytes: None,
+            rotation_interval: None,
         }
     }
 
@@ -368,6 +369,7 @@ mod tests {
             role: DriveRole::Test,
             max_usage_percent: None,
             min_free_bytes: None,
+            rotation_interval: None,
         };
 
         let availability = drive_availability(&drive);

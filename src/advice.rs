@@ -308,11 +308,6 @@ fn compute_offsite_freshness(drives: &[DriveAssessment]) -> PromiseStatus {
 
 // ── Redundancy advisory computation ────────────────────────────────────
 
-/// Threshold (days) beyond which an offsite drive is considered stale.
-/// Aligned with OFFSITE_AT_RISK_DAYS (enforcement). The old 7-day threshold
-/// was too aggressive for monthly offsite rotation patterns.
-const OFFSITE_STALE_ADVISORY_DAYS: i64 = 30;
-
 /// Compute redundancy advisories from config and assessment state.
 ///
 /// Pure function: config + assessments + now in, advisories out. No I/O.
@@ -372,25 +367,31 @@ pub fn compute_redundancy_advisories(
         };
 
         // ── OffsiteDriveStale ──────────────────────────────────────────
-        // Offsite drive unmounted with last send older than 30-day threshold.
+        // Offsite drive unmounted whose per-copy promise has slipped past
+        // on-schedule. Keyed on the now window-aware `status` (UPI 055, RD4),
+        // not a fixed day threshold: the advisory fires once the copy is overdue
+        // (AtRisk) or stale (Unprotected) relative to its rotation window, and
+        // stays silent for an on-schedule offsite drive. Inherits F1 for free —
+        // `status` already carries the present-peer guard from `assess()`, so a
+        // single-offsite (no peer) away copy reaches this branch via its
+        // send-interval status, and an on-schedule fortified copy does not.
         if subvol.send_enabled {
             for da in &effective_drives {
                 if da.role == DriveRole::Offsite
                     && !da.mounted
+                    && da.status != PromiseStatus::Protected
                     && let Some(age) = da.last_send_age
                 {
                     let days = age.num_days();
-                    if days > OFFSITE_STALE_ADVISORY_DAYS {
-                        advisories.push(RedundancyAdvisory {
-                            kind: RedundancyAdvisoryKind::OffsiteDriveStale,
-                            subvolume: assessment.name.clone(),
-                            drive: Some(da.drive_label.clone()),
-                            detail: format!(
-                                "offsite drive {} last sent {} days ago",
-                                da.drive_label, days,
-                            ),
-                        });
-                    }
+                    advisories.push(RedundancyAdvisory {
+                        kind: RedundancyAdvisoryKind::OffsiteDriveStale,
+                        subvolume: assessment.name.clone(),
+                        drive: Some(da.drive_label.clone()),
+                        detail: format!(
+                            "offsite drive {} last sent {} days ago",
+                            da.drive_label, days,
+                        ),
+                    });
                 }
             }
         }
@@ -800,8 +801,10 @@ drives = ["drive-a", "drive-b"]
 
     #[test]
     fn redundancy_offsite_stale_at_31_days() {
-        
-
+        // Single-offsite (no peer) away + aging: with no present peer the
+        // rotation relaxation is suppressed (F1), so the copy keeps its
+        // send-interval status (Unprotected) and the advisory still fires —
+        // an aging sole offsite copy is genuinely worth surfacing (UPI 055).
         let config = offsite_test_config();
         let now = dt(2026, 4, 1, 12, 0);
         let mut fs = MockFileSystemState::new();
@@ -823,13 +826,23 @@ drives = ["drive-a", "drive-b"]
     }
 
     #[test]
-    fn redundancy_offsite_not_stale_at_29_days() {
-        let config = offsite_test_config();
+    fn redundancy_offsite_within_window_with_peer_no_advisory() {
+        // UPI 055 (re-anchored from `redundancy_offsite_not_stale_at_29_days`).
+        // The advisory now keys on the window-aware per-copy status, not a fixed
+        // 30-day threshold. An offsite drive away *within* its rotation window
+        // with a present primary peer reads on-schedule (Protected) → silent.
+        let config = fortified_config(); // primary-drive (peer) + offsite-drive
         let now = dt(2026, 4, 1, 12, 0);
         let mut fs = MockFileSystemState::new();
         fs.local_snapshots
             .insert("sv1".to_string(), vec![snap(dt(2026, 4, 1, 11, 0), "sv1")]);
-        // Offsite drive: last sent 29 days ago, unmounted
+        // Primary peer present and fresh.
+        fs.mounted_drives.insert("primary-drive".to_string());
+        fs.send_times.insert(
+            ("sv1".to_string(), "primary-drive".to_string()),
+            dt(2026, 4, 1, 10, 0),
+        );
+        // Offsite away 29 days — within the 30-day default window.
         fs.send_times.insert(
             ("sv1".to_string(), "offsite-drive".to_string()),
             dt(2026, 3, 3, 12, 0),
@@ -839,8 +852,78 @@ drives = ["drive-a", "drive-b"]
         let advisories = compute_redundancy_advisories(&config, &assessments);
 
         assert!(
-            advisories.is_empty(),
-            "29 days should not trigger offsite stale advisory: {advisories:?}"
+            !advisories
+                .iter()
+                .any(|a| a.kind == RedundancyAdvisoryKind::OffsiteDriveStale),
+            "on-schedule offsite (peer present) must not fire OffsiteDriveStale: {advisories:?}"
+        );
+    }
+
+    #[test]
+    fn redundancy_offsite_source_unchanged_no_advisory() {
+        // UPI 055: a source_unchanged offsite copy reads Protected at any age
+        // (status short-circuit), so `status != Protected` is false → silent.
+        let config = offsite_test_config();
+        let now = dt(2026, 6, 1, 12, 0);
+        let mut fs = MockFileSystemState::new();
+        let pin_snap = snap(dt(2026, 1, 1, 0, 0), "sv1");
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![pin_snap.clone()]);
+        fs.send_times.insert(
+            ("sv1".to_string(), "offsite-drive".to_string()),
+            dt(2026, 1, 2, 0, 0), // 150 days ago
+        );
+        fs.pin_files.insert(
+            (std::path::PathBuf::from("/snap/sv1"), "offsite-drive".to_string()),
+            pin_snap.clone(),
+        );
+        let mb = MockBtrfs::new();
+        mb.generations
+            .borrow_mut()
+            .insert(std::path::PathBuf::from("/data/sv1"), 42);
+        mb.generations.borrow_mut().insert(
+            std::path::PathBuf::from(format!("/snap/sv1/{}", pin_snap.as_str())),
+            42,
+        );
+
+        let assessments = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &mb }, &crate::awareness::StorageSignalMap::new());
+        let advisories = compute_redundancy_advisories(&config, &assessments);
+
+        assert!(
+            !advisories
+                .iter()
+                .any(|a| a.kind == RedundancyAdvisoryKind::OffsiteDriveStale),
+            "source_unchanged offsite must not fire OffsiteDriveStale: {advisories:?}"
+        );
+    }
+
+    #[test]
+    fn redundancy_offsite_overdue_with_peer_fires_advisory() {
+        // UPI 055: an offsite drive *past* its window (overdue → AtRisk) fires
+        // the advisory even with a present peer.
+        let config = fortified_config();
+        let now = dt(2026, 5, 1, 12, 0);
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap(dt(2026, 5, 1, 11, 0), "sv1")]);
+        fs.mounted_drives.insert("primary-drive".to_string());
+        fs.send_times.insert(
+            ("sv1".to_string(), "primary-drive".to_string()),
+            dt(2026, 5, 1, 10, 0),
+        );
+        // Offsite away 45 days — past the 30-day default window.
+        fs.send_times.insert(
+            ("sv1".to_string(), "offsite-drive".to_string()),
+            dt(2026, 3, 17, 12, 0),
+        );
+
+        let assessments = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
+        let advisories = compute_redundancy_advisories(&config, &assessments);
+
+        assert!(
+            advisories.iter().any(|a| a.kind == RedundancyAdvisoryKind::OffsiteDriveStale
+                && a.drive.as_deref() == Some("offsite-drive")),
+            "overdue offsite must fire OffsiteDriveStale: {advisories:?}"
         );
     }
 

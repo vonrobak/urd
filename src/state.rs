@@ -970,6 +970,74 @@ impl StateDb {
         }
     }
 
+    /// Full ordered (oldest-first) mount/unmount history for a drive, from the
+    /// `events` table (`kind='drive'`). The clone of `last_drive_connection`
+    /// without the `LIMIT 1`, collecting every row — the rotation view (UPI
+    /// 055) needs the whole arrival stream, not just the latest event. Rows
+    /// whose payload is not a drive event are logged and skipped, not fatal
+    /// (ADR-102: history must never block a read).
+    ///
+    /// F9: no `LIMIT`. Bounded in practice — an offsite drive logs ~2
+    /// mount/unmount transitions per cycle and this runs only for offsite
+    /// drives — but unbounded in principle over years. Revisit with a
+    /// `LIMIT`/time-window only if a flapping drive ever bloats the row count.
+    pub fn drive_connection_history(
+        &self,
+        drive_label: &str,
+    ) -> crate::error::Result<Vec<DriveConnectionRecord>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, occurred_at, payload
+                 FROM events
+                 WHERE kind = 'drive' AND drive_label = ?1
+                 ORDER BY id ASC",
+            )
+            .map_err(|e| UrdError::State(format!("query failed: {e}")))?;
+
+        let mut rows = stmt
+            .query(rusqlite::params![drive_label])
+            .map_err(|e| UrdError::State(format!("query failed: {e}")))?;
+
+        let mut records = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .map_err(|e| UrdError::State(format!("query failed: {e}")))?
+        {
+            let id: i64 = row
+                .get(0)
+                .map_err(|e| UrdError::State(format!("read id: {e}")))?;
+            let timestamp: String = row
+                .get(1)
+                .map_err(|e| UrdError::State(format!("read occurred_at: {e}")))?;
+            let payload_json: String = row
+                .get(2)
+                .map_err(|e| UrdError::State(format!("read payload: {e}")))?;
+            let payload: EventPayload = serde_json::from_str(&payload_json)
+                .map_err(|e| UrdError::State(format!("decode drive event payload: {e}")))?;
+            let (event_type, detected_by) = match payload {
+                EventPayload::DriveMounted { detected_by } => {
+                    ("mounted".to_string(), detected_by.as_str().to_string())
+                }
+                EventPayload::DriveUnmounted { detected_by } => {
+                    ("unmounted".to_string(), detected_by.as_str().to_string())
+                }
+                other => {
+                    log::warn!("drive event row #{id} has non-drive payload, skipping: {other:?}");
+                    continue;
+                }
+            };
+            records.push(DriveConnectionRecord {
+                id,
+                drive_label: drive_label.to_string(),
+                event_type,
+                timestamp,
+                detected_by,
+            });
+        }
+        Ok(records)
+    }
+
     // ── Drift-sample methods ────────────────────────────────────────
 
     /// Persist a drift sample. Best-effort per ADR-102 (telemetry must
@@ -2643,6 +2711,28 @@ mod tests {
         .unwrap();
         let record = db.last_drive_connection("WD-18TB").unwrap().unwrap();
         assert_eq!(record.event_type, "unmounted"); // most recent wins
+    }
+
+    #[test]
+    fn drive_connection_history_returns_all_ordered_and_empty_for_unknown() {
+        // UPI 055: the rotation view needs the full arrival stream, oldest-first.
+        let db = StateDb::open_memory().unwrap();
+        db.record_drive_event("WD-18TB", DriveEventType::Mounted, DriveEventSource::Sentinel)
+            .unwrap();
+        db.record_drive_event("WD-18TB", DriveEventType::Unmounted, DriveEventSource::Sentinel)
+            .unwrap();
+        db.record_drive_event("WD-18TB", DriveEventType::Mounted, DriveEventSource::Sentinel)
+            .unwrap();
+        // A different drive's events must not bleed into the result.
+        db.record_drive_event("OTHER", DriveEventType::Mounted, DriveEventSource::Sentinel)
+            .unwrap();
+
+        let history = db.drive_connection_history("WD-18TB").unwrap();
+        let kinds: Vec<&str> = history.iter().map(|r| r.event_type.as_str()).collect();
+        assert_eq!(kinds, vec!["mounted", "unmounted", "mounted"]);
+
+        // Unknown drive → empty Vec, not an error.
+        assert!(db.drive_connection_history("never-seen").unwrap().is_empty());
     }
 
     #[test]

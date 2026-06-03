@@ -152,9 +152,28 @@ defends against **site loss** and is **intermittently present by design** — it
 absence is the *normal* operating state, not a fault. This duty distinction (ADR-116
 "Offsite rotation is expected absence") is why, under storage pressure, Urd sheds
 an *away* drive's pin before it breaks a *connected* drive's chain (see `shed`),
-and why offsite freshness will be judged against rotation cadence (UPI 055/056).
-The mechanical pressure decision keys on **presence** (here now?), not role
-directly; role governs *expectation and voice*.
+and why offsite freshness is judged against its rotation cadence (UPI 055; the
+richer forecast voice is 056). The mechanical pressure decision keys on
+**presence** (here now?), not role directly; role governs *expectation and voice*.
+
+**The two clocks and the offsite window (UPI 055, ADR-116).** Every external
+copy carries two independent ages; an offsite drive's freshness is judged on its
+cadence, not the send interval.
+
+| Term | Meaning | Source of truth |
+|------|---------|-----------------|
+| **presence-age** | Time since the drive was last physically here (the `away` duration). The health "away" nag keys on this. | `events` drive history — last `Unmount` |
+| **data-age** | Time since the last successful send to the drive (`last_send_age`). The per-copy promise keys on this. | `events`/operations — last successful send |
+| **rotation cadence** | How often an offsite drive comes home. Declared via `rotation_interval` (PRIMARY) or observed as the median completed inter-arrival gap over ≥3 homecomings. | `config` / `rotation::observed_cadence` |
+| **offsite window** | How long an offsite drive may be away before its absence escalates. Resolved per-drive: declared (`×1.25` overdue, `×2.5` stale) → observed (median `×2`, then `×2`) → 30d/60d default. | `rotation::resolve_offsite_window` |
+| `on_schedule` | Age ≤ overdue threshold — the offsite drive is away on its normal rhythm. Per-copy promise → PROTECTED. | `rotation::classify` |
+| `overdue` | Age past overdue but ≤ stale — worth attention. → AT RISK. | `rotation::classify` |
+| `stale` | Age past the stale threshold — genuinely too long. → UNPROTECTED. | `rotation::classify` |
+
+The relaxation that lets an *away* offsite copy read PROTECTED fires only when a
+real redundancy peer (a non-`test` drive) is currently mounted — an offsite drive
+is the *second* line behind a continuously-present primary (ADR-116). A subvolume
+whose only external drive is an away offsite keeps the send-interval judgment.
 
 ## Cluster: Thread
 

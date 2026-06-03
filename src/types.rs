@@ -58,10 +58,17 @@ impl FromStr for Interval {
 
     fn from_str(s: &str) -> crate::error::Result<Self> {
         let s = s.trim();
-        if s.len() < 2 {
+        // Split the numeric prefix from the unit suffix. "mo" (months) is the
+        // only multi-char unit, so strip it first; every other unit is a
+        // single trailing char. Order is load-bearing (R1): stripping "mo"
+        // before the single-char split keeps "15m" minutes, not "15" months.
+        let (num_str, unit) = if let Some(num) = s.strip_suffix("mo") {
+            (num, "mo")
+        } else if s.len() >= 2 {
+            s.split_at(s.len() - 1)
+        } else {
             return Err(UrdError::Parse(format!("invalid interval: {s:?}")));
-        }
-        let (num_str, unit) = s.split_at(s.len() - 1);
+        };
         let n: i64 = num_str
             .parse()
             .map_err(|_| UrdError::Parse(format!("invalid interval number: {num_str:?}")))?;
@@ -73,8 +80,14 @@ impl FromStr for Interval {
             "h" => Ok(Self(chrono::Duration::hours(n))),
             "d" => Ok(Self(chrono::Duration::days(n))),
             "w" => Ok(Self(chrono::Duration::weeks(n))),
+            // Calendar-ish units for long offsite cadences (UPI 055):
+            // month = 30d, year = 365d. `Display` deliberately does NOT render
+            // these (it would turn an existing "30d" into "1mo"), so "3mo"/"1y"
+            // round-trip through Serialize as "90d"/"365d" — same Duration.
+            "mo" => Ok(Self(chrono::Duration::days(30 * n))),
+            "y" => Ok(Self(chrono::Duration::days(365 * n))),
             _ => Err(UrdError::Parse(format!(
-                "unknown interval unit {unit:?} in {s:?} (expected m/h/d/w)"
+                "unknown interval unit {unit:?} in {s:?} (expected m/h/d/w/mo/y)"
             ))),
         }
     }
@@ -1212,12 +1225,42 @@ mod tests {
     }
 
     #[test]
+    fn parse_interval_months() {
+        // UPI 055: month = 30 days. Display does not render "mo", so it
+        // round-trips as the equivalent day count.
+        let i: Interval = "3mo".parse().unwrap();
+        assert_eq!(i.as_secs(), 3 * 30 * 86400);
+        assert_eq!(i.to_string(), "90d");
+    }
+
+    #[test]
+    fn parse_interval_years() {
+        // UPI 055: year = 365 days.
+        let i: Interval = "1y".parse().unwrap();
+        assert_eq!(i.as_secs(), 365 * 86400);
+        assert_eq!(i.to_string(), "365d");
+    }
+
+    #[test]
+    fn parse_interval_minutes_not_eaten_by_mo_strip() {
+        // R1: "15m" must stay minutes — the "mo" suffix-strip must not
+        // cannibalize the single "m" unit.
+        let i: Interval = "15m".parse().unwrap();
+        assert_eq!(i.as_secs(), 15 * 60);
+    }
+
+    #[test]
     fn parse_interval_invalid() {
         assert!("0h".parse::<Interval>().is_err());
         assert!("-1h".parse::<Interval>().is_err());
         assert!("5x".parse::<Interval>().is_err());
         assert!("h".parse::<Interval>().is_err());
         assert!("".parse::<Interval>().is_err());
+        // UPI 055 unit edge cases: bare/zero/negative months.
+        assert!("mo".parse::<Interval>().is_err());
+        assert!("0mo".parse::<Interval>().is_err());
+        assert!("-1mo".parse::<Interval>().is_err());
+        assert!("0y".parse::<Interval>().is_err());
     }
 
     // ── SendKind tests ──────────────────────────────────────────────

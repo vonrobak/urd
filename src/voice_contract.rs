@@ -432,6 +432,62 @@ mod contract {
         );
     }
 
+    // ── UPI 055 — Offsite rotation: no false gravity within window ──────
+    //
+    // G6: once `assess()` returns Protected for an on-schedule offsite copy
+    // (away within its rotation window, present peer), the drive row renders
+    // the dimmed PROTECTED form — the "protection aging" / "consider
+    // connecting" gravity and the degraded "away" wall disappear *purely from
+    // the status flip*, with no `voice/` code change. This pins that contract.
+
+    #[test]
+    fn rule1_offsite_on_schedule_within_window_no_false_gravity() {
+        let _color = color_guard(true);
+        let mut data = all_sealed_status();
+        // Simulate the post-055 assess() output: every subvolume has an
+        // on-schedule offsite copy on the (unmounted) Offsite-4TB — away 18
+        // days, within window, per-copy status PROTECTED.
+        for a in &mut data.assessments {
+            a.external.push(crate::output::StatusDriveAssessment {
+                drive_label: "Offsite-4TB".to_string(),
+                status: PromiseStatus::Protected,
+                mounted: false,
+                snapshot_count: None,
+                last_send_age_secs: Some(18 * 86400),
+                role: crate::types::DriveRole::Offsite,
+                absent_duration_secs: Some(18 * 86400),
+                last_activity_age_secs: None,
+            });
+        }
+
+        let output = render_status(&data, OutputMode::Interactive);
+        let stripped = helpers::strip_ansi(&output);
+
+        // The Offsite-4TB drive row renders the dimmed away form — no gravity.
+        let offsite_line = stripped
+            .lines()
+            .find(|l| l.starts_with("Drives:") && l.contains("Offsite-4TB"))
+            .unwrap_or_else(|| panic!("no Offsite-4TB drive line in:\n{stripped}"));
+        assert!(
+            offsite_line.contains("away"),
+            "expected the dimmed 'away …' form for the on-schedule offsite: {offsite_line}"
+        );
+        assert!(
+            !offsite_line.contains("protection aging"),
+            "on-schedule offsite must not render 'protection aging': {offsite_line}"
+        );
+        assert!(
+            !offsite_line.contains("consider connecting"),
+            "on-schedule offsite must not render 'consider connecting': {offsite_line}"
+        );
+        // No earned red anywhere — the 7-row degraded wall is gone.
+        assert_eq!(
+            helpers::count_red(&output),
+            0,
+            "on-schedule fortified status must have zero red SGR escapes; got:\n{output}"
+        );
+    }
+
     // ── Rule 2 — No contradictions (no red on a sealed row) ────────────
 
     /// Split a rendered status-table row into its non-empty cells. ANSI

@@ -24,6 +24,7 @@ mod preflight;
 mod recommendation;
 mod reserve;
 mod retention;
+mod rotation;
 mod sentinel;
 mod sentinel_runner;
 mod state;
