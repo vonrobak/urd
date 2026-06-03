@@ -171,6 +171,7 @@ the documentation convention in `contributing-internal.md`).
 | `metrics.rs` | Write Prometheus `.prom` files | Read metrics |
 | `notify.rs` | Compute and dispatch notifications (consumes awareness) | Decide promise states |
 | `drift.rs` | Pure: rolling time-windowed churn aggregation from `drift_samples` | Perform I/O or persist |
+| `rotation.rs` | Pure: infer offsite rotation cadence (median homecoming gap) and resolve the offsite freshness window from drive-mount history | Perform I/O or persist |
 | `drives.rs` | Detect mounted drives, UUID fingerprinting, check space | Mount/unmount drives |
 | `pools.rs` | Detect BTRFS pools, group subvolumes by pool UUID, read sysfs/statvfs utilization | Know about retention, plans, drive lifecycle, or notification policy |
 | `output.rs` | Define structured output types | Render text (`voice/` does that) |
