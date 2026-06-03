@@ -57,7 +57,7 @@ live in `docs/00-foundation/architecture.md`.
 - `awareness.rs` — promise state ("is my data safe?"); `advice.rs` — what to do about it
 - `recommendation.rs` — headroom-aware retention-shape advice (ADR-115)
 - `storage_critical.rs` — storage-state tiers for the Do-No-Harm arc (ADR-113)
-- `drift.rs` — churn aggregation; `preflight.rs` — achievability advisories
+- `drift.rs` — churn aggregation; `rotation.rs` — offsite rotation cadence + freshness window; `preflight.rs` — achievability advisories
 - `chain.rs` — pin files; `state.rs` — SQLite history (granular wrappers)
 - `drives.rs` / `pools.rs` — drive + BTRFS-pool detection
 - `output.rs` / `voice/` — structured output types / mythic-voice rendering
