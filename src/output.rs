@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::advice::{ActionableAdvice, RedundancyAdvisory, RedundancyAdvisoryKind};
 use crate::awareness::{DriveAssessment, PromiseStatus, SubvolAssessment};
+use crate::rotation::WindowSource;
 use crate::storage_critical::{StoragePosture, TightnessTier};
 use crate::types::{ByteSize, DriveRole};
 
@@ -257,6 +258,44 @@ pub struct StatusDriveAssessment {
     /// exist for this drive at all (ops-log fallback).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_activity_age_secs: Option<i64>,
+    /// Rotation context for an offsite drive (UPI 056): cadence, last
+    /// homecoming, and the pre-computed homecoming forecast. Additive,
+    /// offsite-only — omitted entirely for non-offsite drives (`None`) and
+    /// from JSON when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rotation: Option<DriveRotation>,
+}
+
+/// Serializable mirror of `awareness::DriveRotation` — the offsite rotation
+/// forecast block. Additive `--json` evolution (no `schema_version` bump):
+/// `--json` is documented as not-a-stable-contract (cli.md). Deliberately no
+/// `tier` (gravity is the sibling `status` field; S1).
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct DriveRotation {
+    /// Per-drive cadence in seconds — declared interval or observed median gap.
+    /// Absent for the Default window (no rhythm).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cadence_secs: Option<i64>,
+    /// The drive's last homecoming timestamp, if it has ever been seen home.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_home: Option<chrono::NaiveDateTime>,
+    /// Seconds until the next expected homecoming (`last_home + cadence − now`);
+    /// negative when past due. Absent when cadence or last_home is missing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub forecast_secs: Option<i64>,
+    /// Window provenance: `declared` / `observed` / `default`.
+    pub source: WindowSource,
+}
+
+impl DriveRotation {
+    fn from_engine(r: &crate::awareness::DriveRotation) -> Self {
+        Self {
+            cadence_secs: r.cadence.map(|c| c.num_seconds()),
+            last_home: r.last_home,
+            forecast_secs: r.forecast_secs,
+            source: r.source,
+        }
+    }
 }
 
 impl StatusDriveAssessment {
@@ -271,6 +310,7 @@ impl StatusDriveAssessment {
             role: a.role,
             absent_duration_secs: a.absent_duration_secs,
             last_activity_age_secs: a.last_activity_age_secs,
+            rotation: a.rotation.as_ref().map(DriveRotation::from_engine),
         }
     }
 }
@@ -1695,6 +1735,83 @@ mod tests {
         let sa = StatusAssessment::from_assessment(&assessment);
         assert_eq!(sa.redundancy_advisories.len(), 1);
         assert_eq!(sa.redundancy_advisories[0], advisory);
+    }
+
+    // ── UPI 056: additive rotation JSON block ──────────────────────────
+
+    /// A `DriveAssessment` carrying a rotation forecast, for the additive-JSON
+    /// projection tests. Offsite, away, declared/observed cadence present.
+    fn rotation_drive_assessment(
+        rotation: Option<crate::awareness::DriveRotation>,
+    ) -> DriveAssessment {
+        use crate::types::Interval;
+        DriveAssessment {
+            drive_label: "Offsite-4TB".to_string(),
+            status: PromiseStatus::Protected,
+            mounted: false,
+            snapshot_count: Some(3),
+            last_send_age: Some(chrono::Duration::days(18)),
+            source_unchanged: false,
+            configured_interval: Interval::hours(1),
+            role: DriveRole::Offsite,
+            absent_duration_secs: Some(18 * 86400),
+            last_activity_age_secs: None,
+            rotation,
+        }
+    }
+
+    #[test]
+    fn rotation_block_serializes_additively_when_present() {
+        let last_home = chrono::NaiveDate::from_ymd_opt(2026, 5, 14)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap();
+        let da = rotation_drive_assessment(Some(crate::awareness::DriveRotation {
+            cadence: Some(chrono::Duration::days(15)),
+            last_home: Some(last_home),
+            source: crate::rotation::WindowSource::Observed,
+            forecast_secs: Some(-3 * 86400), // past due
+        }));
+        let sa = StatusDriveAssessment::from_assessment(&da);
+        let value = serde_json::to_value(&sa).unwrap();
+
+        let rot = value.get("rotation").expect("rotation block present when Some");
+        assert_eq!(rot.get("cadence_secs"), Some(&serde_json::Value::from(15 * 86400)));
+        assert_eq!(rot.get("forecast_secs"), Some(&serde_json::Value::from(-3 * 86400)));
+        assert_eq!(rot.get("source"), Some(&serde_json::Value::from("observed")));
+        assert!(rot.get("last_home").is_some(), "last_home serialized: {rot}");
+        // S1: gravity is the sibling `status` field — the rotation block carries
+        // no `tier`. This pins the dropped-tier design at the JSON boundary.
+        assert!(rot.get("tier").is_none(), "rotation block must not carry a tier: {rot}");
+    }
+
+    #[test]
+    fn rotation_block_absent_from_json_when_none() {
+        let da = rotation_drive_assessment(None);
+        let sa = StatusDriveAssessment::from_assessment(&da);
+        let value = serde_json::to_value(&sa).unwrap();
+        assert!(
+            value.get("rotation").is_none(),
+            "rotation key must be omitted when None (additive): {value}"
+        );
+    }
+
+    #[test]
+    fn rotation_block_omits_cadence_for_default_window() {
+        // Default window (no declared, <3 observed gaps): cadence/forecast
+        // absent, but `source` still serializes — Spindle can tell "no rhythm".
+        let da = rotation_drive_assessment(Some(crate::awareness::DriveRotation {
+            cadence: None,
+            last_home: None,
+            source: crate::rotation::WindowSource::Default,
+            forecast_secs: None,
+        }));
+        let sa = StatusDriveAssessment::from_assessment(&da);
+        let value = serde_json::to_value(&sa).unwrap();
+        let rot = value.get("rotation").expect("rotation block present");
+        assert!(rot.get("cadence_secs").is_none(), "no cadence on Default: {rot}");
+        assert!(rot.get("forecast_secs").is_none(), "no forecast on Default: {rot}");
+        assert_eq!(rot.get("source"), Some(&serde_json::Value::from("default")));
     }
 
     #[test]

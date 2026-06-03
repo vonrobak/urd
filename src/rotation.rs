@@ -64,8 +64,11 @@ pub struct RotationObservation {
 }
 
 /// Where an `OffsiteWindow` came from. Carried for UPI 056 provenance
-/// (forecast/voice); resolved but not yet read by 055's behavior.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// (forecast/voice). Serializes `snake_case` ("declared"/"observed"/"default")
+/// onto the additive `rotation` JSON block so Spindle can distinguish a
+/// declared rhythm from an observed one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum WindowSource {
     Declared,
     Observed,
@@ -97,9 +100,13 @@ impl OffsiteWindow {
     }
 }
 
-/// A copy's freshness tier relative to its offsite window. 055 ships three
-/// variants; UPI 056 adds `Due` by splitting `OnSchedule` (a compiler-checked
-/// enum extension — every match site is then forced to handle it).
+/// A copy's freshness tier relative to its offsite window — three variants,
+/// shared by 055 and 056. UPI 056's "due" register (an offsite away on schedule
+/// but past its cadence midpoint) is a **voice-only projection**, computed in
+/// `voice/` from the carried `cadence` + data-age — it does *not* split
+/// `OnSchedule` here. Gravity has one source, the per-copy `PromiseStatus`
+/// (RD9, S1); the tier stays 3-valued so the engine never grows a second
+/// freshness representation that could diverge from `status`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RotationTier {
     OnSchedule,
@@ -181,6 +188,21 @@ fn median_duration(sorted_gaps: &[Duration]) -> Duration {
         let b = sorted_gaps[n / 2];
         (a + b) / 2
     }
+}
+
+/// The drive's last homecoming — its most recent `Mount` event — regardless of
+/// how many completed cadence cycles exist. Unlike `observed_cadence` (which
+/// stays silent below `MIN_CYCLES_FOR_CADENCE` gaps), this needs only a single
+/// Mount, so a declared-window drive with one homecoming still gets a forecast
+/// (UPI 056, M4). `max` over the timestamps is clock-skew-safe — insertion
+/// order can't pick a stale arrival.
+#[must_use]
+pub fn last_homecoming(events: &[DriveEvent]) -> Option<NaiveDateTime> {
+    events
+        .iter()
+        .filter(|e| e.kind == DriveEventKind::Mount)
+        .map(|e| e.at)
+        .max()
 }
 
 /// Resolve the offsite window from the two cadence sources in priority order:
@@ -403,6 +425,39 @@ mod tests {
         let obs = observed_cadence(&events, now()).expect("3 positive gaps");
         assert_eq!(obs.gaps_observed, 3);
         assert_eq!(obs.median_gap, Duration::days(15));
+    }
+
+    // ── last_homecoming ────────────────────────────────────────────────
+
+    #[test]
+    fn last_homecoming_none_without_mounts() {
+        assert_eq!(last_homecoming(&[]), None);
+        let only_unmounts = [unmount(dt(2026, 3, 1)), unmount(dt(2026, 3, 10))];
+        assert_eq!(last_homecoming(&only_unmounts), None);
+    }
+
+    #[test]
+    fn last_homecoming_single_mount_below_cadence_floor() {
+        // One Mount is below MIN_CYCLES_FOR_CADENCE (so observed_cadence is
+        // None), but last_homecoming still reports it — the forecast must not
+        // wait for three cycles (M4).
+        let events = [mount(dt(2026, 5, 14))];
+        assert_eq!(observed_cadence(&events, now()), None);
+        assert_eq!(last_homecoming(&events), Some(dt(2026, 5, 14)));
+    }
+
+    #[test]
+    fn last_homecoming_picks_latest_ignoring_unmounts_and_order() {
+        // Mounts delivered out of order, interleaved with unmounts. The latest
+        // Mount wins regardless of insertion order (clock-skew safety).
+        let events = [
+            unmount(dt(2026, 4, 30)),
+            mount(dt(2026, 4, 1)),
+            mount(dt(2026, 5, 14)),
+            mount(dt(2026, 4, 21)),
+            unmount(dt(2026, 6, 1)),
+        ];
+        assert_eq!(last_homecoming(&events), Some(dt(2026, 5, 14)));
     }
 
     // ── resolve_offsite_window ─────────────────────────────────────────

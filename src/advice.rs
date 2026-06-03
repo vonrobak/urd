@@ -381,15 +381,31 @@ pub fn compute_redundancy_advisories(
                     && da.status != PromiseStatus::Protected
                     && let Some(age) = da.last_send_age
                 {
-                    let days = age.num_days();
+                    // Cadence-relative detail (UPI 056, RD10): instead of a bare
+                    // "last sent N days ago", express how far past the drive's
+                    // own rotation cycle the copy has drifted. `tier` reads the
+                    // window-aware `status` (engine terms `overdue`/`stale`, not
+                    // mythic — voice words stay in voice/); the "~Md cycle" reads
+                    // the carried cadence, omitted when there is no rhythm
+                    // (Default window). One advisory kind covers both bands.
+                    let tier = if da.status == PromiseStatus::Unprotected {
+                        "stale"
+                    } else {
+                        "overdue"
+                    };
+                    let cadence_days = da.rotation.and_then(|r| r.cadence).map(|c| c.num_days());
+                    let detail = match cadence_days {
+                        Some(cycle) if cycle > 0 => {
+                            let past = (age.num_days() - cycle).max(0);
+                            format!("{tier} \u{2014} {past} days past its usual ~{cycle}d cycle")
+                        }
+                        _ => format!("{tier} \u{2014} last refreshed {} days ago", age.num_days()),
+                    };
                     advisories.push(RedundancyAdvisory {
                         kind: RedundancyAdvisoryKind::OffsiteDriveStale,
                         subvolume: assessment.name.clone(),
                         drive: Some(da.drive_label.clone()),
-                        detail: format!(
-                            "offsite drive {} last sent {} days ago",
-                            da.drive_label, days,
-                        ),
+                        detail,
                     });
                 }
             }
@@ -551,6 +567,7 @@ drives = ["primary-drive", "offsite-drive"]
             role: DriveRole::Offsite,
             absent_duration_secs: None,
             last_activity_age_secs: None,
+            rotation: None,
         }
     }
 
@@ -566,6 +583,7 @@ drives = ["primary-drive", "offsite-drive"]
             role: DriveRole::Primary,
             absent_duration_secs: None,
             last_activity_age_secs: None,
+            rotation: None,
         }
     }
 
@@ -712,6 +730,7 @@ drives = ["primary-drive", "offsite-drive"]
             role: DriveRole::Offsite,
             absent_duration_secs: None,
             last_activity_age_secs: None,
+            rotation: None,
         };
         let fresh_offsite = offsite_drive_assessment(PromiseStatus::Protected, true);
         let drives = vec![primary_drive_assessment(), stale_offsite, fresh_offsite];
@@ -1398,6 +1417,7 @@ local_retention = "transient"
             role: DriveRole::Primary,
             absent_duration_secs: None,
             last_activity_age_secs: None,
+            rotation: None,
         }
     }
 

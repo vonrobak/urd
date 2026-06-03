@@ -19,7 +19,7 @@ use crate::types::{ByteSize, DriveRole};
 
 use super::{
     SuggestionContext, aggregate_drive_info, append_suggestion, color_result, exposure_label,
-    format_status_table, humanize_duration, pluralize, unmounted_drive_label,
+    format_status_table, humanize_duration, offsite_drive_label, pluralize, unmounted_drive_label,
 };
 
 // ── Status ──────────────────────────────────────────────────────────────
@@ -449,14 +449,15 @@ pub(super) fn render_redundancy_advisories(data: &StatusOutput, out: &mut String
                 "Consider designating a drive as offsite to protect against site loss.".to_string(),
             ),
             RedundancyAdvisoryKind::OffsiteDriveStale => (
+                // The cadence-relative predicate comes from the engine `detail`
+                // (UPI 056, RD10) — e.g. "overdue — 11 days past its usual ~45d
+                // cycle"; voice supplies only the framing.
                 format!(
-                    "The offsite copy on {} has aged.",
-                    advisory
-                        .drive
-                        .as_deref()
-                        .unwrap_or("unknown"),
+                    "The offsite copy on {} is {}.",
+                    advisory.drive.as_deref().unwrap_or("unknown"),
+                    advisory.detail,
                 ),
-                "Cycle the offsite drive to refresh your off-site copy.".to_string(),
+                "Cycle the offsite drive on your next trip to refresh the copy.".to_string(),
             ),
             RedundancyAdvisoryKind::SinglePointOfFailure => (
                 format!(
@@ -507,12 +508,25 @@ pub(super) fn render_drive_summary(data: &StatusOutput, out: &mut String) {
             .ok();
         } else {
             let agg = aggregate_drive_info(&data.assessments, &drive.label);
-            let line = unmounted_drive_label(
-                &drive.label,
-                agg.absent_duration_secs,
-                agg.last_activity_age_secs,
-                agg.worst_status,
-            );
+            // Offsite drives carry rotation context → the seasonal ladder
+            // (hibernating / due / absent); everything else falls through to the
+            // shared away/last-backup cascade (UPI 056, S1: gravity from status).
+            let line = match agg.rotation.as_ref() {
+                Some(rotation) => offsite_drive_label(
+                    &drive.label,
+                    agg.worst_status,
+                    rotation,
+                    agg.data_age_secs,
+                    agg.absent_duration_secs,
+                    agg.last_activity_age_secs,
+                ),
+                None => unmounted_drive_label(
+                    &drive.label,
+                    agg.absent_duration_secs,
+                    agg.last_activity_age_secs,
+                    agg.worst_status,
+                ),
+            };
             writeln!(out, "Drives: {line}").ok();
         }
     }

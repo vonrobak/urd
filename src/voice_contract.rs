@@ -457,6 +457,7 @@ mod contract {
                 role: crate::types::DriveRole::Offsite,
                 absent_duration_secs: Some(18 * 86400),
                 last_activity_age_secs: None,
+                rotation: None,
             });
         }
 
@@ -485,6 +486,197 @@ mod contract {
             helpers::count_red(&output),
             0,
             "on-schedule fortified status must have zero red SGR escapes; got:\n{output}"
+        );
+    }
+
+    // ── UPI 056 — Rotation voice (forecast / hibernating-due / weave) ───
+    //
+    // Gravity is the per-copy `worst_status` band (S1); rotation context only
+    // enriches wording within it. These tests pin that contract: the dropped
+    // engine `tier` can never redden a PROTECTED row, the hibernating/due split
+    // and forecast obey their boundaries (M5/M3), and only the genuinely
+    // degraded bands earn `absent` + the weave words.
+
+    /// Push an unmounted Offsite-4TB copy carrying rotation context onto every
+    /// subvolume of an all-sealed status. `worst_status` for the drive row then
+    /// comes solely from `status`; the rotation block only colours the wording.
+    fn status_with_offsite_rotation(
+        status: PromiseStatus,
+        data_age_secs: i64,
+        rotation: Option<crate::output::DriveRotation>,
+    ) -> crate::output::StatusOutput {
+        let mut data = all_sealed_status();
+        for a in &mut data.assessments {
+            a.external.push(crate::output::StatusDriveAssessment {
+                drive_label: "Offsite-4TB".to_string(),
+                status,
+                mounted: false,
+                snapshot_count: None,
+                last_send_age_secs: Some(data_age_secs),
+                role: crate::types::DriveRole::Offsite,
+                absent_duration_secs: Some(data_age_secs),
+                last_activity_age_secs: None,
+                rotation,
+            });
+        }
+        data
+    }
+
+    fn offsite_line(output: &str) -> String {
+        helpers::strip_ansi(output)
+            .lines()
+            .find(|l| l.starts_with("Drives:") && l.contains("Offsite-4TB"))
+            .map(str::to_string)
+            .unwrap_or_else(|| panic!("no Offsite-4TB drive line in:\n{output}"))
+    }
+
+    fn observed_rotation(
+        cadence_secs: Option<i64>,
+        forecast_secs: Option<i64>,
+    ) -> crate::output::DriveRotation {
+        crate::output::DriveRotation {
+            cadence_secs,
+            last_home: None,
+            forecast_secs,
+            source: crate::rotation::WindowSource::Observed,
+        }
+    }
+
+    /// S1 — the headline guard. A `source_unchanged` away offsite stays
+    /// PROTECTED at *any* data-age; the drive row must read that band (dim
+    /// "due home"), never a raw `classify` on the huge age (which would say
+    /// stale → red "worn thin"). This is the regression the dropped-tier
+    /// design prevents.
+    #[test]
+    fn rule1_source_unchanged_offsite_huge_age_stays_dim() {
+        let _color = color_guard(true);
+        let rotation = observed_rotation(Some(15 * 86400), None); // past due → no forecast
+        let data = status_with_offsite_rotation(
+            PromiseStatus::Protected,
+            200 * 86400, // 200d data-age, yet still PROTECTED (source_unchanged)
+            Some(rotation),
+        );
+        let output = render_status(&data, OutputMode::Interactive);
+        let line = offsite_line(&output);
+        assert!(line.contains("due home"), "past-cadence PROTECTED → due home: {line}");
+        assert!(
+            !line.contains("fraying") && !line.contains("worn thin"),
+            "PROTECTED band must not surface weave-degradation words: {line}"
+        );
+        assert!(
+            !line.contains("absent"),
+            "'absent' is reserved for degraded bands; PROTECTED is 'away'/'due': {line}"
+        );
+        assert_eq!(
+            helpers::count_red(&output),
+            0,
+            "source_unchanged PROTECTED offsite must render zero red: {output}"
+        );
+    }
+
+    /// M5 — the hibernating/due boundary is inclusive of hibernating, plus the
+    /// forecast renders only while the homecoming is still ahead.
+    #[test]
+    fn rule1_hibernating_due_boundary_no_color() {
+        let _color = color_guard(true);
+        let cadence = 15 * 86400;
+        // a == cadence → still hibernating; forecast (ahead) renders.
+        let data = status_with_offsite_rotation(
+            PromiseStatus::Protected,
+            cadence,
+            Some(observed_rotation(Some(cadence), Some(5 * 86400))),
+        );
+        let out = render_status(&data, OutputMode::Interactive);
+        let line = offsite_line(&out);
+        assert!(line.contains("hibernating"), "a == cadence → hibernating: {line}");
+        assert!(line.contains("due home in ~5d"), "forecast shows when ahead: {line}");
+        assert_eq!(helpers::count_red(&out), 0, "hibernating is colourless: {out}");
+
+        // a == cadence + 1s → due, not hibernating.
+        let data2 = status_with_offsite_rotation(
+            PromiseStatus::Protected,
+            cadence + 1,
+            Some(observed_rotation(Some(cadence), None)),
+        );
+        let out2 = render_status(&data2, OutputMode::Interactive);
+        let line2 = offsite_line(&out2);
+        assert!(line2.contains("due home"), "a == cadence+1s → due: {line2}");
+        assert!(!line2.contains("hibernating"), "past midpoint is not hibernating: {line2}");
+        assert_eq!(helpers::count_red(&out2), 0, "due is colourless: {out2}");
+    }
+
+    /// M3 — a past-due forecast (`forecast_secs ≤ 0`) is suppressed: no
+    /// "due home in ~-3d" falsehood; the seasonal word carries it.
+    #[test]
+    fn rule1_forecast_suppressed_when_past_due() {
+        let _color = color_guard(true);
+        let data = status_with_offsite_rotation(
+            PromiseStatus::Protected,
+            10 * 86400, // a ≤ cadence → hibernating
+            Some(observed_rotation(Some(15 * 86400), Some(-3 * 86400))),
+        );
+        let out = render_status(&data, OutputMode::Interactive);
+        let line = offsite_line(&out);
+        assert!(line.contains("hibernating"), "still on schedule: {line}");
+        assert!(
+            !line.contains("due home in"),
+            "past-due forecast must be suppressed (no 'due home in ~-3d'): {line}"
+        );
+    }
+
+    /// Default window (no cadence) → no seasonal split; the plain dim "away"
+    /// form, "no rhythm to speak of".
+    #[test]
+    fn rule1_default_window_falls_back_to_away() {
+        let _color = color_guard(true);
+        let data = status_with_offsite_rotation(
+            PromiseStatus::Protected,
+            5 * 86400,
+            Some(observed_rotation(None, None)),
+        );
+        let out = render_status(&data, OutputMode::Interactive);
+        let line = offsite_line(&out);
+        assert!(line.contains("away"), "Default window → plain dim away: {line}");
+        assert!(
+            !line.contains("hibernating") && !line.contains("due home"),
+            "no rhythm → no seasonal split: {line}"
+        );
+        assert_eq!(helpers::count_red(&out), 0, "calm away form is colourless: {out}");
+    }
+
+    /// The degraded bands earn `absent` + the weave words, and gravity escalates
+    /// amber (AT RISK) → red (UNPROTECTED). Also guards the sole-offsite-no-peer
+    /// case: an AtRisk offsite (its honest send-interval status) is NOT falsely
+    /// dimmed to hibernating just because it carries cadence context.
+    #[test]
+    fn offsite_degraded_bands_earn_absent_and_weave_words() {
+        let _color = color_guard(true);
+        let rotation = observed_rotation(Some(15 * 86400), None);
+
+        let at_risk =
+            status_with_offsite_rotation(PromiseStatus::AtRisk, 40 * 86400, Some(rotation));
+        let out = render_status(&at_risk, OutputMode::Interactive);
+        let line = offsite_line(&out);
+        assert!(
+            line.contains("absent") && line.contains("fraying"),
+            "AtRisk offsite → absent + fraying: {line}"
+        );
+        assert!(
+            !line.contains("hibernating"),
+            "an AtRisk offsite must not be falsely dimmed to hibernating: {line}"
+        );
+
+        let unprot =
+            status_with_offsite_rotation(PromiseStatus::Unprotected, 80 * 86400, Some(rotation));
+        let out2 = render_status(&unprot, OutputMode::Interactive);
+        let line2 = offsite_line(&out2);
+        assert!(
+            line2.contains("absent") && line2.contains("worn thin"),
+            "Unprotected offsite → absent + worn thin: {line2}"
+        );
+        assert!(
+            helpers::count_red(&out2) >= 1,
+            "Unprotected offsite drive row reddens (E2 composition): {out2}"
         );
     }
 
