@@ -24,6 +24,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   *values* shift (the intended flattened sawtooth) — verify against the homelab's ADR-021 if any
   alert is calibrated to the old offsite-away-degrades behavior.
 
+### Changed
+- **Fortified offsite-freshness overlay is now rotation-window-aware, capped at AT RISK** (UPI
+  056, cites ADR-116). The last surface still measuring offsite freshness on a fixed 30/90-day
+  clock now reduces over the per-copy, window-aware promise that `assess()` already computes
+  (UPI 055) — the freshest offsite copy wins. This changes the *timing* of a Fortified
+  subvolume's `promise_status` (same `PROTECTED`/`AT RISK`/`UNPROTECTED` field — no schema
+  change): a long declared rotation window relaxes AT RISK → PROTECTED earlier, a short window
+  degrades earlier. A stale offsite copy now caps the promise at **AT RISK, never UNPROTECTED** —
+  the present local/primary copy keeps the data recoverable, so the old
+  `>90d → UNPROTECTED-from-offsite` degrade is removed (genuine "no current copy" still reaches
+  UNPROTECTED independently). A Fortified subvolume with *no* offsite drive at all now reads AT
+  RISK (site-loss-exposed) rather than UNPROTECTED, with the `NoOffsiteProtection` advisory still
+  firing. No `schema_version` bump (additive `--json` evolution, ADR-114 precedent). Verify
+  against the homelab's ADR-021 if any alert keys on the old offsite-degrade timing.
+
 ## [0.23.0] - 2026-06-02
 
 ### Added
