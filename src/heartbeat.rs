@@ -406,6 +406,7 @@ mod tests {
                     role: DriveRole::Primary,
                     absent_duration_secs: None,
                     last_activity_age_secs: None,
+                    rotation: None,
                 }],
                 chain_health: vec![],
                 advisories: vec![],

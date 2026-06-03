@@ -3686,6 +3686,7 @@ source = "/data/beta"
             role: DriveRole::Primary,
             absent_duration_secs: None,
             last_activity_age_secs: None,
+            rotation: None,
         }
     }
 

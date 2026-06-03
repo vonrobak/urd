@@ -8,6 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Rotation voice: forecast, "hibernating," and the offsite drive-row ladder** (UPI 056 PR2,
+  cites ADR-116). `urd status` now *speaks the rhythm* instead of reporting bald absence. An
+  offsite drive away on schedule reads **hibernating** with a *due home in ~Nd* forecast (shown
+  only while the homecoming is still ahead); past the cadence midpoint but still protected it
+  reads **due home — cycle it on your next trip** — both calm and uncoloured. Only a genuinely
+  overdue/stale copy crosses to **absent**, its offsite thread **fraying** (amber) → **worn
+  thin** (red). Gravity comes solely from the per-copy promise status — the rotation words only
+  enrich the wording within each band, so a `source_unchanged` away offsite never reddens
+  regardless of its data-age. The `OffsiteDriveStale` advisory is now **cadence-relative** ("…
+  overdue — 11 days past its usual ~45d cycle"). After a clean offsite send, `urd backup` adds a
+  *safe to take {drive} back offsite* cue. The `--json` status surface gains an additive,
+  offsite-only `rotation` block (`cadence_secs`, `last_home`, `forecast_secs`, `source`) for
+  Spindle — no `schema_version` bump (additive `--json` evolution, ADR-114 precedent), no
+  metric/heartbeat change.
 - **Role-aware offsite freshness model + rotation view** (UPI 055, ADR-116). Urd's strongest
   tier (multi-drive + offsite) no longer reads chronically degraded while an offsite drive is
   away on its normal rotation rhythm. An offsite drive's absence is now judged against its

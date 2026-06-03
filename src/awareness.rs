@@ -361,6 +361,45 @@ pub struct LocalAssessment {
     pub configured_interval: Interval,
 }
 
+/// Per-offsite-drive rotation context, carried alongside the per-copy
+/// `status` for UPI 056's forecast voice. **Forecast/cadence context only —
+/// deliberately no `tier`.** Gravity has exactly one source, the per-copy
+/// `PromiseStatus`; the rotation voice only enriches wording *within* each
+/// gravity band (RD6, S1). Carrying an engine `RotationTier` here would
+/// reintroduce a second freshness representation that could disagree with
+/// `status` (e.g. render red on a `source_unchanged` away offsite whose
+/// effective status is Protected) — the plan's worst defect, closed
+/// structurally by not carrying it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DriveRotation {
+    /// Per-drive cadence: the declared `rotation_interval` (PRIMARY) or the
+    /// observed `median_gap` (fallback). `None` for the Default window — there
+    /// is no rhythm to forecast against.
+    pub cadence: Option<Duration>,
+    /// The drive's last homecoming (`rotation::last_homecoming`). `None` if it
+    /// has never been seen home.
+    pub last_home: Option<NaiveDateTime>,
+    /// Window provenance, kept for Spindle's JSON ("declared vs observed
+    /// rhythm"). The MVP voice branches only on `cadence.is_some()`.
+    pub source: crate::rotation::WindowSource,
+    /// Pre-computed seconds until the next expected homecoming
+    /// (`last_home + cadence − now`); `None` when either input is missing.
+    /// Pre-computed here because `voice/` has no `now` (same pattern as
+    /// `output::StatusOutput::last_run_age_secs`). Negative = past due.
+    pub forecast_secs: Option<i64>,
+}
+
+/// Per-offsite-drive precompute, built once at the top of `assess()`: the
+/// freshness `window` (consumed by the per-copy relaxation and the away-nag in
+/// `compute_health`) bundled with the `rotation` carrier (cadence/last_home/
+/// forecast) that 056's voice surfaces. Both derive from the same single
+/// `drive_mount_history` read, so they share one map.
+#[derive(Debug, Clone, Copy)]
+struct OffsiteContext {
+    window: crate::rotation::OffsiteWindow,
+    rotation: DriveRotation,
+}
+
 /// External drive send freshness assessment.
 #[derive(Debug)]
 pub struct DriveAssessment {
@@ -391,6 +430,12 @@ pub struct DriveAssessment {
     /// `absent_duration_secs`.
     #[allow(dead_code)] // consumed via StatusDriveAssessment by voice.rs
     pub last_activity_age_secs: Option<i64>,
+    /// Rotation context for an offsite drive (UPI 056): cadence, last
+    /// homecoming, and the pre-computed homecoming forecast. `None` for
+    /// non-offsite drives — only offsite drives have a rotation rhythm. The
+    /// voice reads this to enrich the drive-row wording *within* the gravity
+    /// band set by `status`; it never sets gravity itself (S1).
+    pub rotation: Option<DriveRotation>,
 }
 
 // ── Core function ──────────────────────────────────────────────────────
@@ -476,20 +521,43 @@ pub fn assess(
         })
         .collect();
 
-    // Per-offsite-drive freshness window (UPI 055, ADR-116), computed once.
-    // An offsite drive's absence is expected — judged against its rotation
-    // cadence (declared `rotation_interval` PRIMARY, observed cadence fallback,
-    // 30d default), not the send interval. This is the only new `obs.history`
-    // call in `assess()`; the function stays pure (ADR-108).
-    let offsite_windows: std::collections::HashMap<String, crate::rotation::OffsiteWindow> = config
+    // Per-offsite-drive freshness window + rotation forecast (UPI 055/056,
+    // ADR-116), computed once. An offsite drive's absence is expected — judged
+    // against its rotation cadence (declared `rotation_interval` PRIMARY,
+    // observed cadence fallback, 30d default), not the send interval. The
+    // forecast context (cadence/last_home/forecast_secs) rides alongside the
+    // window from the same single `drive_mount_history` read; `voice/` has no
+    // `now`, so the homecoming forecast is pre-computed here (the
+    // `last_run_age_secs` precedent). This is the only new `obs.history` call in
+    // `assess()`; the function stays pure (ADR-108).
+    let offsite_ctx: std::collections::HashMap<String, OffsiteContext> = config
         .drives
         .iter()
         .filter(|d| d.role == DriveRole::Offsite)
         .map(|d| {
-            let observed =
-                crate::rotation::observed_cadence(&obs.history.drive_mount_history(&d.label), now);
+            let history = obs.history.drive_mount_history(&d.label);
+            let observed = crate::rotation::observed_cadence(&history, now);
             let window = crate::rotation::resolve_offsite_window(d.rotation_interval, observed);
-            (d.label.clone(), window)
+            // Cadence for the forecast, in window-source priority order:
+            // declared (PRIMARY) → observed median → None (Default — no rhythm).
+            let cadence = d
+                .rotation_interval
+                .map(|i| Duration::seconds(i.as_secs()))
+                .or_else(|| observed.map(|o| o.median_gap));
+            // Last homecoming independent of the ≥3-gap cadence floor (M4): a
+            // declared-window drive with a single homecoming still forecasts.
+            let last_home = crate::rotation::last_homecoming(&history);
+            let forecast_secs = match (last_home, cadence) {
+                (Some(home), Some(cadence)) => Some((home + cadence - now).num_seconds()),
+                _ => None,
+            };
+            let rotation = DriveRotation {
+                cadence,
+                last_home,
+                source: window.source,
+                forecast_secs,
+            };
+            (d.label.clone(), OffsiteContext { window, rotation })
         })
         .collect();
 
@@ -698,18 +766,24 @@ pub fn assess(
                 // Unprotected). Using data-age — not presence-age — keeps a
                 // drive that was briefly home but never refreshed honestly stale
                 // (R3). `source_unchanged` / mounted / never-sent are untouched.
+                let offsite_ctx_for_drive = offsite_ctx.get(&drive.label);
                 if drive.role == DriveRole::Offsite
                     && !mounted
                     && !source_unchanged
                     && any_peer_mounted
-                    && let Some(window) = offsite_windows.get(&drive.label)
+                    && let Some(ctx) = offsite_ctx_for_drive
                     && let Some(age) = last_send_age
                 {
-                    status = crate::rotation::classify(age, window).to_promise_status();
+                    status = crate::rotation::classify(age, &ctx.window).to_promise_status();
                 }
 
                 let (absent_duration_secs, last_activity_age_secs) =
                     drive_absence.get(&drive.label).copied().unwrap_or((None, None));
+
+                // Forecast context rides on every offsite drive (presence-based,
+                // applies whether or not the per-copy relaxation above fired);
+                // `None` for non-offsite drives — they have no rotation rhythm.
+                let rotation = offsite_ctx_for_drive.map(|ctx| ctx.rotation);
 
                 drive_assessments.push(DriveAssessment {
                     drive_label: drive.label.clone(),
@@ -722,6 +796,7 @@ pub fn assess(
                     role: drive.role,
                     absent_duration_secs,
                     last_activity_age_secs,
+                    rotation,
                 });
             }
         }
@@ -779,7 +854,7 @@ pub fn assess(
             &subvol.name,
             local_space_tight.is_some(),
             subvol.local_retention.is_transient(),
-            &offsite_windows,
+            &offsite_ctx,
         );
 
         // ── Storage posture (UPI 031-a) ──────────────────────────────
@@ -1106,7 +1181,7 @@ fn compute_health(
     subvol_name: &str,
     local_space_tight: bool,
     is_transient: bool,
-    offsite_windows: &std::collections::HashMap<String, crate::rotation::OffsiteWindow>,
+    offsite_ctx: &std::collections::HashMap<String, OffsiteContext>,
 ) -> (OperationalHealth, Vec<String>) {
     let mut reasons: Vec<String> = Vec::new();
     let mut worst = OperationalHealth::Healthy;
@@ -1249,9 +1324,9 @@ fn compute_health(
             let threshold = if da.role == DriveRole::Offsite {
                 // Every offsite drive is in the map (built from the same
                 // config.drives); the 30-day default is dead-defensive.
-                offsite_windows
+                offsite_ctx
                     .get(&da.drive_label)
-                    .map(|w| w.overdue_days())
+                    .map(|c| c.window.overdue_days())
                     .unwrap_or(30)
             } else {
                 DRIVE_AWAY_DEGRADED_DAYS

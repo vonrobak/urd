@@ -162,11 +162,69 @@ fn render_backup_interactive(data: &BackupSummary) -> String {
     // ── Transitions (mythic voice on events) ─────────────────────────
     render_transitions(&data.transitions, &mut out);
 
+    // ── "Safe to remove" offsite cue (UPI 056, RD2) ──────────────────
+    render_safe_to_remove(data, &mut out);
+
     // ── Next-action suggestion ──────────────────────────────────────
     let has_failures = data.subvolumes.iter().any(|sv| !sv.success);
     append_suggestion(&SuggestionContext::Backup { has_failures }, &mut out);
 
     out
+}
+
+/// After a clean offsite send, tell the user it is safe to take the drive back
+/// offsite — the one retained reconnect sliver of UPI 056 (RD2). Conservative,
+/// data-safety-first: a drive earns the cue only when it is offsite, still
+/// mounted (here now, so the user can act), received at least one **clean**
+/// successful send this run, and had **no** failed/deferred/errored work that
+/// touched it. Any ambiguity suppresses the cue (data-safety > completeness).
+fn render_safe_to_remove(data: &BackupSummary, out: &mut String) {
+    // Offsite drives that are physically present right now (role + mount come
+    // from the post-run assessments — `BackupSummary` has no `Config`).
+    let mut offsite_mounted: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for a in &data.assessments {
+        for e in &a.external {
+            if e.role == DriveRole::Offsite && e.mounted {
+                offsite_mounted.insert(e.drive_label.as_str());
+            }
+        }
+    }
+
+    for drive in offsite_mounted {
+        let mut clean_success = false;
+        let mut troubled = false;
+        for sv in &data.subvolumes {
+            let sent_here = sv.sends.iter().any(|s| s.drive == drive);
+            let errored_here = sv
+                .structured_errors
+                .iter()
+                .any(|e| e.drive.as_deref() == Some(drive));
+            if !sent_here && !errored_here {
+                continue; // this subvolume did not touch the drive
+            }
+            // A subvolume that touched the drive must be wholly clean to count;
+            // any failure, deferral, or error on it taints the drive's cue.
+            let sv_clean = sv.success
+                && sv.deferred.is_empty()
+                && sv.structured_errors.is_empty()
+                && sv.errors.is_empty();
+            if sent_here && sv_clean {
+                clean_success = true;
+            }
+            if !sv_clean {
+                troubled = true;
+            }
+        }
+        if clean_success && !troubled {
+            writeln!(
+                out,
+                "  {} {}",
+                "·".dimmed(),
+                format!("offsite copy refreshed — safe to take {drive} back offsite").dimmed(),
+            )
+            .ok();
+        }
+    }
 }
 
 /// Render transition events as brief mythic voice lines.
@@ -463,7 +521,181 @@ fn format_list(items: &[&str]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::output::SkippedSubvolume;
+    use crate::output::{
+        DeferredInfo, SendSummary, SkippedSubvolume, StatusAssessment, StatusDriveAssessment,
+        StructuredError, SubvolumeSummary,
+    };
+    use crate::voice::test_fixtures::color_guard;
+
+    // ── "Safe to remove" cue (UPI 056, RD2) ────────────────────────────
+
+    fn offsite_entry(drive: &str, mounted: bool) -> StatusDriveAssessment {
+        StatusDriveAssessment {
+            drive_label: drive.to_string(),
+            status: PromiseStatus::Protected,
+            mounted,
+            snapshot_count: Some(3),
+            last_send_age_secs: Some(60),
+            role: DriveRole::Offsite,
+            absent_duration_secs: None,
+            last_activity_age_secs: None,
+            rotation: None,
+        }
+    }
+
+    fn assessment_with(drive: &str, mounted: bool) -> StatusAssessment {
+        StatusAssessment {
+            name: "sv".to_string(),
+            status: PromiseStatus::Protected,
+            health: "healthy".to_string(),
+            health_reasons: vec![],
+            promise_level: None,
+            local_snapshot_count: 1,
+            local_newest_age_secs: None,
+            local_status: PromiseStatus::Protected,
+            external: vec![offsite_entry(drive, mounted)],
+            advisories: vec![],
+            redundancy_advisories: vec![],
+            retention_summary: None,
+            external_only: false,
+            errors: vec![],
+            storage_posture: None,
+            cadence_adapted: false,
+            effective_send_interval_secs: None,
+        }
+    }
+
+    fn send_to(drive: &str) -> SendSummary {
+        SendSummary {
+            drive: drive.to_string(),
+            send_type: "incremental".to_string(),
+            bytes_transferred: Some(1_000_000),
+        }
+    }
+
+    fn subvol(name: &str, success: bool, sends: Vec<SendSummary>) -> SubvolumeSummary {
+        SubvolumeSummary {
+            name: name.to_string(),
+            success,
+            duration_secs: 1.0,
+            sends,
+            errors: vec![],
+            structured_errors: vec![],
+            deferred: vec![],
+        }
+    }
+
+    fn backup_with(
+        subvolumes: Vec<SubvolumeSummary>,
+        assessments: Vec<StatusAssessment>,
+    ) -> BackupSummary {
+        BackupSummary {
+            result: "success".to_string(),
+            run_id: Some(1),
+            duration_secs: 1.0,
+            subvolumes,
+            skipped: vec![],
+            assessments,
+            transitions: vec![],
+            warnings: vec![],
+            notes: vec![],
+        }
+    }
+
+    fn safe_to_remove_text(data: &BackupSummary) -> String {
+        let mut out = String::new();
+        render_safe_to_remove(data, &mut out);
+        out
+    }
+
+    #[test]
+    fn safe_to_remove_fires_once_for_clean_offsite_send() {
+        let _c = color_guard(false);
+        let data = backup_with(
+            vec![subvol("sv", true, vec![send_to("Offsite-4TB")])],
+            vec![assessment_with("Offsite-4TB", true)],
+        );
+        let out = safe_to_remove_text(&data);
+        assert_eq!(
+            out.matches("safe to take Offsite-4TB back offsite").count(),
+            1,
+            "clean single offsite send should fire exactly once: {out}"
+        );
+    }
+
+    #[test]
+    fn safe_to_remove_suppressed_when_drive_unmounted() {
+        let _c = color_guard(false);
+        // A send completed, but the drive is no longer mounted — can't act on it.
+        let data = backup_with(
+            vec![subvol("sv", true, vec![send_to("Offsite-4TB")])],
+            vec![assessment_with("Offsite-4TB", false)],
+        );
+        assert!(
+            !safe_to_remove_text(&data).contains("safe to take"),
+            "unmounted offsite drive must not get the cue"
+        );
+    }
+
+    #[test]
+    fn safe_to_remove_suppressed_when_no_offsite_send() {
+        let _c = color_guard(false);
+        // Offsite mounted, but the only send went to a different (primary) drive.
+        let mut data = backup_with(
+            vec![subvol("sv", true, vec![send_to("WD-18TB")])],
+            vec![assessment_with("Offsite-4TB", true)],
+        );
+        // Make the primary appear in assessments too (not offsite) — irrelevant.
+        data.assessments[0].external.push(StatusDriveAssessment {
+            role: DriveRole::Primary,
+            ..offsite_entry("WD-18TB", true)
+        });
+        assert!(
+            !safe_to_remove_text(&data).contains("safe to take"),
+            "no offsite send this run → no cue"
+        );
+    }
+
+    #[test]
+    fn safe_to_remove_suppressed_when_a_subvol_failed_to_that_drive() {
+        let _c = color_guard(false);
+        // Multi-subvol: sv-a sent cleanly to the offsite, sv-b failed a send to
+        // the same drive (structured error names it) → suppress (conservative).
+        let mut failed = subvol("sv-b", false, vec![]);
+        failed.structured_errors.push(StructuredError {
+            operation: "send".to_string(),
+            summary: "send failed".to_string(),
+            cause: "pipe broke".to_string(),
+            remediation: vec![],
+            drive: Some("Offsite-4TB".to_string()),
+            bytes_transferred: None,
+        });
+        let data = backup_with(
+            vec![subvol("sv-a", true, vec![send_to("Offsite-4TB")]), failed],
+            vec![assessment_with("Offsite-4TB", true)],
+        );
+        assert!(
+            !safe_to_remove_text(&data).contains("safe to take"),
+            "a failed send to the drive must suppress the cue"
+        );
+    }
+
+    #[test]
+    fn safe_to_remove_suppressed_when_sending_subvol_deferred() {
+        let _c = color_guard(false);
+        // The subvolume that sent to the offsite also deferred work — not wholly
+        // clean, so the drive does not earn the cue.
+        let mut sv = subvol("sv", true, vec![send_to("Offsite-4TB")]);
+        sv.deferred.push(DeferredInfo {
+            reason: "retention deferred".to_string(),
+            suggestion: "run calibrate".to_string(),
+        });
+        let data = backup_with(vec![sv], vec![assessment_with("Offsite-4TB", true)]);
+        assert!(
+            !safe_to_remove_text(&data).contains("safe to take"),
+            "a deferral on the sending subvolume must suppress the cue"
+        );
+    }
 
     #[test]
     fn backup_summary_suppresses_unchanged() {

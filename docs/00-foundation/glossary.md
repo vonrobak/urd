@@ -175,6 +175,22 @@ real redundancy peer (a non-`test` drive) is currently mounted — an offsite dr
 is the *second* line behind a continuously-present primary (ADR-116). A subvolume
 whose only external drive is an away offsite keeps the send-interval judgment.
 
+**The rotation voice register (UPI 056).** The `urd status` drive row speaks a calm
+seasonal register *layered over* those engine tiers. Gravity still comes solely
+from the per-copy `PromiseStatus` (S1) — the words only enrich it within each band:
+
+| Voice word | When | Register / colour |
+|------------|------|-------------------|
+| `hibernating` | offsite away *on schedule* — data-age within the calm half of its window; pairs with a `due home in ~Nd` forecast | dim, no colour (`on_schedule` → PROTECTED) |
+| `due home` | the same PROTECTED band but past the cadence midpoint ("due home — cycle it on your next trip"), and the forecast line itself | dim — a *voice-only* projection, not an engine tier |
+| `absent` | reserved for the degraded bands (the drive is away **and** its data has aged past the window) | amber → red (`overdue`/`stale`) |
+
+"due" is computed in `voice/` from the carried cadence + data-age; `RotationTier`
+stays three-valued (no `Due` variant — gravity has one source). The forecast
+(`due home in ~Nd`) renders only while the next homecoming is still ahead; once
+past due, the seasonal word carries it (no "in ~-3d" falsehood). See the Thread
+cluster's `fraying`/`worn thin` for the matching offsite-freshness weave.
+
 ## Cluster: Thread
 
 A **thread** is the lineage of incremental sends connecting a subvolume to a drive.
@@ -203,6 +219,14 @@ send (`voice.rs::render_transitions`).
 drive. `intact` = the steady-state assertion at the end of a clean run. The verb
 `hold` ("All threads hold") appears in shorter status output for the same
 condition.
+
+**Offsite-freshness weave (UPI 056).** A register describing how the *offsite*
+thread wears as its copy ages past the rotation window — distinct from the chain
+breakage above (this is about freshness, not the incremental lineage). It escalates
+`holds` (fresh, on schedule) → `fraying` (overdue, amber) → `worn thin` (stale, red),
+mapping directly onto the per-copy PROTECTED → AT RISK → UNPROTECTED gravity and
+coining no new status. `fraying`/`worn thin` ride the drive row's `absent` bands and
+the `OffsiteDriveStale` advisory's cadence-relative detail.
 
 ## Cluster: Retention tiers
 
