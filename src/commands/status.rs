@@ -147,6 +147,7 @@ pub fn run(config: Config, output_mode: OutputMode) -> anyhow::Result<()> {
     let preamble = crate::commands::acknowledgment::preamble_for(
         &config.general.state_db,
         state_db.as_ref(),
+        output_mode,
     );
     print!("{preamble}{rendered}");
 
