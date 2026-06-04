@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Post-upgrade acknowledgment preamble now gated on output mode** (#168). The one-time
+  v0.13.0 "trust repair" notice could be prepended ahead of the JSON document on a single
+  Daemon (non-TTY) run, making that one output non-parseable as JSON. The preamble is now
+  suppressed in Daemon mode and, crucially, a daemon run no longer consumes the one-shot
+  marker — so the user still sees the reassurance on their next interactive invocation.
+  Closes the latent pattern where any future acknowledgment reusing `preamble_for` would
+  inherit the same JSON-corruption window.
+
 ## [0.24.0] - 2026-06-03
 
 ### Added

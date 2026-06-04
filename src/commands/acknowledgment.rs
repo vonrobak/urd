@@ -1,3 +1,4 @@
+use crate::output::OutputMode;
 use crate::state::StateDb;
 use colored::Colorize;
 use std::path::Path;
@@ -20,7 +21,16 @@ const MESSAGE: &str = "Urd's self-check is now more accurate. Some subvolumes pr
 /// `state_db` path and returns the preamble string (empty if not applicable).
 /// Call sites that already hold a `StateDb` and the `Config` use this to
 /// avoid duplicating the `state_db.parent()` plumbing.
-pub fn preamble_for(state_db_path: &Path, db: Option<&StateDb>) -> String {
+///
+/// The acknowledgment is a user-facing reassurance, so it is suppressed in
+/// Daemon (non-TTY) mode — never prepended ahead of machine-readable JSON.
+/// A daemon run returns early *before* consuming the one-shot, so the marker
+/// stays unwritten and the user still sees the line on their next interactive
+/// invocation.
+pub fn preamble_for(state_db_path: &Path, db: Option<&StateDb>, mode: OutputMode) -> String {
+    if mode != OutputMode::Interactive {
+        return String::new();
+    }
     db.and_then(|db| state_db_path.parent().and_then(|dir| take_post_upgrade_preamble(dir, db)))
         .unwrap_or_default()
 }
@@ -116,5 +126,32 @@ mod tests {
 
         let marker = tmp.path().join(".acknowledgments").join(MARKER_NAME);
         assert!(!marker.exists());
+    }
+
+    #[test]
+    fn daemon_mode_suppresses_and_preserves_one_shot() {
+        let tmp = TempDir::new().unwrap();
+        let db = open_db(&tmp);
+        record_completed_run(&db);
+        let state_db_path = tmp.path().join("urd.db");
+        let marker = tmp.path().join(".acknowledgments").join(MARKER_NAME);
+
+        // Daemon run: returning user, no marker → emits nothing and must NOT
+        // consume the one-shot (the marker stays unwritten).
+        let daemon = preamble_for(&state_db_path, Some(&db), OutputMode::Daemon);
+        assert!(daemon.is_empty());
+        assert!(!marker.exists());
+
+        // The user still sees the line on their next interactive invocation.
+        let interactive = preamble_for(&state_db_path, Some(&db), OutputMode::Interactive);
+        assert!(interactive.contains("self-check is now more accurate"));
+        assert!(marker.exists());
+    }
+
+    #[test]
+    fn interactive_mode_returns_none_without_db() {
+        let tmp = TempDir::new().unwrap();
+        let state_db_path = tmp.path().join("urd.db");
+        assert!(preamble_for(&state_db_path, None, OutputMode::Interactive).is_empty());
     }
 }
