@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.24.1] - 2026-06-04
+
 ### Fixed
 - **Post-upgrade acknowledgment preamble now gated on output mode** (#168). The one-time
   v0.13.0 "trust repair" notice could be prepended ahead of the JSON document on a single
@@ -904,7 +906,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Defense-in-depth pin file protection for unsent snapshots
 - Per-subvolume error isolation in executor
 
-[Unreleased]: https://github.com/vonrobak/urd/compare/v0.24.0...HEAD
+[Unreleased]: https://github.com/vonrobak/urd/compare/v0.24.1...HEAD
+[0.24.1]: https://github.com/vonrobak/urd/compare/v0.24.0...v0.24.1
 [0.24.0]: https://github.com/vonrobak/urd/compare/v0.23.0...v0.24.0
 [0.23.0]: https://github.com/vonrobak/urd/compare/v0.22.0...v0.23.0
 [0.22.0]: https://github.com/vonrobak/urd/compare/v0.21.2...v0.22.0
