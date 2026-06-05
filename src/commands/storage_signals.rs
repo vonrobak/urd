@@ -165,12 +165,12 @@ fn gather_with(
             pool.subvol_names.push(sv.name.clone());
             by_subvol.insert(
                 sv.name.clone(),
-                ResolvedStorageSignal {
-                    free_ratio: pool.free_ratio,
-                    host_root: pool.host_root,
-                    prior_armed_tier: pool.prior_armed_tier,
-                    prior_since: pool.prior_since,
-                },
+                ResolvedStorageSignal::resolved(
+                    pool.free_ratio,
+                    pool.host_root,
+                    pool.prior_armed_tier,
+                    pool.prior_since,
+                ),
             );
         }
     }
@@ -198,10 +198,12 @@ pub struct ResolvedPoolTier {
     pub new_tier: TightnessTier,
 }
 
-/// The armed tier resolved once for the backup run (UPI 031-b AB1). Carries the
-/// planner/executor/awareness-facing `armed_tier_map` (subvol → tier) AND the
-/// per-pool rows the post-exec writeback persists — one resolution, two
-/// consumers, so "resolve once" stays literal.
+/// The armed tier for the backup run (UPI 031-b AB1). Carries the
+/// planner/executor-facing `armed_tier_map` (subvol → tier) AND the per-pool
+/// rows the post-exec writeback persists — both resolved once here, pre-plan,
+/// from the gathered `(prior, free)`. Awareness does not read this map; it reads
+/// the matching per-subvolume `ResolvedStorageSignal::armed_tier`, derived from
+/// the same inputs.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedArmedTiers {
     pub armed_tier_map: ArmedTierMap,
@@ -220,6 +222,14 @@ pub fn resolve_armed_tiers(signals: &StorageSignals) -> ResolvedArmedTiers {
     let mut armed_tier_map = ArmedTierMap::new();
     let mut pools = Vec::with_capacity(signals.pools.len());
     for pool in &signals.pools {
+        // Resolve the per-pool tier from the gathered (prior, free) — the
+        // single pre-plan resolution for the planner/executor map. NEVER
+        // re-resolved post-exec (AB1): clear-all frees space mid-run, and a
+        // re-resolve would see the higher free-ratio and falsely de-escalate
+        // Critical→Tight, defeating the hysteresis. The per-subvolume carrier
+        // awareness reads (`ResolvedStorageSignal::armed_tier`) derives from the
+        // SAME (prior, free), so the two consumers stay coherent by construction
+        // (locked by `gather_stamps_one_tier_read_by_planner_and_awareness`).
         let new_tier = storage_critical::resolve_armed_tier(
             pool.prior_armed_tier,
             pool.free_ratio,
@@ -591,6 +601,27 @@ source = "/"
         assert_eq!(resolved.armed_tier_map.get("alpha"), Some(&TightnessTier::Tight));
         assert_eq!(resolved.armed_tier_map.get("beta"), Some(&TightnessTier::Tight));
         assert_eq!(resolved.armed_tier_map.get("root"), Some(&TightnessTier::Roomy));
+    }
+
+    #[test]
+    fn gather_stamps_one_tier_read_by_planner_and_awareness() {
+        // The coherence the old awareness test could not see: the per-subvolume
+        // tier awareness reads (`ResolvedStorageSignal::armed_tier`) MUST equal
+        // the tier the planner/executor read (`resolve_armed_tiers`'s map),
+        // because both are the SAME value stamped once in `gather_with`. A
+        // desync is the false-AT-RISK failure mode — the planner times against
+        // one tier while awareness judges against another.
+        let signals =
+            gather_with(&cfg(), &HashMap::new(), Some("root-uuid"), resolver, space_tight);
+        let map = resolve_armed_tiers(&signals).armed_tier_map;
+        assert!(!signals.by_subvol.is_empty(), "fixture must exercise subvols");
+        for (name, sig) in &signals.by_subvol {
+            assert_eq!(
+                map.get(name),
+                Some(&sig.armed_tier()),
+                "subvol {name}: awareness tier must equal the planner's map tier"
+            );
+        }
     }
 
     #[test]

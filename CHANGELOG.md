@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Armed-tier coherence hardened from convention into structure** (hardens the ADR-113
+  single-gather invariant). The hysteresis-resolved storage tier is now carried on
+  `ResolvedStorageSignal` and derived once by its constructor; awareness reads that stamped
+  tier instead of independently re-resolving it, so the staleness judgement can no longer
+  desync from the tier the planner timed against — closing a latent false-AT-RISK /
+  false-PROTECTED path. Behavior-preserving: the planner/executor map and the post-exec
+  writeback are unchanged.
+
 ## [0.24.1] - 2026-06-04
 
 ### Fixed

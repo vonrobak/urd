@@ -77,11 +77,13 @@ pub const TIGHT_INTERVAL_FACTOR: f64 = 1.5;
 /// `const fn`).
 pub const CRITICAL_INTERVAL_FLOOR_DAYS: i64 = 7;
 
-/// Planner/executor/awareness-facing map: subvolume name → armed tier (UPI
-/// 031-b). Resolved once pre-plan (`commands/storage_signals::resolve_armed_tiers`)
-/// and threaded into `plan::plan`, the executor, and `awareness::assess`. An
-/// absent key defaults to `Roomy` (`get(..).copied().unwrap_or_default()`) →
-/// declared behavior → zero behavior change (the regression firewall).
+/// Planner/executor-facing map: subvolume name → armed tier (UPI 031-b).
+/// Resolved once pre-plan (`commands/storage_signals::resolve_armed_tiers`) and
+/// threaded into `plan::plan` and the executor. Awareness does not read this
+/// map — it reads the per-subvolume `ResolvedStorageSignal::armed_tier`, derived
+/// from the same gathered inputs. An absent key defaults to `Roomy`
+/// (`get(..).copied().unwrap_or_default()`) → declared behavior → zero behavior
+/// change (the regression firewall).
 pub type ArmedTierMap = HashMap<String, TightnessTier>;
 
 /// Source-pool tightness, free-ratio only (UPI 031-a). Distinct from
@@ -205,8 +207,19 @@ pub fn host_root(
 ///   `FREE_RATIO_CAUTION + HYSTERESIS_BAND_PP` (free `> 0.30`). A pool can fall
 ///   two levels in one run when free recovers past both bands.
 /// - **Unmeasurable** free-ratio (`None`) holds the prior armed tier unchanged.
+///
+/// Resolved at the single pre-plan gather only — never re-derived post-exec
+/// (AB1) and never re-resolved by awareness. The per-subvolume carrier
+/// [`ResolvedStorageSignal::resolved`](crate::awareness::ResolvedStorageSignal::resolved)
+/// derives it in its constructor (awareness reads it back via `armed_tier()`,
+/// never re-resolving); `resolve_armed_tiers` derives the per-pool
+/// `armed_tier_map` for the planner/executor from the same gathered
+/// `(prior, free)`. The two consumers stay coherent because both feed identical
+/// inputs to this deterministic function. `pub(crate)` keeps the resolver
+/// in-crate; the carrier's constructor keeps its stamped tier consistent with
+/// its inputs, so a signal whose tier disagrees with its free-ratio cannot exist.
 #[must_use]
-pub fn resolve_armed_tier(
+pub(crate) fn resolve_armed_tier(
     prior_armed: TightnessTier,
     free_ratio: Option<f64>,
 ) -> TightnessTier {
@@ -278,8 +291,9 @@ pub fn derive_posture(
 /// 031-b, AB2). Carries exactly the three knobs the tier changes (all consumed
 /// this UPI). Paralleling `types::derive_policy`/`DerivedPolicy`, the same tier
 /// in always yields the same policy out — coherence between planner and
-/// awareness rests on both deriving from the *same* armed tier (the single
-/// pre-plan gather, `commands/backup.rs`), not on this function alone.
+/// awareness rests on both reading the *same* armed tier — resolved once at the
+/// single pre-plan gather and stamped on the signal
+/// (`ResolvedStorageSignal::armed_tier`) — not on this function alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EffectivePolicy {
     /// Lifecycle the planner dispatches on. Tight/Critical → `Transient`
