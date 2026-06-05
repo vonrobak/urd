@@ -292,6 +292,49 @@ pub struct ResolvedStorageSignal {
     pub prior_armed_tier: crate::storage_critical::TightnessTier,
     /// When the armed tier last changed (the "flagged since" timestamp).
     pub prior_since: Option<NaiveDateTime>,
+    /// The hysteresis-resolved armed tier for this run, derived ONCE at
+    /// construction from `(prior_armed_tier, free_ratio)`. Private and
+    /// read-only: every consumer (planner via the map, executor, awareness)
+    /// reads back the SAME resolved value instead of re-deriving it, so the
+    /// promise can never desync from the plan. This carries the ADR-113
+    /// single-gather invariant in the type rather than a prose comment. Read
+    /// via [`armed_tier`](ResolvedStorageSignal::armed_tier).
+    armed_tier: crate::storage_critical::TightnessTier,
+}
+
+impl ResolvedStorageSignal {
+    /// Build a signal, deriving the armed tier from `(prior, free_ratio)` via
+    /// the single hysteresis resolver (`storage_critical::resolve_armed_tier`).
+    /// This is the ONLY constructor: a signal whose stamped `armed_tier`
+    /// disagrees with its inputs cannot exist. Stamped once on the single
+    /// pre-plan gather (`commands/storage_signals`); awareness and the
+    /// planner/executor `armed_tier_map` all read it back, never re-resolve.
+    #[must_use]
+    pub fn resolved(
+        free_ratio: Option<f64>,
+        host_root: bool,
+        prior_armed_tier: crate::storage_critical::TightnessTier,
+        prior_since: Option<NaiveDateTime>,
+    ) -> Self {
+        let armed_tier = crate::storage_critical::resolve_armed_tier(
+            prior_armed_tier,
+            free_ratio,
+        );
+        Self {
+            free_ratio,
+            host_root,
+            prior_armed_tier,
+            prior_since,
+            armed_tier,
+        }
+    }
+
+    /// The hysteresis-resolved armed tier for this run (read-only). The single
+    /// value the planner timed against and awareness judges staleness against.
+    #[must_use]
+    pub fn armed_tier(&self) -> crate::storage_critical::TightnessTier {
+        self.armed_tier
+    }
 }
 
 /// Per-subvolume storage signals keyed by subvolume name (UPI 031-a). Built at
@@ -597,17 +640,16 @@ pub fn assess(
         let local_dir = snapshot_root.join(&subvol.name);
 
         // ── Tier-adapted effective policy (UPI 031-b) ────────────────
-        // Resolve the armed tier once (Roomy default when no signal), then
-        // derive the effective policy. The SAME armed tier feeds the planner
-        // (via backup.rs's single pre-plan gather), so the effective send
-        // interval awareness judges staleness against agrees with what the
-        // planner timed against — no false AT RISK for a correctly-adapting
-        // subvolume. `armed` also drives the posture and the AT-RISK cap below.
+        // READ the armed tier stamped once at the single pre-plan gather
+        // (`commands/storage_signals`); awareness never re-resolves. The
+        // planner's `armed_tier_map` carries the SAME stamped value, so the
+        // effective send interval awareness judges staleness against agrees with
+        // what the planner timed against — no false AT RISK for a
+        // correctly-adapting subvolume. Roomy default when a subvolume has no
+        // signal. `armed` also drives the posture and the AT-RISK cap below.
         let armed = storage_signals
             .get(&subvol.name)
-            .map(|sig| {
-                crate::storage_critical::resolve_armed_tier(sig.prior_armed_tier, sig.free_ratio)
-            })
+            .map(|sig| sig.armed_tier())
             .unwrap_or_default();
         let eff = crate::storage_critical::derive_effective_policy(
             &subvol.local_retention,
@@ -1512,12 +1554,12 @@ source = "/data/sv1"
         let mut signals = crate::awareness::StorageSignalMap::new();
         signals.insert(
             "sv1".to_string(),
-            ResolvedStorageSignal {
-                free_ratio: Some(0.20), // < 0.25 → Tight
-                host_root: false,
-                prior_armed_tier: TightnessTier::Roomy,
-                prior_since: None,
-            },
+            ResolvedStorageSignal::resolved(
+                Some(0.20), // < 0.25 → Tight
+                false,
+                TightnessTier::Roomy,
+                None,
+            ),
         );
 
         let results = assess(
@@ -1538,12 +1580,12 @@ source = "/data/sv1"
         let mut signals = crate::awareness::StorageSignalMap::new();
         signals.insert(
             "sv1".to_string(),
-            ResolvedStorageSignal {
-                free_ratio: Some(0.05), // < 0.15 → Critical
-                host_root: true,
-                prior_armed_tier: TightnessTier::Roomy,
-                prior_since: None,
-            },
+            ResolvedStorageSignal::resolved(
+                Some(0.05), // < 0.15 → Critical
+                true,
+                TightnessTier::Roomy,
+                None,
+            ),
         );
 
         let results = assess(
@@ -1564,12 +1606,12 @@ source = "/data/sv1"
         let mut signals = crate::awareness::StorageSignalMap::new();
         signals.insert(
             "sv1".to_string(),
-            ResolvedStorageSignal {
-                free_ratio: Some(0.50), // roomy
-                host_root: true,
-                prior_armed_tier: TightnessTier::Roomy,
-                prior_since: None,
-            },
+            ResolvedStorageSignal::resolved(
+                Some(0.50), // roomy
+                true,
+                TightnessTier::Roomy,
+                None,
+            ),
         );
 
         let results = assess(
@@ -1604,12 +1646,12 @@ source = "/data/sv1"
         // Only sv1 has a signal; sv2 must stay posture-free.
         signals.insert(
             "sv1".to_string(),
-            ResolvedStorageSignal {
-                free_ratio: Some(0.10),
-                host_root: false,
-                prior_armed_tier: TightnessTier::Roomy,
-                prior_since: None,
-            },
+            ResolvedStorageSignal::resolved(
+                Some(0.10),
+                false,
+                TightnessTier::Roomy,
+                None,
+            ),
         );
 
         let results = assess(
@@ -1633,12 +1675,44 @@ source = "/data/sv1"
         let mut signals = crate::awareness::StorageSignalMap::new();
         signals.insert(
             "sv1".to_string(),
-            ResolvedStorageSignal {
-                free_ratio: Some(0.18), // classifies Tight; prior was Roomy
-                host_root: false,
-                prior_armed_tier: TightnessTier::Roomy,
-                prior_since: None,
-            },
+            ResolvedStorageSignal::resolved(
+                Some(0.18), // classifies Tight; prior was Roomy
+                false,
+                TightnessTier::Roomy,
+                None,
+            ),
+        );
+
+        let results = assess(
+            &config,
+            now,
+            &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() },
+            &signals,
+        );
+        let posture = posture_of(&results, "sv1").expect("sv1 should have posture");
+        assert_eq!(posture.tier, TightnessTier::Tight);
+    }
+
+    #[test]
+    fn read_path_posture_reflects_stamped_hysteresis_tier() {
+        // Read paths (status/doctor/default) feed assess the gathered signal and
+        // READ the stamped tier — they never re-resolve. Prove assess reflects
+        // the HYSTERESIS-resolved tier, not the prior and not a naive classify:
+        // prior Critical + 0.28 free de-escalates exactly one band to Tight
+        // (Critical→Tight needs free > 0.25; Tight→Roomy needs > 0.30). So
+        // posture must be Tight — Critical (the prior) or Roomy (a bare classify
+        // of 0.28) would both be wrong, and only the stamped tier is right.
+        use crate::storage_critical::TightnessTier;
+        let (config, now, fs) = posture_fixture();
+        let mut signals = crate::awareness::StorageSignalMap::new();
+        signals.insert(
+            "sv1".to_string(),
+            ResolvedStorageSignal::resolved(
+                Some(0.28),
+                false,
+                TightnessTier::Critical,
+                None,
+            ),
         );
 
         let results = assess(
@@ -1671,12 +1745,12 @@ source = "/data/sv1"
         let mut signals = StorageSignalMap::new();
         signals.insert(
             "sv1".to_string(),
-            ResolvedStorageSignal {
-                free_ratio: Some(free_ratio),
-                host_root: false,
-                prior_armed_tier: TightnessTier::Roomy,
-                prior_since: None,
-            },
+            ResolvedStorageSignal::resolved(
+                Some(free_ratio),
+                false,
+                TightnessTier::Roomy,
+                None,
+            ),
         );
         (config, now, fs, signals)
     }
@@ -1751,12 +1825,26 @@ source = "/data/sv1"
     }
 
     #[test]
-    fn coherence_awareness_and_planner_share_effective_interval() {
-        // S2 coherence: the interval awareness judges staleness against MUST
-        // equal the one the planner times against, for the same armed tier —
-        // both route through `derive_effective_policy`. A future re-gather that
-        // desynced the tier would break this (false AT RISK).
+    fn coherence_awareness_judges_against_the_stamped_tier() {
+        // S2 coherence: awareness judges staleness against the SAME armed tier
+        // the planner times against. The planner reads `resolve_armed_tiers`'s
+        // map; awareness reads the stamped `ResolvedStorageSignal::armed_tier` —
+        // and `gather_with` stamps ONE value for both (that the two stamps agree
+        // is locked by `gather_stamps_one_tier_read_by_planner_and_awareness` in
+        // storage_signals). Here: assert awareness's effective interval is the
+        // one derived from the tier ACTUALLY stamped on the signal — not a tier
+        // re-derived inside the test (the old hardcoded-`Critical` tautology,
+        // which proved only that `derive_effective_policy` is deterministic).
         let (config, now, fs, signals) = capped_fixture(dt(2026, 3, 22, 14, 0), 0.05);
+        let sv1_sig = signals.get("sv1").expect("fixture stamps sv1");
+        // Non-vacuous: 0.05 free resolves to Critical, whose effective interval
+        // (the 7d floor) differs from the declared 1d — so this exercises the
+        // adapted path, not a Roomy passthrough.
+        assert_eq!(
+            sv1_sig.armed_tier(),
+            crate::storage_critical::TightnessTier::Critical,
+            "fixture must exercise the adapted (Critical) interval"
+        );
         let results = assess(
             &config,
             now,
@@ -1770,15 +1858,16 @@ source = "/data/sv1"
             &sv.local_retention,
             sv.send_interval,
             sv.send_enabled,
-            crate::storage_critical::TightnessTier::Critical,
-            // send_interval is invariant under has_away_pin, so this coherence
-            // check holds for either value; awareness itself passes false.
+            // The tier the planner's map ALSO carries (same gather, same value).
+            sv1_sig.armed_tier(),
+            // send_interval is invariant under has_away_pin (UPI 058); awareness
+            // passes false, so coherence holds for either value.
             false,
         );
         assert_eq!(
             sv1.effective_send_interval,
             Some(planner_eff.send_interval),
-            "awareness and planner judge the SAME effective interval"
+            "awareness judges against the interval derived from the stamped tier"
         );
     }
 

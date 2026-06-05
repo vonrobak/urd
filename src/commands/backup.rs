@@ -95,8 +95,10 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     // Critical→Tight — desyncing the effective send interval the planner timed
     // against from the one awareness judges staleness against, surfacing a
     // correctly-adapting subvolume as false AT RISK. The coherence guard is
-    // THIS single gather (Risk 4 / S2), enforced by the awareness coherence
-    // test, not by `derive_effective_policy` alone.
+    // THIS single gather (Risk 4 / S2): the tier is resolved once and STAMPED
+    // on the signal (`ResolvedStorageSignal::armed_tier`, derived in its
+    // constructor), so the planner's map, the executor, the writeback, and
+    // awareness all READ the same value rather than each re-deriving it.
     let signals = storage_signals::gather(&config, state_db.as_ref());
     let resolved = storage_signals::resolve_armed_tiers(&signals);
 
