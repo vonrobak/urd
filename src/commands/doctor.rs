@@ -379,12 +379,11 @@ fn build_doctor_recommendation_view(
         |mp: &Path| pools::pool_space(mp).ok(),
         |uuid: &str| pools::metadata_utilization_ratio(uuid),
         |uuid: &str| {
-            let state_db = state_db?;
             let names = pools_by_uuid.get(uuid)?;
-            let rows = state_db
-                .drift_samples_for_subvolumes(names, since)
-                .ok()?;
-            let samples: Vec<_> = rows.into_iter().map(StateDb::drift_row_to_sample).collect();
+            // Fail-open per ADR-102: absent db / query error → empty samples →
+            // `compute_pool_free_bytes_trend(&[], …)` is `None` (same as the
+            // prior `?`-on-error behavior).
+            let samples = RealFileSystemState { state: state_db }.drift_samples_multi(names, since);
             crate::drift::compute_pool_free_bytes_trend(&samples, window, now, MIN_SAMPLE_DAYS)
         },
     )
@@ -631,16 +630,10 @@ fn compute_churn_for(
     window: chrono::Duration,
     now: chrono::NaiveDateTime,
 ) -> crate::drift::ChurnEstimate {
-    // ADR-102 best-effort: a missing db or a failed query yields a safe-empty
-    // estimate, never an error that could propagate into a backup decision.
-    let Some(db) = state_db else {
-        return crate::drift::ChurnEstimate::default();
-    };
-    let Ok(rows) = db.drift_samples_for_subvolume(name, now - window) else {
-        return crate::drift::ChurnEstimate::default();
-    };
-    let samples: Vec<crate::drift::DriftSample> =
-        rows.into_iter().map(StateDb::drift_row_to_sample).collect();
+    // ADR-102 best-effort: a missing db or a failed query yields empty samples,
+    // and `compute_rolling_churn(&[])` is `ChurnEstimate::default()` — never an
+    // error that could propagate into a backup decision.
+    let samples = RealFileSystemState { state: state_db }.drift_samples(name, now - window);
     crate::drift::compute_rolling_churn(&samples, window, now)
 }
 
