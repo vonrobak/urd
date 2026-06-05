@@ -1440,6 +1440,17 @@ impl FilesystemQuery for RealFileSystemState<'_> {
     }
 }
 
+/// The freshest send size is the newer of the last success and the last
+/// failure — when both exist, the larger byte count; otherwise whichever is
+/// present. The domain rule shared by `last_send_size` and
+/// `last_send_size_any_drive` so it lives in exactly one place.
+fn freshest_send_size(successful: Option<u64>, failed: Option<u64>) -> Option<u64> {
+    match (successful, failed) {
+        (Some(s), Some(f)) => Some(s.max(f)),
+        (s, f) => s.or(f),
+    }
+}
+
 impl HistoryQuery for RealFileSystemState<'_> {
     fn last_send_size(
         &self,
@@ -1457,10 +1468,7 @@ impl HistoryQuery for RealFileSystemState<'_> {
                 .last_failed_send_size(subvol_name, drive_label, send_type)
                 .ok()
                 .flatten();
-            match (successful, failed) {
-                (Some(s), Some(f)) => Some(s.max(f)),
-                (s, f) => s.or(f),
-            }
+            freshest_send_size(successful, failed)
         })
     }
 
@@ -1475,10 +1483,7 @@ impl HistoryQuery for RealFileSystemState<'_> {
                 .last_failed_send_size_any_drive(subvol_name, send_type)
                 .ok()
                 .flatten();
-            match (successful, failed) {
-                (Some(s), Some(f)) => Some(s.max(f)),
-                (s, f) => s.or(f),
-            }
+            freshest_send_size(successful, failed)
         })
     }
 
@@ -1530,10 +1535,69 @@ impl HistoryQuery for RealFileSystemState<'_> {
     }
 }
 
+/// Drift-history composition — the single home for the "fetch rows → map to
+/// `DriftSample` → fail-open (ADR-102)" sequence that command callers used to
+/// re-assemble inline. Mirrors `drive_mount_history`/`drive_record_to_event`:
+/// granular `state.rs` wrappers, with the domain shape localized once at the
+/// adapter. Inherent (not on `HistoryQuery`) because every drift consumer is a
+/// command-layer path holding `Option<&StateDb>`; no pure function reaches drift
+/// through `Observation`. Empty results feed the pure aggregators unchanged —
+/// `drift::compute_rolling_churn(&[])` is `ChurnEstimate::default()` and
+/// `compute_pool_free_bytes_trend(&[], …)` is `None`.
+impl RealFileSystemState<'_> {
+    /// Drift samples for one subvolume since `since`, newest-first. DB absent
+    /// or query error → empty, never an error that could block a backup
+    /// (ADR-102). Feeds `drift::compute_rolling_churn`.
+    #[must_use]
+    pub fn drift_samples(&self, subvol_name: &str, since: NaiveDateTime) -> Vec<crate::drift::DriftSample> {
+        let Some(db) = self.state else {
+            return Vec::new();
+        };
+        match db.drift_samples_for_subvolume(subvol_name, since) {
+            Ok(rows) => rows
+                .into_iter()
+                .map(crate::state::StateDb::drift_row_to_sample)
+                .collect(),
+            Err(e) => {
+                log::warn!("drift_samples_for_subvolume failed for {subvol_name}: {e}");
+                Vec::new()
+            }
+        }
+    }
+
+    /// Batched variant across a set of subvolumes (the pool-trend path, UPI
+    /// 044). Same fail-open contract as `drift_samples`. Feeds
+    /// `drift::compute_pool_free_bytes_trend`.
+    #[must_use]
+    pub fn drift_samples_multi(
+        &self,
+        subvol_names: &[String],
+        since: NaiveDateTime,
+    ) -> Vec<crate::drift::DriftSample> {
+        let Some(db) = self.state else {
+            return Vec::new();
+        };
+        match db.drift_samples_for_subvolumes(subvol_names, since) {
+            Ok(rows) => rows
+                .into_iter()
+                .map(crate::state::StateDb::drift_row_to_sample)
+                .collect(),
+            Err(e) => {
+                log::warn!("drift_samples_for_subvolumes failed: {e}");
+                Vec::new()
+            }
+        }
+    }
+}
+
 /// Map a persisted `DriveConnectionRecord` to a `DriveEvent`, or `None` for an
 /// unknown event type / unparseable timestamp (logged). Shared by
 /// `last_drive_event` (one row) and `drive_mount_history` (all rows). The parse
 /// format matches the sentinel's write format (`%Y-%m-%dT%H:%M:%S`).
+///
+/// This is the read-side composition pattern: granular `state.rs` wrappers, with
+/// the domain shaping localized once at the adapter (see also `drift_samples`).
+/// Keep `state.rs` itself one-method-per-query — composition lives here.
 fn drive_record_to_event(record: &crate::state::DriveConnectionRecord) -> Option<DriveEvent> {
     let kind = match record.event_type.as_str() {
         "mounted" => DriveEventKind::Mount,
@@ -4874,6 +4938,64 @@ local_retention = "transient"
 
         // Unknown drive → empty (never blocks).
         assert!(fs.drive_mount_history("nope").is_empty());
+    }
+
+    // ── Read-side composition: freshest_send_size + drift_samples ───────
+
+    #[test]
+    fn freshest_send_size_picks_larger_when_both_present() {
+        assert_eq!(freshest_send_size(Some(100), Some(250)), Some(250));
+        assert_eq!(freshest_send_size(Some(900), Some(250)), Some(900));
+    }
+
+    #[test]
+    fn freshest_send_size_falls_back_to_whichever_exists() {
+        assert_eq!(freshest_send_size(Some(100), None), Some(100));
+        assert_eq!(freshest_send_size(None, Some(250)), Some(250));
+        assert_eq!(freshest_send_size(None, None), None);
+    }
+
+    fn drift_at(s: &str) -> NaiveDateTime {
+        NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S").unwrap()
+    }
+
+    #[test]
+    fn drift_samples_fail_open_when_db_absent() {
+        // ADR-102: no state DB → empty samples, never an error. This locks the
+        // command-site fallback — `compute_rolling_churn(&[])` is
+        // `ChurnEstimate::default()` and `compute_pool_free_bytes_trend(&[], …)`
+        // is `None`, so empty here reproduces the prior explicit fallbacks.
+        let fs = RealFileSystemState { state: None };
+        let since = drift_at("2026-05-01T00:00:00");
+        assert!(fs.drift_samples("home", since).is_empty());
+        assert!(fs.drift_samples_multi(&["home".to_string()], since).is_empty());
+    }
+
+    #[test]
+    fn drift_samples_round_trips_through_the_adapter() {
+        use crate::state::{DriftSampleRow, StateDb};
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let db = StateDb::open(&dir.path().join("urd.db")).unwrap();
+        db.record_drift_sample_best_effort(&DriftSampleRow {
+            run_id: None,
+            subvolume: "home".to_string(),
+            sampled_at: drift_at("2026-05-02T04:00:00"),
+            seconds_since_prev_send: Some(86_400),
+            bytes_transferred: 4_096,
+            source_free_bytes: None,
+            send_kind: SendKind::Incremental,
+        });
+
+        let fs = RealFileSystemState { state: Some(&db) };
+        let since = drift_at("2026-05-01T00:00:00");
+        let one = fs.drift_samples("home", since);
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].bytes_transferred, 4_096);
+        // Batched variant sees the same row; unrelated names stay empty.
+        assert_eq!(fs.drift_samples_multi(&["home".to_string()], since).len(), 1);
+        assert!(fs.drift_samples("photos", since).is_empty());
     }
 
     // ── Planner event-emission tests ───────────────────────────────────

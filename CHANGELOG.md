@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Drift + send-size composition localized to the read-side adapter** (deepening 03;
+  no behavior change). The "fetch drift rows → map to `DriftSample` → ADR-102 fail-open"
+  sequence had been re-typed at three command sites (`backup.rs`, `doctor.rs` ×2), all
+  bypassing the `RealFileSystemState` read-side seam the rest of history goes through;
+  the "freshest send size = max(success, failure)" rule was written twice in adjacent
+  adapter methods. Both now live once: `RealFileSystemState::{drift_samples, drift_samples_multi}`
+  (mirroring `drive_mount_history`) and a `freshest_send_size` helper. The documented
+  "`state.rs` stays granular" decision is preserved — composition moved *to* the adapter,
+  not into `state.rs` (no ADR change). Fallback is provably identical: empty samples feed
+  the pure aggregators to the same `ChurnEstimate::default()` / `None` the explicit
+  fallbacks produced.
 - **`voice/` drive-row helpers extracted into a dedicated submodule** (deepening 02;
   no behavior change). The status-only drive-row presentation cluster (the away /
   last-backup / disconnected cascade and the offsite hibernating / due-home / absent

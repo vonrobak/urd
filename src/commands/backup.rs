@@ -1244,18 +1244,14 @@ fn build_churn_views(
         return out;
     }
     let window = crate::drift::default_window();
+    let fs = RealFileSystemState { state: state_db };
     for sv in config.subvolumes.iter() {
-        // ADR-102 best-effort: a failed drift_samples query yields the safe-empty
-        // estimate so heartbeat fields stay populated (with `None` placeholders)
-        // and a backup never fails because state observability didn't.
-        let estimate = state_db
-            .and_then(|db| db.drift_samples_for_subvolume(&sv.name, now - window).ok())
-            .map(|rows| {
-                let samples: Vec<crate::drift::DriftSample> =
-                    rows.into_iter().map(StateDb::drift_row_to_sample).collect();
-                crate::drift::compute_rolling_churn(&samples, window, now)
-            })
-            .unwrap_or_default();
+        // ADR-102 best-effort: a failed/absent drift query yields empty samples,
+        // and `compute_rolling_churn(&[])` is `ChurnEstimate::default()` — so
+        // heartbeat fields stay populated (with `None` placeholders) and a backup
+        // never fails because state observability didn't.
+        let samples = fs.drift_samples(&sv.name, now - window);
+        let estimate = crate::drift::compute_rolling_churn(&samples, window, now);
         let mean_incremental_bytes = estimate.mean_incremental_bytes;
         let fields = match crate::output::render_churn(&estimate) {
             ChurnRender::NotMeasured => ChurnHeartbeatFields {
