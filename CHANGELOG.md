@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **`voice/` drive-row helpers extracted into a dedicated submodule** (deepening 02;
+  no behavior change). The status-only drive-row presentation cluster (the away /
+  last-backup / disconnected cascade and the offsite hibernating / due-home / absent
+  ladder) moved out of the 6.3k-line `voice/mod.rs` into a focused `voice/drive_row.rs`
+  owned by its sole consumer, `status.rs`. The three helpers with no cross-renderer
+  caller regain their private scope, so `mod.rs`'s remaining `pub(super)` surface once
+  again means "shared across renderers" — an honest seam the next sub-renderer author can
+  trust. The status renderer's tests moved alongside it. Voice Contract green and
+  untouched; rendered output byte-identical.
 - **Armed-tier coherence hardened from convention into structure** (hardens the ADR-113
   single-gather invariant). The hysteresis-resolved storage tier is now carried on
   `ResolvedStorageSignal` and derived once by its constructor; awareness reads that stamped
