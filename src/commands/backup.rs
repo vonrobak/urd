@@ -269,74 +269,43 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     // Verify drive tokens: collect suspicious drives and verified drives in one pass.
     // A drive is "verified" only when its token file is readable AND tokens match.
     // This excludes fail-open paths (unreadable token file) from being treated as verified.
+    // Probes (the I/O) are gathered here at the boundary; the classification and the
+    // plan mutation are pure (`resolve_token_gating` / `apply_token_gating`).
     if let Some(ref db) = state_db {
-        let mut blocked = std::collections::BTreeSet::new();
-        let mut verified = std::collections::BTreeSet::new();
-
-        for drive in config.drives.iter().filter(|d| drives::is_drive_mounted(d)) {
-            // Pre-check: can we read the token file?
-            let has_readable_token = matches!(
-                drives::read_drive_token(drive),
-                Ok(Some(_))
-            );
-
-            match drives::verify_drive_token(drive, db) {
-                drives::DriveAvailability::TokenMismatch { expected, found } => {
-                    log::warn!(
-                        "Drive {} has a token mismatch (expected {}, found {}) — \
-                         skipping sends to this drive",
-                        drive.label, expected, found,
-                    );
-                    blocked.insert(drive.label.clone());
+        let probes: Vec<(String, drives::DriveAvailability, bool)> = config
+            .drives
+            .iter()
+            .filter(|d| drives::is_drive_mounted(d))
+            .map(|drive| {
+                // Pre-check: can we read the token file?
+                let has_readable_token = matches!(drives::read_drive_token(drive), Ok(Some(_)));
+                let avail = drives::verify_drive_token(drive, db);
+                // Operator warnings stay at the I/O boundary.
+                match &avail {
+                    drives::DriveAvailability::TokenMismatch { expected, found } => {
+                        log::warn!(
+                            "Drive {} has a token mismatch (expected {}, found {}) — \
+                             skipping sends to this drive",
+                            drive.label, expected, found,
+                        );
+                    }
+                    drives::DriveAvailability::TokenExpectedButMissing => {
+                        log::warn!(
+                            "Drive {} is mounted but missing its identity token. Urd has \
+                             previously sent to a drive with this label — this may be a \
+                             different physical drive. Sends to {} are blocked. \
+                             Run `urd drives adopt {}` to accept this drive.",
+                            drive.label, drive.label, drive.label,
+                        );
+                    }
+                    _ => {}
                 }
-                drives::DriveAvailability::TokenExpectedButMissing => {
-                    log::warn!(
-                        "Drive {} is mounted but missing its identity token. Urd has \
-                         previously sent to a drive with this label — this may be a \
-                         different physical drive. Sends to {} are blocked. \
-                         Run `urd drives adopt {}` to accept this drive.",
-                        drive.label, drive.label, drive.label,
-                    );
-                    blocked.insert(drive.label.clone());
-                }
-                drives::DriveAvailability::Available if has_readable_token => {
-                    // Token file exists and matches — drive identity confirmed.
-                    verified.insert(drive.label.clone());
-                }
-                _ => {
-                    // TokenMissing (first use), fail-open, or no token file:
-                    // neither blocked nor verified.
-                }
-            }
-        }
+                (drive.label.clone(), avail, has_readable_token)
+            })
+            .collect();
 
-        if !blocked.is_empty() {
-            // Only sends are blocked for token-suspicious drives. Retention deletes
-            // proceed — a clone's snapshots are redundant copies, and blocking deletes
-            // would cause space exhaustion without safety benefit.
-            backup_plan.operations.retain(|op| {
-                !matches!(
-                    op,
-                    PlannedOperation::SendFull { drive_label, .. }
-                    | PlannedOperation::SendIncremental { drive_label, .. }
-                    if blocked.contains(drive_label)
-                )
-            });
-        }
-
-        // Stamp token_verified on SendFull operations for verified drives.
-        // This allows the executor's chain-break gate to proceed on known-good drives.
-        for op in &mut backup_plan.operations {
-            if let PlannedOperation::SendFull {
-                drive_label,
-                token_verified,
-                ..
-            } = op
-                && verified.contains(drive_label.as_str())
-            {
-                *token_verified = true;
-            }
-        }
+        let gating = resolve_token_gating(&probes);
+        apply_token_gating(&mut backup_plan, &gating);
     }
 
     // Snapshot awareness state before execution so we can detect transitions
@@ -2149,6 +2118,82 @@ fn run_emergency_preflight_with(
         any_deleted,
         emitted_events,
     })
+}
+
+/// Result of classifying drive token probes: which drive labels are blocked
+/// from receiving sends, and which have a confirmed identity.
+///
+/// `blocked` — token mismatch or expected-but-missing: a clone or a swap is
+/// suspected, so sends are held back (but retention deletes still proceed).
+/// `verified` — token file readable and matching: the executor's chain-break
+/// gate may proceed for these drives.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct TokenGating {
+    blocked: std::collections::BTreeSet<String>,
+    verified: std::collections::BTreeSet<String>,
+}
+
+/// Classify drive token probes into blocked and verified labels (pure).
+///
+/// Each probe is `(drive_label, availability, has_readable_token)` — the
+/// I/O results gathered in `run()`. The classification mirrors the verify
+/// semantics: a drive is "verified" only when its token file is readable AND
+/// the stored token matches, which excludes fail-open paths (unreadable token
+/// file) from being treated as verified. Operator warnings stay in `run()` at
+/// the I/O boundary — this function does no logging.
+#[must_use]
+fn resolve_token_gating(probes: &[(String, drives::DriveAvailability, bool)]) -> TokenGating {
+    let mut gating = TokenGating::default();
+    for (label, avail, has_readable_token) in probes {
+        match avail {
+            drives::DriveAvailability::TokenMismatch { .. }
+            | drives::DriveAvailability::TokenExpectedButMissing => {
+                gating.blocked.insert(label.clone());
+            }
+            drives::DriveAvailability::Available if *has_readable_token => {
+                // Token file exists and matches — drive identity confirmed.
+                gating.verified.insert(label.clone());
+            }
+            _ => {
+                // TokenMissing (first use), fail-open, or no token file:
+                // neither blocked nor verified.
+            }
+        }
+    }
+    gating
+}
+
+/// Apply token gating to a backup plan (pure plan mutation).
+///
+/// Drops only the SENDS (`SendFull` / `SendIncremental`) targeting blocked
+/// drives — retention `Delete*` ops are untouched, because a clone's snapshots
+/// are redundant copies and blocking deletes would cause space exhaustion
+/// without safety benefit. Stamps `token_verified = true` on `SendFull`
+/// operations for verified drives so the executor's chain-break gate may
+/// proceed on known-good drives.
+fn apply_token_gating(plan: &mut BackupPlan, gating: &TokenGating) {
+    if !gating.blocked.is_empty() {
+        plan.operations.retain(|op| {
+            !matches!(
+                op,
+                PlannedOperation::SendFull { drive_label, .. }
+                | PlannedOperation::SendIncremental { drive_label, .. }
+                if gating.blocked.contains(drive_label)
+            )
+        });
+    }
+
+    for op in &mut plan.operations {
+        if let PlannedOperation::SendFull {
+            drive_label,
+            token_verified,
+            ..
+        } = op
+            && gating.verified.contains(drive_label.as_str())
+        {
+            *token_verified = true;
+        }
+    }
 }
 
 /// Remove retention delete operations for subvolumes that have a protection promise.
@@ -4325,5 +4370,202 @@ source = "/data/beta"
         // Defensive: u32::MAX × u64::MAX should saturate, not wrap.
         let got = compute_pinned_delta(Some(u32::MAX), Some(u64::MAX));
         assert_eq!(got, Some(u64::MAX));
+    }
+
+    // ── Token gating (UPI 059-b) ───────────────────────────────────────
+
+    fn send_full(drive: &str, token_verified: bool) -> PlannedOperation {
+        PlannedOperation::SendFull {
+            snapshot: PathBuf::from(format!("/snaps/sv/{drive}-snap")),
+            dest_dir: PathBuf::from(format!("/mnt/{drive}/sv")),
+            drive_label: drive.to_string(),
+            subvolume_name: "sv".to_string(),
+            pin_on_success: None,
+            reason: FullSendReason::FirstSend,
+            token_verified,
+        }
+    }
+
+    fn send_incremental(drive: &str) -> PlannedOperation {
+        PlannedOperation::SendIncremental {
+            parent: PathBuf::from("/snaps/sv/parent"),
+            snapshot: PathBuf::from("/snaps/sv/snap"),
+            dest_dir: PathBuf::from(format!("/mnt/{drive}/sv")),
+            drive_label: drive.to_string(),
+            subvolume_name: "sv".to_string(),
+            pin_on_success: None,
+        }
+    }
+
+    fn delete_snapshot(subvol: &str) -> PlannedOperation {
+        PlannedOperation::DeleteSnapshot {
+            path: PathBuf::from(format!("/snaps/{subvol}/old")),
+            reason: "retention".to_string(),
+            subvolume_name: subvol.to_string(),
+            kind: DeleteKind::Policy,
+        }
+    }
+
+    fn token_plan(ops: Vec<PlannedOperation>) -> BackupPlan {
+        BackupPlan {
+            operations: ops,
+            timestamp: chrono::NaiveDateTime::default(),
+            skipped: vec![],
+            events: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn resolve_token_gating_mismatch_blocks() {
+        // A readable-but-mismatched token blocks (readable=true must not verify it).
+        let probes = vec![(
+            "WD-18TB".to_string(),
+            drives::DriveAvailability::TokenMismatch {
+                expected: "aaa".to_string(),
+                found: "bbb".to_string(),
+            },
+            true,
+        )];
+        let g = resolve_token_gating(&probes);
+        assert!(g.blocked.contains("WD-18TB"));
+        assert!(g.verified.is_empty());
+    }
+
+    #[test]
+    fn resolve_token_gating_expected_but_missing_blocks() {
+        let probes = vec![(
+            "WD-18TB".to_string(),
+            drives::DriveAvailability::TokenExpectedButMissing,
+            false,
+        )];
+        let g = resolve_token_gating(&probes);
+        assert!(g.blocked.contains("WD-18TB"));
+        assert!(g.verified.is_empty());
+    }
+
+    #[test]
+    fn resolve_token_gating_available_and_readable_verifies() {
+        let probes = vec![(
+            "WD-18TB".to_string(),
+            drives::DriveAvailability::Available,
+            true,
+        )];
+        let g = resolve_token_gating(&probes);
+        assert!(g.verified.contains("WD-18TB"));
+        assert!(g.blocked.is_empty());
+    }
+
+    #[test]
+    fn resolve_token_gating_available_but_unreadable_is_neither() {
+        // Fail-open: drive is available but its token file can't be read.
+        // Must NOT be treated as verified (excludes fail-open from verified).
+        let probes = vec![(
+            "WD-18TB".to_string(),
+            drives::DriveAvailability::Available,
+            false,
+        )];
+        let g = resolve_token_gating(&probes);
+        assert!(g.blocked.is_empty());
+        assert!(g.verified.is_empty());
+    }
+
+    #[test]
+    fn resolve_token_gating_fallopen_variants_are_neither() {
+        // TokenMissing (genuine first use), unmounted, and UUID-level
+        // unavailability all fall through to neither — even when the token
+        // file happens to be readable (TokenMissing with readable=true).
+        let probes = vec![
+            ("a".to_string(), drives::DriveAvailability::TokenMissing, true),
+            ("b".to_string(), drives::DriveAvailability::NotMounted, false),
+            (
+                "c".to_string(),
+                drives::DriveAvailability::UuidCheckFailed("findmnt not found".to_string()),
+                true,
+            ),
+            (
+                "d".to_string(),
+                drives::DriveAvailability::UuidMismatch {
+                    expected: "x".to_string(),
+                    found: "y".to_string(),
+                },
+                true,
+            ),
+        ];
+        let g = resolve_token_gating(&probes);
+        assert!(g.blocked.is_empty());
+        assert!(g.verified.is_empty());
+    }
+
+    #[test]
+    fn apply_token_gating_blocks_sends_keeps_deletes() {
+        // The load-bearing rule: blocked drives lose their sends, but their
+        // retention deletes proceed (a clone's snapshots are redundant copies).
+        let mut plan = token_plan(vec![
+            send_full("WD-18TB", false),
+            send_incremental("WD-18TB"),
+            delete_snapshot("sv"),
+        ]);
+        let gating = TokenGating {
+            blocked: ["WD-18TB".to_string()].into_iter().collect(),
+            verified: Default::default(),
+        };
+        apply_token_gating(&mut plan, &gating);
+        // Both sends dropped; the delete retained.
+        assert_eq!(plan.operations.len(), 1);
+        assert!(matches!(
+            plan.operations[0],
+            PlannedOperation::DeleteSnapshot { .. }
+        ));
+    }
+
+    #[test]
+    fn apply_token_gating_verifies_full_sends_only() {
+        let mut plan = token_plan(vec![
+            send_full("WD-18TB", false),    // verified drive → flag flipped
+            send_full("2TB-backup", false), // not verified → stays false
+            send_incremental("WD-18TB"),    // incrementals carry no flag → no-op
+        ]);
+        let gating = TokenGating {
+            blocked: Default::default(),
+            verified: ["WD-18TB".to_string()].into_iter().collect(),
+        };
+        apply_token_gating(&mut plan, &gating);
+        // Nothing dropped (no blocked labels).
+        assert_eq!(plan.operations.len(), 3);
+        match &plan.operations[0] {
+            PlannedOperation::SendFull {
+                drive_label,
+                token_verified,
+                ..
+            } => {
+                assert_eq!(drive_label, "WD-18TB");
+                assert!(*token_verified, "verified drive's SendFull should be stamped");
+            }
+            other => panic!("expected SendFull, got {other:?}"),
+        }
+        match &plan.operations[1] {
+            PlannedOperation::SendFull { token_verified, .. } => {
+                assert!(!*token_verified, "unverified drive's SendFull stays false");
+            }
+            other => panic!("expected SendFull, got {other:?}"),
+        }
+        // SendIncremental has no token_verified field — unaffected by construction.
+        assert!(matches!(
+            plan.operations[2],
+            PlannedOperation::SendIncremental { .. }
+        ));
+    }
+
+    #[test]
+    fn apply_token_gating_empty_is_noop() {
+        let mut plan = token_plan(vec![
+            send_full("WD-18TB", false),
+            send_incremental("2TB-backup"),
+            delete_snapshot("sv"),
+        ]);
+        let before = plan.operations.clone();
+        apply_token_gating(&mut plan, &TokenGating::default());
+        // Empty gating touches nothing — no drops, no stamps.
+        assert_eq!(plan.operations, before);
     }
 }

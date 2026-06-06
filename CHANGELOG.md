@@ -17,6 +17,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   signature and call site. The ADR-107 pin-gating and ADR-109 per-subvolume failure-isolation
   paths are now pinned by 8 unit tests against `MockBtrfs` with no live filesystem. Realizes
   ADR-100/101/107/108; no on-disk, metric, heartbeat, or event-contract change.
+- **Token-gating decision extracted into pure functions** (UPI 059-b; no behavior change).
+  The nightly backup path's drive-token gating — block sends to a token-suspicious drive
+  while letting its retention deletes proceed, and stamp `token_verified` on sends to
+  identity-confirmed drives — was an inline block in `run()` with no test seam. The
+  classification and the plan mutation now live in two pure functions (`resolve_token_gating`,
+  `apply_token_gating`); `run()` keeps only the I/O (token probes) and the operator warnings.
+  The load-bearing rule (deletes are never blocked) and the fail-open exclusion (an unreadable
+  token never counts as verified) are now pinned by 8 pure unit tests. Realizes ADR-108; no
+  on-disk, metric, heartbeat, or event-contract change.
 - **Drift + send-size composition localized to the read-side adapter** (deepening 03;
   no behavior change). The "fetch drift rows → map to `DriftSample` → ADR-102 fail-open"
   sequence had been re-typed at three command sites (`backup.rs`, `doctor.rs` ×2), all
