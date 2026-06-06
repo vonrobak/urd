@@ -1983,13 +1983,46 @@ fn run_emergency_preflight(
     config: &Config,
     state_db: Option<&StateDb>,
 ) -> anyhow::Result<bool> {
+    let now = chrono::Local::now().naive_local();
+    let btrfs = RealBtrfs::for_maintenance(&config.general.btrfs_path);
+    let outcome = run_emergency_preflight_with(config, now, &btrfs, |p| {
+        crate::drives::filesystem_free_bytes(p).ok()
+    })?;
+    if let Some(db) = state_db {
+        db.record_events_best_effort(&outcome.emitted_events);
+    }
+    Ok(outcome.any_deleted)
+}
+
+/// Structured outcome of an emergency-preflight pass. The injectable core
+/// ([`run_emergency_preflight_with`]) accumulates the prune events it would
+/// persist and returns them here instead of writing them, so the wrapper owns
+/// the SQLite write and the tests stay free of a `StateDb`.
+struct EmergencyPreflightOutcome {
+    any_deleted: bool,
+    emitted_events: Vec<crate::events::Event>,
+}
+
+/// Testable core of [`run_emergency_preflight`]: the free-space probe and the
+/// btrfs handle are injected and the clock is passed in, so the ADR-107
+/// deletion path is unit-testable without a live filesystem. Reads snapshot
+/// dirs / pin files and issues deletes via `btrfs`, returning the prune events
+/// (the wrapper records them best-effort).
+///
+/// `now` is read once per pass — not per subvolume as the inline version did —
+/// so every prune event in one pass shares an `occurred_at`. Benign: the events
+/// table has no uniqueness on `occurred_at` and intra-pass order is preserved by
+/// the autoincrement `id` (UPI 059-a, F2).
+fn run_emergency_preflight_with(
+    config: &Config,
+    now: chrono::NaiveDateTime,
+    btrfs: &dyn BtrfsOps,
+    free_bytes: impl Fn(&std::path::Path) -> Option<u64>,
+) -> anyhow::Result<EmergencyPreflightOutcome> {
     let resolved = config.resolved_subvolumes();
     let drive_labels = config.drive_labels();
     let mut any_deleted = false;
     let mut emitted_events: Vec<crate::events::Event> = Vec::new();
-
-    // Lazily created btrfs handle — only probe if we need to delete
-    let mut btrfs: Option<crate::btrfs::RealBtrfs> = None;
 
     for root in &config.local_snapshots.roots {
         // Skip roots without min_free_bytes configured
@@ -1998,29 +2031,19 @@ fn run_emergency_preflight(
         };
         let min_free = min_free_bs.bytes();
 
-        let free_bytes = crate::drives::filesystem_free_bytes(&root.path).unwrap_or(u64::MAX);
+        let free = free_bytes(&root.path).unwrap_or(u64::MAX);
 
         // Critical threshold: below 50% of min_free_bytes
-        if free_bytes >= min_free / 2 {
+        if free >= min_free / 2 {
             continue;
         }
 
         log::warn!(
             "Emergency: snapshot root {} is critically low ({} free, threshold {})",
             root.path.display(),
-            crate::types::ByteSize(free_bytes),
+            crate::types::ByteSize(free),
             crate::types::ByteSize(min_free),
         );
-
-        let btrfs = btrfs.get_or_insert_with(|| {
-            let sys = crate::btrfs::SystemBtrfs::probe(&config.general.btrfs_path);
-            let bytes_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-            crate::btrfs::RealBtrfs::new(
-                &config.general.btrfs_path,
-                bytes_counter,
-                sys.supports_compressed_data,
-            )
-        });
 
         for subvol_name in &root.subvolumes {
             // Skip transient subvolumes — already delete aggressively
@@ -2053,7 +2076,7 @@ fn run_emergency_preflight(
                 &snaps,
                 &latest,
                 &pinned,
-                chrono::Local::now().naive_local(),
+                now,
             );
 
             // Map snap → its emitted event (by snapshot name) so we can
@@ -2122,11 +2145,10 @@ fn run_emergency_preflight(
         log::warn!("Emergency retention freed space before backup");
     }
 
-    if let Some(db) = state_db {
-        db.record_events_best_effort(&emitted_events);
-    }
-
-    Ok(any_deleted)
+    Ok(EmergencyPreflightOutcome {
+        any_deleted,
+        emitted_events,
+    })
 }
 
 /// Remove retention delete operations for subvolumes that have a protection promise.
@@ -2623,6 +2645,229 @@ source = "/data/beta"
             },
         );
         assert!(created.borrow().is_empty());
+    }
+
+    // ── Emergency preflight reclaim (UPI 059-a) ────────────────────────
+
+    /// Build a critical-root config: one subvol `alpha` under `root`, with a
+    /// 1 GB `min_free_bytes` so the critical threshold is 500 MB.
+    fn emergency_config(root: &std::path::Path) -> Config {
+        let mut config = wd_config();
+        config.local_snapshots.roots[0].path = root.to_path_buf();
+        config.local_snapshots.roots[0].subvolumes = vec!["alpha".to_string()];
+        config.local_snapshots.roots[0].min_free_bytes =
+            Some(crate::types::ByteSize(1_000_000_000));
+        config
+    }
+
+    /// Create the subvol dir and one child dir per snapshot name.
+    fn make_snap_dirs(subvol_dir: &std::path::Path, names: &[&str]) {
+        std::fs::create_dir_all(subvol_dir).unwrap();
+        for n in names {
+            std::fs::create_dir(subvol_dir.join(n)).unwrap();
+        }
+    }
+
+    /// Paths the mock was asked to delete, in call order.
+    fn deleted_paths(mock: &crate::btrfs::MockBtrfs) -> Vec<PathBuf> {
+        mock.calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                crate::btrfs::MockBtrfsCall::DeleteSubvolume { path } => Some(path),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A fixed pass clock newer than every test snapshot. Its value never
+    /// changes which snapshots `emergency_retention` keeps (latest + pinned).
+    fn pass_now() -> chrono::NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(2026, 1, 4)
+            .unwrap()
+            .and_hms_opt(4, 0, 0)
+            .unwrap()
+    }
+
+    const THREE_SNAPS: [&str; 3] = [
+        "20260101-1200-alpha",
+        "20260102-1200-alpha",
+        "20260103-1200-alpha",
+    ];
+
+    // Below 50 % of `min_free_bytes` (500 MB) → critical.
+    fn below() -> impl Fn(&std::path::Path) -> Option<u64> {
+        |_| Some(400_000_000u64)
+    }
+
+    #[test]
+    fn emergency_deletes_non_latest_keeps_latest() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let alpha = dir.path().join("alpha");
+        make_snap_dirs(&alpha, &THREE_SNAPS);
+        let config = emergency_config(dir.path());
+        let mock = crate::btrfs::MockBtrfs::new();
+
+        let out = run_emergency_preflight_with(&config, pass_now(), &mock, below()).unwrap();
+
+        let deleted = deleted_paths(&mock);
+        assert_eq!(deleted.len(), 2, "two older snaps deleted");
+        assert!(deleted.contains(&alpha.join("20260101-1200-alpha")));
+        assert!(deleted.contains(&alpha.join("20260102-1200-alpha")));
+        assert!(
+            !deleted.contains(&alpha.join("20260103-1200-alpha")),
+            "latest must survive"
+        );
+        assert!(out.any_deleted);
+    }
+
+    #[test]
+    fn emergency_pin_gating_keeps_pinned_oldest() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let alpha = dir.path().join("alpha");
+        make_snap_dirs(&alpha, &THREE_SNAPS);
+        // Legacy unlabeled pin → read unconditionally (chain.rs:78–90),
+        // independent of the empty `drives`. Pins the oldest snapshot, so this
+        // exercises the *primary* ADR-107 layer by construction (F3).
+        std::fs::write(alpha.join(".last-external-parent"), "20260101-1200-alpha\n").unwrap();
+        let config = emergency_config(dir.path());
+
+        // Test-setup insurance: the loop dir (`root.path.join(subvol)`) and the
+        // defence-in-depth dir (`config.local_snapshot_dir`) must agree, else the
+        // two pin layers would read different files.
+        assert_eq!(
+            config.local_snapshot_dir("alpha").unwrap(),
+            alpha,
+            "both pin-read layers must resolve the same dir"
+        );
+
+        let mock = crate::btrfs::MockBtrfs::new();
+        let out = run_emergency_preflight_with(&config, pass_now(), &mock, below()).unwrap();
+
+        assert_eq!(
+            deleted_paths(&mock),
+            vec![alpha.join("20260102-1200-alpha")],
+            "only the middle snap deleted — pinned oldest and latest kept"
+        );
+        assert!(out.any_deleted);
+    }
+
+    #[test]
+    fn emergency_skips_transient_subvol() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let alpha = dir.path().join("alpha");
+        make_snap_dirs(&alpha, &["20260101-1200-alpha", "20260102-1200-alpha"]);
+        let mut config = emergency_config(dir.path());
+        // `subvolumes[0]` is `alpha` (wd_config order); make it transient.
+        config.subvolumes[0].local_retention =
+            Some(crate::types::LocalRetentionConfig::Transient);
+        let mock = crate::btrfs::MockBtrfs::new();
+
+        let out = run_emergency_preflight_with(&config, pass_now(), &mock, below()).unwrap();
+
+        assert!(deleted_paths(&mock).is_empty(), "transient subvol skipped");
+        assert!(!out.any_deleted);
+    }
+
+    #[test]
+    fn emergency_unmeasurable_probe_skips() {
+        let dir = tempfile::TempDir::new().unwrap();
+        make_snap_dirs(
+            &dir.path().join("alpha"),
+            &["20260101-1200-alpha", "20260102-1200-alpha"],
+        );
+        let config = emergency_config(dir.path());
+        let mock = crate::btrfs::MockBtrfs::new();
+        // Probe yields None → core `unwrap_or(u64::MAX)` → not critical → skip.
+        let out = run_emergency_preflight_with(&config, pass_now(), &mock, |_| None).unwrap();
+        assert!(mock.calls().is_empty(), "unmeasurable root issues no btrfs ops");
+        assert!(!out.any_deleted);
+    }
+
+    #[test]
+    fn emergency_above_threshold_skips() {
+        let dir = tempfile::TempDir::new().unwrap();
+        make_snap_dirs(
+            &dir.path().join("alpha"),
+            &["20260101-1200-alpha", "20260102-1200-alpha"],
+        );
+        let config = emergency_config(dir.path());
+        let mock = crate::btrfs::MockBtrfs::new();
+        // 2 GB free > 1 GB min_free → far above the 500 MB critical line.
+        let out =
+            run_emergency_preflight_with(&config, pass_now(), &mock, |_| Some(2_000_000_000u64))
+                .unwrap();
+        assert!(mock.calls().is_empty(), "healthy root issues no btrfs ops");
+        assert!(!out.any_deleted);
+    }
+
+    #[test]
+    fn emergency_emits_prune_events_for_deleted() {
+        let dir = tempfile::TempDir::new().unwrap();
+        make_snap_dirs(&dir.path().join("alpha"), &THREE_SNAPS);
+        let config = emergency_config(dir.path());
+        let mock = crate::btrfs::MockBtrfs::new();
+
+        let out = run_emergency_preflight_with(&config, pass_now(), &mock, below()).unwrap();
+
+        assert_eq!(out.emitted_events.len(), 2);
+        for ev in &out.emitted_events {
+            assert_eq!(ev.subvolume.as_deref(), Some("alpha"));
+            assert_eq!(ev.occurred_at, pass_now(), "events carry the injected pass clock");
+            match &ev.payload {
+                crate::events::EventPayload::RetentionPrune { rule, snapshot, .. } => {
+                    assert_eq!(*rule, crate::events::PruneRule::Emergency);
+                    assert!(snapshot.ends_with("-alpha"));
+                }
+                other => panic!("expected RetentionPrune, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn emergency_isolates_delete_failure() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let alpha = dir.path().join("alpha");
+        make_snap_dirs(&alpha, &THREE_SNAPS);
+        let config = emergency_config(dir.path());
+        let mock = crate::btrfs::MockBtrfs::new();
+        // Fail the oldest's delete; the middle must still be attempted (ADR-109).
+        mock.fail_deletes
+            .borrow_mut()
+            .insert(alpha.join("20260101-1200-alpha"));
+
+        let out = run_emergency_preflight_with(&config, pass_now(), &mock, below()).unwrap();
+
+        let deleted = deleted_paths(&mock);
+        assert!(
+            deleted.contains(&alpha.join("20260101-1200-alpha"))
+                && deleted.contains(&alpha.join("20260102-1200-alpha")),
+            "the loop attempts both deletes despite the failure"
+        );
+        // Event only for the successful delete (the push lives in the Ok arm).
+        assert_eq!(out.emitted_events.len(), 1);
+        match &out.emitted_events[0].payload {
+            crate::events::EventPayload::RetentionPrune { snapshot, .. } => {
+                assert_eq!(snapshot, "20260102-1200-alpha");
+            }
+            other => panic!("expected RetentionPrune, got {other:?}"),
+        }
+        assert!(out.any_deleted, "the middle delete succeeded");
+    }
+
+    #[test]
+    fn emergency_single_snapshot_never_emptied() {
+        let dir = tempfile::TempDir::new().unwrap();
+        make_snap_dirs(&dir.path().join("alpha"), &["20260101-1200-alpha"]);
+        let config = emergency_config(dir.path());
+        let mock = crate::btrfs::MockBtrfs::new();
+
+        let out = run_emergency_preflight_with(&config, pass_now(), &mock, below()).unwrap();
+
+        assert!(
+            deleted_paths(&mock).is_empty(),
+            "the only snapshot is the latest — never deleted"
+        );
+        assert!(!out.any_deleted);
     }
 
     fn make_outcome(

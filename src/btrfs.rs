@@ -129,6 +129,15 @@ impl RealBtrfs {
     pub fn for_reads(btrfs_path: &str) -> Self {
         Self::new(btrfs_path, Arc::new(AtomicU64::new(0)), false)
     }
+
+    /// Handle for non-send maintenance ops (delete, sync). These never read
+    /// `supports_compressed_data` and need no live byte counter, so both are
+    /// defaulted — and no `SystemBtrfs::probe` subprocess runs. Used by the
+    /// emergency-preflight reclaim (UPI 059-a).
+    #[must_use]
+    pub fn for_maintenance(btrfs_path: &str) -> Self {
+        Self::new(btrfs_path, Arc::new(AtomicU64::new(0)), false)
+    }
 }
 
 impl BtrfsOps for RealBtrfs {
