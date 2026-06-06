@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Emergency-preflight reclaim given a dependency-injection seam** (UPI 059-a; no behavior
+  change). The one destructive helper on the nightly backup path — `run_emergency_preflight`,
+  which deletes snapshots when a snapshot root drops below 50 % of `min_free_bytes` —
+  constructed its btrfs handle inline, read free space directly, and had no test seam or unit
+  coverage. Its logic now lives in an injectable core (`run_emergency_preflight_with`) taking
+  the free-space probe, btrfs handle, and clock as parameters; the production wrapper keeps its
+  signature and call site. The ADR-107 pin-gating and ADR-109 per-subvolume failure-isolation
+  paths are now pinned by 8 unit tests against `MockBtrfs` with no live filesystem. Realizes
+  ADR-100/101/107/108; no on-disk, metric, heartbeat, or event-contract change.
 - **Drift + send-size composition localized to the read-side adapter** (deepening 03;
   no behavior change). The "fetch drift rows → map to `DriftSample` → ADR-102 fail-open"
   sequence had been re-typed at three command sites (`backup.rs`, `doctor.rs` ×2), all
