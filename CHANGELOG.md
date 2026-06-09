@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **One home for the read-side assessment view** (UPI 060, PR 2; no behavior change).
+  The assess-then-overlay composition every surface must perform now lives once:
+  `advice::assess_view` — the assessment view, the only input from which surfaces render
+  promise state. All seven call sites (status, default summary, doctor, backup ×3, sentinel)
+  switched; a clippy `disallowed-methods` guard makes the rule structural, so the doctor-style
+  coherence gap (one surface skipping an overlay) can no longer be written. Glossary gains
+  *assessment view* and backfills *rotation view* (UPI 055).
+
 ### Fixed
 - **`urd doctor` now applies the offsite-freshness overlay** (UPI 060, PR 1). Doctor was the
   only one of seven assessment surfaces that skipped `advice::overlay_offsite_freshness`, so a
