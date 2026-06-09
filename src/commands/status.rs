@@ -1,3 +1,5 @@
+use chrono::NaiveDateTime;
+
 use crate::advice;
 use crate::awareness::{ChainBreakReason, ChainStatus, SubvolAssessment};
 use crate::chain;
@@ -12,7 +14,6 @@ use crate::commands::storage_signals;
 use crate::retention;
 use crate::state::StateDb;
 use crate::voice;
-use chrono::NaiveDateTime;
 
 pub fn run(config: Config, output_mode: OutputMode) -> anyhow::Result<()> {
     let state_db = if config.general.state_db.exists() {
