@@ -1,5 +1,5 @@
 use crate::advice;
-use crate::awareness::{self, ChainBreakReason, ChainStatus};
+use crate::awareness::{ChainBreakReason, ChainStatus};
 use crate::chain;
 use crate::config::Config;
 use crate::drives;
@@ -35,9 +35,8 @@ pub fn run(config: Config, output_mode: OutputMode) -> anyhow::Result<()> {
     // Gather storage signals (read-only) and thread the per-subvol map into
     // assess(); status reflects the stabilized tier but never advances it (S1).
     let signals = storage_signals::gather(&config, state_db.as_ref());
-    let mut assessments =
-        awareness::assess(&config, now, &observation, &signals.by_subvol);
-    advice::overlay_offsite_freshness(&mut assessments, &config);
+    let assessments =
+        advice::assess_view(&config, now, &observation, &signals.by_subvol);
     let storage_postures = storage_signals::aggregate(&assessments, &signals, now);
 
     // ── Chain health per subvolume (derived from awareness assessment) ──

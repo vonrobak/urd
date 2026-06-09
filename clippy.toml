@@ -1,0 +1,3 @@
+disallowed-methods = [
+  { path = "urd::awareness::assess", reason = "call advice::assess_view — surfaces render the assessment view, never raw assessments" },
+]

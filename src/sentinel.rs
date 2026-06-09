@@ -768,7 +768,7 @@ pub struct DriveAnomaly {
 /// Extract chain snapshots from assessments for mounted drives only.
 ///
 /// Pure function: reads `SubvolAssessment::chain_health` (populated by
-/// `awareness::assess()`) and filters to chains for drives in
+/// `advice::assess_view()`) and filters to chains for drives in
 /// `mounted_drives`. Unmounted drives are excluded because chain health
 /// cannot be assessed without reading the drive's snapshots.
 #[must_use]

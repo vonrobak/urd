@@ -402,13 +402,12 @@ impl SentinelRunner {
         // to the heartbeat, which carries no posture). Pass an empty signal map
         // so `assess()` computes no posture on this path; on-demand `status` and
         // `backup` runs are where posture is gathered and surfaced.
-        let mut assessments = awareness::assess(
+        let assessments = advice::assess_view(
             &self.config,
             now,
             &observation,
             &awareness::StorageSignalMap::new(),
         );
-        advice::overlay_offsite_freshness(&mut assessments, &self.config);
 
         // Emit promise-transition events when the originating event was
         // Tick/DriveMounted/ConfigChanged. On BackupCompleted the backup

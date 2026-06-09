@@ -49,6 +49,14 @@ heartbeat JSON, NDJSON event payloads, Prometheus labels, SQLite rows. The
 voice labels (next cluster) only render in `urd status` and similar interactive
 output.
 
+**assessment view (UPI 060).** The awareness assessment plus every product
+overlay (today: the offsite-freshness overlay); the only input from which
+surfaces render promise state (`advice::assess_view`). Raw `awareness::assess`
+output is a half-built picture — awareness stays protection-level-blind
+(ADR-110), so a surface reading it directly misses the Fortified
+stale-offsite degradation. A clippy `disallowed-methods` guard enforces the
+rule: surfaces call `assess_view`, never `assess`.
+
 ## Cluster: Voice labels (presentation)
 
 The CLI surface renders the promise states with the mythic voice labels below. The
@@ -169,6 +177,13 @@ cadence, not the send interval.
 | `on_schedule` | Age ≤ overdue threshold — the offsite drive is away on its normal rhythm. Per-copy promise → PROTECTED. | `rotation::classify` |
 | `overdue` | Age past overdue but ≤ stale — worth attention. → AT RISK. | `rotation::classify` |
 | `stale` | Age past the stale threshold — genuinely too long. → UNPROTECTED. | `rotation::classify` |
+
+**rotation view (UPI 055).** The pure projection over drive-mount history
+(`rotation.rs` over `HistoryQuery::drive_mount_history`) that derives an offsite
+drive's rotation cadence and resolves its freshness window. Derives live — no
+new table (RD2). Window sources in priority order: declared `rotation_interval`
+primary, observed median cadence fallback (≥2 completed gaps), conservative
+30d/60d default otherwise (RD1).
 
 The relaxation that lets an *away* offsite copy read PROTECTED fires only when a
 real redundancy peer (a non-`test` drive) is currently mounted — an offsite drive

@@ -40,9 +40,8 @@ pub fn run(config_path: Option<&Path>, output_mode: OutputMode) -> anyhow::Resul
     // Awareness assessment — lighter than status (no chain health, no drive info, no pins)
     let now = chrono::Local::now().naive_local();
     let signals = storage_signals::gather(&config, state_db.as_ref());
-    let mut assessments =
-        awareness::assess(&config, now, &observation, &signals.by_subvol);
-    advice::overlay_offsite_freshness(&mut assessments, &config);
+    let assessments =
+        advice::assess_view(&config, now, &observation, &signals.by_subvol);
 
     let last_run = state_db.as_ref().and_then(|db| db.last_run_info());
 

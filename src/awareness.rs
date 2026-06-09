@@ -1388,6 +1388,8 @@ fn compute_health(
 
 // ── Tests ──────────────────────────────────────────────────────────────
 
+// Module-under-test calls its own raw assess directly (clippy disallowed-methods guard).
+#[allow(clippy::disallowed_methods)]
 #[cfg(test)]
 mod tests {
     use super::*;
