@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`urd doctor` now applies the offsite-freshness overlay** (UPI 060, PR 1). Doctor was the
+  only one of seven assessment surfaces that skipped `advice::overlay_offsite_freshness`, so a
+  Fortified subvolume with a stale offsite copy showed waning in `urd status` but healthy in
+  `urd doctor`. The two surfaces now agree: Fortified rows with stale offsite copies flip
+  healthy → waning in doctor output (and the corresponding `--json` status/issue values shift;
+  the schema is unchanged).
+
 ## [0.24.2] - 2026-06-06
 
 ### Changed
