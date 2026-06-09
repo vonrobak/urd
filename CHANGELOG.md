@@ -15,6 +15,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   switched; a clippy `disallowed-methods` guard makes the rule structural, so the doctor-style
   coherence gap (one surface skipping an overlay) can no longer be written. Glossary gains
   *assessment view* and backfills *rotation view* (UPI 055).
+- **`urd status` assembly extracted into a pure layer** (UPI 060, PR 3; no behavior change).
+  The inline tail of the status command — chain-health worst-selection, promise-level
+  threading, advice filtering, redundancy advisories — had zero tests because it lived between
+  I/O calls in `run()`. It now lives in a pure `assemble_status_output` (gathering stays in
+  `run()`), pinned by 11 characterization tests of the recorded current semantics.
 
 ### Fixed
 - **`urd doctor` now applies the offsite-freshness overlay** (UPI 060, PR 1). Doctor was the
