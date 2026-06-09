@@ -164,8 +164,10 @@ pub fn run(config: Config, args: DoctorArgs, output_mode: OutputMode) -> anyhow:
     let now = chrono::Local::now().naive_local();
     // Read-only gather: thread storage posture into the data-safety section.
     let signals = crate::commands::storage_signals::gather(&config, state_db.as_ref());
-    let assessments =
+    let mut assessments =
         awareness::assess(&config, now, &observation, &signals.by_subvol);
+    // Overlay must follow assess — degrades Fortified rows with stale offsite copies.
+    advice::overlay_offsite_freshness(&mut assessments, &config);
 
     let resolved = config.resolved_subvolumes();
     let data_safety: Vec<DoctorDataSafety> = assessments
