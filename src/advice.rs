@@ -5,14 +5,15 @@
 //! Sibling to [`crate::awareness`], which observes promise state. This
 //! module turns observations into prescriptions.
 
-use chrono::Duration;
+use chrono::{Duration, NaiveDateTime};
 use serde::{Deserialize, Serialize};
 
 use crate::awareness::{
     ChainStatus, DriveAssessment, DriveChainHealth, OperationalHealth, PromiseStatus,
-    SubvolAssessment,
+    StorageSignalMap, SubvolAssessment,
 };
 use crate::config::Config;
+use crate::observation::Observation;
 use crate::types::{DriveRole, ProtectionLevel};
 
 // ── Actionable Advice ─────────────────────────────────────────────────
@@ -245,12 +246,34 @@ pub struct RedundancyAdvisory {
     pub detail: String,
 }
 
+// ── Assessment view ────────────────────────────────────────────────────
+
+/// The assessment view: the awareness assessment plus every product overlay.
+///
+/// The only input from which surfaces render promise state. Callers supply
+/// gathered signals or an empty map (sentinel D6 / backup S4 paths); this
+/// function never gathers (backup's 031-b single-gather invariant).
+#[must_use]
+pub fn assess_view(
+    config: &Config,
+    now: NaiveDateTime,
+    obs: &Observation,
+    storage_signals: &StorageSignalMap,
+) -> Vec<SubvolAssessment> {
+    // The one sanctioned caller of the raw assess (clippy disallowed-methods guard).
+    #[allow(clippy::disallowed_methods)]
+    let mut assessments = crate::awareness::assess(config, now, obs, storage_signals);
+    overlay_offsite_freshness(&mut assessments, config);
+    assessments
+}
+
 // ── Offsite freshness overlay ──────────────────────────────────────────
 
 /// Post-processing overlay: degrade fortified subvolumes with stale offsite copies.
 ///
 /// This is NOT part of `assess()` — awareness remains protection-level-blind per
-/// ADR-110 Invariant 6. Call this after `assess()` returns.
+/// ADR-110 Invariant 6. `assess_view` composes it after `assess()`; surfaces
+/// call `assess_view`, never this overlay directly.
 ///
 /// Pure function: assessments + config in, mutations in place.
 pub fn overlay_offsite_freshness(assessments: &mut [SubvolAssessment], config: &Config) {
@@ -465,9 +488,7 @@ pub fn compute_redundancy_advisories(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::awareness::{
-        ChainBreakReason, DriveChainHealth, LocalAssessment, assess,
-    };
+    use crate::awareness::{ChainBreakReason, DriveChainHealth, LocalAssessment};
     use crate::awareness::test_support::{dt, offsite_test_config, snap, test_config};
     use crate::btrfs::MockBtrfs;
     use crate::observation::Observation;
@@ -840,13 +861,12 @@ drives = ["primary-drive", "offsite-drive"]
             dt(2026, 2, 10, 12, 0),
         );
 
-        let mut assessments = assess(
+        let assessments = assess_view(
             &config,
             now,
             &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() },
             &crate::awareness::StorageSignalMap::new(),
         );
-        overlay_offsite_freshness(&mut assessments, &config);
 
         let sv1 = assessments.iter().find(|a| a.name == "sv1").expect("sv1 assessed");
         assert_eq!(sv1.status, PromiseStatus::Protected);
@@ -873,19 +893,43 @@ drives = ["primary-drive", "offsite-drive"]
             dt(2026, 1, 1, 12, 0),
         );
 
-        let mut assessments = assess(
+        let assessments = assess_view(
             &config,
             now,
             &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() },
             &crate::awareness::StorageSignalMap::new(),
         );
-        overlay_offsite_freshness(&mut assessments, &config);
 
         let sv1 = assessments.iter().find(|a| a.name == "sv1").expect("sv1 assessed");
         assert_eq!(
             sv1.status,
             PromiseStatus::AtRisk,
             "stale offsite must cap at AT RISK, never UNPROTECTED (RD8)"
+        );
+    }
+
+    #[test]
+    fn assess_view_empty_signals_flows_through() {
+        // Pins the sentinel (D6) / backup (S4) empty-map contract: callers may
+        // pass an empty StorageSignalMap and still get assessments — with no
+        // storage posture computed on those paths.
+        let config = fortified_rotation_config();
+        let now = dt(2026, 4, 1, 12, 0);
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap(dt(2026, 4, 1, 11, 0), "sv1")]);
+
+        let assessments = assess_view(
+            &config,
+            now,
+            &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() },
+            &crate::awareness::StorageSignalMap::new(),
+        );
+
+        assert_eq!(assessments.len(), 1, "assessment produced despite empty signals");
+        assert!(
+            assessments[0].storage_posture.is_none(),
+            "no posture on the empty-map paths"
         );
     }
 
@@ -952,7 +996,7 @@ drives = ["drive-a", "drive-b"]
             .insert("sv1".to_string(), vec![snap(dt(2026, 4, 1, 11, 0), "sv1")]);
         fs.mounted_drives.insert("drive-a".to_string());
 
-        let assessments = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
+        let assessments = assess_view(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         let advisories = compute_redundancy_advisories(&config, &assessments);
 
         assert_eq!(advisories.len(), 1);
@@ -978,7 +1022,7 @@ drives = ["drive-a", "drive-b"]
             dt(2026, 3, 1, 12, 0),
         );
 
-        let assessments = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
+        let assessments = assess_view(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         let advisories = compute_redundancy_advisories(&config, &assessments);
 
         assert_eq!(advisories.len(), 1);
@@ -1010,7 +1054,7 @@ drives = ["drive-a", "drive-b"]
             dt(2026, 3, 3, 12, 0),
         );
 
-        let assessments = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
+        let assessments = assess_view(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         let advisories = compute_redundancy_advisories(&config, &assessments);
 
         assert!(
@@ -1048,7 +1092,7 @@ drives = ["drive-a", "drive-b"]
             42,
         );
 
-        let assessments = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &mb }, &crate::awareness::StorageSignalMap::new());
+        let assessments = assess_view(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &mb }, &crate::awareness::StorageSignalMap::new());
         let advisories = compute_redundancy_advisories(&config, &assessments);
 
         assert!(
@@ -1079,7 +1123,7 @@ drives = ["drive-a", "drive-b"]
             dt(2026, 3, 17, 12, 0),
         );
 
-        let assessments = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
+        let assessments = assess_view(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         let advisories = compute_redundancy_advisories(&config, &assessments);
 
         assert!(
@@ -1098,7 +1142,7 @@ drives = ["drive-a", "drive-b"]
             .insert("sv1".to_string(), vec![snap(dt(2026, 4, 1, 11, 0), "sv1")]);
         fs.mounted_drives.insert("primary-drive".to_string());
 
-        let assessments = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
+        let assessments = assess_view(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         let advisories = compute_redundancy_advisories(&config, &assessments);
 
         assert!(
@@ -1165,7 +1209,7 @@ protection_level = "protected"
             dt(2026, 4, 1, 8, 0),
         );
 
-        let assessments = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
+        let assessments = assess_view(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         let advisories = compute_redundancy_advisories(&config, &assessments);
 
         assert_eq!(advisories.len(), 1);
@@ -1184,7 +1228,7 @@ protection_level = "protected"
         fs.mounted_drives.insert("drive-a".to_string());
         fs.mounted_drives.insert("drive-b".to_string());
 
-        let assessments = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
+        let assessments = assess_view(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         let advisories = compute_redundancy_advisories(&config, &assessments);
 
         // Should have NoOffsiteProtection but NOT SinglePointOfFailure
@@ -1244,7 +1288,7 @@ protection_level = "guarded"
         fs.local_snapshots
             .insert("sv1".to_string(), vec![snap(dt(2026, 4, 1, 11, 0), "sv1")]);
 
-        let assessments = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
+        let assessments = assess_view(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         let advisories = compute_redundancy_advisories(&config, &assessments);
 
         assert!(
@@ -1310,7 +1354,7 @@ local_retention = "transient"
             dt(2026, 3, 30, 12, 0),
         );
 
-        let assessments = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
+        let assessments = assess_view(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         let advisories = compute_redundancy_advisories(&config, &assessments);
 
         assert!(
@@ -1334,7 +1378,7 @@ local_retention = "transient"
             dt(2026, 4, 1, 8, 0),
         );
 
-        let assessments = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
+        let assessments = assess_view(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         let advisories = compute_redundancy_advisories(&config, &assessments);
 
         assert!(
@@ -1356,7 +1400,7 @@ local_retention = "transient"
             dt(2026, 3, 30, 12, 0),
         );
 
-        let assessments = assess(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
+        let assessments = assess_view(&config, now, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &crate::awareness::StorageSignalMap::new());
         let advisories = compute_redundancy_advisories(&config, &assessments);
 
         let advisory = advisories

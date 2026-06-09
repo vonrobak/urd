@@ -176,13 +176,12 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
         // Empty-plan path: storage posture is not surfaced here (the heartbeat
         // projection carries no posture — S4), so skip the findmnt sweep and
         // pass an empty signal map.
-        let mut assessments = awareness::assess(
+        let assessments = advice::assess_view(
             &config,
             heartbeat_now,
             &observation,
             &awareness::StorageSignalMap::new(),
         );
-        advice::overlay_offsite_freshness(&mut assessments, &config);
         let hb = heartbeat::build_empty(
             &config,
             heartbeat_now,
@@ -314,14 +313,12 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
         let pre_now = chrono::Local::now().naive_local();
         // Pre-execution snapshot is used only to diff promise-state transitions;
         // posture is not a promise state, so an empty signal map suffices.
-        let mut pre = awareness::assess(
+        advice::assess_view(
             &config,
             pre_now,
             &observation,
             &awareness::StorageSignalMap::new(),
-        );
-        advice::overlay_offsite_freshness(&mut pre, &config);
-        pre
+        )
     };
 
     // Build progress context after token filtering so counters reflect actual work.
@@ -456,9 +453,8 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     // pre-plan tier (so the effective send interval matches what the planner
     // used), then `advance_and_writeback` persists the pre-resolved tier and
     // surfaces escalation transitions for the notification path (D6).
-    let mut assessments =
-        awareness::assess(&config, heartbeat_now, &observation, &signals.by_subvol);
-    advice::overlay_offsite_freshness(&mut assessments, &config);
+    let assessments =
+        advice::assess_view(&config, heartbeat_now, &observation, &signals.by_subvol);
     let hb = heartbeat::build_from_run(
         &config,
         heartbeat_now,

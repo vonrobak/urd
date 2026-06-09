@@ -106,7 +106,7 @@ pub trait HistoryQuery {
 
 /// The read-only world a pure decision function observes: the filesystem of
 /// truth, the SQLite history, and the btrfs generation-read seam. Threaded as
-/// `&Observation` through `plan::plan` and `awareness::assess` so those
+/// `&Observation` through `plan::plan` and `advice::assess_view` so those
 /// functions read state through three narrow, non-mutating trait objects
 /// rather than a single wide one (ADR-100, ADR-101, UPI 052).
 pub struct Observation<'a> {
