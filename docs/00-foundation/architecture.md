@@ -152,7 +152,7 @@ the documentation convention in `contributing-internal.md`).
 | `config.rs` | Parse TOML, validate, expand paths, resolve subvolumes | Touch filesystem beyond path checks |
 | `cli.rs` | Define the `clap` command surface (argument parsing) | Contain command logic (`commands/` does that) |
 | `cli_validation.rs` | CLI-boundary guards: resolve a user string to a known config name before the planner, or refuse with help | Run core logic; let unvalidated input reach the planner |
-| `types.rs` | Domain types, parsing, `Display`, `derive_policy()` | Contain business logic |
+| `types.rs` | Domain types, parsing, `Display`, `derive_policy()`, `validate_protection_contract()` (the ADR-110 opacity contract) | Contain business logic |
 | `plan.rs` | Decide what operations to run (pure function) | Execute anything or call btrfs |
 | `executor.rs` | Execute planned operations, isolate errors per subvolume; host the gated clear-all and the `emergency_reclaim_pool` never-the-only-copy reclaim that both the watchdog abort (ADR-113 Layer 2) and the idle eject (Layer 3) reuse | Decide what to do (the planner's job) |
 | `btrfs.rs` | Wrap `sudo btrfs` calls via `BtrfsOps`; read-only reads via the `BtrfsRead` supertrait (`BtrfsOps: BtrfsRead`) | Know about retention, plans, config |

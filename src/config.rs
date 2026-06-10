@@ -6,8 +6,9 @@ use serde::{Deserialize, Serialize};
 use crate::error::UrdError;
 use crate::notify::NotificationConfig;
 use crate::types::{
-    ByteSize, DriveRole, GraduatedRetention, Interval, LocalRetentionConfig, LocalRetentionPolicy,
-    MonthlyCount, ProtectionLevel, ResolvedGraduatedRetention, RunFrequency,
+    ByteSize, DriveRole, GraduatedRetention, Interval, LocalRetentionConfig, LocalRetentionKind,
+    LocalRetentionPolicy, MonthlyCount, ProtectionContractView, ProtectionLevel,
+    ResolvedGraduatedRetention, RunFrequency, validate_protection_contract,
 };
 
 // ── Top-level config ────────────────────────────────────────────────────
@@ -653,6 +654,32 @@ struct V1SubvolumeConfig {
     external_retention: Option<GraduatedRetention>,
 }
 
+/// Fallback `[defaults]` synthesized for v1/v2 Custom or unset protection
+/// levels. Values match full_retention / full_external_retention from
+/// `derive_policy()` in types.rs (`yearly: None` ↔ resolved 0).
+fn parser_fallback_defaults() -> DefaultsConfig {
+    DefaultsConfig {
+        snapshot_interval: Interval::days(1),
+        send_interval: Interval::days(1),
+        send_enabled: true,
+        enabled: true,
+        local_retention: GraduatedRetention {
+            hourly: Some(24),
+            daily: Some(30),
+            weekly: Some(26),
+            monthly: Some(MonthlyCount::Count(12)),
+            yearly: None,
+        },
+        external_retention: GraduatedRetention {
+            hourly: None,
+            daily: Some(30),
+            weekly: Some(26),
+            monthly: Some(MonthlyCount::Unlimited),
+            yearly: None,
+        },
+    }
+}
+
 impl V1Config {
     /// Convert v1 config into the internal Config representation.
     ///
@@ -687,28 +714,7 @@ impl V1Config {
             })
             .collect();
 
-        // Fallback defaults for v1 Custom/unset protection levels.
-        // Values match full_retention from derive_policy() in types.rs.
-        let defaults = DefaultsConfig {
-            snapshot_interval: Interval::days(1),
-            send_interval: Interval::days(1),
-            send_enabled: true,
-            enabled: true,
-            local_retention: GraduatedRetention {
-                hourly: Some(24),
-                daily: Some(30),
-                weekly: Some(26),
-                monthly: Some(MonthlyCount::Count(12)),
-                yearly: None,
-            },
-            external_retention: GraduatedRetention {
-                hourly: None,
-                daily: Some(30),
-                weekly: Some(26),
-                monthly: Some(MonthlyCount::Unlimited),
-                yearly: None,
-            },
-        };
+        let defaults = parser_fallback_defaults();
 
         // Convert V1SubvolumeConfig → SubvolumeConfig
         let subvolumes: Vec<SubvolumeConfig> = self
@@ -767,104 +773,32 @@ impl V1Config {
             // compatibility. `urd migrate` will rename them to canonical v1 names.
             let level = sv.protection.unwrap_or(ProtectionLevel::Custom);
 
-            // Rule 1: Reject local_retention = "transient" universally in v1
-            // (applies to both named and custom — use local_snapshots = false instead)
-            if matches!(sv.local_retention, Some(LocalRetentionConfig::Transient)) {
-                return Err(format!(
-                    "subvolume {:?}: local_retention = \"transient\" is not supported in v1 \
-                     — use local_snapshots = false instead.",
-                    sv.name
-                ));
-            }
-
-            // Rule 2: Mutual exclusion — local_snapshots = false + local_retention
-            if sv.local_snapshots == Some(false) && sv.local_retention.is_some() {
-                return Err(format!(
-                    "subvolume {:?}: local_snapshots = false and local_retention are mutually \
-                     exclusive — when local_snapshots is disabled, there is nothing to retain.",
-                    sv.name
-                ));
-            }
-
-            // Named levels must not have operational overrides
-            if level != ProtectionLevel::Custom {
-                let forbidden = [
-                    ("snapshot_interval", sv.snapshot_interval.is_some()),
-                    ("send_interval", sv.send_interval.is_some()),
-                    ("send_enabled", sv.send_enabled.is_some()),
-                    ("external_retention", sv.external_retention.is_some()),
-                ];
-                for (field, is_set) in &forbidden {
-                    if *is_set {
-                        return Err(format!(
-                            "subvolume {:?}: {field} cannot be set alongside \
-                             protection = \"{level}\" — the protection level controls this field. \
-                             Use protection = \"custom\" for manual control.",
-                            sv.name
-                        ));
-                    }
-                }
-
-                // Rule 3a: local_snapshots = false is incompatible with named levels
-                if sv.local_snapshots == Some(false) {
-                    return Err(format!(
-                        "subvolume {:?}: local_snapshots = false is incompatible with \
-                         protection = \"{level}\" — named levels require local snapshots. \
-                         Remove the protection field for custom configuration.",
-                        sv.name
-                    ));
-                }
-
-                // Rule 3b: ANY local_retention alongside named level is rejected
-                // (transient already caught by Rule 1 above)
-                if sv.local_retention.is_some() {
-                    return Err(format!(
-                        "subvolume {:?}: local_retention cannot be set alongside \
-                         protection = \"{level}\" — the protection level controls this field. \
-                         Use protection = \"custom\" for manual control.",
-                        sv.name
-                    ));
-                }
-            }
-
-            // Rule 4: local_snapshots = false requires at least one drive
             let has_any_drives = match sv.drives {
                 Some(ref d) => !d.is_empty(),
                 None => !self.drives.is_empty(),
             };
-            if sv.local_snapshots == Some(false) && !has_any_drives {
-                return Err(format!(
-                    "subvolume {:?}: local_snapshots = false requires at least one drive \
-                     — without local snapshots or external sends, nothing is being backed up.",
-                    sv.name
-                ));
-            }
+            let view = ProtectionContractView {
+                name: &sv.name,
+                level,
+                local_retention: match sv.local_retention {
+                    None => LocalRetentionKind::None,
+                    Some(LocalRetentionConfig::Transient) => LocalRetentionKind::Transient,
+                    Some(LocalRetentionConfig::Graduated(_)) => LocalRetentionKind::Graduated,
+                },
+                local_snapshots: sv.local_snapshots,
+                has_snapshot_interval: sv.snapshot_interval.is_some(),
+                has_send_interval: sv.send_interval.is_some(),
+                has_send_enabled: sv.send_enabled.is_some(),
+                has_external_retention: sv.external_retention.is_some(),
+                has_any_drives,
+                has_empty_drive_list: matches!(sv.drives, Some(ref d) if d.is_empty()),
+            };
+            validate_protection_contract(&view, "v1")?;
 
-            // Reject empty drives list on any level that requires external sends
-            if let Some(ref d) = sv.drives
-                && d.is_empty()
-                && matches!(
-                    level,
-                    ProtectionLevel::Sheltered | ProtectionLevel::Fortified
-                )
-            {
-                return Err(format!(
-                    "subvolume {:?}: protection = \"{level}\" requires drives for \
-                     external backups, but drives is an empty list.",
-                    sv.name
-                ));
-            }
-
-            // Sheltered requires at least one drive (global or assigned)
-            if level == ProtectionLevel::Sheltered && !has_any_drives {
-                return Err(format!(
-                    "subvolume {:?}: protection = \"sheltered\" requires at least one \
-                     configured drive for external backups.",
-                    sv.name
-                ));
-            }
-
-            // Fortified requires at least one offsite drive
+            // Fortified requires at least one offsite drive — a v1-only rule,
+            // kept outside the shared contract: v2 deliberately lacks it; the
+            // all-schema achievability home is preflight's
+            // fortified-without-offsite advisory (preflight.rs).
             if level == ProtectionLevel::Fortified {
                 let has_offsite = if let Some(ref sv_drives) = sv.drives {
                     sv_drives.iter().any(|label| {
@@ -1156,28 +1090,7 @@ impl V2Config {
             })
             .collect();
 
-        // Fallback defaults for v2 Custom/unset protection levels. Values
-        // mirror full_retention / full_external_retention from derive_policy.
-        let defaults = DefaultsConfig {
-            snapshot_interval: Interval::days(1),
-            send_interval: Interval::days(1),
-            send_enabled: true,
-            enabled: true,
-            local_retention: GraduatedRetention {
-                hourly: Some(24),
-                daily: Some(30),
-                weekly: Some(26),
-                monthly: Some(MonthlyCount::Count(12)),
-                yearly: None,
-            },
-            external_retention: GraduatedRetention {
-                hourly: None,
-                daily: Some(30),
-                weekly: Some(26),
-                monthly: Some(MonthlyCount::Unlimited),
-                yearly: None,
-            },
-        };
+        let defaults = parser_fallback_defaults();
 
         let subvolumes: Vec<SubvolumeConfig> = self
             .subvolumes
@@ -1232,95 +1145,27 @@ impl V2Config {
         for sv in &self.subvolumes {
             let level = sv.protection.unwrap_or(ProtectionLevel::Custom);
 
-            // Rule 1: Reject local_retention = "transient" universally
-            if matches!(sv.local_retention, Some(V2LocalRetentionConfig::Transient)) {
-                return Err(format!(
-                    "subvolume {:?}: local_retention = \"transient\" is not supported in v2 \
-                     — use local_snapshots = false instead.",
-                    sv.name
-                ));
-            }
-
-            // Rule 2: Mutual exclusion — local_snapshots = false + local_retention
-            if sv.local_snapshots == Some(false) && sv.local_retention.is_some() {
-                return Err(format!(
-                    "subvolume {:?}: local_snapshots = false and local_retention are mutually \
-                     exclusive — when local_snapshots is disabled, there is nothing to retain.",
-                    sv.name
-                ));
-            }
-
-            // Named levels must not have operational overrides
-            if level != ProtectionLevel::Custom {
-                let forbidden = [
-                    ("snapshot_interval", sv.snapshot_interval.is_some()),
-                    ("send_interval", sv.send_interval.is_some()),
-                    ("send_enabled", sv.send_enabled.is_some()),
-                    ("external_retention", sv.external_retention.is_some()),
-                ];
-                for (field, is_set) in &forbidden {
-                    if *is_set {
-                        return Err(format!(
-                            "subvolume {:?}: {field} cannot be set alongside \
-                             protection = \"{level}\" — the protection level controls this field. \
-                             Use protection = \"custom\" for manual control.",
-                            sv.name
-                        ));
-                    }
-                }
-
-                if sv.local_snapshots == Some(false) {
-                    return Err(format!(
-                        "subvolume {:?}: local_snapshots = false is incompatible with \
-                         protection = \"{level}\" — named levels require local snapshots. \
-                         Remove the protection field for custom configuration.",
-                        sv.name
-                    ));
-                }
-
-                if sv.local_retention.is_some() {
-                    return Err(format!(
-                        "subvolume {:?}: local_retention cannot be set alongside \
-                         protection = \"{level}\" — the protection level controls this field. \
-                         Use protection = \"custom\" for manual control.",
-                        sv.name
-                    ));
-                }
-            }
-
             let has_any_drives = match sv.drives {
                 Some(ref d) => !d.is_empty(),
                 None => !self.drives.is_empty(),
             };
-            if sv.local_snapshots == Some(false) && !has_any_drives {
-                return Err(format!(
-                    "subvolume {:?}: local_snapshots = false requires at least one drive \
-                     — without local snapshots or external sends, nothing is being backed up.",
-                    sv.name
-                ));
-            }
-
-            if let Some(ref d) = sv.drives
-                && d.is_empty()
-                && matches!(
-                    level,
-                    ProtectionLevel::Sheltered | ProtectionLevel::Fortified
-                )
-            {
-                return Err(format!(
-                    "subvolume {:?}: protection = \"{level}\" requires drives for \
-                     external backups, but drives is an empty list.",
-                    sv.name
-                ));
-            }
-
-            if level == ProtectionLevel::Sheltered && !has_any_drives {
-                return Err(format!(
-                    "subvolume {:?}: protection = \"sheltered\" requires at least one \
-                     configured drive for external backups.",
-                    sv.name
-                ));
-            }
+            let view = ProtectionContractView {
+                name: &sv.name,
+                level,
+                local_retention: match sv.local_retention {
+                    None => LocalRetentionKind::None,
+                    Some(V2LocalRetentionConfig::Transient) => LocalRetentionKind::Transient,
+                    Some(V2LocalRetentionConfig::Graduated(_)) => LocalRetentionKind::Graduated,
+                },
+                local_snapshots: sv.local_snapshots,
+                has_snapshot_interval: sv.snapshot_interval.is_some(),
+                has_send_interval: sv.send_interval.is_some(),
+                has_send_enabled: sv.send_enabled.is_some(),
+                has_external_retention: sv.external_retention.is_some(),
+                has_any_drives,
+                has_empty_drive_list: matches!(sv.drives, Some(ref d) if d.is_empty()),
+            };
+            validate_protection_contract(&view, "v2")?;
         }
         Ok(())
     }
@@ -2754,6 +2599,132 @@ snapshot_interval = "6h"
         assert!(err.contains("custom"));
     }
 
+    // ── UPI 062 — v2 contract fixtures (one per shared rule) ───────────
+    // Mirrors the dense v1 suite so the v2 projection refactor has its own
+    // no-behaviour-change guard.
+
+    #[test]
+    fn v2_rejects_transient_spelling() {
+        let raw = format!(
+            "{}local_retention = \"transient\"\n",
+            v2_minimal_config_str()
+        );
+        let err = parse_v2(&raw).unwrap_err();
+        assert!(
+            err.contains("not supported in v2"),
+            "expected transient-spelling rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn v2_rejects_local_snapshots_false_with_local_retention() {
+        let raw = r#"
+[general]
+config_version = 2
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp"
+
+[[drives]]
+label = "D1"
+mount_path = "/mnt/d1"
+snapshot_root = ".snap"
+role = "primary"
+
+[[subvolumes]]
+name = "sv"
+source = "/data/sv"
+snapshot_root = "/snap"
+protection = "custom"
+local_snapshots = false
+local_retention = { daily = 7 }
+"#;
+        let err = parse_v2(raw).unwrap_err();
+        assert!(
+            err.contains("mutually exclusive"),
+            "expected mutual-exclusion rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn v2_rejects_local_snapshots_false_on_named_level() {
+        let raw = format!("{}local_snapshots = false\n", v2_minimal_config_str());
+        let err = parse_v2(&raw).unwrap_err();
+        assert!(
+            err.contains("local_snapshots = false is incompatible with"),
+            "expected named-level incompatibility, got: {err}"
+        );
+        assert!(err.contains("sheltered"));
+    }
+
+    #[test]
+    fn v2_rejects_graduated_local_retention_on_named_level() {
+        let raw = format!(
+            "{}local_retention = {{ daily = 7 }}\n",
+            v2_minimal_config_str()
+        );
+        let err = parse_v2(&raw).unwrap_err();
+        assert!(
+            err.contains("local_retention cannot be set alongside"),
+            "expected named-level local_retention rejection, got: {err}"
+        );
+        assert!(err.contains("sheltered"));
+    }
+
+    #[test]
+    fn v2_rejects_local_snapshots_false_without_drives() {
+        let raw = r#"
+[general]
+config_version = 2
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp"
+
+[[subvolumes]]
+name = "sv"
+source = "/data/sv"
+snapshot_root = "/snap"
+local_snapshots = false
+"#;
+        let err = parse_v2(raw).unwrap_err();
+        assert!(
+            err.contains("requires at least one drive"),
+            "expected no-drives rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn v2_rejects_empty_drives_list_on_sheltered() {
+        let raw = format!("{}drives = []\n", v2_minimal_config_str());
+        let err = parse_v2(&raw).unwrap_err();
+        assert!(
+            err.contains("drives is an empty list"),
+            "expected empty-drive-list rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn v2_rejects_sheltered_without_drives() {
+        let raw = r#"
+[general]
+config_version = 2
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp"
+
+[[subvolumes]]
+name = "sv"
+source = "/data/sv"
+snapshot_root = "/snap"
+protection = "sheltered"
+"#;
+        let err = parse_v2(raw).unwrap_err();
+        assert!(
+            err.contains("requires at least one configured drive"),
+            "expected sheltered-without-drives rejection, got: {err}"
+        );
+    }
+
     #[test]
     fn dispatcher_rejects_v3() {
         let raw = r#"
@@ -4038,6 +4009,16 @@ min_free_bytes = "10GB"
             "local monthly diverged"
         );
         assert_eq!(
+            defaults.local_retention.resolved().yearly,
+            policy.local_retention.yearly,
+            "local yearly diverged"
+        );
+        assert_eq!(
+            defaults.external_retention.resolved().hourly,
+            policy.external_retention.hourly,
+            "external hourly diverged"
+        );
+        assert_eq!(
             defaults.external_retention.resolved().daily,
             policy.external_retention.daily,
             "external daily diverged"
@@ -4051,6 +4032,37 @@ min_free_bytes = "10GB"
             defaults.external_retention.resolved().monthly,
             policy.external_retention.monthly,
             "external monthly diverged"
+        );
+        assert_eq!(
+            defaults.external_retention.resolved().yearly,
+            policy.external_retention.yearly,
+            "external yearly diverged"
+        );
+    }
+
+    #[test]
+    fn parser_fallback_defaults_match_derive_policy_all_fields() {
+        use crate::types::{derive_policy, RunFrequency};
+
+        // Both into_configs synthesize their [defaults] from this one fn, so
+        // this covers v1 and v2. yearly: None ↔ 0 maps via resolved().
+        let policy = derive_policy(
+            ProtectionLevel::Sheltered,
+            RunFrequency::Timer {
+                interval: Interval::days(1),
+            },
+        )
+        .expect("sheltered should produce a policy");
+
+        let defaults = parser_fallback_defaults();
+        assert_eq!(defaults.snapshot_interval, policy.snapshot_interval);
+        assert_eq!(defaults.send_interval, policy.send_interval);
+        assert_eq!(defaults.send_enabled, policy.send_enabled);
+        assert!(defaults.enabled);
+        assert_eq!(defaults.local_retention.resolved(), policy.local_retention);
+        assert_eq!(
+            defaults.external_retention.resolved(),
+            policy.external_retention
         );
     }
 

@@ -128,6 +128,11 @@ local_retention = { daily = 3, weekly = 2 }
 The level names describe what the data *becomes* (recorded / sheltered / fortified),
 not the mechanism used to get there. Mechanism is the planner's concern.
 
+**Protection-level contract** — the schema-agnostic rule set that enforces the
+opacity rule at config load: `validate_protection_contract()` in `types.rs`
+(next to `derive_policy()`). Every config schema projects its subvolumes into
+one `ProtectionContractView` and gets the same rejections, byte-for-byte.
+
 ## Cluster: Drive states
 
 | State | Meaning | Source of truth |

@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **One home for the protection-level contract** (UPI 062, PR 1; no acceptance-behavior
+  change). The ADR-110 opacity rules — enforced until now as two near-identical validators in
+  the v1 and v2 config parsers — live once: `validate_protection_contract()` in `types.rs`,
+  next to `derive_policy()`. Each parser projects its subvolumes into a schema-agnostic
+  `ProtectionContractView`; rejection messages stay byte-identical (the dense v1 fixture suite
+  passes untouched, and the v2 side gains its own one-test-per-rule fixture suite it never
+  had). The fortified-requires-offsite rule stays v1-only by design — preflight's
+  `fortified-without-offsite` advisory is the all-schema achievability home. The two
+  field-identical synthesized-`[defaults]` blocks fold into one `parser_fallback_defaults()`,
+  equality-tested against `derive_policy()` on every field.
 - **Structural home for the Prometheus wire contract** (UPI 061; output byte-identical for
   every realistic config, proven by a write-once golden-file test). Every metric name now has
   exactly one definition (`metrics.rs::names`, guard-tested) and every sample line is emitted
