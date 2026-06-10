@@ -201,17 +201,45 @@ pub fn read_existing_timestamps(path: &Path) -> HashMap<String, i64> {
         let Some(rest) = line.strip_prefix(prefix.as_str()) else {
             continue;
         };
-        let Some(close_idx) = rest.find("\"}") else {
+        // The label is written escaped (via sample()); cut at the first
+        // *unescaped* quote — a naive find("\"}") would cut inside an
+        // escaped quote for names containing `"}`. Malformed labels skip
+        // the line, as before.
+        let Some((name, after_label)) = parse_escaped_label(rest) else {
             continue;
         };
-        let name = &rest[..close_idx];
-        let value_str = rest[close_idx + 2..].trim();
-        if let Ok(ts) = value_str.parse::<i64>() {
-            map.insert(name.to_string(), ts);
+        let Some(value_str) = after_label.strip_prefix('}') else {
+            continue;
+        };
+        if let Ok(ts) = value_str.trim().parse::<i64>() {
+            map.insert(name, ts);
         }
     }
 
     map
+}
+
+/// Scan an exposition-format label value up to its closing unescaped `"`,
+/// unescaping `\\`, `\"`, and `\n` along the way — the inverse of
+/// `escape_label_value`. Returns the unescaped value and the remainder
+/// after the closing quote; `None` for malformed labels (unknown escape,
+/// dangling backslash, no closing quote).
+fn parse_escaped_label(s: &str) -> Option<(String, &str)> {
+    let mut value = String::new();
+    let mut chars = s.char_indices();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '"' => return Some((value, &s[i + 1..])),
+            '\\' => match chars.next() {
+                Some((_, '\\')) => value.push('\\'),
+                Some((_, '"')) => value.push('"'),
+                Some((_, 'n')) => value.push('\n'),
+                _ => return None,
+            },
+            other => value.push(other),
+        }
+    }
+    None
 }
 
 /// Fill in `last_success_timestamp` from carried-forward values for subvolumes
@@ -945,6 +973,95 @@ mod tests {
         apply_carried_forward_timestamps(&mut svs, &carried);
 
         assert_eq!(svs[0].last_success_timestamp, Some(12345));
+    }
+
+    // ── Escaped-label round-trip (UPI 061) ────────────────────────
+    //
+    // The writer escapes the subvolume label (via sample()); the reader
+    // must be its true inverse. The `"}`-containing name is the case a
+    // naive find("\"}") cut silently drops — a bare quoted name passes
+    // even with the naive cut, so it alone proves nothing.
+
+    fn ts_subvol(name: &str, ts: i64) -> SubvolumeMetrics {
+        SubvolumeMetrics {
+            name: name.to_string(),
+            success: 1,
+            last_success_timestamp: Some(ts),
+            duration_seconds: 10,
+            local_snapshot_count: 5,
+            external_snapshot_count: 3,
+            send_type: 1,
+            external_expected: false,
+            churn_bytes_per_second: None,
+            last_full_send_bytes: None,
+            local_snapshot_count_v4: None,
+            estimated_local_pinned_delta_bytes: None,
+        }
+    }
+
+    fn roundtrip_through_real_path(name: &str) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("backup.prom");
+        let data = MetricsData {
+            subvolumes: vec![ts_subvol(name, 4242)],
+            external_drive_mounted: true,
+            external_free_bytes: 1_000_000,
+            script_last_run_timestamp: 4242,
+            event_counters: EventCounters::default(),
+            pools: Vec::new(),
+        };
+        write_metrics(&path, &data).unwrap();
+
+        let carried = read_existing_timestamps(&path);
+        let mut svs = vec![ts_subvol(name, 0)];
+        svs[0].last_success_timestamp = None;
+        apply_carried_forward_timestamps(&mut svs, &carried);
+
+        assert_eq!(
+            svs[0].last_success_timestamp,
+            Some(4242),
+            "carry-forward round-trip lost the timestamp for {name:?}"
+        );
+    }
+
+    #[test]
+    fn roundtrip_quoted_name() {
+        roundtrip_through_real_path("my\"vol");
+    }
+
+    #[test]
+    fn roundtrip_name_containing_brace_quote() {
+        roundtrip_through_real_path("a\"}b");
+    }
+
+    #[test]
+    fn roundtrip_backslash_name() {
+        roundtrip_through_real_path("back\\slash");
+    }
+
+    #[test]
+    fn roundtrip_newline_name() {
+        roundtrip_through_real_path("line1\nline2");
+    }
+
+    #[test]
+    fn reader_skips_malformed_escaped_labels() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("backup.prom");
+        std::fs::write(
+            &path,
+            concat!(
+                "backup_last_success_timestamp{subvolume=\"dangling\\\n",
+                "backup_last_success_timestamp{subvolume=\"unterminated} 123\n",
+                "backup_last_success_timestamp{subvolume=\"bad\\tescape\"} 456\n",
+                "backup_last_success_timestamp{subvolume=\"good\"} 789\n",
+            ),
+        )
+        .unwrap();
+
+        let ts = read_existing_timestamps(&path);
+        assert_eq!(ts.len(), 1);
+        assert_eq!(ts.get("good"), Some(&789));
     }
 
     // ── Event-counter family tests ────────────────────────────────
