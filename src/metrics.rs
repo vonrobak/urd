@@ -1167,4 +1167,109 @@ mod tests {
         assert!(output.contains("# HELP backup_pool_total_bytes"));
         assert!(!output.contains("backup_pool_total_bytes{"));
     }
+
+    // ── Golden file (UPI 061) ─────────────────────────────────────
+    //
+    // The golden fixture exercises every emission branch reachable in one
+    // MetricsData: all 20 metrics present, Some/None splits across
+    // subvolumes, both pool roles, non-empty event counters. Branches a
+    // single fixture cannot reach (zero-sentinel counter lines, unmounted
+    // drive, per-metric absence) are pinned by the `contains` tests above.
+    //
+    // src/testdata/golden_metrics.prom is WRITE-ONCE: it was generated from
+    // the pre-UPI-061 formatter and is the byte-level proof that the
+    // contract-surface refactor changed nothing for realistic configs
+    // (ADR-105 / homelab ADR-021). Never regenerate it to make this test
+    // pass — a mismatch is a bug in the formatter, not in the file.
+
+    fn golden_data() -> MetricsData {
+        MetricsData {
+            subvolumes: vec![
+                SubvolumeMetrics {
+                    name: "subvol3-opptak".to_string(),
+                    success: 1,
+                    last_success_timestamp: Some(1_711_100_000),
+                    duration_seconds: 120,
+                    local_snapshot_count: 15,
+                    external_snapshot_count: 14,
+                    send_type: 1,
+                    external_expected: true,
+                    churn_bytes_per_second: Some(1234.5),
+                    last_full_send_bytes: None,
+                    local_snapshot_count_v4: Some(7),
+                    estimated_local_pinned_delta_bytes: Some(0),
+                },
+                SubvolumeMetrics {
+                    name: "htpc-home".to_string(),
+                    success: 2,
+                    last_success_timestamp: None,
+                    duration_seconds: 0,
+                    local_snapshot_count: 20,
+                    external_snapshot_count: 18,
+                    send_type: 2,
+                    external_expected: false,
+                    churn_bytes_per_second: None,
+                    last_full_send_bytes: Some(12_000_000_000),
+                    local_snapshot_count_v4: None,
+                    estimated_local_pinned_delta_bytes: Some(5_000_000),
+                },
+                SubvolumeMetrics {
+                    name: "sv-media".to_string(),
+                    success: 0,
+                    last_success_timestamp: Some(1_711_000_000),
+                    duration_seconds: 33,
+                    local_snapshot_count: 3,
+                    external_snapshot_count: 1,
+                    send_type: 0,
+                    external_expected: true,
+                    churn_bytes_per_second: None,
+                    last_full_send_bytes: None,
+                    local_snapshot_count_v4: Some(0),
+                    estimated_local_pinned_delta_bytes: None,
+                },
+            ],
+            external_drive_mounted: true,
+            external_free_bytes: 4_400_000_000_000,
+            script_last_run_timestamp: 1_711_100_120,
+            event_counters: EventCounters {
+                circuit_breaker_trips: 5,
+                full_sends_by_reason: vec![
+                    ("first_send".to_string(), 3),
+                    ("chain_broken".to_string(), 1),
+                ],
+                defers_by_scope: vec![
+                    ("subvolume".to_string(), 7),
+                    ("drive".to_string(), 3),
+                ],
+                prunes_by_rule: vec![
+                    ("graduated_daily".to_string(), 14),
+                    ("emergency".to_string(), 2),
+                ],
+            },
+            pools: vec![
+                PoolMetric {
+                    uuid: "uuid-src".to_string(),
+                    role: "source".to_string(),
+                    label: "/home".to_string(),
+                    free_bytes: Some(123_456_789),
+                    capacity_bytes: Some(500_000_000_000),
+                    metadata_utilization_ratio: Some(0.25),
+                },
+                PoolMetric {
+                    uuid: "uuid-dst".to_string(),
+                    role: "destination".to_string(),
+                    label: "WD-18TB".to_string(),
+                    free_bytes: Some(4_400_000_000_000),
+                    capacity_bytes: None,
+                    metadata_utilization_ratio: Some(0.5),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn golden_file_byte_identical() {
+        let expected = include_str!("testdata/golden_metrics.prom");
+        assert_eq!(format_metrics(&golden_data()), expected);
+    }
 }

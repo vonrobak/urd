@@ -1,0 +1,99 @@
+# HELP backup_success Backup result: 1=success, 0=failure, 2=schedule-skipped
+# TYPE backup_success gauge
+backup_success{subvolume="subvol3-opptak"} 1
+backup_success{subvolume="htpc-home"} 2
+backup_success{subvolume="sv-media"} 0
+
+# HELP backup_last_success_timestamp Unix timestamp of last successful backup
+# TYPE backup_last_success_timestamp gauge
+backup_last_success_timestamp{subvolume="subvol3-opptak"} 1711100000
+backup_last_success_timestamp{subvolume="sv-media"} 1711000000
+
+# HELP backup_duration_seconds Duration of backup operations in seconds
+# TYPE backup_duration_seconds gauge
+backup_duration_seconds{subvolume="subvol3-opptak"} 120
+backup_duration_seconds{subvolume="htpc-home"} 0
+backup_duration_seconds{subvolume="sv-media"} 33
+
+# HELP backup_snapshot_count Number of snapshots
+# TYPE backup_snapshot_count gauge
+backup_snapshot_count{subvolume="subvol3-opptak",location="local"} 15
+backup_snapshot_count{subvolume="subvol3-opptak",location="external"} 14
+backup_snapshot_count{subvolume="htpc-home",location="local"} 20
+backup_snapshot_count{subvolume="htpc-home",location="external"} 18
+backup_snapshot_count{subvolume="sv-media",location="local"} 3
+backup_snapshot_count{subvolume="sv-media",location="external"} 1
+
+# HELP backup_send_type Send type: 0=full, 1=incremental, 2=no send, 3=deferred
+# TYPE backup_send_type gauge
+backup_send_type{subvolume="subvol3-opptak"} 1
+backup_send_type{subvolume="htpc-home"} 2
+backup_send_type{subvolume="sv-media"} 0
+
+# HELP backup_external_expected 1 if the subvolume has an external destination configured (sends enabled and at least one drive in scope). Line absent otherwise.
+# TYPE backup_external_expected gauge
+backup_external_expected{subvolume="subvol3-opptak"} 1
+backup_external_expected{subvolume="sv-media"} 1
+
+# HELP backup_external_drive_mounted Whether an external backup drive is mounted
+# TYPE backup_external_drive_mounted gauge
+backup_external_drive_mounted 1
+
+# HELP backup_external_free_bytes Free bytes on external backup drive
+# TYPE backup_external_free_bytes gauge
+backup_external_free_bytes 4400000000000
+
+# HELP backup_script_last_run_timestamp Unix timestamp of last backup run
+# TYPE backup_script_last_run_timestamp gauge
+backup_script_last_run_timestamp 1711100120
+
+# HELP backup_subvolume_churn_bytes_per_second Rolling time-windowed churn rate per subvolume (bytes/second). Absent for cold-start subvolumes and for subvolumes whose latest in-window send was a full send.
+# TYPE backup_subvolume_churn_bytes_per_second gauge
+backup_subvolume_churn_bytes_per_second{subvolume="subvol3-opptak"} 1234.5
+
+# HELP backup_subvolume_last_full_send_bytes Bytes of the most recent in-window full send for subvolumes whose latest send was a full send (e.g., transient subvolumes). Absent for incremental-only and cold-start subvolumes.
+# TYPE backup_subvolume_last_full_send_bytes gauge
+backup_subvolume_last_full_send_bytes{subvolume="htpc-home"} 12000000000
+
+# HELP backup_pool_free_bytes Free bytes on a BTRFS pool. Snapshot at backup-run cadence; not a live signal.
+# TYPE backup_pool_free_bytes gauge
+backup_pool_free_bytes{uuid="uuid-src",role="source",label="/home"} 123456789
+backup_pool_free_bytes{uuid="uuid-dst",role="destination",label="WD-18TB"} 4400000000000
+
+# HELP backup_pool_total_bytes Total capacity bytes of a BTRFS pool (statvfs). Snapshot at backup-run cadence; not a live signal.
+# TYPE backup_pool_total_bytes gauge
+backup_pool_total_bytes{uuid="uuid-src",role="source",label="/home"} 500000000000
+
+# HELP backup_pool_metadata_utilization_ratio BTRFS metadata utilization (0.0–1.0); source or destination.
+# TYPE backup_pool_metadata_utilization_ratio gauge
+backup_pool_metadata_utilization_ratio{uuid="uuid-src",role="source",label="/home"} 0.25
+backup_pool_metadata_utilization_ratio{uuid="uuid-dst",role="destination",label="WD-18TB"} 0.5
+
+# HELP backup_subvolume_local_snapshot_count Local snapshot count for a subvolume. Line absent when local snapshots are not configured for that subvolume.
+# TYPE backup_subvolume_local_snapshot_count gauge
+backup_subvolume_local_snapshot_count{subvolume="subvol3-opptak"} 7
+backup_subvolume_local_snapshot_count{subvolume="sv-media"} 0
+
+# HELP backup_subvolume_estimated_local_pinned_delta_bytes Estimated local pinned CoW delta; wire-bytes-derived (mean over incrementals). Understates active periods of bimodal subvolumes; overstates dormancy.
+# TYPE backup_subvolume_estimated_local_pinned_delta_bytes gauge
+backup_subvolume_estimated_local_pinned_delta_bytes{subvolume="subvol3-opptak"} 0
+backup_subvolume_estimated_local_pinned_delta_bytes{subvolume="htpc-home"} 5000000
+
+# HELP urd_circuit_breaker_trips_total Sentinel circuit-breaker open transitions.
+# TYPE urd_circuit_breaker_trips_total counter
+urd_circuit_breaker_trips_total 5
+
+# HELP urd_planner_full_sends_total Full-send choices, by reason.
+# TYPE urd_planner_full_sends_total counter
+urd_planner_full_sends_total{reason="first_send"} 3
+urd_planner_full_sends_total{reason="chain_broken"} 1
+
+# HELP urd_planner_defers_total Planner deferrals, by scope.
+# TYPE urd_planner_defers_total counter
+urd_planner_defers_total{scope="subvolume"} 7
+urd_planner_defers_total{scope="drive"} 3
+
+# HELP urd_retention_prunes_total Snapshots pruned by retention, by rule.
+# TYPE urd_retention_prunes_total counter
+urd_retention_prunes_total{rule="graduated_daily"} 14
+urd_retention_prunes_total{rule="emergency"} 2
