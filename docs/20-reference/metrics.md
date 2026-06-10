@@ -5,9 +5,12 @@
 > contract under [ADR-105](../00-foundation/decisions/2026-03-24-ADR-105-backward-compatibility-contracts.md):
 > renames are breaking changes. The `urd_*` family is internal and may evolve.
 > All values are gauges or counters; cardinality is small and stable
-> (`subvolume`, `location`, `reason`, `scope`, `rule`).
+> (`subvolume`, `location`, `reason`, `scope`, `rule`, and — on the pool
+> gauges — `uuid`, `role`, `label`).
 
-**Source of truth:** `src/metrics.rs`.
+**Source of truth:** `src/metrics.rs` — the `names` const block is the code
+twin of this document; every metric name is defined exactly once there
+(guard-tested).
 **Output format:** Prometheus textfile exposition (one file, atomic temp+rename).
 **Default path:** configured via `[general] metrics_file` (no implicit default).
 **Write cadence:** every backup run, including no-send and skip outcomes.
@@ -49,9 +52,11 @@ These properties are guaranteed and load-bearing for downstream consumers
    read from the existing `.prom` file and re-emitted unchanged. The series
    does not disappear during quiet periods.
 8. **Label cardinality is stable.** `subvolume`, `location` (`local|external`),
-   `reason`, `scope`, `rule` are the only labels. No host labels, no path
-   encoding, no hashes. Series identity must remain queryable across config
-   refactors.
+   `reason`, `scope`, `rule`, and the pool-gauge labels `uuid`, `role`
+   (`source|destination`), `label` are the only labels. No host labels, no
+   path encoding, no hashes. Series identity must remain queryable across
+   config refactors. Label *values* are escaped per the exposition format
+   (`\`, `"`, newline) — a byte no-op for every realistic name.
 9. **The `backup_restore_test_*` namespace is not Urd's.** Restore-test
    metrics are written by external tooling. Urd must never emit those names.
 10. **Reserved namespace.** Urd writes only `backup_*` (public contract) and
@@ -110,6 +115,34 @@ The encoding is part of the contract. Downstream alerts use
 `backup_send_type == 2` to exclude cold subvolumes from staleness rules
 ("subvolume has not backed up in 2 days, but its send_type is 2 — that's fine").
 
+### `backup_external_expected`
+
+Gauge. Emitted as `1` only when the subvolume has an external destination
+configured (sends enabled and at least one drive in scope); **line absent
+otherwise**. Config-derived, independent of the run's outcome.
+
+Lets consumers distinguish "offsite copy missing" from "intentionally
+local-only": join `backup_snapshot_count{location="external"} == 0 and
+on(subvolume) backup_external_expected == 1`.
+
+### `backup_subvolume_local_snapshot_count`
+
+Gauge. Local snapshot count for a subvolume (UPI 043).
+
+**Conditional.** Line absent when local snapshots are not configured for
+that subvolume; `0` is emitted when configured-but-empty (known zero vs
+unknown). Coexists with the legacy `backup_snapshot_count{location="local"}`
+series, which is always emitted per the contract above.
+
+### `backup_subvolume_estimated_local_pinned_delta_bytes`
+
+Gauge. Estimated local pinned CoW delta, derived from wire bytes (mean over
+incrementals; UPI 043). Understates active periods of bimodal subvolumes;
+overstates dormancy.
+
+**Conditional.** Absent for cold-start subvolumes; `0` is emitted when the
+estimate is a known zero.
+
 ### `backup_subvolume_churn_bytes_per_second`
 
 Gauge. Rolling time-windowed churn rate per subvolume, computed by `drift.rs`
@@ -152,6 +185,32 @@ Gauge. Unix epoch seconds of the most recent Urd run, regardless of outcome.
 This is the "Urd itself is alive" canary. Monitors detect a stuck or crashed
 Urd by the staleness of this timestamp. Must be updated on every invocation
 that reaches the metrics writer, including no-send and full-skip runs.
+
+---
+
+## Pool gauges
+
+One series per (BTRFS pool, role), labelled `uuid`, `role`
+(`source|destination`), `label` (UPI 043). For source pools `label` is the
+canonical (shortest) mountpoint string; for destination pools it is the
+configured drive label. Values are snapshots at backup-run cadence — not a
+live signal. Series absent for runs that didn't gather pool observability.
+
+### `backup_pool_free_bytes`
+
+Gauge. Free bytes on the pool (statvfs). Line absent when the pool's
+mountpoint couldn't be read.
+
+### `backup_pool_total_bytes`
+
+Gauge. Total capacity bytes of the pool (statvfs). Paired with
+`backup_pool_free_bytes` from the same syscall, so the two never skew
+within a run; line absent under the same conditions.
+
+### `backup_pool_metadata_utilization_ratio`
+
+Gauge. BTRFS metadata utilization, `0.0`–`1.0`. Line absent when metadata
+info couldn't be read.
 
 ---
 

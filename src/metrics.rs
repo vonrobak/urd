@@ -4,6 +4,40 @@ use std::path::Path;
 
 use crate::error::UrdError;
 
+// ── The Prometheus wire contract ────────────────────────────────────────
+
+/// Canonical metric names — the Prometheus wire contract (ADR-105; consumed
+/// per homelab ADR-021). `docs/20-reference/metrics.md` is the prose twin of
+/// this block. Renaming a `backup_*` const is a breaking contract change;
+/// the guard test below pins every name to exactly one definition here.
+pub(crate) mod names {
+    pub const BACKUP_SUCCESS: &str = "backup_success";
+    pub const BACKUP_LAST_SUCCESS_TIMESTAMP: &str = "backup_last_success_timestamp";
+    pub const BACKUP_DURATION_SECONDS: &str = "backup_duration_seconds";
+    pub const BACKUP_SNAPSHOT_COUNT: &str = "backup_snapshot_count";
+    pub const BACKUP_SEND_TYPE: &str = "backup_send_type";
+    pub const BACKUP_EXTERNAL_EXPECTED: &str = "backup_external_expected";
+    pub const BACKUP_EXTERNAL_DRIVE_MOUNTED: &str = "backup_external_drive_mounted";
+    pub const BACKUP_EXTERNAL_FREE_BYTES: &str = "backup_external_free_bytes";
+    pub const BACKUP_SCRIPT_LAST_RUN_TIMESTAMP: &str = "backup_script_last_run_timestamp";
+    pub const BACKUP_SUBVOLUME_CHURN_BYTES_PER_SECOND: &str =
+        "backup_subvolume_churn_bytes_per_second";
+    pub const BACKUP_SUBVOLUME_LAST_FULL_SEND_BYTES: &str =
+        "backup_subvolume_last_full_send_bytes";
+    pub const BACKUP_POOL_FREE_BYTES: &str = "backup_pool_free_bytes";
+    pub const BACKUP_POOL_TOTAL_BYTES: &str = "backup_pool_total_bytes";
+    pub const BACKUP_POOL_METADATA_UTILIZATION_RATIO: &str =
+        "backup_pool_metadata_utilization_ratio";
+    pub const BACKUP_SUBVOLUME_LOCAL_SNAPSHOT_COUNT: &str =
+        "backup_subvolume_local_snapshot_count";
+    pub const BACKUP_SUBVOLUME_ESTIMATED_LOCAL_PINNED_DELTA_BYTES: &str =
+        "backup_subvolume_estimated_local_pinned_delta_bytes";
+    pub const URD_CIRCUIT_BREAKER_TRIPS_TOTAL: &str = "urd_circuit_breaker_trips_total";
+    pub const URD_PLANNER_FULL_SENDS_TOTAL: &str = "urd_planner_full_sends_total";
+    pub const URD_PLANNER_DEFERS_TOTAL: &str = "urd_planner_defers_total";
+    pub const URD_RETENTION_PRUNES_TOTAL: &str = "urd_retention_prunes_total";
+}
+
 // ── Types ───────────────────────────────────────────────────────────────
 
 /// All metrics data for a single backup run.
@@ -86,7 +120,9 @@ pub struct SubvolumeMetrics {
     pub estimated_local_pinned_delta_bytes: Option<u64>,
 }
 
-/// Escape `\` and `"` in a Prometheus label value per the exposition format.
+/// Escape `\`, `"`, and newline in a Prometheus label value per the
+/// exposition format. Private machinery behind `sample()` — never call it
+/// from an emission site directly.
 #[must_use]
 fn escape_label_value(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -99,6 +135,24 @@ fn escape_label_value(s: &str) -> String {
         }
     }
     out
+}
+
+/// Write one sample line. The ONLY path by which label values reach the
+/// buffer — always escapes per the exposition format. Label-less metrics
+/// pass `&[]`.
+fn sample(out: &mut String, name: &str, labels: &[(&str, &str)], value: impl std::fmt::Display) {
+    out.push_str(name);
+    if !labels.is_empty() {
+        out.push('{');
+        for (i, (key, val)) in labels.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            write!(out, "{key}=\"{}\"", escape_label_value(val)).unwrap();
+        }
+        out.push('}');
+    }
+    writeln!(out, " {value}").unwrap();
 }
 
 // ── Writer ──────────────────────────────────────────────────────────────
@@ -135,28 +189,56 @@ pub fn write_metrics(path: &Path, data: &MetricsData) -> crate::error::Result<()
 #[must_use]
 pub fn read_existing_timestamps(path: &Path) -> HashMap<String, i64> {
     let mut map = HashMap::new();
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(_) => return map,
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return map;
     };
 
+    let prefix = format!("{}{{subvolume=\"", names::BACKUP_LAST_SUCCESS_TIMESTAMP);
     for line in content.lines() {
         let line = line.trim();
         // Match: backup_last_success_timestamp{subvolume="NAME"} VALUE
-        let Some(rest) = line.strip_prefix("backup_last_success_timestamp{subvolume=\"") else {
+        let Some(rest) = line.strip_prefix(prefix.as_str()) else {
             continue;
         };
-        let Some(close_idx) = rest.find("\"}") else {
+        // The label is written escaped (via sample()); cut at the first
+        // *unescaped* quote — a naive find("\"}") would cut inside an
+        // escaped quote for names containing `"}`. Malformed labels skip
+        // the line, as before.
+        let Some((name, after_label)) = parse_escaped_label(rest) else {
             continue;
         };
-        let name = &rest[..close_idx];
-        let value_str = rest[close_idx + 2..].trim();
-        if let Ok(ts) = value_str.parse::<i64>() {
-            map.insert(name.to_string(), ts);
+        let Some(value_str) = after_label.strip_prefix('}') else {
+            continue;
+        };
+        if let Ok(ts) = value_str.trim().parse::<i64>() {
+            map.insert(name, ts);
         }
     }
 
     map
+}
+
+/// Scan an exposition-format label value up to its closing unescaped `"`,
+/// unescaping `\\`, `\"`, and `\n` along the way — the inverse of
+/// `escape_label_value`. Returns the unescaped value and the remainder
+/// after the closing quote; `None` for malformed labels (unknown escape,
+/// dangling backslash, no closing quote).
+fn parse_escaped_label(s: &str) -> Option<(String, &str)> {
+    let mut value = String::new();
+    let mut chars = s.char_indices();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '"' => return Some((value, &s[i + 1..])),
+            '\\' => match chars.next() {
+                Some((_, '\\')) => value.push('\\'),
+                Some((_, '"')) => value.push('"'),
+                Some((_, 'n')) => value.push('\n'),
+                _ => return None,
+            },
+            other => value.push(other),
+        }
+    }
+    None
 }
 
 /// Fill in `last_success_timestamp` from carried-forward values for subvolumes
@@ -180,35 +262,37 @@ fn format_metrics(data: &MetricsData) -> String {
     // backup_success
     writeln!(
         out,
-        "# HELP backup_success Backup result: 1=success, 0=failure, 2=schedule-skipped"
+        "# HELP {} Backup result: 1=success, 0=failure, 2=schedule-skipped",
+        names::BACKUP_SUCCESS
     )
     .unwrap();
-    writeln!(out, "# TYPE backup_success gauge").unwrap();
+    writeln!(out, "# TYPE {} gauge", names::BACKUP_SUCCESS).unwrap();
     for sv in &data.subvolumes {
-        writeln!(
-            out,
-            "backup_success{{subvolume=\"{}\"}} {}",
-            sv.name, sv.success
-        )
-        .unwrap();
+        sample(
+            &mut out,
+            names::BACKUP_SUCCESS,
+            &[("subvolume", sv.name.as_str())],
+            sv.success,
+        );
     }
 
     // backup_last_success_timestamp
     writeln!(out).unwrap();
     writeln!(
         out,
-        "# HELP backup_last_success_timestamp Unix timestamp of last successful backup"
+        "# HELP {} Unix timestamp of last successful backup",
+        names::BACKUP_LAST_SUCCESS_TIMESTAMP
     )
     .unwrap();
-    writeln!(out, "# TYPE backup_last_success_timestamp gauge").unwrap();
+    writeln!(out, "# TYPE {} gauge", names::BACKUP_LAST_SUCCESS_TIMESTAMP).unwrap();
     for sv in &data.subvolumes {
         if let Some(ts) = sv.last_success_timestamp {
-            writeln!(
-                out,
-                "backup_last_success_timestamp{{subvolume=\"{}\"}} {}",
-                sv.name, ts
-            )
-            .unwrap();
+            sample(
+                &mut out,
+                names::BACKUP_LAST_SUCCESS_TIMESTAMP,
+                &[("subvolume", sv.name.as_str())],
+                ts,
+            );
         }
     }
 
@@ -216,71 +300,74 @@ fn format_metrics(data: &MetricsData) -> String {
     writeln!(out).unwrap();
     writeln!(
         out,
-        "# HELP backup_duration_seconds Duration of backup operations in seconds"
+        "# HELP {} Duration of backup operations in seconds",
+        names::BACKUP_DURATION_SECONDS
     )
     .unwrap();
-    writeln!(out, "# TYPE backup_duration_seconds gauge").unwrap();
+    writeln!(out, "# TYPE {} gauge", names::BACKUP_DURATION_SECONDS).unwrap();
     for sv in &data.subvolumes {
-        writeln!(
-            out,
-            "backup_duration_seconds{{subvolume=\"{}\"}} {}",
-            sv.name, sv.duration_seconds
-        )
-        .unwrap();
+        sample(
+            &mut out,
+            names::BACKUP_DURATION_SECONDS,
+            &[("subvolume", sv.name.as_str())],
+            sv.duration_seconds,
+        );
     }
 
     // backup_snapshot_count
     writeln!(out).unwrap();
-    writeln!(out, "# HELP backup_snapshot_count Number of snapshots").unwrap();
-    writeln!(out, "# TYPE backup_snapshot_count gauge").unwrap();
+    writeln!(out, "# HELP {} Number of snapshots", names::BACKUP_SNAPSHOT_COUNT).unwrap();
+    writeln!(out, "# TYPE {} gauge", names::BACKUP_SNAPSHOT_COUNT).unwrap();
     for sv in &data.subvolumes {
-        writeln!(
-            out,
-            "backup_snapshot_count{{subvolume=\"{}\",location=\"local\"}} {}",
-            sv.name, sv.local_snapshot_count
-        )
-        .unwrap();
-        writeln!(
-            out,
-            "backup_snapshot_count{{subvolume=\"{}\",location=\"external\"}} {}",
-            sv.name, sv.external_snapshot_count
-        )
-        .unwrap();
+        sample(
+            &mut out,
+            names::BACKUP_SNAPSHOT_COUNT,
+            &[("subvolume", sv.name.as_str()), ("location", "local")],
+            sv.local_snapshot_count,
+        );
+        sample(
+            &mut out,
+            names::BACKUP_SNAPSHOT_COUNT,
+            &[("subvolume", sv.name.as_str()), ("location", "external")],
+            sv.external_snapshot_count,
+        );
     }
 
     // backup_send_type
     writeln!(out).unwrap();
     writeln!(
         out,
-        "# HELP backup_send_type Send type: 0=full, 1=incremental, 2=no send, 3=deferred"
+        "# HELP {} Send type: 0=full, 1=incremental, 2=no send, 3=deferred",
+        names::BACKUP_SEND_TYPE
     )
     .unwrap();
-    writeln!(out, "# TYPE backup_send_type gauge").unwrap();
+    writeln!(out, "# TYPE {} gauge", names::BACKUP_SEND_TYPE).unwrap();
     for sv in &data.subvolumes {
-        writeln!(
-            out,
-            "backup_send_type{{subvolume=\"{}\"}} {}",
-            sv.name, sv.send_type
-        )
-        .unwrap();
+        sample(
+            &mut out,
+            names::BACKUP_SEND_TYPE,
+            &[("subvolume", sv.name.as_str())],
+            sv.send_type,
+        );
     }
 
     // backup_external_expected
     writeln!(out).unwrap();
     writeln!(
         out,
-        "# HELP backup_external_expected 1 if the subvolume has an external destination configured (sends enabled and at least one drive in scope). Line absent otherwise."
+        "# HELP {} 1 if the subvolume has an external destination configured (sends enabled and at least one drive in scope). Line absent otherwise.",
+        names::BACKUP_EXTERNAL_EXPECTED
     )
     .unwrap();
-    writeln!(out, "# TYPE backup_external_expected gauge").unwrap();
+    writeln!(out, "# TYPE {} gauge", names::BACKUP_EXTERNAL_EXPECTED).unwrap();
     for sv in &data.subvolumes {
         if sv.external_expected {
-            writeln!(
-                out,
-                "backup_external_expected{{subvolume=\"{}\"}} 1",
-                escape_label_value(&sv.name)
-            )
-            .unwrap();
+            sample(
+                &mut out,
+                names::BACKUP_EXTERNAL_EXPECTED,
+                &[("subvolume", sv.name.as_str())],
+                1,
+            );
         }
     }
 
@@ -288,90 +375,97 @@ fn format_metrics(data: &MetricsData) -> String {
     writeln!(out).unwrap();
     writeln!(
         out,
-        "# HELP backup_external_drive_mounted Whether an external backup drive is mounted"
+        "# HELP {} Whether an external backup drive is mounted",
+        names::BACKUP_EXTERNAL_DRIVE_MOUNTED
     )
     .unwrap();
-    writeln!(out, "# TYPE backup_external_drive_mounted gauge").unwrap();
-    writeln!(
-        out,
-        "backup_external_drive_mounted {}",
-        if data.external_drive_mounted { 1 } else { 0 }
-    )
-    .unwrap();
+    writeln!(out, "# TYPE {} gauge", names::BACKUP_EXTERNAL_DRIVE_MOUNTED).unwrap();
+    sample(
+        &mut out,
+        names::BACKUP_EXTERNAL_DRIVE_MOUNTED,
+        &[],
+        i32::from(data.external_drive_mounted),
+    );
 
     // backup_external_free_bytes
     writeln!(out).unwrap();
     writeln!(
         out,
-        "# HELP backup_external_free_bytes Free bytes on external backup drive"
+        "# HELP {} Free bytes on external backup drive",
+        names::BACKUP_EXTERNAL_FREE_BYTES
     )
     .unwrap();
-    writeln!(out, "# TYPE backup_external_free_bytes gauge").unwrap();
-    writeln!(
-        out,
-        "backup_external_free_bytes {}",
-        data.external_free_bytes
-    )
-    .unwrap();
+    writeln!(out, "# TYPE {} gauge", names::BACKUP_EXTERNAL_FREE_BYTES).unwrap();
+    sample(
+        &mut out,
+        names::BACKUP_EXTERNAL_FREE_BYTES,
+        &[],
+        data.external_free_bytes,
+    );
 
     // backup_script_last_run_timestamp
     writeln!(out).unwrap();
     writeln!(
         out,
-        "# HELP backup_script_last_run_timestamp Unix timestamp of last backup run"
+        "# HELP {} Unix timestamp of last backup run",
+        names::BACKUP_SCRIPT_LAST_RUN_TIMESTAMP
     )
     .unwrap();
-    writeln!(out, "# TYPE backup_script_last_run_timestamp gauge").unwrap();
-    writeln!(
-        out,
-        "backup_script_last_run_timestamp {}",
-        data.script_last_run_timestamp
-    )
-    .unwrap();
+    writeln!(out, "# TYPE {} gauge", names::BACKUP_SCRIPT_LAST_RUN_TIMESTAMP).unwrap();
+    sample(
+        &mut out,
+        names::BACKUP_SCRIPT_LAST_RUN_TIMESTAMP,
+        &[],
+        data.script_last_run_timestamp,
+    );
 
     // ── Drift telemetry (UPI 030) ─────────────────────────────────
 
     writeln!(out).unwrap();
     writeln!(
         out,
-        "# HELP backup_subvolume_churn_bytes_per_second Rolling time-windowed churn rate per subvolume (bytes/second). Absent for cold-start subvolumes and for subvolumes whose latest in-window send was a full send."
+        "# HELP {} Rolling time-windowed churn rate per subvolume (bytes/second). Absent for cold-start subvolumes and for subvolumes whose latest in-window send was a full send.",
+        names::BACKUP_SUBVOLUME_CHURN_BYTES_PER_SECOND
     )
     .unwrap();
     writeln!(
         out,
-        "# TYPE backup_subvolume_churn_bytes_per_second gauge"
+        "# TYPE {} gauge",
+        names::BACKUP_SUBVOLUME_CHURN_BYTES_PER_SECOND
     )
     .unwrap();
     for sv in &data.subvolumes {
         if let Some(churn) = sv.churn_bytes_per_second {
-            writeln!(
-                out,
-                "backup_subvolume_churn_bytes_per_second{{subvolume=\"{}\"}} {}",
-                sv.name, churn
-            )
-            .unwrap();
+            sample(
+                &mut out,
+                names::BACKUP_SUBVOLUME_CHURN_BYTES_PER_SECOND,
+                &[("subvolume", sv.name.as_str())],
+                churn,
+            );
         }
     }
 
     writeln!(out).unwrap();
     writeln!(
         out,
-        "# HELP backup_subvolume_last_full_send_bytes Bytes of the most recent in-window full send for subvolumes whose latest send was a full send (e.g., transient subvolumes). Absent for incremental-only and cold-start subvolumes."
+        "# HELP {} Bytes of the most recent in-window full send for subvolumes whose latest send was a full send (e.g., transient subvolumes). Absent for incremental-only and cold-start subvolumes.",
+        names::BACKUP_SUBVOLUME_LAST_FULL_SEND_BYTES
     )
     .unwrap();
     writeln!(
         out,
-        "# TYPE backup_subvolume_last_full_send_bytes gauge"
+        "# TYPE {} gauge",
+        names::BACKUP_SUBVOLUME_LAST_FULL_SEND_BYTES
     )
     .unwrap();
     for sv in &data.subvolumes {
         if let Some(bytes) = sv.last_full_send_bytes {
-            writeln!(
-                out,
-                "backup_subvolume_last_full_send_bytes{{subvolume=\"{}\"}} {}",
-                sv.name, bytes
-            )
-            .unwrap();
+            sample(
+                &mut out,
+                names::BACKUP_SUBVOLUME_LAST_FULL_SEND_BYTES,
+                &[("subvolume", sv.name.as_str())],
+                bytes,
+            );
         }
     }
 
@@ -380,109 +474,122 @@ fn format_metrics(data: &MetricsData) -> String {
     writeln!(out).unwrap();
     writeln!(
         out,
-        "# HELP backup_pool_free_bytes Free bytes on a BTRFS pool. Snapshot at backup-run cadence; not a live signal."
+        "# HELP {} Free bytes on a BTRFS pool. Snapshot at backup-run cadence; not a live signal.",
+        names::BACKUP_POOL_FREE_BYTES
     )
     .unwrap();
-    writeln!(out, "# TYPE backup_pool_free_bytes gauge").unwrap();
+    writeln!(out, "# TYPE {} gauge", names::BACKUP_POOL_FREE_BYTES).unwrap();
     for pool in &data.pools {
         if let Some(bytes) = pool.free_bytes {
-            writeln!(
-                out,
-                "backup_pool_free_bytes{{uuid=\"{}\",role=\"{}\",label=\"{}\"}} {}",
-                escape_label_value(&pool.uuid),
-                escape_label_value(&pool.role),
-                escape_label_value(&pool.label),
-                bytes
-            )
-            .unwrap();
+            sample(
+                &mut out,
+                names::BACKUP_POOL_FREE_BYTES,
+                &[
+                    ("uuid", pool.uuid.as_str()),
+                    ("role", pool.role.as_str()),
+                    ("label", pool.label.as_str()),
+                ],
+                bytes,
+            );
         }
     }
 
     writeln!(out).unwrap();
     writeln!(
         out,
-        "# HELP backup_pool_total_bytes Total capacity bytes of a BTRFS pool (statvfs). Snapshot at backup-run cadence; not a live signal."
+        "# HELP {} Total capacity bytes of a BTRFS pool (statvfs). Snapshot at backup-run cadence; not a live signal.",
+        names::BACKUP_POOL_TOTAL_BYTES
     )
     .unwrap();
-    writeln!(out, "# TYPE backup_pool_total_bytes gauge").unwrap();
+    writeln!(out, "# TYPE {} gauge", names::BACKUP_POOL_TOTAL_BYTES).unwrap();
     for pool in &data.pools {
         if let Some(bytes) = pool.capacity_bytes {
-            writeln!(
-                out,
-                "backup_pool_total_bytes{{uuid=\"{}\",role=\"{}\",label=\"{}\"}} {}",
-                escape_label_value(&pool.uuid),
-                escape_label_value(&pool.role),
-                escape_label_value(&pool.label),
-                bytes
-            )
-            .unwrap();
+            sample(
+                &mut out,
+                names::BACKUP_POOL_TOTAL_BYTES,
+                &[
+                    ("uuid", pool.uuid.as_str()),
+                    ("role", pool.role.as_str()),
+                    ("label", pool.label.as_str()),
+                ],
+                bytes,
+            );
         }
     }
 
     writeln!(out).unwrap();
     writeln!(
         out,
-        "# HELP backup_pool_metadata_utilization_ratio BTRFS metadata utilization (0.0–1.0); source or destination."
+        "# HELP {} BTRFS metadata utilization (0.0–1.0); source or destination.",
+        names::BACKUP_POOL_METADATA_UTILIZATION_RATIO
     )
     .unwrap();
     writeln!(
         out,
-        "# TYPE backup_pool_metadata_utilization_ratio gauge"
+        "# TYPE {} gauge",
+        names::BACKUP_POOL_METADATA_UTILIZATION_RATIO
     )
     .unwrap();
     for pool in &data.pools {
         if let Some(ratio) = pool.metadata_utilization_ratio {
-            writeln!(
-                out,
-                "backup_pool_metadata_utilization_ratio{{uuid=\"{}\",role=\"{}\",label=\"{}\"}} {}",
-                escape_label_value(&pool.uuid),
-                escape_label_value(&pool.role),
-                escape_label_value(&pool.label),
-                ratio
-            )
-            .unwrap();
+            sample(
+                &mut out,
+                names::BACKUP_POOL_METADATA_UTILIZATION_RATIO,
+                &[
+                    ("uuid", pool.uuid.as_str()),
+                    ("role", pool.role.as_str()),
+                    ("label", pool.label.as_str()),
+                ],
+                ratio,
+            );
         }
     }
 
     writeln!(out).unwrap();
     writeln!(
         out,
-        "# HELP backup_subvolume_local_snapshot_count Local snapshot count for a subvolume. Line absent when local snapshots are not configured for that subvolume."
+        "# HELP {} Local snapshot count for a subvolume. Line absent when local snapshots are not configured for that subvolume.",
+        names::BACKUP_SUBVOLUME_LOCAL_SNAPSHOT_COUNT
     )
     .unwrap();
-    writeln!(out, "# TYPE backup_subvolume_local_snapshot_count gauge").unwrap();
+    writeln!(
+        out,
+        "# TYPE {} gauge",
+        names::BACKUP_SUBVOLUME_LOCAL_SNAPSHOT_COUNT
+    )
+    .unwrap();
     for sv in &data.subvolumes {
         if let Some(count) = sv.local_snapshot_count_v4 {
-            writeln!(
-                out,
-                "backup_subvolume_local_snapshot_count{{subvolume=\"{}\"}} {}",
-                escape_label_value(&sv.name),
-                count
-            )
-            .unwrap();
+            sample(
+                &mut out,
+                names::BACKUP_SUBVOLUME_LOCAL_SNAPSHOT_COUNT,
+                &[("subvolume", sv.name.as_str())],
+                count,
+            );
         }
     }
 
     writeln!(out).unwrap();
     writeln!(
         out,
-        "# HELP backup_subvolume_estimated_local_pinned_delta_bytes Estimated local pinned CoW delta; wire-bytes-derived (mean over incrementals). Understates active periods of bimodal subvolumes; overstates dormancy."
+        "# HELP {} Estimated local pinned CoW delta; wire-bytes-derived (mean over incrementals). Understates active periods of bimodal subvolumes; overstates dormancy.",
+        names::BACKUP_SUBVOLUME_ESTIMATED_LOCAL_PINNED_DELTA_BYTES
     )
     .unwrap();
     writeln!(
         out,
-        "# TYPE backup_subvolume_estimated_local_pinned_delta_bytes gauge"
+        "# TYPE {} gauge",
+        names::BACKUP_SUBVOLUME_ESTIMATED_LOCAL_PINNED_DELTA_BYTES
     )
     .unwrap();
     for sv in &data.subvolumes {
         if let Some(bytes) = sv.estimated_local_pinned_delta_bytes {
-            writeln!(
-                out,
-                "backup_subvolume_estimated_local_pinned_delta_bytes{{subvolume=\"{}\"}} {}",
-                escape_label_value(&sv.name),
-                bytes
-            )
-            .unwrap();
+            sample(
+                &mut out,
+                names::BACKUP_SUBVOLUME_ESTIMATED_LOCAL_PINNED_DELTA_BYTES,
+                &[("subvolume", sv.name.as_str())],
+                bytes,
+            );
         }
     }
 
@@ -493,72 +600,94 @@ fn format_metrics(data: &MetricsData) -> String {
     writeln!(out).unwrap();
     writeln!(
         out,
-        "# HELP urd_circuit_breaker_trips_total Sentinel circuit-breaker open transitions."
+        "# HELP {} Sentinel circuit-breaker open transitions.",
+        names::URD_CIRCUIT_BREAKER_TRIPS_TOTAL
     )
     .unwrap();
-    writeln!(out, "# TYPE urd_circuit_breaker_trips_total counter").unwrap();
-    writeln!(
-        out,
-        "urd_circuit_breaker_trips_total {}",
-        counters.circuit_breaker_trips
-    )
-    .unwrap();
+    writeln!(out, "# TYPE {} counter", names::URD_CIRCUIT_BREAKER_TRIPS_TOTAL).unwrap();
+    sample(
+        &mut out,
+        names::URD_CIRCUIT_BREAKER_TRIPS_TOTAL,
+        &[],
+        counters.circuit_breaker_trips,
+    );
 
     writeln!(out).unwrap();
     writeln!(
         out,
-        "# HELP urd_planner_full_sends_total Full-send choices, by reason."
+        "# HELP {} Full-send choices, by reason.",
+        names::URD_PLANNER_FULL_SENDS_TOTAL
     )
     .unwrap();
-    writeln!(out, "# TYPE urd_planner_full_sends_total counter").unwrap();
+    writeln!(out, "# TYPE {} counter", names::URD_PLANNER_FULL_SENDS_TOTAL).unwrap();
     if counters.full_sends_by_reason.is_empty() {
         // Emit a zero so consumers can detect the metric exists.
-        writeln!(out, "urd_planner_full_sends_total{{reason=\"none\"}} 0").unwrap();
+        sample(
+            &mut out,
+            names::URD_PLANNER_FULL_SENDS_TOTAL,
+            &[("reason", "none")],
+            0,
+        );
     } else {
         for (reason, count) in &counters.full_sends_by_reason {
-            writeln!(
-                out,
-                "urd_planner_full_sends_total{{reason=\"{reason}\"}} {count}"
-            )
-            .unwrap();
+            sample(
+                &mut out,
+                names::URD_PLANNER_FULL_SENDS_TOTAL,
+                &[("reason", reason.as_str())],
+                count,
+            );
         }
     }
 
     writeln!(out).unwrap();
     writeln!(
         out,
-        "# HELP urd_planner_defers_total Planner deferrals, by scope."
+        "# HELP {} Planner deferrals, by scope.",
+        names::URD_PLANNER_DEFERS_TOTAL
     )
     .unwrap();
-    writeln!(out, "# TYPE urd_planner_defers_total counter").unwrap();
+    writeln!(out, "# TYPE {} counter", names::URD_PLANNER_DEFERS_TOTAL).unwrap();
     if counters.defers_by_scope.is_empty() {
-        writeln!(out, "urd_planner_defers_total{{scope=\"none\"}} 0").unwrap();
+        sample(
+            &mut out,
+            names::URD_PLANNER_DEFERS_TOTAL,
+            &[("scope", "none")],
+            0,
+        );
     } else {
         for (scope, count) in &counters.defers_by_scope {
-            writeln!(
-                out,
-                "urd_planner_defers_total{{scope=\"{scope}\"}} {count}"
-            )
-            .unwrap();
+            sample(
+                &mut out,
+                names::URD_PLANNER_DEFERS_TOTAL,
+                &[("scope", scope.as_str())],
+                count,
+            );
         }
     }
 
     writeln!(out).unwrap();
     writeln!(
         out,
-        "# HELP urd_retention_prunes_total Snapshots pruned by retention, by rule."
+        "# HELP {} Snapshots pruned by retention, by rule.",
+        names::URD_RETENTION_PRUNES_TOTAL
     )
     .unwrap();
-    writeln!(out, "# TYPE urd_retention_prunes_total counter").unwrap();
+    writeln!(out, "# TYPE {} counter", names::URD_RETENTION_PRUNES_TOTAL).unwrap();
     if counters.prunes_by_rule.is_empty() {
-        writeln!(out, "urd_retention_prunes_total{{rule=\"none\"}} 0").unwrap();
+        sample(
+            &mut out,
+            names::URD_RETENTION_PRUNES_TOTAL,
+            &[("rule", "none")],
+            0,
+        );
     } else {
         for (rule, count) in &counters.prunes_by_rule {
-            writeln!(
-                out,
-                "urd_retention_prunes_total{{rule=\"{rule}\"}} {count}"
-            )
-            .unwrap();
+            sample(
+                &mut out,
+                names::URD_RETENTION_PRUNES_TOTAL,
+                &[("rule", rule.as_str())],
+                count,
+            );
         }
     }
 
@@ -843,6 +972,94 @@ mod tests {
         apply_carried_forward_timestamps(&mut svs, &carried);
 
         assert_eq!(svs[0].last_success_timestamp, Some(12345));
+    }
+
+    // ── Escaped-label round-trip (UPI 061) ────────────────────────
+    //
+    // The writer escapes the subvolume label (via sample()); the reader
+    // must be its true inverse. The `"}`-containing name is the case a
+    // naive find("\"}") cut silently drops — a bare quoted name passes
+    // even with the naive cut, so it alone proves nothing.
+
+    fn ts_subvol(name: &str, ts: Option<i64>) -> SubvolumeMetrics {
+        SubvolumeMetrics {
+            name: name.to_string(),
+            success: 1,
+            last_success_timestamp: ts,
+            duration_seconds: 10,
+            local_snapshot_count: 5,
+            external_snapshot_count: 3,
+            send_type: 1,
+            external_expected: false,
+            churn_bytes_per_second: None,
+            last_full_send_bytes: None,
+            local_snapshot_count_v4: None,
+            estimated_local_pinned_delta_bytes: None,
+        }
+    }
+
+    fn roundtrip_through_real_path(name: &str) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("backup.prom");
+        let data = MetricsData {
+            subvolumes: vec![ts_subvol(name, Some(4242))],
+            external_drive_mounted: true,
+            external_free_bytes: 1_000_000,
+            script_last_run_timestamp: 4242,
+            event_counters: EventCounters::default(),
+            pools: Vec::new(),
+        };
+        write_metrics(&path, &data).unwrap();
+
+        let carried = read_existing_timestamps(&path);
+        let mut svs = vec![ts_subvol(name, None)];
+        apply_carried_forward_timestamps(&mut svs, &carried);
+
+        assert_eq!(
+            svs[0].last_success_timestamp,
+            Some(4242),
+            "carry-forward round-trip lost the timestamp for {name:?}"
+        );
+    }
+
+    #[test]
+    fn roundtrip_quoted_name() {
+        roundtrip_through_real_path("my\"vol");
+    }
+
+    #[test]
+    fn roundtrip_name_containing_brace_quote() {
+        roundtrip_through_real_path("a\"}b");
+    }
+
+    #[test]
+    fn roundtrip_backslash_name() {
+        roundtrip_through_real_path("back\\slash");
+    }
+
+    #[test]
+    fn roundtrip_newline_name() {
+        roundtrip_through_real_path("line1\nline2");
+    }
+
+    #[test]
+    fn reader_skips_malformed_escaped_labels() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("backup.prom");
+        std::fs::write(
+            &path,
+            concat!(
+                "backup_last_success_timestamp{subvolume=\"dangling\\\n",
+                "backup_last_success_timestamp{subvolume=\"unterminated} 123\n",
+                "backup_last_success_timestamp{subvolume=\"bad\\tescape\"} 456\n",
+                "backup_last_success_timestamp{subvolume=\"good\"} 789\n",
+            ),
+        )
+        .unwrap();
+
+        let ts = read_existing_timestamps(&path);
+        assert_eq!(ts.len(), 1);
+        assert_eq!(ts.get("good"), Some(&789));
     }
 
     // ── Event-counter family tests ────────────────────────────────
@@ -1166,5 +1383,236 @@ mod tests {
         let output = format_metrics(&data);
         assert!(output.contains("# HELP backup_pool_total_bytes"));
         assert!(!output.contains("backup_pool_total_bytes{"));
+    }
+
+    // ── sample() helper (UPI 061) ─────────────────────────────────
+
+    #[test]
+    fn sample_no_labels() {
+        let mut out = String::new();
+        sample(&mut out, "metric_a", &[], 42);
+        assert_eq!(out, "metric_a 42\n");
+    }
+
+    #[test]
+    fn sample_one_label() {
+        let mut out = String::new();
+        sample(&mut out, "metric_a", &[("subvolume", "sv-a")], 1);
+        assert_eq!(out, "metric_a{subvolume=\"sv-a\"} 1\n");
+    }
+
+    #[test]
+    fn sample_multi_label_preserves_order() {
+        let mut out = String::new();
+        sample(
+            &mut out,
+            "metric_a",
+            &[("subvolume", "sv-a"), ("location", "local")],
+            7,
+        );
+        assert_eq!(out, "metric_a{subvolume=\"sv-a\",location=\"local\"} 7\n");
+    }
+
+    #[test]
+    fn sample_escapes_quote_backslash_newline() {
+        let mut out = String::new();
+        sample(&mut out, "metric_a", &[("subvolume", "a\"b\\c\nd")], 1);
+        assert_eq!(out, "metric_a{subvolume=\"a\\\"b\\\\c\\nd\"} 1\n");
+    }
+
+    #[test]
+    fn sample_f64_display_passthrough() {
+        let mut out = String::new();
+        sample(&mut out, "metric_a", &[], 1234.5);
+        assert_eq!(out, "metric_a 1234.5\n");
+    }
+
+    // ── Golden file (UPI 061) ─────────────────────────────────────
+    //
+    // The golden fixture exercises every emission branch reachable in one
+    // MetricsData: all 20 metrics present, Some/None splits across
+    // subvolumes, both pool roles, non-empty event counters. Branches a
+    // single fixture cannot reach (zero-sentinel counter lines, unmounted
+    // drive, per-metric absence) are pinned by the `contains` tests above.
+    //
+    // src/testdata/golden_metrics.prom is WRITE-ONCE: it was generated from
+    // the pre-UPI-061 formatter and is the byte-level proof that the
+    // contract-surface refactor changed nothing for realistic configs
+    // (ADR-105 / homelab ADR-021). Never regenerate it to make this test
+    // pass — a mismatch is a bug in the formatter, not in the file.
+
+    fn golden_data() -> MetricsData {
+        MetricsData {
+            subvolumes: vec![
+                SubvolumeMetrics {
+                    name: "subvol3-opptak".to_string(),
+                    success: 1,
+                    last_success_timestamp: Some(1_711_100_000),
+                    duration_seconds: 120,
+                    local_snapshot_count: 15,
+                    external_snapshot_count: 14,
+                    send_type: 1,
+                    external_expected: true,
+                    churn_bytes_per_second: Some(1234.5),
+                    last_full_send_bytes: None,
+                    local_snapshot_count_v4: Some(7),
+                    estimated_local_pinned_delta_bytes: Some(0),
+                },
+                SubvolumeMetrics {
+                    name: "htpc-home".to_string(),
+                    success: 2,
+                    last_success_timestamp: None,
+                    duration_seconds: 0,
+                    local_snapshot_count: 20,
+                    external_snapshot_count: 18,
+                    send_type: 2,
+                    external_expected: false,
+                    churn_bytes_per_second: None,
+                    last_full_send_bytes: Some(12_000_000_000),
+                    local_snapshot_count_v4: None,
+                    estimated_local_pinned_delta_bytes: Some(5_000_000),
+                },
+                SubvolumeMetrics {
+                    name: "sv-media".to_string(),
+                    success: 0,
+                    last_success_timestamp: Some(1_711_000_000),
+                    duration_seconds: 33,
+                    local_snapshot_count: 3,
+                    external_snapshot_count: 1,
+                    send_type: 0,
+                    external_expected: true,
+                    churn_bytes_per_second: None,
+                    last_full_send_bytes: None,
+                    local_snapshot_count_v4: Some(0),
+                    estimated_local_pinned_delta_bytes: None,
+                },
+            ],
+            external_drive_mounted: true,
+            external_free_bytes: 4_400_000_000_000,
+            script_last_run_timestamp: 1_711_100_120,
+            event_counters: EventCounters {
+                circuit_breaker_trips: 5,
+                full_sends_by_reason: vec![
+                    ("first_send".to_string(), 3),
+                    ("chain_broken".to_string(), 1),
+                ],
+                defers_by_scope: vec![
+                    ("subvolume".to_string(), 7),
+                    ("drive".to_string(), 3),
+                ],
+                prunes_by_rule: vec![
+                    ("graduated_daily".to_string(), 14),
+                    ("emergency".to_string(), 2),
+                ],
+            },
+            pools: vec![
+                PoolMetric {
+                    uuid: "uuid-src".to_string(),
+                    role: "source".to_string(),
+                    label: "/home".to_string(),
+                    free_bytes: Some(123_456_789),
+                    capacity_bytes: Some(500_000_000_000),
+                    metadata_utilization_ratio: Some(0.25),
+                },
+                PoolMetric {
+                    uuid: "uuid-dst".to_string(),
+                    role: "destination".to_string(),
+                    label: "WD-18TB".to_string(),
+                    free_bytes: Some(4_400_000_000_000),
+                    capacity_bytes: None,
+                    metadata_utilization_ratio: Some(0.5),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn golden_file_byte_identical() {
+        let expected = include_str!("testdata/golden_metrics.prom");
+        assert_eq!(format_metrics(&golden_data()), expected);
+    }
+
+    // ── Guard: the contract lives only in `names` (UPI 061) ───────
+    //
+    // Scans the production region of this file (everything before the
+    // first `#[cfg(test)]`) with comment lines stripped: each metric name
+    // must appear exactly once — its const definition — so a new inline
+    // emission site (e.g. `writeln!(out, "backup_success{{...")`) fails
+    // here instead of silently re-duplicating the contract. Test code is
+    // exempt: literal assertions are deliberate, redundant contract pins.
+
+    #[test]
+    fn guard_metric_names_live_only_in_names_module() {
+        const ALL: [&str; 20] = [
+            names::BACKUP_SUCCESS,
+            names::BACKUP_LAST_SUCCESS_TIMESTAMP,
+            names::BACKUP_DURATION_SECONDS,
+            names::BACKUP_SNAPSHOT_COUNT,
+            names::BACKUP_SEND_TYPE,
+            names::BACKUP_EXTERNAL_EXPECTED,
+            names::BACKUP_EXTERNAL_DRIVE_MOUNTED,
+            names::BACKUP_EXTERNAL_FREE_BYTES,
+            names::BACKUP_SCRIPT_LAST_RUN_TIMESTAMP,
+            names::BACKUP_SUBVOLUME_CHURN_BYTES_PER_SECOND,
+            names::BACKUP_SUBVOLUME_LAST_FULL_SEND_BYTES,
+            names::BACKUP_POOL_FREE_BYTES,
+            names::BACKUP_POOL_TOTAL_BYTES,
+            names::BACKUP_POOL_METADATA_UTILIZATION_RATIO,
+            names::BACKUP_SUBVOLUME_LOCAL_SNAPSHOT_COUNT,
+            names::BACKUP_SUBVOLUME_ESTIMATED_LOCAL_PINNED_DELTA_BYTES,
+            names::URD_CIRCUIT_BREAKER_TRIPS_TOTAL,
+            names::URD_PLANNER_FULL_SENDS_TOTAL,
+            names::URD_PLANNER_DEFERS_TOTAL,
+            names::URD_RETENTION_PRUNES_TOTAL,
+        ];
+
+        let source = include_str!("metrics.rs");
+        let (production, _) = source
+            .split_once("#[cfg(test)]")
+            .expect("metrics.rs must contain a test module");
+        let stripped: String = production
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // ALL is maintained by hand; if `names` gains a const that isn't
+        // listed here, the guard would silently not cover it.
+        assert_eq!(
+            stripped.matches("pub const ").count(),
+            ALL.len(),
+            "`names` has a const not listed in the guard's ALL array"
+        );
+
+        // Bare-substring counting is only sound if no name contains
+        // another; fail loudly if a future metric name violates that.
+        for a in ALL {
+            for b in ALL {
+                assert!(
+                    a == b || !a.contains(b),
+                    "metric name {a:?} contains {b:?}; the bare-substring \
+                     count below is unsound — restructure the guard"
+                );
+            }
+        }
+
+        for name in ALL {
+            let count = stripped.matches(name).count();
+            assert_eq!(
+                count, 1,
+                "{name} must appear exactly once in production code \
+                 (its const definition in `names`); found {count}"
+            );
+        }
+
+        // Exactly twice: the fn definition and the single call inside
+        // sample(). One means sample() stopped escaping; three means a
+        // site bypassed sample().
+        let escape_calls = stripped.matches("escape_label_value(").count();
+        assert_eq!(
+            escape_calls, 2,
+            "escape_label_value( must appear exactly twice in production \
+             code (definition + the call in sample()); found {escape_calls}"
+        );
     }
 }

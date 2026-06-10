@@ -1378,7 +1378,13 @@ fn validate_name_safe(name: &str, label: &str) -> crate::error::Result<()> {
     if name.is_empty() {
         return Err(UrdError::Config(format!("{label} must not be empty")));
     }
-    if name.contains('/') || name.contains('\\') || name.contains("..") || name.contains('\0') {
+    if name.contains('/')
+        || name.contains('\\')
+        || name.contains("..")
+        || name.contains('\0')
+        || name.contains('"')
+        || name.contains('\n')
+    {
         return Err(UrdError::Config(format!(
             "{label} contains forbidden characters: {name:?}"
         )));
@@ -1887,6 +1893,81 @@ role = "test"
 [[subvolumes]]
 name = "foo/bar"
 short_name = "fb"
+source = "/data"
+"#;
+        let mut config: Config = toml::from_str(config_str).unwrap();
+        config.expand_paths();
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("forbidden characters"));
+    }
+
+    // UPI 061: quotes and newlines never belong in a name — rejecting them
+    // at load makes the Prometheus label-escaping question moot for
+    // config-derived names.
+    #[test]
+    fn validate_name_with_quote_rejected() {
+        let config_str = r#"
+[general]
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp"
+
+[local_snapshots]
+roots = [{ path = "/snap", subvolumes = ['quo"ted'] }]
+
+[defaults]
+snapshot_interval = "1h"
+send_interval = "4h"
+[defaults.local_retention]
+hourly = 24
+[defaults.external_retention]
+daily = 30
+
+[[drives]]
+label = "D1"
+mount_path = "/mnt/d1"
+snapshot_root = ".snapshots"
+role = "test"
+
+[[subvolumes]]
+name = 'quo"ted'
+short_name = "qt"
+source = "/data"
+"#;
+        let mut config: Config = toml::from_str(config_str).unwrap();
+        config.expand_paths();
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("forbidden characters"));
+    }
+
+    #[test]
+    fn validate_name_with_newline_rejected() {
+        let config_str = r#"
+[general]
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp"
+
+[local_snapshots]
+roots = [{ path = "/snap", subvolumes = ["line1\nline2"] }]
+
+[defaults]
+snapshot_interval = "1h"
+send_interval = "4h"
+[defaults.local_retention]
+hourly = 24
+[defaults.external_retention]
+daily = 30
+
+[[drives]]
+label = "D1"
+mount_path = "/mnt/d1"
+snapshot_root = ".snapshots"
+role = "test"
+
+[[subvolumes]]
+name = "line1\nline2"
+short_name = "nl"
 source = "/data"
 "#;
         let mut config: Config = toml::from_str(config_str).unwrap();
