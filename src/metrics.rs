@@ -1533,4 +1533,80 @@ mod tests {
         let expected = include_str!("testdata/golden_metrics.prom");
         assert_eq!(format_metrics(&golden_data()), expected);
     }
+
+    // ── Guard: the contract lives only in `names` (UPI 061) ───────
+    //
+    // Scans the production region of this file (everything before the
+    // first `#[cfg(test)]`) with comment lines stripped: each metric name
+    // must appear exactly once — its const definition — so a new inline
+    // emission site (e.g. `writeln!(out, "backup_success{{...")`) fails
+    // here instead of silently re-duplicating the contract. Test code is
+    // exempt: literal assertions are deliberate, redundant contract pins.
+
+    #[test]
+    fn guard_metric_names_live_only_in_names_module() {
+        const ALL: [&str; 20] = [
+            names::BACKUP_SUCCESS,
+            names::BACKUP_LAST_SUCCESS_TIMESTAMP,
+            names::BACKUP_DURATION_SECONDS,
+            names::BACKUP_SNAPSHOT_COUNT,
+            names::BACKUP_SEND_TYPE,
+            names::BACKUP_EXTERNAL_EXPECTED,
+            names::BACKUP_EXTERNAL_DRIVE_MOUNTED,
+            names::BACKUP_EXTERNAL_FREE_BYTES,
+            names::BACKUP_SCRIPT_LAST_RUN_TIMESTAMP,
+            names::BACKUP_SUBVOLUME_CHURN_BYTES_PER_SECOND,
+            names::BACKUP_SUBVOLUME_LAST_FULL_SEND_BYTES,
+            names::BACKUP_POOL_FREE_BYTES,
+            names::BACKUP_POOL_TOTAL_BYTES,
+            names::BACKUP_POOL_METADATA_UTILIZATION_RATIO,
+            names::BACKUP_SUBVOLUME_LOCAL_SNAPSHOT_COUNT,
+            names::BACKUP_SUBVOLUME_ESTIMATED_LOCAL_PINNED_DELTA_BYTES,
+            names::URD_CIRCUIT_BREAKER_TRIPS_TOTAL,
+            names::URD_PLANNER_FULL_SENDS_TOTAL,
+            names::URD_PLANNER_DEFERS_TOTAL,
+            names::URD_RETENTION_PRUNES_TOTAL,
+        ];
+
+        let source = include_str!("metrics.rs");
+        let (production, _) = source
+            .split_once("#[cfg(test)]")
+            .expect("metrics.rs must contain a test module");
+        let stripped: String = production
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Bare-substring counting is only sound if no name contains
+        // another; fail loudly if a future metric name violates that.
+        for a in ALL {
+            for b in ALL {
+                assert!(
+                    a == b || !a.contains(b),
+                    "metric name {a:?} contains {b:?}; the bare-substring \
+                     count below is unsound — restructure the guard"
+                );
+            }
+        }
+
+        for name in ALL {
+            let count = stripped.matches(name).count();
+            assert_eq!(
+                count, 1,
+                "{name} must appear exactly once in production code \
+                 (its const definition in `names`); found {count}"
+            );
+        }
+
+        // Exactly twice: the fn definition and the single call inside
+        // sample(). One means sample() stopped escaping; three means a
+        // site bypassed sample().
+        let escape_calls = stripped.matches("escape_label_value(").count();
+        assert_eq!(
+            escape_calls, 2,
+            "escape_label_value( must appear exactly twice in production \
+             code (definition + the call in sample()); found {escape_calls}"
+        );
+    }
 }
