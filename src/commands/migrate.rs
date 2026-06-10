@@ -46,6 +46,18 @@ pub fn run(config_path: Option<&Path>, args: &MigrateArgs) -> anyhow::Result<()>
     let result = build_migration(&legacy);
     let v2_toml = render_v2(&legacy);
 
+    // Output self-check: the rendered v2 must survive the full load path
+    // (parse_v2 → expand_paths → Config::validate) — exactly what the next
+    // `urd` run will do. Refusing here can only reject outputs that would
+    // have failed at that next load anyway.
+    if let Err(e) = crate::config::Config::from_str(&v2_toml) {
+        anyhow::bail!(
+            "migration would produce an invalid v2 config — nothing written.\n\
+             v2 load check: {e}\n\
+             fix the source config and re-run `urd migrate`"
+        );
+    }
+
     let schema_label = format!("{source_schema} → v2");
 
     if args.dry_run {
@@ -1524,6 +1536,100 @@ protection = "sheltered"
         let v2_content = std::fs::read_to_string(&config_path).unwrap();
         crate::config::Config::from_str(&v2_content)
             .expect("migrated v2 must re-parse cleanly");
+    }
+
+    // ── UPI 062 — output self-check (full load path) ───────────────────
+
+    /// Legacy config that loads fine today (legacy enforces no contract)
+    /// but renders into a v2 that the v2 load path rejects: sheltered
+    /// with zero drives.
+    fn legacy_sheltered_without_drives() -> &'static str {
+        r#"
+[general]
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp/logs"
+run_frequency = "daily"
+
+[local_snapshots]
+roots = [{ path = "/snap", subvolumes = ["sv"] }]
+
+[defaults]
+snapshot_interval = "1d"
+send_interval = "1d"
+[defaults.local_retention]
+daily = 7
+[defaults.external_retention]
+daily = 14
+
+[[subvolumes]]
+name = "sv"
+short_name = "sv"
+source = "/sv"
+protection_level = "sheltered"
+"#
+    }
+
+    #[test]
+    fn migrate_refuses_output_that_fails_v2_load() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_path = dir.path().join("urd.toml");
+        std::fs::write(&config_path, legacy_sheltered_without_drives()).unwrap();
+
+        let args = MigrateArgs { dry_run: false };
+        let err = run(Some(config_path.as_path()), &args)
+            .expect_err("self-check should refuse invalid v2 output");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("migration would produce an invalid v2 config"),
+            "got: {msg}"
+        );
+        assert!(
+            msg.contains("requires at least one configured drive"),
+            "refusal should carry the v2 load error, got: {msg}"
+        );
+
+        // Nothing written: source untouched, no backup.
+        let after = std::fs::read_to_string(&config_path).unwrap();
+        assert_eq!(after, legacy_sheltered_without_drives());
+        assert!(
+            !dir.path().join("urd.toml.legacy").exists(),
+            "no backup on refusal"
+        );
+    }
+
+    #[test]
+    fn migrate_dry_run_hits_the_same_self_check() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_path = dir.path().join("urd.toml");
+        std::fs::write(&config_path, legacy_sheltered_without_drives()).unwrap();
+
+        let args = MigrateArgs { dry_run: true };
+        let err = run(Some(config_path.as_path()), &args)
+            .expect_err("--dry-run previews the refusal");
+        assert!(
+            err.to_string()
+                .contains("migration would produce an invalid v2 config")
+        );
+
+        let after = std::fs::read_to_string(&config_path).unwrap();
+        assert_eq!(after, legacy_sheltered_without_drives());
+        assert!(!dir.path().join("urd.toml.legacy").exists());
+    }
+
+    #[test]
+    fn migrate_self_check_passes_valid_output_through() {
+        // No-false-refusal: an input whose migrated output loads keeps
+        // migrating exactly as before.
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_path = dir.path().join("urd.toml");
+        std::fs::write(&config_path, example_legacy_toml()).unwrap();
+
+        let args = MigrateArgs { dry_run: false };
+        run(Some(config_path.as_path()), &args)
+            .expect("valid migration passes the self-check");
+        let v2_content = std::fs::read_to_string(&config_path).unwrap();
+        assert!(v2_content.contains("config_version = 2"));
     }
 
     #[test]

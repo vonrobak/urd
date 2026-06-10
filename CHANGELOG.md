@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Legacy configs warn when a named protection level is overridden** (UPI 062, PR 2). The
+  legacy schema predates the ADR-110 opacity contract and silently honors explicit settings
+  alongside a named level — a weakened promise the user never sees. Loading such a config now
+  logs one warning per affected subvolume naming the overridden fields and pointing at
+  `urd migrate`, which converts the subvolume to `protection = "custom"` behavior-preservingly.
+  Warn-don't-reject: existing setups keep loading and backing up unchanged. Visible on the
+  journal/timer/sentinel surfaces (interactive TTY filters to errors by design).
+- **`urd migrate` self-checks its output through the full v2 load path** (UPI 062, PR 2).
+  Before writing anything, the rendered v2 config is run through parse → path expansion →
+  validation — exactly what the next `urd` run would do. If it would fail (e.g. a legacy
+  sheltered subvolume with no drives), migrate refuses with the load error and a non-zero
+  exit instead of leaving a config that stops the nightly timer; `--dry-run` previews the
+  same refusal. Inputs whose output loads cleanly migrate exactly as before.
+
 ### Changed
 - **One home for the protection-level contract** (UPI 062, PR 1; no acceptance-behavior
   change). The ADR-110 opacity rules — enforced until now as two near-identical validators in
