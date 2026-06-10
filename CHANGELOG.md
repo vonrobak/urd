@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Structural home for the Prometheus wire contract** (UPI 061; output byte-identical for
+  every realistic config, proven by a write-once golden-file test). Every metric name now has
+  exactly one definition (`metrics.rs::names`, guard-tested) and every sample line is emitted
+  through one always-escaping `sample()` helper, closing the split where eight older
+  `subvolume`-label sites bypassed exposition-format escaping. Config-derived names now
+  reject `"` and newline at load (no legitimate name contains either).
+  `docs/20-reference/metrics.md` catches up with six shipped-but-undocumented metrics
+  (`backup_external_expected`, the `backup_pool_*` gauges, the UPI 043 subvolume gauges) and
+  the pool labels `uuid`/`role`/`label`.
 - **One home for the read-side assessment view** (UPI 060, PR 2; no behavior change).
   The assess-then-overlay composition every surface must perform now lives once:
   `advice::assess_view` — the assessment view, the only input from which surfaces render
@@ -22,6 +31,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `run()`), pinned by 11 characterization tests of the recorded current semantics.
 
 ### Fixed
+- **Carry-forward timestamp parsing is escape-aware** (UPI 061). The reader is now the true
+  inverse of the writer's label escaping; a subvolume name containing `"}` no longer silently
+  drops its carried `backup_last_success_timestamp` (pathological names only — no realistic
+  config was affected).
 - **`urd doctor` now applies the offsite-freshness overlay** (UPI 060, PR 1). Doctor was the
   only one of seven assessment surfaces that skipped `advice::overlay_offsite_freshness`, so a
   Fortified subvolume with a stale offsite copy showed waning in `urd status` but healthy in
