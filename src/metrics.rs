@@ -120,7 +120,9 @@ pub struct SubvolumeMetrics {
     pub estimated_local_pinned_delta_bytes: Option<u64>,
 }
 
-/// Escape `\` and `"` in a Prometheus label value per the exposition format.
+/// Escape `\`, `"`, and newline in a Prometheus label value per the
+/// exposition format. Private machinery behind `sample()` — never call it
+/// from an emission site directly.
 #[must_use]
 fn escape_label_value(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -133,6 +135,24 @@ fn escape_label_value(s: &str) -> String {
         }
     }
     out
+}
+
+/// Write one sample line. The ONLY path by which label values reach the
+/// buffer — always escapes per the exposition format. Label-less metrics
+/// pass `&[]`.
+fn sample(out: &mut String, name: &str, labels: &[(&str, &str)], value: impl std::fmt::Display) {
+    out.push_str(name);
+    if !labels.is_empty() {
+        out.push('{');
+        for (i, (key, val)) in labels.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            write!(out, "{key}=\"{}\"", escape_label_value(val)).unwrap();
+        }
+        out.push('}');
+    }
+    writeln!(out, " {value}").unwrap();
 }
 
 // ── Writer ──────────────────────────────────────────────────────────────
@@ -221,14 +241,12 @@ fn format_metrics(data: &MetricsData) -> String {
     .unwrap();
     writeln!(out, "# TYPE {} gauge", names::BACKUP_SUCCESS).unwrap();
     for sv in &data.subvolumes {
-        writeln!(
-            out,
-            "{}{{subvolume=\"{}\"}} {}",
+        sample(
+            &mut out,
             names::BACKUP_SUCCESS,
-            sv.name,
-            sv.success
-        )
-        .unwrap();
+            &[("subvolume", sv.name.as_str())],
+            sv.success,
+        );
     }
 
     // backup_last_success_timestamp
@@ -242,14 +260,12 @@ fn format_metrics(data: &MetricsData) -> String {
     writeln!(out, "# TYPE {} gauge", names::BACKUP_LAST_SUCCESS_TIMESTAMP).unwrap();
     for sv in &data.subvolumes {
         if let Some(ts) = sv.last_success_timestamp {
-            writeln!(
-                out,
-                "{}{{subvolume=\"{}\"}} {}",
+            sample(
+                &mut out,
                 names::BACKUP_LAST_SUCCESS_TIMESTAMP,
-                sv.name,
-                ts
-            )
-            .unwrap();
+                &[("subvolume", sv.name.as_str())],
+                ts,
+            );
         }
     }
 
@@ -263,14 +279,12 @@ fn format_metrics(data: &MetricsData) -> String {
     .unwrap();
     writeln!(out, "# TYPE {} gauge", names::BACKUP_DURATION_SECONDS).unwrap();
     for sv in &data.subvolumes {
-        writeln!(
-            out,
-            "{}{{subvolume=\"{}\"}} {}",
+        sample(
+            &mut out,
             names::BACKUP_DURATION_SECONDS,
-            sv.name,
-            sv.duration_seconds
-        )
-        .unwrap();
+            &[("subvolume", sv.name.as_str())],
+            sv.duration_seconds,
+        );
     }
 
     // backup_snapshot_count
@@ -278,22 +292,18 @@ fn format_metrics(data: &MetricsData) -> String {
     writeln!(out, "# HELP {} Number of snapshots", names::BACKUP_SNAPSHOT_COUNT).unwrap();
     writeln!(out, "# TYPE {} gauge", names::BACKUP_SNAPSHOT_COUNT).unwrap();
     for sv in &data.subvolumes {
-        writeln!(
-            out,
-            "{}{{subvolume=\"{}\",location=\"local\"}} {}",
+        sample(
+            &mut out,
             names::BACKUP_SNAPSHOT_COUNT,
-            sv.name,
-            sv.local_snapshot_count
-        )
-        .unwrap();
-        writeln!(
-            out,
-            "{}{{subvolume=\"{}\",location=\"external\"}} {}",
+            &[("subvolume", sv.name.as_str()), ("location", "local")],
+            sv.local_snapshot_count,
+        );
+        sample(
+            &mut out,
             names::BACKUP_SNAPSHOT_COUNT,
-            sv.name,
-            sv.external_snapshot_count
-        )
-        .unwrap();
+            &[("subvolume", sv.name.as_str()), ("location", "external")],
+            sv.external_snapshot_count,
+        );
     }
 
     // backup_send_type
@@ -306,14 +316,12 @@ fn format_metrics(data: &MetricsData) -> String {
     .unwrap();
     writeln!(out, "# TYPE {} gauge", names::BACKUP_SEND_TYPE).unwrap();
     for sv in &data.subvolumes {
-        writeln!(
-            out,
-            "{}{{subvolume=\"{}\"}} {}",
+        sample(
+            &mut out,
             names::BACKUP_SEND_TYPE,
-            sv.name,
-            sv.send_type
-        )
-        .unwrap();
+            &[("subvolume", sv.name.as_str())],
+            sv.send_type,
+        );
     }
 
     // backup_external_expected
@@ -327,13 +335,12 @@ fn format_metrics(data: &MetricsData) -> String {
     writeln!(out, "# TYPE {} gauge", names::BACKUP_EXTERNAL_EXPECTED).unwrap();
     for sv in &data.subvolumes {
         if sv.external_expected {
-            writeln!(
-                out,
-                "{}{{subvolume=\"{}\"}} 1",
+            sample(
+                &mut out,
                 names::BACKUP_EXTERNAL_EXPECTED,
-                escape_label_value(&sv.name)
-            )
-            .unwrap();
+                &[("subvolume", sv.name.as_str())],
+                1,
+            );
         }
     }
 
@@ -346,13 +353,12 @@ fn format_metrics(data: &MetricsData) -> String {
     )
     .unwrap();
     writeln!(out, "# TYPE {} gauge", names::BACKUP_EXTERNAL_DRIVE_MOUNTED).unwrap();
-    writeln!(
-        out,
-        "{} {}",
+    sample(
+        &mut out,
         names::BACKUP_EXTERNAL_DRIVE_MOUNTED,
-        if data.external_drive_mounted { 1 } else { 0 }
-    )
-    .unwrap();
+        &[],
+        if data.external_drive_mounted { 1 } else { 0 },
+    );
 
     // backup_external_free_bytes
     writeln!(out).unwrap();
@@ -363,13 +369,12 @@ fn format_metrics(data: &MetricsData) -> String {
     )
     .unwrap();
     writeln!(out, "# TYPE {} gauge", names::BACKUP_EXTERNAL_FREE_BYTES).unwrap();
-    writeln!(
-        out,
-        "{} {}",
+    sample(
+        &mut out,
         names::BACKUP_EXTERNAL_FREE_BYTES,
-        data.external_free_bytes
-    )
-    .unwrap();
+        &[],
+        data.external_free_bytes,
+    );
 
     // backup_script_last_run_timestamp
     writeln!(out).unwrap();
@@ -380,13 +385,12 @@ fn format_metrics(data: &MetricsData) -> String {
     )
     .unwrap();
     writeln!(out, "# TYPE {} gauge", names::BACKUP_SCRIPT_LAST_RUN_TIMESTAMP).unwrap();
-    writeln!(
-        out,
-        "{} {}",
+    sample(
+        &mut out,
         names::BACKUP_SCRIPT_LAST_RUN_TIMESTAMP,
-        data.script_last_run_timestamp
-    )
-    .unwrap();
+        &[],
+        data.script_last_run_timestamp,
+    );
 
     // ── Drift telemetry (UPI 030) ─────────────────────────────────
 
@@ -405,14 +409,12 @@ fn format_metrics(data: &MetricsData) -> String {
     .unwrap();
     for sv in &data.subvolumes {
         if let Some(churn) = sv.churn_bytes_per_second {
-            writeln!(
-                out,
-                "{}{{subvolume=\"{}\"}} {}",
+            sample(
+                &mut out,
                 names::BACKUP_SUBVOLUME_CHURN_BYTES_PER_SECOND,
-                sv.name,
-                churn
-            )
-            .unwrap();
+                &[("subvolume", sv.name.as_str())],
+                churn,
+            );
         }
     }
 
@@ -431,14 +433,12 @@ fn format_metrics(data: &MetricsData) -> String {
     .unwrap();
     for sv in &data.subvolumes {
         if let Some(bytes) = sv.last_full_send_bytes {
-            writeln!(
-                out,
-                "{}{{subvolume=\"{}\"}} {}",
+            sample(
+                &mut out,
                 names::BACKUP_SUBVOLUME_LAST_FULL_SEND_BYTES,
-                sv.name,
-                bytes
-            )
-            .unwrap();
+                &[("subvolume", sv.name.as_str())],
+                bytes,
+            );
         }
     }
 
@@ -454,16 +454,16 @@ fn format_metrics(data: &MetricsData) -> String {
     writeln!(out, "# TYPE {} gauge", names::BACKUP_POOL_FREE_BYTES).unwrap();
     for pool in &data.pools {
         if let Some(bytes) = pool.free_bytes {
-            writeln!(
-                out,
-                "{}{{uuid=\"{}\",role=\"{}\",label=\"{}\"}} {}",
+            sample(
+                &mut out,
                 names::BACKUP_POOL_FREE_BYTES,
-                escape_label_value(&pool.uuid),
-                escape_label_value(&pool.role),
-                escape_label_value(&pool.label),
-                bytes
-            )
-            .unwrap();
+                &[
+                    ("uuid", pool.uuid.as_str()),
+                    ("role", pool.role.as_str()),
+                    ("label", pool.label.as_str()),
+                ],
+                bytes,
+            );
         }
     }
 
@@ -477,16 +477,16 @@ fn format_metrics(data: &MetricsData) -> String {
     writeln!(out, "# TYPE {} gauge", names::BACKUP_POOL_TOTAL_BYTES).unwrap();
     for pool in &data.pools {
         if let Some(bytes) = pool.capacity_bytes {
-            writeln!(
-                out,
-                "{}{{uuid=\"{}\",role=\"{}\",label=\"{}\"}} {}",
+            sample(
+                &mut out,
                 names::BACKUP_POOL_TOTAL_BYTES,
-                escape_label_value(&pool.uuid),
-                escape_label_value(&pool.role),
-                escape_label_value(&pool.label),
-                bytes
-            )
-            .unwrap();
+                &[
+                    ("uuid", pool.uuid.as_str()),
+                    ("role", pool.role.as_str()),
+                    ("label", pool.label.as_str()),
+                ],
+                bytes,
+            );
         }
     }
 
@@ -505,16 +505,16 @@ fn format_metrics(data: &MetricsData) -> String {
     .unwrap();
     for pool in &data.pools {
         if let Some(ratio) = pool.metadata_utilization_ratio {
-            writeln!(
-                out,
-                "{}{{uuid=\"{}\",role=\"{}\",label=\"{}\"}} {}",
+            sample(
+                &mut out,
                 names::BACKUP_POOL_METADATA_UTILIZATION_RATIO,
-                escape_label_value(&pool.uuid),
-                escape_label_value(&pool.role),
-                escape_label_value(&pool.label),
-                ratio
-            )
-            .unwrap();
+                &[
+                    ("uuid", pool.uuid.as_str()),
+                    ("role", pool.role.as_str()),
+                    ("label", pool.label.as_str()),
+                ],
+                ratio,
+            );
         }
     }
 
@@ -533,14 +533,12 @@ fn format_metrics(data: &MetricsData) -> String {
     .unwrap();
     for sv in &data.subvolumes {
         if let Some(count) = sv.local_snapshot_count_v4 {
-            writeln!(
-                out,
-                "{}{{subvolume=\"{}\"}} {}",
+            sample(
+                &mut out,
                 names::BACKUP_SUBVOLUME_LOCAL_SNAPSHOT_COUNT,
-                escape_label_value(&sv.name),
-                count
-            )
-            .unwrap();
+                &[("subvolume", sv.name.as_str())],
+                count,
+            );
         }
     }
 
@@ -559,14 +557,12 @@ fn format_metrics(data: &MetricsData) -> String {
     .unwrap();
     for sv in &data.subvolumes {
         if let Some(bytes) = sv.estimated_local_pinned_delta_bytes {
-            writeln!(
-                out,
-                "{}{{subvolume=\"{}\"}} {}",
+            sample(
+                &mut out,
                 names::BACKUP_SUBVOLUME_ESTIMATED_LOCAL_PINNED_DELTA_BYTES,
-                escape_label_value(&sv.name),
-                bytes
-            )
-            .unwrap();
+                &[("subvolume", sv.name.as_str())],
+                bytes,
+            );
         }
     }
 
@@ -582,13 +578,12 @@ fn format_metrics(data: &MetricsData) -> String {
     )
     .unwrap();
     writeln!(out, "# TYPE {} counter", names::URD_CIRCUIT_BREAKER_TRIPS_TOTAL).unwrap();
-    writeln!(
-        out,
-        "{} {}",
+    sample(
+        &mut out,
         names::URD_CIRCUIT_BREAKER_TRIPS_TOTAL,
-        counters.circuit_breaker_trips
-    )
-    .unwrap();
+        &[],
+        counters.circuit_breaker_trips,
+    );
 
     writeln!(out).unwrap();
     writeln!(
@@ -600,20 +595,20 @@ fn format_metrics(data: &MetricsData) -> String {
     writeln!(out, "# TYPE {} counter", names::URD_PLANNER_FULL_SENDS_TOTAL).unwrap();
     if counters.full_sends_by_reason.is_empty() {
         // Emit a zero so consumers can detect the metric exists.
-        writeln!(
-            out,
-            "{}{{reason=\"none\"}} 0",
-            names::URD_PLANNER_FULL_SENDS_TOTAL
-        )
-        .unwrap();
+        sample(
+            &mut out,
+            names::URD_PLANNER_FULL_SENDS_TOTAL,
+            &[("reason", "none")],
+            0,
+        );
     } else {
         for (reason, count) in &counters.full_sends_by_reason {
-            writeln!(
-                out,
-                "{}{{reason=\"{reason}\"}} {count}",
-                names::URD_PLANNER_FULL_SENDS_TOTAL
-            )
-            .unwrap();
+            sample(
+                &mut out,
+                names::URD_PLANNER_FULL_SENDS_TOTAL,
+                &[("reason", reason.as_str())],
+                count,
+            );
         }
     }
 
@@ -626,15 +621,20 @@ fn format_metrics(data: &MetricsData) -> String {
     .unwrap();
     writeln!(out, "# TYPE {} counter", names::URD_PLANNER_DEFERS_TOTAL).unwrap();
     if counters.defers_by_scope.is_empty() {
-        writeln!(out, "{}{{scope=\"none\"}} 0", names::URD_PLANNER_DEFERS_TOTAL).unwrap();
+        sample(
+            &mut out,
+            names::URD_PLANNER_DEFERS_TOTAL,
+            &[("scope", "none")],
+            0,
+        );
     } else {
         for (scope, count) in &counters.defers_by_scope {
-            writeln!(
-                out,
-                "{}{{scope=\"{scope}\"}} {count}",
-                names::URD_PLANNER_DEFERS_TOTAL
-            )
-            .unwrap();
+            sample(
+                &mut out,
+                names::URD_PLANNER_DEFERS_TOTAL,
+                &[("scope", scope.as_str())],
+                count,
+            );
         }
     }
 
@@ -647,15 +647,20 @@ fn format_metrics(data: &MetricsData) -> String {
     .unwrap();
     writeln!(out, "# TYPE {} counter", names::URD_RETENTION_PRUNES_TOTAL).unwrap();
     if counters.prunes_by_rule.is_empty() {
-        writeln!(out, "{}{{rule=\"none\"}} 0", names::URD_RETENTION_PRUNES_TOTAL).unwrap();
+        sample(
+            &mut out,
+            names::URD_RETENTION_PRUNES_TOTAL,
+            &[("rule", "none")],
+            0,
+        );
     } else {
         for (rule, count) in &counters.prunes_by_rule {
-            writeln!(
-                out,
-                "{}{{rule=\"{rule}\"}} {count}",
-                names::URD_RETENTION_PRUNES_TOTAL
-            )
-            .unwrap();
+            sample(
+                &mut out,
+                names::URD_RETENTION_PRUNES_TOTAL,
+                &[("rule", rule.as_str())],
+                count,
+            );
         }
     }
 
@@ -1263,6 +1268,48 @@ mod tests {
         let output = format_metrics(&data);
         assert!(output.contains("# HELP backup_pool_total_bytes"));
         assert!(!output.contains("backup_pool_total_bytes{"));
+    }
+
+    // ── sample() helper (UPI 061) ─────────────────────────────────
+
+    #[test]
+    fn sample_no_labels() {
+        let mut out = String::new();
+        sample(&mut out, "metric_a", &[], 42);
+        assert_eq!(out, "metric_a 42\n");
+    }
+
+    #[test]
+    fn sample_one_label() {
+        let mut out = String::new();
+        sample(&mut out, "metric_a", &[("subvolume", "sv-a")], 1);
+        assert_eq!(out, "metric_a{subvolume=\"sv-a\"} 1\n");
+    }
+
+    #[test]
+    fn sample_multi_label_preserves_order() {
+        let mut out = String::new();
+        sample(
+            &mut out,
+            "metric_a",
+            &[("subvolume", "sv-a"), ("location", "local")],
+            7,
+        );
+        assert_eq!(out, "metric_a{subvolume=\"sv-a\",location=\"local\"} 7\n");
+    }
+
+    #[test]
+    fn sample_escapes_quote_backslash_newline() {
+        let mut out = String::new();
+        sample(&mut out, "metric_a", &[("subvolume", "a\"b\\c\nd")], 1);
+        assert_eq!(out, "metric_a{subvolume=\"a\\\"b\\\\c\\nd\"} 1\n");
+    }
+
+    #[test]
+    fn sample_f64_display_passthrough() {
+        let mut out = String::new();
+        sample(&mut out, "metric_a", &[], 1234.5);
+        assert_eq!(out, "metric_a 1234.5\n");
     }
 
     // ── Golden file (UPI 061) ─────────────────────────────────────
