@@ -189,9 +189,8 @@ pub fn write_metrics(path: &Path, data: &MetricsData) -> crate::error::Result<()
 #[must_use]
 pub fn read_existing_timestamps(path: &Path) -> HashMap<String, i64> {
     let mut map = HashMap::new();
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(_) => return map,
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return map;
     };
 
     let prefix = format!("{}{{subvolume=\"", names::BACKUP_LAST_SUCCESS_TIMESTAMP);
@@ -385,7 +384,7 @@ fn format_metrics(data: &MetricsData) -> String {
         &mut out,
         names::BACKUP_EXTERNAL_DRIVE_MOUNTED,
         &[],
-        if data.external_drive_mounted { 1 } else { 0 },
+        i32::from(data.external_drive_mounted),
     );
 
     // backup_external_free_bytes
@@ -982,11 +981,11 @@ mod tests {
     // naive find("\"}") cut silently drops — a bare quoted name passes
     // even with the naive cut, so it alone proves nothing.
 
-    fn ts_subvol(name: &str, ts: i64) -> SubvolumeMetrics {
+    fn ts_subvol(name: &str, ts: Option<i64>) -> SubvolumeMetrics {
         SubvolumeMetrics {
             name: name.to_string(),
             success: 1,
-            last_success_timestamp: Some(ts),
+            last_success_timestamp: ts,
             duration_seconds: 10,
             local_snapshot_count: 5,
             external_snapshot_count: 3,
@@ -1003,7 +1002,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("backup.prom");
         let data = MetricsData {
-            subvolumes: vec![ts_subvol(name, 4242)],
+            subvolumes: vec![ts_subvol(name, Some(4242))],
             external_drive_mounted: true,
             external_free_bytes: 1_000_000,
             script_last_run_timestamp: 4242,
@@ -1013,8 +1012,7 @@ mod tests {
         write_metrics(&path, &data).unwrap();
 
         let carried = read_existing_timestamps(&path);
-        let mut svs = vec![ts_subvol(name, 0)];
-        svs[0].last_success_timestamp = None;
+        let mut svs = vec![ts_subvol(name, None)];
         apply_carried_forward_timestamps(&mut svs, &carried);
 
         assert_eq!(
@@ -1577,6 +1575,14 @@ mod tests {
             .filter(|l| !l.trim_start().starts_with("//"))
             .collect::<Vec<_>>()
             .join("\n");
+
+        // ALL is maintained by hand; if `names` gains a const that isn't
+        // listed here, the guard would silently not cover it.
+        assert_eq!(
+            stripped.matches("pub const ").count(),
+            ALL.len(),
+            "`names` has a const not listed in the guard's ALL array"
+        );
 
         // Bare-substring counting is only sound if no name contains
         // another; fail loudly if a future metric name violates that.
