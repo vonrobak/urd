@@ -678,6 +678,23 @@ pub(crate) fn validate_protection_contract(
     Ok(())
 }
 
+/// The opacity violations on one subvolume view: for a named level, the
+/// fields the user has overridden — the four operational fields in rule
+/// order, plus `"local_retention"` when set (including the transient
+/// spelling). Empty for Custom, where the user owns every field. Used by
+/// the legacy parser's warn path, which honors the overrides instead of
+/// rejecting them.
+pub(crate) fn opacity_violations(sv: &ProtectionContractView<'_>) -> Vec<&'static str> {
+    if sv.level == ProtectionLevel::Custom {
+        return Vec::new();
+    }
+    let mut fields = named_level_field_overrides(sv);
+    if sv.local_retention != LocalRetentionKind::None {
+        fields.push("local_retention");
+    }
+    fields
+}
+
 // ── MonthlyCount ────────────────────────────────────────────────────────
 
 /// Monthly retention quantity: either a bounded count or unlimited.
@@ -2389,5 +2406,56 @@ weekly = 4
         };
         let err = validate_protection_contract(&view, "v1").unwrap_err();
         assert!(err.contains("send_interval cannot be set"));
+    }
+
+    // ── opacity_violations tests ────────────────────────────────────
+
+    #[test]
+    fn opacity_violations_lists_overridden_fields_in_rule_order() {
+        let view = ProtectionContractView {
+            has_snapshot_interval: true,
+            has_send_enabled: true,
+            has_external_retention: true,
+            ..contract_view(ProtectionLevel::Sheltered)
+        };
+        assert_eq!(
+            opacity_violations(&view),
+            vec!["snapshot_interval", "send_enabled", "external_retention"]
+        );
+    }
+
+    #[test]
+    fn opacity_violations_includes_local_retention_when_set() {
+        for kind in [LocalRetentionKind::Graduated, LocalRetentionKind::Transient] {
+            let view = ProtectionContractView {
+                local_retention: kind,
+                has_send_interval: true,
+                ..contract_view(ProtectionLevel::Recorded)
+            };
+            assert_eq!(
+                opacity_violations(&view),
+                vec!["send_interval", "local_retention"]
+            );
+        }
+    }
+
+    #[test]
+    fn opacity_violations_empty_for_clean_named_level() {
+        let view = contract_view(ProtectionLevel::Fortified);
+        assert!(opacity_violations(&view).is_empty());
+    }
+
+    #[test]
+    fn opacity_violations_empty_for_custom_with_everything_set() {
+        let view = ProtectionContractView {
+            local_retention: LocalRetentionKind::Graduated,
+            local_snapshots: Some(true),
+            has_snapshot_interval: true,
+            has_send_interval: true,
+            has_send_enabled: true,
+            has_external_retention: true,
+            ..contract_view(ProtectionLevel::Custom)
+        };
+        assert!(opacity_violations(&view).is_empty());
     }
 }

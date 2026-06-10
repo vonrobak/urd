@@ -8,7 +8,7 @@ use crate::notify::NotificationConfig;
 use crate::types::{
     ByteSize, DriveRole, GraduatedRetention, Interval, LocalRetentionConfig, LocalRetentionKind,
     LocalRetentionPolicy, MonthlyCount, ProtectionContractView, ProtectionLevel,
-    ResolvedGraduatedRetention, RunFrequency, validate_protection_contract,
+    ResolvedGraduatedRetention, RunFrequency, opacity_violations, validate_protection_contract,
 };
 
 // ── Top-level config ────────────────────────────────────────────────────
@@ -328,10 +328,11 @@ impl Config {
         Ok(config)
     }
 
-    /// Parse config from a TOML string with version dispatch (no file I/O, no path expansion).
+    /// Parse config from a TOML string with version dispatch — the load
+    /// path minus file I/O (parse → expand_paths → validate).
     ///
-    /// Used by tests that need to verify generated TOML parses correctly.
-    #[cfg(test)]
+    /// Used by migrate's output self-check and by tests that need to
+    /// verify generated TOML parses correctly.
     pub(crate) fn from_str(raw: &str) -> Result<Self, String> {
         let version = extract_config_version(raw)?;
         let mut config = match version {
@@ -895,9 +896,58 @@ fn extract_config_version(raw: &str) -> Result<Option<u32>, String> {
     Ok(probe.general.and_then(|g| g.config_version))
 }
 
+/// Compose opacity warnings for a legacy config: one message per subvolume
+/// whose named protection level is overridden by explicit settings. Pure —
+/// `parse_legacy` emits them. Legacy predates the ADR-110 contract, so its
+/// semantics honor the overrides (via `resolved()`'s merge); the warning
+/// names `urd migrate` as the behavior-preserving way out.
+fn legacy_opacity_warnings(config: &Config) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for sv in &config.subvolumes {
+        let level = sv.protection_level.unwrap_or(ProtectionLevel::Custom);
+        let has_any_drives = match sv.drives {
+            Some(ref d) => !d.is_empty(),
+            None => !config.drives.is_empty(),
+        };
+        let view = ProtectionContractView {
+            name: &sv.name,
+            level,
+            local_retention: match sv.local_retention {
+                None => LocalRetentionKind::None,
+                Some(LocalRetentionConfig::Transient) => LocalRetentionKind::Transient,
+                Some(LocalRetentionConfig::Graduated(_)) => LocalRetentionKind::Graduated,
+            },
+            // The legacy schema has no local_snapshots field.
+            local_snapshots: None,
+            has_snapshot_interval: sv.snapshot_interval.is_some(),
+            has_send_interval: sv.send_interval.is_some(),
+            has_send_enabled: sv.send_enabled.is_some(),
+            has_external_retention: sv.external_retention.is_some(),
+            has_any_drives,
+            has_empty_drive_list: matches!(sv.drives, Some(ref d) if d.is_empty()),
+        };
+        let violations = opacity_violations(&view);
+        if violations.is_empty() {
+            continue;
+        }
+        warnings.push(format!(
+            "subvolume {:?}: protection_level = \"{level}\" is overridden by explicit \
+             settings ({}) — legacy semantics honor the overrides; `urd migrate` converts \
+             this to protection = \"custom\", preserving current behavior.",
+            sv.name,
+            violations.join(", ")
+        ));
+    }
+    warnings
+}
+
 /// Parse legacy config (no config_version field).
 fn parse_legacy(raw: &str) -> Result<Config, String> {
-    toml::from_str(raw).map_err(|e| e.to_string())
+    let config: Config = toml::from_str(raw).map_err(|e| e.to_string())?;
+    for msg in legacy_opacity_warnings(&config) {
+        log::warn!("{msg}");
+    }
+    Ok(config)
 }
 
 /// Parse v1 config (config_version = 1).
@@ -2908,6 +2958,80 @@ source = "/data/sv"
             config.defaults.external_retention.monthly,
             Some(MonthlyCount::Unlimited)
         );
+    }
+
+    // ── UPI 062 — legacy opacity warnings (warn-don't-reject) ──────────
+
+    fn legacy_config_with_subvolume(subvolume_toml: &str) -> String {
+        format!(
+            r#"
+[general]
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp"
+
+[local_snapshots]
+roots = [{{ path = "/snap", subvolumes = ["sv"] }}]
+
+[defaults]
+snapshot_interval = "1h"
+send_interval = "1d"
+[defaults.local_retention]
+daily = 30
+[defaults.external_retention]
+daily = 30
+
+[[drives]]
+label = "D1"
+mount_path = "/mnt/d1"
+snapshot_root = ".snapshots"
+role = "primary"
+
+[[subvolumes]]
+name = "sv"
+short_name = "sv"
+source = "/data/sv"
+{subvolume_toml}"#
+        )
+    }
+
+    #[test]
+    fn legacy_opacity_warning_names_the_overridden_fields() {
+        let raw = legacy_config_with_subvolume(
+            "protection_level = \"sheltered\"\n\
+             send_interval = \"6h\"\n\
+             local_retention = { daily = 7 }\n",
+        );
+        // Legacy loads despite the violation — warn, don't reject.
+        let config = parse_legacy(&raw).expect("legacy honors overrides and loads");
+        assert_eq!(
+            legacy_opacity_warnings(&config),
+            vec![
+                "subvolume \"sv\": protection_level = \"sheltered\" is overridden by explicit \
+                 settings (send_interval, local_retention) — legacy semantics honor the \
+                 overrides; `urd migrate` converts this to protection = \"custom\", \
+                 preserving current behavior."
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn legacy_opacity_warnings_empty_for_clean_named_level() {
+        let raw = legacy_config_with_subvolume("protection_level = \"sheltered\"\n");
+        let config = parse_legacy(&raw).expect("clean legacy loads");
+        assert!(legacy_opacity_warnings(&config).is_empty());
+    }
+
+    #[test]
+    fn legacy_opacity_warnings_empty_for_custom_with_overrides() {
+        let raw = legacy_config_with_subvolume(
+            "protection_level = \"custom\"\n\
+             send_interval = \"6h\"\n\
+             local_retention = { daily = 7 }\n",
+        );
+        let config = parse_legacy(&raw).expect("custom legacy loads");
+        assert!(legacy_opacity_warnings(&config).is_empty());
     }
 
     #[test]
