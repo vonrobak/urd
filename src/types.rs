@@ -542,6 +542,142 @@ pub fn derive_policy(level: ProtectionLevel, freq: RunFrequency) -> Option<Deriv
     }
 }
 
+// ── Protection-level contract (ADR-110) ─────────────────────────────────
+
+/// How a subvolume's `local_retention` field is set, schema-agnostically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LocalRetentionKind {
+    None,
+    Transient,
+    Graduated,
+}
+
+/// Schema-agnostic projection of one subvolume's protection-relevant
+/// fields. Each config parser builds this view and calls
+/// [`validate_protection_contract`] — the single home for architectural
+/// invariant #10 (named protection levels are opaque, ADR-110).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ProtectionContractView<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) level: ProtectionLevel,
+    pub(crate) local_retention: LocalRetentionKind,
+    pub(crate) local_snapshots: Option<bool>,
+    pub(crate) has_snapshot_interval: bool,
+    pub(crate) has_send_interval: bool,
+    pub(crate) has_send_enabled: bool,
+    pub(crate) has_external_retention: bool,
+    pub(crate) has_any_drives: bool,
+    pub(crate) has_empty_drive_list: bool,
+}
+
+/// The operational fields a named level controls, in rule order. Returns
+/// the names of those set on the view. Shared by the validator and
+/// `opacity_violations` so the field list exists exactly once.
+fn named_level_field_overrides(sv: &ProtectionContractView<'_>) -> Vec<&'static str> {
+    let fields = [
+        ("snapshot_interval", sv.has_snapshot_interval),
+        ("send_interval", sv.has_send_interval),
+        ("send_enabled", sv.has_send_enabled),
+        ("external_retention", sv.has_external_retention),
+    ];
+    fields
+        .iter()
+        .filter(|(_, is_set)| *is_set)
+        .map(|(field, _)| *field)
+        .collect()
+}
+
+/// Validate the protection-level contract for one subvolume view.
+///
+/// The rules and their order are shared by every config schema; only the
+/// transient-spelling message names the schema (via `schema`). Returns the
+/// first violation. Pure function: no I/O (ADR-108).
+pub(crate) fn validate_protection_contract(
+    sv: &ProtectionContractView<'_>,
+    schema: &str,
+) -> Result<(), String> {
+    let name = sv.name;
+    let level = sv.level;
+
+    // Rule 1: Reject local_retention = "transient" universally
+    // (applies to both named and custom — use local_snapshots = false instead)
+    if sv.local_retention == LocalRetentionKind::Transient {
+        return Err(format!(
+            "subvolume {name:?}: local_retention = \"transient\" is not supported in {schema} \
+             — use local_snapshots = false instead."
+        ));
+    }
+
+    // Rule 2: Mutual exclusion — local_snapshots = false + local_retention
+    if sv.local_snapshots == Some(false) && sv.local_retention != LocalRetentionKind::None {
+        return Err(format!(
+            "subvolume {name:?}: local_snapshots = false and local_retention are mutually \
+             exclusive — when local_snapshots is disabled, there is nothing to retain."
+        ));
+    }
+
+    // Named levels must not have operational overrides
+    if level != ProtectionLevel::Custom {
+        if let Some(field) = named_level_field_overrides(sv).first() {
+            return Err(format!(
+                "subvolume {name:?}: {field} cannot be set alongside \
+                 protection = \"{level}\" — the protection level controls this field. \
+                 Use protection = \"custom\" for manual control."
+            ));
+        }
+
+        // local_snapshots = false is incompatible with named levels
+        if sv.local_snapshots == Some(false) {
+            return Err(format!(
+                "subvolume {name:?}: local_snapshots = false is incompatible with \
+                 protection = \"{level}\" — named levels require local snapshots. \
+                 Remove the protection field for custom configuration."
+            ));
+        }
+
+        // ANY local_retention alongside a named level is rejected
+        // (transient already caught by Rule 1 above)
+        if sv.local_retention != LocalRetentionKind::None {
+            return Err(format!(
+                "subvolume {name:?}: local_retention cannot be set alongside \
+                 protection = \"{level}\" — the protection level controls this field. \
+                 Use protection = \"custom\" for manual control."
+            ));
+        }
+    }
+
+    // local_snapshots = false requires at least one drive
+    if sv.local_snapshots == Some(false) && !sv.has_any_drives {
+        return Err(format!(
+            "subvolume {name:?}: local_snapshots = false requires at least one drive \
+             — without local snapshots or external sends, nothing is being backed up."
+        ));
+    }
+
+    // Reject empty drives list on any level that requires external sends
+    if sv.has_empty_drive_list
+        && matches!(
+            level,
+            ProtectionLevel::Sheltered | ProtectionLevel::Fortified
+        )
+    {
+        return Err(format!(
+            "subvolume {name:?}: protection = \"{level}\" requires drives for \
+             external backups, but drives is an empty list."
+        ));
+    }
+
+    // Sheltered requires at least one drive (global or assigned)
+    if level == ProtectionLevel::Sheltered && !sv.has_any_drives {
+        return Err(format!(
+            "subvolume {name:?}: protection = \"sheltered\" requires at least one \
+             configured drive for external backups."
+        ));
+    }
+
+    Ok(())
+}
+
 // ── MonthlyCount ────────────────────────────────────────────────────────
 
 /// Monthly retention quantity: either a bounded count or unlimited.
@@ -1982,5 +2118,276 @@ weekly = 4
             yearly: None,
         };
         assert_eq!(g.resolved().monthly, MonthlyCount::Count(0));
+    }
+
+    // ── protection-level contract tests ────────────────────────────
+
+    /// A view that passes every contract rule; tests flip one field each.
+    fn contract_view(level: ProtectionLevel) -> ProtectionContractView<'static> {
+        ProtectionContractView {
+            name: "home",
+            level,
+            local_retention: LocalRetentionKind::None,
+            local_snapshots: None,
+            has_snapshot_interval: false,
+            has_send_interval: false,
+            has_send_enabled: false,
+            has_external_retention: false,
+            has_any_drives: true,
+            has_empty_drive_list: false,
+        }
+    }
+
+    #[test]
+    fn contract_accepts_clean_views_on_every_level() {
+        for level in [
+            ProtectionLevel::Recorded,
+            ProtectionLevel::Sheltered,
+            ProtectionLevel::Fortified,
+            ProtectionLevel::Custom,
+        ] {
+            let view = contract_view(level);
+            assert!(validate_protection_contract(&view, "v1").is_ok());
+            assert!(validate_protection_contract(&view, "v2").is_ok());
+        }
+    }
+
+    #[test]
+    fn contract_accepts_custom_with_everything_set() {
+        let view = ProtectionContractView {
+            local_retention: LocalRetentionKind::Graduated,
+            local_snapshots: Some(true),
+            has_snapshot_interval: true,
+            has_send_interval: true,
+            has_send_enabled: true,
+            has_external_retention: true,
+            ..contract_view(ProtectionLevel::Custom)
+        };
+        assert!(validate_protection_contract(&view, "v1").is_ok());
+    }
+
+    #[test]
+    fn contract_rejects_transient_spelling_on_named_and_custom() {
+        for level in [ProtectionLevel::Sheltered, ProtectionLevel::Custom] {
+            let view = ProtectionContractView {
+                local_retention: LocalRetentionKind::Transient,
+                ..contract_view(level)
+            };
+            let err = validate_protection_contract(&view, "v1").unwrap_err();
+            assert_eq!(
+                err,
+                "subvolume \"home\": local_retention = \"transient\" is not supported in v1 \
+                 — use local_snapshots = false instead."
+            );
+        }
+    }
+
+    #[test]
+    fn contract_transient_message_carries_the_schema() {
+        let view = ProtectionContractView {
+            local_retention: LocalRetentionKind::Transient,
+            ..contract_view(ProtectionLevel::Custom)
+        };
+        let err = validate_protection_contract(&view, "v2").unwrap_err();
+        assert!(err.contains("not supported in v2"));
+    }
+
+    #[test]
+    fn contract_rejects_local_snapshots_false_with_local_retention() {
+        let view = ProtectionContractView {
+            local_snapshots: Some(false),
+            local_retention: LocalRetentionKind::Graduated,
+            ..contract_view(ProtectionLevel::Custom)
+        };
+        let err = validate_protection_contract(&view, "v1").unwrap_err();
+        assert_eq!(
+            err,
+            "subvolume \"home\": local_snapshots = false and local_retention are mutually \
+             exclusive — when local_snapshots is disabled, there is nothing to retain."
+        );
+    }
+
+    #[test]
+    fn contract_rejects_each_forbidden_field_on_named_level() {
+        let base = contract_view(ProtectionLevel::Sheltered);
+        let cases = [
+            (
+                "snapshot_interval",
+                ProtectionContractView {
+                    has_snapshot_interval: true,
+                    ..base
+                },
+            ),
+            (
+                "send_interval",
+                ProtectionContractView {
+                    has_send_interval: true,
+                    ..base
+                },
+            ),
+            (
+                "send_enabled",
+                ProtectionContractView {
+                    has_send_enabled: true,
+                    ..base
+                },
+            ),
+            (
+                "external_retention",
+                ProtectionContractView {
+                    has_external_retention: true,
+                    ..base
+                },
+            ),
+        ];
+        for (field, view) in cases {
+            let err = validate_protection_contract(&view, "v1").unwrap_err();
+            assert_eq!(
+                err,
+                format!(
+                    "subvolume \"home\": {field} cannot be set alongside \
+                     protection = \"sheltered\" — the protection level controls this field. \
+                     Use protection = \"custom\" for manual control."
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn contract_forbidden_fields_check_in_field_order() {
+        // All four set → snapshot_interval reported first.
+        let view = ProtectionContractView {
+            has_snapshot_interval: true,
+            has_send_interval: true,
+            has_send_enabled: true,
+            has_external_retention: true,
+            ..contract_view(ProtectionLevel::Recorded)
+        };
+        let err = validate_protection_contract(&view, "v1").unwrap_err();
+        assert!(err.contains("snapshot_interval cannot be set"));
+    }
+
+    #[test]
+    fn contract_rejects_local_snapshots_false_on_named_level() {
+        let view = ProtectionContractView {
+            local_snapshots: Some(false),
+            ..contract_view(ProtectionLevel::Sheltered)
+        };
+        let err = validate_protection_contract(&view, "v1").unwrap_err();
+        assert_eq!(
+            err,
+            "subvolume \"home\": local_snapshots = false is incompatible with \
+             protection = \"sheltered\" — named levels require local snapshots. \
+             Remove the protection field for custom configuration."
+        );
+    }
+
+    #[test]
+    fn contract_rejects_graduated_local_retention_on_named_level() {
+        let view = ProtectionContractView {
+            local_retention: LocalRetentionKind::Graduated,
+            ..contract_view(ProtectionLevel::Fortified)
+        };
+        let err = validate_protection_contract(&view, "v1").unwrap_err();
+        assert_eq!(
+            err,
+            "subvolume \"home\": local_retention cannot be set alongside \
+             protection = \"fortified\" — the protection level controls this field. \
+             Use protection = \"custom\" for manual control."
+        );
+    }
+
+    #[test]
+    fn contract_rejects_local_snapshots_false_without_drives() {
+        let view = ProtectionContractView {
+            local_snapshots: Some(false),
+            has_any_drives: false,
+            ..contract_view(ProtectionLevel::Custom)
+        };
+        let err = validate_protection_contract(&view, "v1").unwrap_err();
+        assert_eq!(
+            err,
+            "subvolume \"home\": local_snapshots = false requires at least one drive \
+             — without local snapshots or external sends, nothing is being backed up."
+        );
+    }
+
+    #[test]
+    fn contract_rejects_empty_drive_list_on_external_levels() {
+        for level in [ProtectionLevel::Sheltered, ProtectionLevel::Fortified] {
+            let view = ProtectionContractView {
+                has_empty_drive_list: true,
+                has_any_drives: false,
+                ..contract_view(level)
+            };
+            let err = validate_protection_contract(&view, "v1").unwrap_err();
+            assert_eq!(
+                err,
+                format!(
+                    "subvolume \"home\": protection = \"{level}\" requires drives for \
+                     external backups, but drives is an empty list."
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn contract_accepts_empty_drive_list_on_local_levels() {
+        for level in [ProtectionLevel::Recorded, ProtectionLevel::Custom] {
+            let view = ProtectionContractView {
+                has_empty_drive_list: true,
+                has_any_drives: false,
+                ..contract_view(level)
+            };
+            assert!(validate_protection_contract(&view, "v1").is_ok());
+        }
+    }
+
+    #[test]
+    fn contract_rejects_sheltered_without_drives() {
+        let view = ProtectionContractView {
+            has_any_drives: false,
+            ..contract_view(ProtectionLevel::Sheltered)
+        };
+        let err = validate_protection_contract(&view, "v1").unwrap_err();
+        assert_eq!(
+            err,
+            "subvolume \"home\": protection = \"sheltered\" requires at least one \
+             configured drive for external backups."
+        );
+    }
+
+    #[test]
+    fn contract_accepts_recorded_and_custom_without_drives() {
+        for level in [ProtectionLevel::Recorded, ProtectionLevel::Custom] {
+            let view = ProtectionContractView {
+                has_any_drives: false,
+                ..contract_view(level)
+            };
+            assert!(validate_protection_contract(&view, "v1").is_ok());
+        }
+    }
+
+    #[test]
+    fn contract_first_violation_wins_in_rule_order() {
+        // Mirrors v1_rejects_transient_and_local_snapshots_false: the
+        // transient-spelling rule fires before the mutual-exclusion rule.
+        let view = ProtectionContractView {
+            local_retention: LocalRetentionKind::Transient,
+            local_snapshots: Some(false),
+            ..contract_view(ProtectionLevel::Custom)
+        };
+        let err = validate_protection_contract(&view, "v1").unwrap_err();
+        assert!(err.contains("not supported in v1"));
+
+        // Forbidden operational fields fire before the named-level
+        // local_snapshots = false rule.
+        let view = ProtectionContractView {
+            has_send_interval: true,
+            local_snapshots: Some(false),
+            ..contract_view(ProtectionLevel::Sheltered)
+        };
+        let err = validate_protection_contract(&view, "v1").unwrap_err();
+        assert!(err.contains("send_interval cannot be set"));
     }
 }
