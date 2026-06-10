@@ -570,21 +570,20 @@ pub(crate) struct ProtectionContractView<'a> {
     pub(crate) has_empty_drive_list: bool,
 }
 
-/// The operational fields a named level controls, in rule order. Returns
+/// The operational fields a named level controls, in rule order. Yields
 /// the names of those set on the view. Shared by the validator and
 /// `opacity_violations` so the field list exists exactly once.
-fn named_level_field_overrides(sv: &ProtectionContractView<'_>) -> Vec<&'static str> {
-    let fields = [
+fn named_level_field_overrides(
+    sv: &ProtectionContractView<'_>,
+) -> impl Iterator<Item = &'static str> {
+    [
         ("snapshot_interval", sv.has_snapshot_interval),
         ("send_interval", sv.has_send_interval),
         ("send_enabled", sv.has_send_enabled),
         ("external_retention", sv.has_external_retention),
-    ];
-    fields
-        .iter()
-        .filter(|(_, is_set)| *is_set)
-        .map(|(field, _)| *field)
-        .collect()
+    ]
+    .into_iter()
+    .filter_map(|(field, is_set)| is_set.then_some(field))
 }
 
 /// Validate the protection-level contract for one subvolume view.
@@ -618,7 +617,7 @@ pub(crate) fn validate_protection_contract(
 
     // Named levels must not have operational overrides
     if level != ProtectionLevel::Custom {
-        if let Some(field) = named_level_field_overrides(sv).first() {
+        if let Some(field) = named_level_field_overrides(sv).next() {
             return Err(format!(
                 "subvolume {name:?}: {field} cannot be set alongside \
                  protection = \"{level}\" — the protection level controls this field. \
@@ -684,11 +683,12 @@ pub(crate) fn validate_protection_contract(
 /// spelling). Empty for Custom, where the user owns every field. Used by
 /// the legacy parser's warn path, which honors the overrides instead of
 /// rejecting them.
+#[must_use]
 pub(crate) fn opacity_violations(sv: &ProtectionContractView<'_>) -> Vec<&'static str> {
     if sv.level == ProtectionLevel::Custom {
         return Vec::new();
     }
-    let mut fields = named_level_field_overrides(sv);
+    let mut fields: Vec<&'static str> = named_level_field_overrides(sv).collect();
     if sv.local_retention != LocalRetentionKind::None {
         fields.push("local_retention");
     }
