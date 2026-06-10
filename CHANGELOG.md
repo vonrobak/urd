@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.25.0] - 2026-06-10
+
 ### Added
 - **Legacy configs warn when a named protection level is overridden** (UPI 062, PR 2). The
   legacy schema predates the ADR-110 opacity contract and silently honors explicit settings
@@ -1015,7 +1017,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Defense-in-depth pin file protection for unsent snapshots
 - Per-subvolume error isolation in executor
 
-[Unreleased]: https://github.com/vonrobak/urd/compare/v0.24.2...HEAD
+[Unreleased]: https://github.com/vonrobak/urd/compare/v0.25.0...HEAD
+[0.25.0]: https://github.com/vonrobak/urd/compare/v0.24.2...v0.25.0
 [0.24.2]: https://github.com/vonrobak/urd/compare/v0.24.1...v0.24.2
 [0.24.1]: https://github.com/vonrobak/urd/compare/v0.24.0...v0.24.1
 [0.24.0]: https://github.com/vonrobak/urd/compare/v0.23.0...v0.24.0
