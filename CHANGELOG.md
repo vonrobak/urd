@@ -8,6 +8,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **One tongue: every assessment site judges promises with the same storage posture**
+  (UPI 063, #193). Three sites — the sentinel's assessment tick, the backup's
+  pre-execution snapshot, and the empty-plan heartbeat — assessed with an empty signal
+  map, judging freshness against *declared* intervals while `urd status` judged against
+  *effective* tight-tier intervals. On a tight pool the 1.5× stretch guarantees sends
+  age into the 36–54h window every other day, so the sentinel flipped promises AT RISK
+  mid-afternoon while status said sealed — a daily split-brain feeding the heartbeat,
+  notifications, the event log (~5–9 phantom transitions/day), and the run output's
+  transition acknowledgments. All sites now consume the gathered signals (reflect-only;
+  the backup's post-exec writeback remains the only place the armed tier advances).
+- **Promise transitions are recorded once when a sentinel tick races a backup run**
+  (UPI 063, #194). A tick landing inside a run window diffed mid-run state against the
+  sentinel's private baseline and recorded flips the run recorded again at completion;
+  a tick coalescing with the completion event in the same poll cycle could do the same
+  after the fact. The sentinel now skips event recording while a live backup holds the
+  lock (notifications and its own baseline are unaffected), and a coalesced completion
+  suppresses the tick's trigger — the backup stays canonical for in-run transitions
+  (trigger=Run).
+
 - **`urd init` greets a missing config instead of erroring.** The bare-`urd` greeting
   advertises `urd init` as the first command, but init sat behind the mandatory config
   load and answered a first-time user with a raw I/O error ("No such file or directory").

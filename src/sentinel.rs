@@ -637,6 +637,25 @@ pub fn has_health_changes(
     has_changes(previous, current)
 }
 
+/// Should this assess record promise-transition events? (UPI 063)
+///
+/// Encodes the ownership rule backup.rs states ("Backup is canonical for
+/// in-run promise transitions, trigger=Run") for the window the trigger
+/// suppression alone misses: a sentinel tick landing INSIDE a backup run
+/// would diff mid-run state against the sentinel's private baseline and
+/// record flips the run records again at completion. While a backup holds
+/// the lock (`backup_active`), the sentinel observes but does not record —
+/// its baseline still absorbs the flip (one notification, no duplicate
+/// event), and the run's own pre/post diff is the honest attribution.
+#[must_use]
+pub fn should_record_transitions(
+    has_initial_assessment: bool,
+    trigger: Option<crate::events::TransitionTrigger>,
+    backup_active: bool,
+) -> bool {
+    has_initial_assessment && trigger.is_some() && !backup_active
+}
+
 // ── Snapshot extractors ───────────────────────────────────────────────
 
 /// Extract promise snapshots from assessments for state storage.
@@ -1094,6 +1113,52 @@ mod tests {
     #[test]
     fn tick_empty_assessments_is_2_minutes() {
         assert_eq!(compute_next_tick(&[]), Duration::from_secs(2 * 60));
+    }
+
+    // ── should_record_transitions (UPI 063) ─────────────────────────────
+
+    #[test]
+    fn records_on_tick_when_initialized_and_no_backup() {
+        use crate::events::TransitionTrigger;
+        assert!(should_record_transitions(
+            true,
+            Some(TransitionTrigger::Tick),
+            false
+        ));
+    }
+
+    #[test]
+    fn never_records_before_initial_assessment() {
+        use crate::events::TransitionTrigger;
+        for trigger in [None, Some(TransitionTrigger::Tick)] {
+            for backup_active in [false, true] {
+                assert!(!should_record_transitions(false, trigger, backup_active));
+            }
+        }
+    }
+
+    #[test]
+    fn never_records_without_a_trigger() {
+        // BackupCompleted-only cycles arrive as trigger=None — the backup
+        // already recorded with trigger=Run.
+        for backup_active in [false, true] {
+            assert!(!should_record_transitions(true, None, backup_active));
+        }
+    }
+
+    #[test]
+    fn never_records_while_a_backup_run_is_active() {
+        // The tick-inside-run window: the run's own pre/post diff is the
+        // canonical recorder (trigger=Run); a concurrent tick must not
+        // double-record.
+        use crate::events::TransitionTrigger;
+        for trigger in [
+            TransitionTrigger::Tick,
+            TransitionTrigger::DriveMounted,
+            TransitionTrigger::ConfigChanged,
+        ] {
+            assert!(!should_record_transitions(true, Some(trigger), true));
+        }
     }
 
     // ── Circuit breaker ─────────────────────────────────────────────────

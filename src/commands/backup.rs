@@ -173,15 +173,14 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
             &observability,
         )?;
         let previous_hb = heartbeat::read(&config.general.heartbeat_file);
-        // Empty-plan path: storage posture is not surfaced here (the heartbeat
-        // projection carries no posture — S4), so skip the findmnt sweep and
-        // pass an empty signal map.
-        let assessments = advice::assess_view(
-            &config,
-            heartbeat_now,
-            &observation,
-            &awareness::StorageSignalMap::new(),
-        );
+        // Posture parity (UPI 063): the empty-plan heartbeat embeds promise
+        // verdicts, and verdicts are posture-sensitive — S4's "the projection
+        // carries no posture" conflated fields with judgment. Reuse the
+        // pre-plan `signals` (AB1: still exactly one gather on the run path;
+        // re-gathering here would be judged after the emergency preflight may
+        // have freed space, desyncing this heartbeat from the plan's tier).
+        let assessments =
+            advice::assess_view(&config, heartbeat_now, &observation, &signals.by_subvol);
         let hb = heartbeat::build_empty(
             &config,
             heartbeat_now,
@@ -311,14 +310,14 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     // (thread restored, promise recovered, etc.) by diffing with post-backup state.
     let pre_assessments = {
         let pre_now = chrono::Local::now().naive_local();
-        // Pre-execution snapshot is used only to diff promise-state transitions;
-        // posture is not a promise state, so an empty signal map suffices.
-        advice::assess_view(
-            &config,
-            pre_now,
-            &observation,
-            &awareness::StorageSignalMap::new(),
-        )
+        // Posture parity (UPI 063): judge the pre-snapshot under the SAME
+        // pre-plan signals as the post-exec assess, so the run's transition
+        // diff (events at trigger=Run, and the run output's transition
+        // acknowledgments via `detect_transitions`) records only flips the run
+        // actually caused. An empty map here judged the pre against declared
+        // intervals while the post was judged against effective tight-tier
+        // intervals — fabricating transitions out of the judgment mismatch.
+        advice::assess_view(&config, pre_now, &observation, &signals.by_subvol)
     };
 
     // Build progress context after token filtering so counters reflect actual work.

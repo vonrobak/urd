@@ -18,6 +18,7 @@ use chrono::NaiveDateTime;
 
 use crate::advice;
 use crate::awareness::{self, PromiseStatus, SubvolAssessment};
+use crate::commands::storage_signals;
 use crate::config::Config;
 use crate::drives::{self, DriveAvailability};
 use crate::heartbeat;
@@ -377,6 +378,12 @@ impl SentinelRunner {
 
     // ── Action execution ────────────────────────────────────────────────
 
+    /// True when a foreign live process holds the backup lock (UPI 063).
+    fn backup_run_active(&self) -> bool {
+        let lock_path = self.config.general.state_db.with_extension("lock");
+        backup_run_active_at(&lock_path)
+    }
+
     fn execute_assess(
         &mut self,
         trigger: Option<crate::events::TransitionTrigger>,
@@ -398,23 +405,34 @@ impl SentinelRunner {
             btrfs: &assess_btrfs,
         };
 
-        // The sentinel is deliberately blind to storage posture (D6 — it reacts
-        // to the heartbeat, which carries no posture). Pass an empty signal map
-        // so `assess()` computes no posture on this path; on-demand `status` and
-        // `backup` runs are where posture is gathered and surfaced.
+        // Posture parity (UPI 063): the sentinel judges with the same gathered
+        // signals as `urd status`, so both tongues speak one verdict. D6's
+        // premise ("posture is presentation, not promise") was falsified by
+        // 031-b — the armed tier changes the effective send interval and thus
+        // the verdict, so a posture-blind assess flips promises AT RISK in the
+        // 36–54h window the Tight stretch itself guarantees. `gather()` is
+        // reflect-only (S1: reads never advance hysteresis); the backup's
+        // post-exec writeback remains the only place the armed tier advances.
+        let signals = storage_signals::gather(&self.config, state_db.as_ref());
         let assessments = advice::assess_view(
             &self.config,
             now,
             &observation,
-            &awareness::StorageSignalMap::new(),
+            &signals.by_subvol,
         );
 
         // Emit promise-transition events when the originating event was
         // Tick/DriveMounted/ConfigChanged. On BackupCompleted the backup
         // itself emitted these with trigger=Run; sentinel just refreshes
-        // its baseline.
-        if self.state.has_initial_assessment
-            && let Some(t) = trigger
+        // its baseline. While a backup run holds the lock, recording is
+        // suppressed (UPI 063) — ONLY this statement: the baseline update
+        // below still absorbs the flip (so the next tick doesn't re-detect
+        // it) and notifications keep their timing (grill D).
+        if sentinel::should_record_transitions(
+            self.state.has_initial_assessment,
+            trigger,
+            self.backup_run_active(),
+        ) && let Some(t) = trigger
         {
             audit_events.extend(awareness::diff_promise_states(
                 &self.state.last_promise_states,
@@ -892,16 +910,26 @@ impl SentinelRunner {
 /// This is a separate path from `notify::compute_notifications()`, which operates
 /// on heartbeat data. The two paths converge at `notify::dispatch()`.
 /// Pick the originating `TransitionTrigger` for promise-transition events
-/// emitted during this cycle. Returns `None` when only `BackupCompleted`
-/// fired — in that case the backup itself emitted promise transitions
-/// with `trigger=Run` and the sentinel must not duplicate them.
+/// emitted during this cycle. Returns `None` when `BackupCompleted` fired
+/// without an explicit trigger event — the backup itself emitted promise
+/// transitions with `trigger=Run` and the sentinel must not duplicate them.
+///
+/// `BackupCompleted` suppresses a coalesced routine Tick too (UPI 063): the
+/// run's pid is already dead when the completion is detected, so the
+/// backup-lock probe cannot see this window — a Tick landing in the same
+/// poll cycle would diff against the pre-run baseline and re-record the
+/// run's transitions. The baseline refresh absorbs the post-run state
+/// instead.
 ///
 /// Precedence (when multiple events fire in the same cycle): an explicit
-/// trigger event (DriveMounted, ConfigChanged) wins over a routine Tick.
+/// trigger event (DriveMounted, ConfigChanged) wins over everything — a
+/// drive event coalesced with a completion is a real external change and
+/// keeps its trigger.
 fn pick_transition_trigger(
     events: &[SentinelEvent],
 ) -> Option<crate::events::TransitionTrigger> {
-    let mut chosen = None;
+    let mut saw_tick = false;
+    let mut saw_backup_completed = false;
     for event in events {
         match event {
             SentinelEvent::DriveMounted { .. } => {
@@ -910,14 +938,13 @@ fn pick_transition_trigger(
             SentinelEvent::ConfigChanged => {
                 return Some(crate::events::TransitionTrigger::ConfigChanged);
             }
-            SentinelEvent::AssessmentTick => {
-                chosen.get_or_insert(crate::events::TransitionTrigger::Tick);
-            }
-            // BackupCompleted, DriveUnmounted, Shutdown — no diff trigger.
+            SentinelEvent::AssessmentTick => saw_tick = true,
+            SentinelEvent::BackupCompleted => saw_backup_completed = true,
+            // DriveUnmounted, Shutdown — no diff trigger.
             _ => {}
         }
     }
-    chosen
+    (saw_tick && !saw_backup_completed).then_some(crate::events::TransitionTrigger::Tick)
 }
 
 pub fn build_notifications(
@@ -1172,6 +1199,29 @@ pub fn sentinel_is_running(config: &Config) -> bool {
         return false;
     };
     is_pid_alive(state.pid)
+}
+
+/// True when a foreign live process holds the backup lock metadata (UPI 063).
+///
+/// `read_lock_info` reads metadata only — the lock FILE persists after release
+/// (flock drops on close), so a readable LockInfo proves nothing by itself.
+/// Two checks turn it into evidence of an active run:
+/// - **pid-aliveness**: a dead recorded pid means a finished or crashed run
+///   left the file behind (normal).
+/// - **self-pid exclusion**: the sentinel's own emergency eject (UPI 034)
+///   writes OUR always-alive pid into the metadata; the runner loop is
+///   single-threaded, so we cannot be mid-eject while assessing — our own
+///   pid in the file is always a stale record.
+///
+/// Polarity is fail-open toward recording: the holder's metadata write is
+/// ftruncate-then-write, so a probe racing it may read empty/partial JSON →
+/// `None` → record (worst case one status-quo duplicate event, never lost
+/// monitoring). Do not "fix" this toward suppression.
+fn backup_run_active_at(lock_path: &std::path::Path) -> bool {
+    match crate::lock::read_lock_info(lock_path) {
+        Some(info) => info.pid != std::process::id() && is_pid_alive(info.pid),
+        None => false,
+    }
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
@@ -1451,6 +1501,67 @@ mod tests {
     #[test]
     fn pid_alive_dead_process() {
         assert!(!is_pid_alive(99_999_999));
+    }
+
+    // ── backup_run_active_at (UPI 063) ───────────────────────────────
+
+    fn write_lock_info(path: &std::path::Path, pid: u32) {
+        let info = crate::lock::LockInfo {
+            pid,
+            started: "2026-06-11T04:00:00".to_string(),
+            trigger: "auto".to_string(),
+        };
+        std::fs::write(path, serde_json::to_string(&info).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn probe_false_on_missing_lock_file() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!backup_run_active_at(&dir.path().join("urd.lock")));
+    }
+
+    #[test]
+    fn probe_false_on_dead_pid() {
+        // A finished/crashed run leaves the file behind — flock released,
+        // metadata stale. Not an active run.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("urd.lock");
+        write_lock_info(&path, 99_999_999);
+        assert!(!backup_run_active_at(&path));
+    }
+
+    #[test]
+    fn probe_false_on_own_pid() {
+        // The post-eject case: emergency eject wrote OUR pid, which is alive
+        // for the daemon's whole life. Must read as stale, not active —
+        // otherwise the gate wedges shut forever after the first eject.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("urd.lock");
+        write_lock_info(&path, std::process::id());
+        assert!(!backup_run_active_at(&path));
+    }
+
+    #[test]
+    fn probe_true_on_live_foreign_pid() {
+        // pid 1 is alive on any Linux and is never the test process.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("urd.lock");
+        write_lock_info(&path, 1);
+        assert!(backup_run_active_at(&path));
+    }
+
+    #[test]
+    fn probe_false_on_corrupt_or_empty_lock_file() {
+        // Fail-open toward recording: unreadable metadata is not evidence of
+        // an active run.
+        let dir = tempfile::tempdir().unwrap();
+        let corrupt = dir.path().join("corrupt.lock");
+        std::fs::write(&corrupt, b"not json {{{").unwrap();
+        assert!(!backup_run_active_at(&corrupt));
+
+        let empty = dir.path().join("empty.lock");
+        std::fs::write(&empty, b"").unwrap();
+        assert!(!backup_run_active_at(&empty));
     }
 
     // ── build_notifications ─────────────────────────────────────────
@@ -1878,6 +1989,42 @@ protection = "recorded"
             label: "WD-18TB".into(),
         }];
         assert_eq!(pick_transition_trigger(&events), None);
+    }
+
+    #[test]
+    fn trigger_backup_completed_suppresses_coalesced_tick() {
+        // UPI 063: a Tick in the same poll cycle as the completion would diff
+        // against the pre-run baseline and re-record the run's transitions —
+        // the run's pid is already dead, so the lock probe can't catch it.
+        // Order must not matter.
+        for events in [
+            vec![SentinelEvent::BackupCompleted, SentinelEvent::AssessmentTick],
+            vec![SentinelEvent::AssessmentTick, SentinelEvent::BackupCompleted],
+        ] {
+            assert_eq!(pick_transition_trigger(&events), None);
+        }
+    }
+
+    #[test]
+    fn trigger_explicit_events_survive_backup_completed() {
+        // A drive event coalesced with a completion is a real external change
+        // and keeps its trigger.
+        let events = vec![
+            SentinelEvent::BackupCompleted,
+            SentinelEvent::DriveMounted {
+                label: "WD-18TB".into(),
+            },
+        ];
+        assert_eq!(
+            pick_transition_trigger(&events),
+            Some(crate::events::TransitionTrigger::DriveMounted)
+        );
+
+        let events = vec![SentinelEvent::BackupCompleted, SentinelEvent::ConfigChanged];
+        assert_eq!(
+            pick_transition_trigger(&events),
+            Some(crate::events::TransitionTrigger::ConfigChanged)
+        );
     }
 
     // ── Emergency eject: sample gathering (UPI 034) ────────────────────
