@@ -1812,6 +1812,84 @@ source = "/data/sv1"
     }
 
     #[test]
+    fn tight_stretch_window_verdict_depends_on_signal_map() {
+        // UPI 063 — the split-brain mechanism, pinned. Send age 40h, declared
+        // 1d, pool Tight. Judged WITH the signal: effective interval 36h,
+        // AT-RISK threshold 54h → PROTECTED. Judged with an EMPTY map (the old
+        // posture-blind D6/S4 paths): declared 24h, threshold 36h → AT RISK.
+        // Same filesystem state, opposite verdicts — every assessment site must
+        // therefore consume the gathered signals, or Urd speaks with two
+        // tongues in the 36–54h window the Tight stretch itself guarantees.
+        let (config, now, fs, signals) = capped_fixture(dt(2026, 3, 21, 22, 0), 0.20);
+        let obs = Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() };
+
+        let with_signals = assess(&config, now, &obs, &signals);
+        let sv1 = with_signals.iter().find(|a| a.name == "sv1").unwrap();
+        assert_eq!(
+            sv1.status,
+            PromiseStatus::Protected,
+            "40h is fresh against the effective 36h interval (threshold 54h)"
+        );
+
+        let posture_blind = assess(&config, now, &obs, &StorageSignalMap::new());
+        let sv1_blind = posture_blind.iter().find(|a| a.name == "sv1").unwrap();
+        assert_eq!(
+            sv1_blind.status,
+            PromiseStatus::AtRisk,
+            "40h is stale against the declared 1d interval (threshold 36h)"
+        );
+    }
+
+    #[test]
+    fn pre_post_diff_under_one_judgment_is_empty() {
+        // UPI 063 — the phantom-transition reproducer, fixed half. Pre and
+        // post snapshots judged under the SAME signal map with no underlying
+        // change produce no transitions. This is what backup.rs's pre/post
+        // diff does after posture parity.
+        let (config, now, fs, signals) = capped_fixture(dt(2026, 3, 21, 22, 0), 0.20);
+        let obs = Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() };
+
+        let pre = assess(&config, now, &obs, &signals);
+        let post = assess(&config, now, &obs, &signals);
+
+        let prev_snapshots = crate::sentinel::snapshot_promises(&pre);
+        let events = diff_promise_states(
+            &prev_snapshots,
+            &post,
+            now,
+            crate::events::TransitionTrigger::Run,
+        );
+        assert!(events.is_empty(), "same judgment, same state → no transitions");
+    }
+
+    #[test]
+    fn pre_post_diff_across_judgments_fabricates_transitions() {
+        // UPI 063 — the phantom-transition reproducer, broken half. A
+        // posture-blind pre against a posture-judged post fabricates a
+        // transition from the judgment mismatch alone (40h send age, Tight
+        // pool: blind says AT RISK, judged says PROTECTED — no filesystem
+        // change between the two). This is what backup.rs's diff did before
+        // posture parity.
+        let (config, now, fs, signals) = capped_fixture(dt(2026, 3, 21, 22, 0), 0.20);
+        let obs = Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() };
+
+        let blind_pre = assess(&config, now, &obs, &StorageSignalMap::new());
+        let judged_post = assess(&config, now, &obs, &signals);
+
+        let prev_snapshots = crate::sentinel::snapshot_promises(&blind_pre);
+        let events = diff_promise_states(
+            &prev_snapshots,
+            &judged_post,
+            now,
+            crate::events::TransitionTrigger::Run,
+        );
+        assert!(
+            !events.is_empty(),
+            "split judgment fabricates a transition with no state change"
+        );
+    }
+
+    #[test]
     fn roomy_subvol_has_no_cap_and_no_effective_interval() {
         let (config, now, fs, signals) = capped_fixture(dt(2026, 3, 23, 8, 0), 0.50);
         let results = assess(

@@ -251,8 +251,10 @@ pub struct RedundancyAdvisory {
 /// The assessment view: the awareness assessment plus every product overlay.
 ///
 /// The only input from which surfaces render promise state. Callers supply
-/// gathered signals or an empty map (sentinel D6 / backup S4 paths); this
-/// function never gathers (backup's 031-b single-gather invariant).
+/// gathered signals — since UPI 063 every production assessment site (status,
+/// doctor, bare `urd`, sentinel, backup pre/post/empty-plan) judges with
+/// gathered signals, so all tongues speak one verdict. This function never
+/// gathers itself (backup's 031-b single-gather invariant).
 #[must_use]
 pub fn assess_view(
     config: &Config,
@@ -910,9 +912,11 @@ drives = ["primary-drive", "offsite-drive"]
 
     #[test]
     fn assess_view_empty_signals_flows_through() {
-        // Pins the sentinel (D6) / backup (S4) empty-map contract: callers may
-        // pass an empty StorageSignalMap and still get assessments — with no
-        // storage posture computed on those paths.
+        // assess_view is signal-agnostic: an empty StorageSignalMap still
+        // yields assessments, with no storage posture computed. No production
+        // path passes an empty map since UPI 063 (posture parity), but the
+        // function must not require signals — gather failures degrade to
+        // absent signals, never to a refusal to assess.
         let config = fortified_rotation_config();
         let now = dt(2026, 4, 1, 12, 0);
         let mut fs = MockFileSystemState::new();
