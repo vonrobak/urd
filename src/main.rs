@@ -80,6 +80,11 @@ fn main() -> anyhow::Result<()> {
     if cli.command.is_none() {
         return commands::default::run(cli.config.as_deref(), output_mode);
     }
+    // `urd init` also loads fallibly: the bare-`urd` greeting points first-time
+    // users at it, so a missing config gets guidance, not an I/O error.
+    if let Some(Commands::Init) = cli.command {
+        return commands::init::run_cli(cli.config.as_deref(), output_mode);
+    }
 
     // Strategy C: mandatory config load (all existing commands)
     let config = config::Config::load(cli.config.as_deref())?;
@@ -88,7 +93,6 @@ fn main() -> anyhow::Result<()> {
     match cli.command.unwrap() {
         Commands::Plan(args) => commands::plan_cmd::run(config, args, output_mode),
         Commands::Backup(args) => commands::backup::run(config, args),
-        Commands::Init => commands::init::run(config),
         Commands::Calibrate(args) => commands::calibrate::run(config, args, output_mode),
         Commands::Status => commands::status::run(config, output_mode),
         Commands::History(args) => commands::history::run(config, args, output_mode),
@@ -110,6 +114,8 @@ fn main() -> anyhow::Result<()> {
             commands::retention_preview::run(config, args, output_mode)
         }
         Commands::Events(args) => commands::events::run(config, args, output_mode),
-        Commands::Completions(_) | Commands::Migrate(_) => unreachable!("handled above"),
+        Commands::Completions(_) | Commands::Migrate(_) | Commands::Init => {
+            unreachable!("handled above")
+        }
     }
 }

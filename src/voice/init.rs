@@ -4,11 +4,31 @@
 //! mode.
 
 use std::fmt::Write;
+use std::path::Path;
 
 use colored::Colorize;
 
 use crate::output::{InitOutput, InitStatus, OutputMode};
 use crate::types::{ByteSize, DriveRole};
+
+/// First-run guidance when `urd init` finds no config. The bare-`urd`
+/// greeting points new users here, so a missing config is the expected
+/// starting state — greet and guide, never error.
+#[must_use]
+pub fn render_init_first_time(config_path: &Path, mode: OutputMode) -> String {
+    match mode {
+        OutputMode::Interactive => format!(
+            "Urd is not configured yet — nothing to verify.\n\
+             \n\
+             To begin, create a config at {}.\n\
+             Start from the annotated example (config/urd.toml.example in the\n\
+             Urd repository, walked through in the README's Configuration\n\
+             section), then run `urd init` again to check your setup.\n",
+            config_path.display()
+        ),
+        OutputMode::Daemon => r#"{"status":"not_configured"}"#.to_string(),
+    }
+}
 
 /// Render init output according to the given mode.
 #[must_use]
