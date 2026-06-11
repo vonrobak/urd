@@ -38,6 +38,45 @@ fn record_defer(
     events.push(event);
 }
 
+/// Send-space guard (UPI 054-a): returns the defer reason when the source
+/// pool's free space is below the host-survival floor (`min_free +
+/// cleanup_budget` — the same `guard::source_floor_bytes` the mid-op watchdog
+/// and the sentinel idle decider use; one floor, three deciders). Starting a
+/// send below the floor is the dangerous act the 033 floor-suppression left
+/// reachable: the watchdog suppresses its absolute floor for a started-below
+/// pool, so a slow fill to zero fires neither floor nor cliff (ADR-113's
+/// catastrophic scenario). `force`/`--skip-intervals` do NOT override this
+/// guard — a forced send on a sub-floor pool is still catastrophic, the same
+/// deliberate force-resistance as the snapshot space guard below.
+///
+/// Fail-open on unmeasurable inputs (ADR-107): unreadable capacity ⇒ the
+/// budget's capacity-relative default degrades to 0 (floor = `min_free`);
+/// unreadable free ⇒ proceed.
+fn send_floor_defer_reason(
+    subvol: &ResolvedSubvolume,
+    config: &Config,
+    local_dir: &Path,
+    obs: &Observation,
+) -> Option<String> {
+    let capacity = obs.fs.filesystem_capacity_bytes(local_dir).unwrap_or(0);
+    let floor = crate::guard::source_floor_bytes(
+        subvol.min_free_bytes.unwrap_or(0),
+        config.root_cleanup_budget(&subvol.name),
+        capacity,
+    );
+    let free = obs.fs.filesystem_free_bytes(local_dir).unwrap_or(u64::MAX);
+    if free < floor {
+        use crate::types::ByteSize;
+        Some(format!(
+            "source pool below the host-survival floor ({} free, {} required) — deferring send",
+            ByteSize(free),
+            ByteSize(floor),
+        ))
+    } else {
+        None
+    }
+}
+
 /// Stamp `subvolume` and/or `drive_label` onto events that don't already
 /// carry one. Used after a pure helper returns so the run-level accumulator
 /// has full context before persistence.
@@ -407,6 +446,24 @@ pub fn plan(
 
         // ── External operations ─────────────────────────────────────
         if !filters.local_only && subvol.send_enabled {
+            // Send-space guard (UPI 054-a): one subvolume-scoped defer, then
+            // sends are skipped for every drive this run. The snapshot above
+            // still happens (CoW-cheap local restore point) and external
+            // retention below still runs (destination-side, unrelated to
+            // source-pool pressure).
+            let floor_defer = send_floor_defer_reason(subvol, config, &local_dir, obs);
+            if let Some(reason) = &floor_defer {
+                record_defer(
+                    &mut skipped,
+                    &mut events,
+                    &subvol.name,
+                    None,
+                    reason.clone(),
+                    DeferScope::Subvolume,
+                    now,
+                );
+            }
+
             for drive in &config.drives {
                 if !subvol.accepts_drive(&drive.label) {
                     continue;
@@ -423,20 +480,22 @@ pub fn plan(
                     continue;
                 }
 
-                plan_external_send(
-                    subvol,
-                    &eff,
-                    drive,
-                    &local_dir,
-                    effective_local_snaps,
-                    now,
-                    force,
-                    filters.skip_intervals,
-                    obs,
-                    &mut operations,
-                    &mut skipped,
-                    &mut events,
-                );
+                if floor_defer.is_none() {
+                    plan_external_send(
+                        subvol,
+                        &eff,
+                        drive,
+                        &local_dir,
+                        effective_local_snaps,
+                        now,
+                        force,
+                        filters.skip_intervals,
+                        obs,
+                        &mut operations,
+                        &mut skipped,
+                        &mut events,
+                    );
+                }
 
                 plan_external_retention(
                     subvol,
@@ -880,6 +939,37 @@ fn plan_transient_lifecycle(
     skipped: &mut Vec<(String, String)>,
     events: &mut Vec<Event>,
 ) {
+    // ── Phase 0: Send-space guard (UPI 054-a) ──────────────────────
+    // In the transient path snapshot creation is gated on a send being due
+    // (Phase 2's orphan invariant), so a sub-floor pool defers the WHOLE
+    // lifecycle — creating a snapshot whose send we refuse would strand an
+    // orphan. Retention on leftovers still runs (it frees space). Runs
+    // before Phase 1 so `force`/`--skip-intervals` cannot override it.
+    if let Some(reason) = send_floor_defer_reason(subvol, config, local_dir, obs) {
+        record_defer(
+            skipped,
+            events,
+            &subvol.name,
+            None,
+            reason,
+            DeferScope::Subvolume,
+            now,
+        );
+        plan_local_retention(
+            subvol,
+            eff,
+            local_dir,
+            local_snaps,
+            now,
+            pinned,
+            mounted_pins,
+            obs,
+            operations,
+            events,
+        );
+        return;
+    }
+
     // ── Phase 1: Determine if any send will actually happen ────────
     // Cache newest external snapshot time per drive for skip message formatting.
     let mut sendable_drives: Vec<(&DriveConfig, Option<NaiveDateTime>)> = Vec::new();
@@ -1427,6 +1517,10 @@ impl FilesystemQuery for RealFileSystemState<'_> {
         crate::drives::filesystem_free_bytes(path)
     }
 
+    fn filesystem_capacity_bytes(&self, path: &Path) -> crate::error::Result<u64> {
+        crate::pools::pool_space(path).map(|s| s.capacity_bytes)
+    }
+
     fn read_pin_file(
         &self,
         local_dir: &Path,
@@ -1661,6 +1755,10 @@ pub struct MockFileSystemState {
     pub drive_availability_overrides:
         std::collections::HashMap<String, crate::drives::DriveAvailability>,
     pub free_bytes: std::collections::HashMap<PathBuf, u64>,
+    /// Pool capacity per path (UPI 054-a). Absent ⇒ 0 ("unmeasurable"), which
+    /// degrades the send-floor's capacity-relative budget default to nothing —
+    /// the fail-open production semantics.
+    pub capacity_bytes: std::collections::HashMap<PathBuf, u64>,
     pub pin_files: std::collections::HashMap<(PathBuf, String), SnapshotName>,
     pub send_sizes: std::collections::HashMap<(String, String, SendKind), u64>,
     pub calibrated_sizes: std::collections::HashMap<String, (u64, String)>,
@@ -1686,6 +1784,7 @@ impl MockFileSystemState {
             mounted_drives: HashSet::new(),
             drive_availability_overrides: std::collections::HashMap::new(),
             free_bytes: std::collections::HashMap::new(),
+            capacity_bytes: std::collections::HashMap::new(),
             pin_files: std::collections::HashMap::new(),
             send_sizes: std::collections::HashMap::new(),
             calibrated_sizes: std::collections::HashMap::new(),
@@ -1749,6 +1848,10 @@ impl FilesystemQuery for MockFileSystemState {
 
     fn filesystem_free_bytes(&self, path: &Path) -> crate::error::Result<u64> {
         Ok(*self.free_bytes.get(path).unwrap_or(&u64::MAX))
+    }
+
+    fn filesystem_capacity_bytes(&self, path: &Path) -> crate::error::Result<u64> {
+        Ok(*self.capacity_bytes.get(path).unwrap_or(&0))
     }
 
     fn read_pin_file(
@@ -2780,6 +2883,243 @@ send_enabled = false
         );
     }
 
+    // ── Send-space guard (UPI 054-a): the host-survival floor ──────────
+    //
+    // Floor = min_free + cleanup_budget (default 1.5% of capacity). With
+    // test_config's min_free = 10GB and a 1TB capacity, floor = 25GB.
+
+    fn floor_fixture(source_free: u64) -> MockFileSystemState {
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap("20260322-1300-one")]);
+        fs.mounted_drives.insert("D1".to_string());
+        fs.capacity_bytes
+            .insert(PathBuf::from("/snap/sv1"), 1_000_000_000_000);
+        fs.free_bytes
+            .insert(PathBuf::from("/snap/sv1"), source_free);
+        fs
+    }
+
+    fn sv1_sends(result: &BackupPlan) -> usize {
+        result
+            .operations
+            .iter()
+            .filter(|op| {
+                matches!(op,
+                    PlannedOperation::SendFull { subvolume_name, .. } if subvolume_name == "sv1")
+                    || matches!(op,
+                    PlannedOperation::SendIncremental { subvolume_name, .. } if subvolume_name == "sv1")
+            })
+            .count()
+    }
+
+    fn sv1_creates(result: &BackupPlan) -> usize {
+        result
+            .operations
+            .iter()
+            .filter(|op| {
+                matches!(op,
+                    PlannedOperation::CreateSnapshot { subvolume_name, .. } if subvolume_name == "sv1")
+            })
+            .count()
+    }
+
+    #[test]
+    fn send_planned_when_free_above_host_survival_floor() {
+        let config = test_config();
+        let fs = floor_fixture(30_000_000_000); // above the 25GB floor
+
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
+        assert_eq!(sv1_sends(&result), 1, "Send should proceed above the floor");
+    }
+
+    #[test]
+    fn send_deferred_in_band_between_min_free_and_floor() {
+        // 20GB free sits in (min_free=10GB, floor=25GB): the snapshot is still
+        // planned (CoW-cheap restore point), only the send defers — this is the
+        // band the 033 watchdog floor-suppression left unwatched.
+        let config = test_config();
+        let fs = floor_fixture(20_000_000_000);
+
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
+        assert_eq!(sv1_sends(&result), 0, "Send must defer in the band");
+        assert_eq!(
+            sv1_creates(&result),
+            1,
+            "Snapshot must still be planned in the band"
+        );
+        assert!(
+            result
+                .skipped
+                .iter()
+                .any(|(name, reason)| name == "sv1"
+                    && reason.contains("host-survival floor")),
+            "Defer reason should name the host-survival floor"
+        );
+    }
+
+    #[test]
+    fn send_planned_when_space_unmeasurable() {
+        // No free/capacity entries: free reads u64::MAX, capacity 0 → the
+        // floor degrades to min_free and the send proceeds (fail-open, ADR-107).
+        let config = test_config();
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap("20260322-1300-one")]);
+        fs.mounted_drives.insert("D1".to_string());
+
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
+        assert_eq!(
+            sv1_sends(&result),
+            1,
+            "Unmeasurable space must not block the send"
+        );
+    }
+
+    #[test]
+    fn send_deferred_at_capacity_default_floor_when_min_free_unset() {
+        // The htpc shape: min_free unset (snapshot guard disabled entirely),
+        // cleanup_budget unset → floor = 1.5% of capacity = 15GB. 10GB free →
+        // the send defers while the snapshot is still planned.
+        let toml_str = r#"
+[general]
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp"
+
+[local_snapshots]
+roots = [
+  { path = "/snap", subvolumes = ["sv1"] }
+]
+
+[defaults]
+snapshot_interval = "1h"
+send_interval = "1h"
+send_enabled = true
+enabled = true
+
+[defaults.local_retention]
+hourly = 24
+daily = 30
+weekly = 26
+monthly = 12
+
+[defaults.external_retention]
+daily = 30
+weekly = 26
+monthly = 0
+
+[[drives]]
+label = "D1"
+mount_path = "/mnt/d1"
+snapshot_root = ".snapshots"
+role = "test"
+max_usage_percent = 90
+
+[[subvolumes]]
+name = "sv1"
+short_name = "one"
+source = "/data/sv1"
+priority = 1
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let fs = floor_fixture(10_000_000_000); // below the 15GB default floor
+
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
+        assert_eq!(
+            sv1_sends(&result),
+            0,
+            "Send must defer below the capacity-relative default floor"
+        );
+        assert_eq!(
+            sv1_creates(&result),
+            1,
+            "Snapshot guard is off when min_free is unset — snapshot still planned"
+        );
+    }
+
+    #[test]
+    fn send_floor_honors_explicit_cleanup_budget() {
+        // Explicit cleanup_budget = 5GB with capacity unmeasurable (0): floor =
+        // 10GB + 5GB = 15GB. 12GB free → deferred. (With the capacity default
+        // this free would pass — proves the explicit budget wins.)
+        let toml_str = r#"
+[general]
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp"
+
+[local_snapshots]
+roots = [
+  { path = "/snap", subvolumes = ["sv1"], min_free_bytes = "10GB", cleanup_budget = "5GB" }
+]
+
+[defaults]
+snapshot_interval = "1h"
+send_interval = "1h"
+send_enabled = true
+enabled = true
+
+[defaults.local_retention]
+hourly = 24
+daily = 30
+weekly = 26
+monthly = 12
+
+[defaults.external_retention]
+daily = 30
+weekly = 26
+monthly = 0
+
+[[drives]]
+label = "D1"
+mount_path = "/mnt/d1"
+snapshot_root = ".snapshots"
+role = "test"
+max_usage_percent = 90
+
+[[subvolumes]]
+name = "sv1"
+short_name = "one"
+source = "/data/sv1"
+priority = 1
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap("20260322-1300-one")]);
+        fs.mounted_drives.insert("D1".to_string());
+        fs.free_bytes
+            .insert(PathBuf::from("/snap/sv1"), 12_000_000_000);
+
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
+        assert_eq!(
+            sv1_sends(&result),
+            0,
+            "Explicit cleanup_budget must be honored over the capacity default"
+        );
+    }
+
+    #[test]
+    fn force_does_not_override_send_floor_guard() {
+        // Same deliberate force-resistance as the snapshot space guard: a
+        // forced send on a sub-floor pool is still catastrophic.
+        let config = test_config();
+        let fs = floor_fixture(20_000_000_000); // in the band
+        let filters = PlanFilters {
+            skip_intervals: true,
+            force_snapshot: true,
+            ..PlanFilters::default()
+        };
+
+        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
+        assert_eq!(
+            sv1_sends(&result),
+            0,
+            "force/skip_intervals must not override the floor guard"
+        );
+    }
+
     #[test]
     fn calibrated_size_skips_send_when_too_large() {
         let config = test_config();
@@ -3540,6 +3880,104 @@ local_retention = "transient"
             0,
             "all snapshots should be protected (pinned or unsent)"
         );
+    }
+
+    // ── Transient send-space guard (UPI 054-a) ─────────────────────────
+    //
+    // transient_config has min_free unset, so the floor is the cleanup
+    // budget's capacity default: 1.5% of 1TB = 15GB.
+
+    /// Send is DUE (external newest 5h old > 4h interval), pin advanced to the
+    /// external newest, plus one older deletable leftover. Without the floor
+    /// guard this plans create + send; with it, the whole lifecycle defers.
+    fn transient_floor_fixture(source_free: u64) -> MockFileSystemState {
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots.insert(
+            "sv1".to_string(),
+            vec![snap("20260318-1000-one"), snap("20260322-1000-one")],
+        );
+        fs.pin_files.insert(
+            (PathBuf::from("/snap/sv1"), "D1".to_string()),
+            snap("20260322-1000-one"),
+        );
+        fs.mounted_drives.insert("D1".to_string());
+        fs.external_snapshots.insert(
+            ("D1".to_string(), "sv1".to_string()),
+            vec![snap("20260322-1000-one")],
+        );
+        fs.capacity_bytes
+            .insert(PathBuf::from("/snap/sv1"), 1_000_000_000_000);
+        fs.free_bytes
+            .insert(PathBuf::from("/snap/sv1"), source_free);
+        fs
+    }
+
+    #[test]
+    fn transient_lifecycle_deferred_below_floor_retention_still_runs() {
+        let config = transient_config();
+        let fs = transient_floor_fixture(10_000_000_000); // below the 15GB floor
+
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
+
+        assert_eq!(
+            sv1_creates(&result),
+            0,
+            "Transient snapshot must not be created below the floor (orphan invariant)"
+        );
+        assert_eq!(sv1_sends(&result), 0, "Transient send must defer below the floor");
+        assert!(
+            result
+                .skipped
+                .iter()
+                .any(|(name, reason)| name == "sv1"
+                    && reason.contains("host-survival floor")),
+            "Defer reason should name the host-survival floor"
+        );
+        let deletes = result
+            .operations
+            .iter()
+            .filter(|op| matches!(op, PlannedOperation::DeleteSnapshot { .. }))
+            .count();
+        assert_eq!(
+            deletes, 1,
+            "Retention on leftovers must still run (it frees space): the \
+             older-than-pin snapshot is deletable"
+        );
+    }
+
+    #[test]
+    fn transient_lifecycle_planned_above_floor() {
+        let config = transient_config();
+        let fs = transient_floor_fixture(30_000_000_000); // above the 15GB floor
+
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
+
+        assert_eq!(
+            sv1_creates(&result),
+            1,
+            "Above the floor the transient lifecycle plans as before"
+        );
+        assert_eq!(sv1_sends(&result), 1, "Send due and above floor — planned");
+    }
+
+    #[test]
+    fn transient_force_does_not_override_floor_guard() {
+        let config = transient_config();
+        let fs = transient_floor_fixture(10_000_000_000); // below the 15GB floor
+        let filters = PlanFilters {
+            skip_intervals: true,
+            force_snapshot: true,
+            ..PlanFilters::default()
+        };
+
+        let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
+
+        assert_eq!(
+            sv1_creates(&result),
+            0,
+            "force must not override the transient floor guard"
+        );
+        assert_eq!(sv1_sends(&result), 0, "force must not override the send defer");
     }
 
     #[test]
@@ -4548,10 +4986,13 @@ local_retention = "transient"
             .filter(|op| matches!(op, PlannedOperation::CreateSnapshot { .. }))
             .collect();
         assert_eq!(creates.len(), 0, "no create when space is low");
+        // Since UPI 054-a the stricter send-floor guard (Phase 0) fires before
+        // the snapshot guard ever runs on a transient subvol, so the skip
+        // carries the host-survival-floor reason rather than "low on space".
         let has_space_skip = result
             .skipped
             .iter()
-            .any(|(name, reason)| name == "sv1" && reason.contains("low on space"));
+            .any(|(name, reason)| name == "sv1" && reason.contains("host-survival floor"));
         assert!(has_space_skip, "should have space skip reason: {:?}", result.skipped);
     }
 
