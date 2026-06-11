@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.25.2] - 2026-06-11
+
 ### Fixed
 - **A wedged `btrfs receive` can no longer hang a backup run past the watchdog's
   cancel** (UPI 054-b). The copy pump blocked in `write_all` against a full pipe
@@ -1072,7 +1074,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Defense-in-depth pin file protection for unsent snapshots
 - Per-subvolume error isolation in executor
 
-[Unreleased]: https://github.com/vonrobak/urd/compare/v0.25.1...HEAD
+[Unreleased]: https://github.com/vonrobak/urd/compare/v0.25.2...HEAD
+[0.25.2]: https://github.com/vonrobak/urd/compare/v0.25.1...v0.25.2
 [0.25.1]: https://github.com/vonrobak/urd/compare/v0.25.0...v0.25.1
 [0.25.0]: https://github.com/vonrobak/urd/compare/v0.24.2...v0.25.0
 [0.24.2]: https://github.com/vonrobak/urd/compare/v0.24.1...v0.24.2
