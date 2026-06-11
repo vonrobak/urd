@@ -1821,13 +1821,9 @@ source = "/data/sv1"
         // therefore consume the gathered signals, or Urd speaks with two
         // tongues in the 36–54h window the Tight stretch itself guarantees.
         let (config, now, fs, signals) = capped_fixture(dt(2026, 3, 21, 22, 0), 0.20);
+        let obs = Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() };
 
-        let with_signals = assess(
-            &config,
-            now,
-            &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() },
-            &signals,
-        );
+        let with_signals = assess(&config, now, &obs, &signals);
         let sv1 = with_signals.iter().find(|a| a.name == "sv1").unwrap();
         assert_eq!(
             sv1.status,
@@ -1835,12 +1831,7 @@ source = "/data/sv1"
             "40h is fresh against the effective 36h interval (threshold 54h)"
         );
 
-        let posture_blind = assess(
-            &config,
-            now,
-            &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() },
-            &StorageSignalMap::new(),
-        );
+        let posture_blind = assess(&config, now, &obs, &StorageSignalMap::new());
         let sv1_blind = posture_blind.iter().find(|a| a.name == "sv1").unwrap();
         assert_eq!(
             sv1_blind.status,

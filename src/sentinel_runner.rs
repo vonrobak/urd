@@ -428,11 +428,12 @@ impl SentinelRunner {
         // suppressed (UPI 063) — ONLY this statement: the baseline update
         // below still absorbs the flip (so the next tick doesn't re-detect
         // it) and notifications keep their timing (grill D).
-        if sentinel::should_record_transitions(
-            self.state.has_initial_assessment,
-            trigger,
-            self.backup_run_active(),
-        ) && let Some(t) = trigger
+        if let Some(t) = trigger
+            && sentinel::should_record_transitions(
+                self.state.has_initial_assessment,
+                trigger,
+                self.backup_run_active(),
+            )
         {
             audit_events.extend(awareness::diff_promise_states(
                 &self.state.last_promise_states,
