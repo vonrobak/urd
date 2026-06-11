@@ -14,7 +14,7 @@ use crate::drives;
 use crate::error::BtrfsOperation;
 use crate::state::{DriftSampleRow, OperationRecord, StateDb};
 use crate::storage_critical::{self, ArmedTierMap};
-use crate::types::{BackupPlan, DeleteKind, FullSendReason, PlannedOperation, SendKind};
+use crate::types::{BackupPlan, DeleteKind, FullSendReason, PlannedOperation, SendKind, SnapshotName};
 
 // ── Types ───────────────────────────────────────────────────────────────
 
@@ -752,6 +752,120 @@ impl<'a> Executor<'a> {
         }
     }
 
+    /// Pre-send sweep of abandoned partial snapshots at the destination
+    /// (UPI 054-b, adversary F1). An abandoned `btrfs receive` (wedged
+    /// destination — see the wait restructure in `btrfs.rs`) leaves a partial
+    /// under the *previous* run's snapshot name. The same-name crash-recovery
+    /// check in `execute_send` cannot see it, and destination listings count
+    /// it like a real backup (send-due timing, awareness freshness, restore
+    /// surfaces) — so recovery is designed in here, not hoped for.
+    ///
+    /// Candidates are this subvolume's destination snapshots strictly newer
+    /// than the pin (the pin and everything older are confirmed parents by
+    /// construction; no pin file ⇒ every listed name is a candidate — a
+    /// first-send dir is empty or holds only an aborted first attempt).
+    /// Deletion requires *proof*: only a candidate whose `Received UUID` is
+    /// absent (the receive never finalized) is deleted. A present UUID means
+    /// a completed send whose pin write failed — warned and left; never
+    /// delete a provably complete backup. Query errors skip the candidate,
+    /// fail closed (ADR-107). Pinned names are never candidates (they are
+    /// ≤ pin by definition), preserving the pin defense layers (ADR-106).
+    ///
+    /// Verified at build time (plan Slice 3): awareness freshness reads
+    /// `external_snapshots` listings (`awareness.rs`, mounted-drive arm), so
+    /// an unswept partial *would* masquerade in promise states — this sweep
+    /// is what keeps those listings honest. `urd verify` does not check
+    /// `Received UUID` today (its drive checks are pin/existence based); a
+    /// verify-side check would be defense in depth, not a substitute.
+    fn sweep_abandoned_partials(
+        &self,
+        snapshot: &Path,
+        dest_dir: &Path,
+        drive_label: &str,
+        pin_on_success: Option<&(PathBuf, SnapshotName)>,
+    ) {
+        // The same-name path belongs to the crash-recovery check, not the sweep.
+        let Some(current_os) = snapshot.file_name() else {
+            return;
+        };
+        let Ok(current) = SnapshotName::parse(&current_os.to_string_lossy()) else {
+            return;
+        };
+        // Without a pin location, confirmed parents and partials are
+        // indistinguishable — fail closed, sweep nothing.
+        let Some((pin_path, _)) = pin_on_success else {
+            return;
+        };
+        let Some(pin_dir) = pin_path.parent() else {
+            return;
+        };
+        let pin = match chain::read_pin_file(pin_dir, drive_label) {
+            Ok(pin) => pin.map(|r| r.name),
+            Err(e) => {
+                log::warn!(
+                    "partial sweep: failed to read pin file for {drive_label}: {e} — skipping sweep (fail closed)"
+                );
+                return;
+            }
+        };
+
+        let entries = match std::fs::read_dir(dest_dir) {
+            Ok(entries) => entries,
+            // First send to this drive: the dir doesn't exist yet.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => {
+                log::warn!(
+                    "partial sweep: failed to list {}: {e} — skipping sweep (fail closed)",
+                    dest_dir.display()
+                );
+                return;
+            }
+        };
+
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let Some(name) = file_name.to_str() else {
+                continue;
+            };
+            let Ok(parsed) = SnapshotName::parse(name) else {
+                continue; // pin files, lost+found, anything non-snapshot
+            };
+            if parsed.short_name() != current.short_name() || parsed == current {
+                continue;
+            }
+            if pin.as_ref().is_some_and(|pin| parsed <= *pin) {
+                continue;
+            }
+            let candidate = entry.path();
+            match self.btrfs.received_uuid(&candidate) {
+                Ok(None) => {
+                    log::warn!(
+                        "Deleting abandoned partial snapshot at {} (no Received UUID — the receive never finalized)",
+                        candidate.display()
+                    );
+                    if let Err(e) = self.btrfs.delete_subvolume(&candidate) {
+                        log::error!(
+                            "Failed to delete abandoned partial at {}: {e}",
+                            candidate.display()
+                        );
+                    }
+                }
+                Ok(Some(_)) => {
+                    log::warn!(
+                        "Destination snapshot {} is newer than the pin but has a Received UUID — a completed send whose pin write failed; leaving it",
+                        candidate.display()
+                    );
+                }
+                Err(e) => {
+                    log::warn!(
+                        "partial sweep: received_uuid query failed for {}: {e} — leaving it (fail closed)",
+                        candidate.display()
+                    );
+                }
+            }
+        }
+    }
+
     /// Returns (outcome, pin_failed) where pin_failed is true if send succeeded
     /// but pin file write failed.
     #[allow(clippy::too_many_arguments)]
@@ -877,6 +991,11 @@ impl<'a> Executor<'a> {
                 }
             }
         }
+
+        // Reclaim abandoned partials minted under previous runs' names
+        // (UPI 054-b, adversary F1) before this send lists them as parents
+        // or the new snapshot lands beside them.
+        self.sweep_abandoned_partials(snapshot, dest_dir, drive_label, pin_on_success);
 
         log::info!(
             "Sending {} to {} ({})",
@@ -2628,6 +2747,175 @@ source = "/data/b"
             matches!(&calls[1], MockBtrfsCall::SendReceive { .. }),
             "Second call should be the send"
         );
+    }
+
+    // ── Pre-send partial sweep (UPI 054-b, adversary F1) ────────────────
+
+    /// Sweep-test fixture: a real (TempDir) destination dir with snapshot
+    /// subdirs, a local dir holding the pin file, and a SendFull plan whose
+    /// pin_on_success points into the local dir.
+    struct SweepFixture {
+        _tmp: tempfile::TempDir,
+        dest_dir: PathBuf,
+        plan: BackupPlan,
+    }
+
+    fn sweep_fixture(pin: Option<&str>, dest_entries: &[&str]) -> SweepFixture {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dest_dir = tmp.path().join(".snapshots/sv-a");
+        std::fs::create_dir_all(&dest_dir).unwrap();
+        for entry in dest_entries {
+            std::fs::create_dir(dest_dir.join(entry)).unwrap();
+        }
+        let local_dir = tmp.path().join("local/sv-a");
+        std::fs::create_dir_all(&local_dir).unwrap();
+        if let Some(pin) = pin {
+            chain::write_pin_file(&local_dir, "TEST-DRIVE", &SnapshotName::parse(pin).unwrap())
+                .unwrap();
+        }
+
+        let ts = NaiveDate::from_ymd_opt(2026, 6, 11)
+            .unwrap()
+            .and_hms_opt(14, 30, 0)
+            .unwrap();
+        let plan = BackupPlan {
+            operations: vec![PlannedOperation::SendFull {
+                snapshot: local_dir.join("20260611-1430-sv-a"),
+                dest_dir: dest_dir.clone(),
+                drive_label: "TEST-DRIVE".to_string(),
+                subvolume_name: "sv-a".to_string(),
+                pin_on_success: Some((
+                    local_dir.join(".last-external-parent-TEST-DRIVE"),
+                    SnapshotName::parse("20260611-1430-sv-a").unwrap(),
+                )),
+                reason: FullSendReason::FirstSend,
+                token_verified: false,
+            }],
+            timestamp: ts,
+            skipped: vec![],
+            events: Vec::new(),
+        };
+        SweepFixture {
+            _tmp: tmp,
+            dest_dir,
+            plan,
+        }
+    }
+
+    fn delete_calls_of(mock: &MockBtrfs) -> Vec<PathBuf> {
+        mock.calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                MockBtrfsCall::DeleteSubvolume { path } => Some(path),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn sweep_deletes_unfinalized_partial_newer_than_pin() {
+        let fx = sweep_fixture(
+            Some("20260609-0400-sv-a"),
+            &["20260609-0400-sv-a", "20260610-0400-sv-a"],
+        );
+        let mock = MockBtrfs::new();
+        let partial = fx.dest_dir.join("20260610-0400-sv-a");
+        // Newer than the pin and never finalized by a receive — provably partial.
+        mock.received_uuids.borrow_mut().insert(partial.clone(), None);
+
+        let config = test_config();
+        let shutdown = no_shutdown();
+        let executor = Executor::new(&mock, None, &config, &shutdown);
+        let result = executor.execute(&fx.plan, "full");
+
+        assert_eq!(result.overall, RunResult::Success);
+        assert_eq!(delete_calls_of(&mock), vec![partial]);
+        // Sweep runs before the send.
+        let calls = mock.calls();
+        assert!(matches!(&calls[0], MockBtrfsCall::DeleteSubvolume { .. }));
+        assert!(matches!(
+            calls.last().unwrap(),
+            MockBtrfsCall::SendReceive { .. }
+        ));
+    }
+
+    #[test]
+    fn sweep_leaves_completed_send_whose_pin_write_failed() {
+        let fx = sweep_fixture(
+            Some("20260609-0400-sv-a"),
+            &["20260609-0400-sv-a", "20260610-0400-sv-a"],
+        );
+        let mock = MockBtrfs::new();
+        // Newer than the pin but the receive finalized it: a complete backup
+        // whose pin write failed — never delete it.
+        mock.received_uuids.borrow_mut().insert(
+            fx.dest_dir.join("20260610-0400-sv-a"),
+            Some("9c8b7a6d-aaaa-bbbb-cccc-def012345678".to_string()),
+        );
+
+        let config = test_config();
+        let shutdown = no_shutdown();
+        let executor = Executor::new(&mock, None, &config, &shutdown);
+        let result = executor.execute(&fx.plan, "full");
+
+        assert_eq!(result.overall, RunResult::Success);
+        assert!(delete_calls_of(&mock).is_empty());
+    }
+
+    #[test]
+    fn sweep_fails_closed_when_received_uuid_errors() {
+        let fx = sweep_fixture(
+            Some("20260609-0400-sv-a"),
+            &["20260609-0400-sv-a", "20260610-0400-sv-a"],
+        );
+        let mock = MockBtrfs::new();
+        mock.fail_received_uuids
+            .borrow_mut()
+            .insert(fx.dest_dir.join("20260610-0400-sv-a"));
+
+        let config = test_config();
+        let shutdown = no_shutdown();
+        let executor = Executor::new(&mock, None, &config, &shutdown);
+        let result = executor.execute(&fx.plan, "full");
+
+        // Cannot prove it's a partial → not deleted; the send still proceeds.
+        assert_eq!(result.overall, RunResult::Success);
+        assert!(delete_calls_of(&mock).is_empty());
+    }
+
+    #[test]
+    fn sweep_reclaims_stale_partial_on_no_pin_drive() {
+        // No pin file: a first send whose previous attempt aborted — every
+        // listed name is a candidate.
+        let fx = sweep_fixture(None, &["20260610-0400-sv-a"]);
+        let mock = MockBtrfs::new();
+        let partial = fx.dest_dir.join("20260610-0400-sv-a");
+        mock.received_uuids.borrow_mut().insert(partial.clone(), None);
+
+        let config = test_config();
+        let shutdown = no_shutdown();
+        let executor = Executor::new(&mock, None, &config, &shutdown);
+        let result = executor.execute(&fx.plan, "full");
+
+        assert_eq!(result.overall, RunResult::Success);
+        assert_eq!(delete_calls_of(&mock), vec![partial]);
+    }
+
+    #[test]
+    fn sweep_never_touches_the_pin_target() {
+        let fx = sweep_fixture(Some("20260609-0400-sv-a"), &["20260609-0400-sv-a"]);
+        let mock = MockBtrfs::new();
+        // No received_uuid configured for the pin target: if the sweep ever
+        // considered it a candidate, the query would error (fail closed) —
+        // but it must not even be a candidate (≤ pin by definition).
+
+        let config = test_config();
+        let shutdown = no_shutdown();
+        let executor = Executor::new(&mock, None, &config, &shutdown);
+        let result = executor.execute(&fx.plan, "full");
+
+        assert_eq!(result.overall, RunResult::Success);
+        assert!(delete_calls_of(&mock).is_empty());
     }
 
     #[test]

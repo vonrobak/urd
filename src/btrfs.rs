@@ -1,12 +1,18 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::io::Read as _;
+use std::os::fd::AsFd as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{ChildStdin, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
+
+use nix::fcntl::{FcntlArg, OFlag, fcntl};
+use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 
 use crate::error::{BtrfsErrorContext, BtrfsOperation, SendReceiveErrorContext, UrdError};
+use crate::guard::WATCHDOG_POLL_MS;
 
 // ── BtrfsOps trait ──────────────────────────────────────────────────────
 
@@ -23,6 +29,13 @@ pub struct SendResult {
 pub trait BtrfsRead {
     /// Query the BTRFS generation counter for a subvolume or snapshot.
     fn subvolume_generation(&self, path: &Path) -> crate::error::Result<u64>;
+
+    /// The snapshot's `Received UUID` — `Some` iff a `btrfs receive`
+    /// finalized it, making presence *proof* that a destination snapshot is a
+    /// complete backup and absence proof that it is an abandoned partial
+    /// (UPI 054-b pre-send sweep, adversary F1). Same `subvolume show` call
+    /// as `subvolume_generation` — no new sudoers surface.
+    fn received_uuid(&self, path: &Path) -> crate::error::Result<Option<String>>;
 }
 
 /// Trait abstracting btrfs operations. `RealBtrfs` calls the btrfs binary;
@@ -280,51 +293,110 @@ impl BtrfsOps for RealBtrfs {
             },
         })?;
 
+        // Non-blocking writes so a full pipe (wedged receive) cannot park the
+        // copy thread past the watchdog's cancel (UPI 054-b).
+        set_nonblocking(&recv_stdin).map_err(|e| UrdError::Btrfs {
+            context: BtrfsErrorContext {
+                operation: BtrfsOperation::Receive,
+                exit_code: None,
+                stderr: format!("failed to set receive stdin non-blocking: {e}"),
+                bytes_transferred: None,
+            },
+        })?;
+
+        let recv_stderr = recv_child.stderr.take().ok_or_else(|| UrdError::Btrfs {
+            context: BtrfsErrorContext {
+                operation: BtrfsOperation::Receive,
+                exit_code: None,
+                stderr: "failed to capture btrfs receive stderr".to_string(),
+                bytes_transferred: None,
+            },
+        })?;
+
+        // Drain receive stderr in a background thread (mirror of send's): the
+        // main thread no longer does a blocking `wait_with_output`, so this
+        // keeps the pipe from filling. Deliberately NOT joined when the
+        // receive is abandoned — the thread is parked on the orphan's pipe.
+        // Worst case ≤2 leaked drain threads per abandoned send; urd is a
+        // oneshot process that errors out right after, so the leak is bounded.
+        let recv_stderr_thread = std::thread::spawn(move || {
+            let mut buf = String::new();
+            let mut reader = std::io::BufReader::new(recv_stderr);
+            reader.read_to_string(&mut buf).ok();
+            buf
+        });
+
         // Copy send stdout → receive stdin in a thread, counting bytes. The
         // pump loop is extracted (`pump_with_cancel`) so the byte-counting +
         // mid-op cancel logic is unit-testable against in-memory pipes (UPI 033).
         let counter = self.bytes_counter.clone();
         let cancel = self.cancel.clone();
-        let copy_thread = std::thread::spawn(move || -> std::io::Result<u64> {
-            let total = pump_with_cancel(&mut send_stdout, &mut recv_stdin, &counter, &cancel)?;
+        let copy_thread = std::thread::spawn(move || -> std::io::Result<PumpOutcome> {
+            let outcome = pump_with_cancel(&mut send_stdout, &mut recv_stdin, &counter, &cancel)?;
             drop(recv_stdin); // close pipe to signal EOF to receive
-            Ok(total)
+            Ok(outcome)
         });
 
-        // Wait for receive to finish
-        let recv_output = recv_child.wait_with_output().map_err(|e| UrdError::Btrfs {
-            context: BtrfsErrorContext {
-                operation: BtrfsOperation::Receive,
-                exit_code: None,
-                stderr: format!("failed to wait for btrfs receive: {e}"),
-                bytes_transferred: None,
-            },
-        })?;
+        // Join the copy thread FIRST (UPI 054-b): it is the prompt party — it
+        // returns on stream EOF, a write error, or ≤ ~WATCHDOG_POLL_MS after a
+        // watchdog cancel. The old order (blocking receive wait before this
+        // join) parked the main thread on a wedged receive before the
+        // cancel-responsive pump could ever matter.
+        let pump_result = copy_thread
+            .join()
+            .unwrap_or_else(|_| Err(std::io::Error::other("send/receive copy thread panicked")));
+        let bytes_copied = pump_result.as_ref().ok().copied().map(PumpOutcome::bytes);
+        let grace = abandon_grace(&pump_result);
+        let poll_interval = Duration::from_millis(WATCHDOG_POLL_MS);
 
-        // Wait for send to finish
-        let send_status = send_child.wait().map_err(|e| UrdError::Btrfs {
-            context: BtrfsErrorContext {
-                operation: BtrfsOperation::Send,
-                exit_code: None,
-                stderr: format!("failed to wait for btrfs send: {e}"),
-                bytes_transferred: None,
-            },
-        })?;
+        // Bounded-wait both children: indefinite while no cancel is pending
+        // (a slow but healthy send may take hours), within `grace` once
+        // cancelled. Abandoned children are left for init — urd has no
+        // privilege to kill a sudo process; the pipe was the only lever and
+        // it is already closed.
+        let recv_wait =
+            wait_child_cancellable(|| recv_child.try_wait(), &self.cancel, grace, poll_interval)
+                .map_err(|e| UrdError::Btrfs {
+                    context: BtrfsErrorContext {
+                        operation: BtrfsOperation::Receive,
+                        exit_code: None,
+                        stderr: format!("failed to wait for btrfs receive: {e}"),
+                        bytes_transferred: None,
+                    },
+                })?;
+        let (recv_status, recv_stderr_str) = settle_wait(recv_wait, recv_stderr_thread, "receive");
 
-        let bytes_copied = copy_thread.join().unwrap_or(Ok(0)).ok();
+        // Send normally dies fast on EPIPE once its stdout pipe drops.
+        let send_wait =
+            wait_child_cancellable(|| send_child.try_wait(), &self.cancel, grace, poll_interval)
+                .map_err(|e| UrdError::Btrfs {
+                    context: BtrfsErrorContext {
+                        operation: BtrfsOperation::Send,
+                        exit_code: None,
+                        stderr: format!("failed to wait for btrfs send: {e}"),
+                        bytes_transferred: None,
+                    },
+                })?;
+        let (send_status, send_stderr_str) = settle_wait(send_wait, send_stderr_thread, "send");
 
-        let send_stderr_str = send_stderr_thread.join().unwrap_or_default();
-        let recv_stderr_str = String::from_utf8_lossy(&recv_output.stderr).to_string();
-
-        // Check both exit codes
-        let send_ok = send_status.success();
-        let recv_ok = recv_output.status.success();
+        // Check both exit codes; an abandoned child counts as failed.
+        let send_ok = send_status.is_some_and(|s| s.success());
+        let recv_ok = recv_status.is_some_and(|s| s.success());
 
         if !send_ok || !recv_ok {
-            // Attempt cleanup of partial snapshot at destination
+            // Attempt cleanup of the partial snapshot at the destination —
+            // but only when receive actually exited (`should_cleanup_partial`):
+            // deleting against a kernel-stuck destination would block exactly
+            // like the wait we just escaped. An abandoned partial is reclaimed
+            // by the pre-send sweep on the next run (UPI 054-b).
             if let Some(snap_name) = snapshot.file_name() {
                 let partial = dest_dir.join(snap_name);
-                if partial.exists() {
+                if !should_cleanup_partial(&recv_wait) {
+                    log::warn!(
+                        "skipping partial-snapshot cleanup at {} — receive abandoned (wedged destination); the pre-send sweep reclaims it on the next run",
+                        partial.display()
+                    );
+                } else if partial.exists() {
                     log::warn!("Cleaning up partial snapshot at {}", partial.display());
                     if let Err(e) = self.delete_subvolume(&partial) {
                         log::error!("Failed to clean up partial snapshot: {e}");
@@ -334,9 +406,9 @@ impl BtrfsOps for RealBtrfs {
 
             return Err(UrdError::BtrfsSendReceive {
                 context: SendReceiveErrorContext {
-                    send_exit_code: send_status.code(),
+                    send_exit_code: send_status.and_then(|s| s.code()),
                     send_stderr: send_stderr_str,
-                    recv_exit_code: recv_output.status.code(),
+                    recv_exit_code: recv_status.and_then(|s| s.code()),
                     recv_stderr: recv_stderr_str,
                     bytes_transferred: bytes_copied,
                 },
@@ -355,6 +427,13 @@ impl BtrfsOps for RealBtrfs {
         })
     }
 
+    /// Accepted residual (UPI 054 design Q4-A): a delete against a wedged
+    /// destination blocks this call indefinitely — `output()` is a plain
+    /// blocking wait and urd cannot kill a sudo child. Bounding it would
+    /// need process-group control (a sudoers change); deletes against the
+    /// *source* pool (the reclaim path) are not behind a stuck device, so
+    /// the exposure is the destination-side cleanup only, and the
+    /// send/receive path now skips exactly that case (`should_cleanup_partial`).
     fn delete_subvolume(&self, path: &Path) -> crate::error::Result<()> {
         log::debug!(
             "Running: sudo {} subvolume delete {}",
@@ -446,7 +525,7 @@ impl BtrfsOps for RealBtrfs {
     }
 }
 
-// ── Generation query (BtrfsRead) ───────────────────────────────────────
+// ── Field queries via subvolume show (BtrfsRead) ────────────────────────
 
 /// Parse the `Generation:` field from `btrfs subvolume show` output.
 #[must_use]
@@ -460,39 +539,65 @@ pub fn parse_generation(output: &str) -> Option<u64> {
     None
 }
 
+/// Parse the `Received UUID:` field from `btrfs subvolume show` output.
+/// `-`, empty, or an absent line all mean "never finalized by a receive" —
+/// `None`. The kernel sets this field as the last step of a successful
+/// `btrfs receive`, so its presence proves the snapshot is complete.
+#[must_use]
+pub fn parse_received_uuid(output: &str) -> Option<String> {
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if let Some(value) = trimmed.strip_prefix("Received UUID:") {
+            let value = value.trim();
+            if value.is_empty() || value == "-" {
+                return None;
+            }
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+/// Run `sudo btrfs subvolume show` and return its stdout. Shared by the
+/// `BtrfsRead` field readers (`subvolume_generation`, `received_uuid`) — one
+/// invocation, one sudoers surface.
+fn subvolume_show(path: &Path) -> crate::error::Result<String> {
+    let output = Command::new("sudo")
+        .env("LC_ALL", "C")
+        .arg("btrfs")
+        .args(["subvolume", "show"])
+        .arg(path)
+        .output()
+        .map_err(|e| UrdError::Btrfs {
+            context: BtrfsErrorContext {
+                operation: BtrfsOperation::Show,
+                exit_code: None,
+                stderr: e.to_string(),
+                bytes_transferred: None,
+            },
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        return Err(UrdError::Btrfs {
+            context: BtrfsErrorContext {
+                operation: BtrfsOperation::Show,
+                exit_code: output.status.code(),
+                stderr,
+                bytes_transferred: None,
+            },
+        });
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
 impl BtrfsRead for RealBtrfs {
     /// Query the BTRFS generation counter for a subvolume or snapshot.
     ///
     /// All btrfs subprocess calls remain in `btrfs.rs` (invariant #2).
     fn subvolume_generation(&self, path: &Path) -> crate::error::Result<u64> {
-        let output = Command::new("sudo")
-            .env("LC_ALL", "C")
-            .arg("btrfs")
-            .args(["subvolume", "show"])
-            .arg(path)
-            .output()
-            .map_err(|e| UrdError::Btrfs {
-                context: BtrfsErrorContext {
-                    operation: BtrfsOperation::Show,
-                    exit_code: None,
-                    stderr: e.to_string(),
-                    bytes_transferred: None,
-                },
-            })?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-            return Err(UrdError::Btrfs {
-                context: BtrfsErrorContext {
-                    operation: BtrfsOperation::Show,
-                    exit_code: output.status.code(),
-                    stderr,
-                    bytes_transferred: None,
-                },
-            });
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stdout = subvolume_show(path)?;
         parse_generation(&stdout).ok_or_else(|| UrdError::Btrfs {
             context: BtrfsErrorContext {
                 operation: BtrfsOperation::Show,
@@ -502,42 +607,221 @@ impl BtrfsRead for RealBtrfs {
             },
         })
     }
+
+    fn received_uuid(&self, path: &Path) -> crate::error::Result<Option<String>> {
+        let stdout = subvolume_show(path)?;
+        Ok(parse_received_uuid(&stdout))
+    }
 }
 
-// ── Copy pump (UPI 033) ───────────────────────────────────────────────────
+// ── Copy pump (UPI 033, cancel-responsive writes UPI 054-b) ─────────────
+
+/// How the pump finished: the whole stream was delivered, or the watchdog's
+/// cancel flag stopped it mid-stream. Both carry the bytes written so far so
+/// the error path can report a partial transfer count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PumpOutcome {
+    Completed(u64),
+    Cancelled(u64),
+}
+
+impl PumpOutcome {
+    fn bytes(self) -> u64 {
+        match self {
+            PumpOutcome::Completed(n) | PumpOutcome::Cancelled(n) => n,
+        }
+    }
+}
+
+/// A sink the pump can write to without parking forever: `write` may return
+/// `WouldBlock`, and `wait_writable` blocks until the sink can likely accept
+/// more bytes — or the timeout passes, which is also `Ok` (the pump re-checks
+/// the cancel flag and retries). A trait rather than a waiter closure because
+/// the pump holds `&mut` to the writer while waiting on its fd — one receiver
+/// avoids the double borrow.
+trait PumpSink: std::io::Write {
+    fn wait_writable(&mut self, timeout: Duration) -> std::io::Result<()>;
+}
+
+impl PumpSink for ChildStdin {
+    fn wait_writable(&mut self, timeout: Duration) -> std::io::Result<()> {
+        let mut fds = [PollFd::new(self.as_fd(), PollFlags::POLLOUT)];
+        let timeout = PollTimeout::try_from(timeout).unwrap_or(PollTimeout::MAX);
+        match poll(&mut fds, timeout) {
+            // 0 fds ready = timeout: also Ok — the caller re-checks cancel.
+            Ok(_) => Ok(()),
+            Err(nix::errno::Errno::EINTR) => Ok(()),
+            Err(e) => Err(std::io::Error::from(e)),
+        }
+    }
+}
+
+/// In-memory sink for tests: never blocks, so waiting is a no-op.
+impl PumpSink for Vec<u8> {
+    fn wait_writable(&mut self, _timeout: Duration) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Put our write end of the receive child's stdin pipe into non-blocking
+/// mode, so the pump's writes return `WouldBlock` instead of parking the copy
+/// thread forever when the pipe is full (a wedged `btrfs receive` stops
+/// draining it and the watchdog's cancel would never be observed — UPI 054-b).
+/// Affects only this process's fd, not the child's read end.
+fn set_nonblocking(stdin: &ChildStdin) -> std::io::Result<()> {
+    let flags = fcntl(stdin.as_fd(), FcntlArg::F_GETFL).map_err(std::io::Error::from)?;
+    let flags = OFlag::from_bits_retain(flags) | OFlag::O_NONBLOCK;
+    fcntl(stdin.as_fd(), FcntlArg::F_SETFL(flags)).map_err(std::io::Error::from)?;
+    Ok(())
+}
 
 /// Pump `reader` → `writer` in 128 KB chunks, updating `counter` with the
 /// running byte total and honoring the mid-op watchdog `cancel` flag.
 ///
-/// On cancel the loop breaks *before* writing the pending chunk and returns the
-/// bytes copied so far; the caller closes the receive pipe, which surfaces the
-/// abort as an ordinary `btrfs receive` failure (no new error variant — an
-/// aborted send is a normal send failure, ADR-100/107). The cancel is checked
-/// once per chunk; at realistic throughput the latency is ≪ 1 s. Extracted from
-/// `send_receive` so the cancel + counting path is unit-testable without
-/// spawning btrfs.
-fn pump_with_cancel<R: std::io::Read, W: std::io::Write>(
+/// On cancel the pump returns `Cancelled` with the bytes written so far; the
+/// caller closes the receive pipe, which surfaces the abort as an ordinary
+/// `btrfs receive` failure (no new error variant — an aborted send is a normal
+/// send failure, ADR-100/107). The writer is a `PumpSink` in non-blocking
+/// mode: `POLLOUT` on a pipe only guarantees `PIPE_BUF` (4 KiB) writable, so
+/// a 128 KiB chunk is delivered through a partial-write offset loop that
+/// re-checks cancel each iteration and waits out `WouldBlock` in
+/// `WATCHDOG_POLL_MS` slices — a full pipe (wedged receive) can no longer
+/// park this loop past the watchdog's cancel (UPI 054-b). The fast path (pipe
+/// drains normally) writes whole chunks and never enters the wait.
+///
+/// Residual: a wedged *send* still parks the pump in the blocking `read` —
+/// accepted out of scope for 054-b (the symmetric `wait_readable` fix is
+/// mechanical if field evidence ever demands it).
+fn pump_with_cancel<R: std::io::Read, W: PumpSink>(
     reader: &mut R,
     writer: &mut W,
     counter: &AtomicU64,
     cancel: &AtomicBool,
-) -> std::io::Result<u64> {
+) -> std::io::Result<PumpOutcome> {
     let mut buf = [0u8; 128 * 1024]; // 128KB chunks
     let mut total: u64 = 0;
     counter.store(0, Ordering::Relaxed);
     loop {
         let n = reader.read(&mut buf)?;
         if n == 0 {
-            break;
+            return Ok(PumpOutcome::Completed(total));
         }
         if cancel.load(Ordering::Relaxed) {
-            break;
+            return Ok(PumpOutcome::Cancelled(total));
         }
-        writer.write_all(&buf[..n])?;
-        total += n as u64;
-        counter.store(total, Ordering::Relaxed);
+        let mut offset = 0;
+        while offset < n {
+            if cancel.load(Ordering::Relaxed) {
+                return Ok(PumpOutcome::Cancelled(total));
+            }
+            match writer.write(&buf[offset..n]) {
+                Ok(0) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "sink accepted zero bytes",
+                    ));
+                }
+                Ok(m) => {
+                    offset += m;
+                    total += m as u64;
+                    counter.store(total, Ordering::Relaxed);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    writer.wait_writable(Duration::from_millis(WATCHDOG_POLL_MS))?;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
     }
-    Ok(total)
+}
+
+// ── Cancellable child waits (UPI 054-b) ─────────────────────────────────
+
+/// How waiting on a send/receive child ended: it exited (real status), or the
+/// cancel grace expired and the child was abandoned — left running for init
+/// to reap. urd is unprivileged and the children run under sudo, so there is
+/// no `kill` lever; once the pipe is closed, walking away is the only move
+/// that keeps the run (and the Step-5b source reclaim after it) live.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaitOutcome {
+    Exited(std::process::ExitStatus),
+    Abandoned,
+}
+
+/// Grace for a child to exit after a *cancelled* (truncated) stream: the
+/// receive can only fail at this point — get out fast so the reclaim runs.
+const ABANDON_GRACE_CANCELLED: Duration = Duration::from_secs(5);
+
+/// Grace after a *complete* stream: the receive holds the full stream, so the
+/// likely outcome is a successful send recorded normally, and the reserve the
+/// watchdog already freed bridges the longer wait. Abandoning a completed
+/// stream prematurely is what mints an unfinalized partial in the one case
+/// where waiting converts the run into a success (adversary F3).
+const ABANDON_GRACE_COMPLETED: Duration = Duration::from_secs(30);
+
+/// Pick the abandon grace from how the pump ended (adversary F3). A pump
+/// error (e.g. EPIPE from a dying receive) gets the short grace — the stream
+/// is truncated either way.
+fn abandon_grace(pump_result: &std::io::Result<PumpOutcome>) -> Duration {
+    match pump_result {
+        Ok(PumpOutcome::Completed(_)) => ABANDON_GRACE_COMPLETED,
+        Ok(PumpOutcome::Cancelled(_)) | Err(_) => ABANDON_GRACE_CANCELLED,
+    }
+}
+
+/// Partial-snapshot cleanup deletes against the destination filesystem — on
+/// an abandoned (wedged) receive that delete would block exactly like the
+/// wait we just escaped, so cleanup runs only when receive provably exited.
+fn should_cleanup_partial(recv_wait: &WaitOutcome) -> bool {
+    matches!(recv_wait, WaitOutcome::Exited(_))
+}
+
+/// Resolve a child's `WaitOutcome` into (exit status, stderr). On `Exited`
+/// the stderr drain thread is joined — prompt, since the child's pipe is at
+/// EOF. On `Abandoned` the drain handle is *dropped* instead: the thread is
+/// parked on the orphan's stderr pipe and joining it would inherit the wedge.
+fn settle_wait(
+    wait: WaitOutcome,
+    stderr_drain: std::thread::JoinHandle<String>,
+    what: &str,
+) -> (Option<std::process::ExitStatus>, String) {
+    match wait {
+        WaitOutcome::Exited(status) => (Some(status), stderr_drain.join().unwrap_or_default()),
+        WaitOutcome::Abandoned => (
+            None,
+            format!(
+                "btrfs {what} abandoned after cancel: did not exit within grace; orphaned process left for init"
+            ),
+        ),
+    }
+}
+
+/// Wait for a child via its `try_wait`, staying interruptible by the watchdog
+/// `cancel` flag. While cancel is unset this waits indefinitely (today's
+/// posture — a slow but healthy send may legitimately take hours). Once
+/// cancel is observed set, a grace clock starts; if the child still hasn't
+/// exited when it expires, the child is abandoned. Takes a closure rather
+/// than `&mut Child` so the loop is unit-testable without spawning processes.
+fn wait_child_cancellable(
+    mut try_wait: impl FnMut() -> std::io::Result<Option<std::process::ExitStatus>>,
+    cancel: &AtomicBool,
+    grace: Duration,
+    poll_interval: Duration,
+) -> std::io::Result<WaitOutcome> {
+    let mut grace_started: Option<std::time::Instant> = None;
+    loop {
+        if let Some(status) = try_wait()? {
+            return Ok(WaitOutcome::Exited(status));
+        }
+        if cancel.load(Ordering::Relaxed) {
+            let started = *grace_started.get_or_insert_with(std::time::Instant::now);
+            if started.elapsed() >= grace {
+                return Ok(WaitOutcome::Abandoned);
+            }
+        }
+        std::thread::sleep(poll_interval);
+    }
 }
 
 // ── MockBtrfs ───────────────────────────────────────────────────────────
@@ -580,6 +864,12 @@ pub struct MockBtrfs {
     pub generations: RefCell<HashMap<PathBuf, u64>>,
     /// Paths for which subvolume_generation() should return an error.
     pub fail_generations: RefCell<HashSet<PathBuf>>,
+    /// Received UUIDs for destination snapshot paths (`None` = present but
+    /// never finalized by a receive). Unconfigured paths error, so sweep
+    /// tests must opt in — the fail-closed default.
+    pub received_uuids: RefCell<HashMap<PathBuf, Option<String>>>,
+    /// Paths for which received_uuid() should return an error.
+    pub fail_received_uuids: RefCell<HashSet<PathBuf>>,
 }
 
 #[allow(dead_code)]
@@ -598,6 +888,8 @@ impl MockBtrfs {
             mock_fail_send_bytes: RefCell::new(None),
             generations: RefCell::new(HashMap::new()),
             fail_generations: RefCell::new(HashSet::new()),
+            received_uuids: RefCell::new(HashMap::new()),
+            fail_received_uuids: RefCell::new(HashSet::new()),
         }
     }
 
@@ -630,6 +922,26 @@ impl BtrfsRead for MockBtrfs {
                 source: std::io::Error::new(
                     std::io::ErrorKind::NotFound,
                     "mock: no generation configured",
+                ),
+            })
+    }
+
+    fn received_uuid(&self, path: &Path) -> crate::error::Result<Option<String>> {
+        if self.fail_received_uuids.borrow().contains(path) {
+            return Err(UrdError::Io {
+                path: path.to_path_buf(),
+                source: std::io::Error::other("mock: received_uuid query failed"),
+            });
+        }
+        self.received_uuids
+            .borrow()
+            .get(path)
+            .cloned()
+            .ok_or_else(|| UrdError::Io {
+                path: path.to_path_buf(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "mock: no received_uuid configured",
                 ),
             })
     }
@@ -945,7 +1257,54 @@ mod tests {
         assert_eq!(parse_generation(output), None);
     }
 
-    // ── pump_with_cancel (UPI 033) ──────────────────────────────────────
+    // ── parse_received_uuid (UPI 054-b) ────────────────────────────────
+
+    #[test]
+    fn parse_received_uuid_present() {
+        let output =
+            "\tUUID: \t\t\tabc-123\n\tReceived UUID: \t\t9c8b7a6d-1234-5678-9abc-def012345678\n";
+        assert_eq!(
+            parse_received_uuid(output).as_deref(),
+            Some("9c8b7a6d-1234-5678-9abc-def012345678")
+        );
+    }
+
+    #[test]
+    fn parse_received_uuid_dash_means_none() {
+        let output = "\tUUID: \t\t\tabc-123\n\tReceived UUID: \t\t-\n";
+        assert_eq!(parse_received_uuid(output), None);
+    }
+
+    #[test]
+    fn parse_received_uuid_absent_line_means_none() {
+        let output = "\tUUID: \t\t\tabc-123\n\tGeneration: \t\t42\n";
+        assert_eq!(parse_received_uuid(output), None);
+    }
+
+    #[test]
+    fn mock_received_uuid_lookup_and_failure() {
+        let mock = MockBtrfs::new();
+        let complete = PathBuf::from("/mnt/x/.snapshots/sv/20260610-0400-sv");
+        let partial = PathBuf::from("/mnt/x/.snapshots/sv/20260611-0400-sv");
+        let failing = PathBuf::from("/mnt/x/.snapshots/sv/20260612-0400-sv");
+
+        mock.received_uuids
+            .borrow_mut()
+            .insert(complete.clone(), Some("uuid-1".to_string()));
+        mock.received_uuids.borrow_mut().insert(partial.clone(), None);
+        mock.fail_received_uuids.borrow_mut().insert(failing.clone());
+
+        assert_eq!(
+            mock.received_uuid(&complete).unwrap().as_deref(),
+            Some("uuid-1")
+        );
+        assert_eq!(mock.received_uuid(&partial).unwrap(), None);
+        assert!(mock.received_uuid(&failing).is_err());
+        // Unconfigured path errors — sweep callers fail closed.
+        assert!(mock.received_uuid(Path::new("/elsewhere")).is_err());
+    }
+
+    // ── pump_with_cancel (UPI 033, cancel-responsive writes UPI 054-b) ─
 
     #[test]
     fn pump_copies_all_when_not_cancelled() {
@@ -955,9 +1314,9 @@ mod tests {
         let counter = AtomicU64::new(0);
         let cancel = AtomicBool::new(false);
 
-        let total = pump_with_cancel(&mut reader, &mut writer, &counter, &cancel).unwrap();
+        let outcome = pump_with_cancel(&mut reader, &mut writer, &counter, &cancel).unwrap();
 
-        assert_eq!(total, data.len() as u64);
+        assert_eq!(outcome, PumpOutcome::Completed(data.len() as u64));
         assert_eq!(writer, data);
         assert_eq!(counter.load(Ordering::Relaxed), data.len() as u64);
     }
@@ -970,11 +1329,344 @@ mod tests {
         let counter = AtomicU64::new(0);
         let cancel = AtomicBool::new(true); // cancelled before the first chunk
 
-        let total = pump_with_cancel(&mut reader, &mut writer, &counter, &cancel).unwrap();
+        let outcome = pump_with_cancel(&mut reader, &mut writer, &counter, &cancel).unwrap();
 
         // The first chunk is read but the cancel breaks before writing it.
-        assert_eq!(total, 0);
+        assert_eq!(outcome, PumpOutcome::Cancelled(0));
         assert!(writer.is_empty());
+    }
+
+    /// Scripted `PumpSink` for the non-blocking write path: each `write` call
+    /// consumes the next behavior from `script`; when the script is exhausted
+    /// it accepts whole slices. `wait_writable` counts its calls and can set
+    /// the shared cancel flag on the Nth call (simulating the watchdog firing
+    /// while the pump waits on a full pipe).
+    enum SinkStep {
+        Accept,
+        AcceptBytes(usize),
+        WouldBlock,
+        Fail(std::io::ErrorKind),
+    }
+
+    struct ScriptedSink {
+        script: std::collections::VecDeque<SinkStep>,
+        written: Vec<u8>,
+        waits: usize,
+        cancel: Option<(Arc<AtomicBool>, usize)>, // set flag on the Nth wait
+    }
+
+    impl ScriptedSink {
+        fn new(script: Vec<SinkStep>) -> Self {
+            Self {
+                script: script.into(),
+                written: Vec::new(),
+                waits: 0,
+                cancel: None,
+            }
+        }
+    }
+
+    impl std::io::Write for ScriptedSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            match self.script.pop_front().unwrap_or(SinkStep::Accept) {
+                SinkStep::Accept => {
+                    self.written.extend_from_slice(buf);
+                    Ok(buf.len())
+                }
+                SinkStep::AcceptBytes(n) => {
+                    let n = n.min(buf.len());
+                    self.written.extend_from_slice(&buf[..n]);
+                    Ok(n)
+                }
+                SinkStep::WouldBlock => Err(std::io::ErrorKind::WouldBlock.into()),
+                SinkStep::Fail(kind) => Err(kind.into()),
+            }
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl PumpSink for ScriptedSink {
+        fn wait_writable(&mut self, _timeout: Duration) -> std::io::Result<()> {
+            self.waits += 1;
+            if let Some((flag, on_nth)) = &self.cancel
+                && self.waits >= *on_nth
+            {
+                flag.store(true, Ordering::Relaxed);
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn pump_cancel_observed_while_write_blocked() {
+        // One full chunk goes through, then the pipe is full forever (wedged
+        // receive). The watchdog cancels during the second wait — the pump
+        // must observe it and return instead of blocking until process death.
+        let data = vec![0xCDu8; 300 * 1024];
+        let mut reader = std::io::Cursor::new(data);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut sink = ScriptedSink::new(vec![SinkStep::Accept]);
+        // After the scripted Accept is consumed the default would accept, so
+        // refill the script with WouldBlock for every later write attempt.
+        for _ in 0..64 {
+            sink.script.push_back(SinkStep::WouldBlock);
+        }
+        sink.cancel = Some((cancel.clone(), 2));
+        let counter = AtomicU64::new(0);
+
+        let outcome = pump_with_cancel(&mut reader, &mut sink, &counter, &cancel).unwrap();
+
+        assert_eq!(outcome, PumpOutcome::Cancelled(128 * 1024));
+        assert_eq!(sink.written.len(), 128 * 1024);
+        assert_eq!(sink.waits, 2);
+    }
+
+    #[test]
+    fn pump_resumes_after_wouldblock() {
+        // A transiently full pipe: WouldBlock once, then drain normally.
+        let data = vec![0xEFu8; 200 * 1024];
+        let mut reader = std::io::Cursor::new(data.clone());
+        let mut sink = ScriptedSink::new(vec![SinkStep::WouldBlock]);
+        let counter = AtomicU64::new(0);
+        let cancel = AtomicBool::new(false);
+
+        let outcome = pump_with_cancel(&mut reader, &mut sink, &counter, &cancel).unwrap();
+
+        assert_eq!(outcome, PumpOutcome::Completed(data.len() as u64));
+        assert_eq!(sink.written, data);
+        assert_eq!(sink.waits, 1);
+    }
+
+    #[test]
+    fn pump_delivers_chunks_through_partial_writes() {
+        // POLLOUT only guarantees PIPE_BUF writable — prove the offset loop
+        // delivers a whole chunk through arbitrarily small partial writes.
+        let data: Vec<u8> = (0..4096u32).flat_map(u32::to_le_bytes).collect();
+        let mut reader = std::io::Cursor::new(data.clone());
+        let script = (0..data.len().div_ceil(7))
+            .map(|_| SinkStep::AcceptBytes(7))
+            .collect();
+        let mut sink = ScriptedSink::new(script);
+        let counter = AtomicU64::new(0);
+        let cancel = AtomicBool::new(false);
+
+        let outcome = pump_with_cancel(&mut reader, &mut sink, &counter, &cancel).unwrap();
+
+        assert_eq!(outcome, PumpOutcome::Completed(data.len() as u64));
+        assert_eq!(sink.written, data);
+        assert_eq!(counter.load(Ordering::Relaxed), data.len() as u64);
+    }
+
+    // ── wait_child_cancellable (UPI 054-b) ─────────────────────────────
+
+    /// `try_wait` fake: `None` for the first `pending` calls, then exit 0.
+    fn scripted_try_wait(
+        pending: usize,
+    ) -> impl FnMut() -> std::io::Result<Option<std::process::ExitStatus>> {
+        use std::os::unix::process::ExitStatusExt;
+        let mut calls = 0;
+        move || {
+            calls += 1;
+            if calls <= pending {
+                Ok(None)
+            } else {
+                Ok(Some(std::process::ExitStatus::from_raw(0)))
+            }
+        }
+    }
+
+    #[test]
+    fn wait_child_exits_normally() {
+        use std::os::unix::process::ExitStatusExt;
+        let cancel = AtomicBool::new(false);
+
+        let outcome = wait_child_cancellable(
+            scripted_try_wait(3),
+            &cancel,
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome,
+            WaitOutcome::Exited(std::process::ExitStatus::from_raw(0))
+        );
+    }
+
+    #[test]
+    fn wait_child_never_abandons_without_cancel() {
+        use std::os::unix::process::ExitStatusExt;
+        // Cancel unset ⇒ the grace clock never starts — even a zero grace
+        // waits indefinitely for the child (today's posture preserved).
+        let cancel = AtomicBool::new(false);
+
+        let outcome = wait_child_cancellable(
+            scripted_try_wait(50),
+            &cancel,
+            Duration::ZERO,
+            Duration::from_millis(1),
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome,
+            WaitOutcome::Exited(std::process::ExitStatus::from_raw(0))
+        );
+    }
+
+    #[test]
+    fn wait_child_exits_within_grace_after_cancel() {
+        use std::os::unix::process::ExitStatusExt;
+        let cancel = AtomicBool::new(true);
+
+        let outcome = wait_child_cancellable(
+            scripted_try_wait(3),
+            &cancel,
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome,
+            WaitOutcome::Exited(std::process::ExitStatus::from_raw(0))
+        );
+    }
+
+    #[test]
+    fn wait_child_abandons_after_grace() {
+        let cancel = AtomicBool::new(true);
+
+        let outcome = wait_child_cancellable(
+            || Ok(None), // never exits
+            &cancel,
+            Duration::from_millis(5),
+            Duration::from_millis(1),
+        )
+        .unwrap();
+
+        assert_eq!(outcome, WaitOutcome::Abandoned);
+    }
+
+    #[test]
+    fn grace_is_longer_for_completed_pump() {
+        // F3: a complete stream deserves the longer wait — the likely outcome
+        // is a successful send; a truncated one can only fail.
+        assert_eq!(
+            abandon_grace(&Ok(PumpOutcome::Completed(1))),
+            ABANDON_GRACE_COMPLETED
+        );
+        assert_eq!(
+            abandon_grace(&Ok(PumpOutcome::Cancelled(1))),
+            ABANDON_GRACE_CANCELLED
+        );
+        assert_eq!(
+            abandon_grace(&Err(std::io::ErrorKind::BrokenPipe.into())),
+            ABANDON_GRACE_CANCELLED
+        );
+        assert!(ABANDON_GRACE_COMPLETED > ABANDON_GRACE_CANCELLED);
+    }
+
+    #[test]
+    fn cleanup_runs_only_when_receive_exited() {
+        use std::os::unix::process::ExitStatusExt;
+        assert!(should_cleanup_partial(&WaitOutcome::Exited(
+            std::process::ExitStatus::from_raw(0)
+        )));
+        assert!(!should_cleanup_partial(&WaitOutcome::Abandoned));
+    }
+
+    #[test]
+    fn pump_propagates_write_error() {
+        // EPIPE (receive died) stays an ordinary send failure.
+        let data = vec![0u8; 64];
+        let mut reader = std::io::Cursor::new(data);
+        let mut sink = ScriptedSink::new(vec![SinkStep::Fail(std::io::ErrorKind::BrokenPipe)]);
+        let counter = AtomicU64::new(0);
+        let cancel = AtomicBool::new(false);
+
+        let err = pump_with_cancel(&mut reader, &mut sink, &counter, &cancel).unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+    }
+
+    /// End-to-end liveness proof against a *wedged* receive (UPI 054-b): a
+    /// stub btrfs whose `receive` arm never reads stdin and just sleeps. The
+    /// pipe fills, the pump goes `WouldBlock`, the watchdog cancel fires —
+    /// `send_receive` must return within the cancelled-grace window instead
+    /// of blocking until process death (the pre-054-b behavior).
+    ///
+    /// `#[ignore]`: the stub still runs via `sudo` (the send/receive spawn
+    /// sites hardcode it), which the project's btrfs-only sudoers grant won't
+    /// allow — dev-machine / interactive-sudo only (adversary F4). Run with
+    /// `cargo test -- --ignored` after `sudo -v`.
+    #[test]
+    #[ignore = "needs general passwordless sudo for the stub btrfs (F4); dev-machine only"]
+    fn send_receive_unblocks_on_cancel_with_wedged_receive() {
+        // F4 gate: skip (don't fail) when general sudo is unavailable.
+        let sudo_ok = Command::new("sudo")
+            .args(["-n", "true"])
+            .status()
+            .is_ok_and(|s| s.success());
+        if !sudo_ok {
+            eprintln!(
+                "skipping send_receive_unblocks_on_cancel_with_wedged_receive: \
+                 passwordless general sudo unavailable (project sudoers grants btrfs only)"
+            );
+            return;
+        }
+
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let stub = tmp.path().join("btrfs-stub.sh");
+        // `send` floods stdout; `receive` wedges: never reads stdin, sleeps.
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\ncase \"$1\" in\n  send) dd if=/dev/zero bs=128k count=1000 2>/dev/null ;;\n  receive) sleep 60 ;;\nesac\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let btrfs = RealBtrfs::new(stub.to_str().unwrap(), Arc::new(AtomicU64::new(0)), false)
+            .with_cancel(cancel.clone());
+
+        let canceller = {
+            let cancel = cancel.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(500));
+                cancel.store(true, Ordering::Relaxed);
+                std::time::Instant::now()
+            })
+        };
+
+        let result = btrfs.send_receive(
+            &tmp.path().join("20260611-1430-stub"),
+            None,
+            &tmp.path().join("dest"),
+        );
+        let returned_at = std::time::Instant::now();
+        let cancelled_at = canceller.join().unwrap();
+
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, UrdError::BtrfsSendReceive { .. }),
+            "expected BtrfsSendReceive, got: {err}"
+        );
+        assert!(
+            err.btrfs_stderr().is_some_and(|s| s.contains("abandoned")),
+            "expected the abandoned-receive marker, got: {err}"
+        );
+        // Cancelled stream ⇒ 5 s grace; generous ε for poll intervals + sudo.
+        let elapsed = returned_at.duration_since(cancelled_at);
+        assert!(
+            elapsed < ABANDON_GRACE_CANCELLED + Duration::from_secs(3),
+            "send_receive took {elapsed:?} after cancel — liveness fix not effective"
+        );
     }
 
     #[test]

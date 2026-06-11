@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **A wedged `btrfs receive` can no longer hang a backup run past the watchdog's
+  cancel** (UPI 054-b). The copy pump blocked in `write_all` against a full pipe
+  and the main thread blocked waiting on the stuck receive, so a cancel was never
+  observed and the source reclaim never ran — the host kept filling. The pump now
+  uses non-blocking writes with a poll loop that re-checks the cancel every
+  250 ms, and the waits are restructured (copy thread joined first, children
+  bounded-waited after a cancel: 5 s grace for a truncated stream, 30 s for a
+  complete one) so a child that won't exit is abandoned to init and the run
+  stays live. Abandoned receives can mint unfinalized partial snapshots under a
+  previous run's name at the destination; a new pre-send sweep deletes exactly
+  those — candidates newer than the pin whose `Received UUID` is absent (proof
+  the receive never finalized) — and never touches a provably complete backup
+  (fail-closed deletion, ADR-107).
 - **A send never starts below the host-survival floor** (UPI 054-a). The planner
   gated only snapshots, and only on bare `min_free`, while the mid-op watchdog's
   floor is `min_free + cleanup_budget` — and the watchdog fully suppressed its
