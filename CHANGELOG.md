@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **A send never starts below the host-survival floor** (UPI 054-a). The planner
+  gated only snapshots, and only on bare `min_free`, while the mid-op watchdog's
+  floor is `min_free + cleanup_budget` — and the watchdog fully suppressed its
+  floor for a pool that *started* in that band, leaving a slow fill to zero
+  unwatched (the catastrophic scenario the do-no-harm stack exists to prevent).
+  The planner now reserves the same floor before planning any send — the snapshot
+  is still taken as a local restore point; transient subvolumes defer their whole
+  lifecycle to avoid stranding an orphan — and a started-below pool (now only a
+  plan→start race) degrades the watchdog floor to bare `min_free` instead of 0,
+  so it still aborts before reaching zero. Neither `--force` nor skipped
+  intervals override the guard, matching the snapshot guard's posture.
+
 ## [0.25.1] - 2026-06-11
 
 ### Fixed

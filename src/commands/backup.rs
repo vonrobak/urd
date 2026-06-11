@@ -575,6 +575,11 @@ struct ArmedPool {
     reserve_path: PathBuf,
     /// `min_free + cleanup_budget` — the absolute floor (M5).
     floor_bytes: u64,
+    /// Bare `min_free` — the degraded floor for a pool that *started* below
+    /// `floor_bytes` (UPI 054-a). The planner's send-floor guard makes a
+    /// started-below send a plan→start TOCTOU residual; flooring it at
+    /// `min_free` (not 0) keeps the slow-fill-to-zero scenario unreachable.
+    min_free_bytes: u64,
     /// User-facing pool label for the abort event/notification.
     label: String,
     /// Send-enabled subvolumes on this pool, for the Step-5b abort-reclaim.
@@ -692,8 +697,9 @@ fn arm_watchdog_pools_with(
         .into_iter()
         .map(|t| {
             let first = &t.send_subvols[0];
+            let min_free_bytes = config.root_min_free_bytes(first).unwrap_or(0);
             let floor_bytes = guard::source_floor_bytes(
-                config.root_min_free_bytes(first).unwrap_or(0),
+                min_free_bytes,
                 config.root_cleanup_budget(first),
                 t.space.capacity_bytes,
             );
@@ -701,6 +707,7 @@ fn arm_watchdog_pools_with(
                 reserve_path: reserve::reserve_path(&t.root),
                 poll_path: t.root,
                 floor_bytes,
+                min_free_bytes,
                 label: t.label,
                 subvol_names: t.send_subvols,
             }
@@ -708,22 +715,29 @@ fn arm_watchdog_pools_with(
         .collect()
 }
 
-/// Pure per-pool watchdog decision (UPI 033). Suppresses the **absolute floor**
-/// for a pool that *started* below it: a pool whose free was already under
-/// `min_free + cleanup_budget` when the run began is a pre-flight condition (the
-/// planner's space guard owns "too tight to start"), not an in-flight failure —
-/// firing the floor on it would immediately self-abort a run the planner already
-/// allowed, making no backup progress (round-2 adversary Finding B). The **cliff**
-/// (rate) trigger stays active regardless, so a genuine in-flight free-fall is
-/// still caught on such a pool. A pool that started above the floor keeps both
-/// triggers. Delegates the level/rate logic to `guard::evaluate`.
+/// Pure per-pool watchdog decision (UPI 033, refined by UPI 054-a). For a pool
+/// that *started* below the absolute floor (`min_free + cleanup_budget`), the
+/// floor **degrades to bare `min_free`** rather than firing immediately or
+/// vanishing: the planner's send-floor guard now owns "too tight to start"
+/// (UPI 054-a), so a started-below send is a plan→start TOCTOU residual — it
+/// must not instantly self-abort a run the planner allowed (round-2 adversary
+/// Finding B), but it must still abort before reaching zero (the 033 full
+/// suppression to 0 left a slow fill to zero unwatched — ADR-113's
+/// catastrophic scenario). The **cliff** (rate) trigger stays active
+/// regardless. A pool that started above the floor keeps both triggers at
+/// full strength. Delegates the level/rate logic to `guard::evaluate`.
 fn watchdog_step(
     sample: WatchdogSample,
     floor_bytes: u64,
+    min_free_bytes: u64,
     started_below_floor: bool,
     reserve_present: bool,
 ) -> WatchdogAction {
-    let effective_floor = if started_below_floor { 0 } else { floor_bytes };
+    let effective_floor = if started_below_floor {
+        min_free_bytes
+    } else {
+        floor_bytes
+    };
     guard::evaluate(
         sample,
         WatchdogThresholds {
@@ -789,6 +803,7 @@ fn watchdog_loop(
             match watchdog_step(
                 sample,
                 pool.floor_bytes,
+                pool.min_free_bytes,
                 below,
                 reserve::reserve_present(&pool.reserve_path),
             ) {
@@ -2533,33 +2548,56 @@ source = "/data/beta"
         // reclaim the bridge first; absent → abort.
         let s = wd_sample(GB, GB); // below a 2 GB floor, no fast drop
         assert_eq!(
-            watchdog_step(s, 2 * GB, false, true),
+            watchdog_step(s, 2 * GB, GB / 2, false, true),
             WatchdogAction::ReclaimReserve(WatchdogReason::FloorCrossed)
         );
         assert_eq!(
-            watchdog_step(s, 2 * GB, false, false),
+            watchdog_step(s, 2 * GB, GB / 2, false, false),
             WatchdogAction::Abort(WatchdogReason::FloorCrossed)
         );
     }
 
     #[test]
     fn watchdog_step_started_below_floor_suppresses_floor() {
-        // Finding B: started below floor → the absolute floor is suppressed, so a
-        // quiet below-floor sample is Continue (the run the planner allowed
-        // proceeds), regardless of reserve presence.
-        let s = wd_sample(GB, GB); // below the 2 GB floor, no fast drop
-        assert_eq!(watchdog_step(s, 2 * GB, true, false), WatchdogAction::Continue);
-        assert_eq!(watchdog_step(s, 2 * GB, true, true), WatchdogAction::Continue);
+        // Finding B, refined by UPI 054-a: started below floor → the floor
+        // degrades to bare min_free. A sample below the floor but above
+        // min_free is Continue (the run the planner allowed proceeds),
+        // regardless of reserve presence.
+        let s = wd_sample(GB, GB); // below the 2 GB floor, above 512 MB min_free
+        assert_eq!(
+            watchdog_step(s, 2 * GB, GB / 2, true, false),
+            WatchdogAction::Continue
+        );
+        assert_eq!(
+            watchdog_step(s, 2 * GB, GB / 2, true, true),
+            WatchdogAction::Continue
+        );
+    }
+
+    #[test]
+    fn watchdog_step_started_below_floor_fires_below_min_free() {
+        // UPI 054-a: the degraded floor still bites. A started-below pool whose
+        // free then falls under bare min_free fires — this closes the
+        // slow-fill-to-zero gap the 033 full suppression (floor → 0) opened.
+        let s = wd_sample(GB / 4, GB / 4); // below the 512 MB min_free, no cliff
+        assert_eq!(
+            watchdog_step(s, 2 * GB, GB / 2, true, true),
+            WatchdogAction::ReclaimReserve(WatchdogReason::FloorCrossed)
+        );
+        assert_eq!(
+            watchdog_step(s, 2 * GB, GB / 2, true, false),
+            WatchdogAction::Abort(WatchdogReason::FloorCrossed)
+        );
     }
 
     #[test]
     fn watchdog_step_cliff_fires_even_when_started_below_floor() {
         // The cliff stays active on a started-below pool: 50 MB lost in 250 ms =
-        // 200 MB/s > the 100 MB/s cliff → abort despite floor suppression.
+        // 200 MB/s > the 100 MB/s cliff → abort despite floor degradation.
         let dropped = 50 * 1024 * 1024;
         let s = wd_sample(GB, GB + dropped);
         assert_eq!(
-            watchdog_step(s, 2 * GB, true, false),
+            watchdog_step(s, 2 * GB, GB / 2, true, false),
             WatchdogAction::Abort(WatchdogReason::CliffExceeded)
         );
     }
@@ -2574,6 +2612,7 @@ source = "/data/beta"
             poll_path: dir.path().to_path_buf(),
             reserve_path: dir.path().join(".urd-emergency-reserve"), // absent
             floor_bytes: u64::MAX,
+            min_free_bytes: 0, // preserves pre-054-a full suppression in this fixture
             label: "/data".to_string(),
             subvol_names: vec!["alpha".to_string()],
         };
@@ -2609,6 +2648,7 @@ source = "/data/beta"
             poll_path: dir.path().to_path_buf(),
             reserve_path: reserve_path.clone(),
             floor_bytes: u64::MAX,
+            min_free_bytes: 0, // preserves pre-054-a full suppression in this fixture
             label: "/data".to_string(),
             subvol_names: vec!["alpha".to_string()],
         };
@@ -2642,6 +2682,7 @@ source = "/data/beta"
             poll_path: dir.path().to_path_buf(),
             reserve_path: dir.path().join(".urd-emergency-reserve"),
             floor_bytes: 0, // free is always >= 0, never below → no floor trip
+            min_free_bytes: 0,
             label: "/data".to_string(),
             subvol_names: vec!["alpha".to_string()],
         };
