@@ -51,7 +51,7 @@ pub use drives::{render_drives_adopt, render_drives_list};
 pub use emergency::{render_emergency, render_emergency_result};
 pub use get::render_get;
 pub use history::{render_events, render_history, render_subvolume_history};
-pub use init::render_init;
+pub use init::{render_init, render_init_first_time};
 pub use plan::{render_empty_plan, render_plan};
 pub use retention::render_retention_preview;
 pub use sentinel::render_sentinel_status;
@@ -2298,6 +2298,36 @@ mod tests {
         };
         let output = render_init(&data, OutputMode::Daemon);
         let _: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
+    }
+
+    #[test]
+    fn init_first_time_interactive_guides_without_erroring() {
+        let path = std::path::Path::new("/home/user/.config/urd/urd.toml");
+        let output = render_init_first_time(path, OutputMode::Interactive);
+        assert!(
+            output.contains("/home/user/.config/urd/urd.toml"),
+            "must name the path where the config belongs"
+        );
+        assert!(
+            output.contains("urd.toml.example"),
+            "must point at the annotated example"
+        );
+        assert!(
+            output.contains("`urd init`"),
+            "must close the loop back to init"
+        );
+        assert!(
+            !output.to_lowercase().contains("error"),
+            "a missing config is a starting state, not an error"
+        );
+    }
+
+    #[test]
+    fn init_first_time_daemon_reports_not_configured() {
+        let path = std::path::Path::new("/home/user/.config/urd/urd.toml");
+        let output = render_init_first_time(path, OutputMode::Daemon);
+        let parsed: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
+        assert_eq!(parsed["status"], "not_configured");
     }
 
     // ── Sentinel status tests ──────────────────────────────────────────

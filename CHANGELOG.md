@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`urd init` greets a missing config instead of erroring.** The bare-`urd` greeting
+  advertises `urd init` as the first command, but init sat behind the mandatory config
+  load and answered a first-time user with a raw I/O error ("No such file or directory").
+  It now uses the same fallible-load discrimination as bare `urd`: a missing config gets
+  guidance (where the config lives, where the annotated example is, what to run next);
+  any other load error still surfaces. Daemon mode reports `{"status":"not_configured"}`,
+  matching the bare-`urd` contract.
+
 ## [0.25.0] - 2026-06-10
 
 ### Added

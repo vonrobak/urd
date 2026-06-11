@@ -1,15 +1,39 @@
 use std::io::Write as _;
+use std::path::Path;
 
 use crate::btrfs::{BtrfsOps, RealBtrfs};
 use crate::chain;
 use crate::config::Config;
 use crate::drives;
+use crate::error::UrdError;
 use crate::output::{
     InitCheck, InitDriveStatus, InitIncomplete, InitOutput, InitPinFile, InitSnapshotCount,
     InitStatus, OutputMode,
 };
 use crate::plan::{FilesystemQuery, RealFileSystemState};
 use crate::state::StateDb;
+
+/// CLI entry with fallible config load and first-time discrimination,
+/// mirroring `commands::default::run`: file-not-found → first-time guidance;
+/// all other errors → surface. The bare-`urd` greeting advertises `urd init`
+/// as the first command — a missing config must greet, not error.
+pub fn run_cli(config_path: Option<&Path>, output_mode: OutputMode) -> anyhow::Result<()> {
+    let config = match Config::load(config_path) {
+        Ok(c) => c,
+        Err(UrdError::Io {
+            ref path,
+            ref source,
+        }) if source.kind() == std::io::ErrorKind::NotFound => {
+            print!(
+                "{}",
+                crate::voice::render_init_first_time(path, output_mode)
+            );
+            return Ok(());
+        }
+        Err(e) => return Err(e.into()),
+    };
+    run(config)
+}
 
 pub fn run(config: Config) -> anyhow::Result<()> {
     let fs_state = RealFileSystemState { state: None };
