@@ -120,6 +120,14 @@ pub enum NotificationEvent {
         free_bytes_before: u64,
         floor_bytes: u64,
     },
+    /// Urd released an away/offsite drive's incremental chain under Critical
+    /// pressure (UPI 064-b). The data is safe offsite; only the chain breaks, so
+    /// the next return is a full re-send. `Urgency::Warning` (not Critical —
+    /// Critical stays reserved for host-survival actions).
+    OffsiteChainReleased {
+        subvolume: String,
+        drive: String,
+    },
 }
 
 // ── Urgency ────────────────────────────────────────────────────────────
@@ -490,6 +498,33 @@ pub fn build_emergency_eject_notification(
     }
 }
 
+/// Build the told-not-silent notification for an offsite chain released under
+/// Critical pressure (UPI 064-b). `Urgency::Warning`: the data is **safe
+/// offsite** (a pin proves a completed copy) — only the incremental chain
+/// breaks, so the next return is a full re-send. Critical urgency stays reserved
+/// for host-survival actions (`WatchdogAbort`/`EmergencyEject`). The `parent` is
+/// taken for prose completeness only (not stored on the event).
+#[must_use]
+pub fn build_offsite_chain_released_notification(
+    subvolume: &str,
+    drive: &str,
+    parent: &str,
+) -> Notification {
+    Notification {
+        event: NotificationEvent::OffsiteChainReleased {
+            subvolume: subvolume.to_string(),
+            drive: drive.to_string(),
+        },
+        urgency: Urgency::Warning,
+        title: format!("Offsite chain released: {subvolume}"),
+        body: format!(
+            "Storage pressure forced Urd to release {subvolume}'s offsite chain to {drive} \
+             (was {parent}). The data remains safe offsite; only the incremental link is gone, so \
+             the next backup to {drive} on its return will be a full re-send."
+        ),
+    }
+}
+
 /// User-facing word for a tightness tier in notification prose.
 fn tier_word(tier: TightnessTier) -> &'static str {
     match tier {
@@ -796,6 +831,27 @@ mod tests {
                 floor_bytes: 4_000_000_000,
                 ..
             }
+        ));
+    }
+
+    // ── Offsite chain released notification (UPI 064-b) ────────────
+
+    #[test]
+    fn offsite_chain_released_notification_is_warning_and_reassures() {
+        let n = build_offsite_chain_released_notification(
+            "subvol3-opptak",
+            "WD-18TB1",
+            "20260514-1000-opptak",
+        );
+        // Warning, NOT Critical — the data is safe offsite, only the chain breaks.
+        assert_eq!(n.urgency, Urgency::Warning);
+        assert!(n.title.contains("subvol3-opptak"));
+        assert!(n.body.contains("WD-18TB1"));
+        assert!(n.body.contains("safe offsite"));
+        assert!(n.body.contains("full re-send"));
+        assert!(matches!(
+            n.event,
+            NotificationEvent::OffsiteChainReleased { .. }
         ));
     }
 

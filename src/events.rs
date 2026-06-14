@@ -39,6 +39,12 @@ pub enum EventKind {
     /// `kind` column / the `--kind` filter (UPI 034, M1).
     #[serde(rename = "emergency_eject")]
     EmergencyEject,
+    /// Offsite-rotation events — the told-not-silent `OffsiteChainReleased`
+    /// (UPI 064-b). Queryable via `urd events --kind rotation`.
+    Rotation,
+    /// Storage-posture events — the `StorageTierTransition` audit row (UPI
+    /// 064-b). Queryable via `urd events --kind storage`.
+    Storage,
 }
 
 impl EventKind {
@@ -54,6 +60,8 @@ impl EventKind {
             Self::Drive => "drive",
             Self::Watchdog => "watchdog",
             Self::EmergencyEject => "emergency_eject",
+            Self::Rotation => "rotation",
+            Self::Storage => "storage",
         }
     }
 
@@ -71,6 +79,8 @@ impl EventKind {
             "drive" => Some(Self::Drive),
             "watchdog" => Some(Self::Watchdog),
             "emergency_eject" => Some(Self::EmergencyEject),
+            "rotation" => Some(Self::Rotation),
+            "storage" => Some(Self::Storage),
             _ => None,
         }
     }
@@ -221,6 +231,27 @@ pub enum EventPayload {
         floor_bytes: u64,
         snapshots_reclaimed: u32,
     },
+    /// Urd shed an away/offsite drive's incremental pin under Critical pressure,
+    /// breaking that offsite chain — its next return will be a full re-send (UPI
+    /// 064-b, ADR-116 Consequence 1). Told-not-silent: the data is safe offsite
+    /// (a pin proves a completed copy), only the *chain* breaks. `parent` is the
+    /// shed pin's `SnapshotName` as a string (matching `RetentionPrune.snapshot`).
+    OffsiteChainReleased {
+        subvolume: String,
+        drive: String,
+        parent: String,
+    },
+    /// A pool's armed `TightnessTier` changed (UPI 064-b). Recorded on **any**
+    /// transition — escalation *and* de-escalation — for a complete `urd events`
+    /// audit, closing the #202 gap where transitions notified but wrote no row.
+    /// `from`/`to` are `TightnessTier::as_db_str()` strings (matching
+    /// `RetentionPrune.tier`).
+    StorageTierTransition {
+        pool_label: String,
+        from: String,
+        to: String,
+        host_root: bool,
+    },
 }
 
 impl EventPayload {
@@ -236,6 +267,8 @@ impl EventPayload {
             Self::DriveMounted { .. } | Self::DriveUnmounted { .. } => EventKind::Drive,
             Self::WatchdogAbort { .. } => EventKind::Watchdog,
             Self::EmergencyEject { .. } => EventKind::EmergencyEject,
+            Self::OffsiteChainReleased { .. } => EventKind::Rotation,
+            Self::StorageTierTransition { .. } => EventKind::Storage,
         }
     }
 
@@ -271,6 +304,18 @@ impl EventPayload {
             Self::WatchdogAbort { .. } => Severity::Warn,
             // Shedding local snapshots while idle is a host-survival action too.
             Self::EmergencyEject { .. } => Severity::Warn,
+            // Releasing the offsite chain forces a full re-send — told-not-silent,
+            // same tier as WatchdogAbort/EmergencyEject.
+            Self::OffsiteChainReleased { .. } => Severity::Warn,
+            // Tier transitions: Notice on escalation (worsening), Info on
+            // de-escalation (mirrors PromiseTransition's direction logic).
+            Self::StorageTierTransition { from, to, .. } => {
+                if crate::storage_critical::TightnessTier::escalated_from_db_str(from, to) {
+                    Severity::Notice
+                } else {
+                    Severity::Info
+                }
+            }
         }
     }
 }
@@ -642,6 +687,54 @@ mod tests {
             floor_bytes: 4_000_000_000,
             snapshots_reclaimed: 1,
         });
+        roundtrip(&EventPayload::OffsiteChainReleased {
+            subvolume: "subvol3-opptak".into(),
+            drive: "WD-18TB1".into(),
+            parent: "20260514-1000-opptak".into(),
+        });
+        roundtrip(&EventPayload::StorageTierTransition {
+            pool_label: "/mnt".into(),
+            from: "tight".into(),
+            to: "critical".into(),
+            host_root: false,
+        });
+    }
+
+    // ── UPI 064-b: told-not-silent event payloads ─────────────────────
+
+    #[test]
+    fn offsite_chain_released_is_rotation_warn() {
+        let payload = EventPayload::OffsiteChainReleased {
+            subvolume: "subvol3-opptak".into(),
+            drive: "WD-18TB1".into(),
+            parent: "20260514-1000-opptak".into(),
+        };
+        assert_eq!(payload.kind(), EventKind::Rotation);
+        assert_eq!(payload.severity(), Severity::Warn);
+        assert_eq!(EventKind::Rotation.as_str(), "rotation");
+        let json = serde_json::to_value(&payload).unwrap();
+        assert_eq!(json["type"], "OffsiteChainReleased");
+    }
+
+    #[test]
+    fn storage_tier_transition_is_storage_kind_with_directional_severity() {
+        let escalation = EventPayload::StorageTierTransition {
+            pool_label: "/mnt".into(),
+            from: "tight".into(),
+            to: "critical".into(),
+            host_root: false,
+        };
+        let deescalation = EventPayload::StorageTierTransition {
+            pool_label: "/mnt".into(),
+            from: "tight".into(),
+            to: "roomy".into(),
+            host_root: false,
+        };
+        assert_eq!(escalation.kind(), EventKind::Storage);
+        assert_eq!(EventKind::Storage.as_str(), "storage");
+        // Notice on escalation (worsening), Info on de-escalation.
+        assert_eq!(escalation.severity(), Severity::Notice);
+        assert_eq!(deescalation.severity(), Severity::Info);
     }
 
     #[test]
@@ -783,6 +876,8 @@ mod tests {
             EventKind::Drive,
             EventKind::Watchdog,
             EventKind::EmergencyEject,
+            EventKind::Rotation,
+            EventKind::Storage,
         ] {
             assert_eq!(EventKind::from_str(kind.as_str()), Some(kind));
         }

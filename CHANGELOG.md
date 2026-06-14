@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **A constrained pool now holds its offsite chain at Tight and says so out loud
+  when it sheds at Critical** (UPI 064-b, ADR-116 compliance). Tight gains a new
+  `retain-parents` lifecycle rung that keeps **every** chain's incremental parent
+  (connected *and* away) instead of collapsing to retain-one — so a genuinely
+  small pool no longer drops its offsite parent at Tight (one tier below the
+  ADR-116-mandated Critical+) and force a full re-send. The away pin is shed only
+  at Critical, and that shed is now **told-not-silent**: an `OffsiteChainReleased`
+  event (`urd events --kind rotation`) plus a desktop notification (the data is
+  safe offsite — only the chain breaks). Armed-tier changes also write a
+  `StorageTierTransition` audit row (`urd events --kind storage`), closing the gap
+  where transitions notified but recorded nothing. The reactive watchdog /
+  idle-eject away-shed records the same rotation row for audit symmetry.
+
 ### Fixed
 - **Large, absolutely-roomy pools no longer arm Tight and silently over-thin
   their retention** (UPI 064-a, issue #202). The tightness tier was free-ratio

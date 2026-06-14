@@ -149,6 +149,18 @@ impl TightnessTier {
             _ => None,
         }
     }
+
+    /// True iff `to` is a worse (tighter) tier than `from`, both as DB-strings —
+    /// the escalation direction for a `StorageTierTransition` (UPI 064-b).
+    /// Unparseable inputs → `false`. The single owner of this comparison, read by
+    /// both the event severity (`events.rs`) and its render (`voice_events.rs`).
+    #[must_use]
+    pub fn escalated_from_db_str(from: &str, to: &str) -> bool {
+        matches!(
+            (Self::from_db_str(from), Self::from_db_str(to)),
+            (Some(f), Some(t)) if t > f
+        )
+    }
 }
 
 impl From<HeadroomSeverity> for TightnessTier {
@@ -382,6 +394,16 @@ pub struct EffectivePolicy {
     /// The planner writes no pin (`pin_on_success: None`); the executor deletes
     /// the just-sent snapshot + pin after confirming the send (gated).
     pub clear_all: bool,
+    /// Hold **every** chain's incremental parent — connected *and* away — as a
+    /// discrete protected entry (the `retain-parents` rung, UPI 064-b). `true` at
+    /// **Roomy/Tight** (the offsite chain is held opportunistically, per ADR-116
+    /// Consequence 1); `false` at **Critical** (`retain-one` / `clear-all` — the
+    /// away pin is shed). Only consulted in `plan_local_retention`'s transient
+    /// branch: it picks `pinned` (all parents) over `mounted_pins` (connected
+    /// only). The unsent-expansion anchor is independent (always the oldest
+    /// *mounted* pin), so holding the away parent does not protect the whole
+    /// daily history.
+    pub protect_away_pins: bool,
 }
 
 /// Derive the tier-adapted [`EffectivePolicy`] from a subvolume's *declared*
@@ -425,6 +447,9 @@ pub fn derive_effective_policy(
             local_retention: *declared_retention,
             send_interval: declared_send_interval,
             clear_all: false,
+            // No send chain to hold; the flag is inert (the transient branch of
+            // `plan_local_retention` it gates is never reached for local-only).
+            protect_away_pins: false,
         };
     }
 
@@ -433,11 +458,18 @@ pub fn derive_effective_policy(
             local_retention: *declared_retention,
             send_interval: declared_send_interval,
             clear_all: false,
+            // Roomy keeps the full declared shape, so every pin is already held;
+            // true keeps the invariant "Roomy/Tight hold every chain's parent."
+            protect_away_pins: true,
         },
         TightnessTier::Tight => EffectivePolicy {
             local_retention: LocalRetentionPolicy::Transient,
             send_interval: scale_interval(declared_send_interval, TIGHT_INTERVAL_FACTOR),
             clear_all: false,
+            // retain-parents (UPI 064-b): hold every chain's parent, connected
+            // AND away — the offsite chain is held opportunistically at Tight,
+            // shed only at Critical (ADR-116 Consequence 1).
+            protect_away_pins: true,
         },
         TightnessTier::Critical => {
             let floor = Interval::days(CRITICAL_INTERVAL_FLOOR_DAYS);
@@ -453,6 +485,9 @@ pub fn derive_effective_policy(
                 // Presence-conditional (UPI 058): retain-one for the connected
                 // chain when an away-only pin can be shed instead.
                 clear_all: !has_away_pin,
+                // Critical sheds the away pin (retain-one / clear-all), so the
+                // away parent is NOT held — false at Critical regardless of pin.
+                protect_away_pins: false,
             }
         }
     }
@@ -1054,6 +1089,39 @@ mod tests {
         for tier in [TightnessTier::Roomy, TightnessTier::Tight] {
             let eff = derive_effective_policy(&grad(), Interval::days(1), true, tier, true);
             assert!(!eff.clear_all, "{tier:?} ignores has_away_pin");
+        }
+    }
+
+    // ── UPI 064-b: protect_away_pins (retain-parents) column ──────────────
+
+    #[test]
+    fn effective_policy_protect_away_pins_matrix() {
+        // retain-parents holds the away pin at Roomy/Tight, sheds it at Critical
+        // (both has_away_pin values), and is inert for a local-only subvol.
+        for has_away in [false, true] {
+            assert!(
+                derive_effective_policy(&grad(), Interval::days(1), true, TightnessTier::Roomy, has_away)
+                    .protect_away_pins,
+                "Roomy holds every chain's parent",
+            );
+            assert!(
+                derive_effective_policy(&grad(), Interval::days(1), true, TightnessTier::Tight, has_away)
+                    .protect_away_pins,
+                "Tight = retain-parents: holds the away pin",
+            );
+            assert!(
+                !derive_effective_policy(&grad(), Interval::days(1), true, TightnessTier::Critical, has_away)
+                    .protect_away_pins,
+                "Critical sheds the away pin (retain-one / clear-all)",
+            );
+            // Local-only: flag inert (false), every tier.
+            for tier in [TightnessTier::Roomy, TightnessTier::Tight, TightnessTier::Critical] {
+                assert!(
+                    !derive_effective_policy(&grad(), Interval::days(1), false, tier, has_away)
+                        .protect_away_pins,
+                    "local-only is never a retain-parents holder at {tier:?}",
+                );
+            }
         }
     }
 }
