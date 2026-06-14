@@ -199,14 +199,11 @@ fn summary_for(payload: &EventPayload) -> String {
             host_root,
         } => {
             // Escalation tightens; de-escalation eases (direction by tier order).
-            let escalated = matches!(
-                (
-                    crate::storage_critical::TightnessTier::from_db_str(from),
-                    crate::storage_critical::TightnessTier::from_db_str(to),
-                ),
-                (Some(f), Some(t)) if t > f
-            );
-            let verb = if escalated { "tightened" } else { "eased" };
+            let verb = if crate::storage_critical::TightnessTier::escalated_from_db_str(from, to) {
+                "tightened"
+            } else {
+                "eased"
+            };
             let host = if *host_root { ", host-root" } else { "" };
             format!("{pool_label} {verb}  ({from} → {to}{host})")
         }

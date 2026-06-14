@@ -149,6 +149,18 @@ impl TightnessTier {
             _ => None,
         }
     }
+
+    /// True iff `to` is a worse (tighter) tier than `from`, both as DB-strings —
+    /// the escalation direction for a `StorageTierTransition` (UPI 064-b).
+    /// Unparseable inputs → `false`. The single owner of this comparison, read by
+    /// both the event severity (`events.rs`) and its render (`voice_events.rs`).
+    #[must_use]
+    pub fn escalated_from_db_str(from: &str, to: &str) -> bool {
+        matches!(
+            (Self::from_db_str(from), Self::from_db_str(to)),
+            (Some(f), Some(t)) if t > f
+        )
+    }
 }
 
 impl From<HeadroomSeverity> for TightnessTier {

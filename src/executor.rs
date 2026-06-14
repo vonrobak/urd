@@ -122,6 +122,33 @@ pub struct OffsiteChainRelease {
     pub parent: SnapshotName,
 }
 
+impl OffsiteChainRelease {
+    /// The told-not-silent `OffsiteChainReleased` audit event for this release
+    /// (UPI 064-b), with `subvolume`/`drive_label` stamped. The single owner of
+    /// the release-to-event mapping, used by both the backup surface (the
+    /// planner-driven and reactive-watchdog paths) and the sentinel idle-eject.
+    /// `run_id` is `None` for the sentinel (an idle eject is not a backup run).
+    #[must_use]
+    pub fn to_event(
+        &self,
+        occurred_at: chrono::NaiveDateTime,
+        run_id: Option<i64>,
+    ) -> crate::events::Event {
+        let mut ev = crate::events::Event::pure(
+            occurred_at,
+            crate::events::EventPayload::OffsiteChainReleased {
+                subvolume: self.subvolume.clone(),
+                drive: self.drive.clone(),
+                parent: self.parent.to_string(),
+            },
+        );
+        ev.run_id = run_id;
+        ev.subvolume = Some(self.subvolume.clone());
+        ev.drive_label = Some(self.drive.clone());
+        ev
+    }
+}
+
 /// Outcome of post-send transient cleanup (immediate deletion of old pin parent).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransientCleanupOutcome {

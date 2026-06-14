@@ -827,19 +827,8 @@ impl SentinelRunner {
             // for audit symmetry with the planner-driven away-shed. NO separate
             // notification — the Critical EmergencyEject notification above already
             // states the next backup will be a full send (avoid double-notifying).
-            for r in outcome.releases() {
-                let mut ev = crate::events::Event::pure(
-                    now,
-                    crate::events::EventPayload::OffsiteChainReleased {
-                        subvolume: r.subvolume.clone(),
-                        drive: r.drive.clone(),
-                        parent: r.parent.to_string(),
-                    },
-                );
-                ev.subvolume = Some(r.subvolume.clone());
-                ev.drive_label = Some(r.drive.clone());
-                audit_events.push(ev);
-            }
+            // `run_id = None`: an idle eject is not a backup run.
+            audit_events.extend(outcome.releases().iter().map(|r| r.to_event(now, None)));
             // deleted == 0 && Nothing → silent (natural debounce: idle, nothing
             // creates new snapshots, so after one shed there is nothing left).
         }

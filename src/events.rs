@@ -310,14 +310,11 @@ impl EventPayload {
             // Tier transitions: Notice on escalation (worsening), Info on
             // de-escalation (mirrors PromiseTransition's direction logic).
             Self::StorageTierTransition { from, to, .. } => {
-                let escalated = matches!(
-                    (
-                        crate::storage_critical::TightnessTier::from_db_str(from),
-                        crate::storage_critical::TightnessTier::from_db_str(to),
-                    ),
-                    (Some(f), Some(t)) if t > f
-                );
-                if escalated { Severity::Notice } else { Severity::Info }
+                if crate::storage_critical::TightnessTier::escalated_from_db_str(from, to) {
+                    Severity::Notice
+                } else {
+                    Severity::Info
+                }
             }
         }
     }

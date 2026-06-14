@@ -423,11 +423,11 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
             // for audit symmetry with the planner-driven away-shed. NO separate
             // notification — the Critical WatchdogAbort notification already states
             // the next backup will be a full send (avoid double-notifying).
-            let release_events = build_offsite_release_events(
-                reclaim.releases(),
-                now_ts,
-                result.run_id,
-            );
+            let release_events: Vec<Event> = reclaim
+                .releases()
+                .iter()
+                .map(|r| r.to_event(now_ts, result.run_id))
+                .collect();
             if !release_events.is_empty() {
                 db.record_events_best_effort(&release_events);
             }
@@ -450,11 +450,10 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     if !offsite_releases.is_empty() {
         let now_ts = chrono::Local::now().naive_local();
         if let Some(ref db) = state_db {
-            let events = build_offsite_release_events(
-                &offsite_releases.iter().map(|r| (*r).clone()).collect::<Vec<_>>(),
-                now_ts,
-                result.run_id,
-            );
+            let events: Vec<Event> = offsite_releases
+                .iter()
+                .map(|r| r.to_event(now_ts, result.run_id))
+                .collect();
             db.record_events_best_effort(&events);
         }
         let notes: Vec<notify::Notification> = offsite_releases
@@ -946,34 +945,6 @@ fn establish_reserves_with(
 
 /// Maps an `OperationOutcome.operation` string back to the short user-facing
 /// label ("full" / "incremental"). Returns `None` for non-send operations.
-/// Build the `OffsiteChainReleased` event rows for a set of released chains
-/// (UPI 064-b), stamping `run_id`, `subvolume`, and `drive_label`. Shared by the
-/// planner-driven away-shed surface and the reactive watchdog/idle-eject path so
-/// the audit row is identical regardless of which actor broke the chain.
-fn build_offsite_release_events(
-    releases: &[crate::executor::OffsiteChainRelease],
-    now_ts: chrono::NaiveDateTime,
-    run_id: Option<i64>,
-) -> Vec<Event> {
-    releases
-        .iter()
-        .map(|r| {
-            let mut ev = Event::pure(
-                now_ts,
-                EventPayload::OffsiteChainReleased {
-                    subvolume: r.subvolume.clone(),
-                    drive: r.drive.clone(),
-                    parent: r.parent.to_string(),
-                },
-            );
-            ev.run_id = run_id;
-            ev.subvolume = Some(r.subvolume.clone());
-            ev.drive_label = Some(r.drive.clone());
-            ev
-        })
-        .collect()
-}
-
 fn send_kind_display(op_name: &str) -> Option<&'static str> {
     if op_name == SendKind::Full.as_db_str() {
         Some("full")
