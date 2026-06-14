@@ -14,7 +14,7 @@
 //!   returns escalation transitions for the notification path (D6). UUID-less
 //!   pools are skipped entirely — status-only, never persisted (S5).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use chrono::NaiveDateTime;
@@ -38,8 +38,20 @@ pub struct PoolSignal {
     pub label: String,
     /// Enabled subvolume names whose source resolves to this pool (Min1).
     pub subvol_names: Vec<String>,
-    /// Source free / capacity ratio; `None` when unmeasurable.
+    /// Source free / capacity ratio; `None` when unmeasurable. Retained
+    /// alongside `free_bytes` (it is derivable) to avoid churning the
+    /// display/test reads — the ratio classifier path is unchanged.
     pub free_ratio: Option<f64>,
+    /// Source free bytes (raw, for the absolute-headroom gate); `None` when
+    /// unmeasurable. (UPI 064-a)
+    pub free_bytes: Option<u64>,
+    /// Source pool capacity bytes (raw, needed to finalize the floor); `None`
+    /// when unmeasurable. (UPI 064-a)
+    pub capacity_bytes: Option<u64>,
+    /// The host-survival floor for this pool (`pool_floor_bytes`), the gate's
+    /// absolute anchor. `None` for a local-only pool (no send-enabled subvol) or
+    /// an unmeasurable capacity → the gate is inactive. (UPI 064-a, F1)
+    pub floor_bytes: Option<u64>,
     /// This pool is the host-root pool and an enabled subvol entrusts `/`.
     pub host_root: bool,
     /// Prior armed tier from `pool_armed_tier` (Roomy when untracked).
@@ -78,6 +90,40 @@ enum PoolKey {
     Subvol(String),
 }
 
+/// The host-survival floor for a pool, keyed on its **first send-enabled**
+/// subvolume (UPI 064-a, F1). The single definition shared by the gather (the
+/// absolute-headroom gate's floor) **and** the reactive stack (the UPI-033
+/// watchdog, the UPI-034 idle eject) so the two floors **cannot drift** — the
+/// gate's safety premise ("the reactive stack catches what the gate down-arms")
+/// holds only if they are the *same* number, not approximately equal.
+///
+/// Picks the first send-enabled subvol in `pool_subvols` order (the same
+/// `send_subvols[0]` rule `resolve_pool_targets` uses, since it builds
+/// `send_subvols` by filtering `pool.subvol_names` in order). Returns `None` when
+/// the pool has **no** send-enabled subvol — a local-only pool has no footprint
+/// to cap, so the gate is inactive and the tier drives no ephemeral lifecycle.
+///
+/// (F8) When the result is `Some`, the floor is **non-zero** for any pool with
+/// positive capacity under the default (unset) `cleanup_budget`
+/// (`source_floor_bytes` floors it at 1.5 % of capacity) — the property the
+/// gate's `floor > 0` guard relies on. A config that explicitly zeroes both
+/// `min_free` and `cleanup_budget` could still yield 0; the gate's `> 0` guard is
+/// the safety net there (0 means "gate inactive," never "force Roomy").
+#[must_use]
+pub fn pool_floor_bytes(
+    config: &Config,
+    pool_subvols: &[String],
+    send_enabled: &HashSet<String>,
+    capacity_bytes: u64,
+) -> Option<u64> {
+    let first = pool_subvols.iter().find(|n| send_enabled.contains(*n))?;
+    Some(crate::guard::source_floor_bytes(
+        config.root_min_free_bytes(first).unwrap_or(0),
+        config.root_cleanup_budget(first),
+        capacity_bytes,
+    ))
+}
+
 /// Gather storage signals for all enabled subvolumes (read-only). One
 /// `findmnt` per subvolume source (the combined UUID+mountpoint resolver — S3),
 /// one `statvfs` per distinct pool mountpoint, one batched armed-tier read.
@@ -110,13 +156,19 @@ fn gather_with(
         .iter()
         .any(|sv| sv.enabled && sv.source.as_path() == Path::new("/"));
 
-    // Accumulate distinct pools (insertion-ordered) and the per-subvol map in
-    // one pass: every field `by_subvol` reads is fixed when the pool is first
-    // inserted, so it can be mirrored inline rather than in a second loop.
+    // Two passes (UPI 064-a, F1): the per-pool host-survival floor needs the
+    // pool's COMPLETE subvol set (to find its first send-enabled member), and
+    // every subvol on a pool must read the SAME floor — computing it lazily
+    // mid-loop would give earlier subvols a stale `None`. So pass 1 accumulates
+    // pools, then the floor is finalized once each pool's subvol set is known,
+    // then pass 2 builds the per-subvol map from the finalized pool.
     let mut order: Vec<PoolKey> = Vec::new();
     let mut by_key: HashMap<PoolKey, PoolSignal> = HashMap::new();
-    let mut by_subvol = StorageSignalMap::new();
+    // Subvol name → its pool key, in iteration order, so pass 2 needs no
+    // re-resolve / no extra `findmnt`.
+    let mut subvol_order: Vec<(String, PoolKey)> = Vec::new();
 
+    // ── Pass 1: accumulate pools and record each subvol's pool key. ──
     for sv in &resolved {
         if !sv.enabled {
             continue;
@@ -129,10 +181,12 @@ fn gather_with(
         };
 
         if !by_key.contains_key(&key) {
-            let free_ratio = mountpoint
-                .as_deref()
-                .and_then(&mut space)
-                .and_then(PoolSpace::free_ratio);
+            // Capture the `PoolSpace` once — free_ratio, free_bytes, and
+            // capacity_bytes all derive from this single statvfs (PoolSpace: Copy).
+            let pool_space = mountpoint.as_deref().and_then(&mut space);
+            let free_ratio = pool_space.and_then(PoolSpace::free_ratio);
+            let free_bytes = pool_space.map(|s| s.free_bytes);
+            let capacity_bytes = pool_space.map(|s| s.capacity_bytes);
             let host_root = storage_critical::host_root(
                 uuid.as_deref(),
                 root_pool_uuid,
@@ -154,6 +208,9 @@ fn gather_with(
                     label,
                     subvol_names: Vec::new(),
                     free_ratio,
+                    free_bytes,
+                    capacity_bytes,
+                    floor_bytes: None, // finalized below, once the subvol set is known
                     host_root,
                     prior_armed_tier,
                     prior_since,
@@ -163,10 +220,37 @@ fn gather_with(
         }
         if let Some(pool) = by_key.get_mut(&key) {
             pool.subvol_names.push(sv.name.clone());
+        }
+        subvol_order.push((sv.name.clone(), key));
+    }
+
+    // ── Floor finalization (F1): key each pool's floor on its first
+    // send-enabled subvol, identical to the watchdog/idle-eject
+    // (`resolve_pool_targets` filters the same `sv.enabled && sv.send_enabled`),
+    // via the one shared `pool_floor_bytes` so the floors cannot drift. ──
+    let send_enabled: HashSet<String> = resolved
+        .iter()
+        .filter(|sv| sv.enabled && sv.send_enabled)
+        .map(|sv| sv.name.clone())
+        .collect();
+    for pool in by_key.values_mut() {
+        pool.floor_bytes = pool.capacity_bytes.and_then(|cap| {
+            pool_floor_bytes(config, &pool.subvol_names, &send_enabled, cap)
+        });
+    }
+
+    // ── Pass 2: build the per-subvol map from the FINALIZED pool, so every
+    // subvol on a pool feeds identical (free_ratio, free_bytes, floor_bytes) to
+    // the gated resolver — the coherence the gate's safety premise needs. ──
+    let mut by_subvol = StorageSignalMap::new();
+    for (name, key) in subvol_order {
+        if let Some(pool) = by_key.get(&key) {
             by_subvol.insert(
-                sv.name.clone(),
+                name,
                 ResolvedStorageSignal::resolved(
                     pool.free_ratio,
+                    pool.free_bytes,
+                    pool.floor_bytes,
                     pool.host_root,
                     pool.prior_armed_tier,
                     pool.prior_since,
@@ -233,6 +317,8 @@ pub fn resolve_armed_tiers(signals: &StorageSignals) -> ResolvedArmedTiers {
         let new_tier = storage_critical::resolve_armed_tier(
             pool.prior_armed_tier,
             pool.free_ratio,
+            pool.free_bytes,
+            pool.floor_bytes,
         );
         for name in &pool.subvol_names {
             armed_tier_map.insert(name.clone(), new_tier);
@@ -350,8 +436,12 @@ log_dir = "/tmp/urd-031a-signals"
 heartbeat_file = "/tmp/urd-031a-signals/heartbeat.json"
 
 [local_snapshots]
+# min_free 60 B keeps the host-survival floor (~61 B at these 100-byte test
+# capacities) large enough that the UPI 064-a absolute-headroom gate stays
+# DISENGAGED at the free levels these fixtures use (≤ 50 B < 3×floor), so the
+# ratio classifier still drives the tier — the property these tests exercise.
 roots = [
-  { path = "/snap", subvolumes = ["alpha", "beta", "root"] }
+  { path = "/snap", subvolumes = ["alpha", "beta", "root"], min_free_bytes = "60B" }
 ]
 
 [defaults]
@@ -658,6 +748,253 @@ source = "/"
         let _ = advance_and_writeback(&db, now, &resolved);
         let stored = db.all_armed_tiers().unwrap().get("data-uuid").copied();
         assert_eq!(stored.map(|(t, _)| t), Some(TightnessTier::Critical));
+    }
+
+    // ── UPI 064-a: pool_floor_bytes + absolute-headroom gate via gather ──
+
+    const GB: u64 = 1_000_000_000;
+    const TB: u64 = 1000 * GB;
+
+    /// A config whose `/data` pool carries a **local-only** subvol (`localonly`,
+    /// listed FIRST) and a **send-enabled** subvol (`sent`) in distinct snapshot
+    /// roots with distinct `min_free`, so a floor keyed on the wrong subvol is
+    /// detectable (F1). No `/` subvol — this fixture is only about floor keying.
+    fn floor_cfg() -> Config {
+        let toml_str = r#"
+drives = []
+
+[general]
+state_db = "/tmp/urd-064-floor/urd.db"
+metrics_file = "/tmp/urd-064-floor/backup.prom"
+log_dir = "/tmp/urd-064-floor"
+heartbeat_file = "/tmp/urd-064-floor/heartbeat.json"
+
+[local_snapshots]
+roots = [
+  { path = "/snap-local", subvolumes = ["localonly"], min_free_bytes = "10GB" },
+  { path = "/snap-sent", subvolumes = ["sent"], min_free_bytes = "20GB" }
+]
+
+[defaults]
+snapshot_interval = "1h"
+send_interval = "4h"
+[defaults.local_retention]
+hourly = 24
+daily = 60
+weekly = 52
+monthly = 24
+[defaults.external_retention]
+hourly = 0
+daily = 60
+weekly = 52
+monthly = 24
+
+[[subvolumes]]
+name = "localonly"
+short_name = "lo"
+source = "/data/x"
+send_enabled = false
+
+[[subvolumes]]
+name = "sent"
+short_name = "se"
+source = "/data/y"
+"#;
+        toml::from_str(toml_str).unwrap()
+    }
+
+    /// Like `cfg()` but WITHOUT `min_free`, so the floor is the 1.5%-capacity
+    /// default — a large pool then has free ≫ 3.5×floor and the gate engages.
+    fn mnt_cfg() -> Config {
+        let toml_str = r#"
+drives = []
+
+[general]
+state_db = "/tmp/urd-064-mnt/urd.db"
+metrics_file = "/tmp/urd-064-mnt/backup.prom"
+log_dir = "/tmp/urd-064-mnt"
+heartbeat_file = "/tmp/urd-064-mnt/heartbeat.json"
+
+[local_snapshots]
+roots = [
+  { path = "/snap", subvolumes = ["alpha", "beta", "root"] }
+]
+
+[defaults]
+snapshot_interval = "1h"
+send_interval = "4h"
+[defaults.local_retention]
+hourly = 24
+daily = 60
+weekly = 52
+monthly = 24
+[defaults.external_retention]
+hourly = 0
+daily = 60
+weekly = 52
+monthly = 24
+
+[[subvolumes]]
+name = "alpha"
+short_name = "alpha"
+source = "/data/alpha"
+
+[[subvolumes]]
+name = "beta"
+short_name = "beta"
+source = "/data/beta"
+
+[[subvolumes]]
+name = "root"
+short_name = "root"
+source = "/"
+"#;
+        toml::from_str(toml_str).unwrap()
+    }
+
+    /// `/data`: 15 TB pool, 3 TB free (ratio 0.20 → Tight by ratio). floor =
+    /// 1.5%×15TB ≈ 225 GB; 3 TB ≈ 13× → the gate forces Roomy. `/` stays roomy.
+    fn space_mnt(mp: &Path) -> Option<PoolSpace> {
+        if mp == Path::new("/data") {
+            Some(PoolSpace { free_bytes: 3 * TB, capacity_bytes: 15 * TB })
+        } else {
+            Some(PoolSpace { free_bytes: 8 * TB, capacity_bytes: 16 * TB })
+        }
+    }
+
+    #[test]
+    fn pool_floor_bytes_keys_on_first_send_enabled_subvol() {
+        // The pool lists the local-only subvol first; the floor must key on the
+        // first SEND-ENABLED subvol ("sent", min_free 20 GB), not "localonly"
+        // (10 GB) — the F1 selection rule the watchdog/idle-eject share.
+        let config = floor_cfg();
+        let pool_subvols = vec!["localonly".to_string(), "sent".to_string()];
+        let send_enabled: HashSet<String> = ["sent".to_string()].into_iter().collect();
+        let cap = 1000 * GB;
+        let expected = crate::guard::source_floor_bytes(20 * GB, None, cap);
+        assert_eq!(
+            pool_floor_bytes(&config, &pool_subvols, &send_enabled, cap),
+            Some(expected),
+        );
+        // Sanity: keying on the local-only subvol would give a different floor.
+        assert_ne!(expected, crate::guard::source_floor_bytes(10 * GB, None, cap));
+    }
+
+    #[test]
+    fn pool_floor_bytes_none_for_local_only_pool() {
+        // No send-enabled subvol → no footprint to cap → None (gate inactive).
+        let config = floor_cfg();
+        let pool_subvols = vec!["localonly".to_string()];
+        let send_enabled: HashSet<String> = HashSet::new();
+        assert_eq!(
+            pool_floor_bytes(&config, &pool_subvols, &send_enabled, 1000 * GB),
+            None,
+        );
+    }
+
+    #[test]
+    fn pool_floor_bytes_gather_and_watchdog_paths_agree() {
+        // F1 coherence: the gather calls the helper with the pool's FULL subvol
+        // set; the watchdog calls it with the SEND-ENABLED-only set. Both must
+        // yield the IDENTICAL floor (the gate's safety premise depends on it —
+        // "the reactive stack catches what the gate down-arms").
+        let config = floor_cfg();
+        let cap = 1000 * GB;
+        let send_enabled: HashSet<String> = ["sent".to_string()].into_iter().collect();
+        let gather_floor = pool_floor_bytes(
+            &config,
+            &["localonly".to_string(), "sent".to_string()], // gather: full set
+            &send_enabled,
+            cap,
+        );
+        let watchdog_floor = pool_floor_bytes(
+            &config,
+            &["sent".to_string()], // watchdog: send_subvols only
+            &send_enabled,
+            cap,
+        );
+        assert_eq!(gather_floor, watchdog_floor);
+        assert_eq!(
+            gather_floor,
+            Some(crate::guard::source_floor_bytes(20 * GB, None, cap)),
+        );
+    }
+
+    #[test]
+    fn gather_gate_arms_roomy_for_large_pool_overriding_sticky_tight() {
+        // The #202 fix, end-to-end through the real gather path. /data is a 15 TB
+        // pool at 20% free, prior armed Tight (whose sticky ratio path would keep
+        // it Tight forever — 0.20 never clears the 0.30 band). The absolute-
+        // headroom gate forces Roomy on the first post-deploy run. No migration.
+        let mut prior = HashMap::new();
+        prior.insert(
+            "data-uuid".to_string(),
+            (TightnessTier::Tight, dt("2026-06-02T04:00:00")),
+        );
+        let signals =
+            gather_with(&mnt_cfg(), &prior, Some("root-uuid"), resolver, space_mnt);
+        let resolved = resolve_armed_tiers(&signals);
+        assert_eq!(resolved.armed_tier_map.get("alpha"), Some(&TightnessTier::Roomy));
+        assert_eq!(resolved.armed_tier_map.get("beta"), Some(&TightnessTier::Roomy));
+    }
+
+    #[test]
+    fn gather_floor_keys_on_send_enabled_when_first_subvol_is_local_only() {
+        // F1 end-to-end: /data carries a local-only subvol ("localonly", listed
+        // first) + a send-enabled subvol ("sent"). The gathered pool floor must
+        // key on "sent" (min_free 20 GB), not the local-only first member — and
+        // the raw free/capacity bytes must land on the PoolSignal.
+        let space_data = |mp: &Path| {
+            if mp == Path::new("/data") {
+                Some(PoolSpace { free_bytes: 500 * GB, capacity_bytes: 1000 * GB })
+            } else {
+                Some(PoolSpace { free_bytes: 50 * GB, capacity_bytes: 100 * GB })
+            }
+        };
+        let signals = gather_with(
+            &floor_cfg(),
+            &HashMap::new(),
+            Some("root-uuid"),
+            resolver,
+            space_data,
+        );
+        let data = signals
+            .pools
+            .iter()
+            .find(|p| p.uuid.as_deref() == Some("data-uuid"))
+            .unwrap();
+        let cap = 1000 * GB;
+        assert_eq!(
+            data.floor_bytes,
+            Some(crate::guard::source_floor_bytes(20 * GB, None, cap)),
+            "floor keyed on the send-enabled subvol, not the local-only first one",
+        );
+        assert_eq!(data.free_bytes, Some(500 * GB));
+        assert_eq!(data.capacity_bytes, Some(cap));
+    }
+
+    #[test]
+    fn gather_stamps_coherent_tier_under_active_gate() {
+        // The gate's result must be coherent across BOTH consumers (planner map +
+        // awareness per-subvol signal): they feed the SAME finalized floor from
+        // pass 2, so under an active gate both must read Roomy.
+        let mut prior = HashMap::new();
+        prior.insert(
+            "data-uuid".to_string(),
+            (TightnessTier::Tight, dt("2026-06-02T04:00:00")),
+        );
+        let signals =
+            gather_with(&mnt_cfg(), &prior, Some("root-uuid"), resolver, space_mnt);
+        let map = resolve_armed_tiers(&signals).armed_tier_map;
+        assert!(!signals.by_subvol.is_empty(), "fixture must exercise subvols");
+        for (name, sig) in &signals.by_subvol {
+            assert_eq!(
+                map.get(name),
+                Some(&sig.armed_tier()),
+                "subvol {name}: planner map tier must equal awareness tier under the gate",
+            );
+        }
+        assert_eq!(signals.by_subvol["alpha"].armed_tier(), TightnessTier::Roomy);
     }
 
     fn mk_assess(name: &str, posture: Option<StoragePosture>) -> SubvolAssessment {

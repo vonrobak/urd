@@ -715,11 +715,13 @@ impl SentinelRunner {
                 }
             },
             |first, capacity| {
-                crate::guard::source_floor_bytes(
-                    self.config.root_min_free_bytes(first).unwrap_or(0),
-                    self.config.root_cleanup_budget(first),
-                    capacity,
-                )
+                // F1: route through the ONE shared `pool_floor_bytes` so the
+                // idle-eject floor matches the gate/watchdog floor exactly. `first`
+                // is the pool's first send-enabled subvol, so it is in `send_enabled`
+                // and the `None` arm is unreachable (0 is the inert fallback).
+                let one = [first.to_string()];
+                storage_signals::pool_floor_bytes(&self.config, &one, &send_enabled, capacity)
+                    .unwrap_or(0)
             },
         );
 

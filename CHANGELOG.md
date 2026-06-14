@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Large, absolutely-roomy pools no longer arm Tight and silently over-thin
+  their retention** (UPI 064-a, issue #202). The tightness tier was free-ratio
+  only, so a 15 TB pool at 20 % free (3 TB of real headroom) armed Tight,
+  collapsed every send-enabled subvolume to retain-one, and — never recovering
+  past the 30 % de-escalation band — stayed Tight permanently, dropping offsite
+  incremental parents on every rotation and forcing TB-scale full re-sends. The
+  tier now applies a one-way **absolute-headroom downgrade gate** ahead of the
+  ratio classifier (ADR-113 amendment): a pool with free bytes above a small
+  multiple of the shared host-survival floor (`min_free + cleanup_budget`) is
+  forced Roomy regardless of ratio. The gate is a provable no-op on small pools
+  (e.g. htpc), which still arm correctly. No config knob, no on-disk migration —
+  a pool persisted `tight` re-resolves `roomy` on the first run.
+
 ## [0.25.2] - 2026-06-11
 
 ### Fixed

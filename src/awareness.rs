@@ -303,15 +303,23 @@ pub struct ResolvedStorageSignal {
 }
 
 impl ResolvedStorageSignal {
-    /// Build a signal, deriving the armed tier from `(prior, free_ratio)` via
-    /// the single hysteresis resolver (`storage_critical::resolve_armed_tier`).
-    /// This is the ONLY constructor: a signal whose stamped `armed_tier`
-    /// disagrees with its inputs cannot exist. Stamped once on the single
-    /// pre-plan gather (`commands/storage_signals`); awareness and the
-    /// planner/executor `armed_tier_map` all read it back, never re-resolve.
+    /// Build a signal, deriving the armed tier from `(prior, free_ratio,
+    /// free_bytes, floor_bytes)` via the single hysteresis+gate resolver
+    /// (`storage_critical::resolve_armed_tier`). This is the ONLY constructor: a
+    /// signal whose stamped `armed_tier` disagrees with its inputs cannot exist.
+    /// Stamped once on the single pre-plan gather (`commands/storage_signals`);
+    /// awareness and the planner/executor `armed_tier_map` all read it back,
+    /// never re-resolve.
+    ///
+    /// `free_bytes`/`floor_bytes` (UPI 064-a) feed the absolute-headroom gate but
+    /// are **not** stored — the struct keeps only the resolved `armed_tier`
+    /// (exactly as before), preserving the "stamped once, read back, never
+    /// re-resolved" invariant.
     #[must_use]
     pub fn resolved(
         free_ratio: Option<f64>,
+        free_bytes: Option<u64>,
+        floor_bytes: Option<u64>,
         host_root: bool,
         prior_armed_tier: crate::storage_critical::TightnessTier,
         prior_since: Option<NaiveDateTime>,
@@ -319,6 +327,8 @@ impl ResolvedStorageSignal {
         let armed_tier = crate::storage_critical::resolve_armed_tier(
             prior_armed_tier,
             free_ratio,
+            free_bytes,
+            floor_bytes,
         );
         Self {
             free_ratio,
@@ -1558,6 +1568,8 @@ source = "/data/sv1"
             "sv1".to_string(),
             ResolvedStorageSignal::resolved(
                 Some(0.20), // < 0.25 → Tight
+                None,
+                None,
                 false,
                 TightnessTier::Roomy,
                 None,
@@ -1584,6 +1596,8 @@ source = "/data/sv1"
             "sv1".to_string(),
             ResolvedStorageSignal::resolved(
                 Some(0.05), // < 0.15 → Critical
+                None,
+                None,
                 true,
                 TightnessTier::Roomy,
                 None,
@@ -1610,6 +1624,8 @@ source = "/data/sv1"
             "sv1".to_string(),
             ResolvedStorageSignal::resolved(
                 Some(0.50), // roomy
+                None,
+                None,
                 true,
                 TightnessTier::Roomy,
                 None,
@@ -1650,6 +1666,8 @@ source = "/data/sv1"
             "sv1".to_string(),
             ResolvedStorageSignal::resolved(
                 Some(0.10),
+                None,
+                None,
                 false,
                 TightnessTier::Roomy,
                 None,
@@ -1679,6 +1697,8 @@ source = "/data/sv1"
             "sv1".to_string(),
             ResolvedStorageSignal::resolved(
                 Some(0.18), // classifies Tight; prior was Roomy
+                None,
+                None,
                 false,
                 TightnessTier::Roomy,
                 None,
@@ -1711,6 +1731,8 @@ source = "/data/sv1"
             "sv1".to_string(),
             ResolvedStorageSignal::resolved(
                 Some(0.28),
+                None,
+                None,
                 false,
                 TightnessTier::Critical,
                 None,
@@ -1749,6 +1771,8 @@ source = "/data/sv1"
             "sv1".to_string(),
             ResolvedStorageSignal::resolved(
                 Some(free_ratio),
+                None,
+                None,
                 false,
                 TightnessTier::Roomy,
                 None,
