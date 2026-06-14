@@ -393,14 +393,13 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
         // else escalate to the blanket. Presence is recomputed fresh from the
         // post-abort FS state via the same shared scope helper the planner uses.
         let away = plan::away_shed_map(&config, &fs_state);
-        let reclaimed = executor
-            .emergency_reclaim_pool(
-                &fire.subvol_names,
-                &away,
-                fire.floor_bytes,
-                || pools::pool_free_bytes(&fire.mountpoint).ok(),
-            )
-            .deleted();
+        let reclaim = executor.emergency_reclaim_pool(
+            &fire.subvol_names,
+            &away,
+            fire.floor_bytes,
+            || pools::pool_free_bytes(&fire.mountpoint).ok(),
+        );
+        let reclaimed = reclaim.deleted();
         log::warn!(
             "Watchdog aborted send on {} ({:?}); reclaimed {reclaimed} snapshot(s), reserve freed: {}",
             fire.pool_label,
@@ -408,8 +407,9 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
             fire.freed_reserve,
         );
         if let Some(ref db) = state_db {
+            let now_ts = chrono::Local::now().naive_local();
             let mut ev = Event::pure(
-                chrono::Local::now().naive_local(),
+                now_ts,
                 EventPayload::WatchdogAbort {
                     pool_label: fire.pool_label.clone(),
                     reason: fire.reason,
@@ -419,11 +419,55 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
             );
             ev.run_id = result.run_id;
             db.record_events_best_effort(&[ev]);
+            // (UPI 064-b B7) record the Tier-1 offsite chains the reclaim broke,
+            // for audit symmetry with the planner-driven away-shed. NO separate
+            // notification — the Critical WatchdogAbort notification already states
+            // the next backup will be a full send (avoid double-notifying).
+            let release_events = build_offsite_release_events(
+                reclaim.releases(),
+                now_ts,
+                result.run_id,
+            );
+            if !release_events.is_empty() {
+                db.record_events_best_effort(&release_events);
+            }
         }
         notify::dispatch(
             &[notify::build_watchdog_abort_notification(&fire.pool_label, reclaimed)],
             &config.notifications,
         );
+    }
+
+    // ── Offsite chains released by the planner-driven away-shed (UPI 064-b) ──
+    // Told-not-silent: every away pin the executor shed at Critical earns an
+    // `OffsiteChainReleased` event row + a `Warning` notification (the data is
+    // safe offsite — only the chain breaks). Best-effort; never blocks a run.
+    let offsite_releases: Vec<_> = result
+        .subvolume_results
+        .iter()
+        .flat_map(|s| &s.offsite_releases)
+        .collect();
+    if !offsite_releases.is_empty() {
+        let now_ts = chrono::Local::now().naive_local();
+        if let Some(ref db) = state_db {
+            let events = build_offsite_release_events(
+                &offsite_releases.iter().map(|r| (*r).clone()).collect::<Vec<_>>(),
+                now_ts,
+                result.run_id,
+            );
+            db.record_events_best_effort(&events);
+        }
+        let notes: Vec<notify::Notification> = offsite_releases
+            .iter()
+            .map(|r| {
+                notify::build_offsite_chain_released_notification(
+                    &r.subvolume,
+                    &r.drive,
+                    &r.parent.to_string(),
+                )
+            })
+            .collect();
+        notify::dispatch(&notes, &config.notifications);
     }
 
     // Read previous heartbeat BEFORE writing the new one (notification comparison).
@@ -475,7 +519,8 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     // from the heartbeat-driven promise notifications below and runs regardless
     // of whether the sentinel is up. Best-effort throughout: never blocks a run.
     if let Some(ref db) = state_db {
-        let escalations = storage_signals::advance_and_writeback(db, heartbeat_now, &resolved);
+        let escalations =
+            storage_signals::advance_and_writeback(db, heartbeat_now, &resolved, result.run_id);
         let notes: Vec<notify::Notification> = escalations
             .iter()
             .map(|e| {
@@ -901,6 +946,34 @@ fn establish_reserves_with(
 
 /// Maps an `OperationOutcome.operation` string back to the short user-facing
 /// label ("full" / "incremental"). Returns `None` for non-send operations.
+/// Build the `OffsiteChainReleased` event rows for a set of released chains
+/// (UPI 064-b), stamping `run_id`, `subvolume`, and `drive_label`. Shared by the
+/// planner-driven away-shed surface and the reactive watchdog/idle-eject path so
+/// the audit row is identical regardless of which actor broke the chain.
+fn build_offsite_release_events(
+    releases: &[crate::executor::OffsiteChainRelease],
+    now_ts: chrono::NaiveDateTime,
+    run_id: Option<i64>,
+) -> Vec<Event> {
+    releases
+        .iter()
+        .map(|r| {
+            let mut ev = Event::pure(
+                now_ts,
+                EventPayload::OffsiteChainReleased {
+                    subvolume: r.subvolume.clone(),
+                    drive: r.drive.clone(),
+                    parent: r.parent.to_string(),
+                },
+            );
+            ev.run_id = run_id;
+            ev.subvolume = Some(r.subvolume.clone());
+            ev.drive_label = Some(r.drive.clone());
+            ev
+        })
+        .collect()
+}
+
 fn send_kind_display(op_name: &str) -> Option<&'static str> {
     if op_name == SendKind::Full.as_db_str() {
         Some("full")
@@ -3004,6 +3077,7 @@ source = "/data/beta"
             send_type,
             pin_failures,
             transient_cleanup: TransientCleanupOutcome::NotApplicable,
+            offsite_releases: Vec::new(),
         }
     }
 

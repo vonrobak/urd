@@ -81,6 +81,12 @@ drive's chain. This is a direct extension of ADR-113's existing catastrophic-flo
   preserved whenever shedding the away pin alone relieves the pressure. A full send is the
   fallback, not the default. The user explicitly tolerates the full-send cost (a full pool
   send takes ~48 h, so preserving chains where possible is high-value).
+  - **Tier boundary (clarified UPI 064-b).** "Critical+" is exact: **Tight holds the away
+    pin** — the `retain-parents` rung keeps every chain's parent (connected *and* away) as a
+    discrete entry, dropping only the retention *history*. Shedding the away pin begins at
+    **Critical**. The pre-064-b code shed the away pin already at Tight (one tier below
+    Critical) and silently — an ADR-116 violation that 064-b corrects. See `plan_local_retention`
+    and `derive_effective_policy.protect_away_pins`.
 
 This **amends UPI 031-b's unconditional Critical clear-all**: clear-all is now
 *presence-conditional*. At Critical with a sheddable away-only pin, Urd retains-one for the

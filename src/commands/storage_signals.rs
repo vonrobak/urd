@@ -21,6 +21,7 @@ use chrono::NaiveDateTime;
 
 use crate::awareness::{ResolvedStorageSignal, StorageSignalMap, SubvolAssessment};
 use crate::config::Config;
+use crate::events::{Event, EventPayload};
 use crate::output::PoolPostureSummary;
 use crate::pools::{self, PoolSpace};
 use crate::state::StateDb;
@@ -351,6 +352,7 @@ pub fn advance_and_writeback(
     state_db: &StateDb,
     now: NaiveDateTime,
     resolved: &ResolvedArmedTiers,
+    run_id: Option<i64>,
 ) -> Vec<PostureEscalation> {
     let mut escalations = Vec::new();
     for pool in &resolved.pools {
@@ -365,14 +367,32 @@ pub fn advance_and_writeback(
         };
         state_db.upsert_armed_tier_best_effort(uuid, new, since);
 
-        if let Some(transition) = storage_critical::transition(pool.prior_armed_tier, new)
-            && transition.is_escalation()
-        {
-            escalations.push(PostureEscalation {
-                pool_label: pool.label.clone(),
-                host_root: pool.host_root,
-                transition,
-            });
+        if let Some(transition) = storage_critical::transition(pool.prior_armed_tier, new) {
+            // (F6, UPI 064-b) Record EVERY transition — escalation AND
+            // de-escalation — for a complete `urd events` audit (closing the #202
+            // gap where transitions notified but wrote no row). This is a strict
+            // superset of the escalation-only NOTIFICATIONS below and does NOT
+            // violate "de-escalation is silent": that rule governs notifications,
+            // not the audit log.
+            let mut ev = Event::pure(
+                now,
+                EventPayload::StorageTierTransition {
+                    pool_label: pool.label.clone(),
+                    from: transition.from.as_db_str().to_string(),
+                    to: transition.to.as_db_str().to_string(),
+                    host_root: pool.host_root,
+                },
+            );
+            ev.run_id = run_id;
+            state_db.record_events_best_effort(&[ev]);
+
+            if transition.is_escalation() {
+                escalations.push(PostureEscalation {
+                    pool_label: pool.label.clone(),
+                    host_root: pool.host_root,
+                    transition,
+                });
+            }
         }
     }
     escalations
@@ -572,7 +592,7 @@ source = "/"
         let signals =
             gather_with(&cfg(), &HashMap::new(), Some("root-uuid"), resolver, space_tight);
 
-        let transitions = advance_and_writeback(&db, now, &resolve_armed_tiers(&signals));
+        let transitions = advance_and_writeback(&db, now, &resolve_armed_tiers(&signals), None);
         // Both pools start Roomy; data escalates to Tight, root stays Roomy.
         assert_eq!(transitions.len(), 1);
         assert_eq!(transitions[0].pool_label, "/data");
@@ -584,6 +604,31 @@ source = "/"
         assert_eq!(stored.map(|(t, _)| t), Some(TightnessTier::Tight));
         // `since` was set to `now` (tier changed).
         assert_eq!(stored.map(|(_, s)| s), Some(now));
+
+        // (UPI 064-b) The escalation also writes a queryable `storage` row.
+        let rows = storage_rows(&db);
+        assert_eq!(rows.len(), 1, "one StorageTierTransition row for the escalation");
+        assert_eq!(rows[0].severity(), crate::events::Severity::Notice);
+        assert!(matches!(
+            &rows[0],
+            EventPayload::StorageTierTransition { from, to, .. }
+                if from == "roomy" && to == "tight"
+        ));
+    }
+
+    /// Query the `StorageTierTransition` payloads recorded in `db` (UPI 064-b).
+    fn storage_rows(db: &StateDb) -> Vec<EventPayload> {
+        db.query_events(&crate::state::EventQueryFilter {
+            since: None,
+            kind: Some(crate::events::EventKind::Storage),
+            subvolume: None,
+            drive_label: None,
+            limit: 100,
+        })
+        .unwrap()
+        .into_iter()
+        .map(|r| r.payload)
+        .collect()
     }
 
     #[test]
@@ -597,10 +642,12 @@ source = "/"
             gather_with(&cfg(), &prior, Some("root-uuid"), resolver, space_tight);
         let now = dt("2026-05-30T04:00:00");
 
-        let transitions = advance_and_writeback(&db, now, &resolve_armed_tiers(&signals));
+        let transitions = advance_and_writeback(&db, now, &resolve_armed_tiers(&signals), None);
         assert!(transitions.is_empty()); // no escalation on steady state
         let stored = db.all_armed_tiers().unwrap().get("data-uuid").copied();
         assert_eq!(stored, Some((TightnessTier::Tight, prior_since)));
+        // (UPI 064-b) Steady state = no transition = no `storage` row.
+        assert!(storage_rows(&db).is_empty(), "steady state writes no audit row");
     }
 
     #[test]
@@ -616,12 +663,22 @@ source = "/"
             gather_with(&cfg(), &prior, Some("root-uuid"), resolver, space_full);
         let now = dt("2026-05-30T04:00:00");
 
-        let escalations = advance_and_writeback(&db, now, &resolve_armed_tiers(&signals));
+        let escalations = advance_and_writeback(&db, now, &resolve_armed_tiers(&signals), None);
         // De-escalation is silent — no notification.
         assert!(escalations.is_empty());
         // But the recovery IS persisted, with `since` advanced to now.
         let stored = db.all_armed_tiers().unwrap().get("data-uuid").copied();
         assert_eq!(stored, Some((TightnessTier::Roomy, now)));
+        // (UPI 064-b, F6) De-escalation is silent in NOTIFICATIONS but STILL
+        // writes an audit row (Info severity) — the complete-audit superset.
+        let rows = storage_rows(&db);
+        assert_eq!(rows.len(), 1, "de-escalation writes an audit row");
+        assert_eq!(rows[0].severity(), crate::events::Severity::Info);
+        assert!(matches!(
+            &rows[0],
+            EventPayload::StorageTierTransition { from, to, .. }
+                if from == "critical" && to == "roomy"
+        ));
     }
 
     #[test]
@@ -637,7 +694,7 @@ source = "/"
             space_tight,
         );
         let transitions =
-            advance_and_writeback(&db, dt("2026-05-30T04:00:00"), &resolve_armed_tiers(&signals));
+            advance_and_writeback(&db, dt("2026-05-30T04:00:00"), &resolve_armed_tiers(&signals), None);
         assert!(transitions.is_empty());
         // Nothing written.
         assert!(db.all_armed_tiers().unwrap().is_empty());
@@ -745,7 +802,7 @@ source = "/"
             .unwrap();
         assert_eq!(data.new_tier, TightnessTier::Critical);
 
-        let _ = advance_and_writeback(&db, now, &resolved);
+        let _ = advance_and_writeback(&db, now, &resolved, None);
         let stored = db.all_armed_tiers().unwrap().get("data-uuid").copied();
         assert_eq!(stored.map(|(t, _)| t), Some(TightnessTier::Critical));
     }

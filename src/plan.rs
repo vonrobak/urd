@@ -828,20 +828,33 @@ fn plan_local_retention(
         return;
     }
 
-    // Protect unsent snapshots from retention deletion.
-    // For transient subvolumes, only consider pins from mounted drives —
-    // absent drives can't receive sends, and protecting their pins indefinitely
-    // causes space exhaustion on constrained filesystems.
-    // For graduated subvolumes, protect ALL pins (conservative default).
+    // Protect unsent snapshots from retention deletion. The DISCRETE protected
+    // pin set and the UNSENT-expansion anchor are chosen independently (UPI
+    // 064-b retain-parents):
+    //   - Discrete set (transient): `pinned` (every chain's parent, connected +
+    //     away — the `retain-parents` rung) when `eff.protect_away_pins`, else
+    //     `mounted_pins` (retain-one, connected only — Critical sheds the away
+    //     pin). Graduated keeps `pinned` (conservative default).
+    //   - Unsent anchor (transient): the oldest *mounted* pin — never an old away
+    //     pin, which would protect the whole daily history (the grill's
+    //     {20260514, 20260613, 20260614} example: anchoring on the away 0514
+    //     would keep all ~30 dailies; anchoring on the connected 0613 keeps only
+    //     the 3-set while still holding 0514 as a discrete parent). Graduated
+    //     anchors on the oldest of its protected set (unchanged).
     let protected = if subvol.send_enabled {
-        let effective_pinned = if eff.local_retention.is_transient() {
-            mounted_pins.clone()
-        } else {
-            pinned.clone()
-        };
-        let oldest_pin = effective_pinned.iter().min();
-        let mut expanded = effective_pinned.clone();
-        match oldest_pin {
+        let (discrete, unsent_anchor): (HashSet<SnapshotName>, Option<&SnapshotName>) =
+            if eff.local_retention.is_transient() {
+                let discrete = if eff.protect_away_pins {
+                    pinned.clone()
+                } else {
+                    mounted_pins.clone()
+                };
+                (discrete, mounted_pins.iter().min())
+            } else {
+                (pinned.clone(), pinned.iter().min())
+            };
+        let mut expanded = discrete;
+        match unsent_anchor {
             Some(oldest) => {
                 for snap in local_snaps {
                     if snap > oldest {
@@ -850,8 +863,10 @@ fn plan_local_retention(
                 }
             }
             None if eff.local_retention.is_transient() => {
-                // Transient + no mounted pins = nothing to protect.
-                // Full sends when drives return.
+                // Transient + no mounted pin = no unsent expansion. At
+                // retain-parents the discrete away pins are ALREADY in the
+                // protected set even when no drive is mounted (the held-offsite
+                // fix); the None anchor merely means "no unsent expansion."
             }
             None => {
                 // Non-transient: no pins at all — nothing has ever been sent.
@@ -1949,6 +1964,7 @@ impl HistoryQuery for MockFileSystemState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage_critical::TightnessTier;
     use crate::btrfs::MockBtrfs;
     use chrono::NaiveDate;
 
@@ -2922,6 +2938,22 @@ send_enabled = false
                     PlannedOperation::CreateSnapshot { subvolume_name, .. } if subvolume_name == "sv1")
             })
             .count()
+    }
+
+    /// The file names of `sv1`'s planned snapshot deletions (UPI 064-b helper).
+    fn sv1_delete_names(result: &BackupPlan) -> Vec<String> {
+        result
+            .operations
+            .iter()
+            .filter_map(|op| match op {
+                PlannedOperation::DeleteSnapshot { subvolume_name, path, .. }
+                    if subvolume_name == "sv1" =>
+                {
+                    Some(path.file_name().unwrap().to_string_lossy().to_string())
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     #[test]
@@ -4152,6 +4184,65 @@ local_retention = "transient"
         toml::from_str(toml_str).unwrap()
     }
 
+    /// Like `transient_multi_drive_config` but with a third offsite drive (D3),
+    /// for the multi-away-pin retain-parents scenario (UPI 064-b F4).
+    fn transient_three_drive_config() -> Config {
+        let toml_str = r#"
+[general]
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp"
+
+[local_snapshots]
+roots = [
+  { path = "/snap", subvolumes = ["sv1"] }
+]
+
+[defaults]
+snapshot_interval = "1h"
+send_interval = "4h"
+send_enabled = true
+enabled = true
+
+[defaults.local_retention]
+hourly = 24
+daily = 30
+weekly = 26
+monthly = 12
+
+[defaults.external_retention]
+daily = 30
+weekly = 26
+monthly = 0
+
+[[drives]]
+label = "D1"
+mount_path = "/mnt/d1"
+snapshot_root = ".snapshots"
+role = "primary"
+
+[[drives]]
+label = "D2"
+mount_path = "/mnt/d2"
+snapshot_root = ".snapshots"
+role = "offsite"
+
+[[drives]]
+label = "D3"
+mount_path = "/mnt/d3"
+snapshot_root = ".snapshots"
+role = "offsite"
+
+[[subvolumes]]
+name = "sv1"
+short_name = "one"
+source = "/data/sv1"
+priority = 1
+local_retention = "transient"
+"#;
+        toml::from_str(toml_str).unwrap()
+    }
+
     #[test]
     fn transient_multi_drive_pins_at_different_snapshots() {
         // D1 pin advanced to newest, D2 pin still at older snapshot.
@@ -4268,19 +4359,22 @@ local_retention = "transient"
     }
 
     #[test]
-    fn transient_absent_drive_pins_not_protected() {
-        // D1 mounted (pin at newest), D2 absent (pin at oldest).
-        // Only D1's pin should be in the mounted set.
-        // Snapshots older than D1's pin should be deleted.
+    fn transient_absent_drive_pin_held_at_tight_retain_parents() {
+        // UPI 064-b retain-parents (was `transient_absent_drive_pins_not_protected`,
+        // which asserted the pre-064-b retain-one shed). D1 mounted (connected pin
+        // at newest), D2 absent (away pin at oldest). At Tight, the away pin is now
+        // HELD opportunistically (ADR-116): protected = {away pin, connected pin,
+        // unsent newer than the connected frontier}; the daily between the away and
+        // connected pins is dropped. The away parent is shed only at Critical.
         let config = transient_multi_drive_config();
         let mut fs = MockFileSystemState::new();
         fs.local_snapshots.insert(
             "sv1".to_string(),
             vec![
-                snap("20260319-1000-one"),
-                snap("20260320-1000-one"), // D2's pin (absent)
-                snap("20260321-1000-one"),
-                snap("20260322-1400-one"), // D1's pin (mounted)
+                snap("20260319-1000-one"), // pre-everything → deletable
+                snap("20260320-1000-one"), // D2's away pin → HELD (retain-parents)
+                snap("20260321-1000-one"), // between pins, not unsent → deletable
+                snap("20260322-1400-one"), // D1's connected pin → held
             ],
         );
         fs.pin_files.insert(
@@ -4291,70 +4385,240 @@ local_retention = "transient"
             (PathBuf::from("/snap/sv1"), "D2".to_string()),
             snap("20260320-1000-one"),
         );
-        // Only D1 mounted
+        // Only D1 mounted; D2 away.
         fs.mounted_drives.insert("D1".to_string());
         fs.external_snapshots.insert(
             ("D1".to_string(), "sv1".to_string()),
             vec![snap("20260322-1400-one")],
         );
 
-        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
-        let deletes: Vec<_> = result
-            .operations
-            .iter()
-            .filter_map(|op| match op {
-                PlannedOperation::DeleteSnapshot {
-                    subvolume_name,
-                    path,
-                    ..
-                } if subvolume_name == "sv1" => {
-                    Some(path.file_name().unwrap().to_string_lossy().to_string())
-                }
-                _ => None,
-            })
-            .collect();
+        let mut armed = ArmedTierMap::new();
+        armed.insert("sv1".to_string(), TightnessTier::Tight);
+        let deletes = sv1_delete_names(&plan(
+            &config,
+            now(),
+            &PlanFilters::default(),
+            &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() },
+            &armed,
+        )
+        .unwrap());
 
-        // D2's pin is ignored (absent). D1's pin at 20260322-1400 is the only pin.
-        // Everything older than D1's pin is deletable.
-        assert_eq!(deletes.len(), 3, "3 snapshots older than D1's pin should be deleted: {deletes:?}");
+        assert_eq!(deletes.len(), 2, "only pre-pin + between-pins drop: {deletes:?}");
+        assert!(
+            !deletes.iter().any(|d| d.contains("20260320")),
+            "the away (D2) pin must be HELD at Tight, not shed: {deletes:?}",
+        );
+        assert!(deletes.iter().any(|d| d.contains("20260319")));
+        assert!(deletes.iter().any(|d| d.contains("20260321")));
     }
 
     #[test]
-    fn transient_no_mounted_drives_all_deletable() {
+    fn transient_absent_drive_pin_shed_at_critical() {
+        // The Critical shed path (preserves the pre-064-b guarantee at the RIGHT
+        // tier). Same fixture as the Tight test, but armed Critical → retain-one:
+        // the away (D2) pin is no longer protected; only the connected (D1) pin
+        // and unsent survive, so the away parent IS planned for deletion (the
+        // executor's away-shed removes the pin file before this delete).
+        let config = transient_multi_drive_config();
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots.insert(
+            "sv1".to_string(),
+            vec![
+                snap("20260319-1000-one"),
+                snap("20260320-1000-one"), // D2's away pin → SHED at Critical
+                snap("20260321-1000-one"),
+                snap("20260322-1400-one"), // D1's connected pin → held
+            ],
+        );
+        fs.pin_files.insert(
+            (PathBuf::from("/snap/sv1"), "D1".to_string()),
+            snap("20260322-1400-one"),
+        );
+        fs.pin_files.insert(
+            (PathBuf::from("/snap/sv1"), "D2".to_string()),
+            snap("20260320-1000-one"),
+        );
+        fs.mounted_drives.insert("D1".to_string());
+        fs.external_snapshots.insert(
+            ("D1".to_string(), "sv1".to_string()),
+            vec![snap("20260322-1400-one")],
+        );
+
+        let mut armed = ArmedTierMap::new();
+        armed.insert("sv1".to_string(), TightnessTier::Critical);
+        let deletes = sv1_delete_names(&plan(
+            &config,
+            now(),
+            &PlanFilters::default(),
+            &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() },
+            &armed,
+        )
+        .unwrap());
+
+        assert!(
+            deletes.iter().any(|d| d.contains("20260320")),
+            "at Critical the away (D2) pin IS shed (retain-one): {deletes:?}",
+        );
+    }
+
+    #[test]
+    fn transient_no_mounted_drive_holds_away_pin_at_tight() {
+        // UPI 064-b (was `transient_no_mounted_drives_all_deletable`). A single
+        // away drive's pin, no drive mounted: at Tight the away parent is HELD
+        // (held-offsite fix) and only the rest is deleted — the None unsent-anchor
+        // means "no unsent expansion," not "shed the away pin."
         let config = transient_config();
         let mut fs = MockFileSystemState::new();
         fs.local_snapshots.insert(
             "sv1".to_string(),
             vec![
-                snap("20260320-1000-one"),
+                snap("20260320-1000-one"), // D1's away pin → HELD
                 snap("20260321-1000-one"),
                 snap("20260322-1000-one"),
             ],
         );
-        // Pin exists but drive is NOT mounted
         fs.pin_files.insert(
             (PathBuf::from("/snap/sv1"), "D1".to_string()),
             snap("20260320-1000-one"),
         );
+        // D1 NOT mounted (away).
 
-        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
-        let deletes: Vec<_> = result
-            .operations
-            .iter()
-            .filter(|op| {
-                matches!(
-                    op,
-                    PlannedOperation::DeleteSnapshot {
-                        subvolume_name,
-                        ..
-                    } if subvolume_name == "sv1"
-                )
-            })
-            .collect();
+        let mut armed = ArmedTierMap::new();
+        armed.insert("sv1".to_string(), TightnessTier::Tight);
+        let deletes = sv1_delete_names(&plan(
+            &config,
+            now(),
+            &PlanFilters::default(),
+            &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() },
+            &armed,
+        )
+        .unwrap());
 
-        // No mounted drives → mounted_pins is empty → nothing protected.
-        // The transient skip guard skips snapshot creation but still runs retention.
-        assert_eq!(deletes.len(), 3, "all snapshots deletable when no drives mounted");
+        assert_eq!(deletes.len(), 2, "away parent held; rest deleted: {deletes:?}");
+        assert!(
+            !deletes.iter().any(|d| d.contains("20260320")),
+            "the away pin must be HELD even with no mounted drive: {deletes:?}",
+        );
+    }
+
+    #[test]
+    fn transient_retain_parents_field_scenario_bounds_footprint() {
+        // The exact incident shape + the naive-swap bug guard (grill finding). An
+        // away pin (oldest), a connected pin, and a dense daily history between
+        // them. retain-parents must keep ONLY {away pin, connected pin, snaps newer
+        // than the connected frontier}, NOT the whole history. A naive
+        // mounted_pins→pinned swap would anchor the unsent expansion on the OLD
+        // away pin and protect every daily newer than it (the bug). Dates kept ≤
+        // now() (2026-03-22) to match the harness convention.
+        let config = transient_multi_drive_config();
+        let mut fs = MockFileSystemState::new();
+        let mut history = vec![
+            snap("20260301-1000-one"), // D2 away pin (oldest)
+            snap("20260320-1000-one"), // D1 connected pin
+            snap("20260321-1000-one"), // unsent (newer than connected frontier)
+        ];
+        // A dense daily history BETWEEN the away pin and the connected pin — the
+        // bulk the naive swap would wrongly protect (18 dailies, 0302…0319).
+        for day in 2..=19 {
+            history.push(snap(&format!("202603{day:02}-1000-one")));
+        }
+        fs.local_snapshots.insert("sv1".to_string(), history);
+        fs.pin_files.insert(
+            (PathBuf::from("/snap/sv1"), "D1".to_string()),
+            snap("20260320-1000-one"),
+        );
+        fs.pin_files.insert(
+            (PathBuf::from("/snap/sv1"), "D2".to_string()),
+            snap("20260301-1000-one"),
+        );
+        fs.mounted_drives.insert("D1".to_string()); // D2 away
+        fs.external_snapshots.insert(
+            ("D1".to_string(), "sv1".to_string()),
+            vec![snap("20260320-1000-one")],
+        );
+
+        let mut armed = ArmedTierMap::new();
+        armed.insert("sv1".to_string(), TightnessTier::Tight);
+        let deletes = sv1_delete_names(&plan(
+            &config,
+            now(),
+            &PlanFilters::default(),
+            &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() },
+            &armed,
+        )
+        .unwrap());
+
+        // Protected = {20260301 away, 20260320 connected, 20260321 unsent} = 3.
+        // The ~18 mid dailies are deleted.
+        assert!(
+            !deletes.iter().any(|d| d.contains("20260301")),
+            "the away parent must be held: {deletes:?}",
+        );
+        assert!(!deletes.iter().any(|d| d.contains("20260320")), "connected pin held");
+        assert!(!deletes.iter().any(|d| d.contains("20260321")), "unsent held");
+        // The footprint is the 3-set, so the mid-history IS pruned (a naive swap
+        // would prune ~none of it). A representative mid-daily must be dropped.
+        assert!(
+            deletes.iter().any(|d| d.contains("20260310")),
+            "mid-history between away and connected pins must be pruned: {deletes:?}",
+        );
+        assert!(deletes.len() >= 15, "the daily history is bounded, not held: {deletes:?}");
+    }
+
+    #[test]
+    fn transient_retain_parents_holds_every_away_drive_pin() {
+        // (F4) TWO away-only pins (20260301, 20260310) + a connected pin
+        // (20260320). retain-parents holds BOTH away parents + the connected pin +
+        // unsent, anchored on the CONNECTED frontier (not the oldest away pin), so
+        // the footprint stays bounded even with multiple offsite drives. Needs a
+        // third drive — D1 (connected) + D2, D3 (away).
+        let config = transient_three_drive_config();
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots.insert(
+            "sv1".to_string(),
+            vec![
+                snap("20260301-1000-one"), // D3 away pin
+                snap("20260310-1000-one"), // D2 away pin
+                snap("20260315-1000-one"), // mid daily → deletable
+                snap("20260320-1000-one"), // D1 connected pin
+                snap("20260321-1000-one"), // unsent
+            ],
+        );
+        fs.pin_files.insert(
+            (PathBuf::from("/snap/sv1"), "D1".to_string()),
+            snap("20260320-1000-one"),
+        );
+        fs.pin_files.insert(
+            (PathBuf::from("/snap/sv1"), "D2".to_string()),
+            snap("20260310-1000-one"),
+        );
+        fs.pin_files.insert(
+            (PathBuf::from("/snap/sv1"), "D3".to_string()),
+            snap("20260301-1000-one"),
+        );
+        fs.mounted_drives.insert("D1".to_string()); // D2, D3 away
+        fs.external_snapshots.insert(
+            ("D1".to_string(), "sv1".to_string()),
+            vec![snap("20260320-1000-one")],
+        );
+
+        let mut armed = ArmedTierMap::new();
+        armed.insert("sv1".to_string(), TightnessTier::Tight);
+        let deletes = sv1_delete_names(&plan(
+            &config,
+            now(),
+            &PlanFilters::default(),
+            &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() },
+            &armed,
+        )
+        .unwrap());
+
+        // Both away parents held; the mid daily (newer than the oldest away pin
+        // but older than the connected frontier) is the ONLY drop.
+        assert!(!deletes.iter().any(|d| d.contains("20260301")), "first away parent held");
+        assert!(!deletes.iter().any(|d| d.contains("20260310")), "second away parent held");
+        assert_eq!(deletes.len(), 1, "only the mid daily drops (anchored on connected): {deletes:?}");
+        assert!(deletes[0].contains("20260315"), "the mid daily is the drop: {deletes:?}");
     }
 
     #[test]

@@ -180,6 +180,36 @@ fn summary_for(payload: &EventPayload) -> String {
                 ByteSize(*floor_bytes),
             )
         }
+        EventPayload::OffsiteChainReleased {
+            subvolume,
+            drive,
+            parent,
+        } => {
+            // Reuses 056's thread / worn-thin vocabulary. The data endures
+            // offsite; only the incremental chain breaks (next return is full).
+            format!(
+                "offsite thread to {drive} worn thin — {subvolume} needs a full \
+                 re-send on its next return  (was {parent})"
+            )
+        }
+        EventPayload::StorageTierTransition {
+            pool_label,
+            from,
+            to,
+            host_root,
+        } => {
+            // Escalation tightens; de-escalation eases (direction by tier order).
+            let escalated = matches!(
+                (
+                    crate::storage_critical::TightnessTier::from_db_str(from),
+                    crate::storage_critical::TightnessTier::from_db_str(to),
+                ),
+                (Some(f), Some(t)) if t > f
+            );
+            let verb = if escalated { "tightened" } else { "eased" };
+            let host = if *host_root { ", host-root" } else { "" };
+            format!("{pool_label} {verb}  ({from} → {to}{host})")
+        }
     }
 }
 
@@ -467,6 +497,56 @@ mod tests {
         assert!(rendered.contains("severed 2 thread(s) on /data"));
         assert!(rendered.contains("free"));
         assert!(rendered.contains("floor"));
+    }
+
+    #[test]
+    fn render_offsite_chain_released_uses_worn_thin_thread_vocabulary() {
+        let _color = setup();
+        let row = make_row(
+            EventPayload::OffsiteChainReleased {
+                subvolume: "subvol3-opptak".into(),
+                drive: "WD-18TB1".into(),
+                parent: "20260514-1000-opptak".into(),
+            },
+            None,
+            Some("WD-18TB1"),
+        );
+        let rendered = format_row(&row);
+        assert!(rendered.contains("offsite thread to WD-18TB1 worn thin"));
+        assert!(rendered.contains("subvol3-opptak"));
+        assert!(rendered.contains("full"));
+    }
+
+    #[test]
+    fn render_storage_tier_transition_direction() {
+        let _color = setup();
+        let up = make_row(
+            EventPayload::StorageTierTransition {
+                pool_label: "/mnt".into(),
+                from: "tight".into(),
+                to: "critical".into(),
+                host_root: false,
+            },
+            None,
+            None,
+        );
+        let up_rendered = format_row(&up);
+        assert!(up_rendered.contains("/mnt tightened"));
+        assert!(up_rendered.contains("tight → critical"));
+
+        let down = make_row(
+            EventPayload::StorageTierTransition {
+                pool_label: "/mnt".into(),
+                from: "tight".into(),
+                to: "roomy".into(),
+                host_root: true,
+            },
+            None,
+            None,
+        );
+        let down_rendered = format_row(&down);
+        assert!(down_rendered.contains("/mnt eased"));
+        assert!(down_rendered.contains("host-root"));
     }
 
     #[test]

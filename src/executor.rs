@@ -104,6 +104,22 @@ pub struct SubvolumeResult {
     pub pin_failures: u32,
     /// Outcome of post-send transient cleanup (immediate old-parent deletion).
     pub transient_cleanup: TransientCleanupOutcome,
+    /// Offsite incremental chains released this run by the planner-driven
+    /// away-shed (UPI 064-b): one per *present drive-specific* away pin actually
+    /// removed at Critical. The caller (`commands/backup`) records an
+    /// `OffsiteChainReleased` event + a notification per entry (told-not-silent).
+    pub offsite_releases: Vec<OffsiteChainRelease>,
+}
+
+/// One offsite incremental chain released under Critical pressure (UPI 064-b).
+/// Carries everything the `OffsiteChainReleased` event/notification need without
+/// re-reading the (now-removed) pin file. Emitted only for a *present
+/// drive-specific* pin actually removed — never a phantom (F3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OffsiteChainRelease {
+    pub subvolume: String,
+    pub drive: String,
+    pub parent: SnapshotName,
 }
 
 /// Outcome of post-send transient cleanup (immediate deletion of old pin parent).
@@ -132,13 +148,23 @@ pub enum TransientCleanupOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReclaimOutcome {
     /// Local snapshots on the triggering pool were deleted to free space.
-    Reclaimed { deleted: u32 },
+    /// `releases` carries the **Tier-1** offsite chains broken (UPI 064-b) — the
+    /// away-only pins shed before the blanket; Tier-2 (connected-chain) breaks are
+    /// NOT carried (surfaced by the host-survival event only).
+    Reclaimed {
+        deleted: u32,
+        releases: Vec<OffsiteChainRelease>,
+    },
     /// Nothing to reclaim (no local snapshots present, or every subvol's pin
     /// removal was refused).
     Nothing,
     /// At least one deletion failed; carries how many succeeded and the first
     /// error (ADR-100 isolation — the reclaim continues through failures).
-    Failed { deleted: u32, first_error: String },
+    Failed {
+        deleted: u32,
+        first_error: String,
+        releases: Vec<OffsiteChainRelease>,
+    },
 }
 
 impl ReclaimOutcome {
@@ -146,10 +172,20 @@ impl ReclaimOutcome {
     #[must_use]
     pub fn deleted(&self) -> u32 {
         match self {
-            ReclaimOutcome::Reclaimed { deleted } | ReclaimOutcome::Failed { deleted, .. } => {
-                *deleted
-            }
+            ReclaimOutcome::Reclaimed { deleted, .. }
+            | ReclaimOutcome::Failed { deleted, .. } => *deleted,
             ReclaimOutcome::Nothing => 0,
+        }
+    }
+
+    /// The Tier-1 offsite chains released by this reclaim (UPI 064-b). The
+    /// caller records an `OffsiteChainReleased` event per entry (told-not-silent).
+    #[must_use]
+    pub fn releases(&self) -> &[OffsiteChainRelease] {
+        match self {
+            ReclaimOutcome::Reclaimed { releases, .. }
+            | ReclaimOutcome::Failed { releases, .. } => releases,
+            ReclaimOutcome::Nothing => &[],
         }
     }
 }
@@ -472,16 +508,38 @@ impl<'a> Executor<'a> {
         // footprint suboptimality). A *persistent* `remove_pin_file` failure is
         // pre-existing (031-b clear-all + emergency reclaim both depend on it) —
         // out of 058's scope.
+        // Offsite chains released this run (UPI 064-b told-not-silent). Populated
+        // ONLY for a present drive-specific away pin actually removed (F3).
+        let mut offsite_releases: Vec<OffsiteChainRelease> = Vec::new();
         if !context.shed_away_drives.is_empty()
             && let Some(local_dir) = self.config.local_snapshot_dir(subvol_name)
         {
             for drive_label in &context.shed_away_drives {
-                if let Err(e) = chain::remove_pin_file(&local_dir, drive_label) {
-                    log::warn!(
-                        "UPI 058 away-shed for {subvol_name}: pin removal failed for \
-                         {drive_label}: {e} — holding the away snapshot (fail-closed); \
-                         next run retries",
-                    );
+                // (F3) Read the pin BEFORE removal: emit only for a *present
+                // drive-specific* pin. A `NotFound`→`Ok` remove or a legacy pin
+                // (which `remove_pin_file` does not actually delete) would make the
+                // event a phantom — this is an honesty surface, so guard it.
+                let present_drive_pin = match chain::read_pin_file(&local_dir, drive_label) {
+                    Ok(Some(p)) if p.source == chain::PinSource::DriveSpecific => Some(p.name),
+                    _ => None,
+                };
+                match chain::remove_pin_file(&local_dir, drive_label) {
+                    Ok(()) => {
+                        if let Some(parent) = present_drive_pin {
+                            offsite_releases.push(OffsiteChainRelease {
+                                subvolume: subvol_name.to_string(),
+                                drive: drive_label.clone(),
+                                parent,
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "UPI 058 away-shed for {subvol_name}: pin removal failed for \
+                             {drive_label}: {e} — holding the away snapshot (fail-closed); \
+                             next run retries",
+                        );
+                    }
                 }
             }
         }
@@ -645,6 +703,7 @@ impl<'a> Executor<'a> {
             send_type,
             pin_failures,
             transient_cleanup,
+            offsite_releases,
         }
     }
 
@@ -1496,6 +1555,7 @@ impl<'a> Executor<'a> {
 
         // ── Tier 1: graceful, away-only pins ───────────────────────────
         let mut tier1_roots: HashSet<PathBuf> = HashSet::new();
+        let mut tier1_releases: Vec<OffsiteChainRelease> = Vec::new();
         let mut shed_any_away = false;
         for name in subvol_names {
             let away = away_sheddable.get(name).map(Vec::as_slice).unwrap_or(&[]);
@@ -1506,7 +1566,7 @@ impl<'a> Executor<'a> {
                 continue;
             };
             shed_any_away = true;
-            let (d, e, root) =
+            let (d, e, root, rels) =
                 self.shed_and_delete_unpinned(name, &local_dir, &drive_labels, away);
             deleted += d;
             if first_error.is_none() {
@@ -1515,6 +1575,9 @@ impl<'a> Executor<'a> {
             if let Some(r) = root {
                 tier1_roots.insert(r);
             }
+            // (UPI 064-b) only Tier-1 (away-only) releases are surfaced; Tier-2's
+            // connected-chain breaks are not (the host-survival event covers them).
+            tier1_releases.extend(rels);
         }
         // Commit Tier 1's freed space promptly (T4: btrfs async-cleaner lag).
         for root in &tier1_roots {
@@ -1533,7 +1596,7 @@ impl<'a> Executor<'a> {
         let tier1_sufficient =
             shed_any_away && matches!(measure_free(), Some(free) if free >= floor_bytes);
         if tier1_sufficient {
-            return Self::reclaim_outcome(deleted, first_error);
+            return Self::reclaim_outcome(deleted, first_error, tier1_releases);
         }
 
         // ── Tier 2: blanket (every pin) ────────────────────────────────
@@ -1542,7 +1605,9 @@ impl<'a> Executor<'a> {
             let Some(local_dir) = self.config.local_snapshot_dir(name) else {
                 continue;
             };
-            let (d, e, root) =
+            // Tier 2 is the blanket connected-chain break — its releases are NOT
+            // surfaced as OffsiteChainReleased (the host-survival event covers it).
+            let (d, e, root, _tier2_releases) =
                 self.shed_and_delete_unpinned(name, &local_dir, &drive_labels, &drive_labels);
             deleted += d;
             if first_error.is_none() {
@@ -1561,7 +1626,7 @@ impl<'a> Executor<'a> {
             }
         }
 
-        Self::reclaim_outcome(deleted, first_error)
+        Self::reclaim_outcome(deleted, first_error, tier1_releases)
     }
 
     /// Shed a chosen subset of a subvolume's pins, then delete the now-unpinned
@@ -1569,7 +1634,8 @@ impl<'a> Executor<'a> {
     /// [`Self::emergency_reclaim_pool`] (UPI 058). Tier 1 passes the away-only
     /// pins; Tier 2 passes every drive label. Preserves the never-the-only-copy
     /// gate and the fail-closed re-read in **both**. Returns
-    /// `(deleted, first_error, root_to_sync)`; the caller batches the sync.
+    /// `(deleted, first_error, root_to_sync, releases)`; the caller batches the
+    /// sync and decides which releases to surface (Tier 1 only — UPI 064-b).
     /// `emergency_retention` is deliberately NOT reused — it *keeps* `latest` and
     /// `pinned`, i.e. exactly the snapshot + pin we must shed.
     fn shed_and_delete_unpinned(
@@ -1578,7 +1644,7 @@ impl<'a> Executor<'a> {
         local_dir: &Path,
         drive_labels: &[String],
         pins_to_remove: &[String],
-    ) -> (u32, Option<String>, Option<PathBuf>) {
+    ) -> (u32, Option<String>, Option<PathBuf>, Vec<OffsiteChainRelease>) {
         // (0) Never-the-only-copy gate — a subvol with NO pin has never had a
         // send confirmed offsite, so its local snapshots are its sole stored
         // backup; clearing them is forbidden even at the catastrophic floor
@@ -1589,21 +1655,35 @@ impl<'a> Executor<'a> {
                 "Emergency reclaim: {name} has no confirmed offsite copy (no pin) \
                  — preserving its local snapshots (never delete the only copy)",
             );
-            return (0, None, None);
+            return (0, None, None, Vec::new());
         }
         if pins_to_remove.is_empty() {
-            return (0, None, None);
+            return (0, None, None, Vec::new());
         }
 
         // (1) Drop the chosen pins FIRST (031-b ordering). If any removal fails,
         // refuse THIS subvol's deletions this pass — never a half-cleared state.
+        // (UPI 064-b F3) capture each present drive-specific pin's parent BEFORE
+        // removal so a released chain is recorded honestly (never a phantom).
+        let mut releases: Vec<OffsiteChainRelease> = Vec::new();
         for label in pins_to_remove {
+            let drive_pin = match chain::read_pin_file(local_dir, label) {
+                Ok(Some(p)) if p.source == chain::PinSource::DriveSpecific => Some(p.name),
+                _ => None,
+            };
             if let Err(e) = chain::remove_pin_file(local_dir, label) {
                 log::warn!(
                     "Emergency reclaim for {name}: pin removal failed for {label}: {e} \
                      — refusing this subvol's deletions this pass",
                 );
-                return (0, None, None);
+                return (0, None, None, Vec::new());
+            }
+            if let Some(parent) = drive_pin {
+                releases.push(OffsiteChainRelease {
+                    subvolume: name.to_string(),
+                    drive: label.clone(),
+                    parent,
+                });
             }
         }
 
@@ -1621,7 +1701,7 @@ impl<'a> Executor<'a> {
                     "Emergency reclaim for {name}: cannot list {}: {e}",
                     local_dir.display()
                 );
-                return (0, None, None);
+                return (0, None, None, Vec::new());
             }
         };
         let mut deleted = 0;
@@ -1645,19 +1725,28 @@ impl<'a> Executor<'a> {
             }
         }
 
-        (deleted, first_error, self.config.snapshot_root_for(name))
+        (deleted, first_error, self.config.snapshot_root_for(name), releases)
     }
 
-    /// Map an accumulated `(deleted, first_error)` to a [`ReclaimOutcome`]
-    /// (UPI 058 — shared by both tiers of [`Self::emergency_reclaim_pool`]).
-    fn reclaim_outcome(deleted: u32, first_error: Option<String>) -> ReclaimOutcome {
+    /// Map an accumulated `(deleted, first_error, releases)` to a
+    /// [`ReclaimOutcome`] (UPI 058 — shared by both tiers of
+    /// [`Self::emergency_reclaim_pool`]). `releases` are the Tier-1 offsite chains
+    /// broken (UPI 064-b); a release with `deleted == 0` (an away pin shed whose
+    /// snapshot another drive still holds) is still `Reclaimed`, not `Nothing`, so
+    /// the chain break is recorded.
+    fn reclaim_outcome(
+        deleted: u32,
+        first_error: Option<String>,
+        releases: Vec<OffsiteChainRelease>,
+    ) -> ReclaimOutcome {
         match first_error {
             Some(first_error) => ReclaimOutcome::Failed {
                 deleted,
                 first_error,
+                releases,
             },
-            None if deleted == 0 => ReclaimOutcome::Nothing,
-            None => ReclaimOutcome::Reclaimed { deleted },
+            None if deleted == 0 && releases.is_empty() => ReclaimOutcome::Nothing,
+            None => ReclaimOutcome::Reclaimed { deleted, releases },
         }
     }
 
@@ -4472,7 +4561,8 @@ local_retention = "transient"
 
         let outcome = reclaim_blanket(&executor, &["sv-t".to_string()]);
 
-        assert_eq!(outcome, ReclaimOutcome::Reclaimed { deleted: 2 });
+        assert!(matches!(outcome, ReclaimOutcome::Reclaimed { .. }));
+        assert_eq!(outcome.deleted(), 2);
         let deletes = delete_calls(&mock);
         assert!(deletes.contains(&parent), "pin parent cleared");
         assert!(deletes.contains(&aborted), "aborted snapshot cleared");
@@ -4621,7 +4711,8 @@ local_retention = "transient"
         let outcome =
             reclaim_blanket(&executor, &["pinned-sv".to_string(), "nopin-sv".to_string()]);
 
-        assert_eq!(outcome, ReclaimOutcome::Reclaimed { deleted: 1 });
+        assert!(matches!(outcome, ReclaimOutcome::Reclaimed { .. }));
+        assert_eq!(outcome.deleted(), 1);
         let deletes = delete_calls(&mock);
         assert!(deletes.contains(&pinned_snap), "pinned subvol's snapshot is shed");
         assert!(!deletes.contains(&nopin_snap), "no-pin subvol's snapshot is preserved");
@@ -4670,7 +4761,8 @@ local_retention = "transient"
         let executor = Executor::new(&mock, None, &config, &shutdown);
 
         let outcome = reclaim_blanket(&executor, &["sv-t".to_string()]);
-        assert_eq!(outcome, ReclaimOutcome::Reclaimed { deleted: 1 });
+        assert!(matches!(outcome, ReclaimOutcome::Reclaimed { .. }));
+        assert_eq!(outcome.deleted(), 1);
         let deletes = delete_calls(&mock);
         assert!(deletes.contains(&snap));
         assert!(
@@ -4757,13 +4849,20 @@ local_retention = "transient"
             || Some(floor), // free == floor → at/above → Tier 1 sufficient
         );
 
-        assert_eq!(outcome, ReclaimOutcome::Reclaimed { deleted: 1 });
+        assert!(matches!(outcome, ReclaimOutcome::Reclaimed { .. }));
+        assert_eq!(outcome.deleted(), 1);
         let deletes = delete_calls(&mock);
         assert!(deletes.contains(&away), "away-only snapshot shed");
         assert!(!deletes.contains(&connected), "connected chain preserved");
         assert!(connected.exists(), "connected snapshot survives on disk");
         assert!(primary_pin.exists(), "connected pin survives (chain intact)");
         assert!(!offsite_pin.exists(), "away pin shed");
+        // (UPI 064-b B7) the Tier-1 away-shed is surfaced told-not-silent with the
+        // shed pin's parent — the reactive analog of the planner away-shed.
+        assert_eq!(outcome.releases().len(), 1, "one Tier-1 offsite chain released");
+        assert_eq!(outcome.releases()[0].subvolume, "sv-t");
+        assert_eq!(outcome.releases()[0].drive, "OFFSITE");
+        assert_eq!(outcome.releases()[0].parent.as_str(), "20260101-0900-t");
     }
 
     #[test]
@@ -4857,7 +4956,8 @@ local_retention = "transient"
             || Some(1_000_000),
         );
 
-        assert_eq!(outcome, ReclaimOutcome::Reclaimed { deleted: 1 });
+        assert!(matches!(outcome, ReclaimOutcome::Reclaimed { .. }));
+        assert_eq!(outcome.deleted(), 1);
         assert!(delete_calls(&mock).contains(&shared), "blanket frees the shared snapshot");
         assert!(
             !sv_dir.join(".last-external-parent-OFFSITE").exists(),
@@ -4883,10 +4983,18 @@ local_retention = "transient"
             || Some(1_000_000), // would say "recovered" — but never consulted
         );
 
-        assert_eq!(outcome, ReclaimOutcome::Reclaimed { deleted: 2 });
+        assert!(matches!(outcome, ReclaimOutcome::Reclaimed { .. }));
+        assert_eq!(outcome.deleted(), 2);
         let deletes = delete_calls(&mock);
         assert!(deletes.contains(&connected) && deletes.contains(&away));
         assert!(!primary_pin.exists() && !offsite_pin.exists(), "all pins shed");
+        // (UPI 064-b B7 boundary) Tier-2 (blanket connected-chain) breaks are NOT
+        // surfaced as OffsiteChainReleased — only Tier-1 away-only sheds are. The
+        // host-survival event (WatchdogAbort/EmergencyEject) covers the blanket.
+        assert!(
+            outcome.releases().is_empty(),
+            "Tier-2 blanket reclaim emits no offsite release (host-survival event covers it)",
+        );
     }
 
     #[test]
@@ -5375,6 +5483,13 @@ protection_level = "sheltered"
         assert!(!offsite_pin.exists(), "away pin file removed");
         // Retain-one also cleared the old connected parent.
         assert!(deletes.contains(&old_parent), "old connected parent cleaned (retain-one)");
+        // (UPI 064-b) the shed is recorded told-not-silent: one release for the
+        // OFFSITE drive, carrying the shed pin's parent.
+        let releases = &result.subvolume_results[0].offsite_releases;
+        assert_eq!(releases.len(), 1, "exactly one offsite chain released");
+        assert_eq!(releases[0].subvolume, "sv-t");
+        assert_eq!(releases[0].drive, "OFFSITE");
+        assert_eq!(releases[0].parent.as_str(), "20260101-0900-t");
     }
 
     #[test]
@@ -5443,6 +5558,106 @@ protection_level = "sheltered"
         );
         assert!(away_snap.exists(), "away snapshot survives for next run's retry");
         assert!(connected.exists(), "connected snapshot untouched");
+        // (UPI 064-b F3) the removal FAILED, so NO offsite release is recorded —
+        // an honesty surface must never report a chain it did not actually break.
+        assert!(
+            result.subvolume_results[0].offsite_releases.is_empty(),
+            "a failed away-shed records no release (fail-closed, no phantom)",
+        );
+    }
+
+    #[test]
+    fn upi064b_away_shed_absent_drive_specific_pin_records_no_release() {
+        // (F3) `shed_away_drives` lists OFFSITE, but there is NO drive-specific
+        // `.last-external-parent-OFFSITE` file — `remove_pin_file` returns Ok via
+        // NotFound. Without the read-before-remove guard this would phantom-emit.
+        let snap_dir = tempfile::TempDir::new().unwrap();
+        let primary_dir = tempfile::TempDir::new().unwrap();
+        let offsite_dir = tempfile::TempDir::new().unwrap();
+        let sv_dir = snap_dir.path().join("sv-t");
+        std::fs::create_dir_all(&sv_dir).unwrap();
+        let away_snap = sv_dir.join("20260101-0900-t");
+        std::fs::create_dir(&away_snap).unwrap();
+        // PRIMARY pin only — no OFFSITE drive-specific pin file.
+        chain::write_pin_file(&sv_dir, "PRIMARY", &SnapshotName::parse("20260322-1430-t").unwrap())
+            .unwrap();
+
+        let config = transient_config_n_drives(
+            snap_dir.path(),
+            &[
+                ("PRIMARY", primary_dir.path(), "primary"),
+                ("OFFSITE", offsite_dir.path(), "offsite"),
+            ],
+        );
+        let mock = MockBtrfs::new();
+        let shutdown = no_shutdown();
+        let mut executor = Executor::new(&mock, None, &config, &shutdown);
+        executor.set_armed_tiers(armed_map(storage_critical::TightnessTier::Critical));
+        executor.set_away_shed_pins(away_map("sv-t", &["OFFSITE"]));
+
+        // One op so the subvolume context (and its away-shed) is built.
+        let plan = BackupPlan {
+            operations: vec![PlannedOperation::DeleteSnapshot {
+                path: away_snap.clone(),
+                reason: "transient: not pinned".to_string(),
+                subvolume_name: "sv-t".to_string(),
+                kind: DeleteKind::Policy,
+            }],
+            timestamp: test_ts(),
+            skipped: vec![],
+            events: Vec::new(),
+        };
+        let result = executor.execute(&plan, "full");
+        assert!(
+            result.subvolume_results[0].offsite_releases.is_empty(),
+            "no drive-specific pin was present → no release (no phantom)",
+        );
+    }
+
+    #[test]
+    fn upi064b_tight_run_records_no_offsite_release() {
+        // Anti-transcript: `shed_away_drives` is Critical-gated, so a Tight run
+        // never sheds and never records a release even with away pins present.
+        let snap_dir = tempfile::TempDir::new().unwrap();
+        let primary_dir = tempfile::TempDir::new().unwrap();
+        let offsite_dir = tempfile::TempDir::new().unwrap();
+        let sv_dir = snap_dir.path().join("sv-t");
+        std::fs::create_dir_all(&sv_dir).unwrap();
+        let away_snap = sv_dir.join("20260101-0900-t");
+        std::fs::create_dir(&away_snap).unwrap();
+        chain::write_pin_file(&sv_dir, "OFFSITE", &SnapshotName::parse("20260101-0900-t").unwrap())
+            .unwrap();
+
+        let config = transient_config_n_drives(
+            snap_dir.path(),
+            &[
+                ("PRIMARY", primary_dir.path(), "primary"),
+                ("OFFSITE", offsite_dir.path(), "offsite"),
+            ],
+        );
+        let mock = MockBtrfs::new();
+        let shutdown = no_shutdown();
+        let mut executor = Executor::new(&mock, None, &config, &shutdown);
+        executor.set_armed_tiers(armed_map(storage_critical::TightnessTier::Tight));
+        executor.set_away_shed_pins(away_map("sv-t", &["OFFSITE"]));
+
+        // One op so the subvolume context is built; Tight gates the shed off.
+        let plan = BackupPlan {
+            operations: vec![PlannedOperation::DeleteSnapshot {
+                path: away_snap.clone(),
+                reason: "transient: not pinned".to_string(),
+                subvolume_name: "sv-t".to_string(),
+                kind: DeleteKind::Policy,
+            }],
+            timestamp: test_ts(),
+            skipped: vec![],
+            events: Vec::new(),
+        };
+        let result = executor.execute(&plan, "full");
+        assert!(
+            result.subvolume_results[0].offsite_releases.is_empty(),
+            "Tight never sheds → no offsite release recorded",
+        );
     }
 
     #[test]

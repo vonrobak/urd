@@ -451,6 +451,7 @@ mod tests {
                     send_type: SendType::Incremental,
                     pin_failures: 0,
                     transient_cleanup: TransientCleanupOutcome::NotApplicable,
+                    offsite_releases: Vec::new(),
                 },
                 SubvolumeResult {
                     name: "docs".to_string(),
@@ -460,6 +461,7 @@ mod tests {
                     send_type: SendType::NoSend,
                     pin_failures: 0,
                     transient_cleanup: TransientCleanupOutcome::NotApplicable,
+                    offsite_releases: Vec::new(),
                 },
             ],
             run_id: Some(42),
@@ -878,6 +880,7 @@ mod tests {
                 send_type: SendType::Incremental,
                 pin_failures: 0,
                 transient_cleanup: TransientCleanupOutcome::NotApplicable,
+                offsite_releases: Vec::new(),
             }],
             run_id: Some(1),
         };
@@ -915,6 +918,7 @@ mod tests {
                 send_type: SendType::Deferred,
                 pin_failures: 0,
                 transient_cleanup: TransientCleanupOutcome::NotApplicable,
+                offsite_releases: Vec::new(),
             }],
             run_id: Some(1),
         };
@@ -952,6 +956,7 @@ mod tests {
                 send_type: SendType::NoSend,
                 pin_failures: 0,
                 transient_cleanup: TransientCleanupOutcome::NotApplicable,
+                offsite_releases: Vec::new(),
             }],
             run_id: Some(1),
         };
