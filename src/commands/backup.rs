@@ -693,16 +693,29 @@ fn arm_watchdog_pools_with(
     armed: &crate::storage_critical::ArmedTierMap,
     space: impl FnMut(&std::path::Path) -> Option<PoolSpace>,
 ) -> Vec<ArmedPool> {
+    let send_enabled: HashSet<String> = config
+        .resolved_subvolumes()
+        .into_iter()
+        .filter(|sv| sv.enabled && sv.send_enabled)
+        .map(|sv| sv.name)
+        .collect();
     resolve_pool_targets(config, signals, armed, |t| t >= TightnessTier::Tight, space)
         .into_iter()
         .map(|t| {
             let first = &t.send_subvols[0];
             let min_free_bytes = config.root_min_free_bytes(first).unwrap_or(0);
-            let floor_bytes = guard::source_floor_bytes(
-                min_free_bytes,
-                config.root_cleanup_budget(first),
+            // F1: the floor is the ONE shared `pool_floor_bytes` the gather's
+            // absolute-headroom gate also uses (keyed on the first send-enabled
+            // subvol — here `send_subvols[0]`), so the gate floor and the watchdog
+            // floor cannot drift. `send_subvols` is non-empty and all-send-enabled,
+            // so the `None` arm is unreachable (bare `min_free` if it ever isn't).
+            let floor_bytes = storage_signals::pool_floor_bytes(
+                config,
+                &t.send_subvols,
+                &send_enabled,
                 t.space.capacity_bytes,
-            );
+            )
+            .unwrap_or(min_free_bytes);
             ArmedPool {
                 reserve_path: reserve::reserve_path(&t.root),
                 poll_path: t.root,
@@ -2385,6 +2398,12 @@ source = "/data/beta"
                 label: "/data".to_string(),
                 subvol_names: subvols.iter().map(|s| s.to_string()).collect(),
                 free_ratio: None,
+                // The watchdog computes its own floor from config + the space
+                // closure's capacity (`pool_floor_bytes`), so these raw fields are
+                // inert for this fixture.
+                free_bytes: None,
+                capacity_bytes: None,
+                floor_bytes: None,
                 host_root: false,
                 prior_armed_tier: TightnessTier::Roomy,
                 prior_since: None,

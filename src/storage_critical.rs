@@ -53,6 +53,26 @@ use crate::types::{Interval, LocalRetentionPolicy};
 /// the wider [`CRITICAL_DEESCALATION_BAND_PP`] (UPI 031-b S1).
 pub const HYSTERESIS_BAND_PP: f64 = 0.05;
 
+/// Absolute-headroom downgrade gate — **arm** multiple (UPI 064-a, ADR-113
+/// amendment). When a pool's free bytes are below `floor × this` the gate
+/// **disengages** and the free-ratio classifier is allowed to arm; at or above
+/// it the gate forces Roomy (anchoring the tier on the same host-survival floor
+/// the reactive stack defends, `guard::source_floor_bytes`, not on a capacity
+/// ratio). `= K` from the grill: on a large pool where `floor ≈ 1.5 % × capacity`
+/// this is ≈ 4.5 % free. A tuned code-constant (no config knob), revisited at the
+/// ADR-113 30-day checkpoint with field data. Below this the only protection is
+/// the ratio classifier + the reactive stack — exactly the pre-064 behavior, so
+/// small pools (`capacity ≲ 12×floor`, e.g. htpc 118 GB) are byte-identical
+/// (Risk R1: `3.5×floor` sits above the 25 % ratio-Roomy line there).
+pub const ABS_HEADROOM_GATE_ARM_MULTIPLE: f64 = 3.0;
+
+/// Absolute-headroom downgrade gate — **release** multiple (UPI 064-a). The
+/// gate's own hysteresis band: an already-armed pool (Tight/Critical) returns to
+/// Roomy only once free recovers **above** `floor × this`, wider than the arm
+/// multiple so a pool hovering at the gate boundary does not flap. Strict `>` so
+/// exactly-at-band holds. Sits above [`ABS_HEADROOM_GATE_ARM_MULTIPLE`].
+pub const ABS_HEADROOM_GATE_RELEASE_MULTIPLE: f64 = 3.5;
+
 /// Wider Critical→Tight de-escalation band (UPI 031-b S1, 2026-05-30 amendment
 /// to 031-a's hysteresis). The clear-all control action at Critical *moves the
 /// controlled variable* (it frees Urd's own footprint), so the +0.05 level band
@@ -194,13 +214,38 @@ pub fn host_root(
     on_root_pool && root_subvol_configured
 }
 
-/// Resolve the new armed tier from the prior armed tier and the current
-/// free-ratio (UPI 031-a hysteresis, D4). Pure — no I/O, no clock.
+/// Resolve the new armed tier from the prior armed tier, the current
+/// free-ratio, and the absolute headroom relative to the host-survival floor
+/// (UPI 031-a hysteresis + UPI 064-a gate, D4). Pure — no I/O, no clock.
 ///
+/// - **Absolute-headroom downgrade gate (UPI 064-a, runs first).** When
+///   `free_bytes` and `floor_bytes` are both `Some` and `floor > 0`, a pool with
+///   abundant absolute headroom is forced **Roomy** regardless of ratio — the
+///   ADR-113-amendment fix for #202 (a 15 TB pool at 20 % free / 3 TB absolute is
+///   in no danger and must not arm Tight). One-way and keyed on `prior_armed`:
+///   from Roomy the gate **holds** Roomy while `free >= floor ×
+///   ABS_HEADROOM_GATE_ARM_MULTIPLE`; from Tight/Critical it **releases** to Roomy
+///   only once `free > floor × ABS_HEADROOM_GATE_RELEASE_MULTIPLE` (the wider
+///   release band). When it forces Roomy it returns immediately, **overriding**
+///   the sticky ratio de-escalation below (required: today's sticky path keeps a
+///   media pool Tight forever — 20 % free never clears the 30 % band; that *is*
+///   the bug). When the gate does not force Roomy the ratio classifier runs
+///   **unchanged**.
+///   - The `floor > 0` guard: `floor` is normally guaranteed non-zero by
+///     `guard::source_floor_bytes` flooring the cleanup budget at 1.5 % of
+///     capacity (see `commands/storage_signals::pool_floor_bytes`, which only
+///     returns `Some` for a send-enabled pool). The `> 0` guard is the safety net
+///     if that ever changes — a 0 floor must mean "gate inactive," never "force
+///     Roomy on any positive free." Either input `None` → gate inactive → today's
+///     ratio logic (guarantees the no-op for unmeasurable inputs).
 /// - **Escalate immediately** when the current free-ratio classifies worse
 ///   than the armed tier (no hysteresis on the way up — danger is surfaced
 ///   at once). The escalation target comes from
 ///   `classify_free_ratio_value` (single source of truth for boundaries — M2).
+///   Because the floor is tiny next to the ratio bands, a large gated pool that
+///   does fall below the gate jumps **Roomy → Critical, skipping Tight** — the
+///   accepted Decision-2 consequence (a 15 TB pool below ~5.5 % free is genuinely
+///   in trouble; clear-all is the right response).
 /// - **De-escalate stickily**: drop one level at a time. Critical→Tight is
 ///   gated by `FREE_RATIO_PRESSURE + CRITICAL_DEESCALATION_BAND_PP` (free
 ///   `> 0.25`, the Caution line — UPI 031-b S1); Tight→Roomy by
@@ -214,15 +259,42 @@ pub fn host_root(
 /// derives it in its constructor (awareness reads it back via `armed_tier()`,
 /// never re-resolving); `resolve_armed_tiers` derives the per-pool
 /// `armed_tier_map` for the planner/executor from the same gathered
-/// `(prior, free)`. The two consumers stay coherent because both feed identical
-/// inputs to this deterministic function. `pub(crate)` keeps the resolver
-/// in-crate; the carrier's constructor keeps its stamped tier consistent with
-/// its inputs, so a signal whose tier disagrees with its free-ratio cannot exist.
+/// `(prior, free_ratio, free_bytes, floor_bytes)`. The two consumers stay
+/// coherent because both feed identical inputs to this deterministic function.
+/// `pub(crate)` keeps the resolver in-crate; the carrier's constructor keeps its
+/// stamped tier consistent with its inputs, so a signal whose tier disagrees with
+/// its inputs cannot exist.
 #[must_use]
 pub(crate) fn resolve_armed_tier(
     prior_armed: TightnessTier,
     free_ratio: Option<f64>,
+    free_bytes: Option<u64>,
+    floor_bytes: Option<u64>,
 ) -> TightnessTier {
+    // ── Absolute-headroom downgrade gate (UPI 064-a) — overrides ratio. ──
+    // Active only with both absolute inputs and a positive floor; otherwise
+    // falls straight through to the ratio logic (the no-op for unmeasurable
+    // inputs and the `floor == 0` safety net).
+    if let (Some(free), Some(floor)) = (free_bytes, floor_bytes)
+        && floor > 0
+    {
+        #[allow(clippy::cast_precision_loss)]
+        let free_f = free as f64;
+        #[allow(clippy::cast_precision_loss)]
+        let floor_f = floor as f64;
+        let forces_roomy = match prior_armed {
+            // Hold Roomy while above the arm multiple (>= so exactly-at-arm holds).
+            TightnessTier::Roomy => free_f >= floor_f * ABS_HEADROOM_GATE_ARM_MULTIPLE,
+            // Release an armed pool only above the wider release band (strict `>`).
+            TightnessTier::Tight | TightnessTier::Critical => {
+                free_f > floor_f * ABS_HEADROOM_GATE_RELEASE_MULTIPLE
+            }
+        };
+        if forces_roomy {
+            return TightnessTier::Roomy;
+        }
+    }
+
     let Some(ratio) = free_ratio else {
         // Cannot measure → hold the prior state (never silently disarms).
         return prior_armed;
@@ -469,7 +541,7 @@ mod tests {
     fn escalate_immediate_roomy_to_tight() {
         // 0.20 free → Caution → Tight; jumps up at once.
         assert_eq!(
-            resolve_armed_tier(TightnessTier::Roomy, Some(0.20)),
+            resolve_armed_tier(TightnessTier::Roomy, Some(0.20), None, None),
             TightnessTier::Tight
         );
     }
@@ -478,7 +550,7 @@ mod tests {
     fn escalate_immediate_two_step_to_critical() {
         // 0.05 free → Pressure → Critical; two-step jump up, no hysteresis.
         assert_eq!(
-            resolve_armed_tier(TightnessTier::Roomy, Some(0.05)),
+            resolve_armed_tier(TightnessTier::Roomy, Some(0.05), None, None),
             TightnessTier::Critical
         );
     }
@@ -488,12 +560,12 @@ mod tests {
         // Armed Critical, free recovered to 0.18 (classifies Tight) but not
         // past the 0.25 Caution-line band (031-b S1) → holds Critical (anti-flap).
         assert_eq!(
-            resolve_armed_tier(TightnessTier::Critical, Some(0.18)),
+            resolve_armed_tier(TightnessTier::Critical, Some(0.18), None, None),
             TightnessTier::Critical
         );
         // Even at 0.22 — past the old 0.20 band but below the new 0.25 — it holds.
         assert_eq!(
-            resolve_armed_tier(TightnessTier::Critical, Some(0.22)),
+            resolve_armed_tier(TightnessTier::Critical, Some(0.22), None, None),
             TightnessTier::Critical
         );
     }
@@ -503,7 +575,7 @@ mod tests {
         // Free recovered to 0.26 (> 0.25 Caution line, 031-b S1) → Critical
         // disarms to Tight; 0.26 < 0.30 so it stays Tight.
         assert_eq!(
-            resolve_armed_tier(TightnessTier::Critical, Some(0.26)),
+            resolve_armed_tier(TightnessTier::Critical, Some(0.26), None, None),
             TightnessTier::Tight
         );
     }
@@ -513,7 +585,7 @@ mod tests {
         // Armed Tight, free recovered to 0.28 (classifies Roomy) but not past
         // 0.30 → holds Tight.
         assert_eq!(
-            resolve_armed_tier(TightnessTier::Tight, Some(0.28)),
+            resolve_armed_tier(TightnessTier::Tight, Some(0.28), None, None),
             TightnessTier::Tight
         );
     }
@@ -521,7 +593,7 @@ mod tests {
     #[test]
     fn disarm_tight_to_roomy_above_band() {
         assert_eq!(
-            resolve_armed_tier(TightnessTier::Tight, Some(0.31)),
+            resolve_armed_tier(TightnessTier::Tight, Some(0.31), None, None),
             TightnessTier::Roomy
         );
     }
@@ -531,7 +603,7 @@ mod tests {
         // Armed Critical, free recovered well past both bands (0.35) → drops
         // two levels to Roomy in one run.
         assert_eq!(
-            resolve_armed_tier(TightnessTier::Critical, Some(0.35)),
+            resolve_armed_tier(TightnessTier::Critical, Some(0.35), None, None),
             TightnessTier::Roomy
         );
     }
@@ -539,15 +611,15 @@ mod tests {
     #[test]
     fn unmeasurable_ratio_holds_prior() {
         assert_eq!(
-            resolve_armed_tier(TightnessTier::Critical, None),
+            resolve_armed_tier(TightnessTier::Critical, None, None, None),
             TightnessTier::Critical
         );
         assert_eq!(
-            resolve_armed_tier(TightnessTier::Tight, None),
+            resolve_armed_tier(TightnessTier::Tight, None, None, None),
             TightnessTier::Tight
         );
         assert_eq!(
-            resolve_armed_tier(TightnessTier::Roomy, None),
+            resolve_armed_tier(TightnessTier::Roomy, None, None, None),
             TightnessTier::Roomy
         );
     }
@@ -559,11 +631,11 @@ mod tests {
         // classify_free_ratio_value is strict `<`: 0.15 is NOT < 0.15, so it
         // lands in Caution → Tight. Just inside (0.149) is Critical.
         assert_eq!(
-            resolve_armed_tier(TightnessTier::Roomy, Some(0.15)),
+            resolve_armed_tier(TightnessTier::Roomy, Some(0.15), None, None),
             TightnessTier::Tight
         );
         assert_eq!(
-            resolve_armed_tier(TightnessTier::Roomy, Some(0.149)),
+            resolve_armed_tier(TightnessTier::Roomy, Some(0.149), None, None),
             TightnessTier::Critical
         );
     }
@@ -573,12 +645,12 @@ mod tests {
         // Exactly 0.25 does NOT clear the Critical→Tight band (strict `>`,
         // 031-b S1 wider band).
         assert_eq!(
-            resolve_armed_tier(TightnessTier::Critical, Some(0.25)),
+            resolve_armed_tier(TightnessTier::Critical, Some(0.25), None, None),
             TightnessTier::Critical
         );
         // Just past it disarms.
         assert_eq!(
-            resolve_armed_tier(TightnessTier::Critical, Some(0.2501)),
+            resolve_armed_tier(TightnessTier::Critical, Some(0.2501), None, None),
             TightnessTier::Tight
         );
     }
@@ -587,12 +659,12 @@ mod tests {
     fn boundary_0_25_classifies_roomy() {
         // Escalation classifier is strict `<`: 0.25 is NOT < 0.25 → Roomy.
         assert_eq!(
-            resolve_armed_tier(TightnessTier::Roomy, Some(0.25)),
+            resolve_armed_tier(TightnessTier::Roomy, Some(0.25), None, None),
             TightnessTier::Roomy
         );
         // Just inside is Tight.
         assert_eq!(
-            resolve_armed_tier(TightnessTier::Roomy, Some(0.249)),
+            resolve_armed_tier(TightnessTier::Roomy, Some(0.249), None, None),
             TightnessTier::Tight
         );
     }
@@ -601,12 +673,162 @@ mod tests {
     fn boundary_0_30_tight_disarm_is_strict() {
         // Exactly 0.30 does NOT clear the Tight→Roomy band (strict `>`).
         assert_eq!(
-            resolve_armed_tier(TightnessTier::Tight, Some(0.30)),
+            resolve_armed_tier(TightnessTier::Tight, Some(0.30), None, None),
             TightnessTier::Tight
         );
         assert_eq!(
-            resolve_armed_tier(TightnessTier::Tight, Some(0.3001)),
+            resolve_armed_tier(TightnessTier::Tight, Some(0.3001), None, None),
             TightnessTier::Roomy
+        );
+    }
+
+    // ── UPI 064-a: absolute-headroom downgrade gate ──────────────────────
+
+    const GB: u64 = 1_000_000_000;
+    const TB: u64 = 1000 * GB;
+    /// `/mnt` field floor ≈ `min_free (50 GB) + 1.5 % × 15 TB (225 GB)`.
+    const MNT_FLOOR: u64 = 275 * GB;
+
+    #[test]
+    fn gate_forces_roomy_overriding_sticky_tight() {
+        // The #202 regression. /mnt: 15 TB pool, 3 TB free (ratio 0.20 → Tight by
+        // ratio, and prior Tight's sticky path NEVER clears the 0.30 band, so it
+        // would stay Tight forever). 3 TB / 275 GB ≈ 10.9× > 3.5 → the gate forces
+        // Roomy immediately, overriding the sticky de-escalation. No migration:
+        // the persisted `tight` row just re-resolves `roomy` on the first run.
+        assert_eq!(
+            resolve_armed_tier(
+                TightnessTier::Tight,
+                Some(0.20),
+                Some(3 * TB),
+                Some(MNT_FLOOR),
+            ),
+            TightnessTier::Roomy,
+        );
+    }
+
+    #[test]
+    fn gate_disengages_below_arm_multiple_ratio_skips_tight_to_critical() {
+        // 15 TB pool, 800 GB free (< 3×275 = 825 GB → gate disengages from Roomy),
+        // ratio 5.3 % → the ratio classifier arms Critical directly: a large pool
+        // jumps Roomy → Critical, skipping Tight (accepted Decision-2 consequence —
+        // the floor is tiny next to the ratio bands).
+        assert_eq!(
+            resolve_armed_tier(
+                TightnessTier::Roomy,
+                Some(800.0 * GB as f64 / (15.0 * TB as f64)),
+                Some(800 * GB),
+                Some(MNT_FLOOR),
+            ),
+            TightnessTier::Critical,
+        );
+    }
+
+    #[test]
+    fn gate_holds_roomy_within_arm_band() {
+        // Prior Roomy at 3.2×floor (880 GB free): above the 3.0 arm multiple, so
+        // the gate HOLDS Roomy even though the 5.9 % ratio would say Critical.
+        assert_eq!(
+            resolve_armed_tier(
+                TightnessTier::Roomy,
+                Some(0.0587),
+                Some(32 * MNT_FLOOR / 10), // 3.2 × floor
+                Some(MNT_FLOOR),
+            ),
+            TightnessTier::Roomy,
+        );
+    }
+
+    #[test]
+    fn gate_release_band_is_one_way_strict() {
+        // An already-armed pool releases only ABOVE 3.5×floor (strict `>`).
+        // 3.4×floor: NOT forced → ratio path → sticky hold at Tight (0.20 < 0.30).
+        assert_eq!(
+            resolve_armed_tier(
+                TightnessTier::Tight,
+                Some(0.20),
+                Some(34 * MNT_FLOOR / 10), // 3.4 × floor
+                Some(MNT_FLOOR),
+            ),
+            TightnessTier::Tight,
+            "below the 3.5 release band the gate must not force Roomy",
+        );
+        // 3.6×floor: forced Roomy (release boundary cleared).
+        assert_eq!(
+            resolve_armed_tier(
+                TightnessTier::Tight,
+                Some(0.20),
+                Some(36 * MNT_FLOOR / 10), // 3.6 × floor
+                Some(MNT_FLOOR),
+            ),
+            TightnessTier::Roomy,
+        );
+    }
+
+    #[test]
+    fn gate_inactive_when_inputs_missing_or_floor_zero() {
+        // Each guard falls through to the ratio result (here: sticky hold at Tight,
+        // 0.20 < 0.30). The gate must never engage without both absolute inputs.
+        assert_eq!(
+            resolve_armed_tier(TightnessTier::Tight, Some(0.20), Some(3 * TB), None),
+            TightnessTier::Tight,
+            "floor None → gate inactive",
+        );
+        assert_eq!(
+            resolve_armed_tier(TightnessTier::Tight, Some(0.20), None, Some(MNT_FLOOR)),
+            TightnessTier::Tight,
+            "free None → gate inactive",
+        );
+        // floor == 0 must mean "gate inactive," NOT "force Roomy on any positive
+        // free" — the (F8) safety net if `source_floor_bytes` ever stops flooring.
+        assert_eq!(
+            resolve_armed_tier(
+                TightnessTier::Tight,
+                Some(0.20),
+                Some(100 * TB),
+                Some(0),
+            ),
+            TightnessTier::Tight,
+            "floor == 0 → gate inactive (safety net), not forced Roomy",
+        );
+    }
+
+    #[test]
+    fn gate_is_provable_noop_on_htpc_small_pool() {
+        // Risk R1: on htpc (118 GB, floor ≈ 12 GB) the gate's release threshold
+        // (3.5×12 = 42 GB) sits ABOVE the 25 % ratio-Roomy line (29.5 GB), so the
+        // gate never contradicts ratio. These three points are byte-identical to
+        // the ratio-only classifier (gate active or not, the answer matches ratio).
+        let htpc_floor = 12 * GB;
+        // 8 GB free → ratio 6.8 % → Critical (gate inactive: 8 < 3×12 = 36).
+        assert_eq!(
+            resolve_armed_tier(
+                TightnessTier::Roomy,
+                Some(8.0 * GB as f64 / (118.0 * GB as f64)),
+                Some(8 * GB),
+                Some(htpc_floor),
+            ),
+            TightnessTier::Critical,
+        );
+        // ~29 GB free → ratio 24.6 % → Tight (gate inactive: 29 < 36).
+        assert_eq!(
+            resolve_armed_tier(
+                TightnessTier::Roomy,
+                Some(29.0 * GB as f64 / (118.0 * GB as f64)),
+                Some(29 * GB),
+                Some(htpc_floor),
+            ),
+            TightnessTier::Tight,
+        );
+        // ~40 GB free → ratio 33.9 % → Roomy (gate forces Roomy AND ratio agrees).
+        assert_eq!(
+            resolve_armed_tier(
+                TightnessTier::Roomy,
+                Some(40.0 * GB as f64 / (118.0 * GB as f64)),
+                Some(40 * GB),
+                Some(htpc_floor),
+            ),
+            TightnessTier::Roomy,
         );
     }
 
@@ -674,12 +896,12 @@ mod tests {
         // HOLD Critical, or de-escalating to Tight/retain-one re-grows the
         // footprint and re-escalates (the flap), paying a full send each cycle.
         assert_eq!(
-            resolve_armed_tier(TightnessTier::Critical, Some(0.21)),
+            resolve_armed_tier(TightnessTier::Critical, Some(0.21), None, None),
             TightnessTier::Critical,
         );
         // Only once it clears the Caution line (0.25 free) does it shed the cap.
         assert_eq!(
-            resolve_armed_tier(TightnessTier::Critical, Some(0.26)),
+            resolve_armed_tier(TightnessTier::Critical, Some(0.26), None, None),
             TightnessTier::Tight,
         );
     }

@@ -10,7 +10,7 @@
 > it prefers host survival over backup-chain continuity.
 
 **Date:** 2026-04-18
-**Status:** Accepted (amended 2026-05-30, UPI 031-b)
+**Status:** Accepted (amended 2026-05-30, UPI 031-b; 2026-06-14, UPI 064-a)
 **Supersedes:** UPI 011 (hard-cap of 1 local snapshot for transient subvolumes)
 
 > **Amendment — 2026-05-30 (UPI 031-b, the tier-graded ephemeral spine).**
@@ -37,6 +37,48 @@
 > unchanged** — only the layer *mechanism* evolves (matching the in-place-amendment
 > precedent of ADR-104/105/110/111). See the layer table below for the per-layer
 > detail.
+
+> **Amendment — 2026-06-14 (UPI 064-a, the absolute-headroom arming gate).**
+> Layer 1's **arming signal** evolves from *free-ratio only* to *absolute headroom
+> relative to the host-survival floor*. The free-ratio classifier
+> (`recommendation::classify_free_ratio_value`) remains the primary arming path,
+> but `resolve_armed_tier` now applies a **one-way absolute-headroom downgrade
+> gate** ahead of it: a pool whose free bytes exceed a small multiple of the
+> reactive host-survival floor (`guard::source_floor_bytes` = `min_free +
+> cleanup_budget`) is forced **Roomy** regardless of ratio.
+>
+> - **Why.** Free-ratio conflates "the pool is mostly full" with "the pool is
+>   about to exhaust" — they diverge wildly across pool sizes. A 15 TB media pool
+>   at 20 % free (3 TB absolute) is in no danger of exhaustion, yet the ratio-only
+>   classifier armed it **Tight**, collapsed every send-enabled subvolume to
+>   retain-one, and — because such a pool never recovers past the 30 %
+>   de-escalation band — held Tight *permanently*, shedding offsite incremental
+>   parents on every rotation (issue #202, field-reproduced 2026-06-14). Anchoring
+>   the tier on the **same absolute floor the reactive stack already defends**
+>   unifies the proactive footprint-cap with the Layer-2/3 host-survival floor it
+>   shares.
+> - **Safety premise.** Down-arming an absolutely-roomy pool does not endanger the
+>   host: the reactive stack (the `min_free` space guard, the watchdog, the idle
+>   eject) still fires on absolute bytes against that *same* floor (the gate floor
+>   and the reactive floor are computed by **one** shared `pool_floor_bytes` helper
+>   so they cannot drift). A large pool that does cross the gate falls
+>   **Roomy → Critical, skipping Tight** (the floor is tiny next to the ratio
+>   bands) — appropriate, and the clear-all response is right there.
+> - **Gate hysteresis.** The gate has its own one-way absolute band: arm-disengage
+>   below `3.0×floor`, release-to-Roomy above `3.5×floor`
+>   (`ABS_HEADROOM_GATE_ARM/RELEASE_MULTIPLE`), tuned code constants (no config
+>   knob) revisited at the 30-day checkpoint with `K`. The gate **overrides** the
+>   sticky ratio de-escalation (forces Roomy immediately), so a pool persisted
+>   `tight` re-resolves `roomy` on the first post-deploy run — the
+>   `pool_armed_tier` string meaning is unchanged, **no migration**.
+> - **Scope.** The gate is a provable no-op on small pools (`capacity ≲ 12×floor`,
+>   e.g. htpc 118 GB): there `3.5×floor` sits *above* the 25 % ratio-Roomy line, so
+>   wherever the gate would force Roomy the ratio classifier already says Roomy. It
+>   changes behavior **only** on large, absolutely-roomy pools (`> ~730 GB`).
+>
+> The **invariant and the probabilistic contract are unchanged** — only the Layer-1
+> *arming signal* evolves (matching the 031-b in-place-amendment precedent above,
+> and ADR-104/105/110/111).
 
 ## Context
 
