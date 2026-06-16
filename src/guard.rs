@@ -18,10 +18,15 @@
 //! Two orthogonal triggers, floor-first:
 //! - **Floor** (absolute): free dropped below `floor_bytes` — the backstop.
 //!   `floor = min_free + cleanup_budget`.
-//! - **Cliff** (differential): free is falling faster than `cliff_bytes_per_sec`
-//!   — the primary signal, because `statvfs`-quality free bytes on btrfs do not
-//!   see unallocated chunks or metadata reservations (M7), so the *rate* of
-//!   change is the more trustworthy early warning than the absolute level.
+//! - **Cliff** (differential): free is falling faster than `cliff_bytes_per_sec`,
+//!   measured as a **windowed average** over a ~2 s trailing window
+//!   (`WATCHDOG_CLIFF_WINDOW`, UPI 065-a) rather than one 250 ms sample — the
+//!   primary signal, because `statvfs`-quality free bytes on btrfs do not see
+//!   unallocated chunks or metadata reservations (M7), so the *rate* of change is
+//!   the more trustworthy early warning than the absolute level. Averaging over
+//!   the window rejects transient bursts *without* re-coupling the cliff to the
+//!   (M7-unreliable) absolute level; the windowing lives in the impure sampler
+//!   (`commands/backup.rs`), this decision core stays per-sample.
 //!
 //! On the first trigger the watchdog frees the reserve (a regular-file unlink
 //! commits faster than btrfs's async subvolume-delete cleaner) to buy runway; a
@@ -44,6 +49,20 @@ pub const CLIFF_BYTES_PER_SEC: u64 = 100 * 1024 * 1024;
 /// Watchdog poll cadence, mirroring `progress_display_loop`'s 250 ms (UPI 033).
 pub const WATCHDOG_POLL_MS: u64 = 250;
 
+/// Trailing window over which the cliff rate is averaged (UPI 065-a). The cliff
+/// fires on the *windowed-average* drop rate across this span, not a single
+/// 250 ms sample, so a transient burst (a container flush, `statvfs` jitter)
+/// amortises below [`CLIFF_BYTES_PER_SEC`] while a sustained drop stays above it —
+/// the fix for field incident run #110, where one 100 MB/s spike on a `/home`
+/// pool with ~4× runway signal-killed a healthy 5.5-hour send. Burst budget =
+/// `CLIFF_BYTES_PER_SEC × W` = 200 MB tolerated transient drop; detection lag on
+/// a sustained fill is ≤ W (≤ ~200 MB consumed regardless of fill rate, well
+/// inside the ~1.77 GB reserve and the floor backstop). The windowing lives in
+/// the impure sampler (`commands/backup.rs`); this pure core stays per-sample
+/// (ADR-108). Joins [`CLIFF_BYTES_PER_SEC`], [`WATCHDOG_POLL_MS`], the hysteresis
+/// bands, and `K` as a tuned constant to revisit at the ADR-113 30-day checkpoint.
+pub const WATCHDOG_CLIFF_WINDOW: Duration = Duration::from_secs(2);
+
 /// Default `cleanup_budget` as a fraction of pool capacity when the operator did
 /// not configure one (UPI 033, arc re-grill). 1.5 % scales across hardware —
 /// ~1.77 GB on a 118 GB htpc NVMe — and is the working room the floor sits above
@@ -58,11 +77,17 @@ pub const CLEANUP_BUDGET_CAPACITY_FRACTION: f64 = 0.015;
 pub struct WatchdogSample {
     /// Current free bytes on the source pool (`statvfs`-quality, M7).
     pub free_bytes: u64,
-    /// Free bytes at the previous sample, or `None` on the first sample (no
-    /// rate computable yet).
+    /// Free bytes at the **rate baseline** — the oldest sample within the
+    /// trailing `WATCHDOG_CLIFF_WINDOW`, or `None` when the window holds `< 2`
+    /// samples (the first sample, or the poll right after an OQ2 window reset) and
+    /// no rate is computable yet. The sampler (`commands/backup.rs`) picks the
+    /// baseline; this core only divides the drop by the interval (UPI 065-a — the
+    /// field *role* is unchanged, only which prior reading fills it).
     pub prev_free_bytes: Option<u64>,
-    /// Wall-clock since the previous sample. Zero (or `None` prev) suppresses
-    /// the cliff trigger — a rate needs a non-zero interval.
+    /// Wall-clock since the **baseline** sample (the oldest within the window).
+    /// Zero (or `None` prev) suppresses the cliff trigger — a rate needs a
+    /// non-zero interval. Computed from real `Instant`s, so an irregular poll
+    /// cadence still yields the correct windowed average (UPI 065-a).
     pub elapsed_since_prev: Duration,
 }
 
@@ -70,7 +95,14 @@ pub struct WatchdogSample {
 /// the primary differential signal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WatchdogThresholds {
-    /// Absolute floor — `min_free.unwrap_or(0) + cleanup_budget` (M5).
+    /// Absolute floor — `min_free.unwrap_or(0) + cleanup_budget` (M5). Compared
+    /// against **current** `free_bytes` only — deliberately level-absolute and
+    /// **window-independent**: the cliff carries all rate/windowing logic, the
+    /// floor none (UPI 065-a, adversary F2). This is the linchpin of
+    /// catastrophe-safety — it is what keeps a sustained fill caught *every poll*
+    /// regardless of window contents, including during the one-poll cliff blind
+    /// spot right after an OQ2 window reset. Do **not** "smooth" or window the
+    /// floor: it would silently reintroduce the ADR-113 under-fire risk.
     pub floor_bytes: u64,
     /// Differential cliff in bytes/sec — defaults to [`CLIFF_BYTES_PER_SEC`].
     pub cliff_bytes_per_sec: u64,
@@ -239,6 +271,11 @@ pub fn evaluate_idle_eject(samples: &[PoolPressureSample]) -> Vec<PoolPressureSa
 
 /// The trigger reason for a sample, or `None` when neither threshold is crossed.
 /// Floor wins when both cross.
+///
+/// The floor compares **current** `free_bytes` to `floor_bytes` — no windowing,
+/// no rate (UPI 065-a invariant; see [`WatchdogThresholds::floor_bytes`]). Only
+/// the cliff consults the (windowed) rate baseline carried in the sample. Keeping
+/// the floor level-absolute is what makes the post-reset cliff blind spot safe.
 fn trigger_reason(
     sample: WatchdogSample,
     thresholds: WatchdogThresholds,

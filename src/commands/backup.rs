@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -21,7 +21,7 @@ use crate::executor::{
 };
 use crate::guard::{
     self, WatchdogAction, WatchdogReason, WatchdogSample, WatchdogThresholds, CLIFF_BYTES_PER_SEC,
-    WATCHDOG_POLL_MS,
+    WATCHDOG_CLIFF_WINDOW, WATCHDOG_POLL_MS,
 };
 use crate::heartbeat;
 use crate::lock;
@@ -805,6 +805,43 @@ fn watchdog_step(
     )
 }
 
+/// Push the current `(now, free)` reading into the pool's trailing-window deque,
+/// evict readings older than `window`, and return the cliff **rate baseline** —
+/// the oldest reading still inside the window plus the elapsed wall-clock since it
+/// (UPI 065-a). The baseline feeds `WatchdogSample::{prev_free_bytes,
+/// elapsed_since_prev}`, so `guard::evaluate` computes the cliff rate as a
+/// *windowed average* over up to `window`, not a single 250 ms sample: a transient
+/// burst amortises below the cliff while a sustained drop stays above it (the
+/// field incident run #110 fix).
+///
+/// Owns push + eviction + baseline together (`&mut`) so the eviction boundary is
+/// exercised by the same tests that check the baseline (adversary F3). A deque of
+/// `< 2` readings — the first sample, or the poll right after an OQ2 window reset —
+/// yields `(None, Duration::ZERO)`, which `guard` reads as "no rate yet" → cliff
+/// suppressed for that poll (the floor still fires on current free, A2). Eviction
+/// is by **real age**, so an irregular poll cadence (a busy multi-device `/mnt`
+/// pool under send load) computes the rate over actual elapsed, not a fixed
+/// 250 ms × count (adversary F5).
+fn window_baseline(
+    dq: &mut VecDeque<(Instant, u64)>,
+    now: Instant,
+    free: u64,
+    window: Duration,
+) -> (Option<u64>, Duration) {
+    dq.push_back((now, free));
+    // Evict readings older than the window, but always keep the current one so a
+    // baseline can rebuild (front = oldest reading still inside the window).
+    while dq.len() > 1 && dq.front().is_some_and(|&(t, _)| now.duration_since(t) > window) {
+        dq.pop_front();
+    }
+    // Front is the oldest reading still inside the window. `< 2` readings — the
+    // seed sample, or the poll right after an OQ2 reset — give no rate yet.
+    match dq.front() {
+        Some(&(t, free_at)) if dq.len() >= 2 => (Some(free_at), now.duration_since(t)),
+        _ => (None, Duration::ZERO),
+    }
+}
+
 /// The watchdog thread body (UPI 033). Polls each armed pool's source-pool free
 /// space every `WATCHDOG_POLL_MS`; on a floor/cliff trigger it first frees the
 /// reserve (fast bridge, here on the watchdog thread so it fires even if the
@@ -819,7 +856,10 @@ fn watchdog_loop(
     watchdog_shutdown: &AtomicBool,
     firing: &Mutex<Option<WatchdogFiring>>,
 ) {
-    let mut prev: HashMap<PathBuf, (u64, Instant)> = HashMap::new();
+    // Per-pool trailing window of `(instant, free)` readings — the cliff rate is
+    // a windowed average over the last `WATCHDOG_CLIFF_WINDOW` (UPI 065-a), not a
+    // single prior sample. `window_baseline` owns push/eviction/baseline.
+    let mut windows: HashMap<PathBuf, VecDeque<(Instant, u64)>> = HashMap::new();
     let mut freed: HashSet<PathBuf> = HashSet::new();
     let mut started_below: HashMap<PathBuf, bool> = HashMap::new();
     loop {
@@ -846,11 +886,9 @@ fn watchdog_loop(
                 b
             });
             let now = Instant::now();
-            let (prev_free, elapsed) = match prev.get(&pool.poll_path) {
-                Some((pf, t)) => (Some(*pf), now.duration_since(*t)),
-                None => (None, Duration::ZERO),
-            };
-            prev.insert(pool.poll_path.clone(), (space.free_bytes, now));
+            let dq = windows.entry(pool.poll_path.clone()).or_default();
+            let (prev_free, elapsed) =
+                window_baseline(dq, now, space.free_bytes, WATCHDOG_CLIFF_WINDOW);
 
             let sample = WatchdogSample {
                 free_bytes: space.free_bytes,
@@ -872,6 +910,18 @@ fn watchdog_loop(
                     );
                     if reserve::delete_reserve(&pool.reserve_path).is_ok() {
                         freed.insert(pool.poll_path.clone());
+                        // OQ2: clear the cliff window after a successful reserve
+                        // reclaim so escalation to Abort requires *fresh* continued
+                        // dropping across a rebuilt window — a transient burst that
+                        // fired the reclaim does not then spuriously abort a healthy
+                        // send (#110-class). Load-bearing only for bursts *larger*
+                        // than the reserve: a sub-reserve burst is already suppressed
+                        // by the reserve-delete free-bump alone (adversary F1b). The
+                        // reset fires on *any* ReclaimReserve, including a
+                        // floor-triggered one, where it is a harmless no-op — the
+                        // floor never consults the window (adversary F2/F4). `dq` is
+                        // the same window we sampled above (still borrowed here).
+                        dq.clear();
                     }
                 }
                 WatchdogAction::Abort(reason) => {
@@ -2769,6 +2819,254 @@ source = "/data/beta"
         assert!(!abort.load(Ordering::SeqCst));
         assert!(!exec_shutdown.load(Ordering::SeqCst));
         assert!(firing.lock().unwrap().is_none(), "no firing on a healthy pool");
+    }
+
+    // ── windowed cliff (UPI 065-a) ────────────────────────────────────
+    // The cliff fires on a windowed-average drop rate over WATCHDOG_CLIFF_WINDOW
+    // (2 s), not a single 250 ms sample. These tests drive the `window_baseline`
+    // sampler + `watchdog_step`/`guard::evaluate` with scripted synthetic instants
+    // (offset off one base — no sleep), so the windowing/eviction arithmetic is
+    // deterministic. The pure `guard.rs` tests prove the decision core is untouched.
+
+    const MB: u64 = 1024 * 1024;
+
+    /// Drive one `(now, free)` reading through a pool's window deque and the
+    /// watchdog decision, exactly as `watchdog_loop` does — returns the action. A
+    /// low `floor` isolates the cliff; a high one exercises the floor.
+    fn step(
+        dq: &mut VecDeque<(Instant, u64)>,
+        now: Instant,
+        free: u64,
+        floor: u64,
+        reserve_present: bool,
+    ) -> WatchdogAction {
+        let (prev_free, elapsed) = window_baseline(dq, now, free, WATCHDOG_CLIFF_WINDOW);
+        let sample = WatchdogSample {
+            free_bytes: free,
+            prev_free_bytes: prev_free,
+            elapsed_since_prev: elapsed,
+        };
+        watchdog_step(sample, floor, 0, false, reserve_present)
+    }
+
+    #[test]
+    fn windowed_cliff_suppresses_110_transient_spike() {
+        // Run #110: a single 250 ms spike (50 MB lost = 200 MB/s) on an otherwise
+        // flat pool. The single-sample cliff fired (>100 MB/s); the windowed
+        // average over 2 s is 25 MB/s → Continue. No abort, no reclaim.
+        let mut dq = VecDeque::new();
+        let t0 = Instant::now();
+        let free = 50 * GB;
+        let low_floor = GB; // 50 GB >> floor: only the cliff can speak here
+        // Eight flat 250 ms readings fill the 2 s window.
+        for i in 0..8u64 {
+            let t = t0 + Duration::from_millis(250 * i);
+            assert_eq!(step(&mut dq, t, free, low_floor, true), WatchdogAction::Continue);
+        }
+        // One 50 MB spike in the next slot.
+        let spiked = free - 50 * MB;
+        assert_eq!(
+            step(&mut dq, t0 + Duration::from_millis(250 * 8), spiked, low_floor, true),
+            WatchdogAction::Continue,
+            "a transient spike amortised over the 2 s window stays below the cliff"
+        );
+        // Contrast: the *single-sample* rate (the pre-065-a baseline) WOULD have
+        // fired — 50 MB / 250 ms = 200 MB/s. Proves the test distinguishes the fix.
+        let single_sample = WatchdogSample {
+            free_bytes: spiked,
+            prev_free_bytes: Some(free),
+            elapsed_since_prev: Duration::from_millis(WATCHDOG_POLL_MS),
+        };
+        assert_eq!(
+            watchdog_step(single_sample, low_floor, 0, false, false),
+            WatchdogAction::Abort(WatchdogReason::CliffExceeded),
+            "the pre-065-a single-sample cliff fired on this very spike (#110)"
+        );
+    }
+
+    #[test]
+    fn windowed_cliff_fires_on_sustained_fill() {
+        // A genuine sustained ~120 MB/s fill (30 MB lost each 250 ms slot) keeps
+        // the windowed average above the 100 MB/s cliff → it fires. Windowing
+        // suppresses transients, not real drops.
+        let mut dq = VecDeque::new();
+        let t0 = Instant::now();
+        let low_floor = GB;
+        let drop = 30 * MB;
+        let mut last = WatchdogAction::Continue;
+        for i in 0..8u64 {
+            let t = t0 + Duration::from_millis(250 * i);
+            last = step(&mut dq, t, 50 * GB - drop * i, low_floor, false);
+        }
+        assert_eq!(last, WatchdogAction::Abort(WatchdogReason::CliffExceeded));
+    }
+
+    #[test]
+    fn windowed_cliff_evicts_drop_older_than_window() {
+        // A drop older than the 2 s window stops contributing: once it ages out,
+        // the baseline moves past it, the rate returns to ~0, and the cliff quiets.
+        let mut dq = VecDeque::new();
+        let t0 = Instant::now();
+        let low_floor = GB;
+        let high = 50 * GB;
+        let low = high - 2 * GB;
+        step(&mut dq, t0, high, low_floor, false); // seed
+        // A 2 GB drop in the next 250 ms slot fires while fresh.
+        assert_eq!(
+            step(&mut dq, t0 + Duration::from_millis(250), low, low_floor, false),
+            WatchdogAction::Abort(WatchdogReason::CliffExceeded),
+        );
+        // Flat at the lower level; once the drop ages past 2 s it is evicted.
+        let mut last = WatchdogAction::Continue;
+        for ms in [500u64, 750, 1000, 1250, 1500, 1750, 2000, 2250, 2500] {
+            last = step(&mut dq, t0 + Duration::from_millis(ms), low, low_floor, false);
+        }
+        assert_eq!(
+            last,
+            WatchdogAction::Continue,
+            "the aged-out drop no longer drives the cliff"
+        );
+    }
+
+    #[test]
+    fn windowed_cliff_seed_sample_suppressed() {
+        // The very first reading (deque len 1) yields no baseline → cliff
+        // suppressed (no rate is computable from a single sample).
+        let mut dq = VecDeque::new();
+        let t0 = Instant::now();
+        let (prev, elapsed) = window_baseline(&mut dq, t0, 50 * GB, WATCHDOG_CLIFF_WINDOW);
+        assert_eq!((prev, elapsed), (None, Duration::ZERO));
+    }
+
+    #[test]
+    fn windowed_cliff_reset_on_reclaim_prevents_spurious_abort() {
+        // OQ2 / adversary F1: a transient burst LARGER than the reserve fires
+        // ReclaimReserve; after the reserve free-bump the stale window baseline
+        // still sits above current free, so WITHOUT the reset the next poll would
+        // escalate to a #110-class spurious Abort. Clearing the window on reclaim
+        // forces a fresh baseline → Continue. The burst MUST exceed the reserve,
+        // else the free-bump alone suppresses escalation and the test can't fail.
+        let burst = reserve::RESERVE_SIZE_BYTES + GB; // > the 1 GiB reserve
+        let low_floor = GB;
+        let high = 50 * GB;
+        let trough = high - burst; // free at the burst trough
+        let bumped = trough + reserve::RESERVE_SIZE_BYTES; // reserve unlink frees ~1 GiB
+        let t0 = Instant::now();
+
+        // Shared prefix: a flat window, then the >reserve burst that fires
+        // ReclaimReserve (reserve present).
+        let prime = |dq: &mut VecDeque<(Instant, u64)>| {
+            for i in 0..5u64 {
+                step(dq, t0 + Duration::from_millis(250 * i), high, low_floor, true);
+            }
+            assert_eq!(
+                step(dq, t0 + Duration::from_millis(1250), trough, low_floor, true),
+                WatchdogAction::ReclaimReserve(WatchdogReason::CliffExceeded),
+            );
+        };
+
+        // With reset: clear the window on reclaim (what the loop does), then the
+        // bumped-but-flat free rebuilds a clean baseline → Continue across the
+        // rebuilt window. Reserve is gone now → reserve_present false.
+        let mut reset_dq = VecDeque::new();
+        prime(&mut reset_dq);
+        reset_dq.clear(); // ← the OQ2 reset
+        assert_eq!(
+            step(&mut reset_dq, t0 + Duration::from_millis(1500), bumped, low_floor, false),
+            WatchdogAction::Continue,
+        );
+        assert_eq!(
+            step(&mut reset_dq, t0 + Duration::from_millis(1750), bumped, low_floor, false),
+            WatchdogAction::Continue,
+            "a rebuilt window over flat free stays Continue",
+        );
+
+        // Mirror (no reset): the same post-reclaim poll WOULD abort — the stale
+        // baseline (pre-burst high) over the bumped-but-lower free keeps the cliff
+        // firing, and the reserve is gone. Pins the reset as load-bearing.
+        let mut noreset_dq = VecDeque::new();
+        prime(&mut noreset_dq);
+        assert_eq!(
+            step(&mut noreset_dq, t0 + Duration::from_millis(1500), bumped, low_floor, false),
+            WatchdogAction::Abort(WatchdogReason::CliffExceeded),
+            "without the reset, the stale window escalates a healthy send to Abort",
+        );
+    }
+
+    #[test]
+    fn floor_fires_independent_of_window_contents() {
+        // Adversary F2: the floor reads CURRENT free only — it fires regardless of
+        // window state (empty, stale, or freshly reset). This is the safety
+        // linchpin that keeps a sustained fill caught during the one-poll cliff
+        // blind spot right after an OQ2 reset. (Loop-level floor behaviour is
+        // covered by `watchdog_loop_started_below_floor_*`.)
+        let absurd_floor = 60 * GB; // every realistic free is below it
+        let flat = 50 * GB;
+        let t0 = Instant::now();
+
+        // (a) Empty window: the first reading is below the floor → fires, though
+        // the cliff is suppressed (len 1, no baseline).
+        let mut empty = VecDeque::new();
+        assert_eq!(
+            step(&mut empty, t0, flat, absurd_floor, false),
+            WatchdogAction::Abort(WatchdogReason::FloorCrossed),
+        );
+
+        // (b) Stale window: prior readings exist and the rate is ~0 (flat), yet the
+        // floor still fires on the current below-floor level.
+        let mut stale = VecDeque::new();
+        step(&mut stale, t0, flat, absurd_floor, false);
+        assert_eq!(
+            step(&mut stale, t0 + Duration::from_millis(250), flat, absurd_floor, false),
+            WatchdogAction::Abort(WatchdogReason::FloorCrossed),
+        );
+
+        // (c) Freshly-reset window: after a clear the cliff is suppressed for one
+        // poll, but the floor fires anyway — the blind spot is floor-covered.
+        stale.clear();
+        assert_eq!(
+            step(&mut stale, t0 + Duration::from_millis(500), flat, absurd_floor, false),
+            WatchdogAction::Abort(WatchdogReason::FloorCrossed),
+        );
+    }
+
+    #[test]
+    fn windowed_cliff_handles_irregular_poll_cadence() {
+        // Adversary F5: real Instants, not a fixed 250 ms × count. With uneven gaps
+        // (250 ms, 250 ms, 1.5 s, …) the rate is computed over ACTUAL elapsed and
+        // eviction is by real age — so the cliff fires on the genuine drop and goes
+        // quiet only once the drop truly ages out of the window.
+        let mut dq = VecDeque::new();
+        let low_floor = GB;
+        let high = 50 * GB;
+        let low = high - 500 * MB; // a 500 MB step down
+        let t0 = Instant::now();
+
+        // t=0, 0.25: flat (gaps of 250 ms).
+        assert_eq!(step(&mut dq, t0, high, low_floor, false), WatchdogAction::Continue);
+        assert_eq!(
+            step(&mut dq, t0 + Duration::from_millis(250), high, low_floor, false),
+            WatchdogAction::Continue,
+        );
+        // t=0.5: the 500 MB drop. Rate over the actual 0.5 s window = 1 GB/s →
+        // fires (a fixed-250 ms assumption would have mis-divided by one slot).
+        assert_eq!(
+            step(&mut dq, t0 + Duration::from_millis(500), low, low_floor, false),
+            WatchdogAction::Abort(WatchdogReason::CliffExceeded),
+        );
+        // t=2.0 (a 1.5 s gap): the drop (t=0) is still within the 2 s window → it
+        // still fires. Eviction tracks real age, not sample count.
+        assert_eq!(
+            step(&mut dq, t0 + Duration::from_millis(2000), low, low_floor, false),
+            WatchdogAction::Abort(WatchdogReason::CliffExceeded),
+        );
+        // t=2.5: the pre-drop readings (t=0, 0.25) have aged past 2 s and evicted;
+        // the baseline is now the post-drop level → Continue.
+        assert_eq!(
+            step(&mut dq, t0 + Duration::from_millis(2500), low, low_floor, false),
+            WatchdogAction::Continue,
+            "once the drop ages out under irregular cadence, the cliff goes quiet",
+        );
     }
 
     #[test]
