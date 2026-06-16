@@ -7,7 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.26.0] - 2026-06-15
+### Added
+- **The mid-op watchdog no longer kills a healthy long send over a momentary
+  write spike** (UPI 065-a). Its cliff trigger (free-space drop rate) now fires on
+  a **windowed average** over a ~2 s trailing window instead of a single 250 ms
+  sample, so a transient burst — a container flush, `statvfs` jitter — amortises
+  below the threshold while a sustained fill still trips it. This fixes field
+  incident run #110, where one ~100 MB/s spike on a `/home` pool with ~4× runway
+  signal-killed a 5.5-hour, 2.7 TB first send. The absolute floor stays
+  level-absolute and window-independent (the host-survival backstop is unchanged),
+  and after a reserve reclaim the window resets so a >reserve transient cannot
+  escalate to a spurious abort. No config knob; no on-disk or metric changes.
 
 ### Added
 - **A constrained pool now holds its offsite chain at Tight and says so out loud
