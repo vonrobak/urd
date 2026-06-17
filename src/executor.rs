@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use crate::btrfs::BtrfsOps;
 use crate::chain;
-use crate::commands::backup::{format_completion_line, ProgressContext, SizeEstimates};
+use crate::commands::backup::{format_completion_line, ProgressContext, SizeEstimates, WatchdogCoord};
 use crate::config::Config;
 use crate::drives;
 use crate::error::BtrfsOperation;
@@ -265,6 +265,18 @@ pub struct Executor<'a> {
     /// planner's `clear_all` decision (R1 — coherence by construction). Default
     /// empty → no away-shed → pre-058 behavior.
     away_shed_pins: HashMap<String, Vec<String>>,
+    /// The shared executor↔watchdog coordination cell (UPI 065-b). When set, the
+    /// executor publishes each send's snapshot root into `in_flight` and refuses a
+    /// send whose root is in `tripped`, both under this one lock — so the
+    /// watchdog's same-vs-cross-filesystem decision and this gate are atomic.
+    /// `None` on a Roomy-only run (no armed pools) → no coordination overhead,
+    /// byte-identical to before.
+    watchdog_coord: Option<Arc<Mutex<WatchdogCoord>>>,
+    /// A clone of the shared watchdog cancel flag (UPI 065-b, S1). Reset to
+    /// `false` at the start of each send so a same-filesystem abort's latched flag
+    /// cannot bleed into the *next* pool's send now that the per-pool `tripped`
+    /// gate replaced the global executor shutdown. `None` when no pool is armed.
+    watchdog_cancel: Option<Arc<AtomicBool>>,
 }
 
 impl<'a> Executor<'a> {
@@ -285,7 +297,22 @@ impl<'a> Executor<'a> {
             full_send_policy: FullSendPolicy::Allow,
             armed_tiers: ArmedTierMap::new(),
             away_shed_pins: HashMap::new(),
+            watchdog_coord: None,
+            watchdog_cancel: None,
         }
+    }
+
+    /// Share the executor↔watchdog coordination cell (UPI 065-b). Set by the
+    /// backup path before `execute` only when a pool is armed; default `None`
+    /// leaves every existing `.execute()` test site at pre-065-b behaviour.
+    pub fn set_watchdog_coord(&mut self, coord: Arc<Mutex<WatchdogCoord>>) {
+        self.watchdog_coord = Some(coord);
+    }
+
+    /// Share a clone of the watchdog cancel flag (UPI 065-b, S1) so the executor
+    /// can reset it before each send. Default `None` → no reset (pre-065-b).
+    pub fn set_watchdog_cancel(&mut self, cancel: Arc<AtomicBool>) {
+        self.watchdog_cancel = Some(cancel);
     }
 
     /// Set the full-send policy for chain-break gating.
@@ -367,6 +394,18 @@ impl<'a> Executor<'a> {
             if self.shutdown.load(Ordering::SeqCst) {
                 log::warn!("Shutdown signal received, skipping remaining subvolumes");
                 break;
+            }
+            // Non-authoritative early skip (UPI 065-b): if this subvolume's pool is
+            // already under watchdog pressure (tripped), skip the whole group to
+            // avoid minting a snapshot on a pool the watchdog is trying to relieve.
+            // The *authoritative* gate is the atomic tripped-check immediately
+            // before each send (`execute_send`); this is just an optimisation, so a
+            // poisoned lock falls through to it.
+            if self.pool_tripped(subvol_name) {
+                log::warn!(
+                    "Skipping {subvol_name}: its source pool is under watchdog pressure"
+                );
+                continue;
             }
             let armed = self
                 .armed_tiers
@@ -952,6 +991,20 @@ impl<'a> Executor<'a> {
         }
     }
 
+    /// True if this subvolume's source pool is currently tripped by the watchdog
+    /// (UPI 065-b). Backs the non-authoritative early group skip in `execute`; an
+    /// absent coordination cell, an unresolvable root, or a poisoned lock all read
+    /// `false` so the authoritative per-send gate in `execute_send` decides.
+    fn pool_tripped(&self, subvol_name: &str) -> bool {
+        let Some(coord) = &self.watchdog_coord else {
+            return false;
+        };
+        let Some(root) = self.config.snapshot_root_for(subvol_name) else {
+            return false;
+        };
+        coord.lock().map(|g| g.tripped.contains(&root)).unwrap_or(false)
+    }
+
     /// Returns (outcome, pin_failed) where pin_failed is true if send succeeded
     /// but pin file write failed.
     #[allow(clippy::too_many_arguments)]
@@ -1114,7 +1167,59 @@ impl<'a> Executor<'a> {
             }
         }
 
-        match self.btrfs.send_receive(snapshot, parent, dest_dir) {
+        // ── Watchdog coordination (UPI 065-b) ───────────────────────────
+        // Reset the shared cancel flag FIRST (S1): a latched abort from a previous
+        // pool's same-filesystem trip must not cancel this send. Then, under the
+        // single coordination lock, check-then-publish atomically — if this pool is
+        // already tripped, skip the send; otherwise publish its root as in-flight.
+        // Resetting the cancel flag *before* publishing in-flight is load-bearing:
+        // once the watchdog can read this root it may set the cancel flag for a
+        // same-fs trip, and that set must survive (not be clobbered by a later
+        // reset). The lock makes the check+publish atomic with the watchdog's
+        // trip+read; a poisoned lock fails OPEN (proceeds), per the "backups fail
+        // open" invariant.
+        if let Some(cancel) = &self.watchdog_cancel {
+            cancel.store(false, Ordering::SeqCst);
+        }
+        let coord_root = self.config.snapshot_root_for(subvol_name);
+        if let (Some(coord), Some(root)) = (&self.watchdog_coord, &coord_root)
+            && let Ok(mut g) = coord.lock()
+        {
+            if g.tripped.contains(root) {
+                log::warn!(
+                    "Skipping {op_name} for {subvol_name}: source pool under watchdog pressure"
+                );
+                return (
+                    OperationOutcome {
+                        operation: op_name.to_string(),
+                        drive_label: Some(drive_label.to_string()),
+                        result: OpResult::Skipped,
+                        duration: start.elapsed(),
+                        error: Some("source pool under watchdog pressure".to_string()),
+                        bytes_transferred: None,
+                        btrfs_operation: None,
+                        btrfs_stderr: None,
+                    },
+                    false,
+                );
+            }
+            g.in_flight = Some(root.clone());
+        }
+
+        let send_result = self.btrfs.send_receive(snapshot, parent, dest_dir);
+
+        // Clear in-flight under the same lock now the send has exited (both arms),
+        // but only if it is still *our* root — a later send may already have
+        // published its own (sequential execution means it cannot, but the guard
+        // keeps the invariant local and obvious).
+        if let (Some(coord), Some(root)) = (&self.watchdog_coord, &coord_root)
+            && let Ok(mut g) = coord.lock()
+            && g.in_flight.as_deref() == Some(root.as_path())
+        {
+            g.in_flight = None;
+        }
+
+        match send_result {
             Ok(result) => {
                 // Pin-on-success
                 let mut pin_failed = false;
@@ -1567,7 +1672,17 @@ impl<'a> Executor<'a> {
     /// `away_sheddable` map → Tier 1 sheds nothing → Tier 2 blanket = pre-058
     /// behavior (safe degradation for a caller that cannot compute presence, R3).
     ///
-    /// Safety: relies on the advisory lock preventing concurrent backup runs.
+    /// Safety: the **advisory lock** prevents a concurrent backup *process*. Within
+    /// a run there is now **one** intra-run concurrent caller — the watchdog thread,
+    /// on the cross-filesystem branch (UPI 065-b). That call is safe by
+    /// construction: the caller (`handle_watchdog_trip`) guarantees, via the single
+    /// `WatchdogCoord` lock, that the reclaimed pool is **not** the in-flight send's
+    /// source filesystem — so the snapshots this deletes on the reclaimed pool are
+    /// disjoint from the snapshot the live send reads on another filesystem/device.
+    /// The two coordination orderings (executor publishes `in_flight` first → the
+    /// trip is same-filesystem and aborts instead; or the watchdog marks the pool
+    /// `tripped` first → the executor skips that pool's sends) make it impossible
+    /// for a send on the reclaimed pool to be running when this is called.
     #[must_use]
     pub fn emergency_reclaim_pool(
         &self,
@@ -2134,6 +2249,85 @@ source = "/data/b"
         // Pin file should have been written
         let pin_content = std::fs::read_to_string(&pin_path).unwrap();
         assert_eq!(pin_content.trim(), "20260322-1430-a");
+    }
+
+    fn send_full_plan_for_sv_a() -> BackupPlan {
+        let ts = NaiveDate::from_ymd_opt(2026, 3, 22)
+            .unwrap()
+            .and_hms_opt(14, 30, 0)
+            .unwrap();
+        BackupPlan {
+            operations: vec![PlannedOperation::SendFull {
+                snapshot: PathBuf::from("/snap/sv-a/20260322-1430-a"),
+                dest_dir: PathBuf::from("/mnt/test/.snapshots/sv-a"),
+                drive_label: "TEST-DRIVE".to_string(),
+                subvolume_name: "sv-a".to_string(),
+                pin_on_success: None,
+                reason: FullSendReason::FirstSend,
+                token_verified: false,
+            }],
+            timestamp: ts,
+            skipped: vec![],
+            events: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn watchdog_tripped_pool_skips_send() {
+        // C2 (executor side): when this subvolume's source pool is in `tripped`,
+        // the send is gated — no `send_receive` runs. sv-a resolves to `/snap`.
+        let mock = MockBtrfs::new();
+        let config = test_config();
+        let shutdown = no_shutdown();
+        let mut executor = Executor::new(&mock, None, &config, &shutdown);
+        let coord = Arc::new(Mutex::new(WatchdogCoord {
+            in_flight: None,
+            tripped: [PathBuf::from("/snap")].into_iter().collect(),
+        }));
+        executor.set_watchdog_coord(coord);
+
+        executor.execute(&send_full_plan_for_sv_a(), "full");
+
+        assert!(
+            !mock
+                .calls()
+                .iter()
+                .any(|c| matches!(c, MockBtrfsCall::SendReceive { .. })),
+            "a tripped pool's send must be skipped, not sent"
+        );
+    }
+
+    #[test]
+    fn watchdog_cancel_flag_reset_before_send() {
+        // S1 (executor side): a latched cancel flag from a previous pool's same-fs
+        // abort must NOT bleed into the next pool's send. The executor resets it
+        // before each send (here the pool is NOT tripped, so the send proceeds),
+        // and clears `in_flight` afterward.
+        let mock = MockBtrfs::new();
+        let config = test_config();
+        let shutdown = no_shutdown();
+        let mut executor = Executor::new(&mock, None, &config, &shutdown);
+        let coord = Arc::new(Mutex::new(WatchdogCoord::default()));
+        let cancel = Arc::new(AtomicBool::new(true)); // latched from a prior abort
+        executor.set_watchdog_coord(coord.clone());
+        executor.set_watchdog_cancel(cancel.clone());
+
+        executor.execute(&send_full_plan_for_sv_a(), "full");
+
+        assert!(
+            !cancel.load(Ordering::SeqCst),
+            "the latched cancel flag must be reset before the next pool's send (S1)"
+        );
+        assert!(
+            mock.calls()
+                .iter()
+                .any(|c| matches!(c, MockBtrfsCall::SendReceive { .. })),
+            "an untripped pool's send proceeds once the stale cancel is cleared"
+        );
+        assert!(
+            coord.lock().unwrap().in_flight.is_none(),
+            "in_flight is cleared after the send exits"
+        );
     }
 
     #[test]

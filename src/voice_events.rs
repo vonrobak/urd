@@ -156,16 +156,26 @@ fn summary_for(payload: &EventPayload) -> String {
             reason,
             freed_reserve,
             snapshots_reclaimed,
+            send_aborted,
         } => {
             let cause = match reason {
                 WatchdogReason::FloorCrossed => "floor crossed",
                 WatchdogReason::CliffExceeded => "rapid fill",
             };
             let bridge = if *freed_reserve { "reserve freed" } else { "no reserve" };
-            format!(
-                "guard stopped send on {pool_label}  ({cause}; {bridge}; \
-                 reclaimed {snapshots_reclaimed} snapshot(s))"
-            )
+            if *send_aborted {
+                format!(
+                    "guard stopped send on {pool_label}  ({cause}; {bridge}; \
+                     reclaimed {snapshots_reclaimed} snapshot(s))"
+                )
+            } else {
+                // Cross-filesystem (UPI 065-b): the running send read a different,
+                // independent pool — relieve this one, leave that send untouched.
+                format!(
+                    "guard relieved {pool_label}  ({cause}; {bridge}; \
+                     reclaimed {snapshots_reclaimed} snapshot(s); left the running send untouched)"
+                )
+            }
         }
         EventPayload::EmergencyEject {
             pool_label,
@@ -597,4 +607,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn render_watchdog_abort_same_fs_says_stopped_send() {
+        let _color = setup();
+        let row = make_row(
+            EventPayload::WatchdogAbort {
+                pool_label: "/home".into(),
+                reason: WatchdogReason::CliffExceeded,
+                freed_reserve: true,
+                snapshots_reclaimed: 2,
+                send_aborted: true,
+            },
+            None,
+            None,
+        );
+        let line = format_row(&row);
+        assert!(line.contains("guard stopped send on /home"), "same-fs: {line}");
+        assert!(line.contains("rapid fill"));
+        assert!(line.contains("reclaimed 2 snapshot(s)"));
+    }
+
+    #[test]
+    fn render_watchdog_abort_cross_fs_says_relieved_not_stopped() {
+        // UPI 065-b: a cross-filesystem firing left the running send untouched.
+        let _color = setup();
+        let row = make_row(
+            EventPayload::WatchdogAbort {
+                pool_label: "/home".into(),
+                reason: WatchdogReason::FloorCrossed,
+                freed_reserve: false,
+                snapshots_reclaimed: 3,
+                send_aborted: false,
+            },
+            None,
+            None,
+        );
+        let line = format_row(&row);
+        assert!(line.contains("guard relieved /home"), "cross-fs: {line}");
+        assert!(!line.contains("stopped send"));
+        assert!(line.contains("left the running send untouched"));
+    }
 }

@@ -210,15 +210,28 @@ pub enum EventPayload {
     DriveUnmounted {
         detected_by: DriveEventSource,
     },
-    /// The mid-op watchdog aborted an in-flight send to protect the host
-    /// (UPI 033, ADR-113 Layer 2). `freed_reserve` records whether the fast
-    /// bridge (the reserve file) was deleted; `snapshots_reclaimed` is how many
-    /// local snapshots the abort-reclaim shed on the triggering pool.
+    /// The mid-op watchdog fired to protect the host (UPI 033, ADR-113 Layer 2;
+    /// pool-scoped response by UPI 065-b). `freed_reserve` records whether the
+    /// fast bridge (the reserve file) was deleted; `snapshots_reclaimed` is how
+    /// many local snapshots the reclaim shed on the triggering pool.
+    /// `send_aborted` discriminates the two pool-scoped responses: `true` when the
+    /// in-flight send read the *same* filesystem and was cancelled (UPI 033
+    /// behaviour), `false` when it read a *different, independent* filesystem and
+    /// was left running while this pool was reclaimed concurrently (UPI 065-b).
+    ///
+    /// **`send_aborted` defaults to `true` on the read-old-data path (S2):** rows
+    /// written before UPI 065-b have no field and were *all* same-filesystem
+    /// aborts, so `true` preserves their historical meaning. The language default
+    /// (`false`) would silently relabel every historical abort as "send
+    /// continued," and *no* default would fail the deserialize (ADR-105/114
+    /// break).
     WatchdogAbort {
         pool_label: String,
         reason: WatchdogReason,
         freed_reserve: bool,
         snapshots_reclaimed: u32,
+        #[serde(default = "default_send_aborted")]
+        send_aborted: bool,
     },
     /// The always-on sentinel shed Urd-owned local snapshots while idle to keep a
     /// source pool above the host-survival floor (UPI 034, ADR-113 Layer 3). No
@@ -252,6 +265,14 @@ pub enum EventPayload {
         to: String,
         host_root: bool,
     },
+}
+
+/// Serde default for `WatchdogAbort::send_aborted` (S2): historical rows predate
+/// UPI 065-b's pool-scoping and were all same-filesystem aborts, so a missing
+/// field reads back as `true` — preserving their meaning rather than relabelling
+/// them "send continued."
+fn default_send_aborted() -> bool {
+    true
 }
 
 impl EventPayload {
@@ -474,6 +495,7 @@ mod tests {
                     reason: WatchdogReason::FloorCrossed,
                     freed_reserve: true,
                     snapshots_reclaimed: 3,
+                    send_aborted: true,
                 },
                 EventKind::Watchdog,
             ),
@@ -674,12 +696,14 @@ mod tests {
             reason: WatchdogReason::FloorCrossed,
             freed_reserve: true,
             snapshots_reclaimed: 2,
+            send_aborted: true,
         });
         roundtrip(&EventPayload::WatchdogAbort {
             pool_label: "/".into(),
             reason: WatchdogReason::CliffExceeded,
             freed_reserve: false,
             snapshots_reclaimed: 0,
+            send_aborted: false,
         });
         roundtrip(&EventPayload::EmergencyEject {
             pool_label: "/data".into(),
@@ -773,10 +797,37 @@ mod tests {
                 reason,
                 freed_reserve: true,
                 snapshots_reclaimed: 1,
+                send_aborted: true,
             };
             assert_eq!(payload.severity(), Severity::Warn);
             let json = serde_json::to_value(&payload).unwrap();
             assert_eq!(json.get("reason").and_then(|v| v.as_str()), Some(expected));
+        }
+    }
+
+    #[test]
+    fn watchdog_abort_missing_send_aborted_deserializes_as_true() {
+        // S2 (UPI 065-b): rows written before the field existed have no
+        // `send_aborted` and were ALL same-filesystem aborts. The
+        // `#[serde(default = "default_send_aborted")]` must read them back as
+        // `true` — the language default (`false`) would silently relabel every
+        // historical abort as "send continued," and no default would fail the
+        // deserialize (ADR-105/114 break). The construction-only type-cascade grep
+        // misses this; the deserialize path is the dangerous touchpoint.
+        let historical = r#"{
+            "type": "WatchdogAbort",
+            "pool_label": "/home",
+            "reason": "cliff_exceeded",
+            "freed_reserve": true,
+            "snapshots_reclaimed": 4
+        }"#;
+        let payload: EventPayload = serde_json::from_str(historical).expect("deserialize old row");
+        match payload {
+            EventPayload::WatchdogAbort { send_aborted, snapshots_reclaimed, .. } => {
+                assert!(send_aborted, "a field-less historical abort must read back as send_aborted=true");
+                assert_eq!(snapshots_reclaimed, 4);
+            }
+            other => panic!("expected WatchdogAbort, got {other:?}"),
         }
     }
 
