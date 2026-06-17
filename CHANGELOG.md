@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.0] - 2026-06-17
+
 ### Added
 - **The mid-op watchdog no longer kills a healthy long send over a momentary
   write spike** (UPI 065-a). Its cliff trigger (free-space drop rate) now fires on
@@ -32,6 +34,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reading" provable. The `WatchdogAbort` event gains a `send_aborted` discriminator
   (`urd events --kind watchdog`); historical rows read back as same-filesystem
   aborts. No config knob; no metric or heartbeat changes.
+
+## [0.26.0] - 2026-06-15
 
 ### Added
 - **A constrained pool now holds its offsite chain at Tight and says so out loud
@@ -1128,7 +1132,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Defense-in-depth pin file protection for unsent snapshots
 - Per-subvolume error isolation in executor
 
-[Unreleased]: https://github.com/vonrobak/urd/compare/v0.26.0...HEAD
+[Unreleased]: https://github.com/vonrobak/urd/compare/v0.27.0...HEAD
+[0.27.0]: https://github.com/vonrobak/urd/compare/v0.26.0...v0.27.0
 [0.26.0]: https://github.com/vonrobak/urd/compare/v0.25.2...v0.26.0
 [0.25.2]: https://github.com/vonrobak/urd/compare/v0.25.1...v0.25.2
 [0.25.1]: https://github.com/vonrobak/urd/compare/v0.25.0...v0.25.1
