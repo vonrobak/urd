@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **A long backup run can no longer be killed by a wall-clock timeout.** The
+  packaged systemd unit (`urd-backup.service`) set `TimeoutStartSec=6h`, so systemd
+  SIGTERM'd a healthy, still-progressing run at the 6-hour mark — silently
+  cancelling multi-TB first/full sends that legitimately need longer over USB
+  (observed killing two consecutive nightly runs mid-send). The start timeout is now
+  `infinity`: only a real emergency (the storage watchdog, ADR-113) or a genuine
+  failure may stop a send, never a clock. Existing installs must reinstall the unit
+  (or set `TimeoutStartSec=infinity`) and run `systemctl --user daemon-reload`.
+
 ## [0.27.0] - 2026-06-17
 
 ### Added
