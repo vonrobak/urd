@@ -18,6 +18,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   level-absolute and window-independent (the host-survival backstop is unchanged),
   and after a reserve reclaim the window resets so a >reserve transient cannot
   escalate to a spurious abort. No config knob; no on-disk or metric changes.
+- **Storage pressure on one source pool no longer cancels a healthy backup
+  reading a different, independent pool** (UPI 065-b, ADR-113 amendment). The
+  mid-op watchdog's response — the abort, the new-send gate, and the reclaim — is
+  now **scoped to the in-flight send's source filesystem**. A trip on filesystem A
+  reclaims A's own snapshots; it aborts the running send only if that send reads
+  from A (same filesystem), and leaves an unrelated send on filesystem B running
+  and ungated, relieving A concurrently instead. This closes the other half of
+  field incident run #110, where a `/home` pressure spike cancelled a 2.7 TB send
+  reading the unrelated `/mnt` pool — freeing zero bytes on `/home`. A single
+  identity-keyed coordination lock (keyed on the filesystem's full snapshot-root
+  set, not one representative path) makes "never reclaim a filesystem a send is
+  reading" provable. The `WatchdogAbort` event gains a `send_aborted` discriminator
+  (`urd events --kind watchdog`); historical rows read back as same-filesystem
+  aborts. No config knob; no metric or heartbeat changes.
 
 ### Added
 - **A constrained pool now holds its offsite chain at Tight and says so out loud

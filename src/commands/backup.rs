@@ -16,8 +16,8 @@ use crate::config::Config;
 use crate::drives;
 use crate::events::{Event, EventPayload};
 use crate::executor::{
-    ExecutionResult, Executor, FullSendPolicy, OpResult, RunResult, SendType,
-    TransientCleanupOutcome,
+    ExecutionResult, Executor, FullSendPolicy, OffsiteChainRelease, OpResult, ReclaimOutcome,
+    RunResult, SendType, TransientCleanupOutcome,
 };
 use crate::guard::{
     self, WatchdogAction, WatchdogReason, WatchdogSample, WatchdogThresholds, CLIFF_BYTES_PER_SEC,
@@ -43,6 +43,13 @@ use crate::state::StateDb;
 use crate::types::{BackupPlan, ByteSize, PlannedOperation, ProtectionLevel, SendKind};
 
 pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
+    // Share one config across the run AND the watchdog thread (UPI 065-b): the
+    // thread outlives the `&config` borrow, and its cross-filesystem reclaim needs
+    // a `&Config` for the transient maintenance executor. `Config` is not `Clone`
+    // (a wide family of nested types), so an `Arc` is the cheap, non-invasive way
+    // to give the `'static` thread an owned handle. Deref-coercion keeps every
+    // existing `&config` / `config.field` site unchanged.
+    let config = Arc::new(config);
     crate::cli_validation::require_known_subvolume(&config, args.subvolume.as_deref())?;
 
     let now = chrono::Local::now().naive_local();
@@ -237,6 +244,11 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     // a host-survival abort; it is shared into the btrfs copy loop via
     // `with_cancel`.
     let watchdog_abort = Arc::new(AtomicBool::new(false));
+    // The single executor↔watchdog coordination cell (UPI 065-b). The executor
+    // publishes the in-flight send's root and reads the per-pool tripped gate
+    // under this lock; the watchdog trips pools through it. Empty + unwired on a
+    // Roomy-only run (no armed pools → no thread → byte-identical to before).
+    let watchdog_coord: Arc<Mutex<WatchdogCoord>> = Arc::new(Mutex::new(WatchdogCoord::default()));
     let armed_pools = arm_watchdog_pools(&config, &signals, &resolved.armed_tier_map);
 
     // Set up executor with live byte counter for progress display
@@ -258,6 +270,16 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     // Critical, it sheds the away-only pins in-run while preserving the
     // connected chain. Computed under the lock from the in-run FS state.
     executor.set_away_shed_pins(plan::away_shed_map(&config, &fs_state));
+
+    // Wire the watchdog coordination (UPI 065-b) only when a pool is armed (a
+    // Roomy-only run stays byte-identical — no coord lock, no cancel reset). The
+    // executor publishes/clears the in-flight root and honors the tripped gate
+    // under `watchdog_coord`, and resets the shared cancel flag before each send
+    // so a same-fs abort cannot bleed into the next pool's send (S1).
+    if !armed_pools.is_empty() {
+        executor.set_watchdog_coord(watchdog_coord.clone());
+        executor.set_watchdog_cancel(watchdog_abort.clone());
+    }
 
     // In autonomous mode (systemd), gate chain-break full sends unless --force-full.
     if !args.force_full && std::env::var("INVOCATION_ID").is_ok() {
@@ -350,17 +372,33 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     // Spawned only when at least one pool armed (Roomy-only run → no thread, no
     // overhead, byte-identical output to before).
     let watchdog_shutdown = Arc::new(AtomicBool::new(false));
-    let firing: Arc<Mutex<Option<WatchdogFiring>>> = Arc::new(Mutex::new(None));
+    let firing: Arc<Mutex<Vec<WatchdogFiring>>> = Arc::new(Mutex::new(Vec::new()));
     let watchdog_handle = if armed_pools.is_empty() {
         None
     } else {
         let pools = armed_pools.clone();
         let abort = watchdog_abort.clone();
-        let exec_shutdown = shutdown.clone();
+        let coord = watchdog_coord.clone();
         let wd_shutdown = watchdog_shutdown.clone();
         let firing_slot = firing.clone();
+        // Cross-filesystem reclaim plumbing owned by the thread (M1 — NO DB
+        // connection moves here): a maintenance btrfs handle + an owned config
+        // build a transient `Executor` at reclaim time; the away map is the
+        // spawn-time snapshot, re-filtered to still-unmounted drives (S3).
+        let maint_btrfs = RealBtrfs::for_maintenance(&config.general.btrfs_path);
+        let wd_config = Arc::clone(&config);
+        let wd_away = plan::away_shed_map(&config, &fs_state);
         Some(std::thread::spawn(move || {
-            watchdog_loop(&pools, &abort, &exec_shutdown, &wd_shutdown, &firing_slot);
+            watchdog_loop(
+                &pools,
+                &abort,
+                &coord,
+                &wd_shutdown,
+                &firing_slot,
+                &maint_btrfs,
+                &wd_config,
+                &wd_away,
+            );
         }))
     };
 
@@ -375,46 +413,74 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
         h.join().ok();
     }
 
-    // ── Mid-op watchdog teardown + abort-reclaim (UPI 033, Step 5b) ────
+    // ── Mid-op watchdog teardown (UPI 033, pool-scoped by UPI 065-b) ────
     watchdog_shutdown.store(true, Ordering::SeqCst);
     if let Some(h) = watchdog_handle {
-        h.join().ok();
+        h.join().ok(); // may briefly block on an in-progress cross-fs reclaim
     }
-    // If the watchdog fired, the send was cancelled but the source pool is not
-    // yet relieved — cancelling a send frees no source space (C1). Shed the
-    // triggering pool's local snapshots now that the send has exited (execution
-    // is sequential, so no snapshot is busy), then surface it told-not-silent.
-    // Gated on a firing record — an operator Ctrl-C (no firing) never reclaims.
-    let watchdog_firing = firing.lock().ok().and_then(|mut f| f.take());
-    let watchdog_fired = watchdog_firing.is_some();
-    if let Some(fire) = watchdog_firing {
-        // Two-tier graduated reclaim (UPI 058): shed away-only pins first and
-        // re-measure; the connected chains survive if that clears the floor,
-        // else escalate to the blanket. Presence is recomputed fresh from the
-        // post-abort FS state via the same shared scope helper the planner uses.
-        let away = plan::away_shed_map(&config, &fs_state);
-        let reclaim = executor.emergency_reclaim_pool(
-            &fire.subvol_names,
-            &away,
-            fire.floor_bytes,
-            || pools::pool_free_bytes(&fire.mountpoint).ok(),
-        );
-        let reclaimed = reclaim.deleted();
-        log::warn!(
-            "Watchdog aborted send on {} ({:?}); reclaimed {reclaimed} snapshot(s), reserve freed: {}",
-            fire.pool_label,
-            fire.reason,
-            fire.freed_reserve,
-        );
+    // One firing per tripped pool. Two shapes (UPI 065-b):
+    //   • same-filesystem (`send_aborted`): the watchdog cancelled the in-flight
+    //     send, which freed no source space — do the post-abort two-tier reclaim
+    //     here now that the send has exited (execution is sequential, so no
+    //     snapshot is busy).
+    //   • cross-filesystem (`!send_aborted`): the reclaim already ran on the
+    //     watchdog thread (M1 — no DB connection there); the teardown only records
+    //     the stashed outcome on the single main connection.
+    // An operator Ctrl-C produces no firing and never reclaims.
+    let watchdog_firings: Vec<WatchdogFiring> = firing
+        .lock()
+        .map(|mut f| std::mem::take(&mut *f))
+        .unwrap_or_default();
+    let watchdog_fired = !watchdog_firings.is_empty();
+    let mut watchdog_notifications = Vec::new();
+    for fire in &watchdog_firings {
+        let (reclaimed, releases, event_ts): (u32, Vec<OffsiteChainRelease>, chrono::NaiveDateTime) =
+            if fire.send_aborted {
+                // Two-tier graduated reclaim (UPI 058): shed away-only pins first
+                // and re-measure; connected chains survive if that clears the
+                // floor, else escalate to the blanket. Presence is recomputed
+                // fresh from the post-abort FS state via the shared scope helper.
+                let away = plan::away_shed_map(&config, &fs_state);
+                let reclaim = executor.emergency_reclaim_pool(
+                    &fire.subvol_names,
+                    &away,
+                    fire.floor_bytes,
+                    || pools::pool_free_bytes(&fire.mountpoint).ok(),
+                );
+                log::warn!(
+                    "Watchdog aborted send on {} ({:?}); reclaimed {} snapshot(s), reserve freed: {}",
+                    fire.pool_label,
+                    fire.reason,
+                    reclaim.deleted(),
+                    fire.freed_reserve,
+                );
+                let ts = chrono::Local::now().naive_local();
+                (reclaim.deleted(), reclaim.releases().to_vec(), ts)
+            } else {
+                // Cross-fs: already reclaimed concurrently on the watchdog thread.
+                match &fire.reclaim {
+                    Some((outcome, ts)) => {
+                        log::warn!(
+                            "Watchdog relieved {} concurrently ({:?}); reclaimed {} snapshot(s) on \
+                             the watchdog thread, left the in-flight send (different filesystem) running",
+                            fire.pool_label,
+                            fire.reason,
+                            outcome.deleted(),
+                        );
+                        (outcome.deleted(), outcome.releases().to_vec(), *ts)
+                    }
+                    None => (0, Vec::new(), chrono::Local::now().naive_local()),
+                }
+            };
         if let Some(ref db) = state_db {
-            let now_ts = chrono::Local::now().naive_local();
             let mut ev = Event::pure(
-                now_ts,
+                event_ts,
                 EventPayload::WatchdogAbort {
                     pool_label: fire.pool_label.clone(),
                     reason: fire.reason,
                     freed_reserve: fire.freed_reserve,
                     snapshots_reclaimed: reclaimed,
+                    send_aborted: fire.send_aborted,
                 },
             );
             ev.run_id = result.run_id;
@@ -423,19 +489,28 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
             // for audit symmetry with the planner-driven away-shed. NO separate
             // notification — the Critical WatchdogAbort notification already states
             // the next backup will be a full send (avoid double-notifying).
-            let release_events: Vec<Event> = reclaim
-                .releases()
+            let release_events: Vec<Event> = releases
                 .iter()
-                .map(|r| r.to_event(now_ts, result.run_id))
+                .map(|r| r.to_event(event_ts, result.run_id))
                 .collect();
             if !release_events.is_empty() {
                 db.record_events_best_effort(&release_events);
             }
         }
-        notify::dispatch(
-            &[notify::build_watchdog_abort_notification(&fire.pool_label, reclaimed)],
-            &config.notifications,
-        );
+        watchdog_notifications.push(notify::build_watchdog_abort_notification(
+            &fire.pool_label,
+            reclaimed,
+            fire.send_aborted,
+        ));
+    }
+    // S1 (defensive): clear the shared cancel flag once every aborted send has
+    // exited and its reclaim has run. The real enforcement is the executor's
+    // per-send reset (so a same-fs abort cannot bleed into the next pool's send
+    // *within* the run); this teardown clear is belt-and-suspenders for the
+    // process-end state.
+    watchdog_abort.store(false, Ordering::SeqCst);
+    if !watchdog_notifications.is_empty() {
+        notify::dispatch(&watchdog_notifications, &config.notifications);
     }
 
     // ── Offsite chains released by the planner-driven away-shed (UPI 064-b) ──
@@ -613,8 +688,20 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
 struct ArmedPool {
     /// Source-pool path the watchdog polls — the snapshot root, on the same
     /// filesystem as the reserve and the local snapshots (all on the source
-    /// pool), so its statvfs free bytes are the source pool's.
+    /// pool), so its statvfs free bytes are the source pool's. One
+    /// representative root suffices for the free-space probe and the reserve;
+    /// it is **not** used for the same-filesystem decision (see `roots`).
     poll_path: PathBuf,
+    /// **Pool identity** for the watchdog's same-vs-cross-filesystem decision
+    /// (UPI 065-b, adversary C1): the *full set* of snapshot roots of this
+    /// filesystem's send-enabled subvolumes. A pool is keyed by filesystem UUID
+    /// (`PoolSignal`), and `local_snapshots.roots`/per-subvol `snapshot_root` is
+    /// a `Vec`, so one UUID-pool can span several roots. The same-fs predicate
+    /// is **membership** (`roots.contains(in_flight_root)`), never equality
+    /// against `poll_path` — otherwise two subvolumes on one filesystem under
+    /// different roots misclassify as cross-fs and trigger a concurrent reclaim
+    /// of the very filesystem a send is reading from.
+    roots: HashSet<PathBuf>,
     /// Where the fast-bridge reserve lives for this pool.
     reserve_path: PathBuf,
     /// `min_free + cleanup_budget` — the absolute floor (M5).
@@ -630,8 +717,37 @@ struct ArmedPool {
     subvol_names: Vec<String>,
 }
 
-/// Thread→main record written when the watchdog aborts a send (UPI 033). Carries
-/// everything the abort-reclaim, event, and notification need.
+/// The single coordination cell shared by the executor and the watchdog thread
+/// (UPI 065-b, adversary C2). One lock over **both** fields makes the executor's
+/// check-tripped-then-publish-in-flight and the watchdog's mark-tripped-then-read-
+/// in-flight each atomic, so the two are the only interleavings possible:
+///
+/// - *executor wins the lock first* → `in_flight` holds a tripping-pool root → the
+///   watchdog later reads it → **same-filesystem → abort** (never a concurrent
+///   reclaim of the pool a send is reading);
+/// - *watchdog wins first* → the pool's roots are in `tripped` → the executor later
+///   sees `tripped.contains(root)` → **skips** that send → the concurrent cross-fs
+///   reclaim of the tripping pool is safe (no send on it; any in-flight send is on a
+///   disjoint filesystem).
+///
+/// "Disjoint by construction" is therefore a theorem, not a hope. Two independent
+/// `Mutex` cells (the pre-redesign shape) would let an interleaving both start a
+/// send on a pool *and* concurrently reclaim it.
+#[derive(Debug, Default)]
+pub(crate) struct WatchdogCoord {
+    /// Snapshot root of the send the executor is **currently** running (published
+    /// under this lock immediately before `send_receive`, cleared immediately
+    /// after). `None` between sends.
+    pub(crate) in_flight: Option<PathBuf>,
+    /// Snapshot roots of every pool the watchdog has tripped this run. The
+    /// executor refuses to start a send whose root is in this set (the per-pool
+    /// new-send gate that replaces the old global executor shutdown).
+    pub(crate) tripped: HashSet<PathBuf>,
+}
+
+/// Thread→main record written when the watchdog fires (UPI 033, pool-scoped by
+/// UPI 065-b). Carries everything the abort-reclaim, event, and notification need.
+/// One firing per tripped pool; the teardown iterates the accumulated `Vec`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WatchdogFiring {
     pool_label: String,
@@ -644,6 +760,17 @@ struct WatchdogFiring {
     /// Host-survival floor the Tier-1 reclaim must clear before it can stop
     /// (UPI 058 — `ArmedPool.floor_bytes`, the watchdog's own floor).
     floor_bytes: u64,
+    /// `true` when the trip aborted the in-flight send (same-filesystem); `false`
+    /// when the in-flight send read a *different* filesystem and was left running
+    /// (UPI 065-b). Drives the teardown's reclaim-or-record-only branch and the
+    /// event/notification prose.
+    send_aborted: bool,
+    /// The cross-filesystem reclaim already performed **on the watchdog thread**
+    /// (UPI 065-b, M1), stashed with the timestamp it ran at. `Some` only when
+    /// `send_aborted` is `false`: the teardown records this outcome on the single
+    /// main DB connection rather than reclaiming again. `None` for a same-fs abort
+    /// (the teardown does that reclaim itself, as in UPI 033).
+    reclaim: Option<(ReclaimOutcome, chrono::NaiveDateTime)>,
 }
 
 /// Build the armed-pool list from the pre-plan gather (UPI 033). Production
@@ -760,9 +887,21 @@ fn arm_watchdog_pools_with(
                 t.space.capacity_bytes,
             )
             .unwrap_or(min_free_bytes);
+            // Pool identity (C1): the full root-set of this filesystem's
+            // send-enabled subvolumes. `snapshot_root_for` is the SAME resolver
+            // the executor publishes `in_flight` through, so membership here and
+            // the executor's published root agree by construction. Roots that
+            // don't resolve are dropped (a send-enabled subvol always has one;
+            // the `None` arm is defensive).
+            let roots: HashSet<PathBuf> = t
+                .send_subvols
+                .iter()
+                .filter_map(|n| config.snapshot_root_for(n))
+                .collect();
             ArmedPool {
                 reserve_path: reserve::reserve_path(&t.root),
                 poll_path: t.root,
+                roots,
                 floor_bytes,
                 min_free_bytes,
                 label: t.label,
@@ -842,19 +981,42 @@ fn window_baseline(
     }
 }
 
-/// The watchdog thread body (UPI 033). Polls each armed pool's source-pool free
-/// space every `WATCHDOG_POLL_MS`; on a floor/cliff trigger it first frees the
-/// reserve (fast bridge, here on the watchdog thread so it fires even if the
-/// copy thread is wedged — S4), and on a still-triggering sample with no reserve
-/// it sets the cancel flag (abort the in-flight send) and the executor shutdown
-/// flag (stop new sends), records the firing, and stops polling. The absolute
-/// floor is suppressed for a pool that started below it (see `watchdog_step`).
+/// The watchdog thread body (UPI 033, pool-scoped response by UPI 065-b). Polls
+/// each armed pool's source-pool free space every `WATCHDOG_POLL_MS`; on a
+/// floor/cliff trigger it first frees the reserve (fast bridge, here on the
+/// watchdog thread so it fires even if the copy thread is wedged — S4), and on a
+/// still-triggering sample with no reserve it **scopes the response to the
+/// in-flight send's source filesystem** (the ADR-113 2026-06-17 amendment):
+///
+/// - **Same-filesystem** (no send in flight, or the in-flight send reads a root in
+///   this pool's `roots`): set the cancel flag to abort the in-flight send. The
+///   main-thread teardown sheds this pool's footprint after the send exits.
+/// - **Cross-filesystem** (the in-flight send reads a *different* filesystem):
+///   leave that send running and untouched; reclaim **this** pool's own footprint
+///   concurrently, right here on the watchdog thread (safe by construction — the
+///   pools are disjoint devices, and the coordination lock guarantees no send on
+///   this pool is running, see [`WatchdogCoord`]).
+///
+/// New sends on a tripped pool are gated by inserting its `roots` into
+/// `coord.tripped`; the watchdog no longer sets a global executor shutdown. It
+/// keeps polling after a trip (each pool fires at most once — `done`), so an
+/// independent pool's pressure is still caught. The absolute floor is suppressed
+/// for a pool that started below it (see `watchdog_step`).
+#[allow(clippy::too_many_arguments)]
 fn watchdog_loop(
     pools: &[ArmedPool],
     abort: &AtomicBool,
-    executor_shutdown: &AtomicBool,
+    coord: &Mutex<WatchdogCoord>,
     watchdog_shutdown: &AtomicBool,
-    firing: &Mutex<Option<WatchdogFiring>>,
+    firing: &Mutex<Vec<WatchdogFiring>>,
+    // Cross-filesystem reclaim plumbing (UPI 065-b, M1 — NO DB connection moves to
+    // this thread): a maintenance btrfs handle and the config build a transient
+    // `Executor` that calls the existing `emergency_reclaim_pool`; the away map is
+    // the spawn-time snapshot, re-filtered to still-unmounted drives at reclaim
+    // time (S3).
+    maint_btrfs: &dyn BtrfsOps,
+    config: &Config,
+    away_at_spawn: &HashMap<String, Vec<String>>,
 ) {
     // Per-pool trailing window of `(instant, free)` readings — the cliff rate is
     // a windowed average over the last `WATCHDOG_CLIFF_WINDOW` (UPI 065-a), not a
@@ -862,11 +1024,18 @@ fn watchdog_loop(
     let mut windows: HashMap<PathBuf, VecDeque<(Instant, u64)>> = HashMap::new();
     let mut freed: HashSet<PathBuf> = HashSet::new();
     let mut started_below: HashMap<PathBuf, bool> = HashMap::new();
+    // Each pool fires at most once per run (UPI 065-b): after a same-fs abort or a
+    // cross-fs reclaim it is `done` and skipped, so the loop keeps watching the
+    // *other* independent pools without re-processing this one.
+    let mut done: HashSet<PathBuf> = HashSet::new();
     loop {
         if watchdog_shutdown.load(Ordering::Relaxed) {
             return;
         }
         for pool in pools {
+            if done.contains(&pool.poll_path) {
+                continue; // already fired this run — independence: keep watching others
+            }
             let Ok(space) = pools::pool_space(&pool.poll_path) else {
                 continue; // unmeasurable this tick — try again next poll
             };
@@ -925,28 +1094,147 @@ fn watchdog_loop(
                     }
                 }
                 WatchdogAction::Abort(reason) => {
-                    log::warn!(
-                        "Watchdog: {} {reason:?} — aborting in-flight send (host survival)",
-                        pool.label
+                    let firing_record = handle_watchdog_trip(
+                        pool,
+                        reason,
+                        freed.contains(&pool.poll_path),
+                        abort,
+                        coord,
+                        maint_btrfs,
+                        config,
+                        away_at_spawn,
                     );
-                    abort.store(true, Ordering::SeqCst);
-                    executor_shutdown.store(true, Ordering::SeqCst);
                     if let Ok(mut slot) = firing.lock() {
-                        *slot = Some(WatchdogFiring {
-                            pool_label: pool.label.clone(),
-                            reason,
-                            freed_reserve: freed.contains(&pool.poll_path),
-                            subvol_names: pool.subvol_names.clone(),
-                            mountpoint: pool.poll_path.clone(),
-                            floor_bytes: pool.floor_bytes,
-                        });
+                        slot.push(firing_record);
                     }
-                    return; // abort is in motion — stop polling
+                    done.insert(pool.poll_path.clone());
+                    // Keep polling: independence means an unrelated pool's pressure
+                    // must still be caught after this one fired.
                 }
             }
         }
         std::thread::sleep(Duration::from_millis(WATCHDOG_POLL_MS));
     }
+}
+
+/// Scope a sustained watchdog trip on `pool` to the in-flight send's source
+/// filesystem (UPI 065-b — the ADR-113 2026-06-17 amendment). Extracted from the
+/// loop's `Abort` arm so the same-vs-cross-filesystem decision is unit-testable
+/// without forcing a real floor/cliff trip on a live statvfs.
+///
+/// The atomic trip-then-read is the C2 invariant: under **one** lock acquisition
+/// it marks every one of `pool.roots` tripped (gating that pool's new sends) and
+/// reads the executor's published `in_flight` root. Same lock the executor
+/// publishes/checks through ⇒ only two orderings exist, and neither both starts a
+/// send on this pool and concurrently reclaims it. A poisoned lock degrades to
+/// `None` → same-filesystem → abort: the recoverable error direction (a wrongful
+/// concurrent reclaim under a live send is not).
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+fn handle_watchdog_trip(
+    pool: &ArmedPool,
+    reason: WatchdogReason,
+    freed_reserve: bool,
+    abort: &AtomicBool,
+    coord: &Mutex<WatchdogCoord>,
+    maint_btrfs: &dyn BtrfsOps,
+    config: &Config,
+    away_at_spawn: &HashMap<String, Vec<String>>,
+) -> WatchdogFiring {
+    let in_flight = match coord.lock() {
+        Ok(mut g) => {
+            for r in &pool.roots {
+                g.tripped.insert(r.clone());
+            }
+            g.in_flight.clone()
+        }
+        Err(_) => None,
+    };
+    // Membership, NOT path-equality (C1): a UUID-pool can span several snapshot
+    // roots, so the in-flight root must be tested against the pool's *whole*
+    // root-set. `None` (no send in flight) is same-fs — nothing to cross-pool-harm.
+    let same_fs = in_flight.as_ref().is_none_or(|r| pool.roots.contains(r));
+    if same_fs {
+        log::warn!(
+            "Watchdog: {} {reason:?} — aborting in-flight send (same-filesystem; host survival)",
+            pool.label
+        );
+        abort.store(true, Ordering::SeqCst);
+        WatchdogFiring {
+            pool_label: pool.label.clone(),
+            reason,
+            freed_reserve,
+            subvol_names: pool.subvol_names.clone(),
+            mountpoint: pool.poll_path.clone(),
+            floor_bytes: pool.floor_bytes,
+            send_aborted: true,
+            reclaim: None,
+        }
+    } else {
+        // Cross-filesystem: the in-flight send reads a disjoint pool. Leave it
+        // running and ungated; reclaim THIS pool's own footprint concurrently
+        // (safe by construction — see `WatchdogCoord`). Runs the existing two-tier
+        // reclaim via a transient maintenance executor; NO DB connection on this
+        // thread (M1) — stash the outcome for the teardown.
+        log::warn!(
+            "Watchdog: {} {reason:?} — in-flight send reads a different filesystem; \
+             reclaiming this pool concurrently (independence)",
+            pool.label
+        );
+        let fresh_away = fresh_away_map(away_at_spawn, config);
+        let dummy_shutdown = AtomicBool::new(false);
+        let maint_exec = Executor::new(maint_btrfs, None, config, &dummy_shutdown);
+        let outcome = maint_exec.emergency_reclaim_pool(
+            &pool.subvol_names,
+            &fresh_away,
+            pool.floor_bytes,
+            || pools::pool_free_bytes(&pool.poll_path).ok(),
+        );
+        let ts = chrono::Local::now().naive_local();
+        WatchdogFiring {
+            pool_label: pool.label.clone(),
+            reason,
+            freed_reserve,
+            subvol_names: pool.subvol_names.clone(),
+            mountpoint: pool.poll_path.clone(),
+            floor_bytes: pool.floor_bytes,
+            send_aborted: false,
+            reclaim: Some((outcome, ts)),
+        }
+    }
+}
+
+/// Re-filter a spawn-time away-shed map to drives still **unmounted** at reclaim
+/// time (UPI 065-b, S3). The cross-filesystem reclaim runs on the watchdog thread
+/// using the away map computed before execution; if a drive *reconnected* mid-run
+/// its pin is no longer away-only, so shedding it would break a now-connected
+/// chain. Drop any label whose drive is currently mounted. A label whose drive is
+/// absent from config is kept (it was classified away at spawn and we cannot prove
+/// it reconnected — the conservative direction is to not invent a connected chain).
+/// Subvolumes left with no away labels are dropped, matching `away_shed_map`'s
+/// "absent key = no presence-aware shed."
+#[must_use]
+fn fresh_away_map(
+    away_at_spawn: &HashMap<String, Vec<String>>,
+    config: &Config,
+) -> HashMap<String, Vec<String>> {
+    away_at_spawn
+        .iter()
+        .filter_map(|(subvol, labels)| {
+            let still_away: Vec<String> = labels
+                .iter()
+                .filter(|label| {
+                    config
+                        .drives
+                        .iter()
+                        .find(|d| &d.label == *label)
+                        .is_none_or(|d| !drives::is_drive_mounted(d))
+                })
+                .cloned()
+                .collect();
+            (!still_away.is_empty()).then_some((subvol.clone(), still_away))
+        })
+        .collect()
 }
 
 /// Pre-position the fast-bridge reserve (UPI 033, S3). Production wrapper.
@@ -2551,6 +2839,14 @@ source = "/data/beta"
             vec!["alpha".to_string(), "beta".to_string()]
         );
         assert_eq!(armed[0].label, "/data");
+        // C1 (UPI 065-b): the pool's identity is the full root-set of its
+        // send-enabled subvolumes. Both alpha and beta resolve to `/snap`, so the
+        // set is the single `/snap` (the same-fs membership test keys on this).
+        assert_eq!(
+            armed[0].roots,
+            HashSet::from([PathBuf::from("/snap")]),
+            "roots = the set of the pool's subvolumes' snapshot roots"
+        );
     }
 
     #[test]
@@ -2715,39 +3011,69 @@ source = "/data/beta"
         );
     }
 
+    /// Build an `ArmedPool` for the watchdog tests. `roots` is the pool-identity
+    /// set the same-fs membership test keys on (UPI 065-b); pass more than one to
+    /// model a UUID-pool spanning several snapshot roots.
+    fn test_armed_pool(
+        poll: PathBuf,
+        roots: Vec<PathBuf>,
+        floor_bytes: u64,
+        reserve_path: PathBuf,
+        subvol_names: Vec<String>,
+    ) -> ArmedPool {
+        ArmedPool {
+            poll_path: poll,
+            roots: roots.into_iter().collect(),
+            reserve_path,
+            floor_bytes,
+            min_free_bytes: 0, // preserves pre-054-a full suppression in these fixtures
+            label: "/data".to_string(),
+            subvol_names,
+        }
+    }
+
+    /// Spawn `watchdog_loop` over one pool, let it poll a few times, signal
+    /// shutdown, join, and return (abort flag, recorded firings). The cross-fs
+    /// plumbing (`RealBtrfs::for_maintenance` — Send, unlike the `RefCell`-backed
+    /// `MockBtrfs`; `wd_config`; empty away) is inert for these no-trip cases.
+    fn run_loop_briefly(pool: ArmedPool) -> (bool, Vec<WatchdogFiring>) {
+        let abort = Arc::new(AtomicBool::new(false));
+        let coord = Arc::new(Mutex::new(WatchdogCoord::default()));
+        let wd_shutdown = Arc::new(AtomicBool::new(false));
+        let firing: Arc<Mutex<Vec<WatchdogFiring>>> = Arc::new(Mutex::new(Vec::new()));
+        let a = abort.clone();
+        let c = coord.clone();
+        let wd = wd_shutdown.clone();
+        let f = firing.clone();
+        let handle = std::thread::spawn(move || {
+            let maint = RealBtrfs::for_maintenance("/usr/sbin/btrfs");
+            let cfg = wd_config();
+            let away: HashMap<String, Vec<String>> = HashMap::new();
+            watchdog_loop(&[pool], &a, &c, &wd, &f, &maint, &cfg, &away);
+        });
+        std::thread::sleep(Duration::from_millis(50)); // ≥1 poll
+        wd_shutdown.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
+        let firings = firing.lock().unwrap().clone();
+        (abort.load(Ordering::SeqCst), firings)
+    }
+
     #[test]
     fn watchdog_loop_started_below_floor_does_not_abort() {
         // Finding B at the loop level: floor=u64::MAX guarantees "started below"
         // on a static tempdir. With the floor suppressed and no cliff, the loop
         // neither aborts nor fires — it just keeps watching until shutdown.
         let dir = tempfile::TempDir::new().unwrap();
-        let pool = ArmedPool {
-            poll_path: dir.path().to_path_buf(),
-            reserve_path: dir.path().join(".urd-emergency-reserve"), // absent
-            floor_bytes: u64::MAX,
-            min_free_bytes: 0, // preserves pre-054-a full suppression in this fixture
-            label: "/data".to_string(),
-            subvol_names: vec!["alpha".to_string()],
-        };
-        let abort = Arc::new(AtomicBool::new(false));
-        let exec_shutdown = Arc::new(AtomicBool::new(false));
-        let wd_shutdown = Arc::new(AtomicBool::new(false));
-        let firing = Arc::new(Mutex::new(None));
-
-        let (a, e, wd, f) = (
-            abort.clone(),
-            exec_shutdown.clone(),
-            wd_shutdown.clone(),
-            firing.clone(),
+        let pool = test_armed_pool(
+            dir.path().to_path_buf(),
+            vec![dir.path().to_path_buf()],
+            u64::MAX,
+            dir.path().join(".urd-emergency-reserve"), // absent
+            vec!["alpha".to_string()],
         );
-        let handle = std::thread::spawn(move || watchdog_loop(&[pool], &a, &e, &wd, &f));
-        std::thread::sleep(Duration::from_millis(50)); // ≥1 poll
-        wd_shutdown.store(true, Ordering::SeqCst);
-        handle.join().unwrap();
-
-        assert!(!abort.load(Ordering::SeqCst), "started-below floor must not abort");
-        assert!(!exec_shutdown.load(Ordering::SeqCst));
-        assert!(firing.lock().unwrap().is_none(), "no firing — floor suppressed, no cliff");
+        let (aborted, firings) = run_loop_briefly(pool);
+        assert!(!aborted, "started-below floor must not abort");
+        assert!(firings.is_empty(), "no firing — floor suppressed, no cliff");
     }
 
     #[test]
@@ -2757,68 +3083,206 @@ source = "/data/beta"
         let dir = tempfile::TempDir::new().unwrap();
         let reserve_path = dir.path().join(".urd-emergency-reserve");
         std::fs::write(&reserve_path, b"reserve").unwrap();
-        let pool = ArmedPool {
-            poll_path: dir.path().to_path_buf(),
-            reserve_path: reserve_path.clone(),
-            floor_bytes: u64::MAX,
-            min_free_bytes: 0, // preserves pre-054-a full suppression in this fixture
-            label: "/data".to_string(),
-            subvol_names: vec!["alpha".to_string()],
-        };
-        let abort = Arc::new(AtomicBool::new(false));
-        let exec_shutdown = Arc::new(AtomicBool::new(false));
-        let wd_shutdown = Arc::new(AtomicBool::new(false));
-        let firing = Arc::new(Mutex::new(None));
-
-        let (a, e, wd, f) = (
-            abort.clone(),
-            exec_shutdown.clone(),
-            wd_shutdown.clone(),
-            firing.clone(),
+        let pool = test_armed_pool(
+            dir.path().to_path_buf(),
+            vec![dir.path().to_path_buf()],
+            u64::MAX,
+            reserve_path.clone(),
+            vec!["alpha".to_string()],
         );
-        let handle = std::thread::spawn(move || watchdog_loop(&[pool], &a, &e, &wd, &f));
-        std::thread::sleep(Duration::from_millis(50));
-        wd_shutdown.store(true, Ordering::SeqCst);
-        handle.join().unwrap();
-
+        let (aborted, firings) = run_loop_briefly(pool);
         assert!(reserve_path.exists(), "floor suppressed → reserve not freed");
-        assert!(!abort.load(Ordering::SeqCst));
-        assert!(firing.lock().unwrap().is_none());
+        assert!(!aborted);
+        assert!(firings.is_empty());
     }
 
     #[test]
     fn watchdog_loop_stops_on_shutdown_without_firing() {
-        // Roomy/healthy: a high enough floor of 0 never trips; the loop exits
-        // cleanly when watchdog_shutdown is set, recording no firing.
+        // Roomy/healthy: a floor of 0 never trips; the loop exits cleanly when
+        // watchdog_shutdown is set, recording no firing.
         let dir = tempfile::TempDir::new().unwrap();
-        let pool = ArmedPool {
-            poll_path: dir.path().to_path_buf(),
-            reserve_path: dir.path().join(".urd-emergency-reserve"),
-            floor_bytes: 0, // free is always >= 0, never below → no floor trip
-            min_free_bytes: 0,
-            label: "/data".to_string(),
-            subvol_names: vec!["alpha".to_string()],
-        };
+        let pool = test_armed_pool(
+            dir.path().to_path_buf(),
+            vec![dir.path().to_path_buf()],
+            0, // free is always >= 0, never below → no floor trip
+            dir.path().join(".urd-emergency-reserve"),
+            vec!["alpha".to_string()],
+        );
+        let (aborted, firings) = run_loop_briefly(pool);
+        assert!(!aborted);
+        assert!(firings.is_empty(), "no firing on a healthy pool");
+    }
+
+    // ── pool-scoped trip response (UPI 065-b) ─────────────────────────
+    // `handle_watchdog_trip` is the extracted Abort-arm decision, called directly
+    // so the same-vs-cross-filesystem branch is exercised without forcing a real
+    // floor/cliff trip on a live statvfs.
+
+    #[test]
+    fn trip_same_fs_membership_aborts_not_reclaims() {
+        // THE #110 catastrophe guard (C1/C2/C3): an in-flight send whose root is IN
+        // the pool's root-set is same-filesystem — even when that root differs from
+        // the pool's representative `poll_path`. Membership, not path-equality. The
+        // response is an abort (recoverable), NEVER a concurrent reclaim of the
+        // filesystem the send is reading.
+        let dir = tempfile::TempDir::new().unwrap();
+        let poll = dir.path().join("snap-a");
+        let other_root = dir.path().join("snap-b");
+        let pool = test_armed_pool(
+            poll.clone(),
+            vec![poll.clone(), other_root.clone()], // one UUID-pool, two roots
+            u64::MAX,
+            dir.path().join(".reserve"),
+            vec!["alpha".to_string()],
+        );
         let abort = AtomicBool::new(false);
-        let exec_shutdown = AtomicBool::new(false);
-        let wd_shutdown = Arc::new(AtomicBool::new(false));
-        let firing = Arc::new(Mutex::new(None));
-
-        let wd = wd_shutdown.clone();
-        let fire = firing.clone();
-        let handle = std::thread::spawn(move || {
-            let abort = AtomicBool::new(false);
-            let exec = AtomicBool::new(false);
-            watchdog_loop(&[pool], &abort, &exec, &wd, &fire);
+        let coord = Mutex::new(WatchdogCoord {
+            in_flight: Some(other_root.clone()), // ≠ poll_path, but IS a pool root
+            tripped: HashSet::new(),
         });
-        // Let it poll at least once, then signal teardown.
-        std::thread::sleep(Duration::from_millis(50));
-        wd_shutdown.store(true, Ordering::SeqCst);
-        handle.join().unwrap();
+        let mock = crate::btrfs::MockBtrfs::new();
+        let cfg = wd_config();
+        let away = HashMap::new();
+        let firing = handle_watchdog_trip(
+            &pool,
+            WatchdogReason::CliffExceeded,
+            false,
+            &abort,
+            &coord,
+            &mock,
+            &cfg,
+            &away,
+        );
+        assert!(abort.load(Ordering::SeqCst), "same-fs (by membership) must abort the in-flight send");
+        assert!(firing.send_aborted);
+        assert!(firing.reclaim.is_none(), "same-fs reclaim is deferred to teardown");
+        let g = coord.lock().unwrap();
+        assert!(
+            g.tripped.contains(&poll) && g.tripped.contains(&other_root),
+            "all of the pool's roots are gated"
+        );
+        drop(g);
+        assert!(deleted_paths(&mock).is_empty(), "same-fs does NO concurrent reclaim");
+    }
 
-        assert!(!abort.load(Ordering::SeqCst));
-        assert!(!exec_shutdown.load(Ordering::SeqCst));
-        assert!(firing.lock().unwrap().is_none(), "no firing on a healthy pool");
+    #[test]
+    fn trip_no_in_flight_is_same_fs() {
+        // No send in flight → same-fs (nothing to cross-pool-harm): abort path,
+        // and `freed_reserve` is threaded through verbatim.
+        let dir = tempfile::TempDir::new().unwrap();
+        let poll = dir.path().to_path_buf();
+        let pool = test_armed_pool(
+            poll.clone(),
+            vec![poll],
+            u64::MAX,
+            dir.path().join(".reserve"),
+            vec!["alpha".to_string()],
+        );
+        let abort = AtomicBool::new(false);
+        let coord = Mutex::new(WatchdogCoord::default()); // in_flight = None
+        let mock = crate::btrfs::MockBtrfs::new();
+        let cfg = wd_config();
+        let away = HashMap::new();
+        let firing = handle_watchdog_trip(
+            &pool,
+            WatchdogReason::FloorCrossed,
+            true,
+            &abort,
+            &coord,
+            &mock,
+            &cfg,
+            &away,
+        );
+        assert!(abort.load(Ordering::SeqCst));
+        assert!(firing.send_aborted);
+        assert!(firing.freed_reserve, "freed_reserve threaded through");
+    }
+
+    #[test]
+    fn trip_cross_fs_leaves_send_running_and_ungated() {
+        // C3: the in-flight send reads a DIFFERENT filesystem (its root is NOT in
+        // pool.roots) → do NOT abort; reclaim this pool concurrently; the foreign
+        // (in-flight) pool is NEVER gated — independence.
+        let dir = tempfile::TempDir::new().unwrap();
+        let poll = dir.path().to_path_buf();
+        let foreign = PathBuf::from("/some/other/independent/fs/.snapshots");
+        let pool = test_armed_pool(
+            poll.clone(),
+            vec![poll.clone()],
+            u64::MAX,
+            dir.path().join(".reserve"),
+            vec!["alpha".to_string()],
+        );
+        let abort = AtomicBool::new(false);
+        let coord = Mutex::new(WatchdogCoord {
+            in_flight: Some(foreign.clone()),
+            tripped: HashSet::new(),
+        });
+        let mock = crate::btrfs::MockBtrfs::new();
+        let cfg = wd_config();
+        let away = HashMap::new();
+        let firing = handle_watchdog_trip(
+            &pool,
+            WatchdogReason::CliffExceeded,
+            false,
+            &abort,
+            &coord,
+            &mock,
+            &cfg,
+            &away,
+        );
+        assert!(!abort.load(Ordering::SeqCst), "cross-fs must NOT abort the unrelated send");
+        assert!(!firing.send_aborted);
+        assert!(
+            firing.reclaim.is_some(),
+            "cross-fs reclaims this pool concurrently on the watchdog thread"
+        );
+        let g = coord.lock().unwrap();
+        assert!(g.tripped.contains(&poll), "this pool's roots are gated");
+        assert!(!g.tripped.contains(&foreign), "the in-flight (foreign) pool is NEVER gated");
+    }
+
+    #[test]
+    fn fresh_away_map_drops_reconnected_drives() {
+        // S3: a drive that reconnected mid-run (now mounted) must not have its
+        // now-connected chain shed by the cross-fs reclaim. "/" is always a mount
+        // point; a fresh tempdir is not. So HOME (at "/") is dropped, AWAY (still
+        // unmounted) is kept.
+        let dir = tempfile::TempDir::new().unwrap();
+        let away_mount = dir.path().join("not-mounted");
+        std::fs::create_dir_all(&away_mount).unwrap();
+        let mut config = wd_config();
+        config.drives = vec![
+            crate::config::DriveConfig {
+                label: "HOME".to_string(),
+                uuid: None,
+                mount_path: PathBuf::from("/"), // reconnected: a live mount point
+                snapshot_root: ".snapshots".to_string(),
+                role: crate::types::DriveRole::Primary,
+                max_usage_percent: None,
+                min_free_bytes: None,
+                rotation_interval: None,
+            },
+            crate::config::DriveConfig {
+                label: "AWAY".to_string(),
+                uuid: None,
+                mount_path: away_mount, // still away (not a mount point)
+                snapshot_root: ".snapshots".to_string(),
+                role: crate::types::DriveRole::Offsite,
+                max_usage_percent: None,
+                min_free_bytes: None,
+                rotation_interval: None,
+            },
+        ];
+        let mut away_at_spawn: HashMap<String, Vec<String>> = HashMap::new();
+        away_at_spawn.insert("alpha".to_string(), vec!["HOME".to_string(), "AWAY".to_string()]);
+
+        let fresh = fresh_away_map(&away_at_spawn, &config);
+        assert_eq!(
+            fresh.get("alpha").map(Vec::as_slice),
+            Some(["AWAY".to_string()].as_slice()),
+            "a reconnected (mounted) drive is dropped from the cross-fs shed list",
+        );
     }
 
     // ── windowed cliff (UPI 065-a) ────────────────────────────────────

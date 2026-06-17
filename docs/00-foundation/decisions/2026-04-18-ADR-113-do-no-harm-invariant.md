@@ -10,7 +10,7 @@
 > it prefers host survival over backup-chain continuity.
 
 **Date:** 2026-04-18
-**Status:** Accepted (amended 2026-05-30, UPI 031-b; 2026-06-14, UPI 064-a)
+**Status:** Accepted (amended 2026-05-30, UPI 031-b; 2026-06-14, UPI 064-a; 2026-06-17, UPI 065-b)
 **Supersedes:** UPI 011 (hard-cap of 1 local snapshot for transient subvolumes)
 
 > **Amendment — 2026-05-30 (UPI 031-b, the tier-graded ephemeral spine).**
@@ -79,6 +79,54 @@
 > The **invariant and the probabilistic contract are unchanged** — only the Layer-1
 > *arming signal* evolves (matching the 031-b in-place-amendment precedent above,
 > and ADR-104/105/110/111).
+
+> **Amendment — 2026-06-17 (UPI 065-b, the pool-scoped watchdog response).**
+> Layer 2's **response** evolves from **global** to **per-filesystem (pool-scoped)**. The
+> watchdog already *arms* per source pool (one armed pool per filesystem UUID), but its three
+> levers — the in-flight-send abort flag, the new-send gate, and the abort-reclaim — were
+> **global** across the independent source filesystems. A pressure event on one filesystem
+> therefore acted on a send reading from a *different, healthy* filesystem.
+>
+> - **Why.** Run #110 (2026-06-15, field-reproduced): the `/home` NVMe (uuid `0b396a34`)
+>   tripped the cliff on a transient burst and the shared `watchdog_abort` flag cancelled an
+>   in-flight 2.7 TB send reading from the unrelated 4-device `/mnt` pool (uuid `ac5ee56e`).
+>   Aborting that send freed **zero** bytes on `/home` (the wrong pool for host survival); the
+>   reclaim of `/home`'s own snapshots is what relieved `/home`, and it ran regardless. The
+>   source pools are **fully independent** (disjoint filesystems, disjoint devices, no shared
+>   storage or I/O coupling), so a trip on pool A has zero causal relation to a send from
+>   pool B.
+> - **The ruling.** The watchdog's response is **scoped to the in-flight send's source
+>   filesystem**. A pressured *other* filesystem is relieved by reclaiming **its own**
+>   footprint, **never** by aborting or blocking a send on another filesystem. Concretely:
+>   a trip on filesystem P reclaims P's own local snapshots; it *additionally* aborts the
+>   in-flight send only if that send is reading from P (same-filesystem); P's new sends are
+>   gated, other filesystems' sends are not.
+> - **Same-filesystem is unchanged.** When P *is* the in-flight send's source, behaviour is as
+>   before (UPI 033/058): abort the send, then the two-tier graduated `emergency_reclaim_pool`
+>   sheds P's footprint post-abort — the send's own retained snapshot pins P, so aborting it
+>   *does* release space.
+> - **Cross-filesystem reclaim is concurrent and safe by construction.** A trip on P while the
+>   in-flight send reads pool B (B ≠ P) reclaims P's footprint **on the watchdog thread,
+>   concurrently** with the continuing B send. The reclaim deletes snapshots on P; the send
+>   reads a snapshot on B; on disjoint filesystems/devices nothing the send touches is
+>   disturbed. This is the property the independence invariant buys — concurrent reclaim is the
+>   answer for the cross-filesystem branch, not a risk. The safety is enforced structurally: a
+>   single identity-keyed coordination lock (`in_flight` root + `tripped` root-set, with pool
+>   identity the filesystem's full root-set, not one representative path) admits only two
+>   interleavings — the executor publishes the in-flight root first (→ same-filesystem abort)
+>   or the watchdog marks the pool tripped first (→ the new send is gated, so no send on P is
+>   running when P is reclaimed). No interleaving both starts a P send and concurrently
+>   reclaims P.
+> - **No change to ADR-100/101/106/107.** The reclaim still goes through the offsite-gated,
+>   never-the-only-copy, fail-closed `emergency_reclaim_pool`; a subvolume with no confirmed
+>   offsite copy is still skipped. Host survival still wins over chain continuity for the
+>   tripping filesystem; the dropped pin makes its next send full (the documented acceptable
+>   cost). The catastrophic-floor doctrine is unchanged — it is merely **partitioned by
+>   filesystem**, which is what "the host wins" already means on independent pools.
+>
+> The **invariant and the probabilistic contract are unchanged** — only the Layer-2 *response
+> scope* evolves (matching the 031-b and 064-a in-place-amendment precedents above, and
+> ADR-104/105/110/111).
 
 ## Context
 
