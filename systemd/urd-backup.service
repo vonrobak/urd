@@ -6,8 +6,12 @@ Type=oneshot
 ExecStart=%h/.cargo/bin/urd backup --auto --confirm-retention-change
 Environment=RUST_LOG=info
 
-# Allow long backup runs (large btrfs sends can take hours)
-TimeoutStartSec=6h
+# Never time-limit a backup run. A first full multi-TB send can legitimately
+# take many hours (longer than a day on a large subvolume over USB), and a
+# wall-clock guillotine would SIGTERM a healthy, progressing send. Only a real
+# emergency — the storage watchdog (ADR-113) — or a genuine failure may stop a
+# send. systemd's oneshot default would otherwise kill ExecStart far too soon.
+TimeoutStartSec=infinity
 # Allow 5 minutes for graceful shutdown (cleanup partial snapshots)
 TimeoutStopSec=300
 
