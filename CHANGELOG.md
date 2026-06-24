@@ -8,6 +8,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **The storage watchdog can no longer delete a backup chain's local snapshots
+  without genuine storage pressure** (UPI 066, ADR-113 amendment). The mid-op
+  watchdog's *cliff* is a rate trigger; its proportionate responses are
+  non-destructive (free the disposable reserve, abort the in-flight send). But the
+  follow-on `emergency_reclaim_pool` then ran *unconditionally* — so a transient
+  cliff on a pool with ample free space (field incident run #110, ~4× runway) drove
+  the reclaim, and with the primary backup drive absent its Tier-1 away-shed severed
+  the `htpc-home`/`htpc-root` incremental chains (pin files removed, pinned parents
+  deleted), forcing full re-sends. The reclaim is now gated on **confirmed absolute
+  pressure** — it sheds a pin only when free space reads *below the floor*, the same
+  `< floor` signal the idle-eject layer already requires. A trip that leaves free
+  at/above the floor (the reserve-free/abort sufficed, or a transient cliff fired
+  with healthy runway) now sheds **nothing**; a genuine fill that crosses the floor
+  still reclaims exactly as before. The windowed cliff (065-a) narrowed transient
+  *aborts*; this closes the gap where the *reclaim* acted with no level check. No
+  config knob; no on-disk or metric changes.
 - **A long backup run can no longer be killed by a wall-clock timeout.** The
   packaged systemd unit (`urd-backup.service`) set `TimeoutStartSec=6h`, so systemd
   SIGTERM'd a healthy, still-progressing run at the 6-hour mark — silently
