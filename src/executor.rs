@@ -1645,6 +1645,16 @@ impl<'a> Executor<'a> {
     /// the wrong pool for host survival). The only space Urd can return to the
     /// source pool is its own footprint.
     ///
+    /// **Entry gate (UPI 066, ADR-113 amendment):** before either tier, confirm
+    /// genuine absolute pressure — `measure_free()` must read **below**
+    /// `floor_bytes`. The watchdog's cliff is a rate trigger; its non-destructive
+    /// responses (free the reserve, abort the send) are the caller's, and run
+    /// before this. Pin-shedding breaks a backup chain, so it is reserved for the
+    /// floor regime — the same `< floor` signal Layer 3 (`evaluate_idle_eject`)
+    /// requires. `free >= floor` → [`ReclaimOutcome::Nothing`] (no shed); `None`
+    /// biases to proceed (catastrophe-safety). This is what stops a transient
+    /// cliff on a healthy pool from severing a backup chain (field incident #110).
+    ///
     /// **Tier 1 (graceful, away-first):** shed only the `away_sheddable` pins —
     /// away drives whose pinned snapshot is away-*only* (computed by the caller
     /// from the shared `plan::drive_scopes`, so a snapshot shared with a
@@ -1691,6 +1701,29 @@ impl<'a> Executor<'a> {
         floor_bytes: u64,
         measure_free: impl Fn() -> Option<u64>,
     ) -> ReclaimOutcome {
+        // The one boundary that admits *destructive* reclaim, read fresh on each
+        // call (Tier 1 may free space between calls): free at/above the floor → no
+        // genuine pressure. A `None` (unreadable) level is not at/above, so the
+        // caller proceeds — host survival outranks chain continuity in the dark
+        // (F3 / catastrophe-safety). One definition keeps the entry gate and the
+        // post-Tier-1 sufficiency check from drifting; boundary matches idle eject
+        // (free == floor does not shed).
+        let free_at_or_above_floor = || matches!(measure_free(), Some(free) if free >= floor_bytes);
+
+        // ── Absolute-level gate (UPI 066, ADR-113 amendment) ───────────────
+        // Destructive pin-shedding requires CONFIRMED sub-floor pressure — the
+        // same signal Layer 3 (idle eject, `evaluate_idle_eject`) already demands.
+        // The mid-op watchdog's *cliff* is a rate signal whose proportionate
+        // response is the non-destructive pair the caller already applied before
+        // we run: free the disposable reserve, abort the in-flight send. Shedding
+        // a backup chain's pin is a different regime — it costs a recoverable full
+        // re-send — so it must not follow a trip that leaves free at/above the
+        // floor (the reserve-free/abort sufficed, or a transient cliff fired with
+        // ample runway: field incident run #110, ~4× runway).
+        if free_at_or_above_floor() {
+            return ReclaimOutcome::Nothing;
+        }
+
         let drive_labels = self.config.drive_labels();
         let mut deleted: u32 = 0;
         let mut first_error: Option<String> = None;
@@ -1735,8 +1768,7 @@ impl<'a> Executor<'a> {
         // (F3): escalate unless Tier 1 actually shed something AND the injected
         // probe confirms recovery — an unavailable probe (None) or a no-op Tier 1
         // (empty away map / no away pins) falls through to the blanket Tier 2.
-        let tier1_sufficient =
-            shed_any_away && matches!(measure_free(), Some(free) if free >= floor_bytes);
+        let tier1_sufficient = shed_any_away && free_at_or_above_floor();
         if tier1_sufficient {
             return Self::reclaim_outcome(deleted, first_error, tier1_releases);
         }
@@ -5063,11 +5095,19 @@ local_retention = "transient"
         let executor = Executor::new(&mock, None, &config, &shutdown);
 
         let floor = 100;
+        // Genuine pressure at the entry gate (below floor → reclaim proceeds), then
+        // Tier 1's away-shed recovers free to the floor → STOP before Tier 2. The
+        // probe is read once by the gate, once by the post-Tier-1 sufficiency check.
+        let probe_calls = std::cell::Cell::new(0u32);
         let outcome = executor.emergency_reclaim_pool(
             &["sv-t".to_string()],
             &away_map("sv-t", &["OFFSITE"]),
             floor,
-            || Some(floor), // free == floor → at/above → Tier 1 sufficient
+            || {
+                let n = probe_calls.get();
+                probe_calls.set(n + 1);
+                if n == 0 { Some(floor - 1) } else { Some(floor) }
+            },
         );
 
         assert!(matches!(outcome, ReclaimOutcome::Reclaimed { .. }));
@@ -5168,13 +5208,14 @@ local_retention = "transient"
         let shutdown = no_shutdown();
         let executor = Executor::new(&mock, None, &config, &shutdown);
 
-        // Even a probe that would say "above floor" must not gate Tier 2 here:
-        // shed_any_away is false (empty map), so the probe is never consulted.
+        // Below floor (genuine pressure) so the entry gate (UPI 066) admits the
+        // reclaim; shed_any_away is false (empty map) → Tier 1 no-op → straight to
+        // Tier 2 blanket, the only path that frees a shared snapshot.
         let outcome = executor.emergency_reclaim_pool(
             &["sv-t".to_string()],
             &HashMap::new(),
             100,
-            || Some(1_000_000),
+            || Some(99),
         );
 
         assert!(matches!(outcome, ReclaimOutcome::Reclaimed { .. }));
@@ -5189,8 +5230,8 @@ local_retention = "transient"
     #[test]
     fn emergency_reclaim_no_away_pin_goes_straight_to_blanket() {
         // No away entry for this subvol → Tier 1 no-op → Tier 2 blanket sheds the
-        // connected chain (pre-058 behavior / safe degradation). The probe is not
-        // consulted because Tier 1 shed nothing.
+        // connected chain (pre-058 behavior / safe degradation). Free is below the
+        // floor so the entry gate (UPI 066) admits the reclaim.
         let (_snap, _p, _o, config, connected, away, primary_pin, offsite_pin) =
             away_shed_fixture();
         let mock = MockBtrfs::new();
@@ -5201,7 +5242,7 @@ local_retention = "transient"
             &["sv-t".to_string()],
             &HashMap::new(),
             100,
-            || Some(1_000_000), // would say "recovered" — but never consulted
+            || Some(99), // below floor → entry gate admits; Tier 1 no-op → Tier 2
         );
 
         assert!(matches!(outcome, ReclaimOutcome::Reclaimed { .. }));
@@ -5216,6 +5257,42 @@ local_retention = "transient"
             outcome.releases().is_empty(),
             "Tier-2 blanket reclaim emits no offsite release (host-survival event covers it)",
         );
+    }
+
+    #[test]
+    fn emergency_reclaim_above_floor_sheds_nothing() {
+        // (UPI 066) The absolute-level gate. A watchdog *cliff* can abort a send
+        // and free the disposable reserve while free space is still healthy — the
+        // run-#110 field incident, where a transient 100 MB/s spike on a pool with
+        // ~4× runway tripped the cliff. Destructive pin-shedding must NOT follow a
+        // trip that leaves free at/above the floor: the abort + reserve-free
+        // already bought host survival, and shedding here breaks a backup chain for
+        // zero gain. Both the away-only AND the connected pins + snapshots survive;
+        // nothing is deleted. Boundary mirrors `evaluate_idle_eject` (free == floor
+        // does NOT shed) and the post-Tier-1 `>= floor` sufficiency check.
+        let (_snap, _p, _o, config, connected, away, primary_pin, offsite_pin) =
+            away_shed_fixture();
+        let mock = MockBtrfs::new();
+        let shutdown = no_shutdown();
+        let executor = Executor::new(&mock, None, &config, &shutdown);
+
+        let floor = 100;
+        let outcome = executor.emergency_reclaim_pool(
+            &["sv-t".to_string()],
+            &away_map("sv-t", &["OFFSITE"]),
+            floor,
+            || Some(floor), // free == floor → not below → no genuine pressure
+        );
+
+        assert_eq!(outcome, ReclaimOutcome::Nothing, "healthy level → no reclaim");
+        assert!(delete_calls(&mock).is_empty(), "nothing shed at/above the floor");
+        assert!(connected.exists() && away.exists(), "both snapshots survive on disk");
+        assert!(primary_pin.exists(), "connected pin survives");
+        assert!(
+            offsite_pin.exists(),
+            "away pin survives — no shed without confirmed sub-floor pressure",
+        );
+        assert!(outcome.releases().is_empty(), "no offsite chain released");
     }
 
     #[test]

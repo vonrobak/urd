@@ -128,6 +128,40 @@
 > scope* evolves (matching the 031-b and 064-a in-place-amendment precedents above, and
 > ADR-104/105/110/111).
 
+> **Amendment — 2026-06-24 (UPI 066, the absolute-level reclaim gate).**
+> Layer 2's **reclaim** is gated on confirmed absolute pressure: `emergency_reclaim_pool`
+> sheds a pin (breaks a backup chain) **only when free space reads below the floor** — the
+> same `< floor` signal Layer 3 (idle eject, `evaluate_idle_eject`) already requires. The
+> destructive reclaim and the cliff trigger are decoupled.
+>
+> - **Why.** Run #110 (field-reproduced): the `/home` cliff tripped on a transient burst
+>   with **~4× runway**. The non-destructive responses (free the disposable reserve, abort
+>   the send) are proportionate to a rate signal — but the abort-reclaim then ran
+>   *unconditionally*, and with the primary backup drive away, its Tier-1 away-shed severed
+>   the WD-18TB incremental chains for `htpc-home`/`htpc-root` (pin files removed, parents
+>   deleted). No absolute pressure existed to justify deleting a backup chain. The windowed
+>   cliff (065-a) narrows transient *aborts*; it does not change that the *reclaim* acted
+>   without a level check.
+> - **The ruling.** The cliff is a rate trigger whose proportionate response is the
+>   non-destructive pair (reserve-free + abort). **Pin-shedding belongs to the floor
+>   regime.** `emergency_reclaim_pool` measures free at entry and returns `Nothing` when
+>   `free >= floor_bytes` — the reserve-free/abort already bought host survival, or the
+>   cliff fired with healthy runway. A genuine fill that crosses the floor (FloorCrossed, or
+>   a sustained cliff that actually reaches the floor) still reclaims, exactly as before.
+> - **Probe-unavailable biases to proceed.** A `None` free reading cannot prove safety and
+>   the abort has already happened, so host survival outranks chain continuity in the dark
+>   (the existing F3 escalation bias). Boundary matches idle eject: `free == floor` does not
+>   shed.
+> - **No change to ADR-100/101/106/107 or the layered pattern.** All three reclaim callers
+>   (same-filesystem post-abort, cross-filesystem concurrent, idle eject) share the one
+>   chokepoint, so the gate applies uniformly; idle eject already pre-checked `< floor`, so
+>   its behaviour is unchanged. The tier-retention away-shed (064-b, Tight retain-parents /
+>   Critical shed) is a separate path and is unaffected.
+>
+> The **invariant and the probabilistic contract are unchanged** — Layer 2's *reclaim
+> precondition* is tightened toward the do-no-harm promise (strictly less deletion),
+> matching the 031-b / 064-a / 065-b in-place-amendment precedents above.
+
 ## Context
 
 Urd runs on live systems. It exists to protect user data from loss — but a backup tool
