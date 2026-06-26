@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.1] - 2026-06-26
+
 ### Fixed
 - **The storage watchdog no longer aborts a healthy send on a transient write-rate
   spike, and no longer pre-allocates disk to do so** (UPI 067, ADR-113 amendment).
@@ -1173,7 +1175,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Defense-in-depth pin file protection for unsent snapshots
 - Per-subvolume error isolation in executor
 
-[Unreleased]: https://github.com/vonrobak/urd/compare/v0.27.0...HEAD
+[Unreleased]: https://github.com/vonrobak/urd/compare/v0.27.1...HEAD
+[0.27.1]: https://github.com/vonrobak/urd/compare/v0.27.0...v0.27.1
 [0.27.0]: https://github.com/vonrobak/urd/compare/v0.26.0...v0.27.0
 [0.26.0]: https://github.com/vonrobak/urd/compare/v0.25.2...v0.26.0
 [0.25.2]: https://github.com/vonrobak/urd/compare/v0.25.1...v0.25.2
