@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -19,10 +19,7 @@ use crate::executor::{
     ExecutionResult, Executor, FullSendPolicy, OffsiteChainRelease, OpResult, ReclaimOutcome,
     RunResult, SendType, TransientCleanupOutcome,
 };
-use crate::guard::{
-    self, WatchdogAction, WatchdogReason, WatchdogSample, WatchdogThresholds, CLIFF_BYTES_PER_SEC,
-    WATCHDOG_CLIFF_WINDOW, WATCHDOG_POLL_MS,
-};
+use crate::guard::{self, WatchdogAction, WATCHDOG_POLL_MS};
 use crate::heartbeat;
 use crate::lock;
 use crate::heartbeat::{DriveHeartbeat, PoolHeartbeat};
@@ -35,7 +32,6 @@ use crate::output::{
 use crate::notify;
 use crate::plan::{self, FilesystemQuery, HistoryQuery, PlanFilters, RealFileSystemState};
 use crate::pools::{self, PoolSpace};
-use crate::reserve;
 use crate::sentinel_runner;
 use crate::storage_critical::TightnessTier;
 use crate::preflight;
@@ -431,7 +427,6 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
         .lock()
         .map(|mut f| std::mem::take(&mut *f))
         .unwrap_or_default();
-    let watchdog_fired = !watchdog_firings.is_empty();
     let mut watchdog_notifications = Vec::new();
     for fire in &watchdog_firings {
         let (reclaimed, releases, event_ts): (u32, Vec<OffsiteChainRelease>, chrono::NaiveDateTime) =
@@ -448,11 +443,9 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
                     || pools::pool_free_bytes(&fire.mountpoint).ok(),
                 );
                 log::warn!(
-                    "Watchdog aborted send on {} ({:?}); reclaimed {} snapshot(s), reserve freed: {}",
+                    "Watchdog aborted send on {}; reclaimed {} snapshot(s)",
                     fire.pool_label,
-                    fire.reason,
                     reclaim.deleted(),
-                    fire.freed_reserve,
                 );
                 let ts = chrono::Local::now().naive_local();
                 (reclaim.deleted(), reclaim.releases().to_vec(), ts)
@@ -461,10 +454,9 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
                 match &fire.reclaim {
                     Some((outcome, ts)) => {
                         log::warn!(
-                            "Watchdog relieved {} concurrently ({:?}); reclaimed {} snapshot(s) on \
+                            "Watchdog relieved {} concurrently; reclaimed {} snapshot(s) on \
                              the watchdog thread, left the in-flight send (different filesystem) running",
                             fire.pool_label,
-                            fire.reason,
                             outcome.deleted(),
                         );
                         (outcome.deleted(), outcome.releases().to_vec(), *ts)
@@ -477,8 +469,6 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
                 event_ts,
                 EventPayload::WatchdogAbort {
                     pool_label: fire.pool_label.clone(),
-                    reason: fire.reason,
-                    freed_reserve: fire.freed_reserve,
                     snapshots_reclaimed: reclaimed,
                     send_aborted: fire.send_aborted,
                 },
@@ -663,13 +653,15 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     );
     println!("{preamble}{rendered}");
 
-    // ── Reserve-create-on-idle (UPI 033, S3) ──────────────────────────
-    // Pre-position the fast-bridge reserve on Tight (and Roomy-with-room) source
-    // pools after a clean run, so it pre-exists when a pool jumps to Critical.
-    // Skip when the watchdog just fired (we would re-add the footprint we shed).
-    if result.overall == RunResult::Success && !watchdog_fired {
-        establish_reserves(&config, &signals, &resolved.armed_tier_map);
-    }
+    // ── Orphaned-reserve sweep (UPI 067, one-release cleanup) ──────────
+    // The fast-bridge reserve lifecycle (UPI 033) is retired with the cliff:
+    // nothing creates a `.urd-emergency-reserve` any more, and the code that
+    // unlinked one is gone. Pools that were Tight/Roomy at an earlier run still
+    // carry the `fallocate`'d footprint on disk — so sweep them best-effort here,
+    // where reserve creation used to run. Unconditional (orphans must be reclaimed
+    // even on a failed or watchdog-fired run); idempotent. Self-removes one release
+    // after 067 ships (see registry follow-up).
+    sweep_orphaned_reserves(&config, &signals);
 
     // Exit with appropriate code
     if result.overall != RunResult::Success {
@@ -687,10 +679,10 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ArmedPool {
     /// Source-pool path the watchdog polls — the snapshot root, on the same
-    /// filesystem as the reserve and the local snapshots (all on the source
-    /// pool), so its statvfs free bytes are the source pool's. One
-    /// representative root suffices for the free-space probe and the reserve;
-    /// it is **not** used for the same-filesystem decision (see `roots`).
+    /// filesystem as the local snapshots (all on the source pool), so its statvfs
+    /// free bytes are the source pool's. One representative root suffices for the
+    /// free-space probe; it is **not** used for the same-filesystem decision (see
+    /// `roots`).
     poll_path: PathBuf,
     /// **Pool identity** for the watchdog's same-vs-cross-filesystem decision
     /// (UPI 065-b, adversary C1): the *full set* of snapshot roots of this
@@ -702,8 +694,6 @@ struct ArmedPool {
     /// different roots misclassify as cross-fs and trigger a concurrent reclaim
     /// of the very filesystem a send is reading from.
     roots: HashSet<PathBuf>,
-    /// Where the fast-bridge reserve lives for this pool.
-    reserve_path: PathBuf,
     /// `min_free + cleanup_budget` — the absolute floor (M5).
     floor_bytes: u64,
     /// Bare `min_free` — the degraded floor for a pool that *started* below
@@ -751,8 +741,6 @@ pub(crate) struct WatchdogCoord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WatchdogFiring {
     pool_label: String,
-    reason: WatchdogReason,
-    freed_reserve: bool,
     subvol_names: Vec<String>,
     /// Source-pool mountpoint for the two-tier abort-reclaim's free-probe
     /// (UPI 058 — the watchdog thread already holds it as `ArmedPool.poll_path`).
@@ -796,13 +784,26 @@ struct PoolTarget {
     label: String,
 }
 
-/// Walk source pools and resolve the per-pool bits both watchdog arming and
-/// reserve-creation need (UPI 033). The `tier_ok` predicate filters **before**
-/// the `space` statvfs, so each caller only measures the pools it cares about
-/// (arming skips Roomy entirely). Tier is read from the armed map via ANY subvol
-/// on the pool — resolve fans one tier to every member (M8 join by membership,
-/// not UUID, so a UUID-less tight pool still resolves). Skips pools with no
-/// send-enabled subvolume, no resolvable root, or unmeasurable space.
+/// The set of send-enabled subvolume names (`enabled` AND `send_enabled`) — the
+/// single owner of "which subvolumes have an ephemeral lifecycle / a watchdog
+/// scope," shared by the arming walk, the pool-target resolver, and the reserve
+/// sweep so the predicate cannot drift between them.
+fn send_enabled_names(config: &Config) -> HashSet<String> {
+    config
+        .resolved_subvolumes()
+        .into_iter()
+        .filter(|sv| sv.enabled && sv.send_enabled)
+        .map(|sv| sv.name)
+        .collect()
+}
+
+/// Walk source pools and resolve the per-pool bits watchdog arming needs (UPI
+/// 033). The `tier_ok` predicate filters **before** the `space` statvfs, so each
+/// caller only measures the pools it cares about (arming skips Roomy entirely).
+/// Tier is read from the armed map via ANY subvol on the pool — resolve fans one
+/// tier to every member (M8 join by membership, not UUID, so a UUID-less tight
+/// pool still resolves). Skips pools with no send-enabled subvolume, no resolvable
+/// root, or unmeasurable space.
 fn resolve_pool_targets(
     config: &Config,
     signals: &storage_signals::StorageSignals,
@@ -810,12 +811,7 @@ fn resolve_pool_targets(
     tier_ok: impl Fn(TightnessTier) -> bool,
     mut space: impl FnMut(&std::path::Path) -> Option<PoolSpace>,
 ) -> Vec<PoolTarget> {
-    let send_enabled: HashSet<String> = config
-        .resolved_subvolumes()
-        .into_iter()
-        .filter(|sv| sv.enabled && sv.send_enabled)
-        .map(|sv| sv.name)
-        .collect();
+    let send_enabled = send_enabled_names(config);
 
     let mut out = Vec::new();
     for pool in &signals.pools {
@@ -864,12 +860,7 @@ fn arm_watchdog_pools_with(
     armed: &crate::storage_critical::ArmedTierMap,
     space: impl FnMut(&std::path::Path) -> Option<PoolSpace>,
 ) -> Vec<ArmedPool> {
-    let send_enabled: HashSet<String> = config
-        .resolved_subvolumes()
-        .into_iter()
-        .filter(|sv| sv.enabled && sv.send_enabled)
-        .map(|sv| sv.name)
-        .collect();
+    let send_enabled = send_enabled_names(config);
     resolve_pool_targets(config, signals, armed, |t| t >= TightnessTier::Tight, space)
         .into_iter()
         .map(|t| {
@@ -899,7 +890,6 @@ fn arm_watchdog_pools_with(
                 .filter_map(|n| config.snapshot_root_for(n))
                 .collect();
             ArmedPool {
-                reserve_path: reserve::reserve_path(&t.root),
                 poll_path: t.root,
                 roots,
                 floor_bytes,
@@ -911,82 +901,35 @@ fn arm_watchdog_pools_with(
         .collect()
 }
 
-/// Pure per-pool watchdog decision (UPI 033, refined by UPI 054-a). For a pool
-/// that *started* below the absolute floor (`min_free + cleanup_budget`), the
-/// floor **degrades to bare `min_free`** rather than firing immediately or
-/// vanishing: the planner's send-floor guard now owns "too tight to start"
-/// (UPI 054-a), so a started-below send is a plan→start TOCTOU residual — it
-/// must not instantly self-abort a run the planner allowed (round-2 adversary
-/// Finding B), but it must still abort before reaching zero (the 033 full
-/// suppression to 0 left a slow fill to zero unwatched — ADR-113's
-/// catastrophic scenario). The **cliff** (rate) trigger stays active
-/// regardless. A pool that started above the floor keeps both triggers at
-/// full strength. Delegates the level/rate logic to `guard::evaluate`.
+/// Pure per-pool watchdog decision (UPI 033, refined by UPI 054-a, floor-only
+/// since UPI 067). For a pool that *started* below the absolute floor
+/// (`min_free + cleanup_budget`), the floor **degrades to bare `min_free`** rather
+/// than firing immediately or vanishing: the planner's send-floor guard now owns
+/// "too tight to start" (UPI 054-a), so a started-below send is a plan→start
+/// TOCTOU residual — it must not instantly self-abort a run the planner allowed
+/// (round-2 adversary Finding B), but it must still abort before reaching zero
+/// (full suppression to 0 would leave a slow fill to zero unwatched — ADR-113's
+/// catastrophic scenario). A pool that started above the floor keeps the floor at
+/// full strength. Delegates the level comparison to `guard::evaluate`.
 fn watchdog_step(
-    sample: WatchdogSample,
+    free_bytes: u64,
     floor_bytes: u64,
     min_free_bytes: u64,
     started_below_floor: bool,
-    reserve_present: bool,
 ) -> WatchdogAction {
     let effective_floor = if started_below_floor {
         min_free_bytes
     } else {
         floor_bytes
     };
-    guard::evaluate(
-        sample,
-        WatchdogThresholds {
-            floor_bytes: effective_floor,
-            cliff_bytes_per_sec: CLIFF_BYTES_PER_SEC,
-        },
-        reserve_present,
-    )
+    guard::evaluate(free_bytes, effective_floor)
 }
 
-/// Push the current `(now, free)` reading into the pool's trailing-window deque,
-/// evict readings older than `window`, and return the cliff **rate baseline** —
-/// the oldest reading still inside the window plus the elapsed wall-clock since it
-/// (UPI 065-a). The baseline feeds `WatchdogSample::{prev_free_bytes,
-/// elapsed_since_prev}`, so `guard::evaluate` computes the cliff rate as a
-/// *windowed average* over up to `window`, not a single 250 ms sample: a transient
-/// burst amortises below the cliff while a sustained drop stays above it (the
-/// field incident run #110 fix).
-///
-/// Owns push + eviction + baseline together (`&mut`) so the eviction boundary is
-/// exercised by the same tests that check the baseline (adversary F3). A deque of
-/// `< 2` readings — the first sample, or the poll right after an OQ2 window reset —
-/// yields `(None, Duration::ZERO)`, which `guard` reads as "no rate yet" → cliff
-/// suppressed for that poll (the floor still fires on current free, A2). Eviction
-/// is by **real age**, so an irregular poll cadence (a busy multi-device `/mnt`
-/// pool under send load) computes the rate over actual elapsed, not a fixed
-/// 250 ms × count (adversary F5).
-fn window_baseline(
-    dq: &mut VecDeque<(Instant, u64)>,
-    now: Instant,
-    free: u64,
-    window: Duration,
-) -> (Option<u64>, Duration) {
-    dq.push_back((now, free));
-    // Evict readings older than the window, but always keep the current one so a
-    // baseline can rebuild (front = oldest reading still inside the window).
-    while dq.len() > 1 && dq.front().is_some_and(|&(t, _)| now.duration_since(t) > window) {
-        dq.pop_front();
-    }
-    // Front is the oldest reading still inside the window. `< 2` readings — the
-    // seed sample, or the poll right after an OQ2 reset — give no rate yet.
-    match dq.front() {
-        Some(&(t, free_at)) if dq.len() >= 2 => (Some(free_at), now.duration_since(t)),
-        _ => (None, Duration::ZERO),
-    }
-}
-
-/// The watchdog thread body (UPI 033, pool-scoped response by UPI 065-b). Polls
-/// each armed pool's source-pool free space every `WATCHDOG_POLL_MS`; on a
-/// floor/cliff trigger it first frees the reserve (fast bridge, here on the
-/// watchdog thread so it fires even if the copy thread is wedged — S4), and on a
-/// still-triggering sample with no reserve it **scopes the response to the
-/// in-flight send's source filesystem** (the ADR-113 2026-06-17 amendment):
+/// The watchdog thread body (UPI 033, pool-scoped response by UPI 065-b,
+/// floor-only since UPI 067). Polls each armed pool's source-pool free space
+/// every `WATCHDOG_POLL_MS`; when free crosses below the floor it **scopes the
+/// response to the in-flight send's source filesystem** (the ADR-113 2026-06-17
+/// amendment):
 ///
 /// - **Same-filesystem** (no send in flight, or the in-flight send reads a root in
 ///   this pool's `roots`): set the cancel flag to abort the in-flight send. The
@@ -1018,11 +961,6 @@ fn watchdog_loop(
     config: &Config,
     away_at_spawn: &HashMap<String, Vec<String>>,
 ) {
-    // Per-pool trailing window of `(instant, free)` readings — the cliff rate is
-    // a windowed average over the last `WATCHDOG_CLIFF_WINDOW` (UPI 065-a), not a
-    // single prior sample. `window_baseline` owns push/eviction/baseline.
-    let mut windows: HashMap<PathBuf, VecDeque<(Instant, u64)>> = HashMap::new();
-    let mut freed: HashSet<PathBuf> = HashSet::new();
     let mut started_below: HashMap<PathBuf, bool> = HashMap::new();
     // Each pool fires at most once per run (UPI 065-b): after a same-fs abort or a
     // cross-fs reclaim it is `done` and skipped, so the loop keeps watching the
@@ -1046,7 +984,7 @@ fn watchdog_loop(
                 if b {
                     log::warn!(
                         "Watchdog: {} started below floor ({} < {}) — a tight run the planner \
-                         allowed; watching for cliffs only this run",
+                         allowed; the floor degrades to bare min_free this run",
                         pool.label,
                         space.free_bytes,
                         pool.floor_bytes,
@@ -1054,50 +992,11 @@ fn watchdog_loop(
                 }
                 b
             });
-            let now = Instant::now();
-            let dq = windows.entry(pool.poll_path.clone()).or_default();
-            let (prev_free, elapsed) =
-                window_baseline(dq, now, space.free_bytes, WATCHDOG_CLIFF_WINDOW);
-
-            let sample = WatchdogSample {
-                free_bytes: space.free_bytes,
-                prev_free_bytes: prev_free,
-                elapsed_since_prev: elapsed,
-            };
-            match watchdog_step(
-                sample,
-                pool.floor_bytes,
-                pool.min_free_bytes,
-                below,
-                reserve::reserve_present(&pool.reserve_path),
-            ) {
+            match watchdog_step(space.free_bytes, pool.floor_bytes, pool.min_free_bytes, below) {
                 WatchdogAction::Continue => {}
-                WatchdogAction::ReclaimReserve(reason) => {
-                    log::warn!(
-                        "Watchdog: {} {reason:?} — freeing reserve to buy runway",
-                        pool.label
-                    );
-                    if reserve::delete_reserve(&pool.reserve_path).is_ok() {
-                        freed.insert(pool.poll_path.clone());
-                        // OQ2: clear the cliff window after a successful reserve
-                        // reclaim so escalation to Abort requires *fresh* continued
-                        // dropping across a rebuilt window — a transient burst that
-                        // fired the reclaim does not then spuriously abort a healthy
-                        // send (#110-class). Load-bearing only for bursts *larger*
-                        // than the reserve: a sub-reserve burst is already suppressed
-                        // by the reserve-delete free-bump alone (adversary F1b). The
-                        // reset fires on *any* ReclaimReserve, including a
-                        // floor-triggered one, where it is a harmless no-op — the
-                        // floor never consults the window (adversary F2/F4). `dq` is
-                        // the same window we sampled above (still borrowed here).
-                        dq.clear();
-                    }
-                }
-                WatchdogAction::Abort(reason) => {
+                WatchdogAction::Abort => {
                     let firing_record = handle_watchdog_trip(
                         pool,
-                        reason,
-                        freed.contains(&pool.poll_path),
                         abort,
                         coord,
                         maint_btrfs,
@@ -1120,7 +1019,7 @@ fn watchdog_loop(
 /// Scope a sustained watchdog trip on `pool` to the in-flight send's source
 /// filesystem (UPI 065-b — the ADR-113 2026-06-17 amendment). Extracted from the
 /// loop's `Abort` arm so the same-vs-cross-filesystem decision is unit-testable
-/// without forcing a real floor/cliff trip on a live statvfs.
+/// without forcing a real floor trip on a live statvfs.
 ///
 /// The atomic trip-then-read is the C2 invariant: under **one** lock acquisition
 /// it marks every one of `pool.roots` tripped (gating that pool's new sends) and
@@ -1129,12 +1028,9 @@ fn watchdog_loop(
 /// send on this pool and concurrently reclaims it. A poisoned lock degrades to
 /// `None` → same-filesystem → abort: the recoverable error direction (a wrongful
 /// concurrent reclaim under a live send is not).
-#[allow(clippy::too_many_arguments)]
 #[must_use]
 fn handle_watchdog_trip(
     pool: &ArmedPool,
-    reason: WatchdogReason,
-    freed_reserve: bool,
     abort: &AtomicBool,
     coord: &Mutex<WatchdogCoord>,
     maint_btrfs: &dyn BtrfsOps,
@@ -1156,14 +1052,12 @@ fn handle_watchdog_trip(
     let same_fs = in_flight.as_ref().is_none_or(|r| pool.roots.contains(r));
     if same_fs {
         log::warn!(
-            "Watchdog: {} {reason:?} — aborting in-flight send (same-filesystem; host survival)",
+            "Watchdog: {} below floor — aborting in-flight send (same-filesystem; host survival)",
             pool.label
         );
         abort.store(true, Ordering::SeqCst);
         WatchdogFiring {
             pool_label: pool.label.clone(),
-            reason,
-            freed_reserve,
             subvol_names: pool.subvol_names.clone(),
             mountpoint: pool.poll_path.clone(),
             floor_bytes: pool.floor_bytes,
@@ -1177,7 +1071,7 @@ fn handle_watchdog_trip(
         // reclaim via a transient maintenance executor; NO DB connection on this
         // thread (M1) — stash the outcome for the teardown.
         log::warn!(
-            "Watchdog: {} {reason:?} — in-flight send reads a different filesystem; \
+            "Watchdog: {} below floor — in-flight send reads a different filesystem; \
              reclaiming this pool concurrently (independence)",
             pool.label
         );
@@ -1193,8 +1087,6 @@ fn handle_watchdog_trip(
         let ts = chrono::Local::now().naive_local();
         WatchdogFiring {
             pool_label: pool.label.clone(),
-            reason,
-            freed_reserve,
             subvol_names: pool.subvol_names.clone(),
             mountpoint: pool.poll_path.clone(),
             floor_bytes: pool.floor_bytes,
@@ -1237,44 +1129,39 @@ fn fresh_away_map(
         .collect()
 }
 
-/// Pre-position the fast-bridge reserve (UPI 033, S3). Production wrapper.
-fn establish_reserves(
-    config: &Config,
-    signals: &storage_signals::StorageSignals,
-    armed: &crate::storage_critical::ArmedTierMap,
-) {
-    establish_reserves_with(
-        config,
-        signals,
-        armed,
-        |p| pools::pool_space(p).ok(),
-        reserve::ensure_reserve,
-    );
-}
+/// On-disk name of the retired emergency reserve file (UPI 033, retired by UPI
+/// 067). Kept only so [`sweep_orphaned_reserves`] can unlink the `fallocate`'d
+/// remnants the deleted lifecycle left behind. **One-release cleanup scaffolding:
+/// delete this const and `sweep_orphaned_reserves` one release after 067 ships
+/// (see registry follow-up).**
+const RESERVE_FILENAME: &str = ".urd-emergency-reserve";
 
-/// Testable core of [`establish_reserves`]: space + reserve-creation are
-/// injected. Establishes a reserve on every non-Critical source pool with a
-/// send-enabled subvolume that has clear room to spare it (free > 2× the reserve
-/// size), so the bridge pre-exists when a pool later jumps to Critical. Never on
-/// a Critical pool (no room) and never on a pool too tight to spare the reserve.
-fn establish_reserves_with(
-    config: &Config,
-    signals: &storage_signals::StorageSignals,
-    armed: &crate::storage_critical::ArmedTierMap,
-    space: impl FnMut(&std::path::Path) -> Option<PoolSpace>,
-    mut ensure: impl FnMut(&std::path::Path, u64) -> std::io::Result<()>,
-) {
-    // Non-Critical pools only (Critical has no room to spare the reserve).
-    let targets =
-        resolve_pool_targets(config, signals, armed, |t| t != TightnessTier::Critical, space);
-    for t in targets {
-        // Only when the 1 GiB reserve clearly won't itself cause pressure.
-        if t.space.free_bytes <= reserve::RESERVE_SIZE_BYTES.saturating_mul(2) {
+/// Reclaim the `.urd-emergency-reserve` remnants the retired reserve lifecycle
+/// (UPI 033) left on disk (UPI 067). `establish_reserves` ran after every
+/// successful non-Critical run, so the `fallocate`'d files physically persist on
+/// every pool that was ever Roomy/Tight — and the only code that unlinked them is
+/// gone. Best-effort, idempotent, **tier-blind**: reserves were created on Roomy
+/// *and* Tight pools, so every send-enabled pool is visited (not just the armed
+/// Tight+ ones — do not reuse the tier-filtered `resolve_pool_targets` walk). A
+/// missing file is the steady state, not an error; anything else is logged at
+/// `debug` (silent self-cleanup, never a `warn`).
+fn sweep_orphaned_reserves(config: &Config, signals: &storage_signals::StorageSignals) {
+    let send_enabled = send_enabled_names(config);
+    for pool in &signals.pools {
+        // The representative root is resolved through the SAME `snapshot_root_for`
+        // the retired `establish_reserves` created the reserve at (keyed on the
+        // first send-enabled subvol), so the sweep is the faithful inverse.
+        let Some(first) = pool.subvol_names.iter().find(|n| send_enabled.contains(*n)) else {
+            continue; // local-only pool — never carried a reserve
+        };
+        let Some(root) = config.snapshot_root_for(first) else {
             continue;
-        }
-        let path = reserve::reserve_path(&t.root);
-        if let Err(e) = ensure(&path, reserve::RESERVE_SIZE_BYTES) {
-            log::warn!("Watchdog: could not establish reserve at {}: {e}", path.display());
+        };
+        let path = root.join(RESERVE_FILENAME);
+        match std::fs::remove_file(&path) {
+            Ok(()) => log::debug!("Swept orphaned reserve at {}", path.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => log::debug!("Could not sweep reserve at {}: {e}", path.display()),
         }
     }
 }
@@ -2831,10 +2718,6 @@ source = "/data/beta"
         assert_eq!(armed.len(), 1);
         assert_eq!(armed[0].poll_path, PathBuf::from("/snap"));
         assert_eq!(
-            armed[0].reserve_path,
-            PathBuf::from("/snap/.urd-emergency-reserve")
-        );
-        assert_eq!(
             armed[0].subvol_names,
             vec!["alpha".to_string(), "beta".to_string()]
         );
@@ -2896,41 +2779,27 @@ source = "/data/beta"
     }
 
     #[test]
-    fn establish_reserves_skips_critical_creates_on_tight() {
-        use std::cell::RefCell;
-        let config = wd_config();
-        let signals = wd_signals(&["alpha"]);
+    fn sweep_orphaned_reserves_removes_reserve_and_is_idempotent() {
+        // Step 2a (UPI 067): the sweep unlinks a `.urd-emergency-reserve` left at a
+        // configured snapshot root, and a second run is a no-op (NotFound tolerated).
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().to_path_buf();
+        let mut config = wd_config();
+        config.local_snapshots.roots[0].path = root.clone();
+        // `wd_signals` reports the pool's send-enabled subvols; the sweep resolves
+        // the representative root via `snapshot_root_for(first send-enabled)`.
+        let signals = wd_signals(&["alpha", "beta"]);
 
-        // Critical pool: no reserve created (no room to add footprint).
-        let created: RefCell<Vec<PathBuf>> = RefCell::new(Vec::new());
-        establish_reserves_with(
-            &config,
-            &signals,
-            &tier_map(&[("alpha", TightnessTier::Critical)]),
-            space_cap(100_000_000_000, 40_000_000_000),
-            |p, _| {
-                created.borrow_mut().push(p.to_path_buf());
-                Ok(())
-            },
-        );
-        assert!(created.borrow().is_empty(), "no reserve on a Critical pool");
+        let reserve = root.join(".urd-emergency-reserve");
+        std::fs::write(&reserve, b"orphan").unwrap();
+        assert!(reserve.exists());
 
-        // Tight pool with ample room: reserve created at the snapshot root.
-        let created2: RefCell<Vec<PathBuf>> = RefCell::new(Vec::new());
-        establish_reserves_with(
-            &config,
-            &signals,
-            &tier_map(&[("alpha", TightnessTier::Tight)]),
-            space_cap(100_000_000_000, 40_000_000_000),
-            |p, _| {
-                created2.borrow_mut().push(p.to_path_buf());
-                Ok(())
-            },
-        );
-        assert_eq!(
-            created2.borrow().as_slice(),
-            &[PathBuf::from("/snap/.urd-emergency-reserve")]
-        );
+        sweep_orphaned_reserves(&config, &signals);
+        assert!(!reserve.exists(), "the orphaned reserve is swept");
+
+        // Idempotent: a second sweep over the now-absent file does not panic/error.
+        sweep_orphaned_reserves(&config, &signals);
+        assert!(!reserve.exists());
     }
 
     // ── watchdog decision + loop (UPI 033, Step 7 glue) ───────────────
@@ -2943,71 +2812,45 @@ source = "/data/beta"
 
     const GB: u64 = 1024 * 1024 * 1024;
 
-    fn wd_sample(free: u64, prev: u64) -> WatchdogSample {
-        WatchdogSample {
-            free_bytes: free,
-            prev_free_bytes: Some(prev),
-            elapsed_since_prev: Duration::from_millis(WATCHDOG_POLL_MS),
-        }
-    }
-
     #[test]
     fn watchdog_step_started_above_floor_fires_on_floor() {
-        // Started above floor: a below-floor sample fires. Reserve present →
-        // reclaim the bridge first; absent → abort.
-        let s = wd_sample(GB, GB); // below a 2 GB floor, no fast drop
-        assert_eq!(
-            watchdog_step(s, 2 * GB, GB / 2, false, true),
-            WatchdogAction::ReclaimReserve(WatchdogReason::FloorCrossed)
-        );
-        assert_eq!(
-            watchdog_step(s, 2 * GB, GB / 2, false, false),
-            WatchdogAction::Abort(WatchdogReason::FloorCrossed)
-        );
+        // Started above floor: a below-floor reading aborts (floor-only since 067).
+        assert_eq!(watchdog_step(GB, 2 * GB, GB / 2, false), WatchdogAction::Abort);
     }
 
     #[test]
     fn watchdog_step_started_below_floor_suppresses_floor() {
-        // Finding B, refined by UPI 054-a: started below floor → the floor
-        // degrades to bare min_free. A sample below the floor but above
-        // min_free is Continue (the run the planner allowed proceeds),
-        // regardless of reserve presence.
-        let s = wd_sample(GB, GB); // below the 2 GB floor, above 512 MB min_free
-        assert_eq!(
-            watchdog_step(s, 2 * GB, GB / 2, true, false),
-            WatchdogAction::Continue
-        );
-        assert_eq!(
-            watchdog_step(s, 2 * GB, GB / 2, true, true),
-            WatchdogAction::Continue
-        );
+        // Finding B, refined by UPI 054-a: started below floor → the floor degrades
+        // to bare min_free. A reading below the floor but above min_free is Continue
+        // (the run the planner allowed proceeds).
+        // GB is below the 2 GB floor but above the 512 MB min_free.
+        assert_eq!(watchdog_step(GB, 2 * GB, GB / 2, true), WatchdogAction::Continue);
     }
 
     #[test]
     fn watchdog_step_started_below_floor_fires_below_min_free() {
-        // UPI 054-a: the degraded floor still bites. A started-below pool whose
-        // free then falls under bare min_free fires — this closes the
-        // slow-fill-to-zero gap the 033 full suppression (floor → 0) opened.
-        let s = wd_sample(GB / 4, GB / 4); // below the 512 MB min_free, no cliff
-        assert_eq!(
-            watchdog_step(s, 2 * GB, GB / 2, true, true),
-            WatchdogAction::ReclaimReserve(WatchdogReason::FloorCrossed)
-        );
-        assert_eq!(
-            watchdog_step(s, 2 * GB, GB / 2, true, false),
-            WatchdogAction::Abort(WatchdogReason::FloorCrossed)
-        );
+        // UPI 054-a: the degraded floor still bites. A started-below pool whose free
+        // then falls under bare min_free aborts — this closes the slow-fill-to-zero
+        // gap full suppression (floor → 0) opened.
+        // GB/4 (256 MB) is below the 512 MB min_free.
+        assert_eq!(watchdog_step(GB / 4, 2 * GB, GB / 2, true), WatchdogAction::Abort);
     }
 
     #[test]
-    fn watchdog_step_cliff_fires_even_when_started_below_floor() {
-        // The cliff stays active on a started-below pool: 50 MB lost in 250 ms =
-        // 200 MB/s > the 100 MB/s cliff → abort despite floor degradation.
-        let dropped = 50 * 1024 * 1024;
-        let s = wd_sample(GB, GB + dropped);
+    fn watchdog_step_started_below_crosses_min_free_aborts() {
+        // G3 ①: the G1 backstop proof — a started-below pool's degraded floor
+        // (bare min_free) still bites at the boundary. `free == min_free` is not
+        // below it → Continue; one byte under → Abort. Independent of the
+        // above-floor boundary `evaluate_free_equals_floor_continues` proves.
         assert_eq!(
-            watchdog_step(s, 2 * GB, GB / 2, true, false),
-            WatchdogAction::Abort(WatchdogReason::CliffExceeded)
+            watchdog_step(GB / 2, 2 * GB, GB / 2, true),
+            WatchdogAction::Continue,
+            "free == the degraded floor (min_free) is not below it"
+        );
+        assert_eq!(
+            watchdog_step(GB / 2 - 1, 2 * GB, GB / 2, true),
+            WatchdogAction::Abort,
+            "one byte under the degraded floor aborts"
         );
     }
 
@@ -3018,13 +2861,11 @@ source = "/data/beta"
         poll: PathBuf,
         roots: Vec<PathBuf>,
         floor_bytes: u64,
-        reserve_path: PathBuf,
         subvol_names: Vec<String>,
     ) -> ArmedPool {
         ArmedPool {
             poll_path: poll,
             roots: roots.into_iter().collect(),
-            reserve_path,
             floor_bytes,
             min_free_bytes: 0, // preserves pre-054-a full suppression in these fixtures
             label: "/data".to_string(),
@@ -3068,32 +2909,11 @@ source = "/data/beta"
             dir.path().to_path_buf(),
             vec![dir.path().to_path_buf()],
             u64::MAX,
-            dir.path().join(".urd-emergency-reserve"), // absent
             vec!["alpha".to_string()],
         );
         let (aborted, firings) = run_loop_briefly(pool);
         assert!(!aborted, "started-below floor must not abort");
-        assert!(firings.is_empty(), "no firing — floor suppressed, no cliff");
-    }
-
-    #[test]
-    fn watchdog_loop_started_below_floor_keeps_reserve() {
-        // Floor suppression holds even with a reserve present: a started-below
-        // pool with no cliff neither frees the reserve nor aborts.
-        let dir = tempfile::TempDir::new().unwrap();
-        let reserve_path = dir.path().join(".urd-emergency-reserve");
-        std::fs::write(&reserve_path, b"reserve").unwrap();
-        let pool = test_armed_pool(
-            dir.path().to_path_buf(),
-            vec![dir.path().to_path_buf()],
-            u64::MAX,
-            reserve_path.clone(),
-            vec!["alpha".to_string()],
-        );
-        let (aborted, firings) = run_loop_briefly(pool);
-        assert!(reserve_path.exists(), "floor suppressed → reserve not freed");
-        assert!(!aborted);
-        assert!(firings.is_empty());
+        assert!(firings.is_empty(), "no firing — floor suppressed");
     }
 
     #[test]
@@ -3105,7 +2925,6 @@ source = "/data/beta"
             dir.path().to_path_buf(),
             vec![dir.path().to_path_buf()],
             0, // free is always >= 0, never below → no floor trip
-            dir.path().join(".urd-emergency-reserve"),
             vec!["alpha".to_string()],
         );
         let (aborted, firings) = run_loop_briefly(pool);
@@ -3132,7 +2951,6 @@ source = "/data/beta"
             poll.clone(),
             vec![poll.clone(), other_root.clone()], // one UUID-pool, two roots
             u64::MAX,
-            dir.path().join(".reserve"),
             vec!["alpha".to_string()],
         );
         let abort = AtomicBool::new(false);
@@ -3143,16 +2961,7 @@ source = "/data/beta"
         let mock = crate::btrfs::MockBtrfs::new();
         let cfg = wd_config();
         let away = HashMap::new();
-        let firing = handle_watchdog_trip(
-            &pool,
-            WatchdogReason::CliffExceeded,
-            false,
-            &abort,
-            &coord,
-            &mock,
-            &cfg,
-            &away,
-        );
+        let firing = handle_watchdog_trip(&pool, &abort, &coord, &mock, &cfg, &away);
         assert!(abort.load(Ordering::SeqCst), "same-fs (by membership) must abort the in-flight send");
         assert!(firing.send_aborted);
         assert!(firing.reclaim.is_none(), "same-fs reclaim is deferred to teardown");
@@ -3167,35 +2976,18 @@ source = "/data/beta"
 
     #[test]
     fn trip_no_in_flight_is_same_fs() {
-        // No send in flight → same-fs (nothing to cross-pool-harm): abort path,
-        // and `freed_reserve` is threaded through verbatim.
+        // No send in flight → same-fs (nothing to cross-pool-harm): abort path.
         let dir = tempfile::TempDir::new().unwrap();
         let poll = dir.path().to_path_buf();
-        let pool = test_armed_pool(
-            poll.clone(),
-            vec![poll],
-            u64::MAX,
-            dir.path().join(".reserve"),
-            vec!["alpha".to_string()],
-        );
+        let pool = test_armed_pool(poll.clone(), vec![poll], u64::MAX, vec!["alpha".to_string()]);
         let abort = AtomicBool::new(false);
         let coord = Mutex::new(WatchdogCoord::default()); // in_flight = None
         let mock = crate::btrfs::MockBtrfs::new();
         let cfg = wd_config();
         let away = HashMap::new();
-        let firing = handle_watchdog_trip(
-            &pool,
-            WatchdogReason::FloorCrossed,
-            true,
-            &abort,
-            &coord,
-            &mock,
-            &cfg,
-            &away,
-        );
+        let firing = handle_watchdog_trip(&pool, &abort, &coord, &mock, &cfg, &away);
         assert!(abort.load(Ordering::SeqCst));
         assert!(firing.send_aborted);
-        assert!(firing.freed_reserve, "freed_reserve threaded through");
     }
 
     #[test]
@@ -3210,7 +3002,6 @@ source = "/data/beta"
             poll.clone(),
             vec![poll.clone()],
             u64::MAX,
-            dir.path().join(".reserve"),
             vec!["alpha".to_string()],
         );
         let abort = AtomicBool::new(false);
@@ -3221,16 +3012,7 @@ source = "/data/beta"
         let mock = crate::btrfs::MockBtrfs::new();
         let cfg = wd_config();
         let away = HashMap::new();
-        let firing = handle_watchdog_trip(
-            &pool,
-            WatchdogReason::CliffExceeded,
-            false,
-            &abort,
-            &coord,
-            &mock,
-            &cfg,
-            &away,
-        );
+        let firing = handle_watchdog_trip(&pool, &abort, &coord, &mock, &cfg, &away);
         assert!(!abort.load(Ordering::SeqCst), "cross-fs must NOT abort the unrelated send");
         assert!(!firing.send_aborted);
         assert!(
@@ -3283,274 +3065,6 @@ source = "/data/beta"
             Some(["AWAY".to_string()].as_slice()),
             "a reconnected (mounted) drive is dropped from the cross-fs shed list",
         );
-    }
-
-    // ── windowed cliff (UPI 065-a) ────────────────────────────────────
-    // The cliff fires on a windowed-average drop rate over WATCHDOG_CLIFF_WINDOW
-    // (2 s), not a single 250 ms sample. These tests drive the `window_baseline`
-    // sampler + `watchdog_step`/`guard::evaluate` with scripted synthetic instants
-    // (offset off one base — no sleep), so the windowing/eviction arithmetic is
-    // deterministic. The pure `guard.rs` tests prove the decision core is untouched.
-
-    const MB: u64 = 1024 * 1024;
-
-    /// Drive one `(now, free)` reading through a pool's window deque and the
-    /// watchdog decision, exactly as `watchdog_loop` does — returns the action. A
-    /// low `floor` isolates the cliff; a high one exercises the floor.
-    fn step(
-        dq: &mut VecDeque<(Instant, u64)>,
-        now: Instant,
-        free: u64,
-        floor: u64,
-        reserve_present: bool,
-    ) -> WatchdogAction {
-        let (prev_free, elapsed) = window_baseline(dq, now, free, WATCHDOG_CLIFF_WINDOW);
-        let sample = WatchdogSample {
-            free_bytes: free,
-            prev_free_bytes: prev_free,
-            elapsed_since_prev: elapsed,
-        };
-        watchdog_step(sample, floor, 0, false, reserve_present)
-    }
-
-    #[test]
-    fn windowed_cliff_suppresses_110_transient_spike() {
-        // Run #110: a single 250 ms spike (50 MB lost = 200 MB/s) on an otherwise
-        // flat pool. The single-sample cliff fired (>100 MB/s); the windowed
-        // average over 2 s is 25 MB/s → Continue. No abort, no reclaim.
-        let mut dq = VecDeque::new();
-        let t0 = Instant::now();
-        let free = 50 * GB;
-        let low_floor = GB; // 50 GB >> floor: only the cliff can speak here
-        // Eight flat 250 ms readings fill the 2 s window.
-        for i in 0..8u64 {
-            let t = t0 + Duration::from_millis(250 * i);
-            assert_eq!(step(&mut dq, t, free, low_floor, true), WatchdogAction::Continue);
-        }
-        // One 50 MB spike in the next slot.
-        let spiked = free - 50 * MB;
-        assert_eq!(
-            step(&mut dq, t0 + Duration::from_millis(250 * 8), spiked, low_floor, true),
-            WatchdogAction::Continue,
-            "a transient spike amortised over the 2 s window stays below the cliff"
-        );
-        // Contrast: the *single-sample* rate (the pre-065-a baseline) WOULD have
-        // fired — 50 MB / 250 ms = 200 MB/s. Proves the test distinguishes the fix.
-        let single_sample = WatchdogSample {
-            free_bytes: spiked,
-            prev_free_bytes: Some(free),
-            elapsed_since_prev: Duration::from_millis(WATCHDOG_POLL_MS),
-        };
-        assert_eq!(
-            watchdog_step(single_sample, low_floor, 0, false, false),
-            WatchdogAction::Abort(WatchdogReason::CliffExceeded),
-            "the pre-065-a single-sample cliff fired on this very spike (#110)"
-        );
-    }
-
-    #[test]
-    fn windowed_cliff_fires_on_sustained_fill() {
-        // A genuine sustained ~120 MB/s fill (30 MB lost each 250 ms slot) keeps
-        // the windowed average above the 100 MB/s cliff → it fires. Windowing
-        // suppresses transients, not real drops.
-        let mut dq = VecDeque::new();
-        let t0 = Instant::now();
-        let low_floor = GB;
-        let drop = 30 * MB;
-        let mut last = WatchdogAction::Continue;
-        for i in 0..8u64 {
-            let t = t0 + Duration::from_millis(250 * i);
-            last = step(&mut dq, t, 50 * GB - drop * i, low_floor, false);
-        }
-        assert_eq!(last, WatchdogAction::Abort(WatchdogReason::CliffExceeded));
-    }
-
-    #[test]
-    fn windowed_cliff_evicts_drop_older_than_window() {
-        // A drop older than the 2 s window stops contributing: once it ages out,
-        // the baseline moves past it, the rate returns to ~0, and the cliff quiets.
-        let mut dq = VecDeque::new();
-        let t0 = Instant::now();
-        let low_floor = GB;
-        let high = 50 * GB;
-        let low = high - 2 * GB;
-        step(&mut dq, t0, high, low_floor, false); // seed
-        // A 2 GB drop in the next 250 ms slot fires while fresh.
-        assert_eq!(
-            step(&mut dq, t0 + Duration::from_millis(250), low, low_floor, false),
-            WatchdogAction::Abort(WatchdogReason::CliffExceeded),
-        );
-        // Flat at the lower level; once the drop ages past 2 s it is evicted.
-        let mut last = WatchdogAction::Continue;
-        for ms in [500u64, 750, 1000, 1250, 1500, 1750, 2000, 2250, 2500] {
-            last = step(&mut dq, t0 + Duration::from_millis(ms), low, low_floor, false);
-        }
-        assert_eq!(
-            last,
-            WatchdogAction::Continue,
-            "the aged-out drop no longer drives the cliff"
-        );
-    }
-
-    #[test]
-    fn windowed_cliff_seed_sample_suppressed() {
-        // The very first reading (deque len 1) yields no baseline → cliff
-        // suppressed (no rate is computable from a single sample).
-        let mut dq = VecDeque::new();
-        let t0 = Instant::now();
-        let (prev, elapsed) = window_baseline(&mut dq, t0, 50 * GB, WATCHDOG_CLIFF_WINDOW);
-        assert_eq!((prev, elapsed), (None, Duration::ZERO));
-    }
-
-    #[test]
-    fn windowed_cliff_reset_on_reclaim_prevents_spurious_abort() {
-        // OQ2 / adversary F1: a transient burst LARGER than the reserve fires
-        // ReclaimReserve; after the reserve free-bump the stale window baseline
-        // still sits above current free, so WITHOUT the reset the next poll would
-        // escalate to a #110-class spurious Abort. Clearing the window on reclaim
-        // forces a fresh baseline → Continue. The burst MUST exceed the reserve,
-        // else the free-bump alone suppresses escalation and the test can't fail.
-        let burst = reserve::RESERVE_SIZE_BYTES + GB; // > the 1 GiB reserve
-        let low_floor = GB;
-        let high = 50 * GB;
-        let trough = high - burst; // free at the burst trough
-        let bumped = trough + reserve::RESERVE_SIZE_BYTES; // reserve unlink frees ~1 GiB
-        let t0 = Instant::now();
-
-        // Shared prefix: a flat window, then the >reserve burst that fires
-        // ReclaimReserve (reserve present).
-        let prime = |dq: &mut VecDeque<(Instant, u64)>| {
-            for i in 0..5u64 {
-                step(dq, t0 + Duration::from_millis(250 * i), high, low_floor, true);
-            }
-            assert_eq!(
-                step(dq, t0 + Duration::from_millis(1250), trough, low_floor, true),
-                WatchdogAction::ReclaimReserve(WatchdogReason::CliffExceeded),
-            );
-        };
-
-        // With reset: clear the window on reclaim (what the loop does), then the
-        // bumped-but-flat free rebuilds a clean baseline → Continue across the
-        // rebuilt window. Reserve is gone now → reserve_present false.
-        let mut reset_dq = VecDeque::new();
-        prime(&mut reset_dq);
-        reset_dq.clear(); // ← the OQ2 reset
-        assert_eq!(
-            step(&mut reset_dq, t0 + Duration::from_millis(1500), bumped, low_floor, false),
-            WatchdogAction::Continue,
-        );
-        assert_eq!(
-            step(&mut reset_dq, t0 + Duration::from_millis(1750), bumped, low_floor, false),
-            WatchdogAction::Continue,
-            "a rebuilt window over flat free stays Continue",
-        );
-
-        // Mirror (no reset): the same post-reclaim poll WOULD abort — the stale
-        // baseline (pre-burst high) over the bumped-but-lower free keeps the cliff
-        // firing, and the reserve is gone. Pins the reset as load-bearing.
-        let mut noreset_dq = VecDeque::new();
-        prime(&mut noreset_dq);
-        assert_eq!(
-            step(&mut noreset_dq, t0 + Duration::from_millis(1500), bumped, low_floor, false),
-            WatchdogAction::Abort(WatchdogReason::CliffExceeded),
-            "without the reset, the stale window escalates a healthy send to Abort",
-        );
-    }
-
-    #[test]
-    fn floor_fires_independent_of_window_contents() {
-        // Adversary F2: the floor reads CURRENT free only — it fires regardless of
-        // window state (empty, stale, or freshly reset). This is the safety
-        // linchpin that keeps a sustained fill caught during the one-poll cliff
-        // blind spot right after an OQ2 reset. (Loop-level floor behaviour is
-        // covered by `watchdog_loop_started_below_floor_*`.)
-        let absurd_floor = 60 * GB; // every realistic free is below it
-        let flat = 50 * GB;
-        let t0 = Instant::now();
-
-        // (a) Empty window: the first reading is below the floor → fires, though
-        // the cliff is suppressed (len 1, no baseline).
-        let mut empty = VecDeque::new();
-        assert_eq!(
-            step(&mut empty, t0, flat, absurd_floor, false),
-            WatchdogAction::Abort(WatchdogReason::FloorCrossed),
-        );
-
-        // (b) Stale window: prior readings exist and the rate is ~0 (flat), yet the
-        // floor still fires on the current below-floor level.
-        let mut stale = VecDeque::new();
-        step(&mut stale, t0, flat, absurd_floor, false);
-        assert_eq!(
-            step(&mut stale, t0 + Duration::from_millis(250), flat, absurd_floor, false),
-            WatchdogAction::Abort(WatchdogReason::FloorCrossed),
-        );
-
-        // (c) Freshly-reset window: after a clear the cliff is suppressed for one
-        // poll, but the floor fires anyway — the blind spot is floor-covered.
-        stale.clear();
-        assert_eq!(
-            step(&mut stale, t0 + Duration::from_millis(500), flat, absurd_floor, false),
-            WatchdogAction::Abort(WatchdogReason::FloorCrossed),
-        );
-    }
-
-    #[test]
-    fn windowed_cliff_handles_irregular_poll_cadence() {
-        // Adversary F5: real Instants, not a fixed 250 ms × count. With uneven gaps
-        // (250 ms, 250 ms, 1.5 s, …) the rate is computed over ACTUAL elapsed and
-        // eviction is by real age — so the cliff fires on the genuine drop and goes
-        // quiet only once the drop truly ages out of the window.
-        let mut dq = VecDeque::new();
-        let low_floor = GB;
-        let high = 50 * GB;
-        let low = high - 500 * MB; // a 500 MB step down
-        let t0 = Instant::now();
-
-        // t=0, 0.25: flat (gaps of 250 ms).
-        assert_eq!(step(&mut dq, t0, high, low_floor, false), WatchdogAction::Continue);
-        assert_eq!(
-            step(&mut dq, t0 + Duration::from_millis(250), high, low_floor, false),
-            WatchdogAction::Continue,
-        );
-        // t=0.5: the 500 MB drop. Rate over the actual 0.5 s window = 1 GB/s →
-        // fires (a fixed-250 ms assumption would have mis-divided by one slot).
-        assert_eq!(
-            step(&mut dq, t0 + Duration::from_millis(500), low, low_floor, false),
-            WatchdogAction::Abort(WatchdogReason::CliffExceeded),
-        );
-        // t=2.0 (a 1.5 s gap): the drop (t=0) is still within the 2 s window → it
-        // still fires. Eviction tracks real age, not sample count.
-        assert_eq!(
-            step(&mut dq, t0 + Duration::from_millis(2000), low, low_floor, false),
-            WatchdogAction::Abort(WatchdogReason::CliffExceeded),
-        );
-        // t=2.5: the pre-drop readings (t=0, 0.25) have aged past 2 s and evicted;
-        // the baseline is now the post-drop level → Continue.
-        assert_eq!(
-            step(&mut dq, t0 + Duration::from_millis(2500), low, low_floor, false),
-            WatchdogAction::Continue,
-            "once the drop ages out under irregular cadence, the cliff goes quiet",
-        );
-    }
-
-    #[test]
-    fn establish_reserves_skips_when_no_room() {
-        use std::cell::RefCell;
-        let config = wd_config();
-        let signals = wd_signals(&["alpha"]);
-        let created: RefCell<Vec<PathBuf>> = RefCell::new(Vec::new());
-        // free <= 2× reserve → too tight to spare it; skip even though Tight.
-        establish_reserves_with(
-            &config,
-            &signals,
-            &tier_map(&[("alpha", TightnessTier::Tight)]),
-            space_cap(100_000_000_000, reserve::RESERVE_SIZE_BYTES),
-            |p, _| {
-                created.borrow_mut().push(p.to_path_buf());
-                Ok(())
-            },
-        );
-        assert!(created.borrow().is_empty());
     }
 
     // ── Emergency preflight reclaim (UPI 059-a) ────────────────────────
