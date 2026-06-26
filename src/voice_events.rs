@@ -10,7 +10,6 @@ use std::fmt::Write as _;
 use colored::Colorize;
 
 use crate::events::{EventPayload, Severity};
-use crate::guard::WatchdogReason;
 use crate::output::{EventRow, EventsView};
 use crate::types::ByteSize;
 
@@ -153,26 +152,20 @@ fn summary_for(payload: &EventPayload) -> String {
         }
         EventPayload::WatchdogAbort {
             pool_label,
-            reason,
-            freed_reserve,
             snapshots_reclaimed,
             send_aborted,
         } => {
-            let cause = match reason {
-                WatchdogReason::FloorCrossed => "floor crossed",
-                WatchdogReason::CliffExceeded => "rapid fill",
-            };
-            let bridge = if *freed_reserve { "reserve freed" } else { "no reserve" };
+            // Floor-only since UPI 067 — the cause is always "below floor".
             if *send_aborted {
                 format!(
-                    "guard stopped send on {pool_label}  ({cause}; {bridge}; \
+                    "guard stopped send on {pool_label}  (below floor; \
                      reclaimed {snapshots_reclaimed} snapshot(s))"
                 )
             } else {
                 // Cross-filesystem (UPI 065-b): the running send read a different,
                 // independent pool — relieve this one, leave that send untouched.
                 format!(
-                    "guard relieved {pool_label}  ({cause}; {bridge}; \
+                    "guard relieved {pool_label}  (below floor; \
                      reclaimed {snapshots_reclaimed} snapshot(s); left the running send untouched)"
                 )
             }
@@ -613,8 +606,6 @@ mod tests {
         let row = make_row(
             EventPayload::WatchdogAbort {
                 pool_label: "/home".into(),
-                reason: WatchdogReason::CliffExceeded,
-                freed_reserve: true,
                 snapshots_reclaimed: 2,
                 send_aborted: true,
             },
@@ -623,7 +614,6 @@ mod tests {
         );
         let line = format_row(&row);
         assert!(line.contains("guard stopped send on /home"), "same-fs: {line}");
-        assert!(line.contains("rapid fill"));
         assert!(line.contains("reclaimed 2 snapshot(s)"));
     }
 
@@ -634,8 +624,6 @@ mod tests {
         let row = make_row(
             EventPayload::WatchdogAbort {
                 pool_label: "/home".into(),
-                reason: WatchdogReason::FloorCrossed,
-                freed_reserve: false,
                 snapshots_reclaimed: 3,
                 send_aborted: false,
             },

@@ -1647,13 +1647,16 @@ impl<'a> Executor<'a> {
     ///
     /// **Entry gate (UPI 066, ADR-113 amendment):** before either tier, confirm
     /// genuine absolute pressure — `measure_free()` must read **below**
-    /// `floor_bytes`. The watchdog's cliff is a rate trigger; its non-destructive
-    /// responses (free the reserve, abort the send) are the caller's, and run
-    /// before this. Pin-shedding breaks a backup chain, so it is reserved for the
-    /// floor regime — the same `< floor` signal Layer 3 (`evaluate_idle_eject`)
+    /// `floor_bytes`. The watchdog's abort and this reclaim are separated in time
+    /// (abort fires → send exits → teardown reclaims), so free is **re-measured**
+    /// here: ambient recovery between trip and reclaim must not trigger a
+    /// destructive shed. Pin-shedding breaks a backup chain, so it is reserved for
+    /// the floor regime — the same `< floor` signal Layer 3 (`evaluate_idle_eject`)
     /// requires. `free >= floor` → [`ReclaimOutcome::Nothing`] (no shed); `None`
-    /// biases to proceed (catastrophe-safety). This is what stops a transient
-    /// cliff on a healthy pool from severing a backup chain (field incident #110).
+    /// biases to proceed (catastrophe-safety). Origin (field incident #110): the
+    /// now-deleted write-rate cliff (UPI 067) aborted a send at ~4× runway and its
+    /// reclaim severed a backup chain with no absolute pressure; floor-only makes a
+    /// phantom *abort* unreachable, and this gate keeps a phantom *shed* unreachable.
     ///
     /// **Tier 1 (graceful, away-first):** shed only the `away_sheddable` pins —
     /// away drives whose pinned snapshot is away-*only* (computed by the caller
@@ -1713,13 +1716,13 @@ impl<'a> Executor<'a> {
         // ── Absolute-level gate (UPI 066, ADR-113 amendment) ───────────────
         // Destructive pin-shedding requires CONFIRMED sub-floor pressure — the
         // same signal Layer 3 (idle eject, `evaluate_idle_eject`) already demands.
-        // The mid-op watchdog's *cliff* is a rate signal whose proportionate
-        // response is the non-destructive pair the caller already applied before
-        // we run: free the disposable reserve, abort the in-flight send. Shedding
-        // a backup chain's pin is a different regime — it costs a recoverable full
+        // The abort decision and this reclaim are time-separated (abort → send
+        // exits → teardown reclaims), so free is re-measured here. Shedding a
+        // backup chain's pin is a different regime — it costs a recoverable full
         // re-send — so it must not follow a trip that leaves free at/above the
-        // floor (the reserve-free/abort sufficed, or a transient cliff fired with
-        // ample runway: field incident run #110, ~4× runway).
+        // floor by reclaim time (the abort already bought host survival, or free
+        // recovered between trip and reclaim; historically: the now-deleted cliff
+        // fired with ample runway — field incident run #110, ~4× runway, UPI 067).
         if free_at_or_above_floor() {
             return ReclaimOutcome::Nothing;
         }
@@ -5261,15 +5264,16 @@ local_retention = "transient"
 
     #[test]
     fn emergency_reclaim_above_floor_sheds_nothing() {
-        // (UPI 066) The absolute-level gate. A watchdog *cliff* can abort a send
-        // and free the disposable reserve while free space is still healthy — the
-        // run-#110 field incident, where a transient 100 MB/s spike on a pool with
-        // ~4× runway tripped the cliff. Destructive pin-shedding must NOT follow a
-        // trip that leaves free at/above the floor: the abort + reserve-free
-        // already bought host survival, and shedding here breaks a backup chain for
-        // zero gain. Both the away-only AND the connected pins + snapshots survive;
-        // nothing is deleted. Boundary mirrors `evaluate_idle_eject` (free == floor
-        // does NOT shed) and the post-Tier-1 `>= floor` sufficiency check.
+        // (UPI 066) The absolute-level gate. By reclaim time free can read at/above
+        // the floor even though the watchdog tripped earlier — free recovered
+        // between trip and reclaim, or (historically) the now-deleted write-rate
+        // cliff aborted a send at ~4× runway (the run-#110 field incident, a
+        // transient 100 MB/s spike). Destructive pin-shedding must NOT follow a
+        // trip that leaves free at/above the floor: the abort already bought host
+        // survival, and shedding here breaks a backup chain for zero gain. Both the
+        // away-only AND the connected pins + snapshots survive; nothing is deleted.
+        // Boundary mirrors `evaluate_idle_eject` (free == floor does NOT shed) and
+        // the post-Tier-1 `>= floor` sufficiency check.
         let (_snap, _p, _o, config, connected, away, primary_pin, offsite_pin) =
             away_shed_fixture();
         let mock = MockBtrfs::new();

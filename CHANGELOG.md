@@ -8,6 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **The storage watchdog no longer aborts a healthy send on a transient write-rate
+  spike, and no longer pre-allocates disk to do so** (UPI 067, ADR-113 amendment).
+  Layer 2's mid-op watchdog reverts to a single absolute-floor trigger: its
+  differential *cliff* (write-rate) trigger and the pre-allocated 1 GiB
+  `.urd-emergency-reserve` fast bridge are both deleted. The cliff had been the
+  documented *primary* signal, but its entire production record was the opposite of
+  trustworthy — both times it ever fired it killed a healthy multi-TB send on a pool
+  with ample runway (runs #108, #110), while the absolute floor never misfired. The
+  watchdog now aborts only when free space actually crosses the floor (`min_free +
+  cleanup_budget`) — late but never wrong, since the floor's error direction (fire
+  late → caught by the catastrophic floor / ENOSPC) can never sever a chain on a
+  transient. Any leftover `.urd-emergency-reserve` files are reclaimed automatically
+  on the next backup. The `WatchdogAbort` event drops its now-meaningless
+  `reason`/`freed_reserve` fields; historical event rows still read back unchanged.
+  No config or metric changes.
 - **The storage watchdog can no longer delete a backup chain's local snapshots
   without genuine storage pressure** (UPI 066, ADR-113 amendment). The mid-op
   watchdog's *cliff* is a rate trigger; its proportionate responses are

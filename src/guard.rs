@@ -7,61 +7,32 @@
 //! host writes consume free space. That is the exact window where Urd can become
 //! the proximate cause of a full root filesystem.
 //!
-//! This module is the **pure decision half** of the watchdog (ADR-108): given a
-//! free-space [`WatchdogSample`] and the [`WatchdogThresholds`], decide whether
-//! to keep watching, reclaim the reserve file (the fast bridge), or abort the
-//! in-flight send (the definitive host-survival action). No I/O, no clock — the
-//! command layer samples `pools::pool_space` on the watchdog thread and feeds
-//! the readings in; the reserve I/O lives in `reserve.rs`; the cancel plumbing
-//! and the abort-reclaim live in `btrfs.rs`/`executor.rs`/`commands/backup.rs`.
+//! This module is the **pure decision half** of the watchdog (ADR-108): given
+//! the source pool's current free bytes and the absolute floor, decide whether
+//! to keep watching or abort the in-flight send (the definitive host-survival
+//! action). No I/O, no clock — the command layer samples `pools::pool_space` on
+//! the watchdog thread and feeds the readings in; the cancel plumbing and the
+//! abort-reclaim live in `btrfs.rs`/`executor.rs`/`commands/backup.rs`.
 //!
-//! Two orthogonal triggers, floor-first:
-//! - **Floor** (absolute): free dropped below `floor_bytes` — the backstop.
-//!   `floor = min_free + cleanup_budget`.
-//! - **Cliff** (differential): free is falling faster than `cliff_bytes_per_sec`,
-//!   measured as a **windowed average** over a ~2 s trailing window
-//!   (`WATCHDOG_CLIFF_WINDOW`, UPI 065-a) rather than one 250 ms sample — the
-//!   primary signal, because `statvfs`-quality free bytes on btrfs do not see
-//!   unallocated chunks or metadata reservations (M7), so the *rate* of change is
-//!   the more trustworthy early warning than the absolute level. Averaging over
-//!   the window rejects transient bursts *without* re-coupling the cliff to the
-//!   (M7-unreliable) absolute level; the windowing lives in the impure sampler
-//!   (`commands/backup.rs`), this decision core stays per-sample.
-//!
-//! On the first trigger the watchdog frees the reserve (a regular-file unlink
-//! commits faster than btrfs's async subvolume-delete cleaner) to buy runway; a
-//! still-triggering sample escalates to abort, carrying the reason forward.
+//! **Single trigger — the absolute floor (floor-only since UPI 067).** Free
+//! dropped below `floor_bytes` (`min_free + cleanup_budget`) → abort. The earlier
+//! differential write-rate ("cliff") trigger and its reserve-file fast bridge were
+//! deleted in UPI 067: the entire production firing record of the rate trigger was
+//! phantom and destructive (2/2 firings killed a healthy send on a pool with ample
+//! runway), while the floor and the Layer-3 idle eject never fired. The cliff had
+//! been premised as the *trustworthy* primary because `statvfs`-quality free bytes
+//! on btrfs do not see unallocated chunks or metadata reservations (M7) — but the
+//! record inverted that. A late-but-safe absolute level beats an early-but-wrong
+//! rate: the floor's error direction (fire late → caught by the catastrophic floor
+//! / ENOSPC) never severs a backup chain.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::time::Duration;
-
-use serde::{Deserialize, Serialize};
 
 use crate::types::SnapshotName;
 
-/// Differential trigger: free space falling faster than this is a cliff. 100
-/// MB/s — at the 250 ms poll cadence that is ~25 MB lost between samples, well
-/// above ambient churn but caught long before a 60–109 GB full send fills a
-/// tight pool (UPI 033, design R8b).
-pub const CLIFF_BYTES_PER_SEC: u64 = 100 * 1024 * 1024;
-
 /// Watchdog poll cadence, mirroring `progress_display_loop`'s 250 ms (UPI 033).
 pub const WATCHDOG_POLL_MS: u64 = 250;
-
-/// Trailing window over which the cliff rate is averaged (UPI 065-a). The cliff
-/// fires on the *windowed-average* drop rate across this span, not a single
-/// 250 ms sample, so a transient burst (a container flush, `statvfs` jitter)
-/// amortises below [`CLIFF_BYTES_PER_SEC`] while a sustained drop stays above it —
-/// the fix for field incident run #110, where one 100 MB/s spike on a `/home`
-/// pool with ~4× runway signal-killed a healthy 5.5-hour send. Burst budget =
-/// `CLIFF_BYTES_PER_SEC × W` = 200 MB tolerated transient drop; detection lag on
-/// a sustained fill is ≤ W (≤ ~200 MB consumed regardless of fill rate, well
-/// inside the ~1.77 GB reserve and the floor backstop). The windowing lives in
-/// the impure sampler (`commands/backup.rs`); this pure core stays per-sample
-/// (ADR-108). Joins [`CLIFF_BYTES_PER_SEC`], [`WATCHDOG_POLL_MS`], the hysteresis
-/// bands, and `K` as a tuned constant to revisit at the ADR-113 30-day checkpoint.
-pub const WATCHDOG_CLIFF_WINDOW: Duration = Duration::from_secs(2);
 
 /// Default `cleanup_budget` as a fraction of pool capacity when the operator did
 /// not configure one (UPI 033, arc re-grill). 1.5 % scales across hardware —
@@ -70,93 +41,37 @@ pub const WATCHDOG_CLIFF_WINDOW: Duration = Duration::from_secs(2);
 /// `config.rs`, because it needs the pool capacity to resolve.
 pub const CLEANUP_BUDGET_CAPACITY_FRACTION: f64 = 0.015;
 
-/// A single free-space observation against the prior one (UPI 033). Pure input
-/// to [`evaluate`]; the watchdog thread builds it from successive
-/// `pools::pool_space` reads.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct WatchdogSample {
-    /// Current free bytes on the source pool (`statvfs`-quality, M7).
-    pub free_bytes: u64,
-    /// Free bytes at the **rate baseline** — the oldest sample within the
-    /// trailing `WATCHDOG_CLIFF_WINDOW`, or `None` when the window holds `< 2`
-    /// samples (the first sample, or the poll right after an OQ2 window reset) and
-    /// no rate is computable yet. The sampler (`commands/backup.rs`) picks the
-    /// baseline; this core only divides the drop by the interval (UPI 065-a — the
-    /// field *role* is unchanged, only which prior reading fills it).
-    pub prev_free_bytes: Option<u64>,
-    /// Wall-clock since the **baseline** sample (the oldest within the window).
-    /// Zero (or `None` prev) suppresses the cliff trigger — a rate needs a
-    /// non-zero interval. Computed from real `Instant`s, so an irregular poll
-    /// cadence still yields the correct windowed average (UPI 065-a).
-    pub elapsed_since_prev: Duration,
-}
-
-/// The two trigger levels (UPI 033). Floor is the absolute backstop; cliff is
-/// the primary differential signal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct WatchdogThresholds {
-    /// Absolute floor — `min_free.unwrap_or(0) + cleanup_budget` (M5). Compared
-    /// against **current** `free_bytes` only — deliberately level-absolute and
-    /// **window-independent**: the cliff carries all rate/windowing logic, the
-    /// floor none (UPI 065-a, adversary F2). This is the linchpin of
-    /// catastrophe-safety — it is what keeps a sustained fill caught *every poll*
-    /// regardless of window contents, including during the one-poll cliff blind
-    /// spot right after an OQ2 window reset. Do **not** "smooth" or window the
-    /// floor: it would silently reintroduce the ADR-113 under-fire risk.
-    pub floor_bytes: u64,
-    /// Differential cliff in bytes/sec — defaults to [`CLIFF_BYTES_PER_SEC`].
-    pub cliff_bytes_per_sec: u64,
-}
-
-/// Why the watchdog fired (UPI 033). Carried *inside* the [`WatchdogAction`]
-/// variants (M6) so the event payload can record the precise trigger. Wire form
-/// is snake_case for the `WatchdogAbort` event payload (ADR-114 stability).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WatchdogReason {
-    /// Free bytes crossed below the absolute floor.
-    FloorCrossed,
-    /// Free bytes fell faster than the cliff rate.
-    CliffExceeded,
-}
-
-/// The watchdog's decision for one sample (UPI 033). The reason rides inside the
-/// acting variants so the firing record and event payload need no second
-/// derivation (M6).
+/// The watchdog's decision for one sample (UPI 033, floor-only since UPI 067).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WatchdogAction {
-    /// No trigger — keep watching, stay silent (anti-transcript discipline).
+    /// Free is at or above the floor — keep watching, stay silent (anti-transcript
+    /// discipline).
     Continue,
-    /// Triggered with a reserve still present: free it (fast bridge) and keep
-    /// watching. A subsequent still-triggering sample escalates to [`Abort`].
-    ReclaimReserve(WatchdogReason),
-    /// Triggered with no reserve to free: cancel the in-flight send. The
+    /// Free crossed below the absolute floor: cancel the in-flight send. The
     /// definitive source reclaim (clear-all of the triggering pool's local
     /// snapshots) follows once the send exits.
-    Abort(WatchdogReason),
+    Abort,
 }
 
-/// Decide what the watchdog should do for one sample (UPI 033). Pure (ADR-108).
+/// Decide what the watchdog should do for one sample (UPI 033, floor-only since
+/// UPI 067). Pure (ADR-108).
 ///
-/// Floor-first precedence: a sample that crosses both the floor and the cliff
-/// reports `FloorCrossed` (the more concrete, level-absolute fact). When a
-/// trigger fires, the presence of a reserve decides reclaim-vs-abort:
-/// reserve present → [`WatchdogAction::ReclaimReserve`] (delete it, buy runway);
-/// reserve absent → [`WatchdogAction::Abort`] (the bridge is spent or never
-/// existed, escalate). No trigger → [`WatchdogAction::Continue`].
+/// One trigger, the absolute floor: `free_bytes < floor_bytes` → [`Abort`],
+/// otherwise [`Continue`]. The floor is `min_free + cleanup_budget` (see
+/// [`source_floor_bytes`]); the caller degrades it to bare `min_free` for a pool
+/// that *started* below the floor (UPI 054-a) before passing it here. There is no
+/// rate term and no reserve bridge — the only way to represent an abort is a
+/// below-floor absolute level, so a healthy level can never abort (the UPI 067
+/// guarantee is type-enforced, not test-enforced).
+///
+/// [`Abort`]: WatchdogAction::Abort
+/// [`Continue`]: WatchdogAction::Continue
 #[must_use]
-pub fn evaluate(
-    sample: WatchdogSample,
-    thresholds: WatchdogThresholds,
-    reserve_present: bool,
-) -> WatchdogAction {
-    let Some(reason) = trigger_reason(sample, thresholds) else {
-        return WatchdogAction::Continue;
-    };
-    if reserve_present {
-        WatchdogAction::ReclaimReserve(reason)
+pub fn evaluate(free_bytes: u64, floor_bytes: u64) -> WatchdogAction {
+    if free_bytes < floor_bytes {
+        WatchdogAction::Abort
     } else {
-        WatchdogAction::Abort(reason)
+        WatchdogAction::Continue
     }
 }
 
@@ -269,180 +184,39 @@ pub fn evaluate_idle_eject(samples: &[PoolPressureSample]) -> Vec<PoolPressureSa
         .collect()
 }
 
-/// The trigger reason for a sample, or `None` when neither threshold is crossed.
-/// Floor wins when both cross.
-///
-/// The floor compares **current** `free_bytes` to `floor_bytes` — no windowing,
-/// no rate (UPI 065-a invariant; see [`WatchdogThresholds::floor_bytes`]). Only
-/// the cliff consults the (windowed) rate baseline carried in the sample. Keeping
-/// the floor level-absolute is what makes the post-reset cliff blind spot safe.
-fn trigger_reason(
-    sample: WatchdogSample,
-    thresholds: WatchdogThresholds,
-) -> Option<WatchdogReason> {
-    if sample.free_bytes < thresholds.floor_bytes {
-        return Some(WatchdogReason::FloorCrossed);
-    }
-    if drop_rate_bytes_per_sec(sample) > thresholds.cliff_bytes_per_sec {
-        return Some(WatchdogReason::CliffExceeded);
-    }
-    None
-}
-
-/// Bytes-per-second of *falling* free space between the prior and current
-/// sample. Saturating: a rising free level (or no prior sample, or a zero
-/// elapsed) yields `0` — never a spurious cliff.
-fn drop_rate_bytes_per_sec(sample: WatchdogSample) -> u64 {
-    let Some(prev) = sample.prev_free_bytes else {
-        return 0;
-    };
-    let elapsed = sample.elapsed_since_prev.as_secs_f64();
-    if elapsed <= 0.0 {
-        return 0;
-    }
-    let dropped = prev.saturating_sub(sample.free_bytes);
-    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let rate = (dropped as f64 / elapsed) as u64;
-    rate
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const GB: u64 = 1024 * 1024 * 1024;
 
-    fn thresholds() -> WatchdogThresholds {
-        WatchdogThresholds {
-            floor_bytes: 2 * GB,
-            cliff_bytes_per_sec: CLIFF_BYTES_PER_SEC,
-        }
-    }
-
-    /// A sample comfortably above the floor with the given drop over 250 ms.
-    fn sample_dropping(free: u64, prev: u64) -> WatchdogSample {
-        WatchdogSample {
-            free_bytes: free,
-            prev_free_bytes: Some(prev),
-            elapsed_since_prev: Duration::from_millis(WATCHDOG_POLL_MS),
-        }
-    }
+    const FLOOR: u64 = 2 * GB;
 
     #[test]
     fn healthy_sample_continues() {
-        // Well above floor, free actually rising → Continue regardless of reserve.
-        let s = sample_dropping(10 * GB, 9 * GB);
-        assert_eq!(evaluate(s, thresholds(), true), WatchdogAction::Continue);
-        assert_eq!(evaluate(s, thresholds(), false), WatchdogAction::Continue);
+        // Free comfortably above the floor → keep watching, stay silent.
+        assert_eq!(evaluate(10 * GB, FLOOR), WatchdogAction::Continue);
     }
 
     #[test]
-    fn floor_trigger_with_reserve_reclaims() {
-        // Below 2 GB floor, no meaningful drop rate.
-        let s = sample_dropping(GB, GB);
-        assert_eq!(
-            evaluate(s, thresholds(), true),
-            WatchdogAction::ReclaimReserve(WatchdogReason::FloorCrossed)
-        );
+    fn below_floor_aborts() {
+        // Free below the absolute floor → Abort (the sole trigger, floor-only
+        // since UPI 067 — no reserve bridge, no rate term).
+        assert_eq!(evaluate(GB, FLOOR), WatchdogAction::Abort);
     }
 
     #[test]
-    fn floor_trigger_without_reserve_aborts() {
-        let s = sample_dropping(GB, GB);
-        assert_eq!(
-            evaluate(s, thresholds(), false),
-            WatchdogAction::Abort(WatchdogReason::FloorCrossed)
-        );
+    fn evaluate_free_equals_floor_continues() {
+        // Boundary pin (G3 ②): `free == floor` is NOT below the floor → Continue.
+        // The mid-op path's own boundary test, independent of
+        // `evaluate_idle_eject`'s `idle_eject_exactly_at_floor_does_not_eject`.
+        assert_eq!(evaluate(FLOOR, FLOOR), WatchdogAction::Continue);
     }
 
     #[test]
-    fn cliff_trigger_with_level_ok_reclaims() {
-        // Level fine (10 GB, above floor) but 50 MB lost in 250 ms = 200 MB/s,
-        // over the 100 MB/s cliff.
-        let dropped = 50 * 1024 * 1024;
-        let s = sample_dropping(10 * GB, 10 * GB + dropped);
-        assert_eq!(
-            evaluate(s, thresholds(), true),
-            WatchdogAction::ReclaimReserve(WatchdogReason::CliffExceeded)
-        );
-    }
-
-    #[test]
-    fn cliff_trigger_without_reserve_aborts() {
-        let dropped = 50 * 1024 * 1024;
-        let s = sample_dropping(10 * GB, 10 * GB + dropped);
-        assert_eq!(
-            evaluate(s, thresholds(), false),
-            WatchdogAction::Abort(WatchdogReason::CliffExceeded)
-        );
-    }
-
-    #[test]
-    fn below_cliff_rate_does_not_trigger() {
-        // 10 MB lost in 250 ms = 40 MB/s, below the 100 MB/s cliff; level fine.
-        let dropped = 10 * 1024 * 1024;
-        let s = sample_dropping(10 * GB, 10 * GB + dropped);
-        assert_eq!(evaluate(s, thresholds(), true), WatchdogAction::Continue);
-    }
-
-    #[test]
-    fn floor_wins_when_both_cross() {
-        // Below floor AND a steep drop → reason is FloorCrossed (precedence).
-        let dropped = 80 * 1024 * 1024; // 320 MB/s, over cliff
-        let s = sample_dropping(GB, GB + dropped);
-        assert_eq!(
-            evaluate(s, thresholds(), false),
-            WatchdogAction::Abort(WatchdogReason::FloorCrossed)
-        );
-    }
-
-    #[test]
-    fn reclaim_then_abort_preserves_reason() {
-        // First sample: cliff fires with a reserve → reclaim. Second sample: same
-        // cliff but reserve now gone → abort, same reason carried through.
-        let dropped = 50 * 1024 * 1024;
-        let s = sample_dropping(10 * GB, 10 * GB + dropped);
-        assert_eq!(
-            evaluate(s, thresholds(), true),
-            WatchdogAction::ReclaimReserve(WatchdogReason::CliffExceeded)
-        );
-        assert_eq!(
-            evaluate(s, thresholds(), false),
-            WatchdogAction::Abort(WatchdogReason::CliffExceeded)
-        );
-    }
-
-    #[test]
-    fn first_sample_no_prev_suppresses_cliff() {
-        // No previous reading → no rate → only the floor can fire. Level is fine.
-        let s = WatchdogSample {
-            free_bytes: 10 * GB,
-            prev_free_bytes: None,
-            elapsed_since_prev: Duration::from_millis(WATCHDOG_POLL_MS),
-        };
-        assert_eq!(evaluate(s, thresholds(), true), WatchdogAction::Continue);
-    }
-
-    #[test]
-    fn zero_elapsed_suppresses_cliff() {
-        // Two readings at the same instant → no rate (avoid divide-by-zero spike).
-        let s = WatchdogSample {
-            free_bytes: GB, // would be a huge drop if rate were computed
-            prev_free_bytes: Some(100 * GB),
-            elapsed_since_prev: Duration::ZERO,
-        };
-        // Floor still fires (level is below 2 GB), but via FloorCrossed, not cliff.
-        assert_eq!(
-            evaluate(s, thresholds(), false),
-            WatchdogAction::Abort(WatchdogReason::FloorCrossed)
-        );
-    }
-
-    #[test]
-    fn rising_free_never_yields_negative_rate() {
-        // prev < current: saturating_sub → 0 drop → no cliff. Level fine.
-        let s = sample_dropping(20 * GB, 5 * GB);
-        assert_eq!(evaluate(s, thresholds(), true), WatchdogAction::Continue);
+    fn zero_free_aborts() {
+        // A fully-consumed pool is unambiguously below any positive floor.
+        assert_eq!(evaluate(0, FLOOR), WatchdogAction::Abort);
     }
 
     #[test]
@@ -523,19 +297,6 @@ mod tests {
         // free == floor is not below the floor → no eject (boundary).
         let samples = [sample("a", 2 * GB, 2 * GB)];
         assert!(evaluate_idle_eject(&samples).is_empty());
-    }
-
-    #[test]
-    fn reason_wire_form_is_snake_case() {
-        let cases = [
-            (WatchdogReason::FloorCrossed, "\"floor_crossed\""),
-            (WatchdogReason::CliffExceeded, "\"cliff_exceeded\""),
-        ];
-        for (reason, expected) in cases {
-            assert_eq!(serde_json::to_string(&reason).unwrap(), expected);
-            let back: WatchdogReason = serde_json::from_str(expected).unwrap();
-            assert_eq!(back, reason);
-        }
     }
 
     // ── away_sheddable_pins (UPI 058) ─────────────────────────────────

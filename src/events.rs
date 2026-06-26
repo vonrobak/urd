@@ -15,7 +15,6 @@ use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
 
 use crate::awareness::PromiseStatus;
-use crate::guard::WatchdogReason;
 use crate::sentinel::CircuitState;
 use crate::state::DriveEventSource;
 use crate::types::{FullSendReason, SendKind};
@@ -211,13 +210,13 @@ pub enum EventPayload {
         detected_by: DriveEventSource,
     },
     /// The mid-op watchdog fired to protect the host (UPI 033, ADR-113 Layer 2;
-    /// pool-scoped response by UPI 065-b). `freed_reserve` records whether the
-    /// fast bridge (the reserve file) was deleted; `snapshots_reclaimed` is how
-    /// many local snapshots the reclaim shed on the triggering pool.
-    /// `send_aborted` discriminates the two pool-scoped responses: `true` when the
-    /// in-flight send read the *same* filesystem and was cancelled (UPI 033
-    /// behaviour), `false` when it read a *different, independent* filesystem and
-    /// was left running while this pool was reclaimed concurrently (UPI 065-b).
+    /// pool-scoped response by UPI 065-b; floor-only since UPI 067).
+    /// `snapshots_reclaimed` is how many local snapshots the reclaim shed on the
+    /// triggering pool. `send_aborted` discriminates the two pool-scoped responses:
+    /// `true` when the in-flight send read the *same* filesystem and was cancelled
+    /// (UPI 033 behaviour), `false` when it read a *different, independent*
+    /// filesystem and was left running while this pool was reclaimed concurrently
+    /// (UPI 065-b).
     ///
     /// **`send_aborted` defaults to `true` on the read-old-data path (S2):** rows
     /// written before UPI 065-b have no field and were *all* same-filesystem
@@ -225,10 +224,14 @@ pub enum EventPayload {
     /// (`false`) would silently relabel every historical abort as "send
     /// continued," and *no* default would fail the deserialize (ADR-105/114
     /// break).
+    ///
+    /// **Dropped fields read back ignored (UPI 067, ADR-114):** `reason`
+    /// (`floor_crossed`/`cliff_exceeded`) and `freed_reserve` are gone with the
+    /// cliff + reserve. `EventPayload` carries no `deny_unknown_fields`, so
+    /// historical rows still carrying them deserialize fine — the unknown fields
+    /// are ignored. New rows are a strict subset of old.
     WatchdogAbort {
         pool_label: String,
-        reason: WatchdogReason,
-        freed_reserve: bool,
         snapshots_reclaimed: u32,
         #[serde(default = "default_send_aborted")]
         send_aborted: bool,
@@ -492,8 +495,6 @@ mod tests {
             (
                 EventPayload::WatchdogAbort {
                     pool_label: "/data".into(),
-                    reason: WatchdogReason::FloorCrossed,
-                    freed_reserve: true,
                     snapshots_reclaimed: 3,
                     send_aborted: true,
                 },
@@ -693,15 +694,11 @@ mod tests {
         });
         roundtrip(&EventPayload::WatchdogAbort {
             pool_label: "/data".into(),
-            reason: WatchdogReason::FloorCrossed,
-            freed_reserve: true,
             snapshots_reclaimed: 2,
             send_aborted: true,
         });
         roundtrip(&EventPayload::WatchdogAbort {
             pool_label: "/".into(),
-            reason: WatchdogReason::CliffExceeded,
-            freed_reserve: false,
             snapshots_reclaimed: 0,
             send_aborted: false,
         });
@@ -787,33 +784,27 @@ mod tests {
     }
 
     #[test]
-    fn watchdog_abort_is_warn_and_reason_wire_form_is_snake_case() {
-        for (reason, expected) in [
-            (WatchdogReason::FloorCrossed, "floor_crossed"),
-            (WatchdogReason::CliffExceeded, "cliff_exceeded"),
-        ] {
-            let payload = EventPayload::WatchdogAbort {
-                pool_label: "/data".into(),
-                reason,
-                freed_reserve: true,
-                snapshots_reclaimed: 1,
-                send_aborted: true,
-            };
-            assert_eq!(payload.severity(), Severity::Warn);
-            let json = serde_json::to_value(&payload).unwrap();
-            assert_eq!(json.get("reason").and_then(|v| v.as_str()), Some(expected));
-        }
+    fn watchdog_abort_is_warn() {
+        // An aborted send is a host-survival action the user should see. (The
+        // reason-wire-form assertion retired with the `reason` field in UPI 067.)
+        let payload = EventPayload::WatchdogAbort {
+            pool_label: "/data".into(),
+            snapshots_reclaimed: 1,
+            send_aborted: true,
+        };
+        assert_eq!(payload.severity(), Severity::Warn);
     }
 
     #[test]
-    fn watchdog_abort_missing_send_aborted_deserializes_as_true() {
-        // S2 (UPI 065-b): rows written before the field existed have no
-        // `send_aborted` and were ALL same-filesystem aborts. The
-        // `#[serde(default = "default_send_aborted")]` must read them back as
-        // `true` — the language default (`false`) would silently relabel every
-        // historical abort as "send continued," and no default would fail the
-        // deserialize (ADR-105/114 break). The construction-only type-cascade grep
-        // misses this; the deserialize path is the dangerous touchpoint.
+    fn watchdog_abort_old_format_with_retired_fields_deserializes() {
+        // B5 (UPI 067) backward-compat regression — the load-bearing proof and the
+        // tripwire if anyone later adds `deny_unknown_fields`. A pre-067 row carries
+        // BOTH retired fields (`reason`, `freed_reserve`) and NO `send_aborted`. It
+        // must still deserialize: the retired fields are ignored (no
+        // `deny_unknown_fields`), `send_aborted` defaults to `true` (S2 — historical
+        // aborts were same-filesystem), and `pool_label`/`snapshots_reclaimed`
+        // survive. The construction-only type-cascade grep misses this; the
+        // deserialize path is the dangerous touchpoint.
         let historical = r#"{
             "type": "WatchdogAbort",
             "pool_label": "/home",
@@ -823,7 +814,8 @@ mod tests {
         }"#;
         let payload: EventPayload = serde_json::from_str(historical).expect("deserialize old row");
         match payload {
-            EventPayload::WatchdogAbort { send_aborted, snapshots_reclaimed, .. } => {
+            EventPayload::WatchdogAbort { pool_label, send_aborted, snapshots_reclaimed } => {
+                assert_eq!(pool_label, "/home");
                 assert!(send_aborted, "a field-less historical abort must read back as send_aborted=true");
                 assert_eq!(snapshots_reclaimed, 4);
             }

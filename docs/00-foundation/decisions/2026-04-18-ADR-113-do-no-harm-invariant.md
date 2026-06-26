@@ -10,7 +10,7 @@
 > it prefers host survival over backup-chain continuity.
 
 **Date:** 2026-04-18
-**Status:** Accepted (amended 2026-05-30, UPI 031-b; 2026-06-14, UPI 064-a; 2026-06-17, UPI 065-b)
+**Status:** Accepted (amended 2026-05-30, UPI 031-b; 2026-06-14, UPI 064-a; 2026-06-17, UPI 065-b; 2026-06-24, UPI 066; 2026-06-26, UPI 067)
 **Supersedes:** UPI 011 (hard-cap of 1 local snapshot for transient subvolumes)
 
 > **Amendment — 2026-05-30 (UPI 031-b, the tier-graded ephemeral spine).**
@@ -162,6 +162,45 @@
 > precondition* is tightened toward the do-no-harm promise (strictly less deletion),
 > matching the 031-b / 064-a / 065-b in-place-amendment precedents above.
 
+> **Amendment — 2026-06-26 (UPI 067, Layer 2 reverts to floor-only — the cliff is deleted).**
+> Layer 2's mechanism narrows from "free-space polling **+ write-rate sensing**" to
+> **floor-only**. The differential write-rate ("cliff") trigger, its windowed-average
+> smoothing (065-a), and the `.urd-emergency-reserve` fast-bridge are all removed; Layer 2
+> is now a single-purpose absolute-floor backstop.
+>
+> - **Why — the production record inverted the premise.** The cliff was sold (this ADR + the
+>   glossary) as the **trustworthy primary**: `statvfs`-quality free bytes on btrfs are blind
+>   to unallocated chunks and metadata reservations (M7), so the *rate* of change was deemed
+>   the better early warning than the absolute level. The events table holds the entire
+>   production firing history of the arc: **two `WatchdogAbort` events, both `cliff_exceeded`,
+>   both destructive** (killed a 2.7 TB `/mnt` send, #108; severed the htpc WD-18TB chains at
+>   ~4× runway, #110), and **zero** `FloorCrossed`, **zero** `EmergencyEject`. The cliff is
+>   the only mechanism that ever fired, with a 100% false-positive rate. This amendment
+>   supersedes the prior reasoning that named the rate signal primary — an amendment can
+>   supersede a prior amendment's rationale.
+> - **The ruling.** Delete the cliff and everything built to tame it (065-a windowing, the
+>   reserve bridge, the two-stage `ReclaimReserve` escalation, the now-single-valued
+>   `WatchdogReason`). The floor's theoretical unreliability is the **safe** error direction:
+>   it fires *late* (caught downstream by the catastrophic floor / ENOSPC), never *wrongly* —
+>   it cannot sever a chain on a transient. A late-but-safe absolute level beats an
+>   early-but-wrong rate. The 066 reclaim gate (`free >= floor → Nothing`) is unaffected: a
+>   `FloorCrossed` abort already implies `free < floor`, so the gate's logic is unchanged and
+>   correct.
+> - **Retained but unfalsified — and the falsification trigger (B9).** The floor arm (the
+>   documented "catastrophe-safety linchpin") and Layer 3 idle-eject have **never fired** in
+>   production. They are kept because they *cannot fire wrongly* (an absolute below-floor
+>   level is unambiguous) — but their value is now an unproven hypothesis, not an
+>   observation. **Standing commitment:** if the floor arm has still not fired by the next
+>   constant-review checkpoint, that is evidence Layer 1's footprint-cap is the sole effective
+>   defense, and a future session must reassess whether the floor-watchdog thread + idle-eject
+>   earn their complexity over Layer 1 alone. This is the evidence-based off-ramp to *finish*
+>   the reduction.
+> - **No change to the invariant, the three-layer model, or the probabilistic contract.** No
+>   new ADR, no supersession of the founding ADRs (100–109), no relaxation of ADR-106/107.
+>   The event payload loses two fields (`reason`, `freed_reserve`); old rows still deserialize
+>   (no `deny_unknown_fields` — ADR-114-compatible). Matches the 031-b / 064-a / 065-b / 066
+>   in-place-amendment precedents above.
+
 ## Context
 
 Urd runs on live systems. It exists to protect user data from loss — but a backup tool
@@ -212,7 +251,7 @@ predictive guards retired; see the amendment block above):
 | Layer | Prevents | Failure mode | Caught by |
 |-------|----------|--------------|-----------|
 | 1. **Tier-graded ephemeral footprint-cap** — retain-one @ Tight / clear-all @ Critical, keyed on the per-pool armed `TightnessTier` (031-a/031-b) | Steady-state delta drift in the pin window; at Critical, *any* steady local footprint | N/A (structural) | — |
-| 2. Mid-op watchdog (free-space polling + write-rate sensing during send, UPI 033) | Sends that went bad in-flight | Watchdog loses the race | Layer 3 |
+| 2. Mid-op watchdog (free-space polling during send, floor-only since UPI 067) | Sends that went bad in-flight | Watchdog loses the race | Layer 3 |
 | 3. Emergency eject (sentinel drops Urd-owned snapshots to reclaim space) | Residual pressure after the footprint-cap and watchdog both failed | BTRFS itself failed (ENOSPC mid-transaction, read-only FS) | Outside Urd's domain |
 
 *Retired (2026-05-30):* **Predictive guards (drift projection + defer).** UPI 032
@@ -350,14 +389,14 @@ The Do-No-Harm arc (amended 2026-05-30 — UPI 032 retired, see the amendment bl
    AT RISK while Critical. This is the behavioral Layer 1. *(This UPI.)*
 4. ~~**UPI 032 — Predictive Guards.**~~ **Retired** (2026-05-30 re-grill): redundant where
    the footprint-cap acts, net-negative otherwise (inaction-is-harm).
-5. **UPI 033 — Mid-op Watchdog + Reserve File.** Layer 2. An in-process sibling thread
-   polls source-pool free level **and** drop-rate during sends; on trigger it frees a
-   pre-allocated `.urd-emergency-reserve` (fast bridge) and, if still tripping, sets a
-   cancel flag that aborts the in-flight send. Pure decision core in `guard.rs`
-   (`evaluate → WatchdogAction`); reserve I/O in `reserve.rs`; the thread, cancel
-   plumbing, and abort-reclaim wire in `commands/backup.rs`. Introduces the
-   `cleanup_budget` config field (`floor = min_free + cleanup_budget`, default 1.5 % of
-   capacity). Event-only surface (`WatchdogAbort`, ADR-114) — no cross-repo change.
+5. **UPI 033 — Mid-op Watchdog.** Layer 2 (floor-only since UPI 067 — the `.urd-emergency-reserve`
+   fast bridge and the drop-rate cliff were deleted). An in-process sibling thread polls
+   source-pool free level during sends; when free crosses below the floor it sets a cancel
+   flag that aborts the in-flight send. Pure decision core in `guard.rs`
+   (`evaluate → WatchdogAction`); the thread, cancel plumbing, and abort-reclaim wire in
+   `commands/backup.rs`. Introduces the `cleanup_budget` config field
+   (`floor = min_free + cleanup_budget`, default 1.5 % of capacity). Event-only surface
+   (`WatchdogAbort`, ADR-114) — no cross-repo change.
    **ADR-106-scoped exception (authorized here, not a new ADR):** because cancelling a
    send frees no source space on its own, the watchdog's `emergency_reclaim_pool` clears
    the *triggering pool's* local snapshots after the send exits — including the
