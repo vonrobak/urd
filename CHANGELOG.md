@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Interrupted runs no longer leave orphaned `running` records in the runs
+  table** (#213). A run whose process died before `finish_run` (watchdog abort,
+  drive-away kill, reboot, crash) left its row `result='running'`,
+  `finished_at=NULL` forever, and nothing reaped it — so a zombie row could hold
+  the max id and make `urd status` report a long-dead run as "(running)"
+  indefinitely. Backup startup now reaps stale `running` rows, marking each
+  `interrupted` with a best-effort `finished_at`. This is safe by construction:
+  the advisory lock admits one backup at a time, so any `running` row present when
+  a new run begins belongs to a dead prior run. The reap is best-effort and never
+  blocks a backup (ADR-102). `interrupted` renders dimmed (past history, not an
+  alarm).
+
 ## [0.27.1] - 2026-06-26
 
 ### Fixed
