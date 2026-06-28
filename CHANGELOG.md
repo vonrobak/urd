@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`urd doctor --thorough` now warns about orphan pin files** (#125). A pin file
+  whose drive label is not in `[[drives]]` — e.g. left behind when a drive is
+  removed from config — silently anchors local retention: the planner protects
+  every snapshot newer than the *oldest* pin, so one orphan pin from a retired
+  drive can hold weeks of dailies against the configured shape with no surface to
+  catch it. The new Retention section names the subvolume, pin file, drive label,
+  and the snapshot the pin points to, explains the consequence, and gives the
+  remediation (delete the pin once the drive is retired, or re-add it to
+  `[[drives]]`). Advisory only — nothing is deleted. Renders only when an orphan
+  is found (no false gravity). Doctor JSON schema → v3 (the optional
+  `retention_checks` array; absent when empty).
+
 ### Fixed
 - **Bare `urd` no longer recommends connecting an offsite drive whose absence
   isn't the problem** (#120, defect 2). `compute_advice` Branch 8 recommended
@@ -19,6 +32,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   physical-away, and ignoring `source_unchanged`) was already fixed; this closes
   the residual in the advice surface and future-proofs it against other
   miscaused-degradation paths.
+- **Backup no longer prints contradictory transition lines** ("thread mended"
+  *and* "first thread established" for the same subvolume/drive, one line apart)
+  (#211). `detect_transitions` ran two independent detectors that were not
+  mutually exclusive: `ThreadRestored` (chain went Broken→Intact) and
+  `FirstSendToDrive` (drive had zero snapshots before, some after). When a drive
+  received its first send while its chain record happened to read Broken (e.g.
+  the offsite pin had been shed), both fired. A first send is never a thread
+  *repair* — there was no prior thread to mend — so the two are now mutually
+  exclusive by construction: a single `was_first_send_to_drive` helper both emits
+  `FirstSendToDrive` and suppresses `ThreadRestored` for that pair.
+- **A legacy unlabeled `.last-external-parent` pin no longer anchors local
+  retention when every configured drive already has its own drive-specific pin**
+  (#133, sibling class to #125). `find_pinned_snapshots` used to read the legacy
+  pin unconditionally and add it to the protected set on top of the per-drive
+  pins. Because the planner anchors "protect everything newer" to the *oldest*
+  pin, a stale legacy pin left over from the bash→Urd cutover (late March 2026)
+  became the anchor on every pre-cutover subvolume — silently overriding the
+  configured retention shape (e.g. 60 local snapshots against a cap of ~11). The
+  legacy pin is now consulted only as a *per-drive* fallback for a drive that
+  lacks its own pin (a mid-cutover host); once every drive has a specific pin the
+  legacy file is by construction stale and is ignored. No on-disk change — the
+  legacy file is left in place; retiring it is tracked as #133 Phase 2.
 
 ## [0.27.1] - 2026-06-26
 
