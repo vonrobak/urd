@@ -21,6 +21,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `retention_checks` array; absent when empty).
 
 ### Fixed
+- **Interrupted runs no longer leave orphaned `running` records in the runs
+  table** (#213). A run whose process died before `finish_run` (watchdog abort,
+  drive-away kill, reboot, crash) left its row `result='running'`,
+  `finished_at=NULL` forever, and nothing reaped it — so a zombie row could hold
+  the max id and make `urd status` report a long-dead run as "(running)"
+  indefinitely. Backup startup now reaps stale `running` rows, marking each
+  `interrupted` with a best-effort `finished_at`. This is safe by construction:
+  the advisory lock admits one backup at a time, so any `running` row present when
+  a new run begins belongs to a dead prior run. The reap is best-effort and never
+  blocks a backup (ADR-102). `interrupted` renders dimmed (past history, not an
+  alarm).
 - **The send-size estimate no longer inherits a failed/aborted send's partial
   bytes** (#210). A failed send's `bytes_transferred` is an under-count (the send
   aborted), but the estimate blended successful and failed sizes with `max()` and

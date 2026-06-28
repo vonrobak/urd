@@ -249,6 +249,9 @@ pub(super) fn color_result(result: &str) -> String {
         "success" => "success".green().to_string(),
         "partial" => "partial".yellow().to_string(),
         "failure" => "failure".red().to_string(),
+        // A run whose process died before finalizing, reaped at the next backup
+        // startup (#213). Dimmed — past history, not an active alarm.
+        "interrupted" => "interrupted".dimmed().to_string(),
         other => other.to_string(),
     }
 }

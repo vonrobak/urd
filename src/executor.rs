@@ -1929,6 +1929,15 @@ impl<'a> Executor<'a> {
 
     fn begin_run(&self, mode: &str) -> Option<i64> {
         if let Some(state) = self.state {
+            // Reap any orphaned `running` rows from a prior crashed run before
+            // starting this one. Safe under the backup lock (one run at a time),
+            // so any surviving `running` row is a zombie (#213). Best-effort —
+            // a reap failure must never block the backup (ADR-102).
+            match state.reap_stale_runs() {
+                Ok(0) => {}
+                Ok(n) => log::warn!("Reaped {n} orphaned 'running' run record(s) from a prior interrupted run"),
+                Err(e) => log::warn!("Failed to reap stale run records: {e}"),
+            }
             match state.begin_run(mode) {
                 Ok(id) => Some(id),
                 Err(e) => {

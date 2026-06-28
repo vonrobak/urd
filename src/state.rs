@@ -380,6 +380,28 @@ impl StateDb {
         Ok(())
     }
 
+    /// Reap orphaned `running` run rows — rows whose process died before
+    /// `finish_run` (watchdog abort, drive-away kill, reboot, crash). Marks each
+    /// `result = 'interrupted'` with a best-effort `finished_at = now`, and
+    /// returns the count reaped.
+    ///
+    /// Called at backup startup, where it is safe by construction: the advisory
+    /// lock (`lock.rs`) admits one backup at a time, so any `running` row present
+    /// when a new run begins belongs to a dead prior run — never a live one.
+    /// Without this, a zombie row stays `running`/`finished_at = NULL` forever and
+    /// can hold the max id, so `last_run` reports a long-dead run as "(running)".
+    pub fn reap_stale_runs(&self) -> crate::error::Result<usize> {
+        let now = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+        let reaped = self
+            .conn
+            .execute(
+                "UPDATE runs SET finished_at = ?1, result = 'interrupted' WHERE result = 'running'",
+                rusqlite::params![now],
+            )
+            .map_err(|e| UrdError::State(format!("failed to reap stale runs: {e}")))?;
+        Ok(reaped)
+    }
+
     /// Finish a run with the given result ("success", "partial", "failure").
     pub fn finish_run(&self, run_id: i64, result: &str) -> crate::error::Result<()> {
         let now = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
@@ -1603,6 +1625,32 @@ mod tests {
             .unwrap();
         assert_eq!(result, "success");
         assert!(!finished.is_empty());
+    }
+
+    #[test]
+    fn reap_stale_runs_marks_unfinished_as_interrupted() {
+        let db = StateDb::open_memory().unwrap();
+        // Two orphaned runs (never finished) and one that completed normally.
+        let r1 = db.begin_run("full").unwrap();
+        let r2 = db.begin_run("full").unwrap();
+        let r3 = db.begin_run("full").unwrap();
+        db.finish_run(r3, "success").unwrap();
+
+        let reaped = db.reap_stale_runs().unwrap();
+        assert_eq!(reaped, 2, "only the two unfinished runs are reaped");
+
+        let recent = db.recent_runs(10).unwrap();
+        let find = |id: i64| recent.iter().find(|r| r.id == id).unwrap();
+        assert_eq!(find(r1).result, "interrupted");
+        assert!(find(r1).finished_at.is_some(), "reaped run gets a finished_at");
+        assert_eq!(find(r2).result, "interrupted");
+        assert_eq!(find(r3).result, "success", "a completed run is untouched");
+
+        // The latest run is no longer a zombie 'running' record.
+        assert_eq!(db.last_run().unwrap().unwrap().result, "success");
+
+        // Idempotent — a second reap finds nothing to do.
+        assert_eq!(db.reap_stale_runs().unwrap(), 0);
     }
 
     #[test]
