@@ -290,6 +290,14 @@ pub fn run(config: Config, args: DoctorArgs, output_mode: OutputMode) -> anyhow:
         None
     };
 
+    // ── 5.7 Retention: orphan pin files (#125 — only with --thorough) ──
+    let retention_checks = if args.thorough {
+        build_retention_checks(&config)
+    } else {
+        Vec::new()
+    };
+    warn_count += retention_checks.len();
+
     // ── 6. Verdict ────────────────────────────────────────────────
     let degraded_count = data_safety
         .iter()
@@ -332,12 +340,52 @@ pub fn run(config: Config, args: DoctorArgs, output_mode: OutputMode) -> anyhow:
         verify: verify_output,
         churn: churn_view,
         recommendations: recommendation_view,
+        retention_checks,
         verdict,
     };
 
     print!("{}", voice::render_doctor(&output, output_mode));
 
     Ok(())
+}
+
+/// Build the `--thorough` Retention-section advisories (#125): one `DoctorCheck`
+/// per pin file whose drive label is not in `[[drives]]`. Such an orphan pin
+/// silently anchors local retention (the planner protects everything newer than
+/// the oldest pin) for a drive that no longer exists in config, overriding the
+/// configured shape with no other surface to catch it.
+///
+/// Pure decision (`chain::orphan_pins`) over filesystem-scanned input
+/// (`chain::discover_pin_files`); advisory only — nothing is deleted.
+fn build_retention_checks(config: &Config) -> Vec<DoctorCheck> {
+    let configured = config.drive_labels();
+    let mut checks = Vec::new();
+
+    for sv in config.resolved_subvolumes() {
+        let Some(local_dir) = config.local_snapshot_dir(&sv.name) else {
+            continue;
+        };
+        let discovered = crate::chain::discover_pin_files(&local_dir);
+        for orphan in crate::chain::orphan_pins(&discovered, &configured) {
+            checks.push(DoctorCheck {
+                name: format!("orphan pin: {} · {}", sv.name, orphan.label),
+                status: DoctorCheckStatus::Warn,
+                detail: Some(format!(
+                    "{} names {}, but no configured drive has label \"{}\". \
+                     Retention will not delete that snapshot or any newer one on the chain.",
+                    orphan.path.display(),
+                    orphan.snapshot.as_str(),
+                    orphan.label,
+                )),
+                suggestion: Some(format!(
+                    "Delete the pin file after confirming {} is permanently retired, \
+                     or re-add it to [[drives]].",
+                    orphan.label,
+                )),
+            });
+        }
+    }
+    checks
 }
 
 /// Build the `--thorough` Churn-section view from `drift_samples` history.
@@ -752,6 +800,74 @@ source = "/data/gamma"
             view.rows[1].state,
             crate::output::ChurnRender::FirstMeasurement { .. }
         ));
+    }
+
+    // ── #125 Retention: orphan-pin advisories ──────────────────────
+
+    fn drive(label: &str) -> crate::config::DriveConfig {
+        crate::config::DriveConfig {
+            label: label.to_string(),
+            uuid: None,
+            mount_path: std::path::PathBuf::from(format!("/mnt/{label}")),
+            snapshot_root: ".snapshots".to_string(),
+            role: crate::types::DriveRole::Offsite,
+            max_usage_percent: None,
+            min_free_bytes: None,
+            rotation_interval: None,
+        }
+    }
+
+    #[test]
+    fn retention_checks_flags_orphan_pin() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut config = cfg();
+        config.local_snapshots.roots[0].path = dir.path().to_path_buf();
+        config.drives.push(drive("WD-18TB"));
+
+        let alpha = dir.path().join("alpha");
+        std::fs::create_dir_all(&alpha).unwrap();
+        // One configured pin (fine) + one orphan from a removed drive.
+        std::fs::write(
+            alpha.join(".last-external-parent-WD-18TB"),
+            "20260516-0401-alpha\n",
+        )
+        .unwrap();
+        std::fs::write(
+            alpha.join(".last-external-parent-2TB-backup"),
+            "20260402-1925-alpha\n",
+        )
+        .unwrap();
+
+        let checks = build_retention_checks(&config);
+        assert_eq!(checks.len(), 1, "only the orphan pin should warn");
+        assert_eq!(checks[0].status, DoctorCheckStatus::Warn);
+        assert!(checks[0].name.contains("alpha"));
+        assert!(checks[0].name.contains("2TB-backup"));
+        let detail = checks[0].detail.as_ref().unwrap();
+        assert!(detail.contains("20260402-1925-alpha"));
+        assert!(detail.contains("2TB-backup"));
+        assert!(checks[0].suggestion.is_some());
+    }
+
+    #[test]
+    fn retention_checks_empty_when_all_pins_configured() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut config = cfg();
+        config.local_snapshots.roots[0].path = dir.path().to_path_buf();
+        config.drives.push(drive("WD-18TB"));
+
+        let alpha = dir.path().join("alpha");
+        std::fs::create_dir_all(&alpha).unwrap();
+        std::fs::write(
+            alpha.join(".last-external-parent-WD-18TB"),
+            "20260516-0401-alpha\n",
+        )
+        .unwrap();
+
+        assert!(
+            build_retention_checks(&config).is_empty(),
+            "no orphan pins → no false gravity"
+        );
     }
 
     // ── UPI 041 Recommendations builder ────────────────────────────
