@@ -647,6 +647,7 @@ pub(crate) mod test_fixtures {
             verify: None,
             churn: None,
             recommendations: None,
+            retention_checks: Vec::new(),
             verdict: DoctorVerdict::healthy(),
         }
     }
@@ -2497,6 +2498,49 @@ mod tests {
         assert!(
             output.contains("1 warning"),
             "missing verdict: {output}"
+        );
+    }
+
+    #[test]
+    fn doctor_retention_section_renders_orphan_pin() {
+        let _color = color_guard(false);
+        let mut data = test_doctor_output();
+        data.retention_checks = vec![DoctorCheck {
+            name: "orphan pin: subvol7-containers · 2TB-backup".to_string(),
+            status: DoctorCheckStatus::Warn,
+            detail: Some(
+                "/snap/subvol7-containers/.last-external-parent-2TB-backup names \
+                 20260402-1925-containers, but no configured drive has label \"2TB-backup\". \
+                 Retention will not delete that snapshot or any newer one on the chain."
+                    .to_string(),
+            ),
+            suggestion: Some(
+                "Delete the pin file after confirming 2TB-backup is permanently retired, \
+                 or re-add it to [[drives]]."
+                    .to_string(),
+            ),
+        }];
+        data.verdict = DoctorVerdict::warnings(1);
+        let output = render_doctor(&data, OutputMode::Interactive);
+        assert!(output.contains("Retention"), "missing Retention header: {output}");
+        assert!(
+            output.contains("2TB-backup"),
+            "missing orphan pin label: {output}"
+        );
+        assert!(
+            output.contains("re-add it to [[drives]]"),
+            "missing remediation: {output}"
+        );
+    }
+
+    #[test]
+    fn doctor_no_retention_section_when_clean() {
+        // No false gravity: an empty retention scan renders no Retention header.
+        let _color = color_guard(false);
+        let output = render_doctor(&test_doctor_output(), OutputMode::Interactive);
+        assert!(
+            !output.contains("Retention"),
+            "Retention section must not render when there are no orphan pins: {output}"
         );
     }
 

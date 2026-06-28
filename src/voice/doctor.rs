@@ -267,6 +267,21 @@ fn render_doctor_interactive(data: &DoctorOutput) -> String {
         }
     }
 
+    // Retention section (--thorough only). #125 orphan/legacy pin advisories.
+    // Rendered only when something is wrong — no header, no false gravity, on a
+    // clean scan (Voice Contract Rule 5).
+    if !data.retention_checks.is_empty() {
+        writeln!(out).ok();
+        writeln!(out, "  {}", "Retention".bold()).ok();
+        for check in &data.retention_checks {
+            let detail = check.detail.as_deref().unwrap_or(&check.name);
+            writeln!(out, "    {} {}", "\u{26a0}".yellow(), detail).ok();
+            if let Some(ref suggestion) = check.suggestion {
+                writeln!(out, "      \u{2192} {suggestion}").ok();
+            }
+        }
+    }
+
     // Doctor verdict already provides guidance (rendered at the top now);
     // suggestion is always None.
     append_suggestion(&SuggestionContext::Doctor, &mut out);

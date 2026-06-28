@@ -316,7 +316,7 @@ an operator runs when something feels off.
 
 | Flag | Semantics |
 |------|-----------|
-| `--thorough` | Add thread-verification (`urd verify`) to the battery. Slower; reads every pin file. |
+| `--thorough` | Add thread-verification (`urd verify`), churn, retention-shape recommendations, and the orphan-pin retention scan to the battery. Slower; reads every pin file. |
 
 **Output.** Interactive — voice-rendered diagnostic block with severity
 icons and suggested next steps. Daemon — JSON.
