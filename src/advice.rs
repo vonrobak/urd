@@ -144,8 +144,17 @@ pub fn compute_advice(
             });
         }
 
-        // Branch 8: Protected + Degraded + drive away long
-        if let Some(absent) = assessment.external.iter().find(|d| !d.mounted) {
+        // Branch 8: Protected + Degraded because a specific drive's absence is
+        // the documented cause. Only recommend connecting a drive whose absence
+        // `compute_health` actually flagged — its label leads a health reason
+        // ("{label} away/overdue for N days"). Recommending *any* unmounted drive
+        // would point at an offsite that is legitimately away on its rotation,
+        // telling the user to redo what they just did (#120 defect 2). The
+        // leading-token match also avoids the `WD-18TB`/`WD-18TB1` substring trap
+        // and the unrelated "space tight on {label}" reason.
+        if let Some(absent) = assessment.external.iter().find(|d| {
+            !d.mounted && drive_absence_is_health_cause(&d.drive_label, &assessment.health_reasons)
+        }) {
             return Some(ActionableAdvice {
                 subvolume: name.clone(),
                 issue: format!("degraded — {} away", absent.drive_label),
@@ -156,6 +165,16 @@ pub fn compute_advice(
     }
 
     None
+}
+
+/// True when `drive_label`'s absence is the documented cause of degradation —
+/// i.e. it leads one of `compute_health`'s reasons ("{label} away/overdue for N
+/// days"). The leading-token (`"{label} "`) match is deliberate: it excludes the
+/// "space tight on {label}" reason (label not leading) and never confuses a
+/// label that is a prefix of another (`WD-18TB` vs `WD-18TB1`). See #120.
+fn drive_absence_is_health_cause(drive_label: &str, health_reasons: &[String]) -> bool {
+    let prefix = format!("{drive_label} ");
+    health_reasons.iter().any(|r| r.starts_with(&prefix))
 }
 
 /// Find the first chain break on a mounted drive.
@@ -1544,6 +1563,52 @@ local_retention = "transient"
         assert!(advice.issue.contains("degraded"));
         assert!(advice.command.as_ref().unwrap().contains("--force-full"));
         assert!(advice.reason.as_ref().unwrap().contains("full send"));
+    }
+
+    #[test]
+    fn advice_branch8_fires_when_absence_is_the_cause() {
+        // Offsite genuinely overdue: its label leads a health reason, so
+        // recommending we bring it home is correct.
+        let mut a =
+            test_assessment_for_advice("sv1", PromiseStatus::Protected, OperationalHealth::Degraded);
+        a.external = vec![drive_assessment("WD-18TB1", false, Some(48))];
+        a.health_reasons = vec!["WD-18TB1 overdue for 45 days".to_string()];
+        let advice = compute_advice(&a, true, false).unwrap();
+        assert_eq!(advice.issue, "degraded — WD-18TB1 away");
+        assert!(advice.reason.as_ref().unwrap().contains("Consider connecting WD-18TB1"));
+    }
+
+    #[test]
+    fn advice_branch8_silent_for_legitimately_away_offsite() {
+        // The #120 case: degradation is caused by something else (space tight on
+        // a present drive); the absent offsite is within its rotation window and
+        // is NOT in health_reasons. Branch 8 must not tell the user to reconnect
+        // the drive they just rotated out.
+        let mut a =
+            test_assessment_for_advice("sv1", PromiseStatus::Protected, OperationalHealth::Degraded);
+        a.external = vec![
+            drive_assessment("WD-18TB", true, Some(2)),
+            drive_assessment("WD-18TB1", false, Some(48)),
+        ];
+        a.health_reasons = vec!["space tight on WD-18TB".to_string()];
+        assert!(
+            compute_advice(&a, true, false).is_none(),
+            "must not recommend connecting an offsite whose absence is not the cause"
+        );
+    }
+
+    #[test]
+    fn advice_branch8_substring_label_not_confused() {
+        // "WD-18TB" is a prefix of "WD-18TB1". A reason about WD-18TB1 must not
+        // make the present-but-prefixed drive look like the cause, and vice versa.
+        let mut a =
+            test_assessment_for_advice("sv1", PromiseStatus::Protected, OperationalHealth::Degraded);
+        a.external = vec![drive_assessment("WD-18TB", false, Some(48))];
+        a.health_reasons = vec!["WD-18TB1 overdue for 45 days".to_string()];
+        assert!(
+            compute_advice(&a, true, false).is_none(),
+            "a reason about WD-18TB1 must not flag WD-18TB as the cause"
+        );
     }
 
     #[test]
