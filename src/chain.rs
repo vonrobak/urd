@@ -53,6 +53,14 @@ pub fn read_pin_file(
 
 /// Collect all pinned snapshot names across all drives.
 /// Errors are logged but do not propagate — returns whatever was found.
+///
+/// The legacy unlabeled `.last-external-parent` pin is consulted only as a
+/// *per-drive* fallback inside `read_pin_file`, for a drive that has no
+/// drive-specific pin yet (a mid-cutover host). Once every configured drive has
+/// its own `.last-external-parent-{LABEL}` pin, the legacy file is by
+/// construction stale — it can only name a pre-cutover snapshot — and is
+/// ignored here. Reading it unconditionally used to anchor retention to that
+/// stale snapshot, silently overriding the configured shape (#133).
 #[must_use]
 pub fn find_pinned_snapshots(
     local_snapshot_dir: &Path,
@@ -72,20 +80,6 @@ pub fn find_pinned_snapshots(
                     local_snapshot_dir.display()
                 );
             }
-        }
-    }
-
-    // Also check legacy pin file directly (might reference a snapshot not in any drive-specific file)
-    match try_read_pin(&local_snapshot_dir.join(".last-external-parent")) {
-        Ok(Some(name)) => {
-            pinned.insert(name);
-        }
-        Ok(None) => {}
-        Err(e) => {
-            log::warn!(
-                "Failed to read legacy pin file in {}: {e}",
-                local_snapshot_dir.display()
-            );
         }
     }
 
@@ -281,6 +275,58 @@ mod tests {
         assert_eq!(pinned.len(), 2);
         assert!(pinned.iter().any(|s| s.as_str() == "20260322-opptak"));
         assert!(pinned.iter().any(|s| s.as_str() == "20260321-opptak"));
+    }
+
+    #[test]
+    fn legacy_ignored_when_all_drives_have_specific_pins() {
+        // Every configured drive has its own pin; a stale legacy pin points at an
+        // older snapshot. The legacy pin must NOT join the pinned set — otherwise
+        // it becomes the oldest-pin retention anchor and over-retains (#133).
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join(".last-external-parent-WD-18TB"),
+            "20260516-0401-opptak",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join(".last-external-parent-WD-18TB1"),
+            "20260514-1546-opptak",
+        )
+        .unwrap();
+        // Stale legacy pin from the bash→Urd cutover, older than both.
+        fs::write(dir.path().join(".last-external-parent"), "20260324-opptak").unwrap();
+
+        let labels = vec!["WD-18TB".to_string(), "WD-18TB1".to_string()];
+        let pinned = find_pinned_snapshots(dir.path(), &labels);
+
+        assert_eq!(pinned.len(), 2);
+        assert!(pinned.iter().any(|s| s.as_str() == "20260516-0401-opptak"));
+        assert!(pinned.iter().any(|s| s.as_str() == "20260514-1546-opptak"));
+        assert!(
+            !pinned.iter().any(|s| s.as_str() == "20260324-opptak"),
+            "stale legacy pin must not anchor retention when every drive has a specific pin"
+        );
+    }
+
+    #[test]
+    fn legacy_still_used_when_drive_lacks_specific_pin() {
+        // Mid-cutover host: a drive with no drive-specific pin must still fall back
+        // to the legacy pin (via read_pin_file), so the chain stays protected.
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join(".last-external-parent-WD-18TB"),
+            "20260516-0401-opptak",
+        )
+        .unwrap();
+        fs::write(dir.path().join(".last-external-parent"), "20260324-opptak").unwrap();
+
+        // WD-18TB1 has no drive-specific pin → falls back to legacy.
+        let labels = vec!["WD-18TB".to_string(), "WD-18TB1".to_string()];
+        let pinned = find_pinned_snapshots(dir.path(), &labels);
+
+        assert_eq!(pinned.len(), 2);
+        assert!(pinned.iter().any(|s| s.as_str() == "20260516-0401-opptak"));
+        assert!(pinned.iter().any(|s| s.as_str() == "20260324-opptak"));
     }
 
     #[test]
