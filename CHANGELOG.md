@@ -21,6 +21,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `retention_checks` array; absent when empty).
 
 ### Fixed
+- **Backup no longer prints contradictory transition lines** ("thread mended"
+  *and* "first thread established" for the same subvolume/drive, one line apart)
+  (#211). `detect_transitions` ran two independent detectors that were not
+  mutually exclusive: `ThreadRestored` (chain went Broken→Intact) and
+  `FirstSendToDrive` (drive had zero snapshots before, some after). When a drive
+  received its first send while its chain record happened to read Broken (e.g.
+  the offsite pin had been shed), both fired. A first send is never a thread
+  *repair* — there was no prior thread to mend — so the two are now mutually
+  exclusive by construction: a single `was_first_send_to_drive` helper both emits
+  `FirstSendToDrive` and suppresses `ThreadRestored` for that pair.
 - **A legacy unlabeled `.last-external-parent` pin no longer anchors local
   retention when every configured drive already has its own drive-specific pin**
   (#133, sibling class to #125). `find_pinned_snapshots` used to read the legacy
