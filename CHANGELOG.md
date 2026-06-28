@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Bare `urd` no longer recommends connecting an offsite drive whose absence
+  isn't the problem** (#120, defect 2). `compute_advice` Branch 8 recommended
+  connecting *any* unmounted drive on a Protected+Degraded subvolume, without
+  confirming that drive's absence was the cause — so after rotating an offsite
+  drive in, running a backup, and rotating it back out, Urd's headline could be
+  "Consider connecting {the drive you just used}". It now recommends connecting a
+  drive only when its absence is the documented cause (its label leads a health
+  reason). The upstream half (#103 / `compute_health` mislabeling send-age as
+  physical-away, and ignoring `source_unchanged`) was already fixed; this closes
+  the residual in the advice surface and future-proofs it against other
+  miscaused-degradation paths.
+
 ## [0.27.1] - 2026-06-26
 
 ### Fixed
