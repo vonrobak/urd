@@ -20,7 +20,7 @@ use crate::types::{ByteSize, DriveRole};
 use super::drive_row::{aggregate_drive_info, offsite_drive_label, unmounted_drive_label};
 use super::{
     SuggestionContext, append_suggestion, color_result, exposure_label, format_status_table,
-    humanize_duration, pluralize,
+    humanize_cadence, humanize_duration, pluralize,
 };
 
 // ── Status ──────────────────────────────────────────────────────────────
@@ -204,14 +204,6 @@ pub(super) fn render_storage_adaptations(data: &StatusOutput, out: &mut String) 
         let Some(secs) = a.effective_send_interval_secs else {
             continue; // Roomy — declared cadence, nothing to explain.
         };
-        let cadence = humanize_duration(secs);
-        // Declared-Graduated subvols had graduated local history; the tier
-        // reduced it to retain-one (Tight) or cleared it (Critical).
-        let history = if a.external_only {
-            ""
-        } else {
-            " local history reduced \u{2014} full history is on the drive;"
-        };
         // Capped-by-design (Critical) appends an explicit "by design"
         // reassurance; honest Tight (still Protected) gets the bare note; a
         // genuine failure / UNPROTECTED says nothing here and leads via the
@@ -223,16 +215,34 @@ pub(super) fn render_storage_adaptations(data: &StatusOutput, out: &mut String) 
         } else {
             continue;
         };
-        writeln!(
-            out,
-            "{}",
+
+        // A local-only subvolume (no external drive) has no drive to "spare" and
+        // no full history living "on the drive" — the old line was a flat lie for
+        // it (#195). Say only what's true: the source pool is tight, so Urd keeps
+        // less local history to protect the host.
+        let line = if a.external.is_empty() {
+            format!(
+                "  {}: source pool is tight \u{2014} keeping less local history to protect the host.{suffix}",
+                a.name,
+            )
+        } else {
+            // `humanize_cadence`, not `humanize_duration`: a 36h tight-stretch
+            // must not floor to "1d" (identical to the declared daily), which
+            // would make the sparing invisible (#195).
+            let cadence = humanize_cadence(secs);
+            // Declared-Graduated subvols had graduated local history; the tier
+            // reduced it to retain-one (Tight) or cleared it (Critical).
+            let history = if a.external_only {
+                ""
+            } else {
+                " local history reduced \u{2014} full history is on the drive;"
+            };
             format!(
                 "  {}: tight drive \u{2014}{history} backing up every {cadence} to spare it.{suffix}",
                 a.name,
             )
-            .yellow()
-        )
-        .ok();
+        };
+        writeln!(out, "{}", line.yellow()).ok();
     }
 }
 
@@ -822,6 +832,64 @@ mod tests {
         );
         let head = out.lines().take(4).collect::<Vec<_>>().join("\n");
         assert!(head.contains("chain broken"), "failure reason must lead: {head}");
+    }
+
+    #[test]
+    fn tight_local_only_reassurance_states_only_truths() {
+        // #195: a local-only subvolume (no external drive) must not be told its
+        // "full history is on the drive" or that Urd is "backing up to spare it"
+        // — there is no drive and no send. Say only what's true.
+        let _color = color_guard(false);
+        let mut data = test_status_output();
+        data.assessments.truncate(1);
+        let a = &mut data.assessments[0];
+        a.name = "subvol6-tmp".to_string();
+        a.external = vec![]; // local-only
+        a.status = PromiseStatus::Protected;
+        a.cadence_adapted = false;
+        a.effective_send_interval_secs = Some(86400);
+
+        let mut out = String::new();
+        render_storage_adaptations(&data, &mut out);
+
+        assert!(out.contains("source pool is tight"), "missing true statement: {out}");
+        assert!(out.contains("protect the host"), "missing true statement: {out}");
+        assert!(
+            !out.contains("full history is on the drive"),
+            "phantom-drive claim for local-only: {out}"
+        );
+        assert!(
+            !out.contains("to spare it"),
+            "phantom send-cadence claim for local-only: {out}"
+        );
+        assert!(
+            !out.contains("tight drive"),
+            "local-only has no drive — must not say 'tight drive': {out}"
+        );
+    }
+
+    #[test]
+    fn tight_stretched_cadence_shows_hours_not_floored_day() {
+        // #195 sibling defect: a 36h tight-stretch (daily × 1.5) must render as
+        // "36h", not floor to "1d" (identical to the declared daily — which makes
+        // the sparing invisible).
+        let _color = color_guard(false);
+        let mut data = test_status_output();
+        data.assessments.truncate(1);
+        let a = &mut data.assessments[0]; // htpc-home, has external WD-18TB
+        a.status = PromiseStatus::Protected;
+        a.cadence_adapted = false;
+        a.effective_send_interval_secs = Some(129600); // 36h
+
+        let mut out = String::new();
+        render_storage_adaptations(&data, &mut out);
+
+        assert!(out.contains("every 36h"), "stretched cadence must show 36h: {out}");
+        assert!(!out.contains("every 1d"), "36h must not floor to 1d: {out}");
+        assert!(
+            out.contains("to spare it"),
+            "an external subvol keeps the spare-the-drive prose: {out}"
+        );
     }
 
     #[test]

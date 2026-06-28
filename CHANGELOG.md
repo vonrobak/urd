@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **The tight-pool reassurance line no longer lies for local-only subvolumes**
+  (#195). A subvolume with no external drive was told "full history is on the
+  drive; backing up every 1d to spare it" — but there is no drive and no send.
+  Local-only subvolumes now get a true sentence ("source pool is tight — keeping
+  less local history to protect the host"). Separately, a tight-stretched cadence
+  (e.g. daily × 1.5 = 36h) used `humanize_duration`, which floored it to "1d" —
+  identical to the declared daily, making the sparing invisible. A new
+  `humanize_cadence` renders it honestly ("every 36h"), so the slowdown the voice
+  narrates is actually visible. Voice Contract Rule 1 (every claim verifiable).
+
 ## [0.27.1] - 2026-06-26
 
 ### Fixed
