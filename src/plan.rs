@@ -123,6 +123,11 @@ pub fn estimated_send_size(
     } else {
         SendKind::Incremental
     };
+    // Preference order, strongest signal first (#210): a successful send to this
+    // drive, then a successful send to any drive, then the calibrated size (full
+    // only), and — only when no confident signal exists — a failed/aborted send's
+    // bytes as a last-resort floor. A failed partial must never outrank a real
+    // measurement, which is the bug this order fixes.
     history
         .last_send_size(subvol_name, drive_label, send_kind)
         .or_else(|| history.last_send_size_any_drive(subvol_name, send_kind))
@@ -133,6 +138,7 @@ pub fn estimated_send_size(
                 None
             }
         })
+        .or_else(|| history.last_failed_send_floor(subvol_name, drive_label, send_kind))
 }
 
 // ── PlanFilters ─────────────────────────────────────────────────────────
@@ -1549,17 +1555,6 @@ impl FilesystemQuery for RealFileSystemState<'_> {
     }
 }
 
-/// The freshest send size is the newer of the last success and the last
-/// failure — when both exist, the larger byte count; otherwise whichever is
-/// present. The domain rule shared by `last_send_size` and
-/// `last_send_size_any_drive` so it lives in exactly one place.
-fn freshest_send_size(successful: Option<u64>, failed: Option<u64>) -> Option<u64> {
-    match (successful, failed) {
-        (Some(s), Some(f)) => Some(s.max(f)),
-        (s, f) => s.or(f),
-    }
-}
-
 impl HistoryQuery for RealFileSystemState<'_> {
     fn last_send_size(
         &self,
@@ -1567,32 +1562,40 @@ impl HistoryQuery for RealFileSystemState<'_> {
         drive_label: &str,
         send_kind: SendKind,
     ) -> Option<u64> {
+        // Successful sends only. A failed/aborted send's bytes are an under-count
+        // and must never stand in for a real measurement — they are consulted
+        // separately as a last-resort floor (#210).
         self.state.and_then(|db| {
-            let send_type = send_kind.as_db_str();
-            let successful = db
-                .last_successful_send_size(subvol_name, drive_label, send_type)
+            db.last_successful_send_size(subvol_name, drive_label, send_kind.as_db_str())
                 .ok()
-                .flatten();
-            let failed = db
-                .last_failed_send_size(subvol_name, drive_label, send_type)
-                .ok()
-                .flatten();
-            freshest_send_size(successful, failed)
+                .flatten()
         })
     }
 
     fn last_send_size_any_drive(&self, subvol_name: &str, send_kind: SendKind) -> Option<u64> {
         self.state.and_then(|db| {
+            db.last_successful_send_size_any_drive(subvol_name, send_kind.as_db_str())
+                .ok()
+                .flatten()
+        })
+    }
+
+    fn last_failed_send_floor(
+        &self,
+        subvol_name: &str,
+        drive_label: &str,
+        send_kind: SendKind,
+    ) -> Option<u64> {
+        self.state.and_then(|db| {
             let send_type = send_kind.as_db_str();
-            let successful = db
-                .last_successful_send_size_any_drive(subvol_name, send_type)
+            db.last_failed_send_size(subvol_name, drive_label, send_type)
                 .ok()
-                .flatten();
-            let failed = db
-                .last_failed_send_size_any_drive(subvol_name, send_type)
-                .ok()
-                .flatten();
-            freshest_send_size(successful, failed)
+                .flatten()
+                .or_else(|| {
+                    db.last_failed_send_size_any_drive(subvol_name, send_type)
+                        .ok()
+                        .flatten()
+                })
         })
     }
 
@@ -1927,6 +1930,17 @@ impl HistoryQuery for MockFileSystemState {
             .filter(|((sv, _, st), _)| sv == subvol_name && *st == send_kind)
             .map(|(_, &bytes)| bytes)
             .max()
+    }
+
+    fn last_failed_send_floor(
+        &self,
+        _subvol_name: &str,
+        _drive_label: &str,
+        _send_kind: SendKind,
+    ) -> Option<u64> {
+        // The mock's `send_sizes` model successful sends only; the failed-floor
+        // path is exercised by the real-DB regression tests (#210).
+        None
     }
 
     fn calibrated_size(&self, subvol_name: &str) -> Option<(u64, String)> {
@@ -5645,19 +5659,92 @@ local_retention = "transient"
         assert!(fs.drive_mount_history("nope").is_empty());
     }
 
-    // ── Read-side composition: freshest_send_size + drift_samples ───────
+    // ── Send-size estimation: failed partials never outrank a real signal ──
 
-    #[test]
-    fn freshest_send_size_picks_larger_when_both_present() {
-        assert_eq!(freshest_send_size(Some(100), Some(250)), Some(250));
-        assert_eq!(freshest_send_size(Some(900), Some(250)), Some(900));
+    /// Seed an operation row for the estimate tests.
+    fn seed_op(
+        db: &crate::state::StateDb,
+        subvol: &str,
+        drive: &str,
+        send_kind: SendKind,
+        result: &str,
+        bytes: i64,
+    ) {
+        let run_id = db.begin_run("full").unwrap();
+        db.record_operation(&crate::state::OperationRecord {
+            run_id,
+            subvolume: subvol.to_string(),
+            operation: send_kind.as_db_str().to_string(),
+            drive_label: Some(drive.to_string()),
+            duration_secs: Some(60.0),
+            result: result.to_string(),
+            error_message: if result == "failure" {
+                Some("aborted".to_string())
+            } else {
+                None
+            },
+            bytes_transferred: Some(bytes),
+        })
+        .unwrap();
     }
 
     #[test]
-    fn freshest_send_size_falls_back_to_whichever_exists() {
-        assert_eq!(freshest_send_size(Some(100), None), Some(100));
-        assert_eq!(freshest_send_size(None, Some(250)), Some(250));
-        assert_eq!(freshest_send_size(None, None), None);
+    fn estimated_send_size_prefers_successful_any_drive_over_failed_partial() {
+        // The #210 field case (run #114): subvol4-multimedia had a failed partial
+        // to WD-18TB1 (2.67TB, watchdog-aborted) and a genuine full success to
+        // WD-18TB (7.58TB). The estimate for WD-18TB1 must resolve to the real
+        // any-drive success, not the failed partial.
+        use crate::state::StateDb;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let db = StateDb::open(&dir.path().join("urd.db")).unwrap();
+        seed_op(&db, "multimedia", "WD-18TB", SendKind::Full, "success", 7_577_674_879_444);
+        seed_op(&db, "multimedia", "WD-18TB1", SendKind::Full, "failure", 2_672_831_974_169);
+
+        let fs = RealFileSystemState { state: Some(&db) };
+        assert_eq!(
+            estimated_send_size(&fs, "multimedia", "WD-18TB1", true),
+            Some(7_577_674_879_444),
+            "a failed partial must not outrank a successful any-drive send"
+        );
+    }
+
+    #[test]
+    fn estimated_send_size_uses_failed_partial_only_as_last_resort_floor() {
+        // No successful send and no calibration anywhere → the failed partial is
+        // the only signal, so it is used as a last-resort floor.
+        use crate::state::StateDb;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let db = StateDb::open(&dir.path().join("urd.db")).unwrap();
+        seed_op(&db, "multimedia", "WD-18TB1", SendKind::Full, "failure", 2_672_831_974_169);
+
+        let fs = RealFileSystemState { state: Some(&db) };
+        assert_eq!(
+            estimated_send_size(&fs, "multimedia", "WD-18TB1", true),
+            Some(2_672_831_974_169),
+            "with no better signal, the failed partial is the floor"
+        );
+    }
+
+    #[test]
+    fn last_send_size_excludes_failed_sends() {
+        // The trait method itself is successful-only now — a drive with only a
+        // failed send reports no size (the floor lives behind its own method).
+        use crate::state::StateDb;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let db = StateDb::open(&dir.path().join("urd.db")).unwrap();
+        seed_op(&db, "multimedia", "WD-18TB1", SendKind::Full, "failure", 2_672_831_974_169);
+
+        let fs = RealFileSystemState { state: Some(&db) };
+        assert_eq!(fs.last_send_size("multimedia", "WD-18TB1", SendKind::Full), None);
+        assert_eq!(fs.last_send_size_any_drive("multimedia", SendKind::Full), None);
+        // But the floor method still surfaces it.
+        assert_eq!(
+            fs.last_failed_send_floor("multimedia", "WD-18TB1", SendKind::Full),
+            Some(2_672_831_974_169)
+        );
     }
 
     fn drift_at(s: &str) -> NaiveDateTime {

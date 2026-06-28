@@ -528,9 +528,10 @@ pub struct EmergencyResult {
 /// Started at 2 with UPI 044 (which retroactively names the pre-UPI-044
 /// shape v1). v1 had row-level `local: Option<ShapeRecommendation>`;
 /// v2 has `local: Option<HeadroomAwareRecommendation>` (nested
-/// `.recommendation` plus headroom fields). Bump for any future
-/// breaking JSON shape change; document in CHANGELOG and ADR-115.
-pub const DOCTOR_OUTPUT_SCHEMA_VERSION: u32 = 2;
+/// `.recommendation` plus headroom fields). v3 (#125) adds the optional
+/// `retention_checks` array (orphan/legacy pin advisories; absent when empty).
+/// Bump for any future breaking JSON shape change; document in CHANGELOG.
+pub const DOCTOR_OUTPUT_SCHEMA_VERSION: u32 = 3;
 
 /// Full output for the `urd doctor` command.
 #[derive(Debug, Serialize)]
@@ -557,6 +558,12 @@ pub struct DoctorOutput {
     /// `urd doctor --thorough` (UPI 041, ADR-115). Advisory only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recommendations: Option<DoctorRecommendationView>,
+    /// Orphan/legacy pin-file advisories under `urd doctor --thorough` (#125):
+    /// pin files whose drive label is not in `[[drives]]`, which silently anchor
+    /// local retention against the configured shape. Empty when none found (no
+    /// false gravity); omitted from JSON when empty. Schema v3.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub retention_checks: Vec<DoctorCheck>,
     pub verdict: DoctorVerdict,
 }
 
@@ -2365,6 +2372,7 @@ source = "/data/sv2"
             verify: None,
             churn: None,
             recommendations: None,
+            retention_checks: Vec::new(),
             verdict: DoctorVerdict::healthy(),
         };
         let json = serde_json::to_string(&output).unwrap();
@@ -2389,10 +2397,13 @@ source = "/data/sv2"
             verify: None,
             churn: None,
             recommendations: None,
+            retention_checks: Vec::new(),
             verdict: DoctorVerdict::healthy(),
         };
         let value = serde_json::to_value(&output).unwrap();
-        assert_eq!(value.get("schema_version"), Some(&serde_json::Value::from(2)));
+        assert_eq!(value.get("schema_version"), Some(&serde_json::Value::from(3)));
+        // Empty retention_checks is omitted from JSON (no false gravity, #125).
+        assert_eq!(value.get("retention_checks"), None);
     }
 
     #[test]
