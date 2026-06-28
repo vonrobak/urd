@@ -11,7 +11,7 @@ use crate::chain;
 use crate::commands::backup::{format_completion_line, ProgressContext, SizeEstimates, WatchdogCoord};
 use crate::config::Config;
 use crate::drives;
-use crate::error::BtrfsOperation;
+use crate::error::{BtrfsOperation, UrdError};
 use crate::state::{DriftSampleRow, OperationRecord, StateDb};
 use crate::storage_critical::{self, ArmedTierMap};
 use crate::types::{BackupPlan, DeleteKind, FullSendReason, PlannedOperation, SendKind, SnapshotName};
@@ -91,6 +91,50 @@ pub struct OperationOutcome {
     pub btrfs_operation: Option<BtrfsOperation>,
     /// Raw stderr from btrfs subprocess (when available).
     pub btrfs_stderr: Option<String>,
+}
+
+/// Stamp a successful `OperationOutcome` — centralizes the mechanical bookkeeping
+/// (no error, no btrfs fields) so each `execute_*` success arm only states what
+/// differs (operation, drive, bytes, duration). Branches that carry distinct
+/// fields construct the literal directly (#180).
+fn outcome_success(
+    operation: &str,
+    drive_label: Option<String>,
+    bytes_transferred: Option<u64>,
+    duration: std::time::Duration,
+) -> OperationOutcome {
+    OperationOutcome {
+        operation: operation.to_string(),
+        drive_label,
+        result: OpResult::Success,
+        duration,
+        error: None,
+        bytes_transferred,
+        btrfs_operation: None,
+        btrfs_stderr: None,
+    }
+}
+
+/// Stamp a failed `OperationOutcome` from a btrfs error, extracting the typed
+/// `btrfs_operation` / `btrfs_stderr` in one place so a new failure arm cannot
+/// forget it (#180). `bytes_transferred` defaults to `None`; the send path,
+/// which records a partial transfer, sets it on the returned value.
+fn outcome_failure(
+    operation: &str,
+    drive_label: Option<String>,
+    error: &UrdError,
+    duration: std::time::Duration,
+) -> OperationOutcome {
+    OperationOutcome {
+        operation: operation.to_string(),
+        drive_label,
+        result: OpResult::Failure,
+        duration,
+        error: Some(error.to_string()),
+        bytes_transferred: None,
+        btrfs_operation: error.btrfs_operation(),
+        btrfs_stderr: error.btrfs_stderr().map(String::from),
+    }
 }
 
 #[derive(Debug)]
@@ -848,31 +892,11 @@ impl<'a> Executor<'a> {
         );
 
         match self.btrfs.create_readonly_snapshot(source, dest) {
-            Ok(()) => OperationOutcome {
-                operation: "snapshot".to_string(),
-                drive_label: None,
-                result: OpResult::Success,
-                duration: start.elapsed(),
-                error: None,
-                bytes_transferred: None,
-                btrfs_operation: None,
-                btrfs_stderr: None,
-            },
+            Ok(()) => outcome_success("snapshot", None, None, start.elapsed()),
             Err(e) => {
                 log::error!("Snapshot creation failed: {e}");
-                let btrfs_op = e.btrfs_operation();
-                let btrfs_stderr = e.btrfs_stderr().map(String::from);
                 failed_creates.insert(dest);
-                OperationOutcome {
-                    operation: "snapshot".to_string(),
-                    drive_label: None,
-                    result: OpResult::Failure,
-                    duration: start.elapsed(),
-                    error: Some(e.to_string()),
-                    bytes_transferred: None,
-                    btrfs_operation: btrfs_op,
-                    btrfs_stderr,
-                }
+                outcome_failure("snapshot", None, &e, start.elapsed())
             }
         }
     }
@@ -1090,16 +1114,12 @@ impl<'a> Executor<'a> {
                         snap_name.to_string_lossy()
                     );
                     return (
-                        OperationOutcome {
-                            operation: op_name.to_string(),
-                            drive_label: Some(drive_label.to_string()),
-                            result: OpResult::Success,
-                            duration: start.elapsed(),
-                            error: None,
-                            bytes_transferred: None,
-                            btrfs_operation: None,
-                            btrfs_stderr: None,
-                        },
+                        outcome_success(
+                            op_name,
+                            Some(drive_label.to_string()),
+                            None,
+                            start.elapsed(),
+                        ),
                         false,
                     );
                 }
@@ -1259,40 +1279,26 @@ impl<'a> Executor<'a> {
                 }
 
                 (
-                    OperationOutcome {
-                        operation: op_name.to_string(),
-                        drive_label: Some(drive_label.to_string()),
-                        result: OpResult::Success,
-                        duration: elapsed,
-                        error: None,
-                        bytes_transferred: result.bytes_transferred,
-                        btrfs_operation: None,
-                        btrfs_stderr: None,
-                    },
+                    outcome_success(
+                        op_name,
+                        Some(drive_label.to_string()),
+                        result.bytes_transferred,
+                        elapsed,
+                    ),
                     pin_failed,
                 )
             }
             Err(e) => {
                 let partial_bytes = e.bytes_transferred();
-                let btrfs_op = e.btrfs_operation();
-                let btrfs_stderr = e.btrfs_stderr().map(String::from);
                 log::error!("{op_name} failed for {subvol_name} -> {drive_label}: {e}");
                 if let Some(bytes) = partial_bytes {
                     log::info!("Partial transfer: {} bytes copied before failure", bytes,);
                 }
-                (
-                    OperationOutcome {
-                        operation: op_name.to_string(),
-                        drive_label: Some(drive_label.to_string()),
-                        result: OpResult::Failure,
-                        duration: start.elapsed(),
-                        error: Some(e.to_string()),
-                        bytes_transferred: partial_bytes,
-                        btrfs_operation: btrfs_op,
-                        btrfs_stderr,
-                    },
-                    false,
-                )
+                // Send is the one failure arm that records a partial transfer.
+                let mut outcome =
+                    outcome_failure(op_name, Some(drive_label.to_string()), &e, start.elapsed());
+                outcome.bytes_transferred = partial_bytes;
+                (outcome, false)
             }
         }
     }
@@ -1413,31 +1419,11 @@ impl<'a> Executor<'a> {
                     }
                 }
 
-                OperationOutcome {
-                    operation: "delete".to_string(),
-                    drive_label: self.drive_label_for_path(path),
-                    result: OpResult::Success,
-                    duration: start.elapsed(),
-                    error: None,
-                    bytes_transferred: None,
-                    btrfs_operation: None,
-                    btrfs_stderr: None,
-                }
+                outcome_success("delete", self.drive_label_for_path(path), None, start.elapsed())
             }
             Err(e) => {
                 log::error!("Delete failed for {}: {e}", path.display());
-                let btrfs_op = e.btrfs_operation();
-                let btrfs_stderr = e.btrfs_stderr().map(String::from);
-                OperationOutcome {
-                    operation: "delete".to_string(),
-                    drive_label: self.drive_label_for_path(path),
-                    result: OpResult::Failure,
-                    duration: start.elapsed(),
-                    error: Some(e.to_string()),
-                    bytes_transferred: None,
-                    btrfs_operation: btrfs_op,
-                    btrfs_stderr,
-                }
+                outcome_failure("delete", self.drive_label_for_path(path), &e, start.elapsed())
             }
         }
     }
