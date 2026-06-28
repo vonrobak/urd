@@ -2530,6 +2530,28 @@ fn filter_promise_retention(config: &Config, plan: &mut BackupPlan) {
 /// Detect meaningful state changes by comparing pre-backup and post-backup
 /// awareness assessments. Pure function: two assessment snapshots in,
 /// transition events out.
+/// True when this run was the *first* successful send of `subvolume` to
+/// `drive_label`: the drive was mounted with zero snapshots of it before the run
+/// and has at least one after. A first send is never a thread *repair* — there
+/// was no prior thread to mend — so `FirstSendToDrive` and `ThreadRestored` are
+/// mutually exclusive for a given (subvolume, drive). Single source of truth for
+/// that definition, so the two detectors cannot contradict each other (#211).
+fn was_first_send_to_drive(
+    pre_a: &SubvolAssessment,
+    post_a: &SubvolAssessment,
+    drive_label: &str,
+) -> bool {
+    let now_has_snapshots = post_a
+        .external
+        .iter()
+        .any(|e| e.drive_label == drive_label && e.snapshot_count.unwrap_or(0) > 0);
+    let was_mounted_empty = pre_a
+        .external
+        .iter()
+        .any(|e| e.drive_label == drive_label && e.snapshot_count == Some(0));
+    now_has_snapshots && was_mounted_empty
+}
+
 fn detect_transitions(
     pre: &[SubvolAssessment],
     post: &[SubvolAssessment],
@@ -2540,11 +2562,13 @@ fn detect_transitions(
     let mut transitions = Vec::new();
 
     for post_a in post {
-        let Some(pre_a) = pre_by_name.get(post_a.name.as_str()) else {
+        let Some(&pre_a) = pre_by_name.get(post_a.name.as_str()) else {
             continue;
         };
 
-        // Thread restored: chain was Broken, now Intact
+        // Thread restored: chain was Broken, now Intact. A first send to this
+        // drive is reported as FirstSendToDrive below, not as a repair — emitting
+        // both for one (subvolume, drive) is the contradiction in #211.
         for post_ch in &post_a.chain_health {
             if !matches!(post_ch.status, ChainStatus::Intact { .. }) {
                 continue;
@@ -2553,7 +2577,7 @@ fn detect_transitions(
                 pre_ch.drive_label == post_ch.drive_label
                     && matches!(pre_ch.status, ChainStatus::Broken { .. })
             });
-            if was_broken {
+            if was_broken && !was_first_send_to_drive(pre_a, post_a, &post_ch.drive_label) {
                 transitions.push(TransitionEvent::ThreadRestored {
                     subvolume: post_a.name.clone(),
                     drive: post_ch.drive_label.clone(),
@@ -2566,15 +2590,7 @@ fn detect_transitions(
         // drives that were unmounted (None) — a drive appearing mid-backup
         // with existing snapshots is not a "first send".
         for post_ext in &post_a.external {
-            let post_count = post_ext.snapshot_count.unwrap_or(0);
-            if post_count == 0 {
-                continue;
-            }
-            let was_mounted_empty = pre_a.external.iter().any(|pre_ext| {
-                pre_ext.drive_label == post_ext.drive_label
-                    && pre_ext.snapshot_count == Some(0)
-            });
-            if was_mounted_empty {
+            if was_first_send_to_drive(pre_a, post_a, &post_ext.drive_label) {
                 transitions.push(TransitionEvent::FirstSendToDrive {
                     subvolume: post_a.name.clone(),
                     drive: post_ext.drive_label.clone(),
@@ -4499,13 +4515,79 @@ source = "/data/beta"
         ];
 
         let transitions = detect_transitions(&pre, &post);
-        // Should detect: ThreadRestored, FirstSendToDrive, PromiseRecovered (for a and b), AllSealed
+        // "a" went 0→1 snapshots on WD-18TB, so this is a *first send*, not a
+        // thread repair (#211) — the two are mutually exclusive. Should detect:
+        // FirstSendToDrive (a), PromiseRecovered (a and b), AllSealed.
         assert!(transitions.len() >= 4, "expected multiple transitions, got {transitions:?}");
         assert!(transitions.contains(&TransitionEvent::AllSealed));
-        assert!(transitions.contains(&TransitionEvent::ThreadRestored {
+        assert!(transitions.contains(&TransitionEvent::FirstSendToDrive {
             subvolume: "a".to_string(),
             drive: "WD-18TB".to_string(),
         }));
+        assert!(
+            !transitions.contains(&TransitionEvent::ThreadRestored {
+                subvolume: "a".to_string(),
+                drive: "WD-18TB".to_string(),
+            }),
+            "first send must not also report a thread repair: {transitions:?}"
+        );
+    }
+
+    #[test]
+    fn first_send_and_thread_restored_are_mutually_exclusive() {
+        // Run #114's exact shape: the chain record read Broken (offsite pin shed
+        // by the do-no-harm bug) *and* the drive had zero snapshots pre-run. Both
+        // detectors used to fire, printing "thread mended" and "first thread
+        // established" one line apart (#211). At most one may fire per pair.
+        let pre = vec![make_assessment(
+            "subvol4-multimedia",
+            PromiseStatus::Unprotected,
+            vec![DriveChainHealth {
+                drive_label: "WD-18TB1".to_string(),
+                status: ChainStatus::Broken {
+                    reason: ChainBreakReason::NoPinFile,
+                    pin_parent: None,
+                },
+            }],
+            vec![make_drive_assessment("WD-18TB1", Some(0))],
+        )];
+        let post = vec![make_assessment(
+            "subvol4-multimedia",
+            PromiseStatus::Protected,
+            vec![DriveChainHealth {
+                drive_label: "WD-18TB1".to_string(),
+                status: ChainStatus::Intact {
+                    pin_parent: "20260618-0402-multimedia".to_string(),
+                },
+            }],
+            vec![make_drive_assessment("WD-18TB1", Some(1))],
+        )];
+
+        let transitions = detect_transitions(&pre, &post);
+        let first_send = transitions
+            .iter()
+            .filter(|t| {
+                matches!(
+                    t,
+                    TransitionEvent::FirstSendToDrive { drive, .. } if drive == "WD-18TB1"
+                )
+            })
+            .count();
+        let restored = transitions
+            .iter()
+            .filter(|t| {
+                matches!(
+                    t,
+                    TransitionEvent::ThreadRestored { drive, .. } if drive == "WD-18TB1"
+                )
+            })
+            .count();
+        assert_eq!(first_send, 1, "the first send should be reported: {transitions:?}");
+        assert_eq!(restored, 0, "a first send is not a repair: {transitions:?}");
+        assert!(
+            first_send + restored <= 1,
+            "at most one of the two per (subvolume, drive): {transitions:?}"
+        );
     }
 
     #[test]
