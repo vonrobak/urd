@@ -21,6 +21,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `retention_checks` array; absent when empty).
 
 ### Fixed
+- **The send-size estimate no longer inherits a failed/aborted send's partial
+  bytes** (#210). A failed send's `bytes_transferred` is an under-count (the send
+  aborted), but the estimate blended successful and failed sizes with `max()` and
+  short-circuited on the first hit — so a watchdog-killed 2.67TB partial on the
+  target drive shadowed a genuine 7.58TB full send recorded on another drive
+  (run #114 showed a ~3.8TB header for an ~8.7TB run). `last_send_size` /
+  `last_send_size_any_drive` are now **successful-only**; the preference order is
+  successful (this drive) → successful (any drive) → calibrated (full) → a
+  failed partial as a last-resort *floor*. This also closes a do-no-harm gap: the
+  same value feeds the planner's space-fit gate, where a falsely-low partial
+  estimate could green-light a send onto a drive that cannot hold it (ADR-113).
 - **The tight-pool reassurance line no longer lies for local-only subvolumes**
   (#195). A subvolume with no external drive was told "full history is on the
   drive; backing up every 1d to spare it" — but there is no drive and no send.

@@ -80,6 +80,18 @@ pub trait HistoryQuery {
     /// across **all** drives. Cross-drive fallback for drive swap scenarios.
     fn last_send_size_any_drive(&self, subvol_name: &str, send_kind: SendKind) -> Option<u64>;
 
+    /// A last-resort *floor* from a failed/aborted send (this drive preferred,
+    /// then any drive). A failed send's `bytes_transferred` is an under-count —
+    /// the send aborted — so it must never outrank a successful or calibrated
+    /// signal; it is consulted only after both and treated as a lower bound, not
+    /// a confident estimate (#210). Returns None when no failed send is on record.
+    fn last_failed_send_floor(
+        &self,
+        subvol_name: &str,
+        drive_label: &str,
+        send_kind: SendKind,
+    ) -> Option<u64>;
+
     /// Get a calibrated size estimate for a subvolume (from `urd calibrate`).
     /// Returns `(estimated_bytes, measured_at)` or None if not calibrated.
     fn calibrated_size(&self, subvol_name: &str) -> Option<(u64, String)>;
