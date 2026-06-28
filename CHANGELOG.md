@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`urd doctor --thorough` now warns about orphan pin files** (#125). A pin file
+  whose drive label is not in `[[drives]]` — e.g. left behind when a drive is
+  removed from config — silently anchors local retention: the planner protects
+  every snapshot newer than the *oldest* pin, so one orphan pin from a retired
+  drive can hold weeks of dailies against the configured shape with no surface to
+  catch it. The new Retention section names the subvolume, pin file, drive label,
+  and the snapshot the pin points to, explains the consequence, and gives the
+  remediation (delete the pin once the drive is retired, or re-add it to
+  `[[drives]]`). Advisory only — nothing is deleted. Renders only when an orphan
+  is found (no false gravity). Doctor JSON schema → v3 (the optional
+  `retention_checks` array; absent when empty).
+
 ### Fixed
 - **The send-size estimate no longer inherits a failed/aborted send's partial
   bytes** (#210). A failed send's `bytes_transferred` is an under-count (the send
@@ -19,6 +32,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   failed partial as a last-resort *floor*. This also closes a do-no-harm gap: the
   same value feeds the planner's space-fit gate, where a falsely-low partial
   estimate could green-light a send onto a drive that cannot hold it (ADR-113).
+- **The tight-pool reassurance line no longer lies for local-only subvolumes**
+  (#195). A subvolume with no external drive was told "full history is on the
+  drive; backing up every 1d to spare it" — but there is no drive and no send.
+  Local-only subvolumes now get a true sentence ("source pool is tight — keeping
+  less local history to protect the host"). Separately, a tight-stretched cadence
+  (e.g. daily × 1.5 = 36h) used `humanize_duration`, which floored it to "1d" —
+  identical to the declared daily, making the sparing invisible. A new
+  `humanize_cadence` renders it honestly ("every 36h"), so the slowdown the voice
+  narrates is actually visible. Voice Contract Rule 1 (every claim verifiable).
+- **Bare `urd` no longer recommends connecting an offsite drive whose absence
+  isn't the problem** (#120, defect 2). `compute_advice` Branch 8 recommended
+  connecting *any* unmounted drive on a Protected+Degraded subvolume, without
+  confirming that drive's absence was the cause — so after rotating an offsite
+  drive in, running a backup, and rotating it back out, Urd's headline could be
+  "Consider connecting {the drive you just used}". It now recommends connecting a
+  drive only when its absence is the documented cause (its label leads a health
+  reason). The upstream half (#103 / `compute_health` mislabeling send-age as
+  physical-away, and ignoring `source_unchanged`) was already fixed; this closes
+  the residual in the advice surface and future-proofs it against other
+  miscaused-degradation paths.
+- **Backup no longer prints contradictory transition lines** ("thread mended"
+  *and* "first thread established" for the same subvolume/drive, one line apart)
+  (#211). `detect_transitions` ran two independent detectors that were not
+  mutually exclusive: `ThreadRestored` (chain went Broken→Intact) and
+  `FirstSendToDrive` (drive had zero snapshots before, some after). When a drive
+  received its first send while its chain record happened to read Broken (e.g.
+  the offsite pin had been shed), both fired. A first send is never a thread
+  *repair* — there was no prior thread to mend — so the two are now mutually
+  exclusive by construction: a single `was_first_send_to_drive` helper both emits
+  `FirstSendToDrive` and suppresses `ThreadRestored` for that pair.
+- **A legacy unlabeled `.last-external-parent` pin no longer anchors local
+  retention when every configured drive already has its own drive-specific pin**
+  (#133, sibling class to #125). `find_pinned_snapshots` used to read the legacy
+  pin unconditionally and add it to the protected set on top of the per-drive
+  pins. Because the planner anchors "protect everything newer" to the *oldest*
+  pin, a stale legacy pin left over from the bash→Urd cutover (late March 2026)
+  became the anchor on every pre-cutover subvolume — silently overriding the
+  configured retention shape (e.g. 60 local snapshots against a cap of ~11). The
+  legacy pin is now consulted only as a *per-drive* fallback for a drive that
+  lacks its own pin (a mid-cutover host); once every drive has a specific pin the
+  legacy file is by construction stale and is ignored. No on-disk change — the
+  legacy file is left in place; retiring it is tracked as #133 Phase 2.
 
 ## [0.27.1] - 2026-06-26
 

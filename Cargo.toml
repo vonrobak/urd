@@ -44,6 +44,13 @@ env_logger = "0.11"
 filetime = "0.2.27"
 tempfile = "3"
 
+# Integration tests live under tests/integration/ (CLAUDE.md convention) and are
+# #[ignore]'d by default (they build + shell out to the binary). Run with
+# `cargo test -- --ignored`. Each file is declared as its own test target.
+[[test]]
+name = "cli_subvolume_validation"
+path = "tests/integration/cli_subvolume_validation.rs"
+
 [profile.release]
 lto = true
 strip = true

@@ -124,6 +124,26 @@ pub(super) fn humanize_duration(secs: i64) -> String {
     }
 }
 
+/// Humanize a *cadence* without `humanize_duration`'s lossy day-flooring. The
+/// tight-tier stretch multiplies the declared interval (e.g. daily × 1.5 = 36h);
+/// flooring that to "1d" makes the slowed cadence read identically to the
+/// declared one, hiding the very adaptation the voice is trying to narrate
+/// (#195). Whole numbers of days stay "Nd"; a sub-two-day cadence that isn't a
+/// whole day shows hours ("36h"); anything else with a fractional day shows one
+/// decimal ("2.5d"). Sub-day cadences fall back to `humanize_duration`.
+pub(super) fn humanize_cadence(secs: i64) -> String {
+    // Sub-day (incl. zero/negative) → the plain humanizer handles it.
+    if secs < 86400 {
+        return humanize_duration(secs);
+    }
+    if secs % 86400 == 0 {
+        return format!("{}d", secs / 86400);
+    }
+    if secs < 2 * 86400 && secs % 3600 == 0 {
+        return format!("{}h", secs / 3600);
+    }
+    format!("{:.1}d", secs as f64 / 86400.0)
+}
 
 // ── Table formatter ─────────────────────────────────────────────────────
 
@@ -627,6 +647,7 @@ pub(crate) mod test_fixtures {
             verify: None,
             churn: None,
             recommendations: None,
+            retention_checks: Vec::new(),
             verdict: DoctorVerdict::healthy(),
         }
     }
@@ -2481,6 +2502,49 @@ mod tests {
     }
 
     #[test]
+    fn doctor_retention_section_renders_orphan_pin() {
+        let _color = color_guard(false);
+        let mut data = test_doctor_output();
+        data.retention_checks = vec![DoctorCheck {
+            name: "orphan pin: subvol7-containers · 2TB-backup".to_string(),
+            status: DoctorCheckStatus::Warn,
+            detail: Some(
+                "/snap/subvol7-containers/.last-external-parent-2TB-backup names \
+                 20260402-1925-containers, but no configured drive has label \"2TB-backup\". \
+                 Retention will not delete that snapshot or any newer one on the chain."
+                    .to_string(),
+            ),
+            suggestion: Some(
+                "Delete the pin file after confirming 2TB-backup is permanently retired, \
+                 or re-add it to [[drives]]."
+                    .to_string(),
+            ),
+        }];
+        data.verdict = DoctorVerdict::warnings(1);
+        let output = render_doctor(&data, OutputMode::Interactive);
+        assert!(output.contains("Retention"), "missing Retention header: {output}");
+        assert!(
+            output.contains("2TB-backup"),
+            "missing orphan pin label: {output}"
+        );
+        assert!(
+            output.contains("re-add it to [[drives]]"),
+            "missing remediation: {output}"
+        );
+    }
+
+    #[test]
+    fn doctor_no_retention_section_when_clean() {
+        // No false gravity: an empty retention scan renders no Retention header.
+        let _color = color_guard(false);
+        let output = render_doctor(&test_doctor_output(), OutputMode::Interactive);
+        assert!(
+            !output.contains("Retention"),
+            "Retention section must not render when there are no orphan pins: {output}"
+        );
+    }
+
+    #[test]
     fn doctor_promise_issues() {
         let _color = color_guard(false);
         let mut data = test_doctor_output();
@@ -3763,6 +3827,21 @@ mod tests {
     fn humanize_duration_zero_returns_less_than_one() {
         assert_eq!(humanize_duration(0), "<1s");
         assert_eq!(humanize_duration(-1), "<1s");
+    }
+
+    #[test]
+    fn humanize_cadence_does_not_floor_sub_two_day_stretch() {
+        // #195: the lossy floor that hid the tight-stretch.
+        assert_eq!(humanize_cadence(129600), "36h"); // daily × 1.5
+        assert_eq!(humanize_duration(129600), "1d"); // the old, misleading form
+        // Whole days stay clean.
+        assert_eq!(humanize_cadence(86400), "1d");
+        assert_eq!(humanize_cadence(7 * 86400), "7d");
+        // Beyond two days, a non-whole cadence shows one decimal.
+        assert_eq!(humanize_cadence(216000), "2.5d");
+        // Sub-day falls back to the plain humanizer.
+        assert_eq!(humanize_cadence(3600), "1h");
+        assert_eq!(humanize_cadence(0), "<1s");
     }
 
     // ── UPI 030 Churn section ──────────────────────────────────────
