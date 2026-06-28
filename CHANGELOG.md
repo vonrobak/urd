@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`urd doctor --thorough` now warns about orphan pin files** (#125). A pin file
+  whose drive label is not in `[[drives]]` — e.g. left behind when a drive is
+  removed from config — silently anchors local retention: the planner protects
+  every snapshot newer than the *oldest* pin, so one orphan pin from a retired
+  drive can hold weeks of dailies against the configured shape with no surface to
+  catch it. The new Retention section names the subvolume, pin file, drive label,
+  and the snapshot the pin points to, explains the consequence, and gives the
+  remediation (delete the pin once the drive is retired, or re-add it to
+  `[[drives]]`). Advisory only — nothing is deleted. Renders only when an orphan
+  is found (no false gravity). Doctor JSON schema → v3 (the optional
+  `retention_checks` array; absent when empty).
+
 ### Fixed
 - **A legacy unlabeled `.last-external-parent` pin no longer anchors local
   retention when every configured drive already has its own drive-specific pin**
