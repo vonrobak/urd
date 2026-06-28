@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::time::SystemTime;
 
 use crate::chain;
 use crate::cli::VerifyArgs;
@@ -6,6 +7,7 @@ use crate::config::Config;
 use crate::drives;
 use crate::output::{OutputMode, VerifyCheck, VerifyDrive, VerifyOutput, VerifySubvolume};
 use crate::plan::{FilesystemQuery, RealFileSystemState};
+use crate::types::SnapshotName;
 use crate::voice;
 
 pub fn run(config: Config, args: VerifyArgs, mode: OutputMode) -> anyhow::Result<()> {
@@ -185,27 +187,22 @@ pub(crate) fn collect_verify_output(config: &Config, args: &VerifyArgs) -> Verif
                         total_fail += 1;
                     }
 
-                    // 4. Orphan detection
-                    collect_orphan_checks(
-                        &fs_state,
-                        drive,
-                        &subvol.name,
-                        pin,
-                        &mut checks,
-                        &mut total_ok,
-                        &mut total_warn,
-                    );
+                    // 4. Orphan detection — fetch (I/O), then the pure factory.
+                    let ext_snaps = fs_state
+                        .external_snapshots(drive, &subvol.name)
+                        .unwrap_or_default();
+                    let orphan = orphan_checks(pin, &ext_snaps);
+                    tally(&orphan, &mut total_ok, &mut total_warn);
+                    checks.extend(orphan);
 
                     // 5. Stale pin detection (only meaningful for drive-specific pins)
-                    if !is_legacy {
-                        collect_stale_pin_check(
-                            &local_dir,
-                            &drive.label,
-                            &subvol.send_interval,
-                            &mut checks,
-                            &mut total_ok,
-                            &mut total_warn,
-                        );
+                    if !is_legacy
+                        && let Some(mtime) = pin_file_mtime(&local_dir, &drive.label)
+                    {
+                        let stale =
+                            stale_pin_checks(mtime, &subvol.send_interval, SystemTime::now());
+                        tally(&stale, &mut total_ok, &mut total_warn);
+                        checks.extend(stale);
                     }
                 }
                 Ok(None) => {
@@ -276,83 +273,83 @@ pub(crate) fn collect_verify_output(config: &Config, args: &VerifyArgs) -> Verif
     }
 }
 
-fn collect_orphan_checks(
-    fs_state: &dyn FilesystemQuery,
-    drive: &crate::config::DriveConfig,
-    subvol_name: &str,
-    pin: &crate::types::SnapshotName,
-    checks: &mut Vec<VerifyCheck>,
-    total_ok: &mut u32,
-    total_warn: &mut u32,
-) {
-    let ext_snaps = fs_state
-        .external_snapshots(drive, subvol_name)
-        .unwrap_or_default();
-
-    let orphans: Vec<_> = ext_snaps.iter().filter(|s| *s > pin).collect();
+/// Pure: orphan checks given the pin and the drive's external snapshots
+/// (already fetched). An "orphan" is an external snapshot newer than the pin —
+/// possibly from an interrupted send. Returns one `ok` check when there are
+/// none, or one `warn` per orphan.
+fn orphan_checks(pin: &crate::types::SnapshotName, external: &[SnapshotName]) -> Vec<VerifyCheck> {
+    let orphans: Vec<&SnapshotName> = external.iter().filter(|s| *s > pin).collect();
     if orphans.is_empty() {
-        checks.push(VerifyCheck {
+        return vec![VerifyCheck {
             name: "orphans".to_string(),
             status: "ok".to_string(),
             detail: Some("No orphaned snapshots on drive".to_string()),
             suggestion: None,
-        });
-        *total_ok += 1;
-    } else {
-        for orphan in &orphans {
-            checks.push(VerifyCheck {
-                name: "orphans".to_string(),
-                status: "warn".to_string(),
-                detail: Some(format!(
-                    "Orphaned snapshot on drive: {orphan} (newer than pin, possibly from interrupted send)"
-                )),
-                suggestion: None,
-            });
-        }
-        *total_warn += orphans.len() as u32;
+        }];
     }
+    orphans
+        .iter()
+        .map(|orphan| VerifyCheck {
+            name: "orphans".to_string(),
+            status: "warn".to_string(),
+            detail: Some(format!(
+                "Orphaned snapshot on drive: {orphan} (newer than pin, possibly from interrupted send)"
+            )),
+            suggestion: None,
+        })
+        .collect()
 }
 
-fn collect_stale_pin_check(
-    local_dir: &Path,
-    drive_label: &str,
+/// Pure: stale-pin check given the pin file's mtime, the send interval, and
+/// "now". A pin older than the staleness threshold (`2× send_interval`, min 1
+/// day) warns; otherwise `ok`. The I/O (reading the pin mtime) lives at the call
+/// site so the decision is testable without a filesystem.
+fn stale_pin_checks(
+    pin_mtime: SystemTime,
     send_interval: &crate::types::Interval,
-    checks: &mut Vec<VerifyCheck>,
-    total_ok: &mut u32,
-    total_warn: &mut u32,
-) {
-    let pin_path = local_dir.join(format!(".last-external-parent-{drive_label}"));
-    let Ok(metadata) = std::fs::metadata(&pin_path) else {
-        return;
-    };
-    let Ok(modified) = metadata.modified() else {
-        return;
-    };
-    let age = std::time::SystemTime::now()
-        .duration_since(modified)
-        .unwrap_or_default();
-
+    now: SystemTime,
+) -> Vec<VerifyCheck> {
+    let age = now.duration_since(pin_mtime).unwrap_or_default();
     let threshold_secs = stale_threshold_secs(send_interval);
     if age.as_secs() > threshold_secs as u64 {
         let days = age.as_secs() / 86400;
         let threshold_str = format_threshold(threshold_secs);
-        checks.push(VerifyCheck {
+        vec![VerifyCheck {
             name: "stale-pin".to_string(),
             status: "warn".to_string(),
             detail: Some(format!(
                 "Pin file is {days} day(s) old (threshold: {threshold_str}) \u{2014} last successful send was {days} day(s) ago"
             )),
             suggestion: None,
-        });
-        *total_warn += 1;
+        }]
     } else {
-        checks.push(VerifyCheck {
+        vec![VerifyCheck {
             name: "stale-pin".to_string(),
             status: "ok".to_string(),
             detail: Some("Pin file age OK".to_string()),
             suggestion: None,
-        });
-        *total_ok += 1;
+        }]
+    }
+}
+
+/// Read a drive-specific pin file's mtime, if present and readable. The I/O half
+/// of the stale-pin check, kept separate from the pure decision in
+/// `stale_pin_checks`. Returns `None` when the pin is absent or its mtime can't
+/// be read (the check is then simply skipped, as before).
+fn pin_file_mtime(local_dir: &Path, drive_label: &str) -> Option<SystemTime> {
+    let pin_path = local_dir.join(format!(".last-external-parent-{drive_label}"));
+    std::fs::metadata(&pin_path).and_then(|m| m.modified()).ok()
+}
+
+/// Tally `ok` / `warn` statuses from a batch of checks, folding the running
+/// totals from the returned checks rather than mutating them in each factory.
+fn tally(checks: &[VerifyCheck], total_ok: &mut u32, total_warn: &mut u32) {
+    for c in checks {
+        match c.status.as_str() {
+            "ok" => *total_ok += 1,
+            "warn" => *total_warn += 1,
+            _ => {}
+        }
     }
 }
 
@@ -402,59 +399,62 @@ mod tests {
         assert_eq!(format_threshold(3600), "1h");
     }
 
-    #[test]
-    fn stale_pin_check_with_fresh_file() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let name = SnapshotName::parse("20260322-1430-opptak").unwrap();
-        crate::chain::write_pin_file(dir.path(), "WD-18TB", &name).unwrap();
+    // ── orphan_checks (pure) ───────────────────────────────────────────
 
-        let mut checks = Vec::new();
-        let mut ok = 0;
-        let mut warn = 0;
-        let interval = Interval::hours(4);
-        collect_stale_pin_check(
-            dir.path(),
-            "WD-18TB",
-            &interval,
-            &mut checks,
-            &mut ok,
-            &mut warn,
-        );
-        assert_eq!(ok, 1);
-        assert_eq!(warn, 0);
+    fn snap(s: &str) -> SnapshotName {
+        SnapshotName::parse(s).unwrap()
+    }
+
+    #[test]
+    fn orphan_checks_none_when_pin_is_newest() {
+        let pin = snap("20260322-1430-opptak");
+        let external = vec![snap("20260321-1430-opptak"), snap("20260322-1430-opptak")];
+        let checks = orphan_checks(&pin, &external);
         assert_eq!(checks.len(), 1);
         assert_eq!(checks[0].status, "ok");
     }
 
     #[test]
-    fn stale_pin_warns_with_neutral_message() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let name = SnapshotName::parse("20260322-1430-opptak").unwrap();
-        crate::chain::write_pin_file(dir.path(), "WD-18TB", &name).unwrap();
+    fn orphan_checks_one_warn_per_newer_snapshot() {
+        let pin = snap("20260320-0000-opptak");
+        let external = vec![
+            snap("20260320-0000-opptak"),
+            snap("20260321-0000-opptak"),
+            snap("20260322-0000-opptak"),
+        ];
+        let checks = orphan_checks(&pin, &external);
+        assert_eq!(checks.len(), 2, "two snapshots are newer than the pin");
+        assert!(checks.iter().all(|c| c.status == "warn"));
+        assert!(checks[0].detail.as_ref().unwrap().contains("Orphaned snapshot"));
+    }
 
-        // Backdate the pin file to 3 days ago
-        let pin_path = dir.path().join(".last-external-parent-WD-18TB");
-        let three_days_ago = std::time::SystemTime::now()
-            - std::time::Duration::from_secs(3 * 86400);
-        filetime::set_file_mtime(
-            &pin_path,
-            filetime::FileTime::from_system_time(three_days_ago),
-        )
-        .unwrap();
+    #[test]
+    fn orphan_checks_empty_external_is_ok() {
+        let pin = snap("20260322-1430-opptak");
+        let checks = orphan_checks(&pin, &[]);
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].status, "ok");
+    }
 
-        let mut checks = Vec::new();
-        let mut ok = 0;
-        let mut warn = 0;
-        let interval = Interval::hours(4); // threshold = max(2*4h, 1d) = 1d, pin is 3d old
-        collect_stale_pin_check(
-            dir.path(),
-            "WD-18TB",
-            &interval,
-            &mut checks,
-            &mut ok,
-            &mut warn,
-        );
-        assert_eq!(warn, 1);
+    // ── stale_pin_checks (pure) ────────────────────────────────────────
+
+    #[test]
+    fn stale_pin_ok_at_threshold_boundary() {
+        // age == threshold → ok (the check warns only when age > threshold).
+        let interval = Interval::hours(4); // threshold = max(2*4h, 1d) = 1d
+        let now = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(10 * 86400);
+        let mtime = now - std::time::Duration::from_secs(86400);
+        let checks = stale_pin_checks(mtime, &interval, now);
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].status, "ok");
+    }
+
+    #[test]
+    fn stale_pin_warns_one_second_past_threshold_with_neutral_message() {
+        let interval = Interval::hours(4); // threshold = 1d
+        let now = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(10 * 86400);
+        let mtime = now - std::time::Duration::from_secs(86400 + 1);
+        let checks = stale_pin_checks(mtime, &interval, now);
         assert_eq!(checks.len(), 1);
         assert_eq!(checks[0].status, "warn");
         let detail = checks[0].detail.as_ref().unwrap();
@@ -466,5 +466,18 @@ mod tests {
             !detail.contains("sends may be failing"),
             "should not use accusatory message, got: {detail}"
         );
+    }
+
+    #[test]
+    fn tally_counts_ok_and_warn() {
+        let checks = vec![
+            VerifyCheck { name: "a".into(), status: "ok".into(), detail: None, suggestion: None },
+            VerifyCheck { name: "b".into(), status: "warn".into(), detail: None, suggestion: None },
+            VerifyCheck { name: "c".into(), status: "warn".into(), detail: None, suggestion: None },
+            VerifyCheck { name: "d".into(), status: "fail".into(), detail: None, suggestion: None },
+        ];
+        let (mut ok, mut warn) = (0, 0);
+        tally(&checks, &mut ok, &mut warn);
+        assert_eq!((ok, warn), (1, 2));
     }
 }
