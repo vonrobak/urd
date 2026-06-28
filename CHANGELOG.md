@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **A legacy unlabeled `.last-external-parent` pin no longer anchors local
+  retention when every configured drive already has its own drive-specific pin**
+  (#133, sibling class to #125). `find_pinned_snapshots` used to read the legacy
+  pin unconditionally and add it to the protected set on top of the per-drive
+  pins. Because the planner anchors "protect everything newer" to the *oldest*
+  pin, a stale legacy pin left over from the bash→Urd cutover (late March 2026)
+  became the anchor on every pre-cutover subvolume — silently overriding the
+  configured retention shape (e.g. 60 local snapshots against a cap of ~11). The
+  legacy pin is now consulted only as a *per-drive* fallback for a drive that
+  lacks its own pin (a mid-cutover host); once every drive has a specific pin the
+  legacy file is by construction stale and is ignored. No on-disk change — the
+  legacy file is left in place; retiring it is tracked as #133 Phase 2.
+
 ## [0.27.1] - 2026-06-26
 
 ### Fixed

@@ -3145,11 +3145,26 @@ source = "/data/beta"
         let dir = tempfile::TempDir::new().unwrap();
         let alpha = dir.path().join("alpha");
         make_snap_dirs(&alpha, &THREE_SNAPS);
-        // Legacy unlabeled pin → read unconditionally (chain.rs:78–90),
-        // independent of the empty `drives`. Pins the oldest snapshot, so this
-        // exercises the *primary* ADR-107 layer by construction (F3).
-        std::fs::write(alpha.join(".last-external-parent"), "20260101-1200-alpha\n").unwrap();
-        let config = emergency_config(dir.path());
+        let mut config = emergency_config(dir.path());
+        // A configured drive with its own drive-specific pin on the oldest
+        // snapshot. This exercises the *primary* ADR-107 pin layer by
+        // construction (F3) through the canonical drive-scoped path — the legacy
+        // unlabeled pin no longer anchors retention on its own (#133).
+        config.drives.push(crate::config::DriveConfig {
+            label: "D1".to_string(),
+            uuid: None,
+            mount_path: std::path::PathBuf::from("/mnt/d1"),
+            snapshot_root: ".snapshots".to_string(),
+            role: crate::types::DriveRole::Offsite,
+            max_usage_percent: None,
+            min_free_bytes: None,
+            rotation_interval: None,
+        });
+        std::fs::write(
+            alpha.join(".last-external-parent-D1"),
+            "20260101-1200-alpha\n",
+        )
+        .unwrap();
 
         // Test-setup insurance: the loop dir (`root.path.join(subvol)`) and the
         // defence-in-depth dir (`config.local_snapshot_dir`) must agree, else the
