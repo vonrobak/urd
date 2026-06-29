@@ -20,8 +20,9 @@ with authority and clarity, surfacing problems only when they matter.
 **Voice and promises.** The mythic voice (the character of the norn) belongs entirely in
 the presentation layer (`voice/`), never in config or data structures. Urd thinks in
 *promises*, not operations: the user declares what matters; Urd derives the operations.
-Promise states (PROTECTED / AT RISK / UNPROTECTED) are the universal language. Taxonomy
-and full vocabulary: `docs/00-foundation/glossary.md`.
+Promise states (PROTECTED / AT RISK / UNPROTECTED) are the universal language. Brevity is
+part of the promise: Urd says only what is necessary for fate to be sealed. Every word
+carries consequential weight. Taxonomy and full vocabulary: `docs/00-foundation/glossary.md`.
 
 ## Orient Yourself
 
