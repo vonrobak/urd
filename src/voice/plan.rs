@@ -16,7 +16,7 @@ use crate::output::{
 use crate::plan::format_duration_short;
 use crate::types::ByteSize;
 
-use super::{SuggestionContext, append_suggestion, skip_tag};
+use super::{SuggestionContext, append_suggestion, pluralize, skip_tag};
 
 /// Render an explanation for why a manual backup produced an empty plan.
 #[must_use]
@@ -127,28 +127,32 @@ fn render_plan_interactive(data: &PlanOutput) -> String {
             .filter(|op| op.operation == "send" && op.estimated_bytes.is_some())
             .count();
         if sends_with_estimates == data.summary.sends {
-            format!("{} sends (~{} total)", data.summary.sends, ByteSize(total))
+            format!(
+                "{} (~{} total)",
+                pluralize(data.summary.sends, "send", "sends"),
+                ByteSize(total)
+            )
         } else {
             format!(
-                "{} sends (~{} estimated for {} of {})",
-                data.summary.sends,
+                "{} (~{} estimated for {} of {})",
+                pluralize(data.summary.sends, "send", "sends"),
                 ByteSize(total),
                 sends_with_estimates,
                 data.summary.sends
             )
         }
     } else {
-        format!("{} sends", data.summary.sends)
+        pluralize(data.summary.sends, "send", "sends")
     };
 
     writeln!(
         out,
         "{}",
         format!(
-            "Summary: {}, {} snapshots, {} deletions, {} skipped",
+            "Summary: {}, {}, {}, {} skipped",
             sends_str,
-            data.summary.snapshots,
-            data.summary.deletions,
+            pluralize(data.summary.snapshots, "snapshot", "snapshots"),
+            pluralize(data.summary.deletions, "deletion", "deletions"),
             data.summary.skipped
         )
         .bold()

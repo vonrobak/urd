@@ -589,7 +589,7 @@ fn render_default_status_interactive(data: &DefaultStatusOutput) -> String {
 
     // Safety line
     if data.sealed_count() == data.total {
-        write!(out, "{}", "All connected drives are sealed.".green()).ok();
+        write!(out, "{}", "All sealed.".green()).ok();
     } else {
         write!(out, "{} of {} sealed.", data.sealed_count(), data.total).ok();
         if !data.exposed_names.is_empty() {
@@ -1555,7 +1555,7 @@ mod tests {
     fn default_all_sealed() {
         let _color = color_guard(false);
         let output = render_default_status(&test_default_status_output(), OutputMode::Interactive);
-        assert!(output.contains("All connected drives are sealed."), "missing sealed message in: {output}");
+        assert!(output.contains("All sealed."), "missing sealed message in: {output}");
         assert!(
             output.contains("urd status"),
             "missing hint to run urd status: {output}"
