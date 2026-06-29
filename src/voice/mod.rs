@@ -171,7 +171,9 @@ fn format_status_table(
         .enumerate()
         .map(|(i, h)| format!("{:<width$}", h, width = widths[i]))
         .collect();
-    writeln!(out, "{}", header_line.join("  ").bold()).ok();
+    // Trim the last column's padding — trailing whitespace aligns nothing.
+    let header_str = header_line.join("  ");
+    writeln!(out, "{}", header_str.trim_end().bold()).ok();
 
     // Rows — color SAFETY and HEALTH columns
     for row in rows {
@@ -194,7 +196,8 @@ fn format_status_table(
                 }
             })
             .collect();
-        writeln!(out, "{}", line.join("  ")).ok();
+        let row_str = line.join("  ");
+        writeln!(out, "{}", row_str.trim_end()).ok();
     }
 }
 
@@ -297,7 +300,9 @@ pub(super) fn format_history_table(headers: &[String], rows: &[Vec<String>], out
         .enumerate()
         .map(|(i, h)| format!("{:<width$}", h, width = widths[i]))
         .collect();
-    writeln!(out, "{}", header_line.join("  ").bold()).ok();
+    // Trim the last column's padding — trailing whitespace aligns nothing.
+    let header_str = header_line.join("  ");
+    writeln!(out, "{}", header_str.trim_end().bold()).ok();
 
     // Rows — color the RESULT column
     let result_col = headers.iter().position(|h| h == "RESULT");
@@ -317,7 +322,8 @@ pub(super) fn format_history_table(headers: &[String], rows: &[Vec<String>], out
                 }
             })
             .collect();
-        writeln!(out, "{}", line.join("  ")).ok();
+        let row_str = line.join("  ");
+        writeln!(out, "{}", row_str.trim_end()).ok();
     }
 }
 
@@ -1122,7 +1128,7 @@ mod tests {
         let output = render_plan(&data, OutputMode::Interactive);
         assert!(output.contains("htpc-home"), "missing subvolume name");
         assert!(output.contains("WD-18TB"), "missing drive label");
-        assert!(output.contains("1 snapshots"), "missing summary");
+        assert!(output.contains("1 snapshot,"), "missing summary");
     }
 
     #[test]
@@ -1733,7 +1739,7 @@ mod tests {
         };
         let output = render_plan(&data, OutputMode::Interactive);
         assert!(
-            output.contains("1 sends,"),
+            output.contains("1 send,"),
             "no estimates should just show count: {output}"
         );
         assert!(
