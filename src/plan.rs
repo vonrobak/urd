@@ -64,8 +64,7 @@ fn send_floor_defer_reason(
     obs: &Observation,
 ) -> Option<String> {
     let capacity = obs.fs.filesystem_capacity_bytes(local_dir).unwrap_or(0);
-    let floor =
-        crate::guard::source_floor_bytes(subvol.min_free_bytes.unwrap_or(0), capacity);
+    let floor = crate::guard::source_floor_bytes(subvol.min_free_bytes.unwrap_or(0), capacity);
     let free = obs.fs.filesystem_free_bytes(local_dir).unwrap_or(u64::MAX);
     if free < floor {
         use crate::types::ByteSize;

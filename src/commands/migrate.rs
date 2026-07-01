@@ -141,9 +141,7 @@ fn extract_version(raw: &str) -> anyhow::Result<Option<u32>> {
 fn raw_mentions_cleanup_budget(raw: &str) -> bool {
     fn walk(value: &toml::Value) -> bool {
         match value {
-            toml::Value::Table(t) => t
-                .iter()
-                .any(|(k, v)| k == "cleanup_budget" || walk(v)),
+            toml::Value::Table(t) => t.iter().any(|(k, v)| k == "cleanup_budget" || walk(v)),
             toml::Value::Array(a) => a.iter().any(walk),
             _ => false,
         }
