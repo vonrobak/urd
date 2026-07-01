@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.29.0] - 2026-07-02
+
 ### Added
 - **Emergency retention now notifies when it runs.** The pre-backup emergency
   pre-flight (critical space on a snapshot root) dispatches a Warning
@@ -20,6 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so a cell carrying ANSI color codes inflated its column and shifted every
   later column. Both table formatters now share one core that measures visible
   (ANSI-stripped) width.
+- **Voice polish from the v0.28.0 first-nightly review.** Plan-summary counts
+  pluralize correctly, bare `urd` says `All sealed.` consistently with
+  `urd status`, and status/history tables no longer carry trailing whitespace.
 
 ### Changed
 - **Interval-skip "next due" now flows structured from planner to renderer.**
@@ -1293,7 +1298,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Defense-in-depth pin file protection for unsent snapshots
 - Per-subvolume error isolation in executor
 
-[Unreleased]: https://github.com/vonrobak/urd/compare/v0.28.0...HEAD
+[Unreleased]: https://github.com/vonrobak/urd/compare/v0.29.0...HEAD
+[0.29.0]: https://github.com/vonrobak/urd/compare/v0.28.0...v0.29.0
 [0.28.0]: https://github.com/vonrobak/urd/compare/v0.27.1...v0.28.0
 [0.27.1]: https://github.com/vonrobak/urd/compare/v0.27.0...v0.27.1
 [0.27.0]: https://github.com/vonrobak/urd/compare/v0.26.0...v0.27.0
