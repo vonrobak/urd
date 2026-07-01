@@ -60,16 +60,12 @@ fn record_defer(
 /// unreadable free ⇒ proceed.
 fn send_floor_defer_reason(
     subvol: &ResolvedSubvolume,
-    config: &Config,
     local_dir: &Path,
     obs: &Observation,
 ) -> Option<String> {
     let capacity = obs.fs.filesystem_capacity_bytes(local_dir).unwrap_or(0);
-    let floor = crate::guard::source_floor_bytes(
-        subvol.min_free_bytes.unwrap_or(0),
-        config.root_cleanup_budget(&subvol.name),
-        capacity,
-    );
+    let floor =
+        crate::guard::source_floor_bytes(subvol.min_free_bytes.unwrap_or(0), capacity);
     let free = obs.fs.filesystem_free_bytes(local_dir).unwrap_or(u64::MAX);
     if free < floor {
         use crate::types::ByteSize;
@@ -470,7 +466,7 @@ pub fn plan(
             // still happens (CoW-cheap local restore point) and external
             // retention below still runs (destination-side, unrelated to
             // source-pool pressure).
-            let floor_defer = send_floor_defer_reason(subvol, config, &local_dir, obs);
+            let floor_defer = send_floor_defer_reason(subvol, &local_dir, obs);
             if let Some(reason) = &floor_defer {
                 record_defer(
                     &mut skipped,
@@ -985,7 +981,7 @@ fn plan_transient_lifecycle(
     // lifecycle — creating a snapshot whose send we refuse would strand an
     // orphan. Retention on leftovers still runs (it frees space). Runs
     // before Phase 1 so `force`/`--skip-intervals` cannot override it.
-    if let Some(reason) = send_floor_defer_reason(subvol, config, local_dir, obs) {
+    if let Some(reason) = send_floor_defer_reason(subvol, local_dir, obs) {
         record_defer(
             skipped,
             events,
@@ -3056,6 +3052,8 @@ send_enabled = false
         // The htpc shape: min_free unset (snapshot guard disabled entirely),
         // cleanup_budget unset → floor = 1.5% of capacity = 15GB. 10GB free →
         // the send defers while the snapshot is still planned.
+        // (Identity pin for UPI 068: this TOML sets no cleanup_budget, so it
+        // must pass before and after the knob's retirement with zero edits.)
         let toml_str = r#"
 [general]
 state_db = "/tmp/urd.db"
@@ -3110,68 +3108,6 @@ priority = 1
             sv1_creates(&result),
             1,
             "Snapshot guard is off when min_free is unset — snapshot still planned"
-        );
-    }
-
-    #[test]
-    fn send_floor_honors_explicit_cleanup_budget() {
-        // Explicit cleanup_budget = 5GB with capacity unmeasurable (0): floor =
-        // 10GB + 5GB = 15GB. 12GB free → deferred. (With the capacity default
-        // this free would pass — proves the explicit budget wins.)
-        let toml_str = r#"
-[general]
-state_db = "/tmp/urd.db"
-metrics_file = "/tmp/backup.prom"
-log_dir = "/tmp"
-
-[local_snapshots]
-roots = [
-  { path = "/snap", subvolumes = ["sv1"], min_free_bytes = "10GB", cleanup_budget = "5GB" }
-]
-
-[defaults]
-snapshot_interval = "1h"
-send_interval = "1h"
-send_enabled = true
-enabled = true
-
-[defaults.local_retention]
-hourly = 24
-daily = 30
-weekly = 26
-monthly = 12
-
-[defaults.external_retention]
-daily = 30
-weekly = 26
-monthly = 0
-
-[[drives]]
-label = "D1"
-mount_path = "/mnt/d1"
-snapshot_root = ".snapshots"
-role = "test"
-max_usage_percent = 90
-
-[[subvolumes]]
-name = "sv1"
-short_name = "one"
-source = "/data/sv1"
-priority = 1
-"#;
-        let config: Config = toml::from_str(toml_str).unwrap();
-        let mut fs = MockFileSystemState::new();
-        fs.local_snapshots
-            .insert("sv1".to_string(), vec![snap("20260322-1300-one")]);
-        fs.mounted_drives.insert("D1".to_string());
-        fs.free_bytes
-            .insert(PathBuf::from("/snap/sv1"), 12_000_000_000);
-
-        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &ArmedTierMap::new()).unwrap();
-        assert_eq!(
-            sv1_sends(&result),
-            0,
-            "Explicit cleanup_budget must be honored over the capacity default"
         );
     }
 

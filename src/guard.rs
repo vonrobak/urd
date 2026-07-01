@@ -34,11 +34,12 @@ use crate::types::SnapshotName;
 /// Watchdog poll cadence, mirroring `progress_display_loop`'s 250 ms (UPI 033).
 pub const WATCHDOG_POLL_MS: u64 = 250;
 
-/// Default `cleanup_budget` as a fraction of pool capacity when the operator did
-/// not configure one (UPI 033, arc re-grill). 1.5 % scales across hardware —
-/// ~1.77 GB on a 118 GB htpc NVMe — and is the working room the floor sits above
-/// `min_free`. Applied at watchdog setup (`commands/backup.rs`), not in
-/// `config.rs`, because it needs the pool capacity to resolve.
+/// The `cleanup_budget` as a fraction of pool capacity (UPI 033, arc re-grill;
+/// the config field of the same name was retired in UPI 068 — the budget is
+/// always derived now). 1.5 % scales across hardware — ~1.77 GB on a 118 GB htpc
+/// NVMe — and is the working room the floor sits above `min_free`. Applied at
+/// watchdog setup (`commands/backup.rs`), not in `config.rs`, because it needs
+/// the pool capacity to resolve.
 pub const CLEANUP_BUDGET_CAPACITY_FRACTION: f64 = 0.015;
 
 /// The watchdog's decision for one sample (UPI 033, floor-only since UPI 067).
@@ -77,21 +78,19 @@ pub fn evaluate(free_bytes: u64, floor_bytes: u64) -> WatchdogAction {
 
 /// The source-pool host-survival floor shared by Layer 2 (the mid-op watchdog,
 /// UPI 033) and Layer 3 (idle emergency eject, UPI 034): `min_free +
-/// cleanup_budget`, where an unset `cleanup_budget` defaults to
-/// [`CLEANUP_BUDGET_CAPACITY_FRACTION`] of pool capacity (resolved here because
-/// the fraction needs the capacity in scope). Both layers call this so the floor
-/// cannot drift between them — partitioned by send-state, one number, two actors.
+/// cleanup_budget`, where `cleanup_budget` is the derived working room —
+/// [`CLEANUP_BUDGET_CAPACITY_FRACTION`] (1.5 %) of pool capacity (resolved here
+/// because the fraction needs the capacity in scope). Both layers call this so
+/// the floor cannot drift between them — partitioned by send-state, one number,
+/// two actors.
 #[must_use]
-pub fn source_floor_bytes(min_free: u64, cleanup_budget: Option<u64>, capacity_bytes: u64) -> u64 {
-    let budget = cleanup_budget.unwrap_or_else(|| {
-        #[allow(
-            clippy::cast_precision_loss,
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss
-        )]
-        let b = (capacity_bytes as f64 * CLEANUP_BUDGET_CAPACITY_FRACTION) as u64;
-        b
-    });
+pub fn source_floor_bytes(min_free: u64, capacity_bytes: u64) -> u64 {
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    let budget = (capacity_bytes as f64 * CLEANUP_BUDGET_CAPACITY_FRACTION) as u64;
     min_free + budget
 }
 
@@ -220,24 +219,23 @@ mod tests {
     }
 
     #[test]
-    fn source_floor_unset_min_free_is_just_budget() {
-        // min_free 0, explicit budget 500 MB, capacity irrelevant → floor == budget.
-        assert_eq!(source_floor_bytes(0, Some(500 * 1024 * 1024), 100 * GB), 500 * 1024 * 1024);
-    }
-
-    #[test]
-    fn source_floor_unset_budget_uses_capacity_fraction() {
-        // min_free 2 GB, budget unset → 2 GB + 1.5% of 100 GB capacity.
+    fn source_floor_derives_budget_from_capacity_fraction() {
+        // min_free 2 GB → 2 GB + 1.5% of 100 GB capacity (the budget is always
+        // derived since UPI 068).
         let cap = 100 * GB;
         #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let expected_budget = (cap as f64 * CLEANUP_BUDGET_CAPACITY_FRACTION) as u64;
-        assert_eq!(source_floor_bytes(2 * GB, None, cap), 2 * GB + expected_budget);
+        assert_eq!(source_floor_bytes(2 * GB, cap), 2 * GB + expected_budget);
     }
 
     #[test]
-    fn source_floor_both_set_is_exact_sum() {
-        // Both explicit → capacity ignored, exact sum.
-        assert_eq!(source_floor_bytes(2 * GB, Some(GB), 999 * GB), 3 * GB);
+    fn source_floor_numeric_pin_ten_plus_fifteen_gb() {
+        // Hand-checkable identity pin (UPI 068): 1.5 % of 1000 GB = 15 GB, plus
+        // min_free 10 GB = 25 GB. These literals are load-bearing — 0.015 is not
+        // exactly representable in f64, and the product rounds to the exact
+        // dyadic value only at magnitudes like these. Don't substitute arbitrary
+        // "realistic" odd capacities: they can truncate off-by-one through `as u64`.
+        assert_eq!(source_floor_bytes(10 * GB, 1000 * GB), 25 * GB);
     }
 
     // ── evaluate_idle_eject (UPI 034) ──────────────────────────────

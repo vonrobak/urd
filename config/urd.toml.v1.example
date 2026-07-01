@@ -55,10 +55,6 @@ min_free_bytes = "500GB"
 #
 # In v1, snapshot_root and min_free_bytes are inlined on each subvolume.
 # No [local_snapshots] or [defaults] sections — each block is self-describing.
-#
-# Optional: cleanup_budget = "2GB" — working room the mid-op watchdog keeps free
-# above min_free_bytes on the source pool while a backup sends. Omit it and Urd
-# defaults to 1.5% of the pool's capacity.
 
 # ── Fortified: irreplaceable data on multiple drives ─────────────────────
 
@@ -67,7 +63,6 @@ name = "htpc-home"
 source = "/home"
 snapshot_root = "~/.snapshots"
 min_free_bytes = "10GB"
-# cleanup_budget = "2GB"   # optional; defaults to 1.5% of pool capacity
 priority = 1
 protection = "fortified"
 drives = ["WD-18TB", "WD-18TB1"]   # Active workstation — keep off small test drive

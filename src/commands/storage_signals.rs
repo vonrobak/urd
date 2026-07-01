@@ -105,10 +105,9 @@ enum PoolKey {
 /// to cap, so the gate is inactive and the tier drives no ephemeral lifecycle.
 ///
 /// (F8) When the result is `Some`, the floor is **non-zero** for any pool with
-/// positive capacity under the default (unset) `cleanup_budget`
-/// (`source_floor_bytes` floors it at 1.5 % of capacity) — the property the
-/// gate's `floor > 0` guard relies on. A config that explicitly zeroes both
-/// `min_free` and `cleanup_budget` could still yield 0; the gate's `> 0` guard is
+/// positive capacity (`source_floor_bytes` derives the budget as 1.5 % of
+/// capacity) — the property the gate's `floor > 0` guard relies on. A `Some`
+/// floor is zero only when capacity is unmeasurable; the gate's `> 0` guard is
 /// the safety net there (0 means "gate inactive," never "force Roomy").
 #[must_use]
 pub fn pool_floor_bytes(
@@ -120,7 +119,6 @@ pub fn pool_floor_bytes(
     let first = pool_subvols.iter().find(|n| send_enabled.contains(*n))?;
     Some(crate::guard::source_floor_bytes(
         config.root_min_free_bytes(first).unwrap_or(0),
-        config.root_cleanup_budget(first),
         capacity_bytes,
     ))
 }
@@ -928,13 +926,13 @@ source = "/"
         let pool_subvols = vec!["localonly".to_string(), "sent".to_string()];
         let send_enabled: HashSet<String> = ["sent".to_string()].into_iter().collect();
         let cap = 1000 * GB;
-        let expected = crate::guard::source_floor_bytes(20 * GB, None, cap);
+        let expected = crate::guard::source_floor_bytes(20 * GB, cap);
         assert_eq!(
             pool_floor_bytes(&config, &pool_subvols, &send_enabled, cap),
             Some(expected),
         );
         // Sanity: keying on the local-only subvol would give a different floor.
-        assert_ne!(expected, crate::guard::source_floor_bytes(10 * GB, None, cap));
+        assert_ne!(expected, crate::guard::source_floor_bytes(10 * GB, cap));
     }
 
     #[test]
@@ -973,7 +971,7 @@ source = "/"
         assert_eq!(gather_floor, watchdog_floor);
         assert_eq!(
             gather_floor,
-            Some(crate::guard::source_floor_bytes(20 * GB, None, cap)),
+            Some(crate::guard::source_floor_bytes(20 * GB, cap)),
         );
     }
 
@@ -1023,7 +1021,7 @@ source = "/"
         let cap = 1000 * GB;
         assert_eq!(
             data.floor_bytes,
-            Some(crate::guard::source_floor_bytes(20 * GB, None, cap)),
+            Some(crate::guard::source_floor_bytes(20 * GB, cap)),
             "floor keyed on the send-enabled subvol, not the local-only first one",
         );
         assert_eq!(data.free_bytes, Some(500 * GB));

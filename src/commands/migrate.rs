@@ -16,9 +16,13 @@ pub fn run(config_path: Option<&Path>, args: &MigrateArgs) -> anyhow::Result<()>
     let raw = std::fs::read_to_string(&path).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
 
     let version = extract_version(&raw)?;
+    // Retired-key probe (UPI 068, ADR-111 amendment 2026-07-02): a residual
+    // `cleanup_budget` key is tolerated by all parsers but silently inert —
+    // the migration is where the operator gets told it was dropped.
+    let has_retired_key = raw_mentions_cleanup_budget(&raw);
     let source_schema = match version {
         Some(2) => {
-            println!("  Config is already v2 schema. Nothing to migrate.");
+            println!("{}", already_v2_message(has_retired_key));
             return Ok(());
         }
         Some(1) => "v1",
@@ -43,7 +47,7 @@ pub fn run(config_path: Option<&Path>, args: &MigrateArgs) -> anyhow::Result<()>
             .map_err(|e| anyhow::anyhow!("failed to parse legacy config: {e}"))?
     };
 
-    let result = build_migration(&legacy);
+    let result = build_migration(&legacy, has_retired_key);
     let v2_toml = render_v2(&legacy);
 
     // Output self-check: the rendered v2 must survive the full load path
@@ -125,6 +129,40 @@ fn extract_version(raw: &str) -> anyhow::Result<Option<u32>> {
     let probe: VersionProbe = toml::from_str(raw)
         .map_err(|e| anyhow::anyhow!("failed to parse config: {e}"))?;
     Ok(probe.general.and_then(|g| g.config_version))
+}
+
+// ── Retired-key probe (UPI 068) ────────────────────────────────────────
+
+/// Whether the raw TOML mentions the retired `cleanup_budget` key anywhere
+/// (UPI 068). Version-independent: one recursive walk finds the v1/v2
+/// subvolume-block position and the legacy roots-inline-table position alike.
+/// On parse failure returns `false` — the real parse paths report errors
+/// themselves.
+fn raw_mentions_cleanup_budget(raw: &str) -> bool {
+    fn walk(value: &toml::Value) -> bool {
+        match value {
+            toml::Value::Table(t) => t
+                .iter()
+                .any(|(k, v)| k == "cleanup_budget" || walk(v)),
+            toml::Value::Array(a) => a.iter().any(walk),
+            _ => false,
+        }
+    }
+    toml::from_str::<toml::Value>(raw).is_ok_and(|v| walk(&v))
+}
+
+/// The already-v2 message, with the retired-key deprecation appended when the
+/// probe hit. Pure so the variants are testable without stdout capture.
+fn already_v2_message(has_retired_key: bool) -> String {
+    let mut msg = "  Config is already v2 schema. Nothing to migrate.".to_string();
+    if has_retired_key {
+        msg.push_str(
+            "\n  ⚠ cleanup_budget was retired (UPI 068) and is now ignored — \
+             delete the `cleanup_budget = ...` line; the floor derives its \
+             working room automatically",
+        );
+    }
+    msg
 }
 
 // ── V1 raw config struct (for v1 → v2 path) ────────────────────────────
@@ -387,6 +425,9 @@ enum Change {
     OmittedGeneralDefaults(usize),
     OverrideConverted(Vec<OverrideConversion>),
     TransientToLocalSnapshots(usize),
+    /// The retired `cleanup_budget` key was present in the raw input and is
+    /// dropped by the migration (UPI 068, ADR-111 amendment 2026-07-02).
+    DroppedCleanupBudget,
 }
 
 struct OverrideConversion {
@@ -397,8 +438,14 @@ struct OverrideConversion {
 
 // ── Build migration ────────────────────────────────────────────────────
 
-fn build_migration(legacy: &LegacyConfig) -> MigrationResult {
+fn build_migration(legacy: &LegacyConfig, raw_has_retired_key: bool) -> MigrationResult {
     let mut changes = Vec::new();
+
+    // Retired cleanup_budget dropped (UPI 068). Rides the structured summary
+    // so both the dry-run and write paths report it.
+    if raw_has_retired_key {
+        changes.push(Change::DroppedCleanupBudget);
+    }
 
     // Count subvolumes that get snapshot_root inlined
     let sv_count = legacy.subvolumes.len();
@@ -799,10 +846,10 @@ fn render_subvolume(out: &mut String, sv: &LegacySubvolume, legacy: &LegacyConfi
     out.push_str(&format!("source = \"{}\"\n", sv.source));
 
     // snapshot_root from local_snapshots lookup.
-    // cleanup_budget (UPI 033) is intentionally NOT emitted here: it is an
-    // additive-optional field with a computed default (1.5% of pool capacity),
-    // so a migrated config that never declared one keeps the default — there is
-    // nothing to carry forward from a legacy/v1 source.
+    // cleanup_budget is NOT emitted here because the field was retired
+    // (UPI 068): the floor's working room is always derived (1.5% of pool
+    // capacity), so a residual key in the source is dropped — reported via
+    // Change::DroppedCleanupBudget, not carried forward.
     if let Some(r) = root {
         out.push_str(&format!("snapshot_root = \"{}\"\n", r.path));
         if let Some(ref mfb) = r.min_free_bytes {
@@ -1105,6 +1152,9 @@ fn print_changes(result: &MigrationResult) {
             Change::TransientToLocalSnapshots(n) => {
                 println!("    ✓ Converted local_retention = \"transient\" → local_snapshots = false on {n} subvolumes");
             }
+            Change::DroppedCleanupBudget => {
+                println!("    ⚠ cleanup_budget dropped — the watchdog floor derives its working room automatically (1.5 % of pool capacity)");
+            }
         }
     }
 }
@@ -1217,7 +1267,7 @@ drives = ["WD-18TB", "WD-18TB1"]
     fn migrate_renames_protection_levels() {
         let toml = example_legacy_toml();
         let legacy: LegacyConfig = toml::from_str(toml).unwrap();
-        let result = build_migration(&legacy);
+        let result = build_migration(&legacy, false);
 
         let renames = result.changes.iter().find_map(|c| match c {
             Change::RenamedLevels(r) => Some(r),
@@ -1233,7 +1283,7 @@ drives = ["WD-18TB", "WD-18TB1"]
     fn migrate_removes_redundant_short_names() {
         let toml = example_legacy_toml();
         let legacy: LegacyConfig = toml::from_str(toml).unwrap();
-        let result = build_migration(&legacy);
+        let result = build_migration(&legacy, false);
 
         let removed = result.changes.iter().find_map(|c| match c {
             Change::RemovedShortName(n) => Some(*n),
@@ -1241,6 +1291,84 @@ drives = ["WD-18TB", "WD-18TB1"]
         });
         assert!(removed.is_some(), "should have short_name removals");
         assert!(removed.unwrap() > 0);
+    }
+
+    // ── Retired cleanup_budget: probe + warn-and-drop (UPI 068) ────────
+
+    fn v1_toml_with_cleanup_budget() -> &'static str {
+        r#"
+[general]
+config_version = 1
+
+[[subvolumes]]
+name = "home"
+source = "/home"
+snapshot_root = "/snap"
+min_free_bytes = "10GB"
+cleanup_budget = "2GB"
+"#
+    }
+
+    #[test]
+    fn probe_finds_cleanup_budget_in_v1_subvolume_block() {
+        assert!(raw_mentions_cleanup_budget(v1_toml_with_cleanup_budget()));
+    }
+
+    #[test]
+    fn probe_finds_cleanup_budget_in_legacy_roots_table() {
+        let legacy = r#"
+[general]
+state_db = "/tmp/urd.db"
+
+[local_snapshots]
+roots = [
+  { path = "/snap", subvolumes = ["home"], cleanup_budget = "2GB" }
+]
+
+[[subvolumes]]
+name = "home"
+short_name = "home"
+source = "/home"
+"#;
+        assert!(raw_mentions_cleanup_budget(legacy));
+    }
+
+    #[test]
+    fn probe_ignores_config_without_the_key() {
+        assert!(!raw_mentions_cleanup_budget(example_legacy_toml()));
+    }
+
+    #[test]
+    fn migrate_v1_with_cleanup_budget_reports_drop() {
+        let legacy = legacy_from_v1(v1_toml_with_cleanup_budget()).unwrap();
+        // The real wiring: the probe result is passed into build_migration,
+        // which pushes the Change itself (adversary F1).
+        let result = build_migration(&legacy, true);
+        assert!(
+            result.changes.iter().any(|c| matches!(c, Change::DroppedCleanupBudget)),
+            "probe hit must surface as Change::DroppedCleanupBudget"
+        );
+        let v2 = render_v2(&legacy);
+        assert!(!v2.contains("cleanup_budget"), "the retired key must not be re-emitted");
+
+        // The flag, not the enum's existence, drives the warning.
+        let without = build_migration(&legacy, false);
+        assert!(
+            !without.changes.iter().any(|c| matches!(c, Change::DroppedCleanupBudget)),
+            "no probe hit → no drop reported"
+        );
+    }
+
+    #[test]
+    fn already_v2_message_warns_on_retired_key() {
+        let plain = already_v2_message(false);
+        assert!(plain.contains("Nothing to migrate"));
+        assert!(!plain.contains("cleanup_budget"));
+
+        let warned = already_v2_message(true);
+        assert!(warned.contains("Nothing to migrate"));
+        assert!(warned.contains("cleanup_budget"));
+        assert!(warned.contains("delete the `cleanup_budget = ...` line"));
     }
 
     #[test]
@@ -1295,7 +1423,7 @@ protection_level = "recorded"
 snapshot_interval = "1w"
 "#;
         let legacy: LegacyConfig = toml::from_str(toml).unwrap();
-        let _result = build_migration(&legacy);
+        let _result = build_migration(&legacy, false);
         let v1 = render_v2(&legacy);
 
         // Should NOT have protection = "recorded"
@@ -1399,7 +1527,7 @@ snapshot_interval = "1w"
     fn dry_run_does_not_write_files() {
         let toml = example_legacy_toml();
         let legacy: LegacyConfig = toml::from_str(toml).unwrap();
-        let _result = build_migration(&legacy);
+        let _result = build_migration(&legacy, false);
         let v1 = render_v2(&legacy);
 
         assert!(!v1.is_empty());
@@ -1667,7 +1795,7 @@ protection_level = "sheltered"
 snapshot_interval = "1w"
 "#;
         let legacy: LegacyConfig = toml::from_str(toml).unwrap();
-        let _result = build_migration(&legacy);
+        let _result = build_migration(&legacy, false);
         let v1 = render_v2(&legacy);
 
         // Should have baked all operational fields since it's converted to custom
@@ -1818,7 +1946,7 @@ protection_level = "guarded"
 snapshot_interval = "1d"
 "#;
         let legacy: LegacyConfig = toml::from_str(toml).unwrap();
-        let _result = build_migration(&legacy);
+        let _result = build_migration(&legacy, false);
         let v1 = render_v2(&legacy);
 
         // Should keep the named level (no conversion) since override matches derived

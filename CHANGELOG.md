@@ -36,6 +36,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   No user-visible behavior change except truncated cells in `urd events` now use
   `...` (matching every other table) instead of `…`.
 
+### Removed
+- **The `cleanup_budget` config field is retired** (2026-07-01 audit finding 3).
+  The watchdog floor's working room is always derived — 1.5 % of pool capacity —
+  which is the only behavior real configs ever exercised. Configs still carrying
+  the key keep loading (the residual key is ignored); `urd migrate` now warns
+  and drops it instead of dropping it silently. No schema version bump
+  (ADR-111 amendment 2026-07-02 codifies the retirement criterion).
+
 ## [0.28.0] - 2026-06-29
 
 ### Added

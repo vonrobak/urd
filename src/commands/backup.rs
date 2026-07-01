@@ -2816,7 +2816,7 @@ source = "/data/beta"
         let armed =
             arm_watchdog_pools_with(&config, &signals, &map, space_cap(cap, 40_000_000_000));
         assert_eq!(armed.len(), 1);
-        assert_eq!(armed[0].floor_bytes, guard::source_floor_bytes(0, None, cap));
+        assert_eq!(armed[0].floor_bytes, guard::source_floor_bytes(0, cap));
         assert_eq!(armed[0].floor_bytes, 1_500_000_000);
     }
 
