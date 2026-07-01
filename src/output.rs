@@ -1028,47 +1028,17 @@ impl SkipCategory {
     }
 }
 
-/// Parse a duration string (produced by `format_duration_short` in plan.rs) to minutes.
-///
-/// Handles three formats: `"45m"`, `"2h30m"`, `"3d"`.
-/// When embedded in a reason string, extracts the text between `~` and `)`.
-/// Returns `None` if no parseable duration is found.
-#[must_use]
-pub fn parse_duration_to_minutes(reason: &str) -> Option<u64> {
-    // Extract duration substring: text between '~' and ')'
-    let duration_str = if let Some(start) = reason.find('~') {
-        let after_tilde = &reason[start + 1..];
-        if let Some(end) = after_tilde.find(')') {
-            &after_tilde[..end]
-        } else {
-            after_tilde.trim()
-        }
-    } else {
-        reason.trim()
-    };
-
-    // Parse: "Nd", "NhMm", "Nm"
-    if let Some(d) = duration_str.strip_suffix('d') {
-        d.parse::<u64>().ok().map(|v| v * 1440)
-    } else if let Some(rest) = duration_str.strip_suffix('m') {
-        if let Some(h_pos) = rest.find('h') {
-            let hours = rest[..h_pos].parse::<u64>().ok()?;
-            let mins = rest[h_pos + 1..].parse::<u64>().ok()?;
-            Some(hours * 60 + mins)
-        } else {
-            rest.parse::<u64>().ok()
-        }
-    } else {
-        None
-    }
-}
-
 /// A planner-skipped subvolume/send with reason.
 #[derive(Debug, Serialize)]
 pub struct SkippedSubvolume {
     pub name: String,
     pub reason: String,
     pub category: SkipCategory,
+    /// Minutes until the next due snapshot/send, for interval deferrals.
+    /// Carried structured from the planner so renderers never re-parse it
+    /// out of the prose reason.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_due_minutes: Option<i64>,
 }
 
 // ── PlanOutput ─────────────────────────────────────────────────────────
@@ -2015,49 +1985,6 @@ mod tests {
         }
     }
 
-    // ── parse_duration_to_minutes tests ────────────────────────────────
-
-    #[test]
-    fn parse_duration_minutes_only() {
-        assert_eq!(parse_duration_to_minutes("~45m"), Some(45));
-    }
-
-    #[test]
-    fn parse_duration_hours_minutes() {
-        assert_eq!(parse_duration_to_minutes("~2h30m"), Some(150));
-    }
-
-    #[test]
-    fn parse_duration_days() {
-        assert_eq!(parse_duration_to_minutes("~3d"), Some(4320));
-    }
-
-    #[test]
-    fn parse_duration_embedded_in_reason() {
-        assert_eq!(
-            parse_duration_to_minutes("interval not elapsed (next in ~14h6m)"),
-            Some(846)
-        );
-        assert_eq!(
-            parse_duration_to_minutes("send to WD-18TB not due (next in ~2h30m)"),
-            Some(150)
-        );
-    }
-
-    #[test]
-    fn parse_duration_no_duration() {
-        assert_eq!(parse_duration_to_minutes("disabled"), None);
-    }
-
-    /// Cross-unit comparison: ensures days > hours even though "9d" is shorter
-    /// than "2h30m" as a string. This caught a real bug in the simplify pass.
-    #[test]
-    fn parse_duration_cross_unit_comparison() {
-        let days = parse_duration_to_minutes("~9d").unwrap();
-        let hours = parse_duration_to_minutes("~2h30m").unwrap();
-        assert!(days > hours, "9d ({days}m) should be > 2h30m ({hours}m)");
-    }
-
     #[test]
     fn build_pre_action_from_plan_output() {
         let plan_output = PlanOutput {
@@ -2093,11 +2020,13 @@ mod tests {
             ],
             skipped: vec![
                 SkippedSubvolume {
+                    next_due_minutes: None,
                     name: "sv1".to_string(),
                     reason: "drive D2 not mounted".to_string(),
                     category: SkipCategory::DriveNotMounted,
                 },
                 SkippedSubvolume {
+                    next_due_minutes: None,
                     name: "sv2".to_string(),
                     reason: "drive D2 not mounted".to_string(),
                     category: SkipCategory::DriveNotMounted,

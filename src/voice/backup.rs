@@ -700,6 +700,7 @@ mod tests {
     #[test]
     fn backup_summary_suppresses_unchanged() {
         let skipped = vec![SkippedSubvolume {
+            next_due_minutes: None,
             name: "sv1".to_string(),
             reason: "unchanged \u{2014} no changes since last snapshot (21h ago)".to_string(),
             category: SkipCategory::Unchanged,

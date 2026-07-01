@@ -13,25 +13,31 @@ use crate::retention;
 use crate::storage_critical::{self, ArmedTierMap, EffectivePolicy};
 use crate::types::{
     BackupPlan, DeleteKind, DriveEvent, DriveEventKind, FullSendReason, LocalRetentionPolicy,
-    PlannedOperation, SendKind, SnapshotName,
+    PlannedOperation, PlannedSkip, SendKind, SnapshotName,
 };
 
 // ── Audit helpers ──────────────────────────────────────────────────────
 
-/// Push a `(subvol, reason)` skip onto `skipped` and emit a matching
-/// `PlannerDefer` event. `drive_label` is `Some` when the deferral is
-/// drive-specific (e.g., "send to {drive} not due"), `None` for
-/// subvolume-wide deferrals.
+/// Push a skip onto `skipped` and emit a matching `PlannerDefer` event.
+/// `drive_label` is `Some` when the deferral is drive-specific (e.g.,
+/// "send to {drive} not due"), `None` for subvolume-wide deferrals.
+/// `next_due_minutes` is `Some` only for interval deferrals.
+#[allow(clippy::too_many_arguments)]
 fn record_defer(
-    skipped: &mut Vec<(String, String)>,
+    skipped: &mut Vec<PlannedSkip>,
     events: &mut Vec<Event>,
     subvol_name: &str,
     drive_label: Option<&str>,
     reason: String,
+    next_due_minutes: Option<i64>,
     scope: DeferScope,
     now: NaiveDateTime,
 ) {
-    skipped.push((subvol_name.to_string(), reason.clone()));
+    skipped.push(PlannedSkip {
+        name: subvol_name.to_string(),
+        reason: reason.clone(),
+        next_due_minutes,
+    });
     let mut event = Event::pure(now, EventPayload::PlannerDefer { reason, scope });
     event.subvolume = Some(subvol_name.to_string());
     event.drive_label = drive_label.map(str::to_string);
@@ -164,7 +170,7 @@ fn check_drive_availability(
     subvol_name: &str,
     drive: &DriveConfig,
     obs: &Observation,
-    skipped: &mut Vec<(String, String)>,
+    skipped: &mut Vec<PlannedSkip>,
     events: &mut Vec<Event>,
     now: NaiveDateTime,
 ) -> bool {
@@ -177,6 +183,7 @@ fn check_drive_availability(
                 subvol_name,
                 Some(&drive.label),
                 format!("drive {} not mounted", drive.label),
+                None,
                 DeferScope::Drive,
                 now,
             );
@@ -192,6 +199,7 @@ fn check_drive_availability(
                     "drive {} UUID mismatch (expected {}, found {})",
                     drive.label, expected, found
                 ),
+                None,
                 DeferScope::Drive,
                 now,
             );
@@ -204,6 +212,7 @@ fn check_drive_availability(
                 subvol_name,
                 Some(&drive.label),
                 format!("drive {} UUID check failed: {}", drive.label, reason),
+                None,
                 DeferScope::Drive,
                 now,
             );
@@ -219,6 +228,7 @@ fn check_drive_availability(
                     "drive {} token mismatch (expected {}, found {}) — possible drive swap",
                     drive.label, expected, found
                 ),
+                None,
                 DeferScope::Drive,
                 now,
             );
@@ -234,6 +244,7 @@ fn check_drive_availability(
                     "drive {} token expected but missing \u{2014} run `urd drives adopt {}`",
                     drive.label, drive.label
                 ),
+                None,
                 DeferScope::Drive,
                 now,
             );
@@ -302,6 +313,7 @@ pub fn plan(
                 &subvol.name,
                 None,
                 "disabled".to_string(),
+                None,
                 DeferScope::Subvolume,
                 now,
             );
@@ -332,6 +344,7 @@ pub fn plan(
                 &subvol.name,
                 None,
                 "no snapshot root configured".to_string(),
+                None,
                 DeferScope::Subvolume,
                 now,
             );
@@ -465,6 +478,7 @@ pub fn plan(
                     &subvol.name,
                     None,
                     reason.clone(),
+                    None,
                     DeferScope::Subvolume,
                     now,
                 );
@@ -520,6 +534,7 @@ pub fn plan(
                 &subvol.name,
                 None,
                 "local only".to_string(),
+                None,
                 DeferScope::Subvolume,
                 now,
             );
@@ -669,7 +684,7 @@ fn plan_local_snapshot(
     min_free: u64,
     obs: &Observation,
     operations: &mut Vec<PlannedOperation>,
-    skipped: &mut Vec<(String, String)>,
+    skipped: &mut Vec<PlannedSkip>,
     events: &mut Vec<Event>,
 ) -> Option<SnapshotName> {
     // Space guard: refuse to create if local filesystem is below min_free_bytes threshold.
@@ -690,6 +705,7 @@ fn plan_local_snapshot(
                     ByteSize(free),
                     ByteSize(min_free),
                 ),
+                None,
                 DeferScope::Subvolume,
                 now,
             );
@@ -745,6 +761,7 @@ fn plan_local_snapshot(
                             "unchanged \u{2014} no changes since last snapshot ({} ago)",
                             format_duration_short(mins)
                         ),
+                        None,
                         DeferScope::Subvolume,
                         now,
                     );
@@ -785,6 +802,7 @@ fn plan_local_snapshot(
                 &subvol.name,
                 None,
                 "snapshot already exists".to_string(),
+                None,
                 DeferScope::Subvolume,
                 now,
             );
@@ -810,6 +828,7 @@ fn plan_local_snapshot(
                 "interval not elapsed (next in ~{})",
                 format_duration_short(mins)
             ),
+            Some(mins),
             DeferScope::Subvolume,
             now,
         );
@@ -957,7 +976,7 @@ fn plan_transient_lifecycle(
     mounted_pins: &HashSet<SnapshotName>,
     obs: &Observation,
     operations: &mut Vec<PlannedOperation>,
-    skipped: &mut Vec<(String, String)>,
+    skipped: &mut Vec<PlannedSkip>,
     events: &mut Vec<Event>,
 ) {
     // ── Phase 0: Send-space guard (UPI 054-a) ──────────────────────
@@ -973,6 +992,7 @@ fn plan_transient_lifecycle(
             &subvol.name,
             None,
             reason,
+            None,
             DeferScope::Subvolume,
             now,
         );
@@ -1034,6 +1054,7 @@ fn plan_transient_lifecycle(
                 &subvol.name,
                 None,
                 "transient \u{2014} no drives available for send".to_string(),
+                None,
                 DeferScope::Subvolume,
                 now,
             );
@@ -1055,17 +1076,23 @@ fn plan_transient_lifecycle(
     }
 
     if !any_send_due {
-        let skip_msg = sendable_drives
+        let next_dues: Vec<(String, i64)> = sendable_drives
             .iter()
             .filter_map(|(drive, newest_ext)| {
                 let newest_dt = (*newest_ext)?;
                 let next_in = eff.send_interval.as_chrono()
                     - now.signed_duration_since(newest_dt);
-                Some(format!(
+                Some((drive.label.clone(), next_in.num_minutes()))
+            })
+            .collect();
+        let skip_msg = next_dues
+            .iter()
+            .map(|(label, mins)| {
+                format!(
                     "send to {} not due (next in ~{})",
-                    drive.label,
-                    format_duration_short(next_in.num_minutes())
-                ))
+                    label,
+                    format_duration_short(*mins)
+                )
             })
             .collect::<Vec<_>>()
             .join("; ");
@@ -1078,6 +1105,7 @@ fn plan_transient_lifecycle(
                 &subvol.name,
                 None,
                 skip_msg,
+                next_dues.iter().map(|(_, m)| *m).min(),
                 DeferScope::Subvolume,
                 now,
             );
@@ -1189,7 +1217,7 @@ fn plan_external_send(
     skip_intervals: bool,
     obs: &Observation,
     operations: &mut Vec<PlannedOperation>,
-    skipped: &mut Vec<(String, String)>,
+    skipped: &mut Vec<PlannedSkip>,
     events: &mut Vec<Event>,
 ) {
     let ext_dir = crate::drives::external_snapshot_dir(drive, &subvol.name);
@@ -1222,6 +1250,7 @@ fn plan_external_send(
                 drive.label,
                 format_duration_short(next_in.num_minutes())
             ),
+            Some(next_in.num_minutes()),
             DeferScope::Drive,
             now,
         );
@@ -1241,6 +1270,7 @@ fn plan_external_send(
             &subvol.name,
             None,
             reason,
+            None,
             DeferScope::Subvolume,
             now,
         );
@@ -1258,6 +1288,7 @@ fn plan_external_send(
             &subvol.name,
             Some(&drive.label),
             format!("{} already on {}", snap_to_send, drive.label),
+            None,
             DeferScope::Drive,
             now,
         );
@@ -1309,6 +1340,7 @@ fn plan_external_send(
                     ByteSize(free),
                     ByteSize(min_free),
                 ),
+                None,
                 DeferScope::Drive,
                 now,
             );
@@ -1346,6 +1378,7 @@ fn plan_external_send(
                         ByteSize(available),
                         staleness,
                     ),
+                    None,
                     DeferScope::Drive,
                     now,
                 );
@@ -2278,7 +2311,7 @@ local_retention = "transient"
             result
                 .skipped
                 .iter()
-                .any(|(name, reason)| name == "sv1" && reason.contains("interval"))
+                .any(|s| s.name == "sv1" && s.reason.contains("interval"))
         );
     }
 
@@ -2547,7 +2580,7 @@ local_retention = "transient"
             result
                 .skipped
                 .iter()
-                .any(|(_, reason)| reason.contains("not mounted"))
+                .any(|s| s.reason.contains("not mounted"))
         );
         let sends: Vec<_> = result
             .operations
@@ -2605,7 +2638,7 @@ send_enabled = false
             result
                 .skipped
                 .iter()
-                .any(|(_, reason)| reason.contains("local only"))
+                .any(|s| s.reason.contains("local only"))
         );
     }
 
@@ -2851,7 +2884,7 @@ send_enabled = false
             result
                 .skipped
                 .iter()
-                .any(|(name, reason)| name == "sv1" && reason.contains("estimated")),
+                .any(|s| s.name == "sv1" && s.reason.contains("estimated")),
             "Should report space estimation skip"
         );
     }
@@ -2994,8 +3027,8 @@ send_enabled = false
             result
                 .skipped
                 .iter()
-                .any(|(name, reason)| name == "sv1"
-                    && reason.contains("host-survival floor")),
+                .any(|s| s.name == "sv1"
+                    && s.reason.contains("host-survival floor")),
             "Defer reason should name the host-survival floor"
         );
     }
@@ -3193,7 +3226,7 @@ priority = 1
             result
                 .skipped
                 .iter()
-                .any(|(name, reason)| name == "sv1" && reason.contains("calibrated size")),
+                .any(|s| s.name == "sv1" && s.reason.contains("calibrated size")),
             "Skip reason should mention calibrated size"
         );
     }
@@ -3286,7 +3319,7 @@ priority = 1
             result
                 .skipped
                 .iter()
-                .any(|(name, reason)| name == "sv1" && reason.contains("estimated")),
+                .any(|s| s.name == "sv1" && s.reason.contains("estimated")),
             "Skip reason should mention estimated size"
         );
     }
@@ -3316,7 +3349,7 @@ priority = 1
             result
                 .skipped
                 .iter()
-                .any(|(name, reason)| name == "sv1" && reason.contains("interval")),
+                .any(|s| s.name == "sv1" && s.reason.contains("interval")),
             "Should report interval not elapsed for future-dated snapshot"
         );
     }
@@ -3342,7 +3375,7 @@ priority = 1
             result
                 .skipped
                 .iter()
-                .any(|(_, reason)| reason.contains("UUID mismatch")),
+                .any(|s| s.reason.contains("UUID mismatch")),
             "UUID mismatch should produce a skip reason: {:?}",
             result.skipped
         );
@@ -3379,7 +3412,7 @@ priority = 1
             result
                 .skipped
                 .iter()
-                .any(|(_, reason)| reason.contains("UUID check failed")),
+                .any(|s| s.reason.contains("UUID check failed")),
             "UUID check failure should produce a skip reason: {:?}",
             result.skipped
         );
@@ -3458,7 +3491,7 @@ priority = 1
             result
                 .skipped
                 .iter()
-                .any(|(_, reason)| reason.contains("token mismatch")),
+                .any(|s| s.reason.contains("token mismatch")),
             "Token mismatch should produce a skip reason: {:?}",
             result.skipped
         );
@@ -3518,7 +3551,7 @@ priority = 1
             result
                 .skipped
                 .iter()
-                .any(|(_, reason)| reason.contains("token expected but missing")),
+                .any(|s| s.reason.contains("token expected but missing")),
             "TokenExpectedButMissing should produce a skip reason: {:?}",
             result.skipped
         );
@@ -3587,7 +3620,7 @@ priority = 1
         let skip_reasons: Vec<_> = result
             .skipped
             .iter()
-            .filter(|(name, reason)| name == "sv1" && reason.contains("low on space"))
+            .filter(|s| s.name == "sv1" && s.reason.contains("low on space"))
             .collect();
         assert_eq!(
             skip_reasons.len(),
@@ -3971,8 +4004,8 @@ local_retention = "transient"
             result
                 .skipped
                 .iter()
-                .any(|(name, reason)| name == "sv1"
-                    && reason.contains("host-survival floor")),
+                .any(|s| s.name == "sv1"
+                    && s.reason.contains("host-survival floor")),
             "Defer reason should name the host-survival floor"
         );
         let deletes = result
@@ -4343,7 +4376,7 @@ local_retention = "transient"
         let has_transient_skip = result
             .skipped
             .iter()
-            .any(|(name, reason)| name == "sv1" && reason.contains("transient"));
+            .any(|s| s.name == "sv1" && s.reason.contains("transient"));
         assert!(
             has_transient_skip,
             "should have a transient skip reason, got: {:?}",
@@ -4952,7 +4985,7 @@ priority = 1
             result
                 .skipped
                 .iter()
-                .any(|(name, reason)| name == "sv1" && reason.contains("low on space")),
+                .any(|s| s.name == "sv1" && s.reason.contains("low on space")),
             "should report space guard skip"
         );
     }
@@ -5076,7 +5109,7 @@ priority = 1
         let has_transient_skip = result
             .skipped
             .iter()
-            .any(|(name, reason)| name == "sv1" && reason.contains("transient"));
+            .any(|s| s.name == "sv1" && s.reason.contains("transient"));
         assert!(has_transient_skip, "should have transient skip reason");
     }
 
@@ -5152,11 +5185,16 @@ priority = 1
 
         assert_eq!(creates.len(), 0, "no create when send interval not elapsed");
         assert!(sends.is_empty(), "no sends when interval not elapsed");
-        let has_interval_skip = result
+        let interval_skip = result
             .skipped
             .iter()
-            .any(|(name, reason)| name == "sv1" && reason.contains("not due"));
-        assert!(has_interval_skip, "should have interval skip reason: {:?}", result.skipped);
+            .find(|s| s.name == "sv1" && s.reason.contains("not due"));
+        assert!(interval_skip.is_some(), "should have interval skip reason: {:?}", result.skipped);
+        assert!(
+            interval_skip.unwrap().next_due_minutes.is_some(),
+            "interval defer must carry structured next_due_minutes: {:?}",
+            result.skipped
+        );
     }
 
     #[test]
@@ -5266,7 +5304,7 @@ local_retention = "transient"
         let has_space_skip = result
             .skipped
             .iter()
-            .any(|(name, reason)| name == "sv1" && reason.contains("host-survival floor"));
+            .any(|s| s.name == "sv1" && s.reason.contains("host-survival floor"));
         assert!(has_space_skip, "should have space skip reason: {:?}", result.skipped);
     }
 
@@ -5296,7 +5334,7 @@ local_retention = "transient"
         let d2_skip = result
             .skipped
             .iter()
-            .any(|(name, reason)| name == "sv1" && reason.contains("D2") && reason.contains("not mounted"));
+            .any(|s| s.name == "sv1" && s.reason.contains("D2") && s.reason.contains("not mounted"));
         assert!(d2_skip, "should skip D2: {:?}", result.skipped);
     }
 
@@ -5381,7 +5419,7 @@ local_retention = "transient"
         let d2_skip = result
             .skipped
             .iter()
-            .any(|(name, reason)| name == "sv1" && reason.contains("D2") && reason.contains("not due"));
+            .any(|s| s.name == "sv1" && s.reason.contains("D2") && s.reason.contains("not due"));
         assert!(d2_skip, "D2 should be skipped for interval: {:?}", result.skipped);
     }
 
@@ -5407,12 +5445,12 @@ local_retention = "transient"
             .filter(|op| matches!(op, PlannedOperation::CreateSnapshot { subvolume_name, .. } if subvolume_name == "sv1"))
             .collect();
         assert_eq!(creates.len(), 0, "should skip unchanged subvolume");
-        let skip = result.skipped.iter().find(|(name, _)| name == "sv1");
+        let skip = result.skipped.iter().find(|s| s.name == "sv1");
         assert!(skip.is_some(), "sv1 should be in skipped list");
         assert!(
-            skip.unwrap().1.starts_with("unchanged"),
+            skip.unwrap().reason.starts_with("unchanged"),
             "reason should start with 'unchanged', got: {}",
-            skip.unwrap().1
+            skip.unwrap().reason
         );
     }
 
@@ -5595,9 +5633,9 @@ local_retention = "transient"
             .filter(|op| matches!(op, PlannedOperation::CreateSnapshot { subvolume_name, .. } if subvolume_name == "sv1"))
             .collect();
         assert_eq!(creates.len(), 0, "skip_intervals should not override generation check");
-        let skip = result.skipped.iter().find(|(name, _)| name == "sv1");
+        let skip = result.skipped.iter().find(|s| s.name == "sv1");
         assert!(
-            skip.is_some() && skip.unwrap().1.starts_with("unchanged"),
+            skip.is_some() && skip.unwrap().reason.starts_with("unchanged"),
             "should report unchanged reason"
         );
     }

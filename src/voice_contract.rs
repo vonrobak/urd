@@ -982,6 +982,7 @@ mod contract {
         // configured_subvolumes > 0; force the ops-empty + skips-non-empty
         // branch by leaving one skipped entry in place.
         data.skipped = vec![crate::output::SkippedSubvolume {
+            next_due_minutes: None,
             name: "htpc-docs".to_string(),
             reason: "interval not elapsed".to_string(),
             category: crate::output::SkipCategory::IntervalNotElapsed,

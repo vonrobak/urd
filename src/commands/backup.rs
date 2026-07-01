@@ -1259,10 +1259,11 @@ fn build_backup_summary(
     let skipped: Vec<SkippedSubvolume> = plan
         .skipped
         .iter()
-        .map(|(name, reason)| SkippedSubvolume {
-            name: name.clone(),
-            category: SkipCategory::from_reason(reason),
-            reason: reason.clone(),
+        .map(|skip| SkippedSubvolume {
+            name: skip.name.clone(),
+            category: SkipCategory::from_reason(&skip.reason),
+            reason: skip.reason.clone(),
+            next_due_minutes: skip.next_due_minutes,
         })
         .collect();
 
@@ -1710,8 +1711,8 @@ fn build_empty_plan_explanation(
     let mut has_not_mounted = false;
     let mut has_interval = false;
 
-    for (_, reason) in &plan.skipped {
-        match SkipCategory::from_reason(reason) {
+    for skip in &plan.skipped {
+        match SkipCategory::from_reason(&skip.reason) {
             SkipCategory::Disabled | SkipCategory::LocalOnly => has_disabled = true,
             SkipCategory::SpaceExceeded => has_space = true,
             SkipCategory::DriveNotMounted => has_not_mounted = true,
@@ -1782,7 +1783,8 @@ fn append_skipped_metrics(
     let external_expected = externally_expected_subvolumes(config);
     let mut seen = already_emitted.clone();
 
-    for (name, _reason) in &plan.skipped {
+    for skip in &plan.skipped {
+        let name = &skip.name;
         if !seen.insert(name.clone()) {
             continue; // already emitted by execution results or earlier skip entry
         }
@@ -3693,11 +3695,16 @@ source = "/data/beta"
             operations: vec![],
             timestamp: chrono::NaiveDateTime::default(),
             skipped: vec![
-                (
-                    "htpc-home".to_string(),
-                    "drive WD-18TB not mounted".to_string(),
-                ),
-                ("htpc-docs".to_string(), "disabled".to_string()),
+                crate::types::PlannedSkip {
+                    name: "htpc-home".to_string(),
+                    reason: "drive WD-18TB not mounted".to_string(),
+                    next_due_minutes: None,
+                },
+                crate::types::PlannedSkip {
+                    name: "htpc-docs".to_string(),
+                    reason: "disabled".to_string(),
+                    next_due_minutes: None,
+                },
             ],
             events: Vec::new(),
         };
@@ -4686,7 +4693,11 @@ source = "/data/beta"
                 .unwrap(),
             skipped: skipped
                 .into_iter()
-                .map(|(n, r)| (n.to_string(), r.to_string()))
+                .map(|(n, r)| crate::types::PlannedSkip {
+                    name: n.to_string(),
+                    reason: r.to_string(),
+                    next_due_minutes: None,
+                })
                 .collect(),
             events: Vec::new(),
         }

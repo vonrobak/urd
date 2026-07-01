@@ -1147,6 +1147,16 @@ impl fmt::Display for PlannedOperation {
 
 // ── BackupPlan ──────────────────────────────────────────────────────────
 
+/// A planner-skipped subvolume with its reason. `next_due_minutes` carries
+/// the time until the next due snapshot/send for interval deferrals — kept
+/// structured so renderers never re-parse it out of the prose reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedSkip {
+    pub name: String,
+    pub reason: String,
+    pub next_due_minutes: Option<i64>,
+}
+
 /// The complete output of the backup planner.
 ///
 /// `events` carries the planner's audit-log emissions: full-send choices
@@ -1158,7 +1168,7 @@ impl fmt::Display for PlannedOperation {
 pub struct BackupPlan {
     pub operations: Vec<PlannedOperation>,
     pub timestamp: NaiveDateTime,
-    pub skipped: Vec<(String, String)>, // (subvolume_name, reason)
+    pub skipped: Vec<PlannedSkip>,
     pub events: Vec<crate::events::Event>,
 }
 
@@ -1586,10 +1596,11 @@ mod tests {
                 .unwrap()
                 .and_hms_opt(14, 30, 0)
                 .unwrap(),
-            skipped: vec![(
-                "subvol6-tmp".to_string(),
-                "interval not elapsed".to_string(),
-            )],
+            skipped: vec![PlannedSkip {
+                name: "subvol6-tmp".to_string(),
+                reason: "interval not elapsed".to_string(),
+                next_due_minutes: None,
+            }],
             events: Vec::new(),
         };
         let s = plan.summary();

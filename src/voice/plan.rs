@@ -10,9 +10,7 @@ use std::fmt::Write;
 
 use colored::Colorize;
 
-use crate::output::{
-    OutputMode, PlanOutput, SkipCategory, SkippedSubvolume, parse_duration_to_minutes,
-};
+use crate::output::{OutputMode, PlanOutput, SkipCategory, SkippedSubvolume};
 use crate::plan::format_duration_short;
 use crate::types::ByteSize;
 
@@ -248,13 +246,10 @@ fn render_drive_not_mounted_group(items: &[&SkippedSubvolume], out: &mut String)
 
 /// Render IntervalNotElapsed skips as a single line with count and shortest duration.
 fn render_interval_group(items: &[&SkippedSubvolume], out: &mut String) {
-    let shortest = items
-        .iter()
-        .filter_map(|s| parse_duration_to_minutes(&s.reason))
-        .min();
+    let shortest = items.iter().filter_map(|s| s.next_due_minutes).min();
 
     let suffix = if let Some(mins) = shortest {
-        format!(" (next in ~{})", format_duration_short(mins as i64))
+        format!(" (next in ~{})", format_duration_short(mins))
     } else {
         String::new()
     };
