@@ -87,10 +87,10 @@ pub enum NotificationEvent {
     },
     /// Emergency retention ran before a backup to recover critical space.
     /// Dispatched by the backup command's emergency pre-flight path.
-    #[allow(dead_code)] // Constructed by backup pre-flight, not yet wired to dispatch
+    /// `freed_bytes` is `None` when the post-delete free-space probe failed.
     EmergencyRetentionRan {
         root: String,
-        freed_bytes: u64,
+        freed_bytes: Option<u64>,
         deleted_count: usize,
     },
     /// A source pool's tightness tier escalated (UPI 031-a). Dispatched
@@ -577,14 +577,23 @@ pub fn build_drive_needs_adoption_notification(label: &str) -> Notification {
 }
 
 /// Build a notification for emergency retention that ran before a backup.
+/// `freed_bytes` is `None` when the post-delete free-space probe failed —
+/// the body then reports only the deletion count, never a made-up size.
 #[must_use]
-#[allow(dead_code)] // Will be wired to backup dispatch path
 pub fn build_emergency_retention_notification(
     root: &str,
-    freed_bytes: u64,
+    freed_bytes: Option<u64>,
     deleted_count: usize,
 ) -> Notification {
-    let freed = crate::types::ByteSize(freed_bytes);
+    let body = match freed_bytes {
+        Some(bytes) => format!(
+            "Freed {} from {root} by deleting {deleted_count} snapshots before backup.",
+            crate::types::ByteSize(bytes)
+        ),
+        None => format!(
+            "Deleted {deleted_count} snapshots from {root} to recover critical space before backup."
+        ),
+    };
     Notification {
         event: NotificationEvent::EmergencyRetentionRan {
             root: root.to_string(),
@@ -593,9 +602,7 @@ pub fn build_emergency_retention_notification(
         },
         urgency: Urgency::Warning,
         title: "Emergency retention ran".to_string(),
-        body: format!(
-            "Freed {freed} from {root} by deleting {deleted_count} snapshots before backup."
-        ),
+        body,
     }
 }
 
@@ -1334,9 +1341,10 @@ mod tests {
 
     #[test]
     fn emergency_retention_notification_format() {
-        let n = build_emergency_retention_notification("/snap/home", 8_200_000_000, 39);
+        let n = build_emergency_retention_notification("/snap/home", Some(8_200_000_000), 39);
         assert_eq!(n.urgency, Urgency::Warning);
         assert_eq!(n.title, "Emergency retention ran");
+        assert!(n.body.contains("Freed"), "body: {}", n.body);
         assert!(n.body.contains("39 snapshots"), "body: {}", n.body);
         assert!(n.body.contains("/snap/home"), "body: {}", n.body);
         assert!(
@@ -1350,6 +1358,17 @@ mod tests {
             "event: {:?}",
             n.event
         );
+    }
+
+    #[test]
+    fn emergency_retention_notification_unknown_freed_reports_count_only() {
+        let n = build_emergency_retention_notification("/snap/home", None, 3);
+        assert!(
+            !n.body.contains("Freed"),
+            "must not claim a freed size when the probe failed: {}",
+            n.body
+        );
+        assert!(n.body.contains("3 snapshots"), "body: {}", n.body);
     }
 
     // ── UPI 031-a: storage-pressure notifications ───────────────────

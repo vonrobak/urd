@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Emergency retention now notifies when it runs.** The pre-backup emergency
+  pre-flight (critical space on a snapshot root) dispatches a Warning
+  notification per reclaimed root with the deletion count and the measured
+  freed space — emergency deletions are never silent. The freed size is
+  omitted (never guessed) when the post-delete free-space probe fails.
+
 ### Fixed
 - **History and verify tables no longer mis-align rows containing pre-colored
   cells.** The history-table formatter computed column widths from byte length,
