@@ -2255,16 +2255,45 @@ fn run_emergency_preflight(
     if let Some(db) = state_db {
         db.record_events_best_effort(&outcome.emitted_events);
     }
+    // Told-not-silent: emergency deletions before a backup must never be
+    // silent. Best-effort — dispatch failure never blocks the run.
+    if !outcome.root_summaries.is_empty() {
+        let notes: Vec<notify::Notification> = outcome
+            .root_summaries
+            .iter()
+            .map(|s| {
+                notify::build_emergency_retention_notification(
+                    &s.root,
+                    s.freed_bytes,
+                    s.deleted_count,
+                )
+            })
+            .collect();
+        notify::dispatch(&notes, &config.notifications);
+    }
     Ok(outcome.any_deleted)
 }
 
 /// Structured outcome of an emergency-preflight pass. The injectable core
 /// ([`run_emergency_preflight_with`]) accumulates the prune events it would
 /// persist and returns them here instead of writing them, so the wrapper owns
-/// the SQLite write and the tests stay free of a `StateDb`.
+/// the SQLite write and notification dispatch, and the tests stay free of a
+/// `StateDb`.
 struct EmergencyPreflightOutcome {
     any_deleted: bool,
     emitted_events: Vec<crate::events::Event>,
+    /// One entry per root that had at least one successful emergency delete;
+    /// the wrapper turns these into `EmergencyRetentionRan` notifications.
+    root_summaries: Vec<EmergencyRootReclaim>,
+}
+
+/// Per-root reclaim summary from the emergency pre-flight. `freed_bytes` is
+/// the post-sync free-space delta, `None` when the re-probe failed (never
+/// report a made-up size).
+struct EmergencyRootReclaim {
+    root: String,
+    freed_bytes: Option<u64>,
+    deleted_count: usize,
 }
 
 /// Testable core of [`run_emergency_preflight`]: the free-space probe and the
@@ -2287,6 +2316,7 @@ fn run_emergency_preflight_with(
     let drive_labels = config.drive_labels();
     let mut any_deleted = false;
     let mut emitted_events: Vec<crate::events::Event> = Vec::new();
+    let mut root_summaries: Vec<EmergencyRootReclaim> = Vec::new();
 
     for root in &config.local_snapshots.roots {
         // Skip roots without min_free_bytes configured
@@ -2308,6 +2338,8 @@ fn run_emergency_preflight_with(
             crate::types::ByteSize(free),
             crate::types::ByteSize(min_free),
         );
+
+        let mut root_deleted: usize = 0;
 
         for subvol_name in &root.subvolumes {
             // Skip transient subvolumes — already delete aggressively
@@ -2365,6 +2397,7 @@ fn run_emergency_preflight_with(
                 match btrfs.delete_subvolume(&snap_path) {
                     Ok(()) => {
                         any_deleted = true;
+                        root_deleted += 1;
                         log::info!("Emergency: deleted {}", snap_path.display());
                         // Stamp the matching emitted event with the
                         // subvolume name and stash for persistence.
@@ -2403,6 +2436,17 @@ fn run_emergency_preflight_with(
                 root.path.display()
             );
         }
+
+        if root_deleted > 0 {
+            // Post-sync free-space delta; `free` is a real probe here (a
+            // failed initial probe reads as u64::MAX and skips the root).
+            let freed = free_bytes(&root.path).map(|after| after.saturating_sub(free));
+            root_summaries.push(EmergencyRootReclaim {
+                root: root.path.display().to_string(),
+                freed_bytes: freed,
+                deleted_count: root_deleted,
+            });
+        }
     }
 
     if any_deleted {
@@ -2412,6 +2456,7 @@ fn run_emergency_preflight_with(
     Ok(EmergencyPreflightOutcome {
         any_deleted,
         emitted_events,
+        root_summaries,
     })
 }
 
@@ -3157,6 +3202,31 @@ source = "/data/beta"
             "latest must survive"
         );
         assert!(out.any_deleted);
+    }
+
+    #[test]
+    fn emergency_reclaim_summary_carries_root_count_and_freed_delta() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let alpha = dir.path().join("alpha");
+        make_snap_dirs(&alpha, &THREE_SNAPS);
+        let config = emergency_config(dir.path());
+        let mock = crate::btrfs::MockBtrfs::new();
+
+        // First probe (criticality check) reads 400 MB; the post-delete
+        // re-probe reads 900 MB — a 500 MB freed delta.
+        let calls = std::cell::Cell::new(0u32);
+        let probe = |_: &std::path::Path| {
+            let n = calls.get();
+            calls.set(n + 1);
+            Some(if n == 0 { 400_000_000u64 } else { 900_000_000u64 })
+        };
+        let out = run_emergency_preflight_with(&config, pass_now(), &mock, probe).unwrap();
+
+        assert_eq!(out.root_summaries.len(), 1, "one root reclaimed");
+        let s = &out.root_summaries[0];
+        assert_eq!(s.deleted_count, 2, "two older snaps deleted");
+        assert_eq!(s.freed_bytes, Some(500_000_000));
+        assert_eq!(s.root, dir.path().display().to_string());
     }
 
     #[test]
