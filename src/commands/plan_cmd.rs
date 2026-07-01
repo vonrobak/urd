@@ -69,10 +69,11 @@ pub fn build_plan_output(
     let skipped: Vec<SkippedSubvolume> = backup_plan
         .skipped
         .iter()
-        .map(|(name, reason)| SkippedSubvolume {
-            name: name.clone(),
-            category: SkipCategory::from_reason(reason),
-            reason: reason.clone(),
+        .map(|skip| SkippedSubvolume {
+            name: skip.name.clone(),
+            category: SkipCategory::from_reason(&skip.reason),
+            reason: skip.reason.clone(),
+            next_due_minutes: skip.next_due_minutes,
         })
         .collect();
 

@@ -15,6 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (ANSI-stripped) width.
 
 ### Changed
+- **Interval-skip "next due" now flows structured from planner to renderer.**
+  The planner records `next_due_minutes` on each interval deferral (also exposed
+  in `urd plan --json` skip entries) instead of the renderer re-parsing minutes
+  out of the prose reason string; the stringly duration parser is deleted.
 - **Internal hygiene sweep from the 2026-07-01 repo-wide over-engineering audit**
   (findings 5–10): the two heartbeat builders merged into one `heartbeat::build`
   taking an optional run result; the `NamedSnapshot` trait replaced by plain

@@ -546,11 +546,13 @@ pub(crate) mod test_fixtures {
             ],
             skipped: vec![
                 SkippedSubvolume {
+                    next_due_minutes: None,
                     name: "htpc-home".to_string(),
                     reason: "drive 2TB-backup not mounted".to_string(),
                     category: SkipCategory::DriveNotMounted,
                 },
                 SkippedSubvolume {
+                    next_due_minutes: None,
                     name: "htpc-docs".to_string(),
                     reason: "drive 2TB-backup not mounted".to_string(),
                     category: SkipCategory::DriveNotMounted,
@@ -833,11 +835,13 @@ mod tests {
         let mut data = test_backup_summary();
         data.skipped = vec![
             SkippedSubvolume {
+                next_due_minutes: None,
                 name: "htpc-home".to_string(),
                 reason: "drive WD-18TB not mounted".to_string(),
                 category: SkipCategory::DriveNotMounted,
             },
             SkippedSubvolume {
+                next_due_minutes: None,
                 name: "htpc-home".to_string(),
                 reason: "drive 2TB-backup UUID mismatch (expected abc, found def)".to_string(),
                 category: SkipCategory::Other,
@@ -1075,21 +1079,25 @@ mod tests {
             subvolumes: vec![],
             skipped: vec![
                 SkippedSubvolume {
+                    next_due_minutes: None,
                     name: "htpc-home".to_string(),
                     reason: "drive WD-18TB not mounted".to_string(),
                     category: SkipCategory::DriveNotMounted,
                 },
                 SkippedSubvolume {
+                    next_due_minutes: None,
                     name: "htpc-docs".to_string(),
                     reason: "drive WD-18TB not mounted".to_string(),
                     category: SkipCategory::DriveNotMounted,
                 },
                 SkippedSubvolume {
+                    next_due_minutes: None,
                     name: "htpc-home".to_string(),
                     reason: "drive 2TB-backup not mounted".to_string(),
                     category: SkipCategory::DriveNotMounted,
                 },
                 SkippedSubvolume {
+                    next_due_minutes: None,
                     name: "htpc-docs".to_string(),
                     reason: "drive 2TB-backup not mounted".to_string(),
                     category: SkipCategory::DriveNotMounted,
@@ -1197,6 +1205,7 @@ mod tests {
                 full_send_reason: None,
             }],
             skipped: vec![SkippedSubvolume {
+                next_due_minutes: None,
                 name: "htpc-docs".to_string(),
                 reason: "disabled".to_string(),
                 category: SkipCategory::Disabled,
@@ -1226,6 +1235,7 @@ mod tests {
             timestamp: "2026-03-29 13:57".to_string(),
             operations: vec![],
             skipped: vec![SkippedSubvolume {
+                next_due_minutes: None,
                 name: "htpc-docs".to_string(),
                 reason: "disabled".to_string(),
                 category: SkipCategory::Disabled,
@@ -1263,16 +1273,19 @@ mod tests {
             operations: vec![],
             skipped: vec![
                 SkippedSubvolume {
+                    next_due_minutes: None,
                     name: "htpc-home".to_string(),
                     reason: "drive WD-18TB1 not mounted".to_string(),
                     category: SkipCategory::DriveNotMounted,
                 },
                 SkippedSubvolume {
+                    next_due_minutes: None,
                     name: "htpc-docs".to_string(),
                     reason: "drive WD-18TB1 not mounted".to_string(),
                     category: SkipCategory::DriveNotMounted,
                 },
                 SkippedSubvolume {
+                    next_due_minutes: None,
                     name: "htpc-home".to_string(),
                     reason: "drive 2TB-backup not mounted".to_string(),
                     category: SkipCategory::DriveNotMounted,
@@ -1318,16 +1331,19 @@ mod tests {
             operations: vec![],
             skipped: vec![
                 SkippedSubvolume {
+                    next_due_minutes: Some(846),
                     name: "htpc-home".to_string(),
                     reason: "interval not elapsed (next in ~14h6m)".to_string(),
                     category: SkipCategory::IntervalNotElapsed,
                 },
                 SkippedSubvolume {
+                    next_due_minutes: Some(150),
                     name: "htpc-docs".to_string(),
                     reason: "interval not elapsed (next in ~2h30m)".to_string(),
                     category: SkipCategory::IntervalNotElapsed,
                 },
                 SkippedSubvolume {
+                    next_due_minutes: Some(1200),
                     name: "htpc-tmp".to_string(),
                     reason: "send to WD-18TB not due (next in ~20h0m)".to_string(),
                     category: SkipCategory::IntervalNotElapsed,
@@ -1367,11 +1383,13 @@ mod tests {
             operations: vec![],
             skipped: vec![
                 SkippedSubvolume {
+                    next_due_minutes: Some(9 * 1440),
                     name: "subvol-a".to_string(),
                     reason: "interval not elapsed (next in ~9d)".to_string(),
                     category: SkipCategory::IntervalNotElapsed,
                 },
                 SkippedSubvolume {
+                    next_due_minutes: Some(150),
                     name: "subvol-b".to_string(),
                     reason: "interval not elapsed (next in ~2h30m)".to_string(),
                     category: SkipCategory::IntervalNotElapsed,
@@ -1403,16 +1421,19 @@ mod tests {
             operations: vec![],
             skipped: vec![
                 SkippedSubvolume {
+                    next_due_minutes: None,
                     name: "htpc-root".to_string(),
                     reason: "disabled".to_string(),
                     category: SkipCategory::Disabled,
                 },
                 SkippedSubvolume {
+                    next_due_minutes: None,
                     name: "subvol4-multimedia".to_string(),
                     reason: "disabled".to_string(),
                     category: SkipCategory::Disabled,
                 },
                 SkippedSubvolume {
+                    next_due_minutes: None,
                     name: "subvol6-tmp".to_string(),
                     reason: "local only".to_string(),
                     category: SkipCategory::LocalOnly,
@@ -1458,6 +1479,7 @@ mod tests {
             timestamp: "2026-03-29 13:57".to_string(),
             operations: vec![],
             skipped: vec![SkippedSubvolume {
+                next_due_minutes: None,
                 name: "htpc-home".to_string(),
                 reason: "send to WD-18TB skipped: estimated ~4.5 GB exceeds WD-18TB available"
                     .to_string(),
@@ -1491,6 +1513,7 @@ mod tests {
             timestamp: "2026-03-29 13:57".to_string(),
             operations: vec![],
             skipped: vec![SkippedSubvolume {
+                next_due_minutes: None,
                 name: "htpc-root".to_string(),
                 reason: "external-only \u{2014} sends on next backup".to_string(),
                 category: SkipCategory::ExternalOnly,
@@ -1525,6 +1548,7 @@ mod tests {
         let _color = color_guard(false);
         let mut data = test_backup_summary();
         data.skipped = vec![SkippedSubvolume {
+            next_due_minutes: None,
             name: "htpc-root".to_string(),
             reason: "external-only \u{2014} sends on next backup".to_string(),
             category: SkipCategory::ExternalOnly,
@@ -1548,16 +1572,19 @@ mod tests {
             operations: vec![],
             skipped: vec![
                 SkippedSubvolume {
+                    next_due_minutes: None,
                     name: "sub-a".to_string(),
                     reason: "disabled".to_string(),
                     category: SkipCategory::Disabled,
                 },
                 SkippedSubvolume {
+                    next_due_minutes: None,
                     name: "sub-b".to_string(),
                     reason: "drive WD-18TB not mounted".to_string(),
                     category: SkipCategory::DriveNotMounted,
                 },
                 SkippedSubvolume {
+                    next_due_minutes: None,
                     name: "sub-c".to_string(),
                     reason: "interval not elapsed (next in ~5m)".to_string(),
                     category: SkipCategory::IntervalNotElapsed,
@@ -1593,6 +1620,7 @@ mod tests {
             timestamp: "2026-03-29 13:57".to_string(),
             operations: vec![],
             skipped: vec![SkippedSubvolume {
+                next_due_minutes: None,
                 name: "htpc-home".to_string(),
                 reason: "disabled".to_string(),
                 category: SkipCategory::Disabled,
@@ -1947,11 +1975,13 @@ mod tests {
             subvolumes: vec![],
             skipped: vec![
                 SkippedSubvolume {
+                    next_due_minutes: None,
                     name: "subvol4-multimedia".to_string(),
                     reason: "local only".to_string(),
                     category: SkipCategory::LocalOnly,
                 },
                 SkippedSubvolume {
+                    next_due_minutes: None,
                     name: "htpc-home".to_string(),
                     reason: "drive WD-18TB not mounted".to_string(),
                     category: SkipCategory::DriveNotMounted,
@@ -1981,6 +2011,7 @@ mod tests {
             timestamp: "2026-04-03 12:00".to_string(),
             operations: vec![],
             skipped: vec![SkippedSubvolume {
+                next_due_minutes: None,
                 name: "subvol4-multimedia".to_string(),
                 reason: "local only".to_string(),
                 category: SkipCategory::LocalOnly,
@@ -3720,6 +3751,7 @@ mod tests {
             timestamp: "2026-03-22 15:00".to_string(),
             operations: vec![],
             skipped: vec![SkippedSubvolume {
+                next_due_minutes: None,
                 name: "sv1".to_string(),
                 reason: "unchanged \u{2014} no changes since last snapshot (21h ago)".to_string(),
                 category: SkipCategory::Unchanged,
