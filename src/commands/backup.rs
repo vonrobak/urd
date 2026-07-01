@@ -157,7 +157,7 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
         // Empty plan: no operations to execute. This includes plans where all subvolumes
         // were skipped (drives disconnected, space guard, etc.). Previously this case fell
         // through to the executor which ran zero operations and reported run_result "success".
-        // Now it uses build_empty() with run_result "empty" — more accurate for monitoring.
+        // Now it uses heartbeat::build with no result — run_result "empty" is more accurate for monitoring.
         if !args.auto && !backup_plan.skipped.is_empty() {
             let explanation = build_empty_plan_explanation(&backup_plan, &filters);
             print!("{}", crate::voice::render_empty_plan(&explanation));
@@ -184,9 +184,10 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
         // have freed space, desyncing this heartbeat from the plan's tier).
         let assessments =
             advice::assess_view(&config, heartbeat_now, &observation, &signals.by_subvol);
-        let hb = heartbeat::build_empty(
+        let hb = heartbeat::build(
             &config,
             heartbeat_now,
+            None,
             &assessments,
             &churn_views,
             observability.pools_heartbeat,
@@ -562,10 +563,10 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     // surfaces escalation transitions for the notification path (D6).
     let assessments =
         advice::assess_view(&config, heartbeat_now, &observation, &signals.by_subvol);
-    let hb = heartbeat::build_from_run(
+    let hb = heartbeat::build(
         &config,
         heartbeat_now,
-        &result,
+        Some(&result),
         &assessments,
         &churn_views,
         observability.pools_heartbeat,
@@ -1544,7 +1545,7 @@ fn build_churn_views(
 /// UPI 043: bundled outputs from a single pool-observability pass. Threaded
 /// into both metrics emission (`write_metrics_after_execution` /
 /// `write_metrics_for_skipped`) and heartbeat construction
-/// (`heartbeat::build_from_run` / `heartbeat::build_empty`).
+/// (`heartbeat::build`).
 struct PoolObservability {
     pools_heartbeat: Vec<PoolHeartbeat>,
     drives_heartbeat: Vec<DriveHeartbeat>,

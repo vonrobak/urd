@@ -280,7 +280,6 @@ struct SubvolumeContext {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct ExecutionResult {
     pub overall: RunResult,
     pub subvolume_results: Vec<SubvolumeResult>,

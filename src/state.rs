@@ -66,12 +66,12 @@ impl DriveEventSource {
 
 /// A drive connection event returned from database queries.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct DriveConnectionRecord {
-    pub id: i64,
-    pub drive_label: String,
     pub event_type: String,
     pub timestamp: String,
+    /// Read only by migration tests — verifies the legacy projection
+    /// preserves sentinel/backup attribution (UPI 036).
+    #[allow(dead_code)]
     pub detected_by: String,
 }
 
@@ -489,25 +489,6 @@ impl StateDb {
             .map_err(|e| UrdError::State(format!("failed to read runs: {e}")))
     }
 
-    /// Get all operations for a specific run.
-    #[allow(dead_code)]
-    pub fn run_operations(&self, run_id: i64) -> crate::error::Result<Vec<OperationRow>> {
-        let mut stmt = self
-            .conn
-            .prepare(
-                "SELECT id, run_id, subvolume, operation, drive_label, duration_secs, result, error_message, bytes_transferred
-                 FROM operations WHERE run_id = ?1 ORDER BY id",
-            )
-            .map_err(|e| UrdError::State(format!("query failed: {e}")))?;
-
-        let rows = stmt
-            .query_map([run_id], Self::map_operation_row)
-            .map_err(|e| UrdError::State(format!("query failed: {e}")))?;
-
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|e| UrdError::State(format!("failed to read operations: {e}")))
-    }
-
     /// Get recent operations for a specific subvolume.
     pub fn subvolume_history(
         &self,
@@ -617,7 +598,6 @@ impl StateDb {
 
     /// Get the timestamp of the most recent successful send (full or incremental)
     /// for a subvolume to a specific drive. Returns the run's started_at timestamp.
-    #[allow(dead_code)]
     pub fn last_successful_send_time(
         &self,
         subvol: &str,
@@ -981,8 +961,6 @@ impl StateDb {
                     }
                 };
                 Ok(Some(DriveConnectionRecord {
-                    id,
-                    drive_label: drive_label.to_string(),
                     event_type,
                     timestamp,
                     detected_by,
@@ -1050,8 +1028,6 @@ impl StateDb {
                 }
             };
             records.push(DriveConnectionRecord {
-                id,
-                drive_label: drive_label.to_string(),
                 event_type,
                 timestamp,
                 detected_by,
@@ -1403,7 +1379,6 @@ impl StateDb {
     }
 
     /// Query events with optional filters, newest first.
-    #[allow(dead_code)]
     pub fn query_events(
         &self,
         filter: &EventQueryFilter,
@@ -1479,7 +1454,6 @@ impl StateDb {
     // ── Counter helpers for Prometheus metrics ──────────────────────
 
     /// Total number of `SentinelCircuitBreak` events whose `to` is `open`.
-    #[allow(dead_code)]
     pub fn count_circuit_breaker_trips(&self) -> crate::error::Result<u64> {
         let n: i64 = self
             .conn
@@ -1496,7 +1470,6 @@ impl StateDb {
     }
 
     /// `PlannerSendChoice` counts grouped by `reason` (full-send reason).
-    #[allow(dead_code)]
     pub fn count_full_sends_by_reason(
         &self,
     ) -> crate::error::Result<Vec<(String, u64)>> {
@@ -1504,13 +1477,11 @@ impl StateDb {
     }
 
     /// `PlannerDefer` counts grouped by `scope`.
-    #[allow(dead_code)]
     pub fn count_defers_by_scope(&self) -> crate::error::Result<Vec<(String, u64)>> {
         self.count_grouped("planner", "PlannerDefer", "scope")
     }
 
     /// `RetentionPrune` counts grouped by `rule`.
-    #[allow(dead_code)]
     pub fn count_prunes_by_rule(&self) -> crate::error::Result<Vec<(String, u64)>> {
         self.count_grouped("retention", "RetentionPrune", "rule")
     }
@@ -1548,7 +1519,6 @@ impl StateDb {
 
 /// Filter parameters for `StateDb::query_events`.
 #[derive(Debug, Clone, Default)]
-#[allow(dead_code)]
 pub struct EventQueryFilter {
     pub since: Option<chrono::NaiveDateTime>,
     pub kind: Option<EventKind>,
@@ -1801,21 +1771,6 @@ mod tests {
 
         let one = db.recent_runs(1).unwrap();
         assert_eq!(one.len(), 1);
-    }
-
-    #[test]
-    fn run_operations_returns_ops_for_run() {
-        let db = StateDb::open_memory().unwrap();
-        let (r1, r2) = seed_db(&db);
-
-        let ops1 = db.run_operations(r1).unwrap();
-        assert_eq!(ops1.len(), 2);
-        assert_eq!(ops1[0].operation, "snapshot");
-        assert_eq!(ops1[1].operation, "send_incremental");
-
-        let ops2 = db.run_operations(r2).unwrap();
-        assert_eq!(ops2.len(), 1);
-        assert_eq!(ops2[0].result, "failure");
     }
 
     #[test]
@@ -2260,7 +2215,6 @@ mod tests {
             .unwrap();
 
         let record = db.last_drive_connection("WD-18TB").unwrap().unwrap();
-        assert_eq!(record.drive_label, "WD-18TB");
         assert_eq!(record.event_type, "mounted");
         assert_eq!(record.detected_by, "sentinel");
         assert!(!record.timestamp.is_empty());

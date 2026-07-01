@@ -12,6 +12,7 @@ use colored::Colorize;
 use crate::events::{EventPayload, Severity};
 use crate::output::{EventRow, EventsView};
 use crate::types::ByteSize;
+use crate::voice::truncate_str;
 
 /// Render the events view as a columnar listing for interactive use.
 #[must_use]
@@ -70,9 +71,9 @@ fn format_row(row: &EventRow) -> String {
     let painted = colorize_severity(&row.payload, &summary);
     format!(
         "{:<19}  {:<9}  {:<14}  {painted}",
-        truncate(&row.occurred_at, 19),
+        truncate_str(&row.occurred_at, 19),
         row.kind.as_str(),
-        truncate(&scope, 14),
+        truncate_str(&scope, 14),
     )
 }
 
@@ -243,18 +244,6 @@ fn trigger_phrase(trigger: crate::events::TransitionTrigger) -> &'static str {
         Tick => "tick",
         DriveMounted => "drive mounted",
         ConfigChanged => "config changed",
-    }
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        let mut end = max.saturating_sub(1);
-        while !s.is_char_boundary(end) && end > 0 {
-            end -= 1;
-        }
-        format!("{}…", &s[..end])
     }
 }
 
@@ -573,14 +562,6 @@ mod tests {
             Some("planner")
         );
         assert!(parsed.get("payload").is_some());
-    }
-
-    #[test]
-    fn truncate_is_char_boundary_safe() {
-        let _color = setup();
-        // Multibyte char near the boundary should not panic.
-        let s = "café-café-café";
-        let _ = truncate(s, 6);
     }
 
     fn _unused_event() -> Event {
