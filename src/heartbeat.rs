@@ -126,24 +126,24 @@ pub struct SubvolumeHeartbeat {
 
 // ── Builder ─────────────────────────────────────────────────────────────
 
-/// Build a heartbeat from a completed backup run with awareness assessments.
+/// Build a heartbeat with awareness assessments. `result` is the completed
+/// backup run, or `None` for an empty/skipped run (`run_result: "empty"`).
 ///
 /// If a future addition pushes this past 8 args, refactor to a
 /// `HeartbeatInputs { ... }` struct instead of growing the positional list.
 #[must_use]
 #[allow(clippy::too_many_arguments)]
-pub fn build_from_run(
+pub fn build(
     config: &Config,
     now: NaiveDateTime,
-    result: &ExecutionResult,
+    result: Option<&ExecutionResult>,
     assessments: &[SubvolAssessment],
     churn_views: &HashMap<String, ChurnHeartbeatFields>,
     pools: Vec<PoolHeartbeat>,
     drives: Vec<DriveHeartbeat>,
     subvol_extras: &HashMap<String, SubvolumeExtras>,
 ) -> Heartbeat {
-    let subvolumes =
-        build_subvolume_entries(Some(result), assessments, churn_views, subvol_extras);
+    let subvolumes = build_subvolume_entries(result, assessments, churn_views, subvol_extras);
 
     Heartbeat {
         schema_version: SCHEMA_VERSION,
@@ -151,40 +151,9 @@ pub fn build_from_run(
         stale_after: compute_stale_after(config, now)
             .format("%Y-%m-%dT%H:%M:%S")
             .to_string(),
-        run_result: result.overall.as_str().to_string(),
-        run_id: result.run_id,
-        subvolumes,
-        notifications_dispatched: false,
-        pools,
-        drives,
-    }
-}
-
-/// Build a heartbeat for an empty/skipped run (no execution result).
-///
-/// If a future addition pushes this past 8 args, refactor to a
-/// `HeartbeatInputs { ... }` struct instead of growing the positional list.
-#[must_use]
-#[allow(clippy::too_many_arguments)]
-pub fn build_empty(
-    config: &Config,
-    now: NaiveDateTime,
-    assessments: &[SubvolAssessment],
-    churn_views: &HashMap<String, ChurnHeartbeatFields>,
-    pools: Vec<PoolHeartbeat>,
-    drives: Vec<DriveHeartbeat>,
-    subvol_extras: &HashMap<String, SubvolumeExtras>,
-) -> Heartbeat {
-    let subvolumes = build_subvolume_entries(None, assessments, churn_views, subvol_extras);
-
-    Heartbeat {
-        schema_version: SCHEMA_VERSION,
-        timestamp: now.format("%Y-%m-%dT%H:%M:%S").to_string(),
-        stale_after: compute_stale_after(config, now)
-            .format("%Y-%m-%dT%H:%M:%S")
-            .to_string(),
-        run_result: "empty".to_string(),
-        run_id: None,
+        run_result: result
+            .map_or_else(|| "empty".to_string(), |r| r.overall.as_str().to_string()),
+        run_id: result.and_then(|r| r.run_id),
         subvolumes,
         notifications_dispatched: false,
         pools,
@@ -478,10 +447,10 @@ mod tests {
         let assessments = test_assessments();
         let result = test_execution_result();
 
-        let heartbeat = build_from_run(
+        let heartbeat = build(
             &config,
             now,
-            &result,
+            Some(&result),
             &assessments,
             &HashMap::new(),
             Vec::new(),
@@ -531,10 +500,10 @@ mod tests {
         });
         let result = test_execution_result();
 
-        let heartbeat = build_from_run(
+        let heartbeat = build(
             &config,
             now,
-            &result,
+            Some(&result),
             &assessments,
             &HashMap::new(),
             Vec::new(),
@@ -583,9 +552,10 @@ mod tests {
             NaiveDateTime::parse_from_str("2026-03-24T02:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
         let assessments = test_assessments();
 
-        let heartbeat = build_empty(
+        let heartbeat = build(
             &config,
             now,
+            None,
             &assessments,
             &HashMap::new(),
             Vec::new(),
@@ -616,9 +586,10 @@ mod tests {
             NaiveDateTime::parse_from_str("2026-03-24T02:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
         let assessments = test_assessments();
 
-        let heartbeat = build_empty(
+        let heartbeat = build(
             &config,
             now,
+            None,
             &assessments,
             &HashMap::new(),
             Vec::new(),
@@ -643,9 +614,10 @@ mod tests {
         let config = test_config(&[("home", "1h")]);
         let now =
             NaiveDateTime::parse_from_str("2026-03-24T02:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
-        let heartbeat = build_empty(
+        let heartbeat = build(
             &config,
             now,
+            None,
             &test_assessments(),
             &HashMap::new(),
             Vec::new(),
@@ -664,9 +636,10 @@ mod tests {
         let config = test_config(&[("home", "1h")]);
         let now =
             NaiveDateTime::parse_from_str("2026-04-30T03:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
-        let heartbeat = build_empty(
+        let heartbeat = build(
             &config,
             now,
+            None,
             &test_assessments(),
             &HashMap::new(),
             Vec::new(),
@@ -693,9 +666,10 @@ mod tests {
             },
         );
 
-        let hb = build_empty(
+        let hb = build(
             &config,
             now,
+            None,
             &test_assessments(),
             &churn,
             Vec::new(),
@@ -724,9 +698,10 @@ mod tests {
             },
         );
 
-        let hb = build_empty(
+        let hb = build(
             &config,
             now,
+            None,
             &test_assessments(),
             &churn,
             Vec::new(),
@@ -771,9 +746,10 @@ mod tests {
         let config = test_config(&[("home", "1h")]);
         let now =
             NaiveDateTime::parse_from_str("2026-04-30T03:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
-        let hb = build_empty(
+        let hb = build(
             &config,
             now,
+            None,
             &test_assessments(),
             &HashMap::new(),
             Vec::new(),
@@ -792,9 +768,10 @@ mod tests {
         let config = test_config(&[("home", "1h")]);
         let now =
             NaiveDateTime::parse_from_str("2026-04-30T03:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
-        let hb = build_empty(
+        let hb = build(
             &config,
             now,
+            None,
             &test_assessments(),
             &HashMap::new(),
             Vec::new(),
@@ -885,10 +862,10 @@ mod tests {
             run_id: Some(1),
         };
 
-        let hb = build_from_run(
+        let hb = build(
             &config,
             now,
-            &result,
+            Some(&result),
             &assessments,
             &HashMap::new(),
             Vec::new(),
@@ -923,10 +900,10 @@ mod tests {
             run_id: Some(1),
         };
 
-        let hb = build_from_run(
+        let hb = build(
             &config,
             now,
-            &result,
+            Some(&result),
             &assessments,
             &HashMap::new(),
             Vec::new(),
@@ -961,10 +938,10 @@ mod tests {
             run_id: Some(1),
         };
 
-        let hb = build_from_run(
+        let hb = build(
             &config,
             now,
-            &result,
+            Some(&result),
             &assessments,
             &HashMap::new(),
             Vec::new(),
@@ -1058,9 +1035,10 @@ mod tests {
         let config = test_config(&[("home", "1h")]);
         let now =
             NaiveDateTime::parse_from_str("2026-05-15T03:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
-        let hb = build_empty(
+        let hb = build(
             &config,
             now,
+            None,
             &test_assessments(),
             &HashMap::new(),
             Vec::new(),
@@ -1086,9 +1064,10 @@ mod tests {
             free_bytes: Some(42),
             metadata_utilization_ratio: Some(0.5),
         }];
-        let hb = build_empty(
+        let hb = build(
             &config,
             now,
+            None,
             &test_assessments(),
             &HashMap::new(),
             pools,
@@ -1110,9 +1089,10 @@ mod tests {
         let config = test_config(&[("home", "1h")]);
         let now =
             NaiveDateTime::parse_from_str("2026-05-15T03:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
-        let hb = build_empty(
+        let hb = build(
             &config,
             now,
+            None,
             &test_assessments(),
             &HashMap::new(),
             Vec::new(),
@@ -1137,9 +1117,10 @@ mod tests {
                 estimated_local_pinned_delta_bytes: Some(1_000_000),
             },
         );
-        let hb = build_empty(
+        let hb = build(
             &config,
             now,
+            None,
             &test_assessments(),
             &HashMap::new(),
             Vec::new(),
@@ -1166,9 +1147,10 @@ mod tests {
             mounted: true,
             pool_uuid: Some("uuid-x".to_string()),
         }];
-        let hb = build_empty(
+        let hb = build(
             &config,
             now,
+            None,
             &test_assessments(),
             &HashMap::new(),
             Vec::new(),
@@ -1195,9 +1177,10 @@ mod tests {
         let config = test_config(&[("home", "1h")]);
         let now =
             NaiveDateTime::parse_from_str("2026-05-15T03:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
-        let hb = build_empty(
+        let hb = build(
             &config,
             now,
+            None,
             &test_assessments(),
             &HashMap::new(),
             Vec::new(),

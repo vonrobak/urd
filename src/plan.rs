@@ -1317,7 +1317,10 @@ fn plan_external_send(
     } else if !is_incremental {
         // Tier 3: Calibrated size from `urd calibrate` (only for full sends)
         if let Some((cal_bytes, measured_at)) = obs.history.calibrated_size(&subvol.name) {
-            let age_days = calibration_age_days(&measured_at);
+            let now_ts = chrono::Local::now().naive_local();
+            let age_days = chrono::NaiveDateTime::parse_from_str(&measured_at, "%Y-%m-%dT%H:%M:%S")
+                .map(|ts| (now_ts - ts).num_days())
+                .unwrap_or(365); // corrupt timestamp → treat as stale, not fresh
             let staleness = if age_days > 30 {
                 format!(
                     " (calibrated {} days ago — run `urd calibrate` to refresh)",
@@ -1495,13 +1498,6 @@ fn exceeds_available_space(
     } else {
         None
     }
-}
-
-fn calibration_age_days(measured_at: &str) -> i64 {
-    let now = chrono::Local::now().naive_local();
-    chrono::NaiveDateTime::parse_from_str(measured_at, "%Y-%m-%dT%H:%M:%S")
-        .map(|ts| (now - ts).num_days())
-        .unwrap_or(365) // corrupt timestamp → treat as stale, not fresh
 }
 
 // ── RealFileSystemState ─────────────────────────────────────────────────

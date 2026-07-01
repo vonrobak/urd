@@ -499,7 +499,7 @@ pub struct DriveAssessment {
 ///
 /// Pure function. Empty `previous` returns an empty Vec (suppresses
 /// noise on first run, matching the precedent in
-/// `sentinel::has_changes`). Subvolumes present in `previous` but
+/// `sentinel::has_promise_changes`). Subvolumes present in `previous` but
 /// missing from `current` are silent (deletion is not a transition we
 /// log). Subvolumes new in `current` (not in `previous`) are also
 /// silent — appearance is not a transition either.

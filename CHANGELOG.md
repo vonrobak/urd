@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Internal hygiene sweep from the 2026-07-01 repo-wide over-engineering audit**
+  (findings 5–10): the two heartbeat builders merged into one `heartbeat::build`
+  taking an optional run result; the `NamedSnapshot` trait replaced by plain
+  closure-parameterized change detection; a dead SQLite reader
+  (`run_operations`) deleted; stale `#[allow(dead_code)]` attributes stripped so
+  the dead-code lint regains its value (which surfaced and removed two dead
+  `DriveConnectionRecord` fields); duplicate string-truncation helpers unified.
+  No user-visible behavior change except truncated cells in `urd events` now use
+  `...` (matching every other table) instead of `…`.
+
 ## [0.28.0] - 2026-06-29
 
 ### Added

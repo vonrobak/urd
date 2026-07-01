@@ -330,8 +330,9 @@ pub(super) fn format_history_table(headers: &[String], rows: &[Vec<String>], out
 /// Truncate a string to a maximum visible length, appending an ellipsis when
 /// trimmed. Char-boundary-safe.
 ///
-/// `pub(super)` for sibling voice/* sub-modules (history.rs, verify.rs).
-pub(super) fn truncate_str(s: &str, max_len: usize) -> String {
+/// `pub(crate)` for the voice/* sub-modules (history.rs, verify.rs) and
+/// `voice_events.rs`.
+pub(crate) fn truncate_str(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
         return s.to_string();
     }
@@ -753,6 +754,17 @@ mod tests {
         TransitionEvent, VerifyCheck, VerifyDrive,
         VerifyOutput, VerifySubvolume,
     };
+
+    // ── Table primitive tests ───────────────────────────────────────
+
+    #[test]
+    fn truncate_str_is_char_boundary_safe() {
+        // Multibyte char near the boundary must not panic.
+        let s = "café-café-café";
+        let _ = truncate_str(s, 6);
+        assert_eq!(truncate_str("short", 10), "short");
+        assert!(truncate_str("a-much-longer-string", 10).ends_with("..."));
+    }
 
     // ── Backup summary tests ────────────────────────────────────────
 

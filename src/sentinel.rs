@@ -563,55 +563,33 @@ pub fn evaluate_trigger_result(
 
 // ── Snapshot change detection ──────────────────────────────────────────
 
-/// Trait for snapshot types that can be compared against assessments.
-/// Enables generic change detection across promise and health axes.
-pub trait NamedSnapshot {
-    fn name(&self) -> &str;
-    fn changed(&self, assessment: &SubvolAssessment) -> bool;
-}
-
-impl NamedSnapshot for PromiseSnapshot {
-    fn name(&self) -> &str {
-        &self.name
-    }
-    fn changed(&self, assessment: &SubvolAssessment) -> bool {
-        self.status != assessment.status
-    }
-}
-
-impl NamedSnapshot for HealthSnapshot {
-    fn name(&self) -> &str {
-        &self.name
-    }
-    fn changed(&self, assessment: &SubvolAssessment) -> bool {
-        self.health != assessment.health
-    }
-}
-
 /// Determine whether snapshot state transitions warrant notifications.
-/// Returns true if any subvolume's tracked state changed, appeared, or disappeared.
+/// Returns true if any subvolume's tracked state changed, appeared, or
+/// disappeared. `name` and `changed` project the per-axis snapshot type
+/// (promise status / health).
 ///
 /// Special case: when `previous` is empty (first assessment after startup),
 /// returns false to suppress spurious notifications (review item M3).
-#[must_use]
-pub fn has_changes<T: NamedSnapshot>(
+fn has_changes<T>(
     previous: &[T],
     current: &[SubvolAssessment],
+    name: impl Fn(&T) -> &str,
+    changed: impl Fn(&T, &SubvolAssessment) -> bool,
 ) -> bool {
     if previous.is_empty() {
         return false;
     }
 
     for assess in current {
-        match previous.iter().find(|p| p.name() == assess.name) {
-            Some(prev) if prev.changed(assess) => return true,
+        match previous.iter().find(|p| name(p) == assess.name) {
+            Some(prev) if changed(prev, assess) => return true,
             None => return true,
             _ => {}
         }
     }
 
     for prev in previous {
-        if !current.iter().any(|a| a.name == prev.name()) {
+        if !current.iter().any(|a| a.name == name(prev)) {
             return true;
         }
     }
@@ -619,22 +597,22 @@ pub fn has_changes<T: NamedSnapshot>(
     false
 }
 
-/// Convenience alias: detect promise state changes.
+/// Detect promise state changes.
 #[must_use]
 pub fn has_promise_changes(
     previous: &[PromiseSnapshot],
     current: &[SubvolAssessment],
 ) -> bool {
-    has_changes(previous, current)
+    has_changes(previous, current, |p| &p.name, |p, a| p.status != a.status)
 }
 
-/// Convenience alias: detect health state changes.
+/// Detect health state changes.
 #[must_use]
 pub fn has_health_changes(
     previous: &[HealthSnapshot],
     current: &[SubvolAssessment],
 ) -> bool {
-    has_changes(previous, current)
+    has_changes(previous, current, |p| &p.name, |p, a| p.health != a.health)
 }
 
 /// Should this assess record promise-transition events? (UPI 063)

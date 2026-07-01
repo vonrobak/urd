@@ -682,7 +682,7 @@ pub fn render_churn(estimate: &crate::drift::ChurnEstimate) -> ChurnRender {
 
 /// Heartbeat / metrics projection of a single subvolume's churn state.
 /// `commands/backup.rs` builds a `HashMap<String, ChurnHeartbeatFields>` and
-/// passes it to both `heartbeat::build_from_run` and
+/// passes it to both `heartbeat::build` and
 /// `metrics::write_metrics_after_execution` so both surfaces share the same
 /// policy: incremental → `churn_bytes_per_second`; full-only →
 /// `last_full_send_bytes`. Cold-start subvolumes have both `None`.
@@ -696,7 +696,7 @@ pub struct ChurnHeartbeatFields {
 }
 
 /// Per-subvolume "extras" populated by `gather_pool_observability` and threaded
-/// to both `heartbeat::build_from_run` and `metrics::write_metrics_after_execution`
+/// to both `heartbeat::build` and `metrics::write_metrics_after_execution`
 /// so both surfaces share the same `pool_uuid`, `local_snapshot_count`, and
 /// `estimated_local_pinned_delta_bytes` values for a given run (UPI 043).
 #[derive(Debug, Clone, Default)]
