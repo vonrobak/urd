@@ -147,12 +147,14 @@ pub(super) fn humanize_cadence(secs: i64) -> String {
 
 // ── Table formatter ─────────────────────────────────────────────────────
 
-/// Format status table with optional colored SAFETY and HEALTH columns.
-fn format_status_table(
+/// Format an aligned table: two-space-separated columns, bold header row.
+/// `colorize` maps (column index, cell) to a colored rendering, or `None`
+/// to leave the cell plain. Column widths and padding are computed from
+/// visible (ANSI-stripped) length, so pre-colored cells align correctly.
+fn format_table(
     headers: &[String],
     rows: &[Vec<String>],
-    safety_col: Option<usize>,
-    health_col: Option<usize>,
+    colorize: impl Fn(usize, &str) -> Option<String>,
     out: &mut String,
 ) {
     let cols = headers.len();
@@ -175,30 +177,44 @@ fn format_status_table(
     let header_str = header_line.join("  ");
     writeln!(out, "{}", header_str.trim_end().bold()).ok();
 
-    // Rows — color SAFETY and HEALTH columns
     for row in rows {
         let line: Vec<String> = row
             .iter()
             .enumerate()
             .map(|(i, cell)| {
-                let w = widths.get(i).copied().unwrap_or(cell.len());
-                let visible_len = strip_ansi_len(cell);
-                if safety_col == Some(i) {
-                    color_and_pad(&color_exposure_str(cell), cell.len(), w)
-                } else if health_col == Some(i) {
-                    color_and_pad(&color_health_str(cell), cell.len(), w)
-                } else if visible_len != cell.len() {
-                    // Cell already contains ANSI codes (pre-colored) — pad by visible width
-                    let padding = w.saturating_sub(visible_len);
-                    format!("{cell}{:padding$}", "", padding = padding)
-                } else {
-                    format!("{:<width$}", cell, width = w)
-                }
+                let w = widths.get(i).copied().unwrap_or_else(|| strip_ansi_len(cell));
+                let rendered = colorize(i, cell).unwrap_or_else(|| cell.to_string());
+                let padding = w.saturating_sub(strip_ansi_len(&rendered));
+                format!("{rendered}{:padding$}", "", padding = padding)
             })
             .collect();
         let row_str = line.join("  ");
         writeln!(out, "{}", row_str.trim_end()).ok();
     }
+}
+
+/// Format status table with optional colored SAFETY and HEALTH columns.
+fn format_status_table(
+    headers: &[String],
+    rows: &[Vec<String>],
+    safety_col: Option<usize>,
+    health_col: Option<usize>,
+    out: &mut String,
+) {
+    format_table(
+        headers,
+        rows,
+        |i, cell| {
+            if safety_col == Some(i) {
+                Some(color_exposure_str(cell))
+            } else if health_col == Some(i) {
+                Some(color_health_str(cell))
+            } else {
+                None
+            }
+        },
+        out,
+    );
 }
 
 
@@ -219,12 +235,6 @@ fn strip_ansi_len(s: &str) -> usize {
         }
     }
     len
-}
-
-/// Apply color then pad to column width (ANSI codes are invisible bytes).
-fn color_and_pad(colored: &str, visible_len: usize, width: usize) -> String {
-    let padding = width.saturating_sub(visible_len);
-    format!("{colored}{:padding$}", "", padding = padding)
 }
 
 // ── Color helpers ───────────────────────────────────────────────────────
@@ -284,47 +294,13 @@ pub(super) fn skip_tag(category: &SkipCategory) -> String {
 /// `pub(super)` for sibling voice/* sub-modules (history.rs, verify.rs) per
 /// UPI 050 phase 2 — cross-renderer helper, single definition stays here.
 pub(super) fn format_history_table(headers: &[String], rows: &[Vec<String>], out: &mut String) {
-    let cols = headers.len();
-    let mut widths: Vec<usize> = headers.iter().map(|h| h.len()).collect();
-    for row in rows {
-        for (i, cell) in row.iter().enumerate() {
-            if i < cols {
-                widths[i] = widths[i].max(cell.len());
-            }
-        }
-    }
-
-    // Header
-    let header_line: Vec<String> = headers
-        .iter()
-        .enumerate()
-        .map(|(i, h)| format!("{:<width$}", h, width = widths[i]))
-        .collect();
-    // Trim the last column's padding — trailing whitespace aligns nothing.
-    let header_str = header_line.join("  ");
-    writeln!(out, "{}", header_str.trim_end().bold()).ok();
-
-    // Rows — color the RESULT column
     let result_col = headers.iter().position(|h| h == "RESULT");
-    for row in rows {
-        let line: Vec<String> = row
-            .iter()
-            .enumerate()
-            .map(|(i, cell)| {
-                let w = widths.get(i).copied().unwrap_or(cell.len());
-                if Some(i) == result_col {
-                    let colored = color_result(cell);
-                    let visible_len = cell.len();
-                    let padding = w.saturating_sub(visible_len);
-                    format!("{colored}{:padding$}", "", padding = padding)
-                } else {
-                    format!("{:<width$}", cell, width = w)
-                }
-            })
-            .collect();
-        let row_str = line.join("  ");
-        writeln!(out, "{}", row_str.trim_end()).ok();
-    }
+    format_table(
+        headers,
+        rows,
+        |i, cell| (Some(i) == result_col).then(|| color_result(cell)),
+        out,
+    );
 }
 
 /// Truncate a string to a maximum visible length, appending an ellipsis when
@@ -756,6 +732,46 @@ mod tests {
     };
 
     // ── Table primitive tests ───────────────────────────────────────
+
+    /// Regression: pre-colored cells (ANSI codes already embedded) must not
+    /// inflate column widths — `format_history_table` used byte length for
+    /// width calc, so a colored cell mis-aligned every later column.
+    #[test]
+    fn history_table_aligns_pre_colored_cells() {
+        fn strip_ansi(s: &str) -> String {
+            let mut out = String::new();
+            let mut in_escape = false;
+            for c in s.chars() {
+                if in_escape {
+                    in_escape = c != 'm';
+                } else if c == '\x1b' {
+                    in_escape = true;
+                } else {
+                    out.push(c);
+                }
+            }
+            out
+        }
+
+        let headers = vec!["NAME".to_string(), "NOTE".to_string()];
+        let rows = vec![
+            // Pre-colored cell: 1 visible char, many bytes of ANSI.
+            vec!["\x1b[31mx\x1b[0m".to_string(), "end".to_string()],
+            vec!["yy".to_string(), "end".to_string()],
+        ];
+        let mut out = String::new();
+        format_history_table(&headers, &rows, &mut out);
+
+        let cols: Vec<usize> = out
+            .lines()
+            .skip(1) // header
+            .map(|line| strip_ansi(line).find("end").expect("row has NOTE cell"))
+            .collect();
+        assert_eq!(
+            cols[0], cols[1],
+            "pre-colored cell must not shift the next column: {out:?}"
+        );
+    }
 
     #[test]
     fn truncate_str_is_char_boundary_safe() {

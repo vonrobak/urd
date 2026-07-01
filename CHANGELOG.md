@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **History and verify tables no longer mis-align rows containing pre-colored
+  cells.** The history-table formatter computed column widths from byte length,
+  so a cell carrying ANSI color codes inflated its column and shifted every
+  later column. Both table formatters now share one core that measures visible
+  (ANSI-stripped) width.
+
 ### Changed
 - **Internal hygiene sweep from the 2026-07-01 repo-wide over-engineering audit**
   (findings 5–10): the two heartbeat builders merged into one `heartbeat::build`
