@@ -492,6 +492,8 @@ Config error: snapshot_root on [[subvolumes]] requires config_version = 1
   `Config::validate()` (ADR-109).
 - `name` is an on-disk contract — it must never be derived or defaulted (ADR-105).
 - Schema changes require incrementing `config_version` and updating `urd migrate`.
+  Scope refined by the 2026-07-02 amendment: only *shape-breaking* changes force a bump;
+  additive-optional fields, and the retirement of never-set additive-optional fields, do not.
 - Hardcoded fallback values must be documented in help text.
 
 ## Implementation Gates
@@ -636,6 +638,56 @@ v2 alone. `parse_v1` uses a v1-only shim (`V1GraduatedRetention` keeps
 `monthly: Option<u32>`), and `V1Config::into_config()` maps to `MonthlyCount` explicitly.
 This is load-bearing: without the isolation, parse_v1 would reject every existing v1 config
 with `monthly = 0`, breaking ADR-105's backward-compatibility contract.
+
+## Amendment 2026-07-02: field retirement without a version bump
+
+UPI 068 (retirement of the `cleanup_budget` field) forced a precise reading of the
+Constraints bullet "Schema changes require incrementing `config_version`". This amendment
+corrects that reading, retroactively codifies existing practice, and defines the criterion
+under which a config field may be *retired* without a schema version bump.
+
+### Corrected constraint reading
+
+`config_version` increments for **shape-breaking** changes only: a change after which an
+existing config either fails to load or loads with changed meaning. The version field
+exists so the parser can give old configs their old semantics — it is not a changelog of
+the field set.
+
+### Retroactive codification: additive-optional fields need no bump
+
+Additive-optional fields — new `Option` fields with a `None` default that preserves prior
+behavior — may be added to an existing schema version without a bump. Every config that
+loaded before loads identically after. This has been practice since UPI 033
+(`cleanup_budget`) and UPI 055 (`rotation_interval`); it is now codified.
+
+### Retirement criterion
+
+An additive-optional field may be **retired** without a version bump **iff both hold**:
+
+1. **The set-population is empty or effectively empty.** No known config sets the field
+   (verified against real deployments), so no config's behavior can change.
+2. **The fallback direction is safe.** *Safe means safe for the host*: after retirement,
+   the protective mechanism the field tuned still exists and cannot silently vanish — the
+   derived default takes over unconditionally. This is deliberately two-sided: a config
+   that *did* set an explicit value **below** the derived default is overridden **upward**,
+   meaning the destructive responses gated on that floor (watchdog abort, sentinel idle
+   eject) now fire at a level the operator had deliberately blessed as too conservative.
+   That is accepted: the host-safety direction wins, and the `urd migrate` warning (below)
+   is the operator's notice that their tuning was dropped.
+
+**Mechanism.** The parsers already tolerate unknown keys (no `deny_unknown_fields` on any
+of the three schema structs), so deleting the field from the raw structs makes the residual
+key inert in legacy, v1, and v2 configs alike — every config that loaded before still
+loads. `urd migrate` **warns-and-drops**: it detects the residual key in the raw input and
+reports the drop in its structured summary, fixing the silent-drop behavior that plain
+tolerated-unknown-key deletion would otherwise have.
+
+**First application:** UPI 068, retiring `cleanup_budget` (added UPI 033, never set in
+practice; the derived 1.5 %-of-capacity working room is the only behavior ever exercised).
+
+**Boundary counter-example:** removing `max_usage_percent` *would* force a version bump —
+it is set in real configs, and dropping it would silently widen the send-eligibility of
+drives the operator had constrained. Fails both criteria.
 
 ## Related
 

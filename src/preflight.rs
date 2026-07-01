@@ -400,7 +400,6 @@ mod tests {
                     path: PathBuf::from("/snapshots"),
                     subvolumes: subvolumes.iter().map(|s| s.name.clone()).collect(),
                     min_free_bytes: Some(ByteSize(1_073_741_824)), // 1GB
-                    cleanup_budget: None,
                 }],
             },
             defaults: DefaultsConfig {

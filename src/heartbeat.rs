@@ -322,7 +322,6 @@ mod tests {
                     path: PathBuf::from("/tmp/snapshots"),
                     subvolumes: intervals.iter().map(|(n, _)| n.to_string()).collect(),
                     min_free_bytes: None,
-                    cleanup_budget: None,
                 }],
             },
             defaults: DefaultsConfig {

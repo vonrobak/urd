@@ -80,8 +80,7 @@ pub const ABS_HEADROOM_GATE_RELEASE_MULTIPLE: f64 = 3.5;
 /// factor (the htpc case). A pool therefore leaves Critical only once free
 /// recovers to the **Caution line** (`FREE_RATIO_PRESSURE + 0.10 = 0.25`, where
 /// the classifier stops calling it tight at all) before shedding the
-/// footprint-cap — the conservative "host wins" bias of the north star. The
-/// deeper dwell-time / `cleanup_budget` treatment is 033 scope.
+/// footprint-cap — the conservative "host wins" bias of the north star.
 pub const CRITICAL_DEESCALATION_BAND_PP: f64 = 0.10;
 
 /// Tight send-interval multiplier (UPI 031-b). At Tight the retain-one pin

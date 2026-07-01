@@ -48,7 +48,8 @@ pub trait FilesystemQuery {
 
     /// Get total capacity bytes of the filesystem containing the given path.
     /// Needed by the planner's send-space guard (UPI 054-a) to resolve the
-    /// capacity-relative default of `cleanup_budget` in the host-survival floor.
+    /// capacity-derived working room (`cleanup_budget`, fixed 1.5 %) in the
+    /// host-survival floor.
     fn filesystem_capacity_bytes(&self, path: &Path) -> crate::error::Result<u64>;
 
     /// Read the pin file for a specific drive from a local snapshot directory.
