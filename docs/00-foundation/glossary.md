@@ -12,8 +12,9 @@ language is ambiguous in another doc.
 
 ## How to read this glossary
 
-Terms are grouped into seven **clusters**: Promise, Voice, Protection, Drive,
-Thread, Retention, Identifier. Each cluster has a canonical definition table
+Terms are grouped into **clusters**: Promise, Voice, Protection, Drive, Thread,
+Retention, Identifier, Recommendation, Storage pressure, Read-side query seams,
+Planner soundness. Each cluster has a canonical definition table
 and a short **In context** example grounded in real CLI output, config, or
 on-disk artifacts. Skim by cluster heading; use the examples when a definition
 alone is too abstract. Terms still in transition are collected at the bottom
@@ -433,6 +434,36 @@ reads, rather than on the full fused surface.
 | `FileSystemState` | **Retired (UPI 052, 2026-05-29).** Was a bridge supertrait (`FilesystemQuery + HistoryQuery`) with a blanket impl, kept to preserve pre-split callers while the seam was narrowed. Every command-layer caller now depends on exactly the half it uses, so the bridge was deleted. Use `FilesystemQuery` / `HistoryQuery` / `Observation` instead. The concrete `RealFileSystemState` / `MockFileSystemState` types (which impl both halves) are unaffected. |
 
 Source: `observation.rs`, `btrfs.rs`, ADR-100, ADR-101, ADR-102.
+
+## Cluster: Planner soundness (UPI 069)
+
+The planner's post-plan self-check vocabulary. The planner must never conclude
+"nothing new to send" for a subvolume in the same run it plans a `CreateSnapshot`
+— that contradiction shipped twice (Bug B `0f52555`, transient path; the
+2026-05-02 stranded snapshots, non-transient path). These terms name the two
+failure shapes and the standing tripwire that guards them.
+
+| Term | Meaning |
+|------|---------|
+| `orphaned snapshot` | A snapshot planned or created with no corresponding send that will be **deleted before it ever ships** — the transient-lifecycle harm (transient retention deletes aggressively by design). Consequence: data loss. Guarded by the invariant's arm 1, a blanket check: transient create-without-send is always a bug because transient creation is send-gated by construction (031-b M1). |
+| `stranded snapshot` | A snapshot created while send planning wrongly concluded there was nothing new to send. It persists locally and typically ships on the next run — the non-transient harm. Consequence: one-cycle send latency plus an exposure window (the snapshot exists on no drive), not data loss. Guarded by arm 2, keyed on the `nothing_new_to_send` marker `PlannedSkip` carries from exactly two send-planning conclusions ("already on <drive>", "no local snapshots to send"). |
+| `caught up` | Latest local snapshot == latest external snapshot **for a specific (subvolume, drive) pair**. The per-drive qualifier is load-bearing: a subvolume can be caught up on drive A while behind on drive B. This is the precondition both historical bugs required — steady state keeps external one snapshot behind local, so caught-up states arise from operational firsts (emergency retention; generation-equality skip nights). |
+| `post-plan orphan invariant` | The pure self-check at the end of `plan::plan` (`orphan_invariant_violations`) inspecting the finished plan for both harms: arm 1 (transient create-without-send → orphan) and arm 2 (any-lifecycle create alongside a nothing-new-to-send defer → strand). Violations `warn!` then `debug_assert!` — a test-time tripwire; production strand detection belongs to awareness/heartbeat. "Orphan invariant" is the umbrella idiom even though arm 2's harm is stranding. |
+
+**In context (the 2026-05-02 incident's defer, as recorded in the events table):**
+
+```
+PlannerDefer "20260430-0402-htpc-home already on WD-18TB"
+```
+
+Recorded on a night when a `CreateSnapshot` for `htpc-home` was also planned — the
+defer names the *previous* night's snapshot because send planning consumed a stale
+snapshot list. Tonight's snapshot was stranded. Post-069, that same pair (a planned
+create alongside a nothing-new defer) trips the post-plan orphan invariant instead
+of passing silently.
+
+Source: `plan.rs` (`orphan_invariant_violations`), `types.rs` (`PlannedSkip`),
+`docs/98-journals/2026-05-02-stranded-snapshots-non-transient-planner.md`, UPI 069.
 
 ## Flagged Ambiguities
 

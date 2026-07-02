@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **The post-plan orphan invariant now guards every lifecycle.** The planner
+  self-checks the finished plan: a planned snapshot whose send planning
+  concluded "nothing new to send" — the contradiction behind the 2026-05-02
+  stranded snapshots — now warns loudly as a planner bug instead of stranding
+  silently. The send planner also builds its effective snapshot view
+  internally, so the twice-shipped stale-list bug class cannot be
+  reintroduced by a forgetful caller.
+
 ## [0.29.0] - 2026-07-02
 
 ### Added

@@ -3769,11 +3769,13 @@ source = "/data/beta"
                     name: "htpc-home".to_string(),
                     reason: "drive WD-18TB not mounted".to_string(),
                     next_due_minutes: None,
+                    nothing_new_to_send: false,
                 },
                 crate::types::PlannedSkip {
                     name: "htpc-docs".to_string(),
                     reason: "disabled".to_string(),
                     next_due_minutes: None,
+                    nothing_new_to_send: false,
                 },
             ],
             events: Vec::new(),
@@ -4767,6 +4769,7 @@ source = "/data/beta"
                     name: n.to_string(),
                     reason: r.to_string(),
                     next_due_minutes: None,
+                    nothing_new_to_send: false,
                 })
                 .collect(),
             events: Vec::new(),

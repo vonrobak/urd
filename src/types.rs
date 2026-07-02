@@ -1155,6 +1155,12 @@ pub struct PlannedSkip {
     pub name: String,
     pub reason: String,
     pub next_due_minutes: Option<i64>,
+    /// True when send planning concluded the source offers nothing new for a
+    /// drive — set only by the "already on <drive>" and "no local snapshots
+    /// to send" conclusions. That conclusion is contradictory in a run that
+    /// also plans a `CreateSnapshot` for the subvolume; the post-plan orphan
+    /// invariant in `plan.rs` consumes it to detect stranded snapshots.
+    pub nothing_new_to_send: bool,
 }
 
 /// The complete output of the backup planner.
@@ -1600,6 +1606,7 @@ mod tests {
                 name: "subvol6-tmp".to_string(),
                 reason: "interval not elapsed".to_string(),
                 next_due_minutes: None,
+                nothing_new_to_send: false,
             }],
             events: Vec::new(),
         };
