@@ -194,7 +194,7 @@ discoveries; skipping them should be the exception.
 - **Standard** (medium features, clear scope, no new modules):
   `/design → /grill-me → /prepare → arch-adversary → /post-review → build → /tidy → /check → /commit-push-pr → /session-close`
 - **Full** (new modules, architectural changes, ADR gates):
-  `/brainstorm → /design → /grill-me → [/sequence] → /prepare → arch-adversary → /post-review → build → /tidy → /check → /commit-push-pr → /session-close`
+  `/brainstorm → /design → /grill-me → /prepare → arch-adversary → /post-review → build → /tidy → /check → /commit-push-pr → /session-close`
 
 Available skills and their descriptions are injected into each session — invoke `/<name>`
 to use one. For a multi-UPI arc, run an arc-level `/grill-me` before per-UPI design so
