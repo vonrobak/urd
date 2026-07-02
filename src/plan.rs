@@ -457,27 +457,6 @@ pub fn plan(
             None
         };
 
-        // Send planning must consider the just-planned snapshot. Without
-        // this augmentation, a "caught up" state (latest local already on
-        // drive) defers the send and strands tonight's snapshot until the
-        // next run. Mirrors plan_transient_lifecycle's effective_local_snaps
-        // (Bug B fixed for transient in 0f52555 — same shape applies here).
-        let augmented;
-        let effective_local_snaps: &[SnapshotName] = if let Some(ref snap) = planned_snap {
-            if !local_snaps.iter().any(|s| s.as_str() == snap.as_str()) {
-                augmented = {
-                    let mut v = local_snaps.clone();
-                    v.push(snap.clone());
-                    v
-                };
-                &augmented
-            } else {
-                &local_snaps
-            }
-        } else {
-            &local_snaps
-        };
-
         // ── External operations ─────────────────────────────────────
         if !filters.local_only && subvol.send_enabled {
             // Send-space guard (UPI 054-a): one subvolume-scoped defer, then
@@ -522,7 +501,8 @@ pub fn plan(
                         &eff,
                         drive,
                         &local_dir,
-                        effective_local_snaps,
+                        &local_snaps,
+                        planned_snap.as_ref(),
                         now,
                         force,
                         filters.skip_intervals,
@@ -1233,28 +1213,12 @@ fn plan_transient_lifecycle(
     }
 
     // ── Phase 3: Plan sends for each sendable drive ───────────────
-    // Build augmented local_snaps once (not per-drive).
-    // Only allocate a new vec when planned_snap adds a snapshot not already in the list.
-    let augmented;
-    let effective_local_snaps = if let Some(ref snap) = planned_snap {
-        if !local_snaps.iter().any(|s| s.as_str() == snap.as_str()) {
-            augmented = {
-                let mut v = local_snaps.to_vec();
-                v.push(snap.clone());
-                v
-            };
-            &augmented
-        } else {
-            local_snaps
-        }
-    } else {
-        local_snaps
-    };
-
+    // plan_external_send augments local_snaps with the planned snapshot
+    // internally (UPI 069) — pass the raw on-disk list plus the plan.
     for (drive, _) in &sendable_drives {
         plan_external_send(
-            subvol, eff, drive, local_dir, effective_local_snaps, now, force,
-            filters.skip_intervals, obs, operations, skipped, events,
+            subvol, eff, drive, local_dir, local_snaps, planned_snap.as_ref(), now,
+            force, filters.skip_intervals, obs, operations, skipped, events,
         );
         plan_external_retention(subvol, drive, now, obs, pinned, operations, events);
     }
@@ -1282,6 +1246,7 @@ fn plan_external_send(
     drive: &DriveConfig,
     local_dir: &Path,
     local_snaps: &[SnapshotName],
+    planned_snap: Option<&SnapshotName>,
     now: NaiveDateTime,
     force: bool,
     skip_intervals: bool,
@@ -1290,6 +1255,26 @@ fn plan_external_send(
     skipped: &mut Vec<PlannedSkip>,
     events: &mut Vec<Event>,
 ) {
+    // Send planning must consider the just-planned snapshot: without this
+    // augmentation, a "caught up" state (latest local already on drive)
+    // defers the send and strands tonight's snapshot until the next run —
+    // the shape that shipped twice (Bug B 0f52555 transient; 2026-05-02
+    // non-transient). Hoisted into this function (UPI 069) so a caller
+    // cannot forget it; callers pass the raw on-disk list plus the planned
+    // name. Only allocates when the planned snapshot is not already listed.
+    let augmented;
+    let local_snaps: &[SnapshotName] = match planned_snap {
+        Some(snap) if !local_snaps.iter().any(|s| s.as_str() == snap.as_str()) => {
+            augmented = {
+                let mut v = local_snaps.to_vec();
+                v.push(snap.clone());
+                v
+            };
+            &augmented
+        }
+        _ => local_snaps,
+    };
+
     let ext_dir = crate::drives::external_snapshot_dir(drive, &subvol.name);
     let ext_snaps = obs
         .fs
