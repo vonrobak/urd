@@ -30,6 +30,7 @@ fn record_defer(
     drive_label: Option<&str>,
     reason: String,
     next_due_minutes: Option<i64>,
+    nothing_new_to_send: bool,
     scope: DeferScope,
     now: NaiveDateTime,
 ) {
@@ -37,6 +38,7 @@ fn record_defer(
         name: subvol_name.to_string(),
         reason: reason.clone(),
         next_due_minutes,
+        nothing_new_to_send,
     });
     let mut event = Event::pure(now, EventPayload::PlannerDefer { reason, scope });
     event.subvolume = Some(subvol_name.to_string());
@@ -179,6 +181,7 @@ fn check_drive_availability(
                 Some(&drive.label),
                 format!("drive {} not mounted", drive.label),
                 None,
+                false,
                 DeferScope::Drive,
                 now,
             );
@@ -195,6 +198,7 @@ fn check_drive_availability(
                     drive.label, expected, found
                 ),
                 None,
+                false,
                 DeferScope::Drive,
                 now,
             );
@@ -208,6 +212,7 @@ fn check_drive_availability(
                 Some(&drive.label),
                 format!("drive {} UUID check failed: {}", drive.label, reason),
                 None,
+                false,
                 DeferScope::Drive,
                 now,
             );
@@ -224,6 +229,7 @@ fn check_drive_availability(
                     drive.label, expected, found
                 ),
                 None,
+                false,
                 DeferScope::Drive,
                 now,
             );
@@ -240,6 +246,7 @@ fn check_drive_availability(
                     drive.label, drive.label
                 ),
                 None,
+                false,
                 DeferScope::Drive,
                 now,
             );
@@ -295,6 +302,7 @@ pub fn plan(
     // When adding new patterns, update output::tests::classify_all_18_patterns.
     let mut skipped = Vec::new();
     let mut events: Vec<Event> = Vec::new();
+    let mut judgments: Vec<SubvolJudgment> = Vec::new();
 
     let resolved = config.resolved_subvolumes();
     let drive_labels: Vec<String> = config.drives.iter().map(|d| d.label.clone()).collect();
@@ -309,6 +317,7 @@ pub fn plan(
                 None,
                 "disabled".to_string(),
                 None,
+                false,
                 DeferScope::Subvolume,
                 now,
             );
@@ -340,6 +349,7 @@ pub fn plan(
                 None,
                 "no snapshot root configured".to_string(),
                 None,
+                false,
                 DeferScope::Subvolume,
                 now,
             );
@@ -389,6 +399,16 @@ pub fn plan(
             armed,
             has_away_pin,
         );
+
+        // Record the planner's lifecycle judgment for the post-plan orphan
+        // invariant, which CONSUMES it instead of re-deriving effective
+        // policy — one derivation, one truth (UPI 069). `has_away_pin` above
+        // is the real value; it gates only `clear_all`, never transience.
+        judgments.push(SubvolJudgment {
+            name: subvol.name.clone(),
+            effective_transient: eff.local_retention.is_transient(),
+            send_enabled: subvol.send_enabled,
+        });
 
         // ── Transient subvolumes: atomic lifecycle planning ────────
         // Dispatch on the EFFECTIVE lifecycle: a Tight/Critical declared-Graduated
@@ -474,6 +494,7 @@ pub fn plan(
                     None,
                     reason.clone(),
                     None,
+                    false,
                     DeferScope::Subvolume,
                     now,
                 );
@@ -530,57 +551,20 @@ pub fn plan(
                 None,
                 "local only".to_string(),
                 None,
+                false,
                 DeferScope::Subvolume,
                 now,
             );
         }
     }
 
-    // Transient invariant: CreateSnapshot without Send is an orphan. Keyed on
-    // the EFFECTIVE lifecycle (031-b): a Tight/Critical Graduated subvol routed
-    // through the transient path is subject to the same invariant.
-    for subvol in &resolved {
-        let armed = armed_tiers.get(&subvol.name).copied().unwrap_or_default();
-        let eff = storage_critical::derive_effective_policy(
-            &subvol.local_retention,
-            subvol.send_interval,
-            subvol.send_enabled,
-            armed,
-            // This check reads only `eff.local_retention.is_transient()`, which
-            // `has_away_pin` never affects (it gates `clear_all` alone) — so
-            // `false` is correct here permanently, not just as the Step-4 stub.
-            false,
-        );
-        if !eff.local_retention.is_transient() || !subvol.send_enabled {
-            continue;
-        }
-        let has_create = operations.iter().any(|op| {
-            matches!(
-                op,
-                PlannedOperation::CreateSnapshot { subvolume_name, .. }
-                if subvolume_name == &subvol.name
-            )
-        });
-        let has_send = operations.iter().any(|op| {
-            matches!(
-                op,
-                PlannedOperation::SendIncremental { subvolume_name, .. }
-                | PlannedOperation::SendFull { subvolume_name, .. }
-                if subvolume_name == &subvol.name
-            )
-        });
-        if has_create && !has_send {
-            log::warn!(
-                "Transient invariant violation: {} has CreateSnapshot without Send — \
-                 snapshot will be orphaned. This is a planner bug.",
-                subvol.name
-            );
-            debug_assert!(
-                false,
-                "transient invariant violated: {} has CreateSnapshot without Send",
-                subvol.name
-            );
-        }
+    // Post-plan orphan invariant (UPI 069): pure inspection of the finished
+    // plan against the lifecycle judgments recorded at the main loop's single
+    // derive_effective_policy site. Warn first, then debug_assert, per
+    // violation — the diagnostic must land before any dev-build panic.
+    for violation in orphan_invariant_violations(&judgments, &operations, &skipped) {
+        log::warn!("Post-plan orphan invariant violation: {violation}. This is a planner bug.");
+        debug_assert!(false, "post-plan orphan invariant violated: {violation}");
     }
 
     Ok(BackupPlan {
@@ -589,6 +573,90 @@ pub fn plan(
         skipped,
         events,
     })
+}
+
+/// The planner's per-subvolume lifecycle judgment, recorded by the main
+/// planning loop at its single `derive_effective_policy` site and consumed
+/// by [`orphan_invariant_violations`] — the invariant judges the SAME
+/// lifecycle the planner executed, never a re-derivation, so the two can
+/// never diverge.
+#[derive(Debug)]
+struct SubvolJudgment {
+    name: String,
+    effective_transient: bool,
+    send_enabled: bool,
+}
+
+/// Post-plan orphan invariant (UPI 069) — pure inspection of the finished
+/// plan. Returns one message per violation; `plan()` warns and debug-asserts
+/// on each. Two arms with distinct soundness arguments:
+///
+/// - **Arm 1 (transient blanket):** transient creation is send-gated by
+///   construction (031-b M1), so `CreateSnapshot` without a `Send` is an
+///   orphan — deleted before it ever ships (data loss). Fires even when no
+///   defer was recorded at all.
+/// - **Arm 2 (all lifecycles):** a `nothing_new_to_send` defer claims the
+///   source offers nothing new — a lie by construction in a run that also
+///   plans a `CreateSnapshot`, since tonight's snapshot is the newest and
+///   exists on no drive. Catches the stranded-snapshot class that shipped
+///   twice (Bug B `0f52555` transient; 2026-05-02 non-transient), per drive,
+///   even when another drive's send satisfies arm 1.
+///
+/// Accepted blind spot: a non-transient create-without-send that records NO
+/// defer is invisible here — a blanket non-transient check is impossible
+/// (send intervals, rotated-away drives, and space guards are all legitimate
+/// create-without-send states).
+#[must_use]
+fn orphan_invariant_violations(
+    judgments: &[SubvolJudgment],
+    operations: &[PlannedOperation],
+    skipped: &[PlannedSkip],
+) -> Vec<String> {
+    let mut violations = Vec::new();
+    for j in judgments {
+        let has_create = operations.iter().any(|op| {
+            matches!(
+                op,
+                PlannedOperation::CreateSnapshot { subvolume_name, .. }
+                if subvolume_name == &j.name
+            )
+        });
+        if !has_create {
+            continue;
+        }
+
+        // Arm 1: transient blanket — create without send is an orphan.
+        if j.effective_transient && j.send_enabled {
+            let has_send = operations.iter().any(|op| {
+                matches!(
+                    op,
+                    PlannedOperation::SendIncremental { subvolume_name, .. }
+                    | PlannedOperation::SendFull { subvolume_name, .. }
+                    if subvolume_name == &j.name
+                )
+            });
+            if !has_send {
+                violations.push(format!(
+                    "{} has CreateSnapshot without Send — snapshot will be orphaned",
+                    j.name
+                ));
+            }
+        }
+
+        // Arm 2: any lifecycle — a nothing-new-to-send conclusion is
+        // contradictory alongside a planned create.
+        for skip in skipped
+            .iter()
+            .filter(|s| s.name == j.name && s.nothing_new_to_send)
+        {
+            violations.push(format!(
+                "{} has CreateSnapshot alongside a nothing-new-to-send defer ({:?}) — \
+                 the send planner did not see tonight's snapshot; it will be stranded",
+                j.name, skip.reason
+            ));
+        }
+    }
+    violations
 }
 
 /// Compute the per-drive [`crate::guard::DriveScope`]s for a subvolume from the
@@ -701,6 +769,7 @@ fn plan_local_snapshot(
                     ByteSize(min_free),
                 ),
                 None,
+                false,
                 DeferScope::Subvolume,
                 now,
             );
@@ -757,6 +826,7 @@ fn plan_local_snapshot(
                             format_duration_short(mins)
                         ),
                         None,
+                        false,
                         DeferScope::Subvolume,
                         now,
                     );
@@ -798,6 +868,7 @@ fn plan_local_snapshot(
                 None,
                 "snapshot already exists".to_string(),
                 None,
+                false,
                 DeferScope::Subvolume,
                 now,
             );
@@ -824,6 +895,7 @@ fn plan_local_snapshot(
                 format_duration_short(mins)
             ),
             Some(mins),
+            false,
             DeferScope::Subvolume,
             now,
         );
@@ -988,6 +1060,7 @@ fn plan_transient_lifecycle(
             None,
             reason,
             None,
+            false,
             DeferScope::Subvolume,
             now,
         );
@@ -1050,6 +1123,7 @@ fn plan_transient_lifecycle(
                 None,
                 "transient \u{2014} no drives available for send".to_string(),
                 None,
+                false,
                 DeferScope::Subvolume,
                 now,
             );
@@ -1101,6 +1175,7 @@ fn plan_transient_lifecycle(
                 None,
                 skip_msg,
                 next_dues.iter().map(|(_, m)| *m).min(),
+                false,
                 DeferScope::Subvolume,
                 now,
             );
@@ -1246,6 +1321,7 @@ fn plan_external_send(
                 format_duration_short(next_in.num_minutes())
             ),
             Some(next_in.num_minutes()),
+            false,
             DeferScope::Drive,
             now,
         );
@@ -1266,6 +1342,7 @@ fn plan_external_send(
             None,
             reason,
             None,
+            true,
             DeferScope::Subvolume,
             now,
         );
@@ -1284,6 +1361,7 @@ fn plan_external_send(
             Some(&drive.label),
             format!("{} already on {}", snap_to_send, drive.label),
             None,
+            true,
             DeferScope::Drive,
             now,
         );
@@ -1336,6 +1414,7 @@ fn plan_external_send(
                     ByteSize(min_free),
                 ),
                 None,
+                false,
                 DeferScope::Drive,
                 now,
             );
@@ -1374,6 +1453,7 @@ fn plan_external_send(
                         staleness,
                     ),
                     None,
+                    false,
                     DeferScope::Drive,
                     now,
                 );
@@ -6284,5 +6364,447 @@ priority = 1
             1,
             "Roomy graduated: creates the daily snapshot regardless of send timing"
         );
+    }
+
+    // ── Marker coherence: nothing_new_to_send (UPI 069) ────────────────
+    //
+    // Completeness family in the SkipCategory-test mold: pins exactly which
+    // defer conclusions carry the nothing_new_to_send marker. The two `true`
+    // classes ("already on <drive>", "no local snapshots to send") are the
+    // contradictions the post-plan orphan invariant keys on; every other
+    // producer must stay `false`. A new defer site that forgets to classify
+    // itself fails here instead of silently holing the net.
+
+    /// Find `name`'s skip whose reason contains `substr`; assert its marker.
+    fn assert_marker(result: &BackupPlan, name: &str, substr: &str, expected: bool) {
+        let skip = result
+            .skipped
+            .iter()
+            .find(|s| s.name == name && s.reason.contains(substr))
+            .unwrap_or_else(|| {
+                panic!(
+                    "no skip for {name} matching {substr:?}; skips: {:?}",
+                    result
+                        .skipped
+                        .iter()
+                        .map(|s| (&s.name, &s.reason))
+                        .collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(
+            skip.nothing_new_to_send, expected,
+            "nothing_new_to_send mismatch for skip {:?}",
+            skip.reason
+        );
+    }
+
+    #[test]
+    fn marker_true_already_on_drive_false_for_unchanged_and_intervals() {
+        // sv1: caught-up + unchanged (equal generations) — the legitimate
+        // "nothing changed, latest already shipped" night. No create is
+        // planned, so the true-marked "already on" defer is not contradictory.
+        // sv2: fresh local + external 30m old — both interval defers are false.
+        let config = test_config();
+        let mut fs = MockFileSystemState::new();
+        fs.mounted_drives.insert("D1".to_string());
+
+        let s1 = snap("20260322-1330-one"); // 1.5h old: past 15m snap + 1h send intervals
+        fs.local_snapshots.insert("sv1".to_string(), vec![s1.clone()]);
+        fs.external_snapshots
+            .insert(("D1".to_string(), "sv1".to_string()), vec![s1.clone()]);
+
+        let s2 = snap("20260322-1430-two"); // 30m old: within 1h snap + 4h send intervals
+        fs.local_snapshots.insert("sv2".to_string(), vec![s2.clone()]);
+        fs.external_snapshots
+            .insert(("D1".to_string(), "sv2".to_string()), vec![s2]);
+
+        // Equal generations for sv1 → "unchanged" defer instead of a create.
+        let mb = MockBtrfs::new();
+        mb.generations
+            .borrow_mut()
+            .insert(PathBuf::from("/data/sv1"), 100);
+        mb.generations
+            .borrow_mut()
+            .insert(PathBuf::from("/snap/sv1").join(s1.as_str()), 100);
+
+        let result = plan(
+            &config,
+            now(),
+            &PlanFilters::default(),
+            &Observation { fs: &fs, history: &fs, btrfs: &mb },
+            &ArmedTierMap::new(),
+        )
+        .unwrap();
+
+        assert!(
+            !result
+                .operations
+                .iter()
+                .any(|op| matches!(op, PlannedOperation::CreateSnapshot { .. })),
+            "fixture intent: no creates planned this run"
+        );
+        assert_marker(&result, "sv1", "unchanged", false);
+        assert_marker(&result, "sv1", "already on D1", true);
+        assert_marker(&result, "sv2", "interval not elapsed", false);
+        assert_marker(&result, "sv2", "not due", false);
+    }
+
+    #[test]
+    fn marker_true_no_local_snapshots_to_send() {
+        // --external-only with an empty local set: send planning correctly
+        // concludes there is nothing to send. The filter suppresses creation,
+        // so the true marker is benign here (no create to contradict).
+        let config = test_config();
+        let mut fs = MockFileSystemState::new();
+        fs.mounted_drives.insert("D1".to_string());
+
+        let filters = PlanFilters {
+            external_only: true,
+            ..Default::default()
+        };
+        let result = plan(
+            &config,
+            now(),
+            &filters,
+            &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() },
+            &ArmedTierMap::new(),
+        )
+        .unwrap();
+
+        assert_marker(&result, "sv1", "no local snapshots to send", true);
+    }
+
+    #[test]
+    fn marker_false_drive_not_mounted_and_disabled() {
+        // A planned create + a drive-away defer is the classic benign
+        // create-without-send night (offsite rotation): both stay false.
+        let toml_str = r#"
+[general]
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp"
+
+[local_snapshots]
+roots = [
+  { path = "/snap", subvolumes = ["sv1", "sv2"], min_free_bytes = "10GB" }
+]
+
+[defaults]
+snapshot_interval = "1h"
+send_interval = "4h"
+send_enabled = true
+enabled = true
+
+[defaults.local_retention]
+hourly = 24
+daily = 30
+weekly = 26
+monthly = 12
+
+[defaults.external_retention]
+daily = 30
+weekly = 26
+monthly = 0
+
+[[drives]]
+label = "D1"
+mount_path = "/mnt/d1"
+snapshot_root = ".snapshots"
+role = "test"
+
+[[subvolumes]]
+name = "sv1"
+short_name = "one"
+source = "/data/sv1"
+priority = 1
+
+[[subvolumes]]
+name = "sv2"
+short_name = "two"
+source = "/data/sv2"
+priority = 2
+enabled = false
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let mut fs = MockFileSystemState::new();
+        // D1 NOT mounted. sv1 has an old local snapshot and changed data,
+        // so a create IS planned; the send defers on drive absence.
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap("20260322-1000-one")]);
+        let mb = MockBtrfs::new();
+        mb.generations
+            .borrow_mut()
+            .insert(PathBuf::from("/data/sv1"), 100);
+        mb.generations
+            .borrow_mut()
+            .insert(PathBuf::from("/snap/sv1").join("20260322-1000-one"), 50);
+
+        let result = plan(
+            &config,
+            now(),
+            &PlanFilters::default(),
+            &Observation { fs: &fs, history: &fs, btrfs: &mb },
+            &ArmedTierMap::new(),
+        )
+        .unwrap();
+
+        assert!(
+            result.operations.iter().any(|op| matches!(
+                op,
+                PlannedOperation::CreateSnapshot { subvolume_name, .. }
+                if subvolume_name == "sv1"
+            )),
+            "fixture intent: create planned for sv1"
+        );
+        assert_marker(&result, "sv1", "not mounted", false);
+        assert_marker(&result, "sv2", "disabled", false);
+    }
+
+    #[test]
+    fn marker_false_local_low_space_and_send_floor() {
+        let config = test_config();
+        let mut fs = MockFileSystemState::new();
+        fs.mounted_drives.insert("D1".to_string());
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap("20260322-1000-one")]);
+        // 5 GB free < the 10 GB min_free → creation defers AND the send
+        // floor holds; neither claims the source has nothing new.
+        fs.free_bytes
+            .insert(PathBuf::from("/snap/sv1"), 5_000_000_000);
+
+        let result = plan(
+            &config,
+            now(),
+            &PlanFilters::default(),
+            &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() },
+            &ArmedTierMap::new(),
+        )
+        .unwrap();
+
+        assert_marker(&result, "sv1", "low on space", false);
+        assert_marker(&result, "sv1", "below the host-survival floor", false);
+    }
+
+    #[test]
+    fn marker_false_space_guards() {
+        // Estimated (send-history) and calibrated size guards both defer
+        // with marker false — a create is planned and the local restore
+        // point is the deliberate outcome (UPI 054-a), not a contradiction.
+        let config = test_config();
+        let mut fs = MockFileSystemState::new();
+        fs.mounted_drives.insert("D1".to_string());
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap("20260322-1000-one")]);
+        // D1: 50 GB free vs the drive's 100 GB min_free → available is 0.
+        fs.free_bytes
+            .insert(PathBuf::from("/mnt/d1"), 50_000_000_000);
+        // Estimation tier 1: full-send history of 200 GB.
+        fs.send_sizes.insert(
+            ("sv1".to_string(), "D1".to_string(), SendKind::Full),
+            200_000_000_000,
+        );
+        let mb = MockBtrfs::new();
+        mb.generations
+            .borrow_mut()
+            .insert(PathBuf::from("/data/sv1"), 100);
+        mb.generations
+            .borrow_mut()
+            .insert(PathBuf::from("/snap/sv1").join("20260322-1000-one"), 50);
+
+        let result = plan(
+            &config,
+            now(),
+            &PlanFilters::default(),
+            &Observation { fs: &fs, history: &fs, btrfs: &mb },
+            &ArmedTierMap::new(),
+        )
+        .unwrap();
+        assert_marker(&result, "sv1", "exceeds", false);
+
+        // Estimation tier 3: no history, calibrated size instead.
+        fs.send_sizes.clear();
+        fs.calibrated_sizes.insert(
+            "sv1".to_string(),
+            (200_000_000_000, "2026-03-20T00:00:00".to_string()),
+        );
+        let result = plan(
+            &config,
+            now(),
+            &PlanFilters::default(),
+            &Observation { fs: &fs, history: &fs, btrfs: &mb },
+            &ArmedTierMap::new(),
+        )
+        .unwrap();
+        assert_marker(&result, "sv1", "calibrated size", false);
+    }
+
+    #[test]
+    fn marker_false_transient_defers() {
+        // The transient lifecycle's own defer sites: no-drives and the
+        // batched send-not-due. Neither claims the source has nothing new.
+        let config = transient_config();
+
+        // No drives available for send (D1 not mounted).
+        let fs = MockFileSystemState::new();
+        let result = plan(
+            &config,
+            now(),
+            &PlanFilters::default(),
+            &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() },
+            &ArmedTierMap::new(),
+        )
+        .unwrap();
+        assert_marker(&result, "sv1", "no drives available", false);
+        assert_marker(&result, "sv1", "not mounted", false);
+
+        // Batched send-not-due: D1 mounted, external snapshot 30m old (< 4h).
+        let mut fs = MockFileSystemState::new();
+        fs.mounted_drives.insert("D1".to_string());
+        fs.external_snapshots.insert(
+            ("D1".to_string(), "sv1".to_string()),
+            vec![snap("20260322-1430-one")],
+        );
+        let result = plan(
+            &config,
+            now(),
+            &PlanFilters::default(),
+            &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() },
+            &ArmedTierMap::new(),
+        )
+        .unwrap();
+        assert_marker(&result, "sv1", "not due", false);
+    }
+
+    // ── Post-plan orphan invariant: pure helper (UPI 069) ──────────────
+    //
+    // The violating states are unreachable through plan() at HEAD (the
+    // augmentation fixes prevent them), so the pure helper is the only test
+    // seam — these synthetic-input tests are the strategy, not a fallback.
+
+    fn judgment(name: &str, effective_transient: bool, send_enabled: bool) -> SubvolJudgment {
+        SubvolJudgment {
+            name: name.to_string(),
+            effective_transient,
+            send_enabled,
+        }
+    }
+
+    fn op_create(name: &str) -> PlannedOperation {
+        PlannedOperation::CreateSnapshot {
+            source: PathBuf::from(format!("/data/{name}")),
+            dest: PathBuf::from(format!("/snap/{name}/20260322-1500-x")),
+            subvolume_name: name.to_string(),
+        }
+    }
+
+    fn op_send(name: &str) -> PlannedOperation {
+        PlannedOperation::SendIncremental {
+            parent: PathBuf::from(format!("/snap/{name}/20260321-1500-x")),
+            snapshot: PathBuf::from(format!("/snap/{name}/20260322-1500-x")),
+            dest_dir: PathBuf::from("/mnt/d1/.snapshots"),
+            drive_label: "D1".to_string(),
+            subvolume_name: name.to_string(),
+            pin_on_success: None,
+        }
+    }
+
+    fn skip_entry(name: &str, reason: &str, nothing_new_to_send: bool) -> PlannedSkip {
+        PlannedSkip {
+            name: name.to_string(),
+            reason: reason.to_string(),
+            next_due_minutes: None,
+            nothing_new_to_send,
+        }
+    }
+
+    #[test]
+    fn orphan_invariant_arm1_transient_create_without_send() {
+        let violations = orphan_invariant_violations(
+            &[judgment("sv1", true, true)],
+            &[op_create("sv1")],
+            &[],
+        );
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].contains("orphaned"), "{violations:?}");
+    }
+
+    #[test]
+    fn orphan_invariant_arm1_transient_create_with_send_clean() {
+        let violations = orphan_invariant_violations(
+            &[judgment("sv1", true, true)],
+            &[op_create("sv1"), op_send("sv1")],
+            &[],
+        );
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn orphan_invariant_arm2_create_with_nothing_new_defer() {
+        // The 2026-05-02 shape: a non-transient create whose send planning
+        // concluded "already on drive" — one violation, reason quoted.
+        let violations = orphan_invariant_violations(
+            &[judgment("sv1", false, true)],
+            &[op_create("sv1")],
+            &[skip_entry("sv1", "20260430-0402-one already on D1", true)],
+        );
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].contains("stranded"), "{violations:?}");
+        assert!(violations[0].contains("already on D1"), "{violations:?}");
+    }
+
+    #[test]
+    fn orphan_invariant_arm2_marker_false_defers_clean() {
+        // Benign create-without-send: interval, drive-away, floor, space
+        // guard — all marker-false. At the helper's altitude these are one
+        // input class (the marker-coherence tests own the classification).
+        let violations = orphan_invariant_violations(
+            &[judgment("sv1", false, true)],
+            &[op_create("sv1")],
+            &[
+                skip_entry("sv1", "send to D1 not due (next in ~2h)", false),
+                skip_entry("sv1", "drive D2 not mounted", false),
+                skip_entry("sv1", "send to D3 skipped: estimated ~1 GB exceeds 0 B available", false),
+            ],
+        );
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn orphan_invariant_no_create_nothing_new_clean() {
+        // Legitimate caught-up night: nothing changed, latest already
+        // shipped, no create planned — the true-marked defer is correct.
+        let violations = orphan_invariant_violations(
+            &[judgment("sv1", false, true)],
+            &[],
+            &[skip_entry("sv1", "20260322-1330-one already on D1", true)],
+        );
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn orphan_invariant_arm2_fires_even_with_send_to_other_drive() {
+        // Partial strand: drive A got a send (arm 1 passes) while drive B's
+        // send planning concluded nothing-new. Arm 2 still fires — per-drive
+        // detection, transient lifecycle included.
+        let violations = orphan_invariant_violations(
+            &[judgment("sv1", true, true)],
+            &[op_create("sv1"), op_send("sv1")],
+            &[skip_entry("sv1", "20260321-0400-one already on D2", true)],
+        );
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].contains("stranded"), "{violations:?}");
+    }
+
+    #[test]
+    fn orphan_invariant_blind_spot_no_defer_non_transient_clean() {
+        // Characterization of the ACCEPTED blind spot (design F3): a
+        // non-transient create-without-send that recorded no defer at all is
+        // invisible by design — a blanket non-transient check is impossible.
+        let violations = orphan_invariant_violations(
+            &[judgment("sv1", false, true)],
+            &[op_create("sv1")],
+            &[],
+        );
+        assert!(violations.is_empty(), "{violations:?}");
     }
 }
