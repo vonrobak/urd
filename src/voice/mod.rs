@@ -2730,6 +2730,101 @@ mod tests {
         assert!(output.contains("2026-03-27T10:00:00"), "missing last seen timestamp");
     }
 
+    // ── Doctor infra collapse + sentinel relative age (UPI 029 via 079-c) ──
+
+    #[test]
+    fn doctor_collapses_all_passing_infra_checks() {
+        let _color = color_guard(false);
+        let output = render_doctor(&test_doctor_output(), OutputMode::Interactive);
+        assert!(
+            output.contains("All 2 checks passed."),
+            "passing infra collapses to one counted line: {output}"
+        );
+        assert!(
+            !output.contains("sudo btrfs"),
+            "individual passing checks stay collapsed: {output}"
+        );
+    }
+
+    #[test]
+    fn doctor_expands_infra_when_a_check_fails() {
+        let _color = color_guard(false);
+        let mut data = test_doctor_output();
+        data.infra_checks[1] = DoctorCheck {
+            name: "sudo btrfs".to_string(),
+            status: DoctorCheckStatus::Error,
+            detail: Some("permission denied".to_string()),
+            suggestion: Some("Add btrfs to sudoers".to_string()),
+        };
+        let output = render_doctor(&data, OutputMode::Interactive);
+        assert!(
+            !output.contains("checks passed."),
+            "a failure expands the section: {output}"
+        );
+        assert!(
+            output.contains("sudo btrfs") && output.contains("permission denied"),
+            "the failed check renders with its detail: {output}"
+        );
+        assert!(
+            output.contains("Verifying state database"),
+            "passing checks give the red its green context: {output}"
+        );
+    }
+
+    #[test]
+    fn doctor_expands_infra_under_thorough() {
+        let _color = color_guard(false);
+        let mut data = test_doctor_output();
+        data.verify = Some(test_verify_output());
+        let output = render_doctor(&data, OutputMode::Interactive);
+        assert!(
+            !output.contains("checks passed."),
+            "--thorough means show everything: {output}"
+        );
+        assert!(
+            output.contains("sudo btrfs"),
+            "thorough renders every infra check: {output}"
+        );
+    }
+
+    #[test]
+    fn sentinel_assessment_age_is_relative() {
+        let _color = color_guard(false);
+        let five_min_ago = (chrono::Local::now().naive_local()
+            - chrono::Duration::minutes(5))
+        .format("%Y-%m-%dT%H:%M:%S")
+        .to_string();
+        let mut data = test_sentinel_running();
+        let SentinelStatusOutput::Running { ref mut state, .. } = data else {
+            unreachable!()
+        };
+        state.last_assessment = Some(five_min_ago.clone());
+        let output = render_sentinel_status(&data, OutputMode::Interactive);
+        assert!(
+            output.contains("5m ago"),
+            "assessment age must be relative: {output}"
+        );
+        assert!(
+            !output.contains(&five_min_ago),
+            "the raw ISO stamp belongs to JSON mode only: {output}"
+        );
+    }
+
+    #[test]
+    fn sentinel_assessment_age_falls_back_to_raw_string() {
+        let _color = color_guard(false);
+        let mut data = test_sentinel_running();
+        let SentinelStatusOutput::Running { ref mut state, .. } = data else {
+            unreachable!()
+        };
+        state.last_assessment = Some("not-a-timestamp".to_string());
+        let output = render_sentinel_status(&data, OutputMode::Interactive);
+        assert!(
+            output.contains("not-a-timestamp"),
+            "unparseable stamp renders raw, never panics: {output}"
+        );
+    }
+
     #[test]
     fn sentinel_daemon_produces_valid_json() {
         let output = render_sentinel_status(&test_sentinel_running(), OutputMode::Daemon);
