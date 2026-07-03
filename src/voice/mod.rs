@@ -285,6 +285,8 @@ fn color_exposure_str(exposure: &str) -> String {
         "sealed" => "sealed".green().to_string(),
         "waning" => "waning".yellow().to_string(),
         "exposed" => "exposed".red().to_string(),
+        // An adapting row's cell arrives already dimmed (UPI 080, `status::exposure_cell`)
+        // and falls here — passed through unchanged so the de-emphasis survives.
         other => other.to_string(),
     }
 }
