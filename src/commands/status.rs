@@ -6,7 +6,7 @@ use crate::chain;
 use crate::config::Config;
 use crate::drives;
 use crate::output::{
-    ChainHealth, ChainHealthEntry, DriveInfo, LastRunInfo, OutputMode,
+    AdaptationSummary, ChainHealth, ChainHealthEntry, DriveInfo, LastRunInfo, OutputMode,
     PoolPostureSummary, StatusAssessment, StatusOutput,
 };
 use crate::plan::{Observation, RealFileSystemState};
@@ -40,6 +40,11 @@ pub fn run(config: Config, output_mode: OutputMode) -> anyhow::Result<()> {
     let assessments =
         advice::assess_view(&config, now, &observation, &signals.by_subvol);
     let storage_postures = storage_signals::aggregate(&assessments, &signals, now);
+    // §2: collapse per-subvolume adaptations to one line per group (needs
+    // `signals.pools`, which the renderer can't see — so aggregate here where
+    // `signals` is live, like `storage_postures`).
+    let storage_adaptations =
+        storage_signals::aggregate_adaptations(&assessments, &signals, &config);
 
     // ── Drive info ──────────────────────────────────────────────────
     let drive_infos: Vec<DriveInfo> = config
@@ -79,6 +84,7 @@ pub fn run(config: Config, output_mode: OutputMode) -> anyhow::Result<()> {
     let status_output = assemble_status_output(
         &assessments,
         storage_postures,
+        storage_adaptations,
         drive_infos,
         last_run,
         total_pins,
@@ -102,9 +108,11 @@ pub fn run(config: Config, output_mode: OutputMode) -> anyhow::Result<()> {
 /// chain-health worst-selection, promise-level threading, advice filtering,
 /// redundancy advisories, and last-run age all live here.
 #[must_use]
+#[allow(clippy::too_many_arguments)]
 fn assemble_status_output(
     assessments: &[SubvolAssessment],
     storage_postures: Vec<PoolPostureSummary>,
+    storage_adaptations: Vec<AdaptationSummary>,
     drive_infos: Vec<DriveInfo>,
     last_run: Option<LastRunInfo>,
     total_pins: usize,
@@ -179,6 +187,7 @@ fn assemble_status_output(
         redundancy_advisories,
         advice,
         storage_postures,
+        storage_adaptations,
     }
 }
 
@@ -247,6 +256,7 @@ local_retention = "transient"
     fn assessment(name: &str) -> SubvolAssessment {
         SubvolAssessment {
             name: name.to_string(),
+            short_name: name.to_string(),
             status: PromiseStatus::Protected,
             health: OperationalHealth::Healthy,
             health_reasons: vec![],
@@ -286,6 +296,7 @@ local_retention = "transient"
     fn assemble(assessments: &[SubvolAssessment], config: &Config) -> StatusOutput {
         assemble_status_output(
             assessments,
+            vec![],
             vec![],
             vec![],
             None,
@@ -468,6 +479,7 @@ local_retention = "transient"
         };
         let out = assemble_status_output(
             &[],
+            vec![],
             vec![],
             vec![],
             Some(last_run),

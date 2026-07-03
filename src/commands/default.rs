@@ -76,7 +76,9 @@ pub fn run(config_path: Option<&Path>, output_mode: OutputMode) -> anyhow::Resul
         })
         .collect();
 
-    let total_needing_attention = advice_items.len();
+    // Distinct root causes, not rows (UPI 079-a §3) — symmetric with the full
+    // `urd status` footer. Borrow before consuming `advice_items` below.
+    let total_needing_attention = advice::count_distinct_causes(&advice_items);
     let best_advice = advice_items.into_iter().next();
 
     // Worst tight pool drives the compact bare-`urd` clause.

@@ -387,7 +387,8 @@ fn render_assessment_table(data: &BackupSummary, out: &mut String) {
                     .unwrap_or_else(|| "\u{2014}".to_string()),
             );
         }
-        row.push(assessment.name.clone());
+        // SUBVOLUME cell shows the user-facing short name (§8a).
+        row.push(assessment.short_name.clone());
         row.push(assessment.local_snapshot_count.to_string());
 
         for label in &drive_labels {
@@ -409,21 +410,19 @@ fn render_assessment_table(data: &BackupSummary, out: &mut String) {
 }
 
 /// Render advisories and errors from awareness assessments.
+///
+/// Errors stay per-subvolume; advisory NOTEs group by exact text (UPI 079-a §4)
+/// off the shared `super::group_advisory_notes`. No trailing blank line —
+/// preserving this renderer's current shape (the status caller adds one, keyed
+/// on errors; this one does not).
 fn render_assessment_advisories(data: &BackupSummary, out: &mut String) {
     for assessment in &data.assessments {
         for error in &assessment.errors {
             writeln!(out, "  {} {}: {}", "ERROR".red(), assessment.name, error).ok();
         }
-        for advisory in &assessment.advisories {
-            writeln!(
-                out,
-                "  {} {}: {}",
-                "NOTE".dimmed(),
-                assessment.name,
-                advisory,
-            )
-            .ok();
-        }
+    }
+    for (advisory, subvols) in super::group_advisory_notes(&data.assessments) {
+        writeln!(out, "  {} {}: {}", "NOTE".dimmed(), subvols.join(", "), advisory).ok();
     }
 }
 
@@ -546,6 +545,7 @@ mod tests {
     fn assessment_with(drive: &str, mounted: bool) -> StatusAssessment {
         StatusAssessment {
             name: "sv".to_string(),
+            short_name: "sv".to_string(),
             status: PromiseStatus::Protected,
             health: "healthy".to_string(),
             health_reasons: vec![],

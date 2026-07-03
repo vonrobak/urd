@@ -5,9 +5,10 @@
 //! the persisted prior armed tier. Pure derivation stays in
 //! `storage_critical.rs`; `assess()` consumes the per-subvolume signal map.
 //!
-//! - **Read paths** (`status`, bare `urd`, `doctor`) call `gather()` +
-//!   `aggregate()` only — they *reflect* the hysteresis-stabilized tier and
-//!   never advance state (S1: a read can never fire a transition).
+//! - **Read paths** (`status`, bare `urd`, `doctor`) call `gather()` plus the
+//!   pure display aggregators (`aggregate()`, and `aggregate_adaptations()` for
+//!   `status`) only — they *reflect* the hysteresis-stabilized tier and never
+//!   advance state (S1: a read can never fire a transition).
 //! - **`backup`** additionally calls `advance_and_writeback()` after its
 //!   post-execution `assess()`: it re-runs the pure hysteresis per
 //!   UUID-resolvable pool, persists `(armed_tier, since)` best-effort, and
@@ -19,10 +20,10 @@ use std::path::{Path, PathBuf};
 
 use chrono::NaiveDateTime;
 
-use crate::awareness::{ResolvedStorageSignal, StorageSignalMap, SubvolAssessment};
+use crate::awareness::{PromiseStatus, ResolvedStorageSignal, StorageSignalMap, SubvolAssessment};
 use crate::config::Config;
 use crate::events::{Event, EventPayload};
-use crate::output::PoolPostureSummary;
+use crate::output::{AdaptationSummary, PoolPostureSummary};
 use crate::pools::{self, PoolSpace};
 use crate::state::StateDb;
 use crate::storage_critical::{self, ArmedTierMap, TightnessTier, Transition};
@@ -430,6 +431,111 @@ pub fn aggregate(
         });
     }
     summaries
+}
+
+/// Aggregate per-subvolume storage *adaptations* into one display line per group
+/// (UPI 079-a §2). Pure. Mirrors the renderer's original per-assessment gate but
+/// collapses subvolumes that share an adaptation into a single
+/// [`AdaptationSummary`], so N subvolumes on one tight pool render one line.
+///
+/// **M1 — iterate assessments, not pools.** The original renderer was
+/// assessment-driven (every adapted subvolume rendered). We iterate `assessments`
+/// and gate each on an effective interval AND either Protected (honest Tight) or
+/// AT-RISK-by-design (Critical cap), skipping Roomy and genuine-failure/Unprotected
+/// — mirroring the renderer's `continue`s. Each gated-in assessment reverse-looks
+/// up its pool label from `signals.pools`; **if none is found, the subvolume's own
+/// name is the group key so the line still renders** (pool-iteration would have
+/// silently dropped a gated-in-but-poolless subvolume).
+///
+/// **S2 — conditional grouping key.** A local-only group keys on
+/// `(pool_label, by_design)` only — its sentence renders neither cadence nor the
+/// external/history clause, so folding those in would split identical lines.
+/// A non-local group additionally keys on `(cadence_secs, external_only)`.
+///
+/// `config` supplies the transient/external-only flag, which `SubvolAssessment`
+/// does not carry (it is config-derived, resolved the same way the status
+/// assembler resolves it).
+#[must_use]
+pub fn aggregate_adaptations(
+    assessments: &[SubvolAssessment],
+    signals: &StorageSignals,
+    config: &Config,
+) -> Vec<AdaptationSummary> {
+    let resolved = config.resolved_subvolumes();
+
+    // Grouping key: (pool_label, local_only, cadence_secs, external_only, by_design)
+    // — the cadence/external_only slots carry the normalized (None/false) values
+    // for a local-only group, so S2's conditional key falls out of one tuple.
+    type AdaptKey = (String, bool, Option<i64>, bool, bool);
+    let mut order: Vec<AdaptKey> = Vec::new();
+    let mut groups: HashMap<AdaptKey, AdaptationSummary> = HashMap::new();
+
+    for a in assessments {
+        // Gate (M1): only adapted subvolumes speak here.
+        let Some(interval) = a.effective_send_interval else {
+            continue; // Roomy — nothing to explain.
+        };
+        let cadence_secs = interval.as_secs();
+        let by_design = if a.status == PromiseStatus::AtRisk && a.cadence_adapted {
+            true
+        } else if a.status == PromiseStatus::Protected {
+            false
+        } else {
+            continue; // genuine failure / Unprotected — the summary leads instead
+        };
+
+        let local_only = a.external.is_empty();
+        let external_only = resolved
+            .iter()
+            .find(|sv| sv.name == a.name)
+            .map(|sv| sv.local_retention.is_transient() && sv.send_enabled)
+            .unwrap_or(false);
+
+        // Reverse-look-up the pool label; fall back to the subvolume's own name
+        // so a gated-in but poolless subvolume still renders.
+        let pool_label = signals
+            .pools
+            .iter()
+            .find(|p| p.subvol_names.iter().any(|n| n == &a.name))
+            .map(|p| p.label.clone())
+            .unwrap_or_else(|| a.name.clone());
+
+        // Normalize the cadence/external_only slots to None/false for a
+        // local-only group so identical local-only lines share one key (S2).
+        let (cadence_field, external_only_field) = if local_only {
+            (None, false)
+        } else {
+            (Some(cadence_secs), external_only)
+        };
+        let key: AdaptKey = (
+            pool_label.clone(),
+            local_only,
+            cadence_field,
+            external_only_field,
+            by_design,
+        );
+
+        groups
+            .entry(key.clone())
+            .or_insert_with(|| {
+                order.push(key.clone());
+                AdaptationSummary {
+                    pool_label,
+                    local_only,
+                    external_only: external_only_field,
+                    cadence_secs: cadence_field,
+                    by_design,
+                    subvolumes: Vec::new(),
+                }
+            })
+            .subvolumes
+            .push(a.name.clone());
+    }
+
+    order
+        .into_iter()
+        .filter_map(|k| groups.remove(&k))
+        .collect()
 }
 
 #[cfg(test)]
@@ -1057,6 +1163,7 @@ source = "/"
         use crate::types::Interval;
         SubvolAssessment {
             name: name.to_string(),
+            short_name: name.to_string(),
             status: PromiseStatus::Protected,
             health: OperationalHealth::Healthy,
             health_reasons: vec![],
@@ -1075,5 +1182,186 @@ source = "/"
             cadence_adapted: false,
             effective_send_interval: None,
         }
+    }
+
+    // ── aggregate_adaptations (UPI 079-a §2) ─────────────────────────────
+
+    /// One pool carrying `subvols`, keyed by mountpoint (UUID-less is fine — the
+    /// aggregator reads only `label` and `subvol_names`).
+    fn signals_with_pool(label: &str, subvols: &[&str]) -> StorageSignals {
+        StorageSignals {
+            by_subvol: StorageSignalMap::new(),
+            pools: vec![PoolSignal {
+                uuid: None,
+                label: label.to_string(),
+                subvol_names: subvols.iter().map(|s| s.to_string()).collect(),
+                free_ratio: None,
+                free_bytes: None,
+                capacity_bytes: None,
+                floor_bytes: None,
+                host_root: false,
+                prior_armed_tier: TightnessTier::Roomy,
+                prior_since: None,
+            }],
+        }
+    }
+
+    fn adapt_assess(
+        name: &str,
+        status: crate::awareness::PromiseStatus,
+        cadence_adapted: bool,
+        effective_secs: Option<i64>,
+        has_external: bool,
+    ) -> SubvolAssessment {
+        use crate::awareness::{DriveAssessment, LocalAssessment, OperationalHealth, PromiseStatus};
+        use crate::types::{DriveRole, Interval};
+        let external = if has_external {
+            vec![DriveAssessment {
+                drive_label: "drive".to_string(),
+                status: PromiseStatus::Protected,
+                mounted: true,
+                snapshot_count: Some(1),
+                last_send_age: None,
+                source_unchanged: false,
+                configured_interval: Interval::hours(24),
+                role: DriveRole::Primary,
+                absent_duration_secs: None,
+                last_activity_age_secs: None,
+                rotation: None,
+            }]
+        } else {
+            vec![]
+        };
+        SubvolAssessment {
+            name: name.to_string(),
+            short_name: name.to_string(),
+            status,
+            health: OperationalHealth::Healthy,
+            health_reasons: vec![],
+            local: LocalAssessment {
+                status: PromiseStatus::Protected,
+                snapshot_count: 1,
+                newest_age: None,
+                configured_interval: Interval::hours(1),
+            },
+            external,
+            chain_health: vec![],
+            advisories: vec![],
+            redundancy_advisories: vec![],
+            errors: vec![],
+            storage_posture: None,
+            cadence_adapted,
+            effective_send_interval: effective_secs
+                .map(|s| Interval::from_chrono(chrono::Duration::seconds(s))),
+        }
+    }
+
+    #[test]
+    fn aggregate_adaptations_single_subvol_one_summary() {
+        use crate::awareness::PromiseStatus;
+        let signals = signals_with_pool("/data", &["alpha"]);
+        let assessments =
+            vec![adapt_assess("alpha", PromiseStatus::Protected, false, Some(86400), true)];
+        let out = aggregate_adaptations(&assessments, &signals, &cfg());
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].subvolumes, vec!["alpha".to_string()]);
+        assert_eq!(out[0].pool_label, "/data");
+        assert!(!out[0].by_design);
+        assert_eq!(out[0].cadence_secs, Some(86400));
+    }
+
+    #[test]
+    fn aggregate_adaptations_same_pool_shape_collapses() {
+        use crate::awareness::PromiseStatus;
+        let signals = signals_with_pool("/data", &["alpha", "beta"]);
+        let assessments = vec![
+            adapt_assess("alpha", PromiseStatus::Protected, false, Some(86400), true),
+            adapt_assess("beta", PromiseStatus::Protected, false, Some(86400), true),
+        ];
+        let out = aggregate_adaptations(&assessments, &signals, &cfg());
+        assert_eq!(out.len(), 1, "same pool+cadence+shape collapses: {out:?}");
+        assert_eq!(
+            out[0].subvolumes,
+            vec!["alpha".to_string(), "beta".to_string()]
+        );
+    }
+
+    #[test]
+    fn aggregate_adaptations_non_local_two_cadences_two_summaries() {
+        use crate::awareness::PromiseStatus;
+        let signals = signals_with_pool("/data", &["alpha", "beta"]);
+        let assessments = vec![
+            adapt_assess("alpha", PromiseStatus::Protected, false, Some(86400), true),
+            adapt_assess("beta", PromiseStatus::Protected, false, Some(2 * 86400), true),
+        ];
+        let out = aggregate_adaptations(&assessments, &signals, &cfg());
+        assert_eq!(out.len(), 2, "distinct cadences on a non-local pool split: {out:?}");
+    }
+
+    #[test]
+    fn aggregate_adaptations_local_only_different_cadence_one_summary() {
+        // S2 regression guard: local-only subvols with DIFFERENT cadence still
+        // collapse — the local-only sentence names no cadence, so cadence must not
+        // split the group.
+        use crate::awareness::PromiseStatus;
+        let signals = signals_with_pool("/data", &["alpha", "beta"]);
+        let assessments = vec![
+            adapt_assess("alpha", PromiseStatus::Protected, false, Some(86400), false),
+            adapt_assess("beta", PromiseStatus::Protected, false, Some(2 * 86400), false),
+        ];
+        let out = aggregate_adaptations(&assessments, &signals, &cfg());
+        assert_eq!(out.len(), 1, "local-only group must not split on cadence: {out:?}");
+        assert!(out[0].local_only);
+        assert_eq!(out[0].cadence_secs, None, "local-only carries no cadence");
+        assert_eq!(out[0].subvolumes.len(), 2);
+    }
+
+    #[test]
+    fn aggregate_adaptations_by_design_splits() {
+        // Same pool + cadence + shape but different by_design → two summaries (one
+        // appends the "by design" reassurance, the other does not).
+        use crate::awareness::PromiseStatus;
+        let signals = signals_with_pool("/data", &["alpha", "beta"]);
+        let assessments = vec![
+            adapt_assess("alpha", PromiseStatus::Protected, false, Some(86400), true),
+            adapt_assess("beta", PromiseStatus::AtRisk, true, Some(86400), true),
+        ];
+        let out = aggregate_adaptations(&assessments, &signals, &cfg());
+        assert_eq!(out.len(), 2, "by_design difference splits the group: {out:?}");
+        assert!(out.iter().any(|s| s.by_design));
+        assert!(out.iter().any(|s| !s.by_design));
+    }
+
+    #[test]
+    fn aggregate_adaptations_skips_roomy_and_genuine_failure() {
+        use crate::awareness::PromiseStatus;
+        let signals = signals_with_pool("/data", &["alpha", "beta", "gamma"]);
+        let assessments = vec![
+            adapt_assess("alpha", PromiseStatus::Protected, false, None, true), // Roomy → skip
+            adapt_assess("beta", PromiseStatus::AtRisk, false, Some(86400), true), // failure → skip
+            adapt_assess("gamma", PromiseStatus::Unprotected, false, Some(86400), true), // unprotected → skip
+        ];
+        let out = aggregate_adaptations(&assessments, &signals, &cfg());
+        assert!(
+            out.is_empty(),
+            "Roomy + genuine-failure + unprotected produce no adaptation lines: {out:?}"
+        );
+    }
+
+    #[test]
+    fn aggregate_adaptations_poolless_subvol_still_renders() {
+        // M1 guard: a gated-in subvolume whose pool is absent from signals.pools
+        // must still render (keyed on its own name), never silently drop.
+        use crate::awareness::PromiseStatus;
+        let signals = StorageSignals {
+            by_subvol: StorageSignalMap::new(),
+            pools: vec![],
+        };
+        let assessments =
+            vec![adapt_assess("orphan", PromiseStatus::Protected, false, Some(86400), true)];
+        let out = aggregate_adaptations(&assessments, &signals, &cfg());
+        assert_eq!(out.len(), 1, "poolless gated-in subvol must still render: {out:?}");
+        assert_eq!(out[0].pool_label, "orphan", "falls back to the subvol's own name");
+        assert_eq!(out[0].subvolumes, vec!["orphan".to_string()]);
     }
 }

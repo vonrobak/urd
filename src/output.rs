@@ -131,6 +131,40 @@ pub struct PoolPostureSummary {
     pub since_secs: Option<i64>,
 }
 
+// ── AdaptationSummary ───────────────────────────────────────────────────
+
+/// One per-group storage-adaptation display line (UPI 079-a §2). Mirrors
+/// [`PoolPostureSummary`]: the deliberate-slowdown fact stated once for a set of
+/// subvolumes that share it, so N subvolumes on one tight pool render a single
+/// line instead of N. Aggregated compute-side by
+/// [`crate::commands::storage_signals::aggregate_adaptations`] (it needs
+/// `signals.pools`, which the renderer can't see). These fields fully determine
+/// the rendered sentence — the pool label, whether the pool is local-only, the
+/// external-only (transient) shape, the effective cadence, and whether the AT
+/// RISK reading is by-design.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct AdaptationSummary {
+    /// Display label of the shared source pool (grouping anchor; the sentence
+    /// templates name subvolumes and cadence, not the pool, so this is unread by
+    /// the renderer — carried for `--json`).
+    pub pool_label: String,
+    /// The pool has no external drive for these subvolumes — a different sentence
+    /// (no drive to spare, no history "on the drive").
+    pub local_only: bool,
+    /// Transient local retention (external-only) — suppresses the "local history
+    /// reduced" clause. Unread (carried `false`) for a local-only group.
+    pub external_only: bool,
+    /// The effective send interval in seconds. Unread (carried `None`) for a
+    /// local-only group, whose sentence names no cadence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cadence_secs: Option<i64>,
+    /// The AT RISK reading is a deliberate Critical cap, not a failure — appends
+    /// the "Reads AT RISK by design" reassurance.
+    pub by_design: bool,
+    /// The subvolumes sharing this adaptation (rendered in place of a single name).
+    pub subvolumes: Vec<String>,
+}
+
 // ── StatusOutput ────────────────────────────────────────────────────────
 
 /// Structured output for the `urd status` command.
@@ -159,12 +193,19 @@ pub struct StatusOutput {
     /// pools are Roomy, so roomy systems stay silent.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub storage_postures: Vec<PoolPostureSummary>,
+    /// Per-group storage-adaptation lines (UPI 079-a §2). Omitted from JSON when
+    /// no subvolume is adapting, so a Roomy system stays silent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub storage_adaptations: Vec<AdaptationSummary>,
 }
 
 /// Serializable wrapper around SubvolAssessment data.
 #[derive(Debug, Serialize)]
 pub struct StatusAssessment {
     pub name: String,
+    /// User-facing short name (UPI 079-a §8a) — rendered in the SUBVOLUME cell.
+    /// `name` remains the join key for chain health / advisories / errors.
+    pub short_name: String,
     /// Promise status (serializes SCREAMING: "PROTECTED" / "AT RISK" / "UNPROTECTED").
     pub status: PromiseStatus,
     /// Operational health: "healthy", "degraded", or "blocked".
@@ -212,6 +253,7 @@ impl StatusAssessment {
     pub fn from_assessment(a: &SubvolAssessment) -> Self {
         Self {
             name: a.name.clone(),
+            short_name: a.short_name.clone(),
             status: a.status,
             health: a.health.to_string(),
             health_reasons: a.health_reasons.clone(),
@@ -1690,6 +1732,7 @@ mod tests {
         };
         let assessment = SubvolAssessment {
             name: "sv1".to_string(),
+            short_name: "sv1".to_string(),
             status: PromiseStatus::Protected,
             health: OperationalHealth::Healthy,
             health_reasons: vec![],

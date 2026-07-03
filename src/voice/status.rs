@@ -72,15 +72,9 @@ pub(super) fn render_status_interactive(data: &StatusOutput) -> String {
     // ── Last run ────────────────────────────────────────────────────
     render_last_run(data, &mut out);
 
-    // ── Pin summary ─────────────────────────────────────────────────
-    if data.total_pins > 0 {
-        writeln!(
-            out,
-            "Pinned snapshots: {} across subvolumes",
-            data.total_pins
-        )
-        .ok();
-    }
+    // §8b (UPI 079-a): the "Pinned snapshots: N" line is dropped — pin count is
+    // an internal fact, not a promise the user acts on. `total_pins` stays on
+    // `StatusOutput` for `--json`.
 
     // ── Next-action suggestion ──────────────────────────────────────
     if !data.advice.is_empty() {
@@ -93,7 +87,22 @@ pub(super) fn render_status_interactive(data: &StatusOutput) -> String {
                 writeln!(out, "{}", format!("{} — {}.", a.subvolume, reason).dimmed()).ok();
             }
         } else {
-            writeln!(out, "{}", format!("{} subvolumes need attention — run `urd doctor` for details.", data.advice.len()).dimmed()).ok();
+            // Footer counts distinct root causes, not rows (UPI 079-a §3): N
+            // subvolumes stranded by one absent drive are one thing to fix. The
+            // cause count can be 1 here even though ≥2 advice rows landed in this
+            // branch (they collapsed to one cause), so agree the verb.
+            let causes = crate::advice::count_distinct_causes(&data.advice);
+            let verb = if causes == 1 { "needs" } else { "need" };
+            writeln!(
+                out,
+                "{}",
+                format!(
+                    "{} {verb} attention — run `urd doctor` for details.",
+                    pluralize(causes, "issue", "issues")
+                )
+                .dimmed()
+            )
+            .ok();
         }
     }
 
@@ -184,62 +193,53 @@ pub(super) fn render_summary_line(data: &StatusOutput, out: &mut String) {
     writeln!(out, "{safety_part}{health_part}").ok();
 }
 
-/// Render per-subvolume storage-adaptation prose (UPI 031-b AB3.1). When a tight
-/// pool has slowed Urd's cadence (`effective_send_interval_secs` set), explain
-/// it told-not-silent so the slowdown reads as deliberate care, not failure:
+/// Render storage-adaptation prose (UPI 031-b AB3.1; grouped per UPI 079-a §2).
+/// When a tight pool has slowed Urd's cadence, explain it told-not-silent so the
+/// slowdown reads as deliberate care, not failure. Reads the pre-aggregated
+/// [`AdaptationSummary`] list (one per group of subvolumes that share the
+/// adaptation) — the gate and grouping live compute-side in
+/// [`crate::commands::storage_signals::aggregate_adaptations`], so a Roomy /
+/// genuine-failure subvolume never reaches here:
 ///
-/// - **Critical capped (`cadence_adapted`)** — the promise was dropped to AT RISK
-///   *by design*; say so explicitly, naming the cadence. This is the user-facing
-///   acceptance criterion for the R4 overturn (the 2am golden test).
-/// - **Honest Tight (still `Protected`)** — an informational lengthened-cadence
-///   note; the promise is untouched.
-/// - **Genuine failure** (AT RISK *without* `cadence_adapted`, or UNPROTECTED) —
-///   say nothing here; the failure is the more urgent truth and leads via the
-///   summary/advisories.
+/// - **Critical capped (`by_design`)** — the promise was dropped to AT RISK *by
+///   design*; say so explicitly, naming the cadence (the R4-overturn 2am golden).
+/// - **Honest Tight (`!by_design`)** — an informational lengthened-cadence note;
+///   the promise is untouched.
 ///
-/// A declared-Graduated subvolume (`!external_only`) additionally notes that its
-/// local history was reduced/cleared — full history lives on the drive.
+/// A local-only group (`local_only`) has no drive to "spare" and no history "on
+/// the drive" (#195). A declared-Graduated group (`!external_only`) additionally
+/// notes that its local history was reduced/cleared.
 pub(super) fn render_storage_adaptations(data: &StatusOutput, out: &mut String) {
-    for a in &data.assessments {
-        let Some(secs) = a.effective_send_interval_secs else {
-            continue; // Roomy — declared cadence, nothing to explain.
-        };
-        // Capped-by-design (Critical) appends an explicit "by design"
-        // reassurance; honest Tight (still Protected) gets the bare note; a
-        // genuine failure / UNPROTECTED says nothing here and leads via the
-        // summary instead.
-        let suffix = if a.status == PromiseStatus::AtRisk && a.cadence_adapted {
+    for s in &data.storage_adaptations {
+        // Capped-by-design (Critical) appends an explicit "by design" reassurance;
+        // honest Tight gets the bare note.
+        let suffix = if s.by_design {
             " Reads AT RISK by design, not a failure."
-        } else if a.status == PromiseStatus::Protected {
-            ""
         } else {
-            continue;
+            ""
         };
-
-        // A local-only subvolume (no external drive) has no drive to "spare" and
-        // no full history living "on the drive" — the old line was a flat lie for
-        // it (#195). Say only what's true: the source pool is tight, so Urd keeps
-        // less local history to protect the host.
-        let line = if a.external.is_empty() {
+        let names = s.subvolumes.join(", ");
+        let line = if s.local_only {
+            // A local-only group has no drive to spare and no full history living
+            // "on the drive" (#195). Say only what's true.
             format!(
-                "  {}: source pool is tight \u{2014} keeping less local history to protect the host.{suffix}",
-                a.name,
+                "  {names}: source pool is tight \u{2014} keeping less local history to protect the host.{suffix}",
             )
         } else {
-            // `humanize_cadence`, not `humanize_duration`: a 36h tight-stretch
-            // must not floor to "1d" (identical to the declared daily), which
-            // would make the sparing invisible (#195).
-            let cadence = humanize_cadence(secs);
+            // `humanize_cadence`, not `humanize_duration`: a 36h tight-stretch must
+            // not floor to "1d" (identical to the declared daily), which would make
+            // the sparing invisible (#195). Non-local groups always carry a cadence.
+            let cadence = s.cadence_secs.map(humanize_cadence).unwrap_or_default();
             // Declared-Graduated subvols had graduated local history; the tier
-            // reduced it to retain-one (Tight) or cleared it (Critical).
-            let history = if a.external_only {
+            // reduced it to retain-one (Tight) or cleared it (Critical). Transient
+            // (external-only) groups have no local history to reduce.
+            let history = if s.external_only {
                 ""
             } else {
                 " local history reduced \u{2014} full history is on the drive;"
             };
             format!(
-                "  {}: tight drive \u{2014}{history} backing up every {cadence} to spare it.{suffix}",
-                a.name,
+                "  {names}: tight drive \u{2014}{history} backing up every {cadence} to spare it.{suffix}",
             )
         };
         writeln!(out, "{}", line.yellow()).ok();
@@ -312,9 +312,22 @@ pub(super) fn render_subvolume_table(data: &StatusOutput, out: &mut String) {
     });
     // Only show HEALTH column when at least one subvolume is non-healthy
     let show_health = data.assessments.iter().any(|a| a.health != "healthy");
+    // EXPOSURE is hidden when every subvolume is sealed (all Protected) — the
+    // column would be "sealed" repeated down every row, the seven-line wall one
+    // column over (UPI 079-a §9). Load-bearing coupling: this gate is licensed
+    // ONLY because `render_summary_line` already states the aggregate promise
+    // ("All sealed." in green) as the first line of `urd status`. Do not weaken
+    // that summary without revisiting this gate.
+    let show_exposure = data
+        .assessments
+        .iter()
+        .any(|a| a.status != PromiseStatus::Protected);
 
-    // Build headers: EXPOSURE  [HEALTH]  [PROTECTION]  SUBVOLUME  LOCAL  [DRIVES...]  THREAD
-    let mut headers: Vec<String> = vec!["EXPOSURE".to_string()];
+    // Build headers: [EXPOSURE]  [HEALTH]  [PROTECTION]  SUBVOLUME  LOCAL  [DRIVES...]  THREAD
+    let mut headers: Vec<String> = Vec::new();
+    if show_exposure {
+        headers.push("EXPOSURE".to_string());
+    }
     if show_health {
         headers.push("HEALTH".to_string());
     }
@@ -328,16 +341,23 @@ pub(super) fn render_subvolume_table(data: &StatusOutput, out: &mut String) {
     }
     headers.push("THREAD".to_string());
 
-    // Track which columns need coloring
-    let safety_col = Some(0usize);
-    let health_col = if show_health { Some(1usize) } else { None };
+    // Track which columns need coloring. Indices shift when EXPOSURE is hidden:
+    // HEALTH then leads at index 0 instead of following EXPOSURE at index 1.
+    let safety_col = if show_exposure { Some(0usize) } else { None };
+    let health_col = if show_health {
+        Some(if show_exposure { 1 } else { 0 })
+    } else {
+        None
+    };
 
     // Build rows
     let mut rows: Vec<Vec<String>> = Vec::new();
     for assessment in &data.assessments {
-        // Safety column — new vocabulary
-        let safety = exposure_label(assessment.status);
-        let mut row = vec![safety];
+        // Safety column — omitted entirely when every subvolume is sealed.
+        let mut row: Vec<String> = Vec::new();
+        if show_exposure {
+            row.push(exposure_label(assessment.status));
+        }
 
         if show_health {
             row.push(assessment.health.clone());
@@ -350,7 +370,9 @@ pub(super) fn render_subvolume_table(data: &StatusOutput, out: &mut String) {
                     .unwrap_or_else(|| "\u{2014}".to_string()),
             );
         }
-        row.push(assessment.name.clone());
+        // SUBVOLUME cell shows the user-facing short name (§8a); the long `name`
+        // stays the key for the THREAD join, advisories, errors, and chain_health.
+        row.push(assessment.short_name.clone());
 
         // LOCAL column with temporal context
         let local_cell = if assessment.external_only {
@@ -421,25 +443,44 @@ pub(super) fn format_count_with_age(count: usize, age_secs: Option<i64>) -> Stri
 
 pub(super) fn render_advisories(data: &StatusOutput, out: &mut String) {
     let mut any = false;
+    // Errors stay per-subvolume (genuinely per-unit); only advisory NOTEs group
+    // (UPI 079-a §4). All ERRORs render first, then the grouped NOTEs — today
+    // they interleave per-assessment; the reorder is cosmetic and `contains`-safe
+    // (m2). The trailing blank line still keys on `any` (errors only), preserving
+    // the pre-grouping behavior where advisories alone add no blank line.
     for assessment in &data.assessments {
         for error in &assessment.errors {
             writeln!(out, "  {} {}: {}", "ERROR".red(), assessment.name, error).ok();
             any = true;
         }
-        for advisory in &assessment.advisories {
-            writeln!(
-                out,
-                "  {} {}: {}",
-                "NOTE".dimmed(),
-                assessment.name,
-                advisory
-            )
-            .ok();
-        }
+    }
+    for (advisory, subvols) in super::group_advisory_notes(&data.assessments) {
+        writeln!(out, "  {} {}: {}", "NOTE".dimmed(), subvols.join(", "), advisory).ok();
     }
     if any {
         writeln!(out).ok();
     }
+}
+
+/// Extract the leading day-count the engine embedded in an `OffsiteDriveStale`
+/// `detail` (UPI 056 RD10 format — `"overdue — 11 days past its usual ~45d
+/// cycle"` or `"stale — last refreshed 40 days ago"`). Used only to pick the
+/// most-overdue detail across a drive group (worst-age-wins, UPI 079-a §1 S1).
+/// A drive group is format-homogeneous — cadence is drive-level, so every
+/// member shares the same detail shape — so the *first* integer is monotonic
+/// with `last_send_age` within the group. Returns 0 when no integer is present
+/// (defensive: the format always carries one). Kept in lockstep with the
+/// `advice.rs` detail format; the §1 regression test pins the coupling.
+fn stale_detail_days(detail: &str) -> i64 {
+    let mut digits = String::new();
+    for ch in detail.chars() {
+        if ch.is_ascii_digit() {
+            digits.push(ch);
+        } else if !digits.is_empty() {
+            break;
+        }
+    }
+    digits.parse().unwrap_or(0)
 }
 
 pub(super) fn render_redundancy_advisories(data: &StatusOutput, out: &mut String) {
@@ -450,7 +491,23 @@ pub(super) fn render_redundancy_advisories(data: &StatusOutput, out: &mut String
     writeln!(out).ok();
     writeln!(out, "{}", "REDUNDANCY".dimmed()).ok();
 
+    // OffsiteDriveStale groups by drive (UPI 079-a §1): N subvolumes on one
+    // overdue offsite drive share a single physical fact, so the drive's copy
+    // staleness renders once — naming the affected subvolumes — not N identical
+    // lines. Every other kind is genuinely per-subvolume (its text names the
+    // subvolume) and renders unchanged. Grouping display lines is presentation
+    // (architecture.md: voice/ renders), so it stays render-side.
+    let mut seen_stale_drives: std::collections::HashSet<Option<String>> =
+        std::collections::HashSet::new();
+
     for advisory in &data.redundancy_advisories {
+        // Emit an OffsiteDriveStale drive group only at its first appearance.
+        if advisory.kind == RedundancyAdvisoryKind::OffsiteDriveStale
+            && !seen_stale_drives.insert(advisory.drive.clone())
+        {
+            continue;
+        }
+
         let (observation, suggestion) = match advisory.kind {
             RedundancyAdvisoryKind::NoOffsiteProtection => (
                 format!(
@@ -459,17 +516,37 @@ pub(super) fn render_redundancy_advisories(data: &StatusOutput, out: &mut String
                 ),
                 "Consider designating a drive as offsite to protect against site loss.".to_string(),
             ),
-            RedundancyAdvisoryKind::OffsiteDriveStale => (
-                // The cadence-relative predicate comes from the engine `detail`
-                // (UPI 056, RD10) — e.g. "overdue — 11 days past its usual ~45d
-                // cycle"; voice supplies only the framing.
-                format!(
-                    "The offsite copy on {} is {}.",
-                    advisory.drive.as_deref().unwrap_or("unknown"),
-                    advisory.detail,
-                ),
-                "Cycle the offsite drive on your next trip to refresh the copy.".to_string(),
-            ),
+            RedundancyAdvisoryKind::OffsiteDriveStale => {
+                // Worst-age-wins across the drive group (S1): `detail` embeds a
+                // per-subvolume day count (the cadence-relative predicate from
+                // advice.rs, UPI 056 RD10), so grouping on the raw detail would
+                // fail to collapse different-age subvolumes. Surface the
+                // most-overdue detail and name the affected subvolumes.
+                let mut worst_detail = advisory.detail.as_str();
+                let mut worst_days = stale_detail_days(&advisory.detail);
+                let mut names: Vec<&str> = Vec::new();
+                for a in &data.redundancy_advisories {
+                    if a.kind == RedundancyAdvisoryKind::OffsiteDriveStale
+                        && a.drive == advisory.drive
+                    {
+                        names.push(a.subvolume.as_str());
+                        let days = stale_detail_days(&a.detail);
+                        if days > worst_days {
+                            worst_days = days;
+                            worst_detail = a.detail.as_str();
+                        }
+                    }
+                }
+                (
+                    format!(
+                        "The offsite copy on {} is {} ({}).",
+                        advisory.drive.as_deref().unwrap_or("unknown"),
+                        worst_detail,
+                        names.join(", "),
+                    ),
+                    "Cycle the offsite drive on your next trip to refresh the copy.".to_string(),
+                )
+            }
             RedundancyAdvisoryKind::SinglePointOfFailure => (
                 format!(
                     "{} rests on a single external drive.",
@@ -640,6 +717,10 @@ fn render_default_status_interactive(data: &DefaultStatusOutput) -> String {
 
     // Next-action suggestion
     if let Some(ref advice) = data.best_advice {
+        // `total_needing_attention` is a distinct-cause count (UPI 079-a §3), not
+        // a row count. m1: when N subvolumes share ONE cause it is 1, so this
+        // inline branch fires and names the FIRST subvolume's remediation —
+        // intended (connecting the shared drive fixes all N), not a bug.
         if data.total_needing_attention == 1 {
             if let Some(ref cmd) = advice.command {
                 writeln!(out, "{}", format!("Run `{cmd}`.").dimmed()).ok();
@@ -647,7 +728,16 @@ fn render_default_status_interactive(data: &DefaultStatusOutput) -> String {
                 writeln!(out, "{}", reason.dimmed()).ok();
             }
         } else {
-            writeln!(out, "{}", format!("{} subvolumes need attention — run `urd status` for details.", data.total_needing_attention).dimmed()).ok();
+            writeln!(
+                out,
+                "{}",
+                format!(
+                    "{} need attention — run `urd status` for details.",
+                    pluralize(data.total_needing_attention, "issue", "issues")
+                )
+                .dimmed()
+            )
+            .ok();
         }
     } else if data.sealed_count() < data.total || health_issues > 0 {
         append_suggestion(&SuggestionContext::Default { has_issues: true }, &mut out);
@@ -675,7 +765,7 @@ pub fn render_first_time(mode: OutputMode) -> String {
 mod tests {
     use super::*;
     use crate::advice::ActionableAdvice;
-    use crate::output::{DriveInfo, StatusDriveAssessment};
+    use crate::output::{AdaptationSummary, DriveInfo, StatusDriveAssessment};
     use crate::voice::test_fixtures::*;
 
     #[test]
@@ -799,7 +889,16 @@ mod tests {
         h.status = PromiseStatus::AtRisk; // capped from Protected
         h.cadence_adapted = true;
         h.effective_send_interval_secs = Some(7 * 86400); // weekly
-        // declared-Graduated (external_only stays false) → history-reduced clause.
+        // The adaptation line is driven by the pre-aggregated summary (UPI 079-a
+        // §2). declared-Graduated (external_only false) → history-reduced clause.
+        data.storage_adaptations = vec![AdaptationSummary {
+            pool_label: "/".to_string(),
+            local_only: false,
+            external_only: false,
+            cadence_secs: Some(7 * 86400), // weekly
+            by_design: true,
+            subvolumes: vec!["htpc-home".to_string()],
+        }];
 
         let out = render_status(&data, OutputMode::Interactive);
         let head = out.lines().take(4).collect::<Vec<_>>().join("\n");
@@ -836,18 +935,19 @@ mod tests {
 
     #[test]
     fn tight_local_only_reassurance_states_only_truths() {
-        // #195: a local-only subvolume (no external drive) must not be told its
-        // "full history is on the drive" or that Urd is "backing up to spare it"
-        // — there is no drive and no send. Say only what's true.
+        // #195: a local-only group (no external drive) must not be told its "full
+        // history is on the drive" or that Urd is "backing up to spare it" — there
+        // is no drive and no send. Say only what's true.
         let _color = color_guard(false);
         let mut data = test_status_output();
-        data.assessments.truncate(1);
-        let a = &mut data.assessments[0];
-        a.name = "subvol6-tmp".to_string();
-        a.external = vec![]; // local-only
-        a.status = PromiseStatus::Protected;
-        a.cadence_adapted = false;
-        a.effective_send_interval_secs = Some(86400);
+        data.storage_adaptations = vec![AdaptationSummary {
+            pool_label: "/data".to_string(),
+            local_only: true,
+            external_only: false,
+            cadence_secs: None,
+            by_design: false,
+            subvolumes: vec!["subvol6-tmp".to_string()],
+        }];
 
         let mut out = String::new();
         render_storage_adaptations(&data, &mut out);
@@ -875,11 +975,14 @@ mod tests {
         // the sparing invisible).
         let _color = color_guard(false);
         let mut data = test_status_output();
-        data.assessments.truncate(1);
-        let a = &mut data.assessments[0]; // htpc-home, has external WD-18TB
-        a.status = PromiseStatus::Protected;
-        a.cadence_adapted = false;
-        a.effective_send_interval_secs = Some(129600); // 36h
+        data.storage_adaptations = vec![AdaptationSummary {
+            pool_label: "/data".to_string(),
+            local_only: false,
+            external_only: false, // has local history → "full history on the drive"
+            cadence_secs: Some(129600), // 36h
+            by_design: false,
+            subvolumes: vec!["htpc-home".to_string()],
+        }];
 
         let mut out = String::new();
         render_storage_adaptations(&data, &mut out);
@@ -889,6 +992,82 @@ mod tests {
         assert!(
             out.contains("to spare it"),
             "an external subvol keeps the spare-the-drive prose: {out}"
+        );
+    }
+
+    #[test]
+    fn subvolume_cell_shows_short_name_while_thread_resolves_by_long_name() {
+        // §8a: the SUBVOLUME cell renders the user-facing short name, but the
+        // THREAD column (keyed on the long `name` via chain_health) still resolves
+        // — proving the long name stays the join key.
+        let _color = color_guard(false);
+        let mut data = test_status_output();
+        data.assessments[0].short_name = "SHORTHOME".to_string(); // long name stays "htpc-home"
+        let output = render_status(&data, OutputMode::Interactive);
+        let row = output
+            .lines()
+            .find(|l| l.contains("SHORTHOME"))
+            .unwrap_or_else(|| panic!("no SHORTHOME row in:\n{output}"));
+        assert!(
+            row.contains("unbroken"),
+            "THREAD must resolve via the long name (chain_health keyed 'htpc-home'): {row}"
+        );
+        assert!(
+            !row.contains("htpc-home"),
+            "SUBVOLUME cell must show the short name only, not the long name: {row}"
+        );
+    }
+
+    #[test]
+    fn all_sealed_table_omits_exposure_column_mixed_keeps_it() {
+        // §9: an all-sealed table hides the EXPOSURE column (the aggregate promise
+        // already leads via the summary line); a mixed table keeps it.
+        let _color = color_guard(false);
+
+        // Mixed (fixture htpc-docs is AT RISK) → EXPOSURE header present.
+        let mixed = render_status(&test_status_output(), OutputMode::Interactive);
+        assert!(
+            mixed.contains("EXPOSURE"),
+            "a mixed table must keep the EXPOSURE header: {mixed}"
+        );
+
+        // All sealed → EXPOSURE header and per-row exposure cell gone.
+        let mut data = test_status_output();
+        for a in &mut data.assessments {
+            a.status = PromiseStatus::Protected;
+            a.health = "healthy".to_string();
+            a.health_reasons.clear();
+        }
+        let sealed = render_status(&data, OutputMode::Interactive);
+        assert!(
+            !sealed.contains("EXPOSURE"),
+            "an all-sealed table must omit the EXPOSURE header: {sealed}"
+        );
+        // The aggregate promise state still leads via the summary line.
+        assert!(
+            sealed.contains("All sealed."),
+            "the summary must still state the aggregate promise: {sealed}"
+        );
+    }
+
+    #[test]
+    fn all_sealed_table_health_column_leads_when_exposure_hidden() {
+        // When EXPOSURE is hidden but a sealed subvolume is still degraded, HEALTH
+        // takes index 0 — the color index must shift so the HEALTH cell stays
+        // yellow (a stale health_col = 1 would colour the SUBVOLUME cell instead).
+        let _color = color_guard(true);
+        let mut data = test_status_output();
+        for a in &mut data.assessments {
+            a.status = PromiseStatus::Protected; // all sealed → EXPOSURE hidden
+        }
+        // htpc-docs stays health "degraded" (from the fixture) → HEALTH shown.
+        let output = render_status(&data, OutputMode::Interactive);
+        assert!(!output.contains("EXPOSURE"), "EXPOSURE hidden when all sealed: {output}");
+        assert!(output.contains("HEALTH"), "HEALTH column still shown for a degraded sealed row");
+        // The degraded HEALTH cell (now at index 0) is still yellow-wrapped.
+        assert!(
+            output.contains("\u{1b}[33mdegraded\u{1b}[0m"),
+            "degraded HEALTH cell must stay yellow after the index shift: {output:?}"
         );
     }
 
@@ -1021,13 +1200,6 @@ mod tests {
     }
 
     #[test]
-    fn interactive_contains_pin_count() {
-        let _color = color_guard(false);
-        let output = render_status(&test_status_output(), OutputMode::Interactive);
-        assert!(output.contains("3"), "missing pin count");
-    }
-
-    #[test]
     fn interactive_no_subvolumes() {
         let _color = color_guard(false);
         let data = StatusOutput {
@@ -1040,6 +1212,7 @@ mod tests {
             redundancy_advisories: vec![],
             advice: vec![],
             storage_postures: Vec::new(),
+            storage_adaptations: Vec::new(),
         };
         let output = render_status(&data, OutputMode::Interactive);
         assert!(
@@ -1115,6 +1288,7 @@ mod tests {
             redundancy_advisories: vec![],
             advice: vec![],
             storage_postures: Vec::new(),
+            storage_adaptations: Vec::new(),
         };
         let output = render_status(&data, OutputMode::Interactive);
         assert!(
@@ -1220,13 +1394,44 @@ mod tests {
             },
         ];
         let output = render_status(&data, OutputMode::Interactive);
+        // Two advice rows, distinct causes (one None-reason waning + one
+        // Connect-drive reason) → "2 issues need attention" (UPI 079-a §3).
         assert!(
-            output.contains("2 subvolumes need attention"),
-            "missing doctor redirect: {output}"
+            output.contains("2 issues need attention"),
+            "missing cause-count doctor redirect: {output}"
         );
         assert!(
             output.contains("urd doctor"),
             "missing doctor command: {output}"
+        );
+    }
+
+    #[test]
+    fn status_two_rows_one_cause_reads_one_issue_singular() {
+        // §3: two advice rows sharing one cause collapse to "1 issue needs
+        // attention" — the row count is 2 but the cause count is 1, and the verb
+        // agrees.
+        let _color = color_guard(false);
+        let mut data = test_status_output();
+        let shared = "Connect WD-18TB and run `urd backup`".to_string();
+        data.advice = vec![
+            ActionableAdvice {
+                subvolume: "htpc-home".to_string(),
+                issue: "waning".to_string(),
+                command: None,
+                reason: Some(shared.clone()),
+            },
+            ActionableAdvice {
+                subvolume: "htpc-docs".to_string(),
+                issue: "waning".to_string(),
+                command: None,
+                reason: Some(shared),
+            },
+        ];
+        let output = render_status(&data, OutputMode::Interactive);
+        assert!(
+            output.contains("1 issue needs attention"),
+            "two rows, one cause → singular cause count with agreeing verb: {output}"
         );
     }
 
@@ -1287,6 +1492,87 @@ mod tests {
         assert!(
             !output.contains("REDUNDANCY"),
             "REDUNDANCY section should be absent when no advisories"
+        );
+    }
+
+    fn offsite_stale(subvolume: &str, drive: &str, detail: &str) -> crate::advice::RedundancyAdvisory {
+        crate::advice::RedundancyAdvisory {
+            kind: RedundancyAdvisoryKind::OffsiteDriveStale,
+            subvolume: subvolume.to_string(),
+            drive: Some(drive.to_string()),
+            detail: detail.to_string(),
+        }
+    }
+
+    #[test]
+    fn redundancy_offsite_stale_groups_by_drive_names_affected_subvols() {
+        // UPI 079-a §1: N subvolumes on one overdue offsite drive collapse to a
+        // single line naming all affected subvolumes — not N identical lines.
+        let _color = color_guard(false);
+        let mut data = test_status_output();
+        let detail = "overdue \u{2014} 10 days past its usual ~30d cycle";
+        data.redundancy_advisories = vec![
+            offsite_stale("htpc-home", "WD-18TB", detail),
+            offsite_stale("htpc-docs", "WD-18TB", detail),
+            offsite_stale("htpc-media", "WD-18TB", detail),
+        ];
+        let output = render_status(&data, OutputMode::Interactive);
+        assert_eq!(
+            output.matches("The offsite copy on WD-18TB").count(),
+            1,
+            "one offsite-stale line per drive, got:\n{output}"
+        );
+        let line = output
+            .lines()
+            .find(|l| l.contains("The offsite copy on WD-18TB"))
+            .unwrap();
+        assert!(
+            line.contains("htpc-home") && line.contains("htpc-docs") && line.contains("htpc-media"),
+            "grouped line must name all affected subvolumes: {line}"
+        );
+        assert_eq!(
+            output.matches("Cycle the offsite drive").count(),
+            1,
+            "one suggestion per drive group, got:\n{output}"
+        );
+    }
+
+    #[test]
+    fn redundancy_offsite_stale_group_carries_worst_age() {
+        // S1 regression guard: two subvolumes, same drive, different
+        // last_send_age → one line carrying the OLDER age (worst-age-wins).
+        // Guards the string-identity-vs-fact-identity regression: grouping on the
+        // raw `detail` would fail to collapse the two different-age rows.
+        let _color = color_guard(false);
+        let mut data = test_status_output();
+        data.redundancy_advisories = vec![
+            offsite_stale("htpc-home", "WD-18TB", "overdue \u{2014} 5 days past its usual ~30d cycle"),
+            offsite_stale("htpc-docs", "WD-18TB", "overdue \u{2014} 20 days past its usual ~30d cycle"),
+        ];
+        let output = render_status(&data, OutputMode::Interactive);
+        assert_eq!(output.matches("The offsite copy on WD-18TB").count(), 1);
+        let line = output
+            .lines()
+            .find(|l| l.contains("The offsite copy on WD-18TB"))
+            .unwrap();
+        assert!(line.contains("20 days"), "grouped line must carry the older age: {line}");
+        assert!(!line.contains("5 days"), "must not carry the younger age: {line}");
+    }
+
+    #[test]
+    fn redundancy_offsite_stale_distinct_drives_render_separately() {
+        // Different drives are different facts → two lines, not a false merge.
+        let _color = color_guard(false);
+        let mut data = test_status_output();
+        data.redundancy_advisories = vec![
+            offsite_stale("htpc-home", "WD-18TB", "overdue \u{2014} 5 days past its usual ~30d cycle"),
+            offsite_stale("htpc-docs", "Offsite-4TB", "stale \u{2014} last refreshed 90 days ago"),
+        ];
+        let output = render_status(&data, OutputMode::Interactive);
+        assert_eq!(
+            output.matches("The offsite copy on").count(),
+            2,
+            "two distinct drives → two lines: {output}"
         );
     }
 
@@ -1527,6 +1813,31 @@ mod tests {
     }
 
     #[test]
+    fn advisories_collapse_multi_subvol_into_one_note_line() {
+        // UPI 079-a §4: N subvolumes sharing one advisory collapse to a single
+        // NOTE line naming all of them — not N identical lines.
+        let _color = color_guard(false);
+        let mut data = test_status_output();
+        let shared = "offsite copy stale — resilient promise degraded";
+        data.assessments[0].advisories = vec![shared.to_string()];
+        data.assessments[1].advisories = vec![shared.to_string()];
+        let output = render_status(&data, OutputMode::Interactive);
+        assert_eq!(
+            output.matches(shared).count(),
+            1,
+            "shared advisory must render on a single NOTE line, got:\n{output}"
+        );
+        let note_line = output
+            .lines()
+            .find(|l| l.contains("NOTE"))
+            .unwrap_or_else(|| panic!("no NOTE line in:\n{output}"));
+        assert!(
+            note_line.contains("htpc-home") && note_line.contains("htpc-docs"),
+            "grouped NOTE must name both subvolumes: {note_line}"
+        );
+    }
+
+    #[test]
     fn advisory_transient_no_recovery_uses_disabled_vocabulary() {
         let _color = color_guard(false);
         let mut data = test_status_output();
@@ -1756,8 +2067,8 @@ mod tests {
         data.total_needing_attention = 2;
         let output = render_default_status(&data, OutputMode::Interactive);
         assert!(
-            output.contains("2 subvolumes need attention"),
-            "multiple issues should show count: {output}"
+            output.contains("2 issues need attention"),
+            "multiple issues should show cause count: {output}"
         );
         assert!(
             output.contains("urd status"),

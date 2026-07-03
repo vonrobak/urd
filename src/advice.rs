@@ -167,6 +167,31 @@ pub fn compute_advice(
     None
 }
 
+/// Count the distinct *causes* across a set of actionable advice (UPI 079-a §3).
+///
+/// The footer counts root causes, not rows: N subvolumes stranded by one absent
+/// drive are one thing to fix, not N. A cause is a distinct `Some(reason)` value
+/// (reasons embed the *drive* label, not the subvolume name — see
+/// [`chain_break_reason_text`] and branches 3/5/8 of [`compute_advice`] — so
+/// two subvolumes waiting on the same drive collapse to one cause); each
+/// `None`-reason item counts individually, as those are genuinely per-subvolume
+/// local-staleness singletons (the `!send_enabled`-AtRisk branch and branch 6).
+/// Pure: a slice of advice in, a count out.
+#[must_use]
+pub fn count_distinct_causes(advice: &[ActionableAdvice]) -> usize {
+    let mut distinct_reasons: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut none_reason_count = 0usize;
+    for a in advice {
+        match &a.reason {
+            Some(reason) => {
+                distinct_reasons.insert(reason.as_str());
+            }
+            None => none_reason_count += 1,
+        }
+    }
+    distinct_reasons.len() + none_reason_count
+}
+
 /// True when `drive_label`'s absence is the documented cause of degradation —
 /// i.e. it leads one of `compute_health`'s reasons ("{label} away/overdue for N
 /// days"). The leading-token (`"{label} "`) match is deliberate: it excludes the
@@ -575,6 +600,7 @@ drives = ["primary-drive", "offsite-drive"]
     ) -> SubvolAssessment {
         SubvolAssessment {
             name: name.to_string(),
+            short_name: name.to_string(),
             status,
             health: OperationalHealth::Healthy,
             health_reasons: vec![],
@@ -1452,6 +1478,7 @@ local_retention = "transient"
     ) -> SubvolAssessment {
         SubvolAssessment {
             name: name.to_string(),
+            short_name: name.to_string(),
             status,
             health,
             health_reasons: vec![],
@@ -1636,5 +1663,61 @@ local_retention = "transient"
             "should not say 'last backup' when external_only: {}",
             advice.issue
         );
+    }
+
+    // ── count_distinct_causes (UPI 079-a §3) ───────────────────────────
+
+    fn adv(subvol: &str, reason: Option<&str>) -> ActionableAdvice {
+        ActionableAdvice {
+            subvolume: subvol.to_string(),
+            issue: "issue".to_string(),
+            command: None,
+            reason: reason.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn count_distinct_causes_two_rows_one_reason_is_one() {
+        // Two subvolumes waiting on the same drive → one cause, not two rows.
+        let a = vec![
+            adv("sv1", Some("Connect WD-18TB to restore protection")),
+            adv("sv2", Some("Connect WD-18TB to restore protection")),
+        ];
+        assert_eq!(count_distinct_causes(&a), 1);
+    }
+
+    #[test]
+    fn count_distinct_causes_two_reasons_is_two() {
+        let a = vec![
+            adv("sv1", Some("Connect WD-18TB")),
+            adv("sv2", Some("Connect Offsite-4TB")),
+        ];
+        assert_eq!(count_distinct_causes(&a), 2);
+    }
+
+    #[test]
+    fn count_distinct_causes_none_reasons_each_distinct() {
+        // None-reason items are per-subvolume local-staleness singletons.
+        let a = vec![adv("sv1", None), adv("sv2", None)];
+        assert_eq!(count_distinct_causes(&a), 2);
+    }
+
+    #[test]
+    fn count_distinct_causes_same_drive_chain_break_is_one_cause() {
+        // m3: two branch-4 chain breaks to the SAME drive share the reason (it
+        // embeds the drive, not the subvolume) → one cause.
+        let reason = "thread to WD-18TB broken (no pin)";
+        let a = vec![adv("sv1", Some(reason)), adv("sv2", Some(reason))];
+        assert_eq!(count_distinct_causes(&a), 1);
+    }
+
+    #[test]
+    fn count_distinct_causes_mixes_none_and_shared_reason() {
+        let a = vec![
+            adv("sv1", None),                    // singleton
+            adv("sv2", Some("Connect WD-18TB")), // cause A
+            adv("sv3", Some("Connect WD-18TB")), // same cause A
+        ];
+        assert_eq!(count_distinct_causes(&a), 2); // 1 none + 1 distinct reason
     }
 }

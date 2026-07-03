@@ -260,6 +260,7 @@ mod tests {
     ) -> StatusAssessment {
         StatusAssessment {
             name: "sv1".to_string(),
+            short_name: "sv1".to_string(),
             status,
             health: "healthy".to_string(),
             health_reasons: vec![],

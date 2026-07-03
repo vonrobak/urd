@@ -3439,6 +3439,7 @@ source = "/data/beta"
     fn sample_assessments() -> Vec<SubvolAssessment> {
         vec![SubvolAssessment {
             name: "htpc-home".to_string(),
+            short_name: "htpc-home".to_string(),
             status: PromiseStatus::Protected,
             health: OperationalHealth::Healthy,
             health_reasons: vec![],
@@ -4430,6 +4431,7 @@ source = "/data/beta"
     ) -> SubvolAssessment {
         SubvolAssessment {
             name: name.to_string(),
+            short_name: name.to_string(),
             status,
             health: OperationalHealth::Healthy,
             health_reasons: vec![],

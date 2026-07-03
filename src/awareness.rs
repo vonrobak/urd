@@ -240,6 +240,10 @@ impl std::fmt::Display for OperationalHealth {
 #[derive(Debug)]
 pub struct SubvolAssessment {
     pub name: String,
+    /// The user-facing short name (UPI 079-a §8a) — rendered in the SUBVOLUME
+    /// display cell. `name` stays the join key for chain health, advisories, and
+    /// errors; only the display cell uses this.
+    pub short_name: String,
     pub status: PromiseStatus,
     /// Operational health — can the next backup succeed efficiently?
     pub health: OperationalHealth,
@@ -622,6 +626,7 @@ pub fn assess(
         let Some(ref snapshot_root) = subvol.snapshot_root else {
             assessments.push(SubvolAssessment {
                 name: subvol.name.clone(),
+                short_name: subvol.short_name.clone(),
                 status: PromiseStatus::Unprotected,
                 health: OperationalHealth::Blocked,
                 health_reasons: vec!["no snapshot root configured".to_string()],
@@ -920,6 +925,7 @@ pub fn assess(
 
         assessments.push(SubvolAssessment {
             name: subvol.name.clone(),
+            short_name: subvol.short_name.clone(),
             status: overall,
             health,
             health_reasons,
@@ -5143,6 +5149,7 @@ source = "/data/sv1"
     fn make_assess(name: &str, status: PromiseStatus) -> SubvolAssessment {
         SubvolAssessment {
             name: name.to_string(),
+            short_name: name.to_string(),
             status,
             health: OperationalHealth::Healthy,
             health_reasons: vec![],
