@@ -12,6 +12,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   purely because a Critical source pool made Urd slow its cadence — with the backup
   chain otherwise healthy — now renders its EXPOSURE cell dim instead of the alarming
   yellow a genuine problem gets, so a deliberate adaptation reads as calm, not failure.
+- **`urd plan` leads with the summary and hides the operations wall behind
+  `--verbose`.** The default output is verdict → summary → skip reasons, with a
+  pointer line naming the door (`urd plan --verbose lists every operation`); the
+  full per-operation list renders only when asked. In the verbose list, DELETE
+  lines are tagged `[local]` or `[<drive>]` so identical snapshot names deleted
+  from two places no longer read as a duplicate.
+
+### Fixed
+- **A caught-up subvolume no longer appears twice in the skip list.** The planner's
+  `unchanged` record and its per-drive "already on <drive>" records collapse to one
+  line — "unchanged — no changes since last snapshot (3d ago); already on WD-18TB" —
+  and the summary counts collapsed records, in `urd plan`, `urd backup --dry-run`,
+  and the post-backup summary (#212).
+- **The backup summary's skip count now covers only its own list.** The
+  disconnected-drives count is pluralized properly and scoped to absent-drive
+  sends; actionable skips sit under their own "Needs attention:" heading instead
+  of borrowing the other block's number (#212).
 
 ## [0.31.0] - 2026-07-03
 

@@ -128,7 +128,9 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
             &config,
         );
         let mode = crate::output::OutputMode::detect();
-        print!("{}", crate::voice::render_plan(&plan_output, mode));
+        // Summary-first like `urd plan` (028-R5); the pointer line in the
+        // rendered output redirects detail-seekers to `urd plan --verbose`.
+        print!("{}", crate::voice::render_plan(&plan_output, mode, false));
         return Ok(());
     }
 
@@ -1256,16 +1258,9 @@ fn build_backup_summary(
         })
         .collect();
 
-    let skipped: Vec<SkippedSubvolume> = plan
-        .skipped
-        .iter()
-        .map(|skip| SkippedSubvolume {
-            name: skip.name.clone(),
-            category: SkipCategory::from_reason(&skip.reason),
-            reason: skip.reason.clone(),
-            next_due_minutes: skip.next_due_minutes,
-        })
-        .collect();
+    // Collapsed like the plan surfaces (#212): one record per conclusion,
+    // not one per drive — see plan_cmd::collapse_skipped.
+    let skipped: Vec<SkippedSubvolume> = crate::commands::plan_cmd::collapse_skipped(&plan.skipped);
 
     // Synthesize deferred entries for subvolumes that needed sends but had no snapshots.
     // Works from the skip list outward: adds to existing SubvolumeSummary or creates synthetic.

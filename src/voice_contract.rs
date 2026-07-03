@@ -877,7 +877,7 @@ mod contract {
         let _color = color_guard(false);
         // Non-empty plan: lifted fixture has 2 operations, 1 send.
         let non_empty = test_plan_output();
-        let output = render_plan(&non_empty, OutputMode::Interactive);
+        let output = render_plan(&non_empty, OutputMode::Interactive, true);
         let first = helpers::non_blank_lines(&output)
             .into_iter()
             .next()
@@ -901,7 +901,7 @@ mod contract {
             estimated_total_bytes: None,
             configured_subvolumes: 2,
         };
-        let output = render_plan(&empty, OutputMode::Interactive);
+        let output = render_plan(&empty, OutputMode::Interactive, true);
         let first = helpers::non_blank_lines(&output)
             .into_iter()
             .next()
@@ -995,7 +995,7 @@ mod contract {
             estimated_total_bytes: None,
             configured_subvolumes: 2,
         };
-        let output = render_plan(&data, OutputMode::Interactive);
+        let output = render_plan(&data, OutputMode::Interactive, true);
         let first = helpers::non_blank_lines(&output)
             .into_iter()
             .next()
@@ -1024,7 +1024,7 @@ mod contract {
             estimated_total_bytes: None,
             configured_subvolumes: 0,
         };
-        let output = render_plan(&data, OutputMode::Interactive);
+        let output = render_plan(&data, OutputMode::Interactive, true);
         let first = helpers::non_blank_lines(&output)
             .into_iter()
             .next()
