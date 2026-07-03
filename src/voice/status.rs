@@ -12,7 +12,8 @@ use colored::Colorize;
 use crate::advice::RedundancyAdvisoryKind;
 use crate::awareness::PromiseStatus;
 use crate::output::{
-    ChainHealth, DefaultStatusOutput, OutputMode, PoolPostureSummary, StatusOutput,
+    ChainHealth, DefaultStatusOutput, OutputMode, PoolPostureSummary, StatusAssessment,
+    StatusOutput,
 };
 use crate::storage_critical::TightnessTier;
 use crate::types::{ByteSize, DriveRole};
@@ -287,6 +288,28 @@ fn storage_posture_line(p: &PoolPostureSummary) -> colored::ColoredString {
     }
 }
 
+/// The EXPOSURE cell string for one row (UPI 080, adapting de-emphasis).
+///
+/// Normally the plain voice label (`sealed`/`waning`/`exposed`), coloured
+/// downstream by `color_exposure_str` on the safety column. The one exception:
+/// an *adapting* row — AT RISK purely because the Critical-pool cadence cap
+/// slowed it (`cadence_adapted`), with a healthy chain — is "waning by design",
+/// not a failure, so its cell is pre-dimmed here. De-emphasis only: it is never
+/// brighter than `status`, and the `health == "healthy"` clause is ruling (i) —
+/// a broken-chain (degraded) capped row keeps the alarming yellow, because a
+/// broken chain *is* something to act on. The pre-coloured string passes through
+/// `color_exposure_str`'s fall-through branch untouched.
+fn exposure_cell(a: &StatusAssessment) -> String {
+    let label = exposure_label(a.status);
+    let adapting =
+        a.status == PromiseStatus::AtRisk && a.cadence_adapted && a.health == "healthy";
+    if adapting {
+        label.dimmed().to_string()
+    } else {
+        label
+    }
+}
+
 pub(super) fn render_subvolume_table(data: &StatusOutput, out: &mut String) {
     if data.assessments.is_empty() {
         writeln!(out, "{}", "No subvolumes configured.".dimmed()).ok();
@@ -356,7 +379,7 @@ pub(super) fn render_subvolume_table(data: &StatusOutput, out: &mut String) {
         // Safety column — omitted entirely when every subvolume is sealed.
         let mut row: Vec<String> = Vec::new();
         if show_exposure {
-            row.push(exposure_label(assessment.status));
+            row.push(exposure_cell(assessment));
         }
 
         if show_health {
@@ -1068,6 +1091,34 @@ mod tests {
         assert!(
             output.contains("\u{1b}[33mdegraded\u{1b}[0m"),
             "degraded HEALTH cell must stay yellow after the index shift: {output:?}"
+        );
+    }
+
+    #[test]
+    fn adapting_row_exposure_cell_dims_genuine_waning_stays_yellow() {
+        // UPI 080 (adapting de-emphasis): a row that is AT RISK purely because the
+        // Critical-pool cadence cap slowed it (`cadence_adapted`) and whose chain is
+        // healthy is "waning by design", not a failure — its EXPOSURE cell renders
+        // dim, not the alarming yellow a genuine waning gets. De-emphasis only;
+        // ruling (i): a broken-chain (degraded) capped row stays yellow.
+        let _color = color_guard(true);
+        let mut data = test_status_output();
+        // assessments[0] (htpc-home): make it the adapting row.
+        let a = &mut data.assessments[0];
+        a.status = PromiseStatus::AtRisk;
+        a.cadence_adapted = true;
+        a.health = "healthy".to_string();
+        // assessments[1] (htpc-docs) stays AT RISK + degraded (genuine) from the
+        // fixture — the yellow-waning control on the same table.
+
+        let out = render_status(&data, OutputMode::Interactive);
+        assert!(
+            out.contains("\u{1b}[2mwaning\u{1b}[0m"),
+            "an adapting row's EXPOSURE cell must render dim: {out:?}"
+        );
+        assert!(
+            out.contains("\u{1b}[33mwaning\u{1b}[0m"),
+            "a genuine (non-adapting) waning must stay yellow: {out:?}"
         );
     }
 

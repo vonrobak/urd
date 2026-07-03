@@ -58,6 +58,34 @@ output is a half-built picture — awareness stays protection-level-blind
 stale-offsite degradation. A clippy `disallowed-methods` guard enforces the
 rule: surfaces call `assess_view`, never `assess`.
 
+**gravity.** The single severity ordering by which Urd decides what is more urgent:
+`PromiseStatus`'s derived `Ord` (worst-to-best, `UNPROTECTED < AT RISK < PROTECTED`) —
+and *nothing else*. Every "worst wins" reduction rides this one ordering: `min()` across
+a subvolume's copies, across subvolumes, and the aggregate summary line. The rule is
+load-bearing and deliberately enforced — a second severity representation that could
+disagree with `status` is the bug UPI 053 shipped a deletion to remove (the hand-rolled
+`status_severity` helper), and the mistake `DriveRotation`/`rotation.rs` cite as the one
+not to repeat (no `RotationTier`/`Due` gravity — `awareness.rs:423`, `rotation.rs:107`).
+Orthogonal axes (operational health, storage posture, the rotation voice register) may
+*layer over* gravity, but never re-order it. A derived display classifier reads gravity;
+it never competes with it, and carries no `Ord` of its own.
+
+**operational health** (`OperationalHealth`, `awareness.rs`). A second, orthogonal axis
+answering *"can the next backup succeed efficiently?"* — distinct from gravity's *"is my
+data safe?"*. Three values, ordered worst-to-best (`min()` yields the worst):
+
+| Health | Meaning |
+|--------|---------|
+| `blocked` | Something will prevent or severely impair the next backup. |
+| `degraded` | The next backup will work, but suboptimally (e.g. a broken chain forcing a full send). |
+| `healthy` | Normal — incremental chains intact, space adequate. |
+
+Mostly separate from `PromiseStatus`: a subvolume can be `PROTECTED` yet `degraded`, or
+`AT RISK` yet `healthy`. The one recorded coupling is the Critical-pool AT-RISK cap (see
+`storage posture`). Unlike promise states, health has **no separate voice label** — the
+lowercase engine word renders directly (`healthy` dimmed, `degraded` yellow, `blocked`
+red), and `urd status` shows the HEALTH column only when some subvolume is non-`healthy`.
+
 ## Cluster: Voice labels (presentation)
 
 The CLI surface renders the promise states with the mythic voice labels below. The

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`urd status` de-emphasises a slowdown that is by design.** A row that is AT RISK
+  purely because a Critical source pool made Urd slow its cadence — with the backup
+  chain otherwise healthy — now renders its EXPOSURE cell dim instead of the alarming
+  yellow a genuine problem gets, so a deliberate adaptation reads as calm, not failure.
+
 ## [0.31.0] - 2026-07-03
 
 ### Changed
