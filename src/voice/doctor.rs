@@ -76,9 +76,28 @@ fn render_doctor_interactive(data: &DoctorOutput) -> String {
     // Config section
     render_doctor_check_section(&mut out, "Config", &data.config_checks);
 
-    // Infrastructure section
+    // Infrastructure section. UPI 029 (via 079-c): four green checkmarks
+    // carry no information after first setup — when everything passes,
+    // collapse to one line. `--thorough` (verify present) expands, and any
+    // failure renders the full section so the red has its green context.
     writeln!(out).ok();
-    render_doctor_check_section(&mut out, "Infrastructure", &data.infra_checks);
+    let all_infra_ok = !data.infra_checks.is_empty()
+        && data
+            .infra_checks
+            .iter()
+            .all(|c| c.status == DoctorCheckStatus::Ok);
+    if all_infra_ok && data.verify.is_none() {
+        writeln!(out, "  {}", "Infrastructure".bold()).ok();
+        writeln!(
+            out,
+            "    {} All {} checks passed.",
+            "\u{2713}".green(),
+            data.infra_checks.len()
+        )
+        .ok();
+    } else {
+        render_doctor_check_section(&mut out, "Infrastructure", &data.infra_checks);
+    }
 
     // Data safety section
     writeln!(out).ok();

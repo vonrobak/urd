@@ -29,6 +29,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   disconnected-drives count is pluralized properly and scoped to absent-drive
   sends; actionable skips sit under their own "Needs attention:" heading instead
   of borrowing the other block's number (#212).
+- **`urd doctor` collapses passing infrastructure checks** to one line
+  ("✓ All 4 checks passed.") outside `--thorough`; any failure expands the full
+  section. Remediation guidance now always renders behind the `→` arrow — the
+  drive-absent row no longer hides its "what do I do" in dimmed context text.
+- **`urd sentinel status` shows the last assessment as a relative age** ("5m ago")
+  instead of an ISO timestamp; the JSON surface keeps the raw stamp.
 
 ## [0.31.0] - 2026-07-03
 

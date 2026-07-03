@@ -35,10 +35,19 @@ fn render_sentinel_status_interactive(data: &SentinelStatusOutput) -> String {
             )
             .ok();
 
-            // Assessment timing
+            // Assessment timing. UPI 029 (via 079-c): relative age, not an
+            // ISO stamp the user must subtract from "now" themselves — the
+            // JSON surface keeps the raw timestamp for machine consumers.
             if let Some(ref last) = state.last_assessment {
                 let tick_desc = format_tick_description(state.tick_interval_secs, &state.promise_states);
-                writeln!(out, "  {:<14}{} (tick: {})", "Assessment", last, tick_desc).ok();
+                writeln!(
+                    out,
+                    "  {:<14}{} (tick: {})",
+                    "Assessment",
+                    humanize_assessment_age(last),
+                    tick_desc
+                )
+                .ok();
             }
 
             // Mounted drives
@@ -66,6 +75,24 @@ fn render_sentinel_status_interactive(data: &SentinelStatusOutput) -> String {
     }
 
     out
+}
+
+/// Format the sentinel state file's ISO `last_assessment` stamp as a
+/// relative age ("5m ago"). Falls back to the raw string when it doesn't
+/// parse (hand-edited state file) — degraded, never wrong.
+fn humanize_assessment_age(timestamp: &str) -> String {
+    let Ok(ts) = chrono::NaiveDateTime::parse_from_str(timestamp, "%Y-%m-%dT%H:%M:%S") else {
+        return timestamp.to_string();
+    };
+    let mins = chrono::Local::now()
+        .naive_local()
+        .signed_duration_since(ts)
+        .num_minutes();
+    if mins < 1 {
+        "just now".to_string()
+    } else {
+        format!("{} ago", crate::plan::format_duration_short(mins))
+    }
 }
 
 fn format_tick_description(tick_secs: u64, promise_states: &[crate::output::SentinelPromiseState]) -> String {

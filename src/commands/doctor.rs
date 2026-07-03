@@ -177,22 +177,14 @@ pub fn run(config: Config, args: DoctorArgs, output_mode: OutputMode) -> anyhow:
             let advice = advice::compute_advice(a, send_enabled, external_only);
 
             // Extract structured advice into doctor display fields.
-            let unpack = |adv: &advice::ActionableAdvice| {
-                (
-                    Some(adv.issue.clone()),
-                    adv.command.as_ref().map(|c| format!("Run `{c}`.")),
-                    adv.reason.clone(),
-                )
-            };
-
             let (issue, suggestion, reason) = match a.status {
                 PromiseStatus::Protected if a.health == awareness::OperationalHealth::Healthy => {
                     (None, None, None)
                 }
-                PromiseStatus::Protected => advice.as_ref().map(unpack).unwrap_or_default(),
+                PromiseStatus::Protected => advice.as_ref().map(unpack_advice).unwrap_or_default(),
                 PromiseStatus::Unprotected => {
                     error_count += 1;
-                    advice.as_ref().map(unpack).unwrap_or_else(|| {
+                    advice.as_ref().map(unpack_advice).unwrap_or_else(|| {
                         (
                             Some("exposed — data may not be recoverable".to_string()),
                             Some("Run `urd backup` or connect a drive.".to_string()),
@@ -202,7 +194,7 @@ pub fn run(config: Config, args: DoctorArgs, output_mode: OutputMode) -> anyhow:
                 }
                 PromiseStatus::AtRisk => {
                     warn_count += 1;
-                    advice.as_ref().map(unpack).unwrap_or_else(|| {
+                    advice.as_ref().map(unpack_advice).unwrap_or_else(|| {
                         (
                             Some("waning".to_string()),
                             Some("Run `urd backup` to refresh.".to_string()),
@@ -713,9 +705,67 @@ fn build_doctor_churn_view_inner(
     }
 }
 
+/// Map an `ActionableAdvice` onto doctor's `(issue, suggestion, reason)`
+/// display fields. UPI 029 (via 079-c): remediation always renders behind
+/// the → arrow — `compute_advice` puts machine-runnable fixes in `command`
+/// and human-actionable guidance in `reason` ("Connect WD-18TB1 and run
+/// `urd backup`", branch 5); with no command the reason IS the suggestion,
+/// so promote it rather than leaving the drive-absent row as the one row
+/// without a "what do I do" handle.
+fn unpack_advice(
+    adv: &advice::ActionableAdvice,
+) -> (Option<String>, Option<String>, Option<String>) {
+    match adv.command.as_ref() {
+        Some(c) => (
+            Some(adv.issue.clone()),
+            Some(format!("Run `{c}`.")),
+            adv.reason.clone(),
+        ),
+        None => (Some(adv.issue.clone()), adv.reason.clone(), None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── unpack_advice (UPI 029 Change 4, via 079-c) ───────────────────
+
+    #[test]
+    fn unpack_advice_keeps_command_as_suggestion_with_reason_context() {
+        let adv = advice::ActionableAdvice {
+            subvolume: "music".to_string(),
+            issue: "waning — last external send 43h ago".to_string(),
+            command: Some("urd backup --subvolume music".to_string()),
+            reason: Some("Drive is mounted; a send closes the gap.".to_string()),
+        };
+        let (issue, suggestion, reason) = unpack_advice(&adv);
+        assert_eq!(issue.as_deref(), Some("waning — last external send 43h ago"));
+        assert_eq!(
+            suggestion.as_deref(),
+            Some("Run `urd backup --subvolume music`.")
+        );
+        assert_eq!(reason.as_deref(), Some("Drive is mounted; a send closes the gap."));
+    }
+
+    #[test]
+    fn unpack_advice_promotes_reason_when_no_command() {
+        // Branch 5 (drive absent): the guidance lives in `reason` — it must
+        // reach the → suggestion slot, not render as dimmed context.
+        let adv = advice::ActionableAdvice {
+            subvolume: "music".to_string(),
+            issue: "waning — last external send 3d ago".to_string(),
+            command: None,
+            reason: Some("Connect WD-18TB1 and run `urd backup`".to_string()),
+        };
+        let (_, suggestion, reason) = unpack_advice(&adv);
+        assert_eq!(
+            suggestion.as_deref(),
+            Some("Connect WD-18TB1 and run `urd backup`"),
+            "reason promotes to the arrowed suggestion slot"
+        );
+        assert_eq!(reason, None, "promoted guidance must not render twice");
+    }
 
     fn cfg() -> Config {
         let toml_str = r#"
