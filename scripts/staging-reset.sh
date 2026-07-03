@@ -93,8 +93,8 @@ while IFS= read -r line; do
     line="${line%%#*}"
     line="$(echo "$line" | xargs 2>/dev/null || true)"   # trim
     [[ -n "$line" ]] || continue
-    key="${line%%=*}"
-    val="${line#*=}"
+    key="$(echo "${line%%=*}" | xargs 2>/dev/null || true)"   # tolerate spaces around '='
+    val="$(echo "${line#*=}" | xargs 2>/dev/null || true)"
     case "$key" in
         snapshot_root)
             [[ "$val" == /* ]] || refuse "marker: snapshot_root must be an absolute path (got: $val)"
@@ -224,7 +224,7 @@ remove_pins_under() {
         [[ -d "$subdir" && ! -L "$subdir" ]] || continue
         for pin in "$subdir"/.last-external-parent-* "$subdir"/.last-external-parent; do
             [[ -f "$pin" ]] || continue
-            do_rm "pin file" "$pin" && PIN_COUNT=$((PIN_COUNT + 1)) || true
+            if do_rm "pin file" "$pin"; then PIN_COUNT=$((PIN_COUNT + 1)); fi
         done
         if [[ $APPLY -eq 1 ]]; then
             rmdir "$subdir" 2>/dev/null || true   # non-empty = safe no-op
@@ -244,7 +244,7 @@ for unit in "${UNITS[@]}"; do
         echo "  would disable --now: $unit"
     fi
     if [[ -f "$UNIT_DIR/$unit" ]]; then
-        do_rm "unit file" "$UNIT_DIR/$unit" && UNIT_COUNT=$((UNIT_COUNT + 1)) || true
+        if do_rm "unit file" "$UNIT_DIR/$unit"; then UNIT_COUNT=$((UNIT_COUNT + 1)); fi
     fi
 done
 if [[ $APPLY -eq 1 ]]; then
@@ -360,7 +360,7 @@ for f in urd.db urd.db-wal urd.db-shm urd.lock heartbeat.json backup.prom; do
     [[ -e "$STATE_DIR/$f" ]] && { do_rm "state" "$STATE_DIR/$f" || true; }
 done
 [[ -d "$STATE_DIR/logs" ]] && { do_rm "state logs" "$STATE_DIR/logs/" || true; }
-[[ $APPLY -eq 1 ]] && rmdir "$STATE_DIR" 2>/dev/null || true
+if [[ $APPLY -eq 1 ]]; then rmdir "$STATE_DIR" 2>/dev/null || true; fi
 echo
 
 # ── Category 1: config ───────────────────────────────────────────────────
@@ -369,7 +369,7 @@ echo "[config]"
 for f in urd.toml urd.toml.legacy urd.toml.v1; do
     [[ -e "$CONFIG_DIR/$f" ]] && { do_rm "config" "$CONFIG_DIR/$f" || true; }
 done
-[[ $APPLY -eq 1 ]] && rmdir "$CONFIG_DIR" 2>/dev/null || true
+if [[ $APPLY -eq 1 ]]; then rmdir "$CONFIG_DIR" 2>/dev/null || true; fi
 echo
 
 # ── Category 8: completions ──────────────────────────────────────────────
