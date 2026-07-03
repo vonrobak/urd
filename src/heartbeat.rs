@@ -354,6 +354,7 @@ mod tests {
         vec![
             SubvolAssessment {
                 name: "home".to_string(),
+                short_name: "home".to_string(),
                 status: PromiseStatus::Protected,
                 health: OperationalHealth::Healthy,
                 health_reasons: vec![],
@@ -386,6 +387,7 @@ mod tests {
             },
             SubvolAssessment {
                 name: "docs".to_string(),
+                short_name: "docs".to_string(),
                 status: PromiseStatus::AtRisk,
                 health: OperationalHealth::Healthy,
                 health_reasons: vec![],

@@ -108,6 +108,47 @@ pub(super) fn exposure_label(status: PromiseStatus) -> String {
     }
 }
 
+/// Group per-subvolume advisory NOTE strings for display (UPI 079-a §4).
+///
+/// Collects, for each distinct advisory string (exact equality), the subvolume
+/// names carrying it — in first-appearance order for both the groups and the
+/// names within a group. N subvolumes sharing one advisory collapse to a single
+/// `(advisory, [names…])` group, so a caller emits one NOTE line instead of N
+/// identical ones; a single-subvolume advisory yields a one-name group that
+/// renders byte-identical to the pre-grouping `NOTE name: advisory` line.
+///
+/// Deduping display lines is presentation, not state computation (architecture.md:
+/// voice/ renders), so this lives render-side. Errors are deliberately NOT grouped
+/// — they stay per-subvolume in the callers, which loop `assessment.errors`
+/// directly. Both `render_advisories` (status) and `render_assessment_advisories`
+/// (backup) render their own lines off this shared *grouping* helper because they
+/// differ in trailing-blank-line behavior.
+pub(super) fn group_advisory_notes(
+    assessments: &[crate::output::StatusAssessment],
+) -> Vec<(String, Vec<String>)> {
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for a in assessments {
+        for advisory in &a.advisories {
+            groups
+                .entry(advisory.clone())
+                .or_insert_with(|| {
+                    order.push(advisory.clone());
+                    Vec::new()
+                })
+                .push(a.name.clone());
+        }
+    }
+    order
+        .into_iter()
+        .map(|adv| {
+            let names = groups.remove(&adv).unwrap_or_default();
+            (adv, names)
+        })
+        .collect()
+}
+
 
 /// Humanize seconds into a compact duration string. Cross-renderer helper.
 pub(super) fn humanize_duration(secs: i64) -> String {
@@ -418,6 +459,7 @@ pub(crate) mod test_fixtures {
             assessments: vec![
                 StatusAssessment {
                     name: "htpc-home".to_string(),
+                    short_name: "htpc-home".to_string(),
                     status: PromiseStatus::Protected,
                     health: "healthy".to_string(),
                     health_reasons: vec![],
@@ -447,6 +489,7 @@ pub(crate) mod test_fixtures {
                 },
                 StatusAssessment {
                     name: "htpc-docs".to_string(),
+                    short_name: "htpc-docs".to_string(),
                     status: PromiseStatus::AtRisk,
                     health: "degraded".to_string(),
                     health_reasons: vec![
@@ -512,6 +555,7 @@ pub(crate) mod test_fixtures {
             redundancy_advisories: vec![],
             advice: vec![],
             storage_postures: Vec::new(),
+            storage_adaptations: Vec::new(),
         }
     }
 
@@ -560,6 +604,7 @@ pub(crate) mod test_fixtures {
             ],
             assessments: vec![StatusAssessment {
                 name: "htpc-home".to_string(),
+                short_name: "htpc-home".to_string(),
                 status: PromiseStatus::Protected,
                 health: "healthy".to_string(),
                 health_reasons: vec![],
@@ -782,6 +827,72 @@ mod tests {
         let _ = truncate_str(s, 6);
         assert_eq!(truncate_str("short", 10), "short");
         assert!(truncate_str("a-much-longer-string", 10).ends_with("..."));
+    }
+
+    // ── group_advisory_notes (UPI 079-a §4) ─────────────────────────────
+
+    /// Minimal `StatusAssessment` carrying only the fields `group_advisory_notes`
+    /// reads (`name`, `advisories`).
+    fn adv_assessment(name: &str, advisories: &[&str]) -> crate::output::StatusAssessment {
+        crate::output::StatusAssessment {
+            name: name.to_string(),
+            short_name: name.to_string(),
+            status: PromiseStatus::Protected,
+            health: "healthy".to_string(),
+            health_reasons: vec![],
+            promise_level: None,
+            local_snapshot_count: 0,
+            local_newest_age_secs: None,
+            local_status: PromiseStatus::Protected,
+            external: vec![],
+            advisories: advisories.iter().map(|s| s.to_string()).collect(),
+            redundancy_advisories: vec![],
+            retention_summary: None,
+            external_only: false,
+            errors: vec![],
+            storage_posture: None,
+            cadence_adapted: false,
+            effective_send_interval_secs: None,
+        }
+    }
+
+    #[test]
+    fn group_advisory_notes_single_subvol_one_group() {
+        let groups = group_advisory_notes(&[adv_assessment("sv1", &["offsite stale"])]);
+        assert_eq!(
+            groups,
+            vec![("offsite stale".to_string(), vec!["sv1".to_string()])]
+        );
+    }
+
+    #[test]
+    fn group_advisory_notes_three_subvols_same_string_one_group() {
+        let assessments = vec![
+            adv_assessment("sv1", &["offsite stale"]),
+            adv_assessment("sv2", &["offsite stale"]),
+            adv_assessment("sv3", &["offsite stale"]),
+        ];
+        let groups = group_advisory_notes(&assessments);
+        assert_eq!(groups.len(), 1, "shared advisory collapses to one group: {groups:?}");
+        assert_eq!(groups[0].0, "offsite stale");
+        assert_eq!(
+            groups[0].1,
+            vec!["sv1".to_string(), "sv2".to_string(), "sv3".to_string()],
+            "names preserved in first-appearance order"
+        );
+    }
+
+    #[test]
+    fn group_advisory_notes_two_distinct_strings_two_groups() {
+        let assessments = vec![
+            adv_assessment("sv1", &["advisory A"]),
+            adv_assessment("sv2", &["advisory B"]),
+        ];
+        let groups = group_advisory_notes(&assessments);
+        assert_eq!(groups.len(), 2);
+        // First-appearance order preserved across distinct strings.
+        assert_eq!(groups[0].0, "advisory A");
+        assert_eq!(groups[1].0, "advisory B");
     }
 
     // ── Backup summary tests ────────────────────────────────────────

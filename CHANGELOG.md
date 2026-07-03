@@ -7,7 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.30.0] - 2026-07-03
+### Changed
+- **`urd status` speaks in facts, not rows.** The first status after onboarding
+  now reads like one voice: subvolumes sharing one overdue offsite drive, one
+  tight pool, or one advisory collapse to a single line naming those affected;
+  the footer counts distinct root causes ("2 issues need attention"), not rows;
+  an all-sealed table drops the redundant EXPOSURE column (the summary already
+  says "All sealed."); the SUBVOLUME column shows the short name; and the
+  internal "Pinned snapshots" line is gone. `--json` gains an additive
+  `storage_adaptations` array and a per-assessment `short_name` field.
 
 ### Added
 - **The post-plan orphan invariant now guards every lifecycle.** The planner

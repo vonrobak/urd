@@ -1244,6 +1244,7 @@ mod tests {
     fn make_assessment(name: &str, status: PromiseStatus) -> SubvolAssessment {
         SubvolAssessment {
             name: name.to_string(),
+            short_name: name.to_string(),
             status,
             health: OperationalHealth::Healthy,
             health_reasons: vec![],
