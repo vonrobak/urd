@@ -6,7 +6,7 @@
 > conflicts with this page, this page wins.
 
 **Date:** 2026-05-02 (restructured 2026-05-16 — explicit clusters, in-context
-examples, Flagged Ambiguities section)
+examples, Flagged Ambiguities section; Encounter cluster added 2026-07-03)
 **Audience:** Both human readers and Claude sessions. Read once; refer back when
 language is ambiguous in another doc.
 
@@ -14,7 +14,7 @@ language is ambiguous in another doc.
 
 Terms are grouped into **clusters**: Promise, Voice, Protection, Drive, Thread,
 Retention, Identifier, Recommendation, Storage pressure, Read-side query seams,
-Planner soundness. Each cluster has a canonical definition table
+Planner soundness, Encounter. Each cluster has a canonical definition table
 and a short **In context** example grounded in real CLI output, config, or
 on-disk artifacts. Skim by cluster heading; use the examples when a definition
 alone is too abstract. Terms still in transition are collected at the bottom
@@ -493,6 +493,30 @@ of passing silently.
 Source: `plan.rs` (`orphan_invariant_violations`), `types.rs` (`PlannedSkip`),
 `docs/98-journals/2026-05-02-stranded-snapshots-non-transient-planner.md`, UPI 069.
 
+## Cluster: The Encounter (first meeting)
+
+**The Encounter** is a new user's first meeting with Urd — the journey from the
+GitHub page to the first sealed promise (UPIs 070–078, arc-grilled 2026-07-03).
+The name is internal; the user experiences it as Urd introducing herself, looking
+at what the system has, asking what matters and what they fear, and proposing
+fates — nothing is written without approval. Stages, in order: the doorstep
+(no-config `urd` / `urd init`) → the looking (unprivileged discovery) → the
+conversation → the derivation → the runestone → the carving (config written) →
+the earning (root, via shown sudoers) → the seal.
+
+| Term | Layer | Meaning |
+|------|-------|---------|
+| `runestone` | **voice-layer only** | The rendered strategy proposal at the Encounter's decision point — what the user reads before choosing set-and-forget or delve-deeper. The engine type underneath is `ProposedStrategy` (`strategy.rs`); "runestone" never appears in engine code, config, or data surfaces. |
+| `gap` / `GapKind` | engine | A named disaster a proposed setup cannot survive (e.g. no offsite drive → fire/theft). Derivation attaches gaps instead of refusing or over-promising: the generated config encodes reality (ADR-111), and each gap names the path to more. Extends ADR-116's honest vocabulary for expected absence. |
+| `the seal` | internal + voice | The Encounter's closing stage — the act that makes promises *sealed*: root earned (sudoers shown, installed, `visudo`-verified), drive adoption, systemd units enabled, the first snapshot spun, the first-send offer, handoff to `urd status`. "The seal" is the stage; `sealed` (Voice cluster) remains the per-subvolume promise-state label whose truth the seal establishes. |
+
+Final Encounter wording is deliberately **not** pinned here or in the capsules —
+register rules only, with one full voice rewrite planned post-build. The stage
+names above are the stable internal vocabulary for design docs and code review.
+
+Source: `docs/95-ideas/2026-07-03-arc-proposal-the-encounter.md` (local-only),
+UPIs 070–078.
+
 ## Flagged Ambiguities
 
 Terms in transition, or with a known gap between their canonical definition and
@@ -521,6 +545,14 @@ without re-deriving the context.
   (a drive that is both away *and* whose data has aged past the freshness
   threshold). See `voice.rs::format_drive_age_label` cascade and Voice Contract
   Rule 1.
+
+- **"gap" carries two candidate meanings.** The Encounter's `gap`/`GapKind`
+  (engine, UPI 073) names a disaster a *proposed setup* cannot survive — it is not
+  CLI status vocabulary. Separately, UPI 080's draft display classifier proposes
+  "gap" as one of four row signals; that reuse was previously rejected as CLI
+  vocabulary (superseded by sealed/waning/exposed) and needs a deliberate grill
+  call, not silent adoption. Until the 080 grill rules, "gap" in prose means the
+  Encounter/derivation sense.
 
 - **"Backup" the verb vs "backup" the noun.** Casual project usage treats them
   as interchangeable; in precise contexts, a *backup* is the noun ("an external
