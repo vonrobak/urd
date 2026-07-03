@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.32.0] - 2026-07-03
+
 ### Added
 - **`urd status` de-emphasises a slowdown that is by design.** A row that is AT RISK
   purely because a Critical source pool made Urd slow its cadence — with the backup
@@ -1350,7 +1352,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Defense-in-depth pin file protection for unsent snapshots
 - Per-subvolume error isolation in executor
 
-[Unreleased]: https://github.com/vonrobak/urd/compare/v0.31.0...HEAD
+[Unreleased]: https://github.com/vonrobak/urd/compare/v0.32.0...HEAD
+[0.32.0]: https://github.com/vonrobak/urd/compare/v0.31.0...v0.32.0
 [0.31.0]: https://github.com/vonrobak/urd/compare/v0.30.0...v0.31.0
 [0.30.0]: https://github.com/vonrobak/urd/compare/v0.29.0...v0.30.0
 [0.29.0]: https://github.com/vonrobak/urd/compare/v0.28.0...v0.29.0
