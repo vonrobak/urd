@@ -170,6 +170,10 @@ pub struct PlanArgs {
     /// Create snapshots even for unchanged subvolumes
     #[arg(long)]
     pub force_snapshot: bool,
+
+    /// List every planned operation (default output is summary-first)
+    #[arg(long, short = 'v')]
+    pub verbose: bool,
 }
 
 #[derive(clap::Args, Debug)]

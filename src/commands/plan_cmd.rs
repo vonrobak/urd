@@ -1,6 +1,8 @@
+use std::collections::HashMap;
+
 use crate::cli::PlanArgs;
 use crate::commands::storage_signals;
-use crate::config::Config;
+use crate::config::{Config, DriveConfig};
 use crate::drives;
 use crate::output::{
     OutputMode, PlanOperationEntry, PlanOutput, PlanSummaryOutput, SkipCategory,
@@ -8,7 +10,7 @@ use crate::output::{
 };
 use crate::plan::{self, HistoryQuery, Observation, PlanFilters, RealFileSystemState};
 use crate::state::StateDb;
-use crate::types::PlannedOperation;
+use crate::types::{PlannedOperation, PlannedSkip};
 use crate::voice;
 
 pub fn run(config: Config, args: PlanArgs, mode: OutputMode) -> anyhow::Result<()> {
@@ -46,7 +48,7 @@ pub fn run(config: Config, args: PlanArgs, mode: OutputMode) -> anyhow::Result<(
 
     let mut output = build_plan_output(&backup_plan, &fs_state, &config);
     populate_token_warnings(&mut output, state_db.as_ref(), &config);
-    print!("{}", voice::render_plan(&output, mode));
+    print!("{}", voice::render_plan(&output, mode, args.verbose));
 
     Ok(())
 }
@@ -63,19 +65,13 @@ pub fn build_plan_output(
     let operations: Vec<PlanOperationEntry> = backup_plan
         .operations
         .iter()
-        .map(|op| build_operation_entry(op, fs_state))
+        .map(|op| build_operation_entry(op, fs_state, &config.drives))
         .collect();
 
-    let skipped: Vec<SkippedSubvolume> = backup_plan
-        .skipped
-        .iter()
-        .map(|skip| SkippedSubvolume {
-            name: skip.name.clone(),
-            category: SkipCategory::from_reason(&skip.reason),
-            reason: skip.reason.clone(),
-            next_due_minutes: skip.next_due_minutes,
-        })
-        .collect();
+    let skipped = collapse_skipped(&backup_plan.skipped);
+    // Post-collapse count: the summary must agree with the list the user
+    // reads, not with the planner's raw per-branch emissions.
+    let skipped_count = skipped.len();
 
     // Aggregate estimated bytes across all sends with estimates.
     let estimated_total: u64 = operations
@@ -102,12 +98,53 @@ pub fn build_plan_output(
             snapshots: summary.snapshots,
             sends: summary.sends,
             deletions: summary.deletions,
-            skipped: summary.skipped,
+            skipped: skipped_count,
             estimated_total_bytes,
             configured_subvolumes,
         },
         warnings: Vec::new(),
     }
+}
+
+/// Map planner skips to display records, collapsing each subvolume's
+/// `unchanged` local skip with its `already on <drive>` send skips (#212).
+/// The planner rightly emits one record per branch (ADR-100), but they state
+/// one conclusion — nothing new to store or send — and the user should read
+/// it once, not once per configured drive. Collapsing here at the output
+/// boundary leaves the raw list intact for the post-plan orphan invariant
+/// (which runs inside `plan::plan()`) and for metrics.
+///
+/// Shared by `urd plan` / `urd backup --dry-run` (via [`build_plan_output`])
+/// and the post-run backup summary.
+#[must_use]
+pub(crate) fn collapse_skipped(skipped: &[PlannedSkip]) -> Vec<SkippedSubvolume> {
+    let mut out: Vec<SkippedSubvolume> = Vec::new();
+    let mut unchanged_idx: HashMap<&str, usize> = HashMap::new();
+    for skip in skipped {
+        let category = SkipCategory::from_reason(&skip.reason);
+        if category == SkipCategory::Unchanged {
+            unchanged_idx.insert(skip.name.as_str(), out.len());
+        } else if skip.nothing_new_to_send
+            && let Some((_, drive)) = skip.reason.split_once(" already on ")
+            && let Some(&idx) = unchanged_idx.get(skip.name.as_str())
+        {
+            let merged = &mut out[idx];
+            merged.reason.push_str(if merged.reason.contains("; already on ") {
+                ", "
+            } else {
+                "; already on "
+            });
+            merged.reason.push_str(drive);
+            continue;
+        }
+        out.push(SkippedSubvolume {
+            name: skip.name.clone(),
+            category,
+            reason: skip.reason.clone(),
+            next_due_minutes: skip.next_due_minutes,
+        });
+    }
+    out
 }
 
 /// Post-plan token verification — planner is pure (ADR-100/108) and has no
@@ -142,6 +179,7 @@ pub fn populate_token_warnings(
 fn build_operation_entry(
     op: &PlannedOperation,
     fs_state: &dyn HistoryQuery,
+    drives: &[DriveConfig],
 ) -> PlanOperationEntry {
     match op {
         PlannedOperation::CreateSnapshot {
@@ -225,11 +263,18 @@ fn build_operation_entry(
             kind: _,
         } => {
             let snap_name = path.file_name().unwrap_or_default().to_string_lossy();
+            // Local and external retention can delete the same snapshot name
+            // in one plan (UPI 028); the drive label disambiguates. A path
+            // under no configured mount is local by elimination.
+            let drive_label = drives
+                .iter()
+                .find(|d| path.starts_with(&d.mount_path))
+                .map(|d| d.label.clone());
             PlanOperationEntry {
                 subvolume: subvolume_name.clone(),
                 operation: "delete".to_string(),
                 detail: format!("{snap_name} ({reason})"),
-                drive_label: None,
+                drive_label,
                 estimated_bytes: None,
                 is_full_send: None,
                 full_send_reason: None,
@@ -333,7 +378,7 @@ source = "/data/htpc-docs"
             ("htpc-home".into(), "WD-18TB".into(), SendKind::Full),
             53_000_000_000,
         );
-        let entry = build_operation_entry(&mock_send_full("htpc-home", "WD-18TB"), &fs);
+        let entry = build_operation_entry(&mock_send_full("htpc-home", "WD-18TB"), &fs, &[]);
         assert_eq!(entry.estimated_bytes, Some(53_000_000_000));
         assert_eq!(entry.is_full_send, Some(true));
         // Size is NOT in detail — voice.rs renders it from estimated_bytes.
@@ -349,7 +394,7 @@ source = "/data/htpc-docs"
             ("htpc-home".into(), "OTHER-DRIVE".into(), SendKind::Full),
             50_000_000_000,
         );
-        let entry = build_operation_entry(&mock_send_full("htpc-home", "WD-18TB"), &fs);
+        let entry = build_operation_entry(&mock_send_full("htpc-home", "WD-18TB"), &fs, &[]);
         assert_eq!(entry.estimated_bytes, Some(50_000_000_000));
     }
 
@@ -360,7 +405,7 @@ source = "/data/htpc-docs"
             "htpc-home".into(),
             (45_000_000_000, "2026-03-28".into()),
         );
-        let entry = build_operation_entry(&mock_send_full("htpc-home", "WD-18TB"), &fs);
+        let entry = build_operation_entry(&mock_send_full("htpc-home", "WD-18TB"), &fs, &[]);
         assert_eq!(entry.estimated_bytes, Some(45_000_000_000));
     }
 
@@ -379,14 +424,14 @@ source = "/data/htpc-docs"
             "htpc-home".into(),
             (45_000_000_000, "2026-03-28".into()),
         );
-        let entry = build_operation_entry(&mock_send_full("htpc-home", "WD-18TB"), &fs);
+        let entry = build_operation_entry(&mock_send_full("htpc-home", "WD-18TB"), &fs, &[]);
         assert_eq!(entry.estimated_bytes, Some(53_000_000_000));
     }
 
     #[test]
     fn full_send_no_data() {
         let fs = MockFileSystemState::new();
-        let entry = build_operation_entry(&mock_send_full("htpc-home", "WD-18TB"), &fs);
+        let entry = build_operation_entry(&mock_send_full("htpc-home", "WD-18TB"), &fs, &[]);
         assert_eq!(entry.estimated_bytes, None);
         assert!(entry.detail.contains("(full"), "detail: {}", entry.detail);
         assert!(!entry.detail.contains('~'), "should not have size annotation");
@@ -399,7 +444,7 @@ source = "/data/htpc-docs"
             ("htpc-home".into(), "WD-18TB".into(), SendKind::Incremental),
             5_500_000,
         );
-        let entry = build_operation_entry(&mock_send_incremental("htpc-home", "WD-18TB"), &fs);
+        let entry = build_operation_entry(&mock_send_incremental("htpc-home", "WD-18TB"), &fs, &[]);
         assert_eq!(entry.estimated_bytes, Some(5_500_000));
         assert_eq!(entry.is_full_send, Some(false));
         // Size is NOT in detail — voice.rs renders it from estimated_bytes.
@@ -413,7 +458,7 @@ source = "/data/htpc-docs"
             ("htpc-home".into(), "OTHER".into(), SendKind::Incremental),
             3_000_000,
         );
-        let entry = build_operation_entry(&mock_send_incremental("htpc-home", "WD-18TB"), &fs);
+        let entry = build_operation_entry(&mock_send_incremental("htpc-home", "WD-18TB"), &fs, &[]);
         assert_eq!(entry.estimated_bytes, Some(3_000_000));
     }
 
@@ -425,7 +470,7 @@ source = "/data/htpc-docs"
             "htpc-home".into(),
             (45_000_000_000, "2026-03-28".into()),
         );
-        let entry = build_operation_entry(&mock_send_incremental("htpc-home", "WD-18TB"), &fs);
+        let entry = build_operation_entry(&mock_send_incremental("htpc-home", "WD-18TB"), &fs, &[]);
         assert_eq!(entry.estimated_bytes, None);
     }
 
@@ -486,6 +531,160 @@ source = "/data/htpc-docs"
         };
         let output = build_plan_output(&plan, &fs, &test_config());
         assert_eq!(output.summary.estimated_total_bytes, None);
+    }
+
+    // ── Skip-collapse tests (#212 / 079-b §6) ─────────────────────────
+
+    fn unchanged_skip(name: &str) -> PlannedSkip {
+        PlannedSkip {
+            name: name.to_string(),
+            reason: "unchanged \u{2014} no changes since last snapshot (3d ago)".to_string(),
+            next_due_minutes: None,
+            nothing_new_to_send: false,
+        }
+    }
+
+    fn already_on_skip(name: &str, drive: &str) -> PlannedSkip {
+        PlannedSkip {
+            name: name.to_string(),
+            reason: format!("20260329-0404-{name} already on {drive}"),
+            next_due_minutes: None,
+            nothing_new_to_send: true,
+        }
+    }
+
+    #[test]
+    fn collapse_merges_unchanged_with_already_on() {
+        let skips = vec![
+            unchanged_skip("htpc-home"),
+            already_on_skip("htpc-home", "WD-18TB"),
+        ];
+        let collapsed = collapse_skipped(&skips);
+        assert_eq!(collapsed.len(), 1, "one conclusion, one record");
+        assert_eq!(collapsed[0].category, SkipCategory::Unchanged);
+        assert_eq!(
+            collapsed[0].reason,
+            "unchanged \u{2014} no changes since last snapshot (3d ago); already on WD-18TB",
+            "keeps the age, names the drive"
+        );
+    }
+
+    #[test]
+    fn collapse_folds_multiple_drives_into_one_record() {
+        let skips = vec![
+            unchanged_skip("htpc-home"),
+            already_on_skip("htpc-home", "WD-18TB"),
+            already_on_skip("htpc-home", "WD-18TB1"),
+        ];
+        let collapsed = collapse_skipped(&skips);
+        assert_eq!(collapsed.len(), 1);
+        assert!(
+            collapsed[0].reason.ends_with("already on WD-18TB, WD-18TB1"),
+            "drives fold into one list: {}",
+            collapsed[0].reason
+        );
+    }
+
+    #[test]
+    fn collapse_leaves_lone_already_on_untouched() {
+        // Under --auto a subvolume can be caught up on a drive while its
+        // snapshot interval hasn't elapsed — two distinct facts, no merge.
+        let skips = vec![
+            PlannedSkip {
+                name: "htpc-home".to_string(),
+                reason: "interval not elapsed (next in ~2h)".to_string(),
+                next_due_minutes: Some(120),
+                nothing_new_to_send: false,
+            },
+            already_on_skip("htpc-home", "WD-18TB"),
+        ];
+        let collapsed = collapse_skipped(&skips);
+        assert_eq!(collapsed.len(), 2, "no unchanged record, no merge");
+        assert_eq!(collapsed[1].reason, "20260329-0404-htpc-home already on WD-18TB");
+    }
+
+    #[test]
+    fn collapse_scopes_merge_per_subvolume() {
+        let skips = vec![
+            unchanged_skip("htpc-home"),
+            already_on_skip("htpc-home", "WD-18TB"),
+            unchanged_skip("htpc-docs"),
+            already_on_skip("htpc-docs", "WD-18TB"),
+        ];
+        let collapsed = collapse_skipped(&skips);
+        assert_eq!(collapsed.len(), 2);
+        assert_eq!(collapsed[0].name, "htpc-home");
+        assert_eq!(collapsed[1].name, "htpc-docs");
+        assert!(collapsed[0].reason.contains("already on WD-18TB"));
+        assert!(collapsed[1].reason.contains("already on WD-18TB"));
+    }
+
+    #[test]
+    fn collapse_keeps_unrelated_skips_separate() {
+        let skips = vec![
+            unchanged_skip("htpc-home"),
+            already_on_skip("htpc-home", "WD-18TB"),
+            PlannedSkip {
+                name: "htpc-home".to_string(),
+                reason: "send to WD-18TB1 not due (next in ~4h)".to_string(),
+                next_due_minutes: Some(240),
+                nothing_new_to_send: false,
+            },
+        ];
+        let collapsed = collapse_skipped(&skips);
+        assert_eq!(collapsed.len(), 2, "the send-interval deferral is its own fact");
+        assert_eq!(collapsed[1].category, SkipCategory::IntervalNotElapsed);
+    }
+
+    #[test]
+    fn summary_skipped_counts_collapsed_records() {
+        let fs = MockFileSystemState::new();
+        let plan = BackupPlan {
+            timestamp: chrono::NaiveDateTime::default(),
+            operations: vec![],
+            skipped: vec![
+                unchanged_skip("htpc-home"),
+                already_on_skip("htpc-home", "WD-18TB"),
+                already_on_skip("htpc-home", "WD-18TB1"),
+            ],
+            events: Vec::new(),
+        };
+        let output = build_plan_output(&plan, &fs, &test_config());
+        assert_eq!(output.skipped.len(), 1);
+        assert_eq!(
+            output.summary.skipped, 1,
+            "displayed count must match the collapsed list, not raw planner emissions"
+        );
+    }
+
+    // ── Delete-location tests (UPI 028 Change 2, folded via 079-b) ────
+
+    #[test]
+    fn delete_entry_under_drive_mount_carries_its_label() {
+        let fs = MockFileSystemState::new();
+        let config = test_config();
+        let op = PlannedOperation::DeleteSnapshot {
+            path: PathBuf::from("/mnt/wd/htpc-home/20260322-1430-htpc-home"),
+            reason: "beyond retention window".to_string(),
+            subvolume_name: "htpc-home".to_string(),
+            kind: crate::types::DeleteKind::Policy,
+        };
+        let entry = build_operation_entry(&op, &fs, &config.drives);
+        assert_eq!(entry.drive_label.as_deref(), Some("WD-18TB"));
+    }
+
+    #[test]
+    fn delete_entry_outside_drive_mounts_is_local() {
+        let fs = MockFileSystemState::new();
+        let config = test_config();
+        let op = PlannedOperation::DeleteSnapshot {
+            path: PathBuf::from("/snap/htpc-home/20260322-1430-htpc-home"),
+            reason: "graduated: daily thinning".to_string(),
+            subvolume_name: "htpc-home".to_string(),
+            kind: crate::types::DeleteKind::Policy,
+        };
+        let entry = build_operation_entry(&op, &fs, &config.drives);
+        assert_eq!(entry.drive_label, None, "local delete carries no drive label");
     }
 
     #[test]

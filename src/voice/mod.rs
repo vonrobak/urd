@@ -939,7 +939,7 @@ mod tests {
             output.contains("2TB-backup"),
             "missing drive name in grouped skip"
         );
-        assert!(output.contains("2 send(s) skipped"), "missing skip count");
+        assert!(output.contains("2 sends skipped"), "missing skip count");
     }
 
     #[test]
@@ -1234,7 +1234,7 @@ mod tests {
             output.contains("2TB-backup"),
             "missing second drive in grouped skips"
         );
-        assert!(output.contains("4 send(s) skipped"), "wrong skip count");
+        assert!(output.contains("4 sends skipped"), "wrong skip count");
     }
 
     // ── Plan tests ──────────────────────────────────────────────────────
@@ -1274,10 +1274,129 @@ mod tests {
             },
             warnings: vec![],
         };
-        let output = render_plan(&data, OutputMode::Interactive);
+        let output = render_plan(&data, OutputMode::Interactive, true);
         assert!(output.contains("htpc-home"), "missing subvolume name");
         assert!(output.contains("WD-18TB"), "missing drive label");
         assert!(output.contains("1 snapshot,"), "missing summary");
+    }
+
+    // ── Plan progressive disclosure (UPI 028, folded via 079-b) ─────────
+
+    #[test]
+    fn plan_default_hides_operations_and_names_the_door() {
+        let _color = color_guard(false);
+        let data = test_plan_output();
+        let output = render_plan(&data, OutputMode::Interactive, false);
+        assert!(
+            !output.contains("=== Planned operations ==="),
+            "default view must not show the operations wall: {output}"
+        );
+        assert!(
+            !output.contains("[CREATE]"),
+            "default view must not list individual operations: {output}"
+        );
+        assert!(
+            output.contains("urd plan --verbose"),
+            "hiding detail is only honest with a pointer to it: {output}"
+        );
+        assert!(output.contains("Summary:"), "summary must survive: {output}");
+    }
+
+    #[test]
+    fn plan_verbose_shows_operations_without_pointer() {
+        let _color = color_guard(false);
+        let data = test_plan_output();
+        let output = render_plan(&data, OutputMode::Interactive, true);
+        assert!(
+            output.contains("=== Planned operations ==="),
+            "verbose view lists operations: {output}"
+        );
+        assert!(
+            !output.contains("urd plan --verbose"),
+            "no pointer when the detail is already shown: {output}"
+        );
+    }
+
+    #[test]
+    fn plan_summary_renders_before_skips_and_operations() {
+        let _color = color_guard(false);
+        let mut data = test_plan_output();
+        data.skipped = vec![SkippedSubvolume {
+            next_due_minutes: None,
+            name: "htpc-docs".to_string(),
+            reason: "disabled".to_string(),
+            category: SkipCategory::Disabled,
+        }];
+        data.summary.skipped = 1;
+        let output = render_plan(&data, OutputMode::Interactive, true);
+        let summary_pos = output.find("Summary:").expect("summary present");
+        let skipped_pos = output.find("=== Skipped").expect("skips present");
+        let ops_pos = output.find("=== Planned operations").expect("ops present");
+        assert!(
+            summary_pos < skipped_pos && skipped_pos < ops_pos,
+            "order must be summary, skips, operations: {output}"
+        );
+    }
+
+    #[test]
+    fn plan_all_skipped_shows_no_verbose_pointer() {
+        let _color = color_guard(false);
+        let mut data = test_plan_output();
+        data.operations = vec![];
+        data.skipped = vec![SkippedSubvolume {
+            next_due_minutes: None,
+            name: "htpc-docs".to_string(),
+            reason: "disabled".to_string(),
+            category: SkipCategory::Disabled,
+        }];
+        data.summary = PlanSummaryOutput {
+            snapshots: 0,
+            sends: 0,
+            deletions: 0,
+            skipped: 1,
+            estimated_total_bytes: None,
+            configured_subvolumes: 2,
+        };
+        let output = render_plan(&data, OutputMode::Interactive, false);
+        assert!(
+            !output.contains("urd plan --verbose"),
+            "nothing hidden, nothing to point at: {output}"
+        );
+    }
+
+    #[test]
+    fn plan_verbose_delete_lines_carry_location() {
+        let _color = color_guard(false);
+        let mut data = test_plan_output();
+        data.operations = vec![
+            PlanOperationEntry {
+                subvolume: "music".to_string(),
+                operation: "delete".to_string(),
+                detail: "20260402-2147-music (graduated: daily thinning)".to_string(),
+                drive_label: None,
+                estimated_bytes: None,
+                is_full_send: None,
+                full_send_reason: None,
+            },
+            PlanOperationEntry {
+                subvolume: "music".to_string(),
+                operation: "delete".to_string(),
+                detail: "20260402-2147-music (beyond retention window)".to_string(),
+                drive_label: Some("WD-18TB".to_string()),
+                estimated_bytes: None,
+                is_full_send: None,
+                full_send_reason: None,
+            },
+        ];
+        let output = render_plan(&data, OutputMode::Interactive, true);
+        assert!(
+            output.contains("[local]"),
+            "local delete must be tagged: {output}"
+        );
+        assert!(
+            output.contains("[WD-18TB]"),
+            "external delete must carry the drive label: {output}"
+        );
     }
 
     #[test]
@@ -1296,7 +1415,7 @@ mod tests {
             },
             warnings: vec![],
         };
-        let output = render_plan(&data, OutputMode::Daemon);
+        let output = render_plan(&data, OutputMode::Daemon, false);
         let parsed: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
         assert!(parsed.get("timestamp").is_some());
     }
@@ -1333,7 +1452,7 @@ mod tests {
             },
             warnings: vec![],
         };
-        let output = render_plan(&data, OutputMode::Interactive);
+        let output = render_plan(&data, OutputMode::Interactive, true);
         assert!(
             output.contains("=== Planned operations ==="),
             "missing operations heading"
@@ -1363,7 +1482,7 @@ mod tests {
             },
             warnings: vec![],
         };
-        let output = render_plan(&data, OutputMode::Interactive);
+        let output = render_plan(&data, OutputMode::Interactive, true);
         // UPI 045: the ops-empty+skips-non-empty branch now renders the
         // verdict "No backups planned (all skipped — see below)." on line 1
         // and lets the Skipped section carry the detail. The old
@@ -1414,7 +1533,7 @@ mod tests {
             },
             warnings: vec![],
         };
-        let output = render_plan(&data, OutputMode::Interactive);
+        let output = render_plan(&data, OutputMode::Interactive, true);
         assert!(
             output.contains("Disconnected:"),
             "missing grouped not-mounted line"
@@ -1472,7 +1591,7 @@ mod tests {
             },
             warnings: vec![],
         };
-        let output = render_plan(&data, OutputMode::Interactive);
+        let output = render_plan(&data, OutputMode::Interactive, true);
         assert!(
             output.contains("Interval not elapsed:"),
             "missing interval group"
@@ -1518,7 +1637,7 @@ mod tests {
             },
             warnings: vec![],
         };
-        let output = render_plan(&data, OutputMode::Interactive);
+        let output = render_plan(&data, OutputMode::Interactive, true);
         // 2h30m (150 min) < 9d (12960 min) — must show 2h30m as shortest, not 9d
         assert!(
             output.contains("(next in ~2h30m)"),
@@ -1562,7 +1681,7 @@ mod tests {
             },
             warnings: vec![],
         };
-        let output = render_plan(&data, OutputMode::Interactive);
+        let output = render_plan(&data, OutputMode::Interactive, true);
         assert!(
             output.contains("Disabled:"),
             "missing disabled group: {output}"
@@ -1608,7 +1727,7 @@ mod tests {
             },
             warnings: vec![],
         };
-        let output = render_plan(&data, OutputMode::Interactive);
+        let output = render_plan(&data, OutputMode::Interactive, true);
         assert!(
             output.contains("[SPACE]"),
             "space exceeded should use [SPACE] tag"
@@ -1641,7 +1760,7 @@ mod tests {
             },
             warnings: vec![],
         };
-        let output = render_plan(&data, OutputMode::Interactive);
+        let output = render_plan(&data, OutputMode::Interactive, true);
         assert!(
             output.contains("[EXT]"),
             "external-only should use [EXT] tag: {output}"
@@ -1713,7 +1832,7 @@ mod tests {
             },
             warnings: vec![],
         };
-        let output = render_plan(&data, OutputMode::Interactive);
+        let output = render_plan(&data, OutputMode::Interactive, true);
         let not_mounted_pos = output.find("Disconnected:").expect("missing Disconnected");
         let interval_pos = output.find("Interval not elapsed:").expect("missing Interval");
         let disabled_pos = output.find("Disabled:").expect("missing Disabled");
@@ -1748,7 +1867,7 @@ mod tests {
             },
             warnings: vec![],
         };
-        let output = render_plan(&data, OutputMode::Daemon);
+        let output = render_plan(&data, OutputMode::Daemon, false);
         let parsed: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
         let category = parsed["skipped"][0]["category"]
             .as_str()
@@ -1794,7 +1913,7 @@ mod tests {
             },
             warnings: vec![],
         };
-        let output = render_plan(&data, OutputMode::Interactive);
+        let output = render_plan(&data, OutputMode::Interactive, true);
         assert!(
             output.contains("2 sends (~54.2GB total)"),
             "summary should show total estimate: {output}"
@@ -1831,7 +1950,7 @@ mod tests {
             },
             warnings: vec![],
         };
-        let output = render_plan(&data, OutputMode::Interactive);
+        let output = render_plan(&data, OutputMode::Interactive, true);
         assert!(
             output.contains("last: ~5.5MB"),
             "should render incremental size with 'last:' prefix: {output}"
@@ -1874,7 +1993,7 @@ mod tests {
             },
             warnings: vec![],
         };
-        let output = render_plan(&data, OutputMode::Interactive);
+        let output = render_plan(&data, OutputMode::Interactive, true);
         assert!(
             output.contains("2 sends (~53.0GB estimated for 1 of 2)"),
             "partial estimates should be qualified: {output}"
@@ -1906,7 +2025,7 @@ mod tests {
             },
             warnings: vec![],
         };
-        let output = render_plan(&data, OutputMode::Interactive);
+        let output = render_plan(&data, OutputMode::Interactive, true);
         assert!(
             output.contains("1 send,"),
             "no estimates should just show count: {output}"
@@ -1941,7 +2060,7 @@ mod tests {
             },
             warnings: vec![],
         };
-        let output = render_plan(&data, OutputMode::Daemon);
+        let output = render_plan(&data, OutputMode::Daemon, false);
         let parsed: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
         assert_eq!(
             parsed["operations"][0]["estimated_bytes"].as_u64(),
@@ -1977,7 +2096,7 @@ mod tests {
             },
             warnings: vec![],
         };
-        let output = render_plan(&data, OutputMode::Daemon);
+        let output = render_plan(&data, OutputMode::Daemon, false);
         let parsed: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
         assert!(
             parsed["operations"][0].get("estimated_bytes").is_none(),
@@ -2014,7 +2133,7 @@ mod tests {
                     .to_string(),
             ],
         };
-        let output = render_plan(&data, OutputMode::Interactive);
+        let output = render_plan(&data, OutputMode::Interactive, true);
         assert!(
             output.contains("[WARNING]"),
             "warnings should render with [WARNING] tag: {output}"
@@ -2041,7 +2160,7 @@ mod tests {
             },
             warnings: vec![],
         };
-        let output = render_plan(&data, OutputMode::Daemon);
+        let output = render_plan(&data, OutputMode::Daemon, false);
         let parsed: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
         assert!(
             parsed.get("warnings").is_none(),
@@ -2065,7 +2184,7 @@ mod tests {
             },
             warnings: vec!["Drive X identity suspect".to_string()],
         };
-        let output = render_plan(&data, OutputMode::Daemon);
+        let output = render_plan(&data, OutputMode::Daemon, false);
         let parsed: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
         assert_eq!(
             parsed["warnings"][0].as_str(),
@@ -2139,7 +2258,7 @@ mod tests {
             },
             warnings: vec![],
         };
-        let output = render_plan(&data, OutputMode::Daemon);
+        let output = render_plan(&data, OutputMode::Daemon, false);
         let parsed: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
         assert_eq!(
             parsed["skipped"][0]["category"].as_str(),
@@ -3879,7 +3998,7 @@ mod tests {
             },
             warnings: vec![],
         };
-        let output = render_plan(&data, OutputMode::Interactive);
+        let output = render_plan(&data, OutputMode::Interactive, true);
         assert!(
             output.contains("[SAME]"),
             "plan output should contain [SAME] tag, got: {output}"

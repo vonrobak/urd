@@ -30,17 +30,21 @@ pub fn render_empty_plan(explanation: &crate::output::EmptyPlanExplanation) -> S
 }
 
 /// Render plan output according to the given mode.
+///
+/// `verbose` gates the per-operation wall (UPI 028): the default output is
+/// summary-first with a pointer to `urd plan --verbose`. Daemon mode ignores
+/// it — JSON always carries the full operations list.
 #[must_use]
-pub fn render_plan(data: &PlanOutput, mode: OutputMode) -> String {
+pub fn render_plan(data: &PlanOutput, mode: OutputMode, verbose: bool) -> String {
     match mode {
-        OutputMode::Interactive => render_plan_interactive(data),
+        OutputMode::Interactive => render_plan_interactive(data, verbose),
         OutputMode::Daemon => {
             serde_json::to_string_pretty(data).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
         }
     }
 }
 
-fn render_plan_interactive(data: &PlanOutput) -> String {
+fn render_plan_interactive(data: &PlanOutput, verbose: bool) -> String {
     let mut out = String::new();
 
     // Verdict line first (UPI 045 Rule 5 — first line is the answer).
@@ -73,49 +77,9 @@ fn render_plan_interactive(data: &PlanOutput) -> String {
         return out;
     }
 
-    // === Planned operations ===
-    if !data.operations.is_empty() {
-        writeln!(out, "{}", "=== Planned operations ===".bold()).ok();
-        let mut current_subvol: Option<&str> = None;
-        for entry in &data.operations {
-            if current_subvol != Some(&entry.subvolume) {
-                if current_subvol.is_some() {
-                    writeln!(out).ok();
-                }
-                writeln!(out, "{}:", entry.subvolume.bold()).ok();
-                current_subvol = Some(&entry.subvolume);
-            }
-
-            let label = match entry.operation.as_str() {
-                "create" => "[CREATE]".green().to_string(),
-                "send" => "[SEND]".blue().to_string(),
-                "delete" => "[DELETE]".yellow().to_string(),
-                other => format!("[{other}]"),
-            };
-            let size_annotation = match (entry.estimated_bytes, entry.is_full_send) {
-                (Some(bytes), Some(true)) => format!(" ~{}", ByteSize(bytes)),
-                (Some(bytes), Some(false)) => format!(" last: ~{}", ByteSize(bytes)),
-                _ => String::new(),
-            };
-            writeln!(out, "  {:<10} {}{}", label, entry.detail, size_annotation.dimmed()).ok();
-        }
-        writeln!(out).ok();
-    }
-
-    // === Skipped (N) ===
-    if !data.skipped.is_empty() {
-        writeln!(
-            out,
-            "{}",
-            format!("=== Skipped ({}) ===", data.skipped.len()).dimmed()
-        )
-        .ok();
-        render_plan_skipped_grouped(&data.skipped, &mut out);
-    }
-
-    writeln!(out).ok();
-
-    // Build sends portion of summary, with estimated total if available.
+    // === Summary (UPI 028: summary-first) ===
+    // The user typed `urd plan` to learn what will happen — quantities lead,
+    // detail follows. Build sends portion with estimated total if available.
     let sends_str = if data.summary.sends == 0 {
         "0 sends".to_string()
     } else if let Some(total) = data.summary.estimated_total_bytes {
@@ -156,6 +120,73 @@ fn render_plan_interactive(data: &PlanOutput) -> String {
         .bold()
     )
     .ok();
+    // Hiding detail is only honest when the output names the door.
+    if !verbose && !ops_empty {
+        writeln!(
+            out,
+            "  {}",
+            "(urd plan --verbose lists every operation)".dimmed()
+        )
+        .ok();
+    }
+    writeln!(out).ok();
+
+    // === Skipped (N) ===
+    if !data.skipped.is_empty() {
+        writeln!(
+            out,
+            "{}",
+            format!("=== Skipped ({}) ===", data.skipped.len()).dimmed()
+        )
+        .ok();
+        render_plan_skipped_grouped(&data.skipped, &mut out);
+    }
+
+    // === Planned operations (--verbose only) ===
+    if verbose && !ops_empty {
+        if !data.skipped.is_empty() {
+            writeln!(out).ok();
+        }
+        writeln!(out, "{}", "=== Planned operations ===".bold()).ok();
+        let mut current_subvol: Option<&str> = None;
+        for entry in &data.operations {
+            if current_subvol != Some(&entry.subvolume) {
+                if current_subvol.is_some() {
+                    writeln!(out).ok();
+                }
+                writeln!(out, "{}:", entry.subvolume.bold()).ok();
+                current_subvol = Some(&entry.subvolume);
+            }
+
+            let label = match entry.operation.as_str() {
+                "create" => "[CREATE]".green().to_string(),
+                "send" => "[SEND]".blue().to_string(),
+                "delete" => "[DELETE]".yellow().to_string(),
+                other => format!("[{other}]"),
+            };
+            let size_annotation = match (entry.estimated_bytes, entry.is_full_send) {
+                (Some(bytes), Some(true)) => format!(" ~{}", ByteSize(bytes)),
+                (Some(bytes), Some(false)) => format!(" last: ~{}", ByteSize(bytes)),
+                _ => String::new(),
+            };
+            // UPI 028: local and external retention can delete the same
+            // snapshot name — the location tag is what tells them apart.
+            let location = if entry.operation == "delete" {
+                format!(" [{}]", entry.drive_label.as_deref().unwrap_or("local"))
+            } else {
+                String::new()
+            };
+            writeln!(
+                out,
+                "  {:<10} {}{}{}",
+                label,
+                entry.detail,
+                size_annotation.dimmed(),
+                location.dimmed()
+            )
+            .ok();
+        }
+    }
 
     // ── Next-action suggestion ──────────────────────────────────────
     let has_space_skip = data

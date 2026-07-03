@@ -15,7 +15,7 @@ use crate::types::{ByteSize, DriveRole};
 
 use super::{
     SuggestionContext, append_suggestion, color_result, exposure_label, format_status_table,
-    skip_tag,
+    pluralize, skip_tag,
 };
 
 /// Render post-backup summary according to the given mode.
@@ -328,9 +328,19 @@ fn render_skipped_block(skipped: &[crate::output::SkippedSubvolume], out: &mut S
             not_mounted_drives.join(", "),
         )
         .ok();
-        writeln!(out, "    {} send(s) skipped", not_mounted_count).ok();
+        writeln!(
+            out,
+            "    {} skipped",
+            pluralize(not_mounted_count, "send", "sends")
+        )
+        .ok();
     }
 
+    // #212: label the actionable population so it can't be misread as the
+    // list behind the disconnected-drives count above.
+    if !actionable_skips.is_empty() {
+        writeln!(out, "  Needs attention:").ok();
+    }
     for skip in &actionable_skips {
         writeln!(
             out,
@@ -694,6 +704,59 @@ mod tests {
         assert!(
             !safe_to_remove_text(&data).contains("safe to take"),
             "a deferral on the sending subvolume must suppress the cue"
+        );
+    }
+
+    /// #212: the actionable-skip lines used to render directly under the
+    /// disconnected-drives count line, reading as if enumerated by it — two
+    /// populations sharing one number. Each block now labels itself.
+    #[test]
+    fn skipped_block_actionable_skips_get_own_heading() {
+        let skipped = vec![
+            SkippedSubvolume {
+                next_due_minutes: None,
+                name: "sv1".to_string(),
+                reason: "drive WD-18TB not mounted".to_string(),
+                category: SkipCategory::DriveNotMounted,
+            },
+            SkippedSubvolume {
+                next_due_minutes: None,
+                name: "sv2".to_string(),
+                reason: "estimated send exceeds free space".to_string(),
+                category: SkipCategory::SpaceExceeded,
+            },
+        ];
+        let mut out = String::new();
+        render_skipped_block(&skipped, &mut out);
+        assert!(
+            out.contains("1 send skipped"),
+            "disconnected count covers only its own population: {out}"
+        );
+        assert!(
+            out.contains("Needs attention:"),
+            "actionable skips need their own heading: {out}"
+        );
+        let heading_pos = out.find("Needs attention:").unwrap();
+        let skip_pos = out.find("sv2").unwrap();
+        assert!(
+            heading_pos < skip_pos,
+            "heading must precede the actionable list: {out}"
+        );
+    }
+
+    #[test]
+    fn skipped_block_no_heading_without_actionable_skips() {
+        let skipped = vec![SkippedSubvolume {
+            next_due_minutes: None,
+            name: "sv1".to_string(),
+            reason: "drive WD-18TB not mounted".to_string(),
+            category: SkipCategory::DriveNotMounted,
+        }];
+        let mut out = String::new();
+        render_skipped_block(&skipped, &mut out);
+        assert!(
+            !out.contains("Needs attention:"),
+            "no actionable skips, no heading: {out}"
         );
     }
 
