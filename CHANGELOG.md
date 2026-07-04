@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Config generation + self-check (UPI 074, Encounter arc 5/9).** New
+  `config_render` module converts an approved `ProposedStrategy` into a fully
+  explicit, commented v2 config — intention comments anchored to the subvolume
+  or drive they explain, typed exclusion and gap commentary, and a tool-agnostic
+  header stating that comments do not survive a rewrite. Born through the
+  self-check: the rendered TOML must survive the real load path *and* reload to
+  exactly the approved strategy, or nothing is written. The carve wiring
+  (`commands/encounter.rs`) publishes atomically via hard-link (an existing
+  config is never overwritten, even by a race) and refuses empty strategies.
+  Acceptance property: every strategy the derivation grid can produce
+  round-trips exactly and raises zero preflight advisories. Engine + carve
+  wiring only — no CLI surface until the Encounter conversation (UPI 072).
+
 - **Strategy derivation engine (UPI 073, Encounter arc 4/9).** New `strategy`
   module derives a `ProposedStrategy` from the system inventory plus the fate
   conversation's answers: per-subvolume promises mapped onto the existing named
@@ -26,6 +39,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   statvfs). Ask-don't-guess: conflicting drive signals classify as Ambiguous for
   the conversation to resolve. Engine only — no CLI surface until the Encounter
   conversation (UPI 072) consumes it.
+
+### Fixed
+- **Multi-device btrfs pools no longer derive duplicate backup drives.** A
+  filesystem spanning two external disks made strategy derivation adopt every
+  bearing drive — duplicate drive UUIDs that config validation rejects (and
+  would have meant double-sends into one filesystem). One pool now adopts one
+  destination, first bearing drive wins.
 
 ## [0.32.0] - 2026-07-03
 
