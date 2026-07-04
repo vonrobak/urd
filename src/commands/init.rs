@@ -3,9 +3,9 @@ use std::path::Path;
 
 use crate::btrfs::{BtrfsOps, RealBtrfs};
 use crate::chain;
+use crate::commands::CliExit;
 use crate::config::Config;
 use crate::drives;
-use crate::error::UrdError;
 use crate::output::{
     InitCheck, InitDriveStatus, InitIncomplete, InitOutput, InitPinFile, InitSnapshotCount,
     InitStatus, OutputMode,
@@ -14,25 +14,29 @@ use crate::plan::{FilesystemQuery, RealFileSystemState};
 use crate::state::StateDb;
 
 /// CLI entry with fallible config load and first-time discrimination,
-/// mirroring `commands::default::run`: file-not-found → first-time guidance;
-/// all other errors → surface. The bare-`urd` greeting advertises `urd init`
-/// as the first command — a missing config must greet, not error.
-pub fn run_cli(config_path: Option<&Path>, output_mode: OutputMode) -> anyhow::Result<()> {
-    let config = match Config::load(config_path) {
-        Ok(c) => c,
-        Err(UrdError::Io {
-            ref path,
-            ref source,
-        }) if source.kind() == std::io::ErrorKind::NotFound => {
+/// mirroring `commands::default::run`: file-not-found → first-time guidance
+/// (exit 3 when non-interactive — grill Q5's distinct code); all other
+/// errors → surface. The bare-`urd` greeting advertises `urd init` as the
+/// first command — a missing config must greet, not error.
+pub fn run_cli(config_path: Option<&Path>, output_mode: OutputMode) -> anyhow::Result<CliExit> {
+    let config = match Config::load_or_absent(config_path)? {
+        Some(c) => c,
+        None => {
+            let path = match config_path {
+                Some(p) => p.to_path_buf(),
+                None => crate::config::default_config_path()?,
+            };
             print!(
                 "{}",
-                crate::voice::render_init_first_time(path, output_mode)
+                crate::voice::render_init_first_time(&path, output_mode)
             );
-            return Ok(());
+            return Ok(match output_mode {
+                OutputMode::Interactive => CliExit::Done,
+                OutputMode::Daemon => CliExit::NoConfig,
+            });
         }
-        Err(e) => return Err(e.into()),
     };
-    run(config)
+    run(config).map(|()| CliExit::Done)
 }
 
 pub fn run(config: Config) -> anyhow::Result<()> {
@@ -456,4 +460,37 @@ fn handle_incomplete_deletions(
     }
 
     Ok(deleted)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn run_cli_config_not_found_daemon_reports_no_config_exit() {
+        // Mirrors commands::default — the make-whole verb greets a missing
+        // config, and non-interactive callers get the distinct exit.
+        let bogus = PathBuf::from("/tmp/urd-test-nonexistent-init-config-12345.toml");
+        let result = run_cli(Some(&bogus), OutputMode::Daemon);
+        assert_eq!(result.expect("config-not-found is Ok"), CliExit::NoConfig);
+    }
+
+    #[test]
+    fn run_cli_config_not_found_interactive_greets_and_exits_zero() {
+        let bogus = PathBuf::from("/tmp/urd-test-nonexistent-init-config-12345.toml");
+        let result = run_cli(Some(&bogus), OutputMode::Interactive);
+        assert_eq!(result.expect("config-not-found is Ok"), CliExit::Done);
+    }
+
+    #[test]
+    fn run_cli_invalid_config_surfaces_error() {
+        // An invalid config is never the first-time path — the error must
+        // reach the user (the TTY fix-it loop arrives with the Encounter).
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("bad.toml");
+        std::fs::write(&path, "this is not valid toml [[[").expect("write garbage");
+        let result = run_cli(Some(&path), OutputMode::Daemon);
+        assert!(result.is_err(), "invalid config must surface as Err");
+    }
 }

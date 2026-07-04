@@ -2,24 +2,27 @@ use std::path::Path;
 
 use crate::advice;
 use crate::awareness;
-use crate::commands::storage_signals;
+use crate::commands::{storage_signals, CliExit};
 use crate::config;
-use crate::error::UrdError;
 use crate::output::{DefaultStatusOutput, OutputMode};
 use crate::plan::{Observation, RealFileSystemState};
 use crate::state::StateDb;
 use crate::voice;
 
-pub fn run(config_path: Option<&Path>, output_mode: OutputMode) -> anyhow::Result<()> {
-    // Fallible config load with error discrimination (S1):
-    // file-not-found → first-time user; all other errors → surface.
-    let config = match config::Config::load(config_path) {
-        Ok(c) => c,
-        Err(UrdError::Io { ref source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+pub fn run(config_path: Option<&Path>, output_mode: OutputMode) -> anyhow::Result<CliExit> {
+    // Fallible config load through the shared absence seam (S1/UPI 072):
+    // file-not-found → first-time user (exit 3 when non-interactive — the
+    // grill-pinned distinct code; interactive keeps the greeting until the
+    // Encounter offer lands); all other errors → surface.
+    let config = match config::Config::load_or_absent(config_path)? {
+        Some(c) => c,
+        None => {
             print!("{}", voice::render_first_time(output_mode));
-            return Ok(());
+            return Ok(match output_mode {
+                OutputMode::Interactive => CliExit::Done,
+                OutputMode::Daemon => CliExit::NoConfig,
+            });
         }
-        Err(e) => return Err(e.into()),
     };
 
     let state_db = if config.general.state_db.exists() {
@@ -106,7 +109,7 @@ pub fn run(config_path: Option<&Path>, output_mode: OutputMode) -> anyhow::Resul
         output_mode,
     );
     print!("{preamble}{rendered}");
-    Ok(())
+    Ok(CliExit::Done)
 }
 
 #[cfg(test)]
@@ -115,11 +118,25 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn config_not_found_returns_ok() {
-        // A nonexistent config path should return Ok (first-time path), not an error.
+    fn config_not_found_daemon_reports_no_config_exit() {
+        // A nonexistent config path is the first-time path, not an error —
+        // and non-interactive callers get the distinct exit (grill Q5).
         let bogus = PathBuf::from("/tmp/urd-test-nonexistent-config-12345.toml");
         let result = run(Some(&bogus), OutputMode::Daemon);
-        assert!(result.is_ok(), "config-not-found should return Ok: {result:?}");
+        assert_eq!(
+            result.expect("config-not-found is Ok"),
+            CliExit::NoConfig,
+            "non-TTY no-config must exit 3"
+        );
+    }
+
+    #[test]
+    fn config_not_found_interactive_greets_and_exits_zero() {
+        // Interactive keeps the greeting + exit 0 until the Encounter offer
+        // lands (step 7); the conversation is what changes this, not step 1.
+        let bogus = PathBuf::from("/tmp/urd-test-nonexistent-config-12345.toml");
+        let result = run(Some(&bogus), OutputMode::Interactive);
+        assert_eq!(result.expect("config-not-found is Ok"), CliExit::Done);
     }
 
     #[test]
