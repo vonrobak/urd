@@ -173,6 +173,7 @@ the documentation convention in `contributing-internal.md`).
 | `rotation.rs` | Pure: infer offsite rotation cadence (median homecoming gap) and resolve the offsite freshness window from drive-mount history | Perform I/O or persist |
 | `drives.rs` | Detect mounted drives, UUID fingerprinting, check space | Mount/unmount drives |
 | `pools.rs` | Detect BTRFS pools, group subvolumes by pool UUID, read sysfs/statvfs utilization | Know about retention, plans, drive lifecycle, or notification policy |
+| `discovery.rs` | Build the zero-state `SystemInventory` (pools, mounted subvolumes, candidate drives with internal/external class + LUKS state, typed notes) from unprivileged probes — `lsblk -J`/`findmnt -J` parsing, per-disk signal aggregation; observational only | Use sudo or `BtrfsOps`; read config or state DB; vouch for device identity to privileged consumers (they re-verify at action time) |
 | `output.rs` | Define structured output types | Render text (`voice/` does that) |
 | `voice/` | Render structured output as mythic-voice text; per-command sub-modules, with cross-renderer helpers in `voice/mod.rs` exposed `pub(super)` | Perform I/O or compute state |
 | `voice_events.rs` | Per-variant `EventPayload` renderer (columnar + NDJSON) | Perform I/O or query state |
