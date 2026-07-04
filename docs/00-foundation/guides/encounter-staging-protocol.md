@@ -77,9 +77,15 @@ Dry-run is the default and prints the full deletion plan; only `--apply` execute
 binaries (category 9, for install-experience testing).
 
 Exit codes: `0` clean · `2` usage · `3` refusal (missing/invalid marker, running as
-root, drive sanity) · `4` typed-confirmation mismatch · `5` backup lock held ·
-`6` finished with per-item failures (the summary lists them — the machine is *not* a
-clean slate).
+root, drive sanity) · `4` typed-confirmation mismatch or EOF at the prompt · `5`
+backup lock held · `6` finished with per-item failures (the summary lists them — the
+machine is *not* a clean slate).
+
+**`--apply` with `--drive` needs an interactive terminal.** The typed drive
+confirmation reads from stdin; a non-interactive stdin (pipe, harness passthrough,
+CI) EOFs the prompt, which exits 4 and aborts the drive category *and every category
+after it* — categories already processed stay applied, leaving a half-reset machine
+(observed live in field test 01). Dry-runs never prompt and are safe anywhere.
 
 ### Safety rails
 
@@ -114,10 +120,10 @@ isolates them, continues, and lists every failure in the summary.
 | # | Category | Where |
 |---|----------|-------|
 | 1 | Config | `~/.config/urd/` — `urd.toml` + `urd migrate` backups (`.legacy`, `.v1`) |
-| 2 | State | `~/.local/share/urd/` — `urd.db` (+`-wal`/`-shm`), `urd.lock`, `heartbeat.json`, `backup.prom`, `logs/` |
+| 2 | State | `~/.local/share/urd/` — `urd.db` (+`-wal`/`-shm`), `urd.lock`, `heartbeat.json`, `sentinel-state.json`, `backup.prom`, `logs/`; warns if anything it does not know survives |
 | 3 | Local snapshots | contract-named subvolumes under each marker-declared root |
 | 4 | Pin files | `.last-external-parent-{LABEL}` (+ legacy form) in each snapshot dir |
-| 5 | External drive | contract-named snapshots + `.urd-drive-token` under the drive's snapshot root (`--drive` only) |
+| 5 | External drive | contract-named snapshots + `.urd-drive-token` under the drive's snapshot root, then emptied per-subvolume dirs (`--drive` only) |
 | 6 | Sudoers | `/etc/sudoers.d/urd` (removed, never edited — absence is the pre-Urd state) |
 | 7 | systemd | `urd-backup.timer`, `urd-backup.service`, `urd-sentinel.service`: disabled, unit files removed, `daemon-reload` + `reset-failed` |
 | 8 | Completions | the prescribed install paths (below) |

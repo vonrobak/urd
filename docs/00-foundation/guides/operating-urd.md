@@ -11,8 +11,9 @@ Urd compiles to a single binary. The systemd unit expects it at `~/.cargo/bin/ur
 
 ### First-time install
 
+From the root of your clone:
+
 ```bash
-cd ~/projects/urd
 cargo build --release
 cp target/release/urd ~/.cargo/bin/urd
 ```
@@ -27,10 +28,10 @@ cargo install --path .
 
 **This is the step people forget.** Code changes (new features, bug fixes, review fixes)
 only take effect after rebuilding and replacing the binary. If you pull new code or merge
-a PR but don't rebuild, the running binary is still the old version.
+a PR but don't rebuild, the running binary is still the old version. From the root of
+your clone:
 
 ```bash
-cd ~/projects/urd
 git pull                          # or: merge the PR branch
 cargo build --release
 cp target/release/urd ~/.cargo/bin/urd
@@ -53,6 +54,12 @@ automatically — the service unit runs `%h/.cargo/bin/urd backup` each time, so
 always picks up whatever binary is at that path. No `daemon-reload` needed for binary
 updates (only for unit file changes).
 
+> **This manual path is interim.** The Encounter — Urd's guided first-run
+> conversation, in development — replaces everything from here through Initial
+> Setup: generated config, initialized drive, created directories, verified
+> identity. Until it ships, follow these steps exactly and in order; the traps
+> called out below were all hit in live field testing (2026-07-04).
+
 ## Sudoers Configuration
 
 Urd runs as a regular user and calls `sudo btrfs` for privileged filesystem operations.
@@ -64,8 +71,14 @@ Create `/etc/sudoers.d/urd` (requires root):
 sudo visudo -f /etc/sudoers.d/urd
 ```
 
-Paste the following template, replacing `<user>` with your username, `<btrfs>` with the
-path to your btrfs binary (`which btrfs`), and adjusting paths to match your layout:
+Below is a complete, working example for user **`alice`** backing up `/home` to the
+local snapshot root `/home/alice/.snapshots` and an external drive labeled
+**`backup-1`**, with btrfs at `/usr/bin/btrfs`. **Do not paste it unchanged** —
+substitute three things for your system first:
+
+1. the username (`alice` → yours),
+2. the btrfs path (use the output of `which btrfs`, everywhere it appears),
+3. the source and snapshot-root paths (from your config).
 
 ```sudoers
 # Urd — scoped btrfs permissions for automated backups
@@ -74,23 +87,28 @@ path to your btrfs binary (`which btrfs`), and adjusting paths to match your lay
 # show/sync are read-only diagnostics.
 
 # Snapshot creation — scoped to snapshot directories
-# Add one line per source → snapshot-root mapping in your config.
-<user> ALL=(root) NOPASSWD: <btrfs> subvolume snapshot -r /path/to/source /path/to/snapshot-root/*
+# One line per source → snapshot-root mapping in your config.
+alice ALL=(root) NOPASSWD: /usr/bin/btrfs subvolume snapshot -r /home /home/alice/.snapshots/*
 
 # Snapshot deletion — scoped to snapshot directories only
-# Add one line per snapshot root (local and each external drive).
-<user> ALL=(root) NOPASSWD: <btrfs> subvolume delete /path/to/snapshot-root/*
-<user> ALL=(root) NOPASSWD: <btrfs> subvolume delete /run/media/<user>/drive-label/.snapshots/*
+# One line per snapshot root (local and each external drive).
+alice ALL=(root) NOPASSWD: /usr/bin/btrfs subvolume delete /home/alice/.snapshots/*
+alice ALL=(root) NOPASSWD: /usr/bin/btrfs subvolume delete /run/media/alice/backup-1/.snapshots/*
 
 # Send/receive — broad paths (source subvolumes and external drives vary)
-<user> ALL=(root) NOPASSWD: <btrfs> send *
-<user> ALL=(root) NOPASSWD: <btrfs> receive *
+alice ALL=(root) NOPASSWD: /usr/bin/btrfs send *
+alice ALL=(root) NOPASSWD: /usr/bin/btrfs receive *
 
 # Read-only commands — space estimation, diagnostics, sync after delete
-<user> ALL=(root) NOPASSWD: <btrfs> subvolume show *
-<user> ALL=(root) NOPASSWD: <btrfs> filesystem show *
-<user> ALL=(root) NOPASSWD: <btrfs> subvolume sync *
+alice ALL=(root) NOPASSWD: /usr/bin/btrfs subvolume show *
+alice ALL=(root) NOPASSWD: /usr/bin/btrfs filesystem show *
+alice ALL=(root) NOPASSWD: /usr/bin/btrfs subvolume sync *
 ```
+
+If visudo reports `syntax error` lines when you save and drops you at a
+`What now?` prompt, type `e` to re-open the file and fix it — usually a
+placeholder or path left unsubstituted. visudo never installs a broken file,
+so nothing is damaged; just correct and re-save.
 
 Verify it works:
 
@@ -110,36 +128,45 @@ pair in your config. One deletion line per snapshot directory (each local snapsh
 plus each external drive's snapshot directory). The read-only commands and send/receive
 are one line each.
 
-> **Path note:** The btrfs binary path varies by distribution. Common locations:
-> `/usr/sbin/btrfs` (Fedora, RHEL), `/usr/bin/btrfs` (Arch, Ubuntu).
-> Check with `which btrfs`.
+> **Path note:** run `which btrfs` and use that exact path both here and in the
+> config's btrfs path. Current Fedora resolves `/usr/bin/btrfs` (`/usr/sbin` is a
+> symlink to `bin`; a sudoers line written against either spelling matches an
+> invocation via the other — verified on Fedora 44, sudo 1.9.17). Older
+> Fedora/RHEL report `/usr/sbin/btrfs`; Arch and Ubuntu use `/usr/bin/btrfs`.
 
 ## Initial Setup
 
-After the first install, configure and validate:
+After the first install, configure and validate. Run the `cp` steps from the root
+of your clone (wherever you cloned the repo — the paths below are repo-relative):
 
 ```bash
-# 1. Create config from template
-cp ~/projects/urd/config/urd.toml.example ~/.config/urd/urd.toml
+# 1. Create config from template (~/.config/urd/ does not exist on a fresh
+#    system — create it first)
+mkdir -p ~/.config/urd
+cp config/urd.toml.example ~/.config/urd/urd.toml
 # Edit: set drive mount paths, subvolume sources, snapshot roots for your system
 
 # 2. Validate system readiness
 urd init
 
-# 3. Measure snapshot sizes (space estimation for first external sends)
-urd calibrate
-
-# 4. Preview the backup plan
+# 3. Preview the backup plan
 urd plan
 
-# 5. Dry-run to confirm
+# 4. Dry-run to confirm
 urd backup --dry-run
 
-# 6. Run a real backup
+# 5. Create the first local snapshot, then measure it (calibrate reads local
+#    snapshots — on a fresh system it skips with "no local snapshots" until
+#    one exists)
+urd backup --local-only
+urd calibrate
+
+# 6. Run a real backup (external sends now have size estimates)
 urd backup
 
 # 7. Install the systemd units for nightly backups and the sentinel
-cp ~/projects/urd/systemd/urd-*.{service,timer} ~/.config/systemd/user/
+mkdir -p ~/.config/systemd/user
+cp systemd/urd-*.{service,timer} ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now urd-backup.timer
 systemctl --user enable --now urd-sentinel.service   # recommended; see below
@@ -262,8 +289,11 @@ Urd is a nightly cron job; with it, Urd is a continuous protection layer.
 
 ### Install / update units
 
+From the root of your clone:
+
 ```bash
-cp ~/projects/urd/systemd/urd-*.{service,timer} ~/.config/systemd/user/
+mkdir -p ~/.config/systemd/user
+cp systemd/urd-*.{service,timer} ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now urd-backup.timer
 systemctl --user enable --now urd-sentinel.service   # optional but recommended
@@ -325,8 +355,9 @@ systemctl --user daemon-reload
 
 ### After merging new code
 
+From the root of your clone:
+
 ```bash
-cd ~/projects/urd
 git pull
 cargo build --release
 cp target/release/urd ~/.cargo/bin/urd
@@ -371,7 +402,7 @@ Common causes:
   (shown as "estimated ~X exceeds Y available" in the skip reason)
 - **Broken chain** — parent snapshot deleted or missing on external drive. Next send
   will be a full send (large but self-repairing)
-- **Sudo permission** — `urd init` validates this; check `/etc/sudoers.d/btrfs-backup`
+- **Sudo permission** — `urd init` validates this; check `/etc/sudoers.d/urd`
 
 ### Recalibrate after major data changes
 
