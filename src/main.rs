@@ -6,6 +6,7 @@ mod cli;
 mod cli_validation;
 mod commands;
 mod config;
+mod discovery;
 mod drift;
 mod drives;
 mod error;
