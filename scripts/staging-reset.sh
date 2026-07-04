@@ -25,9 +25,16 @@
 #
 # Usage: scripts/staging-reset.sh [--apply] [--drive UUID] [--full]
 #
+# --apply with --drive reads the typed drive confirmation from stdin: run it in a
+# real interactive terminal. A non-interactive stdin (pipe, harness passthrough,
+# CI) EOFs the prompt, which exits 4 and aborts the drive category AND everything
+# after it — categories already processed stay applied, leaving a half-reset
+# machine. Dry-runs (no --apply) never prompt and are safe non-interactively.
+#
 # Exit codes:
 #   0 clean · 2 usage · 3 refusal (no/invalid marker, root, drive sanity)
-#   4 typed confirmation mismatch · 5 backup lock held · 6 finished with failures
+#   4 typed confirmation mismatch or EOF at the prompt · 5 backup lock held
+#   6 finished with failures
 
 set -euo pipefail
 shopt -s nullglob
@@ -329,6 +336,14 @@ else
                 fi
             fi
             delete_snapshots_under "$EXT_ROOT"
+            if [[ $APPLY -eq 1 ]]; then
+                # mirror remove_pins_under: drop per-subvolume dirs the deletions emptied
+                for subdir in "$EXT_ROOT"/*/; do
+                    subdir="${subdir%/}"
+                    [[ -d "$subdir" && ! -L "$subdir" ]] || continue
+                    rmdir "$subdir" 2>/dev/null || true   # non-empty = safe no-op
+                done
+            fi
             if [[ -f "$EXT_ROOT/.urd-drive-token" ]]; then
                 do_rm "drive token" "$EXT_ROOT/.urd-drive-token" || true
             fi
@@ -356,11 +371,16 @@ echo
 # ── Category 2: state ────────────────────────────────────────────────────
 
 echo "[state]"
-for f in urd.db urd.db-wal urd.db-shm urd.lock heartbeat.json backup.prom; do
+for f in urd.db urd.db-wal urd.db-shm urd.lock heartbeat.json sentinel-state.json backup.prom; do
     [[ -e "$STATE_DIR/$f" ]] && { do_rm "state" "$STATE_DIR/$f" || true; }
 done
 [[ -d "$STATE_DIR/logs" ]] && { do_rm "state logs" "$STATE_DIR/logs/" || true; }
-if [[ $APPLY -eq 1 ]]; then rmdir "$STATE_DIR" 2>/dev/null || true; fi
+if [[ $APPLY -eq 1 && -d "$STATE_DIR" ]]; then
+    if ! rmdir "$STATE_DIR" 2>/dev/null; then
+        echo "  WARNING: $STATE_DIR is not empty after the pass — this script does not know these files (unwind gap?):" >&2
+        find "$STATE_DIR" -mindepth 1 -maxdepth 1 -printf '    %f\n' >&2 2>/dev/null || true
+    fi
+fi
 echo
 
 # ── Category 1: config ───────────────────────────────────────────────────
@@ -369,7 +389,12 @@ echo "[config]"
 for f in urd.toml urd.toml.legacy urd.toml.v1; do
     [[ -e "$CONFIG_DIR/$f" ]] && { do_rm "config" "$CONFIG_DIR/$f" || true; }
 done
-if [[ $APPLY -eq 1 ]]; then rmdir "$CONFIG_DIR" 2>/dev/null || true; fi
+if [[ $APPLY -eq 1 && -d "$CONFIG_DIR" ]]; then
+    if ! rmdir "$CONFIG_DIR" 2>/dev/null; then
+        echo "  WARNING: $CONFIG_DIR is not empty after the pass — this script does not know these files (unwind gap?):" >&2
+        find "$CONFIG_DIR" -mindepth 1 -maxdepth 1 -printf '    %f\n' >&2 2>/dev/null || true
+    fi
+fi
 echo
 
 # ── Category 8: completions ──────────────────────────────────────────────
