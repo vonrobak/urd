@@ -63,6 +63,7 @@ live in `docs/00-foundation/architecture.md`.
 - `drives.rs` / `pools.rs` — drive + BTRFS-pool detection
 - `discovery.rs` — zero-state system inventory from unprivileged probes (the Encounter's looking)
 - `strategy.rs` — derive a proposed protection strategy from inventory + fate answers (pure; the Encounter's proposing)
+- `config_render.rs` — approved strategy → `Config` + commented v2 TOML (pure; the Encounter's carving)
 - `output.rs` / `voice/` — structured output types / mythic-voice rendering
 - `events.rs` / `voice_events.rs` — typed event payloads / their renderer
 - `notify.rs`, `heartbeat.rs`, `metrics.rs` — notification + health surfaces
