@@ -1208,7 +1208,7 @@ fn validate_path_safe(path: &Path, label: &str) -> crate::error::Result<()> {
 }
 
 /// Validate that a name is safe for use in filesystem paths.
-fn validate_name_safe(name: &str, label: &str) -> crate::error::Result<()> {
+pub(crate) fn validate_name_safe(name: &str, label: &str) -> crate::error::Result<()> {
     if name.is_empty() {
         return Err(UrdError::Config(format!("{label} must not be empty")));
     }
