@@ -24,7 +24,9 @@ use crate::config::{
     default_priority, parser_fallback_defaults, v2_general_defaults, Config, DriveConfig,
     LocalSnapshotsConfig, SnapshotRoot, SubvolumeConfig,
 };
-use crate::strategy::{ExclusionReason, IntentionAnchor, ProposedStrategy};
+use crate::strategy::{
+    ExclusionReason, Gap, GapKind, IntentionAnchor, ProposedStrategy, UnusableReason,
+};
 
 /// The carving's two halves: the `Config` the rendered TOML must reload to,
 /// and the rendered TOML itself. `commands/encounter.rs` self-checks one
@@ -184,8 +186,7 @@ fn header_intentions(strategy: &ProposedStrategy) -> Vec<&str> {
 
 /// Factual gap commentary: the disaster, who was held back, what hardware
 /// is present but unusable.
-fn gap_lines(gap: &crate::strategy::Gap) -> Vec<String> {
-    use crate::strategy::{GapKind, UnusableReason};
+fn gap_lines(gap: &Gap) -> Vec<String> {
     let mut lines = Vec::new();
     match gap.kind {
         GapKind::NoExternalDrive => {
@@ -306,6 +307,9 @@ fn render_subvolumes(out: &mut String, config: &Config, strategy: &ProposedStrat
         let _ = writeln!(out, "[[subvolumes]]");
         let _ = writeln!(out, "name = \"{}\"", sv.name);
         let _ = writeln!(out, "source = \"{}\"", sv.source.display());
+        // A rootless subvolume (a strategy_to_config bug) renders no
+        // snapshot_root line, so the required-field parse failure surfaces
+        // in the self-check — deliberately loud, never silently wrong.
         if let Some(root) = config.snapshot_root_for(&sv.name) {
             let _ = writeln!(out, "snapshot_root = \"{}\"", root.display());
         }
@@ -381,10 +385,9 @@ mod tests {
     use super::*;
     use crate::strategy::test_support::for_each_grid_case;
     use crate::strategy::{
-        Gap, GapKind, Intention, ProposedDrive, ProposedSubvolume, UnusableDrive, UnusableReason,
+        ExcludedSubvol, Intention, ProposedDrive, ProposedSubvolume, UnusableDrive,
     };
     use crate::types::{derive_policy, DriveRole, Interval, ProtectionLevel, RunFrequency};
-    use crate::strategy::ExcludedSubvol;
 
     const POOL_UUID: &str = "44444444-4444-4444-8444-444444444444";
 
