@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Zero-state discovery engine (UPI 070, Encounter arc 1/9).** New `discovery`
+  module builds a `SystemInventory` — btrfs pools, mounted subvolumes, candidate
+  drives with internal/external classification and LUKS state, plus structured
+  notes — from unprivileged probes only (`lsblk -J`, `findmnt -t btrfs -J`,
+  statvfs). Ask-don't-guess: conflicting drive signals classify as Ambiguous for
+  the conversation to resolve. Engine only — no CLI surface until the Encounter
+  conversation (UPI 072) consumes it.
+
 ## [0.32.0] - 2026-07-03
 
 ### Added

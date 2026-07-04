@@ -1,0 +1,176 @@
+{
+   "filesystems": [
+      {
+         "target": "/",
+         "source": "/dev/mapper/luks-11111111-1111-4111-8111-111111111111[/root]",
+         "fstype": "btrfs",
+         "options": "rw,relatime,seclabel,compress=zstd:1,ssd,discard=async,space_cache=v2,subvolid=257,subvol=/root",
+         "children": [
+            {
+               "target": "/dev",
+               "source": "devtmpfs",
+               "fstype": "devtmpfs",
+               "options": "rw,nosuid,seclabel,size=8090900k,nr_inodes=2022725,mode=755,inode64",
+               "children": [
+                  {
+                     "target": "/dev/mqueue",
+                     "source": "mqueue",
+                     "fstype": "mqueue",
+                     "options": "rw,nosuid,nodev,noexec,relatime,seclabel"
+                  },{
+                     "target": "/dev/hugepages",
+                     "source": "hugetlbfs",
+                     "fstype": "hugetlbfs",
+                     "options": "rw,nosuid,nodev,relatime,seclabel,pagesize=2M"
+                  },{
+                     "target": "/dev/shm",
+                     "source": "tmpfs",
+                     "fstype": "tmpfs",
+                     "options": "rw,nosuid,nodev,seclabel,inode64,usrquota"
+                  },{
+                     "target": "/dev/pts",
+                     "source": "devpts",
+                     "fstype": "devpts",
+                     "options": "rw,nosuid,noexec,relatime,seclabel,gid=5,mode=600,ptmxmode=000"
+                  }
+               ]
+            },{
+               "target": "/sys",
+               "source": "sysfs",
+               "fstype": "sysfs",
+               "options": "rw,nosuid,nodev,noexec,relatime,seclabel",
+               "children": [
+                  {
+                     "target": "/sys/fs/selinux",
+                     "source": "selinuxfs",
+                     "fstype": "selinuxfs",
+                     "options": "rw,nosuid,noexec,relatime"
+                  },{
+                     "target": "/sys/kernel/tracing",
+                     "source": "tracefs",
+                     "fstype": "tracefs",
+                     "options": "rw,nosuid,nodev,noexec,relatime,seclabel"
+                  },{
+                     "target": "/sys/kernel/debug",
+                     "source": "debugfs",
+                     "fstype": "debugfs",
+                     "options": "rw,nosuid,nodev,noexec,relatime,seclabel"
+                  },{
+                     "target": "/sys/fs/fuse/connections",
+                     "source": "fusectl",
+                     "fstype": "fusectl",
+                     "options": "rw,nosuid,nodev,noexec,relatime"
+                  },{
+                     "target": "/sys/kernel/security",
+                     "source": "securityfs",
+                     "fstype": "securityfs",
+                     "options": "rw,nosuid,nodev,noexec,relatime"
+                  },{
+                     "target": "/sys/fs/cgroup",
+                     "source": "cgroup2",
+                     "fstype": "cgroup2",
+                     "options": "rw,nosuid,nodev,noexec,relatime,seclabel,nsdelegate,memory_recursiveprot,memory_hugetlb_accounting"
+                  },{
+                     "target": "/sys/fs/pstore",
+                     "source": "none",
+                     "fstype": "pstore",
+                     "options": "rw,nosuid,nodev,noexec,relatime,seclabel"
+                  },{
+                     "target": "/sys/fs/bpf",
+                     "source": "bpf",
+                     "fstype": "bpf",
+                     "options": "rw,nosuid,nodev,noexec,relatime,mode=700"
+                  },{
+                     "target": "/sys/kernel/config",
+                     "source": "configfs",
+                     "fstype": "configfs",
+                     "options": "rw,nosuid,nodev,noexec,relatime"
+                  }
+               ]
+            },{
+               "target": "/proc",
+               "source": "proc",
+               "fstype": "proc",
+               "options": "rw,nosuid,nodev,noexec,relatime",
+               "children": [
+                  {
+                     "target": "/proc/sys/fs/binfmt_misc",
+                     "source": "systemd-1",
+                     "fstype": "autofs",
+                     "options": "rw,relatime,fd=41,pgrp=1,timeout=0,minproto=5,maxproto=5,direct,pipe_ino=5693",
+                     "children": [
+                        {
+                           "target": "/proc/sys/fs/binfmt_misc",
+                           "source": "binfmt_misc",
+                           "fstype": "binfmt_misc",
+                           "options": "rw,nosuid,nodev,noexec,relatime"
+                        }
+                     ]
+                  }
+               ]
+            },{
+               "target": "/run",
+               "source": "tmpfs",
+               "fstype": "tmpfs",
+               "options": "rw,nosuid,nodev,seclabel,size=3253460k,nr_inodes=819200,mode=755,inode64",
+               "children": [
+                  {
+                     "target": "/run/credentials/systemd-cryptsetup@luks\\x2d11111111\\x2d1111\\x2d4111\\x2d8111\\x2d111111111111.service",
+                     "source": "none",
+                     "fstype": "tmpfs",
+                     "options": "ro,nosuid,nodev,noexec,relatime,nosymfollow,seclabel,size=1024k,nr_inodes=1024,mode=700,inode64,noswap"
+                  },{
+                     "target": "/run/credentials/systemd-journald.service",
+                     "source": "none",
+                     "fstype": "tmpfs",
+                     "options": "ro,nosuid,nodev,noexec,relatime,nosymfollow,seclabel,size=1024k,nr_inodes=1024,mode=700,inode64,noswap"
+                  },{
+                     "target": "/run/credentials/systemd-resolved.service",
+                     "source": "none",
+                     "fstype": "tmpfs",
+                     "options": "ro,nosuid,nodev,noexec,relatime,nosymfollow,seclabel,size=1024k,nr_inodes=1024,mode=700,inode64,noswap"
+                  },{
+                     "target": "/run/user/1000",
+                     "source": "tmpfs",
+                     "fstype": "tmpfs",
+                     "options": "rw,nosuid,nodev,relatime,seclabel,size=1626728k,nr_inodes=406682,mode=700,uid=1000,gid=1000,inode64",
+                     "children": [
+                        {
+                           "target": "/run/user/1000/gvfs",
+                           "source": "gvfsd-fuse",
+                           "fstype": "fuse.gvfsd-fuse",
+                           "options": "rw,nosuid,nodev,relatime,user_id=1000,group_id=1000"
+                        },{
+                           "target": "/run/user/1000/doc",
+                           "source": "portal",
+                           "fstype": "fuse.portal",
+                           "options": "rw,nosuid,nodev,relatime,user_id=1000,group_id=1000"
+                        }
+                     ]
+                  }
+               ]
+            },{
+               "target": "/home",
+               "source": "/dev/mapper/luks-11111111-1111-4111-8111-111111111111[/home]",
+               "fstype": "btrfs",
+               "options": "rw,relatime,seclabel,compress=zstd:1,ssd,discard=async,space_cache=v2,subvolid=256,subvol=/home"
+            },{
+               "target": "/tmp",
+               "source": "tmpfs",
+               "fstype": "tmpfs",
+               "options": "rw,nosuid,nodev,seclabel,size=8133644k,nr_inodes=1048576,inode64,usrquota"
+            },{
+               "target": "/boot",
+               "source": "/dev/sdb3",
+               "fstype": "ext4",
+               "options": "rw,relatime,seclabel"
+            },{
+               "target": "/var/lib/nfs/rpc_pipefs",
+               "source": "sunrpc",
+               "fstype": "rpc_pipefs",
+               "options": "rw,relatime"
+            }
+         ]
+      }
+   ]
+}

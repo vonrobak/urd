@@ -1,0 +1,23 @@
+{
+   "filesystems": [
+      {
+         "target": "/",
+         "source": "/dev/mapper/luks-11111111-1111-4111-8111-111111111111[/root]",
+         "fstype": "btrfs",
+         "options": "rw,relatime,seclabel,compress=zstd:1,ssd,discard=async,space_cache=v2,subvolid=257,subvol=/root",
+         "children": [
+            {
+               "target": "/run/media/user/urd-test",
+               "source": "/dev/mapper/luks-33333333-3333-4333-8333-333333333333",
+               "fstype": "btrfs",
+               "options": "rw,nosuid,nodev,relatime,seclabel,space_cache=v2,subvolid=5,subvol=/"
+            },{
+               "target": "/home",
+               "source": "/dev/mapper/luks-11111111-1111-4111-8111-111111111111[/home]",
+               "fstype": "btrfs",
+               "options": "rw,relatime,seclabel,compress=zstd:1,ssd,discard=async,space_cache=v2,subvolid=256,subvol=/home"
+            }
+         ]
+      }
+   ]
+}

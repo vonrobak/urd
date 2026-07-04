@@ -1,0 +1,244 @@
+{
+   "blockdevices": [
+      {
+         "name": "sda",
+         "fstype": null,
+         "label": null,
+         "uuid": null,
+         "mountpoints": [],
+         "rm": false,
+         "hotplug": false,
+         "tran": "sata",
+         "size": "1.8T",
+         "children": [
+            {
+               "name": "sda1",
+               "fstype": null,
+               "label": null,
+               "uuid": null,
+               "mountpoints": [],
+               "rm": false,
+               "hotplug": false,
+               "tran": null,
+               "size": "16M"
+            },{
+               "name": "sda2",
+               "fstype": "ntfs",
+               "label": "SamsungSSD QVO 2TB",
+               "uuid": "AAAA0000AAAA0001",
+               "mountpoints": [],
+               "rm": false,
+               "hotplug": false,
+               "tran": null,
+               "size": "1.8T"
+            }
+         ]
+      },{
+         "name": "sdb",
+         "fstype": null,
+         "label": null,
+         "uuid": null,
+         "mountpoints": [],
+         "rm": false,
+         "hotplug": false,
+         "tran": "sata",
+         "size": "1.8T",
+         "children": [
+            {
+               "name": "sdb1",
+               "fstype": null,
+               "label": null,
+               "uuid": null,
+               "mountpoints": [],
+               "rm": false,
+               "hotplug": false,
+               "tran": null,
+               "size": "1M"
+            },{
+               "name": "sdb2",
+               "fstype": "ntfs",
+               "label": "Samsung QVO 2TB",
+               "uuid": "AAAA0000AAAA0002",
+               "mountpoints": [],
+               "rm": false,
+               "hotplug": false,
+               "tran": null,
+               "size": "1.4T"
+            },{
+               "name": "sdb3",
+               "fstype": "ext4",
+               "label": null,
+               "uuid": "55555555-5555-4555-8555-555555555555",
+               "mountpoints": [
+                   "/boot"
+               ],
+               "rm": false,
+               "hotplug": false,
+               "tran": null,
+               "size": "1G"
+            },{
+               "name": "sdb4",
+               "fstype": "crypto_LUKS",
+               "label": null,
+               "uuid": "11111111-1111-4111-8111-111111111111",
+               "mountpoints": [],
+               "rm": false,
+               "hotplug": false,
+               "tran": null,
+               "size": "397.2G",
+               "children": [
+                  {
+                     "name": "luks-11111111-1111-4111-8111-111111111111",
+                     "fstype": "btrfs",
+                     "label": "fedora",
+                     "uuid": "22222222-2222-4222-8222-222222222222",
+                     "mountpoints": [
+                         "/home", "/"
+                     ],
+                     "rm": false,
+                     "hotplug": false,
+                     "tran": null,
+                     "size": "397.1G"
+                  }
+               ]
+            }
+         ]
+      },{
+         "name": "sdc",
+         "fstype": null,
+         "label": null,
+         "uuid": null,
+         "mountpoints": [],
+         "rm": false,
+         "hotplug": false,
+         "tran": "sata",
+         "size": "465.8G",
+         "children": [
+            {
+               "name": "sdc1",
+               "fstype": null,
+               "label": null,
+               "uuid": null,
+               "mountpoints": [],
+               "rm": false,
+               "hotplug": false,
+               "tran": null,
+               "size": "128M"
+            },{
+               "name": "sdc2",
+               "fstype": "ntfs",
+               "label": "SSamsungd",
+               "uuid": "AAAA0000AAAA0003",
+               "mountpoints": [],
+               "rm": false,
+               "hotplug": false,
+               "tran": null,
+               "size": "465.6G"
+            }
+         ]
+      },{
+         "name": "sdd",
+         "fstype": null,
+         "label": null,
+         "uuid": null,
+         "mountpoints": [],
+         "rm": false,
+         "hotplug": true,
+         "tran": "usb",
+         "size": "931.5G",
+         "children": [
+            {
+               "name": "sdd1",
+               "fstype": "crypto_LUKS",
+               "label": null,
+               "uuid": "33333333-3333-4333-8333-333333333333",
+               "mountpoints": [],
+               "rm": false,
+               "hotplug": true,
+               "tran": null,
+               "size": "931.5G",
+               "children": [
+                  {
+                     "name": "luks-33333333-3333-4333-8333-333333333333",
+                     "fstype": "btrfs",
+                     "label": "urd-test",
+                     "uuid": "44444444-4444-4444-8444-444444444444",
+                     "mountpoints": [
+                         "/run/media/user/urd-test"
+                     ],
+                     "rm": false,
+                     "hotplug": false,
+                     "tran": null,
+                     "size": "931.5G"
+                  }
+               ]
+            }
+         ]
+      },{
+         "name": "zram0",
+         "fstype": "swap",
+         "label": "zram0",
+         "uuid": "66666666-6666-4666-8666-666666666666",
+         "mountpoints": [
+             "[SWAP]"
+         ],
+         "rm": false,
+         "hotplug": false,
+         "tran": null,
+         "size": "8G"
+      },{
+         "name": "nvme0n1",
+         "fstype": null,
+         "label": null,
+         "uuid": null,
+         "mountpoints": [],
+         "rm": false,
+         "hotplug": false,
+         "tran": "nvme",
+         "size": "931.5G",
+         "children": [
+            {
+               "name": "nvme0n1p1",
+               "fstype": "vfat",
+               "label": null,
+               "uuid": "AAAA-0001",
+               "mountpoints": [],
+               "rm": false,
+               "hotplug": false,
+               "tran": "nvme",
+               "size": "100M"
+            },{
+               "name": "nvme0n1p2",
+               "fstype": null,
+               "label": null,
+               "uuid": null,
+               "mountpoints": [],
+               "rm": false,
+               "hotplug": false,
+               "tran": "nvme",
+               "size": "16M"
+            },{
+               "name": "nvme0n1p3",
+               "fstype": "ntfs",
+               "label": "nvme",
+               "uuid": "AAAA0000AAAA0004",
+               "mountpoints": [],
+               "rm": false,
+               "hotplug": false,
+               "tran": "nvme",
+               "size": "930.6G"
+            },{
+               "name": "nvme0n1p4",
+               "fstype": "ntfs",
+               "label": null,
+               "uuid": "AAAA0000AAAA0005",
+               "mountpoints": [],
+               "rm": false,
+               "hotplug": false,
+               "tran": "nvme",
+               "size": "809M"
+            }
+         ]
+      }
+   ]
+}

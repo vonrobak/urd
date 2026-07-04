@@ -1,0 +1,189 @@
+{
+   "blockdevices": [
+      {
+         "name": "sda",
+         "maj:min": "8:0",
+         "rm": false,
+         "size": "1.8T",
+         "ro": false,
+         "type": "disk",
+         "mountpoints": [],
+         "children": [
+            {
+               "name": "sda1",
+               "maj:min": "8:1",
+               "rm": false,
+               "size": "16M",
+               "ro": false,
+               "type": "part",
+               "mountpoints": []
+            },{
+               "name": "sda2",
+               "maj:min": "8:2",
+               "rm": false,
+               "size": "1.8T",
+               "ro": false,
+               "type": "part",
+               "mountpoints": []
+            }
+         ]
+      },{
+         "name": "sdb",
+         "maj:min": "8:16",
+         "rm": false,
+         "size": "1.8T",
+         "ro": false,
+         "type": "disk",
+         "mountpoints": [],
+         "children": [
+            {
+               "name": "sdb1",
+               "maj:min": "8:17",
+               "rm": false,
+               "size": "1M",
+               "ro": false,
+               "type": "part",
+               "mountpoints": []
+            },{
+               "name": "sdb2",
+               "maj:min": "8:18",
+               "rm": false,
+               "size": "1.4T",
+               "ro": false,
+               "type": "part",
+               "mountpoints": []
+            },{
+               "name": "sdb3",
+               "maj:min": "8:19",
+               "rm": false,
+               "size": "1G",
+               "ro": false,
+               "type": "part",
+               "mountpoints": [
+                   "/boot"
+               ]
+            },{
+               "name": "sdb4",
+               "maj:min": "8:20",
+               "rm": false,
+               "size": "397.2G",
+               "ro": false,
+               "type": "part",
+               "mountpoints": [],
+               "children": [
+                  {
+                     "name": "luks-11111111-1111-4111-8111-111111111111",
+                     "maj:min": "252:0",
+                     "rm": false,
+                     "size": "397.1G",
+                     "ro": false,
+                     "type": "crypt",
+                     "mountpoints": [
+                         "/home", "/"
+                     ]
+                  }
+               ]
+            }
+         ]
+      },{
+         "name": "sdc",
+         "maj:min": "8:32",
+         "rm": false,
+         "size": "465.8G",
+         "ro": false,
+         "type": "disk",
+         "mountpoints": [],
+         "children": [
+            {
+               "name": "sdc1",
+               "maj:min": "8:33",
+               "rm": false,
+               "size": "128M",
+               "ro": false,
+               "type": "part",
+               "mountpoints": []
+            },{
+               "name": "sdc2",
+               "maj:min": "8:34",
+               "rm": false,
+               "size": "465.6G",
+               "ro": false,
+               "type": "part",
+               "mountpoints": []
+            }
+         ]
+      },{
+         "name": "sdd",
+         "maj:min": "8:48",
+         "rm": false,
+         "size": "931.5G",
+         "ro": false,
+         "type": "disk",
+         "mountpoints": [],
+         "children": [
+            {
+               "name": "sdd1",
+               "maj:min": "8:49",
+               "rm": false,
+               "size": "931.5G",
+               "ro": false,
+               "type": "part",
+               "mountpoints": []
+            }
+         ]
+      },{
+         "name": "zram0",
+         "maj:min": "251:0",
+         "rm": false,
+         "size": "8G",
+         "ro": false,
+         "type": "disk",
+         "mountpoints": [
+             "[SWAP]"
+         ]
+      },{
+         "name": "nvme0n1",
+         "maj:min": "259:0",
+         "rm": false,
+         "size": "931.5G",
+         "ro": false,
+         "type": "disk",
+         "mountpoints": [],
+         "children": [
+            {
+               "name": "nvme0n1p1",
+               "maj:min": "259:1",
+               "rm": false,
+               "size": "100M",
+               "ro": false,
+               "type": "part",
+               "mountpoints": []
+            },{
+               "name": "nvme0n1p2",
+               "maj:min": "259:2",
+               "rm": false,
+               "size": "16M",
+               "ro": false,
+               "type": "part",
+               "mountpoints": []
+            },{
+               "name": "nvme0n1p3",
+               "maj:min": "259:3",
+               "rm": false,
+               "size": "930.6G",
+               "ro": false,
+               "type": "part",
+               "mountpoints": []
+            },{
+               "name": "nvme0n1p4",
+               "maj:min": "259:4",
+               "rm": false,
+               "size": "809M",
+               "ro": false,
+               "type": "part",
+               "mountpoints": []
+            }
+         ]
+      }
+   ]
+}
