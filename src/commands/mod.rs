@@ -6,6 +6,7 @@ pub mod default;
 pub mod doctor;
 pub mod drives;
 pub mod emergency;
+pub mod encounter;
 pub mod events;
 pub mod get;
 pub mod history;

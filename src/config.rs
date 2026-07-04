@@ -130,7 +130,7 @@ pub struct SubvolumeConfig {
     pub drives: Option<Vec<String>>,
 }
 
-fn default_priority() -> u8 {
+pub(crate) fn default_priority() -> u8 {
     2
 }
 
@@ -399,7 +399,7 @@ impl Config {
         resolved
     }
 
-    fn expand_paths(&mut self) {
+    pub(crate) fn expand_paths(&mut self) {
         self.general.state_db = expand_tilde(&self.general.state_db);
         self.general.metrics_file = expand_tilde(&self.general.metrics_file);
         self.general.log_dir = expand_tilde(&self.general.log_dir);
@@ -635,7 +635,7 @@ struct V1SubvolumeConfig {
 /// Fallback `[defaults]` synthesized for v1/v2 Custom or unset protection
 /// levels. Values match full_retention / full_external_retention from
 /// `derive_policy()` in types.rs (`yearly: None` ↔ resolved 0).
-fn parser_fallback_defaults() -> DefaultsConfig {
+pub(crate) fn parser_fallback_defaults() -> DefaultsConfig {
     DefaultsConfig {
         snapshot_interval: Interval::days(1),
         send_interval: Interval::days(1),
@@ -1021,6 +1021,24 @@ struct V2GeneralConfig {
     btrfs_path: String,
     #[serde(default = "default_heartbeat_path")]
     heartbeat_file: PathBuf,
+}
+
+/// The `GeneralConfig` a v2 config with everything but `config_version`
+/// omitted parses to: `config_version` pinned to 2, every other field at its
+/// `V2GeneralConfig` serde default, tilde forms unexpanded. The normal-form
+/// oracle for config generation (UPI 074): `strategy_to_config` pins exactly
+/// these values, so round-trip equality checks against the parser's own
+/// defaults instead of a re-implementation.
+pub(crate) fn v2_general_defaults(run_frequency: RunFrequency) -> GeneralConfig {
+    GeneralConfig {
+        config_version: Some(2),
+        state_db: default_v1_state_db(),
+        metrics_file: default_v1_metrics_file(),
+        log_dir: default_v1_log_dir(),
+        btrfs_path: default_btrfs_path(),
+        heartbeat_file: default_heartbeat_path(),
+        run_frequency,
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -4090,6 +4108,35 @@ min_free_bytes = "10GB"
             defaults.external_retention.resolved(),
             policy.external_retention
         );
+    }
+
+    #[test]
+    fn v2_general_defaults_match_the_v2_parser() {
+        // The oracle must equal what the v2 parser produces for a [general]
+        // section carrying only config_version — proven against the real
+        // load path (parse → expand_paths), not the serde attributes.
+        let config_str = r#"
+[general]
+config_version = 2
+
+[[subvolumes]]
+name = "home"
+source = "/home"
+snapshot_root = "/.snapshots"
+protection = "recorded"
+"#;
+        let parsed = Config::from_str(config_str).unwrap();
+
+        let mut expected = Config {
+            general: v2_general_defaults(default_run_frequency()),
+            local_snapshots: LocalSnapshotsConfig { roots: vec![] },
+            defaults: parser_fallback_defaults(),
+            drives: vec![],
+            subvolumes: vec![],
+            notifications: crate::notify::NotificationConfig::default(),
+        };
+        expected.expand_paths();
+        assert_eq!(parsed.general, expected.general);
     }
 
     #[test]

@@ -409,7 +409,9 @@ fn exclusion(sv: &DiscoveredSubvol, reason: ExclusionReason) -> ExcludedSubvol {
 /// facts. Usable: resolved `External`, not LUKS-locked (a pre-unlocked
 /// LUKS drive is a plain btrfs drive — arc grill Q10), btrfs, and joined
 /// to a pool with a mountpoint to receive into. Internal drives appear in
-/// neither list.
+/// neither list. One destination per pool: additional drives bearing an
+/// already-adopted pool are skipped (multi-device pools would otherwise
+/// derive duplicate drive uuids).
 ///
 /// `CandidateDrive.mounted` is never consulted: it is subtree-wide, so a
 /// mounted non-btrfs partition beside an unmounted btrfs pool would lie.
@@ -420,7 +422,7 @@ pub fn usable_destinations(
     inventory: &SystemInventory,
     resolutions: &[DriveResidencyAnswer],
 ) -> (Vec<Destination>, Vec<UnusableDrive>) {
-    let mut usable = Vec::new();
+    let mut usable: Vec<Destination> = Vec::new();
     let mut unusable = Vec::new();
     for drive in &inventory.drives {
         match resolved_class(drive, resolutions) {
@@ -448,14 +450,25 @@ pub fn usable_destinations(
             .and_then(|uuid| inventory.pools.iter().find(|p| &p.uuid == uuid))
             .and_then(|pool| canonical_mount(pool).map(|mount| (pool, mount)));
         match joined {
-            Some((pool, mount)) => usable.push(Destination {
-                device: drive.device.clone(),
-                label: drive.label.clone().or_else(|| pool.label.clone()),
-                size: drive.size.clone(),
-                transport: drive.transport.clone(),
-                pool_uuid: pool.uuid.clone(),
-                mount_path: mount.clone(),
-            }),
+            Some((pool, mount)) => {
+                // One pool = one receive target. A multi-device pool is borne
+                // by several drives, all carrying the same filesystem UUID;
+                // adopting each bearer would propose duplicate drive uuids
+                // (config validation rejects them) and double-sends into one
+                // filesystem. First bearer wins — the flatten_disk first-node
+                // precedent (UPI 074 build amendment, adversary F1).
+                if usable.iter().any(|d| d.pool_uuid == pool.uuid) {
+                    continue;
+                }
+                usable.push(Destination {
+                    device: drive.device.clone(),
+                    label: drive.label.clone().or_else(|| pool.label.clone()),
+                    size: drive.size.clone(),
+                    transport: drive.transport.clone(),
+                    pool_uuid: pool.uuid.clone(),
+                    mount_path: mount.clone(),
+                });
+            }
             None => unusable.push(unusable_fact(drive, UnusableReason::NotMounted)),
         }
     }
@@ -724,15 +737,19 @@ fn unique(base: String, taken: &mut BTreeSet<String>) -> String {
 
 // ── Tests ───────────────────────────────────────────────────────────────
 
+/// Shared test scaffolding: inventory builders and the answer × inventory
+/// property grid. Lifted from `mod tests` so config_render's acceptance
+/// property (UPI 074) sweeps the same grid strategy.rs's own properties
+/// sweep — the awareness.rs `test_support` precedent, single grid, no drift.
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
     use super::*;
 
-    const SYSTEM_POOL: &str = "22222222-2222-4222-8222-222222222222";
-    const EXTERNAL_POOL: &str = "44444444-4444-4444-8444-444444444444";
-    const ORPHAN_POOL: &str = "99999999-9999-4999-8999-999999999999";
+    pub(crate) const SYSTEM_POOL: &str = "22222222-2222-4222-8222-222222222222";
+    pub(crate) const EXTERNAL_POOL: &str = "44444444-4444-4444-8444-444444444444";
+    pub(crate) const ORPHAN_POOL: &str = "99999999-9999-4999-8999-999999999999";
 
-    fn pool(uuid: &str, mounts: &[&str]) -> DiscoveredPool {
+    pub(crate) fn pool(uuid: &str, mounts: &[&str]) -> DiscoveredPool {
         DiscoveredPool {
             uuid: uuid.to_string(),
             label: None,
@@ -742,7 +759,7 @@ mod tests {
         }
     }
 
-    fn subvol(mount: &str, path: &str, pool: &str) -> DiscoveredSubvol {
+    pub(crate) fn subvol(mount: &str, path: &str, pool: &str) -> DiscoveredSubvol {
         DiscoveredSubvol {
             mountpoint: PathBuf::from(mount),
             subvol_path: path.to_string(),
@@ -751,7 +768,7 @@ mod tests {
         }
     }
 
-    fn drive(
+    pub(crate) fn drive(
         device: &str,
         class: DriveClass,
         luks: LuksState,
@@ -771,7 +788,7 @@ mod tests {
         }
     }
 
-    fn inventory(
+    pub(crate) fn inventory(
         pools: Vec<DiscoveredPool>,
         subvolumes: Vec<DiscoveredSubvol>,
         drives: Vec<CandidateDrive>,
@@ -786,7 +803,7 @@ mod tests {
 
     /// Fedora default layout: one internal pool, `/root` + `/home` nested
     /// subvolumes, one internal NVMe drive bearing the pool.
-    fn fedora_inventory() -> SystemInventory {
+    pub(crate) fn fedora_inventory() -> SystemInventory {
         inventory(
             vec![pool(SYSTEM_POOL, &["/", "/home"])],
             vec![
@@ -802,6 +819,241 @@ mod tests {
             )],
         )
     }
+
+    pub(crate) fn external_btrfs_drive(device: &str, pool_uuid: &str) -> CandidateDrive {
+        drive(
+            device,
+            DriveClass::External,
+            LuksState::NotEncrypted,
+            Some("btrfs"),
+            Some(pool_uuid),
+        )
+    }
+
+    pub(crate) fn today() -> NaiveDate {
+        NaiveDate::from_ymd_opt(2026, 7, 4).unwrap()
+    }
+
+    /// Fedora base with a third candidate so the mixed-importance row
+    /// exercises all three classifications at once.
+    pub(crate) fn fedora3() -> SystemInventory {
+        let mut inv = fedora_inventory();
+        inv.subvolumes.push(subvol("/var", "/var", SYSTEM_POOL));
+        inv
+    }
+
+    pub(crate) fn grid_scenarios() -> Vec<(&'static str, SystemInventory, Vec<DriveResidencyAnswer>)>
+    {
+        let ext_locked = || {
+            drive(
+                "sdd",
+                DriveClass::External,
+                LuksState::Locked,
+                Some("crypto_LUKS"),
+                None,
+            )
+        };
+        let mut scenarios = Vec::new();
+
+        scenarios.push(("D0", fedora3(), Vec::new()));
+
+        let mut inv = fedora3();
+        inv.drives.push(ext_locked());
+        scenarios.push(("D-locked", inv, Vec::new()));
+
+        let mut inv = fedora3();
+        inv.drives.push(drive(
+            "sdd",
+            DriveClass::External,
+            LuksState::NotEncrypted,
+            Some("ntfs"),
+            None,
+        ));
+        scenarios.push(("D-ntfs", inv, Vec::new()));
+
+        let mut inv = fedora3();
+        inv.pools.push(pool(EXTERNAL_POOL, &[]));
+        inv.drives.push(external_btrfs_drive("sdd", EXTERNAL_POOL));
+        scenarios.push(("D-unmounted", inv, Vec::new()));
+
+        let mut inv = fedora3();
+        inv.pools
+            .push(pool(EXTERNAL_POOL, &["/run/media/user/dock"]));
+        inv.drives.push(drive(
+            "sdb",
+            DriveClass::Ambiguous,
+            LuksState::NotEncrypted,
+            Some("btrfs"),
+            Some(EXTERNAL_POOL),
+        ));
+        scenarios.push(("D-unresolved", inv, Vec::new()));
+
+        let mut inv = fedora3();
+        inv.pools
+            .push(pool(EXTERNAL_POOL, &["/run/media/user/backup"]));
+        inv.drives.push(external_btrfs_drive("sdd", EXTERNAL_POOL));
+        scenarios.push(("D1", inv.clone(), Vec::new()));
+
+        inv.pools
+            .push(pool(ORPHAN_POOL, &["/run/media/user/backup2"]));
+        inv.drives.push(external_btrfs_drive("sde", ORPHAN_POOL));
+        scenarios.push(("D2", inv, Vec::new()));
+
+        // F1 (074 adversary): a multi-device pool — two external drives
+        // bearing ONE filesystem — must adopt a single destination, or the
+        // generated config carries duplicate drive uuids.
+        let mut inv = fedora3();
+        inv.pools
+            .push(pool(EXTERNAL_POOL, &["/run/media/user/raid"]));
+        inv.drives.push(external_btrfs_drive("sdd", EXTERNAL_POOL));
+        inv.drives.push(external_btrfs_drive("sde", EXTERNAL_POOL));
+        scenarios.push(("D2-shared-pool", inv, Vec::new()));
+
+        let mut inv = fedora3();
+        inv.pools
+            .push(pool(EXTERNAL_POOL, &["/run/media/user/backup"]));
+        inv.drives.push(external_btrfs_drive("sdd", EXTERNAL_POOL));
+        inv.drives.push(drive(
+            "sde",
+            DriveClass::External,
+            LuksState::Locked,
+            Some("crypto_LUKS"),
+            None,
+        ));
+        scenarios.push(("D1+L", inv, Vec::new()));
+
+        let mut inv = fedora3();
+        inv.pools.push(pool(EXTERNAL_POOL, &["/data"]));
+        inv.subvolumes
+            .push(subvol("/data", "/store", EXTERNAL_POOL));
+        inv.drives.push(drive(
+            "sdb",
+            DriveClass::Ambiguous,
+            LuksState::NotEncrypted,
+            Some("btrfs"),
+            Some(EXTERNAL_POOL),
+        ));
+        scenarios.push((
+            "DA-int",
+            inv,
+            vec![DriveResidencyAnswer {
+                device: "sdb".to_string(),
+                class: ResolvedDriveClass::Internal,
+            }],
+        ));
+
+        let mut inv = fedora3();
+        inv.pools
+            .push(pool(EXTERNAL_POOL, &["/run/media/user/carry"]));
+        inv.drives.push(drive(
+            "sdb",
+            DriveClass::Ambiguous,
+            LuksState::NotEncrypted,
+            Some("btrfs"),
+            Some(EXTERNAL_POOL),
+        ));
+        scenarios.push((
+            "DA-ext",
+            inv,
+            vec![DriveResidencyAnswer {
+                device: "sdb".to_string(),
+                class: ResolvedDriveClass::External,
+            }],
+        ));
+
+        // F1: one disk, two pools — the second pool joins no drive and
+        // must never produce candidates.
+        let mut inv = fedora3();
+        inv.pools.push(pool(ORPHAN_POOL, &["/mnt/second"]));
+        inv.subvolumes
+            .push(subvol("/mnt/second", "/vault", ORPHAN_POOL));
+        scenarios.push(("D-multipool", inv, Vec::new()));
+
+        scenarios
+    }
+
+    pub(crate) const IMPORTANCE_MIXES: [(&str, &[(&str, Importance)]); 5] = [
+        (
+            "all-I",
+            &[
+                ("/", Importance::Irreplaceable),
+                ("/home", Importance::Irreplaceable),
+                ("/var", Importance::Irreplaceable),
+            ],
+        ),
+        (
+            "all-R",
+            &[
+                ("/", Importance::Replaceable),
+                ("/home", Importance::Replaceable),
+                ("/var", Importance::Replaceable),
+            ],
+        ),
+        (
+            "all-N",
+            &[
+                ("/", Importance::NotWorthHistory),
+                ("/home", Importance::NotWorthHistory),
+                ("/var", Importance::NotWorthHistory),
+            ],
+        ),
+        (
+            "mixed",
+            &[
+                ("/", Importance::Irreplaceable),
+                ("/home", Importance::Replaceable),
+                ("/var", Importance::NotWorthHistory),
+            ],
+        ),
+        ("empty", &[]),
+    ];
+
+    pub(crate) const RESIDENCES: [Option<ResidenceAnswer>; 4] = [
+        Some(ResidenceAnswer::FearsSiteLossDriveStays),
+        Some(ResidenceAnswer::DriveKeptElsewhere),
+        Some(ResidenceAnswer::FearsDeletionOnly),
+        None,
+    ];
+
+    pub(crate) const GRANULARITIES: [GranularityAnswer; 2] = [
+        GranularityAnswer::YesterdayIsFine,
+        GranularityAnswer::LastHour,
+    ];
+
+    /// Run `check` over the whole grid with a per-case context label.
+    pub(crate) fn for_each_grid_case(
+        mut check: impl FnMut(&str, &SystemInventory, &FateAnswers, &ProposedStrategy),
+    ) {
+        for (scenario, inv, resolutions) in grid_scenarios() {
+            for (mix_name, mix) in IMPORTANCE_MIXES {
+                for residence in RESIDENCES {
+                    for granularity in GRANULARITIES {
+                        let answers = FateAnswers {
+                            importance: mix
+                                .iter()
+                                .map(|(mount, importance)| ImportanceAnswer {
+                                    mountpoint: PathBuf::from(mount),
+                                    importance: *importance,
+                                })
+                                .collect(),
+                            residence,
+                            granularity,
+                            drive_residency: resolutions.clone(),
+                        };
+                        let strategy = derive_strategy(&inv, &answers, today());
+                        let label = format!("{scenario}/{mix_name}/{residence:?}/{granularity:?}");
+                        check(&label, &inv, &answers, &strategy);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::*;
+    use super::*;
 
     // ── Step 2: protection_candidates ──────────────────────────────────
 
@@ -982,14 +1234,35 @@ mod tests {
 
     // ── Step 3: usable_destinations ────────────────────────────────────
 
-    fn external_btrfs_drive(device: &str, pool_uuid: &str) -> CandidateDrive {
-        drive(
-            device,
-            DriveClass::External,
-            LuksState::NotEncrypted,
-            Some("btrfs"),
-            Some(pool_uuid),
-        )
+    #[test]
+    fn two_drives_bearing_one_pool_adopt_one_destination() {
+        // Multi-device pool (074 adversary F1): both bearers carry the same
+        // filesystem uuid; adopting both would derive duplicate drive uuids.
+        let mut inv = fedora_inventory();
+        inv.pools
+            .push(pool(EXTERNAL_POOL, &["/run/media/user/raid"]));
+        inv.drives.push(external_btrfs_drive("sdd", EXTERNAL_POOL));
+        inv.drives.push(external_btrfs_drive("sde", EXTERNAL_POOL));
+
+        let (usable, unusable) = usable_destinations(&inv, &[]);
+        assert!(unusable.is_empty());
+        assert_eq!(usable.len(), 1);
+        assert_eq!(usable[0].device, "sdd"); // first bearer wins
+        assert_eq!(usable[0].pool_uuid, EXTERNAL_POOL);
+    }
+
+    #[test]
+    fn shared_pool_drives_derive_a_single_config_drive() {
+        let mut inv = fedora_inventory();
+        inv.pools
+            .push(pool(EXTERNAL_POOL, &["/run/media/user/raid"]));
+        inv.drives.push(external_btrfs_drive("sdd", EXTERNAL_POOL));
+        inv.drives.push(external_btrfs_drive("sde", EXTERNAL_POOL));
+
+        let answers = with_importance(base_answers(), "/home", Importance::Irreplaceable);
+        let strategy = derive_strategy(&inv, &answers, today());
+        assert_eq!(strategy.drives.len(), 1);
+        assert_eq!(strategy.drives[0].uuid, EXTERNAL_POOL);
     }
 
     #[test]
@@ -1157,10 +1430,6 @@ mod tests {
     }
 
     // ── Steps 4–6: derive_strategy ─────────────────────────────────────
-
-    fn today() -> NaiveDate {
-        NaiveDate::from_ymd_opt(2026, 7, 4).unwrap()
-    }
 
     fn base_answers() -> FateAnswers {
         FateAnswers {
@@ -1579,210 +1848,6 @@ mod tests {
     // The "passes preflight or carries the matching Gap" property in 073
     // form: hand-rolled loops over the whole answer × inventory space.
     // The literal preflight_checks half lands in 074's round-trip test.
-
-    /// Fedora base with a third candidate so the mixed-importance row
-    /// exercises all three classifications at once.
-    fn fedora3() -> SystemInventory {
-        let mut inv = fedora_inventory();
-        inv.subvolumes.push(subvol("/var", "/var", SYSTEM_POOL));
-        inv
-    }
-
-    fn grid_scenarios() -> Vec<(&'static str, SystemInventory, Vec<DriveResidencyAnswer>)> {
-        let ext_locked = || {
-            drive(
-                "sdd",
-                DriveClass::External,
-                LuksState::Locked,
-                Some("crypto_LUKS"),
-                None,
-            )
-        };
-        let mut scenarios = Vec::new();
-
-        scenarios.push(("D0", fedora3(), Vec::new()));
-
-        let mut inv = fedora3();
-        inv.drives.push(ext_locked());
-        scenarios.push(("D-locked", inv, Vec::new()));
-
-        let mut inv = fedora3();
-        inv.drives.push(drive(
-            "sdd",
-            DriveClass::External,
-            LuksState::NotEncrypted,
-            Some("ntfs"),
-            None,
-        ));
-        scenarios.push(("D-ntfs", inv, Vec::new()));
-
-        let mut inv = fedora3();
-        inv.pools.push(pool(EXTERNAL_POOL, &[]));
-        inv.drives.push(external_btrfs_drive("sdd", EXTERNAL_POOL));
-        scenarios.push(("D-unmounted", inv, Vec::new()));
-
-        let mut inv = fedora3();
-        inv.pools
-            .push(pool(EXTERNAL_POOL, &["/run/media/user/dock"]));
-        inv.drives.push(drive(
-            "sdb",
-            DriveClass::Ambiguous,
-            LuksState::NotEncrypted,
-            Some("btrfs"),
-            Some(EXTERNAL_POOL),
-        ));
-        scenarios.push(("D-unresolved", inv, Vec::new()));
-
-        let mut inv = fedora3();
-        inv.pools
-            .push(pool(EXTERNAL_POOL, &["/run/media/user/backup"]));
-        inv.drives.push(external_btrfs_drive("sdd", EXTERNAL_POOL));
-        scenarios.push(("D1", inv.clone(), Vec::new()));
-
-        inv.pools
-            .push(pool(ORPHAN_POOL, &["/run/media/user/backup2"]));
-        inv.drives.push(external_btrfs_drive("sde", ORPHAN_POOL));
-        scenarios.push(("D2", inv, Vec::new()));
-
-        let mut inv = fedora3();
-        inv.pools
-            .push(pool(EXTERNAL_POOL, &["/run/media/user/backup"]));
-        inv.drives.push(external_btrfs_drive("sdd", EXTERNAL_POOL));
-        inv.drives.push(drive(
-            "sde",
-            DriveClass::External,
-            LuksState::Locked,
-            Some("crypto_LUKS"),
-            None,
-        ));
-        scenarios.push(("D1+L", inv, Vec::new()));
-
-        let mut inv = fedora3();
-        inv.pools.push(pool(EXTERNAL_POOL, &["/data"]));
-        inv.subvolumes
-            .push(subvol("/data", "/store", EXTERNAL_POOL));
-        inv.drives.push(drive(
-            "sdb",
-            DriveClass::Ambiguous,
-            LuksState::NotEncrypted,
-            Some("btrfs"),
-            Some(EXTERNAL_POOL),
-        ));
-        scenarios.push((
-            "DA-int",
-            inv,
-            vec![DriveResidencyAnswer {
-                device: "sdb".to_string(),
-                class: ResolvedDriveClass::Internal,
-            }],
-        ));
-
-        let mut inv = fedora3();
-        inv.pools
-            .push(pool(EXTERNAL_POOL, &["/run/media/user/carry"]));
-        inv.drives.push(drive(
-            "sdb",
-            DriveClass::Ambiguous,
-            LuksState::NotEncrypted,
-            Some("btrfs"),
-            Some(EXTERNAL_POOL),
-        ));
-        scenarios.push((
-            "DA-ext",
-            inv,
-            vec![DriveResidencyAnswer {
-                device: "sdb".to_string(),
-                class: ResolvedDriveClass::External,
-            }],
-        ));
-
-        // F1: one disk, two pools — the second pool joins no drive and
-        // must never produce candidates.
-        let mut inv = fedora3();
-        inv.pools.push(pool(ORPHAN_POOL, &["/mnt/second"]));
-        inv.subvolumes
-            .push(subvol("/mnt/second", "/vault", ORPHAN_POOL));
-        scenarios.push(("D-multipool", inv, Vec::new()));
-
-        scenarios
-    }
-
-    const IMPORTANCE_MIXES: [(&str, &[(&str, Importance)]); 5] = [
-        (
-            "all-I",
-            &[
-                ("/", Importance::Irreplaceable),
-                ("/home", Importance::Irreplaceable),
-                ("/var", Importance::Irreplaceable),
-            ],
-        ),
-        (
-            "all-R",
-            &[
-                ("/", Importance::Replaceable),
-                ("/home", Importance::Replaceable),
-                ("/var", Importance::Replaceable),
-            ],
-        ),
-        (
-            "all-N",
-            &[
-                ("/", Importance::NotWorthHistory),
-                ("/home", Importance::NotWorthHistory),
-                ("/var", Importance::NotWorthHistory),
-            ],
-        ),
-        (
-            "mixed",
-            &[
-                ("/", Importance::Irreplaceable),
-                ("/home", Importance::Replaceable),
-                ("/var", Importance::NotWorthHistory),
-            ],
-        ),
-        ("empty", &[]),
-    ];
-
-    const RESIDENCES: [Option<ResidenceAnswer>; 4] = [
-        Some(ResidenceAnswer::FearsSiteLossDriveStays),
-        Some(ResidenceAnswer::DriveKeptElsewhere),
-        Some(ResidenceAnswer::FearsDeletionOnly),
-        None,
-    ];
-
-    const GRANULARITIES: [GranularityAnswer; 2] = [
-        GranularityAnswer::YesterdayIsFine,
-        GranularityAnswer::LastHour,
-    ];
-
-    /// Run `check` over the whole grid with a per-case context label.
-    fn for_each_grid_case(
-        mut check: impl FnMut(&str, &SystemInventory, &FateAnswers, &ProposedStrategy),
-    ) {
-        for (scenario, inv, resolutions) in grid_scenarios() {
-            for (mix_name, mix) in IMPORTANCE_MIXES {
-                for residence in RESIDENCES {
-                    for granularity in GRANULARITIES {
-                        let answers = FateAnswers {
-                            importance: mix
-                                .iter()
-                                .map(|(mount, importance)| ImportanceAnswer {
-                                    mountpoint: PathBuf::from(mount),
-                                    importance: *importance,
-                                })
-                                .collect(),
-                            residence,
-                            granularity,
-                            drive_residency: resolutions.clone(),
-                        };
-                        let strategy = derive_strategy(&inv, &answers, today());
-                        let label = format!("{scenario}/{mix_name}/{residence:?}/{granularity:?}");
-                        check(&label, &inv, &answers, &strategy);
-                    }
-                }
-            }
-        }
-    }
 
     #[test]
     fn prop_sheltered_implies_adopted_drive() {
