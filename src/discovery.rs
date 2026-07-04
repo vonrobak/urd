@@ -27,7 +27,7 @@ use crate::pools::{canonical_mountpoint_label, PoolSpace};
 /// lsblk column set — shared by the production shim and the golden-fixture
 /// guard test so a typo'd or renamed column becomes a red test instead of a
 /// silently empty inventory (lenient parsing defaults missing columns).
-pub(crate) const LSBLK_COLUMNS: &str = "NAME,FSTYPE,LABEL,UUID,MOUNTPOINTS,RM,HOTPLUG,TRAN,SIZE";
+const LSBLK_COLUMNS: &str = "NAME,FSTYPE,LABEL,UUID,MOUNTPOINTS,RM,HOTPLUG,TRAN,SIZE";
 
 /// Auto-mount prefixes for removable media. Matching is path-component
 /// based (`Path::starts_with`), never string-prefix: `/run/mediaX` is not
@@ -179,31 +179,31 @@ struct LsblkOutput {
 /// so older/other column sets parse and degrade toward *not* offering a
 /// drive; unknown fields (e.g. `maj:min`, `type`) are ignored.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-pub(crate) struct LsblkNode {
-    pub(crate) name: String,
+struct LsblkNode {
+    name: String,
     #[serde(default)]
-    pub(crate) fstype: Option<String>,
+    fstype: Option<String>,
     #[serde(default)]
-    pub(crate) label: Option<String>,
+    label: Option<String>,
     #[serde(default)]
-    pub(crate) uuid: Option<String>,
+    uuid: Option<String>,
     /// Entries may be `null` (unmounted) or pseudo-targets like `[SWAP]`.
     #[serde(default)]
-    pub(crate) mountpoints: Vec<Option<String>>,
+    mountpoints: Vec<Option<String>>,
     #[serde(default)]
-    pub(crate) rm: bool,
+    rm: bool,
     #[serde(default)]
-    pub(crate) hotplug: bool,
+    hotplug: bool,
     #[serde(default)]
-    pub(crate) tran: Option<String>,
+    tran: Option<String>,
     #[serde(default)]
-    pub(crate) size: Option<String>,
+    size: Option<String>,
     #[serde(default)]
-    pub(crate) children: Vec<LsblkNode>,
+    children: Vec<LsblkNode>,
 }
 
 /// Pure parse of `lsblk -J` output into the device forest.
-pub(crate) fn parse_lsblk(json: &str) -> crate::error::Result<Vec<LsblkNode>> {
+fn parse_lsblk(json: &str) -> crate::error::Result<Vec<LsblkNode>> {
     let parsed: LsblkOutput = serde_json::from_str(json)
         .map_err(|e| UrdError::Parse(format!("lsblk JSON: {e}")))?;
     Ok(parsed.blockdevices)
@@ -232,19 +232,19 @@ struct FindmntNode {
 
 /// One mounted btrfs filesystem extracted from the findmnt tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct BtrfsMount {
-    pub(crate) mountpoint: PathBuf,
+struct BtrfsMount {
+    mountpoint: PathBuf,
     /// Raw findmnt source, kept for notes (e.g.
     /// `/dev/mapper/luks-…[/root]`).
-    pub(crate) source: String,
+    source: String,
     /// Basename of the source device, bracket suffix stripped — the join
     /// key against lsblk node names.
-    pub(crate) source_device: Option<String>,
+    source_device: Option<String>,
     /// From the `subvol=` mount option (authoritative); the source bracket
     /// suffix is fallback only — it is absent on whole-pool mounts and
     /// misleading for bind mounts of plain subdirectories.
-    pub(crate) subvol_path: Option<String>,
-    pub(crate) subvolid: Option<String>,
+    subvol_path: Option<String>,
+    subvolid: Option<String>,
 }
 
 /// Pure parse of `findmnt -J` output: recursively walks the mount tree and
@@ -252,7 +252,7 @@ pub(crate) struct BtrfsMount {
 /// optimization, not a load-bearing guarantee. Empty input is a machine
 /// with zero btrfs mounts (`findmnt -t btrfs` exits non-zero with no
 /// output there) — a real Encounter state, not an error.
-pub(crate) fn parse_findmnt(json: &str) -> crate::error::Result<Vec<BtrfsMount>> {
+fn parse_findmnt(json: &str) -> crate::error::Result<Vec<BtrfsMount>> {
     if json.trim().is_empty() {
         return Ok(Vec::new());
     }
@@ -310,34 +310,34 @@ fn split_bracket_suffix(source: &str) -> (&str, Option<&str>) {
 /// transport signals live on the disk node while the mountpoint lives on
 /// the LUKS-mapper grandchild.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DiskSummary {
-    pub(crate) name: String,
-    pub(crate) size: Option<String>,
+struct DiskSummary {
+    name: String,
+    size: Option<String>,
     /// The disk node's own transport (children inherit it implicitly by
     /// living in the subtree).
-    pub(crate) transport: Option<String>,
-    pub(crate) any_rm: bool,
-    pub(crate) any_hotplug: bool,
+    transport: Option<String>,
+    any_rm: bool,
+    any_hotplug: bool,
     /// `tran == "usb"` anywhere in the subtree.
-    pub(crate) usb_transport: bool,
+    usb_transport: bool,
     /// Real mountpoints across the subtree (pseudo-targets like `[SWAP]`
     /// are data, not paths, and are excluded).
-    pub(crate) mountpoints: Vec<PathBuf>,
-    pub(crate) luks: LuksState,
-    pub(crate) btrfs_nodes: Vec<BtrfsNodeInfo>,
+    mountpoints: Vec<PathBuf>,
+    luks: LuksState,
+    btrfs_nodes: Vec<BtrfsNodeInfo>,
     /// Most relevant filesystem: btrfs > crypto_LUKS > first other.
-    pub(crate) fstype: Option<String>,
-    pub(crate) label: Option<String>,
+    fstype: Option<String>,
+    label: Option<String>,
 }
 
 /// A btrfs-bearing lsblk node inside a disk subtree — the raw material for
 /// pool grouping and the findmnt device-name join.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct BtrfsNodeInfo {
-    pub(crate) node_name: String,
-    pub(crate) uuid: Option<String>,
-    pub(crate) label: Option<String>,
-    pub(crate) mountpoints: Vec<PathBuf>,
+struct BtrfsNodeInfo {
+    node_name: String,
+    uuid: Option<String>,
+    label: Option<String>,
+    mountpoints: Vec<PathBuf>,
 }
 
 /// Virtual/optical top-level nodes are never candidate drives.
@@ -357,7 +357,7 @@ fn real_mountpoints(node: &LsblkNode) -> Vec<PathBuf> {
 /// Flatten one top-level disk into its per-disk signal summary (step 4a of
 /// the plan — the decision table runs over this, never over raw nodes).
 #[must_use]
-pub(crate) fn flatten_disk(disk: &LsblkNode) -> DiskSummary {
+fn flatten_disk(disk: &LsblkNode) -> DiskSummary {
     struct Acc {
         any_rm: bool,
         any_hotplug: bool,
@@ -365,7 +365,6 @@ pub(crate) fn flatten_disk(disk: &LsblkNode) -> DiskSummary {
         mountpoints: Vec<PathBuf>,
         has_locked: bool,
         has_unlocked: bool,
-        crypto_seen: bool,
         btrfs_nodes: Vec<BtrfsNodeInfo>,
         first_other: Option<(String, Option<String>)>,
     }
@@ -377,7 +376,6 @@ pub(crate) fn flatten_disk(disk: &LsblkNode) -> DiskSummary {
         acc.mountpoints.extend(real_mountpoints(node));
         match node.fstype.as_deref() {
             Some("crypto_LUKS") => {
-                acc.crypto_seen = true;
                 if node.children.is_empty() {
                     acc.has_locked = true;
                 } else {
@@ -409,7 +407,6 @@ pub(crate) fn flatten_disk(disk: &LsblkNode) -> DiskSummary {
         mountpoints: Vec::new(),
         has_locked: false,
         has_unlocked: false,
-        crypto_seen: false,
         btrfs_nodes: Vec::new(),
         first_other: None,
     };
@@ -424,7 +421,7 @@ pub(crate) fn flatten_disk(disk: &LsblkNode) -> DiskSummary {
     };
     let (fstype, label) = if let Some(b) = acc.btrfs_nodes.first() {
         (Some("btrfs".to_string()), b.label.clone())
-    } else if acc.crypto_seen {
+    } else if acc.has_locked || acc.has_unlocked {
         (Some("crypto_LUKS".to_string()), None)
     } else if let Some((fs, label)) = acc.first_other {
         (Some(fs), label)
@@ -460,7 +457,7 @@ fn under_removable_prefix(path: &Path) -> bool {
 /// mount *outside* the removable prefixes (an fstab-mounted `/data` is
 /// internal evidence exactly like `/home`).
 #[must_use]
-pub(crate) fn classify(summary: &DiskSummary) -> DriveClass {
+fn classify(summary: &DiskSummary) -> DriveClass {
     let removable_mount = summary
         .mountpoints
         .iter()
@@ -480,9 +477,9 @@ pub(crate) fn classify(summary: &DiskSummary) -> DriveClass {
 
 // ── Noise filtering (pure) ─────────────────────────────────────────────
 
-pub(crate) struct FilterOutcome {
-    pub(crate) kept: Vec<BtrfsMount>,
-    pub(crate) notes: Vec<DiscoveryNote>,
+struct FilterOutcome {
+    kept: Vec<BtrfsMount>,
+    notes: Vec<DiscoveryNote>,
 }
 
 /// Filter mount noise, mentioning what was dropped. Real at this
@@ -492,7 +489,7 @@ pub(crate) struct FilterOutcome {
 /// Docker layers and Urd snapshot dirs are subvolumes but not mounts;
 /// findmnt cannot show them here (that noise is 075's, post-seal).
 #[must_use]
-pub(crate) fn filter_mounts(mounts: &[BtrfsMount]) -> FilterOutcome {
+fn filter_mounts(mounts: &[BtrfsMount]) -> FilterOutcome {
     let mut kept = Vec::new();
     let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
     let mut snapper = 0usize;
@@ -548,9 +545,8 @@ pub(crate) fn filter_mounts(mounts: &[BtrfsMount]) -> FilterOutcome {
 /// precedent) so tests substitute fixed stand-ins; production passes
 /// `pools::pool_space`. Per-probe absence degrades the inventory, never
 /// aborts it.
-#[allow(dead_code)] // Consumed by UPI 072/073.
 #[must_use]
-pub fn build_inventory(
+fn build_inventory(
     devices: &[LsblkNode],
     mounts: &[BtrfsMount],
     mut space_resolver: impl FnMut(&Path) -> Option<PoolSpace>,
