@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Strategy derivation engine (UPI 073, Encounter arc 4/9).** New `strategy`
+  module derives a `ProposedStrategy` from the system inventory plus the fate
+  conversation's answers: per-subvolume promises mapped onto the existing named
+  levels (`recorded`/`sheltered` only — `fortified` and `custom` are never
+  derived day one), drive roles from the residence answer, retention strictly
+  from `derive_policy()` shapes, and named `Gap`s where the hardware cannot
+  support the intent (no external drive, no offsite drive) — the config encodes
+  reality, not aspiration. Also defines `FateAnswers` (the exact answers the
+  Encounter conversation collects) and the shared candidate/destination rules
+  the question list is built from. Engine only — no CLI surface until the
+  Encounter conversation (UPI 072) consumes it.
 - **Zero-state discovery engine (UPI 070, Encounter arc 1/9).** New `discovery`
   module builds a `SystemInventory` — btrfs pools, mounted subvolumes, candidate
   drives with internal/external classification and LUKS state, plus structured

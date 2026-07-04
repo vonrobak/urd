@@ -43,34 +43,34 @@ const VIRTUAL_NAME_PREFIXES: [&str; 3] = ["zram", "loop", "sr"];
 /// Everything the unprivileged probes could see, in one structure.
 ///
 /// Observational only — see the module docs' trust-boundary contract.
-#[allow(dead_code)] // Consumed by UPI 072 (rendering) / 073 (derivation).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SystemInventory {
     pub pools: Vec<DiscoveredPool>,
     pub subvolumes: Vec<DiscoveredSubvol>,
     pub drives: Vec<CandidateDrive>,
+    #[allow(dead_code)] // Consumed by UPI 072 (rendering).
     pub notes: Vec<DiscoveryNote>,
 }
 
 /// A btrfs filesystem seen by lsblk, keyed by filesystem UUID. One pool may
 /// span several devices; `device_names` holds every btrfs-bearing lsblk
 /// node (e.g. `luks-…` mappers, bare partitions).
-#[allow(dead_code)] // Consumed by UPI 072/073.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscoveredPool {
     pub uuid: String,
     pub label: Option<String>,
+    #[allow(dead_code)] // Consumed by UPI 072 (rendering) / 075 (second look).
     pub device_names: Vec<String>,
     pub mountpoints: Vec<PathBuf>,
     /// One space fact per pool (arc grill decision 4), measured at the
     /// canonical (shortest) mountpoint. `None` when unmounted or the
     /// resolver failed.
+    #[allow(dead_code)] // Consumed by UPI 072 (rendering).
     pub space: Option<PoolSpace>,
 }
 
 /// A mounted btrfs subvolume from findmnt (`subvol=` is authoritative; the
 /// `source` bracket suffix is fallback only).
-#[allow(dead_code)] // Consumed by UPI 072/073.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscoveredSubvol {
     pub mountpoint: PathBuf,
@@ -86,7 +86,6 @@ pub struct DiscoveredSubvol {
 
 /// A physical disk with per-disk signals aggregated over its whole lsblk
 /// subtree (partitions, LUKS mappers).
-#[allow(dead_code)] // Consumed by UPI 072/073.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CandidateDrive {
     /// Top-level lsblk node name (e.g. `sdd`).
@@ -101,12 +100,19 @@ pub struct CandidateDrive {
     /// *facts* come from statvfs on the pool.
     pub size: Option<String>,
     pub transport: Option<String>,
+    /// Subtree-wide (any mounted partition). Deliberately unread by the
+    /// strategy layer — pool mountpoints are the mount authority there.
+    #[allow(dead_code)] // Consumed by UPI 072 (rendering).
     pub mounted: bool,
+    /// Filesystem UUID of the first btrfs node in this disk's subtree —
+    /// the join key to [`DiscoveredPool`]. `None` when no btrfs is visible
+    /// (blank, non-btrfs, locked). A disk carrying two btrfs pools joins
+    /// only the first (mirrors the fstype/label first-node precedent).
+    pub pool_uuid: Option<String>,
 }
 
 /// Internal vs external classification — ask-don't-guess: `Ambiguous` is
 /// surfaced to the conversation, never auto-resolved.
-#[allow(dead_code)] // Consumed by UPI 072/073.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DriveClass {
     Internal,
@@ -115,7 +121,6 @@ pub enum DriveClass {
 }
 
 /// LUKS encryption state of a drive's subtree.
-#[allow(dead_code)] // Consumed by UPI 072/073.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LuksState {
     NotEncrypted,
@@ -128,7 +133,7 @@ pub enum LuksState {
 
 /// Structured observations — typed data, never pre-rendered English (the
 /// voice belongs to UPI 072's presentation layer).
-#[allow(dead_code)] // Consumed by UPI 072/073.
+#[allow(dead_code)] // Consumed by UPI 072 (rendering).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiscoveryNote {
     /// A locked LUKS drive was seen; label is unreadable while locked.
@@ -150,7 +155,7 @@ pub enum DiscoveryNote {
     ProbeDegraded { probe: Probe, detail: String },
 }
 
-#[allow(dead_code)] // Consumed by UPI 072/073.
+#[allow(dead_code)] // Consumed by UPI 072 (rendering).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoiseCategory {
     /// Snapper-convention `.snapshots` subvolume mounts.
@@ -160,7 +165,7 @@ pub enum NoiseCategory {
     DuplicateMounts,
 }
 
-#[allow(dead_code)] // Consumed by UPI 072/073.
+#[allow(dead_code)] // Consumed by UPI 072 (rendering).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Probe {
     Lsblk,
@@ -652,6 +657,7 @@ fn build_inventory(
             });
         }
         let class = classify(&summary);
+        let pool_uuid = summary.btrfs_nodes.first().and_then(|n| n.uuid.clone());
         drives.push(CandidateDrive {
             device: summary.name,
             class,
@@ -661,6 +667,7 @@ fn build_inventory(
             size: summary.size,
             transport: summary.transport,
             mounted: !summary.mountpoints.is_empty(),
+            pool_uuid,
         });
     }
 
@@ -714,7 +721,7 @@ fn run_findmnt() -> crate::error::Result<String> {
 /// Probe the system and build the inventory. Never fails: a failed probe
 /// degrades the inventory and leaves a [`DiscoveryNote::ProbeDegraded`]
 /// so 072 can say so (fail open, observable).
-#[allow(dead_code)] // Consumed by UPI 072/073 — the Encounter's entry point.
+#[allow(dead_code)] // Consumed by UPI 072 — the Encounter's entry point.
 #[must_use]
 pub fn discover() -> SystemInventory {
     let mut probe_notes = Vec::new();
@@ -1309,6 +1316,32 @@ mod tests {
             size: Some("931.5G".to_string()),
             transport: Some("usb".to_string()),
         }));
+    }
+
+    #[test]
+    fn candidate_drive_carries_pool_uuid_of_its_btrfs_subtree() {
+        // The join key the strategy layer needs: the USB disk's pool UUID
+        // arrives via its LUKS-mapper grandchild — a name join between
+        // `sdd` and the pool's `luks-…` device_names could never land.
+        let devices = parse_lsblk(LSBLK_FULL_UNLOCKED).unwrap();
+        let mounts = parse_findmnt(FINDMNT_BTRFS_UNLOCKED).unwrap();
+        let inventory = build_inventory(&devices, &mounts, fixed_space(100, 1000));
+
+        let usb = inventory.drives.iter().find(|d| d.device == "sdd").unwrap();
+        assert_eq!(usb.pool_uuid.as_deref(), Some(EXTERNAL_POOL));
+    }
+
+    #[test]
+    fn candidate_drive_without_btrfs_has_no_pool_uuid() {
+        let mut part = node("sdb1");
+        part.fstype = Some("ntfs".to_string());
+        let mut disk = node("sdb");
+        disk.tran = Some("sata".to_string());
+        disk.children = vec![part];
+
+        let inventory = build_inventory(&[disk], &[], fixed_space(100, 1000));
+        let drive = inventory.drives.iter().find(|d| d.device == "sdb").unwrap();
+        assert_eq!(drive.pool_uuid, None);
     }
 
     #[test]

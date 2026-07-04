@@ -29,6 +29,7 @@ mod sentinel;
 mod sentinel_runner;
 mod state;
 mod storage_critical;
+mod strategy;
 mod types;
 mod voice;
 #[cfg(test)]
