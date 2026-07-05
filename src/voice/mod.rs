@@ -34,6 +34,8 @@ mod doctor;
 mod drive_row;
 mod drives;
 mod emergency;
+#[allow(dead_code)] // Wired in UPI 072 steps 5-7 (conversation loop + doorstep).
+mod encounter;
 mod get;
 mod history;
 mod init;
@@ -49,6 +51,11 @@ pub use chooser::format_subvolume_chooser;
 pub use doctor::render_doctor;
 pub use drives::{render_drives_adopt, render_drives_list};
 pub use emergency::{render_emergency, render_emergency_result};
+#[allow(unused_imports)] // Wired in UPI 072 steps 5-7 (conversation loop + doorstep).
+pub use encounter::{
+    render_editor_failure, render_empty_report, render_farewell, render_invalid_notice,
+    render_no_editor, render_post_carve, render_prompt,
+};
 pub use get::render_get;
 pub use history::{render_events, render_history, render_subvolume_history};
 pub use init::{render_init, render_init_first_time};
