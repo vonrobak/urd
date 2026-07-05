@@ -157,7 +157,12 @@ pub fn render_invalid_notice(notice: &InputNotice) -> String {
 
 fn render_looking(view: &LookingView) -> String {
     let mut out = String::new();
-    writeln!(out, "{}", "I have looked. Here is what this machine holds:".bold()).ok();
+    writeln!(
+        out,
+        "{}",
+        "I have looked. Here is what this machine holds:".bold()
+    )
+    .ok();
     for entry in &view.pools {
         let label = entry
             .pool
@@ -311,11 +316,18 @@ fn short_uuid(uuid: &str) -> &str {
 
 fn render_runestone(view: &RunestoneView) -> String {
     let mut out = String::new();
-    writeln!(out, "{}", "The runestone. Read it before you answer:".bold()).ok();
+    writeln!(
+        out,
+        "{}",
+        "The runestone. Read it before you answer:".bold()
+    )
+    .ok();
 
     let cadence = match view.run_frequency {
         RunFrequency::Timer { .. } => "Backups run nightly, around 04:00.",
-        RunFrequency::Sentinel => "The sentinel watches continuously — snapshots follow your changes through the day.",
+        RunFrequency::Sentinel => {
+            "The sentinel watches continuously — snapshots follow your changes through the day."
+        }
     };
     writeln!(out, "\n  {cadence}").ok();
 
@@ -479,16 +491,12 @@ fn unusable_sentence(drive: &UnusableDrive) -> String {
 fn exclusion_sentence(reason: ExclusionReason) -> &'static str {
     match reason {
         ExclusionReason::DeclaredNotWorthHistory => "you said it is not worth history",
-        ExclusionReason::WholePoolMount => {
-            "a whole-pool mount — an odd promise; I do not offer it"
-        }
+        ExclusionReason::WholePoolMount => "a whole-pool mount — an odd promise; I do not offer it",
         ExclusionReason::UnknownPool => "no disk I can see explains this mount",
         ExclusionReason::AmbiguousDevice => {
             "its drive stayed unresolved — internal or carried, I cannot say"
         }
-        ExclusionReason::MixedResidency => {
-            "its pool spans drives that live in different places"
-        }
+        ExclusionReason::MixedResidency => "its pool spans drives that live in different places",
         ExclusionReason::UnknownResidency => {
             "no drive claims its pool — I will not guess where it lives"
         }
@@ -509,17 +517,13 @@ fn destination_name(dest: &crate::strategy::Destination) -> String {
 #[must_use]
 pub fn render_farewell(kind: &FarewellKind) -> String {
     match kind {
-        FarewellKind::Declined => {
-            "So be it. Nothing was written.\n\
+        FarewellKind::Declined => "So be it. Nothing was written.\n\
              When you are ready, run `urd init`.\n"
-                .to_string()
-        }
-        FarewellKind::LookingMismatch => {
-            "Then my view is incomplete. Nothing was written.\n\
+            .to_string(),
+        FarewellKind::LookingMismatch => "Then my view is incomplete. Nothing was written.\n\
              Mount or unlock what is missing, then run `urd init` again — \
              looking again is free.\n"
-                .to_string()
-        }
+            .to_string(),
         FarewellKind::Quit => "Nothing was written. Run `urd init` to start over.\n".to_string(),
         FarewellKind::EmptyReport(view) => render_empty_report(view),
     }
@@ -633,13 +637,14 @@ pub fn render_no_editor(path: &Path) -> String {
 mod tests {
     use super::*;
     use crate::discovery::Probe;
-    use crate::encounter::{compose_looking, compose_runestone, EncounterState, Effect, Input};
+    use crate::encounter::{Effect, EncounterState, Input, compose_looking, compose_runestone};
     use crate::strategy::test_support::{
-        drive as mk_drive, external_btrfs_drive, fedora_inventory, inventory, pool, subvol,
-        today, EXTERNAL_POOL, SYSTEM_POOL,
+        EXTERNAL_POOL, SYSTEM_POOL, drive as mk_drive, external_btrfs_drive, fedora_inventory,
+        inventory, pool, subvol, today,
     };
-    use crate::strategy::{derive_strategy, FateAnswers, GranularityAnswer, Importance,
-        ImportanceAnswer};
+    use crate::strategy::{
+        FateAnswers, GranularityAnswer, Importance, ImportanceAnswer, derive_strategy,
+    };
     use crate::voice::test_fixtures::color_guard;
     use std::path::PathBuf;
 
@@ -962,8 +967,10 @@ mod tests {
                 | R::UnknownResidency => {}
             }
         }
-        let rendered: Vec<String> =
-            all.iter().map(|r| exclusion_sentence(*r).to_string()).collect();
+        let rendered: Vec<String> = all
+            .iter()
+            .map(|r| exclusion_sentence(*r).to_string())
+            .collect();
         assert_all_distinct("ExclusionReason", &rendered);
     }
 
@@ -981,11 +988,7 @@ mod tests {
         ];
         for r in &all {
             match r {
-                R::Locked
-                | R::NotBtrfs { .. }
-                | R::NotMounted
-                | R::Unresolved
-                | R::MixedPool => {}
+                R::Locked | R::NotBtrfs { .. } | R::NotMounted | R::Unresolved | R::MixedPool => {}
             }
         }
         let rendered: Vec<String> = all

@@ -22,9 +22,10 @@ use crate::discovery::{
     CandidateDrive, DiscoveredPool, DiscoveredSubvol, DiscoveryNote, DriveClass, SystemInventory,
 };
 use crate::strategy::{
-    derive_strategy, protection_candidates, usable_destinations, CandidateSubvol, Destination,
-    DriveResidencyAnswer, ExcludedSubvol, FateAnswers, Gap, GranularityAnswer, Importance,
-    ImportanceAnswer, ProposedStrategy, ProposedSubvolume, ResidenceAnswer, ResolvedDriveClass,
+    CandidateSubvol, Destination, DriveResidencyAnswer, ExcludedSubvol, FateAnswers, Gap,
+    GranularityAnswer, Importance, ImportanceAnswer, ProposedStrategy, ProposedSubvolume,
+    ResidenceAnswer, ResolvedDriveClass, derive_strategy, protection_candidates,
+    usable_destinations,
 };
 use crate::types::{DriveRole, RunFrequency};
 
@@ -564,9 +565,7 @@ pub fn advance(state: EncounterState, input: Input) -> AdvanceResult {
                 prompt(state)
             }
         }
-        (Phase::Looking, ChoiceId::DoesNotMatch) => {
-            farewell(state, FarewellKind::LookingMismatch)
-        }
+        (Phase::Looking, ChoiceId::DoesNotMatch) => farewell(state, FarewellKind::LookingMismatch),
 
         (
             Phase::DriveResidency { pending, index },
@@ -787,8 +786,8 @@ mod tests {
     use super::*;
     use crate::discovery::LuksState;
     use crate::strategy::test_support::{
-        drive, external_btrfs_drive, fedora_inventory, for_each_grid_case, grid_scenarios,
-        inventory, pool, subvol, today, EXTERNAL_POOL, SYSTEM_POOL,
+        EXTERNAL_POOL, SYSTEM_POOL, drive, external_btrfs_drive, fedora_inventory,
+        for_each_grid_case, grid_scenarios, inventory, pool, subvol, today,
     };
     use crate::strategy::{ExclusionReason, GapKind};
 
@@ -903,7 +902,11 @@ mod tests {
         match &spec_of(&r).kind {
             PromptKind::LookingConfirm { view } => {
                 assert_eq!(view.pools.len(), 2);
-                assert_eq!(view.pools[0].subvolumes.len(), 2, "system pool carries / + /home");
+                assert_eq!(
+                    view.pools[0].subvolumes.len(),
+                    2,
+                    "system pool carries / + /home"
+                );
                 assert!(view.unjoined.is_empty());
                 assert_eq!(view.drives.len(), 2);
             }
@@ -980,7 +983,8 @@ mod tests {
         // classification question.
         let mut inv = fedora_inventory();
         inv.pools.push(pool(EXTERNAL_POOL, &["/data"]));
-        inv.subvolumes.push(subvol("/data", "/store", EXTERNAL_POOL));
+        inv.subvolumes
+            .push(subvol("/data", "/store", EXTERNAL_POOL));
         inv.drives.push(drive(
             "sdb",
             DriveClass::Ambiguous,
@@ -1043,9 +1047,11 @@ mod tests {
                 excluded,
             })) => {
                 assert_eq!(excluded.len(), 2);
-                assert!(excluded
-                    .iter()
-                    .all(|e| e.reason == ExclusionReason::DeclaredNotWorthHistory));
+                assert!(
+                    excluded
+                        .iter()
+                        .all(|e| e.reason == ExclusionReason::DeclaredNotWorthHistory)
+                );
             }
             other => panic!("expected everything-excluded report, got {other:?}"),
         }
@@ -1094,10 +1100,7 @@ mod tests {
         let r = EncounterState::begin(fedora_inventory(), today());
         let before = spec_of(&r).clone();
         let r2 = advance(r.state, Input::Invalid);
-        assert_eq!(
-            r2.notice,
-            Some(InputNotice::InvalidChoice { choices: 2 })
-        );
+        assert_eq!(r2.notice, Some(InputNotice::InvalidChoice { choices: 2 }));
         assert_eq!(spec_of(&r2), &before, "re-prompt must be the same spec");
     }
 
@@ -1197,7 +1200,10 @@ mod tests {
             },
             today(),
         );
-        assert_eq!(strategy, expected, "carved strategy must equal the derivation of the fed answers");
+        assert_eq!(
+            strategy, expected,
+            "carved strategy must equal the derivation of the fed answers"
+        );
     }
 
     #[test]
@@ -1226,7 +1232,10 @@ mod tests {
             PromptKind::Runestone { view } => {
                 assert_eq!(view.gaps.len(), 1);
                 assert_eq!(view.gaps[0].kind, GapKind::NoExternalDrive);
-                assert!(!view.gaps[0].demoted.is_empty(), "irreplaceable held at recorded is named");
+                assert!(
+                    !view.gaps[0].demoted.is_empty(),
+                    "irreplaceable held at recorded is named"
+                );
             }
             other => panic!("expected runestone (residence skipped), got {other:?}"),
         }
@@ -1286,10 +1295,17 @@ mod tests {
         // First candidate "/" → default Replaceable (index 1).
         let spec = spec_of(&r);
         assert_eq!(spec.default, Some(1));
-        assert_eq!(parse_line(spec, ""), Input::Choice(1), "empty line accepts the default");
+        assert_eq!(
+            parse_line(spec, ""),
+            Input::Choice(1),
+            "empty line accepts the default"
+        );
         match &spec.kind {
             PromptKind::Importance {
-                proposed, position, total, ..
+                proposed,
+                position,
+                total,
+                ..
             } => {
                 assert_eq!(*proposed, Importance::Replaceable);
                 assert_eq!((*position, *total), (1, 2));
@@ -1304,7 +1320,8 @@ mod tests {
         // destination, but the runestone must name both disks (074
         // journal question, pinned 2026-07-04).
         let mut inv = fedora_inventory();
-        inv.pools.push(pool(EXTERNAL_POOL, &["/run/media/user/raid"]));
+        inv.pools
+            .push(pool(EXTERNAL_POOL, &["/run/media/user/raid"]));
         inv.drives.push(external_btrfs_drive("sdd", EXTERNAL_POOL));
         inv.drives.push(external_btrfs_drive("sde", EXTERNAL_POOL));
         let r = to_granularity(inv);
@@ -1378,7 +1395,11 @@ mod tests {
             assert_eq!(view.gaps, strategy.gaps, "{label}: gaps");
             assert_eq!(view.excluded, strategy.excluded, "{label}: excluded");
             assert_eq!(view.run_frequency, strategy.run_frequency, "{label}");
-            assert_eq!(view.drives.len(), strategy.drives.len(), "{label}: drive count");
+            assert_eq!(
+                view.drives.len(),
+                strategy.drives.len(),
+                "{label}: drive count"
+            );
             for (rune, proposed) in view.drives.iter().zip(&strategy.drives) {
                 assert_eq!(rune.label, proposed.label, "{label}");
                 assert_eq!(rune.mount_path, proposed.mount_path, "{label}");
@@ -1478,12 +1499,12 @@ mod tests {
                 "{scenario}: one classification question per candidate"
             );
             if candidates.is_empty() {
-                assert_eq!(granularity_asked, 0, "{scenario}: no scene with nothing carvable");
+                assert_eq!(
+                    granularity_asked, 0,
+                    "{scenario}: no scene with nothing carvable"
+                );
                 assert!(
-                    matches!(
-                        terminal,
-                        Effect::Farewell(FarewellKind::EmptyReport(_))
-                    ),
+                    matches!(terminal, Effect::Farewell(FarewellKind::EmptyReport(_))),
                     "{scenario}: empty report expected"
                 );
             } else {
@@ -1492,8 +1513,7 @@ mod tests {
                 let any_irreplaceable = candidates
                     .iter()
                     .any(|c| c.mountpoint == Path::new("/home"));
-                let expect_residence =
-                    usize::from(!destinations.is_empty() && any_irreplaceable);
+                let expect_residence = usize::from(!destinations.is_empty() && any_irreplaceable);
                 assert_eq!(
                     residence_asked, expect_residence,
                     "{scenario}: residence asked iff it changes the derivation"
