@@ -118,37 +118,65 @@ fn second_look(config: &Config, btrfs: &dyn crate::btrfs::BtrfsRead) -> Option<u
     // (adversary F2): `btrfs subvolume list` prints paths relative to the
     // FILESYSTEM root, while config paths are mount-space. findmnt's FSROOT
     // is the mounted subvolume's path within the filesystem.
-    let mut pools: std::collections::BTreeMap<PathBuf, PoolView> =
+    let mut pools: std::collections::BTreeMap<String, PoolView> =
         std::collections::BTreeMap::new();
     for sv in config.resolved_subvolumes().iter().filter(|sv| sv.enabled) {
-        let (mount, fsroot) = mount_and_fsroot(&sv.source)?;
-        let view = pools.entry(mount.clone()).or_insert_with(|| PoolView {
-            fsroot: fsroot.clone(),
-            covered: Vec::new(),
-            snapshot_homes: Vec::new(),
-        });
-        view.covered
-            .push(fs_relative(&sv.source, &mount, &fsroot)?);
-        if let Some(dir) = config.local_snapshot_dir(&sv.name)
-            && dir.starts_with(&mount)
-        {
-            view.snapshot_homes.push(fs_relative(&dir, &mount, &fsroot)?);
-        }
+        let locus = pool_locus(&sv.source)?;
+        let snapshot_dir = config.local_snapshot_dir(&sv.name);
+        fold_source(&mut pools, &locus, &sv.source, snapshot_dir.as_deref())?;
     }
 
     let mut listings = Vec::new();
-    for (mount, view) in pools {
-        let listing = btrfs.list_subvolumes(&mount).ok()?;
+    for view in pools.into_values() {
+        let listing = btrfs.list_subvolumes(&view.mount).ok()?;
         listings.push((listing, view));
     }
     Some(count_uncovered(&listings))
 }
 
-/// One promised pool as the classifier sees it: everything in the pool's
-/// own subvol-path coordinates.
-struct PoolView {
-    #[allow(dead_code)] // fsroot is consumed before the view is stored
+/// Fold one promised source into its pool's view. Pools are keyed by
+/// filesystem UUID, not mount point (live-found 2026-07-05): Fedora's
+/// default layout mounts one filesystem at both `/` (subvol `root`) and
+/// `/home` (subvol `home`), and `subvolume list` returns the WHOLE
+/// filesystem from either mount — keying by mount listed the pool twice
+/// with split coverage, so each promised sibling counted as uncovered and
+/// every genuinely uncovered subvolume counted once per mount.
+fn fold_source(
+    pools: &mut std::collections::BTreeMap<String, PoolView>,
+    locus: &PoolLocus,
+    source: &Path,
+    snapshot_dir: Option<&Path>,
+) -> Option<()> {
+    let view = pools
+        .entry(locus.uuid.clone())
+        .or_insert_with(|| PoolView {
+            mount: locus.mount.clone(),
+            covered: Vec::new(),
+            snapshot_homes: Vec::new(),
+        });
+    view.covered
+        .push(fs_relative(source, &locus.mount, &locus.fsroot)?);
+    if let Some(dir) = snapshot_dir
+        && dir.starts_with(&locus.mount)
+    {
+        view.snapshot_homes
+            .push(fs_relative(dir, &locus.mount, &locus.fsroot)?);
+    }
+    Some(())
+}
+
+/// Where a promised source lives: the mount holding it, that mount's
+/// FSROOT, and the filesystem's UUID (the pool identity).
+struct PoolLocus {
+    mount: PathBuf,
     fsroot: PathBuf,
+    uuid: String,
+}
+
+/// One promised pool as the classifier sees it: everything in the pool's
+/// own subvol-path coordinates, plus one mount to list it through.
+struct PoolView {
+    mount: PathBuf,
     covered: Vec<PathBuf>,
     snapshot_homes: Vec<PathBuf>,
 }
@@ -184,29 +212,41 @@ fn fs_relative(path: &Path, mount: &Path, fsroot: &Path) -> Option<PathBuf> {
     Some(root.join(below))
 }
 
-/// One findmnt call: the mountpoint holding `path` and that mount's FSROOT.
-fn mount_and_fsroot(path: &Path) -> Option<(PathBuf, PathBuf)> {
+/// One findmnt call: the mountpoint holding `path`, that mount's FSROOT,
+/// and the filesystem UUID.
+fn pool_locus(path: &Path) -> Option<PoolLocus> {
     let out = Command::new("findmnt")
         .env("LC_ALL", "C")
-        .args(["-n", "-P", "-o", "TARGET,FSROOT", "--target"])
+        .args(["-n", "-P", "-o", "TARGET,FSROOT,UUID", "--target"])
         .arg(path)
         .output()
         .ok()?;
     if !out.status.success() {
         return None;
     }
-    parse_findmnt_target_fsroot(&String::from_utf8_lossy(&out.stdout))
+    parse_findmnt_locus(&String::from_utf8_lossy(&out.stdout))
 }
 
-/// Pure parse of `findmnt -P -o TARGET,FSROOT`: `TARGET="/" FSROOT="/root"`.
-fn parse_findmnt_target_fsroot(stdout: &str) -> Option<(PathBuf, PathBuf)> {
-    let extract = |key: &str| -> Option<PathBuf> {
+/// Pure parse of `findmnt -P -o TARGET,FSROOT,UUID`:
+/// `TARGET="/" FSROOT="/root" UUID="abcd-..."`. An empty UUID is a parse
+/// failure — without a pool identity the second look stays silent rather
+/// than guessing.
+fn parse_findmnt_locus(stdout: &str) -> Option<PoolLocus> {
+    let extract = |key: &str| -> Option<String> {
         let needle = format!("{key}=\"");
         let start = stdout.find(&needle)? + needle.len();
         let rest = &stdout[start..];
-        Some(PathBuf::from(&rest[..rest.find('"')?]))
+        Some(rest[..rest.find('"')?].to_string())
     };
-    Some((extract("TARGET")?, extract("FSROOT")?))
+    let uuid = extract("UUID")?;
+    if uuid.is_empty() {
+        return None;
+    }
+    Some(PoolLocus {
+        mount: PathBuf::from(extract("TARGET")?),
+        fsroot: PathBuf::from(extract("FSROOT")?),
+        uuid,
+    })
 }
 
 // ── Stage 4: the first local snapshot ───────────────────────────────────
@@ -1357,16 +1397,52 @@ role = "primary"
     // ── The second look's pure classification (adversary F2) ───────────
 
     #[test]
-    fn parse_findmnt_target_fsroot_reads_both_fields() {
+    fn parse_findmnt_locus_reads_all_three_fields() {
+        let locus =
+            parse_findmnt_locus("TARGET=\"/\" FSROOT=\"/root\" UUID=\"ab12\"\n").unwrap();
+        assert_eq!(locus.mount, PathBuf::from("/"));
+        assert_eq!(locus.fsroot, PathBuf::from("/root"));
+        assert_eq!(locus.uuid, "ab12");
+        // No pool identity → no locus: the second look must stay silent
+        // rather than key pools on a guess.
+        assert!(parse_findmnt_locus("TARGET=\"/\" FSROOT=\"/root\" UUID=\"\"\n").is_none());
+        assert!(parse_findmnt_locus("garbage").is_none());
+    }
+
+    /// The live-found double count (2026-07-05): one filesystem mounted at
+    /// both `/` (subvol `root`) and `/home` (subvol `home`) — Fedora's
+    /// default layout — must fold into ONE pool view holding both covered
+    /// sources, not two views that each count the sibling as uncovered.
+    #[test]
+    fn fold_source_merges_mounts_of_the_same_filesystem() {
+        let mut pools = std::collections::BTreeMap::new();
+        let root_locus = PoolLocus {
+            mount: PathBuf::from("/"),
+            fsroot: PathBuf::from("/root"),
+            uuid: "ab12".to_string(),
+        };
+        let home_locus = PoolLocus {
+            mount: PathBuf::from("/home"),
+            fsroot: PathBuf::from("/home"),
+            uuid: "ab12".to_string(),
+        };
+        fold_source(&mut pools, &root_locus, Path::new("/"), None).unwrap();
+        fold_source(&mut pools, &home_locus, Path::new("/home"), None).unwrap();
+        assert_eq!(pools.len(), 1);
+        let view = pools.get("ab12").unwrap();
         assert_eq!(
-            parse_findmnt_target_fsroot("TARGET=\"/home\" FSROOT=\"/home\"\n"),
-            Some((PathBuf::from("/home"), PathBuf::from("/home")))
+            view.covered,
+            vec![PathBuf::from("root"), PathBuf::from("home")]
         );
-        assert_eq!(
-            parse_findmnt_target_fsroot("TARGET=\"/\" FSROOT=\"/root\"\n"),
-            Some((PathBuf::from("/"), PathBuf::from("/root")))
-        );
-        assert_eq!(parse_findmnt_target_fsroot("garbage"), None);
+
+        // Both sources covered + one foreign subvolume → exactly 1, not 5.
+        let listing = vec![
+            PathBuf::from("root"),
+            PathBuf::from("home"),
+            PathBuf::from("var/lib/machines"),
+        ];
+        let view = pools.remove("ab12").unwrap();
+        assert_eq!(count_uncovered(&[(listing, view)]), 1);
     }
 
     #[test]
@@ -1402,7 +1478,7 @@ role = "primary"
             PathBuf::from("var/lib/docker/btrfs/subvolumes/abc123"), // docker layer
         ];
         let view = PoolView {
-            fsroot: PathBuf::from("/"),
+            mount: PathBuf::from("/"),
             covered: vec![PathBuf::from("home")],
             snapshot_homes: vec![PathBuf::from("home/alice/.snapshots")],
         };
@@ -1412,7 +1488,7 @@ role = "primary"
     #[test]
     fn count_uncovered_empty_listing_counts_nothing() {
         let view = PoolView {
-            fsroot: PathBuf::from("/"),
+            mount: PathBuf::from("/"),
             covered: vec![],
             snapshot_homes: vec![],
         };

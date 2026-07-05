@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- The seal's second look now counts honestly on multi-mount filesystems:
+  pools are keyed by filesystem UUID instead of mount point, so Fedora's
+  default layout (one filesystem mounted at both `/` and `/home`) is seen
+  as one pool with both promises covered — previously each promised
+  sibling counted as "uncovered" in the other mount's view and genuinely
+  uncovered subvolumes counted once per mount. The second look's
+  `subvolume list` probe also runs `sudo -n` now: an ungranted line goes
+  silent (the second look is annotation, not verification) instead of
+  prompting for a password mid-seal on the declined-regrant path.
 - `urd doctor`'s drift advisories now point at a verb that heals them:
   `urd init`'s resume gate sees what doctor sees — sudoers coverage gaps
   (expected grant lines the listing definitively lacks) and systemd-unit
