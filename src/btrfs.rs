@@ -42,6 +42,7 @@ pub trait BtrfsRead {
     /// level, NOT to `path` or its mountpoint (UPI 075 second look; callers
     /// must map config paths into subvol-path space before comparing). New
     /// sudoers verb — `expected_grant_lines` carries the matching line.
+    /// Runs `sudo -n`: an ungranted line errors instead of prompting.
     fn list_subvolumes(&self, path: &Path) -> crate::error::Result<Vec<PathBuf>>;
 }
 
@@ -655,8 +656,15 @@ impl BtrfsRead for RealBtrfs {
     }
 
     fn list_subvolumes(&self, path: &Path) -> crate::error::Result<Vec<PathBuf>> {
+        // `-n`: never prompt. The only caller is the seal's second look —
+        // annotation, not verification — and a password prompt mid-seal
+        // (reachable when this exact line is ungranted, e.g. a declined
+        // re-render, live-found 2026-07-05) would scare where silence is
+        // the contract. An ungranted line fails fast; the caller renders
+        // the failure as no note at all.
         let output = Command::new("sudo")
             .env("LC_ALL", "C")
+            .arg("-n")
             .arg(&self.btrfs_path)
             .args(["subvolume", "list"])
             .arg(path)
