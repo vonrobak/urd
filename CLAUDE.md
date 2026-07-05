@@ -65,6 +65,7 @@ live in `docs/00-foundation/architecture.md`.
 - `strategy.rs` — derive a proposed protection strategy from inventory + fate answers (pure; the Encounter's proposing)
 - `config_render.rs` — approved strategy → `Config` + commented v2 TOML (pure; the Encounter's carving)
 - `encounter.rs` — the Fate Conversation state machine (pure; the Encounter's asking — prompts, views, typed carve/farewell effects)
+- `sudoers.rs` — render the scoped sudoers grant and parse `sudo -n -l` for drift (pure; the single oracle); `commands/seal.rs` — stage, verify, and install it (thin I/O; the earning)
 - `output.rs` / `voice/` — structured output types / mythic-voice rendering
 - `events.rs` / `voice_events.rs` — typed event payloads / their renderer
 - `notify.rs`, `heartbeat.rs`, `metrics.rs` — notification + health surfaces
