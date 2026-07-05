@@ -1,3 +1,4 @@
+use std::io::IsTerminal as _;
 use std::path::Path;
 
 use crate::advice;
@@ -17,7 +18,7 @@ pub fn run(config_path: Option<&Path>, output_mode: OutputMode) -> anyhow::Resul
     let config = match config::Config::load_or_absent(config_path)? {
         Some(c) => c,
         None => {
-            let stdin_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
+            let stdin_tty = std::io::stdin().is_terminal();
             return match crate::commands::doorstep_disposition(output_mode, stdin_tty) {
                 crate::commands::Doorstep::Offer => {
                     crate::commands::encounter::run_conversation(config_path)

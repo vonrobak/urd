@@ -1,4 +1,4 @@
-use std::io::Write as _;
+use std::io::{IsTerminal as _, Write as _};
 use std::path::Path;
 
 use crate::btrfs::{BtrfsOps, RealBtrfs};
@@ -19,7 +19,7 @@ use crate::state::StateDb;
 /// the checks. All through the shared absence seam, mirroring
 /// `commands::default::run`.
 pub fn run_cli(config_path: Option<&Path>, output_mode: OutputMode) -> anyhow::Result<CliExit> {
-    let stdin_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
+    let stdin_tty = std::io::stdin().is_terminal();
     let doorstep = crate::commands::doorstep_disposition(output_mode, stdin_tty);
     let config = match Config::load_or_absent(config_path) {
         Ok(Some(c)) => c,
@@ -29,10 +29,7 @@ pub fn run_cli(config_path: Option<&Path>, output_mode: OutputMode) -> anyhow::R
                     crate::commands::encounter::run_conversation(config_path)
                 }
                 crate::commands::Doorstep::Pointer => {
-                    let path = match config_path {
-                        Some(p) => p.to_path_buf(),
-                        None => crate::config::default_config_path()?,
-                    };
+                    let path = crate::commands::resolve_config_path(config_path)?;
                     print!(
                         "{}",
                         crate::voice::render_init_first_time(&path, output_mode)
@@ -48,10 +45,7 @@ pub fn run_cli(config_path: Option<&Path>, output_mode: OutputMode) -> anyhow::R
         Err(e @ crate::error::UrdError::Io { .. }) => return Err(e.into()),
         Err(e) => match doorstep {
             crate::commands::Doorstep::Offer => {
-                let path = match config_path {
-                    Some(p) => p.to_path_buf(),
-                    None => crate::config::default_config_path()?,
-                };
+                let path = crate::commands::resolve_config_path(config_path)?;
                 crate::commands::encounter::fix_invalid_config(&path, &e.to_string())?
             }
             crate::commands::Doorstep::Pointer => return Err(e.into()),

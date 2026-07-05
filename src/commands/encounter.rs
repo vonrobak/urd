@@ -9,7 +9,7 @@
 
 use std::fs;
 use std::io::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{bail, Context};
 use chrono::NaiveDate;
@@ -116,7 +116,7 @@ fn stage(temp: &Path, toml: &str) -> std::io::Result<()> {
 /// editor, or farewell). The loop itself stays thin — every decision
 /// lives in `encounter.rs` (test the functions, not readline).
 pub fn run_conversation(config_path: Option<&Path>) -> anyhow::Result<CliExit> {
-    let target = resolve_target(config_path)?;
+    let target = crate::commands::resolve_config_path(config_path)?;
     let inventory = crate::discovery::discover();
     let today = chrono::Local::now().date_naive();
     let mut result = EncounterState::begin(inventory, today);
@@ -161,13 +161,6 @@ pub fn run_conversation(config_path: Option<&Path>) -> anyhow::Result<CliExit> {
                 };
             }
         }
-    }
-}
-
-fn resolve_target(config_path: Option<&Path>) -> anyhow::Result<PathBuf> {
-    match config_path {
-        Some(p) => Ok(p.to_path_buf()),
-        None => Ok(crate::config::default_config_path()?),
     }
 }
 
@@ -223,15 +216,32 @@ fn parse_editor_choice(line: &str, revert_available: bool) -> Option<EditorChoic
 /// status is deliberately ignored — re-validation of the file is the
 /// only truth (no editor reports abort reliably).
 fn delve(strategy: &ProposedStrategy, today: NaiveDate, path: &Path) -> anyhow::Result<CliExit> {
-    let visual = std::env::var("VISUAL").ok();
-    let editor = std::env::var("EDITOR").ok();
-    let Some(command) = resolve_editor(visual.as_deref(), editor.as_deref()) else {
+    let Some(command) = editor_from_env() else {
         // The file is already carved and valid — keeping it is the
         // honest fallback, never deletion.
         print!("{}", voice::render_no_editor(path));
         return Ok(CliExit::Done);
     };
     delve_with(&command, strategy, today, path)
+}
+
+/// `resolve_editor` over the live environment — the only env read in
+/// this module, shared by delve and the fix-it loop.
+fn editor_from_env() -> Option<Vec<String>> {
+    let visual = std::env::var("VISUAL").ok();
+    let editor = std::env::var("EDITOR").ok();
+    resolve_editor(visual.as_deref(), editor.as_deref())
+}
+
+/// Launch the editor on the file and wait. The exit status is
+/// deliberately dropped: re-validation of the file is the only truth.
+fn open_in_editor(command: &[String], path: &Path) -> anyhow::Result<()> {
+    std::process::Command::new(&command[0])
+        .args(&command[1..])
+        .arg(path)
+        .status()
+        .with_context(|| format!("failed to launch editor `{}`", command[0]))?;
+    Ok(())
 }
 
 fn delve_with(
@@ -241,12 +251,7 @@ fn delve_with(
     path: &Path,
 ) -> anyhow::Result<CliExit> {
     loop {
-        let _status = std::process::Command::new(&command[0])
-            .args(&command[1..])
-            .arg(path)
-            .status()
-            .with_context(|| format!("failed to launch editor `{}`", command[0]))?;
-        // Exit status ignored: revalidate the file, the only truth.
+        open_in_editor(command, path)?;
         let error = match Config::load(Some(path)) {
             Ok(_) => {
                 print!("{}", voice::render_post_carve(path));
@@ -313,25 +318,22 @@ fn kept_invalid(path: &Path) -> anyhow::Error {
 /// for a hand-edited file. Returns the loaded config on success so init
 /// can continue being the make-whole verb.
 pub fn fix_invalid_config(path: &Path, initial_error: &str) -> anyhow::Result<Config> {
-    let visual = std::env::var("VISUAL").ok();
-    let editor = std::env::var("EDITOR").ok();
-    let Some(command) = resolve_editor(visual.as_deref(), editor.as_deref()) else {
+    let Some(command) = editor_from_env() else {
         print!("{}", voice::render_no_editor(path));
-        bail!("the config at {} does not load: {initial_error}", path.display());
+        bail!(
+            "the config at {} does not load: {initial_error}",
+            path.display()
+        );
     };
     let mut error = initial_error.to_string();
     loop {
         match failure_loop_choice(&error, false)? {
-            EditorChoice::EditAgain => {}
-            // Unreachable: r is never offered without a baseline.
-            EditorChoice::Revert => {}
+            // Revert is never offered without a baseline; if it somehow
+            // arrived it would mean edit-again, the safe reading.
+            EditorChoice::EditAgain | EditorChoice::Revert => {}
             EditorChoice::QuitKeep => return Err(kept_invalid(path)),
         }
-        std::process::Command::new(&command[0])
-            .args(&command[1..])
-            .arg(path)
-            .status()
-            .with_context(|| format!("failed to launch editor `{}`", command[0]))?;
+        open_in_editor(&command, path)?;
         match Config::load(Some(path)) {
             Ok(config) => return Ok(config),
             Err(e) => error = e.to_string(),

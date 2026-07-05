@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::cli::MigrateArgs;
+use crate::commands::resolve_config_path;
 use crate::types::{DerivedPolicy, Interval, ProtectionLevel, RunFrequency};
 
 /// Run the `urd migrate` command: transform legacy/v1 config → v2 schema.
@@ -103,13 +104,6 @@ pub fn run(config_path: Option<&Path>, args: &MigrateArgs) -> anyhow::Result<()>
     println!();
 
     Ok(())
-}
-
-fn resolve_config_path(path: Option<&Path>) -> anyhow::Result<PathBuf> {
-    match path {
-        Some(p) => Ok(p.to_path_buf()),
-        None => Ok(crate::config::default_config_path()?),
-    }
 }
 
 // ── Version extraction ─────────────────────────────────────────────────

@@ -18,7 +18,7 @@ use crate::encounter::{
     ChoiceId, EmptyView, FarewellKind, InputNotice, LookingView, PromptKind, PromptSpec,
     RunestoneView,
 };
-use crate::strategy::{ExclusionReason, Gap, GapKind, UnusableDrive, UnusableReason};
+use crate::strategy::{Destination, ExclusionReason, Gap, GapKind, UnusableDrive, UnusableReason};
 use crate::types::{ProtectionLevel, RunFrequency};
 
 // ── Prompts ─────────────────────────────────────────────────────────────
@@ -503,7 +503,7 @@ fn exclusion_sentence(reason: ExclusionReason) -> &'static str {
     }
 }
 
-fn destination_name(dest: &crate::strategy::Destination) -> String {
+fn destination_name(dest: &Destination) -> String {
     match &dest.label {
         Some(label) => label.clone(),
         None => format!("the drive {}", dest.device),

@@ -63,6 +63,16 @@ pub fn doorstep_disposition(output_mode: OutputMode, stdin_is_tty: bool) -> Door
     }
 }
 
+/// The config path a command acts on: the `--config` override or the
+/// default location. One owner for the resolution the doorstep, the
+/// carve target, and the first-time pointer all share.
+pub fn resolve_config_path(config_path: Option<&Path>) -> anyhow::Result<std::path::PathBuf> {
+    match config_path {
+        Some(p) => Ok(p.to_path_buf()),
+        None => Ok(crate::config::default_config_path()?),
+    }
+}
+
 /// Config load for commands that cannot run unconfigured: a missing
 /// config prints the one-sentence pointer and returns `Ok(None)` (the
 /// caller exits with [`CliExit::NoConfig`]); any other load failure is a
