@@ -36,6 +36,13 @@ pub trait BtrfsRead {
     /// (UPI 054-b pre-send sweep, adversary F1). Same `subvolume show` call
     /// as `subvolume_generation` — no new sudoers surface.
     fn received_uuid(&self, path: &Path) -> crate::error::Result<Option<String>>;
+
+    /// Every subvolume of the filesystem containing `path`, as printed by
+    /// `btrfs subvolume list` — paths relative to the filesystem's top
+    /// level, NOT to `path` or its mountpoint (UPI 075 second look; callers
+    /// must map config paths into subvol-path space before comparing). New
+    /// sudoers verb — `expected_grant_lines` carries the matching line.
+    fn list_subvolumes(&self, path: &Path) -> crate::error::Result<Vec<PathBuf>>;
 }
 
 /// Trait abstracting btrfs operations. `RealBtrfs` calls the btrfs binary;
@@ -558,6 +565,40 @@ pub fn parse_received_uuid(output: &str) -> Option<String> {
     None
 }
 
+/// Parse `btrfs subvolume list` output into subvolume paths. Each line is
+/// `ID <n> gen <g> top level <t> path <p>`; the path runs to end-of-line and
+/// may contain spaces, so split on the ` path ` marker, not whitespace.
+/// Paths are relative to the filesystem's top level. Any malformed line is
+/// an error — the second look degrades to no annotation rather than a
+/// partial guess (UPI 075).
+pub fn parse_subvolume_list(output: &str) -> crate::error::Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for line in output.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let path = line
+            .starts_with("ID ")
+            .then(|| line.split_once(" path "))
+            .flatten()
+            .map(|(_, path)| path);
+        match path {
+            Some(p) if !p.is_empty() => paths.push(PathBuf::from(p)),
+            _ => {
+                return Err(UrdError::Btrfs {
+                    context: BtrfsErrorContext {
+                        operation: BtrfsOperation::List,
+                        exit_code: None,
+                        stderr: format!("unrecognized subvolume list line: {line}"),
+                        bytes_transferred: None,
+                    },
+                });
+            }
+        }
+    }
+    Ok(paths)
+}
+
 /// Run `sudo btrfs subvolume show` and return its stdout. Shared by the
 /// `BtrfsRead` field readers (`subvolume_generation`, `received_uuid`) — one
 /// invocation, one sudoers surface.
@@ -611,6 +652,37 @@ impl BtrfsRead for RealBtrfs {
     fn received_uuid(&self, path: &Path) -> crate::error::Result<Option<String>> {
         let stdout = subvolume_show(path)?;
         Ok(parse_received_uuid(&stdout))
+    }
+
+    fn list_subvolumes(&self, path: &Path) -> crate::error::Result<Vec<PathBuf>> {
+        let output = Command::new("sudo")
+            .env("LC_ALL", "C")
+            .arg(&self.btrfs_path)
+            .args(["subvolume", "list"])
+            .arg(path)
+            .output()
+            .map_err(|e| UrdError::Btrfs {
+                context: BtrfsErrorContext {
+                    operation: BtrfsOperation::List,
+                    exit_code: None,
+                    stderr: e.to_string(),
+                    bytes_transferred: None,
+                },
+            })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            return Err(UrdError::Btrfs {
+                context: BtrfsErrorContext {
+                    operation: BtrfsOperation::List,
+                    exit_code: output.status.code(),
+                    stderr,
+                    bytes_transferred: None,
+                },
+            });
+        }
+
+        parse_subvolume_list(&String::from_utf8_lossy(&output.stdout))
     }
 }
 
@@ -870,6 +942,11 @@ pub struct MockBtrfs {
     pub received_uuids: RefCell<HashMap<PathBuf, Option<String>>>,
     /// Paths for which received_uuid() should return an error.
     pub fail_received_uuids: RefCell<HashSet<PathBuf>>,
+    /// Subvolume listings per queried path (filesystem-relative results).
+    /// Unconfigured paths error — the fail-closed default.
+    pub subvolume_lists: RefCell<HashMap<PathBuf, Vec<PathBuf>>>,
+    /// Paths for which list_subvolumes() should return an error.
+    pub fail_subvolume_lists: RefCell<HashSet<PathBuf>>,
 }
 
 #[allow(dead_code)]
@@ -890,6 +967,8 @@ impl MockBtrfs {
             fail_generations: RefCell::new(HashSet::new()),
             received_uuids: RefCell::new(HashMap::new()),
             fail_received_uuids: RefCell::new(HashSet::new()),
+            subvolume_lists: RefCell::new(HashMap::new()),
+            fail_subvolume_lists: RefCell::new(HashSet::new()),
         }
     }
 
@@ -942,6 +1021,26 @@ impl BtrfsRead for MockBtrfs {
                 source: std::io::Error::new(
                     std::io::ErrorKind::NotFound,
                     "mock: no received_uuid configured",
+                ),
+            })
+    }
+
+    fn list_subvolumes(&self, path: &Path) -> crate::error::Result<Vec<PathBuf>> {
+        if self.fail_subvolume_lists.borrow().contains(path) {
+            return Err(UrdError::Io {
+                path: path.to_path_buf(),
+                source: std::io::Error::other("mock: subvolume list failed"),
+            });
+        }
+        self.subvolume_lists
+            .borrow()
+            .get(path)
+            .cloned()
+            .ok_or_else(|| UrdError::Io {
+                path: path.to_path_buf(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "mock: no subvolume list configured",
                 ),
             })
     }
@@ -1302,6 +1401,67 @@ mod tests {
         assert!(mock.received_uuid(&failing).is_err());
         // Unconfigured path errors — sweep callers fail closed.
         assert!(mock.received_uuid(Path::new("/elsewhere")).is_err());
+    }
+
+    // ── parse_subvolume_list (UPI 075 second look) ──────────────────────
+
+    #[test]
+    fn parse_subvolume_list_multiline_nested_and_spaced_paths() {
+        let output = "ID 256 gen 41234 top level 5 path home\n\
+                      ID 257 gen 41230 top level 5 path root\n\
+                      ID 300 gen 41111 top level 256 path home/alice/My Projects\n\
+                      ID 301 gen 40000 top level 5 path data/.snapshots/20260705-0400-docs\n";
+        let paths = parse_subvolume_list(output).unwrap();
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("home"),
+                PathBuf::from("root"),
+                PathBuf::from("home/alice/My Projects"),
+                PathBuf::from("data/.snapshots/20260705-0400-docs"),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_subvolume_list_empty_output_is_no_subvolumes() {
+        assert_eq!(parse_subvolume_list("").unwrap(), Vec::<PathBuf>::new());
+        assert_eq!(parse_subvolume_list("\n\n").unwrap(), Vec::<PathBuf>::new());
+    }
+
+    #[test]
+    fn parse_subvolume_list_malformed_line_is_an_error_not_a_guess() {
+        // A recognizable-but-wrong line must fail the whole parse: the
+        // second look omits its annotation rather than undercounting.
+        for bad in [
+            "ID 256 gen 41234 top level 5",        // no path marker
+            "totally unexpected format",           // no ID prefix
+            "ID 256 gen 41234 top level 5 path ",  // empty path
+        ] {
+            assert!(
+                parse_subvolume_list(bad).is_err(),
+                "line should refuse to parse: {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mock_subvolume_list_lookup_and_failure() {
+        let mock = MockBtrfs::new();
+        let pool = PathBuf::from("/");
+        let failing = PathBuf::from("/data");
+        mock.subvolume_lists
+            .borrow_mut()
+            .insert(pool.clone(), vec![PathBuf::from("home"), PathBuf::from("root")]);
+        mock.fail_subvolume_lists.borrow_mut().insert(failing.clone());
+
+        assert_eq!(
+            mock.list_subvolumes(&pool).unwrap(),
+            vec![PathBuf::from("home"), PathBuf::from("root")]
+        );
+        assert!(mock.list_subvolumes(&failing).is_err());
+        // Unconfigured path errors — the fail-closed default.
+        assert!(mock.list_subvolumes(Path::new("/elsewhere")).is_err());
     }
 
     // ── pump_with_cancel (UPI 033, cancel-responsive writes UPI 054-b) ─

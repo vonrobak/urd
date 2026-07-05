@@ -1110,23 +1110,29 @@ mod contract {
     }
 
     #[test]
-    fn rule6_unsealed_banner_is_yellow_never_red() {
-        // UPI 071: "configured but unsealed" is a designed state on the
-        // declined path — nothing was lost, so the banner must not borrow
-        // red's gravity. Red is earned by exposure, not by a pending
-        // ceremony.
+    fn rule6_seal_gap_banner_is_yellow_never_red() {
+        // UPI 071/075: every incomplete-seal state is designed, not
+        // damaged — nothing was lost, so no banner may borrow red's
+        // gravity. Red is earned by exposure, not by a pending ceremony.
         let _color = color_guard(true);
-        let mut data = all_sealed_status();
-        data.unsealed = true;
-        let output = render_status(&data, OutputMode::Interactive);
-        let banner: Vec<&str> = output.lines().filter(|l| l.contains("unsealed")).collect();
-        assert!(!banner.is_empty(), "unsealed banner must render:\n{output}");
-        for line in banner {
-            assert_eq!(
-                helpers::count_red(line),
-                0,
-                "the unsealed banner must never be red: {line:?}"
-            );
+        for (gap, marker) in [
+            (crate::output::SealGap::Privilege, "unsealed"),
+            (crate::output::SealGap::Units, "not yet enabled"),
+            (crate::output::SealGap::FirstThread, "not yet spun"),
+        ] {
+            let mut data = all_sealed_status();
+            data.seal_gap = Some(gap);
+            let output = render_status(&data, OutputMode::Interactive);
+            let banner: Vec<&str> =
+                output.lines().filter(|l| l.contains(marker)).collect();
+            assert!(!banner.is_empty(), "{gap:?} banner must render:\n{output}");
+            for line in banner {
+                assert_eq!(
+                    helpers::count_red(line),
+                    0,
+                    "the seal-gap banner must never be red: {line:?}"
+                );
+            }
         }
     }
 

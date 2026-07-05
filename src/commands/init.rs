@@ -54,13 +54,17 @@ pub fn run_cli(config_path: Option<&Path>, output_mode: OutputMode) -> anyhow::R
         },
     };
 
-    // The resume verb (arc grill Q5, UPI 071): loadable config + human on
-    // both ends + the grant clearly not answering → resume the seal at the
-    // earning, then continue into the checks. This sits AFTER the whole
+    // The resume verb (arc grill Q5, UPI 071/075): loadable config + human
+    // on both ends + ANY incomplete seal stage (denied grant, missing
+    // units, no first thread) → resume the seal at its first incomplete
+    // stage, then continue into the checks. This sits AFTER the whole
     // match so the fix-it-repaired path resumes too. Unclear never
-    // triggers a ceremony on a guess; non-TTY reports via the checks.
+    // triggers a ceremony on a guess; non-TTY reports via the checks;
+    // a fully sealed system enters no ceremony (Q5: nothing to do).
     let mut sudo_probe = seal::probe_grant(&config.general.btrfs_path);
-    if doorstep == crate::commands::Doorstep::Offer && sudo_probe.0 == GrantProbe::Denied {
+    if doorstep == crate::commands::Doorstep::Offer
+        && seal::seal_gap_given_probe(&config, sudo_probe.0).is_some()
+    {
         let path = crate::commands::resolve_config_path(config_path)?;
         seal::resume_seal(&config, &path)?;
         // Re-probe: the checks below must describe the post-seal state.

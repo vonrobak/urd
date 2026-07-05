@@ -8,6 +8,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **The first seal (UPI 075, Encounter arc 6/9).** Everything between "the
+  config exists and root is granted" and "the terminal closes on a protected
+  system" now happens in one guided pass, and `urd init` resumes it at the
+  first incomplete stage. After the earning: **drive adoption** (each mounted,
+  UUID-verified drive gets its snapshot home and identity token — the
+  `urd drives adopt` decision, shared; unreachable drives get one honest
+  sentence and the seal continues); **systemd units** embedded in the binary
+  (repo `systemd/` files are the compile-time source of truth; ExecStart is
+  substituted with this binary's resolved path — a timer pointing at a missing
+  binary would be a silent protection failure) written to
+  `~/.config/systemd/user/` and enabled with consent, the sentinel service
+  included when the granularity answer chose sentinel mode; **the first local
+  snapshot**, immediately, through the normal backup pipeline — the Encounter
+  never ends with zero threads spun; **the first-send offer**, explicit and
+  honest about duration, never time-limited (Enter sends now, `t` defers to
+  tonight's timer, declined is recorded nowhere); **the privileged second
+  look** (`btrfs subvolume list` via a new `BtrfsRead` method and one new
+  read-only sudoers line), classified in subvol-path space and capped at one
+  advisory sentence; and **the summary scroll** — what was woven, when Urd
+  acts next (derived only from what the installed units actually do), and the
+  handoff to `urd status`. `urd status`/bare `urd` now name the first
+  incomplete seal stage (`seal_gap`: privilege / units / first-thread — one
+  gap, one sentence, replacing the unreleased `unsealed` boolean). `urd
+  doctor` gains a **units drift advisory** (installed files diffed against
+  what this binary would render, both ExecStart paths named) and a **linger
+  check** — user timers fire only while a session exists; `Linger=no` earns
+  one honest sentence and `loginctl enable-linger` is named, never run.
+  Hosts sealed under the 071 grant show one Missing coverage line
+  (`subvolume list`) in doctor until `urd init` re-renders the grant.
+  ~35 new tests.
 - **Privilege bootstrap — guided sudoers (UPI 071, Encounter arc 2/9).** Urd
   now earns root instead of asking you to hand-edit sudoers. New pure
   `sudoers` module is the single oracle for the scoped grant: one

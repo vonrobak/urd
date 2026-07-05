@@ -75,9 +75,11 @@ Each subcommand declares whether it requires a config load:
 ### `urd` (no subcommand)
 
 **Contract.** With a config: a one-screen promise summary (compact status);
-interactively it probes the sudo grant once (`sudo -n`, never prompts) and
-appends a "configured but unsealed — `urd init` resumes the earning" clause
-when the grant is clearly denied. Without a config: offers the Encounter
+interactively it checks the seal once (a `sudo -n` probe, never prompting,
+then unit-file existence and first-snapshot presence) and appends one clause
+for the first incomplete seal stage — configured-but-unsealed, schedule not
+yet enabled, or first thread not yet spun — each pointing at `urd init`.
+Without a config: offers the Encounter
 when a human is on both ends (stdin and stdout are terminals); otherwise
 prints the pointer and exits 3. Declining or quitting the Encounter writes
 nothing — the config file appears only at the carve, after explicit
@@ -154,11 +156,14 @@ requires reading the heartbeat or metrics, not the exit code.
 drive presence, and overall data safety. Reads filesystem, SQLite, and the
 heartbeat file; writes nothing. Safe under any condition, including a
 running backup (advisory locking via `lock.rs` makes the read non-conflicting).
-Interactively it also probes the sudo grant once (`sudo -n`, never prompts) and,
-when the grant is clearly denied, names the **configured but unsealed** state
-with `urd init` as the resume verb. Daemon runs never probe (a denied probe
-writes an auth-log line), so the `unsealed` field is absent from daemon JSON —
-it serializes only when true, and only interactive runs check.
+Interactively it also checks the seal once (a `sudo -n` probe, never prompting,
+plus unit-file existence and first-snapshot presence) and names the **first
+incomplete seal stage** — `privilege` (configured but unsealed), `units` (the
+schedule is not enabled), or `first_thread` (a promise has no local snapshot) —
+with `urd init` as the resume verb, one gap, one sentence. Daemon runs never
+probe (a denied probe writes an auth-log line), so the `seal_gap` field is
+absent from daemon JSON — it serializes only when a gap exists, and only
+interactive runs check.
 
 **Output.** Interactive — voice-rendered status block answering "is my data
 safe?" Daemon — JSON.
@@ -217,18 +222,43 @@ Encounter (pointer + exit 3 without a terminal on both ends). Invalid
 config + terminal → the fix-it loop ((e)dit in `$VISUAL`/`$EDITOR` /
 (q)uit keeping the file, error named), then continues into the checks;
 I/O failures (permissions) always surface instead. With a loadable
-config and a terminal on both ends, a clearly denied sudo grant
-resumes **the seal at the earning** (UPI 071): render the scoped
-sudoers file from the config, `visudo -c` gate, show + consent,
-staged fail-closed install (`/etc/sudoers.d/urd.staging`, root-side
-re-validation, atomic rename to `/etc/sudoers.d/urd`), then a
-passwordless verification probe and a `sudo -l` coverage cross-check.
-Declining prints the content and the manual command; nothing is
-installed without consent, and EOF never installs. After (or without)
-the earning: ensures the state DB directory and heartbeat directory
-exist, runs the same infrastructure checks `doctor` runs, and exits
-cleanly. Safe to run multiple times. The install step prompts for
-your password via sudo.
+config and a terminal on both ends, ANY incomplete seal stage resumes
+**the seal at its first incomplete stage** (UPI 071/075); a fully
+sealed system enters no ceremony. The stages, each opening with an
+idempotent done-check:
+
+1. **The earning** (denied grant): render the scoped sudoers file from
+   the config, `visudo -c` gate, show + consent, staged fail-closed
+   install (`/etc/sudoers.d/urd.staging`, root-side re-validation,
+   atomic rename to `/etc/sudoers.d/urd`), passwordless verification
+   probe + `sudo -l` coverage cross-check. Declining prints the content
+   and the manual command; EOF never installs. A declined or unverified
+   earning ends the seal (later stages need the grant).
+2. **Drive adoption**: each configured, mounted, UUID-verified drive
+   gets its snapshot home and identity token (the `urd drives adopt`
+   decision, shared). Unreachable drives get one honest sentence each;
+   the seal continues.
+3. **Units**: the embedded systemd units (ExecStart substituted with
+   this binary's resolved path), written to `~/.config/systemd/user/`
+   and enabled with consent — the nightly pair, plus the sentinel
+   service in sentinel mode. Lingering off earns one honest sentence
+   (user timers fire only while logged in); Urd never enables lingering.
+4. **The first local snapshot**: local snapshot homes are created, then
+   a normal `backup --local-only` run through the full pipeline.
+5. **The first-send offer**: explicit, honest about duration, never
+   time-limited; Enter sends now, `t`/EOF defer to tonight's timer.
+   Declining is recorded nowhere — a later `urd init` re-offers.
+6. **The second look** (privileged, annotate-only): `btrfs subvolume
+   list` per promised pool; at most one summary sentence about
+   subvolumes no promise covers. Never re-opens the conversation.
+7. **The summary scroll**: what was woven, when Urd acts next (derived
+   only from the installed units), the honest partial states, and the
+   handoff — `urd status`.
+
+After (or without) the seal: ensures the state DB directory and
+heartbeat directory exist, runs the same infrastructure checks
+`doctor` runs, and exits cleanly. Safe to run multiple times. The
+install steps prompt for your password via sudo.
 
 **Output.** Interactive — the conversation or the checklist of
 infrastructure items; `{"status":"not_configured"}` in daemon mode
@@ -345,7 +375,8 @@ config first). Writes to the state DB.
 
 **Contract.** Runs the full diagnostic battery: config preflight,
 infrastructure checks (DB, dirs, sudo btrfs), the sudoers drift advisory,
-drive UUID fingerprinting, and local-space trend warnings. Read-only.
+the systemd-units drift advisory + linger check, drive UUID fingerprinting,
+and local-space trend warnings. Read-only.
 Designed to be the first thing an operator runs when something feels off.
 The drift advisory diffs the config's expected grants (single oracle:
 `sudoers.rs`) against effective privileges from `sudo -n -l`: a working
@@ -354,6 +385,12 @@ covering grant warns and names `urd init` as the re-render verb; a listing
 that needs a password, contains negations, or resists parsing is an honest
 "cannot verify" warning — never a silent pass. When the grant itself is
 denied, only the sudo-btrfs check speaks (one cause, one finding).
+The units advisory diffs the installed unit files against what THIS binary
+would render (single oracle: `systemd_units.rs`): all-match is one Ok row;
+a missing unit warns with `urd init` as the completing verb; a differing
+unit warns naming both ExecStart paths (a doctor run from a dev build
+self-diagnoses). With the units in place, `Linger=no` earns one Warn naming
+`loginctl enable-linger` — user timers fire only while a session exists.
 
 **Notable flags.**
 

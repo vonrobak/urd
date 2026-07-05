@@ -294,6 +294,30 @@ pub fn generate_drive_token() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
+/// What adopting a drive requires, given both token sources. Pure — shared
+/// by `urd drives adopt` and the seal's adoption stage (UPI 075) so the two
+/// verbs can never diverge on the decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdoptDecision {
+    /// On-disk and stored tokens agree — nothing to write.
+    AlreadyCurrent,
+    /// An on-disk token exists that SQLite doesn't know (or knows stale):
+    /// store it, don't regenerate — the drive keeps its identity.
+    AdoptExisting,
+    /// No on-disk token: mint one, write it, store it.
+    GenerateNew,
+}
+
+/// Decide the adoption action from the on-disk token and the SQLite record.
+#[must_use]
+pub fn decide_adoption(on_disk: Option<&str>, stored: Option<&str>) -> AdoptDecision {
+    match (on_disk, stored) {
+        (Some(disk), Some(db)) if disk == db => AdoptDecision::AlreadyCurrent,
+        (Some(_), _) => AdoptDecision::AdoptExisting,
+        (None, _) => AdoptDecision::GenerateNew,
+    }
+}
+
 /// Verify the drive session token against the stored reference in SQLite.
 ///
 /// Call this AFTER `drive_availability()` returns `Available`.
@@ -397,6 +421,16 @@ mod tests {
             min_free_bytes: None,
             rotation_interval: None,
         }
+    }
+
+    #[test]
+    fn decide_adoption_covers_every_token_pairing() {
+        use AdoptDecision::*;
+        assert_eq!(decide_adoption(Some("t1"), Some("t1")), AlreadyCurrent);
+        assert_eq!(decide_adoption(Some("t1"), Some("t2")), AdoptExisting);
+        assert_eq!(decide_adoption(Some("t1"), None), AdoptExisting);
+        assert_eq!(decide_adoption(None, Some("t2")), GenerateNew);
+        assert_eq!(decide_adoption(None, None), GenerateNew);
     }
 
     #[test]

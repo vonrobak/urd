@@ -54,11 +54,13 @@ automatically — the service unit runs `%h/.cargo/bin/urd backup` each time, so
 always picks up whatever binary is at that path. No `daemon-reload` needed for binary
 updates (only for unit file changes).
 
-> **This manual path is interim.** The Encounter — Urd's guided first-run
-> conversation, in development — replaces everything from here through Initial
-> Setup: generated config, initialized drive, created directories, verified
-> identity. Until it ships, follow these steps exactly and in order; the traps
-> called out below were all hit in live field testing (2026-07-04).
+> **The guided path replaces this manual path.** The Encounter — run `urd` (or
+> `urd init`) on an unconfigured system — now covers everything from here
+> through Initial Setup: generated config, the sudoers earning, drive adoption,
+> installed + enabled systemd units, the first local snapshot, and the offer of
+> the first send. `urd init` also resumes an interrupted seal at its first
+> incomplete stage. The manual steps below remain as the fallback reference;
+> the traps called out were all hit in live field testing (2026-07-04).
 
 ## Sudoers Configuration
 
@@ -191,6 +193,9 @@ urd calibrate
 urd backup
 
 # 7. Install the systemd units for nightly backups and the sentinel
+#    (the seal does this for you — `urd init` — including substituting this
+#    binary's real path into ExecStart; the cp below installs the repo units
+#    verbatim with the %h/.cargo/bin path)
 mkdir -p ~/.config/systemd/user
 cp systemd/urd-*.{service,timer} ~/.config/systemd/user/
 systemctl --user daemon-reload
@@ -201,6 +206,12 @@ systemctl --user enable --now urd-sentinel.service   # recommended; see below
 The sentinel is the continuous protection layer — without it, Urd runs only at
 04:00 and promise states drift between runs. Skip the sentinel enable line if you
 want the nightly cron without the always-on watchdog.
+
+**Lingering.** User-level timers fire only while you have an active session. With
+lingering off, a logged-out night is skipped (and caught up at your next login via
+`Persistent=true`); a headless box never runs. `loginctl enable-linger $USER` lets
+the timer fire always — the seal and `urd doctor` name this when it applies, but
+Urd never changes it for you.
 
 ## CLI Commands
 
@@ -306,8 +317,9 @@ is recommended.
 | `urd-sentinel.service` | Long-running daemon: drive events, promise refresh, notifications |
 
 All three run at low priority (`Nice=19`, `IOSchedulingClass=idle`). The backup
-service allows up to 6 hours for large sends. The sentinel restarts on failure
-with a 30-second back-off.
+service never time-limits a run (`TimeoutStartSec=infinity` — a first full send
+can legitimately run longer than a day). The sentinel restarts on failure with a
+30-second back-off.
 
 The sentinel is the integration layer — drive plug/unplug detection, sub-hourly
 promise-state updates, and notification dispatch all live there. Without it,
@@ -315,7 +327,18 @@ Urd is a nightly cron job; with it, Urd is a continuous protection layer.
 
 ### Install / update units
 
-From the root of your clone:
+**The guided path: `urd init`.** The seal renders the units embedded in the
+binary (repo `systemd/` files are the compile-time source of truth), substitutes
+this binary's resolved path into `ExecStart`, writes them to
+`~/.config/systemd/user/`, and enables them with consent. Which units it installs
+follows the config's `run_frequency`: the nightly pair always, plus the sentinel
+service in sentinel mode. `urd doctor` diffs the installed files against what
+this binary would render and names any drift (a doctor run from a different
+binary — e.g. a dev build — reports an expected ExecStart difference naming both
+paths).
+
+Manual fallback, from the root of your clone (installs the repo units verbatim,
+with the `%h/.cargo/bin/urd` path):
 
 ```bash
 mkdir -p ~/.config/systemd/user
@@ -325,7 +348,7 @@ systemctl --user enable --now urd-backup.timer
 systemctl --user enable --now urd-sentinel.service   # optional but recommended
 ```
 
-Re-run this after modifying unit files in the repo. Copying (rather than
+Re-run `urd init` (or this recipe) after unit files change. Copying (rather than
 symlinking) keeps the installed units stable across `git checkout` operations.
 
 ### Monitor

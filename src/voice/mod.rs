@@ -53,9 +53,15 @@ pub use emergency::{render_emergency, render_emergency_result};
 pub use encounter::{
     render_earning_already, render_earning_coverage_unconfirmed, render_earning_declined,
     render_earning_deferred, render_earning_installed, render_earning_request,
-    render_earning_unavailable, render_earning_verify_failed, render_editor_failure,
-    render_farewell, render_invalid_notice, render_no_editor, render_post_carve,
-    render_prompt, render_visudo_refusal,
+    describe_next_action, render_data_dir_failed, render_earning_unavailable,
+    render_earning_verify_failed, render_editor_failure, render_farewell,
+    render_first_thread_already, render_first_thread_failed, render_first_thread_intro,
+    render_invalid_notice, render_linger_notice, render_no_editor, render_post_carve,
+    render_prompt, render_seal_adoption, render_seal_adoption_skipped,
+    render_seal_summary, render_send_deferred, render_send_offer, render_units_already,
+    render_units_failed,
+    render_units_installed, render_units_no_manager, render_units_request,
+    render_units_skipped, render_visudo_refusal,
 };
 pub use get::render_get;
 pub use history::{render_events, render_history, render_subvolume_history};
@@ -466,7 +472,7 @@ pub(crate) mod test_fixtures {
 
     pub(crate) fn test_status_output() -> StatusOutput {
         StatusOutput {
-            unsealed: false,
+            seal_gap: None,
             assessments: vec![
                 StatusAssessment {
                     name: "htpc-home".to_string(),
@@ -698,7 +704,7 @@ pub(crate) mod test_fixtures {
 
     pub(crate) fn test_default_status_output() -> DefaultStatusOutput {
         DefaultStatusOutput {
-            unsealed: false,
+            seal_gap: None,
             total: 4,
             waning_names: vec![],
             exposed_names: vec![],
