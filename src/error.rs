@@ -185,8 +185,9 @@ pub fn translate_btrfs_error(
             summary: "Insufficient permissions".to_string(),
             cause: format!("btrfs {operation} was denied by the system"),
             remediation: vec![
-                "Verify sudoers configuration: `urd init` checks this".to_string(),
-                "Expected entry: <user> ALL=(root) NOPASSWD: /usr/bin/btrfs".to_string(),
+                "Run `urd init` — it verifies the grant and re-renders it from your config"
+                    .to_string(),
+                "`urd doctor` diffs the installed grant against the config".to_string(),
             ],
         };
     }

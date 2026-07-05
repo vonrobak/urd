@@ -1110,6 +1110,27 @@ mod contract {
     }
 
     #[test]
+    fn rule6_unsealed_banner_is_yellow_never_red() {
+        // UPI 071: "configured but unsealed" is a designed state on the
+        // declined path — nothing was lost, so the banner must not borrow
+        // red's gravity. Red is earned by exposure, not by a pending
+        // ceremony.
+        let _color = color_guard(true);
+        let mut data = all_sealed_status();
+        data.unsealed = true;
+        let output = render_status(&data, OutputMode::Interactive);
+        let banner: Vec<&str> = output.lines().filter(|l| l.contains("unsealed")).collect();
+        assert!(!banner.is_empty(), "unsealed banner must render:\n{output}");
+        for line in banner {
+            assert_eq!(
+                helpers::count_red(line),
+                0,
+                "the unsealed banner must never be red: {line:?}"
+            );
+        }
+    }
+
+    #[test]
     fn rule6_unprotected_row_emits_red_on_exposure_cell() {
         let _color = color_guard(true);
         let mut data = test_status_output();

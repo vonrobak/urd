@@ -14,6 +14,7 @@ use std::path::Path;
 use anyhow::{bail, Context};
 use chrono::NaiveDate;
 
+use crate::commands::seal::SealOutcome;
 use crate::commands::CliExit;
 use crate::config::Config;
 use crate::config_render::generate_config;
@@ -22,6 +23,23 @@ use crate::encounter::{
 };
 use crate::strategy::ProposedStrategy;
 use crate::voice;
+
+/// The seal step both terminal carve branches run — injected so tests of
+/// the conversation and editor loops never spawn sudo.
+type SealFn<'a> = &'a dyn Fn(&Config, &Path) -> anyhow::Result<SealOutcome>;
+
+/// Post-carve tail shared by every valid-config exit: name the file, then
+/// run the seal from the **reloaded on-disk config** — a delve edit may
+/// have changed mappings, and sealing from the strategy-derived config
+/// would ship day-one sudoers drift (adversary G6). The reload is the only
+/// config in scope here, so the drift cannot regress silently.
+fn post_carve(path: &Path, seal: SealFn<'_>) -> anyhow::Result<CliExit> {
+    print!("{}", voice::render_post_carve(path));
+    let config = Config::load(Some(path))
+        .with_context(|| format!("reloading the carved config at {}", path.display()))?;
+    seal(&config, path)?;
+    Ok(CliExit::Done)
+}
 
 /// Staging file for the atomic publish, sibling to the final config.
 const TEMP_NAME: &str = ".urd.toml.tmp";
@@ -152,12 +170,12 @@ pub fn run_conversation(config_path: Option<&Path>) -> anyhow::Result<CliExit> {
                 // self-check failure) surfaces as the error it is —
                 // nothing was written, the sentence says so.
                 carve_config(&strategy, today, &target)?;
+                let seal: SealFn<'_> = &|config, path| {
+                    crate::commands::seal::resume_seal(config, path)
+                };
                 return match then {
-                    AfterCarve::Confirm => {
-                        print!("{}", voice::render_post_carve(&target));
-                        Ok(CliExit::Done)
-                    }
-                    AfterCarve::Edit => delve(&strategy, today, &target),
+                    AfterCarve::Confirm => post_carve(&target, seal),
+                    AfterCarve::Edit => delve(&strategy, today, &target, seal),
                 };
             }
         }
@@ -165,8 +183,9 @@ pub fn run_conversation(config_path: Option<&Path>) -> anyhow::Result<CliExit> {
 }
 
 /// One line from stdin; `None` on EOF. Prompts end without a newline
-/// marker, so flush before blocking.
-fn read_input_line() -> anyhow::Result<Option<String>> {
+/// marker, so flush before blocking. Shared with the earning's consent
+/// loop (`commands::seal`).
+pub(crate) fn read_input_line() -> anyhow::Result<Option<String>> {
     print!("> ");
     std::io::stdout().flush().ok();
     let mut line = String::new();
@@ -215,14 +234,20 @@ fn parse_editor_choice(line: &str, revert_available: bool) -> Option<EditorChoic
 /// the config loads or the user keeps it broken. The editor's exit
 /// status is deliberately ignored — re-validation of the file is the
 /// only truth (no editor reports abort reliably).
-fn delve(strategy: &ProposedStrategy, today: NaiveDate, path: &Path) -> anyhow::Result<CliExit> {
+fn delve(
+    strategy: &ProposedStrategy,
+    today: NaiveDate,
+    path: &Path,
+    seal: SealFn<'_>,
+) -> anyhow::Result<CliExit> {
     let Some(command) = editor_from_env() else {
         // The file is already carved and valid — keeping it is the
-        // honest fallback, never deletion.
+        // honest fallback, never deletion. This exit skips the earning;
+        // the sentence names `urd init` as the resume verb.
         print!("{}", voice::render_no_editor(path));
         return Ok(CliExit::Done);
     };
-    delve_with(&command, strategy, today, path)
+    delve_with(&command, strategy, today, path, seal)
 }
 
 /// `resolve_editor` over the live environment — the only env read in
@@ -249,22 +274,19 @@ fn delve_with(
     strategy: &ProposedStrategy,
     today: NaiveDate,
     path: &Path,
+    seal: SealFn<'_>,
 ) -> anyhow::Result<CliExit> {
     loop {
         open_in_editor(command, path)?;
         let error = match Config::load(Some(path)) {
-            Ok(_) => {
-                print!("{}", voice::render_post_carve(path));
-                return Ok(CliExit::Done);
-            }
+            Ok(_) => return post_carve(path, seal),
             Err(e) => e.to_string(),
         };
         match failure_loop_choice(&error, true)? {
             EditorChoice::EditAgain => {}
             EditorChoice::Revert => {
                 overwrite_with_generated(strategy, today, path)?;
-                print!("{}", voice::render_post_carve(path));
-                return Ok(CliExit::Done);
+                return post_carve(path, seal);
             }
             EditorChoice::QuitKeep => return Err(kept_invalid(path)),
         }
@@ -603,9 +625,49 @@ mod tests {
         let path = dir.path().join("urd.toml");
         carve_config(&strategy, today(), &path).unwrap();
 
-        let result = delve_with(&["/bin/true".to_string()], &strategy, today(), &path);
+        let no_seal: SealFn<'_> = &|_, _| Ok(SealOutcome::Sealed);
+        let result = delve_with(&["/bin/true".to_string()], &strategy, today(), &path, no_seal);
         assert_eq!(result.unwrap(), CliExit::Done);
         assert!(Config::load(Some(&path)).is_ok());
+    }
+
+    #[test]
+    fn delve_seals_from_the_reloaded_config_not_the_strategy() {
+        // Adversary G6: an editor that adds a drive must reach the seal —
+        // sealing from the strategy-derived config would render a sudoers
+        // file missing the new mapping on day one.
+        let strategy = sheltered_strategy();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("urd.toml");
+        carve_config(&strategy, today(), &path).unwrap();
+
+        let script = dir.path().join("add-drive.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\ncat >> \"$1\" <<'EOF'\n\n[[drives]]\nlabel = \"delve-added\"\n\
+             mount_path = \"/run/media/alice/delve-added\"\nsnapshot_root = \".snapshots\"\n\
+             role = \"offsite\"\nEOF\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+
+        let sealed_labels = std::cell::RefCell::new(Vec::<String>::new());
+        let capture: SealFn<'_> = &|config, _| {
+            sealed_labels
+                .borrow_mut()
+                .extend(config.drives.iter().map(|d| d.label.clone()));
+            Ok(SealOutcome::Sealed)
+        };
+        let result = delve_with(&[script.display().to_string()], &strategy, today(), &path, capture);
+        assert_eq!(result.unwrap(), CliExit::Done);
+        assert!(
+            sealed_labels.borrow().iter().any(|l| l == "delve-added"),
+            "the seal must see the drive the edit added: {:?}",
+            sealed_labels.borrow()
+        );
     }
 
     #[test]
@@ -625,7 +687,9 @@ mod tests {
         perms.set_mode(0o755);
         std::fs::set_permissions(&script, perms).unwrap();
 
-        let result = delve_with(&[script.display().to_string()], &strategy, today(), &path);
+        let no_seal: SealFn<'_> = &|_, _| Ok(SealOutcome::Sealed);
+        let result =
+            delve_with(&[script.display().to_string()], &strategy, today(), &path, no_seal);
         let err = result.unwrap_err();
         assert!(err.to_string().contains("kept as you left it"), "{err}");
         assert!(

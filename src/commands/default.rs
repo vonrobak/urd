@@ -95,6 +95,9 @@ pub fn run(config_path: Option<&Path>, output_mode: OutputMode) -> anyhow::Resul
         .into_iter()
         .max_by(|a, b| a.tier.cmp(&b.tier).then(a.host_root.cmp(&b.host_root)));
 
+    // Configured but unsealed (UPI 071) — see `seal::probe_unsealed`.
+    let unsealed = crate::commands::seal::probe_unsealed(&config, output_mode);
+
     let output = DefaultStatusOutput {
         total,
         waning_names,
@@ -106,6 +109,7 @@ pub fn run(config_path: Option<&Path>, output_mode: OutputMode) -> anyhow::Resul
         best_advice,
         total_needing_attention,
         storage_posture,
+        unsealed,
     };
 
     let rendered = voice::render_default_status(&output, output_mode);

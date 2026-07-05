@@ -8,6 +8,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Privilege bootstrap — guided sudoers (UPI 071, Encounter arc 2/9).** Urd
+  now earns root instead of asking you to hand-edit sudoers. New pure
+  `sudoers` module is the single oracle for the scoped grant: one
+  snapshot-creation line per source→snapshot-root mapping, one deletion line
+  per snapshot directory, broad send/receive, read-only diagnostics — derived
+  from the config, never a template to edit. The renderer refuses (never
+  escapes) anything that could change a sudoers line's meaning: control
+  characters, `#`, non-UTF-8, near-root snapshot scopes (no `delete /*` can
+  ever be minted), and reserved usernames. After the carve — or via `urd
+  init` at any time — **the earning** shows the exact file, explains what
+  each section permits, and with consent installs it fail-closed: staged
+  inertly as `/etc/sudoers.d/urd.staging` (a dot-name sudo ignores),
+  re-validated by root-side `visudo -c`, activated by atomic rename — a crash
+  or a same-uid race can never leave a broken file that locks sudo host-wide.
+  Verification drops the cached sudo ticket, probes passwordlessly, and
+  cross-checks coverage against `sudo -l`. Declining prints the exact content
+  and manual command; `urd status` and bare `urd` name the **configured but
+  unsealed** state (yellow, never red — nothing was lost) and `urd init`
+  resumes the earning. `urd doctor` gains a sudoers **drift advisory**: config
+  mappings with no covering grant warn with the re-render verb; a listing that
+  needs a password or resists interpretation is an honest "cannot verify",
+  never a silent pass. The sudo-btrfs infrastructure check now distinguishes
+  "grant denied" from "grant works, btrfs failed" (ext4-root hosts no longer
+  read as sudoers problems). Daemon paths never probe sudo. ~60 new tests,
+  including injection-refusal and brute-force grant-model invariants.
 - **The Fate Conversation + entry trigger (UPI 072, Encounter arc 3/9).** The
   Encounter is now reachable: bare `urd` or `urd init` with no config and a
   terminal on both ends offers a guided first-time conversation — Urd looks at

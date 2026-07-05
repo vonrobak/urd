@@ -3,7 +3,9 @@ use std::path::Path;
 
 use crate::btrfs::{BtrfsOps, RealBtrfs};
 use crate::chain;
+use crate::commands::seal;
 use crate::commands::CliExit;
+use crate::sudoers::GrantProbe;
 use crate::config::Config;
 use crate::drives;
 use crate::output::{
@@ -51,12 +53,26 @@ pub fn run_cli(config_path: Option<&Path>, output_mode: OutputMode) -> anyhow::R
             crate::commands::Doorstep::Pointer => return Err(e.into()),
         },
     };
-    run(config).map(|()| CliExit::Done)
+
+    // The resume verb (arc grill Q5, UPI 071): loadable config + human on
+    // both ends + the grant clearly not answering → resume the seal at the
+    // earning, then continue into the checks. This sits AFTER the whole
+    // match so the fix-it-repaired path resumes too. Unclear never
+    // triggers a ceremony on a guess; non-TTY reports via the checks.
+    let mut sudo_probe = seal::probe_grant(&config.general.btrfs_path);
+    if doorstep == crate::commands::Doorstep::Offer && sudo_probe.0 == GrantProbe::Denied {
+        let path = crate::commands::resolve_config_path(config_path)?;
+        seal::resume_seal(&config, &path)?;
+        // Re-probe: the checks below must describe the post-seal state.
+        sudo_probe = seal::probe_grant(&config.general.btrfs_path);
+    }
+
+    run(config, &sudo_probe).map(|()| CliExit::Done)
 }
 
-pub fn run(config: Config) -> anyhow::Result<()> {
+pub fn run(config: Config, sudo_probe: &(GrantProbe, String)) -> anyhow::Result<()> {
     let fs_state = RealFileSystemState { state: None };
-    let mut output = collect_init_data(&config, &fs_state);
+    let mut output = collect_init_data(&config, &fs_state, sudo_probe);
 
     // Render the report (before interactive prompts)
     let mode = OutputMode::detect();
@@ -83,8 +99,12 @@ pub fn run(config: Config) -> anyhow::Result<()> {
 }
 
 /// Collect all init check data. Pure-ish (does I/O for checks, but produces structured output).
-fn collect_init_data(config: &Config, fs_state: &dyn FilesystemQuery) -> InitOutput {
-    let infrastructure = collect_infrastructure_checks(config);
+fn collect_init_data(
+    config: &Config,
+    fs_state: &dyn FilesystemQuery,
+    sudo_probe: &(GrantProbe, String),
+) -> InitOutput {
+    let infrastructure = collect_infrastructure_checks(config, sudo_probe);
     let subvolume_sources = collect_subvolume_sources(config);
     let snapshot_roots = collect_snapshot_roots(config);
     let drives = collect_drive_status(config);
@@ -108,7 +128,10 @@ fn collect_init_data(config: &Config, fs_state: &dyn FilesystemQuery) -> InitOut
     }
 }
 
-pub(crate) fn collect_infrastructure_checks(config: &Config) -> Vec<InitCheck> {
+pub(crate) fn collect_infrastructure_checks(
+    config: &Config,
+    sudo_probe: &(GrantProbe, String),
+) -> Vec<InitCheck> {
     let mut checks = Vec::new();
 
     // State database
@@ -185,41 +208,34 @@ pub(crate) fn collect_infrastructure_checks(config: &Config) -> Vec<InitCheck> {
         }
     }
 
-    // sudo btrfs
-    match std::process::Command::new("sudo")
-        .env("LC_ALL", "C")
-        .arg("-n")
-        .arg(&config.general.btrfs_path)
-        .args(["filesystem", "show", "/"])
-        .output()
-    {
-        Ok(output) if output.status.success() => {
-            checks.push(InitCheck {
-                name: "sudo btrfs".to_string(),
-                status: InitStatus::Ok,
-                detail: None,
-            });
-        }
-        Ok(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            checks.push(InitCheck {
-                name: "sudo btrfs".to_string(),
-                status: InitStatus::Error,
-                detail: Some(format!(
-                    "exit {}: {} — check sudoers config",
-                    output.status.code().unwrap_or(-1),
-                    stderr.trim()
-                )),
-            });
-        }
-        Err(e) => {
-            checks.push(InitCheck {
-                name: "sudo btrfs".to_string(),
-                status: InitStatus::Error,
-                detail: Some(e.to_string()),
-            });
-        }
-    }
+    // sudo btrfs — classified (adversary G3): the probe result is supplied
+    // by the caller (one probe per invocation, shared with the resume
+    // gate). A working grant whose btrfs command failed (ext4-root host)
+    // is Ok-with-detail, never "check sudoers config".
+    let (grant, detail) = sudo_probe;
+    checks.push(match grant {
+        GrantProbe::Granted => InitCheck {
+            name: "sudo btrfs".to_string(),
+            status: InitStatus::Ok,
+            detail: if detail.is_empty() {
+                None
+            } else {
+                Some(format!("grant works; btrfs reported: {detail}"))
+            },
+        },
+        GrantProbe::Denied => InitCheck {
+            name: "sudo btrfs".to_string(),
+            status: InitStatus::Error,
+            detail: Some(format!(
+                "{detail} — configured but unsealed; `urd init` resumes the earning"
+            )),
+        },
+        GrantProbe::Unclear => InitCheck {
+            name: "sudo btrfs".to_string(),
+            status: InitStatus::Warn,
+            detail: Some(format!("could not determine the grant state: {detail}")),
+        },
+    });
 
     checks
 }

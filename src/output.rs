@@ -197,6 +197,12 @@ pub struct StatusOutput {
     /// no subvolume is adapting, so a Roomy system stays silent.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub storage_adaptations: Vec<AdaptationSummary>,
+    /// Configured but unsealed (UPI 071): the sudo grant does not answer a
+    /// passwordless probe, so the promises are not yet in force. Probed only
+    /// on interactive runs (a denied probe writes an auth log line — daemon
+    /// paths never probe); false means "sealed or not checked".
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub unsealed: bool,
 }
 
 /// Serializable wrapper around SubvolAssessment data.
@@ -423,6 +429,9 @@ pub struct DefaultStatusOutput {
     /// bare-`urd` clause. Omitted when all pools are Roomy.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub storage_posture: Option<PoolPostureSummary>,
+    /// Configured but unsealed (UPI 071) — see `StatusOutput::unsealed`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub unsealed: bool,
 }
 
 fn is_zero(n: &usize) -> bool {

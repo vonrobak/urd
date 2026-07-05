@@ -45,6 +45,13 @@ pub(super) fn render_status_interactive(data: &StatusOutput) -> String {
     // ── Summary line ────────────────────────────────────────────────
     render_summary_line(data, &mut out);
 
+    // ── The seal (UPI 071) ──────────────────────────────────────────
+    // Configured but unsealed: said once, high, with the resume verb.
+    // Yellow, never red — nothing was lost (Rule 6, red is earned). The
+    // wording names the state, not the probe: 075 widens what "sealed"
+    // takes (units, first snapshot) without rewording this banner.
+    render_unsealed_banner(data, &mut out);
+
     // ── Storage adaptation prose (UPI 031-b AB3.1) ──────────────────
     // Rendered HIGH (right under the summary, ahead of any routine staleness
     // line) so a deliberately-slowed Critical subvolume does not read as broken
@@ -108,6 +115,21 @@ pub(super) fn render_status_interactive(data: &StatusOutput) -> String {
     }
 
     out
+}
+
+/// The unsealed banner (UPI 071): the promises are carved but not in
+/// force until root leave exists. One sentence, one resume verb.
+pub(super) fn render_unsealed_banner(data: &StatusOutput, out: &mut String) {
+    if !data.unsealed {
+        return;
+    }
+    writeln!(
+        out,
+        "{}",
+        "Configured but unsealed — the promises are not yet in force.".yellow()
+    )
+    .ok();
+    writeln!(out, "Run `urd init` to resume the earning (root leave for btrfs).").ok();
 }
 
 pub(super) fn render_summary_line(data: &StatusOutput, out: &mut String) {
@@ -731,6 +753,16 @@ fn render_default_status_interactive(data: &DefaultStatusOutput) -> String {
         write!(out, "{colored}").ok();
     }
 
+    // Configured but unsealed (UPI 071): one clause, the resume verb.
+    if data.unsealed {
+        write!(
+            out,
+            " {}",
+            "Configured but unsealed — `urd init` resumes the earning.".yellow()
+        )
+        .ok();
+    }
+
     // Last backup age (pre-computed by command handler to keep voice pure)
     if let Some(age_secs) = data.last_run_age_secs {
         write!(out, " Last backup {} ago.", humanize_duration(age_secs)).ok();
@@ -1251,9 +1283,41 @@ mod tests {
     }
 
     #[test]
+    fn interactive_unsealed_banner_names_state_and_resume_verb() {
+        let _color = color_guard(false);
+        let mut data = crate::voice::test_fixtures::test_status_output();
+        data.unsealed = true;
+        let out = render_status(&data, OutputMode::Interactive);
+        assert!(out.contains("unsealed"), "{out}");
+        assert!(out.contains("not yet in force"), "{out}");
+        assert!(out.contains("urd init"), "{out}");
+    }
+
+    #[test]
+    fn interactive_sealed_carries_no_unsealed_banner() {
+        let _color = color_guard(false);
+        let out = render_status(
+            &crate::voice::test_fixtures::test_status_output(),
+            OutputMode::Interactive,
+        );
+        assert!(!out.contains("unsealed"), "{out}");
+    }
+
+    #[test]
+    fn default_unsealed_clause_points_at_init() {
+        let _color = color_guard(false);
+        let mut data = crate::voice::test_fixtures::test_default_status_output();
+        data.unsealed = true;
+        let out = render_default_status(&data, OutputMode::Interactive);
+        assert!(out.contains("unsealed"), "{out}");
+        assert!(out.contains("urd init"), "{out}");
+    }
+
+    #[test]
     fn interactive_no_subvolumes() {
         let _color = color_guard(false);
         let data = StatusOutput {
+            unsealed: false,
             assessments: vec![],
             chain_health: vec![],
             drives: vec![],
@@ -1330,6 +1394,7 @@ mod tests {
     fn interactive_no_last_run() {
         let _color = color_guard(false);
         let data = StatusOutput {
+            unsealed: false,
             assessments: vec![],
             chain_health: vec![],
             drives: vec![],
@@ -1932,6 +1997,7 @@ mod tests {
     fn default_some_exposed() {
         let _color = color_guard(false);
         let data = DefaultStatusOutput {
+            unsealed: false,
             total: 9,
             waning_names: vec![],
             exposed_names: vec!["htpc-root".to_string(), "docs".to_string()],
@@ -1966,6 +2032,7 @@ mod tests {
     fn default_some_waning() {
         let _color = color_guard(false);
         let data = DefaultStatusOutput {
+            unsealed: false,
             total: 5,
             waning_names: vec!["htpc-config".to_string()],
             exposed_names: vec!["htpc-root".to_string()],
@@ -2022,6 +2089,7 @@ mod tests {
     fn default_no_last_backup() {
         let _color = color_guard(false);
         let data = DefaultStatusOutput {
+            unsealed: false,
             total: 2,
             waning_names: vec![],
             exposed_names: vec![],
@@ -2043,6 +2111,7 @@ mod tests {
     #[test]
     fn default_daemon_json() {
         let data = DefaultStatusOutput {
+            unsealed: false,
             total: 3,
             waning_names: vec!["sv1".to_string()],
             exposed_names: vec![],

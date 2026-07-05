@@ -589,16 +589,153 @@ pub fn render_empty_report(view: &EmptyView) -> String {
     out
 }
 
-/// After a successful carve: name the file, point at the next verb.
-/// (The seal — sudo grant, first snapshot — is UPI 075; until it lands,
-/// `urd init` verifies the environment.)
+/// After a successful carve: name the file. The earning (UPI 071) follows
+/// immediately in the same flow, so this line no longer points anywhere.
 #[must_use]
 pub fn render_post_carve(path: &Path) -> String {
     format!(
-        "{} {}\n\
-         Your promises are carved. Run `urd init` to verify your setup.\n",
+        "{} {}\nYour promises are carved.\n",
         "Carved:".bold(),
         path.display()
+    )
+}
+
+// ── The earning (UPI 071): asking for root, scoped and shown ───────────
+
+/// The asking: show the exact file, state what each section permits, offer
+/// the lettered choice. The content shown IS the content installed — the
+/// staged copy is re-validated as root before it goes live.
+#[must_use]
+pub fn render_earning_request(rendered: &str, dest: &Path) -> String {
+    let mut out = String::new();
+    writeln!(out).ok();
+    writeln!(
+        out,
+        "{} To keep them, Urd needs leave to run btrfs as root — exactly this, no more:",
+        "The promises need root.".bold()
+    )
+    .ok();
+    writeln!(out).ok();
+    for line in rendered.lines() {
+        writeln!(out, "    {line}").ok();
+    }
+    writeln!(out).ok();
+    writeln!(
+        out,
+        "Creation and deletion stay inside your snapshot directories. Send and receive\n\
+         move snapshots without destroying anything. Show and sync only read.\n\
+         The file goes to {} after a root-side syntax check.",
+        dest.display()
+    )
+    .ok();
+    writeln!(out).ok();
+    writeln!(out, "  i) install it  (Enter — sudo will ask for your password)").ok();
+    writeln!(out, "  p) print the commands; I'll do it myself").ok();
+    writeln!(out, "  q) not now").ok();
+    out
+}
+
+/// The earning held: grant installed, probe passed, coverage confirmed.
+#[must_use]
+pub fn render_earning_installed() -> String {
+    format!(
+        "{} Root leave granted, scoped as shown, verified without a password.\n",
+        "Earned:".bold()
+    )
+}
+
+/// Installed and probing, but the coverage cross-check could not be
+/// confirmed (listing unavailable or uninterpretable). Honest, not red.
+#[must_use]
+pub fn render_earning_coverage_unconfirmed(reason: &str) -> String {
+    format!(
+        "{} The grant is installed and answers a passwordless probe.\n\
+         Full coverage could not be confirmed: {reason}\n\
+         `urd doctor` repeats this check when you wish.\n",
+        "Earned, mostly verified:".bold()
+    )
+}
+
+/// Installed but the verification probe failed — the file is in place and
+/// the grant does not answer. Name it; `urd init` retries the earning.
+#[must_use]
+pub fn render_earning_verify_failed(detail: &str) -> String {
+    format!(
+        "{} The file is installed, but the passwordless probe failed:\n\
+         \x20 {detail}\n\
+         Nothing more was changed. `urd init` retries the earning.\n",
+        "Not yet earned:".bold()
+    )
+}
+
+/// The declined path (or `p`): the exact content plus the manual command.
+/// The promise is carved but not yet in force; `urd init` resumes.
+#[must_use]
+pub fn render_earning_declined(rendered: &str, dest: &Path) -> String {
+    let mut out = String::new();
+    writeln!(out, "Nothing installed. To grant it yourself, put this in {}:", dest.display())
+        .ok();
+    writeln!(out).ok();
+    for line in rendered.lines() {
+        writeln!(out, "    {line}").ok();
+    }
+    writeln!(out).ok();
+    writeln!(out, "  sudo visudo -f {}", dest.display()).ok();
+    writeln!(out).ok();
+    writeln!(
+        out,
+        "Until the grant exists, the promises are carved but not in force.\n\
+         `urd init` resumes the earning at any time."
+    )
+    .ok();
+    out
+}
+
+/// visudo refused the rendered file — fail-closed, nothing reaches
+/// sudoers.d actively. Names the file that holds the refused content
+/// (the unprivileged temp, or the inert root-owned staging file).
+#[must_use]
+pub fn render_visudo_refusal(kept: &Path, stderr: &str) -> String {
+    format!(
+        "{} visudo refused the rendered file — nothing was activated.\n\
+         \x20 {}\n\
+         The refused content is kept at {} for inspection.\n\
+         This is a bug in urd's rendering, not in your answers.\n",
+        "Refused:".bold(),
+        stderr.trim(),
+        kept.display()
+    )
+}
+
+/// A passwordless grant already answers (e.g. a broader hand-managed
+/// rule) — nothing to ask; the drift advisory watches coverage.
+#[must_use]
+pub fn render_earning_already() -> String {
+    format!(
+        "{} Root leave already answers without a password — nothing to ask.\n\
+         `urd doctor` checks its coverage against the config.\n",
+        "Earned:".bold()
+    )
+}
+
+/// `q) not now`: the user saw the content and deferred — no re-print,
+/// just the honest state and the resume verb.
+#[must_use]
+pub fn render_earning_deferred() -> String {
+    "Nothing installed. The promises are carved but not in force until the earning.\n\
+     `urd init` resumes it at any time.\n"
+        .to_string()
+}
+
+/// sudo itself is not available to this user (not a sudoer, or sudo
+/// missing) — its own sentence, never a generic error.
+#[must_use]
+pub fn render_earning_unavailable(detail: &str) -> String {
+    format!(
+        "{} This account cannot use sudo here: {detail}\n\
+         Ask an administrator to install the grant (`p` prints it), or run\n\
+         `urd init` once sudo works.\n",
+        "Cannot ask:".bold()
     )
 }
 
@@ -623,12 +760,14 @@ pub fn render_editor_failure(error: &str, revert_available: bool) -> String {
 
 /// Delve-deeper was chosen but no editor is set. The file is already
 /// carved and valid — keeping it is the honest fallback, never deletion.
+/// The earning has not happened on this exit: name it (arc grill — `urd
+/// init` is the resume verb).
 #[must_use]
 pub fn render_no_editor(path: &Path) -> String {
     format!(
         "No editor is set ($VISUAL and $EDITOR are both empty).\n\
-         The config is carved at {} — edit it yourself when you wish;\n\
-         `urd init` re-checks it afterwards.\n",
+         The config is carved at {} — edit it yourself when you wish.\n\
+         The earning — root leave for btrfs — still awaits; `urd init` resumes it.\n",
         path.display()
     )
 }
@@ -888,11 +1027,12 @@ mod tests {
     }
 
     #[test]
-    fn post_carve_names_the_file_and_next_verb() {
+    fn post_carve_names_the_file() {
+        // No next-verb pointer any more: the earning follows in-flow (071).
         let _color = color_guard(false);
         let out = render_post_carve(Path::new("/home/user/.config/urd/urd.toml"));
         assert!(out.contains("urd.toml"), "{out}");
-        assert!(out.contains("urd init"), "{out}");
+        assert!(out.contains("carved"), "{out}");
     }
 
     #[test]
@@ -918,6 +1058,78 @@ mod tests {
         let out = render_no_editor(Path::new("/tmp/urd.toml"));
         assert!(out.contains("/tmp/urd.toml"), "{out}");
         assert!(out.contains("EDITOR"), "{out}");
+        // This exit skips the earning — the resume verb must be named (071).
+        assert!(out.contains("urd init"), "{out}");
+    }
+
+    // ── The earning (UPI 071) ───────────────────────────────────────────
+
+    const RENDERED: &str = "# header\nalice ALL=(root) NOPASSWD: /usr/sbin/btrfs send *\n";
+    const DEST: &str = "/etc/sudoers.d/urd";
+
+    #[test]
+    fn earning_request_shows_content_dest_and_lettered_choices() {
+        let _color = color_guard(false);
+        let out = render_earning_request(RENDERED, Path::new(DEST));
+        assert!(out.contains("NOPASSWD: /usr/sbin/btrfs send *"), "{out}");
+        assert!(out.contains(DEST), "{out}");
+        for letter in ["i)", "p)", "q)"] {
+            assert!(
+                out.lines().any(|l| l.trim_start().starts_with(letter)),
+                "missing choice {letter}: {out}"
+            );
+        }
+        assert!(out.contains("root"), "{out}");
+    }
+
+    #[test]
+    fn earning_outcomes_speak_honestly() {
+        let _color = color_guard(false);
+        assert!(render_earning_installed().contains("verified"));
+        let unconfirmed = render_earning_coverage_unconfirmed("listing needs a password");
+        assert!(unconfirmed.contains("could not be confirmed"), "{unconfirmed}");
+        assert!(unconfirmed.contains("listing needs a password"), "{unconfirmed}");
+        let failed = render_earning_verify_failed("exit 1: a password is required");
+        assert!(failed.contains("probe failed"), "{failed}");
+        assert!(failed.contains("urd init"), "{failed}");
+    }
+
+    #[test]
+    fn earning_declined_prints_content_and_the_manual_command() {
+        let _color = color_guard(false);
+        let out = render_earning_declined(RENDERED, Path::new(DEST));
+        assert!(out.contains("Nothing installed"), "{out}");
+        assert!(out.contains("NOPASSWD: /usr/sbin/btrfs send *"), "{out}");
+        assert!(out.contains("sudo visudo -f /etc/sudoers.d/urd"), "{out}");
+        assert!(out.contains("urd init"), "{out}");
+    }
+
+    #[test]
+    fn visudo_refusal_is_fail_closed_and_names_the_kept_file() {
+        let _color = color_guard(false);
+        let out = render_visudo_refusal(Path::new("/tmp/.urd-sudoers"), "syntax error near line 3");
+        assert!(out.contains("nothing was activated"), "{out}");
+        assert!(out.contains("/tmp/.urd-sudoers"), "{out}");
+        assert!(out.contains("syntax error"), "{out}");
+    }
+
+    #[test]
+    fn earning_unavailable_has_its_own_sentence() {
+        let _color = color_guard(false);
+        let out = render_earning_unavailable("alice is not in the sudoers file");
+        assert!(out.contains("cannot use sudo"), "{out}");
+        assert!(out.contains("not in the sudoers file"), "{out}");
+    }
+
+    #[test]
+    fn earning_already_and_deferred_speak_the_state() {
+        let _color = color_guard(false);
+        let already = render_earning_already();
+        assert!(already.contains("already answers"), "{already}");
+        assert!(already.contains("urd doctor"), "{already}");
+        let deferred = render_earning_deferred();
+        assert!(deferred.contains("not in force"), "{deferred}");
+        assert!(deferred.contains("urd init"), "{deferred}");
     }
 
     #[test]

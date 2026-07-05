@@ -74,11 +74,14 @@ Each subcommand declares whether it requires a config load:
 
 ### `urd` (no subcommand)
 
-**Contract.** With a config: a one-screen promise summary (compact status).
-Without one: offers the Encounter when a human is on both ends (stdin and
-stdout are terminals); otherwise prints the pointer and exits 3. Declining
-or quitting the Encounter writes nothing — the config file appears only at
-the carve, after explicit approval of the runestone.
+**Contract.** With a config: a one-screen promise summary (compact status);
+interactively it probes the sudo grant once (`sudo -n`, never prompts) and
+appends a "configured but unsealed — `urd init` resumes the earning" clause
+when the grant is clearly denied. Without a config: offers the Encounter
+when a human is on both ends (stdin and stdout are terminals); otherwise
+prints the pointer and exits 3. Declining or quitting the Encounter writes
+nothing — the config file appears only at the carve, after explicit
+approval of the runestone.
 
 **Output.** Stdout — text; `{"status":"not_configured"}` in daemon mode.
 
@@ -151,6 +154,11 @@ requires reading the heartbeat or metrics, not the exit code.
 drive presence, and overall data safety. Reads filesystem, SQLite, and the
 heartbeat file; writes nothing. Safe under any condition, including a
 running backup (advisory locking via `lock.rs` makes the read non-conflicting).
+Interactively it also probes the sudo grant once (`sudo -n`, never prompts) and,
+when the grant is clearly denied, names the **configured but unsealed** state
+with `urd init` as the resume verb. Daemon runs never probe (a denied probe
+writes an auth-log line), so the `unsealed` field is absent from daemon JSON —
+it serializes only when true, and only interactive runs check.
 
 **Output.** Interactive — voice-rendered status block answering "is my data
 safe?" Daemon — JSON.
@@ -209,10 +217,18 @@ Encounter (pointer + exit 3 without a terminal on both ends). Invalid
 config + terminal → the fix-it loop ((e)dit in `$VISUAL`/`$EDITOR` /
 (q)uit keeping the file, error named), then continues into the checks;
 I/O failures (permissions) always surface instead. With a loadable
-config: ensures the state DB directory and heartbeat directory exist,
-runs the same infrastructure checks `doctor` runs, and exits cleanly.
-Safe to run multiple times. May prompt for sudo if the configured
-`btrfs_path` requires testing.
+config and a terminal on both ends, a clearly denied sudo grant
+resumes **the seal at the earning** (UPI 071): render the scoped
+sudoers file from the config, `visudo -c` gate, show + consent,
+staged fail-closed install (`/etc/sudoers.d/urd.staging`, root-side
+re-validation, atomic rename to `/etc/sudoers.d/urd`), then a
+passwordless verification probe and a `sudo -l` coverage cross-check.
+Declining prints the content and the manual command; nothing is
+installed without consent, and EOF never installs. After (or without)
+the earning: ensures the state DB directory and heartbeat directory
+exist, runs the same infrastructure checks `doctor` runs, and exits
+cleanly. Safe to run multiple times. The install step prompts for
+your password via sudo.
 
 **Output.** Interactive — the conversation or the checklist of
 infrastructure items; `{"status":"not_configured"}` in daemon mode
@@ -328,9 +344,16 @@ config first). Writes to the state DB.
 ### `urd doctor`
 
 **Contract.** Runs the full diagnostic battery: config preflight,
-infrastructure checks (DB, dirs, sudo btrfs), drive UUID fingerprinting,
-and local-space trend warnings. Read-only. Designed to be the first thing
-an operator runs when something feels off.
+infrastructure checks (DB, dirs, sudo btrfs), the sudoers drift advisory,
+drive UUID fingerprinting, and local-space trend warnings. Read-only.
+Designed to be the first thing an operator runs when something feels off.
+The drift advisory diffs the config's expected grants (single oracle:
+`sudoers.rs`) against effective privileges from `sudo -n -l`: a working
+grant with full coverage renders one Ok row; a config mapping with no
+covering grant warns and names `urd init` as the re-render verb; a listing
+that needs a password, contains negations, or resists parsing is an honest
+"cannot verify" warning — never a silent pass. When the grant itself is
+denied, only the sudo-btrfs check speaks (one cause, one finding).
 
 **Notable flags.**
 
