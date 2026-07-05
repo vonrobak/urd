@@ -44,6 +44,25 @@ impl CliExit {
     }
 }
 
+/// Doorstep disposition for a missing config: the Encounter is offered
+/// only when a human is on both ends — stdout interactive AND stdin a
+/// terminal (`urd < file` gets the pointer, never a conversation that
+/// eats the file). Everything else points and exits 3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Doorstep {
+    Offer,
+    Pointer,
+}
+
+#[must_use]
+pub fn doorstep_disposition(output_mode: OutputMode, stdin_is_tty: bool) -> Doorstep {
+    if output_mode == OutputMode::Interactive && stdin_is_tty {
+        Doorstep::Offer
+    } else {
+        Doorstep::Pointer
+    }
+}
+
 /// Config load for commands that cannot run unconfigured: a missing
 /// config prints the one-sentence pointer and returns `Ok(None)` (the
 /// caller exits with [`CliExit::NoConfig`]); any other load failure is a
@@ -73,6 +92,19 @@ mod cli_exit_tests {
         // is an external interface change, not a refactor.
         assert_eq!(CliExit::Done.code(), 0);
         assert_eq!(CliExit::NoConfig.code(), 3);
+    }
+
+    #[test]
+    fn doorstep_offers_only_with_a_human_on_both_ends() {
+        use OutputMode::{Daemon, Interactive};
+        assert_eq!(doorstep_disposition(Interactive, true), Doorstep::Offer);
+        assert_eq!(
+            doorstep_disposition(Interactive, false),
+            Doorstep::Pointer,
+            "urd < file must point, never converse"
+        );
+        assert_eq!(doorstep_disposition(Daemon, true), Doorstep::Pointer);
+        assert_eq!(doorstep_disposition(Daemon, false), Doorstep::Pointer);
     }
 
     #[test]

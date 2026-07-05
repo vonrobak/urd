@@ -11,17 +11,22 @@ use crate::voice;
 
 pub fn run(config_path: Option<&Path>, output_mode: OutputMode) -> anyhow::Result<CliExit> {
     // Fallible config load through the shared absence seam (S1/UPI 072):
-    // file-not-found → first-time user (exit 3 when non-interactive — the
-    // grill-pinned distinct code; interactive keeps the greeting until the
-    // Encounter offer lands); all other errors → surface.
+    // file-not-found → first-time user. With a human on both ends, bare
+    // `urd` offers the Encounter; otherwise one pointer + exit 3 (grill
+    // Q5). All other errors → surface.
     let config = match config::Config::load_or_absent(config_path)? {
         Some(c) => c,
         None => {
-            print!("{}", voice::render_first_time(output_mode));
-            return Ok(match output_mode {
-                OutputMode::Interactive => CliExit::Done,
-                OutputMode::Daemon => CliExit::NoConfig,
-            });
+            let stdin_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
+            return match crate::commands::doorstep_disposition(output_mode, stdin_tty) {
+                crate::commands::Doorstep::Offer => {
+                    crate::commands::encounter::run_conversation(config_path)
+                }
+                crate::commands::Doorstep::Pointer => {
+                    print!("{}", voice::render_first_time(output_mode));
+                    Ok(CliExit::NoConfig)
+                }
+            };
         }
     };
 
@@ -131,12 +136,14 @@ mod tests {
     }
 
     #[test]
-    fn config_not_found_interactive_greets_and_exits_zero() {
-        // Interactive keeps the greeting + exit 0 until the Encounter offer
-        // lands (step 7); the conversation is what changes this, not step 1.
+    fn config_not_found_interactive_without_stdin_tty_points() {
+        // The test harness has no stdin terminal, so even Interactive
+        // output falls to the pointer (`urd < file` must never converse).
+        // The Offer path needs a human on both ends — the gate decision
+        // itself is covered in commands::cli_exit_tests.
         let bogus = PathBuf::from("/tmp/urd-test-nonexistent-config-12345.toml");
         let result = run(Some(&bogus), OutputMode::Interactive);
-        assert_eq!(result.expect("config-not-found is Ok"), CliExit::Done);
+        assert_eq!(result.expect("config-not-found is Ok"), CliExit::NoConfig);
     }
 
     #[test]

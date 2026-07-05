@@ -48,7 +48,6 @@ pub struct SystemInventory {
     pub pools: Vec<DiscoveredPool>,
     pub subvolumes: Vec<DiscoveredSubvol>,
     pub drives: Vec<CandidateDrive>,
-    #[allow(dead_code)] // Consumed by UPI 072 (rendering).
     pub notes: Vec<DiscoveryNote>,
 }
 
@@ -59,13 +58,15 @@ pub struct SystemInventory {
 pub struct DiscoveredPool {
     pub uuid: String,
     pub label: Option<String>,
-    #[allow(dead_code)] // Consumed by UPI 072 (rendering) / 075 (second look).
+    // The runestone names bearers via `CandidateDrive.device` (top-level
+    // disks, the vocabulary a user recognizes) — these raw btrfs-bearing
+    // nodes serve the privileged second look instead.
+    #[allow(dead_code)] // Consumed by UPI 075 (second look).
     pub device_names: Vec<String>,
     pub mountpoints: Vec<PathBuf>,
     /// One space fact per pool (arc grill decision 4), measured at the
     /// canonical (shortest) mountpoint. `None` when unmounted or the
     /// resolver failed.
-    #[allow(dead_code)] // Consumed by UPI 072 (rendering).
     pub space: Option<PoolSpace>,
 }
 
@@ -102,7 +103,6 @@ pub struct CandidateDrive {
     pub transport: Option<String>,
     /// Subtree-wide (any mounted partition). Deliberately unread by the
     /// strategy layer — pool mountpoints are the mount authority there.
-    #[allow(dead_code)] // Consumed by UPI 072 (rendering).
     pub mounted: bool,
     /// Filesystem UUID of the first btrfs node in this disk's subtree —
     /// the join key to [`DiscoveredPool`]. `None` when no btrfs is visible
@@ -133,7 +133,6 @@ pub enum LuksState {
 
 /// Structured observations — typed data, never pre-rendered English (the
 /// voice belongs to UPI 072's presentation layer).
-#[allow(dead_code)] // Consumed by UPI 072 (rendering).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiscoveryNote {
     /// A locked LUKS drive was seen; label is unreadable while locked.
@@ -155,7 +154,6 @@ pub enum DiscoveryNote {
     ProbeDegraded { probe: Probe, detail: String },
 }
 
-#[allow(dead_code)] // Consumed by UPI 072 (rendering).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoiseCategory {
     /// Snapper-convention `.snapshots` subvolume mounts.
@@ -165,7 +163,6 @@ pub enum NoiseCategory {
     DuplicateMounts,
 }
 
-#[allow(dead_code)] // Consumed by UPI 072 (rendering).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Probe {
     Lsblk,
@@ -721,7 +718,6 @@ fn run_findmnt() -> crate::error::Result<String> {
 /// Probe the system and build the inventory. Never fails: a failed probe
 /// degrades the inventory and leaves a [`DiscoveryNote::ProbeDegraded`]
 /// so 072 can say so (fail open, observable).
-#[allow(dead_code)] // Consumed by UPI 072 — the Encounter's entry point.
 #[must_use]
 pub fn discover() -> SystemInventory {
     let mut probe_notes = Vec::new();

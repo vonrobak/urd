@@ -13,28 +13,49 @@ use crate::output::{
 use crate::plan::{FilesystemQuery, RealFileSystemState};
 use crate::state::StateDb;
 
-/// CLI entry with fallible config load and first-time discrimination,
-/// mirroring `commands::default::run`: file-not-found → first-time guidance
-/// (exit 3 when non-interactive — grill Q5's distinct code); all other
-/// errors → surface. The bare-`urd` greeting advertises `urd init` as the
-/// first command — a missing config must greet, not error.
+/// CLI entry for the make-whole verb (arc grill Q5): no config → offer
+/// the Encounter (pointer + exit 3 without a terminal); invalid config →
+/// the TTY fix-it loop, then continue into the checks; loadable config →
+/// the checks. All through the shared absence seam, mirroring
+/// `commands::default::run`.
 pub fn run_cli(config_path: Option<&Path>, output_mode: OutputMode) -> anyhow::Result<CliExit> {
-    let config = match Config::load_or_absent(config_path)? {
-        Some(c) => c,
-        None => {
-            let path = match config_path {
-                Some(p) => p.to_path_buf(),
-                None => crate::config::default_config_path()?,
+    let stdin_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
+    let doorstep = crate::commands::doorstep_disposition(output_mode, stdin_tty);
+    let config = match Config::load_or_absent(config_path) {
+        Ok(Some(c)) => c,
+        Ok(None) => {
+            return match doorstep {
+                crate::commands::Doorstep::Offer => {
+                    crate::commands::encounter::run_conversation(config_path)
+                }
+                crate::commands::Doorstep::Pointer => {
+                    let path = match config_path {
+                        Some(p) => p.to_path_buf(),
+                        None => crate::config::default_config_path()?,
+                    };
+                    print!(
+                        "{}",
+                        crate::voice::render_init_first_time(&path, output_mode)
+                    );
+                    Ok(CliExit::NoConfig)
+                }
             };
-            print!(
-                "{}",
-                crate::voice::render_init_first_time(&path, output_mode)
-            );
-            return Ok(match output_mode {
-                OutputMode::Interactive => CliExit::Done,
-                OutputMode::Daemon => CliExit::NoConfig,
-            });
         }
+        // A config that exists but won't load: with a human present,
+        // re-enter the fix-it loop (grill Q7) and continue made-whole;
+        // otherwise surface the error as ever. I/O failures (permissions,
+        // not-a-file) are never editable states — always surface.
+        Err(e @ crate::error::UrdError::Io { .. }) => return Err(e.into()),
+        Err(e) => match doorstep {
+            crate::commands::Doorstep::Offer => {
+                let path = match config_path {
+                    Some(p) => p.to_path_buf(),
+                    None => crate::config::default_config_path()?,
+                };
+                crate::commands::encounter::fix_invalid_config(&path, &e.to_string())?
+            }
+            crate::commands::Doorstep::Pointer => return Err(e.into()),
+        },
     };
     run(config).map(|()| CliExit::Done)
 }
@@ -477,10 +498,13 @@ mod tests {
     }
 
     #[test]
-    fn run_cli_config_not_found_interactive_greets_and_exits_zero() {
+    fn run_cli_config_not_found_interactive_without_stdin_tty_points() {
+        // No stdin terminal in the harness → the pointer, exit 3. The
+        // offer path needs a human on both ends (gate covered in
+        // commands::cli_exit_tests).
         let bogus = PathBuf::from("/tmp/urd-test-nonexistent-init-config-12345.toml");
         let result = run_cli(Some(&bogus), OutputMode::Interactive);
-        assert_eq!(result.expect("config-not-found is Ok"), CliExit::Done);
+        assert_eq!(result.expect("config-not-found is Ok"), CliExit::NoConfig);
     }
 
     #[test]

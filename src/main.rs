@@ -10,7 +10,6 @@ mod config_render;
 mod discovery;
 mod drift;
 mod drives;
-#[allow(dead_code)] // Wired in UPI 072 step 7 (doorstep offer).
 mod encounter;
 mod error;
 mod events;

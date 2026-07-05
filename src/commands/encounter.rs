@@ -31,7 +31,6 @@ const TEMP_NAME: &str = ".urd.toml.tmp";
 /// existing config is never overwritten (deleting a config is a human
 /// act — the designed refusal sentence is 072's trigger-time rendering,
 /// this one is the race backstop).
-#[allow(dead_code)] // Consumed by UPI 072 (conversation).
 pub fn carve_config(
     strategy: &ProposedStrategy,
     today: NaiveDate,
@@ -116,7 +115,6 @@ fn stage(temp: &Path, toml: &str) -> std::io::Result<()> {
 /// stdin, and execute its terminal effect (carve + confirm, carve +
 /// editor, or farewell). The loop itself stays thin — every decision
 /// lives in `encounter.rs` (test the functions, not readline).
-#[allow(dead_code)] // Wired in step 7 (doorstep offer).
 pub fn run_conversation(config_path: Option<&Path>) -> anyhow::Result<CliExit> {
     let target = resolve_target(config_path)?;
     let inventory = crate::discovery::discover();
@@ -224,7 +222,6 @@ fn parse_editor_choice(line: &str, revert_available: bool) -> Option<EditorChoic
 /// the config loads or the user keeps it broken. The editor's exit
 /// status is deliberately ignored — re-validation of the file is the
 /// only truth (no editor reports abort reliably).
-#[allow(dead_code)] // Wired in step 7 (doorstep offer).
 fn delve(strategy: &ProposedStrategy, today: NaiveDate, path: &Path) -> anyhow::Result<CliExit> {
     let visual = std::env::var("VISUAL").ok();
     let editor = std::env::var("EDITOR").ok();
@@ -315,7 +312,6 @@ fn kept_invalid(path: &Path) -> anyhow::Error {
 /// the same failure loop without (r)evert — no generated baseline exists
 /// for a hand-edited file. Returns the loaded config on success so init
 /// can continue being the make-whole verb.
-#[allow(dead_code)] // Wired in step 7 (doorstep offer).
 pub fn fix_invalid_config(path: &Path, initial_error: &str) -> anyhow::Result<Config> {
     let visual = std::env::var("VISUAL").ok();
     let editor = std::env::var("EDITOR").ok();
