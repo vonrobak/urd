@@ -65,6 +65,32 @@ updates (only for unit file changes).
 Urd runs as a regular user and calls `sudo btrfs` for privileged filesystem operations.
 A scoped sudoers file grants exactly the permissions needed — nothing more.
 
+**The guided path (recommended): let Urd render and install it.** The sudoers content
+is derived from your config, and `urd` is the single oracle for its shape
+(`src/sudoers.rs` — the module doc carries the full scope rationale). After the Fate
+Conversation carves a config — or any time later — run:
+
+```bash
+urd init
+```
+
+With a config present and no working grant, `urd init` resumes **the earning**: it
+renders the exact file your config requires, checks it with `visudo -c`, shows it to
+you, and — with your consent — installs it fail-closed (staged inertly inside
+`/etc/sudoers.d` under a dot-name sudo ignores, re-validated as root, then activated
+by an atomic rename). It verifies the grant afterwards with a passwordless probe and
+cross-checks coverage via `sudo -l`. If you decline, Urd prints the content and the
+manual command instead; `urd status` names the "configured but unsealed" state until
+the grant exists, and `urd doctor` warns when the installed grant drifts behind a
+grown config.
+
+> **Declined-path note for monitoring operators:** human-invoked `urd` commands
+> (`status`, `init`, `doctor`, bare `urd`) each probe the grant with a single
+> non-interactive `sudo -n` call. On an unsealed system that denied probe writes one
+> auth-log line per invocation — whitelist it or seal. Urd's daemons (sentinel,
+> heartbeat, metrics) never probe.
+
+**The manual path** (also the printed fallback when you refuse the guided install).
 Create `/etc/sudoers.d/urd` (requires root):
 
 ```bash

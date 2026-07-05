@@ -81,7 +81,8 @@ pub fn run(config: Config, args: DoctorArgs, output_mode: OutputMode) -> anyhow:
     };
 
     // ── 2. Infrastructure checks (I/O: DB, dirs, sudo btrfs) ─────
-    let init_checks = init::collect_infrastructure_checks(&config);
+    let sudo_probe = crate::commands::seal::probe_grant(&config.general.btrfs_path);
+    let init_checks = init::collect_infrastructure_checks(&config, &sudo_probe);
     let mut infra_checks: Vec<DoctorCheck> = init_checks
         .into_iter()
         .map(|c| {
@@ -104,6 +105,38 @@ pub fn run(config: Config, args: DoctorArgs, output_mode: OutputMode) -> anyhow:
             }
         })
         .collect();
+
+    // ── Sudoers drift (UPI 071) — three-arm gate (adversary F4) ──
+    // Granted → diff effective privileges against the config's expected
+    // grants; Denied → silent here (the sudo-btrfs check above already
+    // speaks — one cause, one finding); Unclear → an honest cannot-verify
+    // Warn, never a silent skip. Not --thorough-gated: drift causes
+    // failures that look like bugs.
+    let drift_checks = match sudo_probe.0 {
+        crate::sudoers::GrantProbe::Denied => Vec::new(),
+        crate::sudoers::GrantProbe::Unclear => vec![cannot_verify_grant_check(format!(
+            "could not determine the sudo grant state: {}",
+            sudo_probe.1
+        ))],
+        crate::sudoers::GrantProbe::Granted => {
+            let listing = std::process::Command::new("sudo")
+                .env("LC_ALL", "C")
+                .args(["-n", "-l"])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+            build_sudoers_drift_checks(&config, listing.as_deref())
+        }
+    };
+    for check in &drift_checks {
+        match check.status {
+            DoctorCheckStatus::Warn => warn_count += 1,
+            DoctorCheckStatus::Error => error_count += 1,
+            DoctorCheckStatus::Ok => {}
+        }
+    }
+    infra_checks.extend(drift_checks);
 
     // UUID fingerprinting checks for mounted drives
     for (label, _uuid, snippet) in drives::check_missing_uuids(&config.drives) {
@@ -339,6 +372,95 @@ pub fn run(config: Config, args: DoctorArgs, output_mode: OutputMode) -> anyhow:
     print!("{}", voice::render_doctor(&output, output_mode));
 
     Ok(())
+}
+
+/// The honest-skip row for a drift check that cannot run: never a silent
+/// pass (arc grill; adversary F4).
+fn cannot_verify_grant_check(detail: String) -> DoctorCheck {
+    DoctorCheck {
+        name: "sudoers drift".to_string(),
+        status: DoctorCheckStatus::Warn,
+        detail: Some(detail),
+        suggestion: Some(
+            "Run `sudo -l` yourself, or re-run `urd doctor` after `sudo -v`.".to_string(),
+        ),
+    }
+}
+
+/// Diff the config's expected grants (`sudoers::expected_grant_lines`, the
+/// single oracle) against effective privileges from `sudo -n -l`. Pure
+/// over the injected listing text; the subprocess stays in `run()`.
+/// `listing = None` means the listing needed a password or failed to run.
+fn build_sudoers_drift_checks(config: &Config, listing: Option<&str>) -> Vec<DoctorCheck> {
+    let expected = match crate::sudoers::expected_grant_lines(config) {
+        Ok(expected) => expected,
+        // A config the oracle refuses to render (hostile characters,
+        // shallow scopes) is its own advisory — nothing to diff against.
+        Err(refusal) => {
+            return vec![DoctorCheck {
+                name: "sudoers drift".to_string(),
+                status: DoctorCheckStatus::Warn,
+                detail: Some(refusal.to_string()),
+                suggestion: Some("Fix the named config value, then re-run `urd init`.".to_string()),
+            }];
+        }
+    };
+    let Some(listing) = listing else {
+        return vec![cannot_verify_grant_check(
+            "the privilege listing needs a password (sudo -n -l) — cannot verify \
+             the grant against the config without interaction"
+                .to_string(),
+        )];
+    };
+    let listing = match crate::sudoers::parse_privilege_listing(listing) {
+        Ok(listing) => listing,
+        Err(uncertain) => return vec![cannot_verify_grant_check(uncertain.reason)],
+    };
+    match crate::sudoers::coverage(&expected, &listing) {
+        crate::sudoers::Coverage::AllCovered => vec![DoctorCheck {
+            name: "sudoers grant covers the config".to_string(),
+            status: DoctorCheckStatus::Ok,
+            detail: None,
+            suggestion: None,
+        }],
+        crate::sudoers::Coverage::CannotInterpret { reason } => {
+            vec![cannot_verify_grant_check(reason)]
+        }
+        crate::sudoers::Coverage::Gaps { missing, uncertain } => {
+            let mut checks: Vec<DoctorCheck> = missing
+                .into_iter()
+                .map(|spec| DoctorCheck {
+                    name: "sudoers drift".to_string(),
+                    status: DoctorCheckStatus::Warn,
+                    detail: Some(format!(
+                        "no grant covers `{spec}` — a config mapping the installed \
+                         sudoers file predates"
+                    )),
+                    suggestion: Some(
+                        "Run `urd init` to re-render and reinstall the grant.".to_string(),
+                    ),
+                })
+                .collect();
+            if !uncertain.is_empty() {
+                checks.push(DoctorCheck {
+                    name: "sudoers drift".to_string(),
+                    status: DoctorCheckStatus::Warn,
+                    detail: Some(format!(
+                        "{} config mapping(s) have no exact covering grant, but broader \
+                         wildcard grants exist that urd does not interpret: {}",
+                        uncertain.len(),
+                        uncertain.join("; ")
+                    )),
+                    suggestion: Some(
+                        "Compare `sudo -l` against the config yourself, or run `urd init` \
+                         to install the exact scoped grant."
+                            .to_string(),
+                    ),
+                });
+            }
+            checks
+        }
+    }
 }
 
 /// Build the `--thorough` Retention-section advisories (#125): one `DoctorCheck`
@@ -728,6 +850,91 @@ fn unpack_advice(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Sudoers drift (UPI 071) ────────────────────────────────────────
+
+    fn drift_config() -> Config {
+        Config::from_str(
+            r#"
+[general]
+config_version = 2
+run_frequency = "daily"
+
+[[subvolumes]]
+name = "docs"
+source = "/data/docs"
+snapshot_root = "/data/.snapshots"
+protection = "recorded"
+"#,
+        )
+        .unwrap()
+    }
+
+    fn listing_of(specs: &[String]) -> String {
+        let rules: String = specs
+            .iter()
+            .map(|s| format!("    (root) NOPASSWD: {s}\n"))
+            .collect();
+        format!("User alice may run the following commands on example-host:\n{rules}")
+    }
+
+    #[test]
+    fn drift_all_covered_renders_one_ok_row() {
+        let config = drift_config();
+        let expected = crate::sudoers::expected_grant_lines(&config).unwrap();
+        let checks = build_sudoers_drift_checks(&config, Some(&listing_of(&expected)));
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].status, DoctorCheckStatus::Ok);
+        assert!(checks[0].name.contains("covers the config"));
+    }
+
+    #[test]
+    fn drift_missing_mapping_warns_with_the_reinstall_verb() {
+        let config = drift_config();
+        let expected: Vec<String> = crate::sudoers::expected_grant_lines(&config)
+            .unwrap()
+            .into_iter()
+            .filter(|s| !s.contains(" delete "))
+            .collect();
+        let checks = build_sudoers_drift_checks(&config, Some(&listing_of(&expected)));
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].status, DoctorCheckStatus::Warn);
+        let detail = checks[0].detail.as_deref().unwrap();
+        assert!(detail.contains("subvolume delete /data/.snapshots/*"), "{detail}");
+        let suggestion = checks[0].suggestion.as_deref().unwrap();
+        assert!(suggestion.contains("urd init"), "{suggestion}");
+    }
+
+    #[test]
+    fn drift_wildcard_grants_are_honest_uncertainty_not_missing() {
+        let config = drift_config();
+        let mut specs: Vec<String> = crate::sudoers::expected_grant_lines(&config)
+            .unwrap()
+            .into_iter()
+            .filter(|s| !s.contains("snapshot -r"))
+            .collect();
+        specs.push("/usr/sbin/btrfs subvolume snapshot -r /data/* /data/.snapshots/*".to_string());
+        let checks = build_sudoers_drift_checks(&config, Some(&listing_of(&specs)));
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].status, DoctorCheckStatus::Warn);
+        let detail = checks[0].detail.as_deref().unwrap();
+        assert!(detail.contains("does not interpret"), "{detail}");
+    }
+
+    #[test]
+    fn drift_unlistable_is_an_honest_skip_never_silent() {
+        let checks = build_sudoers_drift_checks(&drift_config(), None);
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].status, DoctorCheckStatus::Warn);
+        assert!(checks[0].detail.as_deref().unwrap().contains("password"));
+    }
+
+    #[test]
+    fn drift_unparseable_listing_is_an_honest_skip() {
+        let checks = build_sudoers_drift_checks(&drift_config(), Some("garbage output"));
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].status, DoctorCheckStatus::Warn);
+    }
 
     // ── unpack_advice (UPI 029 Change 4, via 079-c) ───────────────────
 

@@ -19,6 +19,7 @@ pub mod migrate;
 pub mod init;
 pub mod plan_cmd;
 pub mod retention_preview;
+pub mod seal;
 pub mod status;
 pub mod sentinel;
 pub mod storage_signals;

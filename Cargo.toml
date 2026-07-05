@@ -30,9 +30,12 @@ anyhow = "1"
 uuid = { version = "1", features = ["v4"] }
 
 # System
-nix = { version = "0.31", features = ["fs", "poll"] }
+nix = { version = "0.31", features = ["fs", "poll", "user"] }
 dirs = "6"
 ctrlc = "3"
+# The earning (UPI 071) stages the rendered sudoers file unprivileged
+# before the visudo gate — production use, not just tests.
+tempfile = "3"
 
 # Output formatting
 colored = "3"
@@ -40,8 +43,6 @@ colored = "3"
 log = "0.4"
 env_logger = "0.11"
 
-[dev-dependencies]
-tempfile = "3"
 
 # Integration tests live under tests/integration/ (CLAUDE.md convention) and are
 # #[ignore]'d by default (they build + shell out to the binary). Run with

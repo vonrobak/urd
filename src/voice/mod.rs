@@ -51,8 +51,11 @@ pub use doctor::render_doctor;
 pub use drives::{render_drives_adopt, render_drives_list};
 pub use emergency::{render_emergency, render_emergency_result};
 pub use encounter::{
-    render_editor_failure, render_farewell, render_invalid_notice, render_no_editor,
-    render_post_carve, render_prompt,
+    render_earning_already, render_earning_coverage_unconfirmed, render_earning_declined,
+    render_earning_deferred, render_earning_installed, render_earning_request,
+    render_earning_unavailable, render_earning_verify_failed, render_editor_failure,
+    render_farewell, render_invalid_notice, render_no_editor, render_post_carve,
+    render_prompt, render_visudo_refusal,
 };
 pub use get::render_get;
 pub use history::{render_events, render_history, render_subvolume_history};
@@ -463,6 +466,7 @@ pub(crate) mod test_fixtures {
 
     pub(crate) fn test_status_output() -> StatusOutput {
         StatusOutput {
+            unsealed: false,
             assessments: vec![
                 StatusAssessment {
                     name: "htpc-home".to_string(),
@@ -694,6 +698,7 @@ pub(crate) mod test_fixtures {
 
     pub(crate) fn test_default_status_output() -> DefaultStatusOutput {
         DefaultStatusOutput {
+            unsealed: false,
             total: 4,
             waning_names: vec![],
             exposed_names: vec![],

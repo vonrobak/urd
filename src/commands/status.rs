@@ -32,6 +32,10 @@ pub fn run(config: Config, output_mode: OutputMode) -> anyhow::Result<()> {
     };
     let drive_labels: Vec<String> = config.drives.iter().map(|d| d.label.clone()).collect();
 
+    // ── The seal (UPI 071) ──────────────────────────────────────────
+    // "Configured but unsealed" is a named state, not a degraded render.
+    let unsealed = crate::commands::seal::probe_unsealed(&config, output_mode);
+
     // ── Awareness model ─────────────────────────────────────────────
     let now = chrono::Local::now().naive_local();
     // Gather storage signals (read-only) and thread the per-subvol map into
@@ -90,6 +94,7 @@ pub fn run(config: Config, output_mode: OutputMode) -> anyhow::Result<()> {
         total_pins,
         &config,
         now,
+        unsealed,
     );
 
     let rendered = voice::render_status(&status_output, output_mode);
@@ -118,6 +123,7 @@ fn assemble_status_output(
     total_pins: usize,
     config: &Config,
     now: NaiveDateTime,
+    unsealed: bool,
 ) -> StatusOutput {
     // ── Chain health per subvolume (derived from awareness assessment) ──
     let chain_health_entries: Vec<ChainHealthEntry> = assessments
@@ -188,6 +194,7 @@ fn assemble_status_output(
         advice,
         storage_postures,
         storage_adaptations,
+        unsealed,
     }
 }
 
@@ -303,7 +310,28 @@ local_retention = "transient"
             0,
             config,
             dt(2026, 6, 10, 12, 0),
+            false,
         )
+    }
+
+    #[test]
+    fn assemble_threads_the_unsealed_state() {
+        // UPI 071: the banner's substance travels through the pure
+        // assembler untouched — probe at the edge, truth in the middle.
+        let config = test_config();
+        let out = assemble_status_output(
+            &[],
+            vec![],
+            vec![],
+            vec![],
+            None,
+            0,
+            &config,
+            dt(2026, 6, 10, 12, 0),
+            true,
+        );
+        assert!(out.unsealed);
+        assert!(!assemble(&[], &config).unsealed);
     }
 
     // ── Chain-health worst-selection ────────────────────────────────
@@ -486,6 +514,7 @@ local_retention = "transient"
             0,
             &test_config(),
             dt(2026, 6, 10, 12, 0),
+            false,
         );
         assert_eq!(out.last_run_age_secs, Some(7200));
     }
