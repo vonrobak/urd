@@ -718,6 +718,24 @@ pub fn render_earning_already() -> String {
     )
 }
 
+/// The grant answers but the config has outgrown it: name the lines no
+/// grant covers, then the same asking follows with the full re-render.
+#[must_use]
+pub fn render_earning_regrant(missing: &[String]) -> String {
+    let mut out = String::new();
+    writeln!(out).ok();
+    writeln!(
+        out,
+        "{} Root leave answers, but the config has outgrown it — no grant covers:",
+        "The grant has drifted.".bold()
+    )
+    .ok();
+    for line in missing {
+        writeln!(out, "    {line}").ok();
+    }
+    out
+}
+
 /// `q) not now`: the user saw the content and deferred — no re-print,
 /// just the honest state and the resume verb.
 #[must_use]
@@ -1488,6 +1506,20 @@ mod tests {
         let deferred = render_earning_deferred();
         assert!(deferred.contains("not in force"), "{deferred}");
         assert!(deferred.contains("urd init"), "{deferred}");
+    }
+
+    #[test]
+    fn earning_regrant_names_every_missing_line() {
+        let _color = color_guard(false);
+        let missing = vec![
+            "/usr/sbin/btrfs subvolume list *".to_string(),
+            "/usr/sbin/btrfs sync /mnt".to_string(),
+        ];
+        let out = render_earning_regrant(&missing);
+        assert!(out.contains("outgrown"), "{out}");
+        for line in &missing {
+            assert!(out.contains(line), "{out}");
+        }
     }
 
     #[test]

@@ -490,10 +490,11 @@ fn build_sudoers_drift_checks(config: &Config, listing: Option<&str>) -> Vec<Doc
                         uncertain.len(),
                         uncertain.join("; ")
                     )),
+                    // No `urd init` here: the resume verb acts only on
+                    // definitively missing lines — a hand-managed wildcard
+                    // grant is honest uncertainty, never a nag (071).
                     suggestion: Some(
-                        "Compare `sudo -l` against the config yourself, or run `urd init` \
-                         to install the exact scoped grant."
-                            .to_string(),
+                        "Compare `sudo -l` against the config yourself.".to_string(),
                     ),
                 });
             }
@@ -1161,6 +1162,11 @@ protection = "recorded"
         assert_eq!(checks[0].status, DoctorCheckStatus::Warn);
         let detail = checks[0].detail.as_deref().unwrap();
         assert!(detail.contains("does not interpret"), "{detail}");
+        // Uncertainty never points at the resume verb: `urd init`'s deep
+        // gate acts only on definitively missing lines, so naming it here
+        // would be a dead suggestion (and a nag for hand-managed grants).
+        let suggestion = checks[0].suggestion.as_deref().unwrap();
+        assert!(!suggestion.contains("urd init"), "{suggestion}");
     }
 
     #[test]
