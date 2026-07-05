@@ -27,16 +27,20 @@ to suppress colors even on a TTY.
 
 ### Exit codes
 
-All commands return the standard Unix convention:
-
 - **0** — success or advisory output only (warnings do not raise).
 - **1** — failure. Either an `anyhow::Error` propagated from the command,
   or an explicit `std::process::exit(1)` for partial-success cases (see
   `backup` and `verify` below).
+- **2** — reserved by clap for usage errors (bad flags, unknown
+  subcommands).
+- **3** — not configured. No config file exists at the resolved path; the
+  command printed a one-sentence pointer at `urd init` (JSON
+  `{"status":"not_configured"}` in daemon mode) and did nothing. Scriptable:
+  `urd status; test $? -eq 3` distinguishes "unconfigured" from "broken".
 
-There is no richer code mapping. Distinguish failure causes by parsing the
-diagnostic message or, for monitoring, by reading the heartbeat / metrics
-files instead of the exit code.
+Beyond these, distinguish failure causes by parsing the diagnostic message
+or, for monitoring, by reading the heartbeat / metrics files instead of the
+exit code.
 
 ### stdout vs stderr
 
@@ -57,8 +61,12 @@ files instead of the exit code.
 Each subcommand declares whether it requires a config load:
 
 - **No config required:** `completions`, `migrate`. Run on a fresh system.
-- **Config required:** all other subcommands. A missing or invalid config
-  fails fast with a diagnostic; no partial behavior.
+- **Config offered:** bare `urd` and `urd init` — with no config and a
+  terminal on both stdin and stdout, they offer the Encounter (the guided
+  first-time conversation); otherwise they print the pointer and exit 3.
+- **Config required:** all other subcommands. A missing config prints one
+  pointer sentence and exits 3; an invalid config fails fast with a
+  diagnostic; no partial behavior.
 
 ---
 
@@ -66,14 +74,17 @@ Each subcommand declares whether it requires a config load:
 
 ### `urd` (no subcommand)
 
-**Contract.** Bare `urd` invocation prints orientation: project name, version,
-config status, and a one-screen summary of what to try next. Falls back to
-help-style output when config is absent or invalid. Never modifies state.
+**Contract.** With a config: a one-screen promise summary (compact status).
+Without one: offers the Encounter when a human is on both ends (stdin and
+stdout are terminals); otherwise prints the pointer and exits 3. Declining
+or quitting the Encounter writes nothing — the config file appears only at
+the carve, after explicit approval of the runestone.
 
-**Output.** Stdout — text orientation block.
+**Output.** Stdout — text; `{"status":"not_configured"}` in daemon mode.
 
-**Exit codes.** `0` always (no operation can fail; missing config is a
-displayable state, not an error).
+**Exit codes.** `0` with a config, or after a declined/quit/carved
+Encounter; `3` when unconfigured and no conversation is possible; `1` on
+real failures (including a carve refusal).
 
 ---
 
@@ -193,15 +204,24 @@ part of `urd doctor --thorough`.
 
 ### `urd init`
 
-**Contract.** Sets up Urd's environment: ensures the state DB directory and
-heartbeat directory exist, runs the same infrastructure checks `doctor`
-runs, and exits cleanly. Idempotent — safe to run multiple times. May
-prompt for sudo if the configured `btrfs_path` requires testing.
+**Contract.** The idempotent make-whole verb. No config → offers the
+Encounter (pointer + exit 3 without a terminal on both ends). Invalid
+config + terminal → the fix-it loop ((e)dit in `$VISUAL`/`$EDITOR` /
+(q)uit keeping the file, error named), then continues into the checks;
+I/O failures (permissions) always surface instead. With a loadable
+config: ensures the state DB directory and heartbeat directory exist,
+runs the same infrastructure checks `doctor` runs, and exits cleanly.
+Safe to run multiple times. May prompt for sudo if the configured
+`btrfs_path` requires testing.
 
-**Output.** Interactive — checklist of infrastructure items.
+**Output.** Interactive — the conversation or the checklist of
+infrastructure items; `{"status":"not_configured"}` in daemon mode
+when unconfigured.
 
-**Exit codes.** `0` on success; `1` if any required infrastructure
-cannot be created or verified.
+**Exit codes.** `0` on success (including a declined/quit Encounter);
+`3` unconfigured without a conversation; `1` if the config stays
+invalid (fix-it quit) or required infrastructure cannot be created or
+verified.
 
 ---
 

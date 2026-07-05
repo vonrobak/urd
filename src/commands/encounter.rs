@@ -1,8 +1,8 @@
-//! The Encounter's carve wiring (UPI 074) — the I/O half of config
-//! generation. The conversation that produces the approved strategy is
-//! UPI 072's; this module owns the last step: self-check the generated
-//! config, refuse anything dishonest, and publish the file atomically
-//! without ever clobbering an existing one.
+//! The Encounter's I/O: the thin stdin loop that drives the pure state
+//! machine (`encounter.rs`, UPI 072), the delve-deeper editor loop, and
+//! the carve (UPI 074) — self-check the generated config, refuse
+//! anything dishonest, and publish the file atomically without ever
+//! clobbering an existing one.
 //!
 //! Refusal order is load-bearing: the checks that touch nothing (empty
 //! strategy, self-check) run before any filesystem side effect.
@@ -14,9 +14,14 @@ use std::path::Path;
 use anyhow::{bail, Context};
 use chrono::NaiveDate;
 
+use crate::commands::CliExit;
 use crate::config::Config;
 use crate::config_render::generate_config;
+use crate::encounter::{
+    advance, parse_line, AdvanceResult, AfterCarve, Effect, EncounterState, Input,
+};
 use crate::strategy::ProposedStrategy;
+use crate::voice;
 
 /// Staging file for the atomic publish, sibling to the final config.
 const TEMP_NAME: &str = ".urd.toml.tmp";
@@ -26,7 +31,6 @@ const TEMP_NAME: &str = ".urd.toml.tmp";
 /// existing config is never overwritten (deleting a config is a human
 /// act — the designed refusal sentence is 072's trigger-time rendering,
 /// this one is the race backstop).
-#[allow(dead_code)] // Consumed by UPI 072 (conversation).
 pub fn carve_config(
     strategy: &ProposedStrategy,
     today: NaiveDate,
@@ -39,29 +43,7 @@ pub fn carve_config(
         bail!("the encounter proposed nothing to protect — nothing to carve, nothing written");
     }
 
-    let generated = generate_config(strategy, today);
-
-    // Self-check, migrate's pattern plus the equality half: the rendered
-    // TOML must survive the full load path (parse → expand_paths →
-    // validate) AND reload to exactly the config it was rendered from.
-    // Parse+validate alone would pass a divergent-but-valid render (e.g. a
-    // non-UTF-8 path rendered lossily names a phantom source) — a config
-    // that differs from what the runestone showed must never reach disk.
-    let reparsed = match Config::from_str(&generated.toml) {
-        Ok(config) => config,
-        Err(e) => bail!(
-            "the encounter would produce an invalid config — nothing written.\n\
-             load check: {e}"
-        ),
-    };
-    let mut expected = generated.config;
-    expected.expand_paths();
-    if reparsed != expected {
-        bail!(
-            "the carved config would not reload to the approved strategy — nothing written.\n\
-             (render/parse divergence: a bug in urd, not in your answers)"
-        );
-    }
+    let (toml, _expected) = checked_toml(strategy, today)?;
 
     if path.exists() {
         return Err(exists_refusal(path));
@@ -77,7 +59,7 @@ pub fn carve_config(
     // with AlreadyExists instead of clobbering, so a config that appeared
     // mid-carve survives and the carve loses loudly.
     let temp = dir.join(TEMP_NAME);
-    stage(&temp, &generated.toml)
+    stage(&temp, &toml)
         .with_context(|| format!("failed to stage config at {}", temp.display()))?;
 
     if let Err(e) = fs::hard_link(&temp, path) {
@@ -92,12 +74,271 @@ pub fn carve_config(
     Ok(())
 }
 
+/// Generate and self-check the TOML for an approved strategy: migrate's
+/// pattern plus the equality half. The rendered TOML must survive the
+/// full load path (parse → expand_paths → validate) AND reload to
+/// exactly the config it was rendered from — parse+validate alone would
+/// pass a divergent-but-valid render (e.g. a non-UTF-8 path rendered
+/// lossily names a phantom source). A config that differs from what the
+/// runestone showed must never reach disk.
+fn checked_toml(strategy: &ProposedStrategy, today: NaiveDate) -> anyhow::Result<(String, Config)> {
+    let generated = generate_config(strategy, today);
+    let reparsed = match Config::from_str(&generated.toml) {
+        Ok(config) => config,
+        Err(e) => bail!(
+            "the encounter would produce an invalid config — nothing written.\n\
+             load check: {e}"
+        ),
+    };
+    let mut expected = generated.config;
+    expected.expand_paths();
+    if reparsed != expected {
+        bail!(
+            "the carved config would not reload to the approved strategy — nothing written.\n\
+             (render/parse divergence: a bug in urd, not in your answers)"
+        );
+    }
+    Ok((generated.toml, expected))
+}
+
 /// Write and fsync the staged config, truncating any stale temp a crashed
 /// carve left behind.
 fn stage(temp: &Path, toml: &str) -> std::io::Result<()> {
     let mut file = fs::File::create(temp)?;
     file.write_all(toml.as_bytes())?;
     file.sync_all()
+}
+
+// ── The conversation loop (UPI 072) ─────────────────────────────────────
+
+/// Run the Fate Conversation: discover, walk the pure machine over
+/// stdin, and execute its terminal effect (carve + confirm, carve +
+/// editor, or farewell). The loop itself stays thin — every decision
+/// lives in `encounter.rs` (test the functions, not readline).
+pub fn run_conversation(config_path: Option<&Path>) -> anyhow::Result<CliExit> {
+    let target = crate::commands::resolve_config_path(config_path)?;
+    let inventory = crate::discovery::discover();
+    let today = chrono::Local::now().date_naive();
+    let mut result = EncounterState::begin(inventory, today);
+    loop {
+        let AdvanceResult {
+            state,
+            effect,
+            notice,
+        } = result;
+        if let Some(notice) = &notice {
+            print!("{}", voice::render_invalid_notice(notice));
+        }
+        match effect {
+            Effect::Prompt(spec) => {
+                print!("{}", voice::render_prompt(&spec));
+                let input = match read_input_line()? {
+                    // Closing stdin is walking away.
+                    None => Input::Quit,
+                    Some(line) => parse_line(&spec, &line),
+                };
+                result = advance(state, input);
+            }
+            Effect::Farewell(kind) => {
+                print!("{}", voice::render_farewell(&kind));
+                return Ok(CliExit::Done);
+            }
+            Effect::Carve {
+                strategy,
+                today,
+                then,
+            } => {
+                // A carve refusal (config appeared mid-conversation, or a
+                // self-check failure) surfaces as the error it is —
+                // nothing was written, the sentence says so.
+                carve_config(&strategy, today, &target)?;
+                return match then {
+                    AfterCarve::Confirm => {
+                        print!("{}", voice::render_post_carve(&target));
+                        Ok(CliExit::Done)
+                    }
+                    AfterCarve::Edit => delve(&strategy, today, &target),
+                };
+            }
+        }
+    }
+}
+
+/// One line from stdin; `None` on EOF. Prompts end without a newline
+/// marker, so flush before blocking.
+fn read_input_line() -> anyhow::Result<Option<String>> {
+    print!("> ");
+    std::io::stdout().flush().ok();
+    let mut line = String::new();
+    let n = std::io::stdin()
+        .read_line(&mut line)
+        .context("failed to read from stdin")?;
+    Ok(if n == 0 { None } else { Some(line) })
+}
+
+// ── Delve deeper: the editor loop (UPI 072, arc grill Q7) ──────────────
+
+/// The user's choice in the visudo-shaped failure loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditorChoice {
+    EditAgain,
+    Revert,
+    QuitKeep,
+}
+
+/// Resolve which editor to launch: `$VISUAL`, then `$EDITOR`, split on
+/// whitespace (first token = program, rest = args; no shell
+/// interpretation — a quoted-argument editor value is a documented
+/// limitation). `None` when neither is set or both are blank.
+fn resolve_editor(visual: Option<&str>, editor: Option<&str>) -> Option<Vec<String>> {
+    [visual, editor]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|v| !v.is_empty())
+        .map(|v| v.split_whitespace().map(str::to_string).collect())
+}
+
+/// Classify one line of the failure-loop prompt. Enter defaults to
+/// edit-again; `r` exists only while a generated baseline does.
+fn parse_editor_choice(line: &str, revert_available: bool) -> Option<EditorChoice> {
+    match line.trim().to_lowercase().as_str() {
+        "" | "e" => Some(EditorChoice::EditAgain),
+        "r" if revert_available => Some(EditorChoice::Revert),
+        "q" => Some(EditorChoice::QuitKeep),
+        _ => None,
+    }
+}
+
+/// Delve deeper: open the carved file in the user's editor, re-validate
+/// on exit, and walk the (e)dit / (r)evert / (q)uit failure loop until
+/// the config loads or the user keeps it broken. The editor's exit
+/// status is deliberately ignored — re-validation of the file is the
+/// only truth (no editor reports abort reliably).
+fn delve(strategy: &ProposedStrategy, today: NaiveDate, path: &Path) -> anyhow::Result<CliExit> {
+    let Some(command) = editor_from_env() else {
+        // The file is already carved and valid — keeping it is the
+        // honest fallback, never deletion.
+        print!("{}", voice::render_no_editor(path));
+        return Ok(CliExit::Done);
+    };
+    delve_with(&command, strategy, today, path)
+}
+
+/// `resolve_editor` over the live environment — the only env read in
+/// this module, shared by delve and the fix-it loop.
+fn editor_from_env() -> Option<Vec<String>> {
+    let visual = std::env::var("VISUAL").ok();
+    let editor = std::env::var("EDITOR").ok();
+    resolve_editor(visual.as_deref(), editor.as_deref())
+}
+
+/// Launch the editor on the file and wait. The exit status is
+/// deliberately dropped: re-validation of the file is the only truth.
+fn open_in_editor(command: &[String], path: &Path) -> anyhow::Result<()> {
+    std::process::Command::new(&command[0])
+        .args(&command[1..])
+        .arg(path)
+        .status()
+        .with_context(|| format!("failed to launch editor `{}`", command[0]))?;
+    Ok(())
+}
+
+fn delve_with(
+    command: &[String],
+    strategy: &ProposedStrategy,
+    today: NaiveDate,
+    path: &Path,
+) -> anyhow::Result<CliExit> {
+    loop {
+        open_in_editor(command, path)?;
+        let error = match Config::load(Some(path)) {
+            Ok(_) => {
+                print!("{}", voice::render_post_carve(path));
+                return Ok(CliExit::Done);
+            }
+            Err(e) => e.to_string(),
+        };
+        match failure_loop_choice(&error, true)? {
+            EditorChoice::EditAgain => {}
+            EditorChoice::Revert => {
+                overwrite_with_generated(strategy, today, path)?;
+                print!("{}", voice::render_post_carve(path));
+                return Ok(CliExit::Done);
+            }
+            EditorChoice::QuitKeep => return Err(kept_invalid(path)),
+        }
+    }
+}
+
+/// Prompt the failure loop until a usable letter arrives. EOF keeps the
+/// file (the least destructive reading of a closed stdin).
+fn failure_loop_choice(error: &str, revert_available: bool) -> anyhow::Result<EditorChoice> {
+    loop {
+        print!("{}", voice::render_editor_failure(error, revert_available));
+        let Some(line) = read_input_line()? else {
+            return Ok(EditorChoice::QuitKeep);
+        };
+        if let Some(choice) = parse_editor_choice(&line, revert_available) {
+            return Ok(choice);
+        }
+    }
+}
+
+/// Replace the file with the freshly generated, self-checked TOML — the
+/// one place 072 intentionally overwrites, and only on the user's
+/// explicit (r)evert. Never routed through `carve_config`, whose
+/// no-clobber contract stays absolute.
+fn overwrite_with_generated(
+    strategy: &ProposedStrategy,
+    today: NaiveDate,
+    path: &Path,
+) -> anyhow::Result<()> {
+    let (toml, _expected) = checked_toml(strategy, today)?;
+    let dir = path
+        .parent()
+        .with_context(|| format!("config path {} has no parent directory", path.display()))?;
+    let temp = dir.join(TEMP_NAME);
+    stage(&temp, &toml)
+        .with_context(|| format!("failed to stage config at {}", temp.display()))?;
+    fs::rename(&temp, path)
+        .with_context(|| format!("failed to restore config at {}", path.display()))
+}
+
+fn kept_invalid(path: &Path) -> anyhow::Error {
+    anyhow::anyhow!(
+        "the config at {} does not load — kept as you left it.\n\
+         `urd init` returns to this fix-it loop.",
+        path.display()
+    )
+}
+
+/// `urd init`'s fix-it re-entry for an invalid config (arc grill Q5/Q7):
+/// the same failure loop without (r)evert — no generated baseline exists
+/// for a hand-edited file. Returns the loaded config on success so init
+/// can continue being the make-whole verb.
+pub fn fix_invalid_config(path: &Path, initial_error: &str) -> anyhow::Result<Config> {
+    let Some(command) = editor_from_env() else {
+        print!("{}", voice::render_no_editor(path));
+        bail!(
+            "the config at {} does not load: {initial_error}",
+            path.display()
+        );
+    };
+    let mut error = initial_error.to_string();
+    loop {
+        match failure_loop_choice(&error, false)? {
+            // Revert is never offered without a baseline; if it somehow
+            // arrived it would mean edit-again, the safe reading.
+            EditorChoice::EditAgain | EditorChoice::Revert => {}
+            EditorChoice::QuitKeep => return Err(kept_invalid(path)),
+        }
+        open_in_editor(&command, path)?;
+        match Config::load(Some(path)) {
+            Ok(config) => return Ok(config),
+            Err(e) => error = e.to_string(),
+        }
+    }
 }
 
 fn exists_refusal(path: &Path) -> anyhow::Error {
@@ -284,5 +525,112 @@ mod tests {
         let mut expected = crate::config_render::generate_config(&strategy, today()).config;
         expected.expand_paths();
         assert_eq!(reloaded, expected);
+    }
+
+    // ── checked_toml / conversation-loop pieces (UPI 072) ───────────────
+
+    #[test]
+    fn checked_toml_matches_what_carve_writes() {
+        let strategy = sheltered_strategy();
+        let (toml, expected) = checked_toml(&strategy, today()).unwrap();
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("urd.toml");
+        carve_config(&strategy, today(), &path).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), toml);
+
+        let reloaded = Config::from_str(&toml).unwrap();
+        assert_eq!(reloaded, expected);
+    }
+
+    #[test]
+    fn resolve_editor_prefers_visual_then_editor_then_none() {
+        assert_eq!(
+            resolve_editor(Some("code --wait"), Some("vi")),
+            Some(vec!["code".to_string(), "--wait".to_string()])
+        );
+        assert_eq!(
+            resolve_editor(None, Some("nano")),
+            Some(vec!["nano".to_string()])
+        );
+        assert_eq!(
+            resolve_editor(Some("  "), Some("vi")),
+            Some(vec!["vi".to_string()]),
+            "blank VISUAL falls through to EDITOR"
+        );
+        assert_eq!(resolve_editor(None, None), None);
+        assert_eq!(resolve_editor(Some(""), Some("   ")), None);
+    }
+
+    #[test]
+    fn parse_editor_choice_defaults_to_edit_and_gates_revert() {
+        assert_eq!(parse_editor_choice("", true), Some(EditorChoice::EditAgain));
+        assert_eq!(parse_editor_choice("e", true), Some(EditorChoice::EditAgain));
+        assert_eq!(parse_editor_choice("E", true), Some(EditorChoice::EditAgain));
+        assert_eq!(parse_editor_choice("r", true), Some(EditorChoice::Revert));
+        assert_eq!(
+            parse_editor_choice("r", false),
+            None,
+            "revert must not exist without a generated baseline"
+        );
+        assert_eq!(parse_editor_choice("q", true), Some(EditorChoice::QuitKeep));
+        assert_eq!(parse_editor_choice("x", true), None);
+    }
+
+    #[test]
+    fn overwrite_with_generated_restores_the_carved_content() {
+        let strategy = sheltered_strategy();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("urd.toml");
+        carve_config(&strategy, today(), &path).unwrap();
+        let carved = std::fs::read_to_string(&path).unwrap();
+
+        std::fs::write(&path, "ruined by an edit [[[").unwrap();
+        overwrite_with_generated(&strategy, today(), &path).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), carved);
+        assert!(!dir.path().join(TEMP_NAME).exists(), "temp not cleaned up");
+        assert!(Config::load(Some(&path)).is_ok());
+    }
+
+    #[test]
+    fn delve_with_a_clean_editor_exit_confirms_the_valid_file() {
+        // /bin/true touches nothing: the carved file stays valid and the
+        // delve ends confirmed — the editor's exit status is not what
+        // decides, the file's validity is.
+        let strategy = sheltered_strategy();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("urd.toml");
+        carve_config(&strategy, today(), &path).unwrap();
+
+        let result = delve_with(&["/bin/true".to_string()], &strategy, today(), &path);
+        assert_eq!(result.unwrap(), CliExit::Done);
+        assert!(Config::load(Some(&path)).is_ok());
+    }
+
+    #[test]
+    fn delve_with_a_ruining_editor_keeps_the_file_on_eof() {
+        // An "editor" that writes garbage puts the loop into the failure
+        // prompt; test stdin is at EOF, which reads as quit-keeping-the-
+        // file: the error is named, the user's bytes survive.
+        let strategy = sheltered_strategy();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("urd.toml");
+        carve_config(&strategy, today(), &path).unwrap();
+
+        let script = dir.path().join("ruin.sh");
+        std::fs::write(&script, "#!/bin/sh\necho 'ruined [[[' > \"$1\"\n").unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+
+        let result = delve_with(&[script.display().to_string()], &strategy, today(), &path);
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("kept as you left it"), "{err}");
+        assert!(
+            std::fs::read_to_string(&path).unwrap().contains("ruined"),
+            "the user's keystrokes must survive"
+        );
     }
 }

@@ -8,6 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **The Fate Conversation + entry trigger (UPI 072, Encounter arc 3/9).** The
+  Encounter is now reachable: bare `urd` or `urd init` with no config and a
+  terminal on both ends offers a guided first-time conversation — Urd looks at
+  what the machine holds (pools, subvolumes, drives, honest notes), asks only
+  questions whose answers change the derived config (per-subvolume importance
+  with a proposed default, one granularity scene, a conditional residence
+  scene, one question per ambiguous drive), and presents the runestone: the
+  proposed promises, adopted drives (every disk of a multi-device pool named),
+  the gaps this setup cannot survive, and what was left out. Accepting carves
+  the config; delve-deeper carves then opens `$VISUAL`/`$EDITOR` on the real
+  file with a visudo-shaped re-validate loop ((e)dit / (r)evert to generated /
+  (q)uit keeping the file). Quitting anywhere writes nothing. `urd init` is
+  the make-whole verb: an invalid config re-enters the fix-it loop on a
+  terminal. Machines with no btrfs (or only locked drives) get one honest
+  report, never a conversation about nothing. New pure state machine
+  (`encounter`) + renderer (`voice/encounter`) + stdin loop; ~100 new tests
+  including grid-wide question-economy and runestone↔strategy properties.
+
 - **Config generation + self-check (UPI 074, Encounter arc 5/9).** New
   `config_render` module converts an approved `ProposedStrategy` into a fully
   explicit, commented v2 config — intention comments anchored to the subvolume
@@ -40,7 +58,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the conversation to resolve. Engine only — no CLI surface until the Encounter
   conversation (UPI 072) consumes it.
 
+### Changed
+- **Exit code 3 = "not configured".** Every command that needs a config now
+  prints a one-sentence pointer (JSON `{"status":"not_configured"}` in daemon
+  mode) and exits 3 when none exists, replacing raw I/O errors (exit 1) on
+  most commands and exit 0 on non-interactive bare `urd` / `urd init`.
+  Documented in `docs/20-reference/cli.md`; 1 stays generic failure, 2 stays
+  clap usage errors.
+
 ### Fixed
+- **A mixed-residency pool is never adopted as a destination (UPI 073).**
+  Found on the first live conversation: a multi-device pool with one
+  external-classified bearer beside internal siblings could be adopted as a
+  send target through that single drive — backups "sheltered" there would
+  never leave the machine. `usable_destinations` now requires the whole
+  pool to resolve external (symmetric with the candidate side's
+  `MixedResidency` exclusion); the refused drive is named in the gaps as a
+  typed fact.
 - **Multi-device btrfs pools no longer derive duplicate backup drives.** A
   filesystem spanning two external disks made strategy derivation adopt every
   bearing drive — duplicate drive UUIDs that config validation rejects (and

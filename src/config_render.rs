@@ -40,7 +40,6 @@ pub struct GeneratedConfig {
 /// Convert an approved strategy into the internal `Config` normal form and
 /// render it as commented v2 TOML. Pure; `today` is the carve date the
 /// header and nothing else consumes.
-#[allow(dead_code)] // Consumed by UPI 072 (conversation).
 #[must_use]
 pub fn generate_config(strategy: &ProposedStrategy, today: NaiveDate) -> GeneratedConfig {
     let config = strategy_to_config(strategy);
@@ -214,6 +213,9 @@ fn gap_lines(gap: &Gap) -> Vec<String> {
             UnusableReason::NotBtrfs { fstype: None } => "not btrfs (no filesystem)".to_string(),
             UnusableReason::NotMounted => "btrfs but not mounted".to_string(),
             UnusableReason::Unresolved => "residency unresolved".to_string(),
+            UnusableReason::MixedPool => {
+                "its filesystem also spans drives inside this machine".to_string()
+            }
         };
         let label = drive.label.as_deref().unwrap_or(&drive.device);
         match &drive.size {

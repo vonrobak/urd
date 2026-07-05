@@ -34,6 +34,7 @@ mod doctor;
 mod drive_row;
 mod drives;
 mod emergency;
+mod encounter;
 mod get;
 mod history;
 mod init;
@@ -49,6 +50,10 @@ pub use chooser::format_subvolume_chooser;
 pub use doctor::render_doctor;
 pub use drives::{render_drives_adopt, render_drives_list};
 pub use emergency::{render_emergency, render_emergency_result};
+pub use encounter::{
+    render_editor_failure, render_farewell, render_invalid_notice, render_no_editor,
+    render_post_carve, render_prompt,
+};
 pub use get::render_get;
 pub use history::{render_events, render_history, render_subvolume_history};
 pub use init::{render_init, render_init_first_time};
@@ -2630,8 +2635,8 @@ mod tests {
             "must name the path where the config belongs"
         );
         assert!(
-            output.contains("urd.toml.example"),
-            "must point at the annotated example"
+            output.contains("propose"),
+            "must say the Encounter proposes protection"
         );
         assert!(
             output.contains("`urd init`"),

@@ -10,6 +10,7 @@ mod config_render;
 mod discovery;
 mod drift;
 mod drives;
+mod encounter;
 mod error;
 mod events;
 mod executor;
@@ -38,11 +39,13 @@ mod voice_contract;
 mod voice_events;
 
 use std::io::IsTerminal;
+use std::process::ExitCode;
 
 use clap::Parser;
 use cli::{Cli, Commands};
+use commands::CliExit;
 
-fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
 
     // Force colors off when not a TTY (piped output, daemon mode).
@@ -70,26 +73,29 @@ fn main() -> anyhow::Result<()> {
 
     // Strategy A: config-free commands — dispatch before config load
     if let Some(Commands::Completions(ref args)) = cli.command {
-        return commands::completions::run(args);
+        return commands::completions::run(args).map(|()| ExitCode::SUCCESS);
     }
     if let Some(Commands::Migrate(ref args)) = cli.command {
-        return commands::migrate::run(cli.config.as_deref(), args);
+        return commands::migrate::run(cli.config.as_deref(), args).map(|()| ExitCode::SUCCESS);
     }
 
     let output_mode = output::OutputMode::detect();
 
     // Strategy B: bare urd — fallible config load (handled inside default::run)
     if cli.command.is_none() {
-        return commands::default::run(cli.config.as_deref(), output_mode);
+        return commands::default::run(cli.config.as_deref(), output_mode).map(cli_exit_code);
     }
     // `urd init` also loads fallibly: the bare-`urd` greeting points first-time
     // users at it, so a missing config gets guidance, not an I/O error.
     if let Some(Commands::Init) = cli.command {
-        return commands::init::run_cli(cli.config.as_deref(), output_mode);
+        return commands::init::run_cli(cli.config.as_deref(), output_mode).map(cli_exit_code);
     }
 
-    // Strategy C: mandatory config load (all existing commands)
-    let config = config::Config::load(cli.config.as_deref())?;
+    // Strategy C: config required — a missing config prints the one-sentence
+    // pointer and exits with the distinct not-configured code (UPI 072).
+    let Some(config) = commands::load_or_point(cli.config.as_deref(), output_mode)? else {
+        return Ok(cli_exit_code(CliExit::NoConfig));
+    };
 
     // Safe to unwrap: None case returned above
     match cli.command.unwrap() {
@@ -120,4 +126,9 @@ fn main() -> anyhow::Result<()> {
             unreachable!("handled above")
         }
     }
+    .map(|()| ExitCode::SUCCESS)
+}
+
+fn cli_exit_code(exit: CliExit) -> ExitCode {
+    ExitCode::from(exit.code())
 }

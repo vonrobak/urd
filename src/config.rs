@@ -321,6 +321,23 @@ impl Config {
         Ok(config)
     }
 
+    /// Load like [`Config::load`], but report a missing config file as
+    /// `Ok(None)` — config-absent is a state the doorstep greets, not an
+    /// error. Every site that discriminates a missing config goes through
+    /// this one seam so the `ErrorKind` semantics cannot drift between
+    /// the doorstep and the pointer.
+    pub fn load_or_absent(path: Option<&Path>) -> crate::error::Result<Option<Self>> {
+        match Self::load(path) {
+            Ok(config) => Ok(Some(config)),
+            Err(UrdError::Io { ref source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// Parse config from a TOML string with version dispatch — the load
     /// path minus file I/O (parse → expand_paths → validate).
     ///
@@ -2384,6 +2401,34 @@ protection = "sheltered"
         let config = parse_v2(v2_minimal_config_str()).expect("v2 minimal parses");
         assert_eq!(config.general.config_version, Some(2));
         assert_eq!(config.subvolumes.len(), 1);
+    }
+
+    // ── load_or_absent (UPI 072 doorstep seam) ─────────────────────────
+
+    #[test]
+    fn load_or_absent_missing_file_is_none() {
+        let bogus = PathBuf::from("/tmp/urd-test-nonexistent-config-load-or-absent.toml");
+        let result = Config::load_or_absent(Some(&bogus)).expect("absent is Ok");
+        assert!(result.is_none(), "missing config must be Ok(None)");
+    }
+
+    #[test]
+    fn load_or_absent_existing_file_loads() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("urd.toml");
+        std::fs::write(&path, v2_minimal_config_str()).expect("write config");
+        let result = Config::load_or_absent(Some(&path)).expect("valid config loads");
+        let config = result.expect("present config must be Some");
+        assert_eq!(config.subvolumes.len(), 1);
+    }
+
+    #[test]
+    fn load_or_absent_invalid_file_errors() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("urd.toml");
+        std::fs::write(&path, "this is not valid toml [[[").expect("write garbage");
+        let result = Config::load_or_absent(Some(&path));
+        assert!(result.is_err(), "parse errors must surface, not read as absent");
     }
 
     #[test]
