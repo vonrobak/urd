@@ -138,6 +138,45 @@ pub fn run(config: Config, args: DoctorArgs, output_mode: OutputMode) -> anyhow:
     }
     infra_checks.extend(drift_checks);
 
+    // ── Units drift + linger (UPI 075) ───────────────────────────
+    // The oracle (`systemd_units::expected_units`) diffed against the
+    // installed files — content included, since ExecStart carries the
+    // resolved binary path (adversary F6: the detail names both paths so a
+    // dev-build doctor self-diagnoses). Not --thorough-gated. The linger
+    // row (adversary F1) speaks only when the units are in place: a user
+    // timer fires only while a session exists.
+    let exe = std::env::current_exe()
+        .and_then(std::fs::canonicalize)
+        .ok();
+    let installed = dirs::config_dir().map(|d| {
+        let dir = d.join("systemd/user");
+        expected_unit_name_set(&config.general.run_frequency)
+            .into_iter()
+            .map(|name| {
+                (
+                    name.to_string(),
+                    std::fs::read_to_string(dir.join(name)).ok(),
+                )
+            })
+            .collect::<std::collections::HashMap<_, _>>()
+    });
+    let mut units_checks =
+        build_units_drift_checks(&config, exe.as_deref(), installed.as_ref());
+    if units_checks
+        .iter()
+        .all(|c| c.status == DoctorCheckStatus::Ok)
+    {
+        units_checks.extend(linger_check());
+    }
+    for check in &units_checks {
+        match check.status {
+            DoctorCheckStatus::Warn => warn_count += 1,
+            DoctorCheckStatus::Error => error_count += 1,
+            DoctorCheckStatus::Ok => {}
+        }
+    }
+    infra_checks.extend(units_checks);
+
     // UUID fingerprinting checks for mounted drives
     for (label, _uuid, snippet) in drives::check_missing_uuids(&config.drives) {
         warn_count += 1;
@@ -460,6 +499,155 @@ fn build_sudoers_drift_checks(config: &Config, listing: Option<&str>) -> Vec<Doc
             }
             checks
         }
+    }
+}
+
+/// The unit filenames the cadence answer expects — the doctor-side twin of
+/// `seal::expected_unit_names` (names only; content comes from the oracle).
+fn expected_unit_name_set(run_frequency: &crate::types::RunFrequency) -> Vec<&'static str> {
+    match run_frequency {
+        crate::types::RunFrequency::Sentinel => {
+            vec!["urd-backup.service", "urd-backup.timer", "urd-sentinel.service"]
+        }
+        crate::types::RunFrequency::Timer { .. } => {
+            vec!["urd-backup.service", "urd-backup.timer"]
+        }
+    }
+}
+
+/// Diff the units oracle (`systemd_units::expected_units`) against the
+/// installed unit files. Pure over the injected exe path and contents map;
+/// the filesystem reads stay in `run()`. `exe = None` = the binary path
+/// could not be resolved; `installed = None` = no config dir — both honest
+/// skips, never a silent pass.
+fn build_units_drift_checks(
+    config: &Config,
+    exe: Option<&std::path::Path>,
+    installed: Option<&std::collections::HashMap<String, Option<String>>>,
+) -> Vec<DoctorCheck> {
+    let cannot_verify = |detail: String| {
+        vec![DoctorCheck {
+            name: "systemd units drift".to_string(),
+            status: DoctorCheckStatus::Warn,
+            detail: Some(detail),
+            suggestion: Some("Run `urd init` to re-render and reinstall the units.".to_string()),
+        }]
+    };
+    let Some(exe) = exe else {
+        return cannot_verify(
+            "could not resolve this urd binary's path — cannot verify the installed units"
+                .to_string(),
+        );
+    };
+    let expected = match crate::systemd_units::expected_units(&config.general.run_frequency, exe)
+    {
+        Ok(expected) => expected,
+        Err(refusal) => return cannot_verify(refusal.to_string()),
+    };
+    let Some(installed) = installed else {
+        return cannot_verify("no config directory for this user".to_string());
+    };
+
+    let drift = crate::systemd_units::diff_units(&expected, installed);
+    if drift.is_empty() {
+        return vec![DoctorCheck {
+            name: "systemd units match this binary".to_string(),
+            status: DoctorCheckStatus::Ok,
+            detail: None,
+            suggestion: None,
+        }];
+    }
+    drift
+        .into_iter()
+        .map(|d| match d.kind {
+            crate::systemd_units::UnitDriftKind::Missing => DoctorCheck {
+                name: "systemd units drift".to_string(),
+                status: DoctorCheckStatus::Warn,
+                detail: Some(format!("{} is not installed", d.name)),
+                suggestion: Some("Run `urd init` to complete the seal.".to_string()),
+            },
+            crate::systemd_units::UnitDriftKind::Differs => {
+                // F6: name both paths — the installed ExecStart vs. this
+                // binary — so a dev-build doctor run reads as what it is.
+                let installed_exec = installed
+                    .get(d.name)
+                    .and_then(|c| c.as_ref())
+                    .and_then(|c| c.lines().find(|l| l.starts_with("ExecStart=")))
+                    .unwrap_or("no ExecStart line")
+                    .to_string();
+                DoctorCheck {
+                    name: "systemd units drift".to_string(),
+                    status: DoctorCheckStatus::Warn,
+                    detail: Some(format!(
+                        "{} differs from what this binary ({}) would render \
+                         (installed: {installed_exec})",
+                        d.name,
+                        exe.display()
+                    )),
+                    suggestion: Some(
+                        "Run `urd init` to re-render and reinstall the units.".to_string(),
+                    ),
+                }
+            }
+        })
+        .collect()
+}
+
+/// The linger advisory (UPI 075, adversary F1): user timers fire only
+/// while a session exists. `Linger=no` → one Warn with the exact command;
+/// an unanswerable loginctl → an honest skip; `Linger=yes` → silence (a
+/// real pass needs no row).
+fn linger_check() -> Vec<DoctorCheck> {
+    let row = |status, detail: String, suggestion: Option<String>| {
+        vec![DoctorCheck {
+            name: "session lingering".to_string(),
+            status,
+            detail: Some(detail),
+            suggestion,
+        }]
+    };
+    let Ok(user) = crate::commands::seal::invoking_username() else {
+        return row(
+            DoctorCheckStatus::Warn,
+            "could not name the invoking user — cannot check lingering".to_string(),
+            None,
+        );
+    };
+    match std::process::Command::new("loginctl")
+        .env("LC_ALL", "C")
+        .args(["show-user", &user, "--property=Linger"])
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            match String::from_utf8_lossy(&out.stdout).trim() {
+                "Linger=no" => row(
+                    DoctorCheckStatus::Warn,
+                    "lingering is off: backups run only while you are logged in \
+                     (missed nights catch up at next login)"
+                        .to_string(),
+                    Some(format!("Run `loginctl enable-linger {user}` to free them.")),
+                ),
+                "Linger=yes" => Vec::new(),
+                other => row(
+                    DoctorCheckStatus::Warn,
+                    format!("could not read the lingering state: {other:?}"),
+                    None,
+                ),
+            }
+        }
+        Ok(out) => row(
+            DoctorCheckStatus::Warn,
+            format!(
+                "loginctl could not answer: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ),
+            None,
+        ),
+        Err(e) => row(
+            DoctorCheckStatus::Warn,
+            format!("could not run loginctl: {e}"),
+            None,
+        ),
     }
 }
 
@@ -876,6 +1064,73 @@ protection = "recorded"
             .map(|s| format!("    (root) NOPASSWD: {s}\n"))
             .collect();
         format!("User alice may run the following commands on example-host:\n{rules}")
+    }
+
+    // ── Units drift (UPI 075) ──────────────────────────────────────────
+
+    fn installed_map(
+        units: &[crate::systemd_units::UnitFile],
+    ) -> std::collections::HashMap<String, Option<String>> {
+        units
+            .iter()
+            .map(|u| (u.name.to_string(), Some(u.content.clone())))
+            .collect()
+    }
+
+    #[test]
+    fn units_all_matching_render_one_ok_row() {
+        let config = drift_config();
+        let exe = std::path::Path::new("/home/alice/.cargo/bin/urd");
+        let expected =
+            crate::systemd_units::expected_units(&config.general.run_frequency, exe).unwrap();
+        let checks = build_units_drift_checks(&config, Some(exe), Some(&installed_map(&expected)));
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].status, DoctorCheckStatus::Ok);
+    }
+
+    #[test]
+    fn units_missing_one_warns_with_the_seal_verb() {
+        let config = drift_config();
+        let exe = std::path::Path::new("/home/alice/.cargo/bin/urd");
+        let expected =
+            crate::systemd_units::expected_units(&config.general.run_frequency, exe).unwrap();
+        let mut installed = installed_map(&expected);
+        installed.insert("urd-backup.timer".to_string(), None);
+        let checks = build_units_drift_checks(&config, Some(exe), Some(&installed));
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].status, DoctorCheckStatus::Warn);
+        assert!(checks[0].detail.as_deref().unwrap().contains("urd-backup.timer"));
+        assert!(checks[0].suggestion.as_deref().unwrap().contains("urd init"));
+    }
+
+    /// Adversary F6: a Differs row names both binaries — the installed
+    /// ExecStart and the doctor's own path — so a dev-build run
+    /// self-diagnoses instead of alarming.
+    #[test]
+    fn units_differing_detail_names_both_exe_paths() {
+        let config = drift_config();
+        let sealed_exe = std::path::Path::new("/home/alice/.cargo/bin/urd");
+        let doctor_exe = std::path::Path::new("/home/alice/dev/urd/target/debug/urd");
+        let sealed =
+            crate::systemd_units::expected_units(&config.general.run_frequency, sealed_exe)
+                .unwrap();
+        let checks =
+            build_units_drift_checks(&config, Some(doctor_exe), Some(&installed_map(&sealed)));
+        // The timer has no ExecStart and matches; the service differs.
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].status, DoctorCheckStatus::Warn);
+        let detail = checks[0].detail.as_deref().unwrap();
+        assert!(detail.contains("target/debug/urd"), "{detail}");
+        assert!(detail.contains(".cargo/bin/urd"), "{detail}");
+    }
+
+    #[test]
+    fn units_unresolvable_exe_is_an_honest_skip_never_silent() {
+        let config = drift_config();
+        let checks = build_units_drift_checks(&config, None, None);
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].status, DoctorCheckStatus::Warn);
+        assert!(checks[0].detail.as_deref().unwrap().contains("binary"));
     }
 
     #[test]

@@ -472,7 +472,7 @@ pub(crate) mod test_fixtures {
 
     pub(crate) fn test_status_output() -> StatusOutput {
         StatusOutput {
-            unsealed: false,
+            seal_gap: None,
             assessments: vec![
                 StatusAssessment {
                     name: "htpc-home".to_string(),
@@ -704,7 +704,7 @@ pub(crate) mod test_fixtures {
 
     pub(crate) fn test_default_status_output() -> DefaultStatusOutput {
         DefaultStatusOutput {
-            unsealed: false,
+            seal_gap: None,
             total: 4,
             waning_names: vec![],
             exposed_names: vec![],

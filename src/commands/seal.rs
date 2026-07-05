@@ -930,7 +930,7 @@ fn earn_privilege(config: &Config, config_path: &Path) -> anyhow::Result<SealOut
 /// The invoking user's passwd name — what the sudoers User_List matches.
 /// Never `$USER` (wrong under `su`); no passwd entry is an honest failure,
 /// never a guess.
-fn invoking_username() -> anyhow::Result<String> {
+pub(crate) fn invoking_username() -> anyhow::Result<String> {
     let uid = nix::unistd::Uid::current();
     let user = nix::unistd::User::from_uid(uid)
         .with_context(|| format!("passwd lookup failed for uid {uid}"))?
@@ -979,14 +979,69 @@ fn stage_rendered(rendered: &str) -> anyhow::Result<tempfile::NamedTempFile> {
     Ok(tmp)
 }
 
-/// Whether a status surface should name the "configured but unsealed" state.
-/// Single owner of the rule (adversary F5): interactive only — a denied
-/// probe writes an auth log line, so automated and monitoring callers must
-/// never generate that noise — and only on a clear denial (`Unclear` stays
-/// silent rather than guess).
-pub(crate) fn probe_unsealed(config: &Config, output_mode: OutputMode) -> bool {
-    output_mode == OutputMode::Interactive
-        && probe_grant(&config.general.btrfs_path).0 == GrantProbe::Denied
+/// The first incomplete seal stage a status surface should name (UPI 075
+/// widened `probe_unsealed`; single owner of the rule). Interactive only —
+/// a denied probe writes an auth log line, so automated and monitoring
+/// callers must never generate that noise — and only on clear evidence:
+/// `Unclear` probes and unreadable directories stay silent rather than
+/// guess. Seal order decides: privilege → units → first thread (one
+/// sentence, one cause — adversary F4/F7). The units arm checks file
+/// EXISTENCE only (content drift is doctor's job; no systemctl call here),
+/// and the first-thread arm is policy-aware (F5).
+pub(crate) fn seal_completeness(
+    config: &Config,
+    output_mode: OutputMode,
+) -> Option<crate::output::SealGap> {
+    if output_mode != OutputMode::Interactive {
+        return None;
+    }
+    seal_gap_given_probe(config, probe_grant(&config.general.btrfs_path).0)
+}
+
+/// The gap decision with the probe injected — `urd init` already holds a
+/// probe result and must not pay (or log) a second one.
+pub(crate) fn seal_gap_given_probe(
+    config: &Config,
+    probe: GrantProbe,
+) -> Option<crate::output::SealGap> {
+    use crate::output::SealGap;
+
+    if probe == GrantProbe::Denied {
+        return Some(SealGap::Privilege);
+    }
+    if units_missing(config) {
+        return Some(SealGap::Units);
+    }
+    if first_thread_pending(config) {
+        return Some(SealGap::FirstThread);
+    }
+    None
+}
+
+/// Is any expected unit file absent? Existence only, by expected name —
+/// no exe resolution and no content compare on the status path; an
+/// unresolvable config dir stays silent (never a guess).
+fn units_missing(config: &Config) -> bool {
+    let Some(dir) = dirs::config_dir().map(|d| d.join("systemd/user")) else {
+        return false;
+    };
+    expected_unit_names(&config.general.run_frequency)
+        .iter()
+        .any(|name| !dir.join(name).exists())
+}
+
+/// The expected unit filenames for a cadence answer — the name-only
+/// companion to `systemd_units::expected_units` (which needs the exe path
+/// for content; status must not resolve or render anything).
+fn expected_unit_names(run_frequency: &crate::types::RunFrequency) -> Vec<&'static str> {
+    match run_frequency {
+        crate::types::RunFrequency::Sentinel => {
+            vec!["urd-backup.service", "urd-backup.timer", "urd-sentinel.service"]
+        }
+        crate::types::RunFrequency::Timer { .. } => {
+            vec!["urd-backup.service", "urd-backup.timer"]
+        }
+    }
 }
 
 /// The passwordless probe (`LC_ALL=C sudo -n <btrfs> filesystem show /`),

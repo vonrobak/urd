@@ -45,12 +45,10 @@ pub(super) fn render_status_interactive(data: &StatusOutput) -> String {
     // ── Summary line ────────────────────────────────────────────────
     render_summary_line(data, &mut out);
 
-    // ── The seal (UPI 071) ──────────────────────────────────────────
-    // Configured but unsealed: said once, high, with the resume verb.
-    // Yellow, never red — nothing was lost (Rule 6, red is earned). The
-    // wording names the state, not the probe: 075 widens what "sealed"
-    // takes (units, first snapshot) without rewording this banner.
-    render_unsealed_banner(data, &mut out);
+    // ── The seal (UPI 071/075) ──────────────────────────────────────
+    // The first incomplete seal stage: said once, high, with the resume
+    // verb. Yellow, never red — nothing was lost (Rule 6, red is earned).
+    render_seal_gap_banner(data, &mut out);
 
     // ── Storage adaptation prose (UPI 031-b AB3.1) ──────────────────
     // Rendered HIGH (right under the summary, ahead of any routine staleness
@@ -117,19 +115,32 @@ pub(super) fn render_status_interactive(data: &StatusOutput) -> String {
     out
 }
 
-/// The unsealed banner (UPI 071): the promises are carved but not in
-/// force until root leave exists. One sentence, one resume verb.
-pub(super) fn render_unsealed_banner(data: &StatusOutput, out: &mut String) {
-    if !data.unsealed {
+/// The seal-gap banner (UPI 071/075): the first incomplete seal stage,
+/// one sentence, one resume verb — `urd init` resumes every one of them.
+pub(super) fn render_seal_gap_banner(data: &StatusOutput, out: &mut String) {
+    let Some(gap) = data.seal_gap else {
         return;
-    }
-    writeln!(
-        out,
-        "{}",
-        "Configured but unsealed — the promises are not yet in force.".yellow()
-    )
-    .ok();
-    writeln!(out, "Run `urd init` to resume the earning (root leave for btrfs).").ok();
+    };
+    let sentence = match gap {
+        crate::output::SealGap::Privilege => {
+            "Configured but unsealed — the promises are not yet in force."
+        }
+        crate::output::SealGap::Units => {
+            "Sealed, but the nightly weave is not yet enabled."
+        }
+        crate::output::SealGap::FirstThread => {
+            "Sealed, but the first thread is not yet spun."
+        }
+    };
+    writeln!(out, "{}", sentence.yellow()).ok();
+    let verb = match gap {
+        crate::output::SealGap::Privilege => {
+            "Run `urd init` to resume the earning (root leave for btrfs)."
+        }
+        crate::output::SealGap::Units => "Run `urd init` to complete the schedule.",
+        crate::output::SealGap::FirstThread => "Run `urd init` to spin it.",
+    };
+    writeln!(out, "{verb}").ok();
 }
 
 pub(super) fn render_summary_line(data: &StatusOutput, out: &mut String) {
@@ -753,14 +764,21 @@ fn render_default_status_interactive(data: &DefaultStatusOutput) -> String {
         write!(out, "{colored}").ok();
     }
 
-    // Configured but unsealed (UPI 071): one clause, the resume verb.
-    if data.unsealed {
-        write!(
-            out,
-            " {}",
-            "Configured but unsealed — `urd init` resumes the earning.".yellow()
-        )
-        .ok();
+    // The first incomplete seal stage (UPI 071/075): one clause, the
+    // resume verb.
+    if let Some(gap) = data.seal_gap {
+        let clause = match gap {
+            crate::output::SealGap::Privilege => {
+                "Configured but unsealed — `urd init` resumes the earning."
+            }
+            crate::output::SealGap::Units => {
+                "The nightly weave is not yet enabled — `urd init` completes it."
+            }
+            crate::output::SealGap::FirstThread => {
+                "The first thread is not yet spun — `urd init` spins it."
+            }
+        };
+        write!(out, " {}", clause.yellow()).ok();
     }
 
     // Last backup age (pre-computed by command handler to keep voice pure)
@@ -1283,41 +1301,52 @@ mod tests {
     }
 
     #[test]
-    fn interactive_unsealed_banner_names_state_and_resume_verb() {
+    fn interactive_seal_gap_banner_names_each_state_and_the_resume_verb() {
         let _color = color_guard(false);
-        let mut data = crate::voice::test_fixtures::test_status_output();
-        data.unsealed = true;
-        let out = render_status(&data, OutputMode::Interactive);
-        assert!(out.contains("unsealed"), "{out}");
-        assert!(out.contains("not yet in force"), "{out}");
-        assert!(out.contains("urd init"), "{out}");
+        for (gap, marker) in [
+            (crate::output::SealGap::Privilege, "not yet in force"),
+            (crate::output::SealGap::Units, "not yet enabled"),
+            (crate::output::SealGap::FirstThread, "not yet spun"),
+        ] {
+            let mut data = crate::voice::test_fixtures::test_status_output();
+            data.seal_gap = Some(gap);
+            let out = render_status(&data, OutputMode::Interactive);
+            assert!(out.contains(marker), "{gap:?}: {out}");
+            assert!(out.contains("urd init"), "{gap:?}: {out}");
+        }
     }
 
     #[test]
-    fn interactive_sealed_carries_no_unsealed_banner() {
+    fn interactive_sealed_carries_no_seal_banner() {
         let _color = color_guard(false);
         let out = render_status(
             &crate::voice::test_fixtures::test_status_output(),
             OutputMode::Interactive,
         );
         assert!(!out.contains("unsealed"), "{out}");
+        assert!(!out.contains("not yet spun"), "{out}");
     }
 
     #[test]
-    fn default_unsealed_clause_points_at_init() {
+    fn default_seal_gap_clause_points_at_init() {
         let _color = color_guard(false);
-        let mut data = crate::voice::test_fixtures::test_default_status_output();
-        data.unsealed = true;
-        let out = render_default_status(&data, OutputMode::Interactive);
-        assert!(out.contains("unsealed"), "{out}");
-        assert!(out.contains("urd init"), "{out}");
+        for gap in [
+            crate::output::SealGap::Privilege,
+            crate::output::SealGap::Units,
+            crate::output::SealGap::FirstThread,
+        ] {
+            let mut data = crate::voice::test_fixtures::test_default_status_output();
+            data.seal_gap = Some(gap);
+            let out = render_default_status(&data, OutputMode::Interactive);
+            assert!(out.contains("urd init"), "{gap:?}: {out}");
+        }
     }
 
     #[test]
     fn interactive_no_subvolumes() {
         let _color = color_guard(false);
         let data = StatusOutput {
-            unsealed: false,
+            seal_gap: None,
             assessments: vec![],
             chain_health: vec![],
             drives: vec![],
@@ -1394,7 +1423,7 @@ mod tests {
     fn interactive_no_last_run() {
         let _color = color_guard(false);
         let data = StatusOutput {
-            unsealed: false,
+            seal_gap: None,
             assessments: vec![],
             chain_health: vec![],
             drives: vec![],
@@ -1997,7 +2026,7 @@ mod tests {
     fn default_some_exposed() {
         let _color = color_guard(false);
         let data = DefaultStatusOutput {
-            unsealed: false,
+            seal_gap: None,
             total: 9,
             waning_names: vec![],
             exposed_names: vec!["htpc-root".to_string(), "docs".to_string()],
@@ -2032,7 +2061,7 @@ mod tests {
     fn default_some_waning() {
         let _color = color_guard(false);
         let data = DefaultStatusOutput {
-            unsealed: false,
+            seal_gap: None,
             total: 5,
             waning_names: vec!["htpc-config".to_string()],
             exposed_names: vec!["htpc-root".to_string()],
@@ -2089,7 +2118,7 @@ mod tests {
     fn default_no_last_backup() {
         let _color = color_guard(false);
         let data = DefaultStatusOutput {
-            unsealed: false,
+            seal_gap: None,
             total: 2,
             waning_names: vec![],
             exposed_names: vec![],
@@ -2111,7 +2140,7 @@ mod tests {
     #[test]
     fn default_daemon_json() {
         let data = DefaultStatusOutput {
-            unsealed: false,
+            seal_gap: None,
             total: 3,
             waning_names: vec!["sv1".to_string()],
             exposed_names: vec![],

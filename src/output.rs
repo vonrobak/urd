@@ -197,12 +197,27 @@ pub struct StatusOutput {
     /// no subvolume is adapting, so a Roomy system stays silent.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub storage_adaptations: Vec<AdaptationSummary>,
-    /// Configured but unsealed (UPI 071): the sudo grant does not answer a
-    /// passwordless probe, so the promises are not yet in force. Probed only
-    /// on interactive runs (a denied probe writes an auth log line — daemon
-    /// paths never probe); false means "sealed or not checked".
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub unsealed: bool,
+    /// The first incomplete seal stage (UPI 071/075), if any: privilege
+    /// (the sudo grant does not answer a passwordless probe), units (the
+    /// schedule is not installed), or first-thread (a promise has no local
+    /// snapshot yet). One gap, one sentence, one cause. Checked only on
+    /// interactive runs (a denied probe writes an auth log line — daemon
+    /// paths never probe); `None` means "sealed or not checked".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seal_gap: Option<SealGap>,
+}
+
+/// The seal stage `urd status` names as incomplete, in seal order —
+/// the first gap wins (adversary F4/F7: one sentence, one cause).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SealGap {
+    /// The earning: the grant does not answer.
+    Privilege,
+    /// The schedule: expected systemd units are not installed.
+    Units,
+    /// The first thread: a promise that plans local snapshots has none.
+    FirstThread,
 }
 
 /// Serializable wrapper around SubvolAssessment data.
@@ -429,9 +444,10 @@ pub struct DefaultStatusOutput {
     /// bare-`urd` clause. Omitted when all pools are Roomy.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub storage_posture: Option<PoolPostureSummary>,
-    /// Configured but unsealed (UPI 071) — see `StatusOutput::unsealed`.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub unsealed: bool,
+    /// The first incomplete seal stage (UPI 071/075) — see
+    /// `StatusOutput::seal_gap`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seal_gap: Option<SealGap>,
 }
 
 fn is_zero(n: &usize) -> bool {
