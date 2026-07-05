@@ -229,7 +229,10 @@ fn drive_facts_line(drive: &CandidateDrive) -> String {
         DriveClass::External => "external",
         DriveClass::Ambiguous => "internal or external — unclear",
     };
-    format!("{} ({class})", parts.join(", "))
+    // Subtree-wide mount fact: a drive already in use should read as in
+    // use before anyone considers it a backup target.
+    let in_use = if drive.mounted { ", in use" } else { "" };
+    format!("{} ({class}{in_use})", parts.join(", "))
 }
 
 /// The per-drive honesty clause: locked and non-btrfs drives are named
@@ -466,6 +469,10 @@ fn unusable_sentence(drive: &UnusableDrive) -> String {
         UnusableReason::Unresolved => {
             format!("{name} stayed unresolved — run `urd init` again to answer for it.")
         }
+        UnusableReason::MixedPool => format!(
+            "{name} shares its filesystem with drives inside this machine — \
+             sending there would never leave the building."
+        ),
     }
 }
 
@@ -970,10 +977,15 @@ mod tests {
             },
             R::NotMounted,
             R::Unresolved,
+            R::MixedPool,
         ];
         for r in &all {
             match r {
-                R::Locked | R::NotBtrfs { .. } | R::NotMounted | R::Unresolved => {}
+                R::Locked
+                | R::NotBtrfs { .. }
+                | R::NotMounted
+                | R::Unresolved
+                | R::MixedPool => {}
             }
         }
         let rendered: Vec<String> = all

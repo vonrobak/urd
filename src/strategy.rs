@@ -41,7 +41,6 @@ use crate::types::{
 /// ignored; `residence: None` while sheltered subvolumes exist derives
 /// `Primary` roles plus a [`GapKind::NoOffsiteDrive`] gap (conservative:
 /// over-inform, never over-promise).
-#[allow(dead_code)] // Constructed by UPI 072 (conversation).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FateAnswers {
     /// One entry per [`protection_candidates`] candidate, keyed by mountpoint.
@@ -55,7 +54,6 @@ pub struct FateAnswers {
 }
 
 /// Per-subvolume importance classification.
-#[allow(dead_code)] // Constructed by UPI 072 (conversation).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportanceAnswer {
     pub mountpoint: PathBuf,
@@ -63,7 +61,6 @@ pub struct ImportanceAnswer {
 }
 
 /// What losing this data would mean.
-#[allow(dead_code)] // Constructed by UPI 072 (conversation).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Importance {
     Irreplaceable,
@@ -72,7 +69,6 @@ pub enum Importance {
 }
 
 /// The site-loss fear and where the external drive lives.
-#[allow(dead_code)] // Constructed by UPI 072 (conversation).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResidenceAnswer {
     /// Fears fire/theft and the drive stays home → `Primary` + offsite gap.
@@ -84,7 +80,6 @@ pub enum ResidenceAnswer {
 }
 
 /// How far back "recent enough" reaches.
-#[allow(dead_code)] // Constructed by UPI 072 (conversation).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GranularityAnswer {
     /// Yesterday is fine → systemd timer, daily.
@@ -97,7 +92,6 @@ pub enum GranularityAnswer {
 /// drive discovery classified `Ambiguous`. Answers for devices that are
 /// not ambiguous (or unknown) are ignored — the inventory stays
 /// observational; answers never overrule what discovery saw directly.
-#[allow(dead_code)] // Constructed by UPI 072 (conversation).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DriveResidencyAnswer {
     pub device: String,
@@ -106,7 +100,6 @@ pub struct DriveResidencyAnswer {
 
 /// Resolution of an ambiguous drive — there is no "still ambiguous" answer;
 /// an unanswered drive simply stays out of `drive_residency`.
-#[allow(dead_code)] // Constructed by UPI 072 (conversation).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResolvedDriveClass {
     Internal,
@@ -227,6 +220,11 @@ pub enum UnusableReason {
     NotMounted,
     /// Classified ambiguous and the residency question went unanswered.
     Unresolved,
+    /// External-classified, but its filesystem also spans drives that
+    /// resolve internal — sending there never leaves the machine. A
+    /// false shelter is worse than none (first seen live 2026-07-05: a
+    /// four-disk pool with one hotplug-signalled bearer).
+    MixedPool,
 }
 
 /// A short factual provenance sentence born at derivation time; UPI 074
@@ -350,7 +348,6 @@ fn pool_residency(
 ///
 /// Subvolumes on external-resolved pools are the destination's own mounts:
 /// neither candidates nor excluded rows (the drive side owns them).
-#[allow(dead_code)] // Consumed by UPI 072 (conversation).
 #[must_use]
 pub fn protection_candidates(
     inventory: &SystemInventory,
@@ -416,7 +413,6 @@ fn exclusion(sv: &DiscoveredSubvol, reason: ExclusionReason) -> ExcludedSubvol {
 /// `CandidateDrive.mounted` is never consulted: it is subtree-wide, so a
 /// mounted non-btrfs partition beside an unmounted btrfs pool would lie.
 /// Pool mountpoints are the sole mount authority.
-#[allow(dead_code)] // Consumed by UPI 072 (conversation).
 #[must_use]
 pub fn usable_destinations(
     inventory: &SystemInventory,
@@ -443,6 +439,28 @@ pub fn usable_destinations(
             let fstype = drive.fstype.clone();
             unusable.push(unusable_fact(drive, UnusableReason::NotBtrfs { fstype }));
             continue;
+        }
+        // The drive being external is not enough: the whole POOL must
+        // resolve external, or a send lands on a filesystem that also
+        // lives inside this machine — a false shelter. (Candidate-side
+        // symmetry: such pools' subvolumes are excluded MixedResidency.)
+        if let Some(uuid) = &drive.pool_uuid {
+            match pool_residency(uuid, &inventory.drives, resolutions) {
+                PoolResidency::External => {}
+                PoolResidency::Mixed => {
+                    unusable.push(unusable_fact(drive, UnusableReason::MixedPool));
+                    continue;
+                }
+                // An unresolved sibling keeps the pool unadoptable; the
+                // sibling's own question is the path to resolution.
+                PoolResidency::Ambiguous => {
+                    unusable.push(unusable_fact(drive, UnusableReason::Unresolved));
+                    continue;
+                }
+                // Internal/Unknown cannot occur for a pool this external
+                // drive itself bears — fall through to the mount check.
+                PoolResidency::Internal | PoolResidency::Unknown => {}
+            }
         }
         let joined = drive
             .pool_uuid
@@ -497,7 +515,6 @@ fn canonical_mount(pool: &DiscoveredPool) -> Option<&PathBuf> {
 /// user answered. Pure and total: any `FateAnswers` produces a proposal
 /// (see the robustness contract on [`FateAnswers`]); `today` is injected
 /// so the intention sentences carry the encounter date without I/O.
-#[allow(dead_code)] // Consumed by UPI 072 (conversation) / 074 (config generation).
 #[must_use]
 pub fn derive_strategy(
     inventory: &SystemInventory,
@@ -969,6 +986,24 @@ pub(crate) mod test_support {
             .push(subvol("/mnt/second", "/vault", ORPHAN_POOL));
         scenarios.push(("D-multipool", inv, Vec::new()));
 
+        // Field find 2026-07-05: a pool spanning an external-classified
+        // drive AND an internal one (four-disk pool, one hotplug-
+        // signalled bearer). The external bearer must never become a
+        // destination — a send there never leaves the machine.
+        let mut inv = fedora3();
+        inv.pools.push(pool(EXTERNAL_POOL, &["/mnt/tank"]));
+        inv.subvolumes
+            .push(subvol("/mnt/tank", "/tank", EXTERNAL_POOL));
+        inv.drives.push(external_btrfs_drive("sdd", EXTERNAL_POOL));
+        inv.drives.push(drive(
+            "sde",
+            DriveClass::Internal,
+            LuksState::NotEncrypted,
+            Some("btrfs"),
+            Some(EXTERNAL_POOL),
+        ));
+        scenarios.push(("D-mixed-pool", inv, Vec::new()));
+
         scenarios
     }
 
@@ -1263,6 +1298,50 @@ mod tests {
         let strategy = derive_strategy(&inv, &answers, today());
         assert_eq!(strategy.drives.len(), 1);
         assert_eq!(strategy.drives[0].uuid, EXTERNAL_POOL);
+    }
+
+    #[test]
+    fn mixed_residency_pool_is_never_a_destination() {
+        // Field find 2026-07-05: one external-classified bearer beside
+        // internal siblings on the same filesystem. Adopting it sends
+        // "sheltered" data to a pool that never leaves the machine —
+        // the drive side must refuse for the same reason the candidate
+        // side excludes the pool's subvolumes (MixedResidency).
+        let mut inv = fedora_inventory();
+        inv.pools.push(pool(EXTERNAL_POOL, &["/mnt/tank"]));
+        inv.subvolumes
+            .push(subvol("/mnt/tank", "/tank", EXTERNAL_POOL));
+        inv.drives.push(external_btrfs_drive("sdd", EXTERNAL_POOL));
+        inv.drives.push(drive(
+            "sde",
+            DriveClass::Internal,
+            LuksState::NotEncrypted,
+            Some("btrfs"),
+            Some(EXTERNAL_POOL),
+        ));
+
+        let (usable, unusable) = usable_destinations(&inv, &[]);
+        assert!(usable.is_empty(), "a mixed pool must never be adopted");
+        assert_eq!(unusable.len(), 1);
+        assert_eq!(unusable[0].device, "sdd");
+        assert_eq!(unusable[0].reason, UnusableReason::MixedPool);
+
+        // Candidate-side symmetry: the pool's subvolume is excluded too.
+        let split = protection_candidates(&inv, &[]);
+        assert!(split
+            .excluded
+            .iter()
+            .any(|e| e.mountpoint == Path::new("/mnt/tank")
+                && e.reason == ExclusionReason::MixedResidency));
+
+        // And the derivation demotes rather than falsely shelters.
+        let answers = with_importance(base_answers(), "/home", Importance::Irreplaceable);
+        let strategy = derive_strategy(&inv, &answers, today());
+        assert!(strategy.drives.is_empty());
+        assert!(strategy
+            .gaps
+            .iter()
+            .any(|g| g.kind == GapKind::NoExternalDrive && !g.demoted.is_empty()));
     }
 
     #[test]
