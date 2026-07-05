@@ -61,9 +61,11 @@ pub fn run_cli(config_path: Option<&Path>, output_mode: OutputMode) -> anyhow::R
     // match so the fix-it-repaired path resumes too. Unclear never
     // triggers a ceremony on a guess; non-TTY reports via the checks;
     // a fully sealed system enters no ceremony (Q5: nothing to do).
+    // The gate is the DEEP one (coverage + units content): init is the
+    // verb doctor's drift advisories name, so it must see what they see.
     let mut sudo_probe = seal::probe_grant(&config.general.btrfs_path);
     if doorstep == crate::commands::Doorstep::Offer
-        && seal::seal_gap_given_probe(&config, sudo_probe.0).is_some()
+        && seal::seal_gap_deep(&config, sudo_probe.0).is_some()
     {
         let path = crate::commands::resolve_config_path(config_path)?;
         seal::resume_seal(&config, &path)?;

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `urd doctor`'s drift advisories now point at a verb that heals them:
+  `urd init`'s resume gate sees what doctor sees — sudoers coverage gaps
+  (expected grant lines the listing definitively lacks) and systemd-unit
+  content drift — instead of only the cheap probe and file existence. The
+  earning re-offers the render when the config has outgrown an answering
+  grant, naming the missing lines; declining a re-render lets the seal
+  continue (the grant still answers), so the units heal is never stranded.
+  Wildcard-grant uncertainty stays doctor's: hand-managed broad grants are
+  never nagged, and the uncertain advisory no longer names `urd init`.
+
 ## [0.33.0] - 2026-07-05
 
 ### Added

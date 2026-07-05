@@ -726,12 +726,25 @@ fn adopt_one(
 fn earn_privilege(config: &Config, config_path: &Path) -> anyhow::Result<SealOutcome> {
     let dest = Path::new(SUDOERS_DEST);
 
-    // Already answers (e.g. a broader hand-managed grant)? Nothing to ask;
-    // the doctor drift advisory watches coverage.
-    if probe_grant(&config.general.btrfs_path).0 == GrantProbe::Granted {
-        print!("{}", voice::render_earning_already());
-        return Ok(SealOutcome::Sealed);
-    }
+    // Already answers (e.g. a broader hand-managed grant)? Ask again only
+    // on clear evidence: expected lines the listing definitively lacks (a
+    // config the installed grant predates). Wildcard uncertainty stays
+    // doctor's — a hand-managed broad grant is never nagged (071).
+    let regrant = if probe_grant(&config.general.btrfs_path).0 == GrantProbe::Granted {
+        let missing = coverage_missing(config);
+        if missing.is_empty() {
+            print!("{}", voice::render_earning_already());
+            return Ok(SealOutcome::Sealed);
+        }
+        print!("{}", voice::render_earning_regrant(&missing));
+        true
+    } else {
+        false
+    };
+    // A declined RE-render leaves a grant that still answers: later stages
+    // can proceed, so the seal continues with coverage unconfirmed instead
+    // of stopping as a fresh earning's decline does (F4 table).
+    let declined = declined_outcome(regrant);
 
     let user = invoking_username()?;
 
@@ -767,7 +780,7 @@ fn earn_privilege(config: &Config, config_path: &Path) -> anyhow::Result<SealOut
             // manual path and leave the decision with the user.
             print!("{}", voice::render_earning_declined(&rendered, dest));
             println!("(visudo could not be run here: {e})");
-            return Ok(SealOutcome::Declined);
+            return Ok(declined);
         }
         Ok(out) if !out.status.success() => {
             // A render visudo refuses is a bug in urd, never installable.
@@ -800,11 +813,11 @@ fn earn_privilege(config: &Config, config_path: &Path) -> anyhow::Result<SealOut
         EarningChoice::Install => {}
         EarningChoice::Print => {
             print!("{}", voice::render_earning_declined(&rendered, dest));
-            return Ok(SealOutcome::Declined);
+            return Ok(declined);
         }
         EarningChoice::Decline => {
             print!("{}", voice::render_earning_deferred());
-            return Ok(SealOutcome::Declined);
+            return Ok(declined);
         }
     }
 
@@ -823,7 +836,7 @@ fn earn_privilege(config: &Config, config_path: &Path) -> anyhow::Result<SealOut
             voice::render_earning_unavailable(&format!("`sudo install` exited {install}"))
         );
         print!("{}", voice::render_earning_declined(&rendered, dest));
-        return Ok(SealOutcome::Declined);
+        return Ok(declined);
     }
 
     // Root-side integrity check: read the now-root-owned staged bytes back
@@ -929,6 +942,18 @@ enum EarningChoice {
     Decline,
 }
 
+/// What a not-installed conclusion means for the seal (pure). A fresh
+/// earning's decline leaves no grant — the seal stops (F4). A re-render's
+/// decline leaves a grant that still answers — the seal continues with
+/// coverage unconfirmed.
+fn declined_outcome(regrant: bool) -> SealOutcome {
+    if regrant {
+        SealOutcome::SealedUnverifiedCoverage
+    } else {
+        SealOutcome::Declined
+    }
+}
+
 /// Classify one consent line: `""`/`i` install, `p` print, `q` not now.
 fn parse_earning_choice(line: &str) -> Option<EarningChoice> {
     match line.trim().to_lowercase().as_str() {
@@ -981,8 +1006,9 @@ pub(crate) fn seal_completeness(
     seal_gap_given_probe(config, probe_grant(&config.general.btrfs_path).0)
 }
 
-/// The gap decision with the probe injected — `urd init` already holds a
-/// probe result and must not pay (or log) a second one.
+/// The cheap gap decision with the probe injected — status surfaces only.
+/// `urd init` gates on `seal_gap_deep` instead: the make-whole verb also
+/// sees coverage gaps and units content drift.
 pub(crate) fn seal_gap_given_probe(
     config: &Config,
     probe: GrantProbe,
@@ -999,6 +1025,52 @@ pub(crate) fn seal_gap_given_probe(
         return Some(SealGap::FirstThread);
     }
     None
+}
+
+/// The make-whole verb's deeper gate (`urd init` only): the content-level
+/// checks the cheap status probe deliberately avoids (adversary F7 scoped
+/// the existence-only rule to status surfaces, not to the explicit resume
+/// verb). Privilege also gaps on a grant that answers but definitively
+/// lacks expected lines (a config the installed file predates); units also
+/// gap on content drift (e.g. an ExecStart naming another binary). Both
+/// arms stay silent on uncertainty — clear evidence only, as everywhere —
+/// and both stages' done-checks make re-entry idempotent and consent-gated.
+pub(crate) fn seal_gap_deep(
+    config: &Config,
+    probe: GrantProbe,
+) -> Option<crate::output::SealGap> {
+    use crate::output::SealGap;
+
+    if probe == GrantProbe::Denied {
+        return Some(SealGap::Privilege);
+    }
+    if probe == GrantProbe::Granted && !coverage_missing(config).is_empty() {
+        return Some(SealGap::Privilege);
+    }
+    if units_missing(config) || units_drifted(config) {
+        return Some(SealGap::Units);
+    }
+    if first_thread_pending(config) {
+        return Some(SealGap::FirstThread);
+    }
+    None
+}
+
+/// Has any expected unit's installed content drifted from what THIS binary
+/// would render? Deep-gate only; any resolution failure is silence, never
+/// a guess — doctor owns the honest cannot-verify sentences.
+fn units_drifted(config: &Config) -> bool {
+    let Ok(exe) = std::env::current_exe().and_then(std::fs::canonicalize) else {
+        return false;
+    };
+    let Ok(units) = crate::systemd_units::expected_units(&config.general.run_frequency, &exe)
+    else {
+        return false;
+    };
+    let Some(dir) = dirs::config_dir().map(|d| d.join("systemd/user")) else {
+        return false;
+    };
+    !crate::systemd_units::diff_units(&units, &installed_unit_contents(&units, &dir)).is_empty()
 }
 
 /// Is any expected unit file absent? Existence only, by expected name —
@@ -1048,18 +1120,7 @@ pub(crate) fn probe_grant(btrfs_path: &str) -> (GrantProbe, String) {
 /// expected grants. `Ok(())` = fully covered; `Err(reason)` = the honest
 /// cannot-confirm sentence's substance (never a silent pass).
 pub(crate) fn check_coverage(config: &Config) -> Result<(), String> {
-    let expected = sudoers::expected_grant_lines(config).map_err(|r| r.to_string())?;
-    let out = Command::new("sudo")
-        .env("LC_ALL", "C")
-        .args(["-n", "-l"])
-        .output()
-        .map_err(|e| format!("could not run sudo -n -l: {e}"))?;
-    if !out.status.success() {
-        return Err("the privilege listing needs a password (sudo -n -l)".to_string());
-    }
-    let listing = sudoers::parse_privilege_listing(&String::from_utf8_lossy(&out.stdout))
-        .map_err(|u| u.reason)?;
-    match sudoers::coverage(&expected, &listing) {
+    match effective_coverage(config)? {
         Coverage::AllCovered => Ok(()),
         Coverage::CannotInterpret { reason } => Err(reason),
         Coverage::Gaps { missing, uncertain } => {
@@ -1073,9 +1134,48 @@ pub(crate) fn check_coverage(config: &Config) -> Result<(), String> {
     }
 }
 
+/// Effective privileges (`LC_ALL=C sudo -n -l`) diffed against the
+/// config's expected grants. `Err` = the listing could not be rendered,
+/// obtained, or parsed.
+fn effective_coverage(config: &Config) -> Result<Coverage, String> {
+    let expected = sudoers::expected_grant_lines(config).map_err(|r| r.to_string())?;
+    let out = Command::new("sudo")
+        .env("LC_ALL", "C")
+        .args(["-n", "-l"])
+        .output()
+        .map_err(|e| format!("could not run sudo -n -l: {e}"))?;
+    if !out.status.success() {
+        return Err("the privilege listing needs a password (sudo -n -l)".to_string());
+    }
+    let listing = sudoers::parse_privilege_listing(&String::from_utf8_lossy(&out.stdout))
+        .map_err(|u| u.reason)?;
+    Ok(sudoers::coverage(&expected, &listing))
+}
+
+/// The expected grant lines the effective listing DEFINITIVELY lacks.
+/// Empty on full coverage — and on every uncertainty (unlistable,
+/// unparseable, wildcard candidates urd does not interpret): the deep
+/// gate and the earning's done-check act only on clear evidence; doctor
+/// owns the honest uncertain sentences.
+fn coverage_missing(config: &Config) -> Vec<String> {
+    match effective_coverage(config) {
+        Ok(Coverage::Gaps { missing, .. }) => missing,
+        _ => Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn declined_outcome_stops_a_fresh_earning_and_continues_a_regrant() {
+        // F4 continuation table: no grant → the seal stops; a grant that
+        // still answers (declined re-render) → the seal continues with
+        // coverage unconfirmed, so the units heal is never stranded.
+        assert_eq!(declined_outcome(false), SealOutcome::Declined);
+        assert_eq!(declined_outcome(true), SealOutcome::SealedUnverifiedCoverage);
+    }
 
     #[test]
     fn parse_earning_choice_defaults_to_install_and_knows_the_letters() {
