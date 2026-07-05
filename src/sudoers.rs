@@ -20,7 +20,10 @@
 //! - **Send/receive stay broad** (`send *`, `receive *`): source subvolumes
 //!   and external mount points vary, and both operations are non-destructive
 //!   (send is read-only; receive creates new subvolumes).
-//! - **show / filesystem show / subvolume sync** are read-only diagnostics.
+//! - **show / list / filesystem show / subvolume sync** are read-only
+//!   diagnostics; `subvolume list` is the post-seal second look's inventory
+//!   read (UPI 075). Hosts sealed before it existed show one Missing line in
+//!   doctor's coverage diff until `urd init` re-renders the grant.
 //! - Known caveat: sudoers wildcards use fnmatch without FNM_PATHNAME, so
 //!   the tail `*` in a scoped line matches across `/` and whitespace. The
 //!   scoped directory prefix is the boundary that matters; the tail is
@@ -228,6 +231,7 @@ fn grant_sections(config: &Config) -> Result<GrantSections, SudoersRefusal> {
         send_receive: vec![format!("{btrfs} send *"), format!("{btrfs} receive *")],
         read_only: vec![
             format!("{btrfs} subvolume show *"),
+            format!("{btrfs} subvolume list *"),
             format!("{btrfs} filesystem show *"),
             format!("{btrfs} subvolume sync *"),
         ],
@@ -740,6 +744,7 @@ protection = "sheltered"
                 "/usr/sbin/btrfs send *",
                 "/usr/sbin/btrfs receive *",
                 "/usr/sbin/btrfs subvolume show *",
+                "/usr/sbin/btrfs subvolume list *",
                 "/usr/sbin/btrfs filesystem show *",
                 "/usr/sbin/btrfs subvolume sync *",
             ]
@@ -1331,6 +1336,7 @@ User alice may run the following commands on example-host:
              (root) NOPASSWD: /usr/sbin/btrfs send *\n    \
              (root) NOPASSWD: /usr/sbin/btrfs receive *\n    \
              (root) NOPASSWD: /usr/sbin/btrfs subvolume show *\n    \
+             (root) NOPASSWD: /usr/sbin/btrfs subvolume list *\n    \
              (root) NOPASSWD: /usr/sbin/btrfs filesystem show *\n    \
              (root) NOPASSWD: /usr/sbin/btrfs subvolume sync *\n",
         )
@@ -1413,8 +1419,8 @@ User alice may run the following commands on example-host:
                     .unwrap_or_else(|| panic!("unexpected line shape: {line}"));
                 let allowlisted = matches!(
                     spec,
-                    "send *" | "receive *" | "subvolume show *" | "filesystem show *"
-                        | "subvolume sync *"
+                    "send *" | "receive *" | "subvolume show *" | "subvolume list *"
+                        | "filesystem show *" | "subvolume sync *"
                 );
                 let scoped_creation = spec.starts_with("subvolume snapshot -r /")
                     && spec.ends_with("/*")

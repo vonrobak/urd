@@ -33,6 +33,7 @@ mod state;
 mod storage_critical;
 mod strategy;
 mod sudoers;
+mod systemd_units;
 mod types;
 mod voice;
 #[cfg(test)]

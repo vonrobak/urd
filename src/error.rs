@@ -13,6 +13,7 @@ pub enum BtrfsOperation {
     Delete,
     Show,
     Sync,
+    List,
 }
 
 impl fmt::Display for BtrfsOperation {
@@ -24,6 +25,7 @@ impl fmt::Display for BtrfsOperation {
             Self::Delete => write!(f, "delete"),
             Self::Show => write!(f, "show"),
             Self::Sync => write!(f, "sync"),
+            Self::List => write!(f, "list"),
         }
     }
 }

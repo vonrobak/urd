@@ -739,6 +739,294 @@ pub fn render_earning_unavailable(detail: &str) -> String {
     )
 }
 
+// ── The seal's later stages (UPI 075) ───────────────────────────────────
+
+/// One adopted drive, by decision. The token is identity, not secret —
+/// `urd drives adopt` already prints it.
+#[must_use]
+pub fn render_seal_adoption(label: &str, action: &crate::output::AdoptAction) -> String {
+    use crate::output::AdoptAction;
+    match action {
+        AdoptAction::GeneratedNew { .. } => format!(
+            "{} {} — snapshot home created, identity written.\n",
+            "Adopted:".bold(),
+            label
+        ),
+        AdoptAction::AdoptedExisting { .. } => format!(
+            "{} {} — it already carried an identity; Urd now remembers it.\n",
+            "Adopted:".bold(),
+            label
+        ),
+        AdoptAction::AlreadyCurrent => {
+            format!("{} {} — already adopted.\n", "Known:".bold(), label)
+        }
+    }
+}
+
+/// A drive the adoption stage could not reach — honest per-drive skip,
+/// never red: the seal continues and `urd init` re-adopts when it's back.
+#[must_use]
+pub fn render_seal_adoption_skipped(label: &str, reason: &str) -> String {
+    format!(
+        "{} {} — {reason}\n\
+         Local protection proceeds without it; `urd init` adopts it once it's reachable.\n",
+        "Not adopted:".yellow().bold(),
+        label
+    )
+}
+
+/// When Urd acts next, derived ONLY from what the units actually do
+/// (adversary F3): the timer fires around 04:00 regardless of configured
+/// intervals (interval gating decides the work at run time), and the
+/// sentinel watches — it never snapshots. Promising sub-daily cadence here
+/// would be a fiction.
+#[must_use]
+pub fn describe_next_action(run_frequency: &crate::types::RunFrequency) -> String {
+    match run_frequency {
+        crate::types::RunFrequency::Sentinel => {
+            "The nightly timer acts around 04:00; the sentinel watches between runs."
+                .to_string()
+        }
+        crate::types::RunFrequency::Timer { .. } => {
+            "The nightly timer acts around 04:00.".to_string()
+        }
+    }
+}
+
+/// The units asking: what will be written where, what enabling means, and
+/// the two-way choice (no print option — the files land in the user's own
+/// config, and declining names the manual path).
+#[must_use]
+pub fn render_units_request(unit_names: &[&str], dir: &Path, next_action: &str) -> String {
+    let mut out = String::new();
+    writeln!(out).ok();
+    writeln!(
+        out,
+        "{} To act unattended, Urd asks systemd to carry her:",
+        "The promises need a schedule.".bold()
+    )
+    .ok();
+    writeln!(out).ok();
+    for name in unit_names {
+        writeln!(out, "    {}", dir.join(name).display()).ok();
+    }
+    writeln!(out).ok();
+    writeln!(out, "{next_action}").ok();
+    writeln!(out).ok();
+    writeln!(out, "  i) write and enable them  (Enter)").ok();
+    writeln!(out, "  q) not now").ok();
+    out
+}
+
+/// Units written and enabled.
+#[must_use]
+pub fn render_units_installed(next_action: &str) -> String {
+    format!("{} {next_action}\n", "Scheduled:".bold())
+}
+
+/// Everything already installed, enabled, and byte-true to the oracle.
+#[must_use]
+pub fn render_units_already(next_action: &str) -> String {
+    format!("{} Already woven into systemd. {next_action}\n", "Scheduled:".bold())
+}
+
+/// `q`: nothing written; the promises have no schedule until `urd init`.
+#[must_use]
+pub fn render_units_skipped() -> String {
+    format!(
+        "{} Nothing was written. Until the units are enabled, Urd acts only when\n\
+         you invoke her. `urd init` resumes this step; the repository's systemd/\n\
+         directory holds the files if you prefer to install them yourself.\n",
+        "Not scheduled:".yellow().bold()
+    )
+}
+
+/// A concrete step failed (write, daemon-reload, enable): name it, keep
+/// the seal moving, point at the resume verb.
+#[must_use]
+pub fn render_units_failed(step: &str, detail: &str) -> String {
+    format!(
+        "{} {step} failed: {detail}\n\
+         The promises hold, but nothing runs unattended yet. `urd init` retries.\n",
+        "Not scheduled:".yellow().bold()
+    )
+}
+
+/// No systemd user manager answers here (container, ssh without a session
+/// bus): its own sentence, never a doomed consent prompt.
+#[must_use]
+pub fn render_units_no_manager(detail: &str) -> String {
+    format!(
+        "{} No systemd user manager answers on this session: {detail}\n\
+         Urd cannot schedule herself here; she acts when you invoke her.\n",
+        "Not scheduled:".yellow().bold()
+    )
+}
+
+/// Lingering is off: the truth about what a user timer does and the one
+/// command that changes it. Urd never enables lingering herself
+/// (adversary F1).
+#[must_use]
+pub fn render_linger_notice(user: &str) -> String {
+    format!(
+        "{} Backups run while you are logged in; missed nights catch up at your\n\
+         next login. To let Urd act even when you are logged out:\n\
+         \x20   loginctl enable-linger {user}\n",
+        "One thread loose:".yellow().bold()
+    )
+}
+
+/// One line before the first local run — the backup's own summary is the
+/// report; this only names the moment.
+#[must_use]
+pub fn render_first_thread_intro() -> String {
+    format!(
+        "\n{} Spinning the first thread now — a local snapshot of every promise.\n\n",
+        "The first thread.".bold()
+    )
+}
+
+/// Every promise that plans local snapshots already has at least one.
+#[must_use]
+pub fn render_first_thread_already() -> String {
+    format!("{} The first threads are already spun.\n", "Recorded:".bold())
+}
+
+/// The grilled truthful state: sealed, first thread not yet spun, with the
+/// exact resume verb.
+#[must_use]
+pub fn render_first_thread_failed(detail: &str) -> String {
+    format!(
+        "{} {detail}\n\
+         Sealed, but the first thread is not yet spun — `urd init` spins it.\n",
+        "Not yet recorded:".yellow().bold()
+    )
+}
+
+/// A local snapshot home could not be created (#250 data-path dirs): one
+/// honest sentence per root, the run proceeds and reports per-subvolume.
+#[must_use]
+pub fn render_data_dir_failed(path: &Path, detail: &str) -> String {
+    format!(
+        "{} could not create {}: {detail}\n",
+        "Snapshot home:".yellow().bold(),
+        path.display()
+    )
+}
+
+/// The first-send offer: explicit, honest about duration, and without a
+/// deadline — sends are never time-limited. Enter sends now (the
+/// recommended path); `t` leaves it to tonight's timer.
+#[must_use]
+pub fn render_send_offer() -> String {
+    let mut out = String::new();
+    writeln!(out).ok();
+    writeln!(
+        out,
+        "{} Your snapshots live beside the data they guard. A copy on the\n\
+         external drive is what survives this machine.",
+        "The first send.".bold()
+    )
+    .ok();
+    writeln!(out).ok();
+    writeln!(
+        out,
+        "A first full send copies everything once. On a large home this can take\n\
+         hours; Urd never cuts a send short, and later sends move only changes."
+    )
+    .ok();
+    writeln!(out).ok();
+    writeln!(out, "  s) send now  (Enter — leave the terminal open, watch it run)").ok();
+    writeln!(out, "  t) tonight — the timer takes the first send at ~04:00").ok();
+    out
+}
+
+/// The deferred path: no scolding, one fact, one place to look.
+#[must_use]
+pub fn render_send_deferred() -> String {
+    "Tonight, then. The timer takes the first send at ~04:00; until it lands,\n\
+     `urd status` names what is not yet sheltered.\n"
+        .to_string()
+}
+
+/// The summary scroll: what was woven, what survives what, when Urd acts
+/// next, and the one command that matters from now on. Honest partial
+/// states carry their `urd init` resume sentence, yellow, never red.
+#[must_use]
+pub fn render_seal_summary(summary: &crate::output::SealSummary) -> String {
+    use crate::output::SealSendState;
+
+    let mut out = String::new();
+    writeln!(out).ok();
+    writeln!(out, "{}", "The seal.".bold()).ok();
+    writeln!(out).ok();
+    for thread in &summary.threads {
+        match &thread.level {
+            Some(level) => writeln!(out, "  {} — {level}", thread.name.bold()).ok(),
+            None => writeln!(out, "  {}", thread.name.bold()).ok(),
+        };
+    }
+    writeln!(out).ok();
+
+    if summary.first_thread_spun {
+        writeln!(out, "The first threads are spun — your history begins today.").ok();
+    } else {
+        writeln!(
+            out,
+            "{}",
+            "Sealed, but the first thread is not yet spun — `urd init` spins it.".yellow()
+        )
+        .ok();
+    }
+    match summary.send {
+        SealSendState::Sent => {
+            writeln!(out, "A copy rests on the external drive — it survives this machine.").ok();
+        }
+        SealSendState::Tonight => {
+            writeln!(out, "The first send waits for tonight's timer.").ok();
+        }
+        SealSendState::NotApplicable => {}
+    }
+    if summary.units_enabled {
+        writeln!(out, "{}", summary.next_action).ok();
+    } else {
+        writeln!(
+            out,
+            "{}",
+            "No schedule is enabled — Urd acts only when invoked. `urd init` completes it."
+                .yellow()
+        )
+        .ok();
+    }
+    if summary.linger_loose {
+        writeln!(
+            out,
+            "{}",
+            "Backups run while you are logged in; `loginctl enable-linger` frees them."
+                .yellow()
+        )
+        .ok();
+    }
+    if let Some(n) = summary.uncovered_subvolumes
+        && n > 0
+    {
+        let plural = if n == 1 { "subvolume" } else { "subvolumes" };
+        writeln!(
+            out,
+            "I also see {n} {plural} your promises don't cover — `urd init` hears new answers."
+        )
+        .ok();
+    }
+    writeln!(out).ok();
+    writeln!(
+        out,
+        "From now on, one command matters: {}. Silence means your data is safe.",
+        "urd status".bold()
+    )
+    .ok();
+    out
+}
+
 // ── The delve-deeper editor loop (rendered here, driven by commands) ────
 
 /// The visudo-shaped failure prompt after an edit broke the config.
@@ -786,6 +1074,76 @@ mod tests {
     };
     use crate::voice::test_fixtures::color_guard;
     use std::path::PathBuf;
+
+    // ── The seal's later stages (UPI 075) ───────────────────────────────
+
+    /// Adversary F3: "when Urd acts next" derives only from installed
+    /// units — never a sub-daily snapshot promise, in either mode.
+    #[test]
+    fn next_action_never_promises_sub_daily_cadence() {
+        let timer = describe_next_action(&crate::types::RunFrequency::Timer {
+            interval: crate::types::Interval::days(1),
+        });
+        assert!(timer.contains("04:00"));
+        assert!(!timer.contains("hour"));
+
+        let sentinel = describe_next_action(&crate::types::RunFrequency::Sentinel);
+        assert!(sentinel.contains("04:00"), "the timer is still what acts");
+        assert!(sentinel.contains("watches"), "the sentinel watches, never snapshots");
+        assert!(!sentinel.contains("hour"));
+    }
+
+    #[test]
+    fn seal_summary_names_threads_states_and_the_one_command() {
+        let _guard = color_guard(false);
+        let summary = crate::output::SealSummary {
+            threads: vec![crate::output::SealThread {
+                name: "docs".to_string(),
+                level: Some("sheltered".to_string()),
+            }],
+            units_enabled: true,
+            next_action: "The nightly timer acts around 04:00.".to_string(),
+            linger_loose: true,
+            first_thread_spun: true,
+            send: crate::output::SealSendState::Tonight,
+            uncovered_subvolumes: Some(2),
+        };
+        let out = render_seal_summary(&summary);
+        assert!(out.contains("docs"));
+        assert!(out.contains("sheltered"));
+        assert!(out.contains("04:00"));
+        assert!(out.contains("tonight's timer"));
+        assert!(out.contains("enable-linger"));
+        assert!(out.contains("2 subvolumes"));
+        assert!(out.contains("urd status"));
+    }
+
+    #[test]
+    fn seal_summary_partial_states_carry_the_resume_verb() {
+        let _guard = color_guard(false);
+        let summary = crate::output::SealSummary {
+            threads: vec![],
+            units_enabled: false,
+            next_action: String::new(),
+            linger_loose: false,
+            first_thread_spun: false,
+            send: crate::output::SealSendState::NotApplicable,
+            uncovered_subvolumes: None,
+        };
+        let out = render_seal_summary(&summary);
+        assert!(out.contains("not yet spun"));
+        assert!(out.contains("urd init"));
+        assert!(out.contains("No schedule is enabled"));
+        assert!(!out.contains("subvolumes your promises"), "None renders as silence");
+    }
+
+    #[test]
+    fn adoption_skip_sentence_names_the_drive_and_the_resume_verb() {
+        let _guard = color_guard(false);
+        let out = render_seal_adoption_skipped("backup-1", "not mounted at /run/media/x");
+        assert!(out.contains("backup-1"));
+        assert!(out.contains("urd init"));
+    }
 
     fn offer_spec() -> PromptSpec {
         PromptSpec {

@@ -165,18 +165,18 @@ pub fn run_drives_adopt(
         .format("%Y-%m-%dT%H:%M:%S")
         .to_string();
 
-    let action = match (on_disk_token, sqlite_token) {
-        // Both exist and match — nothing to do.
-        (Some(ref disk), Some(ref db)) if disk == db => AdoptAction::AlreadyCurrent,
-
-        // On-disk token exists but differs from SQLite (or SQLite has no record).
-        (Some(disk_token), _) => {
+    let action = match crate::drives::decide_adoption(
+        on_disk_token.as_deref(),
+        sqlite_token.as_deref(),
+    ) {
+        crate::drives::AdoptDecision::AlreadyCurrent => AdoptAction::AlreadyCurrent,
+        crate::drives::AdoptDecision::AdoptExisting => {
+            let disk_token = on_disk_token
+                .ok_or_else(|| anyhow::anyhow!("AdoptExisting implies an on-disk token"))?;
             state.store_drive_token(label, &disk_token, &now)?;
             AdoptAction::AdoptedExisting { token: disk_token }
         }
-
-        // No on-disk token — generate new.
-        (None, _) => {
+        crate::drives::AdoptDecision::GenerateNew => {
             let token = generate_drive_token();
             write_drive_token(drive, &token)?;
             state.store_drive_token(label, &token, &now)?;

@@ -1643,7 +1643,7 @@ pub struct DriveAdoptOutput {
 }
 
 /// What the adopt command did.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, PartialEq, Eq)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum AdoptAction {
     /// Adopted an existing on-disk token into SQLite.
@@ -1652,6 +1652,44 @@ pub enum AdoptAction {
     GeneratedNew { token: String },
     /// On-disk token already matches SQLite — no action taken.
     AlreadyCurrent,
+}
+
+// ── The seal's summary scroll (UPI 075) ─────────────────────────────────
+// Plain structs, no serde: the scroll is interactive-only ceremony
+// (ponytail-pinned — no `--json` parity, no schema contract).
+
+/// Everything the closing scroll states: what was woven, what runs when,
+/// and the honest partial states with their resume verb.
+#[derive(Debug)]
+pub struct SealSummary {
+    pub threads: Vec<SealThread>,
+    pub units_enabled: bool,
+    /// When Urd acts next — derived only from installed units (F3).
+    pub next_action: String,
+    /// Lingering is off: timers fire only while logged in (F1).
+    pub linger_loose: bool,
+    pub first_thread_spun: bool,
+    pub send: SealSendState,
+    /// The second look's one-sentence annotation; `None` = silence.
+    pub uncovered_subvolumes: Option<usize>,
+}
+
+/// One woven promise: subvolume and its protection level (display form).
+#[derive(Debug)]
+pub struct SealThread {
+    pub name: String,
+    pub level: Option<String>,
+}
+
+/// Where the first send stands when the scroll is written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SealSendState {
+    /// An external snapshot exists (sent now, or found already sent).
+    Sent,
+    /// Deferred to the timer.
+    Tonight,
+    /// No sends promised, or no drive reachable.
+    NotApplicable,
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
