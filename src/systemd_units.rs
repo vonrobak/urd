@@ -50,6 +50,19 @@ impl fmt::Display for UnitsRefusal {
 
 impl std::error::Error for UnitsRefusal {}
 
+/// The unit filenames a cadence answer selects — the name-only view for
+/// existence checks (status, doctor's read map) that must not resolve an
+/// exe path or render anything.
+#[must_use]
+pub fn expected_unit_names(run_frequency: &RunFrequency) -> Vec<&'static str> {
+    match run_frequency {
+        RunFrequency::Sentinel => {
+            vec!["urd-backup.service", "urd-backup.timer", "urd-sentinel.service"]
+        }
+        RunFrequency::Timer { .. } => vec!["urd-backup.service", "urd-backup.timer"],
+    }
+}
+
 /// The unit set this config's cadence answer selected, with ExecStart
 /// substituted to `exe`. The nightly pair is always required; the sentinel
 /// service joins it when the granularity answer chose sentinel mode (arc

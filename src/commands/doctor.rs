@@ -150,7 +150,7 @@ pub fn run(config: Config, args: DoctorArgs, output_mode: OutputMode) -> anyhow:
         .ok();
     let installed = dirs::config_dir().map(|d| {
         let dir = d.join("systemd/user");
-        expected_unit_name_set(&config.general.run_frequency)
+        crate::systemd_units::expected_unit_names(&config.general.run_frequency)
             .into_iter()
             .map(|name| {
                 (
@@ -498,19 +498,6 @@ fn build_sudoers_drift_checks(config: &Config, listing: Option<&str>) -> Vec<Doc
                 });
             }
             checks
-        }
-    }
-}
-
-/// The unit filenames the cadence answer expects — the doctor-side twin of
-/// `seal::expected_unit_names` (names only; content comes from the oracle).
-fn expected_unit_name_set(run_frequency: &crate::types::RunFrequency) -> Vec<&'static str> {
-    match run_frequency {
-        crate::types::RunFrequency::Sentinel => {
-            vec!["urd-backup.service", "urd-backup.timer", "urd-sentinel.service"]
-        }
-        crate::types::RunFrequency::Timer { .. } => {
-            vec!["urd-backup.service", "urd-backup.timer"]
         }
     }
 }

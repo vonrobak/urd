@@ -231,28 +231,7 @@ fn first_snapshot(config: &Config, config_path: &Path) -> bool {
     }
 
     print!("{}", voice::render_first_thread_intro());
-    // `backup::run` takes the config by value and `Config` is not `Clone`:
-    // reload from disk, the same posture as `post_carve` (a delve edit may
-    // have changed mappings — sealing from a stale value ships drift).
-    let run = crate::config::Config::load(Some(config_path))
-        .map_err(anyhow::Error::from)
-        .and_then(|fresh| {
-            crate::commands::backup::run(
-                fresh,
-                crate::cli::BackupArgs {
-                    dry_run: false,
-                    priority: None,
-                    subvolume: None,
-                    local_only: true,
-                    external_only: false,
-                    confirm_retention_change: false,
-                    force_full: false,
-                    auto: false,
-                    force_snapshot: false,
-                },
-            )
-        });
-    if let Err(e) = run {
+    if let Err(e) = run_seal_backup(config_path, /* local_only */ true) {
         print!("{}", voice::render_first_thread_failed(&format!("the run failed: {e}")));
         return false;
     }
@@ -347,37 +326,41 @@ fn offer_first_send(config: &Config, config_path: &Path) -> crate::output::SealS
             print!("{}", voice::render_send_deferred());
             SealSendState::Tonight
         }
-        SendChoice::SendNow => {
-            let run = crate::config::Config::load(Some(config_path))
-                .map_err(anyhow::Error::from)
-                .and_then(|fresh| {
-                    crate::commands::backup::run(
-                        fresh,
-                        crate::cli::BackupArgs {
-                            dry_run: false,
-                            priority: None,
-                            subvolume: None,
-                            local_only: false,
-                            external_only: true,
-                            confirm_retention_change: false,
-                            force_full: false,
-                            auto: false,
-                            force_snapshot: false,
-                        },
-                    )
-                });
-            match run {
-                Ok(()) => SealSendState::Sent,
-                Err(e) => {
-                    print!(
-                        "{}",
-                        voice::render_first_thread_failed(&format!("the send failed: {e}"))
-                    );
-                    SealSendState::Tonight
-                }
+        SendChoice::SendNow => match run_seal_backup(config_path, /* local_only */ false) {
+            Ok(()) => SealSendState::Sent,
+            Err(e) => {
+                print!(
+                    "{}",
+                    voice::render_first_thread_failed(&format!("the send failed: {e}"))
+                );
+                SealSendState::Tonight
             }
-        }
+        },
     }
+}
+
+/// One manual-mode run through the full backup pipeline, scoped to the
+/// seal's needs: `local_only` spins the first threads, its inverse
+/// (external-only) carries the first send. `backup::run` takes the config
+/// by value and `Config` is not `Clone`: reload from disk, the same
+/// posture as `post_carve` (a delve edit may have changed mappings —
+/// sealing from a stale value ships drift).
+fn run_seal_backup(config_path: &Path, local_only: bool) -> anyhow::Result<()> {
+    let fresh = crate::config::Config::load(Some(config_path))?;
+    crate::commands::backup::run(
+        fresh,
+        crate::cli::BackupArgs {
+            dry_run: false,
+            priority: None,
+            subvolume: None,
+            local_only,
+            external_only: !local_only,
+            confirm_retention_change: false,
+            force_full: false,
+            auto: false,
+            force_snapshot: false,
+        },
+    )
 }
 
 /// Does any enabled promise want external sends at all? (Pure.)
@@ -1025,23 +1008,9 @@ fn units_missing(config: &Config) -> bool {
     let Some(dir) = dirs::config_dir().map(|d| d.join("systemd/user")) else {
         return false;
     };
-    expected_unit_names(&config.general.run_frequency)
+    crate::systemd_units::expected_unit_names(&config.general.run_frequency)
         .iter()
         .any(|name| !dir.join(name).exists())
-}
-
-/// The expected unit filenames for a cadence answer — the name-only
-/// companion to `systemd_units::expected_units` (which needs the exe path
-/// for content; status must not resolve or render anything).
-fn expected_unit_names(run_frequency: &crate::types::RunFrequency) -> Vec<&'static str> {
-    match run_frequency {
-        crate::types::RunFrequency::Sentinel => {
-            vec!["urd-backup.service", "urd-backup.timer", "urd-sentinel.service"]
-        }
-        crate::types::RunFrequency::Timer { .. } => {
-            vec!["urd-backup.service", "urd-backup.timer"]
-        }
-    }
 }
 
 /// The passwordless probe (`LC_ALL=C sudo -n <btrfs> filesystem show /`),
