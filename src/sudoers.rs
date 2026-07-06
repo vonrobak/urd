@@ -141,17 +141,25 @@ fn escape_cmnd_token(s: &str) -> String {
 /// root — same blast radius).
 fn checked_scope(what: &'static str, dir: &Path) -> Result<String, SudoersRefusal> {
     let s = checked_path(what, dir)?;
-    let depth = dir
-        .components()
-        .filter(|c| matches!(c, Component::Normal(_)))
-        .count();
-    if depth < 2 {
+    if !scope_deep_enough(dir) {
         return Err(SudoersRefusal::ShallowScope {
             what,
             scope: s.to_string(),
         });
     }
     Ok(escape_cmnd_token(s))
+}
+
+/// The scope floor as a public predicate: would `dir` survive
+/// `checked_scope`'s depth check? Strategy derivation consults this so it
+/// never proposes a snapshot root the earning must later refuse — the rule
+/// lives here, in the single oracle, not copied into the deriver.
+#[must_use]
+pub fn scope_deep_enough(dir: &Path) -> bool {
+    dir.components()
+        .filter(|c| matches!(c, Component::Normal(_)))
+        .count()
+        >= 2
 }
 
 /// Usernames are never escaped — only accepted or refused. Beyond the

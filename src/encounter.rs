@@ -865,6 +865,7 @@ mod tests {
                 size: None,
                 transport: None,
             }],
+            home: None,
         };
         let r = EncounterState::begin(inv, today());
         match r.effect {
