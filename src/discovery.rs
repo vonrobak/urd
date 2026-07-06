@@ -49,6 +49,26 @@ pub struct SystemInventory {
     pub subvolumes: Vec<DiscoveredSubvol>,
     pub drives: Vec<CandidateDrive>,
     pub notes: Vec<DiscoveryNote>,
+    /// The invoking user's home directory, `None` when `$HOME` is unset
+    /// or relative. Strategy derivation falls back to a home-relative
+    /// snapshot root when a pool's canonical mount is too shallow for the
+    /// sudoers scope floor (field test 02, 2026-07-06).
+    pub home: Option<DiscoveredHome>,
+}
+
+/// The invoking user's home directory with pool attribution from a
+/// targeted `findmnt` probe — never path-prefix guessing: a non-btrfs
+/// `/home` mounted over a btrfs `/` is invisible to the btrfs-only mount
+/// listing, so containment in that listing proves nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredHome {
+    /// Absolute path from `$HOME`.
+    pub path: PathBuf,
+    /// UUID of the btrfs pool the home directory lives on; `None` when
+    /// home is not on btrfs or the probe degraded. A snapshot root must
+    /// share its source's filesystem, so no attribution means no
+    /// home-relative fallback.
+    pub pool_uuid: Option<String>,
 }
 
 /// A btrfs filesystem seen by lsblk, keyed by filesystem UUID. One pool may
@@ -673,6 +693,7 @@ fn build_inventory(
         subvolumes,
         drives,
         notes,
+        home: None,
     }
 }
 
@@ -715,6 +736,17 @@ fn run_findmnt() -> crate::error::Result<String> {
     run_probe("findmnt", &["-t", "btrfs", "-J"], true)
 }
 
+/// Which filesystem holds `path`? (`--target` walks up to the nearest
+/// mount, so the path itself need not be a mountpoint.)
+fn run_findmnt_target(path: &Path) -> crate::error::Result<String> {
+    let target = path.to_string_lossy();
+    run_probe(
+        "findmnt",
+        &["-J", "-o", "TARGET,FSTYPE,UUID", "--target", &target],
+        true,
+    )
+}
+
 /// Probe the system and build the inventory. Never fails: a failed probe
 /// degrades the inventory and leaves a [`DiscoveryNote::ProbeDegraded`]
 /// so 072 can say so (fail open, observable).
@@ -747,7 +779,29 @@ pub fn discover() -> SystemInventory {
     // Probe degradation is the most important note — surface it first.
     probe_notes.append(&mut inventory.notes);
     inventory.notes = probe_notes;
+    inventory.home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .map(|path| {
+            let pool_uuid = run_findmnt_target(&path)
+                .ok()
+                .and_then(|out| parse_findmnt_target(&out));
+            DiscoveredHome { path, pool_uuid }
+        });
     inventory
+}
+
+/// The btrfs pool UUID of the filesystem holding the probed path, from
+/// `findmnt --target` output; `None` for non-btrfs filesystems or
+/// unparseable output.
+fn parse_findmnt_target(json: &str) -> Option<String> {
+    let root: serde_json::Value = serde_json::from_str(json).ok()?;
+    let fs = root.get("filesystems")?.as_array()?.first()?;
+    if fs.get("fstype")?.as_str()? != "btrfs" {
+        return None;
+    }
+    let uuid = fs.get("uuid")?.as_str()?;
+    (!uuid.is_empty()).then(|| uuid.to_string())
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────
@@ -767,6 +821,38 @@ mod tests {
     const EXTERNAL_POOL: &str = "44444444-4444-4444-8444-444444444444";
     const SYSTEM_MAPPER: &str = "luks-11111111-1111-4111-8111-111111111111";
     const EXTERNAL_MAPPER: &str = "luks-33333333-3333-4333-8333-333333333333";
+
+    #[test]
+    fn parse_findmnt_target_btrfs_yields_pool_uuid() {
+        let json = format!(
+            r#"{{"filesystems":[{{"target":"/home","fstype":"btrfs","uuid":"{SYSTEM_POOL}"}}]}}"#
+        );
+        assert_eq!(
+            parse_findmnt_target(&json),
+            Some(SYSTEM_POOL.to_string())
+        );
+    }
+
+    #[test]
+    fn parse_findmnt_target_non_btrfs_yields_none() {
+        // An ext4 /home over a btrfs / must not be attributed to the pool
+        // — a home-relative snapshot root there would cross filesystems.
+        let json = format!(
+            r#"{{"filesystems":[{{"target":"/home","fstype":"ext4","uuid":"{SYSTEM_POOL}"}}]}}"#
+        );
+        assert_eq!(parse_findmnt_target(&json), None);
+    }
+
+    #[test]
+    fn parse_findmnt_target_degraded_output_yields_none() {
+        assert_eq!(parse_findmnt_target(""), None);
+        assert_eq!(parse_findmnt_target("{}"), None);
+        assert_eq!(parse_findmnt_target(r#"{"filesystems":[]}"#), None);
+        assert_eq!(
+            parse_findmnt_target(r#"{"filesystems":[{"target":"/","fstype":"btrfs","uuid":""}]}"#),
+            None
+        );
+    }
 
     fn node(name: &str) -> LsblkNode {
         LsblkNode {

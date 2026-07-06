@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- The Encounter can now seal on the Fedora default layout. Strategy
+  derivation no longer proposes a snapshot root the earning must refuse:
+  when a pool's canonical mount is too shallow for the sudoers scope floor
+  (a pool mounted at `/` derives `/.snapshots`), the root falls back to a
+  home-relative `~/.snapshots` — user-writable, on the same pool, and able
+  to host a promise on `/` itself. Pools mounted deeper keep one common
+  `{pool mount}/.snapshots`. The floor now has a single oracle
+  (`sudoers::scope_deep_enough`) that derivation consults, and discovery
+  attributes the user's home to its pool with a targeted `findmnt` probe —
+  never path guessing.
+- Virgin first backups no longer fail on a missing per-subvolume snapshot
+  directory: the executor now creates `{root}/{subvol}/` before the first
+  local snapshot (mirroring the drive-side destination mkdir), so ordinary
+  runs self-heal too. It still refuses to fabricate a missing snapshot
+  root — an absent root means the configured filesystem is not there.
+- The staging-reset lab script unwinds two artifacts it previously left
+  behind: one-time acknowledgment markers and the persistent timer's
+  last-trigger stamp (which caused a catch-up run on freshly reset
+  machines).
+
 ## [0.33.1] - 2026-07-05
 
 ### Fixed

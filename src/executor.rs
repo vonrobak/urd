@@ -890,6 +890,28 @@ impl<'a> Executor<'a> {
             dest.display()
         );
 
+        // Local snapshots land in `{root}/{subvol_name}/` and nothing else
+        // creates that dir — the seal creates only the roots (field test 03,
+        // F8, 2026-07-06). Self-heal here, mirroring the dest-dir mkdir in
+        // execute_send, so ordinary runs recover too. Same guard: only when
+        // the snapshot root itself is real — never manufacture a missing
+        // root on whatever filesystem happens to sit at its path.
+        if let Some(dir) = dest.parent()
+            && !dir.exists()
+            && dir.parent().is_some_and(Path::exists)
+        {
+            log::info!("Creating local snapshot directory: {}", dir.display());
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                let err = UrdError::Io {
+                    path: dir.to_path_buf(),
+                    source: e,
+                };
+                log::error!("Snapshot directory creation failed: {err}");
+                failed_creates.insert(dest);
+                return outcome_failure("snapshot", None, &err, start.elapsed());
+            }
+        }
+
         match self.btrfs.create_readonly_snapshot(source, dest) {
             Ok(()) => outcome_success("snapshot", None, None, start.elapsed()),
             Err(e) => {
@@ -2183,6 +2205,71 @@ source = "/data/b"
         assert_eq!(result.overall, RunResult::Partial);
         assert!(!result.subvolume_results[0].success); // sv-a failed
         assert!(result.subvolume_results[1].success); // sv-b succeeded
+    }
+
+    #[test]
+    fn create_self_heals_missing_local_snapshot_dir() {
+        // Field test 03, F8: the seal creates only the snapshot roots;
+        // `{root}/{subvol}/` must self-heal here or every virgin first
+        // thread (and any run after the dir vanishes) fails.
+        let mock = MockBtrfs::new();
+        let config = test_config();
+        let shutdown = no_shutdown();
+        let executor = Executor::new(&mock, None, &config, &shutdown);
+
+        let root = tempfile::TempDir::new().unwrap();
+        let dir = root.path().join("sv-a");
+        let dest = dir.join("20260322-1430-a");
+        let plan = BackupPlan {
+            operations: vec![PlannedOperation::CreateSnapshot {
+                source: PathBuf::from("/data/a"),
+                dest,
+                subvolume_name: "sv-a".to_string(),
+            }],
+            timestamp: NaiveDate::from_ymd_opt(2026, 3, 22)
+                .unwrap()
+                .and_hms_opt(14, 30, 0)
+                .unwrap(),
+            skipped: vec![],
+            events: Vec::new(),
+        };
+
+        let result = executor.execute(&plan, "full");
+
+        assert_eq!(result.overall, RunResult::Success);
+        assert!(dir.is_dir(), "the per-subvolume snapshot dir was created");
+    }
+
+    #[test]
+    fn create_never_manufactures_a_missing_snapshot_root() {
+        // The self-heal covers only the per-subvolume dir: a missing root
+        // means the configured filesystem is not there (unmounted, wrong
+        // path) — creating it would fabricate a snapshot home on whatever
+        // sits underneath.
+        let mock = MockBtrfs::new();
+        let config = test_config();
+        let shutdown = no_shutdown();
+        let executor = Executor::new(&mock, None, &config, &shutdown);
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("missing-root").join("sv-a");
+        let plan = BackupPlan {
+            operations: vec![PlannedOperation::CreateSnapshot {
+                source: PathBuf::from("/data/a"),
+                dest: dir.join("20260322-1430-a"),
+                subvolume_name: "sv-a".to_string(),
+            }],
+            timestamp: NaiveDate::from_ymd_opt(2026, 3, 22)
+                .unwrap()
+                .and_hms_opt(14, 30, 0)
+                .unwrap(),
+            skipped: vec![],
+            events: Vec::new(),
+        };
+
+        executor.execute(&plan, "full");
+
+        assert!(!dir.exists(), "no dir chain fabricated under a missing root");
     }
 
     #[test]

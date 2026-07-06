@@ -567,7 +567,7 @@ pub fn derive_strategy(
         subvolumes.push(ProposedSubvolume {
             name,
             source: candidate.mountpoint.clone(),
-            snapshot_root: snapshot_root_for(candidate, &inventory.pools),
+            snapshot_root: snapshot_root_for(candidate, inventory),
             level,
             policy,
         });
@@ -654,18 +654,44 @@ fn role_for(residence: Option<ResidenceAnswer>) -> DriveRole {
     }
 }
 
-/// `{pool canonical mountpoint}/.snapshots`. The fallback (the subvol's
-/// own mountpoint) is safe, not just convenient: that mountpoint is a
-/// mount of the same pool, so the snapshot dir still lands on the right
-/// filesystem.
-fn snapshot_root_for(candidate: &CandidateSubvol, pools: &[DiscoveredPool]) -> PathBuf {
-    pools
+/// `{pool canonical mountpoint}/.snapshots` — one common root per pool —
+/// unless that root sits below the sudoers scope floor
+/// (`sudoers::scope_deep_enough`, the earning's single oracle): on the
+/// Fedora default layout the pool's canonical mount is `/`, and proposing
+/// `/.snapshots` carves a config the earning must refuse (field test 02,
+/// 2026-07-06). A local snapshot root must be deep enough for the floor,
+/// on the same pool as its source, and user-writable (field test 03, F7)
+/// — the home-relative fallback satisfies all three with no chown
+/// ceremony, and covers a promise on `/` itself (home shares the pool on
+/// the default layout). The last resort (the subvol's own mountpoint) is
+/// same-pool by construction; a promise on `/` with home on a different
+/// pool still derives `/.snapshots` there — the documented residual the
+/// earning refuses honestly.
+fn snapshot_root_for(candidate: &CandidateSubvol, inventory: &SystemInventory) -> PathBuf {
+    let pool_root = inventory
+        .pools
         .iter()
         .find(|p| p.uuid == candidate.pool_uuid)
         .and_then(canonical_mount)
         .cloned()
         .unwrap_or_else(|| candidate.mountpoint.clone())
-        .join(".snapshots")
+        .join(".snapshots");
+    if crate::sudoers::scope_deep_enough(&pool_root) {
+        return pool_root;
+    }
+    // Pool attribution comes from discovery's targeted probe, never
+    // path-prefix guessing: a non-btrfs `/home` mounted over a btrfs `/`
+    // is invisible to the btrfs-only mount listing. A snapshot root must
+    // share its source's filesystem, so no attribution = no fallback.
+    if let Some(home) = &inventory.home
+        && home.pool_uuid.as_deref() == Some(candidate.pool_uuid.as_str())
+    {
+        let home_root = home.path.join(".snapshots");
+        if crate::sudoers::scope_deep_enough(&home_root) {
+            return home_root;
+        }
+    }
+    candidate.mountpoint.join(".snapshots")
 }
 
 fn granularity_intention(granularity: GranularityAnswer, today: NaiveDate) -> Intention {
@@ -815,6 +841,12 @@ pub(crate) mod test_support {
             subvolumes,
             drives,
             notes: Vec::new(),
+            // The fixture user's home lives on the system pool's `/home`
+            // subvolume, like the Fedora default layout it models.
+            home: Some(crate::discovery::DiscoveredHome {
+                path: PathBuf::from("/home/user"),
+                pool_uuid: Some(SYSTEM_POOL.to_string()),
+            }),
         }
     }
 
@@ -1678,17 +1710,73 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_root_is_pool_canonical_mount_dot_snapshots() {
-        // Fedora: the pool's canonical (shortest) mount is `/`, shared by
-        // both subvolumes — snapper-familiar `/.snapshots`.
+    fn snapshot_root_shallow_pool_falls_back_to_home_relative() {
+        // Fedora: the pool's canonical (shortest) mount is `/`, so the
+        // snapper-familiar `/.snapshots` sits below the sudoers scope
+        // floor and the earning would refuse it (field test 02). Home
+        // shares the pool, so every subvolume — `/` included — gets one
+        // common home-relative root, user-writable with no chown ceremony.
         let inv = fedora_with_external();
         let strategy = derive_strategy(&inv, &base_answers(), today());
+        assert!(!strategy.subvolumes.is_empty());
         assert!(
             strategy
                 .subvolumes
                 .iter()
-                .all(|s| s.snapshot_root == Path::new("/.snapshots"))
+                .all(|s| s.snapshot_root == Path::new("/home/user/.snapshots"))
         );
+    }
+
+    #[test]
+    fn snapshot_root_deep_pool_keeps_pool_canonical() {
+        // A pool mounted deep enough for the sudoers floor keeps one
+        // common `{pool mount}/.snapshots` — the live-fleet shape.
+        let inv = inventory(
+            vec![pool(SYSTEM_POOL, &["/mnt/btrfs-pool"])],
+            vec![subvol("/mnt/btrfs-pool/tank", "/tank", SYSTEM_POOL)],
+            vec![drive(
+                "sda",
+                DriveClass::Internal,
+                LuksState::NotEncrypted,
+                Some("btrfs"),
+                Some(SYSTEM_POOL),
+            )],
+        );
+        let strategy = derive_strategy(&inv, &base_answers(), today());
+        assert!(!strategy.subvolumes.is_empty());
+        assert!(
+            strategy
+                .subvolumes
+                .iter()
+                .all(|s| s.snapshot_root == Path::new("/mnt/btrfs-pool/.snapshots"))
+        );
+    }
+
+    #[test]
+    fn snapshot_root_home_off_pool_falls_back_to_own_mountpoint() {
+        // Home not attributed to the candidate's pool (ext4 home, another
+        // pool, or a degraded probe): the home-relative root could cross
+        // filesystems, so each subvolume falls back to its own mountpoint.
+        // A promise on `/` keeps the documented residual `/.snapshots`
+        // the earning refuses honestly.
+        let mut inv = fedora_with_external();
+        inv.home.as_mut().unwrap().pool_uuid = None;
+        let strategy = derive_strategy(&inv, &base_answers(), today());
+        let home = subvol_named(&strategy, "home");
+        assert_eq!(home.snapshot_root, Path::new("/home/.snapshots"));
+        let root = subvol_named(&strategy, "root");
+        assert_eq!(root.snapshot_root, Path::new("/.snapshots"));
+    }
+
+    #[test]
+    fn snapshot_root_unknown_home_falls_back_to_own_mountpoint() {
+        let mut inv = fedora_with_external();
+        inv.home = None;
+        let strategy = derive_strategy(&inv, &base_answers(), today());
+        let home = subvol_named(&strategy, "home");
+        assert_eq!(home.snapshot_root, Path::new("/home/.snapshots"));
+        let root = subvol_named(&strategy, "root");
+        assert_eq!(root.snapshot_root, Path::new("/.snapshots"));
     }
 
     // ── Step 5: drives, roles, gaps ────────────────────────────────────

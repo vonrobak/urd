@@ -261,6 +261,14 @@ if [[ $APPLY -eq 1 ]]; then
 else
     echo "  would daemon-reload + reset-failed 'urd-*'"
 fi
+# Persistent=true timers leave a last-trigger stamp that survives unit
+# removal — a "reset" machine would fire a catch-up run the moment the
+# units come back (field visit 2026-07-06, F13).
+for unit in "${UNITS[@]}"; do
+    [[ "$unit" == *.timer ]] || continue
+    stamp="$HOME/.local/share/systemd/timers/stamp-$unit"
+    [[ -e "$stamp" ]] && { do_rm "timer stamp" "$stamp" || true; }
+done
 echo
 
 # ── Hardening C: never reset under a live backup ─────────────────────────
@@ -375,6 +383,9 @@ for f in urd.db urd.db-wal urd.db-shm urd.lock heartbeat.json sentinel-state.jso
     [[ -e "$STATE_DIR/$f" ]] && { do_rm "state" "$STATE_DIR/$f" || true; }
 done
 [[ -d "$STATE_DIR/logs" ]] && { do_rm "state logs" "$STATE_DIR/logs/" || true; }
+# One-time acknowledgment markers (commands/acknowledgment.rs) — field
+# visit 2026-07-06, F5: the reset's own honest-warning caught this dir.
+[[ -d "$STATE_DIR/.acknowledgments" ]] && { do_rm "state acknowledgments" "$STATE_DIR/.acknowledgments/" || true; }
 if [[ $APPLY -eq 1 && -d "$STATE_DIR" ]]; then
     if ! rmdir "$STATE_DIR" 2>/dev/null; then
         echo "  WARNING: $STATE_DIR is not empty after the pass — this script does not know these files (unwind gap?):" >&2
