@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.33.3] - 2026-07-07
+
 ### Added
 - The first-run Encounter now guides you toward an offsite copy. The looking names the
   role it infers for each drive ("a disk inside this machine — where your data lives" /
@@ -1582,7 +1584,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Defense-in-depth pin file protection for unsent snapshots
 - Per-subvolume error isolation in executor
 
-[Unreleased]: https://github.com/vonrobak/urd/compare/v0.33.2...HEAD
+[Unreleased]: https://github.com/vonrobak/urd/compare/v0.33.3...HEAD
+[0.33.3]: https://github.com/vonrobak/urd/compare/v0.33.2...v0.33.3
 [0.33.2]: https://github.com/vonrobak/urd/compare/v0.33.1...v0.33.2
 [0.33.1]: https://github.com/vonrobak/urd/compare/v0.33.0...v0.33.1
 [0.33.0]: https://github.com/vonrobak/urd/compare/v0.32.0...v0.33.0
