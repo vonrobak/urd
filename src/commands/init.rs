@@ -167,17 +167,23 @@ pub(crate) fn collect_infrastructure_checks(
         }
     }
 
-    // Metrics directory
+    // Metrics directory (#253: name what init creates — mirrors the state
+    // database check's Creating/Verifying distinction rather than silently
+    // `create_dir_all`-ing a tree with no mention in the output).
     if let Some(parent) = config.general.metrics_file.parent() {
+        let dir_existed = parent.exists();
         match std::fs::create_dir_all(parent).and_then(|_| {
             let test = parent.join(".urd-write-test");
             std::fs::write(&test, b"").and_then(|_| std::fs::remove_file(&test))
         }) {
             Ok(()) => {
                 checks.push(InitCheck {
-                    name: format!("Metrics directory writable: {}", parent.display()),
+                    name: format!(
+                        "{} metrics directory",
+                        if dir_existed { "Verifying" } else { "Creating" }
+                    ),
                     status: InitStatus::Ok,
-                    detail: None,
+                    detail: Some(parent.display().to_string()),
                 });
             }
             Err(e) => {
@@ -243,7 +249,37 @@ pub(crate) fn collect_infrastructure_checks(
         },
     });
 
+    checks.extend(collect_drive_identity_checks(config));
+
     checks
+}
+
+/// Cross-check each connected drive's config UUID against its detected
+/// filesystem UUID (#252): a hand-edited config that still carries an
+/// example/stale UUID label-matches a differently-identified drive and
+/// `urd plan` then skips every subvolume with "drive UUID mismatch" — a
+/// gap `urd init` has every fact needed to catch itself. Not mounted /
+/// no UUID configured / check-failed are silent here (existing checks and
+/// `urd plan` already speak to those states); only a definite mismatch is
+/// an error.
+fn collect_drive_identity_checks(config: &Config) -> Vec<InitCheck> {
+    config
+        .drives
+        .iter()
+        .filter_map(|drive| match drives::drive_availability(drive) {
+            drives::DriveAvailability::UuidMismatch { expected, found } => Some(InitCheck {
+                name: format!("Drive '{}' identity", drive.label),
+                status: InitStatus::Error,
+                detail: Some(format!(
+                    "config expects UUID {expected}, the filesystem mounted at {} reports {found} — \
+                     fix the `uuid` field for drive '{}' in the config, or this is not the drive you think it is",
+                    drive.mount_path.display(),
+                    drive.label
+                )),
+            }),
+            _ => None,
+        })
+        .collect()
 }
 
 fn collect_subvolume_sources(config: &Config) -> Vec<InitCheck> {
@@ -532,5 +568,87 @@ mod tests {
         std::fs::write(&path, "this is not valid toml [[[").expect("write garbage");
         let result = run_cli(Some(&path), OutputMode::Daemon);
         assert!(result.is_err(), "invalid config must surface as Err");
+    }
+
+    /// #252: a connected drive (mounted, label matches) whose configured
+    /// `uuid` doesn't match the filesystem's real UUID must fail — not pass
+    /// silently — since `urd plan` would skip every subvolume on it.
+    /// Mounts at `/` (always mounted in the test environment) with a
+    /// deliberately wrong UUID, mirroring drives.rs's own
+    /// `drive_availability_uuid_mismatch` fixture.
+    #[test]
+    fn drive_identity_check_fails_on_uuid_mismatch() {
+        let config = Config::from_str(
+            r#"
+subvolumes = []
+
+[general]
+config_version = 2
+run_frequency = "daily"
+
+[[drives]]
+label = "root"
+uuid = "00000000-0000-0000-0000-000000000000"
+mount_path = "/"
+snapshot_root = ".snapshots"
+role = "primary"
+"#,
+        )
+        .expect("fixture config must load");
+
+        let checks = collect_drive_identity_checks(&config);
+        assert_eq!(checks.len(), 1, "expected exactly one identity check: {checks:?}");
+        assert_eq!(checks[0].status, InitStatus::Error);
+        assert!(checks[0].name.contains("root"));
+        let detail = checks[0].detail.as_deref().unwrap_or_default();
+        assert!(detail.contains("00000000-0000-0000-0000-000000000000"));
+        assert!(detail.contains("uuid"), "detail should point at the config field: {detail}");
+    }
+
+    #[test]
+    fn drive_identity_check_silent_when_no_uuid_configured() {
+        let config = Config::from_str(
+            r#"
+subvolumes = []
+
+[general]
+config_version = 2
+run_frequency = "daily"
+
+[[drives]]
+label = "root"
+mount_path = "/"
+snapshot_root = ".snapshots"
+role = "primary"
+"#,
+        )
+        .expect("fixture config must load");
+
+        assert!(collect_drive_identity_checks(&config).is_empty());
+    }
+
+    #[test]
+    fn drive_identity_check_silent_when_not_mounted() {
+        let config = Config::from_str(
+            r#"
+subvolumes = []
+
+[general]
+config_version = 2
+run_frequency = "daily"
+
+[[drives]]
+label = "elsewhere"
+uuid = "00000000-0000-0000-0000-000000000000"
+mount_path = "/tmp/urd-test-nonexistent-mount-12345"
+snapshot_root = ".snapshots"
+role = "primary"
+"#,
+        )
+        .expect("fixture config must load");
+
+        // Not mounted at all — existing checks and `urd plan` already speak
+        // to this state; the identity check must not double up.
+        assert!(collect_drive_identity_checks(&config).is_empty());
     }
 }

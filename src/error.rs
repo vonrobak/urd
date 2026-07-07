@@ -222,6 +222,28 @@ pub fn translate_btrfs_error(
         };
     }
 
+    // Pattern 5b: No such file — snapshot create (local per-subvolume dir
+    // missing, #251). The executor self-heals this directory before every
+    // run (#250/#273), so this now means the self-heal itself failed
+    // (e.g. the snapshot root's parent is gone or unwritable) rather than
+    // a first-run gap — still worth naming the exact path, not a raw
+    // "check journalctl".
+    if stderr_lower.contains("no such file or directory")
+        && matches!(operation, BtrfsOperation::Snapshot)
+    {
+        return BtrfsErrorDetail {
+            summary: "Local snapshot directory missing".to_string(),
+            cause: format!(
+                "The per-subvolume snapshot directory for {subvol} does not exist and could \
+                 not be created"
+            ),
+            remediation: vec![
+                "Check the snapshot root exists and is writable by your user".to_string(),
+                format!("Verify: ls -la <snapshot_root>/{subvol}"),
+            ],
+        };
+    }
+
     // Pattern 6: No such file — receive (destination dir missing)
     if stderr_lower.contains("no such file or directory")
         && matches!(operation, BtrfsOperation::Receive)
@@ -391,6 +413,23 @@ mod tests {
             None,
         );
         assert_eq!(detail.summary, "Snapshot not found at expected path");
+    }
+
+    #[test]
+    fn translate_no_such_file_snapshot() {
+        let detail = translate_btrfs_error(
+            BtrfsOperation::Snapshot,
+            "ERROR: Could not open: No such file or directory",
+            None,
+            Some("docs"),
+        );
+        assert_eq!(detail.summary, "Local snapshot directory missing");
+        assert!(detail.cause.contains("docs"));
+        assert!(
+            detail.remediation.iter().any(|r| r.contains("docs")),
+            "remediation should name the subvolume path: {:?}",
+            detail.remediation
+        );
     }
 
     #[test]

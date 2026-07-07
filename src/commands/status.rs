@@ -98,12 +98,7 @@ pub fn run(config: Config, output_mode: OutputMode) -> anyhow::Result<()> {
     );
 
     let rendered = voice::render_status(&status_output, output_mode);
-    let preamble = crate::commands::acknowledgment::preamble_for(
-        &config.general.state_db,
-        state_db.as_ref(),
-        output_mode,
-    );
-    print!("{preamble}{rendered}");
+    print!("{rendered}");
 
     Ok(())
 }

@@ -3,7 +3,6 @@ use std::path::Path;
 use crate::config::Config;
 use crate::output::OutputMode;
 
-pub mod acknowledgment;
 pub mod backup;
 pub mod calibrate;
 pub mod completions;

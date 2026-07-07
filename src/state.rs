@@ -676,22 +676,6 @@ impl StateDb {
         }
     }
 
-    /// Whether any run has been recorded. Used to gate first-run-only output
-    /// (e.g., the post-upgrade acknowledgment) behind actual usage.
-    pub fn has_any_completed_runs(&self) -> crate::error::Result<bool> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT 1 FROM runs LIMIT 1")
-            .map_err(|e| UrdError::State(format!("query failed: {e}")))?;
-        let mut rows = stmt
-            .query(rusqlite::params![])
-            .map_err(|e| UrdError::State(format!("query failed: {e}")))?;
-        Ok(rows
-            .next()
-            .map_err(|e| UrdError::State(format!("query failed: {e}")))?
-            .is_some())
-    }
-
     // ── Calibration methods ─────────────────────────────────────────
 
     /// Store (or update) a calibrated size for a subvolume.
@@ -2361,19 +2345,6 @@ mod tests {
         })
         .unwrap();
         assert_eq!(db.last_successful_operation_at("WD-18TB").unwrap(), None);
-    }
-
-    #[test]
-    fn has_any_completed_runs_false_for_fresh_db() {
-        let db = StateDb::open_memory().unwrap();
-        assert!(!db.has_any_completed_runs().unwrap());
-    }
-
-    #[test]
-    fn has_any_completed_runs_true_after_begin_run() {
-        let db = StateDb::open_memory().unwrap();
-        let _ = db.begin_run("full").unwrap();
-        assert!(db.has_any_completed_runs().unwrap());
     }
 
     // ── Event log tests ─────────────────────────────────────────────

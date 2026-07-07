@@ -249,6 +249,24 @@ fn parse_findmnt_locus(stdout: &str) -> Option<PoolLocus> {
     })
 }
 
+/// Whether a configured snapshot root needs the earning's privileged
+/// `install -d` (#282): missing entirely, or present but not writable by
+/// the current user (the pool-canonical deep-pool case — typically
+/// root-owned). Probes by attempting the exact write stage 4 will need
+/// (`create_dir_all` + a throwaway file), never by inspecting mode bits —
+/// the kernel's own permission check is the only reliable oracle across
+/// ACLs/group membership/mount options. No side effect on a definite
+/// "needs privilege" verdict: a failed `create_dir_all` creates nothing.
+fn root_needs_privileged_creation(root: &Path) -> bool {
+    if std::fs::create_dir_all(root).is_err() {
+        return true;
+    }
+    let probe = root.join(".urd-write-test");
+    std::fs::write(&probe, b"")
+        .and_then(|()| std::fs::remove_file(&probe))
+        .is_err()
+}
+
 // ── Stage 4: the first local snapshot ───────────────────────────────────
 
 /// Spin the first thread: pre-create the local snapshot homes (#250 — the
@@ -949,6 +967,28 @@ fn earn_privilege(config: &Config, config_path: &Path) -> anyhow::Result<SealOut
         }
     }
 
+    // Deep-pool snapshot roots (#282, F7 residual): a home-relative root is
+    // already user-writable by construction (073), but a pool-canonical
+    // root (e.g. `/mnt/btrfs-pool/.snapshots`) is typically root-owned, and
+    // stage 4 creates snapshot dirs unprivileged. This is the earning's one
+    // interactive-root moment — use it, in the same authenticated window,
+    // rather than stranding stage 4 on a permission error.
+    for root in &config.local_snapshots.roots {
+        if root_needs_privileged_creation(&root.path) {
+            let install_root = Command::new("sudo")
+                .args(["install", "-d", "-o", &user])
+                .arg(&root.path)
+                .status();
+            if !install_root.is_ok_and(|s| s.success()) {
+                log::warn!(
+                    "could not prepare snapshot root {} as {user} during the earning \
+                     — stage 4 will report the permission failure if it persists",
+                    root.path.display()
+                );
+            }
+        }
+    }
+
     // Coverage cross-check (adversary F3): the probe proves *a* grant;
     // this proves *the* grant, at the one moment the user is watching.
     match check_coverage(config) {
@@ -1226,6 +1266,53 @@ mod tests {
         assert_eq!(parse_earning_choice("q"), Some(EarningChoice::Decline));
         assert_eq!(parse_earning_choice("x"), None);
         assert_eq!(parse_earning_choice("install"), None);
+    }
+
+    #[test]
+    fn root_needs_privileged_creation_false_for_writable_existing_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join(".snapshots");
+        std::fs::create_dir_all(&root).unwrap();
+        assert!(!root_needs_privileged_creation(&root));
+    }
+
+    #[test]
+    fn root_needs_privileged_creation_false_for_missing_but_creatable_root() {
+        // The common case: the root's parent is user-writable (home-relative
+        // fallback, 073), so create_dir_all succeeds unprivileged and no
+        // earning-time install -d is needed.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("nested").join(".snapshots");
+        assert!(!root.exists());
+        assert!(!root_needs_privileged_creation(&root));
+        assert!(root.exists(), "the probe itself creates the root when it can");
+    }
+
+    #[test]
+    fn root_needs_privileged_creation_true_for_unwritable_existing_root() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join(".snapshots");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let needs_privilege = root_needs_privileged_creation(&root);
+        // Restore write perms so tempdir cleanup can remove it regardless of outcome.
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(needs_privilege, "a read-only existing root must ask for privileged creation");
+    }
+
+    #[test]
+    fn root_needs_privileged_creation_true_when_parent_is_unwritable() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().join("locked-parent");
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let root = parent.join(".snapshots");
+        let needs_privilege = root_needs_privileged_creation(&root);
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(needs_privilege, "an unwritable parent must ask for privileged creation");
+        assert!(!root.exists(), "create_dir_all must not have partially succeeded");
     }
 
     #[test]

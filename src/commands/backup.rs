@@ -649,12 +649,7 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     );
     let output_mode = OutputMode::detect();
     let rendered = crate::voice::render_backup_summary(&summary, output_mode);
-    let preamble = crate::commands::acknowledgment::preamble_for(
-        &config.general.state_db,
-        state_db.as_ref(),
-        output_mode,
-    );
-    println!("{preamble}{rendered}");
+    println!("{rendered}");
 
     // ── Orphaned-reserve sweep (UPI 067, one-release cleanup) ──────────
     // The fast-bridge reserve lifecycle (UPI 033) is retired with the cliff:

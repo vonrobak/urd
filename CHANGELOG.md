@@ -8,6 +8,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- `urd status`/`doctor`/`plan` no longer reach an interactive `sudo` prompt on a
+  configured-but-unsealed machine. A symmetric review of every `Command::new("sudo")`
+  in `src/` found the pre-grant-reachable site (`subvolume_show`, feeding
+  `subvolume_generation` — read by status/doctor/plan) missing `-n`, plus six
+  post-grant write-path sites (snapshot create, send, receive, delete, exists, sync)
+  that should fail fast rather than ever prompt mid-backup. All seven now carry `-n`;
+  every caller already treats a denied probe as "proceed without the optimization" or
+  "fail with diagnosable stderr" (#274).
+- `urd init` now catches a config/drive UUID mismatch on a connected drive — a
+  hand-edited config that still carries an example or stale UUID label-matched the
+  wrong filesystem and passed all-green, while the very next `urd plan` skipped every
+  subvolume on it with "drive UUID mismatch". Init now runs the same
+  `drives::drive_availability` check `plan` does and fails (not warns) on a definite
+  mismatch, naming both UUIDs and the drive's `mount_path` (#252).
+- `urd init` now says when it creates the metrics directory versus finding it already
+  there (mirroring the state-database check), instead of silently `create_dir_all`-ing
+  a tree with no mention in the output (#253).
+- The example config (`config/urd.toml.example`) no longer ships the maintainer's
+  homelab paths (`~/containers/data/...`) as its metrics/log defaults — both now point
+  at the same XDG-honest `~/.local/share/urd/` paths the v1/v2 examples already use
+  (#253).
+- `translate_btrfs_error` now has a case for a missing local per-subvolume snapshot
+  directory (`btrfs subvolume snapshot` failing ENOENT) — previously only the receive
+  and delete paths got a specific remediation, and this one fell through to a generic
+  "check journalctl" (#251).
+- The earning now creates non-user-writable snapshot roots during its one
+  authenticated-sudo window: a pool-canonical root (e.g. a deep BTRFS pool mounted at
+  `/mnt/btrfs-pool`) is typically root-owned, and stage 4 creates snapshot directories
+  unprivileged — previously stranding every virgin seal on such a layout with a
+  permission error. Detected by probing the exact write stage 4 needs, never by
+  inspecting mode bits (#282).
+- Removed the one-time post-upgrade trust-repair acknowledgment (`commands::
+  acknowledgment`, the v0.13.0 "some subvolumes previously reported as blocked" notice).
+  It fired on a virgin machine's very first backup — `has_any_completed_runs()` became
+  true the instant that first run completed, and the notice is meaningless with no
+  prior history to repair. ~20 releases past the bug it announced, with no plausible
+  un-acknowledged pre-v0.13.0 installation left to serve, full retirement (rather than
+  patching the trigger condition) closes the gap at the root (#278).
 - The Encounter can now seal on the Fedora default layout. Strategy
   derivation no longer proposes a snapshot root the earning must refuse:
   when a pool's canonical mount is too shallow for the sudoers scope floor

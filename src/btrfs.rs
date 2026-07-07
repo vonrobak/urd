@@ -171,6 +171,7 @@ impl BtrfsOps for RealBtrfs {
         );
         let output = Command::new("sudo")
             .env("LC_ALL", "C")
+            .arg("-n")
             .arg(&self.btrfs_path)
             .args(["subvolume", "snapshot", "-r"])
             .arg(source)
@@ -209,6 +210,7 @@ impl BtrfsOps for RealBtrfs {
         let mut send_cmd = Command::new("sudo");
         send_cmd
             .env("LC_ALL", "C")
+            .arg("-n")
             .arg(&self.btrfs_path)
             .arg("send");
         if self.supports_compressed_data {
@@ -276,6 +278,7 @@ impl BtrfsOps for RealBtrfs {
 
         let mut recv_child = Command::new("sudo")
             .env("LC_ALL", "C")
+            .arg("-n")
             .arg(&self.btrfs_path)
             .arg("receive")
             .arg(dest_dir)
@@ -450,6 +453,7 @@ impl BtrfsOps for RealBtrfs {
         );
         let output = Command::new("sudo")
             .env("LC_ALL", "C")
+            .arg("-n")
             .arg(&self.btrfs_path)
             .args(["subvolume", "delete"])
             .arg(path)
@@ -484,6 +488,7 @@ impl BtrfsOps for RealBtrfs {
         // directory as an already-sent snapshot.
         Command::new("sudo")
             .env("LC_ALL", "C")
+            .arg("-n")
             .arg(&self.btrfs_path)
             .args(["subvolume", "show"])
             .arg(path)
@@ -505,6 +510,7 @@ impl BtrfsOps for RealBtrfs {
         );
         let output = Command::new("sudo")
             .env("LC_ALL", "C")
+            .arg("-n")
             .arg(&self.btrfs_path)
             .args(["subvolume", "sync"])
             .arg(path)
@@ -604,8 +610,14 @@ pub fn parse_subvolume_list(output: &str) -> crate::error::Result<Vec<PathBuf>> 
 /// `BtrfsRead` field readers (`subvolume_generation`, `received_uuid`) — one
 /// invocation, one sudoers surface.
 fn subvolume_show(path: &Path) -> crate::error::Result<String> {
+    // `-n`: never prompt. Reachable pre-grant from `urd status`/`doctor`/`plan`
+    // (via `subvolume_generation`) on a configured-but-unsealed machine —
+    // without `-n` this pops an interactive PIN+FIDO prompt from a read-only
+    // fail-open call (field visit 2026-07-06, #274). Callers already treat an
+    // Err here as "no generation info" and proceed without the optimization.
     let output = Command::new("sudo")
         .env("LC_ALL", "C")
+        .arg("-n")
         .arg("btrfs")
         .args(["subvolume", "show"])
         .arg(path)
