@@ -22,7 +22,7 @@ use crate::discovery::{
     CandidateDrive, DiscoveredPool, DiscoveredSubvol, DiscoveryNote, DriveClass, SystemInventory,
 };
 use crate::strategy::{
-    CandidateSubvol, Destination, DriveResidencyAnswer, ExcludedSubvol, FateAnswers, Gap,
+    CandidateSubvol, Destination, DriveResidencyAnswer, ExcludedSubvol, FateAnswers, Gap, GapKind,
     GranularityAnswer, Importance, ImportanceAnswer, ProposedStrategy, ProposedSubvolume,
     ResidenceAnswer, ResolvedDriveClass, derive_strategy, protection_candidates,
     usable_destinations,
@@ -33,12 +33,19 @@ use crate::types::{DriveRole, RunFrequency};
 
 /// One line of user input, parsed against the pending prompt. EOF is
 /// mapped to `Quit` by the loop (closing stdin is walking away).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Discovered` is not user input: the loop feeds it back after
+/// fulfilling an [`Effect::Look`] (the machine's one I/O request). It
+/// carries a whole `SystemInventory`, so `Input` cannot be `Copy`.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Input {
     /// 0-based index into the prompt's `choices`.
     Choice(usize),
     Quit,
     Invalid,
+    /// The result of a look the machine asked for — seeded into the
+    /// awaiting phase (first look, look-again, runestone-confirm).
+    Discovered(SystemInventory),
 }
 
 /// Feedback attached to a re-prompt after unusable input.
@@ -121,6 +128,10 @@ pub enum PromptKind {
     Offer,
     LookingConfirm {
         view: LookingView,
+        /// `None` on the first look; `Some` when the user asked to look
+        /// again — the voice speaks the outcome so a repeat prompt never
+        /// reads as frozen.
+        relook: Option<ReLookOutcome>,
     },
     DriveResidency {
         drive: CandidateDrive,
@@ -140,6 +151,15 @@ pub enum PromptKind {
     Runestone {
         view: RunestoneView,
     },
+}
+
+/// The outcome of a look-again the user asked for at the looking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReLookOutcome {
+    /// The inventory is identical to the previous look.
+    NothingNew,
+    /// Something changed — the looking below is freshly gathered.
+    Refreshed,
 }
 
 // ── Views ───────────────────────────────────────────────────────────────
@@ -225,6 +245,11 @@ pub enum EmptyView {
 pub enum Effect {
     /// Render this prompt and feed the next line back in.
     Prompt(PromptSpec),
+    /// Look at the machine now and feed the result back as
+    /// [`Input::Discovered`]. The machine's *only* I/O request — it never
+    /// calls `discover()` itself (ADR-108). Emitted when the user begins
+    /// the looking, asks to look again, or commits at the runestone.
+    Look,
     /// The user approved the runestone: carve, then confirm or edit.
     Carve {
         strategy: ProposedStrategy,
@@ -232,9 +257,22 @@ pub enum Effect {
         /// same one, or a midnight crossing diverges file from promise.
         today: NaiveDate,
         then: AfterCarve,
+        /// A line to speak before carving — set only when the
+        /// runestone-confirm look was *promised* (a gap's plug-it-in
+        /// invitation was on screen) and found nothing new; otherwise the
+        /// second look is a silent safety-net.
+        announce: Option<ConfirmReLook>,
     },
     /// The conversation is over; render the farewell and exit cleanly.
     Farewell(FarewellKind),
+}
+
+/// The spoken outcome of a promised runestone-confirm look that changed
+/// nothing (the offsite invitation was shown, no drive appeared).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmReLook {
+    /// Looked once more; the gap the user was invited to close still stands.
+    GapStands,
 }
 
 /// The two exits that branch *after* the proposal (arc grill Q7).
@@ -252,9 +290,6 @@ pub enum AfterCarve {
 pub enum FarewellKind {
     /// Declined the offer — come back later is free.
     Declined,
-    /// The looking didn't match reality: mount or unlock what's missing
-    /// and run `urd init` again (re-running is the re-probe).
-    LookingMismatch,
     /// Quit mid-conversation.
     Quit,
     /// Nothing to carve; the view says why, honestly.
@@ -291,7 +326,16 @@ pub struct EncounterState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Phase {
     Offer,
-    Looking,
+    /// Waiting for the loop to fulfil an [`Effect::Look`] with
+    /// [`Input::Discovered`]. Transient — never prompts, never quits (the
+    /// loop supplies the inventory, not the user).
+    AwaitingLook {
+        resume: LookPurpose,
+    },
+    Looking {
+        /// Set when this looking follows a look-again the user asked for.
+        relook: Option<ReLookOutcome>,
+    },
     /// One question per `DriveClass::Ambiguous` drive, carrying the
     /// drive facts so the prompt needs no inventory lookup.
     DriveResidency {
@@ -312,26 +356,31 @@ enum Phase {
     Done,
 }
 
+/// What a look the machine asked for should resume into once the
+/// inventory arrives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LookPurpose {
+    /// The first look, after the offer — empty-check, then the looking.
+    First,
+    /// A look-again from the looking — re-render with the changed/same
+    /// outcome.
+    Again,
+    /// The look before committing at the runestone — a changed inventory
+    /// re-routes (residence/runestone); an unchanged one carves.
+    Confirm {
+        then: AfterCarve,
+    },
+}
+
 impl EncounterState {
-    /// Start the conversation. An inventory with no btrfs pools and no
-    /// mounted subvolumes short-circuits to an honest nothing-discovered
-    /// farewell — never an offer to look at nothing (locked or foreign
-    /// drives ride along so the farewell can name them).
+    /// Start the conversation at the offer. Discovery has not happened
+    /// yet — the machine holds an empty inventory until the user begins
+    /// the looking, so "I can look at what this machine has" is true when
+    /// spoken (#281). The nothing-discovered short-circuit moves to the
+    /// first look ([`handle_discovered`]).
     #[must_use]
-    pub fn begin(inventory: SystemInventory, today: NaiveDate) -> AdvanceResult {
-        if inventory.pools.is_empty() && inventory.subvolumes.is_empty() {
-            let view = EmptyView::NothingDiscovered {
-                drives: inventory.drives.clone(),
-                notes: inventory.notes.clone(),
-            };
-            let state = Self::with_phase(inventory, today, Phase::Done);
-            return AdvanceResult {
-                state,
-                effect: Effect::Farewell(FarewellKind::EmptyReport(view)),
-                notice: None,
-            };
-        }
-        let state = Self::with_phase(inventory, today, Phase::Offer);
+    pub fn begin(today: NaiveDate) -> AdvanceResult {
+        let state = Self::with_phase(SystemInventory::default(), today, Phase::Offer);
         prompt(state)
     }
 
@@ -361,9 +410,12 @@ pub fn prompt_for(state: &EncounterState) -> Option<PromptSpec> {
             choices: vec![ChoiceId::Begin, ChoiceId::NotNow],
             default: None,
         }),
-        Phase::Looking => Some(PromptSpec {
+        // Transient: emitted only with Effect::Look, never prompted.
+        Phase::AwaitingLook { .. } => None,
+        Phase::Looking { relook } => Some(PromptSpec {
             kind: PromptKind::LookingConfirm {
                 view: compose_looking(&state.inventory),
+                relook: *relook,
             },
             choices: vec![ChoiceId::LooksRight, ChoiceId::DoesNotMatch],
             default: None,
@@ -529,6 +581,8 @@ pub fn advance(state: EncounterState, input: Input) -> AdvanceResult {
     let choice = match input {
         Input::Quit => return farewell(state, FarewellKind::Quit),
         Input::Invalid => return invalid(state),
+        // Not user input: the loop's answer to an Effect::Look.
+        Input::Discovered(inventory) => return handle_discovered(state, inventory),
         Input::Choice(idx) => {
             let Some(spec) = prompt_for(&state) else {
                 // Done accepts nothing more; treat any input as leaving.
@@ -544,13 +598,11 @@ pub fn advance(state: EncounterState, input: Input) -> AdvanceResult {
     let mut state = state;
     let phase = std::mem::replace(&mut state.phase, Phase::Done);
     match (phase, choice) {
-        (Phase::Offer, ChoiceId::Begin) => {
-            state.phase = Phase::Looking;
-            prompt(state)
-        }
+        // Begin the looking: the machine asks to look (I/O in the loop).
+        (Phase::Offer, ChoiceId::Begin) => look(state, LookPurpose::First),
         (Phase::Offer, ChoiceId::NotNow) => farewell(state, FarewellKind::Declined),
 
-        (Phase::Looking, ChoiceId::LooksRight) => {
+        (Phase::Looking { .. }, ChoiceId::LooksRight) => {
             let pending: Vec<CandidateDrive> = state
                 .inventory
                 .drives
@@ -565,7 +617,10 @@ pub fn advance(state: EncounterState, input: Input) -> AdvanceResult {
                 prompt(state)
             }
         }
-        (Phase::Looking, ChoiceId::DoesNotMatch) => farewell(state, FarewellKind::LookingMismatch),
+        // "Something is missing" is no longer an exit: look again, inline
+        // and repeatable, so a hotplugged or fetched drive becomes visible
+        // (#281/#283). The user leaves the looking only by quitting.
+        (Phase::Looking { .. }, ChoiceId::DoesNotMatch) => look(state, LookPurpose::Again),
 
         (
             Phase::DriveResidency { pending, index },
@@ -638,22 +693,16 @@ pub fn advance(state: EncounterState, input: Input) -> AdvanceResult {
             runestone_phase(state)
         }
 
-        (Phase::Runestone { strategy }, ChoiceId::Accept | ChoiceId::DelveDeeper) => {
+        // Committing to the runestone looks once more before carving —
+        // never carve against a stale inventory. The strategy is dropped;
+        // the confirm look re-derives it from the (unchanged) answers.
+        (Phase::Runestone { .. }, ChoiceId::Accept | ChoiceId::DelveDeeper) => {
             let then = if choice == ChoiceId::Accept {
                 AfterCarve::Confirm
             } else {
                 AfterCarve::Edit
             };
-            let today = state.today;
-            AdvanceResult {
-                state,
-                effect: Effect::Carve {
-                    strategy,
-                    today,
-                    then,
-                },
-                notice: None,
-            }
+            look(state, LookPurpose::Confirm { then })
         }
 
         // A choice id that doesn't belong to the phase cannot come from
@@ -661,6 +710,90 @@ pub fn advance(state: EncounterState, input: Input) -> AdvanceResult {
         (phase, _) => {
             state.phase = phase;
             invalid(state)
+        }
+    }
+}
+
+/// Park in `AwaitingLook` and ask the loop to look. The machine performs
+/// no I/O — the inventory returns via [`Input::Discovered`].
+fn look(mut state: EncounterState, resume: LookPurpose) -> AdvanceResult {
+    state.phase = Phase::AwaitingLook { resume };
+    AdvanceResult {
+        state,
+        effect: Effect::Look,
+        notice: None,
+    }
+}
+
+/// Consume a look the machine asked for. Routes by the parked purpose:
+/// the first look runs the nothing-discovered short-circuit; a look-again
+/// re-renders the looking with a changed/same outcome; a confirm look
+/// re-routes on a changed inventory or carves on an unchanged one.
+fn handle_discovered(mut state: EncounterState, new_inventory: SystemInventory) -> AdvanceResult {
+    let Phase::AwaitingLook { resume } = std::mem::replace(&mut state.phase, Phase::Done) else {
+        // Discovery only ever answers an Effect::Look; anything else is a
+        // loop bug. Fail safe by leaving cleanly, nothing written.
+        return farewell(state, FarewellKind::Quit);
+    };
+    match resume {
+        LookPurpose::First => {
+            if new_inventory.pools.is_empty() && new_inventory.subvolumes.is_empty() {
+                let view = EmptyView::NothingDiscovered {
+                    drives: new_inventory.drives.clone(),
+                    notes: new_inventory.notes.clone(),
+                };
+                state.inventory = new_inventory;
+                return farewell(state, FarewellKind::EmptyReport(view));
+            }
+            state.inventory = new_inventory;
+            state.phase = Phase::Looking { relook: None };
+            prompt(state)
+        }
+        LookPurpose::Again => {
+            let outcome = if state.inventory == new_inventory {
+                ReLookOutcome::NothingNew
+            } else {
+                ReLookOutcome::Refreshed
+            };
+            state.inventory = new_inventory;
+            state.phase = Phase::Looking {
+                relook: Some(outcome),
+            };
+            prompt(state)
+        }
+        LookPurpose::Confirm { then } => {
+            // Whole-inventory equality: a cosmetic-only delta (a probe note,
+            // `home`) re-prompts an identical runestone rather than risk
+            // missing a material change — the safe direction (M1, review
+            // 2026-07-07).
+            let changed = state.inventory != new_inventory;
+            state.inventory = new_inventory;
+            if changed {
+                // A drive appeared (or vanished): re-derive, and re-ask
+                // residence if a new destination made it newly applicable.
+                return residence_or_runestone(state);
+            }
+            let strategy = derive_strategy(&state.inventory, &assembled_answers(&state), state.today);
+            // Speak only when the second look was promised — a gap's
+            // plug-it-in invitation was on the runestone — and found
+            // nothing. A gapless carve's second look stays silent.
+            let announce = strategy
+                .gaps
+                .iter()
+                .any(|g| matches!(g.kind, GapKind::NoExternalDrive | GapKind::NoOffsiteDrive))
+                .then_some(ConfirmReLook::GapStands);
+            let today = state.today;
+            state.phase = Phase::Done;
+            AdvanceResult {
+                state,
+                effect: Effect::Carve {
+                    strategy,
+                    today,
+                    then,
+                    announce,
+                },
+                notice: None,
+            }
         }
     }
 }
@@ -691,16 +824,19 @@ fn importance_phase(mut state: EncounterState) -> AdvanceResult {
     prompt(state)
 }
 
-/// House-fire scene only when it can change the derivation: at least one
-/// usable destination AND at least one irreplaceable answer. Otherwise
-/// `residence` stays `None` and the runestone follows directly.
+/// House-fire scene only when it can change the derivation: residence
+/// unanswered AND at least one usable destination AND at least one
+/// irreplaceable answer. Otherwise the runestone follows directly. The
+/// `residence.is_none()` guard makes this re-entrant: a confirm look that
+/// surfaces a new destination routes back here, but a residence already
+/// given is never re-asked.
 fn residence_or_runestone(mut state: EncounterState) -> AdvanceResult {
     let (destinations, _) = usable_destinations(&state.inventory, &state.drive_residency);
     let any_irreplaceable = state
         .importance
         .iter()
         .any(|a| a.importance == Importance::Irreplaceable);
-    if !destinations.is_empty() && any_irreplaceable {
+    if state.residence.is_none() && !destinations.is_empty() && any_irreplaceable {
         state.phase = Phase::Residence { destinations };
         prompt(state)
     } else {
@@ -812,6 +948,24 @@ mod tests {
         advance(result.state, Input::Choice(idx))
     }
 
+    /// Fulfil an [`Effect::Look`] with the given inventory — the pure-test
+    /// stand-in for the loop's `discover()`.
+    fn look(result: AdvanceResult, inv: SystemInventory) -> AdvanceResult {
+        assert!(
+            matches!(result.effect, Effect::Look),
+            "expected Effect::Look, got {:?}",
+            result.effect
+        );
+        advance(result.state, Input::Discovered(inv))
+    }
+
+    /// Offer → begin → first look: the looking with `inv` in hand.
+    fn begin_looking(inv: SystemInventory) -> AdvanceResult {
+        let r = EncounterState::begin(today());
+        let r = choose(r, ChoiceId::Begin);
+        look(r, inv)
+    }
+
     fn fedora_with_external() -> SystemInventory {
         let mut inv = fedora_inventory();
         inv.pools
@@ -823,8 +977,7 @@ mod tests {
     /// Walk the fixed head of the conversation: offer → looking →
     /// (no ambiguous drives) → granularity.
     fn to_granularity(inv: SystemInventory) -> AdvanceResult {
-        let r = EncounterState::begin(inv, today());
-        let r = choose(r, ChoiceId::Begin);
+        let r = begin_looking(inv);
         choose(r, ChoiceId::LooksRight)
     }
 
@@ -832,7 +985,9 @@ mod tests {
 
     #[test]
     fn begin_empty_inventory_farewells_nothing_discovered() {
-        let r = EncounterState::begin(inventory(vec![], vec![], vec![]), today());
+        // The offer shows first; the nothing-discovered short-circuit
+        // fires at the first look (#281 — begin no longer pre-judges).
+        let r = begin_looking(inventory(vec![], vec![], vec![]));
         match r.effect {
             Effect::Farewell(FarewellKind::EmptyReport(EmptyView::NothingDiscovered {
                 drives,
@@ -867,7 +1022,7 @@ mod tests {
             }],
             home: None,
         };
-        let r = EncounterState::begin(inv, today());
+        let r = begin_looking(inv);
         match r.effect {
             Effect::Farewell(FarewellKind::EmptyReport(EmptyView::NothingDiscovered {
                 drives,
@@ -881,27 +1036,42 @@ mod tests {
     }
 
     #[test]
-    fn begin_fedora_inventory_offers() {
-        let r = EncounterState::begin(fedora_inventory(), today());
+    fn begin_offers_before_looking() {
+        // begin no longer takes an inventory — it offers, and the look
+        // happens only after the user says yes.
+        let r = EncounterState::begin(today());
         assert_eq!(spec_of(&r).kind, PromptKind::Offer);
         assert_eq!(spec_of(&r).default, None, "the offer carries no default");
+    }
+
+    #[test]
+    fn begin_offers_before_any_discovery() {
+        // The offer is reachable with no inventory in hand; "I can look"
+        // is honest because the look has not happened yet (#281 twin).
+        let r = EncounterState::begin(today());
+        let r = choose(r, ChoiceId::Begin);
+        assert!(
+            matches!(r.effect, Effect::Look),
+            "begin → looking asks to look first, got {:?}",
+            r.effect
+        );
     }
 
     // ── Offer / looking ─────────────────────────────────────────────────
 
     #[test]
     fn offer_decline_farewells_declined() {
-        let r = EncounterState::begin(fedora_inventory(), today());
+        let r = EncounterState::begin(today());
         let r = choose(r, ChoiceId::NotNow);
         assert_eq!(r.effect, Effect::Farewell(FarewellKind::Declined));
     }
 
     #[test]
     fn offer_accept_shows_the_looking_grouped_by_pool() {
-        let r = EncounterState::begin(fedora_with_external(), today());
-        let r = choose(r, ChoiceId::Begin);
+        let r = begin_looking(fedora_with_external());
         match &spec_of(&r).kind {
-            PromptKind::LookingConfirm { view } => {
+            PromptKind::LookingConfirm { view, relook } => {
+                assert_eq!(*relook, None, "the first look is not a re-look");
                 assert_eq!(view.pools.len(), 2);
                 assert_eq!(
                     view.pools[0].subvolumes.len(),
@@ -916,11 +1086,45 @@ mod tests {
     }
 
     #[test]
-    fn looking_mismatch_farewells() {
-        let r = EncounterState::begin(fedora_inventory(), today());
-        let r = choose(r, ChoiceId::Begin);
+    fn looking_something_missing_looks_again_not_farewells() {
+        // "Something is missing" is no longer an exit — it asks to look
+        // again (#281), so a fetched or hotplugged drive can appear.
+        let r = begin_looking(fedora_inventory());
         let r = choose(r, ChoiceId::DoesNotMatch);
-        assert_eq!(r.effect, Effect::Farewell(FarewellKind::LookingMismatch));
+        assert!(
+            matches!(r.effect, Effect::Look),
+            "does-not-match looks again, got {:?}",
+            r.effect
+        );
+    }
+
+    #[test]
+    fn look_again_with_no_change_reports_nothing_new() {
+        let r = begin_looking(fedora_inventory());
+        let r = choose(r, ChoiceId::DoesNotMatch);
+        // The same inventory comes back from the re-look.
+        let r = look(r, fedora_inventory());
+        match &spec_of(&r).kind {
+            PromptKind::LookingConfirm { relook, .. } => {
+                assert_eq!(*relook, Some(ReLookOutcome::NothingNew));
+            }
+            other => panic!("expected the looking again, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn look_again_with_a_new_drive_reports_refreshed() {
+        let r = begin_looking(fedora_inventory());
+        let r = choose(r, ChoiceId::DoesNotMatch);
+        // A drive appeared while the looking waited.
+        let r = look(r, fedora_with_external());
+        match &spec_of(&r).kind {
+            PromptKind::LookingConfirm { view, relook } => {
+                assert_eq!(*relook, Some(ReLookOutcome::Refreshed));
+                assert_eq!(view.drives.len(), 2, "the new drive is now visible");
+            }
+            other => panic!("expected the refreshed looking, got {other:?}"),
+        }
     }
 
     #[test]
@@ -955,8 +1159,7 @@ mod tests {
             None,
             None,
         ));
-        let r = EncounterState::begin(inv, today());
-        let r = choose(r, ChoiceId::Begin);
+        let r = begin_looking(inv);
         let r = choose(r, ChoiceId::LooksRight);
         match &spec_of(&r).kind {
             PromptKind::DriveResidency { drive } => assert_eq!(drive.device, "sdb"),
@@ -993,8 +1196,7 @@ mod tests {
             Some("btrfs"),
             Some(EXTERNAL_POOL),
         ));
-        let r = EncounterState::begin(inv, today());
-        let r = choose(r, ChoiceId::Begin);
+        let r = begin_looking(inv);
         let r = choose(r, ChoiceId::LooksRight);
         let r = choose(r, ChoiceId::PartOfMachine);
         let r = choose(r, ChoiceId::YesterdayIsFine);
@@ -1021,8 +1223,7 @@ mod tests {
                 Some(SYSTEM_POOL),
             )],
         );
-        let r = EncounterState::begin(inv, today());
-        let r = choose(r, ChoiceId::Begin);
+        let r = begin_looking(inv);
         let r = choose(r, ChoiceId::LooksRight);
         match r.effect {
             Effect::Farewell(FarewellKind::EmptyReport(EmptyView::EverythingExcluded {
@@ -1071,9 +1272,16 @@ mod tests {
             None,
             None,
         ));
-        let mut r = EncounterState::begin(inv, today());
+        // Quit works at the offer.
+        let offer = EncounterState::begin(today());
+        assert_eq!(
+            advance(offer.state, Input::Quit).effect,
+            Effect::Farewell(FarewellKind::Quit)
+        );
+        // AwaitingLook is not a prompting state — the loop supplies the
+        // inventory, the user never sees it — so it is not quit-tested.
+        let mut r = begin_looking(inv);
         let script = [
-            ChoiceId::Begin,
             ChoiceId::LooksRight,
             ChoiceId::PartOfMachine,
             ChoiceId::YesterdayIsFine,
@@ -1098,7 +1306,7 @@ mod tests {
 
     #[test]
     fn invalid_input_reprompts_the_identical_spec_with_notice() {
-        let r = EncounterState::begin(fedora_inventory(), today());
+        let r = EncounterState::begin(today());
         let before = spec_of(&r).clone();
         let r2 = advance(r.state, Input::Invalid);
         assert_eq!(r2.notice, Some(InputNotice::InvalidChoice { choices: 2 }));
@@ -1107,7 +1315,7 @@ mod tests {
 
     #[test]
     fn out_of_range_choice_index_is_invalid() {
-        let r = EncounterState::begin(fedora_inventory(), today());
+        let r = EncounterState::begin(today());
         let r2 = advance(r.state, Input::Choice(7));
         assert!(r2.notice.is_some());
     }
@@ -1172,16 +1380,20 @@ mod tests {
         }
         assert_eq!(spec_of(&r).default, None, "approving fate has no default");
         let r = choose(r, ChoiceId::Accept);
+        // Committing looks once more; an unchanged inventory carves.
+        let r = look(r, inv.clone());
         let Effect::Carve {
             strategy,
             today: carve_today,
             then,
+            announce,
         } = r.effect
         else {
             panic!("expected carve, got {:?}", r.effect);
         };
         assert_eq!(then, AfterCarve::Confirm);
         assert_eq!(carve_today, today());
+        assert_eq!(announce, None, "no gap on this path → the second look is silent");
         let expected = derive_strategy(
             &inv,
             &FateAnswers {
@@ -1215,9 +1427,96 @@ mod tests {
         let r = choose(r, ChoiceId::Irreplaceable);
         let r = choose(r, ChoiceId::DeletionOnly);
         let r = choose(r, ChoiceId::DelveDeeper);
+        // Delve also looks once more before carving.
+        let r = look(r, fedora_with_external());
         match r.effect {
             Effect::Carve { then, .. } => assert_eq!(then, AfterCarve::Edit),
             other => panic!("expected carve, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn confirm_relook_with_no_drive_carves_and_announces_the_standing_gap() {
+        // No drive throughout: the runestone shows the NoExternalDrive
+        // gap, the user accepts without plugging anything in, and the
+        // promised second look finds nothing — so it speaks (#281/#283).
+        let r = to_granularity(fedora_inventory());
+        let r = choose(r, ChoiceId::YesterdayIsFine);
+        let r = choose(r, ChoiceId::Replaceable);
+        let r = choose(r, ChoiceId::Irreplaceable);
+        let r = choose(r, ChoiceId::Accept);
+        let r = look(r, fedora_inventory());
+        match r.effect {
+            Effect::Carve {
+                announce, strategy, ..
+            } => {
+                assert_eq!(announce, Some(ConfirmReLook::GapStands));
+                assert!(
+                    strategy
+                        .gaps
+                        .iter()
+                        .any(|g| g.kind == GapKind::NoExternalDrive)
+                );
+            }
+            other => panic!("expected carve, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn confirm_relook_finding_a_new_drive_asks_residence_then_strengthens() {
+        // The #281/#283 payoff: no drive at the runestone, the user plugs
+        // one in and accepts, the confirm look sees it, and residence —
+        // skipped earlier for want of a destination — is now asked.
+        let r = to_granularity(fedora_inventory());
+        let r = choose(r, ChoiceId::YesterdayIsFine);
+        let r = choose(r, ChoiceId::Replaceable);
+        let r = choose(r, ChoiceId::Irreplaceable);
+        // Runestone with the NoExternalDrive gap; accept, then a drive
+        // appears at the confirm look.
+        let r = choose(r, ChoiceId::Accept);
+        let r = look(r, fedora_with_external());
+        assert!(
+            matches!(spec_of(&r).kind, PromptKind::Residence { .. }),
+            "a newly-visible destination makes residence applicable, got {:?}",
+            spec_of(&r).kind
+        );
+        // Answer, reach a stronger runestone: the drive is now adopted and
+        // the no-drive gap is gone.
+        let r = choose(r, ChoiceId::KeptElsewhere);
+        match &spec_of(&r).kind {
+            PromptKind::Runestone { view } => {
+                assert_eq!(view.drives.len(), 1, "the plugged-in drive is adopted");
+                assert!(
+                    !view.gaps.iter().any(|g| g.kind == GapKind::NoExternalDrive),
+                    "the no-drive gap closed"
+                );
+            }
+            other => panic!("expected stronger runestone, got {other:?}"),
+        }
+        // Accept again; an unchanged look now carves.
+        let r = choose(r, ChoiceId::Accept);
+        let r = look(r, fedora_with_external());
+        assert!(matches!(r.effect, Effect::Carve { .. }));
+    }
+
+    #[test]
+    fn confirm_relook_with_a_vanished_drive_rederives_weaker() {
+        // Symmetric to the appeared-drive case: a drive unplugged before
+        // accepting re-derives to a weaker runestone, not a stale carve.
+        let r = to_granularity(fedora_with_external());
+        let r = choose(r, ChoiceId::YesterdayIsFine);
+        let r = choose(r, ChoiceId::Replaceable);
+        let r = choose(r, ChoiceId::Irreplaceable);
+        let r = choose(r, ChoiceId::DeletionOnly);
+        let r = choose(r, ChoiceId::Accept);
+        // The drive is gone at the confirm look.
+        let r = look(r, fedora_inventory());
+        match &spec_of(&r).kind {
+            PromptKind::Runestone { view } => {
+                assert!(view.drives.is_empty(), "the vanished drive is not adopted");
+                assert!(view.gaps.iter().any(|g| g.kind == GapKind::NoExternalDrive));
+            }
+            other => panic!("expected weaker runestone, got {other:?}"),
         }
     }
 
@@ -1264,6 +1563,7 @@ mod tests {
         let r = choose(r, ChoiceId::Irreplaceable);
         let r = choose(r, ChoiceId::DeletionOnly);
         let r = choose(r, ChoiceId::Accept);
+        let r = look(r, fedora_with_external());
         match r.effect {
             Effect::Carve { strategy, .. } => {
                 assert_eq!(strategy.run_frequency, RunFrequency::Sentinel);
@@ -1369,14 +1669,16 @@ mod tests {
     #[test]
     fn today_at_begin_is_today_on_carve() {
         let other_day = NaiveDate::from_ymd_opt(2027, 1, 1).unwrap();
-        let r = EncounterState::begin(fedora_with_external(), other_day);
+        let r = EncounterState::begin(other_day);
         let r = choose(r, ChoiceId::Begin);
+        let r = look(r, fedora_with_external());
         let r = choose(r, ChoiceId::LooksRight);
         let r = choose(r, ChoiceId::YesterdayIsFine);
         let r = choose(r, ChoiceId::Replaceable);
         let r = choose(r, ChoiceId::Irreplaceable);
         let r = choose(r, ChoiceId::DeletionOnly);
         let r = choose(r, ChoiceId::Accept);
+        let r = look(r, fedora_with_external());
         match r.effect {
             Effect::Carve { today: t, .. } => assert_eq!(t, other_day),
             other => panic!("expected carve, got {other:?}"),
@@ -1428,10 +1730,17 @@ mod tests {
             let mut granularity_asked = 0usize;
             let mut residence_asked = 0usize;
 
-            let mut r = EncounterState::begin(inv.clone(), today());
+            let mut r = EncounterState::begin(today());
             let terminal = loop {
                 let spec = match &r.effect {
                     Effect::Prompt(spec) => spec.clone(),
+                    // Every look the machine asks for returns the same grid
+                    // inventory — first look and the runestone-confirm both
+                    // see an unchanged world, so the walk carves.
+                    Effect::Look => {
+                        r = advance(r.state, Input::Discovered(inv.clone()));
+                        continue;
+                    }
                     terminal => break terminal.clone(),
                 };
                 let next = match &spec.kind {

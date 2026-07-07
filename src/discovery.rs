@@ -43,7 +43,10 @@ const VIRTUAL_NAME_PREFIXES: [&str; 3] = ["zram", "loop", "sr"];
 /// Everything the unprivileged probes could see, in one structure.
 ///
 /// Observational only — see the module docs' trust-boundary contract.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Default` is the pre-look empty inventory the machine holds at the
+/// offer, before the first [`Effect::Look`](crate::encounter::Effect).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SystemInventory {
     pub pools: Vec<DiscoveredPool>,
     pub subvolumes: Vec<DiscoveredSubvol>,

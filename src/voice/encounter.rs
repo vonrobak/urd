@@ -15,8 +15,8 @@ use colored::Colorize;
 
 use crate::discovery::{CandidateDrive, DiscoveryNote, DriveClass, LuksState, NoiseCategory};
 use crate::encounter::{
-    ChoiceId, EmptyView, FarewellKind, InputNotice, LookingView, PromptKind, PromptSpec,
-    RunestoneView,
+    ChoiceId, ConfirmReLook, EmptyView, FarewellKind, InputNotice, LookingView, PromptKind,
+    PromptSpec, ReLookOutcome, RunestoneView,
 };
 use crate::strategy::{Destination, ExclusionReason, Gap, GapKind, UnusableDrive, UnusableReason};
 use crate::types::{ProtectionLevel, RunFrequency};
@@ -40,8 +40,29 @@ pub fn render_prompt(spec: &PromptSpec) -> String {
             )
             .ok();
         }
-        PromptKind::LookingConfirm { view } => {
+        PromptKind::LookingConfirm { view, relook } => {
+            // A look-again the user asked for names its outcome first, so
+            // a repeated looking never reads as frozen.
+            if let Some(outcome) = relook {
+                let line = match outcome {
+                    ReLookOutcome::NothingNew => "Nothing new appeared.",
+                    ReLookOutcome::Refreshed => "I looked again.",
+                };
+                writeln!(out, "{}", line.dimmed()).ok();
+            }
             out.push_str(&render_looking(view));
+            // The offsite invitation (#283): urd keeps promises only to a
+            // mounted btrfs drive, so a drive kept elsewhere must be here
+            // to be protected. Naming it turns "look again" into a way to
+            // build toward an offsite copy, not just fix a misread.
+            writeln!(
+                out,
+                "\nI keep promises only to a btrfs drive mounted here — a copy in the\n\
+                 cloud or on a NAS is a fine thing to own, but not one I can watch.\n\
+                 If you keep a drive somewhere else — a drawer, another building —\n\
+                 plug it in now and choose look again."
+            )
+            .ok();
             writeln!(out, "\nDoes this match what you have?").ok();
         }
         PromptKind::DriveResidency { drive } => {
@@ -207,6 +228,12 @@ fn render_looking(view: &LookingView) -> String {
         writeln!(out, "\n  Drives:").ok();
         for drive in &view.drives {
             writeln!(out, "    {}", drive_facts_line(drive)).ok();
+            // Piece 1 (role visibility): name the role I infer for each
+            // disk, so a misread is a keystroke to fix, not a silent
+            // wrong assumption carried into the runestone.
+            if let Some(gloss) = drive_role_gloss(drive) {
+                writeln!(out, "      {gloss}").ok();
+            }
             if let Some(sentence) = drive_status_sentence(drive) {
                 writeln!(out, "      {sentence}").ok();
             }
@@ -216,6 +243,20 @@ fn render_looking(view: &LookingView) -> String {
         writeln!(out, "  {}", note_sentence(note)).ok();
     }
     out
+}
+
+/// The role Urd infers for a drive at the looking, in plain language.
+/// `None` for a drive whose role is genuinely undecided (ambiguous
+/// residency — the drive-residency question resolves it) or that cannot
+/// serve as a target (a non-btrfs external disk).
+fn drive_role_gloss(drive: &CandidateDrive) -> Option<&'static str> {
+    match drive.class {
+        DriveClass::Internal => Some("a disk inside this machine — where your data lives"),
+        DriveClass::External if drive.fstype.as_deref() == Some("btrfs") => {
+            Some("an external btrfs drive — a place I could keep a backup")
+        }
+        DriveClass::External | DriveClass::Ambiguous => None,
+    }
 }
 
 fn drive_facts_line(drive: &CandidateDrive) -> String {
@@ -435,17 +476,35 @@ fn render_gap(gap: &Gap) -> String {
                 writeln!(
                     out,
                     "      You called {} irreplaceable; until a drive arrives, \
-                     I can only record locally. Plug in a btrfs drive and run `urd init`.",
+                     I can only record locally.",
                     gap.demoted.join(", ")
                 )
                 .ok();
             }
+            // The re-discovery at confirm is the call to action: plug a
+            // drive in now and this gap closes before the carve (#281/#283).
+            // Named *external* deliberately — the confirm look adopts only a
+            // resolved external destination; a drive whose residency is still
+            // ambiguous is not re-classified on this path (S1, review
+            // 2026-07-07), so the promise names what it can keep.
+            writeln!(
+                out,
+                "      Plug in an external btrfs drive now and accept; I'll look \
+                 once more before I carve."
+            )
+            .ok();
         }
         GapKind::NoOffsiteDrive => {
             writeln!(
                 out,
                 "    Fire or theft. No drive lives away from this place — \
                  what burns here, burns everywhere."
+            )
+            .ok();
+            writeln!(
+                out,
+                "      If you keep an external btrfs drive elsewhere, plug it in \
+                 now and accept; I'll look once more before I carve."
             )
             .ok();
         }
@@ -520,12 +579,20 @@ pub fn render_farewell(kind: &FarewellKind) -> String {
         FarewellKind::Declined => "So be it. Nothing was written.\n\
              When you are ready, run `urd init`.\n"
             .to_string(),
-        FarewellKind::LookingMismatch => "Then my view is incomplete. Nothing was written.\n\
-             Mount or unlock what is missing, then run `urd init` again — \
-             looking again is free.\n"
-            .to_string(),
         FarewellKind::Quit => "Nothing was written. Run `urd init` to start over.\n".to_string(),
         FarewellKind::EmptyReport(view) => render_empty_report(view),
+    }
+}
+
+/// The one line a promised runestone-confirm look speaks when it found
+/// nothing new — the gap the user was invited to close still stands, and
+/// the carve proceeds with it named.
+#[must_use]
+pub fn render_confirm_relook(outcome: &ConfirmReLook) -> String {
+    match outcome {
+        ConfirmReLook::GapStands => "I looked once more — still no drive kept elsewhere.\n\
+             Carving with that gap named.\n"
+            .to_string(),
     }
 }
 
@@ -1228,6 +1295,7 @@ mod tests {
         let spec = PromptSpec {
             kind: PromptKind::LookingConfirm {
                 view: compose_looking(&inv),
+                relook: None,
             },
             choices: vec![ChoiceId::LooksRight, ChoiceId::DoesNotMatch],
             default: None,
@@ -1240,6 +1308,8 @@ mod tests {
         assert!(out.contains("erases everything"), "{out}");
         assert!(out.contains("snapper"), "{out}");
         assert!(out.contains("match"), "{out}");
+        // The offsite invitation rides the looking (#283).
+        assert!(out.contains("somewhere else"), "{out}");
     }
 
     #[test]
@@ -1332,7 +1402,56 @@ mod tests {
         let out = render_prompt(&spec);
         assert!(out.contains("cannot survive"), "{out}");
         assert!(out.contains("home"), "demoted name shown: {out}");
-        assert!(out.contains("urd init"), "path to more named: {out}");
+        // The path to more is the inline re-look, not a re-run of `urd
+        // init` (#281): plug in now and accept, and the gap closes.
+        assert!(
+            out.contains("Plug in an external btrfs drive now"),
+            "path to more names an external drive (S1): {out}"
+        );
+        assert!(out.contains("look once more"), "the CTA promises the second look: {out}");
+    }
+
+    #[test]
+    fn looking_names_the_inferred_role_of_each_drive() {
+        let _color = color_guard(false);
+        // One internal disk (a source) and one external btrfs (a target).
+        let mut inv = fedora_inventory();
+        inv.pools.push(pool(EXTERNAL_POOL, &["/run/media/user/backup"]));
+        inv.drives.push(mk_drive(
+            "sdd",
+            DriveClass::External,
+            LuksState::NotEncrypted,
+            Some("btrfs"),
+            Some(EXTERNAL_POOL),
+        ));
+        let out = render_looking(&compose_looking(&inv));
+        assert!(out.contains("where your data lives"), "source gloss: {out}");
+        assert!(out.contains("keep a backup"), "target gloss: {out}");
+    }
+
+    #[test]
+    fn look_again_nothing_new_is_spoken() {
+        let _color = color_guard(false);
+        let spec = PromptSpec {
+            kind: PromptKind::LookingConfirm {
+                view: compose_looking(&fedora_inventory()),
+                relook: Some(ReLookOutcome::NothingNew),
+            },
+            choices: vec![ChoiceId::LooksRight, ChoiceId::DoesNotMatch],
+            default: None,
+        };
+        assert!(
+            render_prompt(&spec).contains("Nothing new appeared"),
+            "a fruitless user-invoked re-look must not read as frozen"
+        );
+    }
+
+    #[test]
+    fn confirm_relook_gap_stands_speaks_the_promised_line() {
+        let _color = color_guard(false);
+        let out = render_confirm_relook(&ConfirmReLook::GapStands);
+        assert!(out.contains("looked once more"), "{out}");
+        assert!(out.contains("gap named"), "{out}");
     }
 
     // ── Endings ─────────────────────────────────────────────────────────
@@ -1342,7 +1461,6 @@ mod tests {
         let _color = color_guard(false);
         let kinds = [
             FarewellKind::Declined,
-            FarewellKind::LookingMismatch,
             FarewellKind::Quit,
             FarewellKind::EmptyReport(EmptyView::NothingDiscovered {
                 drives: vec![],
@@ -1391,8 +1509,10 @@ mod tests {
                 Some(SYSTEM_POOL),
             )],
         );
-        let r = EncounterState::begin(inv, today());
+        let r = EncounterState::begin(today());
+        // Offer → begin → the first look supplies the inventory → looking.
         let r = crate::encounter::advance(r.state, Input::Choice(0));
+        let r = crate::encounter::advance(r.state, Input::Discovered(inv));
         let r = crate::encounter::advance(r.state, Input::Choice(0));
         let Effect::Farewell(kind) = &r.effect else {
             panic!("expected farewell");
@@ -1676,7 +1796,6 @@ mod tests {
         use FarewellKind as F;
         let all = [
             F::Declined,
-            F::LookingMismatch,
             F::Quit,
             F::EmptyReport(EmptyView::NothingDiscovered {
                 drives: vec![],
@@ -1686,7 +1805,7 @@ mod tests {
         ];
         for f in &all {
             match f {
-                F::Declined | F::LookingMismatch | F::Quit | F::EmptyReport(_) => {}
+                F::Declined | F::Quit | F::EmptyReport(_) => {}
             }
         }
         let rendered: Vec<String> = all.iter().map(render_farewell).collect();
