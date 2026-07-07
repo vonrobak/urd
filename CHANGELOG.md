@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- The first-run Encounter now guides you toward an offsite copy. The looking names the
+  role it infers for each drive ("a disk inside this machine — where your data lives" /
+  "an external btrfs drive — a place I could keep a backup"), and when a setup cannot
+  survive a fire or theft, the runestone's gap narration says so plainly and invites you
+  to plug in an external drive on the spot — Urd looks once more before it writes the
+  config, so the drive is adopted without restarting. Urd is honest that it keeps
+  promises only to a btrfs drive mounted here, not to cloud or NAS storage (#283).
+
+### Fixed
+- The first-run Encounter now looks at the machine when you *begin* the conversation and
+  again right before it writes the config — so a drive connected or mounted while you
+  read the menu is seen and protected. Previously discovery ran once at process launch,
+  and a drive plugged in mid-conversation stayed invisible for the whole session, leaving
+  the runestone to propose a strategy that silently ignored it (#281).
+
 ## [0.33.2] - 2026-07-07
 
 ### Fixed

@@ -135,9 +135,8 @@ fn stage(temp: &Path, toml: &str) -> std::io::Result<()> {
 /// lives in `encounter.rs` (test the functions, not readline).
 pub fn run_conversation(config_path: Option<&Path>) -> anyhow::Result<CliExit> {
     let target = crate::commands::resolve_config_path(config_path)?;
-    let inventory = crate::discovery::discover();
     let today = chrono::Local::now().date_naive();
-    let mut result = EncounterState::begin(inventory, today);
+    let mut result = EncounterState::begin(today);
     loop {
         let AdvanceResult {
             state,
@@ -157,6 +156,12 @@ pub fn run_conversation(config_path: Option<&Path>) -> anyhow::Result<CliExit> {
                 };
                 result = advance(state, input);
             }
+            Effect::Look => {
+                // The machine's one I/O request: look now, feed it back.
+                // Discovery never fails (probe degradations become notes).
+                let inventory = crate::discovery::discover();
+                result = advance(state, Input::Discovered(inventory));
+            }
             Effect::Farewell(kind) => {
                 print!("{}", voice::render_farewell(&kind));
                 return Ok(CliExit::Done);
@@ -165,7 +170,14 @@ pub fn run_conversation(config_path: Option<&Path>) -> anyhow::Result<CliExit> {
                 strategy,
                 today,
                 then,
+                announce,
             } => {
+                // A promised second look that found nothing gets its one
+                // honest line before the carve; a silent safety-net says
+                // nothing (None).
+                if let Some(announce) = &announce {
+                    print!("{}", voice::render_confirm_relook(announce));
+                }
                 // A carve refusal (config appeared mid-conversation, or a
                 // self-check failure) surfaces as the error it is —
                 // nothing was written, the sentence says so.
