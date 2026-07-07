@@ -4,10 +4,11 @@
 [general]
 # SQLite database for run history and state
 state_db = "~/.local/share/urd/urd.db"
-# Prometheus metrics output (atomic write via tmp+rename)
-metrics_file = "~/containers/data/backup-metrics/backup.prom"
+# Prometheus metrics output (atomic write via tmp+rename). Prometheus
+# integration is opt-in — point this elsewhere only if you're scraping it.
+metrics_file = "~/.local/share/urd/backup.prom"
 # Log directory
-log_dir = "~/containers/data/backup-logs"
+log_dir = "~/.local/share/urd/logs"
 # Path to btrfs binary (sudoers entries reference this)
 btrfs_path = "/usr/sbin/btrfs"
 # Heartbeat file — JSON health signal written after each backup run
