@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.33.2] - 2026-07-07
+
 ### Fixed
 - `urd status`/`doctor`/`plan` no longer reach an interactive `sudo` prompt on a
   configured-but-unsealed machine. A symmetric review of every `Command::new("sudo")`
@@ -1564,7 +1566,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Defense-in-depth pin file protection for unsent snapshots
 - Per-subvolume error isolation in executor
 
-[Unreleased]: https://github.com/vonrobak/urd/compare/v0.33.1...HEAD
+[Unreleased]: https://github.com/vonrobak/urd/compare/v0.33.2...HEAD
+[0.33.2]: https://github.com/vonrobak/urd/compare/v0.33.1...v0.33.2
 [0.33.1]: https://github.com/vonrobak/urd/compare/v0.33.0...v0.33.1
 [0.33.0]: https://github.com/vonrobak/urd/compare/v0.32.0...v0.33.0
 [0.32.0]: https://github.com/vonrobak/urd/compare/v0.31.0...v0.32.0
