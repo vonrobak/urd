@@ -37,7 +37,7 @@ in environments where those are absent.
 ## Testing
 
 ```bash
-cargo test                  # 930+ unit tests
+cargo test                  # 2224 unit tests
 cargo test -- --ignored     # Integration tests (requires BTRFS drives)
 cargo clippy -- -D warnings # Lint (all warnings are errors)
 ```

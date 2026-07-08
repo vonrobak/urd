@@ -8,10 +8,11 @@ graduated retention — so your data is safe without you thinking about it.
 Named after [Urðr](https://en.wikipedia.org/wiki/Ur%C3%B0r), the Norse norn who tends
 the Well of Fate and knows all that has passed.
 
-> **Status:** Early development — experimental. The core backup pipeline is extensively
-> tested (959 tests) and running in production as the sole backup system for the author.
-> In future releases, Urd will be made more flexible and accessible for users with
-> different setups.
+> **Status:** Urd runs in production today as the author's sole backup system, on a
+> core that is extensively tested (2,224 tests). It is field-validated on Fedora;
+> other Linux distributions should work but haven't been proven yet — if your system
+> differs from what Urd expects, `urd doctor` tells you what it found and what it needs.
+> Pre-1.0: the commands may still change.
 
 ## Why Urd?
 
@@ -41,18 +42,76 @@ Urd fills that gap:
 ```
 $ urd status
 
-EXPOSURE  SUBVOLUME      LOCAL  external-1  external-2
-sealed    documents      15     3           2
-sealed    photos         15     3           2
-sealed    recordings     15     3           2
-sealed    music          15     3           —
-sealed    home           15     3           —
-sealed    multimedia     4      —           —
-sealed    scratch        4      —           —
-sealed    containers     4      —           —
+EXPOSURE  PROTECTION  SUBVOLUME    LOCAL  external-1  external-2
+sealed    fortified   documents    15     3           2
+sealed    fortified   photos       15     3           2
+sealed    fortified   recordings   15     3           2
+sealed    fortified   music        15     3           —
+sealed    fortified   home         15     3           —
+sealed    recorded    multimedia   4      —           —
+sealed    recorded    scratch      4      —           —
+sealed    recorded    containers   4      —           —
 
 Drives: external-1 (4.4 TB free), external-2 (1.1 TB free)
 ```
+
+Protection levels you set once; Urd derives the retention and send schedule from them.
+
+## Install
+
+**You need:**
+
+- Linux with a BTRFS filesystem
+- `btrfs-progs`
+- systemd — optional, for the nightly timer and the Sentinel monitoring daemon
+
+**From source** (recommended today — needs a Rust toolchain):
+
+```bash
+git clone https://github.com/vonrobak/urd.git && cd urd
+cargo install --path .    # installs to ~/.cargo/bin/urd
+```
+
+A prebuilt one-step binary, with checksum verification, is coming with the release
+pipeline — watch the [releases page](https://github.com/vonrobak/urd/releases).
+
+There is no `curl | bash` installer, and there won't be — not when the binary lands
+either. You check the sum yourself and decide when Urd has earned the password it asks for.
+
+## Getting started
+
+Install Urd, run `urd`, and she looks at what you have and proposes how to protect it.
+Nothing is written without your approval.
+
+```
+$ urd
+Urd is not configured yet.
+I can look at what this machine has and propose how to protect it.
+Nothing is written without your approval; leaving costs nothing.
+
+  1) begin    2) not now    q) leave — nothing is written
+
+I have looked. Here is what this machine holds:
+
+  data — 2.4 TB free of 3.6 TB
+    /home  (subvolume @home)
+
+  Drives:
+    Elements, 2 TB, usb — an external btrfs drive, a place I could keep a backup
+
+  … a few questions about what matters and where it lives …
+
+The runestone. Read it before you answer:
+
+  Promises:
+    home  (/home)  — sheltered: snapshots kept here and sent to the drive
+```
+
+You approve the runestone, and only then does she carve it — she never touches your
+disks, your `sudo`, or your config until you say the word.
+
+That is the whole first run. For the manual path and the full reference — sudoers,
+config schema, systemd units — see the [operating guide](docs/00-foundation/guides/operating-urd.md).
 
 ## Commands
 
@@ -116,52 +175,10 @@ independent protection layers.
 
 ## Configuration
 
-```toml
-# ~/.config/urd/urd.toml
-
-[general]
-snapshot_root = "/mnt/your-filesystem/.snapshots"
-run_frequency = "daily"
-
-[[subvolumes]]
-name = "documents"
-short_name = "docs"
-source = "/mnt/your-filesystem/documents"
-protection_level = "fortified"
-drives = ["external-1", "external-2"]
-
-[[subvolumes]]
-name = "multimedia"
-short_name = "multimedia"
-source = "/mnt/your-filesystem/multimedia"
-protection_level = "recorded"
-
-[[drives]]
-label = "external-1"
-mount_path = "/run/media/you/external-1"
-uuid = "abcd-1234"
-```
-
-See [`config/urd.toml.example`](config/urd.toml.example) for a complete reference.
-
-## Requirements
-
-- Linux with BTRFS filesystem
-- `btrfs-progs` installed
-- Scoped sudoers entries for `btrfs` subcommands — see the
-  [sudoers template](docs/00-foundation/guides/operating-urd.md#sudoers-configuration)
-  (Urd runs as a regular user, invokes `sudo btrfs` for privileged operations)
-- systemd (optional, for timer and Sentinel daemon integration)
-
-## Building
-
-```bash
-cargo build --release
-cargo install --path .    # Install to ~/.cargo/bin/urd
-
-cargo test                # 959 unit tests
-cargo clippy -- -D warnings
-```
+Urd writes its config for you during the first run — you approve the plan, it carves the
+TOML. To read or hand-edit it afterward, or to configure Urd without the guided first run,
+see the [operating guide](docs/00-foundation/guides/operating-urd.md) and
+[`config/urd.toml.example`](config/urd.toml.example).
 
 ## Architecture
 
