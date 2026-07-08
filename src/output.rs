@@ -205,6 +205,13 @@ pub struct StatusOutput {
     /// paths never probe); `None` means "sealed or not checked".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seal_gap: Option<SealGap>,
+    /// The privilege probe couldn't confirm the grant (UPI 081) — e.g. sudo
+    /// erroring rather than answering Granted/Denied. Mutually exclusive
+    /// with `seal_gap` by construction (`seal::seal_posture`): a status
+    /// surface must not fall silent, nor presume a seal stage, when
+    /// privilege itself is unconfirmed.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub privilege_unclear: bool,
 }
 
 /// The seal stage `urd status` names as incomplete, in seal order —
@@ -448,6 +455,10 @@ pub struct DefaultStatusOutput {
     /// `StatusOutput::seal_gap`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seal_gap: Option<SealGap>,
+    /// The privilege probe couldn't confirm the grant (UPI 081) — see
+    /// `StatusOutput::privilege_unclear`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub privilege_unclear: bool,
 }
 
 fn is_zero(n: &usize) -> bool {
@@ -609,7 +620,12 @@ pub struct DoctorOutput {
     pub config_checks: Vec<DoctorCheck>,
     pub infra_checks: Vec<DoctorCheck>,
     pub data_safety: Vec<DoctorDataSafety>,
-    pub sentinel: DoctorSentinelStatus,
+    /// Sentinel daemon status (UPI 081 B4). `None` under `RunFrequency::Timer`
+    /// — a stopped daemon that a nightly-timer config never installs is not a
+    /// warning; the section omits rather than alarming about a unit that was
+    /// never supposed to run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sentinel: Option<DoctorSentinelStatus>,
     /// Schema deprecation notice (UPI 042 Branch G). `Some(_)` when the
     /// loaded config is legacy or v1; voice renders a single-line notice
     /// suggesting `urd migrate`. `None` for v2.
@@ -2398,11 +2414,11 @@ source = "/data/sv2"
             config_checks: vec![],
             infra_checks: vec![],
             data_safety: vec![],
-            sentinel: DoctorSentinelStatus {
+            sentinel: Some(DoctorSentinelStatus {
                 running: false,
                 pid: None,
                 uptime: None,
-            },
+            }),
             schema_status: None,
             verify: None,
             churn: None,
@@ -2423,11 +2439,11 @@ source = "/data/sv2"
             config_checks: vec![],
             infra_checks: vec![],
             data_safety: vec![],
-            sentinel: DoctorSentinelStatus {
+            sentinel: Some(DoctorSentinelStatus {
                 running: false,
                 pid: None,
                 uptime: None,
-            },
+            }),
             schema_status: None,
             verify: None,
             churn: None,

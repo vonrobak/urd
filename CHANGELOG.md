@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `urd status`/bare `urd` no longer prescribe `urd backup` on a machine whose privileges
+  aren't confirmed — command-producing advice suppresses until the grant is earned, and a
+  new cannot-verify line speaks when the probe itself can't tell (sudo erroring) instead of
+  falling silent (#276).
+- `urd doctor` collapses an all-missing sudoers grant to one "not sealed yet" line instead
+  of burying the real cause under a row per expected command (#280).
+- `urd doctor` omits the Sentinel section entirely on a nightly-timer machine instead of
+  warning about a daemon unit that config never installs (#279).
+
 ## [0.33.3] - 2026-07-07
 
 ### Added

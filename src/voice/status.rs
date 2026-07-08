@@ -45,9 +45,12 @@ pub(super) fn render_status_interactive(data: &StatusOutput) -> String {
     // ── Summary line ────────────────────────────────────────────────
     render_summary_line(data, &mut out);
 
-    // ── The seal (UPI 071/075) ──────────────────────────────────────
+    // ── The seal (UPI 071/075/081) ────────────────────────────────────
     // The first incomplete seal stage: said once, high, with the resume
     // verb. Yellow, never red — nothing was lost (Rule 6, red is earned).
+    // `privilege_unclear` and `seal_gap` are mutually exclusive by
+    // `seal::seal_posture`'s construction, so only one of these speaks.
+    render_privilege_unclear_banner(data.privilege_unclear, &mut out);
     render_seal_gap_banner(data, &mut out);
 
     // ── Storage adaptation prose (UPI 031-b AB3.1) ──────────────────
@@ -113,6 +116,23 @@ pub(super) fn render_status_interactive(data: &StatusOutput) -> String {
     }
 
     out
+}
+
+/// UPI 081 B2: the probe itself couldn't confirm the grant (e.g. sudo
+/// erroring rather than answering Granted/Denied). Shared by both status
+/// renderers so the cannot-verify sentence stays word-for-word identical.
+pub(super) const PRIVILEGE_UNCLEAR_SENTENCE: &str =
+    "Urd couldn't confirm its privileges just now — run `urd doctor` to see why.";
+
+/// The cannot-verify line: never silent when the probe itself failed, never
+/// a guess at which seal stage is incomplete. Mutually exclusive with the
+/// seal-gap banner by `seal::seal_posture`'s construction (`gap` is always
+/// `None` when this is `true`).
+pub(super) fn render_privilege_unclear_banner(privilege_unclear: bool, out: &mut String) {
+    if !privilege_unclear {
+        return;
+    }
+    writeln!(out, "{}", PRIVILEGE_UNCLEAR_SENTENCE.yellow()).ok();
 }
 
 /// The seal-gap banner (UPI 071/075): the first incomplete seal stage,
@@ -765,7 +785,8 @@ fn render_default_status_interactive(data: &DefaultStatusOutput) -> String {
     }
 
     // The first incomplete seal stage (UPI 071/075): one clause, the
-    // resume verb.
+    // resume verb. `privilege_unclear` (UPI 081 B2) is mutually exclusive
+    // with `seal_gap` by `seal::seal_posture`'s construction.
     if let Some(gap) = data.seal_gap {
         let clause = match gap {
             crate::output::SealGap::Privilege => {
@@ -779,6 +800,8 @@ fn render_default_status_interactive(data: &DefaultStatusOutput) -> String {
             }
         };
         write!(out, " {}", clause.yellow()).ok();
+    } else if data.privilege_unclear {
+        write!(out, " {}", PRIVILEGE_UNCLEAR_SENTENCE.yellow()).ok();
     }
 
     // Last backup age (pre-computed by command handler to keep voice pure)
@@ -1327,6 +1350,34 @@ mod tests {
         assert!(!out.contains("not yet spun"), "{out}");
     }
 
+    /// UPI 081 B2: an Unclear probe renders the cannot-verify line, never
+    /// the seal-gap banner (mutually exclusive by construction) and never
+    /// silent.
+    #[test]
+    fn interactive_privilege_unclear_renders_cannot_verify_not_seal_gap() {
+        let _color = color_guard(false);
+        let mut data = crate::voice::test_fixtures::test_status_output();
+        data.privilege_unclear = true;
+        let out = render_status(&data, OutputMode::Interactive);
+        assert!(out.contains("couldn't confirm its privileges"), "{out}");
+        assert!(out.contains("urd doctor"), "{out}");
+        assert!(!out.contains("unsealed"), "{out}");
+        assert!(!out.contains("not yet spun"), "{out}");
+        assert!(!out.contains("not yet enabled"), "{out}");
+    }
+
+    /// A Granted/sealed posture renders neither the cannot-verify line nor
+    /// the seal-gap banner.
+    #[test]
+    fn interactive_sealed_carries_no_privilege_unclear_line() {
+        let _color = color_guard(false);
+        let out = render_status(
+            &crate::voice::test_fixtures::test_status_output(),
+            OutputMode::Interactive,
+        );
+        assert!(!out.contains("couldn't confirm its privileges"), "{out}");
+    }
+
     #[test]
     fn default_seal_gap_clause_points_at_init() {
         let _color = color_guard(false);
@@ -1342,11 +1393,24 @@ mod tests {
         }
     }
 
+    /// UPI 081 B2: bare `urd`'s compact clause also carries the
+    /// cannot-verify line, never a silent status.
+    #[test]
+    fn default_privilege_unclear_clause_names_doctor() {
+        let _color = color_guard(false);
+        let mut data = crate::voice::test_fixtures::test_default_status_output();
+        data.privilege_unclear = true;
+        let out = render_default_status(&data, OutputMode::Interactive);
+        assert!(out.contains("couldn't confirm its privileges"), "{out}");
+        assert!(out.contains("urd doctor"), "{out}");
+    }
+
     #[test]
     fn interactive_no_subvolumes() {
         let _color = color_guard(false);
         let data = StatusOutput {
             seal_gap: None,
+            privilege_unclear: false,
             assessments: vec![],
             chain_health: vec![],
             drives: vec![],
@@ -1424,6 +1488,7 @@ mod tests {
         let _color = color_guard(false);
         let data = StatusOutput {
             seal_gap: None,
+            privilege_unclear: false,
             assessments: vec![],
             chain_health: vec![],
             drives: vec![],
@@ -2027,6 +2092,7 @@ mod tests {
         let _color = color_guard(false);
         let data = DefaultStatusOutput {
             seal_gap: None,
+            privilege_unclear: false,
             total: 9,
             waning_names: vec![],
             exposed_names: vec!["htpc-root".to_string(), "docs".to_string()],
@@ -2062,6 +2128,7 @@ mod tests {
         let _color = color_guard(false);
         let data = DefaultStatusOutput {
             seal_gap: None,
+            privilege_unclear: false,
             total: 5,
             waning_names: vec!["htpc-config".to_string()],
             exposed_names: vec!["htpc-root".to_string()],
@@ -2119,6 +2186,7 @@ mod tests {
         let _color = color_guard(false);
         let data = DefaultStatusOutput {
             seal_gap: None,
+            privilege_unclear: false,
             total: 2,
             waning_names: vec![],
             exposed_names: vec![],
@@ -2141,6 +2209,7 @@ mod tests {
     fn default_daemon_json() {
         let data = DefaultStatusOutput {
             seal_gap: None,
+            privilege_unclear: false,
             total: 3,
             waning_names: vec!["sv1".to_string()],
             exposed_names: vec![],

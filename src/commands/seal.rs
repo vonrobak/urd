@@ -1067,23 +1067,46 @@ fn stage_rendered(rendered: &str) -> anyhow::Result<tempfile::NamedTempFile> {
     Ok(tmp)
 }
 
-/// The first incomplete seal stage a status surface should name (UPI 075
-/// widened `probe_unsealed`; single owner of the rule). Interactive only —
-/// a denied probe writes an auth log line, so automated and monitoring
-/// callers must never generate that noise — and only on clear evidence:
-/// `Unclear` probes and unreadable directories stay silent rather than
-/// guess. Seal order decides: privilege → units → first thread (one
-/// sentence, one cause — adversary F4/F7). The units arm checks file
-/// EXISTENCE only (content drift is doctor's job; no systemctl call here),
-/// and the first-thread arm is policy-aware (F5).
-pub(crate) fn seal_completeness(
-    config: &Config,
-    output_mode: OutputMode,
-) -> Option<crate::output::SealGap> {
-    if output_mode != OutputMode::Interactive {
-        return None;
+/// The full picture a status surface needs (UPI 081): the first incomplete
+/// seal stage alongside whether the machine is earned (grant answers) and
+/// whether the probe itself couldn't confirm (`Unclear`, e.g. sudo erroring).
+/// A single probe backs all three fields — probing twice would double the
+/// auth-log line (memory `feedback_never_time_limit_sends`/071).
+pub(crate) struct SealPosture {
+    pub gap: Option<crate::output::SealGap>,
+    pub earned: bool,
+    pub privilege_unclear: bool,
+}
+
+/// Interactive only — a denied probe writes an auth log line, so automated
+/// and monitoring callers must never generate that noise; non-interactive
+/// callers get no probe (`earned` defaults true — machine consumers keep
+/// today's advice, the suppression is a human-UX concern).
+pub(crate) fn seal_posture(config: &Config, output_mode: OutputMode) -> SealPosture {
+    let probe =
+        (output_mode == OutputMode::Interactive).then(|| probe_grant(&config.general.btrfs_path).0);
+    posture_from_probe(config, probe)
+}
+
+/// The pure mapping from an already-run probe (`None` = non-interactive, no
+/// probe) to a `SealPosture`. Seal order decides the gap: privilege → units
+/// → first thread (one sentence, one cause — adversary F4/F7). The units arm
+/// checks file EXISTENCE only (content drift is doctor's job; no systemctl
+/// call here), and the first-thread arm is policy-aware (F5). `Unclear`
+/// never falls through to `seal_gap_given_probe`: we don't presume
+/// Units/FirstThread stages when privilege itself is unconfirmed.
+pub(crate) fn posture_from_probe(config: &Config, probe: Option<GrantProbe>) -> SealPosture {
+    let Some(probe) = probe else {
+        return SealPosture { gap: None, earned: true, privilege_unclear: false };
+    };
+    SealPosture {
+        gap: match probe {
+            GrantProbe::Unclear => None,
+            p => seal_gap_given_probe(config, p),
+        },
+        earned: probe == GrantProbe::Granted,
+        privilege_unclear: probe == GrantProbe::Unclear,
     }
-    seal_gap_given_probe(config, probe_grant(&config.general.btrfs_path).0)
 }
 
 /// The cheap gap decision with the probe injected — status surfaces only.
@@ -1445,6 +1468,51 @@ protection = "recorded"
         // A real snapshot dir entry satisfies it.
         std::fs::create_dir_all(root.join("docs/20260705-0400-docs")).unwrap();
         assert!(!first_thread_pending(&config));
+    }
+
+    #[test]
+    fn posture_from_probe_maps_each_probe_class() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().join(".snapshots");
+        let config = seal_config(&format!(
+            r#"
+[general]
+config_version = 2
+run_frequency = "daily"
+
+[[subvolumes]]
+name = "docs"
+source = "/data/docs"
+snapshot_root = "{}"
+protection = "recorded"
+"#,
+            root.display()
+        ));
+        // No snapshot on disk yet: first_thread_pending is true, so this
+        // config is incomplete regardless of the ambient units state.
+
+        let non_interactive = posture_from_probe(&config, None);
+        assert_eq!(non_interactive.gap, None);
+        assert!(non_interactive.earned);
+        assert!(!non_interactive.privilege_unclear);
+
+        let denied = posture_from_probe(&config, Some(GrantProbe::Denied));
+        assert_eq!(denied.gap, Some(crate::output::SealGap::Privilege));
+        assert!(!denied.earned);
+        assert!(!denied.privilege_unclear);
+
+        let granted = posture_from_probe(&config, Some(GrantProbe::Granted));
+        assert!(granted.gap.is_some());
+        assert!(granted.earned);
+        assert!(!granted.privilege_unclear);
+
+        // Unclear, even though the same config is incomplete: gap stays None
+        // — never presume Units/FirstThread when privilege itself is
+        // unconfirmed (the one behavior change vs. the old seal_completeness).
+        let unclear = posture_from_probe(&config, Some(GrantProbe::Unclear));
+        assert_eq!(unclear.gap, None);
+        assert!(!unclear.earned);
+        assert!(unclear.privilege_unclear);
     }
 
     /// Send-offer done-detection over a real (temp) drive layout.
