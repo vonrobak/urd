@@ -75,13 +75,23 @@ pub fn run(config_path: Option<&Path>, output_mode: OutputMode) -> anyhow::Resul
         }
     }
 
+    // An incomplete seal stage (UPI 071/075/081) — see `seal::seal_posture`.
+    // Computed before advice: the advice loop needs `posture.earned` to
+    // suppress command-producing advice on an unearned machine.
+    let posture = crate::commands::seal::seal_posture(&config, output_mode);
+
     // Compute actionable advice
     let resolved = config.resolved_subvolumes();
     let advice_items: Vec<advice::ActionableAdvice> = assessments
         .iter()
         .filter_map(|a| {
             let sv = resolved.iter().find(|sv| sv.name == a.name)?;
-            advice::compute_advice(a, sv.send_enabled, sv.local_retention.is_transient())
+            advice::compute_advice(
+                a,
+                posture.earned,
+                sv.send_enabled,
+                sv.local_retention.is_transient(),
+            )
         })
         .collect();
 
@@ -95,9 +105,6 @@ pub fn run(config_path: Option<&Path>, output_mode: OutputMode) -> anyhow::Resul
         .into_iter()
         .max_by(|a, b| a.tier.cmp(&b.tier).then(a.host_root.cmp(&b.host_root)));
 
-    // An incomplete seal stage (UPI 071/075) — see `seal::seal_completeness`.
-    let seal_gap = crate::commands::seal::seal_completeness(&config, output_mode);
-
     let output = DefaultStatusOutput {
         total,
         waning_names,
@@ -109,7 +116,8 @@ pub fn run(config_path: Option<&Path>, output_mode: OutputMode) -> anyhow::Resul
         best_advice,
         total_needing_attention,
         storage_posture,
-        seal_gap,
+        seal_gap: posture.gap,
+        privilege_unclear: posture.privilege_unclear,
     };
 
     let rendered = voice::render_default_status(&output, output_mode);

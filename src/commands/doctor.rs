@@ -246,7 +246,8 @@ pub fn run(config: Config, args: DoctorArgs, output_mode: OutputMode) -> anyhow:
             let sv_config = resolved.iter().find(|sv| sv.name == a.name);
             let send_enabled = sv_config.is_none_or(|sv| sv.send_enabled);
             let external_only = sv_config.is_some_and(|sv| sv.local_retention.is_transient());
-            let advice = advice::compute_advice(a, send_enabled, external_only);
+            let earned = sudo_probe.0 == crate::sudoers::GrantProbe::Granted;
+            let advice = advice::compute_advice(a, earned, send_enabled, external_only);
 
             // Extract structured advice into doctor display fields.
             let (issue, suggestion, reason) = match a.status {
@@ -287,40 +288,48 @@ pub fn run(config: Config, args: DoctorArgs, output_mode: OutputMode) -> anyhow:
         })
         .collect();
 
-    // ── 4. Sentinel status ────────────────────────────────────────
-    let state_path = sentinel_runner::sentinel_state_path(&config);
-    let sentinel = match sentinel_runner::read_sentinel_state_file(&state_path) {
-        Some(state) if sentinel_runner::is_pid_alive(state.pid) => {
-            // Compute uptime from started timestamp
-            let uptime = chrono::NaiveDateTime::parse_from_str(&state.started, "%Y-%m-%dT%H:%M:%S")
-                .ok()
-                .or_else(|| {
-                    chrono::NaiveDateTime::parse_from_str(&state.started, "%Y-%m-%d %H:%M:%S").ok()
-                })
-                .map(|started| {
-                    let dur = now - started;
-                    let hours = dur.num_hours();
-                    let minutes = dur.num_minutes() % 60;
-                    if hours > 0 {
-                        format!("{hours}h {minutes}m")
-                    } else {
-                        format!("{minutes}m")
-                    }
-                });
-            DoctorSentinelStatus {
-                running: true,
-                pid: Some(state.pid),
-                uptime,
+    // ── 4. Sentinel status (UPI 081 B4: Timer-cadence machines omit this
+    // section entirely — a stopped daemon that config never installs is
+    // not a warning) ────────────────────────────────────────────────
+    let sentinel = if config.general.run_frequency == crate::types::RunFrequency::Sentinel {
+        let state_path = sentinel_runner::sentinel_state_path(&config);
+        Some(match sentinel_runner::read_sentinel_state_file(&state_path) {
+            Some(state) if sentinel_runner::is_pid_alive(state.pid) => {
+                // Compute uptime from started timestamp
+                let uptime =
+                    chrono::NaiveDateTime::parse_from_str(&state.started, "%Y-%m-%dT%H:%M:%S")
+                        .ok()
+                        .or_else(|| {
+                            chrono::NaiveDateTime::parse_from_str(&state.started, "%Y-%m-%d %H:%M:%S")
+                                .ok()
+                        })
+                        .map(|started| {
+                            let dur = now - started;
+                            let hours = dur.num_hours();
+                            let minutes = dur.num_minutes() % 60;
+                            if hours > 0 {
+                                format!("{hours}h {minutes}m")
+                            } else {
+                                format!("{minutes}m")
+                            }
+                        });
+                DoctorSentinelStatus {
+                    running: true,
+                    pid: Some(state.pid),
+                    uptime,
+                }
             }
-        }
-        _ => {
-            warn_count += 1;
-            DoctorSentinelStatus {
-                running: false,
-                pid: None,
-                uptime: None,
+            _ => {
+                warn_count += 1;
+                DoctorSentinelStatus {
+                    running: false,
+                    pid: None,
+                    uptime: None,
+                }
             }
-        }
+        })
+    } else {
+        None
     };
 
     // ── 5. Verify (optional — --thorough only) ────────────────────
@@ -466,6 +475,22 @@ fn build_sudoers_drift_checks(config: &Config, listing: Option<&str>) -> Vec<Doc
             vec![cannot_verify_grant_check(reason)]
         }
         crate::sudoers::Coverage::Gaps { missing, uncertain } => {
+            // UPI 081 B3: every expected line is missing (self-implies
+            // uncertain is empty too) → this machine was never sealed, not
+            // a config that drifted since. One earning-vocabulary line, not
+            // N "predates" rows that bury the real cause.
+            if missing.len() == expected.len() {
+                return vec![DoctorCheck {
+                    name: "sudoers drift".to_string(),
+                    status: DoctorCheckStatus::Warn,
+                    detail: Some(
+                        "This machine isn't sealed yet — run `urd init` to earn root's leave \
+                         for btrfs."
+                            .to_string(),
+                    ),
+                    suggestion: Some("Run `urd init` to earn the grant.".to_string()),
+                }];
+            }
             let mut checks: Vec<DoctorCheck> = missing
                 .into_iter()
                 .map(|spec| DoctorCheck {
@@ -1144,6 +1169,25 @@ protection = "recorded"
         assert_eq!(checks[0].status, DoctorCheckStatus::Warn);
         let detail = checks[0].detail.as_deref().unwrap();
         assert!(detail.contains("subvolume delete /data/.snapshots/*"), "{detail}");
+        let suggestion = checks[0].suggestion.as_deref().unwrap();
+        assert!(suggestion.contains("urd init"), "{suggestion}");
+    }
+
+    /// UPI 081 B3 (#280): every expected line missing → this machine was
+    /// never sealed, not a config that drifted since. One "not sealed"
+    /// line, not N per-spec "predates" rows that bury the real cause.
+    #[test]
+    fn drift_all_missing_collapses_to_one_not_sealed_line() {
+        let config = drift_config();
+        // A grant unrelated to any expected line: every expected spec is
+        // missing, none uncertain (a real grant that covers nothing urd
+        // asked for — distinct from an unparseable/empty listing).
+        let unrelated = vec!["/usr/sbin/some-other-tool run".to_string()];
+        let checks = build_sudoers_drift_checks(&config, Some(&listing_of(&unrelated)));
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].status, DoctorCheckStatus::Warn);
+        let detail = checks[0].detail.as_deref().unwrap();
+        assert!(detail.contains("isn't sealed yet"), "{detail}");
         let suggestion = checks[0].suggestion.as_deref().unwrap();
         assert!(suggestion.contains("urd init"), "{suggestion}");
     }

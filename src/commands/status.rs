@@ -32,9 +32,9 @@ pub fn run(config: Config, output_mode: OutputMode) -> anyhow::Result<()> {
     };
     let drive_labels: Vec<String> = config.drives.iter().map(|d| d.label.clone()).collect();
 
-    // ── The seal (UPI 071/075) ──────────────────────────────────────
+    // ── The seal (UPI 071/075/081) ──────────────────────────────────
     // An incomplete seal stage is a named state, not a degraded render.
-    let seal_gap = crate::commands::seal::seal_completeness(&config, output_mode);
+    let posture = crate::commands::seal::seal_posture(&config, output_mode);
 
     // ── Awareness model ─────────────────────────────────────────────
     let now = chrono::Local::now().naive_local();
@@ -94,7 +94,9 @@ pub fn run(config: Config, output_mode: OutputMode) -> anyhow::Result<()> {
         total_pins,
         &config,
         now,
-        seal_gap,
+        posture.gap,
+        posture.earned,
+        posture.privilege_unclear,
     );
 
     let rendered = voice::render_status(&status_output, output_mode);
@@ -119,6 +121,8 @@ fn assemble_status_output(
     config: &Config,
     now: NaiveDateTime,
     seal_gap: Option<crate::output::SealGap>,
+    earned: bool,
+    privilege_unclear: bool,
 ) -> StatusOutput {
     // ── Chain health per subvolume (derived from awareness assessment) ──
     let chain_health_entries: Vec<ChainHealthEntry> = assessments
@@ -174,7 +178,7 @@ fn assemble_status_output(
         .iter()
         .filter_map(|a| {
             let sv = resolved.iter().find(|sv| sv.name == a.name)?;
-            advice::compute_advice(a, sv.send_enabled, sv.local_retention.is_transient())
+            advice::compute_advice(a, earned, sv.send_enabled, sv.local_retention.is_transient())
         })
         .collect();
 
@@ -190,6 +194,7 @@ fn assemble_status_output(
         storage_postures,
         storage_adaptations,
         seal_gap,
+        privilege_unclear,
     }
 }
 
@@ -306,6 +311,8 @@ local_retention = "transient"
             config,
             dt(2026, 6, 10, 12, 0),
             None,
+            true,
+            false,
         )
     }
 
@@ -329,10 +336,34 @@ local_retention = "transient"
                 &config,
                 dt(2026, 6, 10, 12, 0),
                 Some(gap),
+                true,
+                false,
             );
             assert_eq!(out.seal_gap, Some(gap));
         }
         assert_eq!(assemble(&[], &config).seal_gap, None);
+    }
+
+    /// UPI 081 B2: `privilege_unclear` travels through the pure assembler
+    /// untouched, same as `seal_gap`.
+    #[test]
+    fn assemble_threads_privilege_unclear() {
+        let config = test_config();
+        let out = assemble_status_output(
+            &[],
+            vec![],
+            vec![],
+            vec![],
+            None,
+            0,
+            &config,
+            dt(2026, 6, 10, 12, 0),
+            None,
+            false,
+            true,
+        );
+        assert!(out.privilege_unclear);
+        assert!(!assemble(&[], &config).privilege_unclear);
     }
 
     // ── Chain-health worst-selection ────────────────────────────────
@@ -516,6 +547,8 @@ local_retention = "transient"
             &test_config(),
             dt(2026, 6, 10, 12, 0),
             None,
+            true,
+            false,
         );
         assert_eq!(out.last_run_age_secs, Some(7200));
     }

@@ -475,6 +475,7 @@ pub(crate) mod test_fixtures {
     pub(crate) fn test_status_output() -> StatusOutput {
         StatusOutput {
             seal_gap: None,
+            privilege_unclear: false,
             assessments: vec![
                 StatusAssessment {
                     name: "htpc-home".to_string(),
@@ -690,11 +691,11 @@ pub(crate) mod test_fixtures {
                     storage_posture: None,
                 },
             ],
-            sentinel: DoctorSentinelStatus {
+            sentinel: Some(DoctorSentinelStatus {
                 running: true,
                 pid: Some(12345),
                 uptime: Some("3h 12m".to_string()),
-            },
+            }),
             schema_status: None,
             verify: None,
             churn: None,
@@ -707,6 +708,7 @@ pub(crate) mod test_fixtures {
     pub(crate) fn test_default_status_output() -> DefaultStatusOutput {
         DefaultStatusOutput {
             seal_gap: None,
+            privilege_unclear: false,
             total: 4,
             waning_names: vec![],
             exposed_names: vec![],
@@ -3328,6 +3330,22 @@ mod tests {
         assert!(parsed["infra_checks"].is_array());
         assert!(parsed["data_safety"].is_array());
         assert_eq!(parsed["sentinel"]["running"], true);
+    }
+
+    /// UPI 081 B4 (#279): a Timer-cadence machine never installs the
+    /// sentinel unit, so a stopped daemon there is not a warning — the
+    /// whole section omits, both interactive and JSON.
+    #[test]
+    fn doctor_sentinel_section_omitted_under_timer_cadence() {
+        let _color = color_guard(false);
+        let mut data = test_doctor_output();
+        data.sentinel = None;
+        let output = render_doctor(&data, OutputMode::Interactive);
+        assert!(!output.contains("Sentinel"), "{output}");
+
+        let json_output = render_doctor(&data, OutputMode::Daemon);
+        let parsed: serde_json::Value = serde_json::from_str(&json_output).unwrap();
+        assert!(parsed.get("sentinel").is_none(), "{json_output}");
     }
 
     #[test]

@@ -157,39 +157,40 @@ fn render_doctor_interactive(data: &DoctorOutput) -> String {
         }
     }
 
-    // Sentinel section
-    writeln!(out).ok();
-    writeln!(out, "  {}", "Sentinel".bold()).ok();
-    if data.sentinel.running {
-        let pid_info = data
-            .sentinel
-            .pid
-            .map(|p| format!(" (PID {p})"))
-            .unwrap_or_default();
-        let uptime_info = data
-            .sentinel
-            .uptime
-            .as_ref()
-            .map(|u| format!(", uptime {u}"))
-            .unwrap_or_default();
-        writeln!(
-            out,
-            "    {} Sentinel running{pid_info}{uptime_info}",
-            "\u{2713}".green()
-        )
-        .ok();
-    } else {
-        writeln!(
-            out,
-            "    {} Sentinel not running",
-            "\u{26a0}".yellow()
-        )
-        .ok();
-        writeln!(
-            out,
-            "      \u{2192} Start with `systemctl --user start urd-sentinel`"
-        )
-        .ok();
+    // Sentinel section — omitted entirely under Timer cadence (UPI 081 B4):
+    // a stopped daemon that config never installs is not a warning.
+    if let Some(sentinel) = &data.sentinel {
+        writeln!(out).ok();
+        writeln!(out, "  {}", "Sentinel".bold()).ok();
+        if sentinel.running {
+            let pid_info = sentinel
+                .pid
+                .map(|p| format!(" (PID {p})"))
+                .unwrap_or_default();
+            let uptime_info = sentinel
+                .uptime
+                .as_ref()
+                .map(|u| format!(", uptime {u}"))
+                .unwrap_or_default();
+            writeln!(
+                out,
+                "    {} Sentinel running{pid_info}{uptime_info}",
+                "\u{2713}".green()
+            )
+            .ok();
+        } else {
+            writeln!(
+                out,
+                "    {} Sentinel not running",
+                "\u{26a0}".yellow()
+            )
+            .ok();
+            writeln!(
+                out,
+                "      \u{2192} Start with `systemctl --user start urd-sentinel`"
+            )
+            .ok();
+        }
     }
 
     // Verify section (--thorough)
