@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of burying the real cause under a row per expected command (#280).
 - `urd doctor` omits the Sentinel section entirely on a nightly-timer machine instead of
   warning about a daemon unit that config never installs (#279).
+- `urd init` now names its own blocked earning honestly — btrfs missing or the sudoers
+  render refusing — instead of a raw error, and never reads as though you declined (#275).
+- `urd init`'s first-snapshot and first-send ceremony no longer leaks raw executor log
+  lines above the mythic-voice summary; `--verbose` still shows them (#277).
 
 ## [0.33.3] - 2026-07-07
 

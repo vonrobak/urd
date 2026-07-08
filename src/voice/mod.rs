@@ -51,9 +51,9 @@ pub use doctor::render_doctor;
 pub use drives::{render_drives_adopt, render_drives_list};
 pub use emergency::{render_emergency, render_emergency_result};
 pub use encounter::{
-    render_earning_already, render_earning_coverage_unconfirmed, render_earning_declined,
-    render_earning_deferred, render_earning_installed, render_earning_regrant,
-    render_earning_request,
+    render_earning_already, render_earning_blocked, render_earning_coverage_unconfirmed,
+    render_earning_declined, render_earning_deferred, render_earning_installed,
+    render_earning_regrant, render_earning_request,
     describe_next_action, render_confirm_relook, render_data_dir_failed,
     render_earning_unavailable,
     render_earning_verify_failed, render_editor_failure, render_farewell,

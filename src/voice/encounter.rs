@@ -812,6 +812,24 @@ pub fn render_earning_deferred() -> String {
         .to_string()
 }
 
+/// UPI 081 A1/A3 (#275): the earning could not proceed for a reason Urd
+/// itself controls (btrfs missing, the sudoers render refused) — never a
+/// reason the user chose. Register is *Urd-couldn't*, modeled on
+/// `render_first_thread_failed`'s posture (name the state, name the way
+/// back) — explicitly NOT the *you-declined* register of
+/// `render_earning_deferred` above: a blocked first-timer must not read as
+/// having walked away (/steve 2026-07-08). Yellow, never red — the config
+/// is still carved, nothing was lost.
+#[must_use]
+pub fn render_earning_blocked(reason: &str) -> String {
+    format!(
+        "{} {reason}\n\
+         The promises are carved but not in force until the earning.\n\
+         `urd init` resumes it at any time.\n",
+        "Couldn't earn:".yellow().bold()
+    )
+}
+
 /// sudo itself is not available to this user (not a sudoer, or sudo
 /// missing) — its own sentence, never a generic error.
 #[must_use]
@@ -1615,6 +1633,26 @@ mod tests {
         let out = render_earning_unavailable("alice is not in the sudoers file");
         assert!(out.contains("cannot use sudo"), "{out}");
         assert!(out.contains("not in the sudoers file"), "{out}");
+    }
+
+    /// UPI 081 A1 (#275): names the reason, the carved-not-sealed state, and
+    /// the `urd init` way back — yellow, never red (Urd-couldn't, not
+    /// you-declined).
+    #[test]
+    fn earning_blocked_names_reason_state_and_way_back() {
+        let _color = color_guard(false);
+        let out = render_earning_blocked("btrfs not found at /usr/sbin/btrfs");
+        assert!(out.contains("btrfs not found at /usr/sbin/btrfs"), "{out}");
+        assert!(out.contains("carved but not in force"), "{out}");
+        assert!(out.contains("urd init"), "{out}");
+    }
+
+    #[test]
+    fn earning_blocked_is_yellow_not_red() {
+        let _color = color_guard(true);
+        let out = render_earning_blocked("the sudoers render refused");
+        assert!(out.contains(";33m") || out.contains("[33m"), "must be yellow: {out:?}");
+        assert!(!out.contains(";31m") && !out.contains("[31m"), "must not be red: {out:?}");
     }
 
     #[test]
