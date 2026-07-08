@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.33.4] - 2026-07-08
+
 ### Fixed
 - `urd status`/bare `urd` no longer prescribe `urd backup` on a machine whose privileges
   aren't confirmed — command-producing advice suppresses until the grant is earned, and a
@@ -1598,7 +1600,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Defense-in-depth pin file protection for unsent snapshots
 - Per-subvolume error isolation in executor
 
-[Unreleased]: https://github.com/vonrobak/urd/compare/v0.33.3...HEAD
+[Unreleased]: https://github.com/vonrobak/urd/compare/v0.33.4...HEAD
+[0.33.4]: https://github.com/vonrobak/urd/compare/v0.33.3...v0.33.4
 [0.33.3]: https://github.com/vonrobak/urd/compare/v0.33.2...v0.33.3
 [0.33.2]: https://github.com/vonrobak/urd/compare/v0.33.1...v0.33.2
 [0.33.1]: https://github.com/vonrobak/urd/compare/v0.33.0...v0.33.1
