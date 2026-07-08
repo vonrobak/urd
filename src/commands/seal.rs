@@ -289,7 +289,7 @@ fn first_snapshot(config: &Config, config_path: &Path) -> bool {
     }
 
     print!("{}", voice::render_first_thread_intro());
-    if let Err(e) = run_seal_backup(config_path, /* local_only */ true) {
+    if let Err(e) = with_logs_suppressed(|| run_seal_backup(config_path, /* local_only */ true)) {
         print!("{}", voice::render_first_thread_failed(&format!("the run failed: {e}")));
         return false;
     }
@@ -384,7 +384,9 @@ fn offer_first_send(config: &Config, config_path: &Path) -> crate::output::SealS
             print!("{}", voice::render_send_deferred());
             SealSendState::Tonight
         }
-        SendChoice::SendNow => match run_seal_backup(config_path, /* local_only */ false) {
+        SendChoice::SendNow => match with_logs_suppressed(|| {
+            run_seal_backup(config_path, /* local_only */ false)
+        }) {
             Ok(()) => SealSendState::Sent,
             Err(e) => {
                 print!(
@@ -419,6 +421,32 @@ fn run_seal_backup(config_path: &Path, local_only: bool) -> anyhow::Result<()> {
             force_snapshot: false,
         },
     )
+}
+
+/// Restores the prior `log` max level on drop — the error/panic path must
+/// un-suppress too, or a failure inside `f` would leave every later log call
+/// silent for the rest of the process (UPI 081 A3).
+struct LogLevelGuard(log::LevelFilter);
+impl Drop for LogLevelGuard {
+    fn drop(&mut self) {
+        log::set_max_level(self.0);
+    }
+}
+
+/// Suppresses `log!` echoes for the duration of `f` (#277): the ceremony's
+/// backup calls would otherwise leak raw `ERROR urd::executor` lines above
+/// the mythic-voice summary. Honors `--verbose` (only suppresses below
+/// `Debug`). Safe to suppress broadly — every `error!` that names a real
+/// failure is a companion to a returned `OperationOutcome::Failure`/`Err`
+/// that the (unsuppressed) `print!` summary already renders; the bracket
+/// loses log echoes, never the failure itself (adversary M1, design A3).
+fn with_logs_suppressed<T>(f: impl FnOnce() -> T) -> T {
+    let prev = log::max_level();
+    let _guard = LogLevelGuard(prev);
+    if prev < log::LevelFilter::Debug {
+        log::set_max_level(log::LevelFilter::Off);
+    }
+    f()
 }
 
 /// Does any enabled promise want external sends at all? (Pure.)
@@ -810,23 +838,35 @@ fn earn_privilege(config: &Config, config_path: &Path) -> anyhow::Result<SealOut
     // binary would verify never and confuse always.
     let btrfs = Path::new(&config.general.btrfs_path);
     if !btrfs.exists() {
-        bail!(
-            "btrfs not found at {} — fix `btrfs_path` in {} (try `which btrfs`), \
-             then run `urd init` to resume the earning",
-            btrfs.display(),
-            config_path.display()
+        // Declined here = Urd-blocked, not user-declined; no consumer
+        // distinguishes — see design A1 (UPI 081 M4).
+        print!(
+            "{}",
+            voice::render_earning_blocked(&format!(
+                "btrfs not found at {} — fix `btrfs_path` in {} (try `which btrfs`)",
+                btrfs.display(),
+                config_path.display()
+            ))
         );
+        return Ok(declined);
     }
 
-    let rendered = sudoers::render_sudoers(
+    let rendered = match sudoers::render_sudoers(
         config,
         &RenderContext {
             user: &user,
             config_path,
             today: chrono::Local::now().date_naive(),
         },
-    )
-    .map_err(|refusal| anyhow!("{refusal}"))?;
+    ) {
+        Ok(rendered) => rendered,
+        Err(refusal) => {
+            // Declined here = Urd-blocked, not user-declined; no consumer
+            // distinguishes — see design A1 (UPI 081 M4).
+            print!("{}", voice::render_earning_blocked(&refusal.to_string()));
+            return Ok(declined);
+        }
+    };
 
     // Stage unprivileged, 0440 before the gate (visudo owner/mode variance).
     let tmp = stage_rendered(&rendered)?;
@@ -1271,6 +1311,35 @@ fn coverage_missing(config: &Config) -> Vec<String> {
 mod tests {
     use super::*;
 
+    /// UPI 081 A3 (#277): sets `Off` for the closure's duration and always
+    /// restores the prior level after — on the success path, and on the
+    /// panic path via the `Drop` guard (M1: the broad suppression is safe
+    /// only because it always un-suppresses). One test, not three: global
+    /// `log::max_level()` state would race across parallel test threads.
+    #[test]
+    fn with_logs_suppressed_restores_level_on_success_and_panic() {
+        let before = log::max_level();
+
+        let seen_during = with_logs_suppressed(log::max_level);
+        assert_eq!(seen_during, log::LevelFilter::Off);
+        assert_eq!(log::max_level(), before, "must restore after a normal return");
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_logs_suppressed(|| panic!("boom"));
+        }));
+        assert!(result.is_err());
+        assert_eq!(log::max_level(), before, "the Drop guard must restore even after a panic");
+
+        log::set_max_level(log::LevelFilter::Debug);
+        let seen_at_debug = with_logs_suppressed(log::max_level);
+        assert_eq!(
+            seen_at_debug,
+            log::LevelFilter::Debug,
+            "--verbose (Debug+) must not be suppressed"
+        );
+        log::set_max_level(before);
+    }
+
     #[test]
     fn declined_outcome_stops_a_fresh_earning_and_continues_a_regrant() {
         // F4 continuation table: no grant → the seal stops; a grant that
@@ -1423,6 +1492,60 @@ mod tests {
 
     fn seal_config(toml: &str) -> crate::config::Config {
         crate::config::Config::from_str(toml).unwrap()
+    }
+
+    /// UPI 081 A2 (#275): btrfs-not-found routes through `render_earning_blocked`
+    /// and returns `Ok(Declined)`, never `Err` — a blocked first-timer is an
+    /// honest conclusion, not a crash.
+    #[test]
+    fn earn_privilege_declined_not_err_when_btrfs_missing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().join(".snapshots");
+        let config = seal_config(&format!(
+            r#"
+[general]
+config_version = 2
+run_frequency = "daily"
+btrfs_path = "/nonexistent/btrfs-for-test"
+
+[[subvolumes]]
+name = "docs"
+source = "/data/docs"
+snapshot_root = "{}"
+protection = "recorded"
+"#,
+            root.display()
+        ));
+        let outcome = earn_privilege(&config, &tmp.path().join("urd.toml")).unwrap();
+        assert_eq!(outcome, SealOutcome::Declined);
+    }
+
+    /// UPI 081 A2 (#275): a sudoers render refusal (here: a scope too
+    /// shallow for the floor) routes through `render_earning_blocked` and
+    /// returns `Ok(Declined)`, never `Err`. `btrfs_path` points at a real,
+    /// existing binary that carries no grant of its own (`/usr/bin/true`),
+    /// so the probe reads Denied rather than Granted regardless of the test
+    /// runner's own cached sudo ticket — the "already earns" shortcut must
+    /// not mask the render refusal this test targets.
+    #[test]
+    fn earn_privilege_declined_not_err_when_render_refuses() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = seal_config(
+            r#"
+[general]
+config_version = 2
+run_frequency = "daily"
+btrfs_path = "/usr/bin/true"
+
+[[subvolumes]]
+name = "docs"
+source = "/data/docs"
+snapshot_root = "/"
+protection = "recorded"
+"#,
+        );
+        let outcome = earn_privilege(&config, &tmp.path().join("urd.toml")).unwrap();
+        assert_eq!(outcome, SealOutcome::Declined);
     }
 
     #[test]
