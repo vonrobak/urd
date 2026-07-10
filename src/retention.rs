@@ -83,40 +83,22 @@ fn protect_event(snap: &SnapshotName, reason: ProtectReason, now: NaiveDateTime)
     )
 }
 
-/// Apply graduated retention to a list of snapshots.
-///
-/// Windows applied in order (newest to oldest):
-/// 1. Hourly: keep every snapshot from the last `hourly` hours
-/// 2. Daily: keep 1 per calendar day for the next `daily` days
-/// 3. Weekly: keep 1 per ISO week for the next `weekly` weeks
-/// 4. Monthly: keep 1 per year-month — `Count(N)` for N months,
-///    `Count(0)` means "no monthly window" (drop straight to yearly/beyond),
-///    `Unlimited` means "keep per-month indefinitely" (subsumes yearly).
-/// 5. Yearly: keep 1 per calendar year for the next `yearly` years.
-///    Suppressed when monthly is `Unlimited`.
-///
-/// Pinned snapshots are never deleted regardless of retention policy.
-/// If `space_pressure` is true, the hourly window is thinned to 1 per hour.
-#[must_use]
-pub fn graduated_retention(
-    snapshots: &[SnapshotName],
-    now: NaiveDateTime,
-    config: &ResolvedGraduatedRetention,
-    pinned: &HashSet<SnapshotName>,
-    space_pressure: bool,
-) -> RetentionResult {
-    if snapshots.is_empty() {
-        return RetentionResult::default();
-    }
+/// Cascading cutoff timestamps for the graduated retention windows, shared by
+/// `graduated_retention()` (the deciding function) and `compute_recovery_windows()`
+/// (the describing function) so the two surfaces cannot silently diverge (#307).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CascadeCutoffs {
+    hourly: NaiveDateTime,
+    daily: NaiveDateTime,
+    weekly: NaiveDateTime,
+    /// `None` only when `MonthlyCount::Unlimited`.
+    monthly: Option<NaiveDateTime>,
+    /// `None` when monthly is `Unlimited`, or `yearly == 0`.
+    yearly: Option<NaiveDateTime>,
+}
 
-    let mut sorted: Vec<SnapshotName> = snapshots.to_vec();
-    sorted.sort();
-    sorted.reverse(); // newest first
-
-    let mut keep = Vec::new();
-    let mut delete = Vec::new();
-    let mut events = Vec::new();
-
+/// Compute the graduated retention cascade's cutoff timestamps from `now`.
+fn cascade_cutoffs(config: &ResolvedGraduatedRetention, now: NaiveDateTime) -> CascadeCutoffs {
     // Compute window boundaries as timestamps
     let hourly_cutoff = now - chrono::Duration::hours(i64::from(config.hourly));
     let daily_cutoff = hourly_cutoff - chrono::Duration::days(i64::from(config.daily));
@@ -151,6 +133,57 @@ pub fn graduated_retention(
             )
         }
     };
+
+    CascadeCutoffs {
+        hourly: hourly_cutoff,
+        daily: daily_cutoff,
+        weekly: weekly_cutoff,
+        monthly: monthly_cutoff,
+        yearly: yearly_cutoff,
+    }
+}
+
+/// Apply graduated retention to a list of snapshots.
+///
+/// Windows applied in order (newest to oldest):
+/// 1. Hourly: keep every snapshot from the last `hourly` hours
+/// 2. Daily: keep 1 per calendar day for the next `daily` days
+/// 3. Weekly: keep 1 per ISO week for the next `weekly` weeks
+/// 4. Monthly: keep 1 per year-month — `Count(N)` for N months,
+///    `Count(0)` means "no monthly window" (drop straight to yearly/beyond),
+///    `Unlimited` means "keep per-month indefinitely" (subsumes yearly).
+/// 5. Yearly: keep 1 per calendar year for the next `yearly` years.
+///    Suppressed when monthly is `Unlimited`.
+///
+/// Pinned snapshots are never deleted regardless of retention policy.
+/// If `space_pressure` is true, the hourly window is thinned to 1 per hour.
+#[must_use]
+pub fn graduated_retention(
+    snapshots: &[SnapshotName],
+    now: NaiveDateTime,
+    config: &ResolvedGraduatedRetention,
+    pinned: &HashSet<SnapshotName>,
+    space_pressure: bool,
+) -> RetentionResult {
+    if snapshots.is_empty() {
+        return RetentionResult::default();
+    }
+
+    let mut sorted: Vec<SnapshotName> = snapshots.to_vec();
+    sorted.sort();
+    sorted.reverse(); // newest first
+
+    let mut keep = Vec::new();
+    let mut delete = Vec::new();
+    let mut events = Vec::new();
+
+    let CascadeCutoffs {
+        hourly: hourly_cutoff,
+        daily: daily_cutoff,
+        weekly: weekly_cutoff,
+        monthly: monthly_cutoff,
+        yearly: yearly_cutoff,
+    } = cascade_cutoffs(config, now);
 
     // Track which day/week/month/year slots are already filled
     let mut daily_slots: HashSet<NaiveDateTime> = HashSet::new(); // key: date at midnight
@@ -398,15 +431,17 @@ pub fn space_governed_retention(
 
 /// Compute a human-readable preview of a retention policy's consequences.
 ///
-/// Pure function: no I/O, no clock dependency. Replicates the cascading window
-/// math from `graduated_retention()` to produce cumulative recovery window
-/// descriptions, disk usage estimates, and optional transient/graduated comparisons.
+/// Pure function: no I/O. `now` is threaded in as data (ADR-108 purity is about
+/// no I/O, not about accepting time as an input), shared with
+/// `graduated_retention()` via `cascade_cutoffs()` so the preview's cutoffs
+/// can never silently diverge from what the decider actually uses (#307).
 #[must_use]
 pub fn compute_retention_preview(
     subvolume_name: &str,
     policy: &LocalRetentionPolicy,
     snapshot_interval: &Interval,
     avg_snapshot_bytes: Option<u64>,
+    now: NaiveDateTime,
 ) -> RetentionPreview {
     match policy {
         LocalRetentionPolicy::Transient => RetentionPreview {
@@ -418,7 +453,7 @@ pub fn compute_retention_preview(
             transient_comparison: None,
         },
         LocalRetentionPolicy::Graduated(g) => {
-            compute_graduated_preview(subvolume_name, g, snapshot_interval, avg_snapshot_bytes)
+            compute_graduated_preview(subvolume_name, g, snapshot_interval, avg_snapshot_bytes, now)
         }
     }
 }
@@ -430,6 +465,7 @@ pub fn compute_transient_comparison(
     graduated: &ResolvedGraduatedRetention,
     snapshot_interval: &Interval,
     avg_snapshot_bytes: Option<u64>,
+    now: NaiveDateTime,
 ) -> TransientComparison {
     let graduated_count = total_snapshot_count(graduated);
     let transient_count = 1u32; // just the chain parent
@@ -443,7 +479,7 @@ pub fn compute_transient_comparison(
             (None, None, None)
         };
 
-    let windows = compute_recovery_windows(graduated, snapshot_interval);
+    let windows = compute_recovery_windows(graduated, snapshot_interval, now);
     let lost_window = if windows.is_empty() {
         "no recovery windows configured".to_string()
     } else {
@@ -469,8 +505,9 @@ fn compute_graduated_preview(
     config: &ResolvedGraduatedRetention,
     snapshot_interval: &Interval,
     avg_snapshot_bytes: Option<u64>,
+    now: NaiveDateTime,
 ) -> RetentionPreview {
-    let recovery_windows = compute_recovery_windows(config, snapshot_interval);
+    let recovery_windows = compute_recovery_windows(config, snapshot_interval, now);
     let count = total_snapshot_count(config);
 
     let policy_description = format_graduated_policy(config, snapshot_interval);
@@ -492,10 +529,13 @@ fn compute_graduated_preview(
     }
 }
 
-/// Compute recovery windows with cascading offsets matching `graduated_retention()`.
+/// Compute recovery windows from the cutoffs `graduated_retention()` shares via
+/// `cascade_cutoffs()` — each tier's `cumulative_days` is the exact calendar
+/// distance from `now` to that tier's cutoff, not an approximation of it.
 fn compute_recovery_windows(
     config: &ResolvedGraduatedRetention,
     snapshot_interval: &Interval,
+    now: NaiveDateTime,
 ) -> Vec<RecoveryWindow> {
     let mut windows = Vec::new();
     let interval_secs = snapshot_interval.as_secs();
@@ -504,23 +544,14 @@ fn compute_recovery_windows(
     // Suppress hourly when snapshot interval >= 1 day
     let suppress_hourly = interval_secs >= one_day_secs;
 
-    // Track cumulative offset in days from now for human-readable descriptions.
-    // The cascading logic mirrors retention.rs lines 47-62:
-    //   hourly_cutoff = now - hours(hourly)
-    //   daily_cutoff  = hourly_cutoff - days(daily)
-    //   weekly_cutoff = daily_cutoff - weeks(weekly)
-    //   monthly_cutoff = weekly_cutoff - months(monthly)
-
-    // Hourly span in days (fractional, but we'll express in hours)
-    let hourly_hours = config.hourly;
-    // Cumulative offset after hourly window, in days
-    let cumulative_after_hourly_days = f64::from(hourly_hours) / 24.0;
+    let cutoffs = cascade_cutoffs(config, now);
+    let days_from = |cutoff: NaiveDateTime| (now - cutoff).num_seconds() as f64 / one_day_secs as f64;
 
     if !suppress_hourly && config.hourly > 0 {
         windows.push(RecoveryWindow {
             granularity: "hourly",
             count: config.hourly,
-            cumulative_days: cumulative_after_hourly_days,
+            cumulative_days: days_from(cutoffs.hourly),
             cumulative_description: format!(
                 "point-in-time recovery for the last {} hours",
                 config.hourly
@@ -529,35 +560,28 @@ fn compute_recovery_windows(
     }
 
     if config.daily > 0 {
-        // Hourly span is always included in the cumulative offset — when hourly is
-        // suppressed it folds into daily, when shown it still precedes daily.
-        let cumulative_days = f64::from(config.daily) + cumulative_after_hourly_days;
-        let desc = format_cumulative_days(cumulative_days);
+        let days = days_from(cutoffs.daily);
+        let desc = format_cumulative_days(days);
         windows.push(RecoveryWindow {
             granularity: "daily",
             count: config.daily,
-            cumulative_days,
+            cumulative_days: days,
             cumulative_description: format!("daily snapshots back {desc}"),
         });
     }
 
     if config.weekly > 0 {
-        let cumulative_days = cumulative_after_hourly_days
-            + f64::from(config.daily)
-            + f64::from(config.weekly) * 7.0;
-        let desc = format_cumulative_days(cumulative_days);
+        let days = days_from(cutoffs.weekly);
+        let desc = format_cumulative_days(days);
         windows.push(RecoveryWindow {
             granularity: "weekly",
             count: config.weekly,
-            cumulative_days,
+            cumulative_days: days,
             cumulative_description: format!("weekly snapshots back {desc}"),
         });
     }
 
-    let cumulative_after_weekly = cumulative_after_hourly_days
-        + f64::from(config.daily)
-        + f64::from(config.weekly) * 7.0;
-    let cumulative_after_monthly = match config.monthly {
+    match config.monthly {
         MonthlyCount::Unlimited => {
             // Unlimited — keep all monthly snapshots indefinitely.
             // The actual retention engine treats this as no monthly cutoff.
@@ -567,39 +591,42 @@ fn compute_recovery_windows(
                 cumulative_days: f64::INFINITY,
                 cumulative_description: "monthly snapshots kept indefinitely".to_string(),
             });
-            f64::INFINITY
         }
         MonthlyCount::Count(0) => {
             // No monthly window — omit from the list (consistent with
-            // how hourly/daily/weekly = 0 are omitted).
-            cumulative_after_weekly
+            // how hourly/daily/weekly = 0 are omitted). `cascade_cutoffs`
+            // still returns Some(weekly_cutoff) for this case (needed by
+            // graduated_retention's bucketing), but that's not "a window" —
+            // the MonthlyCount match, not the cutoff's Option, is what
+            // decides whether to show one here.
         }
         MonthlyCount::Count(n) => {
-            // Approximate months as 30.44 days (standard average). The actual retention engine
-            // uses calendar month subtraction (checked_sub_months), which can differ by ~3 days
-            // depending on which months are involved. This is within rounding tolerance.
-            let cumulative_days = cumulative_after_weekly + f64::from(n) * 30.44;
-            let desc = format_cumulative_days(cumulative_days);
+            // cutoffs.monthly is Some(_) for every MonthlyCount::Count(_)
+            // variant (cascade_cutoffs only returns None for Unlimited);
+            // the weekly fallback is defensive, not expected to trigger.
+            let days = days_from(cutoffs.monthly.unwrap_or(cutoffs.weekly));
+            let desc = format_cumulative_days(days);
             windows.push(RecoveryWindow {
                 granularity: "monthly",
                 count: n,
-                cumulative_days,
+                cumulative_days: days,
                 cumulative_description: format!("monthly snapshots back {desc}"),
             });
-            cumulative_days
         }
-    };
+    }
 
-    // Yearly window: skip when yearly == 0 OR monthly is Unlimited
-    // (yearly is subsumed; the engine already treats it as 0 in that case,
-    // and the display must agree to avoid two ∞ rows).
-    if config.yearly > 0 && !matches!(config.monthly, MonthlyCount::Unlimited) {
-        let cumulative_days = cumulative_after_monthly + f64::from(config.yearly) * 365.25;
-        let desc = format_cumulative_days(cumulative_days);
+    // Yearly window: gate on the shared cutoff directly rather than
+    // re-deriving `config.yearly > 0 && !matches!(config.monthly, Unlimited)`
+    // — cascade_cutoffs's `yearly` field is None in exactly those two
+    // suppression cases, so reading it here keeps this tier in permanent
+    // lockstep with graduated_retention() instead of restating the rule (#307).
+    if let Some(yearly_cutoff) = cutoffs.yearly {
+        let days = days_from(yearly_cutoff);
+        let desc = format_cumulative_days(days);
         windows.push(RecoveryWindow {
             granularity: "yearly",
             count: config.yearly,
-            cumulative_days,
+            cumulative_days: days,
             cumulative_description: format!("yearly snapshots back {desc}"),
         });
     }
@@ -670,11 +697,15 @@ fn format_graduated_policy(
 /// Compact summary of recovery windows for status one-liners.
 /// Returns e.g. "31d / 7mo / 19mo" or "none (transient)".
 #[must_use]
-pub fn retention_summary(policy: &LocalRetentionPolicy, snapshot_interval: &Interval) -> String {
+pub fn retention_summary(
+    policy: &LocalRetentionPolicy,
+    snapshot_interval: &Interval,
+    now: NaiveDateTime,
+) -> String {
     match policy {
         LocalRetentionPolicy::Transient => "none (transient)".to_string(),
         LocalRetentionPolicy::Graduated(g) => {
-            let windows = compute_recovery_windows(g, snapshot_interval);
+            let windows = compute_recovery_windows(g, snapshot_interval, now);
             if windows.is_empty() {
                 return "\u{2014}".to_string();
             }
@@ -930,6 +961,162 @@ mod tests {
         );
     }
 
+    // ── Cascade cutoffs tests ──────────────────────────────────────────
+    //
+    // Fixtures pin hourly/daily/weekly to 0 so `weekly_cutoff == anchor`
+    // exactly, making the anchor date itself the value fed into
+    // `checked_sub_months` — otherwise a month-end/leap-day anchor could
+    // drift off its intended boundary before reaching the clamp under test.
+
+    fn now_month_end() -> NaiveDateTime {
+        NaiveDate::from_ymd_opt(2026, 3, 31)
+            .unwrap()
+            .and_hms_opt(15, 0, 0)
+            .unwrap()
+    }
+
+    fn now_leap_day() -> NaiveDateTime {
+        NaiveDate::from_ymd_opt(2028, 2, 29)
+            .unwrap()
+            .and_hms_opt(15, 0, 0)
+            .unwrap()
+    }
+
+    #[test]
+    fn cutoffs_monthly_count_zero_equals_weekly_cutoff() {
+        let config = ResolvedGraduatedRetention {
+            hourly: 0,
+            daily: 0,
+            weekly: 0,
+            monthly: MonthlyCount::Count(0),
+            yearly: 0,
+        };
+        let cutoffs = cascade_cutoffs(&config, now());
+        assert_eq!(cutoffs.monthly, Some(cutoffs.weekly));
+        assert_eq!(cutoffs.yearly, None, "yearly == 0 suppresses the yearly cutoff");
+    }
+
+    #[test]
+    fn cutoffs_monthly_count_zero_yearly_present_when_yearly_positive() {
+        let config = ResolvedGraduatedRetention {
+            hourly: 0,
+            daily: 0,
+            weekly: 0,
+            monthly: MonthlyCount::Count(0),
+            yearly: 2,
+        };
+        let cutoffs = cascade_cutoffs(&config, now());
+        assert_eq!(cutoffs.monthly, Some(cutoffs.weekly));
+        assert!(
+            cutoffs.yearly.is_some(),
+            "yearly > 0 with Count(0) monthly should still produce a yearly cutoff"
+        );
+    }
+
+    #[test]
+    fn cutoffs_monthly_unlimited_suppresses_monthly_and_yearly() {
+        let config = ResolvedGraduatedRetention {
+            hourly: 0,
+            daily: 0,
+            weekly: 0,
+            monthly: MonthlyCount::Unlimited,
+            yearly: 5, // even with yearly > 0, must be suppressed
+        };
+        let cutoffs = cascade_cutoffs(&config, now());
+        assert_eq!(cutoffs.monthly, None);
+        assert_eq!(
+            cutoffs.yearly, None,
+            "yearly is suppressed when monthly is Unlimited regardless of yearly count"
+        );
+    }
+
+    #[test]
+    fn cutoffs_monthly_and_yearly_no_clamp_on_boring_anchor() {
+        // now() = 2026-03-22 15:00 — day 22 exists in every target month,
+        // so neither cutoff needs chrono's end-of-month clamp. Contrast case
+        // for the clamping fixtures below.
+        let config = ResolvedGraduatedRetention {
+            hourly: 0,
+            daily: 0,
+            weekly: 0,
+            monthly: MonthlyCount::Count(1),
+            yearly: 1,
+        };
+        let cutoffs = cascade_cutoffs(&config, now());
+        assert_eq!(
+            cutoffs.monthly,
+            Some(NaiveDate::from_ymd_opt(2026, 2, 22).unwrap().and_hms_opt(15, 0, 0).unwrap())
+        );
+        assert_eq!(
+            cutoffs.yearly,
+            Some(NaiveDate::from_ymd_opt(2025, 2, 22).unwrap().and_hms_opt(15, 0, 0).unwrap())
+        );
+    }
+
+    #[test]
+    fn cutoffs_monthly_clamps_at_month_end() {
+        // now_month_end() = 2026-03-31 15:00. Feb 2026 has 28 days (not a
+        // leap year), so `-1 month` must clamp day 31 down to day 28 rather
+        // than erroring or rolling into March. Verified empirically against
+        // chrono 0.4's actual clamping behavior before writing this assertion.
+        let config = ResolvedGraduatedRetention {
+            hourly: 0,
+            daily: 0,
+            weekly: 0,
+            monthly: MonthlyCount::Count(1),
+            yearly: 0,
+        };
+        let cutoffs = cascade_cutoffs(&config, now_month_end());
+        assert_eq!(
+            cutoffs.monthly,
+            Some(NaiveDate::from_ymd_opt(2026, 2, 28).unwrap().and_hms_opt(15, 0, 0).unwrap()),
+            "Mar 31 minus 1 month must clamp to Feb 28, not error or roll over"
+        );
+    }
+
+    #[test]
+    fn cutoffs_yearly_clamps_on_leap_day() {
+        // now_leap_day() = 2028-02-29 15:00 (2028 is a leap year). monthly =
+        // Count(0) keeps monthly_cutoff == weekly_cutoff == the anchor
+        // exactly, so the yearly cutoff's `-12 months` subtracts directly
+        // from Feb 29, landing on 2027 (not a leap year) and requiring the
+        // Feb 29 → Feb 28 clamp. Verified empirically against chrono 0.4's
+        // actual clamping behavior before writing this assertion.
+        let config = ResolvedGraduatedRetention {
+            hourly: 0,
+            daily: 0,
+            weekly: 0,
+            monthly: MonthlyCount::Count(0),
+            yearly: 1,
+        };
+        let cutoffs = cascade_cutoffs(&config, now_leap_day());
+        assert_eq!(
+            cutoffs.yearly,
+            Some(NaiveDate::from_ymd_opt(2027, 2, 28).unwrap().and_hms_opt(15, 0, 0).unwrap()),
+            "Feb 29 (leap year) minus 1 year must clamp to Feb 28, not error"
+        );
+    }
+
+    #[test]
+    fn cutoffs_overflow_clamps_to_min() {
+        // u32::MAX months (~357.9 million years) exceeds chrono's NaiveDate
+        // range (~262,144 years either side of the epoch) and must clamp to
+        // NaiveDateTime::MIN rather than panicking. A smaller, seemingly
+        // pathological count like 3_000_000 months (~250,000 years) does
+        // NOT overflow — verified empirically against chrono 0.4's actual
+        // range before writing this assertion; u32::MAX is the value that
+        // actually forces the fallback path.
+        let config = ResolvedGraduatedRetention {
+            hourly: 0,
+            daily: 0,
+            weekly: 0,
+            monthly: MonthlyCount::Count(u32::MAX),
+            yearly: 0,
+        };
+        let cutoffs = cascade_cutoffs(&config, now());
+        assert_eq!(cutoffs.monthly, Some(NaiveDateTime::MIN));
+    }
+
     // ── Retention preview tests ──────────────────────────────────────
 
     #[test]
@@ -944,7 +1131,7 @@ mod tests {
         let policy = LocalRetentionPolicy::Graduated(config);
         let interval = Interval::hours(4); // sub-daily
 
-        let preview = compute_retention_preview("htpc-root", &policy, &interval, None);
+        let preview = compute_retention_preview("htpc-root", &policy, &interval, None, now());
 
         assert_eq!(preview.subvolume_name, "htpc-root");
         assert_eq!(preview.recovery_windows.len(), 4);
@@ -979,7 +1166,7 @@ mod tests {
         let policy = LocalRetentionPolicy::Graduated(config);
         let interval = Interval::days(1);
 
-        let preview = compute_retention_preview("docs", &policy, &interval, None);
+        let preview = compute_retention_preview("docs", &policy, &interval, None, now());
 
         // hourly=0 → omitted, weekly=0 → omitted
         assert_eq!(preview.recovery_windows.len(), 2);
@@ -992,7 +1179,7 @@ mod tests {
         let policy = LocalRetentionPolicy::Transient;
         let interval = Interval::days(1);
 
-        let preview = compute_retention_preview("htpc-root", &policy, &interval, None);
+        let preview = compute_retention_preview("htpc-root", &policy, &interval, None, now());
 
         assert!(preview.recovery_windows.is_empty());
         assert_eq!(preview.policy_description, "transient");
@@ -1011,7 +1198,7 @@ mod tests {
         let policy = LocalRetentionPolicy::Graduated(config);
         let interval = Interval::hours(1); // sub-daily
 
-        let preview = compute_retention_preview("test", &policy, &interval, None);
+        let preview = compute_retention_preview("test", &policy, &interval, None, now());
 
         assert_eq!(preview.recovery_windows.len(), 3); // hourly, daily, monthly
         assert_eq!(preview.recovery_windows[0].granularity, "hourly");
@@ -1034,7 +1221,7 @@ mod tests {
         let policy = LocalRetentionPolicy::Graduated(config);
         let interval = Interval::days(1); // >= 1 day → suppress hourly
 
-        let preview = compute_retention_preview("test", &policy, &interval, None);
+        let preview = compute_retention_preview("test", &policy, &interval, None, now());
 
         // Hourly should be suppressed
         assert!(
@@ -1067,7 +1254,7 @@ mod tests {
         let policy = LocalRetentionPolicy::Graduated(config);
         let interval = Interval::days(1);
 
-        let preview = compute_retention_preview("test", &policy, &interval, Some(1_500_000_000));
+        let preview = compute_retention_preview("test", &policy, &interval, Some(1_500_000_000), now());
 
         let estimate = preview.estimated_disk_usage.unwrap();
         assert_eq!(estimate.method, crate::output::EstimateMethod::Calibrated);
@@ -1088,7 +1275,7 @@ mod tests {
         let policy = LocalRetentionPolicy::Graduated(config);
         let interval = Interval::days(1);
 
-        let preview = compute_retention_preview("test", &policy, &interval, None);
+        let preview = compute_retention_preview("test", &policy, &interval, None, now());
 
         assert!(preview.estimated_disk_usage.is_none());
     }
@@ -1104,7 +1291,7 @@ mod tests {
         };
         let interval = Interval::hours(4);
 
-        let comparison = compute_transient_comparison(&config, &interval, None);
+        let comparison = compute_transient_comparison(&config, &interval, None, now());
 
         assert_eq!(comparison.graduated_count, 24 + 30 + 26 + 12);
         assert_eq!(comparison.transient_count, 1);
@@ -1124,7 +1311,7 @@ mod tests {
         };
         let interval = Interval::days(1);
 
-        let comparison = compute_transient_comparison(&config, &interval, Some(1_000_000_000));
+        let comparison = compute_transient_comparison(&config, &interval, Some(1_000_000_000), now());
 
         assert_eq!(comparison.graduated_count, 30);
         assert_eq!(comparison.graduated_total_bytes, Some(30_000_000_000));
@@ -1146,7 +1333,7 @@ mod tests {
         let policy = LocalRetentionPolicy::Graduated(config);
         let interval = Interval::days(1);
 
-        let preview = compute_retention_preview("test", &policy, &interval, None);
+        let preview = compute_retention_preview("test", &policy, &interval, None, now());
 
         assert_eq!(preview.recovery_windows.len(), 1, "monthly = 0 (unlimited) should still produce a window");
         assert_eq!(preview.recovery_windows[0].granularity, "monthly");
@@ -1166,7 +1353,7 @@ mod tests {
         };
         let interval = Interval::hours(4);
 
-        let windows = compute_recovery_windows(&config, &interval);
+        let windows = compute_recovery_windows(&config, &interval, now());
 
         // Hourly: 24 hours
         assert_eq!(windows[0].granularity, "hourly");
@@ -1187,6 +1374,80 @@ mod tests {
     }
 
     #[test]
+    fn cumulative_days_hourly_conversion_is_exact() {
+        let config = ResolvedGraduatedRetention {
+            hourly: 24,
+            daily: 0,
+            weekly: 0,
+            monthly: MonthlyCount::Count(0),
+            yearly: 0,
+        };
+        let interval = Interval::hours(1); // sub-daily, hourly not suppressed
+        let windows = compute_recovery_windows(&config, &interval, now());
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].granularity, "hourly");
+        assert_eq!(windows[0].cumulative_days, 1.0, "24 hours must convert to exactly 1.0 day");
+    }
+
+    #[test]
+    fn cumulative_days_daily_conversion_is_exact() {
+        let config = ResolvedGraduatedRetention {
+            hourly: 0,
+            daily: 10,
+            weekly: 0,
+            monthly: MonthlyCount::Count(0),
+            yearly: 0,
+        };
+        let interval = Interval::days(1);
+        let windows = compute_recovery_windows(&config, &interval, now());
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].granularity, "daily");
+        assert_eq!(windows[0].cumulative_days, 10.0, "10 days with no hourly offset must convert to exactly 10.0");
+    }
+
+    #[test]
+    fn cumulative_days_yearly_conversion_is_exact_calendar_math() {
+        // now() = 2026-03-22; -12 months = 2025-03-22 (day 22 exists in both
+        // months, no clamp). Neither year is a leap year, so the span is
+        // exactly 365 days — an exact-math regression this UPI's whole point
+        // was to make true (the old approximation used 365.25).
+        let config = ResolvedGraduatedRetention {
+            hourly: 0,
+            daily: 0,
+            weekly: 0,
+            monthly: MonthlyCount::Count(0),
+            yearly: 1,
+        };
+        let interval = Interval::days(1);
+        let windows = compute_recovery_windows(&config, &interval, now());
+        assert_eq!(windows.len(), 1, "gate must read cutoffs.yearly.is_some(), producing exactly one window");
+        assert_eq!(windows[0].granularity, "yearly");
+        assert_eq!(windows[0].cumulative_days, 365.0);
+    }
+
+    #[test]
+    fn cumulative_days_overflow_clamp_renders_without_panicking() {
+        // Newly-inherited path: compute_recovery_windows's old float math
+        // couldn't overflow, but it now shares cascade_cutoffs's MIN-clamp
+        // fallback with graduated_retention — confirm it renders a large
+        // finite number, not a panic, NaN, or infinity (which would collide
+        // with the Unlimited-monthly sentinel).
+        let config = ResolvedGraduatedRetention {
+            hourly: 0,
+            daily: 0,
+            weekly: 0,
+            monthly: MonthlyCount::Count(u32::MAX),
+            yearly: 0,
+        };
+        let interval = Interval::days(1);
+        let windows = compute_recovery_windows(&config, &interval, now());
+        assert_eq!(windows.len(), 1);
+        let days = windows[0].cumulative_days;
+        assert!(days.is_finite(), "overflow-clamped cutoff must render as a finite day count, got {days}");
+        assert!(days > 0.0);
+    }
+
+    #[test]
     fn retention_summary_graduated() {
         let config = ResolvedGraduatedRetention {
             hourly: 24,
@@ -1198,7 +1459,7 @@ mod tests {
         let policy = LocalRetentionPolicy::Graduated(config);
         let interval = Interval::hours(4);
 
-        let summary = retention_summary(&policy, &interval);
+        let summary = retention_summary(&policy, &interval, now());
 
         // Should contain compact forms like "24h / 31d / 7mo / 1y"
         assert!(summary.contains('/'), "summary should use / separator: {summary}");
@@ -1210,7 +1471,7 @@ mod tests {
         let policy = LocalRetentionPolicy::Transient;
         let interval = Interval::days(1);
 
-        let summary = retention_summary(&policy, &interval);
+        let summary = retention_summary(&policy, &interval, now());
         assert_eq!(summary, "none (transient)");
     }
 
@@ -1226,7 +1487,7 @@ mod tests {
         let policy = LocalRetentionPolicy::Graduated(config);
         let interval = Interval::hours(4);
 
-        let preview = compute_retention_preview("test", &policy, &interval, None);
+        let preview = compute_retention_preview("test", &policy, &interval, None, now());
 
         // monthly = 0 should produce a window with "indefinitely" description
         let monthly = preview
@@ -1262,7 +1523,7 @@ mod tests {
         let policy = LocalRetentionPolicy::Graduated(config);
         let interval = Interval::days(1);
 
-        let summary = retention_summary(&policy, &interval);
+        let summary = retention_summary(&policy, &interval, now());
 
         // Should contain ∞ for unlimited monthly
         assert!(

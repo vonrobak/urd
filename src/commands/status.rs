@@ -150,6 +150,7 @@ fn assemble_status_output(
                 sa.retention_summary = Some(retention::retention_summary(
                     &sv.local_retention,
                     &sv.snapshot_interval,
+                    now,
                 ));
                 sa.external_only = sv.local_retention.is_transient() && sv.send_enabled;
             }

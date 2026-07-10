@@ -40,6 +40,7 @@ pub fn run(config: Config, args: RetentionPreviewArgs, mode: OutputMode) -> anyh
         None
     };
 
+    let now = chrono::Local::now().naive_local();
     let mut previews = Vec::new();
     for sv in &targets {
         let avg_bytes = state_db
@@ -52,13 +53,17 @@ pub fn run(config: Config, args: RetentionPreviewArgs, mode: OutputMode) -> anyh
             &sv.local_retention,
             &sv.snapshot_interval,
             avg_bytes,
+            now,
         );
 
         if args.compare {
             preview.transient_comparison = Some(match &sv.local_retention {
-                LocalRetentionPolicy::Graduated(g) => {
-                    retention::compute_transient_comparison(g, &sv.snapshot_interval, avg_bytes)
-                }
+                LocalRetentionPolicy::Graduated(g) => retention::compute_transient_comparison(
+                    g,
+                    &sv.snapshot_interval,
+                    avg_bytes,
+                    now,
+                ),
                 LocalRetentionPolicy::Transient => {
                     // For transient, show what graduated would cost using config defaults
                     let default_graduated = config.defaults.local_retention.resolved();
@@ -66,6 +71,7 @@ pub fn run(config: Config, args: RetentionPreviewArgs, mode: OutputMode) -> anyh
                         &default_graduated,
                         &sv.snapshot_interval,
                         avg_bytes,
+                        now,
                     )
                 }
             });
