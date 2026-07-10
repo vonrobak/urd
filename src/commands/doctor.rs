@@ -150,16 +150,8 @@ pub fn run(config: Config, args: DoctorArgs, output_mode: OutputMode) -> anyhow:
         .and_then(std::fs::canonicalize)
         .ok();
     let installed = dirs::config_dir().map(|d| {
-        let dir = d.join("systemd/user");
-        crate::systemd_units::expected_unit_names(&config.general.run_frequency)
-            .into_iter()
-            .map(|name| {
-                (
-                    name.to_string(),
-                    std::fs::read_to_string(dir.join(name)).ok(),
-                )
-            })
-            .collect::<std::collections::HashMap<_, _>>()
+        let names = crate::systemd_units::expected_unit_names(&config.general.run_frequency);
+        crate::commands::seal::installed_unit_contents(&names, &d.join("systemd/user"))
     });
     let mut units_checks =
         build_units_drift_checks(&config, exe.as_deref(), installed.as_ref());
@@ -446,11 +438,11 @@ fn build_sudoers_drift_checks(config: &Config, listing: Option<&str>) -> Vec<Doc
                 .to_string(),
         )];
     };
-    let listing = match crate::sudoers::parse_privilege_listing(listing) {
-        Ok(listing) => listing,
-        Err(uncertain) => return vec![cannot_verify_grant_check(uncertain.reason)],
+    let coverage = match crate::commands::seal::coverage_from_listing(&expected, listing) {
+        Ok(coverage) => coverage,
+        Err(reason) => return vec![cannot_verify_grant_check(reason)],
     };
-    match crate::sudoers::coverage(&expected, &listing) {
+    match coverage {
         crate::sudoers::Coverage::AllCovered => vec![DoctorCheck {
             name: "sudoers grant covers the config".to_string(),
             status: DoctorCheckStatus::Ok,

@@ -613,7 +613,8 @@ fn install_units(config: &Config) -> bool {
     }
 
     // Done-detection: byte-true files + everything enabled → nothing to ask.
-    let installed = installed_unit_contents(&units, &dir);
+    let names: Vec<&str> = units.iter().map(|u| u.name).collect();
+    let installed = installed_unit_contents(&names, &dir);
     if crate::systemd_units::diff_units(&units, &installed).is_empty()
         && enabled.iter().all(|p| *p == EnabledProbe::Enabled)
     {
@@ -622,7 +623,6 @@ fn install_units(config: &Config) -> bool {
         return true;
     }
 
-    let names: Vec<&str> = units.iter().map(|u| u.name).collect();
     print!("{}", voice::render_units_request(&names, &dir, &next_action));
     loop {
         match crate::commands::encounter::read_input_line() {
@@ -699,14 +699,17 @@ fn enabled_units(units: &[crate::systemd_units::UnitFile]) -> Vec<EnabledProbe> 
         .collect()
 }
 
-/// Read every expected unit's installed content (`None` = absent).
-fn installed_unit_contents(
-    units: &[crate::systemd_units::UnitFile],
+/// Read every named unit's installed content (`None` = absent). Shared by
+/// `units_drifted` (the deep gate) and doctor's units-drift rows (UPI 085)
+/// so both read the installed map through one loop instead of each
+/// hand-rolling the same `read_to_string` scan.
+pub(crate) fn installed_unit_contents(
+    names: &[&str],
     dir: &Path,
 ) -> std::collections::HashMap<String, Option<String>> {
-    units
+    names
         .iter()
-        .map(|u| (u.name.to_string(), std::fs::read_to_string(dir.join(u.name)).ok()))
+        .map(|name| (name.to_string(), std::fs::read_to_string(dir.join(name)).ok()))
         .collect()
 }
 
@@ -1213,7 +1216,8 @@ fn units_drifted(config: &Config) -> bool {
     let Some(dir) = dirs::config_dir().map(|d| d.join("systemd/user")) else {
         return false;
     };
-    !crate::systemd_units::diff_units(&units, &installed_unit_contents(&units, &dir)).is_empty()
+    let names: Vec<&str> = units.iter().map(|u| u.name).collect();
+    !crate::systemd_units::diff_units(&units, &installed_unit_contents(&names, &dir)).is_empty()
 }
 
 /// Is any expected unit file absent? Existence only, by expected name —
@@ -1290,9 +1294,20 @@ fn effective_coverage(config: &Config) -> Result<Coverage, String> {
     if !out.status.success() {
         return Err("the privilege listing needs a password (sudo -n -l)".to_string());
     }
-    let listing = sudoers::parse_privilege_listing(&String::from_utf8_lossy(&out.stdout))
-        .map_err(|u| u.reason)?;
-    Ok(sudoers::coverage(&expected, &listing))
+    coverage_from_listing(&expected, &String::from_utf8_lossy(&out.stdout))
+}
+
+/// Parse a raw `sudo -n -l` listing and diff it against `expected`. Pure —
+/// the I/O boundary stays with each caller (`effective_coverage`'s own
+/// probe; doctor's injected listing for its test seam) — so the deep gate
+/// and doctor's drift rows share ONE parse-and-compare instead of each
+/// independently calling `parse_privilege_listing`/`coverage` (UPI 085).
+pub(crate) fn coverage_from_listing(
+    expected: &[String],
+    raw_listing: &str,
+) -> Result<Coverage, String> {
+    let listing = sudoers::parse_privilege_listing(raw_listing).map_err(|u| u.reason)?;
+    Ok(sudoers::coverage(expected, &listing))
 }
 
 /// The expected grant lines the effective listing DEFINITIVELY lacks.
@@ -1459,13 +1474,14 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let dir = tmp.path().join("systemd/user");
 
+        let names: Vec<&str> = units.iter().map(|u| u.name).collect();
         write_units(&units, &dir).unwrap();
-        let installed = installed_unit_contents(&units, &dir);
+        let installed = installed_unit_contents(&names, &dir);
         assert!(crate::systemd_units::diff_units(&units, &installed).is_empty());
 
         // Tamper with one file: the diff names exactly it.
         std::fs::write(dir.join("urd-backup.timer"), "[Timer]\n").unwrap();
-        let installed = installed_unit_contents(&units, &dir);
+        let installed = installed_unit_contents(&names, &dir);
         let drift = crate::systemd_units::diff_units(&units, &installed);
         assert_eq!(drift.len(), 1);
         assert_eq!(drift[0].name, "urd-backup.timer");
