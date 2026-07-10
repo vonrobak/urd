@@ -23,6 +23,7 @@ pub mod status;
 pub mod sentinel;
 pub mod storage_signals;
 pub mod verify;
+pub mod world;
 
 /// How a doorstep-aware command finished. `code()` feeds `main`'s
 /// `ExitCode`: 0 = done, 3 = not configured (the documented distinct

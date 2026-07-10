@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use crate::advice;
 use crate::awareness::{self, PromiseStatus};
 use crate::cli::{DoctorArgs, VerifyArgs};
+use crate::commands::world::World;
 use crate::config::Config;
 use crate::drives;
 use crate::output::{
@@ -11,7 +12,7 @@ use crate::output::{
     DoctorRecommendationView, DoctorSentinelStatus, DoctorVerdict, InitStatus, OutputMode,
     SchemaStatus,
 };
-use crate::plan::{Observation, RealFileSystemState};
+use crate::plan::RealFileSystemState;
 use crate::recommendation::{
     self, AdjustmentReason, HeadroomContext, HeadroomSeverity, ShapeRole,
 };
@@ -219,25 +220,10 @@ pub fn run(config: Config, args: DoctorArgs, output_mode: OutputMode) -> anyhow:
     }
 
     // ── 3. Data safety (awareness model) ──────────────────────────
-    let state_db = if config.general.state_db.exists() {
-        StateDb::open(&config.general.state_db).ok()
-    } else {
-        None
-    };
-    let fs_state = RealFileSystemState {
-        state: state_db.as_ref(),
-    };
-    let assess_btrfs = crate::btrfs::RealBtrfs::for_reads(&config.general.btrfs_path);
-    let observation = Observation {
-        fs: &fs_state,
-        history: &fs_state,
-        btrfs: &assess_btrfs,
-    };
+    let world = World::open(&config);
     let now = chrono::Local::now().naive_local();
-    // Read-only gather: thread storage posture into the data-safety section.
-    let signals = crate::commands::storage_signals::gather(&config, state_db.as_ref());
-    let assessments =
-        advice::assess_view(&config, now, &observation, &signals.by_subvol);
+    // Read-only view: thread storage posture into the data-safety section.
+    let assessments = world.view(&config, now).assessments;
 
     let resolved = config.resolved_subvolumes();
     let data_safety: Vec<DoctorDataSafety> = assessments
@@ -351,14 +337,14 @@ pub fn run(config: Config, args: DoctorArgs, output_mode: OutputMode) -> anyhow:
 
     // ── 5.5 Churn (UPI 030 — only with --thorough) ────────────────
     let churn_view = if args.thorough {
-        Some(build_doctor_churn_view(&config, state_db.as_ref()))
+        Some(build_doctor_churn_view(&config, world.db()))
     } else {
         None
     };
 
     // ── 5.6 Recommendations (UPI 041 — only with --thorough) ──────
     let recommendation_view = if args.thorough {
-        Some(build_doctor_recommendation_view(&config, state_db.as_ref()))
+        Some(build_doctor_recommendation_view(&config, world.db()))
     } else {
         None
     };

@@ -13,6 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the executor's in-run away-shed also re-confirms a drive's presence right before
   shedding its pin, so a drive that reconnects mid-run keeps its chain instead of losing
   it to a stale pre-lock snapshot.
+- `status`, bare `urd`, `doctor`, `plan`, and `backup` now assemble their read-only world
+  (state DB, filesystem, btrfs handle) through one shared prelude instead of five
+  hand-rolled copies. Minor accepted side effect: `status`/`doctor`/bare `urd` now try to
+  open the state DB unconditionally like `backup` already does, so a config that's never
+  been backed up or sealed may see `urd.db` created on a plain inspection command.
 
 ## [0.33.4] - 2026-07-08
 

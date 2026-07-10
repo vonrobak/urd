@@ -18,7 +18,7 @@ use chrono::NaiveDateTime;
 
 use crate::advice;
 use crate::awareness::{self, PromiseStatus, SubvolAssessment};
-use crate::commands::storage_signals;
+use crate::commands::{storage_signals, world};
 use crate::config::Config;
 use crate::drives::{self, DriveAvailability};
 use crate::heartbeat;
@@ -414,7 +414,7 @@ impl SentinelRunner {
         // reflect-only (S1: reads never advance hysteresis); the backup's
         // post-exec writeback remains the only place the armed tier advances.
         let signals = storage_signals::gather(&self.config, state_db.as_ref());
-        let assessments = advice::assess_view(
+        let assessments = world::assess(
             &self.config,
             now,
             &observation,
