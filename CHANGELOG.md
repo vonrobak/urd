@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- `doctor`'s sudoers-drift and units-drift rows now derive from the same shared
+  comparisons `urd init`'s deep seal gate uses, instead of re-parsing the privilege
+  listing and re-reading installed unit files independently. No behavior change (#306).
+
+### Changed
 - `drives.rs` and `discovery.rs`'s per-path `findmnt` UUID/mountpoint lookups now delegate
   to one concentrated probe in `pools.rs`; `drives.rs`'s statvfs free-bytes wrapper now
   delegates to `pools.rs`'s too. No behavior change — one probe surface instead of three
