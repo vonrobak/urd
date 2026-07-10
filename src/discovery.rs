@@ -739,17 +739,6 @@ fn run_findmnt() -> crate::error::Result<String> {
     run_probe("findmnt", &["-t", "btrfs", "-J"], true)
 }
 
-/// Which filesystem holds `path`? (`--target` walks up to the nearest
-/// mount, so the path itself need not be a mountpoint.)
-fn run_findmnt_target(path: &Path) -> crate::error::Result<String> {
-    let target = path.to_string_lossy();
-    run_probe(
-        "findmnt",
-        &["-J", "-o", "TARGET,FSTYPE,UUID", "--target", &target],
-        true,
-    )
-}
-
 /// Probe the system and build the inventory. Never fails: a failed probe
 /// degrades the inventory and leaves a [`DiscoveryNote::ProbeDegraded`]
 /// so 072 can say so (fail open, observable).
@@ -786,25 +775,26 @@ pub fn discover() -> SystemInventory {
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
         .map(|path| {
-            let pool_uuid = run_findmnt_target(&path)
+            let pool_uuid = crate::pools::findmnt_probe_target(&path)
                 .ok()
-                .and_then(|out| parse_findmnt_target(&out));
+                .and_then(|entry| btrfs_pool_uuid(&entry));
             DiscoveredHome { path, pool_uuid }
         });
     inventory
 }
 
-/// The btrfs pool UUID of the filesystem holding the probed path, from
-/// `findmnt --target` output; `None` for non-btrfs filesystems or
-/// unparseable output.
-fn parse_findmnt_target(json: &str) -> Option<String> {
-    let root: serde_json::Value = serde_json::from_str(json).ok()?;
-    let fs = root.get("filesystems")?.as_array()?.first()?;
-    if fs.get("fstype")?.as_str()? != "btrfs" {
-        return None;
+/// Gate a [`pools::FindmntEntry`] to its UUID only when the filesystem is
+/// btrfs — an ext4 `/home` over a btrfs `/` must not be attributed to the
+/// pool (a home-relative snapshot root there would cross filesystems). This
+/// gate is specific to discovery's zero-state home-pool lookup, so it stays
+/// here rather than in the shared probe in `pools.rs` (UPI 084).
+#[must_use]
+fn btrfs_pool_uuid(entry: &crate::pools::FindmntEntry) -> Option<String> {
+    if entry.fstype.as_deref() == Some("btrfs") {
+        entry.uuid.clone()
+    } else {
+        None
     }
-    let uuid = fs.get("uuid")?.as_str()?;
-    (!uuid.is_empty()).then(|| uuid.to_string())
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────
@@ -826,33 +816,36 @@ mod tests {
     const EXTERNAL_MAPPER: &str = "luks-33333333-3333-4333-8333-333333333333";
 
     #[test]
-    fn parse_findmnt_target_btrfs_yields_pool_uuid() {
-        let json = format!(
-            r#"{{"filesystems":[{{"target":"/home","fstype":"btrfs","uuid":"{SYSTEM_POOL}"}}]}}"#
-        );
-        assert_eq!(
-            parse_findmnt_target(&json),
-            Some(SYSTEM_POOL.to_string())
-        );
+    fn btrfs_pool_uuid_btrfs_yields_pool_uuid() {
+        let entry = crate::pools::FindmntEntry {
+            target: Some(PathBuf::from("/home")),
+            fstype: Some("btrfs".to_string()),
+            uuid: Some(SYSTEM_POOL.to_string()),
+        };
+        assert_eq!(btrfs_pool_uuid(&entry), Some(SYSTEM_POOL.to_string()));
     }
 
     #[test]
-    fn parse_findmnt_target_non_btrfs_yields_none() {
+    fn btrfs_pool_uuid_non_btrfs_yields_none() {
         // An ext4 /home over a btrfs / must not be attributed to the pool
         // — a home-relative snapshot root there would cross filesystems.
-        let json = format!(
-            r#"{{"filesystems":[{{"target":"/home","fstype":"ext4","uuid":"{SYSTEM_POOL}"}}]}}"#
-        );
-        assert_eq!(parse_findmnt_target(&json), None);
+        let entry = crate::pools::FindmntEntry {
+            target: Some(PathBuf::from("/home")),
+            fstype: Some("ext4".to_string()),
+            uuid: Some(SYSTEM_POOL.to_string()),
+        };
+        assert_eq!(btrfs_pool_uuid(&entry), None);
     }
 
     #[test]
-    fn parse_findmnt_target_degraded_output_yields_none() {
-        assert_eq!(parse_findmnt_target(""), None);
-        assert_eq!(parse_findmnt_target("{}"), None);
-        assert_eq!(parse_findmnt_target(r#"{"filesystems":[]}"#), None);
+    fn btrfs_pool_uuid_degraded_entry_yields_none() {
+        assert_eq!(btrfs_pool_uuid(&crate::pools::FindmntEntry::default()), None);
         assert_eq!(
-            parse_findmnt_target(r#"{"filesystems":[{"target":"/","fstype":"btrfs","uuid":""}]}"#),
+            btrfs_pool_uuid(&crate::pools::FindmntEntry {
+                target: Some(PathBuf::from("/")),
+                fstype: Some("btrfs".to_string()),
+                uuid: None,
+            }),
             None
         );
     }
