@@ -1664,9 +1664,15 @@ mod contract {
         // Surface 1: render_shape_kv (private helper, accessed via
         // recommendation rendering; we test through retention_summary too).
         let interval = crate::types::Interval::days(1);
+        use chrono::NaiveDate;
+        let now = NaiveDate::from_ymd_opt(2026, 1, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap();
         let summary = crate::retention::retention_summary(
             &crate::types::LocalRetentionPolicy::Graduated(shape),
             &interval,
+            now,
         );
         for forbidden in &["monthly = 0", "monthly=0", "monthly: 0"] {
             assert!(
@@ -1678,7 +1684,7 @@ mod contract {
         // Surface 2: compute_retention_preview / recovery_windows path.
         let pol = crate::types::LocalRetentionPolicy::Graduated(shape);
         let preview =
-            crate::retention::compute_retention_preview("sv", &pol, &interval, None);
+            crate::retention::compute_retention_preview("sv", &pol, &interval, None, now);
         let preview_str = format!("{preview:?}");
         for forbidden in &["monthly = 0", "monthly=0", "monthly: 0"] {
             // Allow the `monthly: Count(0)` Debug form (it's the typed

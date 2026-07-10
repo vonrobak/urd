@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- `graduated_retention`'s deciding cutoffs and `retention-preview`/`status`'s describing
+  cutoffs now derive from one shared cascade instead of two independently-maintained
+  copies, one of which approximated month/year math instead of using calendar-exact
+  subtraction. Accepted side effect: `retention-preview`'s `cumulative_days` and
+  `status`'s retention-summary one-liner now report exact-calendar day counts instead of
+  the old fixed-average approximation — the same config can report a slightly different
+  number depending on the day queried (#307).
+
+### Changed
 - `doctor`'s sudoers-drift and units-drift rows now derive from the same shared
   comparisons `urd init`'s deep seal gate uses, instead of re-parsing the privilege
   listing and re-reading installed unit files independently. No behavior change (#306).
