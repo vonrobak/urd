@@ -2096,11 +2096,8 @@ impl HistoryQuery for MockFileSystemState {
         drive_label: &str,
         send_kind: SendKind,
     ) -> Option<u64> {
-        self.send_sizes.get(&(
-            subvol_name.to_string(),
-            drive_label.to_string(),
-            send_kind,
-        ))
+        self.send_sizes
+            .get(&(subvol_name.to_string(), drive_label.to_string(), send_kind))
     }
 
     fn last_send_size_any_drive(&self, subvol_name: &str, send_kind: SendKind) -> Option<u64> {
@@ -2116,11 +2113,7 @@ impl HistoryQuery for MockFileSystemState {
         // This-drive preferred, then any drive — mirrors RealFileSystemState's
         // last_failed_send_size().or_else(last_failed_send_size_any_drive()).
         self.failed_send_floors
-            .get(&(
-                subvol_name.to_string(),
-                drive_label.to_string(),
-                send_kind,
-            ))
+            .get(&(subvol_name.to_string(), drive_label.to_string(), send_kind))
             .or_else(|| {
                 self.failed_send_floors
                     .most_recent_any_drive(subvol_name, send_kind)
