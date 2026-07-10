@@ -1,5 +1,4 @@
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use crate::config::DriveConfig;
 use crate::error::UrdError;
@@ -70,40 +69,13 @@ pub fn drive_availability(drive: &DriveConfig) -> DriveAvailability {
 
 /// Get the filesystem UUID of the filesystem mounted at the given path.
 ///
-/// Uses `findmnt -n -o UUID <mount_path>` which works without sudo and
-/// handles LUKS-encrypted drives transparently (returns the inner filesystem UUID).
+/// Delegates to the concentrated `findmnt --target` probe in `pools.rs`
+/// (UPI 084) — works without sudo and handles LUKS-encrypted drives
+/// transparently (returns the inner filesystem UUID). `--target` matches an
+/// exact mountpoint directly, so this is unchanged for `drive.mount_path`
+/// (always a real mountpoint).
 pub fn get_filesystem_uuid(mount_path: &Path) -> crate::error::Result<Option<String>> {
-    let mount_str = mount_path.to_str().ok_or_else(|| UrdError::Io {
-        path: mount_path.to_path_buf(),
-        source: std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "mount path is not valid UTF-8",
-        ),
-    })?;
-
-    let output = Command::new("findmnt")
-        .env("LC_ALL", "C")
-        .args(["-n", "-o", "UUID", mount_str])
-        .output()
-        .map_err(|e| UrdError::Io {
-            path: PathBuf::from("findmnt"),
-            source: e,
-        })?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(UrdError::Io {
-            path: mount_path.to_path_buf(),
-            source: std::io::Error::other(format!("findmnt failed: {}", stderr.trim())),
-        });
-    }
-
-    let uuid = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if uuid.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(uuid))
-    }
+    crate::pools::pool_uuid_for_path(mount_path)
 }
 
 /// Check mounted drives for missing UUID configuration.
@@ -215,13 +187,10 @@ pub fn is_path_mounted(mount_path: &Path) -> bool {
     false
 }
 
-/// Get free bytes on the filesystem containing the given path.
+/// Get free bytes on the filesystem containing the given path. Delegates to
+/// the single statvfs wrapper in `pools.rs` (UPI 084).
 pub fn filesystem_free_bytes(path: &Path) -> crate::error::Result<u64> {
-    let stat = nix::sys::statvfs::statvfs(path).map_err(|e| UrdError::Io {
-        path: path.to_path_buf(),
-        source: std::io::Error::other(e.to_string()),
-    })?;
-    Ok(stat.blocks_available() * stat.fragment_size())
+    crate::pools::pool_free_bytes(path)
 }
 
 /// Get the external snapshot directory for a subvolume on a drive.

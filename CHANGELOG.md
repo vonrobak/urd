@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- `drives.rs` and `discovery.rs`'s per-path `findmnt` UUID/mountpoint lookups now delegate
+  to one concentrated probe in `pools.rs`; `drives.rs`'s statvfs free-bytes wrapper now
+  delegates to `pools.rs`'s too. No behavior change — one probe surface instead of three
+  hand-rolled parsers (#302).
+
 ### Fixed
 - The external-send space guard now checks the same failed/aborted-send floor
   `estimated_send_size` already used, so a subvolume whose only size signal is a failed
