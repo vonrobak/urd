@@ -13,7 +13,6 @@ use crate::config::Config;
 use crate::drives;
 use crate::error::{BtrfsOperation, UrdError};
 use crate::state::{DriftSampleRow, OperationRecord, StateDb};
-use crate::storage_critical::{self, ArmedTierMap};
 use crate::types::{BackupPlan, DeleteKind, FullSendReason, PlannedOperation, SendKind, SnapshotName};
 
 // ── Types ───────────────────────────────────────────────────────────────
@@ -296,18 +295,6 @@ pub struct Executor<'a> {
     progress_context: Option<Arc<Mutex<ProgressContext>>>,
     size_estimates: Option<SizeEstimates>,
     full_send_policy: FullSendPolicy,
-    /// Per-subvolume armed tier (UPI 031-b). Default empty → every subvolume
-    /// resolves to its declared policy (Roomy), so existing `.execute()` test
-    /// sites need no change (mirrors `full_send_policy`). The backup path sets
-    /// the real map via `set_armed_tiers` before `execute`.
-    armed_tiers: ArmedTierMap,
-    /// Per-subvolume away-sheddable pins (UPI 058): subvol name → away drive
-    /// labels whose pin is away-*only*. Built pre-execution by
-    /// `commands/backup.rs` from the SAME `plan::drive_scopes` the planner used,
-    /// so the executor's `has_away_pin` (and the in-run away-shed) match the
-    /// planner's `clear_all` decision (R1 — coherence by construction). Default
-    /// empty → no away-shed → pre-058 behavior.
-    away_shed_pins: HashMap<String, Vec<String>>,
     /// The shared executor↔watchdog coordination cell (UPI 065-b). When set, the
     /// executor publishes each send's snapshot root into `in_flight` and refuses a
     /// send whose root is in `tripped`, both under this one lock — so the
@@ -338,8 +325,6 @@ impl<'a> Executor<'a> {
             progress_context: None,
             size_estimates: None,
             full_send_policy: FullSendPolicy::Allow,
-            armed_tiers: ArmedTierMap::new(),
-            away_shed_pins: HashMap::new(),
             watchdog_coord: None,
             watchdog_cancel: None,
         }
@@ -361,22 +346,6 @@ impl<'a> Executor<'a> {
     /// Set the full-send policy for chain-break gating.
     pub fn set_full_send_policy(&mut self, policy: FullSendPolicy) {
         self.full_send_policy = policy;
-    }
-
-    /// Set the per-subvolume away-sheddable pin map (UPI 058). The executor
-    /// derives `has_away_pin` from it (so its `clear_all` matches the planner's)
-    /// and, at Critical, sheds those away pin files in-run so the planner's
-    /// already-planned away-only snapshot delete reclaims the same run. Default
-    /// empty → pre-058 behavior (mirrors `set_armed_tiers`).
-    pub fn set_away_shed_pins(&mut self, away_shed_pins: HashMap<String, Vec<String>>) {
-        self.away_shed_pins = away_shed_pins;
-    }
-
-    /// Set the per-subvolume armed tier map (UPI 031-b). The executor derives
-    /// each subvolume's effective lifecycle (`is_transient`) and clear-all
-    /// signal from this + the declared config. Default empty → declared policy.
-    pub fn set_armed_tiers(&mut self, armed_tiers: ArmedTierMap) {
-        self.armed_tiers = armed_tiers;
     }
 
     /// Set progress context for rich progress display.
@@ -423,12 +392,10 @@ impl<'a> Executor<'a> {
         // Per-drive space recovery tracking (shared across subvolumes)
         let mut space_recovered: HashMap<String, bool> = HashMap::new();
 
-        // Resolve effective policies once (UPI 031-b). With the default empty
-        // armed-tier map every subvolume resolves to Roomy → its declared
-        // policy, so `is_transient` is byte-identical to the previous raw-config
-        // check (proven by the equivalence test, incl. the named-level +
-        // explicit-transient case). A Tight/Critical send-enabled subvolume
-        // resolves to Transient; Critical additionally sets `clear_all`.
+        // The declared config, consulted ONLY by the absent-lifecycle fallback
+        // below (hand-built test plans) — production plans always carry an
+        // entry per subvolume (UPI 082, Branch A: the planner is the sole
+        // `derive_effective_policy` caller).
         let resolved_subvols = self.config.resolved_subvolumes();
 
         let mut subvolume_results = Vec::new();
@@ -450,48 +417,36 @@ impl<'a> Executor<'a> {
                 );
                 continue;
             }
-            let armed = self
-                .armed_tiers
-                .get(subvol_name)
-                .copied()
-                .unwrap_or_default();
-            // Away-only pins for this subvol (UPI 058), from the threaded map the
-            // planner's scopes also produced → `has_away_pin` matches the
-            // planner's, so `clear_all` cannot diverge (R1).
-            let away_shed: Vec<String> = self
-                .away_shed_pins
-                .get(subvol_name)
-                .cloned()
-                .unwrap_or_default();
-            let has_away_pin = !away_shed.is_empty();
-            let (is_transient, clear_all) = resolved_subvols
-                .iter()
-                .find(|sv| &sv.name == subvol_name)
-                .map(|sv| {
-                    let eff = storage_critical::derive_effective_policy(
-                        &sv.local_retention,
-                        sv.send_interval,
-                        sv.send_enabled,
-                        armed,
-                        has_away_pin,
-                    );
-                    (eff.local_retention.is_transient(), eff.clear_all)
-                })
-                .unwrap_or((false, false));
-            // Shed the away-only pins in-run ONLY at Critical (UPI 058 B-keep):
-            // Tight holds the away pin (retain-one), Roomy has no shed. The flip
-            // to retain-one (clear_all=false above) and the shed are one decision
-            // (F2 — no half-state).
-            let shed_away_drives = if armed == storage_critical::TightnessTier::Critical {
-                away_shed
-            } else {
-                Vec::new()
-            };
-            let context = SubvolumeContext {
-                name: subvol_name.clone(),
-                is_transient,
-                clear_all,
-                shed_away_drives,
+            // Read the planner's lifecycle judgment (UPI 082, Branch A) rather
+            // than re-deriving it — the executor's SubvolumeContext is built
+            // from the SAME `PlannedLifecycle` the planner computed, so it
+            // cannot desync from the plan's own operations.
+            let context = match plan.lifecycles.get(subvol_name) {
+                Some(lc) => SubvolumeContext {
+                    name: subvol_name.clone(),
+                    is_transient: lc.is_transient,
+                    clear_all: lc.clear_all,
+                    shed_away_drives: lc.shed_away_drives.clone(),
+                },
+                None => {
+                    // Fallback for a hand-built plan with no lifecycle entry
+                    // (only test fixtures hit this). The Roomy-equivalent:
+                    // declared local_retention decides transience, no
+                    // clear-all, nothing to shed — deliberately NOT
+                    // `derive_effective_policy` (the planner stays the sole
+                    // caller; proven equivalent to Roomy by the existing
+                    // equivalence test).
+                    let is_transient = resolved_subvols
+                        .iter()
+                        .find(|sv| &sv.name == subvol_name)
+                        .is_some_and(|sv| sv.local_retention.is_transient());
+                    SubvolumeContext {
+                        name: subvol_name.clone(),
+                        is_transient,
+                        clear_all: false,
+                        shed_away_drives: Vec::new(),
+                    }
+                }
             };
             let result = self.execute_subvolume(
                 &context,
@@ -620,10 +575,39 @@ impl<'a> Executor<'a> {
         // Offsite chains released this run (UPI 064-b told-not-silent). Populated
         // ONLY for a present drive-specific away pin actually removed (F3).
         let mut offsite_releases: Vec<OffsiteChainRelease> = Vec::new();
-        if !context.shed_away_drives.is_empty()
+        // ── UPI 082 F1: act-time presence re-confirmation ────────────
+        // `context.shed_away_drives` was resolved pre-lock (RunArming); a
+        // drive can reconnect between then and this in-run shed. Re-filter
+        // via the shared S3 helper to drives STILL unmounted right now —
+        // cannot prove a drive reconnected, so the conservative direction is
+        // to hold its pin rather than invent a connected chain (closes the
+        // pre-existing hours-wide window). No-ops for the common case: the
+        // real probe (`/proc/mounts`) never reports a TempDir path mounted.
+        let shed_away_drives: Vec<String> = if context.shed_away_drives.is_empty() {
+            Vec::new()
+        } else {
+            let mut spawn_map = HashMap::new();
+            spawn_map.insert(subvol_name.clone(), context.shed_away_drives.clone());
+            let reconfirmed = drives::fresh_away_map(&spawn_map, self.config, drives::is_drive_mounted)
+                .remove(subvol_name)
+                .unwrap_or_default();
+            if reconfirmed.len() < context.shed_away_drives.len() {
+                let reconnected: Vec<&String> = context
+                    .shed_away_drives
+                    .iter()
+                    .filter(|d| !reconfirmed.contains(d))
+                    .collect();
+                log::warn!(
+                    "UPI 058/082 away-shed for {subvol_name}: {reconnected:?} reconnected \
+                     since the pre-lock arming — pin(s) held, not shed",
+                );
+            }
+            reconfirmed
+        };
+        if !shed_away_drives.is_empty()
             && let Some(local_dir) = self.config.local_snapshot_dir(subvol_name)
         {
-            for drive_label in &context.shed_away_drives {
+            for drive_label in &shed_away_drives {
                 // (F3) Read the pin BEFORE removal: emit only for a *present
                 // drive-specific* pin. A `NotFound`→`Ok` remove or a legacy pin
                 // (which `remove_pin_file` does not actually delete) would make the
@@ -2060,7 +2044,7 @@ fn group_by_subvolume(ops: &[PlannedOperation]) -> Vec<(String, Vec<&PlannedOper
 mod tests {
     use super::*;
     use crate::btrfs::{MockBtrfs, MockBtrfsCall};
-    use crate::types::SnapshotName;
+    use crate::types::{PlannedLifecycle, SnapshotName};
     use chrono::NaiveDate;
     use std::path::{Path, PathBuf};
 
@@ -2115,6 +2099,7 @@ source = "/data/b"
             .and_hms_opt(14, 30, 0)
             .unwrap();
         BackupPlan {
+            lifecycles: HashMap::new(),
             operations: vec![
                 PlannedOperation::CreateSnapshot {
                     source: PathBuf::from("/data/a"),
@@ -2183,6 +2168,7 @@ source = "/data/b"
             .and_hms_opt(14, 30, 0)
             .unwrap();
         let plan = BackupPlan {
+            lifecycles: HashMap::new(),
             operations: vec![
                 PlannedOperation::CreateSnapshot {
                     source: PathBuf::from("/data/a"),
@@ -2221,6 +2207,7 @@ source = "/data/b"
         let dir = root.path().join("sv-a");
         let dest = dir.join("20260322-1430-a");
         let plan = BackupPlan {
+            lifecycles: HashMap::new(),
             operations: vec![PlannedOperation::CreateSnapshot {
                 source: PathBuf::from("/data/a"),
                 dest,
@@ -2254,6 +2241,7 @@ source = "/data/b"
         let tmp = tempfile::TempDir::new().unwrap();
         let dir = tmp.path().join("missing-root").join("sv-a");
         let plan = BackupPlan {
+            lifecycles: HashMap::new(),
             operations: vec![PlannedOperation::CreateSnapshot {
                 source: PathBuf::from("/data/a"),
                 dest: dir.join("20260322-1430-a"),
@@ -2288,6 +2276,7 @@ source = "/data/b"
             .and_hms_opt(14, 30, 0)
             .unwrap();
         let plan = BackupPlan {
+            lifecycles: HashMap::new(),
             operations: vec![
                 PlannedOperation::CreateSnapshot {
                     source: PathBuf::from("/data/a"),
@@ -2345,6 +2334,7 @@ source = "/data/b"
             .and_hms_opt(14, 30, 0)
             .unwrap();
         let plan = BackupPlan {
+            lifecycles: HashMap::new(),
             operations: vec![PlannedOperation::SendFull {
                 snapshot: PathBuf::from("/snap/sv-a/20260322-1430-a"),
                 dest_dir: PathBuf::from("/mnt/test/.snapshots/sv-a"),
@@ -2373,6 +2363,7 @@ source = "/data/b"
             .and_hms_opt(14, 30, 0)
             .unwrap();
         BackupPlan {
+            lifecycles: HashMap::new(),
             operations: vec![PlannedOperation::SendFull {
                 snapshot: PathBuf::from("/snap/sv-a/20260322-1430-a"),
                 dest_dir: PathBuf::from("/mnt/test/.snapshots/sv-a"),
@@ -2465,6 +2456,7 @@ source = "/data/b"
             .and_hms_opt(14, 30, 0)
             .unwrap();
         let plan = BackupPlan {
+            lifecycles: HashMap::new(),
             operations: vec![
                 PlannedOperation::CreateSnapshot {
                     source: PathBuf::from("/data/a"),
@@ -2498,6 +2490,7 @@ source = "/data/b"
             .and_hms_opt(14, 30, 0)
             .unwrap();
         let plan = BackupPlan {
+            lifecycles: HashMap::new(),
             operations: vec![],
             timestamp: ts,
             skipped: vec![],
@@ -2523,6 +2516,7 @@ source = "/data/b"
             .and_hms_opt(14, 30, 0)
             .unwrap();
         let plan = BackupPlan {
+            lifecycles: HashMap::new(),
             operations: vec![
                 PlannedOperation::DeleteSnapshot {
                     path: PathBuf::from("/mnt/test/.snapshots/sv-a/20260301-a"),
@@ -2593,6 +2587,7 @@ source = "/data/b"
             .and_hms_opt(14, 30, 0)
             .unwrap();
         let plan = BackupPlan {
+            lifecycles: HashMap::new(),
             operations: vec![PlannedOperation::SendFull {
                 snapshot: PathBuf::from("/snap/sv-a/20260322-1430-a"),
                 dest_dir: PathBuf::from("/mnt/test/.snapshots/sv-a"),
@@ -2628,6 +2623,7 @@ source = "/data/b"
         // sv-a's SpacePressure delete on external drive recovers space.
         // sv-b's SpacePressure deletion on the SAME drive should be skipped.
         let plan = BackupPlan {
+            lifecycles: HashMap::new(),
             operations: vec![
                 PlannedOperation::DeleteSnapshot {
                     path: PathBuf::from("/mnt/test/.snapshots/sv-a/20260301-a"),
@@ -2687,6 +2683,7 @@ source = "/data/b"
             .and_hms_opt(14, 30, 0)
             .unwrap();
         let plan = BackupPlan {
+            lifecycles: HashMap::new(),
             operations: vec![
                 PlannedOperation::DeleteSnapshot {
                     path: PathBuf::from("/mnt/test/.snapshots/sv-a/20260301-a"),
@@ -2771,6 +2768,7 @@ source = "/data/b"
         let policy_b = PathBuf::from("/mnt/test/.snapshots/sv-a/20260302-policy-b");
         let pressure_c = PathBuf::from("/mnt/test/.snapshots/sv-a/20260303-pressure-c");
         let plan = BackupPlan {
+            lifecycles: HashMap::new(),
             operations: vec![
                 PlannedOperation::DeleteSnapshot {
                     path: policy_a.clone(),
@@ -2851,6 +2849,7 @@ source = "/data/b"
             });
         }
         let plan = BackupPlan {
+            lifecycles: HashMap::new(),
             operations: ops,
             timestamp: ts,
             skipped: vec![],
@@ -2936,6 +2935,7 @@ source = "/data/b"
             .and_hms_opt(14, 30, 0)
             .unwrap();
         let plan = BackupPlan {
+            lifecycles: HashMap::new(),
             operations: vec![
                 PlannedOperation::DeleteSnapshot {
                     path: PathBuf::from("/snap/sv-a/20260301-a"),
@@ -2995,6 +2995,7 @@ source = "/data/b"
             .and_hms_opt(14, 30, 0)
             .unwrap();
         let plan = BackupPlan {
+            lifecycles: HashMap::new(),
             operations: vec![PlannedOperation::SendFull {
                 snapshot: PathBuf::from("/snap/sv-a/20260322-1430-a"),
                 dest_dir: PathBuf::from("/mnt/test/.snapshots/sv-a"),
@@ -3058,6 +3059,7 @@ source = "/data/b"
             .and_hms_opt(14, 30, 0)
             .unwrap();
         let plan = BackupPlan {
+            lifecycles: HashMap::new(),
             operations: vec![
                 PlannedOperation::CreateSnapshot {
                     source: PathBuf::from("/data/a"),
@@ -3095,6 +3097,7 @@ source = "/data/b"
             .and_hms_opt(14, 30, 0)
             .unwrap();
         let plan = BackupPlan {
+            lifecycles: HashMap::new(),
             operations: vec![
                 PlannedOperation::CreateSnapshot {
                     source: PathBuf::from("/data/a"),
@@ -3142,6 +3145,7 @@ source = "/data/b"
             .and_hms_opt(14, 30, 0)
             .unwrap();
         let plan = BackupPlan {
+            lifecycles: HashMap::new(),
             operations: vec![PlannedOperation::SendFull {
                 snapshot: PathBuf::from("/snap/sv-a/20260322-1430-a"),
                 dest_dir: PathBuf::from("/mnt/test/.snapshots/sv-a"),
@@ -3205,6 +3209,7 @@ source = "/data/b"
             .and_hms_opt(14, 30, 0)
             .unwrap();
         let plan = BackupPlan {
+            lifecycles: HashMap::new(),
             operations: vec![PlannedOperation::SendFull {
                 snapshot: local_dir.join("20260611-1430-sv-a"),
                 dest_dir: dest_dir.clone(),
@@ -3362,6 +3367,7 @@ source = "/data/b"
             .and_hms_opt(14, 30, 0)
             .unwrap();
         let plan = BackupPlan {
+            lifecycles: HashMap::new(),
             operations: vec![
                 PlannedOperation::CreateSnapshot {
                     source: PathBuf::from("/data/a"),
@@ -3411,6 +3417,7 @@ source = "/data/b"
             .and_hms_opt(14, 30, 0)
             .unwrap();
         let plan = BackupPlan {
+            lifecycles: HashMap::new(),
             operations: vec![
                 PlannedOperation::CreateSnapshot {
                     source: PathBuf::from("/data/a"),
@@ -3548,6 +3555,7 @@ source = "/data/sv1"
             .and_hms_opt(14, 30, 0)
             .unwrap();
         BackupPlan {
+            lifecycles: HashMap::new(),
             operations: vec![PlannedOperation::SendFull {
                 snapshot: PathBuf::from("/snap/sv-a/20260322-1430-a"),
                 dest_dir: PathBuf::from("/mnt/test/.snapshots/sv-a"),
@@ -3644,6 +3652,7 @@ source = "/data/sv1"
             .and_hms_opt(14, 30, 0)
             .unwrap();
         BackupPlan {
+            lifecycles: HashMap::new(),
             operations: vec![PlannedOperation::SendFull {
                 snapshot: PathBuf::from("/snap/sv-a/20260322-1430-a"),
                 dest_dir: PathBuf::from("/mnt/test/.snapshots/sv-a"),
@@ -3748,6 +3757,7 @@ source = "/data/sv1"
             .and_hms_opt(14, 30, 0)
             .unwrap();
         let plan = BackupPlan {
+            lifecycles: HashMap::new(),
             operations: vec![
                 // sv-a: chain-break full send → will be deferred
                 PlannedOperation::SendFull {
@@ -3866,6 +3876,7 @@ local_retention = "transient"
         let new_snap_name = SnapshotName::parse("20260322-1430-t").unwrap();
 
         let plan = BackupPlan {
+            lifecycles: HashMap::new(),
             operations: vec![PlannedOperation::SendIncremental {
                 parent: old_parent.clone(),
                 snapshot: sv_dir.join("20260322-1430-t"),
@@ -3937,6 +3948,7 @@ local_retention = "transient"
         let snap_name = SnapshotName::parse("20260322-1430-t").unwrap();
 
         let plan = BackupPlan {
+            lifecycles: HashMap::new(),
             operations: vec![
                 PlannedOperation::SendIncremental {
                     parent: old_parent.clone(),
@@ -3996,6 +4008,7 @@ local_retention = "transient"
         let snap_name = SnapshotName::parse("20260322-1430-t").unwrap();
 
         let plan = BackupPlan {
+            lifecycles: HashMap::new(),
             operations: vec![PlannedOperation::SendIncremental {
                 parent: old_parent.clone(),
                 snapshot: sv_dir.join("20260322-1430-t"),
@@ -4070,6 +4083,7 @@ local_retention = "transient"
         let snap_name = SnapshotName::parse("20260322-1430-t").unwrap();
 
         let plan = BackupPlan {
+            lifecycles: HashMap::new(),
             operations: vec![
                 PlannedOperation::SendIncremental {
                     parent: old_parent_a.clone(),
@@ -4134,6 +4148,7 @@ local_retention = "transient"
         let snap_name = SnapshotName::parse("20260322-1430-t").unwrap();
 
         let plan = BackupPlan {
+            lifecycles: HashMap::new(),
             operations: vec![PlannedOperation::SendIncremental {
                 parent: old_parent,
                 snapshot: sv_dir.join("20260322-1430-t"),
@@ -4176,6 +4191,7 @@ local_retention = "transient"
         let snap_name = SnapshotName::parse("20260322-1430-t").unwrap();
 
         let plan = BackupPlan {
+            lifecycles: HashMap::new(),
             operations: vec![PlannedOperation::SendFull {
                 snapshot: sv_dir.join("20260322-1430-t"),
                 dest_dir: drive_dir.path().join(".snapshots/sv-t"),
@@ -4238,6 +4254,7 @@ local_retention = "transient"
         let snap_name = SnapshotName::parse("20260322-1430-t").unwrap();
 
         let plan = BackupPlan {
+            lifecycles: HashMap::new(),
             operations: vec![
                 PlannedOperation::SendIncremental {
                     parent: old_parent.clone(),
@@ -4313,6 +4330,7 @@ local_retention = "transient"
         let snap_name = SnapshotName::parse("20260322-1430-t").unwrap();
 
         let plan = BackupPlan {
+            lifecycles: HashMap::new(),
             operations: vec![PlannedOperation::SendIncremental {
                 parent: old_parent.clone(),
                 snapshot: sv_dir.join("20260322-1430-t"),
@@ -4357,6 +4375,7 @@ local_retention = "transient"
             .and_hms_opt(14, 30, 0)
             .unwrap();
         let plan = BackupPlan {
+            lifecycles: HashMap::new(),
             operations: vec![
                 PlannedOperation::DeleteSnapshot {
                     path: PathBuf::from("/snap/sv-a/20260301-a"),
@@ -4425,6 +4444,7 @@ local_retention = "transient"
             .and_hms_opt(14, 30, 0)
             .unwrap();
         let plan = BackupPlan {
+            lifecycles: HashMap::new(),
             operations: vec![
                 // SpacePressure kind so the sync path runs (and is configured to fail).
                 PlannedOperation::DeleteSnapshot {
@@ -4467,6 +4487,7 @@ local_retention = "transient"
             .and_hms_opt(14, 30, 0)
             .unwrap();
         let plan = BackupPlan {
+            lifecycles: HashMap::new(),
             operations: vec![PlannedOperation::DeleteSnapshot {
                 path: PathBuf::from("/mnt/test/.snapshots/sv-a/20260301-a"),
                 reason: "space pressure: expired".to_string(),
@@ -4706,6 +4727,7 @@ local_retention = "transient"
             .and_hms_opt(14, 30, 0)
             .unwrap();
         let plan = BackupPlan {
+            lifecycles: HashMap::new(),
             operations: vec![
                 PlannedOperation::CreateSnapshot {
                     source: PathBuf::from("/data/a"),
@@ -4786,6 +4808,7 @@ local_retention = "transient"
             .and_hms_opt(14, 30, 0)
             .unwrap();
         let plan = BackupPlan {
+            lifecycles: HashMap::new(),
             operations: vec![
                 PlannedOperation::CreateSnapshot {
                     source: PathBuf::from("/data/a"),
@@ -4832,9 +4855,21 @@ local_retention = "transient"
 
     // ── UPI 031-b: Critical clear-all gate (the data-loss firewall) ─────
 
-    fn armed_map(tier: storage_critical::TightnessTier) -> ArmedTierMap {
-        let mut m = ArmedTierMap::new();
-        m.insert("sv-t".to_string(), tier);
+    /// Build a single-subvolume `lifecycles` map for "sv-t" (UPI 082, Branch
+    /// A) — the mechanical replacement for the retired `set_armed_tiers` /
+    /// `set_away_shed_pins` test seam. `is_transient` is always `true` here:
+    /// every fixture below declares `local_retention = "transient"`, and
+    /// Tight/Critical force transience regardless.
+    fn lifecycle_map(clear_all: bool, shed: &[&str]) -> HashMap<String, PlannedLifecycle> {
+        let mut m = HashMap::new();
+        m.insert(
+            "sv-t".to_string(),
+            PlannedLifecycle {
+                is_transient: true,
+                clear_all,
+                shed_away_drives: shed.iter().map(|s| (*s).to_string()).collect(),
+            },
+        );
         m
     }
 
@@ -5401,10 +5436,10 @@ local_retention = "transient"
         let mock = MockBtrfs::new();
         mock.fail_sends.borrow_mut().insert(snap.clone()); // 3am: the send fails
         let shutdown = no_shutdown();
-        let mut executor = Executor::new(&mock, None, &config, &shutdown);
-        executor.set_armed_tiers(armed_map(storage_critical::TightnessTier::Critical));
+        let executor = Executor::new(&mock, None, &config, &shutdown);
 
         let plan = BackupPlan {
+            lifecycles: lifecycle_map(true, &[]),
             operations: vec![PlannedOperation::SendFull {
                 snapshot: snap.clone(),
                 dest_dir: drive_dir.path().join(".snapshots/sv-t"),
@@ -5447,10 +5482,10 @@ local_retention = "transient"
         );
         let mock = MockBtrfs::new();
         let shutdown = no_shutdown();
-        let mut executor = Executor::new(&mock, None, &config, &shutdown);
-        executor.set_armed_tiers(armed_map(storage_critical::TightnessTier::Critical));
+        let executor = Executor::new(&mock, None, &config, &shutdown);
 
         let plan = BackupPlan {
+            lifecycles: lifecycle_map(true, &[]),
             operations: vec![PlannedOperation::SendFull {
                 snapshot: snap.clone(),
                 dest_dir: drive_dir.path().join(".snapshots/sv-t"),
@@ -5503,10 +5538,10 @@ local_retention = "transient"
         );
         let mock = MockBtrfs::new();
         let shutdown = no_shutdown();
-        let mut executor = Executor::new(&mock, None, &config, &shutdown);
-        executor.set_armed_tiers(armed_map(storage_critical::TightnessTier::Critical));
+        let executor = Executor::new(&mock, None, &config, &shutdown);
 
         let plan = BackupPlan {
+            lifecycles: lifecycle_map(true, &[]),
             operations: vec![PlannedOperation::SendIncremental {
                 parent: old_parent.clone(),
                 snapshot: snap.clone(),
@@ -5555,10 +5590,10 @@ local_retention = "transient"
         );
         let mock = MockBtrfs::new();
         let shutdown = no_shutdown();
-        let mut executor = Executor::new(&mock, None, &config, &shutdown);
-        executor.set_armed_tiers(armed_map(storage_critical::TightnessTier::Critical));
+        let executor = Executor::new(&mock, None, &config, &shutdown);
 
         let plan = BackupPlan {
+            lifecycles: lifecycle_map(true, &[]),
             operations: vec![PlannedOperation::SendIncremental {
                 parent: old_parent.clone(),
                 snapshot: snap.clone(),
@@ -5609,10 +5644,10 @@ local_retention = "transient"
         let mock = MockBtrfs::new();
         mock.fail_sends.borrow_mut().insert(snap_b.clone()); // B fails
         let shutdown = no_shutdown();
-        let mut executor = Executor::new(&mock, None, &config, &shutdown);
-        executor.set_armed_tiers(armed_map(storage_critical::TightnessTier::Critical));
+        let executor = Executor::new(&mock, None, &config, &shutdown);
 
         let plan = BackupPlan {
+            lifecycles: lifecycle_map(true, &[]),
             operations: vec![
                 PlannedOperation::SendIncremental {
                     parent: old_parent.clone(),
@@ -5667,11 +5702,11 @@ local_retention = "transient"
         );
         let mock = MockBtrfs::new();
         let shutdown = no_shutdown();
-        let mut executor = Executor::new(&mock, None, &config, &shutdown);
-        executor.set_armed_tiers(armed_map(storage_critical::TightnessTier::Tight));
+        let executor = Executor::new(&mock, None, &config, &shutdown);
 
         let new_pin_path = sv_dir.join(".last-external-parent-DRIVE-A");
         let plan = BackupPlan {
+            lifecycles: lifecycle_map(false, &[]),
             operations: vec![PlannedOperation::SendIncremental {
                 parent: old_parent.clone(),
                 snapshot: snap.clone(),
@@ -5698,6 +5733,129 @@ local_retention = "transient"
         assert!(!deletes.contains(&snap), "new pin (retain-one) survives at Tight");
         let pin = std::fs::read_to_string(&new_pin_path).unwrap();
         assert_eq!(pin.trim(), "20260322-1430-t", "pin advanced to new snapshot");
+    }
+
+    #[test]
+    fn absent_lifecycle_entry_falls_back_to_declared_retention_retain_one() {
+        // UPI 082, Branch A: a hand-built plan with NO lifecycle entry for the
+        // subvolume (only test fixtures hit this — production plans always
+        // carry one, per Step 4). The fallback reads `sv.local_retention`
+        // directly — NOT `derive_effective_policy` (the planner stays the
+        // sole caller) — so a declared-transient subvol still gets retain-one
+        // cleanup: old parent cleaned, the just-sent snapshot (new pin) survives.
+        let snap_dir = tempfile::TempDir::new().unwrap();
+        let drive_dir = tempfile::TempDir::new().unwrap();
+        let sv_dir = snap_dir.path().join("sv-t");
+        std::fs::create_dir_all(&sv_dir).unwrap();
+        let old_parent = sv_dir.join("20260321-t");
+        std::fs::create_dir(&old_parent).unwrap();
+        let snap = sv_dir.join("20260322-1430-t");
+        std::fs::create_dir(&snap).unwrap();
+        chain::write_pin_file(&sv_dir, "DRIVE-A", &SnapshotName::parse("20260321-t").unwrap())
+            .unwrap();
+
+        let config = transient_config_n_drives(
+            snap_dir.path(),
+            &[("DRIVE-A", drive_dir.path(), "primary")],
+        );
+        let mock = MockBtrfs::new();
+        let shutdown = no_shutdown();
+        let executor = Executor::new(&mock, None, &config, &shutdown);
+
+        let new_pin_path = sv_dir.join(".last-external-parent-DRIVE-A");
+        let plan = BackupPlan {
+            lifecycles: HashMap::new(), // no entry for "sv-t" — the fallback path
+            operations: vec![PlannedOperation::SendIncremental {
+                parent: old_parent.clone(),
+                snapshot: snap.clone(),
+                dest_dir: drive_dir.path().join(".snapshots/sv-t"),
+                drive_label: "DRIVE-A".to_string(),
+                subvolume_name: "sv-t".to_string(),
+                pin_on_success: Some((
+                    new_pin_path.clone(),
+                    SnapshotName::parse("20260322-1430-t").unwrap(),
+                )),
+            }],
+            timestamp: test_ts(),
+            skipped: vec![],
+            events: Vec::new(),
+        };
+
+        let result = executor.execute(&plan, "full");
+        assert_eq!(
+            result.subvolume_results[0].transient_cleanup,
+            TransientCleanupOutcome::Cleaned { deleted_count: 1 },
+            "declared-transient subvol still gets retain-one cleanup via the fallback",
+        );
+        let deletes = delete_calls(&mock);
+        assert!(deletes.contains(&old_parent), "old parent cleaned");
+        assert!(!deletes.contains(&snap), "new pin (retain-one) survives");
+    }
+
+    #[test]
+    fn away_shed_skipped_when_drive_reconnected_since_arming() {
+        // UPI 082 F1: the act-time presence re-confirmation. The lifecycle's
+        // shed list was resolved pre-lock and names a drive that is (by the
+        // time this in-run shed runs) reconnected — "/" is always a live
+        // mount point, so the REAL probe (is_drive_mounted) reports it
+        // mounted. The pin must be HELD, not shed: the planned away-snapshot
+        // delete stays refused by the presence-blind re-check.
+        let snap_dir = tempfile::TempDir::new().unwrap();
+        let primary_dir = tempfile::TempDir::new().unwrap();
+        let sv_dir = snap_dir.path().join("sv-t");
+        std::fs::create_dir_all(&sv_dir).unwrap();
+        let away_snap = sv_dir.join("20260101-0900-t");
+        std::fs::create_dir(&away_snap).unwrap();
+        chain::write_pin_file(&sv_dir, "RECONNECTED", &SnapshotName::parse("20260101-0900-t").unwrap())
+            .unwrap();
+        let reconnected_pin = sv_dir.join(".last-external-parent-RECONNECTED");
+        assert!(reconnected_pin.exists());
+
+        let mut config = transient_config_n_drives(
+            snap_dir.path(),
+            &[("PRIMARY", primary_dir.path(), "primary")],
+        );
+        // "RECONNECTED" points at "/" — always a live mount point, unlike
+        // every other drive fixture in this file (TempDir paths, never
+        // mounted). This is what makes the real probe report it mounted.
+        config.drives.push(crate::config::DriveConfig {
+            label: "RECONNECTED".to_string(),
+            uuid: None,
+            mount_path: PathBuf::from("/"),
+            snapshot_root: ".snapshots".to_string(),
+            role: crate::types::DriveRole::Offsite,
+            max_usage_percent: None,
+            min_free_bytes: None,
+            rotation_interval: None,
+        });
+        let mock = MockBtrfs::new();
+        let shutdown = no_shutdown();
+        let executor = Executor::new(&mock, None, &config, &shutdown);
+
+        let plan = BackupPlan {
+            lifecycles: lifecycle_map(false, &["RECONNECTED"]),
+            operations: vec![PlannedOperation::DeleteSnapshot {
+                path: away_snap.clone(),
+                reason: "transient: not pinned".to_string(),
+                subvolume_name: "sv-t".to_string(),
+                kind: DeleteKind::Policy,
+            }],
+            timestamp: test_ts(),
+            skipped: vec![],
+            events: Vec::new(),
+        };
+        let result = executor.execute(&plan, "full");
+
+        assert!(reconnected_pin.exists(), "reconnected drive's pin is HELD, not shed");
+        assert!(
+            !delete_calls(&mock).contains(&away_snap),
+            "away snapshot held — the re-check refused the delete (pin still present)",
+        );
+        assert!(away_snap.exists());
+        assert!(
+            result.subvolume_results[0].offsite_releases.is_empty(),
+            "nothing was actually shed → no release recorded",
+        );
     }
 
     #[test]
@@ -5817,11 +5975,10 @@ protection_level = "sheltered"
         );
         let mock = MockBtrfs::new();
         let shutdown = no_shutdown();
-        let mut executor = Executor::new(&mock, None, &config, &shutdown);
-        executor.set_armed_tiers(armed_map(storage_critical::TightnessTier::Critical));
-        executor.set_away_shed_pins(away_map("sv-t", &["OFFSITE"]));
+        let executor = Executor::new(&mock, None, &config, &shutdown);
 
         let plan = BackupPlan {
+            lifecycles: lifecycle_map(false, &["OFFSITE"]),
             operations: vec![
                 // Connected retain-one send (clear_all=false → pin written).
                 PlannedOperation::SendIncremental {
@@ -5907,15 +6064,14 @@ protection_level = "sheltered"
         );
         let mock = MockBtrfs::new();
         let shutdown = no_shutdown();
-        let mut executor = Executor::new(&mock, None, &config, &shutdown);
-        executor.set_armed_tiers(armed_map(storage_critical::TightnessTier::Critical));
-        executor.set_away_shed_pins(away_map("sv-t", &["OFFSITE"]));
+        let executor = Executor::new(&mock, None, &config, &shutdown);
 
         // Make remove_pin_file(OFFSITE) fail by making the dir read-only — the pin
         // file stays present AND readable.
         std::fs::set_permissions(&sv_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
 
         let plan = BackupPlan {
+            lifecycles: lifecycle_map(false, &["OFFSITE"]),
             operations: vec![PlannedOperation::DeleteSnapshot {
                 path: away_snap.clone(),
                 reason: "transient: not pinned".to_string(),
@@ -5974,12 +6130,11 @@ protection_level = "sheltered"
         );
         let mock = MockBtrfs::new();
         let shutdown = no_shutdown();
-        let mut executor = Executor::new(&mock, None, &config, &shutdown);
-        executor.set_armed_tiers(armed_map(storage_critical::TightnessTier::Critical));
-        executor.set_away_shed_pins(away_map("sv-t", &["OFFSITE"]));
+        let executor = Executor::new(&mock, None, &config, &shutdown);
 
         // One op so the subvolume context (and its away-shed) is built.
         let plan = BackupPlan {
+            lifecycles: lifecycle_map(false, &["OFFSITE"]),
             operations: vec![PlannedOperation::DeleteSnapshot {
                 path: away_snap.clone(),
                 reason: "transient: not pinned".to_string(),
@@ -6020,12 +6175,11 @@ protection_level = "sheltered"
         );
         let mock = MockBtrfs::new();
         let shutdown = no_shutdown();
-        let mut executor = Executor::new(&mock, None, &config, &shutdown);
-        executor.set_armed_tiers(armed_map(storage_critical::TightnessTier::Tight));
-        executor.set_away_shed_pins(away_map("sv-t", &["OFFSITE"]));
+        let executor = Executor::new(&mock, None, &config, &shutdown);
 
         // One op so the subvolume context is built; Tight gates the shed off.
         let plan = BackupPlan {
+            lifecycles: lifecycle_map(false, &[]),
             operations: vec![PlannedOperation::DeleteSnapshot {
                 path: away_snap.clone(),
                 reason: "transient: not pinned".to_string(),
@@ -6075,12 +6229,10 @@ protection_level = "sheltered"
         );
         let mock = MockBtrfs::new();
         let shutdown = no_shutdown();
-        let mut executor = Executor::new(&mock, None, &config, &shutdown);
-        executor.set_armed_tiers(armed_map(storage_critical::TightnessTier::Critical));
-        // Empty away map → has_away_pin=false → clear_all=true; shed_away empty.
-        executor.set_away_shed_pins(HashMap::new());
+        let executor = Executor::new(&mock, None, &config, &shutdown);
 
         let plan = BackupPlan {
+            lifecycles: lifecycle_map(true, &[]),
             operations: vec![PlannedOperation::SendIncremental {
                 parent: shared.clone(),
                 snapshot: new_snap.clone(),

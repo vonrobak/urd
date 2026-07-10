@@ -296,29 +296,27 @@ pub struct ResolvedStorageSignal {
     pub prior_armed_tier: crate::storage_critical::TightnessTier,
     /// When the armed tier last changed (the "flagged since" timestamp).
     pub prior_since: Option<NaiveDateTime>,
-    /// The hysteresis-resolved armed tier for this run, derived ONCE at
-    /// construction from `(prior_armed_tier, free_ratio)`. Private and
-    /// read-only: every consumer (planner via the map, executor, awareness)
-    /// reads back the SAME resolved value instead of re-deriving it, so the
-    /// promise can never desync from the plan. This carries the ADR-113
-    /// single-gather invariant in the type rather than a prose comment. Read
-    /// via [`armed_tier`](ResolvedStorageSignal::armed_tier).
+    /// The hysteresis-resolved armed tier for this run, resolved ONCE at the
+    /// single site (`commands/storage_signals::gather_with`) and stamped here
+    /// by the constructor rather than re-derived. Private and read-only: every
+    /// consumer (planner via the map, executor, awareness) reads back the SAME
+    /// resolved value, so the promise can never desync from the plan. This
+    /// carries the ADR-113 single-gather invariant in the type rather than a
+    /// prose comment. Read via [`armed_tier`](ResolvedStorageSignal::armed_tier).
     armed_tier: crate::storage_critical::TightnessTier,
 }
 
 impl ResolvedStorageSignal {
-    /// Build a signal, deriving the armed tier from `(prior, free_ratio,
-    /// free_bytes, floor_bytes)` via the single hysteresis+gate resolver
-    /// (`storage_critical::resolve_armed_tier`). This is the ONLY constructor: a
-    /// signal whose stamped `armed_tier` disagrees with its inputs cannot exist.
-    /// Stamped once on the single pre-plan gather (`commands/storage_signals`);
-    /// awareness and the planner/executor `armed_tier_map` all read it back,
-    /// never re-resolve.
+    /// Build a signal from an already-resolved `armed_tier` (UPI 082, Branch
+    /// D). Single resolution site is `commands/storage_signals::gather_with`;
+    /// this constructor stores what it's given rather than re-deriving —
+    /// awareness and the planner/executor `armed_tier_map` all read the SAME
+    /// stamped value, so the promise can never desync from the plan.
     ///
-    /// `free_bytes`/`floor_bytes` (UPI 064-a) feed the absolute-headroom gate but
-    /// are **not** stored — the struct keeps only the resolved `armed_tier`
-    /// (exactly as before), preserving the "stamped once, read back, never
-    /// re-resolved" invariant.
+    /// `free_bytes`/`floor_bytes` (UPI 064-a) feed the absolute-headroom gate
+    /// but are **not** stored — kept here only to cross-check the invariant in
+    /// debug builds: a signal whose stamped `armed_tier` disagrees with its
+    /// inputs cannot exist.
     #[must_use]
     pub fn resolved(
         free_ratio: Option<f64>,
@@ -327,12 +325,17 @@ impl ResolvedStorageSignal {
         host_root: bool,
         prior_armed_tier: crate::storage_critical::TightnessTier,
         prior_since: Option<NaiveDateTime>,
+        armed_tier: crate::storage_critical::TightnessTier,
     ) -> Self {
-        let armed_tier = crate::storage_critical::resolve_armed_tier(
-            prior_armed_tier,
-            free_ratio,
-            free_bytes,
-            floor_bytes,
+        debug_assert_eq!(
+            armed_tier,
+            crate::storage_critical::resolve_armed_tier(
+                prior_armed_tier,
+                free_ratio,
+                free_bytes,
+                floor_bytes,
+            ),
+            "ResolvedStorageSignal::resolved: given armed_tier disagrees with its inputs"
         );
         Self {
             free_ratio,
@@ -666,16 +669,14 @@ pub fn assess(
             .get(&subvol.name)
             .map(|sig| sig.armed_tier())
             .unwrap_or_default();
-        let eff = crate::storage_critical::derive_effective_policy(
-            &subvol.local_retention,
+        // Awareness needs only the interval (never clear_all/local_retention),
+        // so it calls the extracted `effective_send_interval` directly rather
+        // than the full policy derivation (UPI 082, Branch C) — one truth
+        // shared with the planner's `derive_effective_policy`.
+        let adapted_send_interval = crate::storage_critical::effective_send_interval(
             subvol.send_interval,
             subvol.send_enabled,
             armed,
-            // Awareness consumes `eff` ONLY for `eff.send_interval` (never
-            // clear_all/local_retention), and A1 leaves send_interval invariant
-            // under has_away_pin (UPI 058), so `false` keeps the single-gather
-            // coherence with the planner trivially intact.
-            false,
         );
 
         // ── Local assessment ────────────────────────────────────────
@@ -791,15 +792,18 @@ pub fn assess(
                 );
                 // Judge staleness against the EFFECTIVE interval (031-b): a
                 // Critical subvol on a weekly cadence must not read AT RISK at
-                // day 2. eff.send_interval == declared at Roomy (no change).
-                let mut status =
-                    assess_external_status(last_send_age, eff.send_interval, source_unchanged);
+                // day 2. adapted_send_interval == declared at Roomy (no change).
+                let mut status = assess_external_status(
+                    last_send_age,
+                    adapted_send_interval,
+                    source_unchanged,
+                );
 
                 if source_unchanged
                     && let Some(age) = last_send_age
                     && status == PromiseStatus::Protected
                     && age.num_seconds() as f64
-                        > eff.send_interval.as_secs() as f64 * EXTERNAL_AT_RISK_MULTIPLIER
+                        > adapted_send_interval.as_secs() as f64 * EXTERNAL_AT_RISK_MULTIPLIER
                 {
                     let secs = age.num_seconds();
                     let coarse = if secs >= 86400 {
@@ -882,8 +886,8 @@ pub fn assess(
         }
         let cadence_adapted = pre_cap == PromiseStatus::Protected
             && armed == crate::storage_critical::TightnessTier::Critical;
-        let effective_send_interval =
-            (armed != crate::storage_critical::TightnessTier::Roomy).then_some(eff.send_interval);
+        let effective_send_interval = (armed != crate::storage_critical::TightnessTier::Roomy)
+            .then_some(adapted_send_interval);
 
         // ── Operational health ─────────────────────────────────────
         // Pre-compute local space pressure (needs config access not available in compute_health)
@@ -1579,6 +1583,7 @@ source = "/data/sv1"
                 false,
                 TightnessTier::Roomy,
                 None,
+                TightnessTier::Tight,
             ),
         );
 
@@ -1607,6 +1612,7 @@ source = "/data/sv1"
                 true,
                 TightnessTier::Roomy,
                 None,
+                TightnessTier::Critical,
             ),
         );
 
@@ -1635,6 +1641,7 @@ source = "/data/sv1"
                 true,
                 TightnessTier::Roomy,
                 None,
+                TightnessTier::Roomy,
             ),
         );
 
@@ -1677,6 +1684,7 @@ source = "/data/sv1"
                 false,
                 TightnessTier::Roomy,
                 None,
+                TightnessTier::Critical,
             ),
         );
 
@@ -1708,6 +1716,7 @@ source = "/data/sv1"
                 false,
                 TightnessTier::Roomy,
                 None,
+                TightnessTier::Tight,
             ),
         );
 
@@ -1742,6 +1751,7 @@ source = "/data/sv1"
                 false,
                 TightnessTier::Critical,
                 None,
+                TightnessTier::Tight,
             ),
         );
 
@@ -1772,6 +1782,12 @@ source = "/data/sv1"
         fs.send_times
             .insert(("sv1".to_string(), "WD-18TB".to_string()), send_at);
         fs.mounted_drives.insert("WD-18TB".to_string());
+        let armed_tier = crate::storage_critical::resolve_armed_tier(
+            TightnessTier::Roomy,
+            Some(free_ratio),
+            None,
+            None,
+        );
         let mut signals = StorageSignalMap::new();
         signals.insert(
             "sv1".to_string(),
@@ -1782,6 +1798,7 @@ source = "/data/sv1"
                 false,
                 TightnessTier::Roomy,
                 None,
+                armed_tier,
             ),
         );
         (config, now, fs, signals)

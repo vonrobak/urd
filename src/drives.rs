@@ -157,6 +157,46 @@ pub fn is_drive_mounted(drive: &DriveConfig) -> bool {
     is_path_mounted(&drive.mount_path)
 }
 
+/// Re-filter an away-shed map to drives still **unmounted** at `probe` time
+/// (UPI 058/065-b, UPI 082 F1). Shared by every act-time presence
+/// re-confirmation site (the executor's in-run shed, the watchdog cross-fs
+/// reclaim, and the teardown reclaim): the away-shed view was resolved once
+/// pre-lock, but a drive can reconnect mid-run, so its pin is no longer
+/// away-only — shedding it would break a now-connected chain. Drop any label
+/// whose drive `probe` reports mounted. A label whose drive is absent from
+/// config is kept (it was classified away at spawn and we cannot prove it
+/// reconnected — the conservative direction is to not invent a connected
+/// chain). Subvolumes left with no away labels are dropped, matching
+/// `plan::away_shed_map`'s "absent key = no presence-aware shed."
+///
+/// `probe` is injectable so tests can drive the re-confirmation directly —
+/// the real probe (`is_drive_mounted`) is a `/proc/mounts` scan that a
+/// `TempDir` fixture can never flip.
+#[must_use]
+pub fn fresh_away_map(
+    away_at_spawn: &std::collections::HashMap<String, Vec<String>>,
+    config: &crate::config::Config,
+    probe: impl Fn(&DriveConfig) -> bool,
+) -> std::collections::HashMap<String, Vec<String>> {
+    away_at_spawn
+        .iter()
+        .filter_map(|(subvol, labels)| {
+            let still_away: Vec<String> = labels
+                .iter()
+                .filter(|label| {
+                    config
+                        .drives
+                        .iter()
+                        .find(|d| &d.label == *label)
+                        .is_none_or(|d| !probe(d))
+                })
+                .cloned()
+                .collect();
+            (!still_away.is_empty()).then_some((subvol.clone(), still_away))
+        })
+        .collect()
+}
+
 /// Check if a path appears as a mount point in /proc/mounts.
 #[must_use]
 pub fn is_path_mounted(mount_path: &Path) -> bool {
@@ -407,7 +447,10 @@ pub fn verify_drive_token(drive: &DriveConfig, state: &StateDb) -> DriveAvailabi
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
+    use crate::config::Config;
     use crate::types::DriveRole;
 
     fn test_drive() -> DriveConfig {
@@ -421,6 +464,126 @@ mod tests {
             min_free_bytes: None,
             rotation_interval: None,
         }
+    }
+
+    fn test_config(drives: Vec<DriveConfig>) -> Config {
+        let toml_str = r#"
+drives = []
+
+[general]
+state_db = "/tmp/urd-drives-fresh-away/urd.db"
+metrics_file = "/tmp/urd-drives-fresh-away/m.prom"
+log_dir = "/tmp/urd-drives-fresh-away"
+heartbeat_file = "/tmp/urd-drives-fresh-away/hb.json"
+
+[local_snapshots]
+roots = [
+  { path = "/snap", subvolumes = ["alpha"] }
+]
+
+[defaults]
+snapshot_interval = "1h"
+send_interval = "4h"
+[defaults.local_retention]
+hourly = 24
+[defaults.external_retention]
+daily = 30
+
+[[subvolumes]]
+name = "alpha"
+short_name = "alpha"
+source = "/data/alpha"
+"#;
+        let mut config: Config = toml::from_str(toml_str).unwrap();
+        config.drives = drives;
+        config
+    }
+
+    #[test]
+    fn fresh_away_map_drops_reconnected_drives() {
+        // S3 (UPI 082 F1): a drive that reconnected mid-run (now mounted) must
+        // not have its now-connected chain shed. "/" is always a mount point;
+        // a fresh tempdir is not. So HOME (at "/") is dropped, AWAY (still
+        // unmounted) is kept. Uses the REAL probe (is_drive_mounted) — the
+        // injected-probe re-confirm test lives with the executor's in-run
+        // shed, the actual UPI 082 consumer.
+        let dir = tempfile::TempDir::new().unwrap();
+        let away_mount = dir.path().join("not-mounted");
+        std::fs::create_dir_all(&away_mount).unwrap();
+        let config = test_config(vec![
+            DriveConfig {
+                label: "HOME".to_string(),
+                uuid: None,
+                mount_path: PathBuf::from("/"), // reconnected: a live mount point
+                snapshot_root: ".snapshots".to_string(),
+                role: DriveRole::Primary,
+                max_usage_percent: None,
+                min_free_bytes: None,
+                rotation_interval: None,
+            },
+            DriveConfig {
+                label: "AWAY".to_string(),
+                uuid: None,
+                mount_path: away_mount, // still away (not a mount point)
+                snapshot_root: ".snapshots".to_string(),
+                role: DriveRole::Offsite,
+                max_usage_percent: None,
+                min_free_bytes: None,
+                rotation_interval: None,
+            },
+        ]);
+        let mut away_at_spawn: HashMap<String, Vec<String>> = HashMap::new();
+        away_at_spawn.insert("alpha".to_string(), vec!["HOME".to_string(), "AWAY".to_string()]);
+
+        let fresh = fresh_away_map(&away_at_spawn, &config, is_drive_mounted);
+        assert_eq!(
+            fresh.get("alpha").map(Vec::as_slice),
+            Some(["AWAY".to_string()].as_slice()),
+            "a reconnected (mounted) drive is dropped from the cross-fs shed list",
+        );
+    }
+
+    #[test]
+    fn fresh_away_map_injected_probe_drops_a_reported_mounted_drive() {
+        // UPI 082 F1: the injectable probe lets this test drive the
+        // re-confirmation directly — no /proc/mounts dependency, unlike the
+        // real-probe test above. Both drives are on paths a TempDir-style
+        // fixture would never mount; only the probe decides.
+        let config = test_config(vec![
+            DriveConfig {
+                label: "RECONNECTED".to_string(),
+                uuid: None,
+                mount_path: PathBuf::from("/not/really/mounted/a"),
+                snapshot_root: ".snapshots".to_string(),
+                role: DriveRole::Primary,
+                max_usage_percent: None,
+                min_free_bytes: None,
+                rotation_interval: None,
+            },
+            DriveConfig {
+                label: "STILL-AWAY".to_string(),
+                uuid: None,
+                mount_path: PathBuf::from("/not/really/mounted/b"),
+                snapshot_root: ".snapshots".to_string(),
+                role: DriveRole::Offsite,
+                max_usage_percent: None,
+                min_free_bytes: None,
+                rotation_interval: None,
+            },
+        ]);
+        let mut away_at_spawn: HashMap<String, Vec<String>> = HashMap::new();
+        away_at_spawn.insert(
+            "alpha".to_string(),
+            vec!["RECONNECTED".to_string(), "STILL-AWAY".to_string()],
+        );
+
+        let fresh =
+            fresh_away_map(&away_at_spawn, &config, |d| d.label == "RECONNECTED");
+        assert_eq!(
+            fresh.get("alpha").map(Vec::as_slice),
+            Some(["STILL-AWAY".to_string()].as_slice()),
+            "the probe-reported-mounted drive is dropped; the other stays shed",
+        );
     }
 
     #[test]
