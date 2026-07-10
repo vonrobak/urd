@@ -60,6 +60,11 @@ pub struct PoolSignal {
     pub prior_armed_tier: TightnessTier,
     /// When the armed tier last changed (the "flagged since" timestamp).
     pub prior_since: Option<NaiveDateTime>,
+    /// The tier resolved from `(prior_armed_tier, free_ratio, free_bytes,
+    /// floor_bytes)` once the floor lands (UPI 082, Branch D). The single
+    /// resolution site: `ResolvedStorageSignal::resolved` and
+    /// `resolve_armed_tiers` both read this back rather than re-deriving.
+    pub armed_tier: TightnessTier,
 }
 
 /// Gathered storage signals: the per-subvolume map fed to `assess()` plus the
@@ -214,6 +219,7 @@ fn gather_with(
                     host_root,
                     prior_armed_tier,
                     prior_since,
+                    armed_tier: prior_armed_tier, // resolved below, once the floor lands
                 },
             );
             order.push(key.clone());
@@ -237,6 +243,15 @@ fn gather_with(
         pool.floor_bytes = pool.capacity_bytes.and_then(|cap| {
             pool_floor_bytes(config, &pool.subvol_names, &send_enabled, cap)
         });
+        // ── Single tier-resolution site (UPI 082, Branch D): the tier needs
+        // floor_bytes, so resolution happens right after the floor lands, in
+        // the same values_mut pass. Every other consumer reads this back. ──
+        pool.armed_tier = storage_critical::resolve_armed_tier(
+            pool.prior_armed_tier,
+            pool.free_ratio,
+            pool.free_bytes,
+            pool.floor_bytes,
+        );
     }
 
     // ── Pass 2: build the per-subvol map from the FINALIZED pool, so every
@@ -254,6 +269,7 @@ fn gather_with(
                     pool.host_root,
                     pool.prior_armed_tier,
                     pool.prior_since,
+                    pool.armed_tier,
                 ),
             );
         }
@@ -282,44 +298,78 @@ pub struct ResolvedPoolTier {
     pub new_tier: TightnessTier,
 }
 
-/// The armed tier for the backup run (UPI 031-b AB1). Carries the
-/// planner/executor-facing `armed_tier_map` (subvol → tier) AND the per-pool
-/// rows the post-exec writeback persists — both resolved once here, pre-plan,
-/// from the gathered `(prior, free)`. Awareness does not read this map; it reads
+/// The armed tier + away-shed view for the backup run (UPI 031-b AB1; UPI 082
+/// Branches C/D/G). Carries the planner/executor-facing `armed_tier_map`
+/// (subvol → tier), the per-pool rows the post-exec writeback persists, and
+/// the away-sheddable pin view (`away_shed`) the planner/watchdog/reclaim all
+/// consume — every field resolved once here, pre-plan, from the gathered
+/// `(prior, free)` and the pin scan. Awareness does not read this map; it reads
 /// the matching per-subvolume `ResolvedStorageSignal::armed_tier`, derived from
 /// the same inputs.
 #[derive(Debug, Clone, PartialEq)]
-pub struct ResolvedArmedTiers {
+pub struct RunArming {
     pub armed_tier_map: ArmedTierMap,
     pub pools: Vec<ResolvedPoolTier>,
+    /// Subvol name → away drive labels whose pin is away-only (UPI 058). See
+    /// [`crate::plan::away_shed_map`]: the SAME source `plan.rs`'s
+    /// `mounted_pins` derives from, so the executor's `has_away_pin` and
+    /// away-shed cannot diverge from the planner's `clear_all` decision.
+    pub away_shed: HashMap<String, Vec<String>>,
+}
+
+impl RunArming {
+    /// Resolve the full pre-lock arming view: today's tier fan-out plus the
+    /// away-shed pin scan (UPI 082, Branch B — resolved before the advisory
+    /// lock, read back everywhere, never re-derived mid-run).
+    #[must_use]
+    pub fn resolve(
+        signals: &StorageSignals,
+        config: &Config,
+        fs: &dyn crate::observation::FilesystemQuery,
+    ) -> Self {
+        let mut arming = resolve_armed_tiers(signals);
+        arming.away_shed = crate::plan::away_shed_map(config, fs);
+        arming
+    }
+}
+
+impl Default for RunArming {
+    /// Empty ≡ all-Roomy ≡ today's empty map — the equivalence hand-built test
+    /// plans rely on (no pool signal means no subvol's tier is anything but
+    /// the `TightnessTier` default, `Roomy`, and no away-shed applies).
+    fn default() -> Self {
+        Self {
+            armed_tier_map: ArmedTierMap::new(),
+            pools: Vec::new(),
+            away_shed: HashMap::new(),
+        }
+    }
 }
 
 /// Resolve each pool's armed tier from the gathered signals exactly once,
-/// pre-plan (UPI 031-b AB1). Fans the per-pool tier out to every subvolume on
-/// the pool to build the `armed_tier_map`, and carries the per-pool rows the
-/// writeback needs. The SAME values are persisted post-exec — never
-/// re-resolved: clear-all frees space mid-run, and a re-resolve would see the
-/// higher free-ratio and falsely de-escalate Critical→Tight, defeating the
-/// hysteresis that stops lifecycle flapping.
+/// pre-plan (UPI 031-b AB1) — the tiers-only helper behind [`RunArming::resolve`].
+/// Fans the per-pool tier out to every subvolume on the pool to build the
+/// `armed_tier_map`, and carries the per-pool rows the writeback needs. The
+/// SAME values are persisted post-exec — never re-resolved: clear-all frees
+/// space mid-run, and a re-resolve would see the higher free-ratio and falsely
+/// de-escalate Critical→Tight, defeating the hysteresis that stops lifecycle
+/// flapping. `away_shed` is empty here — only [`RunArming::resolve`] (which
+/// has a `Config` + `FilesystemQuery` to scan pins) populates it.
 #[must_use]
-pub fn resolve_armed_tiers(signals: &StorageSignals) -> ResolvedArmedTiers {
+pub fn resolve_armed_tiers(signals: &StorageSignals) -> RunArming {
     let mut armed_tier_map = ArmedTierMap::new();
     let mut pools = Vec::with_capacity(signals.pools.len());
     for pool in &signals.pools {
-        // Resolve the per-pool tier from the gathered (prior, free) — the
-        // single pre-plan resolution for the planner/executor map. NEVER
-        // re-resolved post-exec (AB1): clear-all frees space mid-run, and a
-        // re-resolve would see the higher free-ratio and falsely de-escalate
-        // Critical→Tight, defeating the hysteresis. The per-subvolume carrier
-        // awareness reads (`ResolvedStorageSignal::armed_tier`) derives from the
-        // SAME (prior, free), so the two consumers stay coherent by construction
-        // (locked by `gather_stamps_one_tier_read_by_planner_and_awareness`).
-        let new_tier = storage_critical::resolve_armed_tier(
-            pool.prior_armed_tier,
-            pool.free_ratio,
-            pool.free_bytes,
-            pool.floor_bytes,
-        );
+        // Read back the tier `gather_with` already resolved (UPI 082, Branch
+        // D: the single pre-plan resolution site) — never re-resolved. NEVER
+        // re-resolved post-exec (AB1) either: clear-all frees space mid-run,
+        // and a re-resolve would see the higher free-ratio and falsely
+        // de-escalate Critical→Tight, defeating the hysteresis. The
+        // per-subvolume carrier awareness reads
+        // (`ResolvedStorageSignal::armed_tier`) reads the SAME stamped value,
+        // so the two consumers stay coherent by construction (locked by
+        // `gather_stamps_one_tier_read_by_planner_and_awareness`).
+        let new_tier = pool.armed_tier;
         for name in &pool.subvol_names {
             armed_tier_map.insert(name.clone(), new_tier);
         }
@@ -332,25 +382,26 @@ pub fn resolve_armed_tiers(signals: &StorageSignals) -> ResolvedArmedTiers {
             new_tier,
         });
     }
-    ResolvedArmedTiers {
+    RunArming {
         armed_tier_map,
         pools,
+        away_shed: HashMap::new(),
     }
 }
 
 /// Persist the pre-resolved armed tier per UUID-resolvable pool best-effort and
 /// return the **escalation** transitions (backup path only — read paths must
-/// never call this). Consumes the `ResolvedArmedTiers` from
-/// [`resolve_armed_tiers`]: it does **not** re-resolve (AB1 — clear-all frees
-/// space mid-run; a re-resolve would falsely de-escalate). `since` advances to
-/// `now` only when the tier changes; otherwise the prior `since` is preserved
-/// so the "flagged since" timestamp stays stable. UUID-less pools are skipped
-/// (S5) — no persist, no notification, status-only degrade.
+/// never call this). Consumes the [`RunArming`] resolved pre-lock: it does
+/// **not** re-resolve (AB1 — clear-all frees space mid-run; a re-resolve would
+/// falsely de-escalate). `since` advances to `now` only when the tier changes;
+/// otherwise the prior `since` is preserved so the "flagged since" timestamp
+/// stays stable. UUID-less pools are skipped (S5) — no persist, no
+/// notification, status-only degrade.
 #[must_use]
 pub fn advance_and_writeback(
     state_db: &StateDb,
     now: NaiveDateTime,
-    resolved: &ResolvedArmedTiers,
+    resolved: &RunArming,
     run_id: Option<i64>,
 ) -> Vec<PostureEscalation> {
     let mut escalations = Vec::new();
@@ -855,6 +906,87 @@ source = "/"
     }
 
     #[test]
+    fn run_arming_resolve_composes_away_view() {
+        // UPI 082, Branches C/D/G: RunArming::resolve = today's tiers fan-out
+        // (resolve_armed_tiers) + plan::away_shed_map, composed pre-lock from
+        // ONE artifact. Same away-only-pin shape as plan.rs's
+        // upi058_planner_and_executor_agree_on_away_shed, proving the artifact
+        // reaches the same away view the planner's own scopes derive.
+        use crate::plan::MockFileSystemState;
+        use crate::types::SnapshotName;
+
+        let toml_str = r#"
+[general]
+state_db = "/tmp/urd-082-arming/urd.db"
+metrics_file = "/tmp/urd-082-arming/backup.prom"
+log_dir = "/tmp/urd-082-arming"
+heartbeat_file = "/tmp/urd-082-arming/heartbeat.json"
+
+[local_snapshots]
+roots = [
+  { path = "/snap", subvolumes = ["sv1"] }
+]
+
+[defaults]
+snapshot_interval = "1h"
+send_interval = "4h"
+send_enabled = true
+enabled = true
+[defaults.local_retention]
+hourly = 24
+daily = 30
+weekly = 26
+monthly = 12
+[defaults.external_retention]
+daily = 30
+weekly = 26
+monthly = 0
+
+[[drives]]
+label = "D1"
+mount_path = "/mnt/d1"
+snapshot_root = ".snapshots"
+role = "primary"
+
+[[drives]]
+label = "D2"
+mount_path = "/mnt/d2"
+snapshot_root = ".snapshots"
+role = "offsite"
+
+[[subvolumes]]
+name = "sv1"
+short_name = "one"
+source = "/data/sv1"
+priority = 1
+local_retention = "transient"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+
+        let mut fs = MockFileSystemState::new();
+        // D2 away (unmounted) with an away-only pin: D1 is mounted with no
+        // pin, so D2's pin has no shared-parent shielding it.
+        fs.pin_files.insert(
+            (PathBuf::from("/snap/sv1"), "D2".to_string()),
+            SnapshotName::parse("20260101-0900-one").unwrap(),
+        );
+        fs.mounted_drives.insert("D1".to_string());
+
+        let signals = StorageSignals { by_subvol: StorageSignalMap::new(), pools: Vec::new() };
+        let arming = RunArming::resolve(&signals, &config, &fs);
+
+        assert_eq!(
+            arming.away_shed.get("sv1").map(Vec::as_slice),
+            Some(["D2".to_string()].as_slice()),
+            "RunArming::resolve must compose the away-shed view from plan::away_shed_map",
+        );
+        // Tiers-only fields behave exactly like resolve_armed_tiers on empty
+        // signals — the away-view composition adds no tier side effects.
+        assert!(arming.armed_tier_map.is_empty());
+        assert!(arming.pools.is_empty());
+    }
+
+    #[test]
     fn gather_stamps_one_tier_read_by_planner_and_awareness() {
         // The coherence the old awareness test could not see: the per-subvolume
         // tier awareness reads (`ResolvedStorageSignal::armed_tier`) MUST equal
@@ -872,6 +1004,37 @@ source = "/"
                 Some(&sig.armed_tier()),
                 "subvol {name}: awareness tier must equal the planner's map tier"
             );
+        }
+    }
+
+    #[test]
+    fn pool_signal_by_subvol_and_armed_tier_map_agree_for_every_subvol() {
+        // UPI 082, Branch D: PoolSignal.armed_tier is now the single
+        // resolution site. Prove the tri-consistency directly: the stamped
+        // pool tier, the per-subvolume carrier's tier, and the planner/
+        // executor map's tier must all be the SAME value for every subvol on
+        // the pool — not merely equal by coincidence of identical inputs.
+        let signals =
+            gather_with(&cfg(), &HashMap::new(), Some("root-uuid"), resolver, space_tight);
+        let armed_tier_map = resolve_armed_tiers(&signals).armed_tier_map;
+        assert!(!signals.pools.is_empty(), "fixture must exercise pools");
+        for pool in &signals.pools {
+            for name in &pool.subvol_names {
+                let by_subvol_tier = signals
+                    .by_subvol
+                    .get(name)
+                    .unwrap_or_else(|| panic!("subvol {name} missing from by_subvol"))
+                    .armed_tier();
+                assert_eq!(
+                    pool.armed_tier, by_subvol_tier,
+                    "subvol {name}: PoolSignal.armed_tier must equal by_subvol's armed_tier()"
+                );
+                assert_eq!(
+                    armed_tier_map.get(name),
+                    Some(&pool.armed_tier),
+                    "subvol {name}: PoolSignal.armed_tier must equal armed_tier_map's entry"
+                );
+            }
         }
     }
 
@@ -1202,6 +1365,7 @@ source = "/"
                 host_root: false,
                 prior_armed_tier: TightnessTier::Roomy,
                 prior_since: None,
+                armed_tier: TightnessTier::Roomy,
             }],
         }
     }

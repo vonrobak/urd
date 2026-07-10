@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Tier resolution, the away-shed view, and the executor's lifecycle judgment now flow
+  through one pre-lock artifact instead of three independently-derived tier/pin maps —
+  the executor's in-run away-shed also re-confirms a drive's presence right before
+  shedding its pin, so a drive that reconnects mid-run keeps its chain instead of losing
+  it to a stale pre-lock snapshot.
+
 ## [0.33.4] - 2026-07-08
 
 ### Fixed

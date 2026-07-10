@@ -264,17 +264,14 @@ pub fn host_root(
 ///   two levels in one run when free recovers past both bands.
 /// - **Unmeasurable** free-ratio (`None`) holds the prior armed tier unchanged.
 ///
-/// Resolved at the single pre-plan gather only — never re-derived post-exec
-/// (AB1) and never re-resolved by awareness. The per-subvolume carrier
+/// Called from a single site: `commands/storage_signals::gather_with`, once
+/// the floor lands, to stamp `PoolSignal::armed_tier` (UPI 082, Branch D).
+/// Never re-derived post-exec (AB1) and never re-resolved by any other
+/// consumer. The per-subvolume carrier
 /// [`ResolvedStorageSignal::resolved`](crate::awareness::ResolvedStorageSignal::resolved)
-/// derives it in its constructor (awareness reads it back via `armed_tier()`,
-/// never re-resolving); `resolve_armed_tiers` derives the per-pool
-/// `armed_tier_map` for the planner/executor from the same gathered
-/// `(prior, free_ratio, free_bytes, floor_bytes)`. The two consumers stay
-/// coherent because both feed identical inputs to this deterministic function.
-/// `pub(crate)` keeps the resolver in-crate; the carrier's constructor keeps its
-/// stamped tier consistent with its inputs, so a signal whose tier disagrees with
-/// its inputs cannot exist.
+/// and `resolve_armed_tiers` both read `PoolSignal::armed_tier` back rather
+/// than re-deriving it, so the two consumers stay coherent by construction.
+/// `pub(crate)` keeps the resolver in-crate.
 #[must_use]
 pub(crate) fn resolve_armed_tier(
     prior_armed: TightnessTier,
@@ -440,11 +437,14 @@ pub fn derive_effective_policy(
     armed: TightnessTier,
     has_away_pin: bool,
 ) -> EffectivePolicy {
+    let send_interval =
+        effective_send_interval(declared_send_interval, send_enabled, armed);
+
     // Local-only: no send, no ephemeral lifecycle. Declared passthrough.
     if !send_enabled {
         return EffectivePolicy {
             local_retention: *declared_retention,
-            send_interval: declared_send_interval,
+            send_interval,
             clear_all: false,
             // No send chain to hold; the flag is inert (the transient branch of
             // `plan_local_retention` it gates is never reached for local-only).
@@ -455,7 +455,7 @@ pub fn derive_effective_policy(
     match armed {
         TightnessTier::Roomy => EffectivePolicy {
             local_retention: *declared_retention,
-            send_interval: declared_send_interval,
+            send_interval,
             clear_all: false,
             // Roomy keeps the full declared shape, so every pin is already held;
             // true keeps the invariant "Roomy/Tight hold every chain's parent."
@@ -463,30 +463,51 @@ pub fn derive_effective_policy(
         },
         TightnessTier::Tight => EffectivePolicy {
             local_retention: LocalRetentionPolicy::Transient,
-            send_interval: scale_interval(declared_send_interval, TIGHT_INTERVAL_FACTOR),
+            send_interval,
             clear_all: false,
             // retain-parents (UPI 064-b): hold every chain's parent, connected
             // AND away — the offsite chain is held opportunistically at Tight,
             // shed only at Critical (ADR-116 Consequence 1).
             protect_away_pins: true,
         },
+        TightnessTier::Critical => EffectivePolicy {
+            local_retention: LocalRetentionPolicy::Transient,
+            send_interval,
+            // Presence-conditional (UPI 058): retain-one for the connected
+            // chain when an away-only pin can be shed instead.
+            clear_all: !has_away_pin,
+            // Critical sheds the away pin (retain-one / clear-all), so the
+            // away parent is NOT held — false at Critical regardless of pin.
+            protect_away_pins: false,
+        },
+    }
+}
+
+/// The send interval adapted for the armed tier (UPI 082, Branch C —
+/// extracted from `derive_effective_policy` so awareness's read-path judgment
+/// and the planner's full policy derivation share one truth). Roomy and
+/// local-only (`!send_enabled`) pass the declared interval through
+/// unchanged; Tight scales it by [`TIGHT_INTERVAL_FACTOR`]; Critical floors it
+/// at `max(declared, CRITICAL_INTERVAL_FLOOR_DAYS)` — never shortens an
+/// already-sparse subvol.
+#[must_use]
+pub fn effective_send_interval(
+    declared: Interval,
+    send_enabled: bool,
+    armed: TightnessTier,
+) -> Interval {
+    if !send_enabled {
+        return declared;
+    }
+    match armed {
+        TightnessTier::Roomy => declared,
+        TightnessTier::Tight => scale_interval(declared, TIGHT_INTERVAL_FACTOR),
         TightnessTier::Critical => {
             let floor = Interval::days(CRITICAL_INTERVAL_FLOOR_DAYS);
-            // max(declared, floor) — never shorten an already-sparse subvol.
-            let send_interval = if declared_send_interval.as_secs() >= floor.as_secs() {
-                declared_send_interval
+            if declared.as_secs() >= floor.as_secs() {
+                declared
             } else {
                 floor
-            };
-            EffectivePolicy {
-                local_retention: LocalRetentionPolicy::Transient,
-                send_interval,
-                // Presence-conditional (UPI 058): retain-one for the connected
-                // chain when an away-only pin can be shed instead.
-                clear_all: !has_away_pin,
-                // Critical sheds the away pin (retain-one / clear-all), so the
-                // away parent is NOT held — false at Critical regardless of pin.
-                protect_away_pins: false,
             }
         }
     }
@@ -959,6 +980,48 @@ mod tests {
         assert_eq!(eff.local_retention, grad());
         assert_eq!(eff.send_interval.as_secs(), Interval::days(1).as_secs());
         assert!(!eff.clear_all);
+    }
+
+    #[test]
+    fn effective_send_interval_matrix() {
+        // UPI 082, Branch C: the extracted single truth for the adapted
+        // interval — Roomy/local-only pass declared through, Tight scales,
+        // Critical floors. Mirrors `derive_effective_policy`'s interval field
+        // exactly (locked by the invariant tests below).
+        let declared = Interval::days(1);
+
+        // Local-only (!send_enabled): declared passthrough at every tier.
+        for tier in [TightnessTier::Roomy, TightnessTier::Tight, TightnessTier::Critical] {
+            assert_eq!(
+                effective_send_interval(declared, false, tier).as_secs(),
+                declared.as_secs(),
+                "local-only must pass declared through unchanged at {tier:?}",
+            );
+        }
+
+        // Roomy: declared passthrough.
+        assert_eq!(
+            effective_send_interval(declared, true, TightnessTier::Roomy).as_secs(),
+            declared.as_secs(),
+        );
+
+        // Tight: declared × TIGHT_INTERVAL_FACTOR (daily × 1.5 = 36h).
+        assert_eq!(
+            effective_send_interval(declared, true, TightnessTier::Tight).as_secs(),
+            36 * 3600,
+        );
+
+        // Critical: max(declared, floor) — declared daily < 7d floor → floored.
+        assert_eq!(
+            effective_send_interval(declared, true, TightnessTier::Critical).as_secs(),
+            Interval::days(7).as_secs(),
+        );
+
+        // Critical never shortens an already-sparse subvol: declared 30d stays 30d.
+        assert_eq!(
+            effective_send_interval(Interval::days(30), true, TightnessTier::Critical).as_secs(),
+            Interval::days(30).as_secs(),
+        );
     }
 
     #[test]

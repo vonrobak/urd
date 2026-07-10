@@ -42,9 +42,8 @@ pub fn run(config: Config, args: PlanArgs, mode: OutputMode) -> anyhow::Result<(
     // rather than declared policy. Degrades gracefully — an unmounted/unmeasurable
     // pool yields free_ratio None → Roomy → declared behavior.
     let signals = storage_signals::gather(&config, state_db.as_ref());
-    let resolved = storage_signals::resolve_armed_tiers(&signals);
-    let backup_plan =
-        plan::plan(&config, now, &filters, &observation, &resolved.armed_tier_map)?;
+    let arming = storage_signals::RunArming::resolve(&signals, &config, &fs_state);
+    let backup_plan = plan::plan(&config, now, &filters, &observation, &arming)?;
 
     let mut output = build_plan_output(&backup_plan, &fs_state, &config);
     populate_token_warnings(&mut output, state_db.as_ref(), &config);
@@ -488,6 +487,7 @@ source = "/data/htpc-docs"
             1_200_000_000,
         );
         let plan = crate::types::BackupPlan {
+            lifecycles: HashMap::new(),
             timestamp: chrono::NaiveDateTime::default(),
             operations: vec![
                 mock_send_full("htpc-home", "WD-18TB"),
@@ -508,6 +508,7 @@ source = "/data/htpc-docs"
             53_000_000_000,
         );
         let plan = crate::types::BackupPlan {
+            lifecycles: HashMap::new(),
             timestamp: chrono::NaiveDateTime::default(),
             operations: vec![
                 mock_send_full("htpc-home", "WD-18TB"),
@@ -524,6 +525,7 @@ source = "/data/htpc-docs"
     fn summary_no_estimates_is_none() {
         let fs = MockFileSystemState::new();
         let plan = crate::types::BackupPlan {
+            lifecycles: HashMap::new(),
             timestamp: chrono::NaiveDateTime::default(),
             operations: vec![mock_send_full("htpc-home", "WD-18TB")],
             skipped: vec![],
@@ -640,6 +642,7 @@ source = "/data/htpc-docs"
     fn summary_skipped_counts_collapsed_records() {
         let fs = MockFileSystemState::new();
         let plan = BackupPlan {
+            lifecycles: HashMap::new(),
             timestamp: chrono::NaiveDateTime::default(),
             operations: vec![],
             skipped: vec![
@@ -697,6 +700,7 @@ source = "/data/htpc-docs"
         use crate::types::DeleteKind;
 
         let make_plan = |kind: DeleteKind| BackupPlan {
+            lifecycles: HashMap::new(),
             operations: vec![PlannedOperation::DeleteSnapshot {
                 path: PathBuf::from("/snap/htpc-home/20260329-0404-htpc-home"),
                 reason: "graduated: weekly thinning".to_string(),

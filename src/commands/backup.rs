@@ -89,24 +89,22 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
         btrfs: &plan_btrfs,
     };
 
-    // ── Single pre-plan storage gather (UPI 031-b AB1/S2 — INVARIANT) ──
-    // ONE gather of storage signals, resolved ONCE here pre-plan, feeds the
-    // planner (and the emergency re-plan), the executor's clear-all gate, the
-    // post-exec awareness assess, and the armed-tier writeback. Do NOT add a
-    // second gather for the post-exec assess: clear-all frees space mid-run, so
-    // a re-gather would see a higher free-ratio and falsely de-escalate
-    // Critical→Tight — desyncing the effective send interval the planner timed
-    // against from the one awareness judges staleness against, surfacing a
-    // correctly-adapting subvolume as false AT RISK. The coherence guard is
-    // THIS single gather (Risk 4 / S2): the tier is resolved once and STAMPED
-    // on the signal (`ResolvedStorageSignal::armed_tier`, derived in its
-    // constructor), so the planner's map, the executor, the writeback, and
-    // awareness all READ the same value rather than each re-deriving it.
+    // ── Single pre-plan storage gather + arming (UPI 031-b AB1/S2 — INVARIANT;
+    // UPI 082 Branch B) ──
+    // ONE gather of storage signals, resolved ONCE here pre-lock into a single
+    // `RunArming` artifact, feeds the planner (and the emergency re-plan), the
+    // executor (via `backup_plan.lifecycles`), the post-exec awareness assess,
+    // and the armed-tier writeback. Do NOT add a second gather for the
+    // post-exec assess: clear-all frees space mid-run, so a re-gather would see
+    // a higher free-ratio and falsely de-escalate Critical→Tight — desyncing
+    // the effective send interval the planner timed against from the one
+    // awareness judges staleness against, surfacing a correctly-adapting
+    // subvolume as false AT RISK. See [`storage_signals::RunArming`] for the
+    // full single-resolution-site invariant this artifact carries.
     let signals = storage_signals::gather(&config, state_db.as_ref());
-    let resolved = storage_signals::resolve_armed_tiers(&signals);
+    let arming = storage_signals::RunArming::resolve(&signals, &config, &fs_state);
 
-    let mut backup_plan =
-        plan::plan(&config, now, &filters, &observation, &resolved.armed_tier_map)?;
+    let mut backup_plan = plan::plan(&config, now, &filters, &observation, &arming)?;
 
     // ADR-107: fail-closed for retention on promise-level subvolumes.
     // If a subvolume has a protection_level, skip retention deletions unless
@@ -145,11 +143,10 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     let emergency_ran = run_emergency_preflight(&config, state_db.as_ref())?;
 
     // Re-plan if emergency freed space — plan may have different space_pressure
-    // decisions. Reuses the SAME pre-plan `resolved` armed tiers (AB1: never
-    // re-resolve mid-run, even though emergency just freed space).
+    // decisions. Reuses the SAME pre-plan `arming` (AB1: never re-resolve
+    // mid-run, even though emergency just freed space).
     if emergency_ran {
-        backup_plan =
-            plan::plan(&config, now, &filters, &observation, &resolved.armed_tier_map)?;
+        backup_plan = plan::plan(&config, now, &filters, &observation, &arming)?;
         if !args.confirm_retention_change {
             filter_promise_retention(&config, &mut backup_plan);
         }
@@ -248,7 +245,7 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     // under this lock; the watchdog trips pools through it. Empty + unwired on a
     // Roomy-only run (no armed pools → no thread → byte-identical to before).
     let watchdog_coord: Arc<Mutex<WatchdogCoord>> = Arc::new(Mutex::new(WatchdogCoord::default()));
-    let armed_pools = arm_watchdog_pools(&config, &signals, &resolved.armed_tier_map);
+    let armed_pools = arm_watchdog_pools(&config, &signals, &arming.armed_tier_map);
 
     // Set up executor with live byte counter for progress display
     let bytes_counter = Arc::new(AtomicU64::new(0));
@@ -257,18 +254,6 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
         .with_cancel(watchdog_abort.clone());
 
     let mut executor = Executor::new(&btrfs, state_db.as_ref(), &config, &shutdown);
-
-    // Thread the pre-plan armed tiers (031-b) so the executor's clear-all gate
-    // derives the SAME effective lifecycle the planner used (the single-gather
-    // invariant). Critical subvolumes clear the just-sent snapshot + pin.
-    executor.set_armed_tiers(resolved.armed_tier_map.clone());
-
-    // Thread the away-sheddable pin map (UPI 058) computed from the SAME shared
-    // scope helper the planner used (`plan::drive_scopes`), so the executor's
-    // has_away_pin matches the planner's clear_all decision (R1) and, at
-    // Critical, it sheds the away-only pins in-run while preserving the
-    // connected chain. Computed under the lock from the in-run FS state.
-    executor.set_away_shed_pins(plan::away_shed_map(&config, &fs_state));
 
     // Wire the watchdog coordination (UPI 065-b) only when a pool is armed (a
     // Roomy-only run stays byte-identical — no coord lock, no cancel reset). The
@@ -386,7 +371,7 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
         // spawn-time snapshot, re-filtered to still-unmounted drives (S3).
         let maint_btrfs = RealBtrfs::for_maintenance(&config.general.btrfs_path);
         let wd_config = Arc::clone(&config);
-        let wd_away = plan::away_shed_map(&config, &fs_state);
+        let wd_away = arming.away_shed.clone();
         Some(std::thread::spawn(move || {
             watchdog_loop(
                 &pools,
@@ -436,9 +421,16 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
             if fire.send_aborted {
                 // Two-tier graduated reclaim (UPI 058): shed away-only pins first
                 // and re-measure; connected chains survive if that clears the
-                // floor, else escalate to the blanket. Presence is recomputed
-                // fresh from the post-abort FS state via the shared scope helper.
-                let away = plan::away_shed_map(&config, &fs_state);
+                // floor, else escalate to the blanket. Presence is re-confirmed
+                // from the frozen pre-lock `arming.away_shed` (UPI 082 F1, the
+                // SAME relocated helper the executor's in-run shed and the
+                // watchdog's cross-fs reclaim use) rather than freshly derived —
+                // the list can only shrink versus a fresh derive, so a drive
+                // unplugged mid-run is invisible here and Tier 1 escalates to
+                // the Tier-2 blanket sooner (ADR-113 bias-to-escalate: more full
+                // re-sends possible in that compound race, zero data loss).
+                let away =
+                    drives::fresh_away_map(&arming.away_shed, &config, drives::is_drive_mounted);
                 let reclaim = executor.emergency_reclaim_pool(
                     &fire.subvol_names,
                     &away,
@@ -587,7 +579,7 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     // of whether the sentinel is up. Best-effort throughout: never blocks a run.
     if let Some(ref db) = state_db {
         let escalations =
-            storage_signals::advance_and_writeback(db, heartbeat_now, &resolved, result.run_id);
+            storage_signals::advance_and_writeback(db, heartbeat_now, &arming, result.run_id);
         let notes: Vec<notify::Notification> = escalations
             .iter()
             .map(|e| {
@@ -1073,7 +1065,7 @@ fn handle_watchdog_trip(
              reclaiming this pool concurrently (independence)",
             pool.label
         );
-        let fresh_away = fresh_away_map(away_at_spawn, config);
+        let fresh_away = drives::fresh_away_map(away_at_spawn, config, drives::is_drive_mounted);
         let dummy_shutdown = AtomicBool::new(false);
         let maint_exec = Executor::new(maint_btrfs, None, config, &dummy_shutdown);
         let outcome = maint_exec.emergency_reclaim_pool(
@@ -1092,39 +1084,6 @@ fn handle_watchdog_trip(
             reclaim: Some((outcome, ts)),
         }
     }
-}
-
-/// Re-filter a spawn-time away-shed map to drives still **unmounted** at reclaim
-/// time (UPI 065-b, S3). The cross-filesystem reclaim runs on the watchdog thread
-/// using the away map computed before execution; if a drive *reconnected* mid-run
-/// its pin is no longer away-only, so shedding it would break a now-connected
-/// chain. Drop any label whose drive is currently mounted. A label whose drive is
-/// absent from config is kept (it was classified away at spawn and we cannot prove
-/// it reconnected — the conservative direction is to not invent a connected chain).
-/// Subvolumes left with no away labels are dropped, matching `away_shed_map`'s
-/// "absent key = no presence-aware shed."
-#[must_use]
-fn fresh_away_map(
-    away_at_spawn: &HashMap<String, Vec<String>>,
-    config: &Config,
-) -> HashMap<String, Vec<String>> {
-    away_at_spawn
-        .iter()
-        .filter_map(|(subvol, labels)| {
-            let still_away: Vec<String> = labels
-                .iter()
-                .filter(|label| {
-                    config
-                        .drives
-                        .iter()
-                        .find(|d| &d.label == *label)
-                        .is_none_or(|d| !drives::is_drive_mounted(d))
-                })
-                .cloned()
-                .collect();
-            (!still_away.is_empty()).then_some((subvol.clone(), still_away))
-        })
-        .collect()
 }
 
 /// On-disk name of the retired emergency reserve file (UPI 033, retired by UPI
@@ -2730,6 +2689,7 @@ source = "/data/beta"
                 host_root: false,
                 prior_armed_tier: TightnessTier::Roomy,
                 prior_since: None,
+                armed_tier: TightnessTier::Roomy,
             }],
         }
     }
@@ -3078,49 +3038,6 @@ source = "/data/beta"
         assert!(!g.tripped.contains(&foreign), "the in-flight (foreign) pool is NEVER gated");
     }
 
-    #[test]
-    fn fresh_away_map_drops_reconnected_drives() {
-        // S3: a drive that reconnected mid-run (now mounted) must not have its
-        // now-connected chain shed by the cross-fs reclaim. "/" is always a mount
-        // point; a fresh tempdir is not. So HOME (at "/") is dropped, AWAY (still
-        // unmounted) is kept.
-        let dir = tempfile::TempDir::new().unwrap();
-        let away_mount = dir.path().join("not-mounted");
-        std::fs::create_dir_all(&away_mount).unwrap();
-        let mut config = wd_config();
-        config.drives = vec![
-            crate::config::DriveConfig {
-                label: "HOME".to_string(),
-                uuid: None,
-                mount_path: PathBuf::from("/"), // reconnected: a live mount point
-                snapshot_root: ".snapshots".to_string(),
-                role: crate::types::DriveRole::Primary,
-                max_usage_percent: None,
-                min_free_bytes: None,
-                rotation_interval: None,
-            },
-            crate::config::DriveConfig {
-                label: "AWAY".to_string(),
-                uuid: None,
-                mount_path: away_mount, // still away (not a mount point)
-                snapshot_root: ".snapshots".to_string(),
-                role: crate::types::DriveRole::Offsite,
-                max_usage_percent: None,
-                min_free_bytes: None,
-                rotation_interval: None,
-            },
-        ];
-        let mut away_at_spawn: HashMap<String, Vec<String>> = HashMap::new();
-        away_at_spawn.insert("alpha".to_string(), vec!["HOME".to_string(), "AWAY".to_string()]);
-
-        let fresh = fresh_away_map(&away_at_spawn, &config);
-        assert_eq!(
-            fresh.get("alpha").map(Vec::as_slice),
-            Some(["AWAY".to_string()].as_slice()),
-            "a reconnected (mounted) drive is dropped from the cross-fs shed list",
-        );
-    }
-
     // ── Emergency preflight reclaim (UPI 059-a) ────────────────────────
 
     /// Build a critical-root config: one subvol `alpha` under `root`, with a
@@ -3452,6 +3369,7 @@ source = "/data/beta"
 
     fn empty_plan() -> BackupPlan {
         BackupPlan {
+            lifecycles: HashMap::new(),
             operations: vec![],
             timestamp: chrono::NaiveDateTime::default(),
             skipped: vec![],
@@ -3611,6 +3529,7 @@ source = "/data/beta"
     #[test]
     fn build_summary_skipped_deletions_warning() {
         let plan = BackupPlan {
+            lifecycles: HashMap::new(),
             operations: vec![
                 PlannedOperation::DeleteSnapshot {
                     path: PathBuf::from("/snaps/sv1/20260320-0400-sv1"),
@@ -3674,6 +3593,7 @@ source = "/data/beta"
     #[test]
     fn build_summary_space_guard_plural_snapshots() {
         let plan = BackupPlan {
+            lifecycles: HashMap::new(),
             operations: vec![],
             timestamp: chrono::NaiveDateTime::default(),
             skipped: vec![],
@@ -3729,6 +3649,7 @@ source = "/data/beta"
     #[test]
     fn build_summary_no_notes_when_no_skips() {
         let plan = BackupPlan {
+            lifecycles: HashMap::new(),
             operations: vec![],
             timestamp: chrono::NaiveDateTime::default(),
             skipped: vec![],
@@ -3753,6 +3674,7 @@ source = "/data/beta"
     #[test]
     fn build_summary_maps_plan_skips() {
         let plan = BackupPlan {
+            lifecycles: HashMap::new(),
             operations: vec![],
             timestamp: chrono::NaiveDateTime::default(),
             skipped: vec![
@@ -4205,6 +4127,7 @@ source = "/data/beta"
         use crate::plan::MockFileSystemState;
 
         let plan = BackupPlan {
+            lifecycles: HashMap::new(),
             operations: vec![
                 PlannedOperation::SendFull {
                     snapshot: PathBuf::from("/snaps/sv1/20260329-0400-sv1"),
@@ -4265,6 +4188,7 @@ source = "/data/beta"
         use crate::plan::MockFileSystemState;
 
         let plan = BackupPlan {
+            lifecycles: HashMap::new(),
             operations: vec![PlannedOperation::SendFull {
                 snapshot: PathBuf::from("/snaps/sv1/snap"),
                 dest_dir: PathBuf::from("/mnt/d/sv1"),
@@ -4293,6 +4217,7 @@ source = "/data/beta"
         use crate::plan::MockFileSystemState;
 
         let plan = BackupPlan {
+            lifecycles: HashMap::new(),
             operations: vec![PlannedOperation::SendFull {
                 snapshot: PathBuf::from("/snaps/sv1/snap"),
                 dest_dir: PathBuf::from("/mnt/new/sv1"),
@@ -4331,6 +4256,7 @@ source = "/data/beta"
 
         // Full send: should fall through to calibrated
         let plan_full = BackupPlan {
+            lifecycles: HashMap::new(),
             operations: vec![PlannedOperation::SendFull {
                 snapshot: PathBuf::from("/snaps/sv1/snap"),
                 dest_dir: PathBuf::from("/mnt/d/sv1"),
@@ -4349,6 +4275,7 @@ source = "/data/beta"
 
         // Incremental send: should NOT use calibrated (two-tier only)
         let plan_inc = BackupPlan {
+            lifecycles: HashMap::new(),
             operations: vec![PlannedOperation::SendIncremental {
                 parent: PathBuf::from("/snaps/sv1/old"),
                 snapshot: PathBuf::from("/snaps/sv1/new"),
@@ -4750,6 +4677,7 @@ source = "/data/beta"
     fn empty_plan_with_skips(skipped: Vec<(&str, &str)>) -> BackupPlan {
         use chrono::NaiveDate;
         BackupPlan {
+            lifecycles: HashMap::new(),
             operations: vec![],
             timestamp: NaiveDate::from_ymd_opt(2026, 3, 24)
                 .unwrap()
@@ -4776,6 +4704,7 @@ source = "/data/beta"
         ]);
         // Add a CreateSnapshot operation to the plan so executor produces a SubvolumeResult
         let plan = BackupPlan {
+            lifecycles: HashMap::new(),
             operations: vec![PlannedOperation::CreateSnapshot {
                 source: PathBuf::from("/data"),
                 dest: PathBuf::from("/snap/htpc-root/20260324-0400-root"),
@@ -4958,6 +4887,7 @@ source = "/data/beta"
 
     fn token_plan(ops: Vec<PlannedOperation>) -> BackupPlan {
         BackupPlan {
+            lifecycles: HashMap::new(),
             operations: ops,
             timestamp: chrono::NaiveDateTime::default(),
             skipped: vec![],

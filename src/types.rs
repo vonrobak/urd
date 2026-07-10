@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -1163,12 +1164,25 @@ pub struct PlannedSkip {
     pub nothing_new_to_send: bool,
 }
 
+/// The lifecycle judgment the planner made for one subvolume (UPI 082,
+/// Branches A/C): the pieces of `EffectivePolicy` the executor needs, carried
+/// on the plan instead of re-derived. Deliberately excludes `send_interval` —
+/// no executor consumer reads it (grilled).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedLifecycle {
+    pub is_transient: bool,
+    pub clear_all: bool,
+    pub shed_away_drives: Vec<String>,
+}
+
 /// The complete output of the backup planner.
 ///
 /// `events` carries the planner's audit-log emissions: full-send choices
 /// with reason, deferrals with scope, and retention rationale flowed up
 /// from `RetentionResult.events`. The executor persists them at run end
-/// via `state::record_events_best_effort`.
+/// via `state::record_events_best_effort`. `lifecycles` (UPI 082, Branch A)
+/// carries the planner's per-subvolume lifecycle judgment — the executor
+/// builds its `SubvolumeContext` from this rather than re-deriving.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct BackupPlan {
@@ -1176,6 +1190,7 @@ pub struct BackupPlan {
     pub timestamp: NaiveDateTime,
     pub skipped: Vec<PlannedSkip>,
     pub events: Vec<crate::events::Event>,
+    pub lifecycles: HashMap<String, PlannedLifecycle>,
 }
 
 #[allow(dead_code)]
@@ -1579,6 +1594,7 @@ mod tests {
     #[test]
     fn plan_summary() {
         let plan = BackupPlan {
+            lifecycles: HashMap::new(),
             operations: vec![
                 PlannedOperation::CreateSnapshot {
                     source: PathBuf::from("/home"),
