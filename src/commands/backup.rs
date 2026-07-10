@@ -7,11 +7,11 @@ use std::time::{Duration, Instant};
 
 use colored::Colorize;
 
-use crate::advice;
 use crate::awareness::{self, ChainStatus, PromiseStatus, SubvolAssessment};
 use crate::btrfs::{BtrfsOps, RealBtrfs};
 use crate::cli::BackupArgs;
 use crate::commands::storage_signals;
+use crate::commands::world::{self, World};
 use crate::config::Config;
 use crate::drives;
 use crate::events::{Event, EventPayload};
@@ -68,26 +68,12 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
         "full"
     };
 
-    let state_db = match StateDb::open(&config.general.state_db) {
-        Ok(db) => Some(db),
-        Err(e) => {
-            log::warn!("Failed to open state DB, continuing without history: {e}");
-            None
-        }
-    };
-
-    let fs_state = RealFileSystemState {
-        state: state_db.as_ref(),
-    };
+    let world = World::open(&config);
+    let fs_state = world.fs();
     // Near-unit btrfs handle for plan/assess generation reads (UPI 052):
     // a generation read needs no live byte counter and no compression
     // negotiation. The executor builds its own full RealBtrfs at send time.
-    let plan_btrfs = RealBtrfs::for_reads(&config.general.btrfs_path);
-    let observation = plan::Observation {
-        fs: &fs_state,
-        history: &fs_state,
-        btrfs: &plan_btrfs,
-    };
+    let observation = world.observation(&fs_state);
 
     // ── Single pre-plan storage gather + arming (UPI 031-b AB1/S2 — INVARIANT;
     // UPI 082 Branch B) ──
@@ -101,7 +87,7 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     // awareness judges staleness against, surfacing a correctly-adapting
     // subvolume as false AT RISK. See [`storage_signals::RunArming`] for the
     // full single-resolution-site invariant this artifact carries.
-    let signals = storage_signals::gather(&config, state_db.as_ref());
+    let signals = storage_signals::gather(&config, world.db());
     let arming = storage_signals::RunArming::resolve(&signals, &config, &fs_state);
 
     let mut backup_plan = plan::plan(&config, now, &filters, &observation, &arming)?;
@@ -122,7 +108,7 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
             crate::commands::plan_cmd::build_plan_output(&backup_plan, &fs_state, &config);
         crate::commands::plan_cmd::populate_token_warnings(
             &mut plan_output,
-            state_db.as_ref(),
+            world.db(),
             &config,
         );
         let mode = crate::output::OutputMode::detect();
@@ -140,7 +126,7 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     // Emergency pre-flight: if any snapshot root is critically below threshold
     // (< 50% of min_free_bytes), run emergency retention before planning.
     // Runs under the lock because it performs destructive btrfs deletions.
-    let emergency_ran = run_emergency_preflight(&config, state_db.as_ref())?;
+    let emergency_ran = run_emergency_preflight(&config, world.db())?;
 
     // Re-plan if emergency freed space — plan may have different space_pressure
     // decisions. Reuses the SAME pre-plan `arming` (AB1: never re-resolve
@@ -164,7 +150,7 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
             println!("{}", "Nothing to do.".dimmed());
         }
         let heartbeat_now = chrono::Local::now().naive_local();
-        let churn_views = build_churn_views(&config, state_db.as_ref(), heartbeat_now);
+        let churn_views = build_churn_views(&config, world.db(), heartbeat_now);
         let observability = gather_pool_observability(&config, &churn_views, &fs_state);
         write_metrics_for_skipped(
             &config,
@@ -182,7 +168,7 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
         // re-gathering here would be judged after the emergency preflight may
         // have freed space, desyncing this heartbeat from the plan's tier).
         let assessments =
-            advice::assess_view(&config, heartbeat_now, &observation, &signals.by_subvol);
+            world::assess(&config, heartbeat_now, &observation, &signals.by_subvol);
         let hb = heartbeat::build(
             &config,
             heartbeat_now,
@@ -253,7 +239,7 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     let btrfs = RealBtrfs::new(&config.general.btrfs_path, bytes_counter.clone(), sys.supports_compressed_data)
         .with_cancel(watchdog_abort.clone());
 
-    let mut executor = Executor::new(&btrfs, state_db.as_ref(), &config, &shutdown);
+    let mut executor = Executor::new(&btrfs, world.db(), &config, &shutdown);
 
     // Wire the watchdog coordination (UPI 065-b) only when a pool is armed (a
     // Roomy-only run stays byte-identical — no coord lock, no cancel reset). The
@@ -275,7 +261,7 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     // This excludes fail-open paths (unreadable token file) from being treated as verified.
     // Probes (the I/O) are gathered here at the boundary; the classification and the
     // plan mutation are pure (`resolve_token_gating` / `apply_token_gating`).
-    if let Some(ref db) = state_db {
+    if let Some(db) = world.db() {
         let probes: Vec<(String, drives::DriveAvailability, bool)> = config
             .drives
             .iter()
@@ -323,7 +309,7 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
         // actually caused. An empty map here judged the pre against declared
         // intervals while the post was judged against effective tight-tier
         // intervals — fabricating transitions out of the judgment mismatch.
-        advice::assess_view(&config, pre_now, &observation, &signals.by_subvol)
+        world::assess(&config, pre_now, &observation, &signals.by_subvol)
     };
 
     // Build progress context after token filtering so counters reflect actual work.
@@ -459,7 +445,7 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
                     None => (0, Vec::new(), chrono::Local::now().naive_local()),
                 }
             };
-        if let Some(ref db) = state_db {
+        if let Some(db) = world.db() {
             let mut ev = Event::pure(
                 event_ts,
                 EventPayload::WatchdogAbort {
@@ -509,7 +495,7 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
         .collect();
     if !offsite_releases.is_empty() {
         let now_ts = chrono::Local::now().naive_local();
-        if let Some(ref db) = state_db {
+        if let Some(db) = world.db() {
             let events: Vec<Event> = offsite_releases
                 .iter()
                 .map(|r| r.to_event(now_ts, result.run_id))
@@ -535,7 +521,7 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     // Compute churn views from the just-recorded drift samples, then thread
     // the same projection into both metrics and heartbeat (UPI 030).
     let heartbeat_now = chrono::Local::now().naive_local();
-    let churn_views = build_churn_views(&config, state_db.as_ref(), heartbeat_now);
+    let churn_views = build_churn_views(&config, world.db(), heartbeat_now);
     let observability = gather_pool_observability(&config, &churn_views, &fs_state);
 
     // Write metrics
@@ -556,7 +542,7 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     // used), then `advance_and_writeback` persists the pre-resolved tier and
     // surfaces escalation transitions for the notification path (D6).
     let assessments =
-        advice::assess_view(&config, heartbeat_now, &observation, &signals.by_subvol);
+        world::assess(&config, heartbeat_now, &observation, &signals.by_subvol);
     let hb = heartbeat::build(
         &config,
         heartbeat_now,
@@ -577,9 +563,16 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     // blind to posture (D6), so backup is the sole dispatcher — this is separate
     // from the heartbeat-driven promise notifications below and runs regardless
     // of whether the sentinel is up. Best-effort throughout: never blocks a run.
-    if let Some(ref db) = state_db {
-        let escalations =
-            storage_signals::advance_and_writeback(db, heartbeat_now, &arming, result.run_id);
+    if let Some(db) = world.db() {
+        // The one sanctioned caller of the raw writeback (clippy
+        // disallowed-methods guard — backup is the sole posture writer, D6).
+        #[allow(clippy::disallowed_methods)]
+        let escalations = storage_signals::writeback::advance_and_writeback(
+            db,
+            heartbeat_now,
+            &arming,
+            result.run_id,
+        );
         let notes: Vec<notify::Notification> = escalations
             .iter()
             .map(|e| {
@@ -613,7 +606,7 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
 
     // Backup is canonical for in-run promise transitions (trigger=Run);
     // sentinel skips on BackupCompleted to avoid duplicates.
-    if let Some(ref db) = state_db {
+    if let Some(db) = world.db() {
         let prev_snapshots = crate::sentinel::snapshot_promises(&pre_assessments);
         let promise_events = awareness::diff_promise_states(
             &prev_snapshots,

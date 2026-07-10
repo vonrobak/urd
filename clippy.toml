@@ -1,3 +1,5 @@
 disallowed-methods = [
   { path = "urd::awareness::assess", reason = "call advice::assess_view — surfaces render the assessment view, never raw assessments" },
+  { path = "urd::advice::assess_view", reason = "call world::assess / World::view — the prelude is the sanctioned door" },
+  { path = "urd::commands::storage_signals::writeback::advance_and_writeback", reason = "backup's single post-execution writeback is the sole sanctioned caller — read paths never advance posture state" },
 ]

@@ -189,6 +189,7 @@ the documentation convention in `contributing-internal.md`).
 | `sentinel.rs` | Pure state machine for the Sentinel daemon (events, actions, circuit breaker) | Perform I/O (`sentinel_runner.rs` does that) |
 | `sentinel_runner.rs` | I/O wrapper around the Sentinel state machine — the daemon's only I/O surface; also drives the idle emergency-eject poll (ADR-113 Layer 3, `maybe_emergency_reclaim`), the daemon's sole filesystem-mutating action, as a side-path outside the state machine | Make state-machine decisions (`sentinel.rs` does that) |
 | `error.rs` | Error types; `translate_btrfs_error()` for actionable messages | Recovery logic |
+| `commands/world.rs` | The observed-world prelude: `World::open` owns the best-effort `StateDb` + read-only `RealBtrfs`; Layer 1 `world.view()` returns an owned `WorldView { signals, assessments }` for `status`/`default`/`doctor`; Layer 2 `world.fs()`/`world.observation()` serve `plan_cmd`/`backup`, which hold the `Observation` for their own timing; the sole sanctioned production door onto `advice::assess_view` (clippy `disallowed-methods` guard) via `world::assess` | Compute or decide anything; cache signals across calls |
 | `commands/` | CLI subcommand handlers (wire pure modules to I/O) | Core logic (delegate to the modules above) |
 
 ## What the events table is for (ADR-114)

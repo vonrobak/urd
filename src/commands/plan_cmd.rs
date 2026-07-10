@@ -2,13 +2,14 @@ use std::collections::HashMap;
 
 use crate::cli::PlanArgs;
 use crate::commands::storage_signals;
+use crate::commands::world::World;
 use crate::config::{Config, DriveConfig};
 use crate::drives;
 use crate::output::{
     OutputMode, PlanOperationEntry, PlanOutput, PlanSummaryOutput, SkipCategory,
     SkippedSubvolume,
 };
-use crate::plan::{self, HistoryQuery, Observation, PlanFilters, RealFileSystemState};
+use crate::plan::{self, HistoryQuery, PlanFilters};
 use crate::state::StateDb;
 use crate::types::{PlannedOperation, PlannedSkip};
 use crate::voice;
@@ -26,27 +27,20 @@ pub fn run(config: Config, args: PlanArgs, mode: OutputMode) -> anyhow::Result<(
         force_snapshot: args.force_snapshot,
     };
 
-    let state_db = StateDb::open(&config.general.state_db).ok();
-    let fs_state = RealFileSystemState {
-        state: state_db.as_ref(),
-    };
-    let plan_btrfs = crate::btrfs::RealBtrfs::for_reads(&config.general.btrfs_path);
-    let observation = Observation {
-        fs: &fs_state,
-        history: &fs_state,
-        btrfs: &plan_btrfs,
-    };
+    let world = World::open(&config);
+    let fs_state = world.fs();
+    let observation = world.observation(&fs_state);
     // Storage-adapted preview (031-b M5): gather the same read-only signals the
     // backup path uses and resolve the armed tier, so `urd plan` shows the
     // truth of what `urd backup` will do (transient route / no pin at Critical)
     // rather than declared policy. Degrades gracefully — an unmounted/unmeasurable
     // pool yields free_ratio None → Roomy → declared behavior.
-    let signals = storage_signals::gather(&config, state_db.as_ref());
+    let signals = storage_signals::gather(&config, world.db());
     let arming = storage_signals::RunArming::resolve(&signals, &config, &fs_state);
     let backup_plan = plan::plan(&config, now, &filters, &observation, &arming)?;
 
     let mut output = build_plan_output(&backup_plan, &fs_state, &config);
-    populate_token_warnings(&mut output, state_db.as_ref(), &config);
+    populate_token_warnings(&mut output, world.db(), &config);
     print!("{}", voice::render_plan(&output, mode, args.verbose));
 
     Ok(())

@@ -552,6 +552,9 @@ pub fn compute_redundancy_advisories(
 
 // ── Tests ──────────────────────────────────────────────────────────────
 
+// Module-under-test calls its own assess_view directly (clippy
+// disallowed-methods guard — world.rs is the sanctioned production door).
+#[allow(clippy::disallowed_methods)]
 #[cfg(test)]
 mod tests {
     use super::*;

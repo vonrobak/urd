@@ -3,33 +3,19 @@ use chrono::NaiveDateTime;
 use crate::advice;
 use crate::awareness::{ChainBreakReason, ChainStatus, SubvolAssessment};
 use crate::chain;
+use crate::commands::storage_signals;
+use crate::commands::world::{World, WorldView};
 use crate::config::Config;
 use crate::drives;
 use crate::output::{
     AdaptationSummary, ChainHealth, ChainHealthEntry, DriveInfo, LastRunInfo, OutputMode,
     PoolPostureSummary, StatusAssessment, StatusOutput,
 };
-use crate::plan::{Observation, RealFileSystemState};
-use crate::commands::storage_signals;
 use crate::retention;
-use crate::state::StateDb;
 use crate::voice;
 
 pub fn run(config: Config, output_mode: OutputMode) -> anyhow::Result<()> {
-    let state_db = if config.general.state_db.exists() {
-        StateDb::open(&config.general.state_db).ok()
-    } else {
-        None
-    };
-    let fs_state = RealFileSystemState {
-        state: state_db.as_ref(),
-    };
-    let assess_btrfs = crate::btrfs::RealBtrfs::for_reads(&config.general.btrfs_path);
-    let observation = Observation {
-        fs: &fs_state,
-        history: &fs_state,
-        btrfs: &assess_btrfs,
-    };
+    let world = World::open(&config);
     let drive_labels: Vec<String> = config.drives.iter().map(|d| d.label.clone()).collect();
 
     // ── The seal (UPI 071/075/081) ──────────────────────────────────
@@ -38,11 +24,8 @@ pub fn run(config: Config, output_mode: OutputMode) -> anyhow::Result<()> {
 
     // ── Awareness model ─────────────────────────────────────────────
     let now = chrono::Local::now().naive_local();
-    // Gather storage signals (read-only) and thread the per-subvol map into
-    // assess(); status reflects the stabilized tier but never advances it (S1).
-    let signals = storage_signals::gather(&config, state_db.as_ref());
-    let assessments =
-        advice::assess_view(&config, now, &observation, &signals.by_subvol);
+    // status reflects the stabilized tier but never advances it (S1).
+    let WorldView { signals, assessments } = world.view(&config, now);
     let storage_postures = storage_signals::aggregate(&assessments, &signals, now);
     // §2: collapse per-subvolume adaptations to one line per group (needs
     // `signals.pools`, which the renderer can't see — so aggregate here where
@@ -70,7 +53,7 @@ pub fn run(config: Config, output_mode: OutputMode) -> anyhow::Result<()> {
         .collect();
 
     // ── Last run ────────────────────────────────────────────────────
-    let last_run = state_db.as_ref().and_then(|db| db.last_run_info());
+    let last_run = world.db().and_then(|db| db.last_run_info());
 
     // ── Pin count ───────────────────────────────────────────────────
     let total_pins: usize = config

@@ -3,11 +3,10 @@ use std::path::Path;
 
 use crate::advice;
 use crate::awareness;
+use crate::commands::world::{World, WorldView};
 use crate::commands::{storage_signals, CliExit};
 use crate::config;
 use crate::output::{DefaultStatusOutput, OutputMode};
-use crate::plan::{Observation, RealFileSystemState};
-use crate::state::StateDb;
 use crate::voice;
 
 pub fn run(config_path: Option<&Path>, output_mode: OutputMode) -> anyhow::Result<CliExit> {
@@ -31,28 +30,13 @@ pub fn run(config_path: Option<&Path>, output_mode: OutputMode) -> anyhow::Resul
         }
     };
 
-    let state_db = if config.general.state_db.exists() {
-        StateDb::open(&config.general.state_db).ok()
-    } else {
-        None
-    };
-    let fs_state = RealFileSystemState {
-        state: state_db.as_ref(),
-    };
-    let assess_btrfs = crate::btrfs::RealBtrfs::for_reads(&config.general.btrfs_path);
-    let observation = Observation {
-        fs: &fs_state,
-        history: &fs_state,
-        btrfs: &assess_btrfs,
-    };
+    let world = World::open(&config);
 
     // Awareness assessment — lighter than status (no chain health, no drive info, no pins)
     let now = chrono::Local::now().naive_local();
-    let signals = storage_signals::gather(&config, state_db.as_ref());
-    let assessments =
-        advice::assess_view(&config, now, &observation, &signals.by_subvol);
+    let WorldView { signals, assessments } = world.view(&config, now);
 
-    let last_run = state_db.as_ref().and_then(|db| db.last_run_info());
+    let last_run = world.db().and_then(|db| db.last_run_info());
 
     let last_run_age_secs = last_run.as_ref().and_then(|run| run.age_secs(now));
 

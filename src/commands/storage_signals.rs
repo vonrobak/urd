@@ -9,11 +9,14 @@
 //!   pure display aggregators (`aggregate()`, and `aggregate_adaptations()` for
 //!   `status`) only — they *reflect* the hysteresis-stabilized tier and never
 //!   advance state (S1: a read can never fire a transition).
-//! - **`backup`** additionally calls `advance_and_writeback()` after its
-//!   post-execution `assess()`: it re-runs the pure hysteresis per
+//! - **`backup`** additionally calls `writeback::advance_and_writeback()` after
+//!   its post-execution `assess()`: it re-runs the pure hysteresis per
 //!   UUID-resolvable pool, persists `(armed_tier, since)` best-effort, and
 //!   returns escalation transitions for the notification path (D6). UUID-less
-//!   pools are skipped entirely — status-only, never persisted (S5).
+//!   pools are skipped entirely — status-only, never persisted (S5). The
+//!   write half lives in the `writeback` submodule (UPI 082-b, Branch E) —
+//!   a structural read/write split backed by a clippy `disallowed-methods`
+//!   guard, so a read path cannot reach for it by accident.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -22,11 +25,10 @@ use chrono::NaiveDateTime;
 
 use crate::awareness::{PromiseStatus, ResolvedStorageSignal, StorageSignalMap, SubvolAssessment};
 use crate::config::Config;
-use crate::events::{Event, EventPayload};
 use crate::output::{AdaptationSummary, PoolPostureSummary};
 use crate::pools::{self, PoolSpace};
 use crate::state::StateDb;
-use crate::storage_critical::{self, ArmedTierMap, TightnessTier, Transition};
+use crate::storage_critical::{self, ArmedTierMap, TightnessTier};
 
 /// Per-pool resolved signal (UPI 031-a). The command-layer view that backs
 /// both `aggregate()` (display) and `advance_and_writeback()` (persistence).
@@ -73,17 +75,6 @@ pub struct PoolSignal {
 pub struct StorageSignals {
     pub by_subvol: StorageSignalMap,
     pub pools: Vec<PoolSignal>,
-}
-
-/// An escalating pool transition surfaced by `advance_and_writeback` for the
-/// notification path (D6). Carries everything the notification needs without a
-/// back-correlation: the display label, the host-root escalation flag, and the
-/// tier change.
-#[derive(Debug, Clone, PartialEq)]
-pub struct PostureEscalation {
-    pub pool_label: String,
-    pub host_root: bool,
-    pub transition: Transition,
 }
 
 /// How distinct pools are grouped within `gather_with`: by UUID when known,
@@ -389,63 +380,90 @@ pub fn resolve_armed_tiers(signals: &StorageSignals) -> RunArming {
     }
 }
 
-/// Persist the pre-resolved armed tier per UUID-resolvable pool best-effort and
-/// return the **escalation** transitions (backup path only — read paths must
-/// never call this). Consumes the [`RunArming`] resolved pre-lock: it does
-/// **not** re-resolve (AB1 — clear-all frees space mid-run; a re-resolve would
-/// falsely de-escalate). `since` advances to `now` only when the tier changes;
-/// otherwise the prior `since` is preserved so the "flagged since" timestamp
-/// stays stable. UUID-less pools are skipped (S5) — no persist, no
-/// notification, status-only degrade.
-#[must_use]
-pub fn advance_and_writeback(
-    state_db: &StateDb,
-    now: NaiveDateTime,
-    resolved: &RunArming,
-    run_id: Option<i64>,
-) -> Vec<PostureEscalation> {
-    let mut escalations = Vec::new();
-    for pool in &resolved.pools {
-        let Some(uuid) = pool.uuid.as_deref() else {
-            continue; // UUID-less: status-only (S5)
-        };
-        let new = pool.new_tier; // pre-resolved (AB1: never re-resolve)
-        let since = if new == pool.prior_armed_tier {
-            pool.prior_since.unwrap_or(now)
-        } else {
-            now
-        };
-        state_db.upsert_armed_tier_best_effort(uuid, new, since);
+/// The write half of storage-signal handling (UPI 082-b, Branch E): the sole
+/// production caller is `backup`'s single post-execution writeback
+/// (`commands/backup.rs`), sanctioned via a clippy `disallowed-methods` allow
+/// — the same structural guard `world.rs` uses for `assess_view`. Read paths
+/// (`status`, bare `urd`, `doctor`, `urd plan`) never advance state (S1); this
+/// module is where that boundary is enforced, not just documented.
+pub mod writeback {
+    use chrono::NaiveDateTime;
 
-        if let Some(transition) = storage_critical::transition(pool.prior_armed_tier, new) {
-            // (F6, UPI 064-b) Record EVERY transition — escalation AND
-            // de-escalation — for a complete `urd events` audit (closing the #202
-            // gap where transitions notified but wrote no row). This is a strict
-            // superset of the escalation-only NOTIFICATIONS below and does NOT
-            // violate "de-escalation is silent": that rule governs notifications,
-            // not the audit log.
-            let mut ev = Event::pure(
-                now,
-                EventPayload::StorageTierTransition {
-                    pool_label: pool.label.clone(),
-                    from: transition.from.as_db_str().to_string(),
-                    to: transition.to.as_db_str().to_string(),
-                    host_root: pool.host_root,
-                },
-            );
-            ev.run_id = run_id;
-            state_db.record_events_best_effort(&[ev]);
+    use crate::events::{Event, EventPayload};
+    use crate::state::StateDb;
+    use crate::storage_critical::{self, Transition};
 
-            if transition.is_escalation() {
-                escalations.push(PostureEscalation {
-                    pool_label: pool.label.clone(),
-                    host_root: pool.host_root,
-                    transition,
-                });
+    use super::RunArming;
+
+    /// An escalating pool transition surfaced by `advance_and_writeback` for the
+    /// notification path (D6). Carries everything the notification needs without a
+    /// back-correlation: the display label, the host-root escalation flag, and the
+    /// tier change.
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct PostureEscalation {
+        pub pool_label: String,
+        pub host_root: bool,
+        pub transition: Transition,
+    }
+
+    /// Persist the pre-resolved armed tier per UUID-resolvable pool best-effort and
+    /// return the **escalation** transitions (backup path only — read paths must
+    /// never call this). Consumes the [`RunArming`] resolved pre-lock: it does
+    /// **not** re-resolve (AB1 — clear-all frees space mid-run; a re-resolve would
+    /// falsely de-escalate). `since` advances to `now` only when the tier changes;
+    /// otherwise the prior `since` is preserved so the "flagged since" timestamp
+    /// stays stable. UUID-less pools are skipped (S5) — no persist, no
+    /// notification, status-only degrade.
+    #[must_use]
+    pub fn advance_and_writeback(
+        state_db: &StateDb,
+        now: NaiveDateTime,
+        resolved: &RunArming,
+        run_id: Option<i64>,
+    ) -> Vec<PostureEscalation> {
+        let mut escalations = Vec::new();
+        for pool in &resolved.pools {
+            let Some(uuid) = pool.uuid.as_deref() else {
+                continue; // UUID-less: status-only (S5)
+            };
+            let new = pool.new_tier; // pre-resolved (AB1: never re-resolve)
+            let since = if new == pool.prior_armed_tier {
+                pool.prior_since.unwrap_or(now)
+            } else {
+                now
+            };
+            state_db.upsert_armed_tier_best_effort(uuid, new, since);
+
+            if let Some(transition) = storage_critical::transition(pool.prior_armed_tier, new) {
+                // (F6, UPI 064-b) Record EVERY transition — escalation AND
+                // de-escalation — for a complete `urd events` audit (closing the #202
+                // gap where transitions notified but wrote no row). This is a strict
+                // superset of the escalation-only NOTIFICATIONS below and does NOT
+                // violate "de-escalation is silent": that rule governs notifications,
+                // not the audit log.
+                let mut ev = Event::pure(
+                    now,
+                    EventPayload::StorageTierTransition {
+                        pool_label: pool.label.clone(),
+                        from: transition.from.as_db_str().to_string(),
+                        to: transition.to.as_db_str().to_string(),
+                        host_root: pool.host_root,
+                    },
+                );
+                ev.run_id = run_id;
+                state_db.record_events_best_effort(&[ev]);
+
+                if transition.is_escalation() {
+                    escalations.push(PostureEscalation {
+                        pool_label: pool.label.clone(),
+                        host_root: pool.host_root,
+                        transition,
+                    });
+                }
             }
         }
+        escalations
     }
-    escalations
 }
 
 /// Aggregate the per-subvolume postures into one display line per tight pool
@@ -589,9 +607,13 @@ pub fn aggregate_adaptations(
         .collect()
 }
 
+// Module-under-test calls its own writeback::advance_and_writeback directly
+// (clippy disallowed-methods guard — backup.rs is the sanctioned production door).
+#[allow(clippy::disallowed_methods)]
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::EventPayload;
     use crate::storage_critical::{StoragePosture, TightnessTier};
 
     fn dt(s: &str) -> NaiveDateTime {
@@ -747,7 +769,8 @@ source = "/"
         let signals =
             gather_with(&cfg(), &HashMap::new(), Some("root-uuid"), resolver, space_tight);
 
-        let transitions = advance_and_writeback(&db, now, &resolve_armed_tiers(&signals), None);
+        let transitions =
+            writeback::advance_and_writeback(&db, now, &resolve_armed_tiers(&signals), None);
         // Both pools start Roomy; data escalates to Tight, root stays Roomy.
         assert_eq!(transitions.len(), 1);
         assert_eq!(transitions[0].pool_label, "/data");
@@ -797,7 +820,8 @@ source = "/"
             gather_with(&cfg(), &prior, Some("root-uuid"), resolver, space_tight);
         let now = dt("2026-05-30T04:00:00");
 
-        let transitions = advance_and_writeback(&db, now, &resolve_armed_tiers(&signals), None);
+        let transitions =
+            writeback::advance_and_writeback(&db, now, &resolve_armed_tiers(&signals), None);
         assert!(transitions.is_empty()); // no escalation on steady state
         let stored = db.all_armed_tiers().unwrap().get("data-uuid").copied();
         assert_eq!(stored, Some((TightnessTier::Tight, prior_since)));
@@ -818,7 +842,8 @@ source = "/"
             gather_with(&cfg(), &prior, Some("root-uuid"), resolver, space_full);
         let now = dt("2026-05-30T04:00:00");
 
-        let escalations = advance_and_writeback(&db, now, &resolve_armed_tiers(&signals), None);
+        let escalations =
+            writeback::advance_and_writeback(&db, now, &resolve_armed_tiers(&signals), None);
         // De-escalation is silent — no notification.
         assert!(escalations.is_empty());
         // But the recovery IS persisted, with `since` advanced to now.
@@ -848,8 +873,12 @@ source = "/"
             resolver_no_uuid,
             space_tight,
         );
-        let transitions =
-            advance_and_writeback(&db, dt("2026-05-30T04:00:00"), &resolve_armed_tiers(&signals), None);
+        let transitions = writeback::advance_and_writeback(
+            &db,
+            dt("2026-05-30T04:00:00"),
+            &resolve_armed_tiers(&signals),
+            None,
+        );
         assert!(transitions.is_empty());
         // Nothing written.
         assert!(db.all_armed_tiers().unwrap().is_empty());
@@ -1069,7 +1098,7 @@ local_retention = "transient"
             .unwrap();
         assert_eq!(data.new_tier, TightnessTier::Critical);
 
-        let _ = advance_and_writeback(&db, now, &resolved, None);
+        let _ = writeback::advance_and_writeback(&db, now, &resolved, None);
         let stored = db.all_armed_tiers().unwrap().get("data-uuid").copied();
         assert_eq!(stored.map(|(t, _)| t), Some(TightnessTier::Critical));
     }
