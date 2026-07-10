@@ -7,7 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- The external-send space guard now checks the same failed/aborted-send floor
+  `estimated_send_size` already used, so a subvolume whose only size signal is a failed
+  send is deferred instead of retried against space it has evidence won't fit (#304).
+
 ### Changed
+- The send-space guard's three-tier space check is now one call into the shared
+  `estimated_send_size` cascade instead of a second, independently-maintained copy that
+  had drifted to omit the failed-send floor tier (#304, #308).
 - Tier resolution, the away-shed view, and the executor's lifecycle judgment now flow
   through one pre-lock artifact instead of three independently-derived tier/pin maps —
   the executor's in-run away-shed also re-confirms a drive's presence right before

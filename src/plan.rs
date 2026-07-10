@@ -107,21 +107,35 @@ pub use crate::observation::{FilesystemQuery, HistoryQuery, Observation};
 
 // ── Size estimation helper ──────────────────────────────────────────────
 
-/// Best available estimate of the bytes a next send will transfer.
-/// Strategy: same-drive history > cross-drive history > calibrated
-/// size (full sends only). Returns None when no data is available.
+/// Which cascade tier `estimated_send_size_with_source` resolved to — lets a
+/// caller reconstruct tier-specific display detail (the calibrated-staleness
+/// note) without re-running the cascade or duplicating it (#304).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SizeEstimateSource {
+    /// A successful send, same-drive or cross-drive.
+    History,
+    /// The full subvolume footprint from `urd calibrate`.
+    Calibrated,
+    /// A failed/aborted send's byte count, used as a last-resort floor (#210).
+    FailedFloor,
+}
+
+/// Best available estimate of the bytes a next send will transfer, plus
+/// which tier produced it. Strategy: same-drive history > cross-drive
+/// history > calibrated size (full sends only) > failed-send floor.
+/// Returns None when no data is available.
 ///
 /// Note: calibrated size is the full subvolume footprint, so it is
 /// only a valid estimate when a full send is needed. For incremental
-/// sends, returning None is correct — callers must treat "unknown"
-/// as not-a-constraint rather than substituting calibrated.
+/// sends, calibrated is skipped — callers must treat "unknown" as
+/// not-a-constraint rather than substituting calibrated.
 #[must_use]
-pub fn estimated_send_size(
+pub fn estimated_send_size_with_source(
     history: &dyn HistoryQuery,
     subvol_name: &str,
     drive_label: &str,
     needs_full: bool,
-) -> Option<u64> {
+) -> Option<(u64, SizeEstimateSource)> {
     let send_kind = if needs_full {
         SendKind::Full
     } else {
@@ -135,14 +149,35 @@ pub fn estimated_send_size(
     history
         .last_send_size(subvol_name, drive_label, send_kind)
         .or_else(|| history.last_send_size_any_drive(subvol_name, send_kind))
+        .map(|bytes| (bytes, SizeEstimateSource::History))
         .or_else(|| {
             if needs_full {
-                history.calibrated_size(subvol_name).map(|(bytes, _)| bytes)
+                history
+                    .calibrated_size(subvol_name)
+                    .map(|(bytes, _)| (bytes, SizeEstimateSource::Calibrated))
             } else {
                 None
             }
         })
-        .or_else(|| history.last_failed_send_floor(subvol_name, drive_label, send_kind))
+        .or_else(|| {
+            history
+                .last_failed_send_floor(subvol_name, drive_label, send_kind)
+                .map(|bytes| (bytes, SizeEstimateSource::FailedFloor))
+        })
+}
+
+/// Best available estimate of the bytes a next send will transfer. Thin
+/// wrapper over `estimated_send_size_with_source` for callers that only need
+/// the byte count, not which tier produced it.
+#[must_use]
+pub fn estimated_send_size(
+    history: &dyn HistoryQuery,
+    subvol_name: &str,
+    drive_label: &str,
+    needs_full: bool,
+) -> Option<u64> {
+    estimated_send_size_with_source(history, subvol_name, drive_label, needs_full)
+        .map(|(bytes, _)| bytes)
 }
 
 // ── PlanFilters ─────────────────────────────────────────────────────────
@@ -1394,82 +1429,65 @@ fn plan_external_send(
     };
 
     // Space estimation: skip if estimated send size exceeds available space.
-    // Three-tier fallback: same-drive history > cross-drive history > calibrated (full only).
-    let send_kind = if is_incremental {
-        SendKind::Incremental
-    } else {
-        SendKind::Full
-    };
-    if let Some(last_size) = obs
-        .history
-        .last_send_size(&subvol.name, &drive.label, send_kind)
-        .or_else(|| obs.history.last_send_size_any_drive(&subvol.name, send_kind))
+    // One cascade (#210/#304): same-drive history > cross-drive history >
+    // calibrated (full sends only) > failed-send floor (last-resort lower
+    // bound). Previously a separate inline copy stopped at tier 3, so a
+    // subvolume whose only signal was a failed send was never deferred here.
+    if let Some((raw_bytes, source)) =
+        estimated_send_size_with_source(obs.history, &subvol.name, &drive.label, !is_incremental)
+        && let Some((estimated, available, free, min_free)) =
+            exceeds_available_space(raw_bytes, &ext_dir, drive, obs)
     {
-        // Tier 1/2: historical data from same drive or cross-drive fallback
-        if let Some((estimated, available, free, min_free)) =
-            exceeds_available_space(last_size, &ext_dir, drive, obs)
-        {
-            use crate::types::ByteSize;
-            record_defer(
-                skipped,
-                events,
-                &subvol.name,
-                Some(&drive.label),
-                format!(
-                    "send to {} skipped: estimated ~{} exceeds {} available (free: {}, min_free: {})",
-                    drive.label,
-                    ByteSize(estimated),
-                    ByteSize(available),
-                    ByteSize(free),
-                    ByteSize(min_free),
-                ),
-                None,
-                false,
-                DeferScope::Drive,
-                now,
-            );
-            return;
-        }
-    } else if !is_incremental {
-        // Tier 3: Calibrated size from `urd calibrate` (only for full sends)
-        if let Some((cal_bytes, measured_at)) = obs.history.calibrated_size(&subvol.name) {
-            let now_ts = chrono::Local::now().naive_local();
-            let age_days = chrono::NaiveDateTime::parse_from_str(&measured_at, "%Y-%m-%dT%H:%M:%S")
-                .map(|ts| (now_ts - ts).num_days())
-                .unwrap_or(365); // corrupt timestamp → treat as stale, not fresh
-            let staleness = if age_days > 30 {
-                format!(
-                    " (calibrated {} days ago — run `urd calibrate` to refresh)",
-                    age_days
-                )
-            } else {
-                String::new()
-            };
-
-            if let Some((estimated, available, _, _)) =
-                exceeds_available_space(cal_bytes, &ext_dir, drive, obs)
-            {
-                use crate::types::ByteSize;
-                record_defer(
-                    skipped,
-                    events,
-                    &subvol.name,
-                    Some(&drive.label),
-                    format!(
-                        "send to {} skipped: calibrated size ~{} exceeds {} available{}",
-                        drive.label,
-                        ByteSize(estimated),
-                        ByteSize(available),
-                        staleness,
-                    ),
-                    None,
-                    false,
-                    DeferScope::Drive,
-                    now,
-                );
-                return;
-            }
-        }
+        use crate::types::ByteSize;
+        let reason = if source == SizeEstimateSource::Calibrated {
+            let staleness = obs
+                .history
+                .calibrated_size(&subvol.name)
+                .map(|(_, measured_at)| {
+                    let now_ts = chrono::Local::now().naive_local();
+                    let age_days =
+                        chrono::NaiveDateTime::parse_from_str(&measured_at, "%Y-%m-%dT%H:%M:%S")
+                            .map(|ts| (now_ts - ts).num_days())
+                            .unwrap_or(365); // corrupt timestamp → treat as stale, not fresh
+                    if age_days > 30 {
+                        format!(
+                            " (calibrated {} days ago — run `urd calibrate` to refresh)",
+                            age_days
+                        )
+                    } else {
+                        String::new()
+                    }
+                })
+                .unwrap_or_default();
+            format!(
+                "send to {} skipped: calibrated size ~{} exceeds {} available{}",
+                drive.label,
+                ByteSize(estimated),
+                ByteSize(available),
+                staleness,
+            )
+        } else {
+            format!(
+                "send to {} skipped: estimated ~{} exceeds {} available (free: {}, min_free: {})",
+                drive.label,
+                ByteSize(estimated),
+                ByteSize(available),
+                ByteSize(free),
+                ByteSize(min_free),
+            )
+        };
+        record_defer(
+            skipped,
+            events,
+            &subvol.name,
+            Some(&drive.label),
+            reason,
+            None,
+            false,
+            DeferScope::Drive,
+            now,
+        );
+        return;
     }
 
     // Critical (clear_all) writes NO pin: the executor deletes the just-sent
@@ -1877,6 +1895,53 @@ pub(crate) fn read_snapshot_dir(dir: &Path) -> crate::error::Result<Vec<Snapshot
 
 // ── MockFileSystemState ─────────────────────────────────────────────────
 
+/// Insertion-ordered send-size store. Same `insert`/`clear` surface as a
+/// plain `HashMap<(subvol, drive, kind), u64>` (so existing call sites are
+/// unchanged), but also remembers *when* each key was (re-)inserted, so
+/// cross-drive lookups can pick the most recent entry rather than the
+/// largest — matching the real adapter's `ORDER BY id DESC` (every insert,
+/// including one that repeats an existing key, is a new row in production).
+/// The mock previously modeled this as max-by-value, a documented divergence
+/// (#308) that let recency-dependent scenarios pass against behavior
+/// production doesn't have.
+#[cfg(test)]
+#[derive(Debug, Default, Clone)]
+pub struct SendSizeHistory {
+    values: std::collections::HashMap<(String, String, SendKind), u64>,
+    order: Vec<(String, String, SendKind)>,
+}
+
+#[cfg(test)]
+impl SendSizeHistory {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn insert(&mut self, key: (String, String, SendKind), bytes: u64) {
+        self.order.push(key.clone());
+        self.values.insert(key, bytes);
+    }
+
+    pub fn clear(&mut self) {
+        self.values.clear();
+        self.order.clear();
+    }
+
+    fn get(&self, key: &(String, String, SendKind)) -> Option<u64> {
+        self.values.get(key).copied()
+    }
+
+    /// Most recently (re-)inserted entry for `subvol_name`/`send_kind`
+    /// across any drive — the mock's analogue of `ORDER BY id DESC LIMIT 1`.
+    fn most_recent_any_drive(&self, subvol_name: &str, send_kind: SendKind) -> Option<u64> {
+        self.order
+            .iter()
+            .rev()
+            .find(|(sv, _, kind)| sv == subvol_name && *kind == send_kind)
+            .and_then(|key| self.values.get(key).copied())
+    }
+}
+
 #[cfg(test)]
 pub struct MockFileSystemState {
     pub local_snapshots: std::collections::HashMap<String, Vec<SnapshotName>>,
@@ -1892,7 +1957,11 @@ pub struct MockFileSystemState {
     /// the fail-open production semantics.
     pub capacity_bytes: std::collections::HashMap<PathBuf, u64>,
     pub pin_files: std::collections::HashMap<(PathBuf, String), SnapshotName>,
-    pub send_sizes: std::collections::HashMap<(String, String, SendKind), u64>,
+    pub send_sizes: SendSizeHistory,
+    /// Failed/aborted-send byte counts — the #210 last-resort floor tier.
+    /// Same insertion-ordered shape as `send_sizes`; kept as a separate store
+    /// since production tracks them via a distinct `result = 'failure'` query.
+    pub failed_send_floors: SendSizeHistory,
     pub calibrated_sizes: std::collections::HashMap<String, (u64, String)>,
     pub send_times: std::collections::HashMap<(String, String), NaiveDateTime>,
     pub drive_events: std::collections::HashMap<String, DriveEvent>,
@@ -1918,7 +1987,8 @@ impl MockFileSystemState {
             free_bytes: std::collections::HashMap::new(),
             capacity_bytes: std::collections::HashMap::new(),
             pin_files: std::collections::HashMap::new(),
-            send_sizes: std::collections::HashMap::new(),
+            send_sizes: SendSizeHistory::new(),
+            failed_send_floors: SendSizeHistory::new(),
             calibrated_sizes: std::collections::HashMap::new(),
             send_times: std::collections::HashMap::new(),
             drive_events: std::collections::HashMap::new(),
@@ -2027,34 +2097,27 @@ impl HistoryQuery for MockFileSystemState {
         send_kind: SendKind,
     ) -> Option<u64> {
         self.send_sizes
-            .get(&(
-                subvol_name.to_string(),
-                drive_label.to_string(),
-                send_kind,
-            ))
-            .copied()
+            .get(&(subvol_name.to_string(), drive_label.to_string(), send_kind))
     }
 
     fn last_send_size_any_drive(&self, subvol_name: &str, send_kind: SendKind) -> Option<u64> {
-        // Note: returns max by value, not most-recent-by-time.
-        // Real impl uses recency (ORDER BY id DESC). The mock has no
-        // insertion ordering, so max-by-value is the best approximation.
-        self.send_sizes
-            .iter()
-            .filter(|((sv, _, st), _)| sv == subvol_name && *st == send_kind)
-            .map(|(_, &bytes)| bytes)
-            .max()
+        self.send_sizes.most_recent_any_drive(subvol_name, send_kind)
     }
 
     fn last_failed_send_floor(
         &self,
-        _subvol_name: &str,
-        _drive_label: &str,
-        _send_kind: SendKind,
+        subvol_name: &str,
+        drive_label: &str,
+        send_kind: SendKind,
     ) -> Option<u64> {
-        // The mock's `send_sizes` model successful sends only; the failed-floor
-        // path is exercised by the real-DB regression tests (#210).
-        None
+        // This-drive preferred, then any drive — mirrors RealFileSystemState's
+        // last_failed_send_size().or_else(last_failed_send_size_any_drive()).
+        self.failed_send_floors
+            .get(&(subvol_name.to_string(), drive_label.to_string(), send_kind))
+            .or_else(|| {
+                self.failed_send_floors
+                    .most_recent_any_drive(subvol_name, send_kind)
+            })
     }
 
     fn calibrated_size(&self, subvol_name: &str) -> Option<(u64, String)> {
@@ -2317,6 +2380,20 @@ local_retention = "transient"
         fs.send_sizes
             .insert(("sv1".into(), "OTHER".into(), SendKind::Full), 10_000_000_000);
         assert_eq!(estimated_send_size(&fs, "sv1", "D1", true), Some(10_000_000_000));
+    }
+
+    #[test]
+    fn est_any_drive_prefers_recency_over_value() {
+        // #308: last_send_size_any_drive must pick the most-recently-recorded
+        // entry (mirrors production's `ORDER BY id DESC`), not the largest.
+        // An older, larger send to D1 followed by a newer, smaller send to
+        // D2 must resolve to D2's value.
+        let mut fs = MockFileSystemState::new();
+        fs.send_sizes
+            .insert(("sv1".into(), "D1".into(), SendKind::Full), 90_000_000_000);
+        fs.send_sizes
+            .insert(("sv1".into(), "D2".into(), SendKind::Full), 10_000_000_000);
+        assert_eq!(estimated_send_size(&fs, "sv1", "D3", true), Some(10_000_000_000));
     }
 
     #[test]
@@ -3289,6 +3366,47 @@ priority = 1
             sends.len(),
             1,
             "Tier 1 history should override calibrated size"
+        );
+    }
+
+    #[test]
+    fn last_failed_send_floor_skips_send_when_too_large() {
+        // #304: the send-space guard omits the #210 failed-floor tier, so a
+        // subvolume whose only size signal is a failed/aborted send is not
+        // space-deferred and the planner retries a send history says won't
+        // fit. No successful history, no calibration — only a failed-send
+        // floor — must still defer.
+        let config = test_config();
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots
+            .insert("sv1".to_string(), vec![snap("20260322-1300-one")]);
+        fs.mounted_drives.insert("D1".to_string());
+        fs.failed_send_floors.insert(
+            ("sv1".to_string(), "D1".to_string(), SendKind::Full),
+            1_000_000_000_000,
+        );
+        // Drive has only 500GB free — the 1TB floor exceeds it.
+        fs.free_bytes
+            .insert(PathBuf::from("/mnt/d1"), 500_000_000_000);
+
+        let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &RunArming::default()).unwrap();
+        let sends: Vec<_> = result
+            .operations
+            .iter()
+            .filter(|op| matches!(op, PlannedOperation::SendFull { subvolume_name, .. } if subvolume_name == "sv1"))
+            .collect();
+        assert_eq!(
+            sends.len(),
+            0,
+            "Send should be skipped when the failed-send floor exceeds available space"
+        );
+        assert!(
+            result
+                .skipped
+                .iter()
+                .any(|s| s.name == "sv1" && s.reason.contains("skipped: estimated")),
+            "Skip reason should use the generic estimated-size wording, not calibrated: {:?}",
+            result.skipped
         );
     }
 
