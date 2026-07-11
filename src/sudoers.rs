@@ -430,10 +430,7 @@ fn parse_rule(
         let mut spec = raw.trim();
         // Leading TAG: tokens (NOPASSWD:, PASSWD:, SETENV:, …) update the
         // tag state; only the password tags change what we track.
-        loop {
-            let Some((token, tail)) = spec.split_once(' ') else {
-                break;
-            };
+        while let Some((token, tail)) = spec.split_once(' ') {
             let Some(tag) = token.strip_suffix(':') else {
                 break;
             };
