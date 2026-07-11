@@ -346,12 +346,19 @@ impl EventPayload {
 
 // ── Event record ───────────────────────────────────────────────────────
 
-/// A single event ready for persistence. Constructed by pure modules;
-/// persisted by impure callers via `state::record_events_best_effort`.
+/// A single event ready for persistence.
 ///
-/// Contextual fields (`run_id`, `subvolume`, `drive_label`) are stamped
-/// by the caller — the pure emitter often leaves them as `None` and the
-/// impure layer fills them in before the batch goes to SQLite.
+/// Doctrine (UPI 088-c): pure modules emit — [`Event::pure`] returns an
+/// [`UnstampedEvent`], and the only path to a persistable `Event` is
+/// `stamp(&RunContext)`, invoked by the recorder (`recorder.rs`), which
+/// owns the full ADR-114 dance: stamp → persist best-effort (ADR-102) →
+/// dispatch per policy. Two sanctioned exceptions to "everything goes
+/// through the recorder": `StateDb::record_drive_event` stamps
+/// `outside_run` internally (a granular, error-propagating wrapper with
+/// no notification — not a dance site), and the read side (`state.rs`
+/// row hydration, `urd events`) constructs `Event` directly from stored
+/// rows. **Direct `Event` struct literals are read-side only** — an emit
+/// path building one by hand is bypassing the stamp and is a bug.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Event {
     pub occurred_at: NaiveDateTime,

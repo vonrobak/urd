@@ -465,6 +465,15 @@ Source: `storage_critical.rs`, `commands/storage_signals.rs`, `state.rs` (`pool_
 ADR-113. See also the user-facing rename `drift` → "churn" on the Recommendation cluster's
 `drift signal`.
 
+**recorder** (UPI 088-c). The impure seam owning the ADR-114 dance: run-context
+stamping (`UnstampedEvent::stamp` — the only path from a pure emitter to a
+persistable `Event`), best-effort persistence (ADR-102 semantics inside), and
+policy-driven dispatch (`DispatchPolicy::{Immediate, GateOnSentinel}`). Every audit
+event reaches persistence through it; notifications that accompany the dance ride
+the same `record()` call. Pure modules emit; the recorder records. Event-less
+notification sites (the sentinel's drive notices) remain direct `notify::dispatch`
+calls — the recorder owns the dance, not all of notify.
+
 ## Cluster: Read-side query seams (ADR-102)
 
 The read side of the backup pipeline is split along the ADR-102 axis —
