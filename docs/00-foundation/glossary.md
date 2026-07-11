@@ -86,6 +86,24 @@ Mostly separate from `PromiseStatus`: a subvolume can be `PROTECTED` yet `degrad
 lowercase engine word renders directly (`healthy` dimmed, `degraded` yellow, `blocked`
 red), and `urd status` shows the HEALTH column only when some subvolume is non-`healthy`.
 
+**PromiseRollup** (`awareness.rs`, UPI 088-a). The three-way partition of subvolume
+names by promise state — the single home of the protected/at-risk/unprotected
+reduction. Every "how many are sealed?" / "is everything broken?" question reads this
+one projection (`from_assessments` / `from_pairs`); no surface re-derives the
+partition. It rides gravity and carries no `Ord` of its own. Empty-input semantics are
+deliberately asymmetric and load-bearing: `all_protected()` is **vacuously true**
+(zero subvolumes, zero broken promises — `urd doctor` renders "✓ 0 of 0 sealed"),
+`all_unprotected()` is **guarded false** (the alarm needs actual subvolumes).
+
+**promise change** (`PromiseChange`, `awareness.rs`, UPI 088-a). The *detection
+result* of diffing two promise-snapshot sets by name: `name` went `from` → `to`,
+computed only by `awareness::promise_changes` (the single transition detection).
+Distinct from `EventPayload::PromiseTransition`, the *persisted event* a change may
+become downstream — a change is ephemeral analysis; a transition is history. First-run
+suppression belongs to callers, and the two callers differ deliberately: `notify`
+skips transitions on `previous: None` but still evaluates all-unprotected; the
+sentinel runner gates the whole call on `has_initial_assessment`.
+
 ## Cluster: Voice labels (presentation)
 
 The CLI surface renders the promise states with the mythic voice labels below. The
@@ -464,6 +482,20 @@ reads, rather than on the full fused surface.
 | `FileSystemState` | **Retired (UPI 052, 2026-05-29).** Was a bridge supertrait (`FilesystemQuery + HistoryQuery`) with a blanket impl, kept to preserve pre-split callers while the seam was narrowed. Every command-layer caller now depends on exactly the half it uses, so the bridge was deleted. Use `FilesystemQuery` / `HistoryQuery` / `Observation` instead. The concrete `RealFileSystemState` / `MockFileSystemState` types (which impl both halves) are unaffected. |
 
 Source: `observation.rs`, `btrfs.rs`, ADR-100, ADR-101, ADR-102.
+
+## Cluster: Projections (code idiom)
+
+**projection** (a.k.a. *sibling projection*). A small purpose-built type computed
+*from* a wide domain type, instead of widening the domain type with new fields — the
+codebase's standing answer to "this surface needs a different view of X." Instances:
+`ChurnHeartbeatFields` (heartbeat's narrow view of churn), `SubvolumeExtras`
+(status's per-subvolume enrichments), `PromiseRollup` (the promise partition,
+UPI 088-a). The idiom exists because widening is expensive and viral —
+`SubvolAssessment` has ~29 struct-literal construction sites and no `Default`, so
+every added field touches every site — while a sibling projection has one
+constructor and only the consumers that want it. Rule of thumb: if a new field on a
+wide type would be `None`/default at most construction sites, it wants to be a
+projection instead.
 
 ## Cluster: Planner soundness (UPI 069)
 

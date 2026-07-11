@@ -14,7 +14,9 @@ use std::time::{Duration, Instant};
 use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
 
-use crate::awareness::{ChainStatus, OperationalHealth, PromiseStatus, SubvolAssessment};
+use crate::awareness::{
+    ChainStatus, OperationalHealth, PromiseSnapshot, PromiseStatus, SubvolAssessment,
+};
 use crate::guard::{self, PoolPressureSample};
 
 // ── Events ──────────────────────────────────────────────────────────────
@@ -89,14 +91,6 @@ pub struct SentinelState {
     pub last_health_states: Vec<HealthSnapshot>,
     /// Circuit breaker state (active mode only, but tracked always).
     pub circuit_breaker: CircuitBreaker,
-}
-
-/// A snapshot of promise states from a single assessment, used for
-/// comparing state transitions to decide notifications.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PromiseSnapshot {
-    pub name: String,
-    pub status: PromiseStatus,
 }
 
 impl SentinelState {
@@ -636,18 +630,9 @@ pub fn should_record_transitions(
 }
 
 // ── Snapshot extractors ───────────────────────────────────────────────
-
-/// Extract promise snapshots from assessments for state storage.
-#[must_use]
-pub fn snapshot_promises(assessments: &[SubvolAssessment]) -> Vec<PromiseSnapshot> {
-    assessments
-        .iter()
-        .map(|a| PromiseSnapshot {
-            name: a.name.clone(),
-            status: a.status,
-        })
-        .collect()
-}
+// (`snapshot_promises` moved to awareness.rs with `PromiseSnapshot`,
+// UPI 088-a — the health twin below stays: `HealthSnapshot` is
+// sentinel-only state.)
 
 /// A snapshot of operational health from a single assessment, for
 /// comparing health transitions to decide notifications.
@@ -1763,21 +1748,6 @@ mod tests {
         let current = vec![make_assessment("sv1", PromiseStatus::Protected)];
 
         assert!(has_promise_changes(&previous, &current));
-    }
-
-    #[test]
-    fn snapshot_promises_roundtrip() {
-        let assessments = vec![
-            make_assessment("sv1", PromiseStatus::Protected),
-            make_assessment("sv2", PromiseStatus::AtRisk),
-        ];
-
-        let snaps = snapshot_promises(&assessments);
-        assert_eq!(snaps.len(), 2);
-        assert_eq!(snaps[0].name, "sv1");
-        assert_eq!(snaps[0].status, PromiseStatus::Protected);
-        assert_eq!(snaps[1].name, "sv2");
-        assert_eq!(snaps[1].status, PromiseStatus::AtRisk);
     }
 
     // ── Chain snapshot + anomaly detection tests ───────────────────────

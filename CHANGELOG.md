@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `urd backup`'s post-run table and `--json` output now carry the same complete
+  promise fields (`promise_level`, `retention_summary`, `external_only`) that
+  `urd status` shows for the same world — the two surfaces no longer disagree.
+  A healthy run's table is unchanged; the PROTECTION column appears only when
+  some promise is degraded, matching status's quiet gate (#297).
+
+### Changed
+- Promise-state reductions (transition detection, degradation direction, the
+  three-way partition, the all-unprotected check) and the notification prose
+  they feed each have exactly one implementation now (`PromiseRollup`,
+  `promise_changes`, `worsened_from`, one shared prose builder) — the backup
+  and sentinel notification paths render byte-identical sentences from one
+  core, pinned by golden tests. No behavior change (#297).
+
 ## [0.34.0] - 2026-07-11
 
 ### Added

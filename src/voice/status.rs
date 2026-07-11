@@ -10,7 +10,7 @@ use std::fmt::Write;
 use colored::Colorize;
 
 use crate::advice::RedundancyAdvisoryKind;
-use crate::awareness::PromiseStatus;
+use crate::awareness::{PromiseRollup, PromiseStatus};
 use crate::output::{
     ChainHealth, DefaultStatusOutput, OutputMode, PoolPostureSummary, StatusAssessment,
     StatusOutput,
@@ -168,35 +168,27 @@ pub(super) fn render_summary_line(data: &StatusOutput, out: &mut String) {
         return;
     }
 
-    let total = data.assessments.len();
-    let safe_count = data
-        .assessments
-        .iter()
-        .filter(|a| a.status == PromiseStatus::Protected)
-        .count();
+    // Promise partition via the one rollup (UPI 088-a). all_protected()
+    // is vacuously true on empty input, but the is_empty() early return
+    // above means this renderer never sees that case.
+    let rollup = PromiseRollup::from_pairs(
+        data.assessments.iter().map(|a| (a.name.clone(), a.status)),
+    );
     let has_health_issues = data.assessments.iter().any(|a| a.health != "healthy");
 
-    let safety_part = if safe_count == total {
+    let safety_part = if rollup.all_protected() {
         "All sealed.".green().to_string()
     } else {
-        let exposed_names: Vec<&str> = data
-            .assessments
-            .iter()
-            .filter(|a| a.status == PromiseStatus::Unprotected)
-            .map(|a| a.name.as_str())
-            .collect();
-        let waning_names: Vec<&str> = data
-            .assessments
-            .iter()
-            .filter(|a| a.status == PromiseStatus::AtRisk)
-            .map(|a| a.name.as_str())
-            .collect();
-        let mut parts = vec![format!("{} of {} sealed.", safe_count, total)];
-        if !exposed_names.is_empty() {
-            parts.push(format!("{} exposed.", exposed_names.join(", ")));
+        let mut parts = vec![format!(
+            "{} of {} sealed.",
+            rollup.protected.len(),
+            rollup.total()
+        )];
+        if !rollup.unprotected.is_empty() {
+            parts.push(format!("{} exposed.", rollup.unprotected.join(", ")));
         }
-        if !waning_names.is_empty() {
-            parts.push(format!("{} waning.", waning_names.join(", ")));
+        if !rollup.at_risk.is_empty() {
+            parts.push(format!("{} waning.", rollup.at_risk.join(", ")));
         }
         parts.join(" ").yellow().to_string()
     };

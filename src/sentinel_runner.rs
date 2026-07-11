@@ -17,7 +17,7 @@ use std::time::{Duration, Instant, SystemTime};
 use chrono::NaiveDateTime;
 
 use crate::advice;
-use crate::awareness::{self, PromiseStatus, SubvolAssessment};
+use crate::awareness::{self, PromiseSnapshot, SubvolAssessment};
 use crate::commands::{storage_signals, world};
 use crate::config::Config;
 use crate::drives::{self, DriveAvailability};
@@ -27,8 +27,7 @@ use crate::output::{SentinelCircuitState, SentinelPromiseState, SentinelStateFil
 use crate::plan::{Observation, RealFileSystemState};
 use crate::sentinel::{
     self, CircuitBreakerConfig, EjectAction, EjectEvent, EjectPhase, EjectState,
-    EjectTransition, PromiseSnapshot, SentinelAction, SentinelEvent, SentinelState,
-    TransitionResult,
+    EjectTransition, SentinelAction, SentinelEvent, SentinelState, TransitionResult,
 };
 use crate::state::StateDb;
 
@@ -532,7 +531,7 @@ impl SentinelRunner {
         }
 
         // Update state.
-        self.state.last_promise_states = sentinel::snapshot_promises(&assessments);
+        self.state.last_promise_states = awareness::snapshot_promises(&assessments);
         self.state.last_health_states = sentinel::snapshot_health(&assessments);
         if !self.state.has_initial_assessment {
             self.state.has_initial_assessment = true;
@@ -1014,69 +1013,15 @@ pub fn build_notifications(
     previous: &[PromiseSnapshot],
     current: &[SubvolAssessment],
 ) -> Vec<Notification> {
-    let mut notifications = Vec::new();
+    // Thin adapter over the shared prose core (UPI 088-a, arc R1):
+    // detect via awareness, speak via notify. First-run suppression is
+    // NOT here — the `has_initial_assessment && has_promise_changes`
+    // gate in execute_assess owns it (load-bearing: with an empty
+    // `previous`, all-unprotected below would still fire).
+    let changes = awareness::promise_changes(previous, &awareness::snapshot_promises(current));
+    let all_unprotected = awareness::PromiseRollup::from_assessments(current).all_unprotected();
 
-    // ── Promise state transitions ──────────────────────────────────
-    for assess in current {
-        if let Some(prev) = previous.iter().find(|p| p.name == assess.name)
-            && assess.status != prev.status
-        {
-            let from = prev.status.to_string();
-            let to = assess.status.to_string();
-
-            if assess.status < prev.status {
-                // Degradation
-                notifications.push(Notification {
-                    event: NotificationEvent::PromiseDegraded {
-                        subvolume: assess.name.clone(),
-                        from: from.clone(),
-                        to: to.clone(),
-                    },
-                    urgency: Urgency::Warning,
-                    title: format!("Urd: {} is now {}", assess.name, to),
-                    body: format!(
-                        "The thread of {} has frayed — it was {}, now {}. \
-                         The well remembers, but the thread grows thin.",
-                        assess.name, from, to
-                    ),
-                });
-            } else {
-                // Recovery
-                notifications.push(Notification {
-                    event: NotificationEvent::PromiseRecovered {
-                        subvolume: assess.name.clone(),
-                        from: from.clone(),
-                        to: to.clone(),
-                    },
-                    urgency: Urgency::Info,
-                    title: format!("Urd: {} restored to {}", assess.name, to),
-                    body: format!(
-                        "The thread of {} is mended — restored from {} to {}.",
-                        assess.name, from, to
-                    ),
-                });
-            }
-        }
-    }
-
-    // ── All unprotected ────────────────────────────────────────────
-    let all_unprotected = !current.is_empty()
-        && current
-            .iter()
-            .all(|a| a.status == PromiseStatus::Unprotected);
-
-    if all_unprotected {
-        notifications.push(Notification {
-            event: NotificationEvent::AllUnprotected,
-            urgency: Urgency::Critical,
-            title: "Urd: all promises broken".to_string(),
-            body: "Every thread in the well has snapped. No subvolume is protected. \
-                   Attend to this — your data stands exposed."
-                .to_string(),
-        });
-    }
-
-    notifications
+    notify::build_promise_change_notifications(&changes, all_unprotected)
 }
 
 /// Check whether the heartbeat is stale and a BackupOverdue notification is needed.
@@ -1741,6 +1686,118 @@ mod tests {
 
         let notifications = build_notifications(&previous, &current);
         assert!(notifications.is_empty());
+    }
+
+    // ── Golden prose (UPI 088-a, arc R8) ────────────────────────────
+    // Twin fixtures: byte-identical to notify.rs's golden section by
+    // design — the two builders emit the same sentences independently,
+    // and these goldens are the acceptance criterion for collapsing
+    // both onto one shared core. See notify.rs for the rationale.
+
+    #[test]
+    fn golden_twin_degraded_prose_exact() {
+        let previous = vec![PromiseSnapshot {
+            name: "home".to_string(),
+            status: PromiseStatus::Protected,
+        }];
+        let current = vec![make_assessment("home", PromiseStatus::AtRisk)];
+
+        let notifications = build_notifications(&previous, &current);
+
+        let degraded: Vec<_> = notifications
+            .iter()
+            .filter(|n| matches!(n.event, NotificationEvent::PromiseDegraded { .. }))
+            .collect();
+        assert_eq!(degraded.len(), 1);
+        assert_eq!(degraded[0].urgency, Urgency::Warning);
+        assert_eq!(degraded[0].title, "Urd: home is now AT RISK");
+        assert_eq!(
+            degraded[0].body,
+            "The thread of home has frayed — it was PROTECTED, now AT RISK. \
+             The well remembers, but the thread grows thin."
+        );
+    }
+
+    #[test]
+    fn golden_twin_recovered_prose_exact() {
+        let previous = vec![PromiseSnapshot {
+            name: "home".to_string(),
+            status: PromiseStatus::AtRisk,
+        }];
+        let current = vec![make_assessment("home", PromiseStatus::Protected)];
+
+        let notifications = build_notifications(&previous, &current);
+
+        let recovered: Vec<_> = notifications
+            .iter()
+            .filter(|n| matches!(n.event, NotificationEvent::PromiseRecovered { .. }))
+            .collect();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].urgency, Urgency::Info);
+        assert_eq!(recovered[0].title, "Urd: home restored to PROTECTED");
+        assert_eq!(
+            recovered[0].body,
+            "The thread of home is mended — restored from AT RISK to PROTECTED."
+        );
+    }
+
+    #[test]
+    fn golden_twin_all_unprotected_prose_exact() {
+        let previous = vec![
+            PromiseSnapshot {
+                name: "home".to_string(),
+                status: PromiseStatus::Protected,
+            },
+            PromiseSnapshot {
+                name: "docs".to_string(),
+                status: PromiseStatus::Protected,
+            },
+        ];
+        let current = vec![
+            make_assessment("home", PromiseStatus::Unprotected),
+            make_assessment("docs", PromiseStatus::Unprotected),
+        ];
+
+        let notifications = build_notifications(&previous, &current);
+
+        let all_unprot: Vec<_> = notifications
+            .iter()
+            .filter(|n| matches!(n.event, NotificationEvent::AllUnprotected))
+            .collect();
+        assert_eq!(all_unprot.len(), 1);
+        assert_eq!(all_unprot[0].urgency, Urgency::Critical);
+        assert_eq!(all_unprot[0].title, "Urd: all promises broken");
+        assert_eq!(
+            all_unprot[0].body,
+            "Every thread in the well has snapped. No subvolume is protected. \
+             Attend to this — your data stands exposed."
+        );
+    }
+
+    #[test]
+    fn golden_twin_empty_previous_all_unprotected_still_fires() {
+        // This function has NO internal first-run guard: with an empty
+        // `previous`, transitions cannot match but all-unprotected still
+        // fires. The runner's `has_initial_assessment &&
+        // has_promise_changes` gate in execute_assess is what suppresses
+        // first-run noise — that gate is load-bearing, and this test
+        // documents why.
+        let previous: Vec<PromiseSnapshot> = vec![];
+        let current = vec![make_assessment("home", PromiseStatus::Unprotected)];
+
+        let notifications = build_notifications(&previous, &current);
+
+        assert!(notifications.iter().all(|n| !matches!(
+            n.event,
+            NotificationEvent::PromiseDegraded { .. }
+                | NotificationEvent::PromiseRecovered { .. }
+        )));
+        let all_unprot: Vec<_> = notifications
+            .iter()
+            .filter(|n| matches!(n.event, NotificationEvent::AllUnprotected))
+            .collect();
+        assert_eq!(all_unprot.len(), 1);
+        assert_eq!(all_unprot[0].title, "Urd: all promises broken");
     }
 
     // ── check_backup_overdue (S2: pure function with tests) ─────────

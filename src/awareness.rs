@@ -204,6 +204,19 @@ pub enum PromiseStatus {
     Protected,
 }
 
+impl PromiseStatus {
+    /// Did the promise worsen relative to `prev`?
+    ///
+    /// The single home of the `to < from` direction test (UPI 088-a) —
+    /// every degradation/recovery decision delegates here. Rides the
+    /// enum's worst-to-best `Ord`; the "do not reorder" contract above
+    /// is what makes this comparison meaningful.
+    #[must_use]
+    pub fn worsened_from(self, prev: Self) -> bool {
+        self < prev
+    }
+}
+
 impl std::fmt::Display for PromiseStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -498,6 +511,137 @@ pub struct DriveAssessment {
     pub rotation: Option<DriveRotation>,
 }
 
+// ── Promise snapshots and transition detection (UPI 088-a) ─────────────
+
+/// A snapshot of promise state from a single assessment, used for
+/// comparing state transitions across time.
+///
+/// Formerly defined in `sentinel.rs` — a core→daemon inversion, since
+/// this module's own transition detection consumed it. It lives beside
+/// `PromiseStatus` now; the daemon imports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromiseSnapshot {
+    pub name: String,
+    pub status: PromiseStatus,
+}
+
+/// Extract promise snapshots from assessments for state storage.
+#[must_use]
+pub fn snapshot_promises(assessments: &[SubvolAssessment]) -> Vec<PromiseSnapshot> {
+    assessments
+        .iter()
+        .map(|a| PromiseSnapshot {
+            name: a.name.clone(),
+            status: a.status,
+        })
+        .collect()
+}
+
+/// One detected promise-state change: `name` went `from` → `to`.
+///
+/// The detection *result* — distinct from the persisted
+/// `EventPayload::PromiseTransition` it may become downstream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromiseChange {
+    pub name: String,
+    pub from: PromiseStatus,
+    pub to: PromiseStatus,
+}
+
+/// The single transition detection: diff two snapshot sets by name and
+/// report every status change, in `current` order.
+///
+/// Names present only in `previous` are silent (a vanished subvolume is
+/// not a transition); names new in `current` are silent too (no `from`
+/// to compare against). Callers own first-run suppression:
+/// `notify::compute_notifications` skips on `previous: None`, the
+/// sentinel runner gates on `has_initial_assessment` — the two
+/// semantics differ deliberately and stay caller-side.
+#[must_use]
+pub fn promise_changes(
+    previous: &[PromiseSnapshot],
+    current: &[PromiseSnapshot],
+) -> Vec<PromiseChange> {
+    current
+        .iter()
+        .filter_map(|curr| {
+            previous
+                .iter()
+                .find(|p| p.name == curr.name)
+                .filter(|prev| prev.status != curr.status)
+                .map(|prev| PromiseChange {
+                    name: curr.name.clone(),
+                    from: prev.status,
+                    to: curr.status,
+                })
+        })
+        .collect()
+}
+
+/// The three-way partition of subvolume names by promise state — the
+/// single home of the protected/at-risk/unprotected reduction
+/// (UPI 088-a; deepening-05's `PromiseRollup`). Vectors preserve input
+/// order. A projection that rides gravity (`PromiseStatus`'s one `Ord`);
+/// it carries no ordering of its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromiseRollup {
+    pub protected: Vec<String>,
+    pub at_risk: Vec<String>,
+    pub unprotected: Vec<String>,
+}
+
+impl PromiseRollup {
+    /// Partition assessments by promise state.
+    #[must_use]
+    pub fn from_assessments(assessments: &[SubvolAssessment]) -> Self {
+        Self::from_pairs(assessments.iter().map(|a| (a.name.clone(), a.status)))
+    }
+
+    /// Partition `(name, status)` pairs — the entry point for the other
+    /// promise-state carriers (heartbeat entries, status rows, doctor
+    /// rows).
+    #[must_use]
+    pub fn from_pairs(pairs: impl IntoIterator<Item = (String, PromiseStatus)>) -> Self {
+        let mut rollup = Self {
+            protected: Vec::new(),
+            at_risk: Vec::new(),
+            unprotected: Vec::new(),
+        };
+        for (name, status) in pairs {
+            match status {
+                PromiseStatus::Protected => rollup.protected.push(name),
+                PromiseStatus::AtRisk => rollup.at_risk.push(name),
+                PromiseStatus::Unprotected => rollup.unprotected.push(name),
+            }
+        }
+        rollup
+    }
+
+    /// Total number of subvolumes rolled up.
+    #[must_use]
+    pub fn total(&self) -> usize {
+        self.protected.len() + self.at_risk.len() + self.unprotected.len()
+    }
+
+    /// Is every promise kept? Vacuously TRUE on empty input — zero
+    /// subvolumes means zero broken promises (`urd doctor` says
+    /// "✓ 0 of 0 sealed" for an all-disabled config). Deliberately
+    /// asymmetric with `all_unprotected`.
+    #[must_use]
+    pub fn all_protected(&self) -> bool {
+        self.at_risk.is_empty() && self.unprotected.is_empty()
+    }
+
+    /// Is every promise broken? FALSE on empty input — the alarm only
+    /// rings over actual subvolumes (both notification paths' historic
+    /// `!is_empty()` guard). Deliberately asymmetric with
+    /// `all_protected`.
+    #[must_use]
+    pub fn all_unprotected(&self) -> bool {
+        !self.unprotected.is_empty() && self.protected.is_empty() && self.at_risk.is_empty()
+    }
+}
+
 // ── Core function ──────────────────────────────────────────────────────
 
 /// Diff a previous set of promise snapshots against the current
@@ -506,14 +650,11 @@ pub struct DriveAssessment {
 ///
 /// Pure function. Empty `previous` returns an empty Vec (suppresses
 /// noise on first run, matching the precedent in
-/// `sentinel::has_promise_changes`). Subvolumes present in `previous` but
-/// missing from `current` are silent (deletion is not a transition we
-/// log). Subvolumes new in `current` (not in `previous`) are also
-/// silent — appearance is not a transition either.
+/// `sentinel::has_promise_changes`). Name-set asymmetries are silent —
+/// see `promise_changes`, which owns the detection.
 #[must_use]
-#[allow(dead_code)]
 pub fn diff_promise_states(
-    previous: &[crate::sentinel::PromiseSnapshot],
+    previous: &[PromiseSnapshot],
     current: &[SubvolAssessment],
     now: NaiveDateTime,
     trigger: crate::events::TransitionTrigger,
@@ -521,24 +662,21 @@ pub fn diff_promise_states(
     if previous.is_empty() {
         return Vec::new();
     }
-    let mut events = Vec::new();
-    for assess in current {
-        if let Some(prev) = previous.iter().find(|p| p.name == assess.name)
-            && prev.status != assess.status
-        {
+    promise_changes(previous, &snapshot_promises(current))
+        .into_iter()
+        .map(|change| {
             let mut event = crate::events::Event::pure(
                 now,
                 crate::events::EventPayload::PromiseTransition {
-                    from: prev.status,
-                    to: assess.status,
+                    from: change.from,
+                    to: change.to,
                     trigger,
                 },
             );
-            event.subvolume = Some(assess.name.clone());
-            events.push(event);
-        }
-    }
-    events
+            event.subvolume = Some(change.name);
+            event
+        })
+        .collect()
 }
 
 /// Compute promise states for all enabled subvolumes.
@@ -1419,6 +1557,19 @@ mod tests {
     use crate::types::SnapshotName;
     use chrono::NaiveDate;
 
+    // ── PromiseStatus::worsened_from (UPI 088-a) ────────────────────
+    // Moved from notify.rs (`is_degradation_follows_ord`) when the
+    // direction test got its single home next to the Ord it rides.
+
+    #[test]
+    fn worsened_from_follows_ord() {
+        // Worsening (to < from) is a degradation; improving is not.
+        assert!(PromiseStatus::AtRisk.worsened_from(PromiseStatus::Protected));
+        assert!(PromiseStatus::Unprotected.worsened_from(PromiseStatus::AtRisk));
+        assert!(!PromiseStatus::Protected.worsened_from(PromiseStatus::AtRisk));
+        assert!(!PromiseStatus::Protected.worsened_from(PromiseStatus::Protected));
+    }
+
     /// Test config with one drive and min_free_bytes set.
     fn test_config_with_min_free() -> Config {
         let toml_str = r#"
@@ -1899,7 +2050,7 @@ source = "/data/sv1"
         let pre = assess(&config, now, &obs, &signals);
         let post = assess(&config, now, &obs, &signals);
 
-        let prev_snapshots = crate::sentinel::snapshot_promises(&pre);
+        let prev_snapshots = snapshot_promises(&pre);
         let events = diff_promise_states(
             &prev_snapshots,
             &post,
@@ -1923,7 +2074,7 @@ source = "/data/sv1"
         let blind_pre = assess(&config, now, &obs, &StorageSignalMap::new());
         let judged_post = assess(&config, now, &obs, &signals);
 
-        let prev_snapshots = crate::sentinel::snapshot_promises(&blind_pre);
+        let prev_snapshots = snapshot_promises(&blind_pre);
         let events = diff_promise_states(
             &prev_snapshots,
             &judged_post,
@@ -5187,11 +5338,8 @@ source = "/data/sv1"
         }
     }
 
-    fn make_promise_snapshot(
-        name: &str,
-        status: PromiseStatus,
-    ) -> crate::sentinel::PromiseSnapshot {
-        crate::sentinel::PromiseSnapshot {
+    fn make_promise_snapshot(name: &str, status: PromiseStatus) -> PromiseSnapshot {
+        PromiseSnapshot {
             name: name.to_string(),
             status,
         }
@@ -5202,6 +5350,173 @@ source = "/data/sv1"
             .unwrap()
             .and_hms_opt(3, 14, 22)
             .unwrap()
+    }
+
+    // ── snapshot_promises + promise_changes (UPI 088-a) ────────────
+
+    #[test]
+    fn snapshot_promises_roundtrip() {
+        // Moved from sentinel.rs with the function.
+        let assessments = vec![
+            make_assess("sv1", PromiseStatus::Protected),
+            make_assess("sv2", PromiseStatus::AtRisk),
+        ];
+
+        let snaps = snapshot_promises(&assessments);
+        assert_eq!(snaps.len(), 2);
+        assert_eq!(snaps[0].name, "sv1");
+        assert_eq!(snaps[0].status, PromiseStatus::Protected);
+        assert_eq!(snaps[1].name, "sv2");
+        assert_eq!(snaps[1].status, PromiseStatus::AtRisk);
+    }
+
+    #[test]
+    fn promise_changes_empty_inputs_yield_nothing() {
+        assert!(promise_changes(&[], &[]).is_empty());
+    }
+
+    #[test]
+    fn promise_changes_detects_degradation() {
+        let prev = vec![make_promise_snapshot("sv1", PromiseStatus::Protected)];
+        let curr = vec![make_promise_snapshot("sv1", PromiseStatus::AtRisk)];
+        let changes = promise_changes(&prev, &curr);
+        assert_eq!(
+            changes,
+            vec![PromiseChange {
+                name: "sv1".to_string(),
+                from: PromiseStatus::Protected,
+                to: PromiseStatus::AtRisk,
+            }]
+        );
+    }
+
+    #[test]
+    fn promise_changes_detects_recovery() {
+        let prev = vec![make_promise_snapshot("sv1", PromiseStatus::Unprotected)];
+        let curr = vec![make_promise_snapshot("sv1", PromiseStatus::Protected)];
+        let changes = promise_changes(&prev, &curr);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].from, PromiseStatus::Unprotected);
+        assert_eq!(changes[0].to, PromiseStatus::Protected);
+    }
+
+    #[test]
+    fn promise_changes_no_change_is_silent() {
+        let prev = vec![make_promise_snapshot("sv1", PromiseStatus::AtRisk)];
+        let curr = vec![make_promise_snapshot("sv1", PromiseStatus::AtRisk)];
+        assert!(promise_changes(&prev, &curr).is_empty());
+    }
+
+    #[test]
+    fn promise_changes_name_only_in_previous_is_silent() {
+        // A vanished subvolume is not a transition.
+        let prev = vec![make_promise_snapshot("gone", PromiseStatus::Protected)];
+        let curr = vec![make_promise_snapshot("sv1", PromiseStatus::Protected)];
+        assert!(promise_changes(&prev, &curr).is_empty());
+    }
+
+    #[test]
+    fn promise_changes_name_only_in_current_is_silent() {
+        // A new subvolume has no `from` — appearance is not a transition.
+        let prev = vec![make_promise_snapshot("sv1", PromiseStatus::Protected)];
+        let curr = vec![
+            make_promise_snapshot("sv1", PromiseStatus::Protected),
+            make_promise_snapshot("newborn", PromiseStatus::Unprotected),
+        ];
+        assert!(promise_changes(&prev, &curr).is_empty());
+    }
+
+    // ── PromiseRollup (UPI 088-a) ───────────────────────────────────
+
+    #[test]
+    fn rollup_empty_is_vacuously_protected_but_not_unprotected() {
+        // The asymmetry pair: all_protected() is vacuous truth (zero
+        // subvolumes, zero broken promises); all_unprotected() is
+        // guarded false (the alarm needs actual subvolumes).
+        let rollup = PromiseRollup::from_assessments(&[]);
+        assert_eq!(rollup.total(), 0);
+        assert!(rollup.all_protected());
+        assert!(!rollup.all_unprotected());
+    }
+
+    #[test]
+    fn rollup_partitions_mixed_assessments() {
+        let assessments = vec![
+            make_assess("a", PromiseStatus::Protected),
+            make_assess("b", PromiseStatus::AtRisk),
+            make_assess("c", PromiseStatus::Unprotected),
+            make_assess("d", PromiseStatus::Protected),
+        ];
+        let rollup = PromiseRollup::from_assessments(&assessments);
+        assert_eq!(rollup.protected, vec!["a", "d"]);
+        assert_eq!(rollup.at_risk, vec!["b"]);
+        assert_eq!(rollup.unprotected, vec!["c"]);
+        assert_eq!(rollup.total(), 4);
+        assert!(!rollup.all_protected());
+        assert!(!rollup.all_unprotected());
+    }
+
+    #[test]
+    fn rollup_all_protected_when_every_promise_kept() {
+        let assessments = vec![
+            make_assess("a", PromiseStatus::Protected),
+            make_assess("b", PromiseStatus::Protected),
+        ];
+        let rollup = PromiseRollup::from_assessments(&assessments);
+        assert!(rollup.all_protected());
+        assert!(!rollup.all_unprotected());
+    }
+
+    #[test]
+    fn rollup_all_unprotected_when_every_promise_broken() {
+        let assessments = vec![
+            make_assess("a", PromiseStatus::Unprotected),
+            make_assess("b", PromiseStatus::Unprotected),
+        ];
+        let rollup = PromiseRollup::from_assessments(&assessments);
+        assert!(rollup.all_unprotected());
+        assert!(!rollup.all_protected());
+    }
+
+    #[test]
+    fn rollup_preserves_input_order_within_each_partition() {
+        let assessments = vec![
+            make_assess("z", PromiseStatus::AtRisk),
+            make_assess("a", PromiseStatus::AtRisk),
+            make_assess("m", PromiseStatus::AtRisk),
+        ];
+        let rollup = PromiseRollup::from_assessments(&assessments);
+        assert_eq!(rollup.at_risk, vec!["z", "a", "m"]);
+    }
+
+    #[test]
+    fn rollup_from_pairs_matches_from_assessments() {
+        let assessments = vec![
+            make_assess("a", PromiseStatus::Protected),
+            make_assess("b", PromiseStatus::Unprotected),
+        ];
+        let via_pairs = PromiseRollup::from_pairs(
+            assessments.iter().map(|a| (a.name.clone(), a.status)),
+        );
+        assert_eq!(via_pairs, PromiseRollup::from_assessments(&assessments));
+    }
+
+    #[test]
+    fn promise_changes_preserve_current_order() {
+        let prev = vec![
+            make_promise_snapshot("a", PromiseStatus::Protected),
+            make_promise_snapshot("b", PromiseStatus::Protected),
+            make_promise_snapshot("c", PromiseStatus::AtRisk),
+        ];
+        // `current` deliberately reordered vs `previous`: output follows current.
+        let curr = vec![
+            make_promise_snapshot("c", PromiseStatus::Protected),
+            make_promise_snapshot("a", PromiseStatus::Unprotected),
+            make_promise_snapshot("b", PromiseStatus::Protected),
+        ];
+        let changes = promise_changes(&prev, &curr);
+        let names: Vec<&str> = changes.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["c", "a"]);
     }
 
     #[test]

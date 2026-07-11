@@ -314,7 +314,7 @@ impl EventPayload {
             Self::PlannerDefer { .. } => Severity::Info,
             Self::PromiseTransition { from, to, .. } => {
                 // PromiseStatus is ordered worst-to-best.
-                if to < from {
+                if to.worsened_from(*from) {
                     Severity::Notice // degradation
                 } else {
                     Severity::Info // recovery (or no-op, but no-ops are filtered upstream)

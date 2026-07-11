@@ -11,7 +11,7 @@ use std::fmt::Write;
 
 use colored::Colorize;
 
-use crate::awareness::PromiseStatus;
+use crate::awareness::PromiseRollup;
 use crate::output::{DoctorCheck, DoctorCheckStatus, DoctorOutput, DoctorVerdictStatus, OutputMode};
 use crate::plan::format_duration_short;
 use crate::storage_critical::TightnessTier;
@@ -102,13 +102,15 @@ fn render_doctor_interactive(data: &DoctorOutput) -> String {
     // Data safety section
     writeln!(out).ok();
     writeln!(out, "  {}", "Data safety".bold()).ok();
-    let sealed_count = data
-        .data_safety
-        .iter()
-        .filter(|d| d.status == PromiseStatus::Protected)
-        .count();
-    let total = data.data_safety.len();
-    if sealed_count == total {
+    // Promise partition via the one rollup (UPI 088-a). all_protected()
+    // is vacuously true on empty input — zero subvolumes renders
+    // "✓ 0 of 0 sealed", pinned by the tests below.
+    let rollup = PromiseRollup::from_pairs(
+        data.data_safety.iter().map(|d| (d.name.clone(), d.status)),
+    );
+    let sealed_count = rollup.protected.len();
+    let total = rollup.total();
+    if rollup.all_protected() {
         writeln!(
             out,
             "    {} {} of {} sealed",
@@ -121,10 +123,10 @@ fn render_doctor_interactive(data: &DoctorOutput) -> String {
         writeln!(
             out,
             "    {} {} of {} sealed",
-            if data.data_safety.iter().any(|d| d.status == PromiseStatus::Unprotected) {
-                "\u{2717}".red().to_string()
-            } else {
+            if rollup.unprotected.is_empty() {
                 "\u{26a0}".yellow().to_string()
+            } else {
+                "\u{2717}".red().to_string()
             },
             sealed_count,
             total
@@ -588,5 +590,93 @@ pub(super) fn check_icon_style(status: DoctorCheckStatus) -> (&'static str, fn(&
         DoctorCheckStatus::Ok => ("\u{2713}", |s: &str| s.green().to_string()),
         DoctorCheckStatus::Warn => ("\u{26a0}", |s: &str| s.yellow().to_string()),
         DoctorCheckStatus::Error => ("\u{2717}", |s: &str| s.red().to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::awareness::PromiseStatus;
+    use crate::output::{
+        DOCTOR_OUTPUT_SCHEMA_VERSION, DoctorDataSafety, DoctorOutput, DoctorVerdict,
+    };
+
+    // Characterization tests (UPI 088-a): this renderer had no test
+    // module before the sealed-count reduction moved onto PromiseRollup;
+    // these pin the Data safety lines the swap must not change.
+
+    fn safety(name: &str, status: PromiseStatus) -> DoctorDataSafety {
+        DoctorDataSafety {
+            name: name.to_string(),
+            status,
+            health: "healthy".to_string(),
+            issue: None,
+            suggestion: None,
+            reason: None,
+            storage_posture: None,
+        }
+    }
+
+    fn doctor_output(data_safety: Vec<DoctorDataSafety>) -> DoctorOutput {
+        DoctorOutput {
+            schema_version: DOCTOR_OUTPUT_SCHEMA_VERSION,
+            config_checks: vec![],
+            infra_checks: vec![],
+            data_safety,
+            sentinel: None,
+            schema_status: None,
+            verify: None,
+            churn: None,
+            recommendations: None,
+            retention_checks: vec![],
+            verdict: DoctorVerdict {
+                status: DoctorVerdictStatus::Healthy,
+                count: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn doctor_all_sealed_renders_check_and_counts() {
+        let data = doctor_output(vec![
+            safety("home", PromiseStatus::Protected),
+            safety("docs", PromiseStatus::Protected),
+        ]);
+        let out = render_doctor(&data, OutputMode::Interactive);
+        assert!(out.contains("2 of 2 sealed"), "got: {out}");
+        assert!(out.contains('\u{2713}'));
+    }
+
+    #[test]
+    fn doctor_waning_only_renders_warning_mark() {
+        let data = doctor_output(vec![
+            safety("home", PromiseStatus::Protected),
+            safety("docs", PromiseStatus::AtRisk),
+        ]);
+        let out = render_doctor(&data, OutputMode::Interactive);
+        assert!(out.contains("1 of 2 sealed"), "got: {out}");
+        assert!(out.contains('\u{26a0}'), "waning-only wears ⚠, not ✗");
+    }
+
+    #[test]
+    fn doctor_unprotected_renders_cross_mark() {
+        let data = doctor_output(vec![
+            safety("home", PromiseStatus::Protected),
+            safety("docs", PromiseStatus::Unprotected),
+        ]);
+        let out = render_doctor(&data, OutputMode::Interactive);
+        assert!(out.contains("1 of 2 sealed"), "got: {out}");
+        assert!(out.contains('\u{2717}'), "any exposed subvolume wears ✗");
+    }
+
+    #[test]
+    fn doctor_empty_data_safety_is_vacuously_sealed() {
+        // Zero subvolumes means zero broken promises: "✓ 0 of 0 sealed".
+        // Pins the vacuous-truth branch end-to-end — the rollup's
+        // `all_protected()` must stay TRUE on empty or this flips to ✗/⚠.
+        let data = doctor_output(vec![]);
+        let out = render_doctor(&data, OutputMode::Interactive);
+        assert!(out.contains("0 of 0 sealed"), "got: {out}");
+        assert!(out.contains('\u{2713}'));
     }
 }

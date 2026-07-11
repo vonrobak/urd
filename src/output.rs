@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::advice::{ActionableAdvice, RedundancyAdvisory, RedundancyAdvisoryKind};
 use crate::awareness::{DriveAssessment, PromiseStatus, SubvolAssessment};
+use crate::config::ResolvedSubvolume;
 use crate::rotation::WindowSource;
 use crate::storage_critical::{StoragePosture, TightnessTier};
 use crate::types::{ByteSize, DriveRole};
@@ -277,8 +278,58 @@ pub struct StatusAssessment {
 }
 
 impl StatusAssessment {
+    /// Build the complete rows for a set of assessments — the only
+    /// public construction path (UPI 088-a). Joins each assessment to
+    /// its resolved subvolume by name and fills `promise_level`,
+    /// `retention_summary`, and `external_only` at construction: the
+    /// mirror is total, no caller backfills.
+    ///
+    /// A name miss is impossible for real `assess()` output (it emits
+    /// names verbatim from `resolved_subvolumes()`). If a join bug ever
+    /// produces one, the row still renders with those three fields
+    /// defaulted — fail-open: a subvolume must never vanish from a
+    /// report — and debug builds assert loudly.
     #[must_use]
-    pub fn from_assessment(a: &SubvolAssessment) -> Self {
+    pub fn rows(
+        assessments: &[SubvolAssessment],
+        resolved: &[ResolvedSubvolume],
+        now: chrono::NaiveDateTime,
+    ) -> Vec<Self> {
+        assessments
+            .iter()
+            .map(|a| match resolved.iter().find(|sv| sv.name == a.name) {
+                Some(sv) => Self::from_assessment(a, sv, now),
+                None => {
+                    debug_assert!(
+                        false,
+                        "assessment {:?} has no resolved subvolume — join bug",
+                        a.name
+                    );
+                    Self::incomplete_from_assessment(a)
+                }
+            })
+            .collect()
+    }
+
+    /// The total constructor: every field filled, including the three
+    /// config-derived ones the old public constructor left for callers
+    /// to remember.
+    fn from_assessment(a: &SubvolAssessment, sv: &ResolvedSubvolume, now: chrono::NaiveDateTime) -> Self {
+        Self {
+            promise_level: sv.protection_level.map(|pl| pl.to_string()),
+            retention_summary: Some(crate::retention::retention_summary(
+                &sv.local_retention,
+                &sv.snapshot_interval,
+                now,
+            )),
+            external_only: sv.local_retention.is_transient() && sv.send_enabled,
+            ..Self::incomplete_from_assessment(a)
+        }
+    }
+
+    /// Assessment-only fields; the three config-derived fields default.
+    /// Reached in production only through `rows()`'s impossible-miss arm.
+    fn incomplete_from_assessment(a: &SubvolAssessment) -> Self {
         Self {
             name: a.name.clone(),
             short_name: a.short_name.clone(),
@@ -1831,7 +1882,7 @@ mod tests {
             effective_send_interval: None,
         };
 
-        let sa = StatusAssessment::from_assessment(&assessment);
+        let sa = StatusAssessment::incomplete_from_assessment(&assessment);
         assert_eq!(sa.redundancy_advisories.len(), 1);
         assert_eq!(sa.redundancy_advisories[0], advisory);
     }
