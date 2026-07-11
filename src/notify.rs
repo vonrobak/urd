@@ -14,8 +14,8 @@ use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
-use crate::awareness::PromiseStatus;
-use crate::heartbeat::Heartbeat;
+use crate::awareness::{PromiseChange, PromiseSnapshot, PromiseStatus, promise_changes};
+use crate::heartbeat::{Heartbeat, SubvolumeHeartbeat};
 use crate::storage_critical::{TightnessTier, Transition};
 
 // ── Event types ────────────────────────────────────────────────────────
@@ -230,74 +230,31 @@ pub fn compute_notifications(
     previous: Option<&Heartbeat>,
     current: &Heartbeat,
 ) -> Vec<Notification> {
-    let mut notifications = Vec::new();
-
-    // ── Promise state transitions ──────────────────────────────────
-    if let Some(prev) = previous {
-        for current_sv in &current.subvolumes {
-            if let Some(prev_sv) = prev
-                .subvolumes
-                .iter()
-                .find(|s| s.name == current_sv.name)
-                .filter(|prev_sv| prev_sv.promise_status != current_sv.promise_status)
-            {
-                if is_degradation(prev_sv.promise_status, current_sv.promise_status) {
-                    notifications.push(Notification {
-                        event: NotificationEvent::PromiseDegraded {
-                            subvolume: current_sv.name.clone(),
-                            from: prev_sv.promise_status.to_string(),
-                            to: current_sv.promise_status.to_string(),
-                        },
-                        urgency: Urgency::Warning,
-                        title: format!(
-                            "Urd: {} is now {}",
-                            current_sv.name, current_sv.promise_status
-                        ),
-                        body: format!(
-                            "The thread of {} has frayed — it was {}, now {}. \
-                             The well remembers, but the thread grows thin.",
-                            current_sv.name, prev_sv.promise_status, current_sv.promise_status
-                        ),
-                    });
-                } else {
-                    notifications.push(Notification {
-                        event: NotificationEvent::PromiseRecovered {
-                            subvolume: current_sv.name.clone(),
-                            from: prev_sv.promise_status.to_string(),
-                            to: current_sv.promise_status.to_string(),
-                        },
-                        urgency: Urgency::Info,
-                        title: format!(
-                            "Urd: {} restored to {}",
-                            current_sv.name, current_sv.promise_status
-                        ),
-                        body: format!(
-                            "The thread of {} is mended — restored from {} to {}.",
-                            current_sv.name, prev_sv.promise_status, current_sv.promise_status
-                        ),
-                    });
-                }
-            }
-        }
+    fn snapshots(subvolumes: &[SubvolumeHeartbeat]) -> Vec<PromiseSnapshot> {
+        subvolumes
+            .iter()
+            .map(|sv| PromiseSnapshot {
+                name: sv.name.clone(),
+                status: sv.promise_status,
+            })
+            .collect()
     }
 
-    // ── All unprotected ────────────────────────────────────────────
+    // ── Promise state transitions + all-unprotected ────────────────
+    // First-run semantics: `previous: None` yields no transitions, but
+    // all-unprotected is still evaluated on `current` — a system born
+    // broken must say so.
+    let changes = match previous {
+        Some(prev) => promise_changes(&snapshots(&prev.subvolumes), &snapshots(&current.subvolumes)),
+        None => Vec::new(),
+    };
     let all_unprotected = !current.subvolumes.is_empty()
         && current
             .subvolumes
             .iter()
             .all(|sv| sv.promise_status == PromiseStatus::Unprotected);
 
-    if all_unprotected {
-        notifications.push(Notification {
-            event: NotificationEvent::AllUnprotected,
-            urgency: Urgency::Critical,
-            title: "Urd: all promises broken".to_string(),
-            body: "Every thread in the well has snapped. No subvolume is protected. \
-                   Attend to this — your data stands exposed."
-                .to_string(),
-        });
-    }
+    let mut notifications = build_promise_change_notifications(&changes, all_unprotected);
 
     // ── Backup failures ────────────────────────────────────────────
     let failed_count = current
@@ -359,8 +316,67 @@ pub fn compute_notifications(
 /// True when the promise status worsened. `PromiseStatus`'s `Ord` is
 /// worst-to-best (`Unprotected < AtRisk < Protected`), so a degradation is
 /// `to < from`. Named helper documents direction; mirrors `events.rs`.
-fn is_degradation(from: PromiseStatus, to: PromiseStatus) -> bool {
-    to.worsened_from(from)
+/// Render promise-change notifications — THE single home of the
+/// degraded/recovered/all-unprotected prose (UPI 088-a, arc R1).
+///
+/// Both notification paths feed it: `compute_notifications` (heartbeat
+/// diff, backup path) and `sentinel_runner::build_notifications`
+/// (assessment diff, daemon path). First-run suppression is deliberately
+/// the caller's: pass the changes you want spoken and the
+/// all-unprotected verdict you computed — the two callers suppress
+/// differently and must keep doing so.
+#[must_use]
+pub fn build_promise_change_notifications(
+    changes: &[PromiseChange],
+    all_unprotected: bool,
+) -> Vec<Notification> {
+    let mut notifications = Vec::new();
+
+    for change in changes {
+        if change.to.worsened_from(change.from) {
+            notifications.push(Notification {
+                event: NotificationEvent::PromiseDegraded {
+                    subvolume: change.name.clone(),
+                    from: change.from.to_string(),
+                    to: change.to.to_string(),
+                },
+                urgency: Urgency::Warning,
+                title: format!("Urd: {} is now {}", change.name, change.to),
+                body: format!(
+                    "The thread of {} has frayed — it was {}, now {}. \
+                     The well remembers, but the thread grows thin.",
+                    change.name, change.from, change.to
+                ),
+            });
+        } else {
+            notifications.push(Notification {
+                event: NotificationEvent::PromiseRecovered {
+                    subvolume: change.name.clone(),
+                    from: change.from.to_string(),
+                    to: change.to.to_string(),
+                },
+                urgency: Urgency::Info,
+                title: format!("Urd: {} restored to {}", change.name, change.to),
+                body: format!(
+                    "The thread of {} is mended — restored from {} to {}.",
+                    change.name, change.from, change.to
+                ),
+            });
+        }
+    }
+
+    if all_unprotected {
+        notifications.push(Notification {
+            event: NotificationEvent::AllUnprotected,
+            urgency: Urgency::Critical,
+            title: "Urd: all promises broken".to_string(),
+            body: "Every thread in the well has snapped. No subvolume is protected. \
+                   Attend to this — your data stands exposed."
+                .to_string(),
+        });
+    }
+
+    notifications
 }
 
 // ── Drive reconnection notifications ──────────────────────────────────
