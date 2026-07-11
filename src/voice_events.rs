@@ -109,14 +109,11 @@ fn summary_for(payload: &EventPayload) -> String {
             format!("deferred — {reason}")
         }
         EventPayload::PromiseTransition { from, to, trigger } => {
-            let arrow = if to < from { "←" } else { "→" };
+            let worsened = to.worsened_from(*from);
+            let arrow = if worsened { "←" } else { "→" };
             format!(
                 "the thread of this subvolume {} ({} {arrow} {})  [{}]",
-                if to < from {
-                    "frayed"
-                } else {
-                    "is mended"
-                },
+                if worsened { "frayed" } else { "is mended" },
                 from,
                 to,
                 trigger_phrase(*trigger)

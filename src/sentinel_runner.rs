@@ -1024,7 +1024,7 @@ pub fn build_notifications(
             let from = prev.status.to_string();
             let to = assess.status.to_string();
 
-            if assess.status < prev.status {
+            if assess.status.worsened_from(prev.status) {
                 // Degradation
                 notifications.push(Notification {
                     event: NotificationEvent::PromiseDegraded {

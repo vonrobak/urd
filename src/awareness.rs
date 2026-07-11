@@ -204,6 +204,19 @@ pub enum PromiseStatus {
     Protected,
 }
 
+impl PromiseStatus {
+    /// Did the promise worsen relative to `prev`?
+    ///
+    /// The single home of the `to < from` direction test (UPI 088-a) —
+    /// every degradation/recovery decision delegates here. Rides the
+    /// enum's worst-to-best `Ord`; the "do not reorder" contract above
+    /// is what makes this comparison meaningful.
+    #[must_use]
+    pub fn worsened_from(self, prev: Self) -> bool {
+        self < prev
+    }
+}
+
 impl std::fmt::Display for PromiseStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1418,6 +1431,19 @@ mod tests {
     use crate::plan::MockFileSystemState;
     use crate::types::SnapshotName;
     use chrono::NaiveDate;
+
+    // ── PromiseStatus::worsened_from (UPI 088-a) ────────────────────
+    // Moved from notify.rs (`is_degradation_follows_ord`) when the
+    // direction test got its single home next to the Ord it rides.
+
+    #[test]
+    fn worsened_from_follows_ord() {
+        // Worsening (to < from) is a degradation; improving is not.
+        assert!(PromiseStatus::AtRisk.worsened_from(PromiseStatus::Protected));
+        assert!(PromiseStatus::Unprotected.worsened_from(PromiseStatus::AtRisk));
+        assert!(!PromiseStatus::Protected.worsened_from(PromiseStatus::AtRisk));
+        assert!(!PromiseStatus::Protected.worsened_from(PromiseStatus::Protected));
+    }
 
     /// Test config with one drive and min_free_bytes set.
     fn test_config_with_min_free() -> Config {

@@ -360,7 +360,7 @@ pub fn compute_notifications(
 /// worst-to-best (`Unprotected < AtRisk < Protected`), so a degradation is
 /// `to < from`. Named helper documents direction; mirrors `events.rs`.
 fn is_degradation(from: PromiseStatus, to: PromiseStatus) -> bool {
-    to < from
+    to.worsened_from(from)
 }
 
 // ── Drive reconnection notifications ──────────────────────────────────
@@ -1256,27 +1256,6 @@ mod tests {
     }
 
     // ── Degradation direction ──────────────────────────────────────
-
-    #[test]
-    fn is_degradation_follows_ord() {
-        // Worsening (to < from) is a degradation; improving is not.
-        assert!(is_degradation(
-            PromiseStatus::Protected,
-            PromiseStatus::AtRisk
-        ));
-        assert!(is_degradation(
-            PromiseStatus::AtRisk,
-            PromiseStatus::Unprotected
-        ));
-        assert!(!is_degradation(
-            PromiseStatus::AtRisk,
-            PromiseStatus::Protected
-        ));
-        assert!(!is_degradation(
-            PromiseStatus::Protected,
-            PromiseStatus::Protected
-        ));
-    }
 
     // ── Multiple events in one transition ──────────────────────────
 
