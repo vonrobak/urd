@@ -794,6 +794,44 @@ source = "/"
         ));
     }
 
+    #[test]
+    fn advance_stamps_run_id_on_the_transition_row() {
+        // (UPI 088-c characterization) The transition's audit row carries the
+        // executor's run id through the writeback stamp path. Every other test
+        // passes `None`; this pins the `Some` path the recorder must preserve.
+        // The run row must exist first — events.run_id REFERENCES runs(id), and
+        // record_events_best_effort swallows the FK violation otherwise.
+        let db = StateDb::open_memory().unwrap();
+        let run_id = db.begin_run("backup").unwrap();
+        let now = dt("2026-05-30T04:00:00");
+        let signals =
+            gather_with(&cfg(), &HashMap::new(), Some("root-uuid"), resolver, space_tight);
+
+        let transitions = writeback::advance_and_writeback(
+            &db,
+            now,
+            &resolve_armed_tiers(&signals),
+            Some(run_id),
+        );
+        assert_eq!(transitions.len(), 1);
+
+        let rows = db
+            .query_events(&crate::state::EventQueryFilter {
+                since: None,
+                kind: Some(crate::events::EventKind::Storage),
+                subvolume: None,
+                drive_label: None,
+                limit: 100,
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].run_id,
+            Some(run_id),
+            "writeback stamps the executor's run id"
+        );
+    }
+
     /// Query the `StorageTierTransition` payloads recorded in `db` (UPI 064-b).
     fn storage_rows(db: &StateDb) -> Vec<EventPayload> {
         db.query_events(&crate::state::EventQueryFilter {
