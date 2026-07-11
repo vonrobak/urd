@@ -389,6 +389,94 @@ impl Event {
     }
 }
 
+// ── Run context + the emit-side stamp (UPI 088-c) ─────────────────────
+
+/// The run context an impure layer stamps onto events at persistence
+/// time. `run_id: None` is never a default — it is only reachable through
+/// the explicit [`RunContext::outside_run`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // callers arrive with the step-3 type flip (UPI 088-c)
+pub struct RunContext {
+    run_id: Option<i64>,
+}
+
+#[allow(dead_code)] // callers arrive with the step-3 type flip (UPI 088-c)
+impl RunContext {
+    /// Context for a backup run. `run_id` comes from the executor's
+    /// `begin_run` (`None` when the state DB is unavailable — ADR-102).
+    #[must_use]
+    pub fn for_run(run_id: Option<i64>) -> Self {
+        Self { run_id }
+    }
+
+    /// Context outside any backup run — sentinel rounds, the pre-run
+    /// emergency preflight, drive detection. Stamps `run_id: None`.
+    #[must_use]
+    pub fn outside_run() -> Self {
+        Self { run_id: None }
+    }
+}
+
+/// An event that has not yet been stamped with its run context. The only
+/// way from a pure emitter to a persistable [`Event`] is [`stamp`] — that
+/// makes "emitter output cannot reach the DB unstamped" a compile fact.
+///
+/// Deliberately NO accessor returning `&Event`: that would hand back a
+/// cloneable `Event` and reopen the bypass. Tests stamp with a dummy
+/// [`RunContext`], then assert on the stamped event.
+///
+/// [`stamp`]: UnstampedEvent::stamp
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // callers arrive with the step-3 type flip (UPI 088-c)
+pub struct UnstampedEvent {
+    event: Event,
+}
+
+#[allow(dead_code)] // callers arrive with the step-3 type flip (UPI 088-c)
+impl UnstampedEvent {
+    /// Interim constructor (UPI 088-c step 1); `Event::pure` becomes the
+    /// sole entry once its return type flips in step 3.
+    #[must_use]
+    pub(crate) fn new(occurred_at: NaiveDateTime, payload: EventPayload) -> Self {
+        Self {
+            event: Event {
+                occurred_at,
+                run_id: None,
+                subvolume: None,
+                drive_label: None,
+                payload,
+            },
+        }
+    }
+
+    /// Stamp the run context, yielding the persistable event. Sets
+    /// `run_id` ONLY — `occurred_at` is the producer's semantic clock and
+    /// is never overwritten.
+    #[must_use = "a dropped stamp() is a discarded event"]
+    pub fn stamp(self, ctx: &RunContext) -> Event {
+        let mut event = self.event;
+        event.run_id = ctx.run_id;
+        event
+    }
+
+    /// Set the semantic-origin subvolume if not already set. `None` is a
+    /// no-op; an already-set value is never clobbered (preserves the
+    /// planner's `stamp_context` fill-if-unset guard).
+    pub fn fill_subvolume(&mut self, subvolume: Option<String>) {
+        if self.event.subvolume.is_none() {
+            self.event.subvolume = subvolume;
+        }
+    }
+
+    /// Set the semantic-origin drive label if not already set. Same
+    /// fill-if-unset semantics as [`fill_subvolume`](Self::fill_subvolume).
+    pub fn fill_drive_label(&mut self, drive_label: Option<String>) {
+        if self.event.drive_label.is_none() {
+            self.event.drive_label = drive_label;
+        }
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -944,5 +1032,56 @@ mod tests {
         };
         let json = serde_json::to_value(&payload).unwrap();
         assert!(json.get("tier").is_none(), "tier should be omitted when None");
+    }
+
+    // ── UnstampedEvent + RunContext (UPI 088-c) ───────────────────────
+
+    fn unstamped() -> UnstampedEvent {
+        UnstampedEvent::new(
+            now(),
+            EventPayload::WatchdogAbort {
+                pool_label: "/data".into(),
+                snapshots_reclaimed: 2,
+                send_aborted: true,
+            },
+        )
+    }
+
+    #[test]
+    fn stamp_sets_run_id_from_context() {
+        assert_eq!(
+            unstamped().stamp(&RunContext::for_run(Some(7))).run_id,
+            Some(7)
+        );
+        assert_eq!(unstamped().stamp(&RunContext::for_run(None)).run_id, None);
+        assert_eq!(unstamped().stamp(&RunContext::outside_run()).run_id, None);
+    }
+
+    #[test]
+    fn stamp_preserves_producer_fields() {
+        let mut ev = unstamped();
+        ev.fill_subvolume(Some("alpha".into()));
+        ev.fill_drive_label(Some("WD".into()));
+        let stamped = ev.stamp(&RunContext::for_run(Some(3)));
+        // occurred_at is the producer's semantic clock — never overwritten.
+        assert_eq!(stamped.occurred_at, now());
+        assert_eq!(stamped.subvolume.as_deref(), Some("alpha"));
+        assert_eq!(stamped.drive_label.as_deref(), Some("WD"));
+        assert!(matches!(
+            stamped.payload,
+            EventPayload::WatchdogAbort { snapshots_reclaimed: 2, .. }
+        ));
+    }
+
+    #[test]
+    fn fill_is_set_if_unset() {
+        let mut ev = unstamped();
+        ev.fill_subvolume(Some("alpha".into()));
+        ev.fill_subvolume(Some("beta".into())); // already set — never clobbered
+        ev.fill_drive_label(None); // None is a no-op
+        ev.fill_drive_label(Some("WD".into()));
+        let stamped = ev.stamp(&RunContext::outside_run());
+        assert_eq!(stamped.subvolume.as_deref(), Some("alpha"));
+        assert_eq!(stamped.drive_label.as_deref(), Some("WD"));
     }
 }
