@@ -21,6 +21,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `promise_changes`, `worsened_from`, one shared prose builder) — the backup
   and sentinel notification paths render byte-identical sentences from one
   core, pinned by golden tests. No behavior change (#297).
+- Every audit event now reaches the events log through one recorder seam that
+  stamps its run context, persists best-effort, and dispatches the matching
+  notification — an unstamped event can no longer be persisted at all (the
+  type system forbids it), so `urd events` rows can be trusted to carry their
+  run context. Event rows, notification prose, and dispatch behavior are
+  byte-identical. No behavior change (#301).
 
 ## [0.34.0] - 2026-07-11
 
