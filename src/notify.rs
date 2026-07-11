@@ -312,9 +312,6 @@ pub fn compute_notifications(
     notifications
 }
 
-/// True when the promise status worsened. `PromiseStatus`'s `Ord` is
-/// worst-to-best (`Unprotected < AtRisk < Protected`), so a degradation is
-/// `to < from`. Named helper documents direction; mirrors `events.rs`.
 /// Render promise-change notifications — THE single home of the
 /// degraded/recovered/all-unprotected prose (UPI 088-a, arc R1).
 ///

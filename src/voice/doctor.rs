@@ -11,6 +11,7 @@ use std::fmt::Write;
 
 use colored::Colorize;
 
+use crate::awareness::PromiseRollup;
 use crate::output::{DoctorCheck, DoctorCheckStatus, DoctorOutput, DoctorVerdictStatus, OutputMode};
 use crate::plan::format_duration_short;
 use crate::storage_critical::TightnessTier;
@@ -104,7 +105,7 @@ fn render_doctor_interactive(data: &DoctorOutput) -> String {
     // Promise partition via the one rollup (UPI 088-a). all_protected()
     // is vacuously true on empty input — zero subvolumes renders
     // "✓ 0 of 0 sealed", pinned by the tests below.
-    let rollup = crate::awareness::PromiseRollup::from_pairs(
+    let rollup = PromiseRollup::from_pairs(
         data.data_safety.iter().map(|d| (d.name.clone(), d.status)),
     );
     let sealed_count = rollup.protected.len();
