@@ -362,16 +362,20 @@ pub struct Event {
 }
 
 impl Event {
-    /// Pure-module constructor: leaves `run_id`/`subvolume`/`drive_label`
-    /// unset so the impure caller can stamp them before persistence.
+    /// Pure-module constructor. Returns an [`UnstampedEvent`]: the only
+    /// path from here to a persistable `Event` is
+    /// [`UnstampedEvent::stamp`], so emitter output cannot reach the DB
+    /// without a [`RunContext`] (UPI 088-c).
     #[must_use]
-    pub fn pure(occurred_at: NaiveDateTime, payload: EventPayload) -> Self {
-        Self {
-            occurred_at,
-            run_id: None,
-            subvolume: None,
-            drive_label: None,
-            payload,
+    pub fn pure(occurred_at: NaiveDateTime, payload: EventPayload) -> UnstampedEvent {
+        UnstampedEvent {
+            event: Self {
+                occurred_at,
+                run_id: None,
+                subvolume: None,
+                drive_label: None,
+                payload,
+            },
         }
     }
 
@@ -395,12 +399,10 @@ impl Event {
 /// time. `run_id: None` is never a default — it is only reachable through
 /// the explicit [`RunContext::outside_run`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // callers arrive with the step-3 type flip (UPI 088-c)
 pub struct RunContext {
     run_id: Option<i64>,
 }
 
-#[allow(dead_code)] // callers arrive with the step-3 type flip (UPI 088-c)
 impl RunContext {
     /// Context for a backup run. `run_id` comes from the executor's
     /// `begin_run` (`None` when the state DB is unavailable — ADR-102).
@@ -427,28 +429,11 @@ impl RunContext {
 ///
 /// [`stamp`]: UnstampedEvent::stamp
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // callers arrive with the step-3 type flip (UPI 088-c)
 pub struct UnstampedEvent {
-    event: Event,
+    pub(crate) event: Event, // pub(crate) only for Event::pure's construction — no accessor
 }
 
-#[allow(dead_code)] // callers arrive with the step-3 type flip (UPI 088-c)
 impl UnstampedEvent {
-    /// Interim constructor (UPI 088-c step 1); `Event::pure` becomes the
-    /// sole entry once its return type flips in step 3.
-    #[must_use]
-    pub(crate) fn new(occurred_at: NaiveDateTime, payload: EventPayload) -> Self {
-        Self {
-            event: Event {
-                occurred_at,
-                run_id: None,
-                subvolume: None,
-                drive_label: None,
-                payload,
-            },
-        }
-    }
-
     /// Stamp the run context, yielding the persistable event. Sets
     /// `run_id` ONLY — `occurred_at` is the producer's semantic clock and
     /// is never overwritten.
@@ -457,6 +442,15 @@ impl UnstampedEvent {
         let mut event = self.event;
         event.run_id = ctx.run_id;
         event
+    }
+
+    /// Read-only payload access for emit-side matching (e.g. pairing a
+    /// retention prune event with its executed delete). Deliberately NOT
+    /// `&Event`: a payload reference cannot be turned into a persistable
+    /// `Event` without a read-side-only struct literal.
+    #[must_use]
+    pub fn payload(&self) -> &EventPayload {
+        &self.event.payload
     }
 
     /// Set the semantic-origin subvolume if not already set. `None` is a
@@ -1037,7 +1031,7 @@ mod tests {
     // ── UnstampedEvent + RunContext (UPI 088-c) ───────────────────────
 
     fn unstamped() -> UnstampedEvent {
-        UnstampedEvent::new(
+        Event::pure(
             now(),
             EventPayload::WatchdogAbort {
                 pool_label: "/data".into(),

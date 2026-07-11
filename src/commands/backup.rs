@@ -446,15 +446,16 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
                 }
             };
         if let Some(db) = world.db() {
-            let mut ev = Event::pure(
+            let ctx = crate::events::RunContext::for_run(result.run_id);
+            let ev = Event::pure(
                 event_ts,
                 EventPayload::WatchdogAbort {
                     pool_label: fire.pool_label.clone(),
                     snapshots_reclaimed: reclaimed,
                     send_aborted: fire.send_aborted,
                 },
-            );
-            ev.run_id = result.run_id;
+            )
+            .stamp(&ctx);
             db.record_events_best_effort(&[ev]);
             // (UPI 064-b B7) record the Tier-1 offsite chains the reclaim broke,
             // for audit symmetry with the planner-driven away-shed. NO separate
@@ -462,7 +463,7 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
             // the next backup will be a full send (avoid double-notifying).
             let release_events: Vec<Event> = releases
                 .iter()
-                .map(|r| r.to_event(event_ts, result.run_id))
+                .map(|r| r.to_event(event_ts).stamp(&ctx))
                 .collect();
             if !release_events.is_empty() {
                 db.record_events_best_effort(&release_events);
@@ -496,9 +497,10 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     if !offsite_releases.is_empty() {
         let now_ts = chrono::Local::now().naive_local();
         if let Some(db) = world.db() {
+            let ctx = crate::events::RunContext::for_run(result.run_id);
             let events: Vec<Event> = offsite_releases
                 .iter()
-                .map(|r| r.to_event(now_ts, result.run_id))
+                .map(|r| r.to_event(now_ts).stamp(&ctx))
                 .collect();
             db.record_events_best_effort(&events);
         }
@@ -615,11 +617,10 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
             crate::events::TransitionTrigger::Run,
         );
         if !promise_events.is_empty() {
-            // Stamp run_id from the executor result.
-            let mut stamped = promise_events;
-            for ev in &mut stamped {
-                ev.run_id = result.run_id;
-            }
+            // Stamp the run context from the executor result.
+            let ctx = crate::events::RunContext::for_run(result.run_id);
+            let stamped: Vec<Event> =
+                promise_events.into_iter().map(|e| e.stamp(&ctx)).collect();
             db.record_events_best_effort(&stamped);
         }
     }
@@ -2195,7 +2196,14 @@ fn run_emergency_preflight(
         crate::drives::filesystem_free_bytes(p).ok()
     })?;
     if let Some(db) = state_db {
-        db.record_events_best_effort(&outcome.emitted_events);
+        // Emergency runs before begin_run — explicitly outside any run.
+        let ctx = crate::events::RunContext::outside_run();
+        let stamped: Vec<Event> = outcome
+            .emitted_events
+            .iter()
+            .map(|e| e.clone().stamp(&ctx))
+            .collect();
+        db.record_events_best_effort(&stamped);
     }
     // Told-not-silent: emergency deletions before a backup must never be
     // silent. Best-effort — dispatch failure never blocks the run.
@@ -2223,7 +2231,7 @@ fn run_emergency_preflight(
 /// `StateDb`.
 struct EmergencyPreflightOutcome {
     any_deleted: bool,
-    emitted_events: Vec<crate::events::Event>,
+    emitted_events: Vec<crate::events::UnstampedEvent>,
     /// One entry per root that had at least one successful emergency delete;
     /// the wrapper turns these into `EmergencyRetentionRan` notifications.
     root_summaries: Vec<EmergencyRootReclaim>,
@@ -2257,7 +2265,7 @@ fn run_emergency_preflight_with(
     let resolved = config.resolved_subvolumes();
     let drive_labels = config.drive_labels();
     let mut any_deleted = false;
-    let mut emitted_events: Vec<crate::events::Event> = Vec::new();
+    let mut emitted_events: Vec<crate::events::UnstampedEvent> = Vec::new();
     let mut root_summaries: Vec<EmergencyRootReclaim> = Vec::new();
 
     for root in &config.local_snapshots.roots {
@@ -2344,7 +2352,7 @@ fn run_emergency_preflight_with(
                         // Stamp the matching emitted event with the
                         // subvolume name and stash for persistence.
                         if let Some(idx) =
-                            result.events.iter().position(|ev| match &ev.payload {
+                            result.events.iter().position(|ev| match ev.payload() {
                                 crate::events::EventPayload::RetentionPrune {
                                     snapshot,
                                     ..
@@ -2353,9 +2361,7 @@ fn run_emergency_preflight_with(
                             })
                         {
                             let mut ev = result.events.remove(idx);
-                            if ev.subvolume.is_none() {
-                                ev.subvolume = Some(subvol_name.clone());
-                            }
+                            ev.fill_subvolume(Some(subvol_name.clone()));
                             emitted_events.push(ev);
                         }
                     }
@@ -3234,7 +3240,11 @@ source = "/data/beta"
         let out = run_emergency_preflight_with(&config, pass_now(), &mock, below()).unwrap();
 
         assert_eq!(out.emitted_events.len(), 2);
+        // Stamp-then-assert (UPI 088-c): context fields are read off the
+        // stamped event; UnstampedEvent deliberately has no accessor.
+        let ctx = crate::events::RunContext::outside_run();
         for ev in &out.emitted_events {
+            let ev = ev.clone().stamp(&ctx);
             assert_eq!(ev.subvolume.as_deref(), Some("alpha"));
             assert_eq!(ev.occurred_at, pass_now(), "events carry the injected pass clock");
             match &ev.payload {
@@ -3269,7 +3279,7 @@ source = "/data/beta"
         );
         // Event only for the successful delete (the push lives in the Ok arm).
         assert_eq!(out.emitted_events.len(), 1);
-        match &out.emitted_events[0].payload {
+        match out.emitted_events[0].payload() {
             crate::events::EventPayload::RetentionPrune { snapshot, .. } => {
                 assert_eq!(snapshot, "20260102-1200-alpha");
             }

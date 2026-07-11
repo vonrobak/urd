@@ -441,7 +441,7 @@ pub mod writeback {
                 // superset of the escalation-only NOTIFICATIONS below and does NOT
                 // violate "de-escalation is silent": that rule governs notifications,
                 // not the audit log.
-                let mut ev = Event::pure(
+                let ev = Event::pure(
                     now,
                     EventPayload::StorageTierTransition {
                         pool_label: pool.label.clone(),
@@ -449,8 +449,8 @@ pub mod writeback {
                         to: transition.to.as_db_str().to_string(),
                         host_root: pool.host_root,
                     },
-                );
-                ev.run_id = run_id;
+                )
+                .stamp(&crate::events::RunContext::for_run(run_id));
                 state_db.record_events_best_effort(&[ev]);
 
                 if transition.is_escalation() {

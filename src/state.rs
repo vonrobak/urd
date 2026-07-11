@@ -886,8 +886,12 @@ impl StateDb {
             DriveEventType::Mounted => EventPayload::DriveMounted { detected_by },
             DriveEventType::Unmounted => EventPayload::DriveUnmounted { detected_by },
         };
+        // Not a dance site: no notification, error-propagating granular
+        // wrapper (pre-088-c contract). Drive detection happens outside
+        // any backup run, so the stamp is an explicit outside_run.
         let mut event = Event::pure(chrono::Local::now().naive_local(), payload);
-        event.drive_label = Some(drive_label.to_string());
+        event.fill_drive_label(Some(drive_label.to_string()));
+        let event = event.stamp(&crate::events::RunContext::outside_run());
         self.record_events_inner(&[event])
             .map_err(|e| UrdError::State(format!("failed to record drive event: {e}")))
     }

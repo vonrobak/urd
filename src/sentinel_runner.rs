@@ -168,7 +168,7 @@ impl SentinelRunner {
     /// `execute_assess` so it can emit promise-transition events with the
     /// correct `TransitionTrigger`.
     fn process_events(&mut self, events: Vec<SentinelEvent>) {
-        let mut all_audit_events: Vec<crate::events::Event> = Vec::new();
+        let mut all_audit_events: Vec<crate::events::UnstampedEvent> = Vec::new();
 
         // Pre-pass: reload config before state machine processes ConfigChanged.
         // This ensures the Assess action (emitted by the transition) uses the new config.
@@ -195,11 +195,15 @@ impl SentinelRunner {
 
         self.execute_actions(&all_actions, trigger, &mut all_audit_events);
 
-        // Persist all collected audit events best-effort.
+        // Persist all collected audit events best-effort. A sentinel round
+        // is outside any backup run — the stamp is an explicit outside_run.
         if !all_audit_events.is_empty()
             && let Ok(db) = StateDb::open(&self.config.general.state_db)
         {
-            db.record_events_best_effort(&all_audit_events);
+            let ctx = crate::events::RunContext::outside_run();
+            let stamped: Vec<crate::events::Event> =
+                all_audit_events.into_iter().map(|e| e.stamp(&ctx)).collect();
+            db.record_events_best_effort(&stamped);
         }
     }
 
@@ -213,7 +217,7 @@ impl SentinelRunner {
         &mut self,
         actions: &[SentinelAction],
         trigger: Option<crate::events::TransitionTrigger>,
-        audit_events: &mut Vec<crate::events::Event>,
+        audit_events: &mut Vec<crate::events::UnstampedEvent>,
     ) {
         let mut need_assess = false;
 
@@ -315,7 +319,7 @@ impl SentinelRunner {
     /// Emits `ConfigReloaded` on success or `ConfigReloadFailed` on
     /// parse error. Initial loads (sentinel startup) do **not** call this
     /// — only sentinel-detected reloads do.
-    fn try_reload_config(&mut self, audit_events: &mut Vec<crate::events::Event>) {
+    fn try_reload_config(&mut self, audit_events: &mut Vec<crate::events::UnstampedEvent>) {
         let now = chrono::Local::now().naive_local();
         match Config::load(Some(&self.config_path)) {
             Ok(new_config) => {
@@ -381,7 +385,7 @@ impl SentinelRunner {
     fn execute_assess(
         &mut self,
         trigger: Option<crate::events::TransitionTrigger>,
-        audit_events: &mut Vec<crate::events::Event>,
+        audit_events: &mut Vec<crate::events::UnstampedEvent>,
     ) -> anyhow::Result<()> {
         let now = chrono::Local::now().naive_local();
         let state_db = if self.config.general.state_db.exists() {
@@ -520,7 +524,7 @@ impl SentinelRunner {
                         ),
                     },
                 );
-                event.drive_label = Some(anomaly.drive_label.clone());
+                event.fill_drive_label(Some(anomaly.drive_label.clone()));
                 audit_events.push(event);
             }
             self.state.last_chain_health = current_chains;
@@ -704,7 +708,14 @@ impl SentinelRunner {
             if !ctx.audit_events.is_empty()
                 && let Ok(db) = StateDb::open(&self.config.general.state_db)
             {
-                db.record_events_best_effort(&ctx.audit_events);
+                // An idle eject is not a backup run — explicit outside_run.
+                let run_ctx = crate::events::RunContext::outside_run();
+                let stamped: Vec<crate::events::Event> = ctx
+                    .audit_events
+                    .iter()
+                    .map(|e| e.clone().stamp(&run_ctx))
+                    .collect();
+                db.record_events_best_effort(&stamped);
             }
             if !ctx.notifications.is_empty() {
                 notify::dispatch(&ctx.notifications, &self.config.notifications);
@@ -889,7 +900,7 @@ impl SentinelRunner {
                 // states the next backup will be a full send (avoid double-notifying).
                 // `run_id = None`: an idle eject is not a backup run.
                 ctx.audit_events
-                    .extend(outcome.releases().iter().map(|r| r.to_event(ctx.now, None)));
+                    .extend(outcome.releases().iter().map(|r| r.to_event(ctx.now)));
                 // deleted == 0 && Nothing → silent (natural debounce: idle, nothing
                 // creates new snapshots, so after one shed there is nothing left).
                 Some(EjectEvent::ReclaimFinished)
@@ -1137,7 +1148,7 @@ struct EjectContext {
     btrfs: crate::btrfs::RealBtrfs,
     away: HashMap<String, Vec<String>>,
     now: NaiveDateTime,
-    audit_events: Vec<crate::events::Event>,
+    audit_events: Vec<crate::events::UnstampedEvent>,
     notifications: Vec<Notification>,
 }
 
@@ -2038,7 +2049,7 @@ protection = "recorded"
         // Config should be unchanged.
         assert_eq!(runner.config.general.state_db, original_state_db);
         assert!(events.iter().any(|e| matches!(
-            e.payload,
+            e.payload(),
             crate::events::EventPayload::ConfigReloadFailed { .. }
         )));
     }
@@ -2060,7 +2071,7 @@ protection = "recorded"
         runner.try_reload_config(&mut events);
 
         assert!(events.iter().any(|e| matches!(
-            e.payload,
+            e.payload(),
             crate::events::EventPayload::ConfigReloaded { .. }
         )));
 

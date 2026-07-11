@@ -150,7 +150,7 @@ impl<'a> Recorder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::{EventPayload, UnstampedEvent};
+    use crate::events::{Event, EventPayload, UnstampedEvent};
     use crate::heartbeat;
     use crate::notify::{NotificationChannel, NotificationConfig, NotificationEvent, Urgency};
 
@@ -160,7 +160,7 @@ mod tests {
 
     fn unstamped_pair() -> Vec<UnstampedEvent> {
         vec![
-            UnstampedEvent::new(
+            Event::pure(
                 ts(),
                 EventPayload::WatchdogAbort {
                     pool_label: "/data".into(),
@@ -168,7 +168,7 @@ mod tests {
                     send_aborted: true,
                 },
             ),
-            UnstampedEvent::new(
+            Event::pure(
                 ts(),
                 EventPayload::EmergencyEject {
                     pool_label: "/data".into(),

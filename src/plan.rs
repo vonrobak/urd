@@ -9,7 +9,7 @@ use crate::commands::storage_signals::RunArming;
 use crate::config::{Config, DriveConfig, ResolvedSubvolume};
 use crate::drives::DriveAvailability;
 use crate::error::UrdError;
-use crate::events::{DeferScope, Event, EventPayload};
+use crate::events::{DeferScope, Event, EventPayload, UnstampedEvent};
 use crate::retention;
 use crate::storage_critical::{self, EffectivePolicy};
 use crate::types::{
@@ -26,7 +26,7 @@ use crate::types::{
 #[allow(clippy::too_many_arguments)]
 fn record_defer(
     skipped: &mut Vec<PlannedSkip>,
-    events: &mut Vec<Event>,
+    events: &mut Vec<UnstampedEvent>,
     subvol_name: &str,
     drive_label: Option<&str>,
     reason: String,
@@ -42,8 +42,8 @@ fn record_defer(
         nothing_new_to_send,
     });
     let mut event = Event::pure(now, EventPayload::PlannerDefer { reason, scope });
-    event.subvolume = Some(subvol_name.to_string());
-    event.drive_label = drive_label.map(str::to_string);
+    event.fill_subvolume(Some(subvol_name.to_string()));
+    event.fill_drive_label(drive_label.map(str::to_string));
     events.push(event);
 }
 
@@ -81,21 +81,18 @@ fn send_floor_defer_reason(
     }
 }
 
-/// Stamp `subvolume` and/or `drive_label` onto events that don't already
-/// carry one. Used after a pure helper returns so the run-level accumulator
-/// has full context before persistence.
-fn stamp_context(events: &mut [Event], subvolume: Option<&str>, drive_label: Option<&str>) {
+/// Fill `subvolume` and/or `drive_label` onto events that don't already
+/// carry one (the `fill_*` setters are set-if-unset). Used after a pure
+/// helper returns so the run-level accumulator has full context before
+/// the recorder stamps and persists it.
+fn stamp_context(
+    events: &mut [UnstampedEvent],
+    subvolume: Option<&str>,
+    drive_label: Option<&str>,
+) {
     for ev in events.iter_mut() {
-        if let Some(sv) = subvolume
-            && ev.subvolume.is_none()
-        {
-            ev.subvolume = Some(sv.to_string());
-        }
-        if let Some(d) = drive_label
-            && ev.drive_label.is_none()
-        {
-            ev.drive_label = Some(d.to_string());
-        }
+        ev.fill_subvolume(subvolume.map(str::to_string));
+        ev.fill_drive_label(drive_label.map(str::to_string));
     }
 }
 
@@ -204,7 +201,7 @@ fn check_drive_availability(
     drive: &DriveConfig,
     obs: &Observation,
     skipped: &mut Vec<PlannedSkip>,
-    events: &mut Vec<Event>,
+    events: &mut Vec<UnstampedEvent>,
     now: NaiveDateTime,
 ) -> bool {
     match obs.fs.drive_availability(drive) {
@@ -339,7 +336,7 @@ pub fn plan(
     // Skip reason strings are classified by output::SkipCategory::from_reason().
     // When adding new patterns, update output::tests::classify_all_18_patterns.
     let mut skipped = Vec::new();
-    let mut events: Vec<Event> = Vec::new();
+    let mut events: Vec<UnstampedEvent> = Vec::new();
     let mut judgments: Vec<SubvolJudgment> = Vec::new();
     let mut lifecycles: std::collections::HashMap<String, PlannedLifecycle> =
         std::collections::HashMap::new();
@@ -788,7 +785,7 @@ fn plan_local_snapshot(
     obs: &Observation,
     operations: &mut Vec<PlannedOperation>,
     skipped: &mut Vec<PlannedSkip>,
-    events: &mut Vec<Event>,
+    events: &mut Vec<UnstampedEvent>,
 ) -> Option<SnapshotName> {
     // Space guard: refuse to create if local filesystem is below min_free_bytes threshold.
     // This prevents the catastrophic failure mode where snapshot creation fills the source
@@ -954,7 +951,7 @@ fn plan_local_retention(
     mounted_pins: &HashSet<SnapshotName>,
     obs: &Observation,
     operations: &mut Vec<PlannedOperation>,
-    events: &mut Vec<Event>,
+    events: &mut Vec<UnstampedEvent>,
 ) {
     if local_snaps.is_empty() {
         return;
@@ -1084,7 +1081,7 @@ fn plan_transient_lifecycle(
     obs: &Observation,
     operations: &mut Vec<PlannedOperation>,
     skipped: &mut Vec<PlannedSkip>,
-    events: &mut Vec<Event>,
+    events: &mut Vec<UnstampedEvent>,
 ) {
     // ── Phase 0: Send-space guard (UPI 054-a) ──────────────────────
     // In the transient path snapshot creation is gated on a send being due
@@ -1313,7 +1310,7 @@ fn plan_external_send(
     obs: &Observation,
     operations: &mut Vec<PlannedOperation>,
     skipped: &mut Vec<PlannedSkip>,
-    events: &mut Vec<Event>,
+    events: &mut Vec<UnstampedEvent>,
 ) {
     // Send planning must consider the just-planned snapshot: without this
     // augmentation, a "caught up" state (latest local already on drive)
@@ -1545,8 +1542,8 @@ fn plan_external_send(
                 drive_label: drive.label.clone(),
             },
         );
-        event.subvolume = Some(subvol.name.clone());
-        event.drive_label = Some(drive.label.clone());
+        event.fill_subvolume(Some(subvol.name.clone()));
+        event.fill_drive_label(Some(drive.label.clone()));
         events.push(event);
     }
 }
@@ -1558,7 +1555,7 @@ fn plan_external_retention(
     obs: &Observation,
     pinned: &HashSet<SnapshotName>,
     operations: &mut Vec<PlannedOperation>,
-    events: &mut Vec<Event>,
+    events: &mut Vec<UnstampedEvent>,
 ) {
     let ext_dir = crate::drives::external_snapshot_dir(drive, &subvol.name);
     let ext_snaps = obs
@@ -5972,12 +5969,12 @@ local_retention = "transient"
     // ── Planner event-emission tests ───────────────────────────────────
 
     fn count_planner_send_choices_for(
-        events: &[Event],
+        events: &[UnstampedEvent],
         drive: &str,
     ) -> usize {
         events
             .iter()
-            .filter(|e| match &e.payload {
+            .filter(|e| match e.payload() {
                 EventPayload::PlannerSendChoice { drive_label, .. } => drive_label == drive,
                 _ => false,
             })
@@ -5998,7 +5995,7 @@ local_retention = "transient"
         let plan = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &RunArming::default()).unwrap();
         let saw_first_send = plan.events.iter().any(|e| {
             matches!(
-                &e.payload,
+                &e.payload(),
                 EventPayload::PlannerSendChoice {
                     reason: FullSendReason::FirstSend,
                     drive_label,
@@ -6059,7 +6056,7 @@ local_retention = "transient"
         }
         let fs = MockFileSystemState::new();
         let plan = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &RunArming::default()).unwrap();
-        let saw_disabled_defer = plan.events.iter().any(|e| match &e.payload {
+        let saw_disabled_defer = plan.events.iter().any(|e| match &e.payload() {
             EventPayload::PlannerDefer { reason, scope } => {
                 reason == "disabled" && *scope == DeferScope::Subvolume
             }
@@ -6083,7 +6080,7 @@ local_retention = "transient"
         // Drive D1 not mounted.
 
         let plan = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &RunArming::default()).unwrap();
-        let saw_drive_defer = plan.events.iter().any(|e| match &e.payload {
+        let saw_drive_defer = plan.events.iter().any(|e| match &e.payload() {
             EventPayload::PlannerDefer { reason, scope } => {
                 reason.contains("not mounted") && *scope == DeferScope::Drive
             }
@@ -6105,9 +6102,13 @@ local_retention = "transient"
         }
         let fs = MockFileSystemState::new();
         let plan = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &RunArming::default()).unwrap();
+        // Stamp-then-assert (UPI 088-c): context fields are read off the
+        // stamped event; UnstampedEvent deliberately has no accessor.
+        let ctx = crate::events::RunContext::outside_run();
         let sv2_defers: Vec<_> = plan
             .events
             .iter()
+            .map(|e| e.clone().stamp(&ctx))
             .filter(|e| matches!(e.payload, EventPayload::PlannerDefer { .. }))
             .filter(|e| e.subvolume.as_deref() == Some("sv2"))
             .collect();

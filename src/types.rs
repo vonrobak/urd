@@ -1189,7 +1189,7 @@ pub struct BackupPlan {
     pub operations: Vec<PlannedOperation>,
     pub timestamp: NaiveDateTime,
     pub skipped: Vec<PlannedSkip>,
-    pub events: Vec<crate::events::Event>,
+    pub events: Vec<crate::events::UnstampedEvent>,
     pub lifecycles: HashMap<String, PlannedLifecycle>,
 }
 

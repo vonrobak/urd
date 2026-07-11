@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use chrono::{Datelike, Months, NaiveDateTime, Timelike};
 
-use crate::events::{Event, EventPayload, ProtectReason, PruneRule};
+use crate::events::{Event, EventPayload, ProtectReason, PruneRule, UnstampedEvent};
 use crate::output::{
     DiskEstimate, EstimateMethod, RecoveryWindow, RetentionPreview, TransientComparison,
 };
@@ -52,17 +52,17 @@ pub struct RetentionDelete {
 /// The result of a retention computation.
 ///
 /// `events` carries rationale for the planner's audit log. Pure modules
-/// emit; impure callers (executor) persist via
-/// `state::record_events_best_effort`. Contextual fields
-/// (`run_id`, `subvolume`, `drive_label`) are stamped by the caller.
+/// emit unstamped; the recorder stamps the run context at persistence
+/// (UPI 088-c). `subvolume`/`drive_label` are filled by the planner's
+/// `stamp_context`.
 #[derive(Debug, Clone, Default)]
 pub struct RetentionResult {
     pub keep: Vec<SnapshotName>,
     pub delete: Vec<RetentionDelete>,
-    pub events: Vec<Event>,
+    pub events: Vec<UnstampedEvent>,
 }
 
-fn prune_event(snap: &SnapshotName, rule: PruneRule, now: NaiveDateTime) -> Event {
+fn prune_event(snap: &SnapshotName, rule: PruneRule, now: NaiveDateTime) -> UnstampedEvent {
     Event::pure(
         now,
         EventPayload::RetentionPrune {
@@ -73,7 +73,7 @@ fn prune_event(snap: &SnapshotName, rule: PruneRule, now: NaiveDateTime) -> Even
     )
 }
 
-fn protect_event(snap: &SnapshotName, reason: ProtectReason, now: NaiveDateTime) -> Event {
+fn protect_event(snap: &SnapshotName, reason: ProtectReason, now: NaiveDateTime) -> UnstampedEvent {
     Event::pure(
         now,
         EventPayload::RetentionProtect {
@@ -202,7 +202,7 @@ pub fn graduated_retention(
          delete_reason: &str,
          keep: &mut Vec<SnapshotName>,
          delete: &mut Vec<RetentionDelete>,
-         events: &mut Vec<Event>| {
+         events: &mut Vec<UnstampedEvent>| {
             if slot_was_empty {
                 keep.push(snap.clone());
             } else if is_pinned {
@@ -1638,7 +1638,7 @@ mod tests {
             .iter()
             .filter(|e| {
                 matches!(
-                    e.payload,
+                    e.payload(),
                     crate::events::EventPayload::RetentionPrune { .. }
                 )
             })
@@ -1657,8 +1657,8 @@ mod tests {
         let result =
             graduated_retention(&snaps, now(), &default_config(), &HashSet::new(), false);
         for ev in &result.events {
-            if let crate::events::EventPayload::RetentionPrune { rule, .. } = ev.payload {
-                assert_eq!(rule, crate::events::PruneRule::GraduatedDaily);
+            if let crate::events::EventPayload::RetentionPrune { rule, .. } = ev.payload() {
+                assert_eq!(*rule, crate::events::PruneRule::GraduatedDaily);
             }
         }
     }
@@ -1679,7 +1679,7 @@ mod tests {
         let result = graduated_retention(&snaps, now(), &config, &HashSet::new(), false);
         let saw = result.events.iter().any(|e| {
             matches!(
-                e.payload,
+                e.payload(),
                 crate::events::EventPayload::RetentionPrune {
                     rule: crate::events::PruneRule::BeyondWindow,
                     ..
@@ -1699,7 +1699,7 @@ mod tests {
         assert!(result.keep.contains(&future));
         let saw = result.events.iter().any(|e| {
             matches!(
-                e.payload,
+                e.payload(),
                 crate::events::EventPayload::RetentionProtect {
                     reason: crate::events::ProtectReason::ClockSkewFuture,
                     ..
@@ -1722,7 +1722,7 @@ mod tests {
         assert!(result.keep.contains(&older));
         let saw = result.events.iter().any(|e| {
             matches!(
-                e.payload,
+                e.payload(),
                 crate::events::EventPayload::RetentionProtect {
                     reason: crate::events::ProtectReason::PinOverrodeThinning,
                     ..
@@ -1742,7 +1742,7 @@ mod tests {
         assert!(result.keep.contains(&very_old));
         let saw = result.events.iter().any(|e| {
             matches!(
-                e.payload,
+                e.payload(),
                 crate::events::EventPayload::RetentionProtect {
                     reason: crate::events::ProtectReason::PinOverrodeWindow,
                     ..
@@ -1767,7 +1767,7 @@ mod tests {
             .iter()
             .filter(|e| {
                 matches!(
-                    e.payload,
+                    e.payload(),
                     crate::events::EventPayload::RetentionProtect { .. }
                 )
             })
@@ -1811,7 +1811,7 @@ mod tests {
         );
         let saw = result.events.iter().any(|e| {
             matches!(
-                e.payload,
+                e.payload(),
                 crate::events::EventPayload::RetentionPrune {
                     rule: crate::events::PruneRule::SpacePressure,
                     ..
@@ -1831,7 +1831,7 @@ mod tests {
         assert_eq!(result.delete.len(), 4);
         for ev in &result.events {
             assert!(matches!(
-                ev.payload,
+                ev.payload(),
                 crate::events::EventPayload::RetentionPrune {
                     rule: crate::events::PruneRule::Emergency,
                     ..
