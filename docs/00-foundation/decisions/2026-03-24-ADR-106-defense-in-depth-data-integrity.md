@@ -85,7 +85,7 @@ Silent data loss requires all three layers to fail simultaneously on the same sn
 
 - ADR-100: Planner/executor separation (the layers map to the planner/executor boundary)
 - ADR-104: Graduated retention (the retention logic where these layers operate)
-- [Phase 1 hardening review](../../99-reports/2026-03-22-phase1-hardening-review.md) —
+- Phase 1 hardening review (`docs/99-reports/2026-03-22-phase1-hardening-review.md`) —
   unsent snapshot protection introduced
-- [Phase 3.5 adversary review](../../99-reports/2026-03-22-arch-adversary-phase35.md) —
+- Phase 3.5 adversary review (`docs/99-reports/2026-03-22-arch-adversary-phase35.md`) —
   "three layers of protection" articulated

@@ -228,6 +228,6 @@ correct under the softened heartbeat contract above.
 - ADR-109: Config-boundary validation (v2 rejects `monthly = 0` at parse time)
 - ADR-111: Config system architecture (Amendment 2026-05-15 — `config_version = 2`,
   migration command, dual-parser dispatcher)
-- [Roadmap](../../96-project-supervisor/roadmap.md) §Backward Compatibility, §Prometheus Metrics
-- [Pre-cutover hardening journal](../../98-journals/2026-03-24-pre-cutover-hardening.md) —
+- Roadmap (`docs/96-project-supervisor/roadmap.md`) §Backward Compatibility, §Prometheus Metrics
+- Pre-cutover hardening journal (`docs/98-journals/2026-03-24-pre-cutover-hardening.md`) —
   legacy pin handling refinement

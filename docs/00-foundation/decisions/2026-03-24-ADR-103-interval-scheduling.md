@@ -68,6 +68,6 @@ model — there is no `[defaults]` section; configs are self-describing artifact
 ## Related
 
 - ADR-104: Graduated retention (the retention model that handles frequent snapshots)
-- [Phase 1 journal](../../98-journals/2026-03-22-urd-phase01.md) — documents the redesign
+- Phase 1 journal (`docs/98-journals/2026-03-22-urd-phase01.md`) — documents the redesign
   from calendar schedules to intervals
-- [Roadmap](../../96-project-supervisor/roadmap.md) — original Schedule enum specification
+- Roadmap (`docs/96-project-supervisor/roadmap.md`) — original Schedule enum specification

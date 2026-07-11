@@ -76,6 +76,6 @@ other modules interact with btrfs exclusively through this trait.
 ## Related
 
 - ADR-100: Planner/executor separation (the trait's primary consumer)
-- [Phase 2 journal](../../98-journals/2026-03-22-urd-phase02.md) — send/receive pipeline design
-- [Phase 3 adversary review](../../99-reports/2026-03-22-phase3-adversary-review.md) —
+- Phase 2 journal (`docs/98-journals/2026-03-22-urd-phase02.md`) — send/receive pipeline design
+- Phase 3 adversary review (`docs/99-reports/2026-03-22-phase3-adversary-review.md`) —
   removed `to_string_lossy()` from `RealBtrfs`

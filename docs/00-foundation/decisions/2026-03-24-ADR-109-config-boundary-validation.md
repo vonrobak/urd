@@ -103,7 +103,7 @@ are separate from config validation because they come from a different trust bou
 
 - ADR-101: BtrfsOps trait (the module where validated paths reach sudo commands)
 - ADR-111: Config system architecture (structural vs runtime error distinction, new fields)
-- [Phase 1 hardening review](../../99-reports/2026-03-22-phase1-hardening-review.md) —
+- Phase 1 hardening review (`docs/99-reports/2026-03-22-phase1-hardening-review.md`) —
   path validation introduced
-- [Phase 3.5 adversary review](../../99-reports/2026-03-22-arch-adversary-phase35.md) —
+- Phase 3.5 adversary review (`docs/99-reports/2026-03-22-arch-adversary-phase35.md`) —
   "Every path that reaches `sudo btrfs` has been validated"

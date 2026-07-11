@@ -73,7 +73,7 @@ the send/pin dependency is structural, not implicit.
 
 ## Related
 
-- [Roadmap](../../96-project-supervisor/roadmap.md) §Architecture: Key Design Principles
-- [Phase 1 journal](../../98-journals/2026-03-22-urd-phase01.md) — original implementation
-- [Phase 2 journal](../../98-journals/2026-03-22-urd-phase02.md) — Executor Contract
+- Roadmap (`docs/96-project-supervisor/roadmap.md`) §Architecture: Key Design Principles
+- Phase 1 journal (`docs/98-journals/2026-03-22-urd-phase01.md`) — original implementation
+- Phase 2 journal (`docs/98-journals/2026-03-22-urd-phase02.md`) — Executor Contract
 - ADR-101: BtrfsOps trait (the executor's interface to btrfs)

@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Continuous integration on every pull request: clippy (warnings-as-errors), the full
+  test suite, and documentation link/convention lint now run as GitHub Actions required
+  checks before anything merges. Third-party actions are pinned to full commit SHAs.
+
 ### Fixed
 - Two new clippy lints on current stable (Rust 1.97) in `discovery` and `sudoers` —
   mechanical rewrites, no behavior change — and an ETXTBSY race in the Encounter's

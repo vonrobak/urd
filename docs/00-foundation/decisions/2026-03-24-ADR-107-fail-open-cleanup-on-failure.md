@@ -97,8 +97,8 @@ fail-open was constrained to prevent masking a real problem.
 
 - ADR-106: Defense-in-depth (deletion fails closed while backup fails open)
 - ADR-102: Filesystem truth (crash recovery relies on filesystem, not SQLite)
-- [Space estimation adversary review](../../99-reports/2026-03-23-arch-adversary-space-estimation.md) —
+- Space estimation adversary review (`docs/99-reports/2026-03-23-arch-adversary-space-estimation.md`) —
   "No history → allow the send"
-- [Awareness model design review](../../99-reports/2026-03-23-awareness-model-design-review.md) —
+- Awareness model design review (`docs/99-reports/2026-03-23-awareness-model-design-review.md`) —
   clock skew exception
-- [Phase 2 journal](../../98-journals/2026-03-22-urd-phase02.md) — crash recovery design
+- Phase 2 journal (`docs/98-journals/2026-03-22-urd-phase02.md`) — crash recovery design
