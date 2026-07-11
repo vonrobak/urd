@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Release binaries: every tag push builds a statically linked `urd-x86_64-linux`
+  (musl — one binary for any x86_64 Linux), checksums it into a `SHA256SUMS` manifest,
+  attests provenance via keyless sigstore, and attaches everything to the GitHub
+  Release. The release is promoted to *latest* only after assets verify, so the
+  stable download URL never points at a broken or half-published release (ADR-117).
 - Continuous integration on every pull request: clippy (warnings-as-errors), the full
   test suite, and documentation link/convention lint now run as GitHub Actions required
   checks before anything merges. Third-party actions are pinned to full commit SHAs.
