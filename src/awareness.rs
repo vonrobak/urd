@@ -511,6 +511,73 @@ pub struct DriveAssessment {
     pub rotation: Option<DriveRotation>,
 }
 
+// ── Promise snapshots and transition detection (UPI 088-a) ─────────────
+
+/// A snapshot of promise state from a single assessment, used for
+/// comparing state transitions across time.
+///
+/// Formerly defined in `sentinel.rs` — a core→daemon inversion, since
+/// this module's own transition detection consumed it. It lives beside
+/// `PromiseStatus` now; the daemon imports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromiseSnapshot {
+    pub name: String,
+    pub status: PromiseStatus,
+}
+
+/// Extract promise snapshots from assessments for state storage.
+#[must_use]
+pub fn snapshot_promises(assessments: &[SubvolAssessment]) -> Vec<PromiseSnapshot> {
+    assessments
+        .iter()
+        .map(|a| PromiseSnapshot {
+            name: a.name.clone(),
+            status: a.status,
+        })
+        .collect()
+}
+
+/// One detected promise-state change: `name` went `from` → `to`.
+///
+/// The detection *result* — distinct from the persisted
+/// `EventPayload::PromiseTransition` it may become downstream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromiseChange {
+    pub name: String,
+    pub from: PromiseStatus,
+    pub to: PromiseStatus,
+}
+
+/// The single transition detection: diff two snapshot sets by name and
+/// report every status change, in `current` order.
+///
+/// Names present only in `previous` are silent (a vanished subvolume is
+/// not a transition); names new in `current` are silent too (no `from`
+/// to compare against). Callers own first-run suppression:
+/// `notify::compute_notifications` skips on `previous: None`, the
+/// sentinel runner gates on `has_initial_assessment` — the two
+/// semantics differ deliberately and stay caller-side.
+#[must_use]
+pub fn promise_changes(
+    previous: &[PromiseSnapshot],
+    current: &[PromiseSnapshot],
+) -> Vec<PromiseChange> {
+    current
+        .iter()
+        .filter_map(|curr| {
+            previous
+                .iter()
+                .find(|p| p.name == curr.name)
+                .filter(|prev| prev.status != curr.status)
+                .map(|prev| PromiseChange {
+                    name: curr.name.clone(),
+                    from: prev.status,
+                    to: curr.status,
+                })
+        })
+        .collect()
+}
+
 // ── Core function ──────────────────────────────────────────────────────
 
 /// Diff a previous set of promise snapshots against the current
@@ -519,14 +586,11 @@ pub struct DriveAssessment {
 ///
 /// Pure function. Empty `previous` returns an empty Vec (suppresses
 /// noise on first run, matching the precedent in
-/// `sentinel::has_promise_changes`). Subvolumes present in `previous` but
-/// missing from `current` are silent (deletion is not a transition we
-/// log). Subvolumes new in `current` (not in `previous`) are also
-/// silent — appearance is not a transition either.
+/// `sentinel::has_promise_changes`). Name-set asymmetries are silent —
+/// see `promise_changes`, which owns the detection.
 #[must_use]
-#[allow(dead_code)]
 pub fn diff_promise_states(
-    previous: &[crate::sentinel::PromiseSnapshot],
+    previous: &[PromiseSnapshot],
     current: &[SubvolAssessment],
     now: NaiveDateTime,
     trigger: crate::events::TransitionTrigger,
@@ -534,24 +598,21 @@ pub fn diff_promise_states(
     if previous.is_empty() {
         return Vec::new();
     }
-    let mut events = Vec::new();
-    for assess in current {
-        if let Some(prev) = previous.iter().find(|p| p.name == assess.name)
-            && prev.status != assess.status
-        {
+    promise_changes(previous, &snapshot_promises(current))
+        .into_iter()
+        .map(|change| {
             let mut event = crate::events::Event::pure(
                 now,
                 crate::events::EventPayload::PromiseTransition {
-                    from: prev.status,
-                    to: assess.status,
+                    from: change.from,
+                    to: change.to,
                     trigger,
                 },
             );
-            event.subvolume = Some(assess.name.clone());
-            events.push(event);
-        }
-    }
-    events
+            event.subvolume = Some(change.name);
+            event
+        })
+        .collect()
 }
 
 /// Compute promise states for all enabled subvolumes.
@@ -1925,7 +1986,7 @@ source = "/data/sv1"
         let pre = assess(&config, now, &obs, &signals);
         let post = assess(&config, now, &obs, &signals);
 
-        let prev_snapshots = crate::sentinel::snapshot_promises(&pre);
+        let prev_snapshots = snapshot_promises(&pre);
         let events = diff_promise_states(
             &prev_snapshots,
             &post,
@@ -1949,7 +2010,7 @@ source = "/data/sv1"
         let blind_pre = assess(&config, now, &obs, &StorageSignalMap::new());
         let judged_post = assess(&config, now, &obs, &signals);
 
-        let prev_snapshots = crate::sentinel::snapshot_promises(&blind_pre);
+        let prev_snapshots = snapshot_promises(&blind_pre);
         let events = diff_promise_states(
             &prev_snapshots,
             &judged_post,
@@ -5213,11 +5274,8 @@ source = "/data/sv1"
         }
     }
 
-    fn make_promise_snapshot(
-        name: &str,
-        status: PromiseStatus,
-    ) -> crate::sentinel::PromiseSnapshot {
-        crate::sentinel::PromiseSnapshot {
+    fn make_promise_snapshot(name: &str, status: PromiseStatus) -> PromiseSnapshot {
+        PromiseSnapshot {
             name: name.to_string(),
             status,
         }
@@ -5228,6 +5286,98 @@ source = "/data/sv1"
             .unwrap()
             .and_hms_opt(3, 14, 22)
             .unwrap()
+    }
+
+    // ── snapshot_promises + promise_changes (UPI 088-a) ────────────
+
+    #[test]
+    fn snapshot_promises_roundtrip() {
+        // Moved from sentinel.rs with the function.
+        let assessments = vec![
+            make_assess("sv1", PromiseStatus::Protected),
+            make_assess("sv2", PromiseStatus::AtRisk),
+        ];
+
+        let snaps = snapshot_promises(&assessments);
+        assert_eq!(snaps.len(), 2);
+        assert_eq!(snaps[0].name, "sv1");
+        assert_eq!(snaps[0].status, PromiseStatus::Protected);
+        assert_eq!(snaps[1].name, "sv2");
+        assert_eq!(snaps[1].status, PromiseStatus::AtRisk);
+    }
+
+    #[test]
+    fn promise_changes_empty_inputs_yield_nothing() {
+        assert!(promise_changes(&[], &[]).is_empty());
+    }
+
+    #[test]
+    fn promise_changes_detects_degradation() {
+        let prev = vec![make_promise_snapshot("sv1", PromiseStatus::Protected)];
+        let curr = vec![make_promise_snapshot("sv1", PromiseStatus::AtRisk)];
+        let changes = promise_changes(&prev, &curr);
+        assert_eq!(
+            changes,
+            vec![PromiseChange {
+                name: "sv1".to_string(),
+                from: PromiseStatus::Protected,
+                to: PromiseStatus::AtRisk,
+            }]
+        );
+    }
+
+    #[test]
+    fn promise_changes_detects_recovery() {
+        let prev = vec![make_promise_snapshot("sv1", PromiseStatus::Unprotected)];
+        let curr = vec![make_promise_snapshot("sv1", PromiseStatus::Protected)];
+        let changes = promise_changes(&prev, &curr);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].from, PromiseStatus::Unprotected);
+        assert_eq!(changes[0].to, PromiseStatus::Protected);
+    }
+
+    #[test]
+    fn promise_changes_no_change_is_silent() {
+        let prev = vec![make_promise_snapshot("sv1", PromiseStatus::AtRisk)];
+        let curr = vec![make_promise_snapshot("sv1", PromiseStatus::AtRisk)];
+        assert!(promise_changes(&prev, &curr).is_empty());
+    }
+
+    #[test]
+    fn promise_changes_name_only_in_previous_is_silent() {
+        // A vanished subvolume is not a transition.
+        let prev = vec![make_promise_snapshot("gone", PromiseStatus::Protected)];
+        let curr = vec![make_promise_snapshot("sv1", PromiseStatus::Protected)];
+        assert!(promise_changes(&prev, &curr).is_empty());
+    }
+
+    #[test]
+    fn promise_changes_name_only_in_current_is_silent() {
+        // A new subvolume has no `from` — appearance is not a transition.
+        let prev = vec![make_promise_snapshot("sv1", PromiseStatus::Protected)];
+        let curr = vec![
+            make_promise_snapshot("sv1", PromiseStatus::Protected),
+            make_promise_snapshot("newborn", PromiseStatus::Unprotected),
+        ];
+        assert!(promise_changes(&prev, &curr).is_empty());
+    }
+
+    #[test]
+    fn promise_changes_preserve_current_order() {
+        let prev = vec![
+            make_promise_snapshot("a", PromiseStatus::Protected),
+            make_promise_snapshot("b", PromiseStatus::Protected),
+            make_promise_snapshot("c", PromiseStatus::AtRisk),
+        ];
+        // `current` deliberately reordered vs `previous`: output follows current.
+        let curr = vec![
+            make_promise_snapshot("c", PromiseStatus::Protected),
+            make_promise_snapshot("a", PromiseStatus::Unprotected),
+            make_promise_snapshot("b", PromiseStatus::Protected),
+        ];
+        let changes = promise_changes(&prev, &curr);
+        let names: Vec<&str> = changes.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["c", "a"]);
     }
 
     #[test]

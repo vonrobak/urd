@@ -17,7 +17,7 @@ use std::time::{Duration, Instant, SystemTime};
 use chrono::NaiveDateTime;
 
 use crate::advice;
-use crate::awareness::{self, PromiseStatus, SubvolAssessment};
+use crate::awareness::{self, PromiseSnapshot, PromiseStatus, SubvolAssessment};
 use crate::commands::{storage_signals, world};
 use crate::config::Config;
 use crate::drives::{self, DriveAvailability};
@@ -27,8 +27,7 @@ use crate::output::{SentinelCircuitState, SentinelPromiseState, SentinelStateFil
 use crate::plan::{Observation, RealFileSystemState};
 use crate::sentinel::{
     self, CircuitBreakerConfig, EjectAction, EjectEvent, EjectPhase, EjectState,
-    EjectTransition, PromiseSnapshot, SentinelAction, SentinelEvent, SentinelState,
-    TransitionResult,
+    EjectTransition, SentinelAction, SentinelEvent, SentinelState, TransitionResult,
 };
 use crate::state::StateDb;
 
@@ -532,7 +531,7 @@ impl SentinelRunner {
         }
 
         // Update state.
-        self.state.last_promise_states = sentinel::snapshot_promises(&assessments);
+        self.state.last_promise_states = awareness::snapshot_promises(&assessments);
         self.state.last_health_states = sentinel::snapshot_health(&assessments);
         if !self.state.has_initial_assessment {
             self.state.has_initial_assessment = true;

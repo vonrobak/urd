@@ -607,7 +607,7 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     // Backup is canonical for in-run promise transitions (trigger=Run);
     // sentinel skips on BackupCompleted to avoid duplicates.
     if let Some(db) = world.db() {
-        let prev_snapshots = crate::sentinel::snapshot_promises(&pre_assessments);
+        let prev_snapshots = awareness::snapshot_promises(&pre_assessments);
         let promise_events = awareness::diff_promise_states(
             &prev_snapshots,
             &assessments,
