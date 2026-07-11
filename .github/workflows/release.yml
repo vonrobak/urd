@@ -59,8 +59,11 @@ jobs:
 
       - name: Smoke-check the binary
         run: |
-          # `ldd` exits non-zero on a static binary, so assert positively via file(1).
-          file urd-x86_64-linux | grep -q 'statically linked'
+          # `ldd` exits non-zero on a static binary, so assert positively via
+          # file(1). rustc links musl targets as static-pie, which file(1)
+          # reports as "static-pie linked", not "statically linked".
+          file urd-x86_64-linux
+          file urd-x86_64-linux | grep -qE 'statically linked|static-pie linked'
           ./urd-x86_64-linux --version
           if [ "${GITHUB_REF#refs/tags/}" != "$GITHUB_REF" ]; then
             ./urd-x86_64-linux --version | grep -qF "${GITHUB_REF_NAME#v}"
