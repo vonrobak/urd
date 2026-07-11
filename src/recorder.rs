@@ -15,7 +15,6 @@ use crate::state::StateDb;
 
 /// One recording: the events and notifications a site produced together,
 /// plus how the notifications reach the user.
-#[allow(dead_code)] // callers arrive with the step-4 site migrations (UPI 088-c)
 pub struct Recording {
     pub events: Vec<UnstampedEvent>,
     pub notifications: Vec<Notification>,
@@ -23,7 +22,6 @@ pub struct Recording {
 }
 
 /// How a recording's notifications reach the user.
-#[allow(dead_code)] // callers arrive with the step-4 site migrations (UPI 088-c)
 pub enum DispatchPolicy {
     /// Dispatch unconditionally (when notifications are present). Never
     /// touches the heartbeat dispatched flag — marking is a gate-path
@@ -41,7 +39,6 @@ pub enum DispatchPolicy {
 /// The impure seam through which every audit event reaches persistence.
 /// Holds the run-scoped resources; the per-call [`RunContext`] carries
 /// what varies between recordings.
-#[allow(dead_code)] // callers arrive with the step-4 site migrations (UPI 088-c)
 pub struct Recorder<'a> {
     /// `None` ⇒ skip persistence, still dispatch (ADR-102 posture:
     /// SQLite unavailability never suppresses a notification).
@@ -52,7 +49,6 @@ pub struct Recorder<'a> {
     sentinel_probe: fn(&Config) -> bool,
 }
 
-#[allow(dead_code)] // callers arrive with the step-4 site migrations (UPI 088-c)
 impl<'a> Recorder<'a> {
     #[must_use]
     pub fn new(db: Option<&'a StateDb>, config: &'a Config) -> Self {

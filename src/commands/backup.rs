@@ -32,7 +32,6 @@ use crate::output::{
 use crate::notify;
 use crate::plan::{self, FilesystemQuery, HistoryQuery, PlanFilters, RealFileSystemState};
 use crate::pools::{self, PoolSpace};
-use crate::sentinel_runner;
 use crate::storage_critical::TightnessTier;
 use crate::preflight;
 use crate::state::StateDb;
@@ -188,14 +187,17 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
         if let Err(e) = heartbeat::write(&config.general.heartbeat_file, &hb) {
             log::warn!("Failed to write heartbeat: {e}");
         }
-        if sentinel_runner::sentinel_is_running(&config) {
-            log::info!("Sentinel is running — deferring notification dispatch");
-            if let Err(e) = heartbeat::mark_dispatched(&config.general.heartbeat_file) {
-                log::warn!("Failed to update heartbeat dispatched flag: {e}");
-            }
-        } else {
-            dispatch_notifications(previous_hb.as_ref(), &hb, &config);
-        }
+        // The sentinel gate: dispatch-or-mark for promise-change
+        // notifications (computed here, pure — the recorder's
+        // GateOnSentinel owns the probe/mark/retry mechanics).
+        recorder.record(
+            &crate::events::RunContext::outside_run(),
+            crate::recorder::Recording {
+                events: vec![],
+                notifications: notify::compute_notifications(previous_hb.as_ref(), &hb),
+                dispatch: crate::recorder::DispatchPolicy::GateOnSentinel,
+            },
+        );
         return Ok(());
     }
 
@@ -610,15 +612,17 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
         );
     }
 
-    // Dispatch notifications for promise state changes (unless Sentinel handles it).
-    if sentinel_runner::sentinel_is_running(&config) {
-        log::info!("Sentinel is running — deferring notification dispatch");
-        if let Err(e) = heartbeat::mark_dispatched(&config.general.heartbeat_file) {
-            log::warn!("Failed to update heartbeat dispatched flag: {e}");
-        }
-    } else {
-        dispatch_notifications(previous_hb.as_ref(), &hb, &config);
-    }
+    // Dispatch notifications for promise state changes (unless the Sentinel
+    // handles it): the recorder's GateOnSentinel owns the probe/mark/retry
+    // mechanics; the computation stays here, pure.
+    recorder.record(
+        &crate::events::RunContext::for_run(result.run_id),
+        crate::recorder::Recording {
+            events: vec![],
+            notifications: notify::compute_notifications(previous_hb.as_ref(), &hb),
+            dispatch: crate::recorder::DispatchPolicy::GateOnSentinel,
+        },
+    );
 
     // Build and render structured summary
     let transitions = detect_transitions(&pre_assessments, &assessments);
@@ -2159,39 +2163,6 @@ fn format_elapsed(d: Duration) -> String {
         format!("{hours}:{mins:02}:{secs:02}")
     } else {
         format!("{mins}:{secs:02}")
-    }
-}
-
-/// Compute and dispatch notifications for promise state changes.
-///
-/// Sequence: compute from heartbeat transition → dispatch → mark dispatched.
-/// Only marks dispatched if at least one channel succeeded, so the Sentinel (5b)
-/// can retry on total failure.
-fn dispatch_notifications(
-    previous: Option<&heartbeat::Heartbeat>,
-    current: &heartbeat::Heartbeat,
-    config: &Config,
-) {
-    let notifications = notify::compute_notifications(previous, current);
-    if notifications.is_empty() {
-        // No state changes — mark dispatched immediately
-        if let Err(e) = heartbeat::mark_dispatched(&config.general.heartbeat_file) {
-            log::warn!("Failed to update heartbeat dispatched flag: {e}");
-        }
-        return;
-    }
-
-    let any_delivered = notify::dispatch(&notifications, &config.notifications);
-
-    if any_delivered {
-        if let Err(e) = heartbeat::mark_dispatched(&config.general.heartbeat_file) {
-            log::warn!("Failed to update heartbeat dispatched flag: {e}");
-        }
-    } else {
-        log::warn!(
-            "All notification channels failed — heartbeat not marked as dispatched \
-             (Sentinel will retry)"
-        );
     }
 }
 
