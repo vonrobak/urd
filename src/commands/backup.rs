@@ -587,7 +587,8 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
             db,
             heartbeat_now,
             &arming,
-            result.run_id,
+            &recorder,
+            &crate::events::RunContext::for_run(result.run_id),
         );
         let notes: Vec<notify::Notification> = escalations
             .iter()
@@ -599,9 +600,14 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
                 )
             })
             .collect();
-        if !notes.is_empty() {
-            notify::dispatch(&notes, &config.notifications);
-        }
+        recorder.record(
+            &crate::events::RunContext::for_run(result.run_id),
+            crate::recorder::Recording {
+                events: vec![],
+                notifications: notes,
+                dispatch: crate::recorder::DispatchPolicy::Immediate,
+            },
+        );
     }
 
     // Dispatch notifications for promise state changes (unless Sentinel handles it).
