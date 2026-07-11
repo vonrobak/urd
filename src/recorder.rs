@@ -112,33 +112,31 @@ impl<'a> Recorder<'a> {
     /// `min_urgency` returns `false` and must NOT mark — the sentinel
     /// retries, exactly as before this seam existed.
     fn gate_dispatch(&self, notifications: &[Notification]) {
-        let heartbeat_file = &self.config.general.heartbeat_file;
         if (self.sentinel_probe)(self.config) {
             log::info!("Sentinel is running — deferring notification dispatch");
-            if let Err(e) = crate::heartbeat::mark_dispatched(heartbeat_file) {
-                log::warn!("Failed to update heartbeat dispatched flag: {e}");
-            }
+            self.mark_dispatched_best_effort();
             return;
         }
 
         if notifications.is_empty() {
             // No state changes — mark dispatched immediately.
-            if let Err(e) = crate::heartbeat::mark_dispatched(heartbeat_file) {
-                log::warn!("Failed to update heartbeat dispatched flag: {e}");
-            }
+            self.mark_dispatched_best_effort();
             return;
         }
 
-        let any_delivered = notify::dispatch(notifications, &self.config.notifications);
-        if any_delivered {
-            if let Err(e) = crate::heartbeat::mark_dispatched(heartbeat_file) {
-                log::warn!("Failed to update heartbeat dispatched flag: {e}");
-            }
+        if notify::dispatch(notifications, &self.config.notifications) {
+            self.mark_dispatched_best_effort();
         } else {
             log::warn!(
                 "All notification channels failed — heartbeat not marked as dispatched \
                  (Sentinel will retry)"
             );
+        }
+    }
+
+    fn mark_dispatched_best_effort(&self) {
+        if let Err(e) = crate::heartbeat::mark_dispatched(&self.config.general.heartbeat_file) {
+            log::warn!("Failed to update heartbeat dispatched flag: {e}");
         }
     }
 }

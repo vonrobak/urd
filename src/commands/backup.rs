@@ -14,7 +14,7 @@ use crate::commands::storage_signals;
 use crate::commands::world::{self, World};
 use crate::config::Config;
 use crate::drives;
-use crate::events::{Event, EventPayload};
+use crate::events::{Event, EventPayload, RunContext};
 use crate::executor::{
     ExecutionResult, Executor, FullSendPolicy, OffsiteChainRelease, OpResult, ReclaimOutcome,
     RunResult, SendType, TransientCleanupOutcome,
@@ -36,6 +36,7 @@ use crate::storage_critical::TightnessTier;
 use crate::preflight;
 use crate::state::StateDb;
 use crate::types::{BackupPlan, ByteSize, PlannedOperation, ProtectionLevel, SendKind};
+use crate::recorder::{DispatchPolicy, Recorder, Recording};
 
 pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     // Share one config across the run AND the watchdog thread (UPI 065-b): the
@@ -126,7 +127,7 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     // and notification dispatch on the run path. Per-site RunContexts
     // carry what varies (pre-run sites are outside_run; post-execute
     // sites are for_run(result.run_id)).
-    let recorder = crate::recorder::Recorder::new(world.db(), &config);
+    let recorder = Recorder::new(world.db(), &config);
 
     // Emergency pre-flight: if any snapshot root is critically below threshold
     // (< 50% of min_free_bytes), run emergency retention before planning.
@@ -191,11 +192,11 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
         // notifications (computed here, pure — the recorder's
         // GateOnSentinel owns the probe/mark/retry mechanics).
         recorder.record(
-            &crate::events::RunContext::outside_run(),
-            crate::recorder::Recording {
+            &RunContext::outside_run(),
+            Recording {
                 events: vec![],
                 notifications: notify::compute_notifications(previous_hb.as_ref(), &hb),
-                dispatch: crate::recorder::DispatchPolicy::GateOnSentinel,
+                dispatch: DispatchPolicy::GateOnSentinel,
             },
         );
         return Ok(());
@@ -453,10 +454,10 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
                     None => (0, Vec::new(), chrono::Local::now().naive_local()),
                 }
             };
-        let ctx = crate::events::RunContext::for_run(result.run_id);
+        let ctx = RunContext::for_run(result.run_id);
         recorder.record(
             &ctx,
-            crate::recorder::Recording {
+            Recording {
                 events: vec![Event::pure(
                     event_ts,
                     EventPayload::WatchdogAbort {
@@ -466,7 +467,7 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
                     },
                 )],
                 notifications: vec![],
-                dispatch: crate::recorder::DispatchPolicy::Immediate,
+                dispatch: DispatchPolicy::Immediate,
             },
         );
         // (UPI 064-b B7) record the Tier-1 offsite chains the reclaim broke,
@@ -475,10 +476,10 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
         // the next backup will be a full send (avoid double-notifying).
         recorder.record(
             &ctx,
-            crate::recorder::Recording {
+            Recording {
                 events: releases.iter().map(|r| r.to_event(event_ts)).collect(),
                 notifications: vec![],
-                dispatch: crate::recorder::DispatchPolicy::Immediate,
+                dispatch: DispatchPolicy::Immediate,
             },
         );
         watchdog_notifications.push(notify::build_watchdog_abort_notification(
@@ -494,11 +495,11 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     // process-end state.
     watchdog_abort.store(false, Ordering::SeqCst);
     recorder.record(
-        &crate::events::RunContext::for_run(result.run_id),
-        crate::recorder::Recording {
+        &RunContext::for_run(result.run_id),
+        Recording {
             events: vec![],
             notifications: watchdog_notifications,
-            dispatch: crate::recorder::DispatchPolicy::Immediate,
+            dispatch: DispatchPolicy::Immediate,
         },
     );
 
@@ -524,11 +525,11 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
             })
             .collect();
         recorder.record(
-            &crate::events::RunContext::for_run(result.run_id),
-            crate::recorder::Recording {
+            &RunContext::for_run(result.run_id),
+            Recording {
                 events: offsite_releases.iter().map(|r| r.to_event(now_ts)).collect(),
                 notifications: notes,
-                dispatch: crate::recorder::DispatchPolicy::Immediate,
+                dispatch: DispatchPolicy::Immediate,
             },
         );
     }
@@ -582,6 +583,7 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     // from the heartbeat-driven promise notifications below and runs regardless
     // of whether the sentinel is up. Best-effort throughout: never blocks a run.
     if let Some(db) = world.db() {
+        let ctx = RunContext::for_run(result.run_id);
         // The one sanctioned caller of the raw writeback (clippy
         // disallowed-methods guard — backup is the sole posture writer, D6).
         #[allow(clippy::disallowed_methods)]
@@ -590,7 +592,7 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
             heartbeat_now,
             &arming,
             &recorder,
-            &crate::events::RunContext::for_run(result.run_id),
+            &ctx,
         );
         let notes: Vec<notify::Notification> = escalations
             .iter()
@@ -603,11 +605,11 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
             })
             .collect();
         recorder.record(
-            &crate::events::RunContext::for_run(result.run_id),
-            crate::recorder::Recording {
+            &ctx,
+            Recording {
                 events: vec![],
                 notifications: notes,
-                dispatch: crate::recorder::DispatchPolicy::Immediate,
+                dispatch: DispatchPolicy::Immediate,
             },
         );
     }
@@ -616,11 +618,11 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     // handles it): the recorder's GateOnSentinel owns the probe/mark/retry
     // mechanics; the computation stays here, pure.
     recorder.record(
-        &crate::events::RunContext::for_run(result.run_id),
-        crate::recorder::Recording {
+        &RunContext::for_run(result.run_id),
+        Recording {
             events: vec![],
             notifications: notify::compute_notifications(previous_hb.as_ref(), &hb),
-            dispatch: crate::recorder::DispatchPolicy::GateOnSentinel,
+            dispatch: DispatchPolicy::GateOnSentinel,
         },
     );
 
@@ -642,11 +644,11 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
             crate::events::TransitionTrigger::Run,
         );
         recorder.record(
-            &crate::events::RunContext::for_run(result.run_id),
-            crate::recorder::Recording {
+            &RunContext::for_run(result.run_id),
+            Recording {
                 events: promise_events,
                 notifications: vec![],
-                dispatch: crate::recorder::DispatchPolicy::Immediate,
+                dispatch: DispatchPolicy::Immediate,
             },
         );
     }
@@ -2181,7 +2183,7 @@ fn format_elapsed(d: Duration) -> String {
 /// events have `run_id = None`.
 fn run_emergency_preflight(
     config: &Config,
-    recorder: &crate::recorder::Recorder<'_>,
+    recorder: &Recorder<'_>,
 ) -> anyhow::Result<bool> {
     let now = chrono::Local::now().naive_local();
     let btrfs = RealBtrfs::for_maintenance(&config.general.btrfs_path);
@@ -2203,11 +2205,11 @@ fn run_emergency_preflight(
         })
         .collect();
     recorder.record(
-        &crate::events::RunContext::outside_run(),
-        crate::recorder::Recording {
+        &RunContext::outside_run(),
+        Recording {
             events: outcome.emitted_events,
             notifications: notes,
-            dispatch: crate::recorder::DispatchPolicy::Immediate,
+            dispatch: DispatchPolicy::Immediate,
         },
     );
     Ok(outcome.any_deleted)
@@ -3231,7 +3233,7 @@ source = "/data/beta"
         assert_eq!(out.emitted_events.len(), 2);
         // Stamp-then-assert (UPI 088-c): context fields are read off the
         // stamped event; UnstampedEvent deliberately has no accessor.
-        let ctx = crate::events::RunContext::outside_run();
+        let ctx = RunContext::outside_run();
         for ev in &out.emitted_events {
             let ev = ev.clone().stamp(&ctx);
             assert_eq!(ev.subvolume.as_deref(), Some("alpha"));
