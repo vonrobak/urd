@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- The sentinel's idle emergency-eject decisions (ADR-113 Layer 3) — the ~60 s timer
+  gate, the eject verdict, the defer-to-a-running-backup, and the re-confirm-under-lock
+  sequencing — now live in the pure sentinel state machine as a table-tested
+  request-response protocol (`eject_transition`) instead of a 160-line untested runner
+  side-path; the runner samples pool pressure and executes effects. No behavior change
+  (#300).
+
+### Changed
 - `graduated_retention`'s deciding cutoffs and `retention-preview`/`status`'s describing
   cutoffs now derive from one shared cascade instead of two independently-maintained
   copies, one of which approximated month/year math instead of using calendar-exact
