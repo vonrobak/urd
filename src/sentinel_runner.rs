@@ -17,7 +17,7 @@ use std::time::{Duration, Instant, SystemTime};
 use chrono::NaiveDateTime;
 
 use crate::advice;
-use crate::awareness::{self, PromiseSnapshot, PromiseStatus, SubvolAssessment};
+use crate::awareness::{self, PromiseSnapshot, SubvolAssessment};
 use crate::commands::{storage_signals, world};
 use crate::config::Config;
 use crate::drives::{self, DriveAvailability};
@@ -1019,11 +1019,7 @@ pub fn build_notifications(
     // gate in execute_assess owns it (load-bearing: with an empty
     // `previous`, all-unprotected below would still fire).
     let changes = awareness::promise_changes(previous, &awareness::snapshot_promises(current));
-
-    let all_unprotected = !current.is_empty()
-        && current
-            .iter()
-            .all(|a| a.status == PromiseStatus::Unprotected);
+    let all_unprotected = awareness::PromiseRollup::from_assessments(current).all_unprotected();
 
     notify::build_promise_change_notifications(&changes, all_unprotected)
 }

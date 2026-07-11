@@ -14,7 +14,7 @@ use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
-use crate::awareness::{PromiseChange, PromiseSnapshot, PromiseStatus, promise_changes};
+use crate::awareness::{PromiseChange, PromiseRollup, PromiseSnapshot, promise_changes};
 use crate::heartbeat::{Heartbeat, SubvolumeHeartbeat};
 use crate::storage_critical::{TightnessTier, Transition};
 
@@ -244,15 +244,14 @@ pub fn compute_notifications(
     // First-run semantics: `previous: None` yields no transitions, but
     // all-unprotected is still evaluated on `current` — a system born
     // broken must say so.
+    let current_snaps = snapshots(&current.subvolumes);
     let changes = match previous {
-        Some(prev) => promise_changes(&snapshots(&prev.subvolumes), &snapshots(&current.subvolumes)),
+        Some(prev) => promise_changes(&snapshots(&prev.subvolumes), &current_snaps),
         None => Vec::new(),
     };
-    let all_unprotected = !current.subvolumes.is_empty()
-        && current
-            .subvolumes
-            .iter()
-            .all(|sv| sv.promise_status == PromiseStatus::Unprotected);
+    let all_unprotected =
+        PromiseRollup::from_pairs(current_snaps.iter().map(|s| (s.name.clone(), s.status)))
+            .all_unprotected();
 
     let mut notifications = build_promise_change_notifications(&changes, all_unprotected);
 
@@ -798,6 +797,7 @@ fn dispatch_log(notification: &Notification) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::awareness::PromiseStatus;
     use crate::heartbeat::{Heartbeat, SubvolumeHeartbeat};
 
     fn make_heartbeat(statuses: &[(&str, PromiseStatus, Option<bool>)]) -> Heartbeat {

@@ -40,18 +40,15 @@ pub fn run(config_path: Option<&Path>, output_mode: OutputMode) -> anyhow::Resul
 
     let last_run_age_secs = last_run.as_ref().and_then(|run| run.age_secs(now));
 
-    // Build output — single pass over assessments
-    let total = assessments.len();
-    let mut waning_names = Vec::new();
-    let mut exposed_names = Vec::new();
+    // Build output — promise partition via the one rollup (UPI 088-a);
+    // health is an orthogonal axis, counted locally.
+    let rollup = awareness::PromiseRollup::from_assessments(&assessments);
+    let total = rollup.total();
+    let waning_names = rollup.at_risk;
+    let exposed_names = rollup.unprotected;
     let mut degraded_count = 0usize;
     let mut blocked_count = 0usize;
     for a in &assessments {
-        match a.status {
-            awareness::PromiseStatus::AtRisk => waning_names.push(a.name.clone()),
-            awareness::PromiseStatus::Unprotected => exposed_names.push(a.name.clone()),
-            awareness::PromiseStatus::Protected => {}
-        }
         match a.health {
             awareness::OperationalHealth::Degraded => degraded_count += 1,
             awareness::OperationalHealth::Blocked => blocked_count += 1,

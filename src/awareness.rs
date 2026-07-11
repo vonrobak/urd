@@ -578,6 +578,70 @@ pub fn promise_changes(
         .collect()
 }
 
+/// The three-way partition of subvolume names by promise state — the
+/// single home of the protected/at-risk/unprotected reduction
+/// (UPI 088-a; deepening-05's `PromiseRollup`). Vectors preserve input
+/// order. A projection that rides gravity (`PromiseStatus`'s one `Ord`);
+/// it carries no ordering of its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromiseRollup {
+    pub protected: Vec<String>,
+    pub at_risk: Vec<String>,
+    pub unprotected: Vec<String>,
+}
+
+impl PromiseRollup {
+    /// Partition assessments by promise state.
+    #[must_use]
+    pub fn from_assessments(assessments: &[SubvolAssessment]) -> Self {
+        Self::from_pairs(assessments.iter().map(|a| (a.name.clone(), a.status)))
+    }
+
+    /// Partition `(name, status)` pairs — the entry point for the other
+    /// promise-state carriers (heartbeat entries, status rows, doctor
+    /// rows).
+    #[must_use]
+    pub fn from_pairs(pairs: impl IntoIterator<Item = (String, PromiseStatus)>) -> Self {
+        let mut rollup = Self {
+            protected: Vec::new(),
+            at_risk: Vec::new(),
+            unprotected: Vec::new(),
+        };
+        for (name, status) in pairs {
+            match status {
+                PromiseStatus::Protected => rollup.protected.push(name),
+                PromiseStatus::AtRisk => rollup.at_risk.push(name),
+                PromiseStatus::Unprotected => rollup.unprotected.push(name),
+            }
+        }
+        rollup
+    }
+
+    /// Total number of subvolumes rolled up.
+    #[must_use]
+    pub fn total(&self) -> usize {
+        self.protected.len() + self.at_risk.len() + self.unprotected.len()
+    }
+
+    /// Is every promise kept? Vacuously TRUE on empty input — zero
+    /// subvolumes means zero broken promises (`urd doctor` says
+    /// "✓ 0 of 0 sealed" for an all-disabled config). Deliberately
+    /// asymmetric with `all_unprotected`.
+    #[must_use]
+    pub fn all_protected(&self) -> bool {
+        self.at_risk.is_empty() && self.unprotected.is_empty()
+    }
+
+    /// Is every promise broken? FALSE on empty input — the alarm only
+    /// rings over actual subvolumes (both notification paths' historic
+    /// `!is_empty()` guard). Deliberately asymmetric with
+    /// `all_protected`.
+    #[must_use]
+    pub fn all_unprotected(&self) -> bool {
+        !self.unprotected.is_empty() && self.protected.is_empty() && self.at_risk.is_empty()
+    }
+}
+
 // ── Core function ──────────────────────────────────────────────────────
 
 /// Diff a previous set of promise snapshots against the current
@@ -5360,6 +5424,81 @@ source = "/data/sv1"
             make_promise_snapshot("newborn", PromiseStatus::Unprotected),
         ];
         assert!(promise_changes(&prev, &curr).is_empty());
+    }
+
+    // ── PromiseRollup (UPI 088-a) ───────────────────────────────────
+
+    #[test]
+    fn rollup_empty_is_vacuously_protected_but_not_unprotected() {
+        // The asymmetry pair: all_protected() is vacuous truth (zero
+        // subvolumes, zero broken promises); all_unprotected() is
+        // guarded false (the alarm needs actual subvolumes).
+        let rollup = PromiseRollup::from_assessments(&[]);
+        assert_eq!(rollup.total(), 0);
+        assert!(rollup.all_protected());
+        assert!(!rollup.all_unprotected());
+    }
+
+    #[test]
+    fn rollup_partitions_mixed_assessments() {
+        let assessments = vec![
+            make_assess("a", PromiseStatus::Protected),
+            make_assess("b", PromiseStatus::AtRisk),
+            make_assess("c", PromiseStatus::Unprotected),
+            make_assess("d", PromiseStatus::Protected),
+        ];
+        let rollup = PromiseRollup::from_assessments(&assessments);
+        assert_eq!(rollup.protected, vec!["a", "d"]);
+        assert_eq!(rollup.at_risk, vec!["b"]);
+        assert_eq!(rollup.unprotected, vec!["c"]);
+        assert_eq!(rollup.total(), 4);
+        assert!(!rollup.all_protected());
+        assert!(!rollup.all_unprotected());
+    }
+
+    #[test]
+    fn rollup_all_protected_when_every_promise_kept() {
+        let assessments = vec![
+            make_assess("a", PromiseStatus::Protected),
+            make_assess("b", PromiseStatus::Protected),
+        ];
+        let rollup = PromiseRollup::from_assessments(&assessments);
+        assert!(rollup.all_protected());
+        assert!(!rollup.all_unprotected());
+    }
+
+    #[test]
+    fn rollup_all_unprotected_when_every_promise_broken() {
+        let assessments = vec![
+            make_assess("a", PromiseStatus::Unprotected),
+            make_assess("b", PromiseStatus::Unprotected),
+        ];
+        let rollup = PromiseRollup::from_assessments(&assessments);
+        assert!(rollup.all_unprotected());
+        assert!(!rollup.all_protected());
+    }
+
+    #[test]
+    fn rollup_preserves_input_order_within_each_partition() {
+        let assessments = vec![
+            make_assess("z", PromiseStatus::AtRisk),
+            make_assess("a", PromiseStatus::AtRisk),
+            make_assess("m", PromiseStatus::AtRisk),
+        ];
+        let rollup = PromiseRollup::from_assessments(&assessments);
+        assert_eq!(rollup.at_risk, vec!["z", "a", "m"]);
+    }
+
+    #[test]
+    fn rollup_from_pairs_matches_from_assessments() {
+        let assessments = vec![
+            make_assess("a", PromiseStatus::Protected),
+            make_assess("b", PromiseStatus::Unprotected),
+        ];
+        let via_pairs = PromiseRollup::from_pairs(
+            assessments.iter().map(|a| (a.name.clone(), a.status)),
+        );
+        assert_eq!(via_pairs, PromiseRollup::from_assessments(&assessments));
     }
 
     #[test]
