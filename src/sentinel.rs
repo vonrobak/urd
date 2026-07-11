@@ -9,12 +9,13 @@
 // arrive — inotify, polling, or test harness.
 
 use std::collections::BTreeSet;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
 
 use crate::awareness::{ChainStatus, OperationalHealth, PromiseStatus, SubvolAssessment};
+use crate::guard::{self, PoolPressureSample};
 
 // ── Events ──────────────────────────────────────────────────────────────
 
@@ -839,6 +840,235 @@ pub fn detect_simultaneous_chain_breaks(
     }
 
     anomalies
+}
+
+// ── Idle emergency-eject protocol (ADR-113 Layer 3, UPI 087) ───────────
+
+/// Dedicated cadence for the idle emergency-eject space check (UPI 034). Its own
+/// fixed ~60 s timer, independent of the adaptive assessment tick: a slow idle
+/// fill (pin CoW delta, ambient host data) develops over hours, so 60 s is ample,
+/// and it avoids both 5 s-loop `findmnt` churn and a pool-map cache.
+const SPACE_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+
+/// State of the idle emergency-eject protocol (ADR-113 Layer 3), owned by the
+/// runner alongside [`SentinelState`]. Only `last_space_check` carries
+/// information between poll iterations — the runner drives every protocol
+/// round to quiescence within one iteration, so `phase` is `Idle` whenever the
+/// driver is not on the stack. A leaked non-Idle phase (a bug) self-heals on
+/// the next `SpaceCheckTick` rather than wedging the protocol shut: the
+/// host-survival net must fail toward re-arming.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EjectState {
+    pub last_space_check: Option<Instant>,
+    pub phase: EjectPhase,
+}
+
+impl EjectState {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            last_space_check: None,
+            phase: EjectPhase::Idle,
+        }
+    }
+}
+
+impl Default for EjectState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Protocol phase. The eject choreography is a strict request-response
+/// conversation: each transition emits at most one [`EjectAction`]; the runner
+/// executes it and feeds the result back as the next [`EjectEvent`] before
+/// anything else happens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EjectPhase {
+    /// Nothing in flight — the only phase observable between poll iterations.
+    Idle,
+    /// `SamplePressure` issued; awaiting `PressureSampled`.
+    AwaitingSamples,
+    /// Pools below the floor decided; awaiting `LockResult`.
+    AwaitingLock { ejects: Vec<PoolPressureSample> },
+    /// Lock held by the runner; pools re-confirmed and reclaimed in order.
+    Reclaiming {
+        current: PoolPressureSample,
+        remaining: Vec<PoolPressureSample>,
+    },
+}
+
+/// Events the runner feeds the eject protocol — each the result of executing
+/// the previous [`EjectAction`], except the entry tick.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EjectEvent {
+    /// Fired by the runner every poll iteration. `now` is the runner's
+    /// monotonic clock; the machine gates sampling on the ~60 s interval.
+    SpaceCheckTick { now: Instant },
+    /// Result of `SamplePressure`: one sample per source pool with
+    /// send-enabled subvolumes (pools whose space could not be read are
+    /// already dropped by the gather).
+    PressureSampled { samples: Vec<PoolPressureSample> },
+    /// Result of `AcquireEjectLock`. `acquired: false` covers both a live
+    /// backup holding the lock and a lock error (the runner warns on the
+    /// error case); the protocol defers identically — the watchdog owns
+    /// space mid-send.
+    LockResult { acquired: bool },
+    /// Result of `ReconfirmPool`: a fresh free-bytes reading taken under the
+    /// held lock. `None` = unreadable (the runner has already warned) — the
+    /// pool is skipped (the outer re-confirm fails closed; the executor's
+    /// internal gate is the deliberate fail-open actor in the dark).
+    ///
+    /// Pairing invariant: this event deliberately carries no pool identity.
+    /// The runner feeds each action's result back before any other event, so
+    /// a reading always applies to the `Reclaiming` phase's `current` pool.
+    PoolReconfirmed { free_bytes: Option<u64> },
+    /// Result of `ReclaimPool` (outcome surfacing is a runner effect).
+    ReclaimFinished,
+}
+
+/// Effects the runner executes for the eject protocol. The machine decides;
+/// these name the I/O.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EjectAction {
+    /// Gather one [`PoolPressureSample`] per send-enabled source pool.
+    SamplePressure,
+    /// Try the backup lock (`"sentinel-eject"`). On success the runner holds
+    /// the guard until the protocol quiesces and builds the act-time context
+    /// (away-shed presence map, btrfs handle, one shared event timestamp).
+    AcquireEjectLock,
+    /// Fresh free-bytes read for `eject.mountpoint` under the lock.
+    ReconfirmPool { eject: PoolPressureSample },
+    /// Reclaim `eject`'s pool via `executor::emergency_reclaim_pool` and
+    /// surface the outcome (log / `EmergencyEject` event / notification /
+    /// release events).
+    ReclaimPool { eject: PoolPressureSample },
+}
+
+/// What [`eject_transition`] returns: new state and at most one action
+/// (`None` = protocol quiescent; the runner stops driving).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EjectTransition {
+    pub state: EjectState,
+    pub action: Option<EjectAction>,
+}
+
+/// Pure protocol machine for the idle emergency eject (UPI 087): every
+/// decision the runner's old `maybe_emergency_reclaim` made inline — the
+/// ~60 s timer gate, the eject verdict ([`guard::evaluate_idle_eject`]), the
+/// defer-to-a-running-backup, the re-confirm-under-lock verdict, and the
+/// per-pool sequencing — expressed as table-testable transitions. The runner
+/// samples, locks, reads statvfs, reclaims, and surfaces; it decides nothing.
+#[must_use]
+pub fn eject_transition(state: &EjectState, event: &EjectEvent) -> EjectTransition {
+    match (&state.phase, event) {
+        // Timer gate. A SpaceCheckTick in a non-Idle phase means the previous
+        // driver run leaked its phase (a bug — the runner warns): self-heal by
+        // treating it as Idle so the host-survival net re-arms instead of
+        // wedging shut. Safe: a leaked phase implies the previous driver run
+        // already returned and dropped its lock context.
+        (_, EjectEvent::SpaceCheckTick { now }) => {
+            let due = state
+                .last_space_check
+                .is_none_or(|last| now.duration_since(last) >= SPACE_CHECK_INTERVAL);
+            if due {
+                // Stamp the attempt regardless of outcome, as the runner
+                // side-path always did.
+                EjectTransition {
+                    state: EjectState {
+                        last_space_check: Some(*now),
+                        phase: EjectPhase::AwaitingSamples,
+                    },
+                    action: Some(EjectAction::SamplePressure),
+                }
+            } else {
+                eject_idle(state.last_space_check)
+            }
+        }
+
+        (EjectPhase::AwaitingSamples, EjectEvent::PressureSampled { samples }) => {
+            let ejects = guard::evaluate_idle_eject(samples);
+            if ejects.is_empty() {
+                eject_idle(state.last_space_check)
+            } else {
+                EjectTransition {
+                    state: EjectState {
+                        last_space_check: state.last_space_check,
+                        phase: EjectPhase::AwaitingLock { ejects },
+                    },
+                    action: Some(EjectAction::AcquireEjectLock),
+                }
+            }
+        }
+
+        // Defer silently to a running backup — retry next gate window.
+        (EjectPhase::AwaitingLock { .. }, EjectEvent::LockResult { acquired: false }) => {
+            eject_idle(state.last_space_check)
+        }
+
+        (EjectPhase::AwaitingLock { ejects }, EjectEvent::LockResult { acquired: true }) => {
+            eject_advance(state.last_space_check, ejects.clone())
+        }
+
+        (
+            EjectPhase::Reclaiming { current, remaining },
+            EjectEvent::PoolReconfirmed { free_bytes },
+        ) => match free_bytes {
+            // Still below the floor under the lock → reclaim this pool.
+            // Strict `<`: free == floor does not eject (guard.rs boundary).
+            Some(free) if *free < current.floor_bytes => EjectTransition {
+                state: state.clone(),
+                action: Some(EjectAction::ReclaimPool {
+                    eject: current.clone(),
+                }),
+            },
+            // Recovered (>= floor) or unreadable → skip this pool.
+            _ => eject_advance(state.last_space_check, remaining.clone()),
+        },
+
+        (EjectPhase::Reclaiming { remaining, .. }, EjectEvent::ReclaimFinished) => {
+            eject_advance(state.last_space_check, remaining.clone())
+        }
+
+        // Phase-mismatched events are inert (defensive totality).
+        _ => EjectTransition {
+            state: state.clone(),
+            action: None,
+        },
+    }
+}
+
+/// Quiesce: return to Idle with no action, preserving the gate stamp.
+fn eject_idle(last_space_check: Option<Instant>) -> EjectTransition {
+    EjectTransition {
+        state: EjectState {
+            last_space_check,
+            phase: EjectPhase::Idle,
+        },
+        action: None,
+    }
+}
+
+/// Advance to the next pool in the queue — re-confirm it — or quiesce when
+/// the queue is exhausted (the runner then flushes and drops the lock).
+fn eject_advance(
+    last_space_check: Option<Instant>,
+    mut queue: Vec<PoolPressureSample>,
+) -> EjectTransition {
+    if queue.is_empty() {
+        return eject_idle(last_space_check);
+    }
+    let current = queue.remove(0);
+    EjectTransition {
+        state: EjectState {
+            last_space_check,
+            phase: EjectPhase::Reclaiming {
+                current: current.clone(),
+                remaining: queue,
+            },
+        },
+        action: Some(EjectAction::ReconfirmPool { eject: current }),
+    }
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
@@ -2087,5 +2317,436 @@ mod tests {
             }),
             "remount should emit reconnection: {actions:?}"
         );
+    }
+
+    // ── Idle emergency-eject protocol (UPI 087) ─────────────────────────
+
+    const GB: u64 = 1024 * 1024 * 1024;
+
+    fn psample(uuid: &str, free: u64, floor: u64) -> PoolPressureSample {
+        PoolPressureSample {
+            pool_uuid: uuid.to_string(),
+            mountpoint: std::path::PathBuf::from(format!("/mnt/{uuid}")),
+            free_bytes: free,
+            floor_bytes: floor,
+            subvol_names: vec![format!("{uuid}-sv")],
+        }
+    }
+
+    fn eject_state(last: Option<Instant>, phase: EjectPhase) -> EjectState {
+        EjectState {
+            last_space_check: last,
+            phase,
+        }
+    }
+
+    #[test]
+    fn idle_tick_first_ever_stamps_and_samples() {
+        let t0 = Instant::now();
+        let out = eject_transition(
+            &EjectState::new(),
+            &EjectEvent::SpaceCheckTick { now: t0 },
+        );
+        assert_eq!(out.state.last_space_check, Some(t0));
+        assert_eq!(out.state.phase, EjectPhase::AwaitingSamples);
+        assert_eq!(out.action, Some(EjectAction::SamplePressure));
+    }
+
+    #[test]
+    fn idle_tick_before_interval_is_silent() {
+        let t0 = Instant::now();
+        let state = eject_state(Some(t0), EjectPhase::Idle);
+        let out = eject_transition(
+            &state,
+            &EjectEvent::SpaceCheckTick {
+                now: t0 + Duration::from_secs(30),
+            },
+        );
+        assert_eq!(out.state, state, "stamp must not advance while throttled");
+        assert_eq!(out.action, None);
+    }
+
+    #[test]
+    fn idle_tick_exactly_at_interval_samples() {
+        // Frozen boundary: the old gate was `elapsed < 60s → skip`, so exactly
+        // 60s proceeds.
+        let t0 = Instant::now();
+        let now = t0 + Duration::from_secs(60);
+        let out = eject_transition(
+            &eject_state(Some(t0), EjectPhase::Idle),
+            &EjectEvent::SpaceCheckTick { now },
+        );
+        assert_eq!(out.state.last_space_check, Some(now));
+        assert_eq!(out.action, Some(EjectAction::SamplePressure));
+    }
+
+    #[test]
+    fn stamp_advances_even_when_samples_return_empty() {
+        // The attempt is stamped when the gate opens, before sampling — an
+        // empty outcome must not un-stamp it (frozen: stamp-on-attempt).
+        let t0 = Instant::now();
+        let out = eject_transition(
+            &EjectState::new(),
+            &EjectEvent::SpaceCheckTick { now: t0 },
+        );
+        let out = eject_transition(
+            &out.state,
+            &EjectEvent::PressureSampled { samples: vec![] },
+        );
+        assert_eq!(out.state.last_space_check, Some(t0));
+        assert_eq!(out.state.phase, EjectPhase::Idle);
+
+        // 30s later: still throttled by the stamped attempt.
+        let out = eject_transition(
+            &out.state,
+            &EjectEvent::SpaceCheckTick {
+                now: t0 + Duration::from_secs(30),
+            },
+        );
+        assert_eq!(out.action, None);
+    }
+
+    #[test]
+    fn sampled_empty_returns_to_idle_without_lock() {
+        let out = eject_transition(
+            &eject_state(Some(Instant::now()), EjectPhase::AwaitingSamples),
+            &EjectEvent::PressureSampled { samples: vec![] },
+        );
+        assert_eq!(out.state.phase, EjectPhase::Idle);
+        assert_eq!(out.action, None);
+    }
+
+    #[test]
+    fn sampled_below_floor_requests_lock_preserving_order() {
+        let samples = vec![
+            psample("p1", GB, 2 * GB),
+            psample("p2", 10 * GB, 2 * GB), // healthy — dropped by the verdict
+            psample("p3", GB, 2 * GB),
+        ];
+        let out = eject_transition(
+            &eject_state(Some(Instant::now()), EjectPhase::AwaitingSamples),
+            &EjectEvent::PressureSampled { samples },
+        );
+        assert_eq!(out.action, Some(EjectAction::AcquireEjectLock));
+        match out.state.phase {
+            EjectPhase::AwaitingLock { ejects } => {
+                let uuids: Vec<&str> =
+                    ejects.iter().map(|e| e.pool_uuid.as_str()).collect();
+                assert_eq!(uuids, vec!["p1", "p3"], "order preserved, healthy dropped");
+            }
+            other => panic!("expected AwaitingLock, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sampled_at_floor_boundary_is_dropped() {
+        // free == floor does not eject (guard.rs boundary) — wiring check that
+        // the machine delegates the verdict to evaluate_idle_eject.
+        let out = eject_transition(
+            &eject_state(Some(Instant::now()), EjectPhase::AwaitingSamples),
+            &EjectEvent::PressureSampled {
+                samples: vec![psample("p1", 2 * GB, 2 * GB)],
+            },
+        );
+        assert_eq!(out.state.phase, EjectPhase::Idle);
+        assert_eq!(out.action, None);
+    }
+
+    #[test]
+    fn lock_unavailable_defers_silently() {
+        // Backup running → defer: no action, no reclaim, retry next window.
+        let out = eject_transition(
+            &eject_state(
+                Some(Instant::now()),
+                EjectPhase::AwaitingLock {
+                    ejects: vec![psample("p1", GB, 2 * GB)],
+                },
+            ),
+            &EjectEvent::LockResult { acquired: false },
+        );
+        assert_eq!(out.state.phase, EjectPhase::Idle);
+        assert_eq!(out.action, None);
+    }
+
+    #[test]
+    fn lock_acquired_reconfirms_first_pool() {
+        let e1 = psample("p1", GB, 2 * GB);
+        let e2 = psample("p2", GB, 2 * GB);
+        let out = eject_transition(
+            &eject_state(
+                Some(Instant::now()),
+                EjectPhase::AwaitingLock {
+                    ejects: vec![e1.clone(), e2.clone()],
+                },
+            ),
+            &EjectEvent::LockResult { acquired: true },
+        );
+        assert_eq!(out.action, Some(EjectAction::ReconfirmPool { eject: e1.clone() }));
+        assert_eq!(
+            out.state.phase,
+            EjectPhase::Reclaiming {
+                current: e1,
+                remaining: vec![e2],
+            }
+        );
+    }
+
+    #[test]
+    fn reconfirm_below_floor_reclaims_current() {
+        let e1 = psample("p1", GB, 2 * GB);
+        let state = eject_state(
+            Some(Instant::now()),
+            EjectPhase::Reclaiming {
+                current: e1.clone(),
+                remaining: vec![],
+            },
+        );
+        let out = eject_transition(
+            &state,
+            &EjectEvent::PoolReconfirmed {
+                free_bytes: Some(GB),
+            },
+        );
+        assert_eq!(out.action, Some(EjectAction::ReclaimPool { eject: e1 }));
+        assert_eq!(out.state, state, "phase unchanged until ReclaimFinished");
+    }
+
+    #[test]
+    fn reconfirm_recovered_skips_pool_and_advances() {
+        // Floor recovered between sample and confirm → no-op for this pool.
+        let e1 = psample("p1", GB, 2 * GB);
+        let e2 = psample("p2", GB, 2 * GB);
+        let out = eject_transition(
+            &eject_state(
+                Some(Instant::now()),
+                EjectPhase::Reclaiming {
+                    current: e1,
+                    remaining: vec![e2.clone()],
+                },
+            ),
+            &EjectEvent::PoolReconfirmed {
+                free_bytes: Some(3 * GB),
+            },
+        );
+        assert_eq!(out.action, Some(EjectAction::ReconfirmPool { eject: e2.clone() }));
+        assert_eq!(
+            out.state.phase,
+            EjectPhase::Reclaiming {
+                current: e2,
+                remaining: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn reconfirm_exactly_at_floor_skips() {
+        // Strict `<` at act time too: free == floor does not reclaim.
+        let e1 = psample("p1", GB, 2 * GB);
+        let out = eject_transition(
+            &eject_state(
+                Some(Instant::now()),
+                EjectPhase::Reclaiming {
+                    current: e1,
+                    remaining: vec![],
+                },
+            ),
+            &EjectEvent::PoolReconfirmed {
+                free_bytes: Some(2 * GB),
+            },
+        );
+        assert_eq!(out.state.phase, EjectPhase::Idle);
+        assert_eq!(out.action, None);
+    }
+
+    #[test]
+    fn reconfirm_unreadable_skips_pool() {
+        // Unreadable re-confirm fails closed: skip, never reclaim blind.
+        let e1 = psample("p1", GB, 2 * GB);
+        let out = eject_transition(
+            &eject_state(
+                Some(Instant::now()),
+                EjectPhase::Reclaiming {
+                    current: e1,
+                    remaining: vec![],
+                },
+            ),
+            &EjectEvent::PoolReconfirmed { free_bytes: None },
+        );
+        assert_eq!(out.state.phase, EjectPhase::Idle);
+        assert_eq!(out.action, None);
+    }
+
+    #[test]
+    fn reclaim_finished_advances_to_next_pool() {
+        let e1 = psample("p1", GB, 2 * GB);
+        let e2 = psample("p2", GB, 2 * GB);
+        let out = eject_transition(
+            &eject_state(
+                Some(Instant::now()),
+                EjectPhase::Reclaiming {
+                    current: e1,
+                    remaining: vec![e2.clone()],
+                },
+            ),
+            &EjectEvent::ReclaimFinished,
+        );
+        assert_eq!(out.action, Some(EjectAction::ReconfirmPool { eject: e2 }));
+    }
+
+    #[test]
+    fn last_pool_done_returns_to_idle_without_action() {
+        let out = eject_transition(
+            &eject_state(
+                Some(Instant::now()),
+                EjectPhase::Reclaiming {
+                    current: psample("p1", GB, 2 * GB),
+                    remaining: vec![],
+                },
+            ),
+            &EjectEvent::ReclaimFinished,
+        );
+        assert_eq!(out.state.phase, EjectPhase::Idle);
+        assert_eq!(out.action, None);
+    }
+
+    #[test]
+    fn multi_pool_order_preserved_through_mixed_skip_and_reclaim() {
+        // Full protocol walk, three pressured pools: p1 reclaims, p2 recovered
+        // (skips), p3 reclaims. Asserts the exact action sequence.
+        let t0 = Instant::now();
+        let samples = vec![
+            psample("p1", GB, 2 * GB),
+            psample("p2", GB, 2 * GB),
+            psample("p3", GB, 2 * GB),
+        ];
+        let mut actions = Vec::new();
+        let mut state = EjectState::new();
+        let events = [
+            EjectEvent::SpaceCheckTick { now: t0 },
+            EjectEvent::PressureSampled { samples },
+            EjectEvent::LockResult { acquired: true },
+            EjectEvent::PoolReconfirmed { free_bytes: Some(GB) }, // p1 below → reclaim
+            EjectEvent::ReclaimFinished,                          // → reconfirm p2
+            EjectEvent::PoolReconfirmed { free_bytes: Some(3 * GB) }, // p2 recovered → p3
+            EjectEvent::PoolReconfirmed { free_bytes: Some(GB) }, // p3 below → reclaim
+            EjectEvent::ReclaimFinished,                          // queue empty → Idle
+        ];
+        for event in &events {
+            let out = eject_transition(&state, event);
+            state = out.state;
+            if let Some(a) = out.action {
+                actions.push(a);
+            }
+        }
+        let describe: Vec<String> = actions
+            .iter()
+            .map(|a| match a {
+                EjectAction::SamplePressure => "sample".to_string(),
+                EjectAction::AcquireEjectLock => "lock".to_string(),
+                EjectAction::ReconfirmPool { eject } => format!("confirm:{}", eject.pool_uuid),
+                EjectAction::ReclaimPool { eject } => format!("reclaim:{}", eject.pool_uuid),
+            })
+            .collect();
+        assert_eq!(
+            describe,
+            vec![
+                "sample", "lock", "confirm:p1", "reclaim:p1", "confirm:p2",
+                "confirm:p3", "reclaim:p3",
+            ]
+        );
+        assert_eq!(state.phase, EjectPhase::Idle);
+        assert_eq!(state.last_space_check, Some(t0));
+    }
+
+    #[test]
+    fn leaked_phase_self_heals_on_due_tick() {
+        // A leaked non-Idle phase must re-arm, never wedge — from every
+        // non-Idle phase, a due tick behaves exactly as from Idle.
+        let t0 = Instant::now();
+        let now = t0 + Duration::from_secs(61);
+        for phase in [
+            EjectPhase::AwaitingSamples,
+            EjectPhase::AwaitingLock {
+                ejects: vec![psample("p1", GB, 2 * GB)],
+            },
+            EjectPhase::Reclaiming {
+                current: psample("p1", GB, 2 * GB),
+                remaining: vec![],
+            },
+        ] {
+            let out = eject_transition(
+                &eject_state(Some(t0), phase.clone()),
+                &EjectEvent::SpaceCheckTick { now },
+            );
+            assert_eq!(
+                out.state.phase,
+                EjectPhase::AwaitingSamples,
+                "leaked {phase:?} must re-arm"
+            );
+            assert_eq!(out.action, Some(EjectAction::SamplePressure));
+        }
+    }
+
+    #[test]
+    fn leaked_phase_resets_to_idle_on_not_due_tick() {
+        let t0 = Instant::now();
+        let out = eject_transition(
+            &eject_state(Some(t0), EjectPhase::AwaitingSamples),
+            &EjectEvent::SpaceCheckTick {
+                now: t0 + Duration::from_secs(30),
+            },
+        );
+        assert_eq!(out.state.phase, EjectPhase::Idle, "leaked phase heals to Idle");
+        assert_eq!(out.action, None);
+    }
+
+    #[test]
+    fn mismatched_events_are_inert() {
+        let idle = eject_state(Some(Instant::now()), EjectPhase::Idle);
+        for event in [
+            EjectEvent::PressureSampled {
+                samples: vec![psample("p1", GB, 2 * GB)],
+            },
+            EjectEvent::LockResult { acquired: true },
+            EjectEvent::PoolReconfirmed {
+                free_bytes: Some(GB),
+            },
+            EjectEvent::ReclaimFinished,
+        ] {
+            let out = eject_transition(&idle, &event);
+            assert_eq!(out.state, idle, "{event:?} must be inert at Idle");
+            assert_eq!(out.action, None);
+        }
+
+        // A reconfirm reading arriving while still awaiting the lock is inert.
+        let awaiting = eject_state(
+            Some(Instant::now()),
+            EjectPhase::AwaitingLock {
+                ejects: vec![psample("p1", GB, 2 * GB)],
+            },
+        );
+        let out = eject_transition(
+            &awaiting,
+            &EjectEvent::PoolReconfirmed {
+                free_bytes: Some(GB),
+            },
+        );
+        assert_eq!(out.state, awaiting);
+        assert_eq!(out.action, None);
+    }
+
+    #[test]
+    fn awaiting_lock_with_empty_ejects_is_defensive_idle() {
+        // Unreachable by construction (AwaitingLock is only entered with a
+        // non-empty verdict), but the machine is total: quiesce, don't panic.
+        let out = eject_transition(
+            &eject_state(
+                Some(Instant::now()),
+                EjectPhase::AwaitingLock { ejects: vec![] },
+            ),
+            &EjectEvent::LockResult { acquired: true },
+        );
+        assert_eq!(out.state.phase, EjectPhase::Idle);
+        assert_eq!(out.action, None);
     }
 }
