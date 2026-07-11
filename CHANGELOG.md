@@ -12,6 +12,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mechanical rewrites, no behavior change — and an ETXTBSY race in the Encounter's
   fake-editor tests that made the suite flake roughly once per two dozen runs: the
   test editors now run as `sh script` instead of exec'ing the freshly written file.
+- Sixteen tests were coupled to the developer machine's environment and failed on a
+  stock Ubuntu CI runner: executor fixtures used `/snap` as the snapshot root (absent
+  on Fedora, present on Ubuntu via snapd, turning the mkdir fail-open guard into a
+  real permission error), and one sealing test assumed no passwordless root (a CI
+  runner's NOPASSWD grant short-circuited the earning before the render refusal under
+  test). Fixtures now use an absent-everywhere root; the earning tests inject a
+  stubbed privilege probe.
 
 ### Changed
 - The sentinel's idle emergency-eject decisions (ADR-113 Layer 3) — the ~60 s timer
