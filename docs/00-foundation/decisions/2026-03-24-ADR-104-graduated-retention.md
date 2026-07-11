@@ -141,5 +141,5 @@ already-shipped recommendation outputs.
 - ADR-105: Backward-compatibility contracts (Amendment 2026-05-15 — `monthly = 0` semantic shift)
 - ADR-111: Config system architecture (Amendment 2026-05-15 — `config_version = 2`)
 - ADR-115: Retention shape symmetry and the recommendation layer (4-slot recommender scope)
-- [Phase 1 journal](../../98-journals/2026-03-22-urd-phase01.md) — retention redesign
-- [Roadmap](../../96-project-supervisor/roadmap.md) — original flat retention specification
+- Phase 1 journal (`docs/98-journals/2026-03-22-urd-phase01.md`) — retention redesign
+- Roadmap (`docs/96-project-supervisor/roadmap.md`) — original flat retention specification

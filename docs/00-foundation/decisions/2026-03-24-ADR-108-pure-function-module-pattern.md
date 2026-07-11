@@ -97,9 +97,9 @@ Tests are deterministic — same inputs always produce same outputs.
 ## Related
 
 - ADR-100: Planner/executor separation (the original instance of this pattern)
-- [Awareness model design review](../../99-reports/2026-03-23-awareness-model-design-review.md) —
+- Awareness model design review (`docs/99-reports/2026-03-23-awareness-model-design-review.md`) —
   "Following the planner pattern"
-- [Presentation layer design review](../../99-reports/2026-03-24-presentation-layer-design-review.md) —
+- Presentation layer design review (`docs/99-reports/2026-03-24-presentation-layer-design-review.md`) —
   "commands produce structured types, not formatted strings"
-- [Vision architecture review](../../99-reports/2026-03-23-vision-architecture-review.md) §2 —
+- Vision architecture review (`docs/99-reports/2026-03-23-vision-architecture-review.md`) §2 —
   awareness model must work without Sentinel

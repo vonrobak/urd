@@ -74,6 +74,6 @@ made historical queries impossible ("when did the last backup run? how long did 
 ## Related
 
 - ADR-100: Planner/executor separation (planner reads filesystem through trait)
-- [Roadmap](../../96-project-supervisor/roadmap.md) §SQLite Schema — documents the decision
+- Roadmap (`docs/96-project-supervisor/roadmap.md`) §SQLite Schema — documents the decision
   to remove the `snapshots` table
-- [Phase 2 journal](../../98-journals/2026-03-22-urd-phase02.md) — state.rs implementation
+- Phase 2 journal (`docs/98-journals/2026-03-22-urd-phase02.md`) — state.rs implementation

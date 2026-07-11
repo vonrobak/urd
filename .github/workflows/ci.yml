@@ -1,0 +1,44 @@
+# CI quality gate (UPI 077). Both jobs are required status checks on master.
+#
+# Action pins are full commit SHAs — mutable tags can be repointed by a compromised
+# action repo, the same attack class the no-`curl | bash` install posture refuses.
+# The tag in the trailing comment is informational only; bump by editing the SHA.
+#
+# No `cargo fmt --check`: HEAD is formatted with an older rustfmt and the current
+# version mass-reformats many files (see CLAUDE.md, Project State).
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+# Superseded pushes to the same PR cancel their stale runs; master pushes never cancel.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+
+  docs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - run: bash scripts/check-docs.sh
+      - run: bash scripts/check-present-not-journey.sh

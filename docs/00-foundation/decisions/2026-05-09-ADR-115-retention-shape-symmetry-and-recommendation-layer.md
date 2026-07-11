@@ -24,7 +24,7 @@ ADR-113 (do-no-harm invariant), ADR-114 (structured event log)
 
 Six weeks of autonomous operation produced the first evidence-based view of
 per-subvolume cost
-([report](../../99-reports/2026-05-09-retention-tuning-from-real-world-data.md)).
+(report: `docs/99-reports/2026-05-09-retention-tuning-from-real-world-data.md`).
 Two patterns emerged:
 
 1. **Named-level retention shapes are decoupled from real cost.** The same
