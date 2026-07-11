@@ -468,16 +468,19 @@ impl<'a> Executor<'a> {
         // Finish run in SQLite
         self.finish_run(run_id, overall.as_str());
 
-        // Persist plan-level events (planner choices, deferrals, retention
-        // rationale) best-effort. Stamp clones so the pure plan stays
+        // Record plan-level events (planner choices, deferrals, retention
+        // rationale) — the recorder stamps clones so the pure plan stays
         // unmutated and the &BackupPlan signature is preserved.
-        if let Some(state) = self.state
-            && !plan.events.is_empty()
-        {
-            let ctx = crate::events::RunContext::for_run(run_id);
-            let stamped: Vec<crate::events::Event> =
-                plan.events.iter().map(|ev| ev.clone().stamp(&ctx)).collect();
-            state.record_events_best_effort(&stamped);
+        if !plan.events.is_empty() {
+            let recorder = crate::recorder::Recorder::new(self.state, self.config);
+            recorder.record(
+                &crate::events::RunContext::for_run(run_id),
+                crate::recorder::Recording {
+                    events: plan.events.clone(),
+                    notifications: vec![],
+                    dispatch: crate::recorder::DispatchPolicy::Immediate,
+                },
+            );
         }
 
         ExecutionResult {
