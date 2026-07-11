@@ -3426,6 +3426,44 @@ source = "/data/beta"
     }
 
     #[test]
+    fn backup_json_assessment_rows_lack_promise_fields() {
+        // Golden fixture (UPI 088-a, arc R8): pins today's split-brain —
+        // backup's serialized assessment rows carry NO promise_level /
+        // retention_summary / external_only keys (status backfills them,
+        // backup doesn't). Step 6 of 088-a deliberately flips this test
+        // when the mirror becomes total: the keys appear, additively.
+        let result = ExecutionResult {
+            overall: RunResult::Success,
+            subvolume_results: vec![],
+            run_id: Some(10),
+        };
+        let summary = build_backup_summary(
+            &empty_plan(),
+            &result,
+            &sample_assessments(),
+            vec![],
+            Duration::from_secs(5),
+            &[],
+        );
+
+        let json = serde_json::to_value(&summary).expect("summary serializes");
+        let row = &json["assessments"][0];
+        assert_eq!(row["name"], "htpc-home");
+        assert!(
+            row.get("promise_level").is_none(),
+            "backup rows carry no promise_level pre-088-a"
+        );
+        assert!(
+            row.get("retention_summary").is_none(),
+            "backup rows carry no retention_summary pre-088-a"
+        );
+        assert!(
+            row.get("external_only").is_none(),
+            "external_only is skip-when-false and from_assessment defaults it"
+        );
+    }
+
+    #[test]
     fn build_summary_multi_drive_sends() {
         let result = ExecutionResult {
             overall: RunResult::Success,

@@ -1017,6 +1017,135 @@ mod tests {
         assert!(all_unprotected.is_empty());
     }
 
+    // ── Golden prose (UPI 088-a, arc R8) ───────────────────────────
+    // Byte-exact fixtures for every promise-transition sentence. Before
+    // 088-a nothing pinned these bodies, and sentinel_runner's twin
+    // builder emits the identical prose independently — these goldens
+    // are the acceptance criterion for collapsing both onto one shared
+    // core. Change a string here only as a deliberate voice decision.
+
+    #[test]
+    fn golden_degraded_prose_exact() {
+        let prev = make_heartbeat(&[("home", PromiseStatus::Protected, Some(true))]);
+        let curr = make_heartbeat(&[("home", PromiseStatus::AtRisk, Some(true))]);
+
+        let notifications = compute_notifications(Some(&prev), &curr);
+
+        let degraded: Vec<_> = notifications
+            .iter()
+            .filter(|n| matches!(n.event, NotificationEvent::PromiseDegraded { .. }))
+            .collect();
+        assert_eq!(degraded.len(), 1);
+        assert_eq!(degraded[0].urgency, Urgency::Warning);
+        assert_eq!(degraded[0].title, "Urd: home is now AT RISK");
+        assert_eq!(
+            degraded[0].body,
+            "The thread of home has frayed — it was PROTECTED, now AT RISK. \
+             The well remembers, but the thread grows thin."
+        );
+    }
+
+    #[test]
+    fn golden_recovered_prose_exact() {
+        let prev = make_heartbeat(&[("home", PromiseStatus::AtRisk, Some(true))]);
+        let curr = make_heartbeat(&[("home", PromiseStatus::Protected, Some(true))]);
+
+        let notifications = compute_notifications(Some(&prev), &curr);
+
+        let recovered: Vec<_> = notifications
+            .iter()
+            .filter(|n| matches!(n.event, NotificationEvent::PromiseRecovered { .. }))
+            .collect();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].urgency, Urgency::Info);
+        assert_eq!(recovered[0].title, "Urd: home restored to PROTECTED");
+        assert_eq!(
+            recovered[0].body,
+            "The thread of home is mended — restored from AT RISK to PROTECTED."
+        );
+    }
+
+    #[test]
+    fn golden_all_unprotected_prose_exact() {
+        let curr = make_heartbeat(&[
+            ("home", PromiseStatus::Unprotected, Some(true)),
+            ("docs", PromiseStatus::Unprotected, Some(true)),
+        ]);
+
+        let notifications = compute_notifications(None, &curr);
+
+        let all_unprotected: Vec<_> = notifications
+            .iter()
+            .filter(|n| matches!(n.event, NotificationEvent::AllUnprotected))
+            .collect();
+        assert_eq!(all_unprotected.len(), 1);
+        assert_eq!(all_unprotected[0].urgency, Urgency::Critical);
+        assert_eq!(all_unprotected[0].title, "Urd: all promises broken");
+        assert_eq!(
+            all_unprotected[0].body,
+            "Every thread in the well has snapped. No subvolume is protected. \
+             Attend to this — your data stands exposed."
+        );
+    }
+
+    #[test]
+    fn golden_first_run_all_unprotected_still_fires() {
+        // First run (`previous: None`): transitions are suppressed, but
+        // all-unprotected is still evaluated on `current` — a system that
+        // is born broken must say so.
+        let curr = make_heartbeat(&[("home", PromiseStatus::Unprotected, Some(true))]);
+
+        let notifications = compute_notifications(None, &curr);
+
+        assert!(notifications.iter().all(|n| !matches!(
+            n.event,
+            NotificationEvent::PromiseDegraded { .. }
+                | NotificationEvent::PromiseRecovered { .. }
+        )));
+        let all_unprotected: Vec<_> = notifications
+            .iter()
+            .filter(|n| matches!(n.event, NotificationEvent::AllUnprotected))
+            .collect();
+        assert_eq!(all_unprotected.len(), 1);
+        assert_eq!(all_unprotected[0].title, "Urd: all promises broken");
+    }
+
+    #[test]
+    fn golden_mixed_transitions_prose_exact() {
+        // One degradation and one recovery in the same diff: both bodies
+        // exact, each carrying its own from/to pair.
+        let prev = make_heartbeat(&[
+            ("home", PromiseStatus::Protected, Some(true)),
+            ("docs", PromiseStatus::AtRisk, Some(true)),
+        ]);
+        let curr = make_heartbeat(&[
+            ("home", PromiseStatus::AtRisk, Some(true)),
+            ("docs", PromiseStatus::Protected, Some(true)),
+        ]);
+
+        let notifications = compute_notifications(Some(&prev), &curr);
+
+        let degraded: Vec<_> = notifications
+            .iter()
+            .filter(|n| matches!(n.event, NotificationEvent::PromiseDegraded { .. }))
+            .collect();
+        let recovered: Vec<_> = notifications
+            .iter()
+            .filter(|n| matches!(n.event, NotificationEvent::PromiseRecovered { .. }))
+            .collect();
+        assert_eq!(degraded.len(), 1);
+        assert_eq!(
+            degraded[0].body,
+            "The thread of home has frayed — it was PROTECTED, now AT RISK. \
+             The well remembers, but the thread grows thin."
+        );
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(
+            recovered[0].body,
+            "The thread of docs is mended — restored from AT RISK to PROTECTED."
+        );
+    }
+
     // ── Backup failures ────────────────────────────────────────────
 
     #[test]

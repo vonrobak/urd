@@ -1743,6 +1743,118 @@ mod tests {
         assert!(notifications.is_empty());
     }
 
+    // ── Golden prose (UPI 088-a, arc R8) ────────────────────────────
+    // Twin fixtures: byte-identical to notify.rs's golden section by
+    // design — the two builders emit the same sentences independently,
+    // and these goldens are the acceptance criterion for collapsing
+    // both onto one shared core. See notify.rs for the rationale.
+
+    #[test]
+    fn golden_twin_degraded_prose_exact() {
+        let previous = vec![PromiseSnapshot {
+            name: "home".to_string(),
+            status: PromiseStatus::Protected,
+        }];
+        let current = vec![make_assessment("home", PromiseStatus::AtRisk)];
+
+        let notifications = build_notifications(&previous, &current);
+
+        let degraded: Vec<_> = notifications
+            .iter()
+            .filter(|n| matches!(n.event, NotificationEvent::PromiseDegraded { .. }))
+            .collect();
+        assert_eq!(degraded.len(), 1);
+        assert_eq!(degraded[0].urgency, Urgency::Warning);
+        assert_eq!(degraded[0].title, "Urd: home is now AT RISK");
+        assert_eq!(
+            degraded[0].body,
+            "The thread of home has frayed — it was PROTECTED, now AT RISK. \
+             The well remembers, but the thread grows thin."
+        );
+    }
+
+    #[test]
+    fn golden_twin_recovered_prose_exact() {
+        let previous = vec![PromiseSnapshot {
+            name: "home".to_string(),
+            status: PromiseStatus::AtRisk,
+        }];
+        let current = vec![make_assessment("home", PromiseStatus::Protected)];
+
+        let notifications = build_notifications(&previous, &current);
+
+        let recovered: Vec<_> = notifications
+            .iter()
+            .filter(|n| matches!(n.event, NotificationEvent::PromiseRecovered { .. }))
+            .collect();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].urgency, Urgency::Info);
+        assert_eq!(recovered[0].title, "Urd: home restored to PROTECTED");
+        assert_eq!(
+            recovered[0].body,
+            "The thread of home is mended — restored from AT RISK to PROTECTED."
+        );
+    }
+
+    #[test]
+    fn golden_twin_all_unprotected_prose_exact() {
+        let previous = vec![
+            PromiseSnapshot {
+                name: "home".to_string(),
+                status: PromiseStatus::Protected,
+            },
+            PromiseSnapshot {
+                name: "docs".to_string(),
+                status: PromiseStatus::Protected,
+            },
+        ];
+        let current = vec![
+            make_assessment("home", PromiseStatus::Unprotected),
+            make_assessment("docs", PromiseStatus::Unprotected),
+        ];
+
+        let notifications = build_notifications(&previous, &current);
+
+        let all_unprot: Vec<_> = notifications
+            .iter()
+            .filter(|n| matches!(n.event, NotificationEvent::AllUnprotected))
+            .collect();
+        assert_eq!(all_unprot.len(), 1);
+        assert_eq!(all_unprot[0].urgency, Urgency::Critical);
+        assert_eq!(all_unprot[0].title, "Urd: all promises broken");
+        assert_eq!(
+            all_unprot[0].body,
+            "Every thread in the well has snapped. No subvolume is protected. \
+             Attend to this — your data stands exposed."
+        );
+    }
+
+    #[test]
+    fn golden_twin_empty_previous_all_unprotected_still_fires() {
+        // This function has NO internal first-run guard: with an empty
+        // `previous`, transitions cannot match but all-unprotected still
+        // fires. The runner's `has_initial_assessment &&
+        // has_promise_changes` gate in execute_assess is what suppresses
+        // first-run noise — that gate is load-bearing, and this test
+        // documents why.
+        let previous: Vec<PromiseSnapshot> = vec![];
+        let current = vec![make_assessment("home", PromiseStatus::Unprotected)];
+
+        let notifications = build_notifications(&previous, &current);
+
+        assert!(notifications.iter().all(|n| !matches!(
+            n.event,
+            NotificationEvent::PromiseDegraded { .. }
+                | NotificationEvent::PromiseRecovered { .. }
+        )));
+        let all_unprot: Vec<_> = notifications
+            .iter()
+            .filter(|n| matches!(n.event, NotificationEvent::AllUnprotected))
+            .collect();
+        assert_eq!(all_unprot.len(), 1);
+        assert_eq!(all_unprot[0].title, "Urd: all promises broken");
+    }
+
     // ── check_backup_overdue (S2: pure function with tests) ─────────
 
     fn dt(s: &str) -> NaiveDateTime {
