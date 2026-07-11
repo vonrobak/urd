@@ -627,8 +627,9 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     }
 
     // Backup is canonical for in-run promise transitions (trigger=Run);
-    // sentinel skips on BackupCompleted to avoid duplicates.
-    if let Some(db) = world.db() {
+    // sentinel skips on BackupCompleted to avoid duplicates. The db guard
+    // gates the diff computation itself, as before the recorder seam.
+    if world.db().is_some() {
         let prev_snapshots = awareness::snapshot_promises(&pre_assessments);
         let promise_events = awareness::diff_promise_states(
             &prev_snapshots,
@@ -636,13 +637,14 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
             heartbeat_now,
             crate::events::TransitionTrigger::Run,
         );
-        if !promise_events.is_empty() {
-            // Stamp the run context from the executor result.
-            let ctx = crate::events::RunContext::for_run(result.run_id);
-            let stamped: Vec<Event> =
-                promise_events.into_iter().map(|e| e.stamp(&ctx)).collect();
-            db.record_events_best_effort(&stamped);
-        }
+        recorder.record(
+            &crate::events::RunContext::for_run(result.run_id),
+            crate::recorder::Recording {
+                events: promise_events,
+                notifications: vec![],
+                dispatch: crate::recorder::DispatchPolicy::Immediate,
+            },
+        );
     }
 
     let summary = build_backup_summary(
