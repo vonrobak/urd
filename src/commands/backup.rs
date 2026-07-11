@@ -123,10 +123,16 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     let trigger = if args.auto { "auto" } else { "manual" };
     let _lock = lock::acquire_lock(&lock_path, trigger)?;
 
+    // The run-wide recorder (UPI 088-c): one seam for every event persist
+    // and notification dispatch on the run path. Per-site RunContexts
+    // carry what varies (pre-run sites are outside_run; post-execute
+    // sites are for_run(result.run_id)).
+    let recorder = crate::recorder::Recorder::new(world.db(), &config);
+
     // Emergency pre-flight: if any snapshot root is critically below threshold
     // (< 50% of min_free_bytes), run emergency retention before planning.
     // Runs under the lock because it performs destructive btrfs deletions.
-    let emergency_ran = run_emergency_preflight(&config, world.db())?;
+    let emergency_ran = run_emergency_preflight(&config, &recorder)?;
 
     // Re-plan if emergency freed space — plan may have different space_pressure
     // decisions. Reuses the SAME pre-plan `arming` (AB1: never re-resolve
@@ -445,30 +451,34 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
                     None => (0, Vec::new(), chrono::Local::now().naive_local()),
                 }
             };
-        if let Some(db) = world.db() {
-            let ctx = crate::events::RunContext::for_run(result.run_id);
-            let ev = Event::pure(
-                event_ts,
-                EventPayload::WatchdogAbort {
-                    pool_label: fire.pool_label.clone(),
-                    snapshots_reclaimed: reclaimed,
-                    send_aborted: fire.send_aborted,
-                },
-            )
-            .stamp(&ctx);
-            db.record_events_best_effort(&[ev]);
-            // (UPI 064-b B7) record the Tier-1 offsite chains the reclaim broke,
-            // for audit symmetry with the planner-driven away-shed. NO separate
-            // notification — the Critical WatchdogAbort notification already states
-            // the next backup will be a full send (avoid double-notifying).
-            let release_events: Vec<Event> = releases
-                .iter()
-                .map(|r| r.to_event(event_ts).stamp(&ctx))
-                .collect();
-            if !release_events.is_empty() {
-                db.record_events_best_effort(&release_events);
-            }
-        }
+        let ctx = crate::events::RunContext::for_run(result.run_id);
+        recorder.record(
+            &ctx,
+            crate::recorder::Recording {
+                events: vec![Event::pure(
+                    event_ts,
+                    EventPayload::WatchdogAbort {
+                        pool_label: fire.pool_label.clone(),
+                        snapshots_reclaimed: reclaimed,
+                        send_aborted: fire.send_aborted,
+                    },
+                )],
+                notifications: vec![],
+                dispatch: crate::recorder::DispatchPolicy::Immediate,
+            },
+        );
+        // (UPI 064-b B7) record the Tier-1 offsite chains the reclaim broke,
+        // for audit symmetry with the planner-driven away-shed. NO separate
+        // notification — the Critical WatchdogAbort notification already states
+        // the next backup will be a full send (avoid double-notifying).
+        recorder.record(
+            &ctx,
+            crate::recorder::Recording {
+                events: releases.iter().map(|r| r.to_event(event_ts)).collect(),
+                notifications: vec![],
+                dispatch: crate::recorder::DispatchPolicy::Immediate,
+            },
+        );
         watchdog_notifications.push(notify::build_watchdog_abort_notification(
             &fire.pool_label,
             reclaimed,
@@ -481,9 +491,14 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     // *within* the run); this teardown clear is belt-and-suspenders for the
     // process-end state.
     watchdog_abort.store(false, Ordering::SeqCst);
-    if !watchdog_notifications.is_empty() {
-        notify::dispatch(&watchdog_notifications, &config.notifications);
-    }
+    recorder.record(
+        &crate::events::RunContext::for_run(result.run_id),
+        crate::recorder::Recording {
+            events: vec![],
+            notifications: watchdog_notifications,
+            dispatch: crate::recorder::DispatchPolicy::Immediate,
+        },
+    );
 
     // ── Offsite chains released by the planner-driven away-shed (UPI 064-b) ──
     // Told-not-silent: every away pin the executor shed at Critical earns an
@@ -496,14 +511,6 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
         .collect();
     if !offsite_releases.is_empty() {
         let now_ts = chrono::Local::now().naive_local();
-        if let Some(db) = world.db() {
-            let ctx = crate::events::RunContext::for_run(result.run_id);
-            let events: Vec<Event> = offsite_releases
-                .iter()
-                .map(|r| r.to_event(now_ts).stamp(&ctx))
-                .collect();
-            db.record_events_best_effort(&events);
-        }
         let notes: Vec<notify::Notification> = offsite_releases
             .iter()
             .map(|r| {
@@ -514,7 +521,14 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
                 )
             })
             .collect();
-        notify::dispatch(&notes, &config.notifications);
+        recorder.record(
+            &crate::events::RunContext::for_run(result.run_id),
+            crate::recorder::Recording {
+                events: offsite_releases.iter().map(|r| r.to_event(now_ts)).collect(),
+                notifications: notes,
+                dispatch: crate::recorder::DispatchPolicy::Immediate,
+            },
+        );
     }
 
     // Read previous heartbeat BEFORE writing the new one (notification comparison).
@@ -2188,39 +2202,35 @@ fn dispatch_notifications(
 /// events have `run_id = None`.
 fn run_emergency_preflight(
     config: &Config,
-    state_db: Option<&StateDb>,
+    recorder: &crate::recorder::Recorder<'_>,
 ) -> anyhow::Result<bool> {
     let now = chrono::Local::now().naive_local();
     let btrfs = RealBtrfs::for_maintenance(&config.general.btrfs_path);
     let outcome = run_emergency_preflight_with(config, now, &btrfs, |p| {
         crate::drives::filesystem_free_bytes(p).ok()
     })?;
-    if let Some(db) = state_db {
-        // Emergency runs before begin_run — explicitly outside any run.
-        let ctx = crate::events::RunContext::outside_run();
-        let stamped: Vec<Event> = outcome
-            .emitted_events
-            .iter()
-            .map(|e| e.clone().stamp(&ctx))
-            .collect();
-        db.record_events_best_effort(&stamped);
-    }
     // Told-not-silent: emergency deletions before a backup must never be
-    // silent. Best-effort — dispatch failure never blocks the run.
-    if !outcome.root_summaries.is_empty() {
-        let notes: Vec<notify::Notification> = outcome
-            .root_summaries
-            .iter()
-            .map(|s| {
-                notify::build_emergency_retention_notification(
-                    &s.root,
-                    s.freed_bytes,
-                    s.deleted_count,
-                )
-            })
-            .collect();
-        notify::dispatch(&notes, &config.notifications);
-    }
+    // silent. Best-effort — persist and dispatch failure never block the
+    // run. Emergency runs before begin_run — explicitly outside any run.
+    let notes: Vec<notify::Notification> = outcome
+        .root_summaries
+        .iter()
+        .map(|s| {
+            notify::build_emergency_retention_notification(
+                &s.root,
+                s.freed_bytes,
+                s.deleted_count,
+            )
+        })
+        .collect();
+    recorder.record(
+        &crate::events::RunContext::outside_run(),
+        crate::recorder::Recording {
+            events: outcome.emitted_events,
+            notifications: notes,
+            dispatch: crate::recorder::DispatchPolicy::Immediate,
+        },
+    );
     Ok(outcome.any_deleted)
 }
 
