@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.34.0] - 2026-07-11
+
 ### Added
 - Release binaries: every tag push builds a statically linked `urd-x86_64-linux`
   (musl — one binary for any x86_64 Linux), checksums it into a `SHA256SUMS` manifest,
@@ -16,6 +18,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Continuous integration on every pull request: clippy (warnings-as-errors), the full
   test suite, and documentation link/convention lint now run as GitHub Actions required
   checks before anything merges. Third-party actions are pinned to full commit SHAs.
+
+### Changed
+- The sentinel's idle emergency-eject decisions (ADR-113 Layer 3) — the ~60 s timer
+  gate, the eject verdict, the defer-to-a-running-backup, and the re-confirm-under-lock
+  sequencing — now live in the pure sentinel state machine as a table-tested
+  request-response protocol (`eject_transition`) instead of a 160-line untested runner
+  side-path; the runner samples pool pressure and executes effects. No behavior change
+  (#300).
+
+- `graduated_retention`'s deciding cutoffs and `retention-preview`/`status`'s describing
+  cutoffs now derive from one shared cascade instead of two independently-maintained
+  copies, one of which approximated month/year math instead of using calendar-exact
+  subtraction. Accepted side effect: `retention-preview`'s `cumulative_days` and
+  `status`'s retention-summary one-liner now report exact-calendar day counts instead of
+  the old fixed-average approximation — the same config can report a slightly different
+  number depending on the day queried (#307).
+
+- `doctor`'s sudoers-drift and units-drift rows now derive from the same shared
+  comparisons `urd init`'s deep seal gate uses, instead of re-parsing the privilege
+  listing and re-reading installed unit files independently. No behavior change (#306).
+
+- `drives.rs` and `discovery.rs`'s per-path `findmnt` UUID/mountpoint lookups now delegate
+  to one concentrated probe in `pools.rs`; `drives.rs`'s statvfs free-bytes wrapper now
+  delegates to `pools.rs`'s too. No behavior change — one probe surface instead of three
+  hand-rolled parsers (#302).
+
+- The send-space guard's three-tier space check is now one call into the shared
+  `estimated_send_size` cascade instead of a second, independently-maintained copy that
+  had drifted to omit the failed-send floor tier (#304, #308).
+- Tier resolution, the away-shed view, and the executor's lifecycle judgment now flow
+  through one pre-lock artifact instead of three independently-derived tier/pin maps —
+  the executor's in-run away-shed also re-confirms a drive's presence right before
+  shedding its pin, so a drive that reconnects mid-run keeps its chain instead of losing
+  it to a stale pre-lock snapshot.
+- `status`, bare `urd`, `doctor`, `plan`, and `backup` now assemble their read-only world
+  (state DB, filesystem, btrfs handle) through one shared prelude instead of five
+  hand-rolled copies. Minor accepted side effect: `status`/`doctor`/bare `urd` now try to
+  open the state DB unconditionally like `backup` already does, so a config that's never
+  been backed up or sealed may see `urd.db` created on a plain inspection command.
 
 ### Fixed
 - Two new clippy lints on current stable (Rust 1.97) in `discovery` and `sudoers` —
@@ -30,53 +71,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   test). Fixtures now use an absent-everywhere root; the earning tests inject a
   stubbed privilege probe.
 
-### Changed
-- The sentinel's idle emergency-eject decisions (ADR-113 Layer 3) — the ~60 s timer
-  gate, the eject verdict, the defer-to-a-running-backup, and the re-confirm-under-lock
-  sequencing — now live in the pure sentinel state machine as a table-tested
-  request-response protocol (`eject_transition`) instead of a 160-line untested runner
-  side-path; the runner samples pool pressure and executes effects. No behavior change
-  (#300).
-
-### Changed
-- `graduated_retention`'s deciding cutoffs and `retention-preview`/`status`'s describing
-  cutoffs now derive from one shared cascade instead of two independently-maintained
-  copies, one of which approximated month/year math instead of using calendar-exact
-  subtraction. Accepted side effect: `retention-preview`'s `cumulative_days` and
-  `status`'s retention-summary one-liner now report exact-calendar day counts instead of
-  the old fixed-average approximation — the same config can report a slightly different
-  number depending on the day queried (#307).
-
-### Changed
-- `doctor`'s sudoers-drift and units-drift rows now derive from the same shared
-  comparisons `urd init`'s deep seal gate uses, instead of re-parsing the privilege
-  listing and re-reading installed unit files independently. No behavior change (#306).
-
-### Changed
-- `drives.rs` and `discovery.rs`'s per-path `findmnt` UUID/mountpoint lookups now delegate
-  to one concentrated probe in `pools.rs`; `drives.rs`'s statvfs free-bytes wrapper now
-  delegates to `pools.rs`'s too. No behavior change — one probe surface instead of three
-  hand-rolled parsers (#302).
-
-### Fixed
 - The external-send space guard now checks the same failed/aborted-send floor
   `estimated_send_size` already used, so a subvolume whose only size signal is a failed
   send is deferred instead of retried against space it has evidence won't fit (#304).
 
-### Changed
-- The send-space guard's three-tier space check is now one call into the shared
-  `estimated_send_size` cascade instead of a second, independently-maintained copy that
-  had drifted to omit the failed-send floor tier (#304, #308).
-- Tier resolution, the away-shed view, and the executor's lifecycle judgment now flow
-  through one pre-lock artifact instead of three independently-derived tier/pin maps —
-  the executor's in-run away-shed also re-confirms a drive's presence right before
-  shedding its pin, so a drive that reconnects mid-run keeps its chain instead of losing
-  it to a stale pre-lock snapshot.
-- `status`, bare `urd`, `doctor`, `plan`, and `backup` now assemble their read-only world
-  (state DB, filesystem, btrfs handle) through one shared prelude instead of five
-  hand-rolled copies. Minor accepted side effect: `status`/`doctor`/bare `urd` now try to
-  open the state DB unconditionally like `backup` already does, so a config that's never
-  been backed up or sealed may see `urd.db` created on a plain inspection command.
 
 ## [0.33.4] - 2026-07-08
 
@@ -1671,7 +1669,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Defense-in-depth pin file protection for unsent snapshots
 - Per-subvolume error isolation in executor
 
-[Unreleased]: https://github.com/vonrobak/urd/compare/v0.33.4...HEAD
+[Unreleased]: https://github.com/vonrobak/urd/compare/v0.34.0...HEAD
+[0.34.0]: https://github.com/vonrobak/urd/compare/v0.33.4...v0.34.0
 [0.33.4]: https://github.com/vonrobak/urd/compare/v0.33.3...v0.33.4
 [0.33.3]: https://github.com/vonrobak/urd/compare/v0.33.2...v0.33.3
 [0.33.2]: https://github.com/vonrobak/urd/compare/v0.33.1...v0.33.2
