@@ -813,13 +813,24 @@ fn adopt_one(
 // ── Stage 1: the earning ────────────────────────────────────────────────
 
 fn earn_privilege(config: &Config, config_path: &Path) -> anyhow::Result<SealOutcome> {
+    earn_privilege_with(config, config_path, probe_grant)
+}
+
+/// `earn_privilege` with the live-sudo probe injected — tests stub it, since
+/// the machine's own grant state (e.g. a CI runner's passwordless root)
+/// otherwise short-circuits the paths under test before they are reached.
+fn earn_privilege_with(
+    config: &Config,
+    config_path: &Path,
+    probe: impl FnOnce(&str) -> (GrantProbe, String),
+) -> anyhow::Result<SealOutcome> {
     let dest = Path::new(SUDOERS_DEST);
 
     // Already answers (e.g. a broader hand-managed grant)? Ask again only
     // on clear evidence: expected lines the listing definitively lacks (a
     // config the installed grant predates). Wildcard uncertainty stays
     // doctor's — a hand-managed broad grant is never nagged (071).
-    let regrant = if probe_grant(&config.general.btrfs_path).0 == GrantProbe::Granted {
+    let regrant = if probe(&config.general.btrfs_path).0 == GrantProbe::Granted {
         let missing = coverage_missing(config);
         if missing.is_empty() {
             print!("{}", voice::render_earning_already());
@@ -1532,17 +1543,18 @@ protection = "recorded"
 "#,
             root.display()
         ));
-        let outcome = earn_privilege(&config, &tmp.path().join("urd.toml")).unwrap();
+        let outcome = earn_privilege_with(&config, &tmp.path().join("urd.toml"), denied_probe)
+            .unwrap();
         assert_eq!(outcome, SealOutcome::Declined);
     }
 
     /// UPI 081 A2 (#275): a sudoers render refusal (here: a scope too
     /// shallow for the floor) routes through `render_earning_blocked` and
-    /// returns `Ok(Declined)`, never `Err`. `btrfs_path` points at a real,
-    /// existing binary that carries no grant of its own (`/usr/bin/true`),
-    /// so the probe reads Denied rather than Granted regardless of the test
-    /// runner's own cached sudo ticket — the "already earns" shortcut must
-    /// not mask the render refusal this test targets.
+    /// returns `Ok(Declined)`, never `Err`. The probe is stubbed Denied:
+    /// on a machine where sudo answers without a password (a CI runner's
+    /// NOPASSWD grant covers any binary, `/usr/bin/true` included), the
+    /// live probe reads Granted and the "already earns" shortcut would
+    /// return Sealed before the render refusal this test targets.
     #[test]
     fn earn_privilege_declined_not_err_when_render_refuses() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1560,8 +1572,15 @@ snapshot_root = "/"
 protection = "recorded"
 "#,
         );
-        let outcome = earn_privilege(&config, &tmp.path().join("urd.toml")).unwrap();
+        let outcome = earn_privilege_with(&config, &tmp.path().join("urd.toml"), denied_probe)
+            .unwrap();
         assert_eq!(outcome, SealOutcome::Declined);
+    }
+
+    /// Probe stub for `earn_privilege_with`: the no-grant machine state the
+    /// earning tests exercise, independent of the runner's real sudo.
+    fn denied_probe(_btrfs: &str) -> (GrantProbe, String) {
+        (GrantProbe::Denied, "password required (stub)".to_string())
     }
 
     #[test]
