@@ -167,16 +167,13 @@ pub struct OffsiteChainRelease {
 
 impl OffsiteChainRelease {
     /// The told-not-silent `OffsiteChainReleased` audit event for this release
-    /// (UPI 064-b), with `subvolume`/`drive_label` stamped. The single owner of
+    /// (UPI 064-b), with `subvolume`/`drive_label` filled. The single owner of
     /// the release-to-event mapping, used by both the backup surface (the
     /// planner-driven and reactive-watchdog paths) and the sentinel idle-eject.
-    /// `run_id` is `None` for the sentinel (an idle eject is not a backup run).
+    /// Unstamped: the recorder stamps the run context at persistence — the
+    /// sentinel's `outside_run` context yields the idle-eject's `run_id: None`.
     #[must_use]
-    pub fn to_event(
-        &self,
-        occurred_at: chrono::NaiveDateTime,
-        run_id: Option<i64>,
-    ) -> crate::events::Event {
+    pub fn to_event(&self, occurred_at: chrono::NaiveDateTime) -> crate::events::UnstampedEvent {
         let mut ev = crate::events::Event::pure(
             occurred_at,
             crate::events::EventPayload::OffsiteChainReleased {
@@ -185,9 +182,8 @@ impl OffsiteChainRelease {
                 parent: self.parent.to_string(),
             },
         );
-        ev.run_id = run_id;
-        ev.subvolume = Some(self.subvolume.clone());
-        ev.drive_label = Some(self.drive.clone());
+        ev.fill_subvolume(Some(self.subvolume.clone()));
+        ev.fill_drive_label(Some(self.drive.clone()));
         ev
     }
 }
@@ -472,17 +468,19 @@ impl<'a> Executor<'a> {
         // Finish run in SQLite
         self.finish_run(run_id, overall.as_str());
 
-        // Persist plan-level events (planner choices, deferrals, retention
-        // rationale) best-effort. Stamp run_id on a clone so the pure plan
-        // stays unmutated and the &BackupPlan signature is preserved.
-        if let Some(state) = self.state
-            && !plan.events.is_empty()
-        {
-            let mut stamped: Vec<crate::events::Event> = plan.events.clone();
-            for ev in &mut stamped {
-                ev.run_id = run_id;
-            }
-            state.record_events_best_effort(&stamped);
+        // Record plan-level events (planner choices, deferrals, retention
+        // rationale) — the recorder stamps clones so the pure plan stays
+        // unmutated and the &BackupPlan signature is preserved.
+        if !plan.events.is_empty() {
+            let recorder = crate::recorder::Recorder::new(self.state, self.config);
+            recorder.record(
+                &crate::events::RunContext::for_run(run_id),
+                crate::recorder::Recording {
+                    events: plan.events.clone(),
+                    notifications: vec![],
+                    dispatch: crate::recorder::DispatchPolicy::Immediate,
+                },
+            );
         }
 
         ExecutionResult {
@@ -4535,7 +4533,7 @@ local_retention = "transient"
                 scope: DeferScope::Subvolume,
             },
         );
-        event.subvolume = Some("sv-a".to_string());
+        event.fill_subvolume(Some("sv-a".to_string()));
         plan.events.push(event);
 
         let result = executor.execute(&plan, "full");
@@ -4576,12 +4574,35 @@ local_retention = "transient"
                 scope: DeferScope::Subvolume,
             },
         );
-        event.subvolume = Some("sv-a".to_string());
+        event.fill_subvolume(Some("sv-a".to_string()));
         plan.events.push(event);
 
         // No state DB, no panic — events are silently dropped.
         let result = executor.execute(&plan, "full");
         assert_eq!(result.overall, RunResult::Success);
+    }
+
+    #[test]
+    fn to_event_carries_subvolume_and_drive_context() {
+        // (UPI 088-c) The release event's context fields survive the stamp.
+        // A fill dropped during a refactor compiles fine but strips audit
+        // context — `urd events --drive X` would miss the chain release.
+        let release = OffsiteChainRelease {
+            subvolume: "alpha".into(),
+            drive: "WD-18TB".into(),
+            parent: SnapshotName::parse("20260101-1200-alpha").unwrap(),
+        };
+        let ts = NaiveDate::from_ymd_opt(2026, 7, 11)
+            .unwrap()
+            .and_hms_opt(4, 0, 0)
+            .unwrap();
+        let ev = release
+            .to_event(ts)
+            .stamp(&crate::events::RunContext::for_run(Some(9)));
+        assert_eq!(ev.subvolume.as_deref(), Some("alpha"));
+        assert_eq!(ev.drive_label.as_deref(), Some("WD-18TB"));
+        assert_eq!(ev.run_id, Some(9));
+        assert_eq!(ev.occurred_at, ts, "producer's semantic clock is preserved");
     }
 
     #[test]

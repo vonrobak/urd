@@ -14,7 +14,7 @@ use crate::commands::storage_signals;
 use crate::commands::world::{self, World};
 use crate::config::Config;
 use crate::drives;
-use crate::events::{Event, EventPayload};
+use crate::events::{Event, EventPayload, RunContext};
 use crate::executor::{
     ExecutionResult, Executor, FullSendPolicy, OffsiteChainRelease, OpResult, ReclaimOutcome,
     RunResult, SendType, TransientCleanupOutcome,
@@ -32,11 +32,11 @@ use crate::output::{
 use crate::notify;
 use crate::plan::{self, FilesystemQuery, HistoryQuery, PlanFilters, RealFileSystemState};
 use crate::pools::{self, PoolSpace};
-use crate::sentinel_runner;
 use crate::storage_critical::TightnessTier;
 use crate::preflight;
 use crate::state::StateDb;
 use crate::types::{BackupPlan, ByteSize, PlannedOperation, ProtectionLevel, SendKind};
+use crate::recorder::{DispatchPolicy, Recorder, Recording};
 
 pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     // Share one config across the run AND the watchdog thread (UPI 065-b): the
@@ -123,10 +123,16 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     let trigger = if args.auto { "auto" } else { "manual" };
     let _lock = lock::acquire_lock(&lock_path, trigger)?;
 
+    // The run-wide recorder (UPI 088-c): one seam for every event persist
+    // and notification dispatch on the run path. Per-site RunContexts
+    // carry what varies (pre-run sites are outside_run; post-execute
+    // sites are for_run(result.run_id)).
+    let recorder = Recorder::new(world.db(), &config);
+
     // Emergency pre-flight: if any snapshot root is critically below threshold
     // (< 50% of min_free_bytes), run emergency retention before planning.
     // Runs under the lock because it performs destructive btrfs deletions.
-    let emergency_ran = run_emergency_preflight(&config, world.db())?;
+    let emergency_ran = run_emergency_preflight(&config, &recorder)?;
 
     // Re-plan if emergency freed space — plan may have different space_pressure
     // decisions. Reuses the SAME pre-plan `arming` (AB1: never re-resolve
@@ -182,14 +188,17 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
         if let Err(e) = heartbeat::write(&config.general.heartbeat_file, &hb) {
             log::warn!("Failed to write heartbeat: {e}");
         }
-        if sentinel_runner::sentinel_is_running(&config) {
-            log::info!("Sentinel is running — deferring notification dispatch");
-            if let Err(e) = heartbeat::mark_dispatched(&config.general.heartbeat_file) {
-                log::warn!("Failed to update heartbeat dispatched flag: {e}");
-            }
-        } else {
-            dispatch_notifications(previous_hb.as_ref(), &hb, &config);
-        }
+        // The sentinel gate: dispatch-or-mark for promise-change
+        // notifications (computed here, pure — the recorder's
+        // GateOnSentinel owns the probe/mark/retry mechanics).
+        recorder.record(
+            &RunContext::outside_run(),
+            Recording {
+                events: vec![],
+                notifications: notify::compute_notifications(previous_hb.as_ref(), &hb),
+                dispatch: DispatchPolicy::GateOnSentinel,
+            },
+        );
         return Ok(());
     }
 
@@ -445,29 +454,34 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
                     None => (0, Vec::new(), chrono::Local::now().naive_local()),
                 }
             };
-        if let Some(db) = world.db() {
-            let mut ev = Event::pure(
-                event_ts,
-                EventPayload::WatchdogAbort {
-                    pool_label: fire.pool_label.clone(),
-                    snapshots_reclaimed: reclaimed,
-                    send_aborted: fire.send_aborted,
-                },
-            );
-            ev.run_id = result.run_id;
-            db.record_events_best_effort(&[ev]);
-            // (UPI 064-b B7) record the Tier-1 offsite chains the reclaim broke,
-            // for audit symmetry with the planner-driven away-shed. NO separate
-            // notification — the Critical WatchdogAbort notification already states
-            // the next backup will be a full send (avoid double-notifying).
-            let release_events: Vec<Event> = releases
-                .iter()
-                .map(|r| r.to_event(event_ts, result.run_id))
-                .collect();
-            if !release_events.is_empty() {
-                db.record_events_best_effort(&release_events);
-            }
-        }
+        let ctx = RunContext::for_run(result.run_id);
+        recorder.record(
+            &ctx,
+            Recording {
+                events: vec![Event::pure(
+                    event_ts,
+                    EventPayload::WatchdogAbort {
+                        pool_label: fire.pool_label.clone(),
+                        snapshots_reclaimed: reclaimed,
+                        send_aborted: fire.send_aborted,
+                    },
+                )],
+                notifications: vec![],
+                dispatch: DispatchPolicy::Immediate,
+            },
+        );
+        // (UPI 064-b B7) record the Tier-1 offsite chains the reclaim broke,
+        // for audit symmetry with the planner-driven away-shed. NO separate
+        // notification — the Critical WatchdogAbort notification already states
+        // the next backup will be a full send (avoid double-notifying).
+        recorder.record(
+            &ctx,
+            Recording {
+                events: releases.iter().map(|r| r.to_event(event_ts)).collect(),
+                notifications: vec![],
+                dispatch: DispatchPolicy::Immediate,
+            },
+        );
         watchdog_notifications.push(notify::build_watchdog_abort_notification(
             &fire.pool_label,
             reclaimed,
@@ -480,9 +494,14 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     // *within* the run); this teardown clear is belt-and-suspenders for the
     // process-end state.
     watchdog_abort.store(false, Ordering::SeqCst);
-    if !watchdog_notifications.is_empty() {
-        notify::dispatch(&watchdog_notifications, &config.notifications);
-    }
+    recorder.record(
+        &RunContext::for_run(result.run_id),
+        Recording {
+            events: vec![],
+            notifications: watchdog_notifications,
+            dispatch: DispatchPolicy::Immediate,
+        },
+    );
 
     // ── Offsite chains released by the planner-driven away-shed (UPI 064-b) ──
     // Told-not-silent: every away pin the executor shed at Critical earns an
@@ -495,13 +514,6 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
         .collect();
     if !offsite_releases.is_empty() {
         let now_ts = chrono::Local::now().naive_local();
-        if let Some(db) = world.db() {
-            let events: Vec<Event> = offsite_releases
-                .iter()
-                .map(|r| r.to_event(now_ts, result.run_id))
-                .collect();
-            db.record_events_best_effort(&events);
-        }
         let notes: Vec<notify::Notification> = offsite_releases
             .iter()
             .map(|r| {
@@ -512,7 +524,14 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
                 )
             })
             .collect();
-        notify::dispatch(&notes, &config.notifications);
+        recorder.record(
+            &RunContext::for_run(result.run_id),
+            Recording {
+                events: offsite_releases.iter().map(|r| r.to_event(now_ts)).collect(),
+                notifications: notes,
+                dispatch: DispatchPolicy::Immediate,
+            },
+        );
     }
 
     // Read previous heartbeat BEFORE writing the new one (notification comparison).
@@ -564,6 +583,7 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     // from the heartbeat-driven promise notifications below and runs regardless
     // of whether the sentinel is up. Best-effort throughout: never blocks a run.
     if let Some(db) = world.db() {
+        let ctx = RunContext::for_run(result.run_id);
         // The one sanctioned caller of the raw writeback (clippy
         // disallowed-methods guard — backup is the sole posture writer, D6).
         #[allow(clippy::disallowed_methods)]
@@ -571,7 +591,8 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
             db,
             heartbeat_now,
             &arming,
-            result.run_id,
+            &recorder,
+            &ctx,
         );
         let notes: Vec<notify::Notification> = escalations
             .iter()
@@ -583,20 +604,27 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
                 )
             })
             .collect();
-        if !notes.is_empty() {
-            notify::dispatch(&notes, &config.notifications);
-        }
+        recorder.record(
+            &ctx,
+            Recording {
+                events: vec![],
+                notifications: notes,
+                dispatch: DispatchPolicy::Immediate,
+            },
+        );
     }
 
-    // Dispatch notifications for promise state changes (unless Sentinel handles it).
-    if sentinel_runner::sentinel_is_running(&config) {
-        log::info!("Sentinel is running — deferring notification dispatch");
-        if let Err(e) = heartbeat::mark_dispatched(&config.general.heartbeat_file) {
-            log::warn!("Failed to update heartbeat dispatched flag: {e}");
-        }
-    } else {
-        dispatch_notifications(previous_hb.as_ref(), &hb, &config);
-    }
+    // Dispatch notifications for promise state changes (unless the Sentinel
+    // handles it): the recorder's GateOnSentinel owns the probe/mark/retry
+    // mechanics; the computation stays here, pure.
+    recorder.record(
+        &RunContext::for_run(result.run_id),
+        Recording {
+            events: vec![],
+            notifications: notify::compute_notifications(previous_hb.as_ref(), &hb),
+            dispatch: DispatchPolicy::GateOnSentinel,
+        },
+    );
 
     // Build and render structured summary
     let transitions = detect_transitions(&pre_assessments, &assessments);
@@ -605,8 +633,9 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     }
 
     // Backup is canonical for in-run promise transitions (trigger=Run);
-    // sentinel skips on BackupCompleted to avoid duplicates.
-    if let Some(db) = world.db() {
+    // sentinel skips on BackupCompleted to avoid duplicates. The db guard
+    // gates the diff computation itself, as before the recorder seam.
+    if world.db().is_some() {
         let prev_snapshots = awareness::snapshot_promises(&pre_assessments);
         let promise_events = awareness::diff_promise_states(
             &prev_snapshots,
@@ -614,14 +643,14 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
             heartbeat_now,
             crate::events::TransitionTrigger::Run,
         );
-        if !promise_events.is_empty() {
-            // Stamp run_id from the executor result.
-            let mut stamped = promise_events;
-            for ev in &mut stamped {
-                ev.run_id = result.run_id;
-            }
-            db.record_events_best_effort(&stamped);
-        }
+        recorder.record(
+            &RunContext::for_run(result.run_id),
+            Recording {
+                events: promise_events,
+                notifications: vec![],
+                dispatch: DispatchPolicy::Immediate,
+            },
+        );
     }
 
     let summary = build_backup_summary(
@@ -2139,39 +2168,6 @@ fn format_elapsed(d: Duration) -> String {
     }
 }
 
-/// Compute and dispatch notifications for promise state changes.
-///
-/// Sequence: compute from heartbeat transition → dispatch → mark dispatched.
-/// Only marks dispatched if at least one channel succeeded, so the Sentinel (5b)
-/// can retry on total failure.
-fn dispatch_notifications(
-    previous: Option<&heartbeat::Heartbeat>,
-    current: &heartbeat::Heartbeat,
-    config: &Config,
-) {
-    let notifications = notify::compute_notifications(previous, current);
-    if notifications.is_empty() {
-        // No state changes — mark dispatched immediately
-        if let Err(e) = heartbeat::mark_dispatched(&config.general.heartbeat_file) {
-            log::warn!("Failed to update heartbeat dispatched flag: {e}");
-        }
-        return;
-    }
-
-    let any_delivered = notify::dispatch(&notifications, &config.notifications);
-
-    if any_delivered {
-        if let Err(e) = heartbeat::mark_dispatched(&config.general.heartbeat_file) {
-            log::warn!("Failed to update heartbeat dispatched flag: {e}");
-        }
-    } else {
-        log::warn!(
-            "All notification channels failed — heartbeat not marked as dispatched \
-             (Sentinel will retry)"
-        );
-    }
-}
-
 /// Emergency pre-flight: check each snapshot root for critical space conditions.
 ///
 /// If any root has `free_bytes < min_free_bytes / 2` (critical threshold), run
@@ -2187,32 +2183,35 @@ fn dispatch_notifications(
 /// events have `run_id = None`.
 fn run_emergency_preflight(
     config: &Config,
-    state_db: Option<&StateDb>,
+    recorder: &Recorder<'_>,
 ) -> anyhow::Result<bool> {
     let now = chrono::Local::now().naive_local();
     let btrfs = RealBtrfs::for_maintenance(&config.general.btrfs_path);
     let outcome = run_emergency_preflight_with(config, now, &btrfs, |p| {
         crate::drives::filesystem_free_bytes(p).ok()
     })?;
-    if let Some(db) = state_db {
-        db.record_events_best_effort(&outcome.emitted_events);
-    }
     // Told-not-silent: emergency deletions before a backup must never be
-    // silent. Best-effort — dispatch failure never blocks the run.
-    if !outcome.root_summaries.is_empty() {
-        let notes: Vec<notify::Notification> = outcome
-            .root_summaries
-            .iter()
-            .map(|s| {
-                notify::build_emergency_retention_notification(
-                    &s.root,
-                    s.freed_bytes,
-                    s.deleted_count,
-                )
-            })
-            .collect();
-        notify::dispatch(&notes, &config.notifications);
-    }
+    // silent. Best-effort — persist and dispatch failure never block the
+    // run. Emergency runs before begin_run — explicitly outside any run.
+    let notes: Vec<notify::Notification> = outcome
+        .root_summaries
+        .iter()
+        .map(|s| {
+            notify::build_emergency_retention_notification(
+                &s.root,
+                s.freed_bytes,
+                s.deleted_count,
+            )
+        })
+        .collect();
+    recorder.record(
+        &RunContext::outside_run(),
+        Recording {
+            events: outcome.emitted_events,
+            notifications: notes,
+            dispatch: DispatchPolicy::Immediate,
+        },
+    );
     Ok(outcome.any_deleted)
 }
 
@@ -2223,7 +2222,7 @@ fn run_emergency_preflight(
 /// `StateDb`.
 struct EmergencyPreflightOutcome {
     any_deleted: bool,
-    emitted_events: Vec<crate::events::Event>,
+    emitted_events: Vec<crate::events::UnstampedEvent>,
     /// One entry per root that had at least one successful emergency delete;
     /// the wrapper turns these into `EmergencyRetentionRan` notifications.
     root_summaries: Vec<EmergencyRootReclaim>,
@@ -2257,7 +2256,7 @@ fn run_emergency_preflight_with(
     let resolved = config.resolved_subvolumes();
     let drive_labels = config.drive_labels();
     let mut any_deleted = false;
-    let mut emitted_events: Vec<crate::events::Event> = Vec::new();
+    let mut emitted_events: Vec<crate::events::UnstampedEvent> = Vec::new();
     let mut root_summaries: Vec<EmergencyRootReclaim> = Vec::new();
 
     for root in &config.local_snapshots.roots {
@@ -2344,7 +2343,7 @@ fn run_emergency_preflight_with(
                         // Stamp the matching emitted event with the
                         // subvolume name and stash for persistence.
                         if let Some(idx) =
-                            result.events.iter().position(|ev| match &ev.payload {
+                            result.events.iter().position(|ev| match ev.payload() {
                                 crate::events::EventPayload::RetentionPrune {
                                     snapshot,
                                     ..
@@ -2353,9 +2352,7 @@ fn run_emergency_preflight_with(
                             })
                         {
                             let mut ev = result.events.remove(idx);
-                            if ev.subvolume.is_none() {
-                                ev.subvolume = Some(subvol_name.clone());
-                            }
+                            ev.fill_subvolume(Some(subvol_name.clone()));
                             emitted_events.push(ev);
                         }
                     }
@@ -3234,7 +3231,11 @@ source = "/data/beta"
         let out = run_emergency_preflight_with(&config, pass_now(), &mock, below()).unwrap();
 
         assert_eq!(out.emitted_events.len(), 2);
+        // Stamp-then-assert (UPI 088-c): context fields are read off the
+        // stamped event; UnstampedEvent deliberately has no accessor.
+        let ctx = RunContext::outside_run();
         for ev in &out.emitted_events {
+            let ev = ev.clone().stamp(&ctx);
             assert_eq!(ev.subvolume.as_deref(), Some("alpha"));
             assert_eq!(ev.occurred_at, pass_now(), "events carry the injected pass clock");
             match &ev.payload {
@@ -3269,7 +3270,7 @@ source = "/data/beta"
         );
         // Event only for the successful delete (the push lives in the Ok arm).
         assert_eq!(out.emitted_events.len(), 1);
-        match &out.emitted_events[0].payload {
+        match out.emitted_events[0].payload() {
             crate::events::EventPayload::RetentionPrune { snapshot, .. } => {
                 assert_eq!(snapshot, "20260102-1200-alpha");
             }

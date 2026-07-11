@@ -25,6 +25,7 @@ mod plan;
 mod pools;
 mod preflight;
 mod recommendation;
+mod recorder;
 mod retention;
 mod rotation;
 mod sentinel;

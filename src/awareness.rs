@@ -658,7 +658,7 @@ pub fn diff_promise_states(
     current: &[SubvolAssessment],
     now: NaiveDateTime,
     trigger: crate::events::TransitionTrigger,
-) -> Vec<crate::events::Event> {
+) -> Vec<crate::events::UnstampedEvent> {
     if previous.is_empty() {
         return Vec::new();
     }
@@ -673,7 +673,7 @@ pub fn diff_promise_states(
                     trigger,
                 },
             );
-            event.subvolume = Some(change.name);
+            event.fill_subvolume(Some(change.name));
             event
         })
         .collect()
@@ -5543,7 +5543,7 @@ source = "/data/sv1"
             crate::events::TransitionTrigger::Tick,
         );
         assert_eq!(events.len(), 1);
-        match &events[0].payload {
+        match &events[0].payload() {
             crate::events::EventPayload::PromiseTransition { from, to, trigger } => {
                 assert_eq!(*from, PromiseStatus::Protected);
                 assert_eq!(*to, PromiseStatus::AtRisk);
@@ -5595,9 +5595,9 @@ source = "/data/sv1"
             let events = diff_promise_states(&prev, &curr, diff_dt(), trigger);
             assert_eq!(events.len(), 1);
             if let crate::events::EventPayload::PromiseTransition { trigger: t, .. } =
-                events[0].payload
+                events[0].payload()
             {
-                assert_eq!(t, trigger);
+                assert_eq!(*t, trigger);
             } else {
                 panic!("expected PromiseTransition");
             }

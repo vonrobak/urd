@@ -414,12 +414,17 @@ pub mod writeback {
     /// otherwise the prior `since` is preserved so the "flagged since" timestamp
     /// stays stable. UUID-less pools are skipped (S5) — no persist, no
     /// notification, status-only degrade.
+    ///
+    /// `state_db` is the posture writeback handle; the transition's audit
+    /// event goes through `recorder`/`ctx` (UPI 088-c) so the row stays
+    /// welded to the writeback that makes it true.
     #[must_use]
     pub fn advance_and_writeback(
         state_db: &StateDb,
         now: NaiveDateTime,
         resolved: &RunArming,
-        run_id: Option<i64>,
+        recorder: &crate::recorder::Recorder<'_>,
+        ctx: &crate::events::RunContext,
     ) -> Vec<PostureEscalation> {
         let mut escalations = Vec::new();
         for pool in &resolved.pools {
@@ -441,17 +446,22 @@ pub mod writeback {
                 // superset of the escalation-only NOTIFICATIONS below and does NOT
                 // violate "de-escalation is silent": that rule governs notifications,
                 // not the audit log.
-                let mut ev = Event::pure(
-                    now,
-                    EventPayload::StorageTierTransition {
-                        pool_label: pool.label.clone(),
-                        from: transition.from.as_db_str().to_string(),
-                        to: transition.to.as_db_str().to_string(),
-                        host_root: pool.host_root,
+                recorder.record(
+                    ctx,
+                    crate::recorder::Recording {
+                        events: vec![Event::pure(
+                            now,
+                            EventPayload::StorageTierTransition {
+                                pool_label: pool.label.clone(),
+                                from: transition.from.as_db_str().to_string(),
+                                to: transition.to.as_db_str().to_string(),
+                                host_root: pool.host_root,
+                            },
+                        )],
+                        notifications: vec![],
+                        dispatch: crate::recorder::DispatchPolicy::Immediate,
                     },
                 );
-                ev.run_id = run_id;
-                state_db.record_events_best_effort(&[ev]);
 
                 if transition.is_escalation() {
                     escalations.push(PostureEscalation {
@@ -761,16 +771,33 @@ source = "/"
         assert_eq!(data.prior_since, Some(dt("2026-05-20T04:00:00")));
     }
 
+    /// Shared recorder fixture for the writeback tests (UPI 088-c, S2):
+    /// events persist to `db`; notifications never dispatch from the
+    /// writeback itself, so the config's channels are irrelevant here.
+    fn test_recorder<'a>(
+        db: &'a StateDb,
+        config: &'a Config,
+    ) -> crate::recorder::Recorder<'a> {
+        crate::recorder::Recorder::new(Some(db), config)
+    }
+
     #[test]
     fn advance_writes_back_and_emits_escalation() {
         let db = StateDb::open_memory().unwrap();
         let now = dt("2026-05-30T04:00:00");
         // data-uuid escalates Roomy→Tight (20% free).
+        let config = cfg();
         let signals =
-            gather_with(&cfg(), &HashMap::new(), Some("root-uuid"), resolver, space_tight);
+            gather_with(&config, &HashMap::new(), Some("root-uuid"), resolver, space_tight);
 
-        let transitions =
-            writeback::advance_and_writeback(&db, now, &resolve_armed_tiers(&signals), None);
+        let recorder = test_recorder(&db, &config);
+        let transitions = writeback::advance_and_writeback(
+            &db,
+            now,
+            &resolve_armed_tiers(&signals),
+            &recorder,
+            &crate::events::RunContext::for_run(None),
+        );
         // Both pools start Roomy; data escalates to Tight, root stays Roomy.
         assert_eq!(transitions.len(), 1);
         assert_eq!(transitions[0].pool_label, "/data");
@@ -792,6 +819,47 @@ source = "/"
             EventPayload::StorageTierTransition { from, to, .. }
                 if from == "roomy" && to == "tight"
         ));
+    }
+
+    #[test]
+    fn advance_stamps_run_id_on_the_transition_row() {
+        // (UPI 088-c characterization) The transition's audit row carries the
+        // executor's run id through the writeback stamp path. Every other test
+        // passes `None`; this pins the `Some` path the recorder must preserve.
+        // The run row must exist first — events.run_id REFERENCES runs(id), and
+        // record_events_best_effort swallows the FK violation otherwise.
+        let db = StateDb::open_memory().unwrap();
+        let run_id = db.begin_run("backup").unwrap();
+        let now = dt("2026-05-30T04:00:00");
+        let config = cfg();
+        let signals =
+            gather_with(&config, &HashMap::new(), Some("root-uuid"), resolver, space_tight);
+
+        let recorder = test_recorder(&db, &config);
+        let transitions = writeback::advance_and_writeback(
+            &db,
+            now,
+            &resolve_armed_tiers(&signals),
+            &recorder,
+            &crate::events::RunContext::for_run(Some(run_id)),
+        );
+        assert_eq!(transitions.len(), 1);
+
+        let rows = db
+            .query_events(&crate::state::EventQueryFilter {
+                since: None,
+                kind: Some(crate::events::EventKind::Storage),
+                subvolume: None,
+                drive_label: None,
+                limit: 100,
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].run_id,
+            Some(run_id),
+            "writeback stamps the executor's run id"
+        );
     }
 
     /// Query the `StorageTierTransition` payloads recorded in `db` (UPI 064-b).
@@ -816,12 +884,19 @@ source = "/"
         let mut prior = HashMap::new();
         prior.insert("data-uuid".to_string(), (TightnessTier::Tight, prior_since));
         // Still 20% free → stays Tight (sticky); no change.
+        let config = cfg();
         let signals =
-            gather_with(&cfg(), &prior, Some("root-uuid"), resolver, space_tight);
+            gather_with(&config, &prior, Some("root-uuid"), resolver, space_tight);
         let now = dt("2026-05-30T04:00:00");
 
-        let transitions =
-            writeback::advance_and_writeback(&db, now, &resolve_armed_tiers(&signals), None);
+        let recorder = test_recorder(&db, &config);
+        let transitions = writeback::advance_and_writeback(
+            &db,
+            now,
+            &resolve_armed_tiers(&signals),
+            &recorder,
+            &crate::events::RunContext::for_run(None),
+        );
         assert!(transitions.is_empty()); // no escalation on steady state
         let stored = db.all_armed_tiers().unwrap().get("data-uuid").copied();
         assert_eq!(stored, Some((TightnessTier::Tight, prior_since)));
@@ -838,12 +913,19 @@ source = "/"
             "data-uuid".to_string(),
             (TightnessTier::Critical, dt("2026-05-20T04:00:00")),
         );
+        let config = cfg();
         let signals =
-            gather_with(&cfg(), &prior, Some("root-uuid"), resolver, space_full);
+            gather_with(&config, &prior, Some("root-uuid"), resolver, space_full);
         let now = dt("2026-05-30T04:00:00");
 
-        let escalations =
-            writeback::advance_and_writeback(&db, now, &resolve_armed_tiers(&signals), None);
+        let recorder = test_recorder(&db, &config);
+        let escalations = writeback::advance_and_writeback(
+            &db,
+            now,
+            &resolve_armed_tiers(&signals),
+            &recorder,
+            &crate::events::RunContext::for_run(None),
+        );
         // De-escalation is silent — no notification.
         assert!(escalations.is_empty());
         // But the recovery IS persisted, with `since` advanced to now.
@@ -866,18 +948,21 @@ source = "/"
         let db = StateDb::open_memory().unwrap();
         // Resolver yields no UUID but a mountpoint → posture surfaces, no persist.
         let resolver_no_uuid = |_p: &Path| (None, Some(PathBuf::from("/data")));
+        let config = cfg();
         let signals = gather_with(
-            &cfg(),
+            &config,
             &HashMap::new(),
             None,
             resolver_no_uuid,
             space_tight,
         );
+        let recorder = test_recorder(&db, &config);
         let transitions = writeback::advance_and_writeback(
             &db,
             dt("2026-05-30T04:00:00"),
             &resolve_armed_tiers(&signals),
-            None,
+            &recorder,
+            &crate::events::RunContext::for_run(None),
         );
         assert!(transitions.is_empty());
         // Nothing written.
@@ -1083,8 +1168,9 @@ local_retention = "transient"
                 Some(PoolSpace { free_bytes: 50, capacity_bytes: 100 })
             }
         };
+        let config = cfg();
         let signals = gather_with(
-            &cfg(),
+            &config,
             &HashMap::new(),
             Some("root-uuid"),
             resolver,
@@ -1098,7 +1184,14 @@ local_retention = "transient"
             .unwrap();
         assert_eq!(data.new_tier, TightnessTier::Critical);
 
-        let _ = writeback::advance_and_writeback(&db, now, &resolved, None);
+        let recorder = test_recorder(&db, &config);
+        let _ = writeback::advance_and_writeback(
+            &db,
+            now,
+            &resolved,
+            &recorder,
+            &crate::events::RunContext::for_run(None),
+        );
         let stored = db.all_armed_tiers().unwrap().get("data-uuid").copied();
         assert_eq!(stored.map(|(t, _)| t), Some(TightnessTier::Critical));
     }
