@@ -371,11 +371,20 @@ fn render_assessment_table(data: &BackupSummary, out: &mut String) {
         }
     }
 
-    let has_promises = data.assessments.iter().any(|a| a.promise_level.is_some());
+    // Show PROTECTION only when exposure conflicts with promise — the
+    // same quiet gate as `urd status`, but on backup's OWN license
+    // (RD1, UPI 088-a): there is no summary line here; a completed
+    // healthy run's report is itself the all-well message, and brevity
+    // is part of the promise. (status's gate is licensed by its "All
+    // sealed." line — that reasoning does not transfer.)
+    let show_protection = data
+        .assessments
+        .iter()
+        .any(|a| a.promise_level.is_some() && a.status != PromiseStatus::Protected);
 
     // Build headers: EXPOSURE  [PROTECTION]  SUBVOLUME  LOCAL  [DRIVE1]  [DRIVE2]
     let mut headers: Vec<String> = vec!["EXPOSURE".to_string()];
-    if has_promises {
+    if show_protection {
         // NOTE: Level names (guarded/protected/resilient) stay until Phase 6
         headers.push("PROTECTION".to_string());
     }
@@ -389,7 +398,7 @@ fn render_assessment_table(data: &BackupSummary, out: &mut String) {
     let mut rows: Vec<Vec<String>> = Vec::new();
     for assessment in &data.assessments {
         let mut row = vec![exposure_label(assessment.status)];
-        if has_promises {
+        if show_protection {
             row.push(
                 assessment
                     .promise_level
@@ -775,5 +784,50 @@ mod tests {
             !out.contains("unchanged"),
             "backup summary should suppress unchanged skips, got: {out}"
         );
+    }
+
+    // ── PROTECTION column gate (RD1, UPI 088-a) ─────────────────────
+
+    fn table_summary(assessments: Vec<StatusAssessment>) -> BackupSummary {
+        BackupSummary {
+            result: "success".to_string(),
+            run_id: Some(1),
+            duration_secs: 1.0,
+            subvolumes: vec![],
+            skipped: vec![],
+            assessments,
+            transitions: vec![],
+            warnings: vec![],
+            notes: vec![],
+        }
+    }
+
+    #[test]
+    fn protection_column_hidden_when_all_sealed() {
+        // promise_level is real in backup rows now, but a healthy run's
+        // table stays exactly as before the fields were completed — the
+        // column appears only when some promise is degraded.
+        let mut sealed = assessment_with("WD-18TB", true);
+        sealed.promise_level = Some("sheltered".to_string());
+        let summary = table_summary(vec![sealed]);
+        let mut out = String::new();
+        render_assessment_table(&summary, &mut out);
+        assert!(!out.contains("PROTECTION"), "quiet gate: got {out}");
+    }
+
+    #[test]
+    fn protection_column_shown_when_promise_degraded() {
+        let mut sealed = assessment_with("WD-18TB", true);
+        sealed.promise_level = Some("sheltered".to_string());
+        let mut waning = assessment_with("WD-18TB", true);
+        waning.name = "sv2".to_string();
+        waning.short_name = "sv2".to_string();
+        waning.status = PromiseStatus::AtRisk;
+        waning.promise_level = Some("fortified".to_string());
+        let summary = table_summary(vec![sealed, waning]);
+        let mut out = String::new();
+        render_assessment_table(&summary, &mut out);
+        assert!(out.contains("PROTECTION"), "got: {out}");
+        assert!(out.contains("fortified"), "got: {out}");
     }
 }

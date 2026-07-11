@@ -627,7 +627,7 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     let summary = build_backup_summary(
         &backup_plan,
         &result,
-        &assessments,
+        StatusAssessment::rows(&assessments, &config.resolved_subvolumes(), heartbeat_now),
         transitions,
         exec_duration,
         &preflight_warnings,
@@ -1130,12 +1130,15 @@ fn send_kind_display(op_name: &str) -> Option<&'static str> {
     }
 }
 
-/// Build a structured backup summary from plan, execution results, and awareness assessments.
-/// Pure function — no I/O.
+/// Build a structured backup summary from plan, execution results, and
+/// the completed assessment rows. Pure function — no I/O. The caller
+/// builds rows via `StatusAssessment::rows()` (UPI 088-a), so backup's
+/// rows carry the same promise fields status's do — the split-brain is
+/// closed at the constructor, not by a backfill here.
 fn build_backup_summary(
     plan: &BackupPlan,
     result: &ExecutionResult,
-    assessments: &[SubvolAssessment],
+    assessment_rows: Vec<StatusAssessment>,
     transitions: Vec<TransitionEvent>,
     duration: Duration,
     preflight_warnings: &[preflight::PreflightCheck],
@@ -1312,10 +1315,7 @@ fn build_backup_summary(
         duration_secs: duration.as_secs_f64(),
         subvolumes,
         skipped,
-        assessments: assessments
-            .iter()
-            .map(StatusAssessment::from_assessment)
-            .collect(),
+        assessments: assessment_rows,
         transitions,
         warnings,
         notes,
@@ -3370,6 +3370,75 @@ source = "/data/beta"
         }
     }
 
+    /// Resolved subvolumes matching the given assessments by name —
+    /// `rows()` joins on the name and a miss debug-asserts, so the
+    /// fixture derives from whatever assessments a test passes.
+    fn summary_resolved(
+        assessments: &[SubvolAssessment],
+    ) -> Vec<crate::config::ResolvedSubvolume> {
+        assessments
+            .iter()
+            .map(|a| crate::config::ResolvedSubvolume {
+                name: a.name.clone(),
+                short_name: a.short_name.clone(),
+                source: PathBuf::from(format!("/data/{}", a.name)),
+                priority: 5,
+                enabled: true,
+                snapshot_interval: Interval::hours(1),
+                send_interval: Interval::days(1),
+                send_enabled: true,
+                local_retention: crate::types::LocalRetentionPolicy::Graduated(
+                    crate::types::ResolvedGraduatedRetention {
+                        hourly: 24,
+                        daily: 30,
+                        weekly: 0,
+                        monthly: crate::types::MonthlyCount::Count(0),
+                        yearly: 0,
+                    },
+                ),
+                external_retention: crate::types::ResolvedGraduatedRetention {
+                    hourly: 0,
+                    daily: 30,
+                    weekly: 0,
+                    monthly: crate::types::MonthlyCount::Count(0),
+                    yearly: 0,
+                },
+                protection_level: Some(ProtectionLevel::Sheltered),
+                drives: None,
+                snapshot_root: None,
+                min_free_bytes: None,
+            })
+            .collect()
+    }
+
+    fn summary_now() -> chrono::NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(2026, 7, 11)
+            .unwrap()
+            .and_hms_opt(4, 0, 0)
+            .unwrap()
+    }
+
+    /// UPI 088-a: `build_backup_summary` now takes completed rows.
+    /// This wrapper builds them from name-matched fixtures so the
+    /// summary tests stay single calls.
+    fn summary_for_test(
+        plan: &BackupPlan,
+        result: &ExecutionResult,
+        assessments: &[SubvolAssessment],
+        transitions: Vec<TransitionEvent>,
+        duration: Duration,
+        preflight_warnings: &[preflight::PreflightCheck],
+    ) -> BackupSummary {
+        build_backup_summary(
+            plan,
+            result,
+            StatusAssessment::rows(assessments, &summary_resolved(assessments), summary_now()),
+            transitions,
+            duration,
+            preflight_warnings,
+        )
+    }
+
     #[test]
     fn build_summary_extracts_successful_sends_only() {
         let result = ExecutionResult {
@@ -3400,7 +3469,7 @@ source = "/data/beta"
             run_id: Some(10),
         };
 
-        let summary = build_backup_summary(
+        let summary = summary_for_test(
             &empty_plan(),
             &result,
             &empty_assessments(),
@@ -3426,18 +3495,18 @@ source = "/data/beta"
     }
 
     #[test]
-    fn backup_json_assessment_rows_lack_promise_fields() {
-        // Golden fixture (UPI 088-a, arc R8): pins today's split-brain —
-        // backup's serialized assessment rows carry NO promise_level /
-        // retention_summary / external_only keys (status backfills them,
-        // backup doesn't). Step 6 of 088-a deliberately flips this test
-        // when the mirror becomes total: the keys appear, additively.
+    fn backup_json_assessment_rows_carry_promise_fields() {
+        // Golden fixture, deliberately FLIPPED in step 6 (UPI 088-a):
+        // step 1 pinned these keys ABSENT (the split-brain — status
+        // backfilled them, backup didn't). The mirror is total now;
+        // backup's serialized rows carry the same keys status's do.
+        // This is the slice's one intended visible change.
         let result = ExecutionResult {
             overall: RunResult::Success,
             subvolume_results: vec![],
             run_id: Some(10),
         };
-        let summary = build_backup_summary(
+        let summary = summary_for_test(
             &empty_plan(),
             &result,
             &sample_assessments(),
@@ -3449,17 +3518,41 @@ source = "/data/beta"
         let json = serde_json::to_value(&summary).expect("summary serializes");
         let row = &json["assessments"][0];
         assert_eq!(row["name"], "htpc-home");
+        assert_eq!(row["promise_level"], "sheltered");
         assert!(
-            row.get("promise_level").is_none(),
-            "backup rows carry no promise_level pre-088-a"
-        );
-        assert!(
-            row.get("retention_summary").is_none(),
-            "backup rows carry no retention_summary pre-088-a"
+            row["retention_summary"].is_string(),
+            "graduated fixture policy renders a retention summary"
         );
         assert!(
             row.get("external_only").is_none(),
-            "external_only is skip-when-false and from_assessment defaults it"
+            "still skip-when-false: the fixture policy is not transient"
+        );
+    }
+
+    #[test]
+    fn backup_rows_match_status_rows_for_same_world() {
+        // The split-brain heal, asserted: for one world, backup's
+        // serialized assessment rows equal the rows status builds.
+        let result = ExecutionResult {
+            overall: RunResult::Success,
+            subvolume_results: vec![],
+            run_id: Some(10),
+        };
+        let assessments = sample_assessments();
+        let resolved = summary_resolved(&assessments);
+        let summary = summary_for_test(
+            &empty_plan(),
+            &result,
+            &assessments,
+            vec![],
+            Duration::from_secs(5),
+            &[],
+        );
+        let status_rows = StatusAssessment::rows(&assessments, &resolved, summary_now());
+
+        assert_eq!(
+            serde_json::to_value(&summary.assessments).unwrap(),
+            serde_json::to_value(&status_rows).unwrap(),
         );
     }
 
@@ -3492,7 +3585,7 @@ source = "/data/beta"
             run_id: Some(11),
         };
 
-        let summary = build_backup_summary(
+        let summary = summary_for_test(
             &empty_plan(),
             &result,
             &empty_assessments(),
@@ -3520,7 +3613,7 @@ source = "/data/beta"
             run_id: Some(12),
         };
 
-        let summary = build_backup_summary(
+        let summary = summary_for_test(
             &empty_plan(),
             &result,
             &empty_assessments(),
@@ -3542,7 +3635,7 @@ source = "/data/beta"
             run_id: Some(13),
         };
 
-        let summary = build_backup_summary(
+        let summary = summary_for_test(
             &empty_plan(),
             &result,
             &empty_assessments(),
@@ -3598,7 +3691,7 @@ source = "/data/beta"
             run_id: Some(14),
         };
 
-        let summary = build_backup_summary(
+        let summary = summary_for_test(
             &plan,
             &result,
             &empty_assessments(),
@@ -3663,7 +3756,7 @@ source = "/data/beta"
             )],
             run_id: Some(15),
         };
-        let summary = build_backup_summary(
+        let summary = summary_for_test(
             &plan,
             &result,
             &empty_assessments(),
@@ -3691,7 +3784,7 @@ source = "/data/beta"
             subvolume_results: vec![],
             run_id: Some(16),
         };
-        let summary = build_backup_summary(
+        let summary = summary_for_test(
             &plan,
             &result,
             &empty_assessments(),
@@ -3731,7 +3824,7 @@ source = "/data/beta"
             run_id: None,
         };
 
-        let summary = build_backup_summary(
+        let summary = summary_for_test(
             &plan,
             &result,
             &empty_assessments(),
@@ -3755,7 +3848,7 @@ source = "/data/beta"
             run_id: Some(15),
         };
 
-        let summary = build_backup_summary(
+        let summary = summary_for_test(
             &empty_plan(),
             &result,
             &sample_assessments(),
@@ -3777,7 +3870,7 @@ source = "/data/beta"
             run_id: Some(99),
         };
 
-        let summary = build_backup_summary(
+        let summary = summary_for_test(
             &empty_plan(),
             &result,
             &empty_assessments(),
@@ -3813,7 +3906,7 @@ source = "/data/beta"
             run_id: Some(16),
         };
 
-        let summary = build_backup_summary(
+        let summary = summary_for_test(
             &empty_plan(),
             &result,
             &empty_assessments(),
@@ -4753,7 +4846,7 @@ source = "/data/beta"
             run_id: Some(1),
         };
 
-        let summary = build_backup_summary(
+        let summary = summary_for_test(
             &plan, &result, &empty_assessments(),
             vec![], Duration::from_secs(1), &[],
         );
@@ -4776,7 +4869,7 @@ source = "/data/beta"
             run_id: Some(1),
         };
 
-        let summary = build_backup_summary(
+        let summary = summary_for_test(
             &plan, &result, &empty_assessments(),
             vec![], Duration::from_secs(1), &[],
         );
@@ -4796,7 +4889,7 @@ source = "/data/beta"
             run_id: Some(1),
         };
 
-        let summary = build_backup_summary(
+        let summary = summary_for_test(
             &plan, &result, &empty_assessments(),
             vec![], Duration::from_secs(1), &[],
         );
@@ -4818,7 +4911,7 @@ source = "/data/beta"
             run_id: Some(1),
         };
 
-        let summary = build_backup_summary(
+        let summary = summary_for_test(
             &plan, &result, &empty_assessments(),
             vec![], Duration::from_secs(1), &[],
         );
@@ -4837,7 +4930,7 @@ source = "/data/beta"
             run_id: Some(1),
         };
 
-        let summary = build_backup_summary(
+        let summary = summary_for_test(
             &plan, &result, &empty_assessments(),
             vec![], Duration::from_secs(1), &[],
         );

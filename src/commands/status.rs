@@ -11,7 +11,6 @@ use crate::output::{
     AdaptationSummary, ChainHealth, ChainHealthEntry, DriveInfo, LastRunInfo, OutputMode,
     PoolPostureSummary, StatusAssessment, StatusOutput,
 };
-use crate::retention;
 use crate::voice;
 
 pub fn run(config: Config, output_mode: OutputMode) -> anyhow::Result<()> {
@@ -139,24 +138,10 @@ fn assemble_status_output(
     let redundancy_advisories =
         advice::compute_redundancy_advisories(config, assessments);
 
-    // Thread protection_level from resolved config into status assessments
+    // Complete rows at construction (UPI 088-a): the rows() join fills
+    // promise_level / retention_summary / external_only — no backfill.
     let resolved = config.resolved_subvolumes();
-    let assessments_with_promises: Vec<StatusAssessment> = assessments
-        .iter()
-        .map(|a| {
-            let mut sa = StatusAssessment::from_assessment(a);
-            if let Some(sv) = resolved.iter().find(|sv| sv.name == a.name) {
-                sa.promise_level = sv.protection_level.map(|pl| pl.to_string());
-                sa.retention_summary = Some(retention::retention_summary(
-                    &sv.local_retention,
-                    &sv.snapshot_interval,
-                    now,
-                ));
-                sa.external_only = sv.local_retention.is_transient() && sv.send_enabled;
-            }
-            sa
-        })
-        .collect();
+    let assessments_with_promises = StatusAssessment::rows(assessments, &resolved, now);
 
     let advice: Vec<advice::ActionableAdvice> = assessments
         .iter()
@@ -462,8 +447,23 @@ local_retention = "transient"
         assert!(sv2.external_only, "transient + send_enabled is external-only");
     }
 
+    // A name miss is impossible for real assess() output; rows() (UPI
+    // 088-a) debug-asserts on one and fails open in release. Two tests,
+    // one per build profile — the release twin is dormant under normal
+    // `cargo test` (debug) and documents the fail-open contract.
+
+    #[cfg(debug_assertions)]
     #[test]
-    fn stitching_unknown_assessment_name_leaves_fields_default() {
+    #[should_panic(expected = "no resolved subvolume")]
+    fn stitching_unknown_assessment_name_asserts_in_debug() {
+        let _ = assemble(&[assessment("ghost")], &test_config());
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn stitching_unknown_assessment_name_fails_open_in_release() {
+        // Fail-open: the row still renders (a subvolume must never
+        // vanish from a report), with the three joined fields defaulted.
         let out = assemble(&[assessment("ghost")], &test_config());
         let sa = &out.assessments[0];
         assert!(sa.promise_level.is_none());
