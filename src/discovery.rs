@@ -413,12 +413,10 @@ fn flatten_disk(disk: &LsblkNode) -> DiskSummary {
                 label: node.label.clone(),
                 mountpoints: real_mountpoints(node),
             }),
-            Some(other) => {
-                if acc.first_other.is_none() {
-                    acc.first_other = Some((other.to_string(), node.label.clone()));
-                }
+            Some(other) if acc.first_other.is_none() => {
+                acc.first_other = Some((other.to_string(), node.label.clone()));
             }
-            None => {}
+            _ => {}
         }
         for child in &node.children {
             walk(child, acc);

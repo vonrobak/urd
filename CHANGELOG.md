@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Two new clippy lints on current stable (Rust 1.97) in `discovery` and `sudoers` —
+  mechanical rewrites, no behavior change — and an ETXTBSY race in the Encounter's
+  fake-editor tests that made the suite flake roughly once per two dozen runs: the
+  test editors now run as `sh script` instead of exec'ing the freshly written file.
+
 ### Changed
 - The sentinel's idle emergency-eject decisions (ADR-113 Layer 3) — the ~60 s timer
   gate, the eject verdict, the defer-to-a-running-backup, and the re-confirm-under-lock

@@ -661,10 +661,6 @@ mod tests {
              role = \"offsite\"\nEOF\n",
         )
         .unwrap();
-        use std::os::unix::fs::PermissionsExt as _;
-        let mut perms = std::fs::metadata(&script).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&script, perms).unwrap();
 
         let sealed_labels = std::cell::RefCell::new(Vec::<String>::new());
         let capture: SealFn<'_> = &|config, _| {
@@ -673,7 +669,11 @@ mod tests {
                 .extend(config.drives.iter().map(|d| d.label.clone()));
             Ok(SealOutcome::Sealed)
         };
-        let result = delve_with(&[script.display().to_string()], &strategy, today(), &path, capture);
+        // The "editor" runs as `sh script`, never by exec'ing the script itself:
+        // exec of a freshly written file races ETXTBSY against write fds inherited
+        // by other tests' concurrently forked children.
+        let editor = ["sh".to_string(), script.display().to_string()];
+        let result = delve_with(&editor, &strategy, today(), &path, capture);
         assert_eq!(result.unwrap(), CliExit::Done);
         assert!(
             sealed_labels.borrow().iter().any(|l| l == "delve-added"),
@@ -694,14 +694,11 @@ mod tests {
 
         let script = dir.path().join("ruin.sh");
         std::fs::write(&script, "#!/bin/sh\necho 'ruined [[[' > \"$1\"\n").unwrap();
-        use std::os::unix::fs::PermissionsExt as _;
-        let mut perms = std::fs::metadata(&script).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&script, perms).unwrap();
 
         let no_seal: SealFn<'_> = &|_, _| Ok(SealOutcome::Sealed);
-        let result =
-            delve_with(&[script.display().to_string()], &strategy, today(), &path, no_seal);
+        // `sh script`, not the script itself — same ETXTBSY guard as above.
+        let editor = ["sh".to_string(), script.display().to_string()];
+        let result = delve_with(&editor, &strategy, today(), &path, no_seal);
         let err = result.unwrap_err();
         assert!(err.to_string().contains("kept as you left it"), "{err}");
         assert!(
