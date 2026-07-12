@@ -102,7 +102,7 @@ pub struct TailPlan<'a> {
     pub transitions: Vec<TransitionEvent>,
     /// Executed exit only, and only when history is available: the
     /// trigger=Run promise-diff events (backup is canonical for in-run
-    /// promise transitions; the sentinel skips on BackupCompleted).
+    /// promise transitions; the sentinel skips on `BackupCompleted`).
     pub promise_diff: Option<Recording>,
     /// `result.overall != Success` — drives the adapter's exit code.
     pub run_failed: bool,
