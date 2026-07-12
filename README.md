@@ -65,18 +65,32 @@ Protection levels you set once; Urd derives the retention and send schedule from
 - `btrfs-progs`
 - systemd — optional, for the nightly timer and the Sentinel monitoring daemon
 
-**From source** (recommended today — needs a Rust toolchain):
+**Prebuilt binary** (x86_64 Linux, statically linked — no toolchain needed):
+
+```bash
+curl -LO https://github.com/vonrobak/urd/releases/latest/download/urd-x86_64-linux
+curl -LO https://github.com/vonrobak/urd/releases/latest/download/SHA256SUMS
+
+# Verify it is the binary the author published, then put it on your PATH
+sha256sum --ignore-missing -c SHA256SUMS
+install -Dm755 urd-x86_64-linux ~/.local/bin/urd
+```
+
+If `urd: command not found` follows, `~/.local/bin` isn't on your `PATH` — add it and
+open a new shell. Want proof of who built the binary, not just that it arrived intact?
+Every release carries a [build provenance
+attestation](https://github.com/vonrobak/urd/attestations): `gh attestation verify
+urd-x86_64-linux --repo vonrobak/urd`.
+
+**From source** (needs a Rust toolchain):
 
 ```bash
 git clone https://github.com/vonrobak/urd.git && cd urd
 cargo install --path .    # installs to ~/.cargo/bin/urd
 ```
 
-A prebuilt one-step binary, with checksum verification, is coming with the release
-pipeline — watch the [releases page](https://github.com/vonrobak/urd/releases).
-
-There is no `curl | bash` installer, and there won't be — not when the binary lands
-either. You check the sum yourself and decide when Urd has earned the password it asks for.
+There is no `curl | bash` installer, and there won't be. You check the sum yourself
+and decide when Urd has earned the password it asks for.
 
 ## Getting started
 
