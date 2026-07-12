@@ -36,6 +36,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cross-filesystem reclaim routing is unit-tested without tripping a real
   watchdog. Heartbeat JSON, `.prom` metrics, event rows, notification prose,
   and exit codes are byte-identical. No behavior change (#299).
+- `plan.rs` (7,137 lines) is now `plan/{mod,local,transient,send,external,testkit,tests}.rs`,
+  and the local snapshot/retention pair takes typed inputs (`SubvolInputs`,
+  `LocalSnapshotInputs`, `LocalRetentionInputs`) and returns a `PlanFragment`/
+  `SnapshotOutcome` instead of mutating shared accumulators — the first two
+  regions on the arc's typed-inputs path. A live run-pair against the current
+  binary confirmed `urd plan`, `urd plan --auto`, and `urd backup --dry-run`
+  are byte-identical. No behavior change (#325).
 
 ## [0.34.0] - 2026-07-11
 
