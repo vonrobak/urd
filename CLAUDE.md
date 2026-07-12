@@ -60,6 +60,7 @@ live in `docs/00-foundation/architecture.md`.
 - `storage_critical.rs` — storage-state tiers for the Do-No-Harm arc (ADR-113)
 - `drift.rs` — churn aggregation; `rotation.rs` — offsite rotation cadence + freshness window; `preflight.rs` — achievability advisories
 - `recorder.rs` — the impure seam owning the ADR-114 dance: stamp (`UnstampedEvent` → `RunContext`), persist best-effort, dispatch per policy
+- `run_tail.rs` — pure run-tail decisions: `decide_tail` for both exits (one truth table, one gate site), the `decide_reclaim`/`firing_recordings` teardown sandwich, transition detection
 - `chain.rs` — pin files; `state.rs` — SQLite history (granular wrappers)
 - `drives.rs` / `pools.rs` — drive + BTRFS-pool detection
 - `discovery.rs` — zero-state system inventory from unprivileged probes (the Encounter's looking)

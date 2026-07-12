@@ -28,6 +28,7 @@ mod recommendation;
 mod recorder;
 mod retention;
 mod rotation;
+mod run_tail;
 mod sentinel;
 mod sentinel_runner;
 mod state;

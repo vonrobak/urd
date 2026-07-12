@@ -474,6 +474,21 @@ the same `record()` call. Pure modules emit; the recorder records. Event-less
 notification sites (the sentinel's drive notices) remain direct `notify::dispatch`
 calls — the recorder owns the dance, not all of notify.
 
+**run tail** (UPI 088-b). The closing sequence of a backup run — everything after
+execution returns, and the empty-plan early exit: metrics, heartbeat, the sentinel
+gate, transition detection, the promise-diff events, the exit verdict. Decided pure
+in `run_tail.rs`; `commands/backup.rs` remains the driver, executing the decided
+effects in the contract order (metrics → heartbeat write → posture writeback →
+gate → promise-diff), which preserves the notification wire order (watchdog batch →
+offsite → storage → promise gate).
+
+**decide_tail** (UPI 088-b). The one pure function BOTH exits call to decide the run
+tail (`TailInputs` → `TailPlan`; `TailExit::{EmptyPlan, Executed}` types the
+divergence) — collapsing the formerly duplicated empty-plan tail and the two
+sentinel-gate sites to one. Companions in `run_tail.rs`: `decide_reclaim` /
+`firing_recordings` (the watchdog-teardown sandwich — pure routing and effect
+assembly around the adapter's act-time reclaim I/O) and `offsite_recordings`.
+
 ## Cluster: Read-side query seams (ADR-102)
 
 The read side of the backup pipeline is split along the ADR-102 axis —

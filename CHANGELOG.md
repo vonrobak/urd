@@ -27,6 +27,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   type system forbids it), so `urd events` rows can be trusted to carry their
   run context. Event rows, notification prose, and dispatch behavior are
   byte-identical. No behavior change (#301).
+- The backup run's closing sequence (metrics, heartbeat, the sentinel
+  notification gate, transition detection, promise-diff events, the
+  watchdog-teardown reclaim dispatch, exit code) is now decided by one pure,
+  table-tested module (`run_tail.rs`) that both the empty-plan and executed
+  exits share — the formerly duplicated empty-plan tail and the two
+  sentinel-gate call sites are gone, and the same-filesystem vs
+  cross-filesystem reclaim routing is unit-tested without tripping a real
+  watchdog. Heartbeat JSON, `.prom` metrics, event rows, notification prose,
+  and exit codes are byte-identical. No behavior change (#299).
 
 ## [0.34.0] - 2026-07-11
 
