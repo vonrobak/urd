@@ -54,7 +54,9 @@ pub struct Heartbeat {
 }
 
 /// UPI 043: per-pool view (one entry per deduplicated BTRFS UUID).
-#[derive(Debug, Serialize, Deserialize)]
+/// `Clone`: `decide_tail` (UPI 088-b) clones the gathered per-run vec into
+/// `heartbeat::build` while the metrics writers keep the borrow.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PoolHeartbeat {
     pub uuid: String,
     pub mountpoints: Vec<PathBuf>,
@@ -63,7 +65,8 @@ pub struct PoolHeartbeat {
 }
 
 /// UPI 043: per-configured-drive view.
-#[derive(Debug, Serialize, Deserialize)]
+/// `Clone`: same reason as [`PoolHeartbeat`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DriveHeartbeat {
     pub label: String,
     pub uuid: Option<String>,

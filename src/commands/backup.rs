@@ -7,17 +7,16 @@ use std::time::{Duration, Instant};
 
 use colored::Colorize;
 
-use crate::awareness::{self, ChainStatus, PromiseStatus, SubvolAssessment};
 use crate::btrfs::{BtrfsOps, RealBtrfs};
 use crate::cli::BackupArgs;
 use crate::commands::storage_signals;
 use crate::commands::world::{self, World};
 use crate::config::Config;
 use crate::drives;
-use crate::events::{Event, EventPayload, RunContext};
+use crate::events::RunContext;
 use crate::executor::{
-    ExecutionResult, Executor, FullSendPolicy, OffsiteChainRelease, OpResult, ReclaimOutcome,
-    RunResult, SendType, TransientCleanupOutcome,
+    ExecutionResult, Executor, FullSendPolicy, OffsiteChainRelease, OpResult, SendType,
+    TransientCleanupOutcome,
 };
 use crate::guard::{self, WatchdogAction, WATCHDOG_POLL_MS};
 use crate::heartbeat;
@@ -37,6 +36,9 @@ use crate::preflight;
 use crate::state::StateDb;
 use crate::types::{BackupPlan, ByteSize, PlannedOperation, ProtectionLevel, SendKind};
 use crate::recorder::{DispatchPolicy, Recorder, Recording};
+use crate::run_tail::{
+    self, MetricsSpec, PoolObservability, ReclaimDecision, TailExit, TailInputs, WatchdogFiring,
+};
 
 pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     // Share one config across the run AND the watchdog thread (UPI 065-b): the
@@ -155,17 +157,15 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
         } else {
             println!("{}", "Nothing to do.".dimmed());
         }
+        // ── The run tail, empty-plan exit (UPI 088-b) ──────────────────
+        // Gather → decide (pure) → execute, same contract order as the
+        // executed exit: metrics → heartbeat write → gate. `previous_hb` is
+        // read before the decision (RD6 — nothing between here and
+        // `heartbeat::write` touches the heartbeat file), and the assess is
+        // judged before the metrics write (the writer only touches `.prom`).
         let heartbeat_now = chrono::Local::now().naive_local();
         let churn_views = build_churn_views(&config, world.db(), heartbeat_now);
         let observability = gather_pool_observability(&config, &churn_views, &fs_state);
-        write_metrics_for_skipped(
-            &config,
-            &backup_plan,
-            now,
-            &fs_state,
-            &churn_views,
-            &observability,
-        )?;
         let previous_hb = heartbeat::read(&config.general.heartbeat_file);
         // Posture parity (UPI 063): the empty-plan heartbeat embeds promise
         // verdicts, and verdicts are posture-sensitive — S4's "the projection
@@ -175,30 +175,32 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
         // have freed space, desyncing this heartbeat from the plan's tier).
         let assessments =
             world::assess(&config, heartbeat_now, &observation, &signals.by_subvol);
-        let hb = heartbeat::build(
-            &config,
+        let tail = run_tail::decide_tail(&TailInputs {
+            config: &config,
+            exit: TailExit::EmptyPlan,
             heartbeat_now,
-            None,
-            &assessments,
+            assessments: &assessments,
+            previous_hb: previous_hb.as_ref(),
+            churn_views: &churn_views,
+            observability: &observability,
+            history_available: world.db().is_some(),
+        });
+        write_metrics_per_spec(
+            &config,
+            &tail.metrics,
+            &backup_plan,
+            now,
+            &fs_state,
             &churn_views,
-            observability.pools_heartbeat,
-            observability.drives_heartbeat,
-            &observability.subvol_extras,
-        );
-        if let Err(e) = heartbeat::write(&config.general.heartbeat_file, &hb) {
+            &observability,
+        )?;
+        if let Err(e) = heartbeat::write(&config.general.heartbeat_file, &tail.heartbeat) {
             log::warn!("Failed to write heartbeat: {e}");
         }
         // The sentinel gate: dispatch-or-mark for promise-change
-        // notifications (computed here, pure — the recorder's
+        // notifications (computed in `decide_tail`, pure — the recorder's
         // GateOnSentinel owns the probe/mark/retry mechanics).
-        recorder.record(
-            &RunContext::outside_run(),
-            Recording {
-                events: vec![],
-                notifications: notify::compute_notifications(previous_hb.as_ref(), &hb),
-                dispatch: DispatchPolicy::GateOnSentinel,
-            },
-        );
+        recorder.record(&tail.ctx, tail.gate);
         return Ok(());
     }
 
@@ -412,81 +414,71 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
         .unwrap_or_default();
     let mut watchdog_notifications = Vec::new();
     for fire in &watchdog_firings {
+        // Route the response (pure, `run_tail::decide_reclaim`); the act-time
+        // I/O — presence re-confirmation and the reclaim itself — threads
+        // around the decision here. Second defense layer behind this routing:
+        // `emergency_reclaim_pool`'s absolute-level gate (UPI 066) re-measures
+        // free at reclaim time and returns `Nothing` at/above the floor. Do
+        // not weaken it — and do not lean on it (the routing's own tests are
+        // the first layer's proof).
         let (reclaimed, releases, event_ts): (u32, Vec<OffsiteChainRelease>, chrono::NaiveDateTime) =
-            if fire.send_aborted {
-                // Two-tier graduated reclaim (UPI 058): shed away-only pins first
-                // and re-measure; connected chains survive if that clears the
-                // floor, else escalate to the blanket. Presence is re-confirmed
-                // from the frozen pre-lock `arming.away_shed` (UPI 082 F1, the
-                // SAME relocated helper the executor's in-run shed and the
-                // watchdog's cross-fs reclaim use) rather than freshly derived —
-                // the list can only shrink versus a fresh derive, so a drive
-                // unplugged mid-run is invisible here and Tier 1 escalates to
-                // the Tier-2 blanket sooner (ADR-113 bias-to-escalate: more full
-                // re-sends possible in that compound race, zero data loss).
-                let away =
-                    drives::fresh_away_map(&arming.away_shed, &config, drives::is_drive_mounted);
-                let reclaim = executor.emergency_reclaim_pool(
-                    &fire.subvol_names,
-                    &away,
-                    fire.floor_bytes,
-                    || pools::pool_free_bytes(&fire.mountpoint).ok(),
-                );
-                log::warn!(
-                    "Watchdog aborted send on {}; reclaimed {} snapshot(s)",
-                    fire.pool_label,
-                    reclaim.deleted(),
-                );
-                let ts = chrono::Local::now().naive_local();
-                (reclaim.deleted(), reclaim.releases().to_vec(), ts)
-            } else {
-                // Cross-fs: already reclaimed concurrently on the watchdog thread.
-                match &fire.reclaim {
-                    Some((outcome, ts)) => {
+            match run_tail::decide_reclaim(fire) {
+                ReclaimDecision::ReclaimHere {
+                    subvol_names,
+                    mountpoint,
+                    floor_bytes,
+                } => {
+                    // Two-tier graduated reclaim (UPI 058): shed away-only pins first
+                    // and re-measure; connected chains survive if that clears the
+                    // floor, else escalate to the blanket. Presence is re-confirmed
+                    // from the frozen pre-lock `arming.away_shed` (UPI 082 F1, the
+                    // SAME relocated helper the executor's in-run shed and the
+                    // watchdog's cross-fs reclaim use) rather than freshly derived —
+                    // the list can only shrink versus a fresh derive, so a drive
+                    // unplugged mid-run is invisible here and Tier 1 escalates to
+                    // the Tier-2 blanket sooner (ADR-113 bias-to-escalate: more full
+                    // re-sends possible in that compound race, zero data loss).
+                    let away = drives::fresh_away_map(
+                        &arming.away_shed,
+                        &config,
+                        drives::is_drive_mounted,
+                    );
+                    let reclaim = executor.emergency_reclaim_pool(
+                        subvol_names,
+                        &away,
+                        floor_bytes,
+                        || pools::pool_free_bytes(mountpoint).ok(),
+                    );
+                    log::warn!(
+                        "Watchdog aborted send on {}; reclaimed {} snapshot(s)",
+                        fire.pool_label,
+                        reclaim.deleted(),
+                    );
+                    let ts = chrono::Local::now().naive_local();
+                    (reclaim.deleted(), reclaim.releases().to_vec(), ts)
+                }
+                // Cross-fs: already reclaimed concurrently on the watchdog thread
+                // (or nothing stashed — still recorded, told-not-silent). The
+                // stashless arm logs nothing, exactly as before.
+                ReclaimDecision::RecordStashed { deleted, releases, ts } => {
+                    if ts.is_some() {
                         log::warn!(
                             "Watchdog relieved {} concurrently; reclaimed {} snapshot(s) on \
                              the watchdog thread, left the in-flight send (different filesystem) running",
                             fire.pool_label,
-                            outcome.deleted(),
+                            deleted,
                         );
-                        (outcome.deleted(), outcome.releases().to_vec(), *ts)
                     }
-                    None => (0, Vec::new(), chrono::Local::now().naive_local()),
+                    (
+                        deleted,
+                        releases.to_vec(),
+                        ts.unwrap_or_else(|| chrono::Local::now().naive_local()),
+                    )
                 }
             };
-        let ctx = RunContext::for_run(result.run_id);
-        recorder.record(
-            &ctx,
-            Recording {
-                events: vec![Event::pure(
-                    event_ts,
-                    EventPayload::WatchdogAbort {
-                        pool_label: fire.pool_label.clone(),
-                        snapshots_reclaimed: reclaimed,
-                        send_aborted: fire.send_aborted,
-                    },
-                )],
-                notifications: vec![],
-                dispatch: DispatchPolicy::Immediate,
-            },
-        );
-        // (UPI 064-b B7) record the Tier-1 offsite chains the reclaim broke,
-        // for audit symmetry with the planner-driven away-shed. NO separate
-        // notification — the Critical WatchdogAbort notification already states
-        // the next backup will be a full send (avoid double-notifying).
-        recorder.record(
-            &ctx,
-            Recording {
-                events: releases.iter().map(|r| r.to_event(event_ts)).collect(),
-                notifications: vec![],
-                dispatch: DispatchPolicy::Immediate,
-            },
-        );
-        watchdog_notifications.push(notify::build_watchdog_abort_notification(
-            &fire.pool_label,
-            reclaimed,
-            fire.send_aborted,
-        ));
+        let effects = run_tail::firing_recordings(fire, reclaimed, &releases, event_ts);
+        recorder.record(&RunContext::for_run(result.run_id), effects.events);
+        watchdog_notifications.push(effects.notification);
     }
     // S1 (defensive): clear the shared cancel flag once every aborted send has
     // exited and its reclaim has run. The real enforcement is the executor's
@@ -507,34 +499,23 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     // Told-not-silent: every away pin the executor shed at Critical earns an
     // `OffsiteChainReleased` event row + a `Warning` notification (the data is
     // safe offsite — only the chain breaks). Best-effort; never blocks a run.
-    let offsite_releases: Vec<_> = result
-        .subvolume_results
-        .iter()
-        .flat_map(|s| &s.offsite_releases)
-        .collect();
-    if !offsite_releases.is_empty() {
-        let now_ts = chrono::Local::now().naive_local();
-        let notes: Vec<notify::Notification> = offsite_releases
-            .iter()
-            .map(|r| {
-                notify::build_offsite_chain_released_notification(
-                    &r.subvolume,
-                    &r.drive,
-                    &r.parent.to_string(),
-                )
-            })
-            .collect();
-        recorder.record(
-            &RunContext::for_run(result.run_id),
-            Recording {
-                events: offsite_releases.iter().map(|r| r.to_event(now_ts)).collect(),
-                notifications: notes,
-                dispatch: DispatchPolicy::Immediate,
-            },
-        );
+    // Assembled pure in `run_tail::offsite_recordings`.
+    if let Some(rec) =
+        run_tail::offsite_recordings(&result, chrono::Local::now().naive_local())
+    {
+        recorder.record(&RunContext::for_run(result.run_id), rec);
     }
 
-    // Read previous heartbeat BEFORE writing the new one (notification comparison).
+    // ── The run tail, executed exit (UPI 088-b) ────────────────────────
+    // Gather → decide (pure) → execute in the contract order: metrics →
+    // heartbeat write → posture writeback → gate → promise-diff → summary.
+    // That order preserves the notification wire order (watchdog batch →
+    // offsite → storage → promise gate). The gather MUST stay below the
+    // watchdog teardown and offsite blocks above — the same-fs abort-reclaim
+    // deletes local snapshots, so an earlier gather would record state the
+    // run then contradicts. `previous_hb` is read before the new heartbeat
+    // is written (notification comparison); the assess is judged before the
+    // metrics write (the writer only touches `.prom`).
     let previous_hb = heartbeat::read(&config.general.heartbeat_file);
 
     // Compute churn views from the just-recorded drift samples, then thread
@@ -543,10 +524,30 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     let churn_views = build_churn_views(&config, world.db(), heartbeat_now);
     let observability = gather_pool_observability(&config, &churn_views, &fs_state);
 
-    // Write metrics
-    write_metrics_after_execution(
+    // Assess under the SINGLE pre-plan `signals` (the AB1/S2 invariant
+    // above) — do NOT re-gather. The post-execution assess reflects the
+    // pre-plan tier (so the effective send interval matches what the planner
+    // used), then `advance_and_writeback` persists the pre-resolved tier and
+    // surfaces escalation transitions for the notification path (D6).
+    let assessments =
+        world::assess(&config, heartbeat_now, &observation, &signals.by_subvol);
+    let tail = run_tail::decide_tail(&TailInputs {
+        config: &config,
+        exit: TailExit::Executed {
+            result: &result,
+            pre_assessments: &pre_assessments,
+        },
+        heartbeat_now,
+        assessments: &assessments,
+        previous_hb: previous_hb.as_ref(),
+        churn_views: &churn_views,
+        observability: &observability,
+        history_available: world.db().is_some(),
+    });
+
+    write_metrics_per_spec(
         &config,
-        &result,
+        &tail.metrics,
         &backup_plan,
         now,
         &fs_state,
@@ -555,24 +556,7 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     )?;
 
     // Write heartbeat (fresh timestamp — `now` is from before execution).
-    // Reuse the SINGLE pre-plan `signals`/`resolved` (the AB1/S2 invariant
-    // above) — do NOT re-gather. The post-execution assess reflects the
-    // pre-plan tier (so the effective send interval matches what the planner
-    // used), then `advance_and_writeback` persists the pre-resolved tier and
-    // surfaces escalation transitions for the notification path (D6).
-    let assessments =
-        world::assess(&config, heartbeat_now, &observation, &signals.by_subvol);
-    let hb = heartbeat::build(
-        &config,
-        heartbeat_now,
-        Some(&result),
-        &assessments,
-        &churn_views,
-        observability.pools_heartbeat,
-        observability.drives_heartbeat,
-        &observability.subvol_extras,
-    );
-    if let Err(e) = heartbeat::write(&config.general.heartbeat_file, &hb) {
+    if let Err(e) = heartbeat::write(&config.general.heartbeat_file, &tail.heartbeat) {
         log::warn!("Failed to write heartbeat: {e}");
     }
 
@@ -583,7 +567,7 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     // from the heartbeat-driven promise notifications below and runs regardless
     // of whether the sentinel is up. Best-effort throughout: never blocks a run.
     if let Some(db) = world.db() {
-        let ctx = RunContext::for_run(result.run_id);
+        let ctx = tail.ctx;
         // The one sanctioned caller of the raw writeback (clippy
         // disallowed-methods guard — backup is the sole posture writer, D6).
         #[allow(clippy::disallowed_methods)]
@@ -616,48 +600,27 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
 
     // Dispatch notifications for promise state changes (unless the Sentinel
     // handles it): the recorder's GateOnSentinel owns the probe/mark/retry
-    // mechanics; the computation stays here, pure.
-    recorder.record(
-        &RunContext::for_run(result.run_id),
-        Recording {
-            events: vec![],
-            notifications: notify::compute_notifications(previous_hb.as_ref(), &hb),
-            dispatch: DispatchPolicy::GateOnSentinel,
-        },
-    );
+    // mechanics; the computation lives in `decide_tail`, pure — this is the
+    // single gate site both exits share (UPI 088-b).
+    recorder.record(&tail.ctx, tail.gate);
 
-    // Build and render structured summary
-    let transitions = detect_transitions(&pre_assessments, &assessments);
-    if !transitions.is_empty() {
-        log::debug!("Detected {} transition(s)", transitions.len());
+    if !tail.transitions.is_empty() {
+        log::debug!("Detected {} transition(s)", tail.transitions.len());
     }
 
     // Backup is canonical for in-run promise transitions (trigger=Run);
-    // sentinel skips on BackupCompleted to avoid duplicates. The db guard
-    // gates the diff computation itself, as before the recorder seam.
-    if world.db().is_some() {
-        let prev_snapshots = awareness::snapshot_promises(&pre_assessments);
-        let promise_events = awareness::diff_promise_states(
-            &prev_snapshots,
-            &assessments,
-            heartbeat_now,
-            crate::events::TransitionTrigger::Run,
-        );
-        recorder.record(
-            &RunContext::for_run(result.run_id),
-            Recording {
-                events: promise_events,
-                notifications: vec![],
-                dispatch: DispatchPolicy::Immediate,
-            },
-        );
+    // sentinel skips on BackupCompleted to avoid duplicates. The
+    // `history_available` guard inside `decide_tail` gates the diff
+    // computation itself, as before the tail seam.
+    if let Some(rec) = tail.promise_diff {
+        recorder.record(&tail.ctx, rec);
     }
 
     let summary = build_backup_summary(
         &backup_plan,
         &result,
         StatusAssessment::rows(&assessments, &config.resolved_subvolumes(), heartbeat_now),
-        transitions,
+        tail.transitions,
         exec_duration,
         &preflight_warnings,
     );
@@ -676,7 +639,7 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     sweep_orphaned_reserves(&config, &signals);
 
     // Exit with appropriate code
-    if result.overall != RunResult::Success {
+    if tail.run_failed {
         std::process::exit(1);
     }
 
@@ -745,32 +708,6 @@ pub(crate) struct WatchdogCoord {
     /// executor refuses to start a send whose root is in this set (the per-pool
     /// new-send gate that replaces the old global executor shutdown).
     pub(crate) tripped: HashSet<PathBuf>,
-}
-
-/// Thread→main record written when the watchdog fires (UPI 033, pool-scoped by
-/// UPI 065-b). Carries everything the abort-reclaim, event, and notification need.
-/// One firing per tripped pool; the teardown iterates the accumulated `Vec`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct WatchdogFiring {
-    pool_label: String,
-    subvol_names: Vec<String>,
-    /// Source-pool mountpoint for the two-tier abort-reclaim's free-probe
-    /// (UPI 058 — the watchdog thread already holds it as `ArmedPool.poll_path`).
-    mountpoint: PathBuf,
-    /// Host-survival floor the Tier-1 reclaim must clear before it can stop
-    /// (UPI 058 — `ArmedPool.floor_bytes`, the watchdog's own floor).
-    floor_bytes: u64,
-    /// `true` when the trip aborted the in-flight send (same-filesystem); `false`
-    /// when the in-flight send read a *different* filesystem and was left running
-    /// (UPI 065-b). Drives the teardown's reclaim-or-record-only branch and the
-    /// event/notification prose.
-    send_aborted: bool,
-    /// The cross-filesystem reclaim already performed **on the watchdog thread**
-    /// (UPI 065-b, M1), stashed with the timestamp it ran at. `Some` only when
-    /// `send_aborted` is `false`: the teardown records this outcome on the single
-    /// main DB connection rather than reclaiming again. `None` for a same-fs abort
-    /// (the teardown does that reclaim itself, as in UPI 033).
-    reclaim: Option<(ReclaimOutcome, chrono::NaiveDateTime)>,
 }
 
 /// Build the armed-pool list from the pre-plan gather (UPI 033). Production
@@ -1433,6 +1370,34 @@ fn write_metrics_after_execution(
     write_global_metrics(config, now_ts, subvolume_metrics, observability.pool_metrics.clone())
 }
 
+/// Execute the tail's metrics decision (UPI 088-b): one total match over
+/// [`MetricsSpec`], shared by both exits — the variant carries the execution
+/// result its writer needs, so neither call site has an impossible arm.
+fn write_metrics_per_spec(
+    config: &Config,
+    spec: &MetricsSpec<'_>,
+    plan: &crate::types::BackupPlan,
+    now: chrono::NaiveDateTime,
+    fs_state: &dyn FilesystemQuery,
+    churn_views: &HashMap<String, ChurnHeartbeatFields>,
+    observability: &PoolObservability,
+) -> anyhow::Result<()> {
+    match spec {
+        MetricsSpec::Skipped => {
+            write_metrics_for_skipped(config, plan, now, fs_state, churn_views, observability)
+        }
+        MetricsSpec::AfterExecution(result) => write_metrics_after_execution(
+            config,
+            result,
+            plan,
+            now,
+            fs_state,
+            churn_views,
+            observability,
+        ),
+    }
+}
+
 fn write_metrics_for_skipped(
     config: &Config,
     plan: &crate::types::BackupPlan,
@@ -1512,17 +1477,6 @@ fn build_churn_views(
         out.insert(sv.name.clone(), fields);
     }
     out
-}
-
-/// UPI 043: bundled outputs from a single pool-observability pass. Threaded
-/// into both metrics emission (`write_metrics_after_execution` /
-/// `write_metrics_for_skipped`) and heartbeat construction
-/// (`heartbeat::build`).
-struct PoolObservability {
-    pools_heartbeat: Vec<PoolHeartbeat>,
-    drives_heartbeat: Vec<DriveHeartbeat>,
-    subvol_extras: HashMap<String, SubvolumeExtras>,
-    pool_metrics: Vec<PoolMetric>,
 }
 
 /// UPI 043: detect source pools, resolve configured drives, and project both
@@ -2512,110 +2466,15 @@ fn filter_promise_retention(config: &Config, plan: &mut BackupPlan) {
     }
 }
 
-// ── Transition detection ────────────────────────────────────────────────
-
-/// Detect meaningful state changes by comparing pre-backup and post-backup
-/// awareness assessments. Pure function: two assessment snapshots in,
-/// transition events out.
-/// True when this run was the *first* successful send of `subvolume` to
-/// `drive_label`: the drive was mounted with zero snapshots of it before the run
-/// and has at least one after. A first send is never a thread *repair* — there
-/// was no prior thread to mend — so `FirstSendToDrive` and `ThreadRestored` are
-/// mutually exclusive for a given (subvolume, drive). Single source of truth for
-/// that definition, so the two detectors cannot contradict each other (#211).
-fn was_first_send_to_drive(
-    pre_a: &SubvolAssessment,
-    post_a: &SubvolAssessment,
-    drive_label: &str,
-) -> bool {
-    let now_has_snapshots = post_a
-        .external
-        .iter()
-        .any(|e| e.drive_label == drive_label && e.snapshot_count.unwrap_or(0) > 0);
-    let was_mounted_empty = pre_a
-        .external
-        .iter()
-        .any(|e| e.drive_label == drive_label && e.snapshot_count == Some(0));
-    now_has_snapshots && was_mounted_empty
-}
-
-fn detect_transitions(
-    pre: &[SubvolAssessment],
-    post: &[SubvolAssessment],
-) -> Vec<TransitionEvent> {
-    let pre_by_name: HashMap<&str, &SubvolAssessment> =
-        pre.iter().map(|a| (a.name.as_str(), a)).collect();
-
-    let mut transitions = Vec::new();
-
-    for post_a in post {
-        let Some(&pre_a) = pre_by_name.get(post_a.name.as_str()) else {
-            continue;
-        };
-
-        // Thread restored: chain was Broken, now Intact. A first send to this
-        // drive is reported as FirstSendToDrive below, not as a repair — emitting
-        // both for one (subvolume, drive) is the contradiction in #211.
-        for post_ch in &post_a.chain_health {
-            if !matches!(post_ch.status, ChainStatus::Intact { .. }) {
-                continue;
-            }
-            let was_broken = pre_a.chain_health.iter().any(|pre_ch| {
-                pre_ch.drive_label == post_ch.drive_label
-                    && matches!(pre_ch.status, ChainStatus::Broken { .. })
-            });
-            if was_broken && !was_first_send_to_drive(pre_a, post_a, &post_ch.drive_label) {
-                transitions.push(TransitionEvent::ThreadRestored {
-                    subvolume: post_a.name.clone(),
-                    drive: post_ch.drive_label.clone(),
-                });
-            }
-        }
-
-        // First send to drive: mounted with zero snapshots before, has some now.
-        // Only fires for drives that were mounted pre-backup (Some(0)), not
-        // drives that were unmounted (None) — a drive appearing mid-backup
-        // with existing snapshots is not a "first send".
-        for post_ext in &post_a.external {
-            if was_first_send_to_drive(pre_a, post_a, &post_ext.drive_label) {
-                transitions.push(TransitionEvent::FirstSendToDrive {
-                    subvolume: post_a.name.clone(),
-                    drive: post_ext.drive_label.clone(),
-                });
-            }
-        }
-
-        // Promise recovered: status improved
-        if post_a.status > pre_a.status {
-            transitions.push(TransitionEvent::PromiseRecovered {
-                subvolume: post_a.name.clone(),
-                from: pre_a.status,
-                to: post_a.status,
-            });
-        }
-    }
-
-    // AllSealed: all post are Protected, but not all pre were
-    let all_post_protected = !post.is_empty()
-        && post.iter().all(|a| a.status == PromiseStatus::Protected);
-    let any_pre_not_protected = pre.iter().any(|a| a.status != PromiseStatus::Protected);
-    if all_post_protected && any_pre_not_protected {
-        transitions.push(TransitionEvent::AllSealed);
-    }
-
-    transitions
-}
-
 // ── Tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::awareness::{
-        ChainBreakReason, ChainStatus, DriveAssessment, DriveChainHealth, LocalAssessment,
-        OperationalHealth, PromiseStatus, SubvolAssessment,
+        LocalAssessment, OperationalHealth, PromiseStatus, SubvolAssessment,
     };
-    use crate::types::{DriveRole, SendKind};
+    use crate::types::SendKind;
     use crate::executor::{
         ExecutionResult, OpResult, OperationOutcome, RunResult, SendType, SubvolumeResult,
         TransientCleanupOutcome,
@@ -4461,340 +4320,6 @@ source = "/data/beta"
             subvolumes: vec![],
             notifications: NotificationConfig::default(),
         }
-    }
-
-    // ── Transition detection tests ──────────────────────────────────
-
-    fn make_assessment(
-        name: &str,
-        status: PromiseStatus,
-        chain_health: Vec<DriveChainHealth>,
-        external: Vec<DriveAssessment>,
-    ) -> SubvolAssessment {
-        SubvolAssessment {
-            name: name.to_string(),
-            short_name: name.to_string(),
-            status,
-            health: OperationalHealth::Healthy,
-            health_reasons: vec![],
-            local: LocalAssessment {
-                status: PromiseStatus::Protected,
-                snapshot_count: 10,
-                newest_age: None,
-                configured_interval: Interval::hours(1),
-            },
-            external,
-            chain_health,
-            advisories: vec![],
-            redundancy_advisories: vec![],
-            errors: vec![],
-            storage_posture: None,
-            cadence_adapted: false,
-            effective_send_interval: None,
-        }
-    }
-
-    fn make_drive_assessment(label: &str, count: Option<usize>) -> DriveAssessment {
-        DriveAssessment {
-            drive_label: label.to_string(),
-            status: PromiseStatus::Protected,
-            mounted: true,
-            snapshot_count: count,
-            last_send_age: None,
-            source_unchanged: false,
-            configured_interval: Interval::hours(4),
-            role: DriveRole::Primary,
-            absent_duration_secs: None,
-            last_activity_age_secs: None,
-            rotation: None,
-        }
-    }
-
-    #[test]
-    fn detect_thread_restored() {
-        let pre = vec![make_assessment(
-            "htpc-home",
-            PromiseStatus::Protected,
-            vec![DriveChainHealth {
-                drive_label: "WD-18TB".to_string(),
-                status: ChainStatus::Broken {
-                    reason: ChainBreakReason::PinMissingOnDrive,
-                    pin_parent: Some("20260401-0400-htpc-home".to_string()),
-                },
-            }],
-            vec![make_drive_assessment("WD-18TB", Some(5))],
-        )];
-        let post = vec![make_assessment(
-            "htpc-home",
-            PromiseStatus::Protected,
-            vec![DriveChainHealth {
-                drive_label: "WD-18TB".to_string(),
-                status: ChainStatus::Intact {
-                    pin_parent: "20260401-1200-htpc-home".to_string(),
-                },
-            }],
-            vec![make_drive_assessment("WD-18TB", Some(6))],
-        )];
-
-        let transitions = detect_transitions(&pre, &post);
-        assert_eq!(
-            transitions,
-            vec![TransitionEvent::ThreadRestored {
-                subvolume: "htpc-home".to_string(),
-                drive: "WD-18TB".to_string(),
-            }]
-        );
-    }
-
-    #[test]
-    fn detect_first_send_to_drive() {
-        let pre = vec![make_assessment(
-            "docs",
-            PromiseStatus::AtRisk,
-            vec![],
-            vec![make_drive_assessment("WD-18TB", Some(0))],
-        )];
-        let post = vec![make_assessment(
-            "docs",
-            PromiseStatus::Protected,
-            vec![],
-            vec![make_drive_assessment("WD-18TB", Some(1))],
-        )];
-
-        let transitions = detect_transitions(&pre, &post);
-        assert!(transitions.contains(&TransitionEvent::FirstSendToDrive {
-            subvolume: "docs".to_string(),
-            drive: "WD-18TB".to_string(),
-        }));
-    }
-
-    #[test]
-    fn detect_all_sealed() {
-        let pre = vec![
-            make_assessment("a", PromiseStatus::Protected, vec![], vec![]),
-            make_assessment("b", PromiseStatus::AtRisk, vec![], vec![]),
-        ];
-        let post = vec![
-            make_assessment("a", PromiseStatus::Protected, vec![], vec![]),
-            make_assessment("b", PromiseStatus::Protected, vec![], vec![]),
-        ];
-
-        let transitions = detect_transitions(&pre, &post);
-        assert!(transitions.contains(&TransitionEvent::AllSealed));
-    }
-
-    #[test]
-    fn detect_promise_recovered() {
-        let pre = vec![make_assessment(
-            "htpc-home",
-            PromiseStatus::Unprotected,
-            vec![],
-            vec![],
-        )];
-        let post = vec![make_assessment(
-            "htpc-home",
-            PromiseStatus::Protected,
-            vec![],
-            vec![],
-        )];
-
-        let transitions = detect_transitions(&pre, &post);
-        assert!(transitions.contains(&TransitionEvent::PromiseRecovered {
-            subvolume: "htpc-home".to_string(),
-            from: PromiseStatus::Unprotected,
-            to: PromiseStatus::Protected,
-        }));
-    }
-
-    #[test]
-    fn no_transitions_routine_backup() {
-        let pre = vec![
-            make_assessment("a", PromiseStatus::Protected, vec![], vec![]),
-            make_assessment("b", PromiseStatus::Protected, vec![], vec![]),
-        ];
-        let post = vec![
-            make_assessment("a", PromiseStatus::Protected, vec![], vec![]),
-            make_assessment("b", PromiseStatus::Protected, vec![], vec![]),
-        ];
-
-        let transitions = detect_transitions(&pre, &post);
-        assert!(transitions.is_empty(), "routine backup should have no transitions");
-    }
-
-    #[test]
-    fn multiple_transitions() {
-        let pre = vec![
-            make_assessment(
-                "a",
-                PromiseStatus::Unprotected,
-                vec![DriveChainHealth {
-                    drive_label: "WD-18TB".to_string(),
-                    status: ChainStatus::Broken {
-                        reason: ChainBreakReason::NoPinFile,
-                        pin_parent: None,
-                    },
-                }],
-                vec![make_drive_assessment("WD-18TB", Some(0))],
-            ),
-            make_assessment("b", PromiseStatus::AtRisk, vec![], vec![]),
-        ];
-        let post = vec![
-            make_assessment(
-                "a",
-                PromiseStatus::Protected,
-                vec![DriveChainHealth {
-                    drive_label: "WD-18TB".to_string(),
-                    status: ChainStatus::Intact {
-                        pin_parent: "20260401-1200-a".to_string(),
-                    },
-                }],
-                vec![make_drive_assessment("WD-18TB", Some(1))],
-            ),
-            make_assessment("b", PromiseStatus::Protected, vec![], vec![]),
-        ];
-
-        let transitions = detect_transitions(&pre, &post);
-        // "a" went 0→1 snapshots on WD-18TB, so this is a *first send*, not a
-        // thread repair (#211) — the two are mutually exclusive. Should detect:
-        // FirstSendToDrive (a), PromiseRecovered (a and b), AllSealed.
-        assert!(transitions.len() >= 4, "expected multiple transitions, got {transitions:?}");
-        assert!(transitions.contains(&TransitionEvent::AllSealed));
-        assert!(transitions.contains(&TransitionEvent::FirstSendToDrive {
-            subvolume: "a".to_string(),
-            drive: "WD-18TB".to_string(),
-        }));
-        assert!(
-            !transitions.contains(&TransitionEvent::ThreadRestored {
-                subvolume: "a".to_string(),
-                drive: "WD-18TB".to_string(),
-            }),
-            "first send must not also report a thread repair: {transitions:?}"
-        );
-    }
-
-    #[test]
-    fn first_send_and_thread_restored_are_mutually_exclusive() {
-        // Run #114's exact shape: the chain record read Broken (offsite pin shed
-        // by the do-no-harm bug) *and* the drive had zero snapshots pre-run. Both
-        // detectors used to fire, printing "thread mended" and "first thread
-        // established" one line apart (#211). At most one may fire per pair.
-        let pre = vec![make_assessment(
-            "subvol4-multimedia",
-            PromiseStatus::Unprotected,
-            vec![DriveChainHealth {
-                drive_label: "WD-18TB1".to_string(),
-                status: ChainStatus::Broken {
-                    reason: ChainBreakReason::NoPinFile,
-                    pin_parent: None,
-                },
-            }],
-            vec![make_drive_assessment("WD-18TB1", Some(0))],
-        )];
-        let post = vec![make_assessment(
-            "subvol4-multimedia",
-            PromiseStatus::Protected,
-            vec![DriveChainHealth {
-                drive_label: "WD-18TB1".to_string(),
-                status: ChainStatus::Intact {
-                    pin_parent: "20260618-0402-multimedia".to_string(),
-                },
-            }],
-            vec![make_drive_assessment("WD-18TB1", Some(1))],
-        )];
-
-        let transitions = detect_transitions(&pre, &post);
-        let first_send = transitions
-            .iter()
-            .filter(|t| {
-                matches!(
-                    t,
-                    TransitionEvent::FirstSendToDrive { drive, .. } if drive == "WD-18TB1"
-                )
-            })
-            .count();
-        let restored = transitions
-            .iter()
-            .filter(|t| {
-                matches!(
-                    t,
-                    TransitionEvent::ThreadRestored { drive, .. } if drive == "WD-18TB1"
-                )
-            })
-            .count();
-        assert_eq!(first_send, 1, "the first send should be reported: {transitions:?}");
-        assert_eq!(restored, 0, "a first send is not a repair: {transitions:?}");
-        assert!(
-            first_send + restored <= 1,
-            "at most one of the two per (subvolume, drive): {transitions:?}"
-        );
-    }
-
-    #[test]
-    fn all_sealed_not_fired_when_already_sealed() {
-        let pre = vec![
-            make_assessment("a", PromiseStatus::Protected, vec![], vec![]),
-            make_assessment("b", PromiseStatus::Protected, vec![], vec![]),
-        ];
-        let post = vec![
-            make_assessment("a", PromiseStatus::Protected, vec![], vec![]),
-            make_assessment("b", PromiseStatus::Protected, vec![], vec![]),
-        ];
-
-        let transitions = detect_transitions(&pre, &post);
-        assert!(
-            !transitions.contains(&TransitionEvent::AllSealed),
-            "AllSealed should not fire when already all sealed"
-        );
-    }
-
-    #[test]
-    fn promise_degraded_not_a_transition() {
-        let pre = vec![make_assessment(
-            "htpc-home",
-            PromiseStatus::Protected,
-            vec![],
-            vec![],
-        )];
-        let post = vec![make_assessment(
-            "htpc-home",
-            PromiseStatus::AtRisk,
-            vec![],
-            vec![],
-        )];
-
-        let transitions = detect_transitions(&pre, &post);
-        assert!(
-            transitions.is_empty(),
-            "degradation should not produce transitions"
-        );
-    }
-
-    #[test]
-    fn first_send_not_fired_for_unmounted_drive() {
-        // Drive was unmounted (snapshot_count: None) pre-backup, mounted with
-        // existing snapshots post-backup. This is not a "first send" — the
-        // snapshots already existed, the drive was just away.
-        let pre = vec![make_assessment(
-            "docs",
-            PromiseStatus::Protected,
-            vec![],
-            vec![make_drive_assessment("WD-18TB", None)],
-        )];
-        let post = vec![make_assessment(
-            "docs",
-            PromiseStatus::Protected,
-            vec![],
-            vec![make_drive_assessment("WD-18TB", Some(5))],
-        )];
-
-        let transitions = detect_transitions(&pre, &post);
-        assert!(
-            !transitions.contains(&TransitionEvent::FirstSendToDrive {
-                subvolume: "docs".to_string(),
-                drive: "WD-18TB".to_string(),
-            }),
-            "should not fire FirstSendToDrive for previously unmounted drive"
-        );
     }
 
     // ── Deferred synthesis tests ──────────────────────────────────────
