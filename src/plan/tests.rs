@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use super::*;
 use crate::storage_critical::{ArmedTierMap, TightnessTier};
 use crate::btrfs::MockBtrfs;
+use crate::events::EventPayload;
 use crate::types::FullSendReason;
 use chrono::NaiveDate;
 

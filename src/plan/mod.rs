@@ -7,7 +7,7 @@ use crate::commands::storage_signals::RunArming;
 use crate::config::{Config, DriveConfig, ResolvedSubvolume};
 use crate::drives::DriveAvailability;
 use crate::error::UrdError;
-use crate::events::{DeferScope, Event, EventPayload, UnstampedEvent};
+use crate::events::{DeferScope, UnstampedEvent};
 use crate::storage_critical;
 use crate::types::{
     BackupPlan, DriveEvent, DriveEventKind, PlannedLifecycle, PlannedOperation, PlannedSkip,
@@ -15,6 +15,7 @@ use crate::types::{
 };
 
 mod external;
+mod fragment;
 mod local;
 mod send;
 mod transient;
@@ -45,15 +46,16 @@ fn record_defer(
     scope: DeferScope,
     now: NaiveDateTime,
 ) {
-    skipped.push(PlannedSkip {
-        name: subvol_name.to_string(),
-        reason: reason.clone(),
+    let (skip, event) = fragment::defer_parts(
+        subvol_name,
+        drive_label,
+        reason,
         next_due_minutes,
         nothing_new_to_send,
-    });
-    let mut event = Event::pure(now, EventPayload::PlannerDefer { reason, scope });
-    event.fill_subvolume(Some(subvol_name.to_string()));
-    event.fill_drive_label(drive_label.map(str::to_string));
+        scope,
+        now,
+    );
+    skipped.push(skip);
     events.push(event);
 }
 
@@ -91,20 +93,6 @@ fn send_floor_defer_reason(
     }
 }
 
-/// Fill `subvolume` and/or `drive_label` onto events that don't already
-/// carry one (the `fill_*` setters are set-if-unset). Used after a pure
-/// helper returns so the run-level accumulator has full context before
-/// the recorder stamps and persists it.
-fn stamp_context(
-    events: &mut [UnstampedEvent],
-    subvolume: Option<&str>,
-    drive_label: Option<&str>,
-) {
-    for ev in events.iter_mut() {
-        ev.fill_subvolume(subvolume.map(str::to_string));
-        ev.fill_drive_label(drive_label.map(str::to_string));
-    }
-}
 // The read-side query traits now live in `crate::observation`, split along
 // the ADR-102 axis (filesystem is truth, SQLite is history). Re-exported here
 // so existing `crate::plan::{FilesystemQuery, HistoryQuery, ..}` import paths
@@ -446,6 +434,17 @@ pub fn plan(
             has_away_pin,
         );
 
+        // The shared core every region reads (arc RD2) — built once per
+        // subvolume, reused by every `*Inputs` construction below.
+        let core = fragment::SubvolInputs {
+            subvol,
+            eff: &eff,
+            local_dir: &local_dir,
+            local_snaps: &local_snaps,
+            now,
+            obs,
+        };
+
         // The planner's lifecycle judgment for the executor (UPI 082, Branch
         // A): the pieces of `eff` the executor needs, carried on the plan
         // instead of re-derived. `shed_away_drives` gates on Critical here —
@@ -490,33 +489,19 @@ pub fn plan(
         // The executor relies on this ordering within each subvolume.
         // Do not reorder without updating the executor contract in PLAN.md.
         let planned_snap = if !filters.external_only {
-            let min_free = subvol.min_free_bytes.unwrap_or(0);
-            let planned = local::plan_local_snapshot(
-                subvol,
-                &local_dir,
-                &local_snaps,
-                now,
+            let out = local::plan_local_snapshot(&fragment::LocalSnapshotInputs {
+                core,
                 force,
                 filters,
-                min_free,
-                obs,
-                &mut operations,
-                &mut skipped,
-                &mut events,
-            );
-            local::plan_local_retention(
-                subvol,
-                &eff,
-                &local_dir,
-                &local_snaps,
-                now,
-                &pinned,
-                &mounted_pins,
-                obs,
-                &mut operations,
-                &mut events,
-            );
-            planned
+            });
+            out.fragment.drain_into(&mut operations, &mut skipped, &mut events);
+            local::plan_local_retention(&fragment::LocalRetentionInputs {
+                core,
+                pinned: &pinned,
+                mounted_pins: &mounted_pins,
+            })
+            .drain_into(&mut operations, &mut skipped, &mut events);
+            out.planned
         } else {
             None
         };

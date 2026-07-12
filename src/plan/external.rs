@@ -8,6 +8,7 @@ use crate::retention;
 use crate::types::{PlannedOperation, SnapshotName};
 
 use super::Observation;
+use super::fragment::stamp_context;
 
 pub(super) fn plan_external_retention(
     subvol: &ResolvedSubvolume,
@@ -49,6 +50,6 @@ pub(super) fn plan_external_retention(
         });
     }
 
-    super::stamp_context(&mut result.events, Some(&subvol.name), Some(&drive.label));
+    stamp_context(&mut result.events, Some(&subvol.name), Some(&drive.label));
     events.extend(result.events);
 }

@@ -8,6 +8,7 @@ use crate::events::{DeferScope, UnstampedEvent};
 use crate::storage_critical::EffectivePolicy;
 use crate::types::{PlannedOperation, PlannedSkip, SnapshotName};
 
+use super::fragment::{LocalRetentionInputs, LocalSnapshotInputs, SubvolInputs};
 use super::{Observation, PlanFilters};
 
 /// Atomic lifecycle planning for transient subvolumes.
@@ -39,6 +40,15 @@ pub(super) fn plan_transient_lifecycle(
     skipped: &mut Vec<PlannedSkip>,
     events: &mut Vec<UnstampedEvent>,
 ) {
+    let core = SubvolInputs {
+        subvol,
+        eff,
+        local_dir,
+        local_snaps,
+        now,
+        obs,
+    };
+
     // ── Phase 0: Send-space guard (UPI 054-a) ──────────────────────
     // In the transient path snapshot creation is gated on a send being due
     // (Phase 2's orphan invariant), so a sub-floor pool defers the WHOLE
@@ -57,18 +67,12 @@ pub(super) fn plan_transient_lifecycle(
             DeferScope::Subvolume,
             now,
         );
-        super::local::plan_local_retention(
-            subvol,
-            eff,
-            local_dir,
-            local_snaps,
-            now,
+        super::local::plan_local_retention(&LocalRetentionInputs {
+            core,
             pinned,
             mounted_pins,
-            obs,
-            operations,
-            events,
-        );
+        })
+        .drain_into(operations, skipped, events);
         return;
     }
 
@@ -122,18 +126,12 @@ pub(super) fn plan_transient_lifecycle(
             );
         }
         // Phase 4 only: retention on leftovers
-        super::local::plan_local_retention(
-            subvol,
-            eff,
-            local_dir,
-            local_snaps,
-            now,
+        super::local::plan_local_retention(&LocalRetentionInputs {
+            core,
             pinned,
             mounted_pins,
-            obs,
-            operations,
-            events,
-        );
+        })
+        .drain_into(operations, skipped, events);
         return;
     }
 
@@ -174,18 +172,12 @@ pub(super) fn plan_transient_lifecycle(
             );
         }
         // Phase 4 only: retention on leftovers
-        super::local::plan_local_retention(
-            subvol,
-            eff,
-            local_dir,
-            local_snaps,
-            now,
+        super::local::plan_local_retention(&LocalRetentionInputs {
+            core,
             pinned,
             mounted_pins,
-            obs,
-            operations,
-            events,
-        );
+        })
+        .drain_into(operations, skipped, events);
         return;
     }
 
@@ -199,29 +191,25 @@ pub(super) fn plan_transient_lifecycle(
     // Critical send with daily creation would strand 7 unsent snapshots and
     // reproduce the htpc catastrophe this UPI exists to prevent.
     let planned_snap = if !filters.external_only {
-        let min_free = subvol.min_free_bytes.unwrap_or(0);
-        super::local::plan_local_snapshot(
-            subvol, local_dir, local_snaps, now, force, filters,
-            min_free, obs, operations, skipped, events,
-        )
+        let out = super::local::plan_local_snapshot(&LocalSnapshotInputs {
+            core,
+            force,
+            filters,
+        });
+        out.fragment.drain_into(operations, skipped, events);
+        out.planned
     } else {
         None
     };
 
     if planned_snap.is_none() && local_snaps.iter().max().is_none() {
         // No planned snapshot and no existing snapshots — nothing to send.
-        super::local::plan_local_retention(
-            subvol,
-            eff,
-            local_dir,
-            local_snaps,
-            now,
+        super::local::plan_local_retention(&LocalRetentionInputs {
+            core,
             pinned,
             mounted_pins,
-            obs,
-            operations,
-            events,
-        );
+        })
+        .drain_into(operations, skipped, events);
         return;
     }
 
@@ -238,16 +226,10 @@ pub(super) fn plan_transient_lifecycle(
 
     // ── Phase 4: Plan transient retention ─────────────────────────
     // Use original local_snaps — retention only operates on existing-on-disk snapshots.
-    super::local::plan_local_retention(
-        subvol,
-        eff,
-        local_dir,
-        local_snaps,
-        now,
+    super::local::plan_local_retention(&LocalRetentionInputs {
+        core,
         pinned,
         mounted_pins,
-        obs,
-        operations,
-        events,
-    );
+    })
+    .drain_into(operations, skipped, events);
 }
