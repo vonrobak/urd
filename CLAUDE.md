@@ -51,7 +51,7 @@ live in `docs/00-foundation/architecture.md`.
 - `config.rs` — parse/validate TOML, resolve subvolumes
 - `cli.rs` / `cli_validation.rs` — clap command surface / pre-planner input guards
 - `types.rs` — domain types, parsing, `derive_policy()`
-- `plan.rs` — decide operations (pure); `executor.rs` — run them, isolate failures
+- `plan/` — decide operations (pure); `executor.rs` — run them, isolate failures
 - `btrfs.rs` — sole path to `sudo btrfs` (`BtrfsOps: BtrfsRead`)
 - `observation.rs` — read-side query traits (`FilesystemQuery` + `HistoryQuery`)
 - `retention.rs` — which snapshots to keep/delete (pure)

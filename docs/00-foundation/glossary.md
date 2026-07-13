@@ -548,7 +548,7 @@ snapshot list. Tonight's snapshot was stranded. Post-069, that same pair (a plan
 create alongside a nothing-new defer) trips the post-plan orphan invariant instead
 of passing silently.
 
-Source: `plan.rs` (`orphan_invariant_violations`), `types.rs` (`PlannedSkip`),
+Source: `plan/mod.rs` (`orphan_invariant_violations`), `types.rs` (`PlannedSkip`),
 `docs/98-journals/2026-05-02-stranded-snapshots-non-transient-planner.md`, UPI 069.
 
 ## Cluster: The Encounter (first meeting)
