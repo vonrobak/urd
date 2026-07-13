@@ -24,7 +24,7 @@ flowchart LR
     %% Pure core
     subgraph pure["Pure functions (no I/O)"]
         direction TB
-        plan["plan.rs<br/>decide operations"]
+        plan["plan/<br/>decide operations"]
         awareness["awareness.rs<br/>compute promise states"]
         advice["advice.rs<br/>assessment → advice"]
         retention["retention.rs<br/>which snapshots to drop"]
@@ -107,7 +107,7 @@ The diagram is shaped by three architectural rules. Each is load-bearing — the
 ADR in parentheses is the canonical statement (full list of invariants in
 `CLAUDE.md`).
 
-1. **The planner never modifies anything (ADR-100).** `plan.rs` is a pure
+1. **The planner never modifies anything (ADR-100).** `plan/` is a pure
    function from `(config, Observation)` to `Vec<PlannedOperation>`, where
    `Observation` bundles the filesystem-of-truth and SQLite-history query traits.
    Every skip/proceed decision lives there. The executor trusts the plan — it
@@ -155,7 +155,7 @@ the documentation convention in `contributing-internal.md`).
 | `cli.rs` | Define the `clap` command surface (argument parsing) | Contain command logic (`commands/` does that) |
 | `cli_validation.rs` | CLI-boundary guards: resolve a user string to a known config name before the planner, or refuse with help | Run core logic; let unvalidated input reach the planner |
 | `types.rs` | Domain types, parsing, `Display`, `derive_policy()`, `validate_protection_contract()` (the ADR-110 opacity contract) | Contain business logic |
-| `plan.rs` | Decide what operations to run (pure function); stamps each subvolume's lifecycle judgment (`PlannedLifecycle`: is_transient, clear_all, shed_away_drives) onto `BackupPlan.lifecycles` for the executor to read back | Execute anything or call btrfs |
+| `plan/` | Decide what operations to run (pure function, one region module per lifecycle path — local/transient/send/external — composed by `plan()`); stamps each subvolume's lifecycle judgment (`PlannedLifecycle`: is_transient, clear_all, shed_away_drives) onto `BackupPlan.lifecycles` for the executor to read back | Execute anything or call btrfs |
 | `executor.rs` | Execute planned operations, isolate errors per subvolume; build each `SubvolumeContext` from the plan's `PlannedLifecycle` (no tier/away-shed setters — the planner is the sole `derive_effective_policy` caller); host the gated clear-all and the `emergency_reclaim_pool` never-the-only-copy reclaim that both the watchdog abort (ADR-113 Layer 2) and the idle eject (Layer 3) reuse | Decide what to do (the planner's job); re-derive a lifecycle the plan already carries |
 | `btrfs.rs` | Wrap `sudo btrfs` calls via `BtrfsOps`; read-only reads via the `BtrfsRead` supertrait (`BtrfsOps: BtrfsRead`) | Know about retention, plans, config |
 | `observation.rs` | Define read-side query traits on the ADR-102 axis: `FilesystemQuery` (filesystem of truth) + `HistoryQuery` (SQLite history), bundled as `Observation` | Perform I/O (traits only); decide anything |
