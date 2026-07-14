@@ -125,6 +125,86 @@ local_retention = "transient"
 }
 
 #[test]
+fn drive_gate_truth_table_all_seven_availability_variants() {
+    let config = two_drive_config(None);
+    let drive = &config.drives[0]; // label "PRIMARY"
+    let btrfs = MockBtrfs::new();
+
+    // Two Ready arms: Available and the benign TokenMissing (first use).
+    for avail in [DriveAvailability::Available, DriveAvailability::TokenMissing] {
+        let mut fs = MockFileSystemState::new();
+        fs.drive_availability_overrides
+            .insert("PRIMARY".into(), avail.clone());
+        let obs = Observation {
+            fs: &fs,
+            history: &fs,
+            btrfs: &btrfs,
+        };
+        assert!(
+            matches!(
+                check_drive_availability("sv1", drive, &obs, now()),
+                DriveGate::Ready
+            ),
+            "{avail:?} should be Ready",
+        );
+    }
+
+    // Five Deferred arms, each with its exact prose.
+    let deferred = [
+        (DriveAvailability::NotMounted, "drive PRIMARY not mounted"),
+        (
+            DriveAvailability::UuidMismatch {
+                expected: "aaa".into(),
+                found: "bbb".into(),
+            },
+            "drive PRIMARY UUID mismatch (expected aaa, found bbb)",
+        ),
+        (
+            DriveAvailability::UuidCheckFailed("io error".into()),
+            "drive PRIMARY UUID check failed: io error",
+        ),
+        (
+            DriveAvailability::TokenMismatch {
+                expected: "t1".into(),
+                found: "t2".into(),
+            },
+            "drive PRIMARY token mismatch (expected t1, found t2) — possible drive swap",
+        ),
+        (
+            DriveAvailability::TokenExpectedButMissing,
+            "drive PRIMARY token expected but missing \u{2014} run `urd drives adopt PRIMARY`",
+        ),
+    ];
+    for (avail, expected_reason) in deferred {
+        let mut fs = MockFileSystemState::new();
+        fs.drive_availability_overrides
+            .insert("PRIMARY".into(), avail.clone());
+        let obs = Observation {
+            fs: &fs,
+            history: &fs,
+            btrfs: &btrfs,
+        };
+        match check_drive_availability("sv1", drive, &obs, now()) {
+            DriveGate::Deferred(f) => {
+                let mut ops = Vec::new();
+                let mut skipped = Vec::new();
+                let mut events = Vec::new();
+                f.drain_into(&mut ops, &mut skipped, &mut events);
+                assert!(ops.is_empty(), "{avail:?}");
+                assert_eq!(skipped.len(), 1, "{avail:?}");
+                assert_eq!(skipped[0].reason, expected_reason, "{avail:?}");
+                assert!(
+                    !skipped[0].is_nothing_new(),
+                    "a gate defer is never nothing-new: {avail:?}",
+                );
+                assert_eq!(events.len(), 1, "one PlannerDefer event per gate defer");
+            }
+            DriveGate::Ready => panic!("{avail:?} should defer"),
+        }
+    }
+}
+
+#[test]
 fn drive_scopes_classifies_presence_and_reads_all_pins() {
     let config = two_drive_config(None);
     let resolved = config.resolved_subvolumes();

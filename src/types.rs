@@ -1157,11 +1157,14 @@ pub struct PlannedSkip {
     pub reason: String,
     pub next_due_minutes: Option<i64>,
     /// True when send planning concluded the source offers nothing new for a
-    /// drive — set only by the "already on <drive>" and "no local snapshots
-    /// to send" conclusions. That conclusion is contradictory in a run that
-    /// also plans a `CreateSnapshot` for the subvolume; the post-plan orphan
-    /// invariant in `plan.rs` consumes it to detect stranded snapshots.
-    pub nothing_new_to_send: bool,
+    /// drive. Set ONLY by [`PlannedSkip::nothing_new`] (from a sanctioned
+    /// [`NothingNew`] conclusion); [`PlannedSkip::deferred`] always leaves it
+    /// false. Private so the marker cannot be set outside these constructors —
+    /// the field and the reason prose cannot drift. That conclusion is
+    /// contradictory in a run that also plans a `CreateSnapshot` for the
+    /// subvolume; the post-plan orphan invariant's arm 2 consumes it (via
+    /// [`PlannedSkip::is_nothing_new`]) to detect stranded snapshots.
+    nothing_new_to_send: bool,
 }
 
 /// The two sanctioned send-planning conclusions that mean "this (subvolume,
@@ -1172,14 +1175,6 @@ pub struct PlannedSkip {
 /// drift unrepresentable. A third conclusion is a new variant: greppable,
 /// reviewable, and the exhaustive match in [`NothingNew::reason`] forces the
 /// decision to be explicit (UPI 089-b).
-//
-// 089-b commit 1 is additive: the first PRODUCTION callers of `NothingNew`,
-// `reason()`, `deferred()`, and `nothing_new()` land in commit 2 (the
-// send-region reshape). Until then their only users are tests, so the bin
-// target (compiled without `cfg(test)`) sees them as dead. These `allow`s
-// come off in commit 2. `is_nothing_new()` needs none — arm 2 and
-// `collapse_skipped` already read it.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NothingNew {
     /// The chosen snapshot is already on the drive ("caught up").
@@ -1200,7 +1195,6 @@ impl NothingNew {
     /// `collapse_skipped`'s `" already on "` split. Exhaustive match, no
     /// wildcard: a third variant must decide its own prose here.
     #[must_use]
-    #[allow(dead_code)] // commit 2 (send-region reshape) is the first production caller
     pub fn reason(&self) -> String {
         match self {
             NothingNew::AlreadyOn { snapshot, drive } => format!("{snapshot} already on {drive}"),
@@ -1219,7 +1213,6 @@ impl PlannedSkip {
     /// `nothing_new_to_send` marker is always `false`. This is the only
     /// constructor for every skip except the two sanctioned send conclusions.
     #[must_use]
-    #[allow(dead_code)] // commit 2 (defer_parts/record_defer bool-drop) is the first production caller
     pub fn deferred(name: impl Into<String>, reason: String, next_due_minutes: Option<i64>) -> Self {
         Self {
             name: name.into(),
@@ -1233,7 +1226,6 @@ impl PlannedSkip {
     /// `true` and the reason prose is DERIVED from `why` — the two cannot
     /// drift. The only true-constructor of the arm-2 marker.
     #[must_use]
-    #[allow(dead_code)] // commit 2 (send-region reshape) is the first production caller
     pub fn nothing_new(name: impl Into<String>, why: &NothingNew) -> Self {
         Self {
             name: name.into(),

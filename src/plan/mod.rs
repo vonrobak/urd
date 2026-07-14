@@ -42,19 +42,10 @@ fn record_defer(
     drive_label: Option<&str>,
     reason: String,
     next_due_minutes: Option<i64>,
-    nothing_new_to_send: bool,
     scope: DeferScope,
     now: NaiveDateTime,
 ) {
-    let (skip, event) = fragment::defer_parts(
-        subvol_name,
-        drive_label,
-        reason,
-        next_due_minutes,
-        nothing_new_to_send,
-        scope,
-        now,
-    );
+    let (skip, event) = fragment::defer_parts(subvol_name, drive_label, reason, next_due_minutes, scope, now);
     skipped.push(skip);
     events.push(event);
 }
@@ -191,101 +182,60 @@ pub struct PlanFilters {
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
-/// Check if a drive can receive sends. Returns true if available, false (with
-/// skip reason emitted) if not. Handles all DriveAvailability variants.
+/// The outcome of gating a drive for sends: ready to receive, or the defer
+/// fragment explaining why not. Carrying the defer fragment inside `Deferred`
+/// makes the illegal state (unavailable-but-no-defer) unrepresentable — the
+/// caller cannot skip a drive without also recording why (UPI 089-b).
+enum DriveGate {
+    Ready,
+    Deferred(fragment::PlanFragment),
+}
+
+/// Gate a drive for sends. `Ready` if it can receive; `Deferred(fragment)` —
+/// carrying the skip + `PlannerDefer` event — if not. Handles all
+/// `DriveAvailability` variants: `Available` and `TokenMissing` (benign: first
+/// use or pre-token drive) are ready; the other five defer, drive-scoped.
 fn check_drive_availability(
     subvol_name: &str,
     drive: &DriveConfig,
     obs: &Observation,
-    skipped: &mut Vec<PlannedSkip>,
-    events: &mut Vec<UnstampedEvent>,
     now: NaiveDateTime,
-) -> bool {
+) -> DriveGate {
+    // Every defer arm is drive-scoped with no next-due — only the reason prose
+    // differs. One closure keeps the shape single-homed and the reasons the
+    // only per-arm variation.
+    let deferred = |reason: String| {
+        let mut f = fragment::PlanFragment::default();
+        f.defer(
+            subvol_name,
+            Some(&drive.label),
+            reason,
+            None,
+            DeferScope::Drive,
+            now,
+        );
+        DriveGate::Deferred(f)
+    };
     match obs.fs.drive_availability(drive) {
-        DriveAvailability::Available => true,
-        DriveAvailability::NotMounted => {
-            record_defer(
-                skipped,
-                events,
-                subvol_name,
-                Some(&drive.label),
-                format!("drive {} not mounted", drive.label),
-                None,
-                false,
-                DeferScope::Drive,
-                now,
-            );
-            false
-        }
-        DriveAvailability::UuidMismatch { expected, found } => {
-            record_defer(
-                skipped,
-                events,
-                subvol_name,
-                Some(&drive.label),
-                format!(
-                    "drive {} UUID mismatch (expected {}, found {})",
-                    drive.label, expected, found
-                ),
-                None,
-                false,
-                DeferScope::Drive,
-                now,
-            );
-            false
-        }
+        DriveAvailability::Available => DriveGate::Ready,
+        DriveAvailability::NotMounted => deferred(format!("drive {} not mounted", drive.label)),
+        DriveAvailability::UuidMismatch { expected, found } => deferred(format!(
+            "drive {} UUID mismatch (expected {}, found {})",
+            drive.label, expected, found
+        )),
         DriveAvailability::UuidCheckFailed(reason) => {
-            record_defer(
-                skipped,
-                events,
-                subvol_name,
-                Some(&drive.label),
-                format!("drive {} UUID check failed: {}", drive.label, reason),
-                None,
-                false,
-                DeferScope::Drive,
-                now,
-            );
-            false
+            deferred(format!("drive {} UUID check failed: {}", drive.label, reason))
         }
-        DriveAvailability::TokenMismatch { expected, found } => {
-            record_defer(
-                skipped,
-                events,
-                subvol_name,
-                Some(&drive.label),
-                format!(
-                    "drive {} token mismatch (expected {}, found {}) — possible drive swap",
-                    drive.label, expected, found
-                ),
-                None,
-                false,
-                DeferScope::Drive,
-                now,
-            );
-            false
-        }
-        DriveAvailability::TokenExpectedButMissing => {
-            record_defer(
-                skipped,
-                events,
-                subvol_name,
-                Some(&drive.label),
-                format!(
-                    "drive {} token expected but missing \u{2014} run `urd drives adopt {}`",
-                    drive.label, drive.label
-                ),
-                None,
-                false,
-                DeferScope::Drive,
-                now,
-            );
-            false
-        }
-        DriveAvailability::TokenMissing => {
-            // Benign: first use or pre-token drive. Proceed with send.
-            true
-        }
+        DriveAvailability::TokenMismatch { expected, found } => deferred(format!(
+            "drive {} token mismatch (expected {}, found {}) — possible drive swap",
+            drive.label, expected, found
+        )),
+        DriveAvailability::TokenExpectedButMissing => deferred(format!(
+            "drive {} token expected but missing \u{2014} run `urd drives adopt {}`",
+            drive.label, drive.label
+        )),
+        // Benign: first use or pre-token drive. Proceed with send.
+        DriveAvailability::TokenMissing => DriveGate::Ready,
     }
 }
 
@@ -350,7 +300,6 @@ pub fn plan(
                 None,
                 "disabled".to_string(),
                 None,
-                false,
                 DeferScope::Subvolume,
                 now,
             );
@@ -382,7 +331,6 @@ pub fn plan(
                 None,
                 "no snapshot root configured".to_string(),
                 None,
-                false,
                 DeferScope::Subvolume,
                 now,
             );
@@ -522,7 +470,6 @@ pub fn plan(
                     None,
                     reason.clone(),
                     None,
-                    false,
                     DeferScope::Subvolume,
                     now,
                 );
@@ -533,44 +480,31 @@ pub fn plan(
                     continue;
                 }
 
-                if !check_drive_availability(
-                    &subvol.name,
-                    drive,
-                    obs,
-                    &mut skipped,
-                    &mut events,
-                    now,
-                ) {
-                    continue;
+                match check_drive_availability(&subvol.name, drive, obs, now) {
+                    DriveGate::Ready => {}
+                    DriveGate::Deferred(f) => {
+                        f.drain_into(&mut operations, &mut skipped, &mut events);
+                        continue;
+                    }
                 }
 
                 if floor_defer.is_none() {
-                    send::plan_external_send(
-                        subvol,
-                        &eff,
+                    send::plan_external_send(&fragment::SendInputs {
+                        core,
                         drive,
-                        &local_dir,
-                        &local_snaps,
-                        planned_snap.as_ref(),
-                        now,
+                        planned_snap: planned_snap.as_ref(),
                         force,
-                        filters.skip_intervals,
-                        obs,
-                        &mut operations,
-                        &mut skipped,
-                        &mut events,
-                    );
+                        skip_intervals: filters.skip_intervals,
+                    })
+                    .drain_into(&mut operations, &mut skipped, &mut events);
                 }
 
-                external::plan_external_retention(
-                    subvol,
+                external::plan_external_retention(&fragment::ExternalRetentionInputs {
+                    core,
                     drive,
-                    now,
-                    obs,
-                    &pinned,
-                    &mut operations,
-                    &mut events,
-                );
+                    pinned: &pinned,
+                })
+                .drain_into(&mut operations, &mut skipped, &mut events);
             }
         } else if !filters.local_only && !subvol.send_enabled {
             record_defer(
@@ -580,7 +514,6 @@ pub fn plan(
                 None,
                 "local only".to_string(),
                 None,
-                false,
                 DeferScope::Subvolume,
                 now,
             );
