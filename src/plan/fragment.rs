@@ -155,12 +155,7 @@ mod tests {
             subvolume_name: "pre".to_string(),
             kind: crate::types::DeleteKind::Policy,
         }];
-        let mut skipped = vec![PlannedSkip {
-            name: "pre".to_string(),
-            reason: "prefix".to_string(),
-            next_due_minutes: None,
-            nothing_new_to_send: false,
-        }];
+        let mut skipped = vec![PlannedSkip::deferred("pre", "prefix".to_string(), None)];
         let mut events = Vec::new();
 
         let mut fragment = PlanFragment::default();
@@ -242,6 +237,6 @@ mod tests {
         let mut events = Vec::new();
         fragment.drain_into(&mut operations, &mut skipped, &mut events);
 
-        assert!(!skipped[0].nothing_new_to_send);
+        assert!(!skipped[0].is_nothing_new());
     }
 }

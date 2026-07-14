@@ -1164,6 +1164,94 @@ pub struct PlannedSkip {
     pub nothing_new_to_send: bool,
 }
 
+/// The two sanctioned send-planning conclusions that mean "this (subvolume,
+/// drive) pair offers nothing new to send" — the ONLY constructors of a
+/// marker-true [`PlannedSkip`] (via [`PlannedSkip::nothing_new`]). The
+/// post-plan orphan invariant's arm 2 (stranded-snapshot tripwire) keys on
+/// the marker; deriving the reason prose from the variant makes marker/prose
+/// drift unrepresentable. A third conclusion is a new variant: greppable,
+/// reviewable, and the exhaustive match in [`NothingNew::reason`] forces the
+/// decision to be explicit (UPI 089-b).
+//
+// 089-b commit 1 is additive: the first PRODUCTION callers of `NothingNew`,
+// `reason()`, `deferred()`, and `nothing_new()` land in commit 2 (the
+// send-region reshape). Until then their only users are tests, so the bin
+// target (compiled without `cfg(test)`) sees them as dead. These `allow`s
+// come off in commit 2. `is_nothing_new()` needs none — arm 2 and
+// `collapse_skipped` already read it.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NothingNew {
+    /// The chosen snapshot is already on the drive ("caught up").
+    AlreadyOn {
+        snapshot: SnapshotName,
+        drive: String,
+    },
+    /// No local snapshots exist to choose from. `transient` selects the
+    /// lifecycle-appropriate prose: transient reads as routine (sends resume
+    /// next backup); non-transient reads as a gap.
+    NoLocalSnapshots { transient: bool },
+}
+
+impl NothingNew {
+    /// The exact reason prose — byte-identical to the strings the planner
+    /// emitted before UPI 089-b. Consumed by `SkipCategory::from_reason` (the
+    /// two `NoLocalSnapshots` forms classify differently) and by
+    /// `collapse_skipped`'s `" already on "` split. Exhaustive match, no
+    /// wildcard: a third variant must decide its own prose here.
+    #[must_use]
+    #[allow(dead_code)] // commit 2 (send-region reshape) is the first production caller
+    pub fn reason(&self) -> String {
+        match self {
+            NothingNew::AlreadyOn { snapshot, drive } => format!("{snapshot} already on {drive}"),
+            NothingNew::NoLocalSnapshots { transient: true } => {
+                "external-only \u{2014} sends on next backup".to_string()
+            }
+            NothingNew::NoLocalSnapshots { transient: false } => {
+                "no local snapshots to send".to_string()
+            }
+        }
+    }
+}
+
+impl PlannedSkip {
+    /// A deferral that is NOT a nothing-new-to-send conclusion. The
+    /// `nothing_new_to_send` marker is always `false`. This is the only
+    /// constructor for every skip except the two sanctioned send conclusions.
+    #[must_use]
+    #[allow(dead_code)] // commit 2 (defer_parts/record_defer bool-drop) is the first production caller
+    pub fn deferred(name: impl Into<String>, reason: String, next_due_minutes: Option<i64>) -> Self {
+        Self {
+            name: name.into(),
+            reason,
+            next_due_minutes,
+            nothing_new_to_send: false,
+        }
+    }
+
+    /// A sanctioned nothing-new-to-send conclusion. The marker is always
+    /// `true` and the reason prose is DERIVED from `why` — the two cannot
+    /// drift. The only true-constructor of the arm-2 marker.
+    #[must_use]
+    #[allow(dead_code)] // commit 2 (send-region reshape) is the first production caller
+    pub fn nothing_new(name: impl Into<String>, why: &NothingNew) -> Self {
+        Self {
+            name: name.into(),
+            reason: why.reason(),
+            next_due_minutes: None,
+            nothing_new_to_send: true,
+        }
+    }
+
+    /// Whether this skip is a sanctioned nothing-new-to-send conclusion —
+    /// the accessor the post-plan orphan invariant's arm 2 and
+    /// `collapse_skipped` consume.
+    #[must_use]
+    pub fn is_nothing_new(&self) -> bool {
+        self.nothing_new_to_send
+    }
+}
+
 /// The lifecycle judgment the planner made for one subvolume (UPI 082,
 /// Branches A/C): the pieces of `EffectivePolicy` the executor needs, carried
 /// on the plan instead of re-derived. Deliberately excludes `send_interval` —
@@ -1377,6 +1465,90 @@ pub fn format_run_duration(started: &str, finished: &str) -> Option<String> {
 mod tests {
     use super::*;
     use chrono::NaiveDate;
+
+    // ── NothingNew / PlannedSkip constructor tests (UPI 089-b) ──────
+    //
+    // The reason prose is a byte-stable contract: `SkipCategory::from_reason`
+    // pattern-classifies these strings (the two NoLocalSnapshots forms land in
+    // DIFFERENT categories) and `collapse_skipped` splits AlreadyOn on
+    // " already on ". These three tests pin the strings byte-for-byte.
+
+    #[test]
+    fn nothing_new_reason_already_on_is_byte_stable() {
+        let why = NothingNew::AlreadyOn {
+            snapshot: SnapshotName::parse("20260430-0402-one").expect("valid"),
+            drive: "WD-18TB".to_string(),
+        };
+        assert_eq!(why.reason(), "20260430-0402-one already on WD-18TB");
+    }
+
+    #[test]
+    fn nothing_new_reason_no_local_transient_is_external_only_prose() {
+        let why = NothingNew::NoLocalSnapshots { transient: true };
+        // em-dash literal, not a hyphen — SkipCategory::ExternalOnly matches
+        // starts_with("external-only").
+        assert_eq!(why.reason(), "external-only \u{2014} sends on next backup");
+    }
+
+    #[test]
+    fn nothing_new_reason_no_local_non_transient_is_gap_prose() {
+        let why = NothingNew::NoLocalSnapshots { transient: false };
+        assert_eq!(why.reason(), "no local snapshots to send");
+    }
+
+    #[test]
+    fn planned_skip_deferred_never_sets_marker() {
+        let skip = PlannedSkip::deferred("sv1", "drive not mounted".to_string(), None);
+        assert!(!skip.is_nothing_new());
+        assert_eq!(skip.reason, "drive not mounted");
+        assert_eq!(skip.next_due_minutes, None);
+    }
+
+    #[test]
+    fn planned_skip_deferred_carries_next_due() {
+        let skip = PlannedSkip::deferred("sv1", "not due".to_string(), Some(42));
+        assert_eq!(skip.next_due_minutes, Some(42));
+        assert!(!skip.is_nothing_new());
+    }
+
+    #[test]
+    fn planned_skip_nothing_new_always_sets_marker_and_derives_reason() {
+        let why = NothingNew::AlreadyOn {
+            snapshot: SnapshotName::parse("20260322-1330-one").expect("valid"),
+            drive: "D1".to_string(),
+        };
+        let skip = PlannedSkip::nothing_new("sv1", &why);
+        assert!(skip.is_nothing_new());
+        assert_eq!(skip.reason, "20260322-1330-one already on D1");
+        assert_eq!(skip.next_due_minutes, None);
+    }
+
+    /// Exhaustive-variant sweep (RD-b1 §6b, adversary F4): every sanctioned
+    /// `NothingNew` variant is strand-tripping (marker-true). The `match` has
+    /// NO wildcard, so a third variant breaks it — forcing an explicit
+    /// decision here about whether it trips arm 2, not merely that prose
+    /// exists for it in `reason()`.
+    #[test]
+    fn nothing_new_every_variant_is_strand_tripping() {
+        for why in [
+            NothingNew::AlreadyOn {
+                snapshot: SnapshotName::parse("20260322-1330-one").expect("valid"),
+                drive: "D1".to_string(),
+            },
+            NothingNew::NoLocalSnapshots { transient: true },
+            NothingNew::NoLocalSnapshots { transient: false },
+        ] {
+            let trips_arm2 = match why {
+                NothingNew::AlreadyOn { .. } => true,
+                NothingNew::NoLocalSnapshots { .. } => true,
+            };
+            assert_eq!(
+                trips_arm2,
+                PlannedSkip::nothing_new("sv", &why).is_nothing_new(),
+                "sanctioned conclusion must trip arm 2: {why:?}",
+            );
+        }
+    }
 
     // ── Interval tests ──────────────────────────────────────────────
 
@@ -1618,12 +1790,11 @@ mod tests {
                 .unwrap()
                 .and_hms_opt(14, 30, 0)
                 .unwrap(),
-            skipped: vec![PlannedSkip {
-                name: "subvol6-tmp".to_string(),
-                reason: "interval not elapsed".to_string(),
-                next_due_minutes: None,
-                nothing_new_to_send: false,
-            }],
+            skipped: vec![PlannedSkip::deferred(
+                "subvol6-tmp",
+                "interval not elapsed".to_string(),
+                None,
+            )],
             events: Vec::new(),
         };
         let s = plan.summary();

@@ -5,7 +5,7 @@ use super::*;
 use crate::storage_critical::{ArmedTierMap, TightnessTier};
 use crate::btrfs::MockBtrfs;
 use crate::events::EventPayload;
-use crate::types::FullSendReason;
+use crate::types::{FullSendReason, NothingNew};
 use chrono::NaiveDate;
 
 fn test_config() -> Config {
@@ -4569,7 +4569,7 @@ fn assert_marker(result: &BackupPlan, name: &str, substr: &str, expected: bool) 
             )
         });
     assert_eq!(
-        skip.nothing_new_to_send, expected,
+        skip.is_nothing_new(), expected,
         "nothing_new_to_send mismatch for skip {:?}",
         skip.reason
     );
@@ -4885,13 +4885,23 @@ fn op_send(name: &str) -> PlannedOperation {
     }
 }
 
-fn skip_entry(name: &str, reason: &str, nothing_new_to_send: bool) -> PlannedSkip {
-    PlannedSkip {
-        name: name.to_string(),
-        reason: reason.to_string(),
-        next_due_minutes: None,
-        nothing_new_to_send,
-    }
+/// A marker-false deferral (interval, drive-away, floor, space guard — the
+/// benign create-without-send inputs to arm 2).
+fn skip_deferred(name: &str, reason: &str) -> PlannedSkip {
+    PlannedSkip::deferred(name, reason.to_string(), None)
+}
+
+/// A marker-true "already on <drive>" conclusion — the sanctioned nothing-new
+/// input arm 2 keys on. Prose is derived from the variant (`{snapshot} already
+/// on {drive}`), byte-identical to what the planner emits.
+fn skip_already_on(name: &str, snapshot: &str, drive: &str) -> PlannedSkip {
+    PlannedSkip::nothing_new(
+        name,
+        &NothingNew::AlreadyOn {
+            snapshot: snap(snapshot),
+            drive: drive.to_string(),
+        },
+    )
 }
 
 #[test]
@@ -4922,7 +4932,7 @@ fn orphan_invariant_arm2_create_with_nothing_new_defer() {
     let violations = orphan_invariant_violations(
         &[judgment("sv1", false, true)],
         &[op_create("sv1")],
-        &[skip_entry("sv1", "20260430-0402-one already on D1", true)],
+        &[skip_already_on("sv1", "20260430-0402-one", "D1")],
     );
     assert_eq!(violations.len(), 1);
     assert!(violations[0].contains("stranded"), "{violations:?}");
@@ -4938,9 +4948,9 @@ fn orphan_invariant_arm2_marker_false_defers_clean() {
         &[judgment("sv1", false, true)],
         &[op_create("sv1")],
         &[
-            skip_entry("sv1", "send to D1 not due (next in ~2h)", false),
-            skip_entry("sv1", "drive D2 not mounted", false),
-            skip_entry("sv1", "send to D3 skipped: estimated ~1 GB exceeds 0 B available", false),
+            skip_deferred("sv1", "send to D1 not due (next in ~2h)"),
+            skip_deferred("sv1", "drive D2 not mounted"),
+            skip_deferred("sv1", "send to D3 skipped: estimated ~1 GB exceeds 0 B available"),
         ],
     );
     assert!(violations.is_empty(), "{violations:?}");
@@ -4953,7 +4963,7 @@ fn orphan_invariant_no_create_nothing_new_clean() {
     let violations = orphan_invariant_violations(
         &[judgment("sv1", false, true)],
         &[],
-        &[skip_entry("sv1", "20260322-1330-one already on D1", true)],
+        &[skip_already_on("sv1", "20260322-1330-one", "D1")],
     );
     assert!(violations.is_empty(), "{violations:?}");
 }
@@ -4966,7 +4976,7 @@ fn orphan_invariant_arm2_fires_even_with_send_to_other_drive() {
     let violations = orphan_invariant_violations(
         &[judgment("sv1", true, true)],
         &[op_create("sv1"), op_send("sv1")],
-        &[skip_entry("sv1", "20260321-0400-one already on D2", true)],
+        &[skip_already_on("sv1", "20260321-0400-one", "D2")],
     );
     assert_eq!(violations.len(), 1);
     assert!(violations[0].contains("stranded"), "{violations:?}");

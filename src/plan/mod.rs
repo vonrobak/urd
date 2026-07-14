@@ -676,7 +676,7 @@ fn orphan_invariant_violations(
         // contradictory alongside a planned create.
         for skip in skipped
             .iter()
-            .filter(|s| s.name == j.name && s.nothing_new_to_send)
+            .filter(|s| s.name == j.name && s.is_nothing_new())
         {
             violations.push(format!(
                 "{} has CreateSnapshot alongside a nothing-new-to-send defer ({:?}) — \

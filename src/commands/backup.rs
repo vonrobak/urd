@@ -3662,18 +3662,12 @@ source = "/data/beta"
             operations: vec![],
             timestamp: chrono::NaiveDateTime::default(),
             skipped: vec![
-                crate::types::PlannedSkip {
-                    name: "htpc-home".to_string(),
-                    reason: "drive WD-18TB not mounted".to_string(),
-                    next_due_minutes: None,
-                    nothing_new_to_send: false,
-                },
-                crate::types::PlannedSkip {
-                    name: "htpc-docs".to_string(),
-                    reason: "disabled".to_string(),
-                    next_due_minutes: None,
-                    nothing_new_to_send: false,
-                },
+                crate::types::PlannedSkip::deferred(
+                    "htpc-home",
+                    "drive WD-18TB not mounted".to_string(),
+                    None,
+                ),
+                crate::types::PlannedSkip::deferred("htpc-docs", "disabled".to_string(), None),
             ],
             events: Vec::new(),
         };
@@ -4335,12 +4329,7 @@ source = "/data/beta"
                 .unwrap(),
             skipped: skipped
                 .into_iter()
-                .map(|(n, r)| crate::types::PlannedSkip {
-                    name: n.to_string(),
-                    reason: r.to_string(),
-                    next_due_minutes: None,
-                    nothing_new_to_send: false,
-                })
+                .map(|(n, r)| crate::types::PlannedSkip::deferred(n, r.to_string(), None))
                 .collect(),
             events: Vec::new(),
         }
