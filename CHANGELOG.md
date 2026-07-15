@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.35.0] - 2026-07-15
+
 ### Fixed
 - `urd backup`'s post-run table and `--json` output now carry the same complete
   promise fields (`promise_level`, `retention_summary`, `external_only`) that
@@ -1723,7 +1725,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Defense-in-depth pin file protection for unsent snapshots
 - Per-subvolume error isolation in executor
 
-[Unreleased]: https://github.com/vonrobak/urd/compare/v0.34.0...HEAD
+[Unreleased]: https://github.com/vonrobak/urd/compare/v0.35.0...HEAD
+[0.35.0]: https://github.com/vonrobak/urd/compare/v0.34.0...v0.35.0
 [0.34.0]: https://github.com/vonrobak/urd/compare/v0.33.4...v0.34.0
 [0.33.4]: https://github.com/vonrobak/urd/compare/v0.33.3...v0.33.4
 [0.33.3]: https://github.com/vonrobak/urd/compare/v0.33.2...v0.33.3
