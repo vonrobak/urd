@@ -1,3 +1,13 @@
+---
+type: ADR
+title: Config System Architecture
+categories: ['[[ADR]]']
+project: ['[[urd]]']
+sensitivity: public
+status: active
+created: '2026-03-27'
+timestamp: '2026-07-02T01:04:01+02:00'
+---
 # ADR-111: Config System Architecture
 
 > **TL;DR:** The config file is a complete, self-describing artifact with no hidden inheritance.

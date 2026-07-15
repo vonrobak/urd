@@ -1,3 +1,13 @@
+---
+type: ADR
+title: Pure-Function Module Pattern
+categories: ['[[ADR]]']
+project: ['[[urd]]']
+sensitivity: public
+status: active
+created: '2026-03-24'
+timestamp: '2026-07-11T09:19:17+02:00'
+---
 # ADR-108: Pure-Function Module Pattern
 
 > **TL;DR:** Core logic modules are pure functions: inputs in (config, state, time),

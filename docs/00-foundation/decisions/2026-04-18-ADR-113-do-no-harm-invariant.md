@@ -1,3 +1,13 @@
+---
+type: ADR
+title: The Do-No-Harm Invariant
+categories: ['[[ADR]]']
+project: ['[[urd]]']
+sensitivity: public
+status: active
+created: '2026-04-21'
+timestamp: '2026-06-26T12:00:41+02:00'
+---
 # ADR-113: The Do-No-Harm Invariant
 
 > **TL;DR:** Urd shall not be the proximate cause of local storage pressure on monitored

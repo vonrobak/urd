@@ -1,3 +1,13 @@
+---
+type: Guide
+title: Operating Urd
+categories: ['[[Guide]]']
+project: ['[[urd]]']
+sensitivity: public
+status: active
+created: '2026-03-23'
+timestamp: '2026-07-05T15:58:56+02:00'
+---
 # Operating Urd
 
 > **TL;DR:** How to build, install, update, and run Urd day-to-day. Covers the full

@@ -1,3 +1,13 @@
+---
+type: Guide
+title: 'Runbook: Restarting the Sentinel'
+categories: ['[[Guide]]']
+project: ['[[urd]]']
+sensitivity: public
+status: active
+created: '2026-05-02'
+timestamp: '2026-05-02T21:54:24+02:00'
+---
 # Runbook: Restarting the Sentinel
 
 > **TL;DR:** The Sentinel is a stateless observer of the SQLite event log

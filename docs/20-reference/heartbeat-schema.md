@@ -1,3 +1,13 @@
+---
+type: Guide
+title: Heartbeat Schema Reference
+categories: ['[[Guide]]']
+project: ['[[urd]]']
+sensitivity: public
+status: active
+created: '2026-05-02'
+timestamp: '2026-05-02T20:45:51+02:00'
+---
 # Heartbeat Schema Reference
 
 > **TL;DR:** `heartbeat.json` is a JSON health signal Urd writes after every

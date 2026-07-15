@@ -59,8 +59,23 @@ for file in "${targets[@]}"; do
     checked=$((checked + 1))
 
     lineno=0
+    in_frontmatter=0
     while IFS= read -r raw || [[ -n "$raw" ]]; do
         lineno=$((lineno + 1))
+
+        # Skip the YAML frontmatter block (ADR-118: public-tier docs now carry OKF
+        # frontmatter, e.g. `created: '2026-05-02'`). Structured metadata dates are not
+        # journey narration -- the lint governs prose, not the schema built to hold dates.
+        if [[ $lineno -eq 1 && "$raw" == "---" ]]; then
+            in_frontmatter=1
+            continue
+        fi
+        if [[ $in_frontmatter -eq 1 ]]; then
+            if [[ "$raw" == "---" ]]; then
+                in_frontmatter=0
+            fi
+            continue
+        fi
 
         # Strip inline-code spans (`…`) and markdown link targets ](…) so dated-filename
         # pointers and path references don't trip the lint. Link *text* is kept.

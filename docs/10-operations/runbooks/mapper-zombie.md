@@ -1,3 +1,13 @@
+---
+type: Guide
+title: 'Runbook: "File exists" on Re-unlocking a LUKS Backup Drive'
+categories: ['[[Guide]]']
+project: ['[[urd]]']
+sensitivity: public
+status: active
+created: '2026-05-02'
+timestamp: '2026-05-02T20:45:51+02:00'
+---
 # Runbook: "File exists" on Re-unlocking a LUKS Backup Drive
 
 > **TL;DR:** When a removable LUKS drive is unplugged and reconnected, the

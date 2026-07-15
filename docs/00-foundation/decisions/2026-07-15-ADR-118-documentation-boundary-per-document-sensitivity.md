@@ -1,3 +1,13 @@
+---
+type: ADR
+title: Documentation Boundary as Per-Document Sensitivity
+categories: ['[[ADR]]']
+project: ['[[urd]]']
+sensitivity: public
+status: active
+created: '2026-07-15'
+timestamp: '2026-07-15T12:39:55+02:00'
+---
 # ADR-118: Documentation Boundary as Per-Document Sensitivity
 
 > **TL;DR:** Urd's six internal doc directories (`90-archive`, `95-ideas`,

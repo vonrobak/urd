@@ -1,3 +1,13 @@
+---
+type: Guide
+title: BTRFS Reference for Backup Tooling
+categories: ['[[Guide]]']
+project: ['[[urd]]']
+sensitivity: public
+status: active
+created: '2026-04-05'
+timestamp: '2026-05-02T19:40:32+02:00'
+---
 # BTRFS Reference for Backup Tooling
 
 > Based on btrfs-progs documentation through v6.12+ (training data).

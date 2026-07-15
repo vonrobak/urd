@@ -1,3 +1,13 @@
+---
+type: Guide
+title: Glossary
+categories: ['[[Guide]]']
+project: ['[[urd]]']
+sensitivity: public
+status: active
+created: '2026-05-02'
+timestamp: '2026-07-13T02:14:58+02:00'
+---
 # Glossary
 
 > **TL;DR:** Single source for Urd's controlled vocabulary — promise states, voice

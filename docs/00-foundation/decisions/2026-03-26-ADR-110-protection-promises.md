@@ -1,3 +1,13 @@
+---
+type: ADR
+title: Protection Promises
+categories: ['[[ADR]]']
+project: ['[[urd]]']
+sensitivity: public
+status: active
+created: '2026-03-26'
+timestamp: '2026-05-30T21:25:09+02:00'
+---
 # ADR-110: Protection Promises
 
 > **TL;DR:** Protection promises are named levels that map to concrete operational policies.

@@ -1,3 +1,13 @@
+---
+type: ADR
+title: Structured Event Log for Decisions and State Transitions
+categories: ['[[ADR]]']
+project: ['[[urd]]']
+sensitivity: public
+status: active
+created: '2026-04-30'
+timestamp: '2026-05-29T18:25:12+02:00'
+---
 # ADR-114: Structured Event Log for Decisions and State Transitions
 
 > **TL;DR:** Urd shall persist a typed, immutable log of state changes and decisions —

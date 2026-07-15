@@ -1,3 +1,13 @@
+---
+type: ADR
+title: Config-Boundary Validation
+categories: ['[[ADR]]']
+project: ['[[urd]]']
+sensitivity: public
+status: active
+created: '2026-03-24'
+timestamp: '2026-07-11T09:19:17+02:00'
+---
 # ADR-109: Config-Boundary Validation
 
 > **TL;DR:** All user-provided paths and names are validated once at config load time.

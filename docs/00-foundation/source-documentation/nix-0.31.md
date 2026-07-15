@@ -1,3 +1,13 @@
+---
+type: Guide
+title: nix 0.31 Reference
+categories: ['[[Guide]]']
+project: ['[[urd]]']
+sensitivity: public
+status: active
+created: '2026-04-05'
+timestamp: '2026-05-02T19:40:32+02:00'
+---
 # nix 0.31 Reference
 
 > Urd dependency: `nix = { version = "0.31", features = ["fs"] }`

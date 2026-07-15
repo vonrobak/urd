@@ -1,3 +1,13 @@
+---
+type: ADR
+title: Daily External Backups with Incremental Sends
+categories: ['[[ADR]]']
+project: ['[[urd]]']
+sensitivity: public
+status: active
+created: '2026-03-23'
+timestamp: '2026-05-02T19:40:32+02:00'
+---
 # ADR-020: Daily External Backups with Incremental Sends
 
 **Date:** 2026-03-21
