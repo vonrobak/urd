@@ -3,10 +3,10 @@ use std::path::Path;
 
 use chrono::NaiveDateTime;
 
-use crate::config::ResolvedSubvolume;
+use crate::config::{DriveConfig, ResolvedSubvolume};
 use crate::events::{DeferScope, Event, EventPayload, UnstampedEvent};
 use crate::storage_critical::EffectivePolicy;
-use crate::types::{PlannedOperation, PlannedSkip, SnapshotName};
+use crate::types::{NothingNew, PlannedOperation, PlannedSkip, SnapshotName};
 
 use super::{Observation, PlanFilters};
 
@@ -26,13 +26,17 @@ impl PlanFragment {
         self.operations.push(op);
     }
 
+    pub(crate) fn push_event(&mut self, event: UnstampedEvent) {
+        self.events.push(event);
+    }
+
     pub(crate) fn extend_events(&mut self, events: impl IntoIterator<Item = UnstampedEvent>) {
         self.events.extend(events);
     }
 
     /// `record_defer`'s successor: one skip + its `PlannerDefer` event,
-    /// together. Never sets the `nothing_new_to_send` marker — that
-    /// conclusion is only ever reached by the send-planning region (slice b).
+    /// together. Always marker-false — the marker-true path is
+    /// [`Self::defer_nothing_new`].
     pub(crate) fn defer(
         &mut self,
         subvol: &str,
@@ -42,7 +46,28 @@ impl PlanFragment {
         scope: DeferScope,
         now: NaiveDateTime,
     ) {
-        let (skip, event) = defer_parts(subvol, drive, reason, next_due, false, scope, now);
+        let (skip, event) = defer_parts(subvol, drive, reason, next_due, scope, now);
+        self.skipped.push(skip);
+        self.events.push(event);
+    }
+
+    /// The ONLY path to a marker-true skip: takes a sanctioned [`NothingNew`]
+    /// conclusion, derives its prose (via [`NothingNew::reason`]) and its defer
+    /// coordinates (drive scope) from the variant, and emits the skip +
+    /// `PlannerDefer` event as one unit. The internal exhaustive `match` — no
+    /// wildcard — is the second compile-fail guard on the variant set (the
+    /// first is `reason()`); it also keeps `DeferScope` derivation in
+    /// `plan/` rather than forcing a `types.rs → events.rs` dependency. The
+    /// event is built through the shared [`defer_event`], the same seam
+    /// `defer_parts` uses (UPI 089-b).
+    pub(crate) fn defer_nothing_new(&mut self, subvol: &str, why: NothingNew, now: NaiveDateTime) {
+        let (drive_label, scope) = match &why {
+            NothingNew::AlreadyOn { drive, .. } => (Some(drive.as_str()), DeferScope::Drive),
+            NothingNew::NoLocalSnapshots { .. } => (None, DeferScope::Subvolume),
+        };
+        // `nothing_new` derives the reason once; the event reuses it.
+        let skip = PlannedSkip::nothing_new(subvol, &why);
+        let event = defer_event(subvol, drive_label, &skip.reason, scope, now);
         self.skipped.push(skip);
         self.events.push(event);
     }
@@ -63,28 +88,49 @@ impl PlanFragment {
 
 /// The ONE home for the skip+event construction `record_defer` and
 /// `PlanFragment::defer` both need — the anti-twin seam CLAUDE.md's
-/// symmetric-fix rule warns about. `record_defer` (mod.rs, surviving for
-/// unreshaped callers until slice c) calls this with the caller-supplied
-/// `nothing_new_to_send`; `PlanFragment::defer` always passes `false`.
+/// symmetric-fix rule warns about. Always produces a marker-false skip (via
+/// [`PlannedSkip::deferred`]); the only marker-true path is
+/// [`PlanFragment::defer_nothing_new`]. The event half goes through the shared
+/// [`defer_event`], the same seam `defer_nothing_new` uses — so the two defer
+/// paths cannot build the `PlannerDefer` event differently (UPI 089-b,
+/// adversary F1).
 pub(super) fn defer_parts(
     subvol_name: &str,
     drive_label: Option<&str>,
     reason: String,
     next_due_minutes: Option<i64>,
-    nothing_new_to_send: bool,
     scope: DeferScope,
     now: NaiveDateTime,
 ) -> (PlannedSkip, UnstampedEvent) {
-    let skip = PlannedSkip {
-        name: subvol_name.to_string(),
-        reason: reason.clone(),
-        next_due_minutes,
-        nothing_new_to_send,
-    };
-    let mut event = Event::pure(now, EventPayload::PlannerDefer { reason, scope });
+    // Build the event first (borrowing `reason`), then move `reason` into the
+    // skip — one allocation.
+    let event = defer_event(subvol_name, drive_label, &reason, scope, now);
+    let skip = PlannedSkip::deferred(subvol_name, reason, next_due_minutes);
+    (skip, event)
+}
+
+/// The single home for the `PlannerDefer` event both defer paths emit
+/// (`defer_parts` for ordinary deferrals, `defer_nothing_new` for the
+/// sanctioned nothing-new conclusions). Keeping it one function means a change
+/// to how the event is built — a new field, a changed fill — can't diverge
+/// between the two paths (UPI 089-b, adversary F1).
+pub(super) fn defer_event(
+    subvol_name: &str,
+    drive_label: Option<&str>,
+    reason: &str,
+    scope: DeferScope,
+    now: NaiveDateTime,
+) -> UnstampedEvent {
+    let mut event = Event::pure(
+        now,
+        EventPayload::PlannerDefer {
+            reason: reason.to_string(),
+            scope,
+        },
+    );
     event.fill_subvolume(Some(subvol_name.to_string()));
     event.fill_drive_label(drive_label.map(str::to_string));
-    (skip, event)
+    event
 }
 
 /// Fill `subvolume` and/or `drive_label` onto events that don't already
@@ -127,6 +173,23 @@ pub(crate) struct LocalRetentionInputs<'a> {
     pub mounted_pins: &'a HashSet<SnapshotName>,
 }
 
+pub(crate) struct SendInputs<'a> {
+    pub core: SubvolInputs<'a>,
+    pub drive: &'a DriveConfig,
+    /// The just-planned snapshot (UPI 069 anti-strand augmentation): send
+    /// planning must consider it so a caught-up state does not strand tonight's
+    /// snapshot. `plan_external_send` augments `core.local_snaps` with it.
+    pub planned_snap: Option<&'a SnapshotName>,
+    pub force: bool,
+    pub skip_intervals: bool,
+}
+
+pub(crate) struct ExternalRetentionInputs<'a> {
+    pub core: SubvolInputs<'a>,
+    pub drive: &'a DriveConfig,
+    pub pinned: &'a HashSet<SnapshotName>,
+}
+
 /// The planned-snapshot outcome: the name (threaded into send planning by
 /// `plan()` and, in slice c, by the transient composite) plus the fragment.
 #[must_use]
@@ -155,12 +218,7 @@ mod tests {
             subvolume_name: "pre".to_string(),
             kind: crate::types::DeleteKind::Policy,
         }];
-        let mut skipped = vec![PlannedSkip {
-            name: "pre".to_string(),
-            reason: "prefix".to_string(),
-            next_due_minutes: None,
-            nothing_new_to_send: false,
-        }];
+        let mut skipped = vec![PlannedSkip::deferred("pre", "prefix".to_string(), None)];
         let mut events = Vec::new();
 
         let mut fragment = PlanFragment::default();
@@ -242,6 +300,64 @@ mod tests {
         let mut events = Vec::new();
         fragment.drain_into(&mut operations, &mut skipped, &mut events);
 
-        assert!(!skipped[0].nothing_new_to_send);
+        assert!(!skipped[0].is_nothing_new());
+    }
+
+    #[test]
+    fn defer_nothing_new_derives_marker_prose_scope_and_drive() {
+        let why = NothingNew::AlreadyOn {
+            snapshot: SnapshotName::parse("20260322-1330-one").expect("valid"),
+            drive: "D1".to_string(),
+        };
+        let mut fragment = PlanFragment::default();
+        fragment.defer_nothing_new("sv1", why, now());
+
+        let mut operations = Vec::new();
+        let mut skipped = Vec::new();
+        let mut events = Vec::new();
+        fragment.drain_into(&mut operations, &mut skipped, &mut events);
+
+        assert!(skipped[0].is_nothing_new());
+        assert_eq!(skipped[0].reason, "20260322-1330-one already on D1");
+
+        let ctx = crate::events::RunContext::outside_run();
+        let stamped = events[0].clone().stamp(&ctx);
+        assert_eq!(stamped.subvolume.as_deref(), Some("sv1"));
+        assert_eq!(stamped.drive_label.as_deref(), Some("D1"));
+        match &stamped.payload {
+            EventPayload::PlannerDefer { reason, scope } => {
+                assert_eq!(reason, "20260322-1330-one already on D1");
+                assert_eq!(*scope, DeferScope::Drive);
+            }
+            other => panic!("expected PlannerDefer, got {other:?}"),
+        }
+    }
+
+    /// F1: `defer_parts` and `defer_nothing_new` must build the `PlannerDefer`
+    /// event identically — same (subvol, drive_label, reason, scope, now) ⇒
+    /// byte-identical event. Guards the shared `defer_event` seam against a
+    /// future divergence between the two defer paths.
+    #[test]
+    fn both_defer_paths_build_identical_events() {
+        let why = NothingNew::AlreadyOn {
+            snapshot: SnapshotName::parse("20260322-1330-one").expect("valid"),
+            drive: "D1".to_string(),
+        };
+
+        let mut fragment = PlanFragment::default();
+        fragment.defer_nothing_new("sv1", why.clone(), now());
+        let mut operations = Vec::new();
+        let mut skipped = Vec::new();
+        let mut events = Vec::new();
+        fragment.drain_into(&mut operations, &mut skipped, &mut events);
+
+        // Same coordinates through the ordinary-defer path.
+        let (_, direct) = defer_parts("sv1", Some("D1"), why.reason(), None, DeferScope::Drive, now());
+
+        let ctx = crate::events::RunContext::outside_run();
+        assert_eq!(
+            format!("{:?}", events[0].clone().stamp(&ctx)),
+            format!("{:?}", direct.stamp(&ctx)),
+        );
     }
 }

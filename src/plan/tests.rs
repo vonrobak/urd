@@ -5,7 +5,7 @@ use super::*;
 use crate::storage_critical::{ArmedTierMap, TightnessTier};
 use crate::btrfs::MockBtrfs;
 use crate::events::EventPayload;
-use crate::types::FullSendReason;
+use crate::types::{FullSendReason, NothingNew};
 use chrono::NaiveDate;
 
 fn test_config() -> Config {
@@ -122,6 +122,86 @@ local_retention = "transient"
 {drives_filter}"#,
     );
     toml::from_str(&toml_str).unwrap()
+}
+
+#[test]
+fn drive_gate_truth_table_all_seven_availability_variants() {
+    let config = two_drive_config(None);
+    let drive = &config.drives[0]; // label "PRIMARY"
+    let btrfs = MockBtrfs::new();
+
+    // Two Ready arms: Available and the benign TokenMissing (first use).
+    for avail in [DriveAvailability::Available, DriveAvailability::TokenMissing] {
+        let mut fs = MockFileSystemState::new();
+        fs.drive_availability_overrides
+            .insert("PRIMARY".into(), avail.clone());
+        let obs = Observation {
+            fs: &fs,
+            history: &fs,
+            btrfs: &btrfs,
+        };
+        assert!(
+            matches!(
+                check_drive_availability("sv1", drive, &obs, now()),
+                DriveGate::Ready
+            ),
+            "{avail:?} should be Ready",
+        );
+    }
+
+    // Five Deferred arms, each with its exact prose.
+    let deferred = [
+        (DriveAvailability::NotMounted, "drive PRIMARY not mounted"),
+        (
+            DriveAvailability::UuidMismatch {
+                expected: "aaa".into(),
+                found: "bbb".into(),
+            },
+            "drive PRIMARY UUID mismatch (expected aaa, found bbb)",
+        ),
+        (
+            DriveAvailability::UuidCheckFailed("io error".into()),
+            "drive PRIMARY UUID check failed: io error",
+        ),
+        (
+            DriveAvailability::TokenMismatch {
+                expected: "t1".into(),
+                found: "t2".into(),
+            },
+            "drive PRIMARY token mismatch (expected t1, found t2) — possible drive swap",
+        ),
+        (
+            DriveAvailability::TokenExpectedButMissing,
+            "drive PRIMARY token expected but missing \u{2014} run `urd drives adopt PRIMARY`",
+        ),
+    ];
+    for (avail, expected_reason) in deferred {
+        let mut fs = MockFileSystemState::new();
+        fs.drive_availability_overrides
+            .insert("PRIMARY".into(), avail.clone());
+        let obs = Observation {
+            fs: &fs,
+            history: &fs,
+            btrfs: &btrfs,
+        };
+        match check_drive_availability("sv1", drive, &obs, now()) {
+            DriveGate::Deferred(f) => {
+                let mut ops = Vec::new();
+                let mut skipped = Vec::new();
+                let mut events = Vec::new();
+                f.drain_into(&mut ops, &mut skipped, &mut events);
+                assert!(ops.is_empty(), "{avail:?}");
+                assert_eq!(skipped.len(), 1, "{avail:?}");
+                assert_eq!(skipped[0].reason, expected_reason, "{avail:?}");
+                assert!(
+                    !skipped[0].is_nothing_new(),
+                    "a gate defer is never nothing-new: {avail:?}",
+                );
+                assert_eq!(events.len(), 1, "one PlannerDefer event per gate defer");
+            }
+            DriveGate::Ready => panic!("{avail:?} should defer"),
+        }
+    }
 }
 
 #[test]
@@ -4569,7 +4649,7 @@ fn assert_marker(result: &BackupPlan, name: &str, substr: &str, expected: bool) 
             )
         });
     assert_eq!(
-        skip.nothing_new_to_send, expected,
+        skip.is_nothing_new(), expected,
         "nothing_new_to_send mismatch for skip {:?}",
         skip.reason
     );
@@ -4885,13 +4965,23 @@ fn op_send(name: &str) -> PlannedOperation {
     }
 }
 
-fn skip_entry(name: &str, reason: &str, nothing_new_to_send: bool) -> PlannedSkip {
-    PlannedSkip {
-        name: name.to_string(),
-        reason: reason.to_string(),
-        next_due_minutes: None,
-        nothing_new_to_send,
-    }
+/// A marker-false deferral (interval, drive-away, floor, space guard — the
+/// benign create-without-send inputs to arm 2).
+fn skip_deferred(name: &str, reason: &str) -> PlannedSkip {
+    PlannedSkip::deferred(name, reason.to_string(), None)
+}
+
+/// A marker-true "already on <drive>" conclusion — the sanctioned nothing-new
+/// input arm 2 keys on. Prose is derived from the variant (`{snapshot} already
+/// on {drive}`), byte-identical to what the planner emits.
+fn skip_already_on(name: &str, snapshot: &str, drive: &str) -> PlannedSkip {
+    PlannedSkip::nothing_new(
+        name,
+        &NothingNew::AlreadyOn {
+            snapshot: snap(snapshot),
+            drive: drive.to_string(),
+        },
+    )
 }
 
 #[test]
@@ -4922,7 +5012,7 @@ fn orphan_invariant_arm2_create_with_nothing_new_defer() {
     let violations = orphan_invariant_violations(
         &[judgment("sv1", false, true)],
         &[op_create("sv1")],
-        &[skip_entry("sv1", "20260430-0402-one already on D1", true)],
+        &[skip_already_on("sv1", "20260430-0402-one", "D1")],
     );
     assert_eq!(violations.len(), 1);
     assert!(violations[0].contains("stranded"), "{violations:?}");
@@ -4938,9 +5028,9 @@ fn orphan_invariant_arm2_marker_false_defers_clean() {
         &[judgment("sv1", false, true)],
         &[op_create("sv1")],
         &[
-            skip_entry("sv1", "send to D1 not due (next in ~2h)", false),
-            skip_entry("sv1", "drive D2 not mounted", false),
-            skip_entry("sv1", "send to D3 skipped: estimated ~1 GB exceeds 0 B available", false),
+            skip_deferred("sv1", "send to D1 not due (next in ~2h)"),
+            skip_deferred("sv1", "drive D2 not mounted"),
+            skip_deferred("sv1", "send to D3 skipped: estimated ~1 GB exceeds 0 B available"),
         ],
     );
     assert!(violations.is_empty(), "{violations:?}");
@@ -4953,7 +5043,7 @@ fn orphan_invariant_no_create_nothing_new_clean() {
     let violations = orphan_invariant_violations(
         &[judgment("sv1", false, true)],
         &[],
-        &[skip_entry("sv1", "20260322-1330-one already on D1", true)],
+        &[skip_already_on("sv1", "20260322-1330-one", "D1")],
     );
     assert!(violations.is_empty(), "{violations:?}");
 }
@@ -4966,7 +5056,7 @@ fn orphan_invariant_arm2_fires_even_with_send_to_other_drive() {
     let violations = orphan_invariant_violations(
         &[judgment("sv1", true, true)],
         &[op_create("sv1"), op_send("sv1")],
-        &[skip_entry("sv1", "20260321-0400-one already on D2", true)],
+        &[skip_already_on("sv1", "20260321-0400-one", "D2")],
     );
     assert_eq!(violations.len(), 1);
     assert!(violations[0].contains("stranded"), "{violations:?}");

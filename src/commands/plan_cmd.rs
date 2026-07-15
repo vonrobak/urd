@@ -117,7 +117,7 @@ pub(crate) fn collapse_skipped(skipped: &[PlannedSkip]) -> Vec<SkippedSubvolume>
         let category = SkipCategory::from_reason(&skip.reason);
         if category == SkipCategory::Unchanged {
             unchanged_idx.insert(skip.name.as_str(), out.len());
-        } else if skip.nothing_new_to_send
+        } else if skip.is_nothing_new()
             && let Some((_, drive)) = skip.reason.split_once(" already on ")
             && let Some(&idx) = unchanged_idx.get(skip.name.as_str())
         {
@@ -280,7 +280,7 @@ fn build_operation_entry(
 mod tests {
     use super::*;
     use crate::plan::MockFileSystemState;
-    use crate::types::{BackupPlan, SendKind, SnapshotName};
+    use crate::types::{BackupPlan, NothingNew, SendKind, SnapshotName};
     use std::path::PathBuf;
 
     fn dummy_snap(subvol: &str) -> SnapshotName {
@@ -532,21 +532,21 @@ source = "/data/htpc-docs"
     // ── Skip-collapse tests (#212 / 079-b §6) ─────────────────────────
 
     fn unchanged_skip(name: &str) -> PlannedSkip {
-        PlannedSkip {
-            name: name.to_string(),
-            reason: "unchanged \u{2014} no changes since last snapshot (3d ago)".to_string(),
-            next_due_minutes: None,
-            nothing_new_to_send: false,
-        }
+        PlannedSkip::deferred(
+            name,
+            "unchanged \u{2014} no changes since last snapshot (3d ago)".to_string(),
+            None,
+        )
     }
 
     fn already_on_skip(name: &str, drive: &str) -> PlannedSkip {
-        PlannedSkip {
-            name: name.to_string(),
-            reason: format!("20260329-0404-{name} already on {drive}"),
-            next_due_minutes: None,
-            nothing_new_to_send: true,
-        }
+        PlannedSkip::nothing_new(
+            name,
+            &NothingNew::AlreadyOn {
+                snapshot: SnapshotName::parse(&format!("20260329-0404-{name}")).expect("valid"),
+                drive: drive.to_string(),
+            },
+        )
     }
 
     #[test]
@@ -586,12 +586,11 @@ source = "/data/htpc-docs"
         // Under --auto a subvolume can be caught up on a drive while its
         // snapshot interval hasn't elapsed — two distinct facts, no merge.
         let skips = vec![
-            PlannedSkip {
-                name: "htpc-home".to_string(),
-                reason: "interval not elapsed (next in ~2h)".to_string(),
-                next_due_minutes: Some(120),
-                nothing_new_to_send: false,
-            },
+            PlannedSkip::deferred(
+                "htpc-home",
+                "interval not elapsed (next in ~2h)".to_string(),
+                Some(120),
+            ),
             already_on_skip("htpc-home", "WD-18TB"),
         ];
         let collapsed = collapse_skipped(&skips);
@@ -620,12 +619,11 @@ source = "/data/htpc-docs"
         let skips = vec![
             unchanged_skip("htpc-home"),
             already_on_skip("htpc-home", "WD-18TB"),
-            PlannedSkip {
-                name: "htpc-home".to_string(),
-                reason: "send to WD-18TB1 not due (next in ~4h)".to_string(),
-                next_due_minutes: Some(240),
-                nothing_new_to_send: false,
-            },
+            PlannedSkip::deferred(
+                "htpc-home",
+                "send to WD-18TB1 not due (next in ~4h)".to_string(),
+                Some(240),
+            ),
         ];
         let collapsed = collapse_skipped(&skips);
         assert_eq!(collapsed.len(), 2, "the send-interval deferral is its own fact");

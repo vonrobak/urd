@@ -8,7 +8,9 @@ use crate::events::{DeferScope, UnstampedEvent};
 use crate::storage_critical::EffectivePolicy;
 use crate::types::{PlannedOperation, PlannedSkip, SnapshotName};
 
-use super::fragment::{LocalRetentionInputs, LocalSnapshotInputs, SubvolInputs};
+use super::fragment::{
+    ExternalRetentionInputs, LocalRetentionInputs, LocalSnapshotInputs, SendInputs, SubvolInputs,
+};
 use super::{Observation, PlanFilters};
 
 /// Atomic lifecycle planning for transient subvolumes.
@@ -63,7 +65,6 @@ pub(super) fn plan_transient_lifecycle(
             None,
             reason,
             None,
-            false,
             DeferScope::Subvolume,
             now,
         );
@@ -85,8 +86,12 @@ pub(super) fn plan_transient_lifecycle(
         if !subvol.accepts_drive(&drive.label) {
             continue;
         }
-        if !super::check_drive_availability(&subvol.name, drive, obs, skipped, events, now) {
-            continue; // skip reason already emitted
+        match super::check_drive_availability(&subvol.name, drive, obs, now) {
+            super::DriveGate::Ready => {}
+            super::DriveGate::Deferred(f) => {
+                f.drain_into(operations, skipped, events);
+                continue; // skip reason already emitted
+            }
         }
 
         // Send-interval check: would this drive actually receive a send?
@@ -120,7 +125,6 @@ pub(super) fn plan_transient_lifecycle(
                 None,
                 "transient \u{2014} no drives available for send".to_string(),
                 None,
-                false,
                 DeferScope::Subvolume,
                 now,
             );
@@ -166,7 +170,6 @@ pub(super) fn plan_transient_lifecycle(
                 None,
                 skip_msg,
                 next_dues.iter().map(|(_, m)| *m).min(),
-                false,
                 DeferScope::Subvolume,
                 now,
             );
@@ -217,11 +220,20 @@ pub(super) fn plan_transient_lifecycle(
     // plan_external_send augments local_snaps with the planned snapshot
     // internally (UPI 069) — pass the raw on-disk list plus the plan.
     for (drive, _) in &sendable_drives {
-        super::send::plan_external_send(
-            subvol, eff, drive, local_dir, local_snaps, planned_snap.as_ref(), now,
-            force, filters.skip_intervals, obs, operations, skipped, events,
-        );
-        super::external::plan_external_retention(subvol, drive, now, obs, pinned, operations, events);
+        super::send::plan_external_send(&SendInputs {
+            core,
+            drive,
+            planned_snap: planned_snap.as_ref(),
+            force,
+            skip_intervals: filters.skip_intervals,
+        })
+        .drain_into(operations, skipped, events);
+        super::external::plan_external_retention(&ExternalRetentionInputs {
+            core,
+            drive,
+            pinned,
+        })
+        .drain_into(operations, skipped, events);
     }
 
     // ── Phase 4: Plan transient retention ─────────────────────────

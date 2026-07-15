@@ -43,6 +43,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   regions on the arc's typed-inputs path. A live run-pair against the current
   binary confirmed `urd plan`, `urd plan --auto`, and `urd backup --dry-run`
   are byte-identical. No behavior change (#325).
+- The send seam continues the `plan/` arc: `plan_external_send` and
+  `plan_external_retention` take typed inputs (`SendInputs`,
+  `ExternalRetentionInputs`) and return a `PlanFragment`, and drive-availability
+  gating is now a typed `DriveGate` — an unavailable drive can no longer be
+  skipped without recording why. The stranded-snapshot marker is type-enforced:
+  it derives its reason prose from a `NothingNew` conclusion and can only be set
+  through two constructors, so the marker and its prose can no longer drift. A
+  live run-pair confirmed `urd plan`, `urd plan --auto`, and
+  `urd backup --dry-run` are byte-identical. No behavior change (#327).
 
 ## [0.34.0] - 2026-07-11
 
