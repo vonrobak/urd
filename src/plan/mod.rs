@@ -425,10 +425,15 @@ pub fn plan(
         // Dispatch on the EFFECTIVE lifecycle: a Tight/Critical declared-Graduated
         // send-enabled subvolume now routes through the transient path.
         if eff.local_retention.is_transient() && subvol.send_enabled {
-            transient::plan_transient_lifecycle(
-                subvol, &eff, config, &local_dir, &local_snaps, now, force, filters,
-                &pinned, &mounted_pins, obs, &mut operations, &mut skipped, &mut events,
-            );
+            transient::plan_transient_lifecycle(&fragment::TransientInputs {
+                core,
+                drives: &config.drives,
+                force,
+                filters,
+                pinned: &pinned,
+                mounted_pins: &mounted_pins,
+            })
+            .drain_into(&mut operations, &mut skipped, &mut events);
             continue; // skip the normal two-phase flow
         }
 

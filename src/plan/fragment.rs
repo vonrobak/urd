@@ -72,6 +72,14 @@ impl PlanFragment {
         self.events.push(event);
     }
 
+    /// Order-preserving append of another region's fragment — the composite's
+    /// (and, from slice c's final commit, `plan()`'s) composition primitive.
+    pub(crate) fn absorb(&mut self, other: PlanFragment) {
+        self.operations.extend(other.operations);
+        self.skipped.extend(other.skipped);
+        self.events.extend(other.events);
+    }
+
     /// Interim + terminal composition: drain into `plan()`'s accumulators
     /// (slices a/b) and, at arc end, into `BackupPlan` construction.
     pub(crate) fn drain_into(
@@ -188,6 +196,18 @@ pub(crate) struct ExternalRetentionInputs<'a> {
     pub core: SubvolInputs<'a>,
     pub drive: &'a DriveConfig,
     pub pinned: &'a HashSet<SnapshotName>,
+}
+
+/// The transient composite's inputs (UPI 089-c). `drives` is the narrow slice
+/// of config the body actually reads — a region test builds a drive list,
+/// never a `Config`.
+pub(crate) struct TransientInputs<'a> {
+    pub core: SubvolInputs<'a>,
+    pub drives: &'a [DriveConfig],
+    pub force: bool,
+    pub filters: &'a PlanFilters,
+    pub pinned: &'a HashSet<SnapshotName>,
+    pub mounted_pins: &'a HashSet<SnapshotName>,
 }
 
 /// The planned-snapshot outcome: the name (threaded into send planning by

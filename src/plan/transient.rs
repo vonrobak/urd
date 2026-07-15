@@ -1,17 +1,12 @@
-use std::collections::HashSet;
-use std::path::Path;
-
 use chrono::NaiveDateTime;
 
-use crate::config::{Config, DriveConfig, ResolvedSubvolume};
-use crate::events::{DeferScope, UnstampedEvent};
-use crate::storage_critical::EffectivePolicy;
-use crate::types::{PlannedOperation, PlannedSkip, SnapshotName};
+use crate::config::DriveConfig;
+use crate::events::DeferScope;
 
 use super::fragment::{
-    ExternalRetentionInputs, LocalRetentionInputs, LocalSnapshotInputs, SendInputs, SubvolInputs,
+    ExternalRetentionInputs, LocalRetentionInputs, LocalSnapshotInputs, PlanFragment, SendInputs,
+    SubvolInputs, TransientInputs,
 };
-use super::{Observation, PlanFilters};
 
 /// Atomic lifecycle planning for transient subvolumes.
 ///
@@ -25,31 +20,25 @@ use super::{Observation, PlanFilters};
 /// 2. Plan snapshot creation (only if a send will happen)
 /// 3. Plan sends for each sendable drive
 /// 4. Plan transient retention
-#[allow(clippy::too_many_arguments)]
-pub(super) fn plan_transient_lifecycle(
-    subvol: &ResolvedSubvolume,
-    eff: &EffectivePolicy,
-    config: &Config,
-    local_dir: &Path,
-    local_snaps: &[SnapshotName],
-    now: NaiveDateTime,
-    force: bool,
-    filters: &PlanFilters,
-    pinned: &HashSet<SnapshotName>,
-    mounted_pins: &HashSet<SnapshotName>,
-    obs: &Observation,
-    operations: &mut Vec<PlannedOperation>,
-    skipped: &mut Vec<PlannedSkip>,
-    events: &mut Vec<UnstampedEvent>,
-) {
-    let core = SubvolInputs {
+pub(super) fn plan_transient_lifecycle(i: &TransientInputs) -> PlanFragment {
+    let TransientInputs {
+        core,
+        drives,
+        force,
+        filters,
+        pinned,
+        mounted_pins,
+    } = *i;
+    let SubvolInputs {
         subvol,
         eff,
         local_dir,
         local_snaps,
         now,
         obs,
-    };
+    } = core;
+
+    let mut f = PlanFragment::default();
 
     // ── Phase 0: Send-space guard (UPI 054-a) ──────────────────────
     // In the transient path snapshot creation is gated on a send being due
@@ -58,23 +47,13 @@ pub(super) fn plan_transient_lifecycle(
     // orphan. Retention on leftovers still runs (it frees space). Runs
     // before Phase 1 so `force`/`--skip-intervals` cannot override it.
     if let Some(reason) = super::send_floor_defer_reason(subvol, local_dir, obs) {
-        super::record_defer(
-            skipped,
-            events,
-            &subvol.name,
-            None,
-            reason,
-            None,
-            DeferScope::Subvolume,
-            now,
-        );
-        super::local::plan_local_retention(&LocalRetentionInputs {
+        f.defer(&subvol.name, None, reason, None, DeferScope::Subvolume, now);
+        f.absorb(super::local::plan_local_retention(&LocalRetentionInputs {
             core,
             pinned,
             mounted_pins,
-        })
-        .drain_into(operations, skipped, events);
-        return;
+        }));
+        return f;
     }
 
     // ── Phase 1: Determine if any send will actually happen ────────
@@ -82,14 +61,14 @@ pub(super) fn plan_transient_lifecycle(
     let mut sendable_drives: Vec<(&DriveConfig, Option<NaiveDateTime>)> = Vec::new();
     let mut any_send_due = false;
 
-    for drive in &config.drives {
+    for drive in drives {
         if !subvol.accepts_drive(&drive.label) {
             continue;
         }
         match super::check_drive_availability(&subvol.name, drive, obs, now) {
             super::DriveGate::Ready => {}
-            super::DriveGate::Deferred(f) => {
-                f.drain_into(operations, skipped, events);
+            super::DriveGate::Deferred(gate) => {
+                f.absorb(gate);
                 continue; // skip reason already emitted
             }
         }
@@ -118,9 +97,7 @@ pub(super) fn plan_transient_lifecycle(
     // Decision gate
     if sendable_drives.is_empty() {
         if !filters.external_only {
-            super::record_defer(
-                skipped,
-                events,
+            f.defer(
                 &subvol.name,
                 None,
                 "transient \u{2014} no drives available for send".to_string(),
@@ -130,13 +107,12 @@ pub(super) fn plan_transient_lifecycle(
             );
         }
         // Phase 4 only: retention on leftovers
-        super::local::plan_local_retention(&LocalRetentionInputs {
+        f.absorb(super::local::plan_local_retention(&LocalRetentionInputs {
             core,
             pinned,
             mounted_pins,
-        })
-        .drain_into(operations, skipped, events);
-        return;
+        }));
+        return f;
     }
 
     if !any_send_due {
@@ -163,9 +139,7 @@ pub(super) fn plan_transient_lifecycle(
         if !skip_msg.is_empty() {
             // Subvolume-scope: applies to the whole subvolume across the
             // batch of sendable drives, not a single drive.
-            super::record_defer(
-                skipped,
-                events,
+            f.defer(
                 &subvol.name,
                 None,
                 skip_msg,
@@ -175,13 +149,12 @@ pub(super) fn plan_transient_lifecycle(
             );
         }
         // Phase 4 only: retention on leftovers
-        super::local::plan_local_retention(&LocalRetentionInputs {
+        f.absorb(super::local::plan_local_retention(&LocalRetentionInputs {
             core,
             pinned,
             mounted_pins,
-        })
-        .drain_into(operations, skipped, events);
-        return;
+        }));
+        return f;
     }
 
     // ── Phase 2: Plan snapshot creation (only if a send will happen) ──
@@ -199,7 +172,7 @@ pub(super) fn plan_transient_lifecycle(
             force,
             filters,
         });
-        out.fragment.drain_into(operations, skipped, events);
+        f.absorb(out.fragment);
         out.planned
     } else {
         None
@@ -207,43 +180,42 @@ pub(super) fn plan_transient_lifecycle(
 
     if planned_snap.is_none() && local_snaps.iter().max().is_none() {
         // No planned snapshot and no existing snapshots — nothing to send.
-        super::local::plan_local_retention(&LocalRetentionInputs {
+        f.absorb(super::local::plan_local_retention(&LocalRetentionInputs {
             core,
             pinned,
             mounted_pins,
-        })
-        .drain_into(operations, skipped, events);
-        return;
+        }));
+        return f;
     }
 
     // ── Phase 3: Plan sends for each sendable drive ───────────────
     // plan_external_send augments local_snaps with the planned snapshot
     // internally (UPI 069) — pass the raw on-disk list plus the plan.
     for (drive, _) in &sendable_drives {
-        super::send::plan_external_send(&SendInputs {
+        f.absorb(super::send::plan_external_send(&SendInputs {
             core,
             drive,
             planned_snap: planned_snap.as_ref(),
             force,
             skip_intervals: filters.skip_intervals,
-        })
-        .drain_into(operations, skipped, events);
-        super::external::plan_external_retention(&ExternalRetentionInputs {
-            core,
-            drive,
-            pinned,
-        })
-        .drain_into(operations, skipped, events);
+        }));
+        f.absorb(super::external::plan_external_retention(
+            &ExternalRetentionInputs {
+                core,
+                drive,
+                pinned,
+            },
+        ));
     }
 
     // ── Phase 4: Plan transient retention ─────────────────────────
     // Use original local_snaps — retention only operates on existing-on-disk snapshots.
-    super::local::plan_local_retention(&LocalRetentionInputs {
+    f.absorb(super::local::plan_local_retention(&LocalRetentionInputs {
         core,
         pinned,
         mounted_pins,
-    })
-    .drain_into(operations, skipped, events);
+    }));
+    f
 }
 
 // ── Characterization truth table (UPI 089-c) ───────────────────────────
@@ -270,17 +242,21 @@ pub(super) fn plan_transient_lifecycle(
 //   empty.
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::path::PathBuf;
 
     use chrono::{NaiveDate, NaiveDateTime};
 
     use crate::btrfs::MockBtrfs;
-    use crate::config::Config;
-    use crate::events::EventPayload;
+    use crate::config::{Config, ResolvedSubvolume};
+    use crate::events::{EventPayload, UnstampedEvent};
     use crate::observation::Observation;
     use crate::plan::testkit::MockFileSystemState;
+    use crate::plan::PlanFilters;
+    use crate::storage_critical::EffectivePolicy;
     use crate::types::{
-        Interval, LocalRetentionPolicy, MonthlyCount, PlannedSkip, ResolvedGraduatedRetention,
+        Interval, LocalRetentionPolicy, MonthlyCount, PlannedOperation, PlannedSkip,
+        ResolvedGraduatedRetention, SnapshotName,
     };
 
     use super::*;
@@ -415,25 +391,26 @@ priority = 1
         };
         let pinned = HashSet::new();
         let mounted_pins = HashSet::new();
+        let dir = local_dir();
         let mut operations = Vec::new();
         let mut skipped = Vec::new();
         let mut events = Vec::new();
-        plan_transient_lifecycle(
-            subvol,
-            eff,
-            config,
-            &local_dir(),
-            local_snaps,
-            now(),
+        plan_transient_lifecycle(&TransientInputs {
+            core: SubvolInputs {
+                subvol,
+                eff,
+                local_dir: &dir,
+                local_snaps,
+                now: now(),
+                obs: &obs,
+            },
+            drives: &config.drives,
             force,
             filters,
-            &pinned,
-            &mounted_pins,
-            &obs,
-            &mut operations,
-            &mut skipped,
-            &mut events,
-        );
+            pinned: &pinned,
+            mounted_pins: &mounted_pins,
+        })
+        .drain_into(&mut operations, &mut skipped, &mut events);
         (operations, skipped, events)
     }
 
