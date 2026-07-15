@@ -15,8 +15,11 @@ Thumbs.db
 # Test artifacts
 /tmp-test-*/
 
-# Claude Code (CLAUDE.md stays tracked — commands and settings are local)
+# Claude Code (commands and settings are local; CLAUDE.md is untracked too — ADR-118
+# delta 7: a public, mergeable CLAUDE.md is an instruction-injection surface for AI-assisted
+# sessions. It becomes a symlink into the Huldr vault like the docs below.)
 .claude/
+CLAUDE.md
 
 # Project-management documentation (kept locally, not published)
 # Everything in the 9*-* range is internal: ideas, plans, journals, reports,
@@ -25,17 +28,24 @@ Thumbs.db
 # — they're the public engineering record. The internal documentation guide
 # itself (contributing-internal.md) stays local; CONTRIBUTING.md is its public
 # counterpart.
-docs/90-archive/
-docs/95-ideas/
-docs/96-project-supervisor/
-docs/97-plans/
-docs/98-journals/
-docs/99-reports/
+#
+# No trailing slash on these six: they become symlinks into the Huldr vault
+# (~/Huldr/projects/urd/), and trailing-slash gitignore patterns match real
+# directories only, not symlinks — a trailing slash here would silently
+# un-ignore the symlink itself.
+docs/90-archive
+docs/95-ideas
+docs/96-project-supervisor
+docs/97-plans
+docs/98-journals
+docs/99-reports
 docs/contributing-internal.md
 # Local scripts and prompts stay private; tracked dev tooling is whitelisted below.
 scripts/*
 !scripts/install-hooks.sh
+!scripts/pre-commit.sh
 !scripts/pre-commit-pii.sh
+!scripts/check-vault-boundary.sh
 !scripts/check-docs.sh
 !scripts/check-registry.sh
 !scripts/check-present-not-journey.sh

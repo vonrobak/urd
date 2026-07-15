@@ -7,7 +7,7 @@
 #     scripts/install-hooks.sh
 #
 # Currently installs:
-#     pre-commit -> scripts/pre-commit-pii.sh   (PII guard)
+#     pre-commit -> scripts/pre-commit.sh   (dispatcher: PII guard, then vault-boundary check)
 
 set -euo pipefail
 
@@ -43,7 +43,7 @@ install_hook() {
 }
 
 echo "Installing Urd git hooks into ${HOOKS_DIR}"
-install_hook "pre-commit" "pre-commit-pii.sh"
+install_hook "pre-commit" "pre-commit.sh"
 
 echo
 echo "Done. Bypass any hook for a single commit with: git commit --no-verify"

@@ -34,6 +34,10 @@ scripts/check-registry.sh   # UPI registry ↔ design files are consistent (loca
 `docs/96-project-supervisor/registry.md` and `docs/95-ideas/`, so it short-circuits
 in environments where those are absent.
 
+Internal docs (ideas, plans, journals, reports, project-supervisor state, the archive)
+live in a private vault, reached from this repo only through gitignored symlinks — no
+paths or titles are referenced here (ADR-118).
+
 ## Testing
 
 ```bash
