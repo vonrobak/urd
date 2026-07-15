@@ -15,6 +15,10 @@
 # enumeration of volatile internals (UPI history, retired type names) was the shared root cause
 # of both the file's bloat and its staleness.
 #
+# CLAUDE.md is untracked (ADR-118) — a gitignored symlink into the private vault. A
+# checkout without vault access (CI, a fresh clone) skips it rather than failing; the
+# convention is still enforced wherever the symlink resolves.
+#
 # Usage: scripts/check-present-not-journey.sh
 #   exit 0 = clean, exit 1 = violations found.
 
@@ -45,8 +49,11 @@ checked=0
 
 for file in "${targets[@]}"; do
     if [[ ! -f "$file" ]]; then
-        echo "ERROR: governed file not found: ${file}" >&2
-        errors=$((errors + 1))
+        # CLAUDE.md is untracked (ADR-118): a gitignored symlink into the vault. Absent
+        # in any checkout without vault access (CI, a fresh clone) — skip rather than
+        # fail, matching check-registry.sh's degrade-gracefully pattern. Still enforced
+        # locally wherever the symlink resolves.
+        echo "Governed file not present, skipping (local-only): ${file}" >&2
         continue
     fi
     checked=$((checked + 1))
