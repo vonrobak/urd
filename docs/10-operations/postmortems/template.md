@@ -1,3 +1,13 @@
+---
+type: Guide
+title: 'Postmortem: {Incident Title}'
+categories: ['[[Guide]]']
+project: ['[[urd]]']
+sensitivity: public
+status: active
+created: '2026-05-02'
+timestamp: '2026-05-02T19:55:41+02:00'
+---
 # Postmortem: {Incident Title}
 
 > **TL;DR:** {What happened, what the blast radius was, what invariant was added

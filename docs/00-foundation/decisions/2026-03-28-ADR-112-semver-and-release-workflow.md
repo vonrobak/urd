@@ -1,3 +1,13 @@
+---
+type: ADR
+title: SemVer Versioning and Release Workflow
+categories: ['[[ADR]]']
+project: ['[[urd]]']
+sensitivity: public
+status: active
+created: '2026-03-28'
+timestamp: '2026-03-28T15:15:38+01:00'
+---
 # ADR-112: SemVer Versioning and Release Workflow
 
 > **TL;DR:** Urd uses standard Semantic Versioning (SemVer) for all releases. Versions

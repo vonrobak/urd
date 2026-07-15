@@ -1,3 +1,13 @@
+---
+type: ADR
+title: BtrfsOps Trait as Sole Btrfs Interface
+categories: ['[[ADR]]']
+project: ['[[urd]]']
+sensitivity: public
+status: active
+created: '2026-03-24'
+timestamp: '2026-07-11T09:19:17+02:00'
+---
 # ADR-101: BtrfsOps Trait as Sole Btrfs Interface
 
 > **TL;DR:** All btrfs subprocess calls go through a single trait (`BtrfsOps`) in a single

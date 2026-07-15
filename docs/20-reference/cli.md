@@ -1,3 +1,13 @@
+---
+type: Guide
+title: CLI Reference
+categories: ['[[Guide]]']
+project: ['[[urd]]']
+sensitivity: public
+status: active
+created: '2026-05-02'
+timestamp: '2026-07-05T15:58:56+02:00'
+---
 # CLI Reference
 
 > **TL;DR:** Reference for every `urd` subcommand — its contract (what it

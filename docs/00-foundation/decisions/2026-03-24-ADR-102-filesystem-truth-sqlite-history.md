@@ -1,3 +1,13 @@
+---
+type: ADR
+title: Filesystem as Source of Truth, SQLite as History
+categories: ['[[ADR]]']
+project: ['[[urd]]']
+sensitivity: public
+status: active
+created: '2026-03-24'
+timestamp: '2026-07-11T09:19:17+02:00'
+---
 # ADR-102: Filesystem as Source of Truth, SQLite as History
 
 > **TL;DR:** Snapshot directories and pin files on disk are the authoritative record of

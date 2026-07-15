@@ -1,3 +1,13 @@
+---
+type: ADR
+title: Retention Shape Symmetry and the Recommendation Layer
+categories: ['[[ADR]]']
+project: ['[[urd]]']
+sensitivity: public
+status: active
+created: '2026-05-14'
+timestamp: '2026-07-11T09:19:17+02:00'
+---
 # ADR-115: Retention Shape Symmetry and the Recommendation Layer
 
 > **TL;DR:** The cost of retaining a snapshot is **symmetric across source and

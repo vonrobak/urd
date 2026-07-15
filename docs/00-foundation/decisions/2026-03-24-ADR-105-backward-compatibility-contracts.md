@@ -1,3 +1,13 @@
+---
+type: ADR
+title: Backward Compatibility Contracts
+categories: ['[[ADR]]']
+project: ['[[urd]]']
+sensitivity: public
+status: active
+created: '2026-03-24'
+timestamp: '2026-07-11T09:19:17+02:00'
+---
 # ADR-105: Backward Compatibility Contracts
 
 > **TL;DR:** Four data formats are load-bearing — snapshot names, snapshot directory

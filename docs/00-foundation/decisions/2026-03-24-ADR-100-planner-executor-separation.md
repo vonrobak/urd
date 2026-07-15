@@ -1,3 +1,13 @@
+---
+type: ADR
+title: Planner/Executor Separation
+categories: ['[[ADR]]']
+project: ['[[urd]]']
+sensitivity: public
+status: active
+created: '2026-03-24'
+timestamp: '2026-07-11T09:19:17+02:00'
+---
 # ADR-100: Planner/Executor Separation
 
 > **TL;DR:** The planner is a pure function that decides what operations to run. The executor

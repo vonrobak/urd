@@ -1,3 +1,13 @@
+---
+type: ADR
+title: Graduated Retention Model
+categories: ['[[ADR]]']
+project: ['[[urd]]']
+sensitivity: public
+status: active
+created: '2026-03-24'
+timestamp: '2026-07-11T09:19:17+02:00'
+---
 # ADR-104: Graduated Retention Model
 
 > **TL;DR:** Urd uses Time Machine-style graduated retention — keep everything recent, thin

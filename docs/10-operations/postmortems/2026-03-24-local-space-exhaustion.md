@@ -1,3 +1,13 @@
+---
+type: Report
+title: 'Postmortem: Local Space Exhaustion on System Drive'
+categories: ['[[Report]]']
+project: ['[[urd]]']
+sensitivity: public
+status: final
+created: '2026-05-02'
+timestamp: '2026-05-02T19:55:41+02:00'
+---
 # Postmortem: Local Space Exhaustion on System Drive
 
 > **TL;DR:** Urd filled the host's NVMe system drive with local snapshots and

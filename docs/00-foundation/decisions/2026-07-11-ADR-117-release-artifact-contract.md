@@ -1,3 +1,13 @@
+---
+type: ADR
+title: Release Artifact Contract
+categories: ['[[ADR]]']
+project: ['[[urd]]']
+sensitivity: public
+status: active
+created: '2026-07-11'
+timestamp: '2026-07-11T09:39:50+02:00'
+---
 # ADR-117: Release Artifact Contract
 
 > **TL;DR:** Every release publishes one statically linked musl binary named

@@ -1,3 +1,13 @@
+---
+type: ADR
+title: Defense-in-Depth for Data Integrity
+categories: ['[[ADR]]']
+project: ['[[urd]]']
+sensitivity: public
+status: active
+created: '2026-03-24'
+timestamp: '2026-07-11T09:19:17+02:00'
+---
 # ADR-106: Defense-in-Depth for Data Integrity
 
 > **TL;DR:** Retention and deletion logic uses multiple independent layers of protection so

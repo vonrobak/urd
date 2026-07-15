@@ -1,3 +1,13 @@
+---
+type: Guide
+title: The Encounter Staging Protocol
+categories: ['[[Guide]]']
+project: ['[[urd]]']
+sensitivity: public
+status: active
+created: '2026-07-03'
+timestamp: '2026-07-04T15:47:41+02:00'
+---
 # The Encounter Staging Protocol
 
 > **TL;DR:** A real, physical staging machine — Fedora Workstation, native btrfs with

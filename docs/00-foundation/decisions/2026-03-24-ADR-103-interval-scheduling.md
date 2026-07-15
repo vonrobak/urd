@@ -1,3 +1,13 @@
+---
+type: ADR
+title: Interval-Based Scheduling
+categories: ['[[ADR]]']
+project: ['[[urd]]']
+sensitivity: public
+status: active
+created: '2026-03-24'
+timestamp: '2026-07-11T09:19:17+02:00'
+---
 # ADR-103: Interval-Based Scheduling
 
 > **TL;DR:** Urd uses time intervals (`15m`, `1h`, `1d`) for snapshot and send scheduling

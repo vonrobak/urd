@@ -1,3 +1,13 @@
+---
+type: Guide
+title: rusqlite 0.39 Reference
+categories: ['[[Guide]]']
+project: ['[[urd]]']
+sensitivity: public
+status: active
+created: '2026-04-05'
+timestamp: '2026-05-02T19:40:32+02:00'
+---
 # rusqlite 0.39 Reference
 
 > Urd dependency: `rusqlite = { version = "0.39", features = ["bundled"] }`

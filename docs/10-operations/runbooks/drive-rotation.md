@@ -1,3 +1,13 @@
+---
+type: Guide
+title: 'Runbook: Drive Rotation'
+categories: ['[[Guide]]']
+project: ['[[urd]]']
+sensitivity: public
+status: active
+created: '2026-05-02'
+timestamp: '2026-05-02T20:45:51+02:00'
+---
 # Runbook: Drive Rotation
 
 > **TL;DR:** Removable backup drives can be disconnected and reconnected

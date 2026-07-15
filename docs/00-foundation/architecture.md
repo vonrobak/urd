@@ -1,3 +1,13 @@
+---
+type: Guide
+title: Architecture at a Glance
+categories: ['[[Guide]]']
+project: ['[[urd]]']
+sensitivity: public
+status: active
+created: '2026-05-02'
+timestamp: '2026-07-13T02:14:58+02:00'
+---
 # Architecture at a Glance
 
 > **TL;DR:** Urd is a strict pipeline — *config → plan → execute → btrfs* — with a

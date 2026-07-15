@@ -1,3 +1,13 @@
+---
+type: Guide
+title: Prometheus Metrics Reference
+categories: ['[[Guide]]']
+project: ['[[urd]]']
+sensitivity: public
+status: active
+created: '2026-05-02'
+timestamp: '2026-06-10T08:44:18+02:00'
+---
 # Prometheus Metrics Reference
 
 > **TL;DR:** Urd writes a Prometheus textfile (`backup.prom`) consumed by

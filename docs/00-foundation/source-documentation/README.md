@@ -1,3 +1,13 @@
+---
+type: Guide
+title: Source Documentation
+categories: ['[[Guide]]']
+project: ['[[urd]]']
+sensitivity: public
+status: active
+created: '2026-04-05'
+timestamp: '2026-05-02T19:40:32+02:00'
+---
 # Source Documentation
 
 Reference documents for Urd's key dependencies and toolchain. Written to help

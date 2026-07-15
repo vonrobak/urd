@@ -1,3 +1,13 @@
+---
+type: ADR
+title: Offsite Rotation Is Expected Absence
+categories: ['[[ADR]]']
+project: ['[[urd]]']
+sensitivity: public
+status: active
+created: '2026-06-02'
+timestamp: '2026-06-15T01:37:42+02:00'
+---
 # ADR-116: Offsite Rotation Is Expected Absence
 
 > **TL;DR:** An *offsite* drive defends against site loss and is **intermittently present
