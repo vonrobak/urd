@@ -34,9 +34,9 @@ impl PlanFragment {
         self.events.extend(events);
     }
 
-    /// `record_defer`'s successor: one skip + its `PlannerDefer` event,
-    /// together. Always marker-false — the marker-true path is
-    /// [`Self::defer_nothing_new`].
+    /// One skip + its `PlannerDefer` event, together (successor to the
+    /// retired `record_defer`, UPI 089-c). Always marker-false — the
+    /// marker-true path is [`Self::defer_nothing_new`].
     pub(crate) fn defer(
         &mut self,
         subvol: &str,
@@ -80,23 +80,23 @@ impl PlanFragment {
         self.events.extend(other.events);
     }
 
-    /// Interim + terminal composition: drain into `plan()`'s accumulators
-    /// (slices a/b) and, at arc end, into `BackupPlan` construction.
-    pub(crate) fn drain_into(
+    /// Terminal composition: `plan()` destructures its accumulated fragment
+    /// BEFORE the post-plan orphan invariant runs, so the invariant reads the
+    /// same slices `BackupPlan` is built from (UPI 089-c).
+    pub(crate) fn into_parts(
         self,
-        operations: &mut Vec<PlannedOperation>,
-        skipped: &mut Vec<PlannedSkip>,
-        events: &mut Vec<UnstampedEvent>,
+    ) -> (
+        Vec<PlannedOperation>,
+        Vec<PlannedSkip>,
+        Vec<UnstampedEvent>,
     ) {
-        operations.extend(self.operations);
-        skipped.extend(self.skipped);
-        events.extend(self.events);
+        (self.operations, self.skipped, self.events)
     }
 }
 
-/// The ONE home for the skip+event construction `record_defer` and
-/// `PlanFragment::defer` both need — the anti-twin seam CLAUDE.md's
-/// symmetric-fix rule warns about. Always produces a marker-false skip (via
+/// The ONE home for the ordinary-deferral skip+event construction — the
+/// anti-twin seam CLAUDE.md's symmetric-fix rule warns about.
+/// Always produces a marker-false skip (via
 /// [`PlannedSkip::deferred`]); the only marker-true path is
 /// [`PlanFragment::defer_nothing_new`]. The event half goes through the shared
 /// [`defer_event`], the same seam `defer_nothing_new` uses — so the two defer
@@ -231,15 +231,17 @@ mod tests {
     }
 
     #[test]
-    fn drain_into_appends_without_reordering() {
-        let mut operations = vec![PlannedOperation::DeleteSnapshot {
+    fn absorb_appends_without_reordering() {
+        let mut accumulator = PlanFragment::default();
+        accumulator.push_operation(PlannedOperation::DeleteSnapshot {
             path: "/pre-existing".into(),
             reason: "prefix".to_string(),
             subvolume_name: "pre".to_string(),
             kind: crate::types::DeleteKind::Policy,
-        }];
-        let mut skipped = vec![PlannedSkip::deferred("pre", "prefix".to_string(), None)];
-        let mut events = Vec::new();
+        });
+        accumulator
+            .skipped
+            .push(PlannedSkip::deferred("pre", "prefix".to_string(), None));
 
         let mut fragment = PlanFragment::default();
         fragment.push_operation(PlannedOperation::DeleteSnapshot {
@@ -257,12 +259,13 @@ mod tests {
             now(),
         );
 
-        fragment.drain_into(&mut operations, &mut skipped, &mut events);
+        accumulator.absorb(fragment);
+        let (operations, skipped, events) = accumulator.into_parts();
 
         assert_eq!(operations.len(), 2);
         assert_eq!(skipped.len(), 2);
         assert_eq!(events.len(), 1);
-        // The pre-populated prefix survives untouched, ahead of the drained content.
+        // The accumulator's prefix survives untouched, ahead of the absorbed content.
         assert_eq!(skipped[0].name, "pre");
         assert_eq!(skipped[1].name, "sv1");
     }
@@ -279,10 +282,7 @@ mod tests {
             now(),
         );
 
-        let mut operations = Vec::new();
-        let mut skipped = Vec::new();
-        let mut events = Vec::new();
-        fragment.drain_into(&mut operations, &mut skipped, &mut events);
+        let (_operations, skipped, events) = fragment.into_parts();
 
         assert_eq!(skipped.len(), 1);
         assert_eq!(skipped[0].name, "sv1");
@@ -315,10 +315,7 @@ mod tests {
             now(),
         );
 
-        let mut operations = Vec::new();
-        let mut skipped = Vec::new();
-        let mut events = Vec::new();
-        fragment.drain_into(&mut operations, &mut skipped, &mut events);
+        let (_operations, skipped, _events) = fragment.into_parts();
 
         assert!(!skipped[0].is_nothing_new());
     }
@@ -332,10 +329,7 @@ mod tests {
         let mut fragment = PlanFragment::default();
         fragment.defer_nothing_new("sv1", why, now());
 
-        let mut operations = Vec::new();
-        let mut skipped = Vec::new();
-        let mut events = Vec::new();
-        fragment.drain_into(&mut operations, &mut skipped, &mut events);
+        let (_operations, skipped, events) = fragment.into_parts();
 
         assert!(skipped[0].is_nothing_new());
         assert_eq!(skipped[0].reason, "20260322-1330-one already on D1");
@@ -366,10 +360,7 @@ mod tests {
 
         let mut fragment = PlanFragment::default();
         fragment.defer_nothing_new("sv1", why.clone(), now());
-        let mut operations = Vec::new();
-        let mut skipped = Vec::new();
-        let mut events = Vec::new();
-        fragment.drain_into(&mut operations, &mut skipped, &mut events);
+        let (_operations, _skipped, events) = fragment.into_parts();
 
         // Same coordinates through the ordinary-defer path.
         let (_, direct) = defer_parts("sv1", Some("D1"), why.reason(), None, DeferScope::Drive, now());

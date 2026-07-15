@@ -392,9 +392,6 @@ priority = 1
         let pinned = HashSet::new();
         let mounted_pins = HashSet::new();
         let dir = local_dir();
-        let mut operations = Vec::new();
-        let mut skipped = Vec::new();
-        let mut events = Vec::new();
         plan_transient_lifecycle(&TransientInputs {
             core: SubvolInputs {
                 subvol,
@@ -410,8 +407,7 @@ priority = 1
             pinned: &pinned,
             mounted_pins: &mounted_pins,
         })
-        .drain_into(&mut operations, &mut skipped, &mut events);
-        (operations, skipped, events)
+        .into_parts()
     }
 
     /// Row 9 (adversary-amended): every row's output must satisfy the

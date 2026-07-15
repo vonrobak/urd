@@ -163,15 +163,12 @@ mod tests {
         };
         let d = drive();
         let pinned = HashSet::new();
-        let mut ops = Vec::new();
-        let mut skipped = Vec::new();
-        let mut events = Vec::new();
-        run(&ExternalRetentionInputs {
+        let (ops, _skipped, events) = run(&ExternalRetentionInputs {
             core: core(&sv, &e, &obs),
             drive: &d,
             pinned: &pinned,
         })
-        .drain_into(&mut ops, &mut skipped, &mut events);
+        .into_parts();
         assert!(ops.is_empty() && events.is_empty());
     }
 
@@ -192,15 +189,12 @@ mod tests {
         };
         let d = drive();
         let pinned = HashSet::new();
-        let mut ops = Vec::new();
-        let mut skipped = Vec::new();
-        let mut events = Vec::new();
-        run(&ExternalRetentionInputs {
+        let (ops, _skipped, events) = run(&ExternalRetentionInputs {
             core: core(&sv, &e, &obs),
             drive: &d,
             pinned: &pinned,
         })
-        .drain_into(&mut ops, &mut skipped, &mut events);
+        .into_parts();
 
         assert!(
             ops.iter()
@@ -237,15 +231,12 @@ mod tests {
         // Pin BOTH — even keep-nothing retention must not delete a pinned snap
         // (ADR-106 planner layer).
         let pinned: HashSet<SnapshotName> = [s0, s1].into_iter().collect();
-        let mut ops = Vec::new();
-        let mut skipped = Vec::new();
-        let mut events = Vec::new();
-        run(&ExternalRetentionInputs {
+        let (ops, _skipped, _events) = run(&ExternalRetentionInputs {
             core: core(&sv, &e, &obs),
             drive: &d,
             pinned: &pinned,
         })
-        .drain_into(&mut ops, &mut skipped, &mut events);
+        .into_parts();
         assert!(
             !ops
                 .iter()

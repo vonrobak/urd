@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use super::*;
 use crate::storage_critical::{ArmedTierMap, TightnessTier};
 use crate::btrfs::MockBtrfs;
-use crate::events::EventPayload;
+use crate::events::{EventPayload, UnstampedEvent};
 use crate::types::{FullSendReason, NothingNew};
 use chrono::NaiveDate;
 
@@ -186,10 +186,7 @@ fn drive_gate_truth_table_all_seven_availability_variants() {
         };
         match check_drive_availability("sv1", drive, &obs, now()) {
             DriveGate::Deferred(f) => {
-                let mut ops = Vec::new();
-                let mut skipped = Vec::new();
-                let mut events = Vec::new();
-                f.drain_into(&mut ops, &mut skipped, &mut events);
+                let (ops, skipped, events) = f.into_parts();
                 assert!(ops.is_empty(), "{avail:?}");
                 assert_eq!(skipped.len(), 1, "{avail:?}");
                 assert_eq!(skipped[0].reason, expected_reason, "{avail:?}");
