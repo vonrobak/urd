@@ -24,7 +24,7 @@ language is ambiguous in another doc.
 
 Terms are grouped into **clusters**: Promise, Voice, Protection, Drive, Thread,
 Retention, Identifier, Recommendation, Storage pressure, Read-side query seams,
-Planner soundness, Encounter. Each cluster has a canonical definition table
+Projections, Planner soundness, Planner structure, Encounter. Each cluster has a canonical definition table
 and a short **In context** example grounded in real CLI output, config, or
 on-disk artifacts. Skim by cluster heading; use the examples when a definition
 alone is too abstract. Terms still in transition are collected at the bottom
@@ -542,9 +542,10 @@ failure shapes and the standing tripwire that guards them.
 | Term | Meaning |
 |------|---------|
 | `orphaned snapshot` | A snapshot planned or created with no corresponding send that will be **deleted before it ever ships** — the transient-lifecycle harm (transient retention deletes aggressively by design). Consequence: data loss. Guarded by the invariant's arm 1, a blanket check: transient create-without-send is always a bug because transient creation is send-gated by construction (031-b M1). |
-| `stranded snapshot` | A snapshot created while send planning wrongly concluded there was nothing new to send. It persists locally and typically ships on the next run — the non-transient harm. Consequence: one-cycle send latency plus an exposure window (the snapshot exists on no drive), not data loss. Guarded by arm 2, keyed on the `nothing_new_to_send` marker `PlannedSkip` carries from exactly two send-planning conclusions ("already on <drive>", "no local snapshots to send"). |
+| `stranded snapshot` | A snapshot created while send planning wrongly concluded there was nothing new to send. It persists locally and typically ships on the next run — the non-transient harm. Consequence: one-cycle send latency plus an exposure window (the snapshot exists on no drive), not data loss. Guarded by arm 2, keyed on the private `nothing_new_to_send` marker that only the `NothingNew` constructor path can set — one true-constructor (`PlannedSkip::nothing_new`), prose derived from the variant, so marker and reason cannot drift. The sanctioned conclusions are `AlreadyOn` ("<snapshot> already on <drive>") and `NoLocalSnapshots` ("no local snapshots to send"; transient form: "external-only — sends on next backup"). |
 | `caught up` | Latest local snapshot == latest external snapshot **for a specific (subvolume, drive) pair**. The per-drive qualifier is load-bearing: a subvolume can be caught up on drive A while behind on drive B. This is the precondition both historical bugs required — steady state keeps external one snapshot behind local, so caught-up states arise from operational firsts (emergency retention; generation-equality skip nights). |
 | `post-plan orphan invariant` | The pure self-check at the end of `plan::plan` (`orphan_invariant_violations`) inspecting the finished plan for both harms: arm 1 (transient create-without-send → orphan) and arm 2 (any-lifecycle create alongside a nothing-new-to-send defer → strand). Violations `warn!` then `debug_assert!` — a test-time tripwire; production strand detection belongs to awareness/heartbeat. "Orphan invariant" is the umbrella idiom even though arm 2's harm is stranding. |
+| `NothingNew` / *sanctioned conclusions* | The two-variant enum (`types.rs`) that is the ONLY way to a marker-true skip: `AlreadyOn { snapshot, drive }` and `NoLocalSnapshots { transient }`. `PlannedSkip::nothing_new` derives the reason prose from the variant, and `PlanFragment::defer_nothing_new` derives the defer's scope and drive from it too — a third "nothing new" semantics requires a new variant, which the exhaustive matches turn into compile errors. This is the type-enforcement of arm 2's tripwire: a rogue `nothing_new_to_send = true` writer cannot exist. |
 
 **In context (the 2026-05-02 incident's defer, as recorded in the events table):**
 
@@ -557,6 +558,27 @@ defer names the *previous* night's snapshot because send planning consumed a sta
 snapshot list. Tonight's snapshot was stranded. Post-069, that same pair (a planned
 create alongside a nothing-new defer) trips the post-plan orphan invariant instead
 of passing silently.
+
+## Cluster: Planner structure (UPI 089)
+
+How `plan/` is shaped: the planner is one pure `plan()` composing per-lifecycle
+**regions** behind typed interfaces. This is the structural vocabulary; the failure
+vocabulary the structure exists to guard lives in the Planner-soundness cluster
+above (the two clusters are consumed together when debugging planner behavior).
+
+| Term | Meaning |
+|------|---------|
+| `region` | A planner concern with a typed interface: a `*Inputs` struct in, a `PlanFragment` (or a small named wrapper embedding one, e.g. `SnapshotOutcome`) out. One module per lifecycle path — `local`, `send`, `external`, `transient` — each directly testable with fixtures proportional to what it reads. The transient region is the *composite*: it calls the other four internally. |
+| `plan fragment` | `PlanFragment` — one region's contribution to the plan (operations + skips + events) in emission order. `plan()` accumulates one fragment via `absorb` and destructures it via `into_parts` before the orphan invariant runs. Emission order is load-bearing (ADR-100: the executor relies on create → send → delete within each subvolume); order lives only in the fragment's vecs. |
+| `SubvolInputs` | The shared core every region reads: `{ subvol, eff, local_dir, local_snaps, now, obs }` — built once per subvolume in `plan()`'s loop and embedded in each region's `*Inputs` struct. `eff` (`EffectivePolicy`) rides here so the tier-adapted policy has a single carrier. |
+| `DriveGate` | The drive-availability gate's outcome: `Ready`, or `Deferred(fragment)` carrying the skip + `PlannerDefer` event. The illegal state (unavailable but nothing recorded) is unrepresentable — a caller cannot skip a drive without absorbing why. |
+
+**In context (a region signature and its composition site):**
+
+```rust
+fn plan_transient_lifecycle(i: &TransientInputs) -> PlanFragment   // the region
+f.absorb(transient::plan_transient_lifecycle(&TransientInputs { core, ... }));  // plan()
+```
 
 Source: `plan/mod.rs` (`orphan_invariant_violations`), `types.rs` (`PlannedSkip`),
 `docs/98-journals/2026-05-02-stranded-snapshots-non-transient-planner.md`, UPI 069.
