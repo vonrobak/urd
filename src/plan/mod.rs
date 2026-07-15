@@ -7,7 +7,7 @@ use crate::commands::storage_signals::RunArming;
 use crate::config::{Config, DriveConfig, ResolvedSubvolume};
 use crate::drives::DriveAvailability;
 use crate::error::UrdError;
-use crate::events::{DeferScope, UnstampedEvent};
+use crate::events::DeferScope;
 use crate::storage_critical;
 use crate::types::{
     BackupPlan, DriveEvent, DriveEventKind, PlannedLifecycle, PlannedOperation, PlannedSkip,
@@ -27,28 +27,6 @@ mod tests;
 
 #[cfg(test)]
 pub use testkit::MockFileSystemState;
-
-// ── Audit helpers ──────────────────────────────────────────────────────
-
-/// Push a skip onto `skipped` and emit a matching `PlannerDefer` event.
-/// `drive_label` is `Some` when the deferral is drive-specific (e.g.,
-/// "send to {drive} not due"), `None` for subvolume-wide deferrals.
-/// `next_due_minutes` is `Some` only for interval deferrals.
-#[allow(clippy::too_many_arguments)]
-fn record_defer(
-    skipped: &mut Vec<PlannedSkip>,
-    events: &mut Vec<UnstampedEvent>,
-    subvol_name: &str,
-    drive_label: Option<&str>,
-    reason: String,
-    next_due_minutes: Option<i64>,
-    scope: DeferScope,
-    now: NaiveDateTime,
-) {
-    let (skip, event) = fragment::defer_parts(subvol_name, drive_label, reason, next_due_minutes, scope, now);
-    skipped.push(skip);
-    events.push(event);
-}
 
 /// Send-space guard (UPI 054-a): returns the defer reason when the source
 /// pool's free space is below the host-survival floor (`min_free +
@@ -278,11 +256,11 @@ pub fn plan(
     obs: &Observation,
     arming: &RunArming,
 ) -> crate::error::Result<BackupPlan> {
-    let mut operations = Vec::new();
+    // The run's single accumulator (UPI 089-c): every region fragment is
+    // absorbed and every body defer recorded here, in emission order.
     // Skip reason strings are classified by output::SkipCategory::from_reason().
     // When adding new patterns, update output::tests::classify_all_18_patterns.
-    let mut skipped = Vec::new();
-    let mut events: Vec<UnstampedEvent> = Vec::new();
+    let mut f = fragment::PlanFragment::default();
     let mut judgments: Vec<SubvolJudgment> = Vec::new();
     let mut lifecycles: std::collections::HashMap<String, PlannedLifecycle> =
         std::collections::HashMap::new();
@@ -293,9 +271,7 @@ pub fn plan(
     for subvol in &resolved {
         // Filter: enabled
         if !subvol.enabled {
-            record_defer(
-                &mut skipped,
-                &mut events,
+            f.defer(
                 &subvol.name,
                 None,
                 "disabled".to_string(),
@@ -324,9 +300,7 @@ pub fn plan(
 
         // Resolve local snapshot directory
         let Some(ref snapshot_root) = subvol.snapshot_root else {
-            record_defer(
-                &mut skipped,
-                &mut events,
+            f.defer(
                 &subvol.name,
                 None,
                 "no snapshot root configured".to_string(),
@@ -425,10 +399,16 @@ pub fn plan(
         // Dispatch on the EFFECTIVE lifecycle: a Tight/Critical declared-Graduated
         // send-enabled subvolume now routes through the transient path.
         if eff.local_retention.is_transient() && subvol.send_enabled {
-            transient::plan_transient_lifecycle(
-                subvol, &eff, config, &local_dir, &local_snaps, now, force, filters,
-                &pinned, &mounted_pins, obs, &mut operations, &mut skipped, &mut events,
-            );
+            f.absorb(transient::plan_transient_lifecycle(
+                &fragment::TransientInputs {
+                    core,
+                    drives: &config.drives,
+                    force,
+                    filters,
+                    pinned: &pinned,
+                    mounted_pins: &mounted_pins,
+                },
+            ));
             continue; // skip the normal two-phase flow
         }
 
@@ -442,13 +422,12 @@ pub fn plan(
                 force,
                 filters,
             });
-            out.fragment.drain_into(&mut operations, &mut skipped, &mut events);
-            local::plan_local_retention(&fragment::LocalRetentionInputs {
+            f.absorb(out.fragment);
+            f.absorb(local::plan_local_retention(&fragment::LocalRetentionInputs {
                 core,
                 pinned: &pinned,
                 mounted_pins: &mounted_pins,
-            })
-            .drain_into(&mut operations, &mut skipped, &mut events);
+            }));
             out.planned
         } else {
             None
@@ -463,9 +442,7 @@ pub fn plan(
             // source-pool pressure).
             let floor_defer = send_floor_defer_reason(subvol, &local_dir, obs);
             if let Some(reason) = &floor_defer {
-                record_defer(
-                    &mut skipped,
-                    &mut events,
+                f.defer(
                     &subvol.name,
                     None,
                     reason.clone(),
@@ -482,34 +459,32 @@ pub fn plan(
 
                 match check_drive_availability(&subvol.name, drive, obs, now) {
                     DriveGate::Ready => {}
-                    DriveGate::Deferred(f) => {
-                        f.drain_into(&mut operations, &mut skipped, &mut events);
+                    DriveGate::Deferred(gate) => {
+                        f.absorb(gate);
                         continue;
                     }
                 }
 
                 if floor_defer.is_none() {
-                    send::plan_external_send(&fragment::SendInputs {
+                    f.absorb(send::plan_external_send(&fragment::SendInputs {
                         core,
                         drive,
                         planned_snap: planned_snap.as_ref(),
                         force,
                         skip_intervals: filters.skip_intervals,
-                    })
-                    .drain_into(&mut operations, &mut skipped, &mut events);
+                    }));
                 }
 
-                external::plan_external_retention(&fragment::ExternalRetentionInputs {
-                    core,
-                    drive,
-                    pinned: &pinned,
-                })
-                .drain_into(&mut operations, &mut skipped, &mut events);
+                f.absorb(external::plan_external_retention(
+                    &fragment::ExternalRetentionInputs {
+                        core,
+                        drive,
+                        pinned: &pinned,
+                    },
+                ));
             }
         } else if !filters.local_only && !subvol.send_enabled {
-            record_defer(
-                &mut skipped,
-                &mut events,
+            f.defer(
                 &subvol.name,
                 None,
                 "local only".to_string(),
@@ -519,6 +494,10 @@ pub fn plan(
             );
         }
     }
+
+    // Destructure the fragment BEFORE the invariant so it inspects the very
+    // slices `BackupPlan` is built from (UPI 089-c).
+    let (operations, skipped, events) = f.into_parts();
 
     // Post-plan orphan invariant (UPI 069): pure inspection of the finished
     // plan against the lifecycle judgments recorded at the main loop's single

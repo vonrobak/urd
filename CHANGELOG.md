@@ -15,6 +15,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   some promise is degraded, matching status's quiet gate (#297).
 
 ### Changed
+- The planner's regions all have typed interfaces now (`*Inputs` in,
+  `PlanFragment` out; UPI 089 arc, #298): `plan.rs` became the `plan/`
+  directory, the send seam and drive gate are fragment-shaped, the
+  stranded-snapshot marker is constructor-enforced (`NothingNew`), and the
+  historically buggiest path — the transient composite — is pinned by an
+  11-row characterization truth table written before its reshape.
+  `record_defer` and `drain_into` retired; `plan()` composes one fragment.
+  Behavior-neutral: live plan/dry-run byte-identical across the arc.
 - Promise-state reductions (transition detection, degradation direction, the
   three-way partition, the all-unprotected check) and the notification prose
   they feed each have exactly one implementation now (`PromiseRollup`,

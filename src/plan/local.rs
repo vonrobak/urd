@@ -380,10 +380,7 @@ mod tests {
             filters: &filters,
         });
         assert!(out.planned.is_none());
-        let mut ops = Vec::new();
-        let mut skipped = Vec::new();
-        let mut events = Vec::new();
-        out.fragment.drain_into(&mut ops, &mut skipped, &mut events);
+        let (ops, skipped, _events) = out.fragment.into_parts();
         assert!(ops.is_empty());
         assert_eq!(skipped.len(), 1);
         assert!(skipped[0].reason.contains("low on space"), "{}", skipped[0].reason);
@@ -505,10 +502,7 @@ mod tests {
             filters: &filters,
         });
         assert!(out.planned.is_none());
-        let mut ops = Vec::new();
-        let mut skipped = Vec::new();
-        let mut events = Vec::new();
-        out.fragment.drain_into(&mut ops, &mut skipped, &mut events);
+        let (_ops, skipped, _events) = out.fragment.into_parts();
         assert_eq!(skipped.len(), 1);
         assert_eq!(skipped[0].next_due_minutes, Some(45));
     }
@@ -544,10 +538,7 @@ mod tests {
             filters: &filters,
         });
         assert!(out.planned.is_none());
-        let mut ops = Vec::new();
-        let mut skipped = Vec::new();
-        let mut events = Vec::new();
-        out.fragment.drain_into(&mut ops, &mut skipped, &mut events);
+        let (_ops, skipped, _events) = out.fragment.into_parts();
         assert_eq!(skipped.len(), 1);
         assert!(skipped[0].reason.contains("unchanged"), "{}", skipped[0].reason);
     }
@@ -718,10 +709,7 @@ mod tests {
             filters: &filters,
         });
         assert!(out.planned.is_none());
-        let mut ops = Vec::new();
-        let mut skipped = Vec::new();
-        let mut events = Vec::new();
-        out.fragment.drain_into(&mut ops, &mut skipped, &mut events);
+        let (ops, skipped, _events) = out.fragment.into_parts();
         assert!(ops.is_empty());
         assert_eq!(skipped.len(), 1);
         assert!(skipped[0].reason.contains("already exists"), "{}", skipped[0].reason);
@@ -752,10 +740,7 @@ mod tests {
             filters: &filters,
         });
         let planned = out.planned.clone().expect("first snapshot must create");
-        let mut ops = Vec::new();
-        let mut skipped = Vec::new();
-        let mut events = Vec::new();
-        out.fragment.drain_into(&mut ops, &mut skipped, &mut events);
+        let (ops, _skipped, _events) = out.fragment.into_parts();
         assert_eq!(ops.len(), 1);
         match &ops[0] {
             PlannedOperation::CreateSnapshot { dest, .. } => {
@@ -826,10 +811,7 @@ mod tests {
             filters: &filters,
         });
         assert!(out.planned.is_none(), "clock skew defers rather than creating");
-        let mut ops = Vec::new();
-        let mut skipped = Vec::new();
-        let mut events = Vec::new();
-        out.fragment.drain_into(&mut ops, &mut skipped, &mut events);
+        let (_ops, skipped, _events) = out.fragment.into_parts();
         assert_eq!(skipped.len(), 1);
         assert!(skipped[0].reason.contains("interval not elapsed"), "{}", skipped[0].reason);
     }
@@ -861,10 +843,7 @@ mod tests {
             pinned: &pinned,
             mounted_pins: &mounted_pins,
         });
-        let mut ops = Vec::new();
-        let mut skipped = Vec::new();
-        let mut events = Vec::new();
-        f.drain_into(&mut ops, &mut skipped, &mut events);
+        let (ops, skipped, events) = f.into_parts();
         assert!(ops.is_empty());
         assert!(skipped.is_empty());
         assert!(events.is_empty());
@@ -899,10 +878,7 @@ mod tests {
             pinned: &pinned,
             mounted_pins: &mounted_pins,
         });
-        let mut ops = Vec::new();
-        let mut skipped = Vec::new();
-        let mut events = Vec::new();
-        f.drain_into(&mut ops, &mut skipped, &mut events);
+        let (ops, _skipped, _events) = f.into_parts();
         assert!(ops.is_empty(), "away + mounted + unsent all protected: {ops:?}");
     }
 
@@ -935,10 +911,7 @@ mod tests {
             pinned: &pinned,
             mounted_pins: &mounted_pins,
         });
-        let mut ops = Vec::new();
-        let mut skipped = Vec::new();
-        let mut events = Vec::new();
-        f.drain_into(&mut ops, &mut skipped, &mut events);
+        let (ops, _skipped, _events) = f.into_parts();
         assert_eq!(ops.len(), 1);
         match &ops[0] {
             PlannedOperation::DeleteSnapshot { path, .. } => {
@@ -977,10 +950,7 @@ mod tests {
             pinned: &pinned,
             mounted_pins: &mounted_pins,
         });
-        let mut ops = Vec::new();
-        let mut skipped = Vec::new();
-        let mut events = Vec::new();
-        f.drain_into(&mut ops, &mut skipped, &mut events);
+        let (ops, _skipped, _events) = f.into_parts();
         assert_eq!(ops.len(), 1);
         match &ops[0] {
             PlannedOperation::DeleteSnapshot { path, .. } => {
@@ -1018,10 +988,7 @@ mod tests {
             pinned: &pinned,
             mounted_pins: &mounted_pins,
         });
-        let mut ops = Vec::new();
-        let mut skipped = Vec::new();
-        let mut events = Vec::new();
-        f.drain_into(&mut ops, &mut skipped, &mut events);
+        let (ops, _skipped, _events) = f.into_parts();
         assert_eq!(ops.len(), 1);
         match &ops[0] {
             PlannedOperation::DeleteSnapshot { path, .. } => {
@@ -1078,10 +1045,7 @@ mod tests {
             pinned: &pinned,
             mounted_pins: &mounted_pins,
         });
-        let mut ops = Vec::new();
-        let mut skipped = Vec::new();
-        let mut events = Vec::new();
-        f.drain_into(&mut ops, &mut skipped, &mut events);
+        let (ops, _skipped, _events) = f.into_parts();
         assert!(ops.is_empty(), "no pins yet -> protect everything until first send: {ops:?}");
     }
 
@@ -1136,10 +1100,7 @@ mod tests {
                 pinned: &pinned,
                 mounted_pins: &mounted_pins,
             });
-            let mut ops = Vec::new();
-            let mut skipped = Vec::new();
-            let mut events = Vec::new();
-            f.drain_into(&mut ops, &mut skipped, &mut events);
+            let (ops, _skipped, _events) = f.into_parts();
             ops.len()
         };
 
@@ -1180,10 +1141,7 @@ mod tests {
             pinned: &pinned,
             mounted_pins: &mounted_pins,
         });
-        let mut ops = Vec::new();
-        let mut skipped = Vec::new();
-        let mut events = Vec::new();
-        f.drain_into(&mut ops, &mut skipped, &mut events);
+        let (ops, _skipped, _events) = f.into_parts();
         assert_eq!(ops.len(), 1);
         match &ops[0] {
             PlannedOperation::DeleteSnapshot { path, .. } => {
@@ -1230,10 +1188,7 @@ mod tests {
             pinned: &pinned,
             mounted_pins: &mounted_pins,
         });
-        let mut ops = Vec::new();
-        let mut skipped = Vec::new();
-        let mut events = Vec::new();
-        f.drain_into(&mut ops, &mut skipped, &mut events);
+        let (ops, _skipped, _events) = f.into_parts();
         assert!(
             !ops.iter().any(|op| matches!(
                 op,
@@ -1270,10 +1225,7 @@ mod tests {
             pinned: &pinned,
             mounted_pins: &mounted_pins,
         });
-        let mut ops = Vec::new();
-        let mut skipped = Vec::new();
-        let mut events = Vec::new();
-        f.drain_into(&mut ops, &mut skipped, &mut events);
+        let (ops, _skipped, _events) = f.into_parts();
         assert_eq!(ops.len(), 1);
         match &ops[0] {
             PlannedOperation::DeleteSnapshot { reason, kind, .. } => {

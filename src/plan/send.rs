@@ -334,13 +334,9 @@ mod tests {
         }
     }
 
-    /// Run `plan_external_send` and drain its fragment into flat vecs.
+    /// Run `plan_external_send` and split its fragment into flat vecs.
     fn run(i: &SendInputs) -> (Vec<PlannedOperation>, Vec<PlannedSkip>, Vec<UnstampedEvent>) {
-        let mut ops = Vec::new();
-        let mut skipped = Vec::new();
-        let mut events = Vec::new();
-        plan_external_send(i).drain_into(&mut ops, &mut skipped, &mut events);
-        (ops, skipped, events)
+        plan_external_send(i).into_parts()
     }
 
     // ── NothingNew conclusions ───────────────────────────────────────
