@@ -34,9 +34,11 @@ scripts/check-registry.sh   # UPI registry ↔ design files are consistent (loca
 `docs/96-project-supervisor/registry.md` and `docs/95-ideas/`, so it short-circuits
 in environments where those are absent.
 
-Internal docs (ideas, plans, journals, reports, project-supervisor state, the archive)
-live in a private vault, reached from this repo only through gitignored symlinks — no
-paths or titles are referenced here (ADR-118).
+## Internal docs
+
+Internal docs (ideas, plans, journals, reports, project-supervisor state, the archive) and
+`CLAUDE.md` itself live in a private vault, reached from this repo only through gitignored
+symlinks — no paths or titles are referenced here (ADR-118).
 
 ## Testing
 
@@ -56,7 +58,8 @@ All three must pass before submitting a PR.
 - No `unsafe`, no `unwrap()`/`expect()` in library code
 - Unit tests live in `#[cfg(test)] mod tests` in the same file
 
-See [`CLAUDE.md`](CLAUDE.md) for the full coding conventions and architectural invariants.
+`CLAUDE.md` (not in this repo — see "Internal docs" above) has the full coding conventions
+and architectural invariants.
 
 ## Architecture
 
