@@ -636,13 +636,14 @@ without re-deriving the context.
   threshold). See `voice.rs::format_drive_age_label` cascade and Voice Contract
   Rule 1.
 
-- **"gap" carries two candidate meanings.** The Encounter's `gap`/`GapKind`
+- **"gap" means the Encounter/derivation sense.** The Encounter's `gap`/`GapKind`
   (engine, UPI 073) names a disaster a *proposed setup* cannot survive — it is not
-  CLI status vocabulary. Separately, UPI 080's draft display classifier proposes
-  "gap" as one of four row signals; that reuse was previously rejected as CLI
-  vocabulary (superseded by sealed/waning/exposed) and needs a deliberate grill
-  call, not silent adoption. Until the 080 grill rules, "gap" in prose means the
-  Encounter/derivation sense.
+  CLI status vocabulary. The one competing candidate (UPI 080's draft display
+  classifier, which proposed "gap" as one of four row signals) was retired
+  2026-07-16 without building; the signal-model question, including whether "gap"
+  may be one of its words, transfers to Spindle's design. Any future reuse of
+  "gap" as display vocabulary still needs a deliberate grill call — it was once
+  already rejected as CLI vocabulary (superseded by sealed/waning/exposed).
 
 - **"Backup" the verb vs "backup" the noun.** Casual project usage treats them
   as interchangeable; in precise contexts, a *backup* is the noun ("an external
