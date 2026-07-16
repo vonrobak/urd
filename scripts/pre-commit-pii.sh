@@ -12,10 +12,20 @@
 #     stderr and exits 1, so the operator must either fix the diff or pass
 #     --no-verify deliberately.
 #
+# Report mode (--report): scans the working tree instead of the staged diff —
+# `git diff HEAD` plus untracked files — prints the same classified report to
+# stdout, and always exits 0. For pre-staging review (/commit-push-pr Phase 2);
+# the hook still re-scans the staged diff at commit time.
+#
 # Bypass for a single commit (use sparingly): git commit --no-verify
 # Install: scripts/install-hooks.sh
 
 set -euo pipefail
+
+MODE="hook"
+if [[ "${1:-}" == "--report" ]]; then
+    MODE="report"
+fi
 
 # Resolve identifiers we will scan for.
 USERNAME="$(whoami)"
@@ -32,10 +42,28 @@ fi
 HOME_PATH="/home/${USERNAME}/"
 MEDIA_PATH="/run/media/${USERNAME}/"
 
-# Pull only the staged additions. -U0 strips context so we only see new lines.
-DIFF="$(git diff --cached --no-color -U0 --diff-filter=ACMR || true)"
+# Pull only the added lines. -U0 strips context so we only see new lines.
+# Hook mode scans the staged diff; report mode scans the working tree vs HEAD
+# and appends untracked text files as synthetic additions (same classifier).
+if [[ "$MODE" == "report" ]]; then
+    SRC="$(mktemp)"
+    trap 'rm -f "$SRC"' EXIT
+    git diff HEAD --no-color -U0 --diff-filter=ACMR > "$SRC" 2>/dev/null || true
+    while IFS= read -r f; do
+        [[ -f "$f" ]] || continue
+        grep -qI . "$f" 2>/dev/null || continue   # skip binary/empty
+        printf '+++ b/%s\n' "$f" >> "$SRC"
+        sed 's/^/+/' "$f" >> "$SRC"
+    done < <(git ls-files --others --exclude-standard)
+    DIFF="$(cat "$SRC")"
+else
+    DIFF="$(git diff --cached --no-color -U0 --diff-filter=ACMR || true)"
+fi
 
 if [[ -z "$DIFF" ]]; then
+    if [[ "$MODE" == "report" ]]; then
+        echo "PII report: no changes to scan (working tree matches HEAD)."
+    fi
     exit 0
 fi
 
@@ -95,13 +123,18 @@ while IFS= read -r line; do
 done <<< "$DIFF"
 
 if [[ $TOTAL -eq 0 ]]; then
+    if [[ "$MODE" == "report" ]]; then
+        echo "PII report: clean — no matches in working tree vs HEAD (incl. untracked)."
+    fi
     exit 0
 fi
 
-{
+emit_report() {
+    local scope="staged diff"
+    [[ "$MODE" == "report" ]] && scope="working tree (vs HEAD, incl. untracked)"
     echo
     echo "================================================================="
-    echo "  PII pre-commit scan: ${TOTAL} potential match(es) in staged diff"
+    echo "  PII scan: ${TOTAL} potential match(es) in ${scope}"
     echo "================================================================="
 
     if [[ ${#CODE_HITS[@]} -gt 0 ]]; then
@@ -127,9 +160,20 @@ fi
     echo "    ${USERNAME} (standalone)"
     [[ -n "$HOSTNAME_VAL" ]] && echo "    ${HOSTNAME_VAL} (standalone)"
     echo
-    echo "  Review with: git diff --cached"
+    if [[ "$MODE" == "report" ]]; then
+        echo "  Fix source/config hits before staging; docs hits are operator judgment."
+    else
+        echo "  Review with: git diff --cached"
+    fi
     echo
-} >&2
+}
+
+if [[ "$MODE" == "report" ]]; then
+    emit_report
+    exit 0
+fi
+
+emit_report >&2
 
 # Try to prompt on the controlling TTY. If unavailable (agent commit, CI),
 # fail closed — the operator can rerun with --no-verify after deciding.

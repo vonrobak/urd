@@ -50,3 +50,7 @@ scripts/*
 !scripts/check-registry.sh
 !scripts/check-present-not-journey.sh
 !scripts/staging-reset.sh
+!scripts/check.sh
+!scripts/release-preflight.sh
+!scripts/release-bump.sh
+!scripts/collect-diagnostics.sh
