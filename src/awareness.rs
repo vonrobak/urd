@@ -261,6 +261,28 @@ impl std::fmt::Display for OperationalHealth {
     }
 }
 
+impl OperationalHealth {
+    /// Recover the enum from its `Display` label — the inverse mapping, kept
+    /// beside `Display` so the two stay in sync. `StatusAssessment.health`
+    /// (`output.rs`) stays a plain `String` rather than this enum: it is
+    /// part of the `--json` surface and existing voice-contract tests mutate
+    /// it directly as a raw label fixture, so the type can't be carried all
+    /// the way to the HEALTH color decision the way `PromiseStatus` is for
+    /// EXPOSURE (#305). This lets the color decision (`voice::health_cell`)
+    /// still match exhaustively on the enum instead of re-matching the label
+    /// string a second time (the #361 bug) — see
+    /// `voice::status::assessment_health_cell`.
+    #[must_use]
+    pub fn from_label(label: &str) -> Option<Self> {
+        match label {
+            "blocked" => Some(Self::Blocked),
+            "degraded" => Some(Self::Degraded),
+            "healthy" => Some(Self::Healthy),
+            _ => None,
+        }
+    }
+}
+
 /// Complete assessment for a single subvolume.
 #[derive(Debug)]
 pub struct SubvolAssessment {

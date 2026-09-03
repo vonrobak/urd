@@ -11,7 +11,7 @@ use std::fmt::Write;
 
 use colored::Colorize;
 
-use crate::awareness::PromiseStatus;
+use crate::awareness::{OperationalHealth, PromiseStatus};
 use crate::output::{SkipCategory, VerifyCheck, VerifyOutput};
 // Test-only imports — moved-renderer types still referenced by parent tests
 // (renderer extractions per UPI 050 phases 1 + 2).
@@ -140,7 +140,7 @@ pub(super) fn exposure_label(status: PromiseStatus) -> String {
 ///
 /// The returned string already carries its ANSI color; table rendering must
 /// not re-match on it (that was the bug) — it passes cells through unchanged
-/// unless a column asks for further coloring (see `format_status_table`).
+/// unless a column asks for further coloring (see `format_table`).
 pub(super) fn exposure_cell(status: PromiseStatus, dimmed: bool) -> String {
     let label = exposure_label(status);
     if dimmed {
@@ -237,7 +237,14 @@ pub(super) fn humanize_cadence(secs: i64) -> String {
 /// `colorize` maps (column index, cell) to a colored rendering, or `None`
 /// to leave the cell plain. Column widths and padding are computed from
 /// visible (ANSI-stripped) length, so pre-colored cells align correctly.
-fn format_table(
+///
+/// The status table's EXPOSURE and HEALTH columns pass `|_, _| None` here:
+/// their callers build already-colored cells via `exposure_cell` (#305) and
+/// `health_cell` (#361) before the row is handed to this formatter, so
+/// those cells simply pass through unchanged like any other pre-rendered
+/// cell — `colorize` only has real work left for `format_history_table`'s
+/// RESULT column.
+pub(super) fn format_table(
     headers: &[String],
     rows: &[Vec<String>],
     colorize: impl Fn(usize, &str) -> Option<String>,
@@ -279,27 +286,6 @@ fn format_table(
     }
 }
 
-/// Format status table with an optional colored HEALTH column.
-///
-/// The EXPOSURE column is no longer colored here — callers build already-
-/// colored cells via `exposure_cell` before the row is handed to this
-/// formatter (#305), so the EXPOSURE cell simply passes through unchanged
-/// like any other pre-rendered cell.
-fn format_status_table(
-    headers: &[String],
-    rows: &[Vec<String>],
-    health_col: Option<usize>,
-    out: &mut String,
-) {
-    format_table(
-        headers,
-        rows,
-        |i, cell| (health_col == Some(i)).then(|| color_health_str(cell)),
-        out,
-    );
-}
-
-
 /// Get visible (non-ANSI) length of a string.
 fn strip_ansi_len(s: &str) -> usize {
     // ANSI escape sequences: ESC[ ... m
@@ -321,12 +307,21 @@ fn strip_ansi_len(s: &str) -> usize {
 
 // ── Color helpers ───────────────────────────────────────────────────────
 
-fn color_health_str(health: &str) -> String {
+/// Render an operational health as its colored HEALTH cell, in one step.
+///
+/// Mirrors `exposure_cell` (#305): the color match is exhaustive on
+/// `OperationalHealth` — compiler-enforced against new variants — replacing
+/// the former re-match on the health label (`"healthy"` / `"degraded"` /
+/// `"blocked"`) that silently rendered any unmatched label uncolored (#361).
+/// `StatusAssessment.health` itself stays a `String` (see
+/// `OperationalHealth::from_label`'s doc for why); callers that only hold
+/// the label recover the enum via `voice::status::assessment_health_cell`
+/// before calling this.
+pub(super) fn health_cell(health: OperationalHealth) -> String {
     match health {
-        "healthy" => "healthy".dimmed().to_string(),
-        "degraded" => "degraded".yellow().to_string(),
-        "blocked" => "blocked".red().to_string(),
-        other => other.to_string(),
+        OperationalHealth::Healthy => "healthy".dimmed().to_string(),
+        OperationalHealth::Degraded => "degraded".yellow().to_string(),
+        OperationalHealth::Blocked => "blocked".red().to_string(),
     }
 }
 
@@ -3033,24 +3028,87 @@ mod tests {
 
     /// End-to-end pass-through pin: a pre-colored EXPOSURE cell (the UPI 080
     /// dimmed adapting-row case, built by `exposure_cell`) must survive
-    /// `format_status_table` byte-identical. Before #305, the EXPOSURE column
-    /// was re-matched by `color_exposure_str` inside this formatter — any
-    /// already-colored string that didn't match `"sealed"`/`"waning"`/
+    /// `format_table` byte-identical when the caller passes `|_, _| None`
+    /// (the status table's actual usage). Before #305, the EXPOSURE column
+    /// was re-matched by `color_exposure_str` inside a dedicated formatter —
+    /// any already-colored string that didn't match `"sealed"`/`"waning"`/
     /// `"exposed"` fell through unchanged only because of an explicit (and
-    /// easy to lose) fallback arm. Now the formatter never touches the
-    /// EXPOSURE column at all, so pass-through is structural, not a matched
-    /// case.
+    /// easy to lose) fallback arm. Now no column is colored here at all, so
+    /// pass-through is structural, not a matched case.
     #[test]
-    fn format_status_table_passes_through_precolored_exposure_cell_unchanged() {
+    fn format_table_passes_through_precolored_exposure_cell_unchanged() {
         let _color = color_guard(true);
         let headers = vec!["EXPOSURE".to_string(), "SUBVOLUME".to_string()];
         let precolored = exposure_cell(PromiseStatus::AtRisk, true);
         let rows = vec![vec![precolored.clone(), "htpc-home".to_string()]];
         let mut out = String::new();
-        format_status_table(&headers, &rows, None, &mut out);
+        format_table(&headers, &rows, |_, _| None, &mut out);
         assert!(
             out.contains(&precolored),
             "pre-colored EXPOSURE cell must pass through byte-identical: {out:?}"
+        );
+    }
+
+    /// Pins the colored `health_cell` output for every `OperationalHealth`
+    /// variant (#361). The old string-relay design (`color_health_str`
+    /// re-matching the label) let a future label change silently ship
+    /// uncolored output because the fall-through arm passed any unmatched
+    /// string through unchanged. Now the color decision matches on the enum
+    /// directly and exhaustively — a new `OperationalHealth` variant fails
+    /// to compile here rather than rendering uncolored at runtime.
+    #[test]
+    fn health_cell_colors_every_operational_health() {
+        let _color = color_guard(true);
+        assert_eq!(
+            health_cell(OperationalHealth::Healthy),
+            "healthy".dimmed().to_string()
+        );
+        assert_eq!(
+            health_cell(OperationalHealth::Degraded),
+            "degraded".yellow().to_string()
+        );
+        assert_eq!(
+            health_cell(OperationalHealth::Blocked),
+            "blocked".red().to_string()
+        );
+    }
+
+    /// `OperationalHealth::from_label` must round-trip every variant's
+    /// `Display` string exactly (#361) — the two mappings are hand-written
+    /// in different spots (`awareness.rs`) and only this test would catch
+    /// them drifting apart.
+    #[test]
+    fn operational_health_from_label_round_trips_display() {
+        for health in [
+            OperationalHealth::Healthy,
+            OperationalHealth::Degraded,
+            OperationalHealth::Blocked,
+        ] {
+            assert_eq!(
+                OperationalHealth::from_label(&health.to_string()),
+                Some(health),
+                "from_label must recover {health} from its own Display output"
+            );
+        }
+        assert_eq!(OperationalHealth::from_label("bogus"), None);
+    }
+
+    /// End-to-end pass-through pin: a pre-colored HEALTH cell (built by
+    /// `health_cell`) must survive `format_table` byte-identical when the
+    /// caller passes `|_, _| None` (the status table's actual usage) — no
+    /// column is colored there at all (#361), mirroring EXPOSURE's
+    /// pass-through (#305).
+    #[test]
+    fn format_table_passes_through_precolored_health_cell_unchanged() {
+        let _color = color_guard(true);
+        let headers = vec!["HEALTH".to_string(), "SUBVOLUME".to_string()];
+        let precolored = health_cell(OperationalHealth::Degraded);
+        let rows = vec![vec![precolored.clone(), "htpc-home".to_string()]];
+        let mut out = String::new();
+        format_table(&headers, &rows, |_, _| None, &mut out);
+        assert!(
+            out.contains(&precolored),
+            "pre-colored HEALTH cell must pass through byte-identical: {out:?}"
         );
     }
 

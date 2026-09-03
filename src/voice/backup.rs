@@ -15,7 +15,7 @@ use crate::types::{ByteSize, DriveRole};
 
 use super::{
     SuggestionContext, append_suggestion, color_result, exposure_cell, exposure_label,
-    format_status_table, pluralize, skip_tag,
+    format_table, pluralize, skip_tag,
 };
 
 /// Render post-backup summary according to the given mode.
@@ -439,7 +439,9 @@ fn render_assessment_table(data: &BackupSummary, out: &mut String) {
         rows.push(row);
     }
 
-    format_status_table(&headers, &rows, None, out);
+    // The EXPOSURE cell above already carries its own color (`exposure_cell`,
+    // #305), so no column needs further coloring here.
+    format_table(&headers, &rows, |_, _| None, out);
 }
 
 /// Render advisories and errors from awareness assessments.
