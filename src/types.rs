@@ -1362,17 +1362,24 @@ impl FromStr for ByteSize {
 impl fmt::Display for ByteSize {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let b = self.0;
-        if b >= 1_000_000_000_000 {
-            write!(f, "{:.1}TB", b as f64 / 1_000_000_000_000.0)
+        let (value, unit) = if b >= 1_000_000_000_000 {
+            (b as f64 / 1_000_000_000_000.0, "TB")
         } else if b >= 1_000_000_000 {
-            write!(f, "{:.1}GB", b as f64 / 1_000_000_000.0)
+            (b as f64 / 1_000_000_000.0, "GB")
         } else if b >= 1_000_000 {
-            write!(f, "{:.1}MB", b as f64 / 1_000_000.0)
+            (b as f64 / 1_000_000.0, "MB")
         } else if b >= 1_000 {
-            write!(f, "{:.1}KB", b as f64 / 1_000.0)
+            (b as f64 / 1_000.0, "KB")
         } else {
-            write!(f, "{b}B")
-        }
+            return write!(f, "{b}B");
+        };
+        // Format with one decimal, then strip a trailing ".0" so whole values
+        // render without a spurious fraction. Stripping the formatted string
+        // (rather than checking `value.fract() == 0.0`) keeps rounding
+        // consistent: 9.96 GB formats to "10.0" and strips to "10GB", not "9.9GB".
+        let formatted = format!("{value:.1}");
+        let formatted = formatted.strip_suffix(".0").unwrap_or(&formatted);
+        write!(f, "{formatted}{unit}")
     }
 }
 
@@ -1722,9 +1729,31 @@ mod tests {
 
     #[test]
     fn byte_size_display() {
-        assert_eq!(ByteSize(10_000_000_000).to_string(), "10.0GB");
+        assert_eq!(ByteSize(10_000_000_000).to_string(), "10GB");
         assert_eq!(ByteSize(1_500_000_000_000).to_string(), "1.5TB");
-        assert_eq!(ByteSize(512_000_000).to_string(), "512.0MB");
+        assert_eq!(ByteSize(512_000_000).to_string(), "512MB");
+    }
+
+    #[test]
+    fn byte_size_display_whole_units_drop_decimal() {
+        // Whole values at the chosen unit render without a fraction.
+        assert_eq!(ByteSize(10_000_000_000).to_string(), "10GB");
+        assert_eq!(ByteSize(1_000).to_string(), "1KB");
+        assert_eq!(ByteSize(999).to_string(), "999B");
+        assert_eq!(ByteSize(1_000_000_000_000).to_string(), "1TB");
+    }
+
+    #[test]
+    fn byte_size_display_fractional_units_keep_one_decimal() {
+        assert_eq!(ByteSize(1_500_000_000).to_string(), "1.5GB");
+        assert_eq!(ByteSize(2_500_000).to_string(), "2.5MB");
+    }
+
+    #[test]
+    fn byte_size_display_rounds_before_stripping_decimal() {
+        // 9.96 GB rounds to "10.0" at one decimal, then strips to "10GB" —
+        // never "9.9GB" (no rounding) nor "10.0GB" (no stripping).
+        assert_eq!(ByteSize(9_960_000_000).to_string(), "10GB");
     }
 
     // ── GraduatedRetention tests ────────────────────────────────────

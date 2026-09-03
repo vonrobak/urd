@@ -3829,7 +3829,7 @@ source = "/data/beta"
         let line = format_progress_line("htpc-home", "WD-18TB", 1, 3, 1_000_000_000, 178_300_000.0, Duration::from_secs(6), None);
         assert!(line.contains("[1/3]"));
         assert!(line.contains("htpc-home → WD-18TB:"));
-        assert!(line.contains("1.0GB"));
+        assert!(line.contains("1GB"));
         assert!(line.contains("178.3MB/s"));
         assert!(!line.contains("left"));
     }
@@ -3838,7 +3838,7 @@ source = "/data/beta"
     fn format_progress_no_estimate_no_rate() {
         let line = format_progress_line("sv1", "drive1", 2, 5, 500_000, 0.0, Duration::from_secs(1), None);
         assert!(line.contains("[2/5]"));
-        assert!(line.contains("500.0KB"));
+        assert!(line.contains("500KB"));
         assert!(!line.contains("/s"));
     }
 
@@ -3863,7 +3863,7 @@ source = "/data/beta"
             Duration::from_secs(2), // < 5s
             Some(10_000_000_000),
         );
-        assert!(line.contains("/ ~10.0GB"));
+        assert!(line.contains("/ ~10GB"));
         assert!(!line.contains("left"), "ETA should be suppressed in early phase");
     }
 
@@ -3888,7 +3888,7 @@ source = "/data/beta"
             Some(10_000_000_000),
         );
         // Zero rate: falls through to no-rate branch
-        assert!(line.contains("100.0KB"));
+        assert!(line.contains("100KB"));
         assert!(!line.contains("/s"));
     }
 

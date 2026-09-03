@@ -1593,11 +1593,11 @@ mod contract {
         let stripped = helpers::strip_ansi(&output);
         // current=200 GB, adjusted=25 GB → 175 GB recovered.
         assert!(
-            stripped.contains("175.0GB") || stripped.contains("175 GB"),
+            stripped.contains("175GB"),
             "Rule 1 violation: recovery must match rendered (tightened) shape (~175 GB): {stripped}"
         );
         assert!(
-            !stripped.contains("150.0GB") && !stripped.contains("150 GB"),
+            !stripped.contains("150GB"),
             "Rule 1 violation: recovery used suggested_cost (~150 GB) instead of adjusted_cost: {stripped}"
         );
     }

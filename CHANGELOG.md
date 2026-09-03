@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `ByteSize`'s display no longer pads whole values with a spurious decimal —
+  `10GB` instead of `10.0GB`, `1KB` instead of `1.0KB` — while values that
+  aren't whole at their unit still keep exactly one decimal (`1.5GB`).
+  Rounding is unchanged: `9.96GB` still rounds up and now reads `10GB`
+  instead of `10.0GB` (#332).
+
 ## [0.35.0] - 2026-07-15
 
 ### Fixed

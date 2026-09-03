@@ -1940,7 +1940,7 @@ mod tests {
         );
         // Size annotation rendered by voice, not embedded in detail
         assert!(
-            output.contains("~53.0GB"),
+            output.contains("~53GB"),
             "should render full send size annotation: {output}"
         );
     }
@@ -2015,7 +2015,7 @@ mod tests {
         };
         let output = render_plan(&data, OutputMode::Interactive, true);
         assert!(
-            output.contains("2 sends (~53.0GB estimated for 1 of 2)"),
+            output.contains("2 sends (~53GB estimated for 1 of 2)"),
             "partial estimates should be qualified: {output}"
         );
     }
@@ -3467,7 +3467,7 @@ mod tests {
             "missing weekly window: {output}"
         );
         assert!(
-            output.contains("120.0GB"),
+            output.contains("120GB"),
             "missing disk estimate: {output}"
         );
         assert!(
@@ -3729,7 +3729,7 @@ mod tests {
             "should mention full backup: {output}"
         );
         assert!(output.contains("7 snapshots"), "should count snapshots: {output}");
-        assert!(output.contains("~53.0GB"), "should show size estimate: {output}");
+        assert!(output.contains("~53GB"), "should show size estimate: {output}");
     }
 
     #[test]
@@ -5045,11 +5045,11 @@ mod tests {
         // current=200 GB, adjusted=25 GB → recover 175 GB.
         // Not current=200 GB - suggested=50 GB = 150 GB.
         assert!(
-            out.contains("175.0GB") || out.contains("175 GB"),
+            out.contains("175GB"),
             "recovery delta must use adjusted_cost (~175 GB): {out}"
         );
         assert!(
-            !out.contains("150.0GB") && !out.contains("150 GB"),
+            !out.contains("150GB"),
             "recovery delta must not use suggested_cost (150 GB): {out}"
         );
     }
