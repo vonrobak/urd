@@ -45,6 +45,7 @@ mod status;
 mod verify;
 
 pub use backup::{render_backup_summary, render_pre_action};
+pub(crate) use backup::render_warning_lines;
 pub use calibrate::render_calibrate;
 pub use chooser::format_subvolume_chooser;
 pub use doctor::render_doctor;

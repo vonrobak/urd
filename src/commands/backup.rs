@@ -134,12 +134,12 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     // Emergency pre-flight: if any snapshot root is critically below threshold
     // (< 50% of min_free_bytes), run emergency retention before planning.
     // Runs under the lock because it performs destructive btrfs deletions.
-    let emergency_ran = run_emergency_preflight(&config, &recorder)?;
+    let emergency = run_emergency_preflight(&config, &recorder)?;
 
     // Re-plan if emergency freed space — plan may have different space_pressure
     // decisions. Reuses the SAME pre-plan `arming` (AB1: never re-resolve
     // mid-run, even though emergency just freed space).
-    if emergency_ran {
+    if emergency.any_deleted {
         backup_plan = plan::plan(&config, now, &filters, &observation, &arming)?;
         if !args.confirm_retention_change {
             filter_promise_retention(&config, &mut backup_plan);
@@ -147,6 +147,21 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     }
 
     if backup_plan.is_empty() {
+        // Emergency reclaim warnings (issue #174): the emergency pass may
+        // have deleted snapshots and then the re-plan still found nothing
+        // to do. The notification + event already carry the story in
+        // daemon/auto contexts (dispatched from `run_emergency_preflight`
+        // regardless of this branch), but an interactive TTY user landing
+        // here would otherwise see only "Nothing to do." with no hint that
+        // Urd just deleted history to make room. Same `!args.auto` gate as
+        // the explanation/"Nothing to do." choice below, and the same
+        // `WARNING:` rendering the post-run summary uses, so the two
+        // surfaces can never drift.
+        if !args.auto && !emergency.root_summaries.is_empty() {
+            let warnings = emergency_reclaim_warnings(&emergency.root_summaries);
+            print!("{}", crate::voice::render_warning_lines(&warnings));
+            println!();
+        }
         // Empty plan: no operations to execute. This includes plans where all subvolumes
         // were skipped (drives disconnected, space guard, etc.). Previously this case fell
         // through to the executor which ran zero operations and reported run_result "success".
@@ -616,7 +631,7 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
         recorder.record(&tail.ctx, rec);
     }
 
-    let summary = build_backup_summary(
+    let mut summary = build_backup_summary(
         &backup_plan,
         &result,
         StatusAssessment::rows(&assessments, &config.resolved_subvolumes(), heartbeat_now),
@@ -624,6 +639,14 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
         exec_duration,
         &preflight_warnings,
     );
+    // Emergency reclaim warnings (issue #174): same prose as the
+    // notification dispatched from `run_emergency_preflight`, one line per
+    // root that had a successful delete, so a TTY user sees inline that
+    // Urd deleted history to make room — not only in the events log,
+    // journald, or a desktop notification.
+    summary
+        .warnings
+        .extend(emergency_reclaim_warnings(&emergency.root_summaries));
     let output_mode = OutputMode::detect();
     let rendered = crate::voice::render_backup_summary(&summary, output_mode);
     println!("{rendered}");
@@ -2138,7 +2161,7 @@ fn format_elapsed(d: Duration) -> String {
 fn run_emergency_preflight(
     config: &Config,
     recorder: &Recorder<'_>,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<EmergencyPreflightResult> {
     let now = chrono::Local::now().naive_local();
     let btrfs = RealBtrfs::for_maintenance(&config.general.btrfs_path);
     let outcome = run_emergency_preflight_with(config, now, &btrfs, |p| {
@@ -2166,7 +2189,31 @@ fn run_emergency_preflight(
             dispatch: DispatchPolicy::Immediate,
         },
     );
-    Ok(outcome.any_deleted)
+    Ok(EmergencyPreflightResult {
+        any_deleted: outcome.any_deleted,
+        root_summaries: outcome.root_summaries,
+    })
+}
+
+/// Outcome of the emergency pre-flight surfaced to the run loop (issue
+/// #174): whether a re-plan is needed, and the per-root reclaim summaries
+/// the caller pushes into the interactive backup summary's warnings — the
+/// same prose the notification body uses, via
+/// [`notify::emergency_retention_prose`], so the two surfaces cannot drift.
+struct EmergencyPreflightResult {
+    any_deleted: bool,
+    root_summaries: Vec<EmergencyRootReclaim>,
+}
+
+/// Turn per-root emergency reclaim summaries into interactive backup
+/// summary warning lines (issue #174) — one line per root, built from the
+/// same [`notify::emergency_retention_prose`] the notification body uses,
+/// so the two surfaces can never drift. Pure function — no I/O.
+fn emergency_reclaim_warnings(root_summaries: &[EmergencyRootReclaim]) -> Vec<String> {
+    root_summaries
+        .iter()
+        .map(|r| notify::emergency_retention_prose(&r.root, r.freed_bytes, r.deleted_count))
+        .collect()
 }
 
 /// Structured outcome of an emergency-preflight pass. The injectable core
@@ -2983,6 +3030,45 @@ source = "/data/beta"
         assert_eq!(s.deleted_count, 2, "two older snaps deleted");
         assert_eq!(s.freed_bytes, Some(500_000_000));
         assert_eq!(s.root, dir.path().display().to_string());
+    }
+
+    #[test]
+    fn emergency_reclaim_warnings_one_line_per_root_known_and_unknown_freed() {
+        // Issue #174: the interactive summary gets one warning line per
+        // root, using the exact prose the notification body uses — a known
+        // freed delta for one root, an unknown (probe-failed) delta for
+        // the other, and the unknown case must never invent a size.
+        let root_summaries = vec![
+            EmergencyRootReclaim {
+                root: "/snap/home".to_string(),
+                freed_bytes: Some(8_200_000_000),
+                deleted_count: 39,
+            },
+            EmergencyRootReclaim {
+                root: "/snap/media".to_string(),
+                freed_bytes: None,
+                deleted_count: 3,
+            },
+        ];
+
+        let warnings = emergency_reclaim_warnings(&root_summaries);
+
+        assert_eq!(warnings.len(), 2, "one warning line per root");
+        assert_eq!(
+            warnings[0],
+            notify::emergency_retention_prose("/snap/home", Some(8_200_000_000), 39),
+            "must match the notification's prose exactly (one prose builder)"
+        );
+        assert_eq!(
+            warnings[1],
+            notify::emergency_retention_prose("/snap/media", None, 3),
+            "must match the notification's prose exactly (one prose builder)"
+        );
+        assert!(
+            !warnings[1].contains("Freed"),
+            "unknown freed-bytes must never invent a size: {}",
+            warnings[1]
+        );
     }
 
     #[test]
