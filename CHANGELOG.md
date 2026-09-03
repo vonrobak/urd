@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- The interactive `urd backup` summary now surfaces an emergency-preflight
+  reclaim inline as a warning — one line per snapshot root, reporting the
+  freed space (or the deletion count alone when the post-delete probe
+  failed) — instead of leaving the story to the events log, journald, and
+  the desktop notification alone. The same warning renders on the
+  empty-plan exit too, when the emergency pass freed space but the
+  re-planned run then found nothing to do. The warning line and the
+  notification body are built from the same prose function, so the two
+  surfaces can't drift (#174).
+
 ### Fixed
 - `ByteSize`'s display no longer pads whole values with a spurious decimal —
   `10GB` instead of `10.0GB`, `1KB` instead of `1.0KB` — while values that

@@ -838,6 +838,54 @@ mod contract {
         );
     }
 
+    // ── Emergency reclaim warning (issue #174) ──────────────────────────
+    // The interactive summary must surface an emergency-preflight reclaim
+    // inline, using the exact prose the desktop notification body uses
+    // (`notify::emergency_retention_prose`) — one prose builder, two
+    // surfaces, so they can never drift.
+
+    #[test]
+    fn emergency_reclaim_warning_renders_with_known_freed_bytes() {
+        let _color = color_guard(false);
+        let mut s = test_backup_summary();
+        s.warnings = vec![crate::notify::emergency_retention_prose(
+            "/snap/home",
+            Some(8_200_000_000),
+            39,
+        )];
+        let output = render_backup_summary(&s, OutputMode::Interactive);
+        assert!(
+            output.contains("WARNING:"),
+            "expected a WARNING: line in:\n{output}"
+        );
+        assert!(
+            output.contains("Freed 8.2GB from /snap/home by deleting 39 snapshots before backup."),
+            "expected the exact emergency reclaim prose in:\n{output}"
+        );
+    }
+
+    #[test]
+    fn emergency_reclaim_warning_renders_without_inventing_a_size() {
+        let _color = color_guard(false);
+        let mut s = test_backup_summary();
+        s.warnings = vec![crate::notify::emergency_retention_prose(
+            "/snap/media",
+            None,
+            3,
+        )];
+        let output = render_backup_summary(&s, OutputMode::Interactive);
+        assert!(
+            output.contains(
+                "Deleted 3 snapshots from /snap/media to recover critical space before backup."
+            ),
+            "expected the count-only emergency reclaim prose in:\n{output}"
+        );
+        assert!(
+            !output.contains("Freed"),
+            "must not invent a freed size when the probe failed: {output}"
+        );
+    }
+
     // ── Rule 5 — First-line answer ─────────────────────────────────────
 
     #[test]

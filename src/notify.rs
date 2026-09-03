@@ -588,6 +588,24 @@ pub fn build_drive_needs_adoption_notification(label: &str) -> Notification {
     }
 }
 
+/// Prose for one snapshot root's emergency reclaim. Shared verbatim between
+/// the notification body and the interactive backup summary's warning line
+/// (issue #174) so the two surfaces can never drift. `freed_bytes` is `None`
+/// when the post-delete free-space probe failed — the prose then reports
+/// only the deletion count, never a made-up size.
+#[must_use]
+pub fn emergency_retention_prose(root: &str, freed_bytes: Option<u64>, deleted_count: usize) -> String {
+    match freed_bytes {
+        Some(bytes) => format!(
+            "Freed {} from {root} by deleting {deleted_count} snapshots before backup.",
+            crate::types::ByteSize(bytes)
+        ),
+        None => format!(
+            "Deleted {deleted_count} snapshots from {root} to recover critical space before backup."
+        ),
+    }
+}
+
 /// Build a notification for emergency retention that ran before a backup.
 /// `freed_bytes` is `None` when the post-delete free-space probe failed —
 /// the body then reports only the deletion count, never a made-up size.
@@ -597,15 +615,7 @@ pub fn build_emergency_retention_notification(
     freed_bytes: Option<u64>,
     deleted_count: usize,
 ) -> Notification {
-    let body = match freed_bytes {
-        Some(bytes) => format!(
-            "Freed {} from {root} by deleting {deleted_count} snapshots before backup.",
-            crate::types::ByteSize(bytes)
-        ),
-        None => format!(
-            "Deleted {deleted_count} snapshots from {root} to recover critical space before backup."
-        ),
-    };
+    let body = emergency_retention_prose(root, freed_bytes, deleted_count);
     Notification {
         event: NotificationEvent::EmergencyRetentionRan {
             root: root.to_string(),

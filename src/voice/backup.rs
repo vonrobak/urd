@@ -31,6 +31,22 @@ fn render_backup_daemon(data: &BackupSummary) -> String {
     serde_json::to_string_pretty(data).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
 }
 
+/// Render each warning with the `WARNING:` prefix, one per line. Shared by
+/// the interactive summary's warnings block and the empty-plan exit's
+/// emergency-reclaim announcement (issue #174) — an emergency pass can
+/// delete snapshots and then find nothing left to do, and that exit has no
+/// `BackupSummary` to attach a warning to, so it renders the same lines
+/// directly. Kept here so both call sites can never drift: the voice layer
+/// owns the `WARNING:` prefix, not the caller. Empty input renders nothing.
+#[must_use]
+pub(crate) fn render_warning_lines(warnings: &[String]) -> String {
+    let mut out = String::new();
+    for warning in warnings {
+        writeln!(out, "{} {}", "WARNING:".yellow().bold(), warning).ok();
+    }
+    out
+}
+
 fn render_backup_interactive(data: &BackupSummary) -> String {
     let mut out = String::new();
 
@@ -144,9 +160,7 @@ fn render_backup_interactive(data: &BackupSummary) -> String {
     // ── Warnings ─────────────────────────────────────────────────────
     if !data.warnings.is_empty() {
         writeln!(out).ok();
-        for warning in &data.warnings {
-            writeln!(out, "{} {}", "WARNING:".yellow().bold(), warning).ok();
-        }
+        out.push_str(&render_warning_lines(&data.warnings));
     }
 
     // ── Notes (informational, not warnings) ──────────────────────────
@@ -544,6 +558,35 @@ mod tests {
         StructuredError, SubvolumeSummary,
     };
     use crate::voice::test_fixtures::color_guard;
+
+    // ── Warning lines (issue #174) ──────────────────────────────────────
+    // Shared verbatim by the interactive summary's warnings block and the
+    // empty-plan exit's emergency-reclaim announcement — pinning it here
+    // covers both call sites at once.
+
+    #[test]
+    fn render_warning_lines_prefixes_each_line() {
+        let _c = color_guard(false);
+        let warnings = vec![
+            "Freed 8.2GB from /snap/home by deleting 39 snapshots before backup.".to_string(),
+            "Deleted 3 snapshots from /snap/media to recover critical space before backup."
+                .to_string(),
+        ];
+
+        let out = render_warning_lines(&warnings);
+
+        assert_eq!(
+            out,
+            "WARNING: Freed 8.2GB from /snap/home by deleting 39 snapshots before backup.\n\
+             WARNING: Deleted 3 snapshots from /snap/media to recover critical space before backup.\n"
+        );
+    }
+
+    #[test]
+    fn render_warning_lines_empty_input_renders_nothing() {
+        let _c = color_guard(false);
+        assert_eq!(render_warning_lines(&[]), "");
+    }
 
     // ── "Safe to remove" cue (UPI 056, RD2) ────────────────────────────
 
