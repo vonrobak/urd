@@ -215,6 +215,18 @@ impl PromiseStatus {
     pub fn worsened_from(self, prev: Self) -> bool {
         self < prev
     }
+
+    /// Prometheus metric value for `backup_promise_state`: 0=protected,
+    /// 1=at_risk, 2=unprotected. The encoding is part of the `backup_*`
+    /// contract (`docs/20-reference/metrics.md`) — do not renumber.
+    #[must_use]
+    pub fn metric_value(self) -> u8 {
+        match self {
+            Self::Protected => 0,
+            Self::AtRisk => 1,
+            Self::Unprotected => 2,
+        }
+    }
 }
 
 impl std::fmt::Display for PromiseStatus {
@@ -1568,6 +1580,15 @@ mod tests {
         assert!(PromiseStatus::Unprotected.worsened_from(PromiseStatus::AtRisk));
         assert!(!PromiseStatus::Protected.worsened_from(PromiseStatus::AtRisk));
         assert!(!PromiseStatus::Protected.worsened_from(PromiseStatus::Protected));
+    }
+
+    // ── PromiseStatus::metric_value (backup_promise_state, issue #337) ──
+
+    #[test]
+    fn metric_value_matches_contract_encoding() {
+        assert_eq!(PromiseStatus::Protected.metric_value(), 0);
+        assert_eq!(PromiseStatus::AtRisk.metric_value(), 1);
+        assert_eq!(PromiseStatus::Unprotected.metric_value(), 2);
     }
 
     /// Test config with one drive and min_free_bytes set.

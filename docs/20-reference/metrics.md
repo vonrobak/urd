@@ -6,7 +6,7 @@ project: ['[[urd]]']
 sensitivity: public
 status: active
 created: '2026-05-02'
-timestamp: '2026-09-03T12:45:40+02:00'
+timestamp: '2026-09-03T13:15:00+02:00'
 ---
 # Prometheus Metrics Reference
 
@@ -37,9 +37,11 @@ These properties are guaranteed and load-bearing for downstream consumers
    change with coordinated downstream updates. The `urd_*` namespace is
    reserved for Urd internals and may evolve freely.
 2. **Encoding stability.** `backup_send_type`'s value mapping
-   (`0=full / 1=incremental / 2=no-send / 3=deferred`) and
-   `backup_success`'s mapping (`0=failure / 1=success / 2=schedule-skipped`)
-   are part of the contract. A consumer that filters on `backup_send_type == 2`
+   (`0=full / 1=incremental / 2=no-send / 3=deferred`),
+   `backup_success`'s mapping (`0=failure / 1=success / 2=schedule-skipped`),
+   and `backup_promise_state`'s mapping (`0=protected / 1=at_risk /
+   2=unprotected`, `PromiseStatus::metric_value` in `src/awareness.rs`) are
+   part of the contract. A consumer that filters on `backup_send_type == 2`
    to suppress alerts on cold subvolumes will silently break if the encoding shifts.
 3. **`backup_script_last_run_timestamp` is the heartbeat.** Updated on every
    run regardless of outcome. A monitor can detect "Urd itself stopped" by
@@ -84,6 +86,18 @@ These properties are guaranteed and load-bearing for downstream consumers
    metrics are written by external tooling. Urd must never emit those names.
 10. **Reserved namespace.** Urd writes only `backup_*` (public contract) and
     `urd_*` (internal). Other prefixes are out of scope.
+11. **The `_total` counters are all-time cumulative, not per-run.** Every
+    `_total` series (`backup_circuit_breaker_trips_total`,
+    `backup_emergency_prunes_total`, `backup_chain_broken_full_sends_total`,
+    and their `urd_*` siblings) is a `COUNT(*)` over the structured event log
+    ([ADR-114](../00-foundation/decisions/2026-04-30-ADR-114-structured-event-log.md)),
+    not a delta since the last run. They are monotonic for as long as the
+    events table is never pruned — true today (`src/state.rs` has no
+    events-table delete path). If a future retention policy starts pruning
+    old events, these counters would drop rather than only ever climb;
+    consumers should query them with `increase()` or `rate()`, both of which
+    already tolerate a counter reset, rather than assuming monotonicity by
+    reading the raw value.
 
 ---
 
@@ -185,6 +199,29 @@ Gauge. Bytes of the most recent in-window full send (UPI 030).
 subvolumes. Emitted for transient/storage-critical subvolumes whose latest
 send was a full send (so the previous incremental rate doesn't apply).
 
+### `backup_pin_failures`
+
+Gauge. Number of sends that succeeded but whose pin-file (chain marker)
+write failed, for this subvolume in this run. Same source as heartbeat v3's
+per-subvolume `pin_failures` field.
+
+**Conditional.** Emitted (including `0`, per contract point 4) for every
+subvolume this run's awareness assessment covers — every *enabled*
+subvolume, whether executed, skipped (interval, drive absent), or deferred.
+**Absent for a disabled subvolume**: awareness computes no assessment for a
+disabled subvolume, so there is no promise for it to report pin failures
+against. This is the same population as `backup_promise_state` below.
+
+### `backup_promise_state`
+
+Gauge. This subvolume's post-run promise status: `0=protected`, `1=at_risk`,
+`2=unprotected` (see Contract point 2). Sourced from the same post-run
+awareness assessment that feeds the heartbeat's `promise_status` field.
+
+**Conditional.** Same population and absence rule as `backup_pin_failures`
+above: present for every enabled subvolume assessed this run, absent for a
+disabled subvolume.
+
 ---
 
 ## Global gauges
@@ -284,6 +321,34 @@ Same `scope="none"` zero sentinel as above.
 Counter, label `rule`. Snapshot prunes by retention rule
 (`graduated_hourly`, `graduated_daily`, `emergency`, ...). Same `rule="none"`
 zero sentinel as above.
+
+---
+
+## Public mirrors of alert-worthy counters (`backup_*`)
+
+Three signals above were alert-worthy but reachable only under `urd_*`,
+which downstream alerting does not bind to (issues #337/#338). Each mirror
+below has **the exact same value** as a specific `urd_*` series or label
+slice — same events-table derivation, same all-time-cumulative semantics
+(Contract point 11) — projected onto a no-label `backup_*` name so an alert
+rule can reach it directly.
+
+### `backup_circuit_breaker_trips_total`
+
+Counter, no labels. Same value as `urd_circuit_breaker_trips_total`.
+
+### `backup_emergency_prunes_total`
+
+Counter, no labels. Same value as
+`urd_retention_prunes_total{rule="emergency"}`; `0` when no emergency-rule
+prune events exist (including when the events table is empty).
+
+### `backup_chain_broken_full_sends_total`
+
+Counter, no labels. Same value as
+`urd_planner_full_sends_total{reason="chain_broken"}`; `0` when no
+chain-broken full sends have occurred (including when the events table is
+empty).
 
 ---
 

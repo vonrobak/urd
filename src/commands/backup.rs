@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use colored::Colorize;
 
+use crate::awareness::{PromiseStatus, SubvolAssessment};
 use crate::btrfs::{BtrfsOps, RealBtrfs};
 use crate::cli::BackupArgs;
 use crate::commands::storage_signals;
@@ -213,6 +214,7 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
             &fs_state,
             &churn_views,
             &observability,
+            &assessments,
         )?;
         if let Err(e) = heartbeat::write(&config.general.heartbeat_file, &tail.heartbeat) {
             log::warn!("Failed to write heartbeat: {e}");
@@ -578,6 +580,7 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
         &fs_state,
         &churn_views,
         &observability,
+        &assessments,
     )?;
 
     // Write heartbeat (fresh timestamp — `now` is from before execution).
@@ -1336,6 +1339,19 @@ fn externally_expected_subvolumes(config: &Config) -> HashSet<String> {
         .collect()
 }
 
+/// Look up each assessed subvolume's promise status by name (issues
+/// #337/#338: `backup_pin_failures` / `backup_promise_state`). The
+/// population is exactly the awareness assessments for this run — enabled
+/// subvolumes only; disabled subvolumes never appear here, matching
+/// heartbeat v3's own `pin_failures`/`promise_status` population.
+fn promise_status_lookup(assessments: &[SubvolAssessment]) -> HashMap<&str, PromiseStatus> {
+    assessments
+        .iter()
+        .map(|a| (a.name.as_str(), a.status))
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
 fn write_metrics_after_execution(
     config: &Config,
     result: &crate::executor::ExecutionResult,
@@ -1344,9 +1360,11 @@ fn write_metrics_after_execution(
     fs_state: &dyn FilesystemQuery,
     churn_views: &HashMap<String, ChurnHeartbeatFields>,
     observability: &PoolObservability,
+    assessments: &[SubvolAssessment],
 ) -> anyhow::Result<()> {
     let now_ts = now.and_utc().timestamp();
     let external_expected = externally_expected_subvolumes(config);
+    let promise_by_name = promise_status_lookup(assessments);
     let mut subvolume_metrics = Vec::new();
 
     // Metrics for executed subvolumes
@@ -1362,6 +1380,11 @@ fn write_metrics_after_execution(
         let external_count = count_external_snapshots(config, &sv_result.name, fs_state);
         let churn = churn_views.get(&sv_result.name).copied().unwrap_or_default();
         let extras = observability.subvol_extras.get(&sv_result.name);
+        // `Some` iff this subvolume has an assessment this run (always true for
+        // an executed subvolume in practice — the executor only runs enabled
+        // subvolumes, and assess() covers every enabled one). Ties pin_failures'
+        // presence to promise_state's rather than assuming it independently.
+        let assessed_status = promise_by_name.get(sv_result.name.as_str()).copied();
 
         subvolume_metrics.push(SubvolumeMetrics {
             name: sv_result.name.clone(),
@@ -1377,6 +1400,8 @@ fn write_metrics_after_execution(
             local_snapshot_count_v4: extras.and_then(|e| e.local_snapshot_count),
             estimated_local_pinned_delta_bytes: extras
                 .and_then(|e| e.estimated_local_pinned_delta_bytes),
+            pin_failures: assessed_status.map(|_| sv_result.pin_failures),
+            promise_state: assessed_status.map(|s| s.metric_value()),
         });
     }
 
@@ -1394,6 +1419,7 @@ fn write_metrics_after_execution(
         &already_emitted,
         churn_views,
         observability,
+        &promise_by_name,
     );
 
     // Carry forward last_success_timestamp from previous .prom file
@@ -1406,6 +1432,7 @@ fn write_metrics_after_execution(
 /// Execute the tail's metrics decision (UPI 088-b): one total match over
 /// [`MetricsSpec`], shared by both exits — the variant carries the execution
 /// result its writer needs, so neither call site has an impossible arm.
+#[allow(clippy::too_many_arguments)]
 fn write_metrics_per_spec(
     config: &Config,
     spec: &MetricsSpec<'_>,
@@ -1414,11 +1441,18 @@ fn write_metrics_per_spec(
     fs_state: &dyn FilesystemQuery,
     churn_views: &HashMap<String, ChurnHeartbeatFields>,
     observability: &PoolObservability,
+    assessments: &[SubvolAssessment],
 ) -> anyhow::Result<()> {
     match spec {
-        MetricsSpec::Skipped => {
-            write_metrics_for_skipped(config, plan, now, fs_state, churn_views, observability)
-        }
+        MetricsSpec::Skipped => write_metrics_for_skipped(
+            config,
+            plan,
+            now,
+            fs_state,
+            churn_views,
+            observability,
+            assessments,
+        ),
         MetricsSpec::AfterExecution(result) => write_metrics_after_execution(
             config,
             result,
@@ -1427,6 +1461,7 @@ fn write_metrics_per_spec(
             fs_state,
             churn_views,
             observability,
+            assessments,
         ),
     }
 }
@@ -1438,8 +1473,10 @@ fn write_metrics_for_skipped(
     fs_state: &dyn FilesystemQuery,
     churn_views: &HashMap<String, ChurnHeartbeatFields>,
     observability: &PoolObservability,
+    assessments: &[SubvolAssessment],
 ) -> anyhow::Result<()> {
     let now_ts = now.and_utc().timestamp();
+    let promise_by_name = promise_status_lookup(assessments);
     let mut subvolume_metrics = Vec::new();
 
     append_skipped_metrics(
@@ -1450,6 +1487,7 @@ fn write_metrics_for_skipped(
         &HashSet::new(),
         churn_views,
         observability,
+        &promise_by_name,
     );
 
     // Carry forward last_success_timestamp from previous .prom file
@@ -1731,6 +1769,7 @@ fn build_empty_plan_explanation(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn append_skipped_metrics(
     config: &Config,
     plan: &crate::types::BackupPlan,
@@ -1739,6 +1778,7 @@ fn append_skipped_metrics(
     already_emitted: &HashSet<String>,
     churn_views: &HashMap<String, ChurnHeartbeatFields>,
     observability: &PoolObservability,
+    promise_by_name: &HashMap<&str, PromiseStatus>,
 ) {
     let external_expected = externally_expected_subvolumes(config);
     let mut seen = already_emitted.clone();
@@ -1753,6 +1793,11 @@ fn append_skipped_metrics(
         let external_count = count_external_snapshots(config, name, fs_state);
         let churn = churn_views.get(name).copied().unwrap_or_default();
         let extras = observability.subvol_extras.get(name);
+        // A skipped subvolume was never executed, so any pin failure is
+        // impossible — 0 whenever it was assessed (mirrors heartbeat's
+        // `sv_result.map(...).unwrap_or(0)`, where `sv_result` is always
+        // `None` for a name absent from `result.subvolume_results`).
+        let assessed_status = promise_by_name.get(name.as_str()).copied();
 
         subvolume_metrics.push(SubvolumeMetrics {
             name: name.clone(),
@@ -1768,6 +1813,8 @@ fn append_skipped_metrics(
             local_snapshot_count_v4: extras.and_then(|e| e.local_snapshot_count),
             estimated_local_pinned_delta_bytes: extras
                 .and_then(|e| e.estimated_local_pinned_delta_bytes),
+            pin_failures: assessed_status.map(|_| 0),
+            promise_state: assessed_status.map(|s| s.metric_value()),
         });
     }
 }
@@ -2543,9 +2590,7 @@ fn filter_promise_retention(config: &Config, plan: &mut BackupPlan) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::awareness::{
-        LocalAssessment, OperationalHealth, PromiseStatus, SubvolAssessment,
-    };
+    use crate::awareness::{LocalAssessment, OperationalHealth};
     use crate::types::SendKind;
     use crate::executor::{
         ExecutionResult, OpResult, OperationOutcome, RunResult, SendType, SubvolumeResult,
@@ -3329,6 +3374,32 @@ source = "/data/beta"
             cadence_adapted: false,
             effective_send_interval: None,
         }]
+    }
+
+    // ── promise_status_lookup (backup_pin_failures / backup_promise_state,
+    //    issues #337/#338) ────────────────────────────────────────────
+
+    #[test]
+    fn promise_status_lookup_finds_assessed_subvolume() {
+        let assessments = sample_assessments();
+        let lookup = promise_status_lookup(&assessments);
+        assert_eq!(lookup.get("htpc-home"), Some(&PromiseStatus::Protected));
+    }
+
+    #[test]
+    fn promise_status_lookup_misses_unassessed_subvolume() {
+        // Models a disabled subvolume: assess() never produced an entry for
+        // it, so the lookup must not synthesize one.
+        let assessments = sample_assessments();
+        let lookup = promise_status_lookup(&assessments);
+        assert_eq!(lookup.get("some-disabled-subvol"), None);
+    }
+
+    #[test]
+    fn promise_status_lookup_empty_for_no_assessments() {
+        let assessments = empty_assessments();
+        let lookup = promise_status_lookup(&assessments);
+        assert!(lookup.is_empty());
     }
 
     fn empty_plan() -> BackupPlan {
