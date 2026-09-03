@@ -20,7 +20,7 @@ use crate::types::{ByteSize, DriveRole};
 
 use super::drive_row::{aggregate_drive_info, offsite_drive_label, unmounted_drive_label};
 use super::{
-    SuggestionContext, append_suggestion, color_result, exposure_label, format_status_table,
+    SuggestionContext, append_suggestion, color_result, exposure_cell, format_status_table,
     humanize_cadence, humanize_duration, pluralize,
 };
 
@@ -335,24 +335,20 @@ fn storage_posture_line(p: &PoolPostureSummary) -> colored::ColoredString {
 
 /// The EXPOSURE cell string for one row (UPI 080, adapting de-emphasis).
 ///
-/// Normally the plain voice label (`sealed`/`waning`/`exposed`), coloured
-/// downstream by `color_exposure_str` on the safety column. The one exception:
-/// an *adapting* row — AT RISK purely because the Critical-pool cadence cap
-/// slowed it (`cadence_adapted`), with a healthy chain — is "waning by design",
-/// not a failure, so its cell is pre-dimmed here. De-emphasis only: it is never
-/// brighter than `status`, and the `health == "healthy"` clause is ruling (i) —
-/// a broken-chain (degraded) capped row keeps the alarming yellow, because a
-/// broken chain *is* something to act on. The pre-coloured string passes through
-/// `color_exposure_str`'s fall-through branch untouched.
-fn exposure_cell(a: &StatusAssessment) -> String {
-    let label = exposure_label(a.status);
+/// Normally the earned color for `a.status` (`sealed`/`waning`/`exposed`),
+/// via the shared `exposure_cell(status, dimmed)` (#305) — the enum drives
+/// the color decision directly, no string re-match involved. The one
+/// exception: an *adapting* row — AT RISK purely because the Critical-pool
+/// cadence cap slowed it (`cadence_adapted`), with a healthy chain — is
+/// "waning by design", not a failure, so its cell is pre-dimmed instead.
+/// De-emphasis only: it is never brighter than `status`, and the
+/// `health == "healthy"` clause is ruling (i) — a broken-chain (degraded)
+/// capped row keeps the alarming yellow, because a broken chain *is*
+/// something to act on.
+fn assessment_exposure_cell(a: &StatusAssessment) -> String {
     let adapting =
         a.status == PromiseStatus::AtRisk && a.cadence_adapted && a.health == "healthy";
-    if adapting {
-        label.dimmed().to_string()
-    } else {
-        label
-    }
+    exposure_cell(a.status, adapting)
 }
 
 pub(super) fn render_subvolume_table(data: &StatusOutput, out: &mut String) {
@@ -409,9 +405,11 @@ pub(super) fn render_subvolume_table(data: &StatusOutput, out: &mut String) {
     }
     headers.push("THREAD".to_string());
 
-    // Track which columns need coloring. Indices shift when EXPOSURE is hidden:
-    // HEALTH then leads at index 0 instead of following EXPOSURE at index 1.
-    let safety_col = if show_exposure { Some(0usize) } else { None };
+    // Track which column needs HEALTH coloring. Its index shifts when
+    // EXPOSURE is hidden: HEALTH then leads at index 0 instead of following
+    // EXPOSURE at index 1. EXPOSURE cells arrive already colored (built via
+    // `assessment_exposure_cell`/`exposure_cell`, #305) so they need no
+    // column-index bookkeeping here.
     let health_col = if show_health {
         Some(if show_exposure { 1 } else { 0 })
     } else {
@@ -424,7 +422,7 @@ pub(super) fn render_subvolume_table(data: &StatusOutput, out: &mut String) {
         // Safety column — omitted entirely when every subvolume is sealed.
         let mut row: Vec<String> = Vec::new();
         if show_exposure {
-            row.push(exposure_cell(assessment));
+            row.push(assessment_exposure_cell(assessment));
         }
 
         if show_health {
@@ -488,7 +486,7 @@ pub(super) fn render_subvolume_table(data: &StatusOutput, out: &mut String) {
         rows.push(row);
     }
 
-    format_status_table(&headers, &rows, safety_col, health_col, out);
+    format_status_table(&headers, &rows, health_col, out);
 }
 
 /// Render chain health for interactive display.

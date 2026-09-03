@@ -14,6 +14,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Rounding is unchanged: `9.96GB` still rounds up and now reads `10GB`
   instead of `10.0GB` (#332).
 
+### Changed
+- The EXPOSURE column's label-to-color plumbing now carries `PromiseStatus`
+  straight to the color decision instead of round-tripping through the
+  `"sealed"`/`"waning"`/`"exposed"` strings: `exposure_cell(status, dimmed)`
+  matches the enum exhaustively (compiler-enforced against new variants),
+  with the UPI 080 pre-dimmed adapting-row case as an explicit parameter. The
+  table formatter no longer re-matches on the EXPOSURE column at all, closing
+  the silent-uncolored-fallthrough hazard the old string relay had. No
+  behavior change — `urd status`/`urd backup` output is byte-identical (#305).
+
 ## [0.35.0] - 2026-07-15
 
 ### Fixed

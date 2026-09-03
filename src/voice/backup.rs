@@ -14,8 +14,8 @@ use crate::output::{BackupSummary, OutputMode, PreActionSummary, SkipCategory};
 use crate::types::{ByteSize, DriveRole};
 
 use super::{
-    SuggestionContext, append_suggestion, color_result, exposure_label, format_status_table,
-    pluralize, skip_tag,
+    SuggestionContext, append_suggestion, color_result, exposure_cell, exposure_label,
+    format_status_table, pluralize, skip_tag,
 };
 
 /// Render post-backup summary according to the given mode.
@@ -397,7 +397,7 @@ fn render_assessment_table(data: &BackupSummary, out: &mut String) {
     // Build rows
     let mut rows: Vec<Vec<String>> = Vec::new();
     for assessment in &data.assessments {
-        let mut row = vec![exposure_label(assessment.status)];
+        let mut row = vec![exposure_cell(assessment.status, false)];
         if show_protection {
             row.push(
                 assessment
@@ -425,7 +425,7 @@ fn render_assessment_table(data: &BackupSummary, out: &mut String) {
         rows.push(row);
     }
 
-    format_status_table(&headers, &rows, Some(0), None, out);
+    format_status_table(&headers, &rows, None, out);
 }
 
 /// Render advisories and errors from awareness assessments.
