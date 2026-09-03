@@ -402,7 +402,13 @@ enum SuggestionContext {
     /// Bare `urd` (default command).
     Default { has_issues: bool },
     /// `urd plan`.
-    Plan { has_operations: bool, has_space_skip: bool },
+    Plan {
+        has_operations: bool,
+        has_space_skip: bool,
+        /// At least one full send has no size estimate — `urd calibrate`
+        /// would give it a total and an ETA on the progress line (UPI 254).
+        has_unsized_full_send: bool,
+    },
     /// `urd backup`.
     Backup { has_failures: bool },
     /// `urd verify`.
@@ -420,12 +426,15 @@ fn suggest_next_action(context: &SuggestionContext) -> Option<&'static str> {
         SuggestionContext::Default { has_issues: true } => {
             Some("Run `urd status` for details.")
         }
-        SuggestionContext::Plan { has_space_skip: true, has_operations: true } => {
+        SuggestionContext::Plan { has_space_skip: true, has_operations: true, .. } => {
             Some("Run `urd calibrate` to review retention, then `urd backup`.")
         }
         SuggestionContext::Plan { has_space_skip: true, .. } => {
             Some("Run `urd calibrate` to review retention.")
         }
+        SuggestionContext::Plan { has_unsized_full_send: true, .. } => Some(
+            "Run `urd calibrate` to size first sends \u{2014} the progress line then shows a total and an ETA.",
+        ),
         SuggestionContext::Plan { has_operations: true, .. } => {
             Some("Run `urd backup` to execute this plan.")
         }
@@ -2071,6 +2080,105 @@ mod tests {
     }
 
     #[test]
+    fn plan_unsized_full_send_suggests_calibrate() {
+        let _color = color_guard(false);
+        let data = PlanOutput {
+            timestamp: "2026-03-29 13:57".to_string(),
+            operations: vec![PlanOperationEntry {
+                subvolume: "htpc-docs".to_string(),
+                operation: "send".to_string(),
+                detail: "snap -> WD-18TB (full \u{2014} first send)".to_string(),
+                drive_label: Some("WD-18TB".to_string()),
+                estimated_bytes: None,
+                is_full_send: Some(true),
+                full_send_reason: Some("first send".to_string()),
+            }],
+            skipped: vec![],
+            summary: PlanSummaryOutput {
+                snapshots: 1,
+                sends: 1,
+                deletions: 0,
+                skipped: 0,
+                estimated_total_bytes: None,
+                configured_subvolumes: 1,
+            },
+            warnings: vec![],
+        };
+        let output = render_plan(&data, OutputMode::Interactive, true);
+        assert!(
+            output.contains("urd calibrate"),
+            "unsized full send should nudge toward calibrate: {output}"
+        );
+    }
+
+    #[test]
+    fn plan_sized_full_send_no_calibrate_suggestion() {
+        let _color = color_guard(false);
+        let data = PlanOutput {
+            timestamp: "2026-03-29 13:57".to_string(),
+            operations: vec![PlanOperationEntry {
+                subvolume: "htpc-home".to_string(),
+                operation: "send".to_string(),
+                detail: "snap -> WD-18TB (full \u{2014} first send)".to_string(),
+                drive_label: Some("WD-18TB".to_string()),
+                estimated_bytes: Some(53_000_000_000),
+                is_full_send: Some(true),
+                full_send_reason: Some("first send".to_string()),
+            }],
+            skipped: vec![],
+            summary: PlanSummaryOutput {
+                snapshots: 1,
+                sends: 1,
+                deletions: 0,
+                skipped: 0,
+                estimated_total_bytes: Some(53_000_000_000),
+                configured_subvolumes: 1,
+            },
+            warnings: vec![],
+        };
+        let output = render_plan(&data, OutputMode::Interactive, true);
+        assert!(
+            !output.contains("urd calibrate"),
+            "a full send that already has an estimate should not nudge toward calibrate: {output}"
+        );
+    }
+
+    #[test]
+    fn plan_unsized_incremental_no_calibrate_suggestion() {
+        let _color = color_guard(false);
+        // Calibration cannot help an incremental send (it sizes whole
+        // subvolumes, not diffs), so a missing estimate here must not
+        // trigger the nudge.
+        let data = PlanOutput {
+            timestamp: "2026-03-29 13:57".to_string(),
+            operations: vec![PlanOperationEntry {
+                subvolume: "htpc-home".to_string(),
+                operation: "send".to_string(),
+                detail: "snap -> WD-18TB (incremental, parent: prev)".to_string(),
+                drive_label: Some("WD-18TB".to_string()),
+                estimated_bytes: None,
+                is_full_send: Some(false),
+                full_send_reason: None,
+            }],
+            skipped: vec![],
+            summary: PlanSummaryOutput {
+                snapshots: 1,
+                sends: 1,
+                deletions: 0,
+                skipped: 0,
+                estimated_total_bytes: None,
+                configured_subvolumes: 1,
+            },
+            warnings: vec![],
+        };
+        let output = render_plan(&data, OutputMode::Interactive, true);
+        assert!(
+            !output.contains("urd calibrate"),
+            "an unsized incremental send should not nudge toward calibrate: {output}"
+        );
+    }
+
+    #[test]
     fn plan_daemon_json_includes_estimated_bytes() {
         let data = PlanOutput {
             timestamp: "2026-03-29 13:57".to_string(),
@@ -3657,6 +3765,7 @@ mod tests {
         assert!(suggest_next_action(&SuggestionContext::Plan {
             has_operations: false,
             has_space_skip: false,
+            has_unsized_full_send: false,
         })
         .is_none());
     }
@@ -3666,6 +3775,7 @@ mod tests {
         let s = suggest_next_action(&SuggestionContext::Plan {
             has_operations: true,
             has_space_skip: false,
+            has_unsized_full_send: false,
         })
         .unwrap();
         assert!(s.contains("urd backup"), "should suggest backup: {s}");
@@ -3676,10 +3786,38 @@ mod tests {
         let s = suggest_next_action(&SuggestionContext::Plan {
             has_operations: true,
             has_space_skip: true,
+            has_unsized_full_send: false,
         })
         .unwrap();
         assert!(s.contains("urd calibrate"), "should suggest calibrate: {s}");
         assert!(s.contains("urd backup"), "should also suggest backup: {s}");
+    }
+
+    #[test]
+    fn suggestion_plan_unsized_full_send_suggests_calibrate() {
+        let s = suggest_next_action(&SuggestionContext::Plan {
+            has_operations: true,
+            has_space_skip: false,
+            has_unsized_full_send: true,
+        })
+        .unwrap();
+        assert!(s.contains("urd calibrate"), "should suggest calibrate: {s}");
+        assert!(s.contains("total"), "should mention the progress-line total: {s}");
+        assert!(s.contains("ETA"), "should mention the ETA: {s}");
+    }
+
+    #[test]
+    fn suggestion_plan_space_skip_wins_over_unsized_full_send() {
+        // Only one suggestion line is ever shown — space-skip's calibrate
+        // nudge already points at `urd calibrate`, so it takes priority
+        // over the unsized-full-send nudge when both conditions hold.
+        let s = suggest_next_action(&SuggestionContext::Plan {
+            has_operations: true,
+            has_space_skip: true,
+            has_unsized_full_send: true,
+        })
+        .unwrap();
+        assert!(s.contains("review retention"), "space-skip wording should win: {s}");
     }
 
     #[test]

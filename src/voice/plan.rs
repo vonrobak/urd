@@ -193,10 +193,18 @@ fn render_plan_interactive(data: &PlanOutput, verbose: bool) -> String {
         .skipped
         .iter()
         .any(|s| s.category == SkipCategory::SpaceExceeded);
+    // A first-ever full send has nothing to estimate from (no same-drive or
+    // any-drive history, no calibrated size) — `urd calibrate` is the honest
+    // fix, since auto-calibrating with a `du -sb` walk before every send
+    // would be a do-no-harm concern (UPI 254).
+    let has_unsized_full_send = data.operations.iter().any(|op| {
+        op.operation == "send" && op.is_full_send == Some(true) && op.estimated_bytes.is_none()
+    });
     append_suggestion(
         &SuggestionContext::Plan {
             has_operations: !data.operations.is_empty(),
             has_space_skip,
+            has_unsized_full_send,
         },
         &mut out,
     );
