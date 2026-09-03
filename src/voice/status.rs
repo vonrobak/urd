@@ -1,7 +1,7 @@
 //! Status renderer — `urd status` command output.
 //!
 //! Sub-module of `crate::voice`. Cross-renderer helpers (`exposure_label`,
-//! `humanize_duration`, `format_status_table`, `color_*`) live in the
+//! `humanize_duration`, `format_table`, `color_*`) live in the
 //! parent and are imported via `super`. Status-private helpers (per-section
 //! formatters, table builders) live here.
 
@@ -10,7 +10,7 @@ use std::fmt::Write;
 use colored::Colorize;
 
 use crate::advice::RedundancyAdvisoryKind;
-use crate::awareness::{PromiseRollup, PromiseStatus};
+use crate::awareness::{OperationalHealth, PromiseRollup, PromiseStatus};
 use crate::output::{
     ChainHealth, DefaultStatusOutput, OutputMode, PoolPostureSummary, StatusAssessment,
     StatusOutput,
@@ -20,7 +20,7 @@ use crate::types::{ByteSize, DriveRole};
 
 use super::drive_row::{aggregate_drive_info, offsite_drive_label, unmounted_drive_label};
 use super::{
-    SuggestionContext, append_suggestion, color_result, exposure_cell, format_status_table,
+    SuggestionContext, append_suggestion, color_result, exposure_cell, format_table, health_cell,
     humanize_cadence, humanize_duration, pluralize,
 };
 
@@ -351,6 +351,22 @@ fn assessment_exposure_cell(a: &StatusAssessment) -> String {
     exposure_cell(a.status, adapting)
 }
 
+/// Recover `StatusAssessment.health`'s enum via `OperationalHealth::from_label`
+/// and render its colored HEALTH cell (mirrors `assessment_exposure_cell`).
+/// An unrecognized label can only mean that mapping has drifted from
+/// `OperationalHealth::Display` — caught here via `debug_assert!` rather
+/// than shipped silently (#361); a release build fails open (ADR-107) and
+/// renders the label uncolored.
+fn assessment_health_cell(a: &StatusAssessment) -> String {
+    match OperationalHealth::from_label(&a.health) {
+        Some(health) => health_cell(health),
+        None => {
+            debug_assert!(false, "unrecognized health label: {:?}", a.health);
+            a.health.clone()
+        }
+    }
+}
+
 pub(super) fn render_subvolume_table(data: &StatusOutput, out: &mut String) {
     if data.assessments.is_empty() {
         writeln!(out, "{}", "No subvolumes configured.".dimmed()).ok();
@@ -405,17 +421,6 @@ pub(super) fn render_subvolume_table(data: &StatusOutput, out: &mut String) {
     }
     headers.push("THREAD".to_string());
 
-    // Track which column needs HEALTH coloring. Its index shifts when
-    // EXPOSURE is hidden: HEALTH then leads at index 0 instead of following
-    // EXPOSURE at index 1. EXPOSURE cells arrive already colored (built via
-    // `assessment_exposure_cell`/`exposure_cell`, #305) so they need no
-    // column-index bookkeeping here.
-    let health_col = if show_health {
-        Some(if show_exposure { 1 } else { 0 })
-    } else {
-        None
-    };
-
     // Build rows
     let mut rows: Vec<Vec<String>> = Vec::new();
     for assessment in &data.assessments {
@@ -426,7 +431,10 @@ pub(super) fn render_subvolume_table(data: &StatusOutput, out: &mut String) {
         }
 
         if show_health {
-            row.push(assessment.health.clone());
+            // Pre-colored, like the EXPOSURE cell (#305) — `format_table` below
+            // is passed `|_, _| None` and never re-matches the HEALTH column
+            // (#361).
+            row.push(assessment_health_cell(assessment));
         }
         if show_protection {
             row.push(
@@ -486,7 +494,10 @@ pub(super) fn render_subvolume_table(data: &StatusOutput, out: &mut String) {
         rows.push(row);
     }
 
-    format_status_table(&headers, &rows, health_col, out);
+    // Both EXPOSURE and HEALTH cells above already carry their own color
+    // (`exposure_cell` #305, `assessment_health_cell`/`health_cell` #361),
+    // so no column needs further coloring here.
+    format_table(&headers, &rows, |_, _| None, out);
 }
 
 /// Render chain health for interactive display.

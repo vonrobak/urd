@@ -51,6 +51,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   table formatter no longer re-matches on the EXPOSURE column at all, closing
   the silent-uncolored-fallthrough hazard the old string relay had. No
   behavior change — `urd status`/`urd backup` output is byte-identical (#305).
+- The HEALTH column's sibling relay now matches `OperationalHealth`
+  exhaustively too: `health_cell(health)` replaces the old
+  `"healthy"`/`"degraded"`/`"blocked"` re-match, and the table formatter no
+  longer touches the HEALTH column — cells arrive pre-colored, like EXPOSURE
+  after #305. `StatusAssessment.health` stays a `String` on the `--json`
+  surface, so `OperationalHealth::from_label` recovers the enum at the one
+  row-building call site; no behavior change (#361).
 
 ### Fixed
 - `ByteSize`'s display no longer pads whole values with a spurious decimal —
