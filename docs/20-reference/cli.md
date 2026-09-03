@@ -285,7 +285,9 @@ verified.
 
 **Contract.** Measures snapshot sizes (via `du`) to improve send-time
 estimates. Reads the filesystem; may take significant wall-clock time on
-large subvolumes. Writes calibration data to the state DB.
+large subvolumes. Writes calibration data to the state DB. Calibrating
+before a subvolume's first-ever full send gives that send's progress line
+a total and an ETA it would otherwise lack.
 
 **Notable flags.**
 

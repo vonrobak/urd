@@ -27,6 +27,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pool row — the run timestamp for a pool measured this run, the
   carried-forward timestamp otherwise — so staleness stays honest. A drive
   removed from config stops being carried forward (#339).
+- `urd plan` (and `urd backup`'s dry-run preview) now nudges toward
+  `urd calibrate` when a planned full send has no size estimate — the one
+  case the progress line can't show a total or an ETA for. Incremental
+  sends without an estimate don't trigger it (calibration can't help
+  those), and the suggestion only appears in interactive output (#254).
 
 ### Changed
 - The EXPOSURE column's label-to-color plumbing now carries `PromiseStatus`
