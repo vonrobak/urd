@@ -108,21 +108,12 @@ pub fn run(config_path: Option<&Path>, args: &MigrateArgs) -> anyhow::Result<()>
 
 // ── Version extraction ─────────────────────────────────────────────────
 
-#[derive(serde::Deserialize)]
-struct VersionProbe {
-    #[serde(default)]
-    general: Option<VersionProbeGeneral>,
-}
-
-#[derive(serde::Deserialize)]
-struct VersionProbeGeneral {
-    config_version: Option<u32>,
-}
-
+/// Wraps [`crate::config::extract_config_version`] in `anyhow` — the shared
+/// probe so `urd migrate` reports the same honest syntax-error-vs-
+/// config_version distinction as `urd plan`/`urd doctor` (issue #333),
+/// instead of a second, independently-worded parse error.
 fn extract_version(raw: &str) -> anyhow::Result<Option<u32>> {
-    let probe: VersionProbe = toml::from_str(raw)
-        .map_err(|e| anyhow::anyhow!("failed to parse config: {e}"))?;
-    Ok(probe.general.and_then(|g| g.config_version))
+    crate::config::extract_config_version(raw).map_err(|e| anyhow::anyhow!(e))
 }
 
 // ── Retired-key probe (UPI 068) ────────────────────────────────────────
