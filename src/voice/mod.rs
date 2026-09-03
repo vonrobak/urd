@@ -124,6 +124,34 @@ pub(super) fn exposure_label(status: PromiseStatus) -> String {
     }
 }
 
+/// Render a promise status as its colored EXPOSURE cell string, in one step.
+///
+/// The type is carried all the way to the color decision instead of round-
+/// tripping through the label string (#305): callers pass the `PromiseStatus`
+/// enum here directly, so an exhaustive `match` — compiler-enforced against
+/// new variants — replaces the former string re-match on `"sealed"` /
+/// `"waning"` / `"exposed"` that silently left an unmatched label uncolored.
+///
+/// `dimmed` is the explicit pre-dimmed case (UPI 080, `status::exposure_cell`):
+/// an adapting row is "waning by design", not a failure, so its cell renders
+/// dim instead of the earned color. Dimming always wins over the earned
+/// color — it only ever de-emphasizes a row, never brightens one.
+///
+/// The returned string already carries its ANSI color; table rendering must
+/// not re-match on it (that was the bug) — it passes cells through unchanged
+/// unless a column asks for further coloring (see `format_status_table`).
+pub(super) fn exposure_cell(status: PromiseStatus, dimmed: bool) -> String {
+    let label = exposure_label(status);
+    if dimmed {
+        return label.dimmed().to_string();
+    }
+    match status {
+        PromiseStatus::Protected => label.green().to_string(),
+        PromiseStatus::AtRisk => label.yellow().to_string(),
+        PromiseStatus::Unprotected => label.red().to_string(),
+    }
+}
+
 /// Group per-subvolume advisory NOTE strings for display (UPI 079-a §4).
 ///
 /// Collects, for each distinct advisory string (exact equality), the subvolume
@@ -250,26 +278,22 @@ fn format_table(
     }
 }
 
-/// Format status table with optional colored SAFETY and HEALTH columns.
+/// Format status table with an optional colored HEALTH column.
+///
+/// The EXPOSURE column is no longer colored here — callers build already-
+/// colored cells via `exposure_cell` before the row is handed to this
+/// formatter (#305), so the EXPOSURE cell simply passes through unchanged
+/// like any other pre-rendered cell.
 fn format_status_table(
     headers: &[String],
     rows: &[Vec<String>],
-    safety_col: Option<usize>,
     health_col: Option<usize>,
     out: &mut String,
 ) {
     format_table(
         headers,
         rows,
-        |i, cell| {
-            if safety_col == Some(i) {
-                Some(color_exposure_str(cell))
-            } else if health_col == Some(i) {
-                Some(color_health_str(cell))
-            } else {
-                None
-            }
-        },
+        |i, cell| (health_col == Some(i)).then(|| color_health_str(cell)),
         out,
     );
 }
@@ -295,17 +319,6 @@ fn strip_ansi_len(s: &str) -> usize {
 }
 
 // ── Color helpers ───────────────────────────────────────────────────────
-
-fn color_exposure_str(exposure: &str) -> String {
-    match exposure {
-        "sealed" => "sealed".green().to_string(),
-        "waning" => "waning".yellow().to_string(),
-        "exposed" => "exposed".red().to_string(),
-        // An adapting row's cell arrives already dimmed (UPI 080, `status::exposure_cell`)
-        // and falls here — passed through unchanged so the de-emphasis survives.
-        other => other.to_string(),
-    }
-}
 
 fn color_health_str(health: &str) -> String {
     match health {
@@ -2863,6 +2876,73 @@ mod tests {
         assert_eq!(exposure_label(PromiseStatus::Protected), "sealed");
         assert_eq!(exposure_label(PromiseStatus::AtRisk), "waning");
         assert_eq!(exposure_label(PromiseStatus::Unprotected), "exposed");
+    }
+
+    /// Pins the colored `exposure_cell` output for every `PromiseStatus`
+    /// variant (#305). The old string-relay design (`exposure_label` then a
+    /// re-match in `color_exposure_str`) let a future label change silently
+    /// ship uncolored output because the fall-through arm passed any
+    /// unmatched string through unchanged. Now the color decision matches on
+    /// the enum directly and exhaustively — a new `PromiseStatus` variant
+    /// fails to compile here rather than rendering uncolored at runtime.
+    #[test]
+    fn exposure_cell_colors_every_promise_status() {
+        let _color = color_guard(true);
+        assert_eq!(
+            exposure_cell(PromiseStatus::Protected, false),
+            "sealed".green().to_string()
+        );
+        assert_eq!(
+            exposure_cell(PromiseStatus::AtRisk, false),
+            "waning".yellow().to_string()
+        );
+        assert_eq!(
+            exposure_cell(PromiseStatus::Unprotected, false),
+            "exposed".red().to_string()
+        );
+    }
+
+    /// The UPI 080 pre-dimmed adapting-row cell must render byte-identical
+    /// regardless of which `PromiseStatus` it dims — `dimmed: true` always
+    /// wins over the earned color (#305).
+    #[test]
+    fn exposure_cell_dimmed_overrides_earned_color_for_every_status() {
+        let _color = color_guard(true);
+        assert_eq!(
+            exposure_cell(PromiseStatus::Protected, true),
+            "sealed".dimmed().to_string()
+        );
+        assert_eq!(
+            exposure_cell(PromiseStatus::AtRisk, true),
+            "waning".dimmed().to_string()
+        );
+        assert_eq!(
+            exposure_cell(PromiseStatus::Unprotected, true),
+            "exposed".dimmed().to_string()
+        );
+    }
+
+    /// End-to-end pass-through pin: a pre-colored EXPOSURE cell (the UPI 080
+    /// dimmed adapting-row case, built by `exposure_cell`) must survive
+    /// `format_status_table` byte-identical. Before #305, the EXPOSURE column
+    /// was re-matched by `color_exposure_str` inside this formatter — any
+    /// already-colored string that didn't match `"sealed"`/`"waning"`/
+    /// `"exposed"` fell through unchanged only because of an explicit (and
+    /// easy to lose) fallback arm. Now the formatter never touches the
+    /// EXPOSURE column at all, so pass-through is structural, not a matched
+    /// case.
+    #[test]
+    fn format_status_table_passes_through_precolored_exposure_cell_unchanged() {
+        let _color = color_guard(true);
+        let headers = vec!["EXPOSURE".to_string(), "SUBVOLUME".to_string()];
+        let precolored = exposure_cell(PromiseStatus::AtRisk, true);
+        let rows = vec![vec![precolored.clone(), "htpc-home".to_string()]];
+        let mut out = String::new();
+        format_status_table(&headers, &rows, None, &mut out);
+        assert!(
+            out.contains(&precolored),
+            "pre-colored EXPOSURE cell must pass through byte-identical: {out:?}"
+        );
     }
 
     #[test]
