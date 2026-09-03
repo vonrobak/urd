@@ -287,11 +287,16 @@ pub(crate) fn metadata_utilization_ratio_from(sysfs_root: &Path, uuid: &str) -> 
 /// `space_resolver` and `metadata_resolver` are accepted as closures so tests
 /// can substitute pure stand-ins; production callers pass `pool_space` /
 /// `metadata_utilization_ratio`. `space_resolver` returns free + capacity from
-/// a single statvfs so the two never skew within a run.
+/// a single statvfs so the two never skew within a run. `now_ts` is the run's
+/// canonical timestamp — the same value written to
+/// `backup_script_last_run_timestamp` — stamped onto every row's
+/// `last_seen_timestamp` (issue #339); a row measured this run is never
+/// ambiguous about when "this run" was.
 #[must_use]
 pub fn compute_pool_metrics_from(
     detected_pools: &[SourcePool],
     drives: &[DriveResolution],
+    now_ts: i64,
     mut space_resolver: impl FnMut(&Path) -> Option<PoolSpace>,
     mut metadata_resolver: impl FnMut(&str) -> Option<f64>,
 ) -> Vec<PoolMetric> {
@@ -309,6 +314,7 @@ pub fn compute_pool_metrics_from(
             free_bytes: space.map(|s| s.free_bytes),
             capacity_bytes: space.map(|s| s.capacity_bytes),
             metadata_utilization_ratio: meta,
+            last_seen_timestamp: now_ts,
         });
     }
 
@@ -329,6 +335,7 @@ pub fn compute_pool_metrics_from(
             free_bytes: space.map(|s| s.free_bytes),
             capacity_bytes: space.map(|s| s.capacity_bytes),
             metadata_utilization_ratio: meta,
+            last_seen_timestamp: now_ts,
         });
     }
 
@@ -564,7 +571,7 @@ mod tests {
         }];
 
         let meta = |_: &str| Some(0.25_f64);
-        let metrics = compute_pool_metrics_from(&pools, &drives, fixed_space(42, 100), meta);
+        let metrics = compute_pool_metrics_from(&pools, &drives, 1_711_100_120, fixed_space(42, 100), meta);
 
         assert_eq!(metrics.len(), 2);
         assert_eq!(metrics[0].uuid, "uuid-src");
@@ -586,7 +593,7 @@ mod tests {
             mounted: false,
             mountpoint: None,
         }];
-        let metrics = compute_pool_metrics_from(&[], &drives, fixed_space(0, 0), |_| None);
+        let metrics = compute_pool_metrics_from(&[], &drives, 1_711_100_120, fixed_space(0, 0), |_| None);
         assert!(metrics.is_empty());
     }
 
@@ -644,7 +651,7 @@ mod tests {
             mounted: true,
             mountpoint: Some(PathBuf::from("/mnt/wd")),
         }];
-        let metrics = compute_pool_metrics_from(&[], &drives, fixed_space(0, 0), |_| None);
+        let metrics = compute_pool_metrics_from(&[], &drives, 1_711_100_120, fixed_space(0, 0), |_| None);
         assert!(metrics.is_empty());
     }
 }

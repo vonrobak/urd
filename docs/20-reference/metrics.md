@@ -6,7 +6,7 @@ project: ['[[urd]]']
 sensitivity: public
 status: active
 created: '2026-05-02'
-timestamp: '2026-06-10T08:44:18+02:00'
+timestamp: '2026-09-03T12:45:40+02:00'
 ---
 # Prometheus Metrics Reference
 
@@ -57,10 +57,23 @@ These properties are guaranteed and load-bearing for downstream consumers
    subvolumes and for subvolumes whose latest in-window send was the wrong kind
    (full / incremental respectively). The `# HELP` text states this explicitly;
    alerts must not assume the series exists.
-7. **Carry-forward of `backup_last_success_timestamp`.** When a subvolume is
-   not attempted in a run (interval gating, skip), its previous timestamp is
-   read from the existing `.prom` file and re-emitted unchanged. The series
-   does not disappear during quiet periods.
+7. **Carry-forward of `backup_last_success_timestamp` and the pool gauges.**
+   When a subvolume is not attempted in a run (interval gating, skip), its
+   previous timestamp is read from the existing `.prom` file and re-emitted
+   unchanged. The series does not disappear during quiet periods.
+
+   The same mechanism covers a configured destination drive that isn't
+   mounted this run (the offsite rotation drive being the motivating case,
+   issue #339): `backup_pool_free_bytes`, `backup_pool_total_bytes`, and
+   `backup_pool_metadata_utilization_ratio` are re-read from the previous
+   `.prom` file, keyed by `label`, and re-emitted with all labels (`uuid`,
+   `role`, `label`) verbatim. Only labels still present in config are
+   eligible — removing a drive from config stops the carry-forward and its
+   series goes absent, same as any other conditional series here. Source
+   pools (`role="source"`) are always measured and never carried. A
+   configured drive that has never been mounted while Urd ran has no prior
+   row to carry, so its series simply doesn't exist yet — it appears after
+   the drive's first mounted run.
 8. **Label cardinality is stable.** `subvolume`, `location` (`local|external`),
    `reason`, `scope`, `rule`, and the pool-gauge labels `uuid`, `role`
    (`source|destination`), `label` are the only labels. No host labels, no
@@ -221,6 +234,20 @@ within a run; line absent under the same conditions.
 
 Gauge. BTRFS metadata utilization, `0.0`–`1.0`. Line absent when metadata
 info couldn't be read.
+
+### `backup_pool_last_seen_timestamp`
+
+Gauge. Unix epoch seconds. Emitted for **every** pool row, including
+carried-forward ones (UPI issue #339) — unlike the three gauges above, this
+one is never conditional on a syscall succeeding.
+
+For a pool measured in this run, it equals `backup_script_last_run_timestamp`.
+For a destination row carried forward because its drive wasn't mounted this
+run, it is the timestamp of the run that last measured it. This is what
+makes carry-forward staleness-honest: a consumer can alert on
+`time() - backup_pool_last_seen_timestamp{role="destination"} > threshold`
+without being fooled by a flat-lined `backup_pool_free_bytes` value that
+just hasn't been refreshed.
 
 ---
 

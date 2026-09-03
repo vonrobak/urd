@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::Path;
 
@@ -28,6 +28,7 @@ pub(crate) mod names {
     pub const BACKUP_POOL_TOTAL_BYTES: &str = "backup_pool_total_bytes";
     pub const BACKUP_POOL_METADATA_UTILIZATION_RATIO: &str =
         "backup_pool_metadata_utilization_ratio";
+    pub const BACKUP_POOL_LAST_SEEN_TIMESTAMP: &str = "backup_pool_last_seen_timestamp";
     pub const BACKUP_SUBVOLUME_LOCAL_SNAPSHOT_COUNT: &str =
         "backup_subvolume_local_snapshot_count";
     pub const BACKUP_SUBVOLUME_ESTIMATED_LOCAL_PINNED_DELTA_BYTES: &str =
@@ -70,6 +71,14 @@ pub struct PoolMetric {
     /// never skew within a run.
     pub capacity_bytes: Option<u64>,
     pub metadata_utilization_ratio: Option<f64>,
+    /// Unix seconds this row was last measured (issue #339). For a pool
+    /// measured in this run it equals `script_last_run_timestamp`; for a
+    /// carried-forward destination row (configured drive absent this run)
+    /// it is the timestamp of the run that last measured it. Always
+    /// present — unlike the three gauges above, this feeds
+    /// `backup_pool_last_seen_timestamp`, emitted unconditionally for every
+    /// row so staleness stays honest even when a pool row itself is thin.
+    pub last_seen_timestamp: i64,
 }
 
 /// Prometheus counter family derived from the events table by
@@ -239,6 +248,156 @@ fn parse_escaped_label(s: &str) -> Option<(String, &str)> {
         }
     }
     None
+}
+
+/// A destination pool row reconstructed from a previous `.prom` file
+/// (issue #339): everything `apply_carried_forward_pools` needs to re-emit
+/// `backup_pool_free_bytes` / `backup_pool_total_bytes` /
+/// `backup_pool_metadata_utilization_ratio` / `backup_pool_last_seen_timestamp`
+/// for a configured drive that is absent this run.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CarriedPoolRow {
+    pub uuid: String,
+    pub free_bytes: Option<u64>,
+    pub capacity_bytes: Option<u64>,
+    pub metadata_utilization_ratio: Option<f64>,
+    pub last_seen_timestamp: i64,
+}
+
+/// The pool-gauge names `read_existing_pool_rows` scans for — every metric
+/// carrying the `{uuid,role,label}` label set.
+const POOL_GAUGE_NAMES: [&str; 4] = [
+    names::BACKUP_POOL_FREE_BYTES,
+    names::BACKUP_POOL_TOTAL_BYTES,
+    names::BACKUP_POOL_METADATA_UTILIZATION_RATIO,
+    names::BACKUP_POOL_LAST_SEEN_TIMESTAMP,
+];
+
+/// Parse one pool-gauge sample line (`<metric>{uuid="...",role="...",label="..."} value`)
+/// against the known pool-gauge names. Reuses `parse_escaped_label` — the
+/// same unescaping logic `read_existing_timestamps` uses — rather than a
+/// second hand-rolled parser. Returns the matched metric name, the three
+/// labels (unescaped), and the raw value string; `None` for anything that
+/// isn't a pool-gauge line or is malformed.
+fn parse_pool_sample_line(line: &str) -> Option<(&'static str, String, String, String, &str)> {
+    for &metric_name in &POOL_GAUGE_NAMES {
+        let prefix = format!("{metric_name}{{uuid=\"");
+        let Some(rest) = line.strip_prefix(prefix.as_str()) else {
+            continue;
+        };
+        let (uuid, rest) = parse_escaped_label(rest)?;
+        let rest = rest.strip_prefix(",role=\"")?;
+        let (role, rest) = parse_escaped_label(rest)?;
+        let rest = rest.strip_prefix(",label=\"")?;
+        let (label, rest) = parse_escaped_label(rest)?;
+        let rest = rest.strip_prefix('}')?;
+        return Some((metric_name, uuid, role, label, rest.trim()));
+    }
+    None
+}
+
+/// Read destination-pool rows (`role="destination"`) from an existing
+/// `.prom` file, keyed by `label` — the drive's config identity (issue
+/// #339). Only labels with a carried `backup_pool_last_seen_timestamp`
+/// entry are returned: a `.prom` written before this gauge existed has no
+/// honest "last seen" value to carry, so that row is simply not carried
+/// forward until the drive is next mounted and measured under this code.
+/// Missing or unparseable files return an empty map — never fails the run
+/// (metrics are best-effort, mirroring `read_existing_timestamps`).
+#[must_use]
+pub fn read_existing_pool_rows(path: &Path) -> HashMap<String, CarriedPoolRow> {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return HashMap::new();
+    };
+
+    let mut uuid_by_label: HashMap<String, String> = HashMap::new();
+    let mut free_bytes: HashMap<String, u64> = HashMap::new();
+    let mut capacity_bytes: HashMap<String, u64> = HashMap::new();
+    let mut metadata_ratio: HashMap<String, f64> = HashMap::new();
+    let mut last_seen: HashMap<String, i64> = HashMap::new();
+
+    for line in content.lines() {
+        let Some((metric_name, uuid, role, label, value)) =
+            parse_pool_sample_line(line.trim())
+        else {
+            continue;
+        };
+        if role != "destination" {
+            continue;
+        }
+        uuid_by_label.insert(label.clone(), uuid);
+        if metric_name == names::BACKUP_POOL_FREE_BYTES
+            && let Ok(v) = value.parse()
+        {
+            free_bytes.insert(label, v);
+        } else if metric_name == names::BACKUP_POOL_TOTAL_BYTES
+            && let Ok(v) = value.parse()
+        {
+            capacity_bytes.insert(label, v);
+        } else if metric_name == names::BACKUP_POOL_METADATA_UTILIZATION_RATIO
+            && let Ok(v) = value.parse()
+        {
+            metadata_ratio.insert(label, v);
+        } else if metric_name == names::BACKUP_POOL_LAST_SEEN_TIMESTAMP
+            && let Ok(v) = value.parse()
+        {
+            last_seen.insert(label, v);
+        }
+    }
+
+    last_seen
+        .into_iter()
+        .filter_map(|(label, ts)| {
+            let uuid = uuid_by_label.get(&label)?.clone();
+            Some((
+                label.clone(),
+                CarriedPoolRow {
+                    uuid,
+                    free_bytes: free_bytes.get(&label).copied(),
+                    capacity_bytes: capacity_bytes.get(&label).copied(),
+                    metadata_utilization_ratio: metadata_ratio.get(&label).copied(),
+                    last_seen_timestamp: ts,
+                },
+            ))
+        })
+        .collect()
+}
+
+/// Re-emit destination-pool rows for configured drives that weren't
+/// measured this run (issue #339, option 1: carried-forward last-seen
+/// values). A row is eligible only when its `label` is still in
+/// `configured_destination_labels` — remove a drive from config and its
+/// series goes absent, same posture as every other conditional series in
+/// this file. Rows already present this run (measured, with a fresh
+/// `last_seen_timestamp`) are left untouched and never duplicated.
+pub fn apply_carried_forward_pools(
+    pools: &mut Vec<PoolMetric>,
+    carried: &HashMap<String, CarriedPoolRow>,
+    configured_destination_labels: &HashSet<String>,
+) {
+    let measured_destination_labels: HashSet<String> = pools
+        .iter()
+        .filter(|p| p.role == "destination")
+        .map(|p| p.label.clone())
+        .collect();
+
+    for label in configured_destination_labels {
+        if measured_destination_labels.contains(label) {
+            continue;
+        }
+        let Some(row) = carried.get(label) else {
+            continue;
+        };
+        pools.push(PoolMetric {
+            uuid: row.uuid.clone(),
+            role: "destination".to_string(),
+            label: label.clone(),
+            free_bytes: row.free_bytes,
+            capacity_bytes: row.capacity_bytes,
+            metadata_utilization_ratio: row.metadata_utilization_ratio,
+            last_seen_timestamp: row.last_seen_timestamp,
+        });
+    }
 }
 
 /// Fill in `last_success_timestamp` from carried-forward values for subvolumes
@@ -543,6 +702,27 @@ fn format_metrics(data: &MetricsData) -> String {
                 ratio,
             );
         }
+    }
+
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "# HELP {} Unix timestamp this pool row was last measured. Equals the run timestamp for a pool measured this run; for a destination pool whose drive is absent this run, the timestamp of the run that last measured it (carried forward from the previous .prom file). Emitted for every pool row, including carried-forward ones.",
+        names::BACKUP_POOL_LAST_SEEN_TIMESTAMP
+    )
+    .unwrap();
+    writeln!(out, "# TYPE {} gauge", names::BACKUP_POOL_LAST_SEEN_TIMESTAMP).unwrap();
+    for pool in &data.pools {
+        sample(
+            &mut out,
+            names::BACKUP_POOL_LAST_SEEN_TIMESTAMP,
+            &[
+                ("uuid", pool.uuid.as_str()),
+                ("role", pool.role.as_str()),
+                ("label", pool.label.as_str()),
+            ],
+            pool.last_seen_timestamp,
+        );
     }
 
     writeln!(out).unwrap();
@@ -974,6 +1154,204 @@ mod tests {
         assert_eq!(svs[0].last_success_timestamp, Some(12345));
     }
 
+    // ── Pool carry-forward (issue #339) ────────────────────────────
+    //
+    // Mirrors the subvolume-timestamp carry-forward tests above: read the
+    // previous `.prom` file, merge with what this run measured, and prove
+    // labels no longer in config stop being carried.
+
+    fn dest_pool(uuid: &str, label: &str, last_seen: i64) -> PoolMetric {
+        PoolMetric {
+            uuid: uuid.to_string(),
+            role: "destination".to_string(),
+            label: label.to_string(),
+            free_bytes: Some(1_000_000_000),
+            capacity_bytes: Some(2_000_000_000),
+            metadata_utilization_ratio: Some(0.1),
+            last_seen_timestamp: last_seen,
+        }
+    }
+
+    #[test]
+    fn read_existing_pool_rows_missing_file_is_empty() {
+        let rows = read_existing_pool_rows(Path::new("/nonexistent/backup.prom"));
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn read_existing_pool_rows_only_carries_destination_role() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("backup.prom");
+        let mut data = sample_data();
+        data.pools.push(PoolMetric {
+            uuid: "uuid-src".to_string(),
+            role: "source".to_string(),
+            label: "/home".to_string(),
+            free_bytes: Some(1),
+            capacity_bytes: Some(2),
+            metadata_utilization_ratio: Some(0.1),
+            last_seen_timestamp: 1_000_000,
+        });
+        write_metrics(&path, &data).unwrap();
+
+        let rows = read_existing_pool_rows(&path);
+        assert!(rows.is_empty(), "source-role rows must never be carried forward");
+    }
+
+    #[test]
+    fn read_existing_pool_rows_skips_row_without_last_seen_line() {
+        // A .prom written before backup_pool_last_seen_timestamp existed:
+        // free/total present, no last_seen line. There is no honest "last
+        // seen" value to carry, so the row is not carried — it reappears
+        // once the drive is next mounted and measured under this code.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("backup.prom");
+        std::fs::write(
+            &path,
+            concat!(
+                "backup_pool_free_bytes{uuid=\"uuid-old\",role=\"destination\",label=\"OLD\"} 111\n",
+                "backup_pool_total_bytes{uuid=\"uuid-old\",role=\"destination\",label=\"OLD\"} 222\n",
+            ),
+        )
+        .unwrap();
+
+        let rows = read_existing_pool_rows(&path);
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn pool_carry_forward_roundtrip_reemits_absent_destination_row() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("backup.prom");
+
+        // First run: OFFSITE mounted and measured.
+        let mut data = sample_data();
+        data.pools.push(dest_pool("uuid-offsite", "OFFSITE", 1_000_000));
+        write_metrics(&path, &data).unwrap();
+
+        // Second run: OFFSITE absent (drive away), but still configured.
+        let carried = read_existing_pool_rows(&path);
+        let mut configured = HashSet::new();
+        configured.insert("OFFSITE".to_string());
+        let mut pools: Vec<PoolMetric> = Vec::new(); // nothing measured this run
+        apply_carried_forward_pools(&mut pools, &carried, &configured);
+
+        assert_eq!(pools.len(), 1);
+        let row = &pools[0];
+        assert_eq!(row.uuid, "uuid-offsite");
+        assert_eq!(row.role, "destination");
+        assert_eq!(row.label, "OFFSITE");
+        assert_eq!(row.free_bytes, Some(1_000_000_000));
+        assert_eq!(row.capacity_bytes, Some(2_000_000_000));
+        assert_eq!(row.metadata_utilization_ratio, Some(0.1));
+        assert_eq!(row.last_seen_timestamp, 1_000_000);
+
+        // The rendered output carries all three gauges plus last_seen,
+        // labels verbatim.
+        let mut data2 = sample_data();
+        data2.pools = pools;
+        let output = format_metrics(&data2);
+        assert!(output.contains(
+            "backup_pool_free_bytes{uuid=\"uuid-offsite\",role=\"destination\",label=\"OFFSITE\"} 1000000000"
+        ));
+        assert!(output.contains(
+            "backup_pool_total_bytes{uuid=\"uuid-offsite\",role=\"destination\",label=\"OFFSITE\"} 2000000000"
+        ));
+        assert!(output.contains(
+            "backup_pool_metadata_utilization_ratio{uuid=\"uuid-offsite\",role=\"destination\",label=\"OFFSITE\"} 0.1"
+        ));
+        assert!(output.contains(
+            "backup_pool_last_seen_timestamp{uuid=\"uuid-offsite\",role=\"destination\",label=\"OFFSITE\"} 1000000"
+        ));
+    }
+
+    #[test]
+    fn pool_carry_forward_does_not_duplicate_when_drive_present() {
+        let mut carried = HashMap::new();
+        carried.insert(
+            "OFFSITE".to_string(),
+            CarriedPoolRow {
+                uuid: "uuid-offsite".to_string(),
+                free_bytes: Some(1),
+                capacity_bytes: Some(2),
+                metadata_utilization_ratio: Some(0.5),
+                last_seen_timestamp: 1_000_000,
+            },
+        );
+        let mut configured = HashSet::new();
+        configured.insert("OFFSITE".to_string());
+
+        // This run measured OFFSITE fresh — the run timestamp, not the
+        // carried one, must win.
+        let mut pools = vec![dest_pool("uuid-offsite", "OFFSITE", 2_000_000)];
+        pools[0].free_bytes = Some(999);
+        apply_carried_forward_pools(&mut pools, &carried, &configured);
+
+        assert_eq!(pools.len(), 1, "measured row must not be duplicated by carry-forward");
+        assert_eq!(pools[0].free_bytes, Some(999));
+        assert_eq!(pools[0].last_seen_timestamp, 2_000_000);
+    }
+
+    #[test]
+    fn pool_carry_forward_drops_label_not_in_config() {
+        let mut carried = HashMap::new();
+        carried.insert(
+            "RETIRED-DRIVE".to_string(),
+            CarriedPoolRow {
+                uuid: "uuid-retired".to_string(),
+                free_bytes: Some(1),
+                capacity_bytes: Some(2),
+                metadata_utilization_ratio: Some(0.5),
+                last_seen_timestamp: 1_000_000,
+            },
+        );
+        let configured = HashSet::new(); // RETIRED-DRIVE no longer configured
+
+        let mut pools: Vec<PoolMetric> = Vec::new();
+        apply_carried_forward_pools(&mut pools, &carried, &configured);
+
+        assert!(
+            pools.is_empty(),
+            "a label removed from config must not be carried forward"
+        );
+    }
+
+    #[test]
+    fn pool_carry_forward_noop_when_nothing_carried() {
+        // No prior .prom file: read_existing_pool_rows returns an empty map
+        // (see read_existing_pool_rows_missing_file_is_empty), so a run's
+        // freshly measured rows pass through unchanged — identical to
+        // today's behavior, plus the last_seen_timestamp each row already
+        // carries from compute_pool_metrics_from.
+        let mut pools = vec![dest_pool("uuid-a", "OFFSITE", 500)];
+        let before = pools.clone();
+        let carried = HashMap::new();
+        let mut configured = HashSet::new();
+        configured.insert("OFFSITE".to_string());
+
+        apply_carried_forward_pools(&mut pools, &carried, &configured);
+
+        assert_eq!(pools, before);
+    }
+
+    #[test]
+    fn format_metrics_emits_pool_last_seen_timestamp_help_and_type() {
+        let data = sample_data();
+        let output = format_metrics(&data);
+        assert!(output.contains("# HELP backup_pool_last_seen_timestamp"));
+        assert!(output.contains("# TYPE backup_pool_last_seen_timestamp gauge"));
+    }
+
+    #[test]
+    fn format_metrics_emits_pool_last_seen_timestamp_unconditionally_per_row() {
+        let mut data = sample_data();
+        data.pools.push(dest_pool("uuid-a", "OFFSITE", 42));
+        let output = format_metrics(&data);
+        assert!(output.contains(
+            "backup_pool_last_seen_timestamp{uuid=\"uuid-a\",role=\"destination\",label=\"OFFSITE\"} 42"
+        ));
+    }
+
     // ── Escaped-label round-trip (UPI 061) ────────────────────────
     //
     // The writer escapes the subvolume label (via sample()); the reader
@@ -1186,6 +1564,7 @@ mod tests {
             free_bytes: None,
             capacity_bytes: None,
             metadata_utilization_ratio: None,
+            last_seen_timestamp: 0,
         }
     }
 
@@ -1430,16 +1809,20 @@ mod tests {
     // ── Golden file (UPI 061) ─────────────────────────────────────
     //
     // The golden fixture exercises every emission branch reachable in one
-    // MetricsData: all 20 metrics present, Some/None splits across
+    // MetricsData: all 21 metrics present, Some/None splits across
     // subvolumes, both pool roles, non-empty event counters. Branches a
     // single fixture cannot reach (zero-sentinel counter lines, unmounted
     // drive, per-metric absence) are pinned by the `contains` tests above.
     //
-    // src/testdata/golden_metrics.prom is WRITE-ONCE: it was generated from
-    // the pre-UPI-061 formatter and is the byte-level proof that the
-    // contract-surface refactor changed nothing for realistic configs
-    // (ADR-105 / homelab ADR-021). Never regenerate it to make this test
-    // pass — a mismatch is a bug in the formatter, not in the file.
+    // src/testdata/golden_metrics.prom is WRITE-ONCE for refactors: it was
+    // generated from the pre-UPI-061 formatter and is the byte-level proof
+    // that the contract-surface refactor changed nothing for realistic
+    // configs (ADR-105 / homelab ADR-021). Never regenerate it to make this
+    // test pass after a refactor — a mismatch is a bug in the formatter, not
+    // the file. A deliberate new metric (e.g. `backup_pool_last_seen_timestamp`,
+    // issue #339) is the one case that legitimately amends the fixture —
+    // done by hand, with the diff reviewed as part of the change, not by
+    // regenerating from formatter output.
 
     fn golden_data() -> MetricsData {
         MetricsData {
@@ -1513,6 +1896,7 @@ mod tests {
                     free_bytes: Some(123_456_789),
                     capacity_bytes: Some(500_000_000_000),
                     metadata_utilization_ratio: Some(0.25),
+                    last_seen_timestamp: 1_711_100_120,
                 },
                 PoolMetric {
                     uuid: "uuid-dst".to_string(),
@@ -1521,6 +1905,10 @@ mod tests {
                     free_bytes: Some(4_400_000_000_000),
                     capacity_bytes: None,
                     metadata_utilization_ratio: Some(0.5),
+                    // Deliberately distinct from script_last_run_timestamp —
+                    // exercises the carried-forward case (a destination row
+                    // whose last_seen predates this run) in the golden fixture.
+                    last_seen_timestamp: 1_700_000_000,
                 },
             ],
         }
@@ -1543,7 +1931,7 @@ mod tests {
 
     #[test]
     fn guard_metric_names_live_only_in_names_module() {
-        const ALL: [&str; 20] = [
+        const ALL: [&str; 21] = [
             names::BACKUP_SUCCESS,
             names::BACKUP_LAST_SUCCESS_TIMESTAMP,
             names::BACKUP_DURATION_SECONDS,
@@ -1558,6 +1946,7 @@ mod tests {
             names::BACKUP_POOL_FREE_BYTES,
             names::BACKUP_POOL_TOTAL_BYTES,
             names::BACKUP_POOL_METADATA_UTILIZATION_RATIO,
+            names::BACKUP_POOL_LAST_SEEN_TIMESTAMP,
             names::BACKUP_SUBVOLUME_LOCAL_SNAPSHOT_COUNT,
             names::BACKUP_SUBVOLUME_ESTIMATED_LOCAL_PINNED_DELTA_BYTES,
             names::URD_CIRCUIT_BREAKER_TRIPS_TOTAL,
