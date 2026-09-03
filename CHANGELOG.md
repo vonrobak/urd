@@ -17,6 +17,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   re-planned run then found nothing to do. The warning line and the
   notification body are built from the same prose function, so the two
   surfaces can't drift (#174).
+- Destination pool capacity gauges (`backup_pool_free_bytes`,
+  `backup_pool_total_bytes`, `backup_pool_metadata_utilization_ratio`) now
+  survive a configured drive's absence: when the drive isn't mounted for a
+  run, its last-seen values are carried forward from the previous `.prom`
+  file, all labels verbatim, so the offsite rotation drive still has
+  telemetry to alert on while it's away. A new gauge,
+  `backup_pool_last_seen_timestamp{uuid,role,label}`, is emitted for every
+  pool row — the run timestamp for a pool measured this run, the
+  carried-forward timestamp otherwise — so staleness stays honest. A drive
+  removed from config stops being carried forward (#339).
 
 ### Changed
 - The EXPOSURE column's label-to-color plumbing now carries `PromiseStatus`

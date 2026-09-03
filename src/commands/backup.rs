@@ -180,7 +180,12 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
         // judged before the metrics write (the writer only touches `.prom`).
         let heartbeat_now = chrono::Local::now().naive_local();
         let churn_views = build_churn_views(&config, world.db(), heartbeat_now);
-        let observability = gather_pool_observability(&config, &churn_views, &fs_state);
+        let observability = gather_pool_observability(
+            &config,
+            now.and_utc().timestamp(),
+            &churn_views,
+            &fs_state,
+        );
         let previous_hb = heartbeat::read(&config.general.heartbeat_file);
         // Posture parity (UPI 063): the empty-plan heartbeat embeds promise
         // verdicts, and verdicts are posture-sensitive — S4's "the projection
@@ -537,7 +542,12 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     // the same projection into both metrics and heartbeat (UPI 030).
     let heartbeat_now = chrono::Local::now().naive_local();
     let churn_views = build_churn_views(&config, world.db(), heartbeat_now);
-    let observability = gather_pool_observability(&config, &churn_views, &fs_state);
+    let observability = gather_pool_observability(
+        &config,
+        now.and_utc().timestamp(),
+        &churn_views,
+        &fs_state,
+    );
 
     // Assess under the SINGLE pre-plan `signals` (the AB1/S2 invariant
     // above) — do NOT re-gather. The post-execution assess reflects the
@@ -1509,6 +1519,7 @@ fn build_churn_views(
 /// heartbeat for the same run.
 fn gather_pool_observability(
     config: &Config,
+    now_ts: i64,
     churn_views: &HashMap<String, ChurnHeartbeatFields>,
     fs_state: &dyn FilesystemQuery,
 ) -> PoolObservability {
@@ -1537,6 +1548,7 @@ fn gather_pool_observability(
     let pool_metrics = pools::compute_pool_metrics_from(
         &source_pools,
         &drive_resolutions,
+        now_ts,
         |mp| pools::pool_space(mp).ok(),
         pools::metadata_utilization_ratio,
     );
@@ -1764,9 +1776,22 @@ fn write_global_metrics(
     config: &Config,
     now_ts: i64,
     subvolume_metrics: Vec<SubvolumeMetrics>,
-    pool_metrics: Vec<PoolMetric>,
+    mut pool_metrics: Vec<PoolMetric>,
 ) -> anyhow::Result<()> {
     let (drive_mounted, free_bytes) = drives::first_mounted_drive_status(config);
+
+    // Carry forward destination-pool rows for configured drives absent this
+    // run (issue #339) — same best-effort posture and reader mechanism as
+    // the subvolume timestamp carry-forward above. A drive removed from
+    // config is never carried; `apply_carried_forward_pools` checks that.
+    let configured_destination_labels: HashSet<String> =
+        config.drives.iter().map(|d| d.label.clone()).collect();
+    let carried_pools = metrics::read_existing_pool_rows(&config.general.metrics_file);
+    metrics::apply_carried_forward_pools(
+        &mut pool_metrics,
+        &carried_pools,
+        &configured_destination_labels,
+    );
 
     // Aggregate counter families from the events table.
     // Best-effort: a missing or unreadable DB yields zeros, never an error.

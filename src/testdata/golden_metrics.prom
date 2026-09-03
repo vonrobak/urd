@@ -69,6 +69,11 @@ backup_pool_total_bytes{uuid="uuid-src",role="source",label="/home"} 50000000000
 backup_pool_metadata_utilization_ratio{uuid="uuid-src",role="source",label="/home"} 0.25
 backup_pool_metadata_utilization_ratio{uuid="uuid-dst",role="destination",label="WD-18TB"} 0.5
 
+# HELP backup_pool_last_seen_timestamp Unix timestamp this pool row was last measured. Equals the run timestamp for a pool measured this run; for a destination pool whose drive is absent this run, the timestamp of the run that last measured it (carried forward from the previous .prom file). Emitted for every pool row, including carried-forward ones.
+# TYPE backup_pool_last_seen_timestamp gauge
+backup_pool_last_seen_timestamp{uuid="uuid-src",role="source",label="/home"} 1711100120
+backup_pool_last_seen_timestamp{uuid="uuid-dst",role="destination",label="WD-18TB"} 1700000000
+
 # HELP backup_subvolume_local_snapshot_count Local snapshot count for a subvolume. Line absent when local snapshots are not configured for that subvolume.
 # TYPE backup_subvolume_local_snapshot_count gauge
 backup_subvolume_local_snapshot_count{subvolume="subvol3-opptak"} 7
