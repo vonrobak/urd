@@ -18,13 +18,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   notification body are built from the same prose function, so the two
   surfaces can't drift (#174).
 
-### Fixed
-- `ByteSize`'s display no longer pads whole values with a spurious decimal —
-  `10GB` instead of `10.0GB`, `1KB` instead of `1.0KB` — while values that
-  aren't whole at their unit still keep exactly one decimal (`1.5GB`).
-  Rounding is unchanged: `9.96GB` still rounds up and now reads `10GB`
-  instead of `10.0GB` (#332).
-
 ### Changed
 - The EXPOSURE column's label-to-color plumbing now carries `PromiseStatus`
   straight to the color decision instead of round-tripping through the
@@ -34,6 +27,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   table formatter no longer re-matches on the EXPOSURE column at all, closing
   the silent-uncolored-fallthrough hazard the old string relay had. No
   behavior change — `urd status`/`urd backup` output is byte-identical (#305).
+
+### Fixed
+- `ByteSize`'s display no longer pads whole values with a spurious decimal —
+  `10GB` instead of `10.0GB`, `1KB` instead of `1.0KB` — while values that
+  aren't whole at their unit still keep exactly one decimal (`1.5GB`).
+  Rounding is unchanged: `9.96GB` still rounds up and now reads `10GB`
+  instead of `10.0GB` (#332).
+- Config loading no longer misdiagnoses a TOML syntax error as a
+  `config_version` problem. Any parse failure — even one on a line far from
+  `[general]` — used to be reported as `failed to read config_version: ...`,
+  which sent hand-editing users chasing the wrong field. The `config_version`
+  probe now parses into a generic TOML value first, so a syntax error is
+  reported as `config file is not valid TOML: ...` (with the `toml` crate's
+  own line/column context) and never mentions `config_version`; only once the
+  file is known to parse does a malformed `config_version` (a string,
+  negative, zero, or non-integer) get its own `config_version must be a
+  positive integer (found: ...)` message. `urd migrate` shares the same probe
+  instead of its own copy, so both surfaces report identically (#333).
 
 ## [0.35.0] - 2026-07-15
 

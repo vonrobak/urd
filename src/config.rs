@@ -840,23 +840,32 @@ impl V1Config {
 
 // ── Version dispatch ───────────────────────────────────────────────────
 
-/// Minimal struct for extracting just the config_version from [general].
-#[derive(Deserialize)]
-struct VersionProbe {
-    #[serde(default)]
-    general: Option<VersionProbeGeneral>,
-}
+/// Extract `config_version` from raw TOML without fully parsing the config
+/// schema.
+///
+/// Two distinct failure modes, kept apart on purpose (issue #333): a file
+/// that isn't valid TOML at all must never be misdiagnosed as a
+/// `config_version` problem — the syntax error can be anywhere in the file,
+/// far from `[general]`. So this parses into a generic `Value` first (where
+/// syntax errors surface, carrying the `toml` crate's own line/column
+/// context) and only *then* inspects `general.config_version`.
+pub(crate) fn extract_config_version(raw: &str) -> Result<Option<u32>, String> {
+    let value: toml::Value =
+        toml::from_str(raw).map_err(|e| format!("config file is not valid TOML: {e}"))?;
 
-#[derive(Deserialize)]
-struct VersionProbeGeneral {
-    config_version: Option<u32>,
-}
+    let Some(config_version) = value
+        .get("general")
+        .and_then(|general| general.get("config_version"))
+    else {
+        return Ok(None);
+    };
 
-/// Extract config_version from raw TOML without fully parsing.
-fn extract_config_version(raw: &str) -> Result<Option<u32>, String> {
-    let probe: VersionProbe =
-        toml::from_str(raw).map_err(|e| format!("failed to read config_version: {e}"))?;
-    Ok(probe.general.and_then(|g| g.config_version))
+    match config_version.as_integer().and_then(|n| u32::try_from(n).ok()) {
+        Some(n) if n > 0 => Ok(Some(n)),
+        _ => Err(format!(
+            "config_version must be a positive integer (found: {config_version})"
+        )),
+    }
 }
 
 /// Compose opacity warnings for a legacy config: one message per subvolume
@@ -2359,6 +2368,56 @@ state_db = "/tmp/urd.db"
 config_version = 99
 "#;
         assert_eq!(extract_config_version(raw).unwrap(), Some(99));
+    }
+
+    // ── config_version error handling (issue #333) ──────────────────────
+    //
+    // A TOML syntax error anywhere in the file must never be misdiagnosed
+    // as a config_version problem, and a malformed config_version value
+    // must get its own specific message once the file is known to parse.
+
+    #[test]
+    fn extract_version_syntax_error_does_not_mention_config_version() {
+        // The stray quote is on a line far from [general]; the failure has
+        // nothing to do with config_version.
+        let raw = r#"
+[general]
+config_version = 2
+state_db = "/tmp/urd.db"
+
+[[subvolumes]]
+name = "broken
+"#;
+        let err = extract_config_version(raw).unwrap_err();
+        assert!(
+            !err.contains("config_version"),
+            "syntax error message must not mention config_version: {err}"
+        );
+        // The underlying toml error carries its own line/column context.
+        assert!(
+            err.contains("line") && err.contains("column"),
+            "syntax error message should carry line/column context: {err}"
+        );
+    }
+
+    #[test]
+    fn extract_version_string_is_malformed() {
+        let raw = r#"
+[general]
+config_version = "2"
+"#;
+        let err = extract_config_version(raw).unwrap_err();
+        assert!(err.contains("config_version must be a positive integer"), "{err}");
+    }
+
+    #[test]
+    fn extract_version_negative_is_malformed() {
+        let raw = r#"
+[general]
+config_version = -1
+"#;
+        let err = extract_config_version(raw).unwrap_err();
+        assert!(err.contains("config_version must be a positive integer"), "{err}");
     }
 
     // ── V2 (UPI 042) tests ─────────────────────────────────────────────
