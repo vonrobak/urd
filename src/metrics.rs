@@ -37,6 +37,15 @@ pub(crate) mod names {
     pub const URD_PLANNER_FULL_SENDS_TOTAL: &str = "urd_planner_full_sends_total";
     pub const URD_PLANNER_DEFERS_TOTAL: &str = "urd_planner_defers_total";
     pub const URD_RETENTION_PRUNES_TOTAL: &str = "urd_retention_prunes_total";
+    // Alert-worthy signals promoted into the public contract (issues #337/#338):
+    // same events-table derivation as their urd_* siblings, or the same
+    // per-run population as heartbeat v3, just under a `backup_*` name so
+    // downstream alerting (which only binds to `backup_*`) can reach them.
+    pub const BACKUP_CIRCUIT_BREAKER_TRIPS_TOTAL: &str = "backup_circuit_breaker_trips_total";
+    pub const BACKUP_EMERGENCY_PRUNES_TOTAL: &str = "backup_emergency_prunes_total";
+    pub const BACKUP_CHAIN_BROKEN_FULL_SENDS_TOTAL: &str = "backup_chain_broken_full_sends_total";
+    pub const BACKUP_PIN_FAILURES: &str = "backup_pin_failures";
+    pub const BACKUP_PROMISE_STATE: &str = "backup_promise_state";
 }
 
 // ── Types ───────────────────────────────────────────────────────────────
@@ -127,6 +136,19 @@ pub struct SubvolumeMetrics {
     /// Emit policy: line absent when `None` (cold-start);
     /// `Some(0)` is emitted (distinguishes "known zero" from "unknown").
     pub estimated_local_pinned_delta_bytes: Option<u64>,
+    /// Pin-file write failures for this subvolume in this run. `Some(_)` for
+    /// the same population as `promise_state` below (every subvolume the
+    /// post-run awareness assessment covers — enabled subvolumes only);
+    /// `None` for a subvolume with no assessment this run (disabled). Feeds
+    /// `backup_pin_failures`. Mirrors heartbeat v3's per-subvolume
+    /// `pin_failures` population and source exactly.
+    pub pin_failures: Option<u32>,
+    /// Post-run promise status: `Some(0)`=protected, `Some(1)`=at_risk,
+    /// `Some(2)`=unprotected (`PromiseStatus::metric_value`). `None` when no
+    /// awareness assessment exists for this subvolume this run (disabled
+    /// subvolumes — Urd holds no promise for them). Feeds
+    /// `backup_promise_state`.
+    pub promise_state: Option<u8>,
 }
 
 /// Escape `\`, `"`, and newline in a Prometheus label value per the
@@ -773,6 +795,51 @@ fn format_metrics(data: &MetricsData) -> String {
         }
     }
 
+    // ── Pin failures / promise state (alert-worthy `backup_*` promotions) ──
+    //
+    // Both share the awareness-assessment population: `Some` only for a
+    // subvolume this run's `assess()` covered (enabled subvolumes); `None`
+    // for a disabled subvolume, which has no promise to report. Mirrors
+    // heartbeat v3's own `pin_failures`/`promise_status` population exactly.
+
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "# HELP {} Pin-file write failures for this subvolume in this run (sends that succeeded but whose chain marker could not be written). Emitted for every subvolume this run's awareness assessment covers; absent for disabled subvolumes.",
+        names::BACKUP_PIN_FAILURES
+    )
+    .unwrap();
+    writeln!(out, "# TYPE {} gauge", names::BACKUP_PIN_FAILURES).unwrap();
+    for sv in &data.subvolumes {
+        if let Some(pin_failures) = sv.pin_failures {
+            sample(
+                &mut out,
+                names::BACKUP_PIN_FAILURES,
+                &[("subvolume", sv.name.as_str())],
+                pin_failures,
+            );
+        }
+    }
+
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "# HELP {} Post-run promise status: 0=protected, 1=at_risk, 2=unprotected. Emitted for every subvolume this run's awareness assessment covers; absent for disabled subvolumes.",
+        names::BACKUP_PROMISE_STATE
+    )
+    .unwrap();
+    writeln!(out, "# TYPE {} gauge", names::BACKUP_PROMISE_STATE).unwrap();
+    for sv in &data.subvolumes {
+        if let Some(promise_state) = sv.promise_state {
+            sample(
+                &mut out,
+                names::BACKUP_PROMISE_STATE,
+                &[("subvolume", sv.name.as_str())],
+                promise_state,
+            );
+        }
+    }
+
     // ── Structured event counters ─────────────────────────────────
 
     let counters = &data.event_counters;
@@ -871,7 +938,74 @@ fn format_metrics(data: &MetricsData) -> String {
         }
     }
 
+    // ── Public mirrors of alert-worthy internal counters (backup_*) ────
+    //
+    // Same events-table derivation as their urd_* siblings above — the
+    // downstream alerting consumer only binds to `backup_*` names, so these
+    // exist purely to make the value reachable under the public contract.
+    // Both are all-time cumulative over the events log (ADR-114): monotonic
+    // for as long as the log is not pruned (it currently never is — see
+    // docs/20-reference/metrics.md). Consumers should use `increase()` /
+    // `rate()`, which tolerate a counter reset if that ever changes.
+
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "# HELP {} Sentinel circuit-breaker open transitions. Public mirror of {}; same value.",
+        names::BACKUP_CIRCUIT_BREAKER_TRIPS_TOTAL,
+        names::URD_CIRCUIT_BREAKER_TRIPS_TOTAL,
+    )
+    .unwrap();
+    writeln!(out, "# TYPE {} counter", names::BACKUP_CIRCUIT_BREAKER_TRIPS_TOTAL).unwrap();
+    sample(
+        &mut out,
+        names::BACKUP_CIRCUIT_BREAKER_TRIPS_TOTAL,
+        &[],
+        counters.circuit_breaker_trips,
+    );
+
+    let emergency_prunes = counter_value(&counters.prunes_by_rule, "emergency");
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "# HELP {} Snapshots pruned under emergency retention. Public mirror of {}{{rule=\"emergency\"}}; same value, 0 when no such events exist.",
+        names::BACKUP_EMERGENCY_PRUNES_TOTAL,
+        names::URD_RETENTION_PRUNES_TOTAL,
+    )
+    .unwrap();
+    writeln!(out, "# TYPE {} counter", names::BACKUP_EMERGENCY_PRUNES_TOTAL).unwrap();
+    sample(&mut out, names::BACKUP_EMERGENCY_PRUNES_TOTAL, &[], emergency_prunes);
+
+    let chain_broken_full_sends = counter_value(&counters.full_sends_by_reason, "chain_broken");
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "# HELP {} Full sends triggered by a broken incremental chain. Public mirror of {}{{reason=\"chain_broken\"}}; same value, 0 when no such events exist.",
+        names::BACKUP_CHAIN_BROKEN_FULL_SENDS_TOTAL,
+        names::URD_PLANNER_FULL_SENDS_TOTAL,
+    )
+    .unwrap();
+    writeln!(out, "# TYPE {} counter", names::BACKUP_CHAIN_BROKEN_FULL_SENDS_TOTAL).unwrap();
+    sample(
+        &mut out,
+        names::BACKUP_CHAIN_BROKEN_FULL_SENDS_TOTAL,
+        &[],
+        chain_broken_full_sends,
+    );
+
     out
+}
+
+/// Look up a labeled counter's value by key, defaulting to 0 when the key is
+/// absent (no such events this run — the events-table queries never emit a
+/// zero row for an untriggered label, unlike the `reason="none"` /
+/// `rule="none"` family sentinels above).
+#[must_use]
+fn counter_value(pairs: &[(String, u64)], key: &str) -> u64 {
+    pairs
+        .iter()
+        .find(|(label, _)| label == key)
+        .map_or(0, |(_, count)| *count)
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
@@ -896,6 +1030,8 @@ mod tests {
                     last_full_send_bytes: None,
                     local_snapshot_count_v4: None,
                     estimated_local_pinned_delta_bytes: None,
+                    pin_failures: None,
+                    promise_state: None,
                 },
                 SubvolumeMetrics {
                     name: "htpc-home".to_string(),
@@ -910,6 +1046,8 @@ mod tests {
                     last_full_send_bytes: None,
                     local_snapshot_count_v4: None,
                     estimated_local_pinned_delta_bytes: None,
+                    pin_failures: None,
+                    promise_state: None,
                 },
             ],
             external_drive_mounted: true,
@@ -1062,6 +1200,8 @@ mod tests {
                 last_full_send_bytes: None,
                 local_snapshot_count_v4: None,
                 estimated_local_pinned_delta_bytes: None,
+                pin_failures: None,
+                promise_state: None,
             },
             SubvolumeMetrics {
                 name: "sv-b".to_string(),
@@ -1076,6 +1216,8 @@ mod tests {
                 last_full_send_bytes: None,
                 local_snapshot_count_v4: None,
                 estimated_local_pinned_delta_bytes: None,
+                pin_failures: None,
+                promise_state: None,
             },
             SubvolumeMetrics {
                 name: "sv-c".to_string(),
@@ -1090,6 +1232,8 @@ mod tests {
                 last_full_send_bytes: None,
                 local_snapshot_count_v4: None,
                 estimated_local_pinned_delta_bytes: None,
+                pin_failures: None,
+                promise_state: None,
             },
         ];
 
@@ -1124,6 +1268,8 @@ mod tests {
                 last_full_send_bytes: None,
                 local_snapshot_count_v4: None,
                 estimated_local_pinned_delta_bytes: None,
+                pin_failures: None,
+                promise_state: None,
             }],
             external_drive_mounted: true,
             external_free_bytes: 1_000_000,
@@ -1148,6 +1294,8 @@ mod tests {
             last_full_send_bytes: None,
             local_snapshot_count_v4: None,
             estimated_local_pinned_delta_bytes: None,
+            pin_failures: None,
+            promise_state: None,
         }];
         apply_carried_forward_timestamps(&mut svs, &carried);
 
@@ -1373,6 +1521,8 @@ mod tests {
             last_full_send_bytes: None,
             local_snapshot_count_v4: None,
             estimated_local_pinned_delta_bytes: None,
+            pin_failures: None,
+            promise_state: None,
         }
     }
 
@@ -1764,6 +1914,147 @@ mod tests {
         assert!(!output.contains("backup_pool_total_bytes{"));
     }
 
+    // ── backup_pin_failures / backup_promise_state (issues #337/#338) ──
+
+    #[test]
+    fn format_metrics_emits_pin_failures_and_promise_state_help_and_type() {
+        let data = sample_data();
+        let output = format_metrics(&data);
+        assert!(output.contains("# HELP backup_pin_failures"));
+        assert!(output.contains("# TYPE backup_pin_failures gauge"));
+        assert!(output.contains("# HELP backup_promise_state"));
+        assert!(output.contains("# TYPE backup_promise_state gauge"));
+    }
+
+    #[test]
+    fn format_metrics_emits_pin_failures_zero_for_assessed_subvolume() {
+        let mut data = sample_data();
+        data.subvolumes[0].pin_failures = Some(0);
+        let output = format_metrics(&data);
+        assert!(
+            output.contains("backup_pin_failures{subvolume=\"subvol3-opptak\"} 0"),
+            "series presence beats value: a zero pin-failure count must still be emitted"
+        );
+    }
+
+    #[test]
+    fn format_metrics_emits_pin_failures_nonzero_value() {
+        let mut data = sample_data();
+        data.subvolumes[0].pin_failures = Some(3);
+        let output = format_metrics(&data);
+        assert!(output.contains("backup_pin_failures{subvolume=\"subvol3-opptak\"} 3"));
+    }
+
+    #[test]
+    fn format_metrics_omits_pin_failures_and_promise_state_for_unassessed_subvolume() {
+        // `None` models a disabled subvolume: no awareness assessment this
+        // run, so neither series is emitted for it — HELP/TYPE stay present
+        // unconditionally (both fields already default to None in sample_data()).
+        let data = sample_data();
+        let output = format_metrics(&data);
+        assert!(!output.contains("backup_pin_failures{"));
+        assert!(!output.contains("backup_promise_state{"));
+    }
+
+    #[test]
+    fn format_metrics_emits_promise_state_for_all_three_encodings() {
+        let mut data = sample_data();
+        data.subvolumes[0].promise_state = Some(0); // protected
+        data.subvolumes[1].promise_state = Some(2); // unprotected
+        data.subvolumes.push(SubvolumeMetrics {
+            promise_state: Some(1), // at_risk
+            ..ts_subvol("sv-third", None)
+        });
+        let output = format_metrics(&data);
+        assert!(output.contains("backup_promise_state{subvolume=\"subvol3-opptak\"} 0"));
+        assert!(output.contains("backup_promise_state{subvolume=\"htpc-home\"} 2"));
+        assert!(output.contains("backup_promise_state{subvolume=\"sv-third\"} 1"));
+    }
+
+    #[test]
+    fn format_metrics_emits_pin_failures_for_skipped_subvolume() {
+        // A skipped subvolume (success == 2) still gets an assessed
+        // pin_failures/promise_state pair — the population is the awareness
+        // assessment, not the execution outcome.
+        let mut data = sample_data();
+        data.subvolumes[1].pin_failures = Some(0); // htpc-home is success == 2 (skipped)
+        data.subvolumes[1].promise_state = Some(1);
+        let output = format_metrics(&data);
+        assert!(output.contains("backup_pin_failures{subvolume=\"htpc-home\"} 0"));
+        assert!(output.contains("backup_promise_state{subvolume=\"htpc-home\"} 1"));
+    }
+
+    // ── backup_circuit_breaker_trips_total / backup_emergency_prunes_total /
+    //    backup_chain_broken_full_sends_total (issues #337/#338) ──────
+    //
+    // Public `backup_*` mirrors of the `urd_*` event counters — same
+    // events-table derivation, same values, reachable under the name the
+    // downstream alerting consumer actually binds to.
+
+    #[test]
+    fn format_metrics_emits_backup_counter_mirrors_help_and_type() {
+        let data = sample_data();
+        let output = format_metrics(&data);
+        assert!(output.contains("# HELP backup_circuit_breaker_trips_total"));
+        assert!(output.contains("# TYPE backup_circuit_breaker_trips_total counter"));
+        assert!(output.contains("# HELP backup_emergency_prunes_total"));
+        assert!(output.contains("# TYPE backup_emergency_prunes_total counter"));
+        assert!(output.contains("# HELP backup_chain_broken_full_sends_total"));
+        assert!(output.contains("# TYPE backup_chain_broken_full_sends_total counter"));
+    }
+
+    #[test]
+    fn format_metrics_emits_zero_backup_counter_mirrors_when_no_events() {
+        // sample_data()'s EventCounters::default() has no trips, no
+        // "emergency" prune, no "chain_broken" full send.
+        let data = sample_data();
+        let output = format_metrics(&data);
+        assert!(output.contains("backup_circuit_breaker_trips_total 0"));
+        assert!(output.contains("backup_emergency_prunes_total 0"));
+        assert!(output.contains("backup_chain_broken_full_sends_total 0"));
+    }
+
+    #[test]
+    fn format_metrics_mirrors_circuit_breaker_trips_value() {
+        let mut data = sample_data();
+        data.event_counters.circuit_breaker_trips = 7;
+        let output = format_metrics(&data);
+        assert!(output.contains("urd_circuit_breaker_trips_total 7"));
+        assert!(output.contains("backup_circuit_breaker_trips_total 7"));
+    }
+
+    #[test]
+    fn format_metrics_mirrors_emergency_prunes_ignoring_other_rules() {
+        let mut data = sample_data();
+        data.event_counters.prunes_by_rule = vec![
+            ("graduated_daily".to_string(), 14),
+            ("emergency".to_string(), 2),
+        ];
+        let output = format_metrics(&data);
+        assert!(output.contains("backup_emergency_prunes_total 2"));
+        // The non-emergency rule count must not leak into the mirror.
+        assert!(!output.contains("backup_emergency_prunes_total 14"));
+    }
+
+    #[test]
+    fn format_metrics_mirrors_chain_broken_full_sends_ignoring_other_reasons() {
+        let mut data = sample_data();
+        data.event_counters.full_sends_by_reason = vec![
+            ("first_send".to_string(), 3),
+            ("chain_broken".to_string(), 1),
+        ];
+        let output = format_metrics(&data);
+        assert!(output.contains("backup_chain_broken_full_sends_total 1"));
+        assert!(!output.contains("backup_chain_broken_full_sends_total 3"));
+    }
+
+    #[test]
+    fn counter_value_defaults_to_zero_for_missing_key() {
+        let pairs = vec![("first_send".to_string(), 3)];
+        assert_eq!(counter_value(&pairs, "chain_broken"), 0);
+        assert_eq!(counter_value(&pairs, "first_send"), 3);
+    }
+
     // ── sample() helper (UPI 061) ─────────────────────────────────
 
     #[test]
@@ -1809,20 +2100,23 @@ mod tests {
     // ── Golden file (UPI 061) ─────────────────────────────────────
     //
     // The golden fixture exercises every emission branch reachable in one
-    // MetricsData: all 21 metrics present, Some/None splits across
+    // MetricsData: all 26 metrics present, Some/None splits across
     // subvolumes, both pool roles, non-empty event counters. Branches a
     // single fixture cannot reach (zero-sentinel counter lines, unmounted
     // drive, per-metric absence) are pinned by the `contains` tests above.
     //
-    // src/testdata/golden_metrics.prom is WRITE-ONCE for refactors: it was
-    // generated from the pre-UPI-061 formatter and is the byte-level proof
-    // that the contract-surface refactor changed nothing for realistic
-    // configs (ADR-105 / homelab ADR-021). Never regenerate it to make this
-    // test pass after a refactor — a mismatch is a bug in the formatter, not
-    // the file. A deliberate new metric (e.g. `backup_pool_last_seen_timestamp`,
-    // issue #339) is the one case that legitimately amends the fixture —
-    // done by hand, with the diff reviewed as part of the change, not by
-    // regenerating from formatter output.
+    // src/testdata/golden_metrics.prom was generated from the pre-UPI-061
+    // formatter and is the byte-level proof that the contract-surface
+    // refactor changed nothing for realistic configs (ADR-105 / homelab
+    // ADR-021). It is WRITE-ONCE except for a deliberate, documented
+    // contract addition: a mismatch from touching unrelated formatter code
+    // is a bug in the formatter, not in the file — never regenerate to paper
+    // over that. Two such additions have landed by hand, each reviewed as a
+    // diff against the prior fixture rather than regenerated wholesale: issue
+    // #339 added the backup_pool_last_seen_timestamp block, and issues
+    // #337/#338 added the backup_pin_failures/backup_promise_state/
+    // backup_circuit_breaker_trips_total/backup_emergency_prunes_total/
+    // backup_chain_broken_full_sends_total blocks.
 
     fn golden_data() -> MetricsData {
         MetricsData {
@@ -1840,6 +2134,8 @@ mod tests {
                     last_full_send_bytes: None,
                     local_snapshot_count_v4: Some(7),
                     estimated_local_pinned_delta_bytes: Some(0),
+                    pin_failures: Some(0),
+                    promise_state: Some(0),
                 },
                 SubvolumeMetrics {
                     name: "htpc-home".to_string(),
@@ -1854,6 +2150,8 @@ mod tests {
                     last_full_send_bytes: Some(12_000_000_000),
                     local_snapshot_count_v4: None,
                     estimated_local_pinned_delta_bytes: Some(5_000_000),
+                    pin_failures: Some(0),
+                    promise_state: Some(1),
                 },
                 SubvolumeMetrics {
                     name: "sv-media".to_string(),
@@ -1868,6 +2166,8 @@ mod tests {
                     last_full_send_bytes: None,
                     local_snapshot_count_v4: Some(0),
                     estimated_local_pinned_delta_bytes: None,
+                    pin_failures: Some(2),
+                    promise_state: Some(2),
                 },
             ],
             external_drive_mounted: true,
@@ -1931,7 +2231,7 @@ mod tests {
 
     #[test]
     fn guard_metric_names_live_only_in_names_module() {
-        const ALL: [&str; 21] = [
+        const ALL: [&str; 26] = [
             names::BACKUP_SUCCESS,
             names::BACKUP_LAST_SUCCESS_TIMESTAMP,
             names::BACKUP_DURATION_SECONDS,
@@ -1953,6 +2253,11 @@ mod tests {
             names::URD_PLANNER_FULL_SENDS_TOTAL,
             names::URD_PLANNER_DEFERS_TOTAL,
             names::URD_RETENTION_PRUNES_TOTAL,
+            names::BACKUP_CIRCUIT_BREAKER_TRIPS_TOTAL,
+            names::BACKUP_EMERGENCY_PRUNES_TOTAL,
+            names::BACKUP_CHAIN_BROKEN_FULL_SENDS_TOTAL,
+            names::BACKUP_PIN_FAILURES,
+            names::BACKUP_PROMISE_STATE,
         ];
 
         let source = include_str!("metrics.rs");

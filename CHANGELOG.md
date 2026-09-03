@@ -32,6 +32,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   case the progress line can't show a total or an ETA for. Incremental
   sends without an estimate don't trigger it (calibration can't help
   those), and the suggestion only appears in interactive output (#254).
+- Five alert-worthy signals are now reachable under the public `backup_*`
+  Prometheus contract, since downstream alerting only binds to that
+  namespace: `backup_circuit_breaker_trips_total`,
+  `backup_emergency_prunes_total`, and
+  `backup_chain_broken_full_sends_total` mirror their existing `urd_*`
+  counters byte-for-byte; `backup_pin_failures` and `backup_promise_state`
+  are new per-subvolume gauges sourced from the same post-run awareness
+  assessment that already feeds the heartbeat. Every existing `urd_*` series
+  is unchanged (#337, #338).
 
 ### Changed
 - The EXPOSURE column's label-to-color plumbing now carries `PromiseStatus`

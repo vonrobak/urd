@@ -84,6 +84,18 @@ backup_subvolume_local_snapshot_count{subvolume="sv-media"} 0
 backup_subvolume_estimated_local_pinned_delta_bytes{subvolume="subvol3-opptak"} 0
 backup_subvolume_estimated_local_pinned_delta_bytes{subvolume="htpc-home"} 5000000
 
+# HELP backup_pin_failures Pin-file write failures for this subvolume in this run (sends that succeeded but whose chain marker could not be written). Emitted for every subvolume this run's awareness assessment covers; absent for disabled subvolumes.
+# TYPE backup_pin_failures gauge
+backup_pin_failures{subvolume="subvol3-opptak"} 0
+backup_pin_failures{subvolume="htpc-home"} 0
+backup_pin_failures{subvolume="sv-media"} 2
+
+# HELP backup_promise_state Post-run promise status: 0=protected, 1=at_risk, 2=unprotected. Emitted for every subvolume this run's awareness assessment covers; absent for disabled subvolumes.
+# TYPE backup_promise_state gauge
+backup_promise_state{subvolume="subvol3-opptak"} 0
+backup_promise_state{subvolume="htpc-home"} 1
+backup_promise_state{subvolume="sv-media"} 2
+
 # HELP urd_circuit_breaker_trips_total Sentinel circuit-breaker open transitions.
 # TYPE urd_circuit_breaker_trips_total counter
 urd_circuit_breaker_trips_total 5
@@ -102,3 +114,15 @@ urd_planner_defers_total{scope="drive"} 3
 # TYPE urd_retention_prunes_total counter
 urd_retention_prunes_total{rule="graduated_daily"} 14
 urd_retention_prunes_total{rule="emergency"} 2
+
+# HELP backup_circuit_breaker_trips_total Sentinel circuit-breaker open transitions. Public mirror of urd_circuit_breaker_trips_total; same value.
+# TYPE backup_circuit_breaker_trips_total counter
+backup_circuit_breaker_trips_total 5
+
+# HELP backup_emergency_prunes_total Snapshots pruned under emergency retention. Public mirror of urd_retention_prunes_total{rule="emergency"}; same value, 0 when no such events exist.
+# TYPE backup_emergency_prunes_total counter
+backup_emergency_prunes_total 2
+
+# HELP backup_chain_broken_full_sends_total Full sends triggered by a broken incremental chain. Public mirror of urd_planner_full_sends_total{reason="chain_broken"}; same value, 0 when no such events exist.
+# TYPE backup_chain_broken_full_sends_total counter
+backup_chain_broken_full_sends_total 1
