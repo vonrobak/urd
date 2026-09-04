@@ -11,7 +11,6 @@
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
-use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
 
 use crate::awareness::{
@@ -89,66 +88,37 @@ pub struct SentinelState {
     /// Operational health per subvolume from the last assessment.
     /// Used by health transition detection to fire HealthDegraded/Recovered.
     pub last_health_states: Vec<HealthSnapshot>,
-    /// Circuit breaker state (active mode only, but tracked always).
-    pub circuit_breaker: CircuitBreaker,
 }
 
 impl SentinelState {
     /// Create initial state for a fresh sentinel startup.
     #[must_use]
-    pub fn new(circuit_breaker_config: CircuitBreakerConfig) -> Self {
+    pub fn new() -> Self {
         Self {
             mounted_drives: BTreeSet::new(),
             last_promise_states: Vec::new(),
             has_initial_assessment: false,
             last_chain_health: Vec::new(),
             last_health_states: Vec::new(),
-            circuit_breaker: CircuitBreaker::new(circuit_breaker_config),
         }
     }
 }
 
-// ── Circuit Breaker ─────────────────────────────────────────────────────
-
-/// Configuration for the circuit breaker (from config or defaults).
-#[derive(Debug, Clone)]
-pub struct CircuitBreakerConfig {
-    /// Minimum interval between auto-triggered backups.
-    #[allow(dead_code)] // Session 4: active mode
-    pub min_interval: Duration,
-    /// Maximum consecutive failures before the circuit opens.
-    #[allow(dead_code)] // Session 4: active mode
-    pub max_failures: u32,
-}
-
-impl Default for CircuitBreakerConfig {
+impl Default for SentinelState {
     fn default() -> Self {
-        Self {
-            min_interval: Duration::from_secs(3600), // 1h
-            max_failures: 3,
-        }
+        Self::new()
     }
 }
 
-/// Circuit breaker preventing cascade failures from auto-triggered backups.
+/// The circuit-breaker state carried on the `SentinelCircuitBreak` event
+/// (ADR-105 on-disk contract — old event rows must keep deserializing).
 ///
-/// States:
-/// - Closed: triggers allowed, failure counter tracks consecutive failures.
-/// - Open: triggers blocked, exponential backoff before half-open attempt.
-/// - HalfOpen: one trial trigger allowed — success closes, failure re-opens.
-#[derive(Debug, Clone)]
-pub struct CircuitBreaker {
-    #[allow(dead_code)] // Session 4: active mode
-    pub config: CircuitBreakerConfig,
-    pub state: CircuitState,
-    pub failure_count: u32,
-    #[allow(dead_code)] // Session 4: active mode
-    pub last_trigger: Option<NaiveDateTime>,
-    /// Current backoff duration (doubles on each failure, capped at 24h).
-    #[allow(dead_code)] // Session 4: active mode
-    pub backoff: Duration,
-}
-
+/// The decision machinery that used to populate this (auto-trigger
+/// evaluation, backoff, half-open trials) was deleted as dormant, dead
+/// code — see #385. This type, the event variant, and the
+/// `backup_circuit_breaker_trips_total` / `urd_circuit_breaker_trips_total`
+/// metrics remain as permanently-zero contract surfaces; a future
+/// active-mode design can repopulate them without a contract change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CircuitState {
@@ -165,135 +135,6 @@ impl std::fmt::Display for CircuitState {
             Self::HalfOpen => write!(f, "half-open"),
         }
     }
-}
-
-/// Maximum backoff duration: 24 hours.
-#[allow(dead_code)] // Session 4: active mode
-const MAX_BACKOFF: Duration = Duration::from_secs(24 * 3600);
-/// Initial backoff after first circuit open: 15 minutes.
-#[allow(dead_code)] // Session 4: active mode
-const INITIAL_BACKOFF: Duration = Duration::from_secs(15 * 60);
-
-impl CircuitBreaker {
-    #[must_use]
-    pub fn new(config: CircuitBreakerConfig) -> Self {
-        Self {
-            config,
-            state: CircuitState::Closed,
-            failure_count: 0,
-            last_trigger: None,
-            backoff: INITIAL_BACKOFF,
-        }
-    }
-
-    /// Check whether a trigger is allowed and what kind of trigger it is.
-    ///
-    /// Returns `Allowed` for normal closed-circuit triggers, `HalfOpenTrial`
-    /// when the circuit is open but backoff has elapsed (the runner should
-    /// treat the result as a trial), or `Blocked` when the trigger is not
-    /// permitted. The runner passes the returned permission to
-    /// `evaluate_trigger_result` so the circuit breaker knows whether to
-    /// apply half-open semantics — no implicit protocol.
-    #[must_use]
-    #[allow(dead_code)] // Session 4: active mode
-    pub fn check_trigger(&self, now: NaiveDateTime) -> TriggerPermission {
-        match self.state {
-            CircuitState::Open => {
-                // Check if backoff has elapsed → half-open trial
-                let elapsed_ok = match self.last_trigger {
-                    Some(last) => {
-                        let elapsed = now.signed_duration_since(last);
-                        elapsed >= chrono::Duration::from_std(self.backoff)
-                            .unwrap_or(chrono::Duration::MAX)
-                    }
-                    None => true,
-                };
-                if elapsed_ok {
-                    TriggerPermission::HalfOpenTrial
-                } else {
-                    TriggerPermission::Blocked
-                }
-            }
-            CircuitState::HalfOpen => TriggerPermission::HalfOpenTrial,
-            CircuitState::Closed => {
-                // Respect min_interval
-                let interval_ok = match self.last_trigger {
-                    Some(last) => {
-                        let elapsed = now.signed_duration_since(last);
-                        elapsed >= chrono::Duration::from_std(self.config.min_interval)
-                            .unwrap_or(chrono::Duration::MAX)
-                    }
-                    None => true,
-                };
-                if interval_ok {
-                    TriggerPermission::Allowed
-                } else {
-                    TriggerPermission::Blocked
-                }
-            }
-        }
-    }
-}
-
-// ── Trigger types ───────────────────────────────────────────────────────
-
-/// Result of `CircuitBreaker::check_trigger` — tells the runner what kind
-/// of trigger this is, so `evaluate_trigger_result` can apply the correct
-/// circuit breaker semantics without an implicit protocol.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // Session 4: active mode
-pub enum TriggerPermission {
-    /// Normal trigger (circuit closed, min_interval elapsed).
-    Allowed,
-    /// Circuit is open but backoff elapsed — this is a trial. If it fails,
-    /// backoff doubles. If it succeeds, circuit closes.
-    HalfOpenTrial,
-    /// Trigger not permitted (circuit open during backoff, or min_interval
-    /// not elapsed).
-    Blocked,
-}
-
-#[allow(dead_code)] // Session 4: active mode
-impl TriggerPermission {
-    /// Whether this permission allows a trigger to proceed.
-    #[must_use]
-    pub fn is_allowed(self) -> bool {
-        matches!(self, Self::Allowed | Self::HalfOpenTrial)
-    }
-}
-
-/// Why the sentinel wants to trigger a backup.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // Session 4: active mode
-pub enum TriggerReason {
-    /// A drive was mounted that has pending sends.
-    DriveMounted { label: String },
-    /// Promise states degraded (something went from Protected to worse).
-    PromiseDegraded,
-}
-
-/// A decision to trigger a backup, with context for result evaluation.
-#[derive(Debug, Clone)]
-#[allow(dead_code)] // Session 4: active mode
-pub struct BackupTrigger {
-    pub reason: TriggerReason,
-    pub triggered_at: NaiveDateTime,
-    /// How the circuit breaker permitted this trigger — passed through to
-    /// `evaluate_trigger_result` so it knows whether to apply half-open
-    /// semantics. Eliminates the implicit protocol (review item S2).
-    pub permission: TriggerPermission,
-}
-
-/// Outcome of a triggered backup, for circuit breaker evaluation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // Session 4: active mode
-pub enum TriggerOutcome {
-    /// Backup succeeded (exit 0, or heartbeat shows improvement).
-    Success,
-    /// Backup failed or the trigger condition didn't improve.
-    Failure,
-    /// Lock was held — another backup was already running. Not a failure.
-    LockHeld,
 }
 
 // ── Adaptive tick ───────────────────────────────────────────────────────
@@ -340,7 +181,7 @@ pub struct TransitionResult {
 /// Audit events for sentinel transitions are emitted by the runner, not
 /// here — drive mount/unmount via `record_drive_event`, promise transitions
 /// via `awareness::diff_promise_states`, anomalies from the chain-break
-/// detector. Circuit-breaker events are deferred to active mode.
+/// detector.
 #[must_use]
 pub fn sentinel_transition(
     state: &SentinelState,
@@ -405,155 +246,6 @@ pub fn sentinel_transition(
         state: new_state,
         actions,
     }
-}
-
-// ── Trigger decision (runner-level) ─────────────────────────────────────
-
-/// Decide whether to auto-trigger a backup based on the event, current
-/// assessments, and sentinel state.
-///
-/// This is a pure function that lives in sentinel.rs, but it is called by
-/// the **runner** after executing the Assess action — NOT by
-/// sentinel_transition(). The runner provides the assessments from the
-/// just-completed assessment. (Review item S3: runner-level decision.)
-///
-/// Only relevant when active mode is enabled (`[sentinel] active = true`).
-#[must_use]
-#[allow(dead_code)] // Session 4: active mode
-pub fn should_trigger_backup(
-    state: &SentinelState,
-    event: &SentinelEvent,
-    assessments: &[SubvolAssessment],
-    now: NaiveDateTime,
-) -> Option<BackupTrigger> {
-    // Check circuit breaker permission once — shared by all trigger paths.
-    let permission = state.circuit_breaker.check_trigger(now);
-    if !permission.is_allowed() {
-        return None;
-    }
-
-    // Only DriveMounted and AssessmentTick (with degradation) can trigger.
-    match event {
-        SentinelEvent::DriveMounted { label } => {
-            if !state.has_initial_assessment {
-                return None; // M2: don't trigger before baseline is established
-            }
-
-            // Trigger if any subvolume needs a send to this drive.
-            let drive_needs_send = assessments.iter().any(|a| {
-                a.external.iter().any(|d| {
-                    d.drive_label == *label && d.status != PromiseStatus::Protected
-                })
-            });
-
-            if drive_needs_send {
-                Some(BackupTrigger {
-                    reason: TriggerReason::DriveMounted {
-                        label: label.clone(),
-                    },
-                    triggered_at: now,
-                    permission,
-                })
-            } else {
-                None
-            }
-        }
-
-        SentinelEvent::AssessmentTick => {
-            if !state.has_initial_assessment {
-                return None; // Don't trigger on the very first assessment
-            }
-
-            let degraded = has_promise_degradation(&state.last_promise_states, assessments);
-            if degraded {
-                Some(BackupTrigger {
-                    reason: TriggerReason::PromiseDegraded,
-                    triggered_at: now,
-                    permission,
-                })
-            } else {
-                None
-            }
-        }
-
-        // BackupCompleted, DriveUnmounted, Shutdown — never trigger.
-        _ => None,
-    }
-}
-
-/// Check if any subvolume's promise status degraded (got worse) between
-/// the previous snapshot and current assessments.
-#[allow(dead_code)] // Session 4: active mode (used by should_trigger_backup)
-fn has_promise_degradation(
-    previous: &[PromiseSnapshot],
-    current: &[SubvolAssessment],
-) -> bool {
-    for assess in current {
-        if let Some(prev) = previous.iter().find(|p| p.name == assess.name) {
-            // PromiseStatus is ordered Unprotected < AtRisk < Protected,
-            // so degradation means current < previous.
-            if assess.status < prev.status {
-                return true;
-            }
-        }
-        // New subvolumes (not in previous) don't count as degradation.
-    }
-    false
-}
-
-// ── Circuit breaker evaluation ──────────────────────────────────────────
-
-/// Evaluate a trigger result and return the updated circuit breaker state.
-///
-/// Pure function — the runner calls this after a triggered backup completes
-/// and stores the result.
-#[must_use]
-#[allow(dead_code)] // Session 4: active mode
-pub fn evaluate_trigger_result(
-    circuit: &CircuitBreaker,
-    trigger: &BackupTrigger,
-    result: &TriggerOutcome,
-) -> CircuitBreaker {
-    let mut new = circuit.clone();
-
-    match result {
-        TriggerOutcome::Success => {
-            new.last_trigger = Some(trigger.triggered_at);
-            new.state = CircuitState::Closed;
-            new.failure_count = 0;
-            new.backoff = INITIAL_BACKOFF;
-        }
-
-        TriggerOutcome::Failure => {
-            new.last_trigger = Some(trigger.triggered_at);
-            new.failure_count += 1;
-
-            // Use the permission carried on the trigger to determine
-            // whether this was a half-open trial — no implicit protocol
-            // between check_trigger and evaluate_trigger_result (S2 fix).
-            if trigger.permission == TriggerPermission::HalfOpenTrial {
-                // Half-open trial failed — re-open with doubled backoff
-                new.state = CircuitState::Open;
-                new.backoff = circuit
-                    .backoff
-                    .checked_mul(2)
-                    .map(|d| d.min(MAX_BACKOFF))
-                    .unwrap_or(MAX_BACKOFF);
-            } else if new.failure_count >= new.config.max_failures {
-                // Closed circuit hit max failures — open with initial backoff
-                new.state = CircuitState::Open;
-                new.backoff = INITIAL_BACKOFF;
-            }
-        }
-
-        TriggerOutcome::LockHeld => {
-            // M1 fix: Not a real trigger — don't update last_trigger,
-            // don't change circuit state, don't increment failure count.
-            // This avoids consuming the min_interval cooldown.
-        }
-    }
-
-    new
 }
 
 // ── Snapshot change detection ──────────────────────────────────────────
@@ -1061,47 +753,16 @@ fn eject_advance(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::awareness::{
-        DriveAssessment, DriveChainHealth, LocalAssessment, OperationalHealth,
-    };
-    use crate::types::{DriveRole, Interval};
-
-    fn dt(s: &str) -> NaiveDateTime {
-        NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M").unwrap()
-    }
+    use crate::awareness::{DriveChainHealth, LocalAssessment, OperationalHealth};
+    use crate::types::Interval;
 
     fn fresh_state() -> SentinelState {
-        SentinelState::new(CircuitBreakerConfig::default())
+        SentinelState::new()
     }
 
     fn make_assessment(name: &str, status: PromiseStatus) -> SubvolAssessment {
         SubvolAssessment {
             local: LocalAssessment::fixture(status, 5, None),
-            ..SubvolAssessment::fixture(name, status)
-        }
-    }
-
-    fn make_assessment_with_drive(
-        name: &str,
-        status: PromiseStatus,
-        drive_label: &str,
-        drive_status: PromiseStatus,
-    ) -> SubvolAssessment {
-        SubvolAssessment {
-            local: LocalAssessment::fixture(PromiseStatus::Protected, 5, None),
-            external: vec![DriveAssessment {
-                drive_label: drive_label.to_string(),
-                status: drive_status,
-                mounted: true,
-                snapshot_count: Some(3),
-                last_send_age: None,
-                source_unchanged: false,
-                configured_interval: Interval::hours(24),
-                role: DriveRole::Primary,
-                absent_duration_secs: None,
-                last_activity_age_secs: None,
-                rotation: None,
-            }],
             ..SubvolAssessment::fixture(name, status)
         }
     }
@@ -1321,336 +982,6 @@ mod tests {
         ] {
             assert!(!should_record_transitions(true, Some(trigger), true));
         }
-    }
-
-    // ── Circuit breaker ─────────────────────────────────────────────────
-
-    /// Helper to build a trigger with a given permission.
-    fn make_trigger(at: &str, permission: TriggerPermission) -> BackupTrigger {
-        BackupTrigger {
-            reason: TriggerReason::PromiseDegraded,
-            triggered_at: dt(at),
-            permission,
-        }
-    }
-
-    #[test]
-    fn circuit_starts_closed() {
-        let cb = CircuitBreaker::new(CircuitBreakerConfig::default());
-        assert_eq!(cb.state, CircuitState::Closed);
-        assert_eq!(cb.failure_count, 0);
-    }
-
-    #[test]
-    fn circuit_stays_closed_on_success() {
-        let cb = CircuitBreaker::new(CircuitBreakerConfig::default());
-        let trigger = make_trigger("2026-03-27 10:00", TriggerPermission::Allowed);
-
-        let cb = evaluate_trigger_result(&cb, &trigger, &TriggerOutcome::Success);
-        assert_eq!(cb.state, CircuitState::Closed);
-        assert_eq!(cb.failure_count, 0);
-    }
-
-    #[test]
-    fn circuit_opens_after_max_failures() {
-        let config = CircuitBreakerConfig {
-            max_failures: 3,
-            ..Default::default()
-        };
-        let mut cb = CircuitBreaker::new(config);
-        let now = dt("2026-03-27 10:00");
-
-        for i in 0..3 {
-            let trigger = BackupTrigger {
-                reason: TriggerReason::PromiseDegraded,
-                triggered_at: now + chrono::Duration::minutes(i),
-                permission: TriggerPermission::Allowed,
-            };
-            cb = evaluate_trigger_result(&cb, &trigger, &TriggerOutcome::Failure);
-        }
-
-        assert_eq!(cb.state, CircuitState::Open);
-        assert_eq!(cb.failure_count, 3);
-    }
-
-    #[test]
-    fn circuit_does_not_open_below_max_failures() {
-        let config = CircuitBreakerConfig {
-            max_failures: 3,
-            ..Default::default()
-        };
-        let mut cb = CircuitBreaker::new(config);
-
-        for i in 0..2 {
-            let trigger = BackupTrigger {
-                reason: TriggerReason::PromiseDegraded,
-                triggered_at: dt("2026-03-27 10:00") + chrono::Duration::minutes(i),
-                permission: TriggerPermission::Allowed,
-            };
-            cb = evaluate_trigger_result(&cb, &trigger, &TriggerOutcome::Failure);
-        }
-
-        assert_eq!(cb.state, CircuitState::Closed);
-        assert_eq!(cb.failure_count, 2);
-    }
-
-    #[test]
-    fn circuit_open_blocks_trigger_during_backoff() {
-        let config = CircuitBreakerConfig {
-            max_failures: 1,
-            min_interval: Duration::from_secs(60),
-        };
-        let mut cb = CircuitBreaker::new(config);
-        let trigger = make_trigger("2026-03-27 10:00", TriggerPermission::Allowed);
-        cb = evaluate_trigger_result(&cb, &trigger, &TriggerOutcome::Failure);
-        assert_eq!(cb.state, CircuitState::Open);
-
-        // 5 minutes later — still within backoff (15 min initial)
-        assert_eq!(cb.check_trigger(dt("2026-03-27 10:05")), TriggerPermission::Blocked);
-    }
-
-    #[test]
-    fn circuit_open_returns_half_open_trial_after_backoff() {
-        let config = CircuitBreakerConfig {
-            max_failures: 1,
-            min_interval: Duration::from_secs(60),
-        };
-        let mut cb = CircuitBreaker::new(config);
-        let trigger = make_trigger("2026-03-27 10:00", TriggerPermission::Allowed);
-        cb = evaluate_trigger_result(&cb, &trigger, &TriggerOutcome::Failure);
-
-        // 20 minutes later — past initial 15-min backoff → HalfOpenTrial
-        assert_eq!(
-            cb.check_trigger(dt("2026-03-27 10:20")),
-            TriggerPermission::HalfOpenTrial
-        );
-    }
-
-    #[test]
-    fn circuit_half_open_trial_failure_reopens_with_doubled_backoff() {
-        let config = CircuitBreakerConfig {
-            max_failures: 1,
-            min_interval: Duration::from_secs(60),
-        };
-        let mut cb = CircuitBreaker::new(config);
-
-        // Open circuit with Allowed trigger
-        let trigger = make_trigger("2026-03-27 10:00", TriggerPermission::Allowed);
-        cb = evaluate_trigger_result(&cb, &trigger, &TriggerOutcome::Failure);
-        assert_eq!(cb.state, CircuitState::Open);
-
-        // Half-open trial fails — S2: permission carries the context, no manual state set
-        let trial = make_trigger("2026-03-27 10:20", TriggerPermission::HalfOpenTrial);
-        let cb = evaluate_trigger_result(&cb, &trial, &TriggerOutcome::Failure);
-        assert_eq!(cb.state, CircuitState::Open);
-        assert!(cb.backoff > INITIAL_BACKOFF, "backoff should double on half-open failure");
-    }
-
-    #[test]
-    fn circuit_half_open_trial_success_closes() {
-        let config = CircuitBreakerConfig {
-            max_failures: 1,
-            min_interval: Duration::from_secs(60),
-        };
-        let mut cb = CircuitBreaker::new(config);
-
-        // Open circuit
-        let trigger = make_trigger("2026-03-27 10:00", TriggerPermission::Allowed);
-        cb = evaluate_trigger_result(&cb, &trigger, &TriggerOutcome::Failure);
-
-        // Half-open trial succeeds — back to closed
-        let trial = make_trigger("2026-03-27 10:20", TriggerPermission::HalfOpenTrial);
-        let cb = evaluate_trigger_result(&cb, &trial, &TriggerOutcome::Success);
-        assert_eq!(cb.state, CircuitState::Closed);
-        assert_eq!(cb.failure_count, 0);
-        assert_eq!(cb.backoff, INITIAL_BACKOFF);
-    }
-
-    #[test]
-    fn circuit_lock_held_does_not_count_as_failure() {
-        let cb = CircuitBreaker::new(CircuitBreakerConfig::default());
-        let trigger = BackupTrigger {
-            reason: TriggerReason::DriveMounted {
-                label: "WD-18TB".to_string(),
-            },
-            triggered_at: dt("2026-03-27 10:00"),
-            permission: TriggerPermission::Allowed,
-        };
-
-        let cb = evaluate_trigger_result(&cb, &trigger, &TriggerOutcome::LockHeld);
-        assert_eq!(cb.state, CircuitState::Closed);
-        assert_eq!(cb.failure_count, 0);
-    }
-
-    #[test]
-    fn circuit_lock_held_does_not_consume_min_interval() {
-        // M1 fix: LockHeld should not update last_trigger, so the next
-        // real trigger is not blocked by min_interval.
-        let config = CircuitBreakerConfig {
-            min_interval: Duration::from_secs(3600),
-            max_failures: 3,
-        };
-        let cb = CircuitBreaker::new(config);
-
-        let trigger = BackupTrigger {
-            reason: TriggerReason::DriveMounted {
-                label: "WD-18TB".to_string(),
-            },
-            triggered_at: dt("2026-03-27 10:00"),
-            permission: TriggerPermission::Allowed,
-        };
-        let cb = evaluate_trigger_result(&cb, &trigger, &TriggerOutcome::LockHeld);
-
-        // Immediately after — should still be allowed (last_trigger not set)
-        assert_eq!(
-            cb.check_trigger(dt("2026-03-27 10:01")),
-            TriggerPermission::Allowed
-        );
-    }
-
-    #[test]
-    fn circuit_backoff_capped_at_24h() {
-        let config = CircuitBreakerConfig {
-            max_failures: 1,
-            min_interval: Duration::from_secs(60),
-        };
-        let mut cb = CircuitBreaker::new(config);
-        cb.backoff = Duration::from_secs(20 * 3600); // 20h
-
-        // Half-open trial with doubled backoff should cap at 24h
-        let trigger = make_trigger("2026-03-27 10:00", TriggerPermission::HalfOpenTrial);
-        let cb = evaluate_trigger_result(&cb, &trigger, &TriggerOutcome::Failure);
-
-        assert_eq!(cb.backoff, MAX_BACKOFF);
-    }
-
-    #[test]
-    fn circuit_closed_respects_min_interval() {
-        let config = CircuitBreakerConfig {
-            min_interval: Duration::from_secs(3600), // 1h
-            max_failures: 3,
-        };
-        let mut cb = CircuitBreaker::new(config);
-        cb.last_trigger = Some(dt("2026-03-27 10:00"));
-
-        // 30 minutes later — too soon
-        assert_eq!(cb.check_trigger(dt("2026-03-27 10:30")), TriggerPermission::Blocked);
-        // 61 minutes later — ok
-        assert_eq!(cb.check_trigger(dt("2026-03-27 11:01")), TriggerPermission::Allowed);
-    }
-
-    // ── Trigger logic ───────────────────────────────────────────────────
-
-    #[test]
-    fn trigger_on_drive_mount_with_pending_sends() {
-        let mut state = fresh_state();
-        state.has_initial_assessment = true;
-
-        let assessments = vec![make_assessment_with_drive(
-            "sv1",
-            PromiseStatus::AtRisk,
-            "WD-18TB",
-            PromiseStatus::Unprotected,
-        )];
-
-        let event = SentinelEvent::DriveMounted {
-            label: "WD-18TB".to_string(),
-        };
-        let now = dt("2026-03-27 10:00");
-
-        let trigger = should_trigger_backup(&state, &event, &assessments, now);
-        assert!(trigger.is_some());
-        assert_eq!(
-            trigger.unwrap().reason,
-            TriggerReason::DriveMounted {
-                label: "WD-18TB".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn no_trigger_on_drive_mount_when_all_protected() {
-        let mut state = fresh_state();
-        state.has_initial_assessment = true;
-
-        let assessments = vec![make_assessment_with_drive(
-            "sv1",
-            PromiseStatus::Protected,
-            "WD-18TB",
-            PromiseStatus::Protected,
-        )];
-
-        let event = SentinelEvent::DriveMounted {
-            label: "WD-18TB".to_string(),
-        };
-        let now = dt("2026-03-27 10:00");
-
-        assert!(should_trigger_backup(&state, &event, &assessments, now).is_none());
-    }
-
-    #[test]
-    fn trigger_on_promise_degradation() {
-        let mut state = fresh_state();
-        state.has_initial_assessment = true;
-        state.last_promise_states = vec![PromiseSnapshot {
-            name: "sv1".to_string(),
-            status: PromiseStatus::Protected,
-        }];
-
-        let assessments = vec![make_assessment("sv1", PromiseStatus::AtRisk)];
-        let now = dt("2026-03-27 10:00");
-
-        let trigger =
-            should_trigger_backup(&state, &SentinelEvent::AssessmentTick, &assessments, now);
-        assert!(trigger.is_some());
-        assert_eq!(trigger.unwrap().reason, TriggerReason::PromiseDegraded);
-    }
-
-    #[test]
-    fn no_trigger_on_first_assessment() {
-        let state = fresh_state(); // has_initial_assessment = false
-
-        let assessments = vec![make_assessment("sv1", PromiseStatus::Unprotected)];
-        let now = dt("2026-03-27 10:00");
-
-        assert!(
-            should_trigger_backup(&state, &SentinelEvent::AssessmentTick, &assessments, now)
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn no_trigger_on_drive_mount_before_initial_assessment() {
-        // M2 fix: DriveMounted before baseline is established should not trigger.
-        let state = fresh_state(); // has_initial_assessment = false
-
-        let assessments = vec![make_assessment_with_drive(
-            "sv1",
-            PromiseStatus::AtRisk,
-            "WD-18TB",
-            PromiseStatus::Unprotected,
-        )];
-
-        let event = SentinelEvent::DriveMounted {
-            label: "WD-18TB".to_string(),
-        };
-        let now = dt("2026-03-27 10:00");
-
-        assert!(should_trigger_backup(&state, &event, &assessments, now).is_none());
-    }
-
-    #[test]
-    fn no_trigger_on_backup_completed() {
-        let mut state = fresh_state();
-        state.has_initial_assessment = true;
-
-        let assessments = vec![make_assessment("sv1", PromiseStatus::Unprotected)];
-        let now = dt("2026-03-27 10:00");
-
-        assert!(
-            should_trigger_backup(&state, &SentinelEvent::BackupCompleted, &assessments, now)
-                .is_none()
-        );
     }
 
     // ── Promise change detection ────────────────────────────────────────

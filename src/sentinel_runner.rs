@@ -26,8 +26,8 @@ use crate::notify::{self, Notification, NotificationEvent, Urgency};
 use crate::output::{SentinelCircuitState, SentinelPromiseState, SentinelStateFile};
 use crate::plan::{Observation, RealFileSystemState};
 use crate::sentinel::{
-    self, CircuitBreakerConfig, EjectAction, EjectEvent, EjectPhase, EjectState,
-    EjectTransition, SentinelAction, SentinelEvent, SentinelState, TransitionResult,
+    self, EjectAction, EjectEvent, EjectPhase, EjectState, EjectTransition, SentinelAction,
+    SentinelEvent, SentinelState, TransitionResult,
 };
 use crate::state::StateDb;
 
@@ -78,7 +78,7 @@ impl SentinelRunner {
             .ok()
             .and_then(|m| m.modified().ok());
 
-        let state = SentinelState::new(CircuitBreakerConfig::default());
+        let state = SentinelState::new();
         let started = chrono::Local::now().naive_local();
 
         Ok(Self {
@@ -954,9 +954,12 @@ impl SentinelRunner {
                     }
                 })
                 .collect(),
+            // The circuit-breaker decision machinery was deleted as dormant
+            // dead code (#385) — this field is a permanently-zero contract
+            // surface until schema v4 drops it (#372).
             circuit_breaker: SentinelCircuitState {
-                state: self.state.circuit_breaker.state.to_string(),
-                failure_count: self.state.circuit_breaker.failure_count,
+                state: "closed".to_string(),
+                failure_count: 0,
             },
             visual_state: Some(sentinel::compute_visual_state(assessments)),
             advisory_summary,
