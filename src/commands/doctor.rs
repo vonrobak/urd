@@ -162,7 +162,7 @@ pub fn run(config: Config, args: DoctorArgs, output_mode: OutputMode) -> anyhow:
         };
         let min_free = min_free_bs.bytes();
         if let Ok(free) = drives::filesystem_free_bytes(&root.path)
-            && free < min_free * 2
+            && free < crate::guard::doctor_warn_threshold(min_free)
         {
             let free_display = crate::types::ByteSize(free);
             let threshold_display = crate::types::ByteSize(min_free);

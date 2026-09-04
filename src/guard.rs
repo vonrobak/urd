@@ -94,6 +94,49 @@ pub fn source_floor_bytes(min_free: u64, capacity_bytes: u64) -> u64 {
     min_free + budget
 }
 
+// ── The min_free_bytes criticality ladder (UPI 016) ────────────────────
+
+// Three surfaces ask the same question — "is this root close enough to
+// `min_free_bytes` to act?" — and answer it differently, because each acts
+// differently: `urd doctor` only warns, `urd emergency` asks a human first,
+// and the pre-backup preflight deletes unattended. The rungs were designed
+// together in UPI 016 (April 2026,
+// `docs/97-plans/2026-04-05-plan-016-emergency-space-response.md`, lines
+// 194/324/382) but lived as three bare multipliers in three files; they are
+// named here, next to `source_floor_bytes`, because this module already owns
+// the thresholds derived from `min_free_bytes`.
+//
+// The ladder predates the tiered storage model
+// (`storage_critical::TightnessTier`, UPI 031-a), which now answers a related
+// question per pool with hysteresis. Whether the ladder survives alongside the
+// tiers, or folds into them, belongs to the ADR-113 do-no-harm re-grill —
+// naming the rungs is the prerequisite for that conversation, not its answer.
+
+/// Widest rung — `urd doctor`'s space-trend warning: twice `min_free_bytes`.
+/// Doctor only prints, so it may speak long before anything is at stake.
+#[must_use]
+pub fn doctor_warn_threshold(min_free: u64) -> u64 {
+    min_free.saturating_mul(2)
+}
+
+/// Middle rung — the crisis line for the invoked `urd emergency`:
+/// `min_free_bytes` itself. The command deletes only after a human confirms,
+/// so it may act at the configured floor rather than below it. Identity by
+/// design: the rung is named so the whole ladder reads in one place.
+#[must_use]
+pub fn emergency_interactive_threshold(min_free: u64) -> u64 {
+    min_free
+}
+
+/// Narrowest rung — the automatic pre-backup preflight: half
+/// `min_free_bytes`. The only rung that deletes with no human present, so it
+/// waits until the root is unambiguously in trouble; a backup that merely
+/// dips below `min_free_bytes` is left for the human-facing surfaces.
+#[must_use]
+pub fn emergency_automatic_threshold(min_free: u64) -> u64 {
+    min_free / 2
+}
+
 // ── Presence-aware pin shedding (ADR-116, UPI 058) ─────────────────────
 
 /// One drive's scope for a subvolume: whether it is **usable for a send right
@@ -376,5 +419,38 @@ mod tests {
     #[test]
     fn away_sheddable_empty_scopes_is_empty() {
         assert!(away_sheddable_pins(&[]).is_empty());
+    }
+
+    // ── The min_free_bytes criticality ladder (UPI 016) ────────────────
+
+    #[test]
+    fn ladder_rungs_widen_with_how_gently_the_surface_acts() {
+        // The ordering is the whole point: doctor (warns) speaks first, the
+        // invoked emergency (asks) next, the unattended preflight (deletes)
+        // last. A change that reorders these is a behavior change, not a
+        // refactor.
+        let min_free = 1_000_000_000u64;
+        assert!(
+            emergency_automatic_threshold(min_free)
+                < emergency_interactive_threshold(min_free)
+        );
+        assert!(
+            emergency_interactive_threshold(min_free) < doctor_warn_threshold(min_free)
+        );
+    }
+
+    #[test]
+    fn ladder_rungs_keep_their_designed_values() {
+        let min_free = 1_000_000_000u64;
+        assert_eq!(doctor_warn_threshold(min_free), 2_000_000_000);
+        assert_eq!(emergency_interactive_threshold(min_free), 1_000_000_000);
+        assert_eq!(emergency_automatic_threshold(min_free), 500_000_000);
+    }
+
+    #[test]
+    fn doctor_warn_saturates_instead_of_wrapping() {
+        // An absurd min_free must not wrap to a tiny threshold and silence
+        // the warning entirely.
+        assert_eq!(doctor_warn_threshold(u64::MAX), u64::MAX);
     }
 }

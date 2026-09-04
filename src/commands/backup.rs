@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use crate::awareness::{PromiseStatus, SubvolAssessment};
 use crate::btrfs::{BtrfsOps, RealBtrfs};
 use crate::cli::BackupArgs;
+use crate::commands::emergency;
 use crate::commands::storage_signals;
 use crate::commands::world::{self, World};
 use crate::config::Config;
@@ -2277,9 +2278,10 @@ fn format_elapsed(d: Duration) -> String {
 
 /// Emergency pre-flight: check each snapshot root for critical space conditions.
 ///
-/// If any root has `free_bytes < min_free_bytes / 2` (critical threshold), run
-/// `emergency_retention()` on that root's subvolumes and delete the results.
-/// Returns `true` if any deletions were performed (caller should re-plan).
+/// If any root is below `guard::emergency_automatic_threshold` (half
+/// `min_free_bytes` — the unattended rung of the ladder), walk that root with
+/// the shared `emergency::emergency_walk` and delete what it offers. Returns
+/// `true` if any deletions were performed (caller should re-plan).
 ///
 /// Runs under the advisory lock. Skips roots without `min_free_bytes`.
 /// Skips transient subvolumes. Isolates per-subvolume failures (ADR-109).
@@ -2370,9 +2372,10 @@ struct EmergencyRootReclaim {
 
 /// Testable core of [`run_emergency_preflight`]: the free-space probe and the
 /// btrfs handle are injected and the clock is passed in, so the ADR-107
-/// deletion path is unit-testable without a live filesystem. Reads snapshot
-/// dirs / pin files and issues deletes via `btrfs`, returning the prune events
-/// (the wrapper records them best-effort).
+/// deletion path is unit-testable without a live filesystem. Selects candidates
+/// through `emergency::emergency_walk` — the same walk `urd emergency` renders
+/// — and issues the deletes via `btrfs`, returning the prune events (the
+/// wrapper records them best-effort).
 ///
 /// `now` is read once per pass — not per subvolume as the inline version did —
 /// so every prune event in one pass shares an `occurred_at`. Benign: the events
@@ -2399,8 +2402,9 @@ fn run_emergency_preflight_with(
 
         let free = free_bytes(&root.path).unwrap_or(u64::MAX);
 
-        // Critical threshold: below 50% of min_free_bytes
-        if free >= min_free / 2 {
+        // Critical threshold: the narrowest rung of the min_free_bytes ladder
+        // (`guard`), because this is the only rung that deletes unattended.
+        if free >= guard::emergency_automatic_threshold(min_free) {
             continue;
         }
 
@@ -2413,39 +2417,15 @@ fn run_emergency_preflight_with(
 
         let mut root_deleted: usize = 0;
 
-        for subvol_name in &root.subvolumes {
-            // Skip transient subvolumes — already delete aggressively
-            let subvol = resolved.iter().find(|s| &s.name == subvol_name);
-            if subvol.is_some_and(|s| s.local_retention.is_transient()) {
-                continue;
-            }
-
-            let local_dir = root.path.join(subvol_name);
-            let snaps = match plan::read_snapshot_dir(&local_dir) {
-                Ok(s) => s,
-                Err(e) => {
-                    log::warn!(
-                        "Emergency: cannot read {}: {e} — skipping",
-                        local_dir.display()
-                    );
-                    continue;
-                }
-            };
-
-            if snaps.is_empty() {
-                continue;
-            }
-
-            let latest = snaps.iter().max().unwrap().clone();
-            let pinned =
-                crate::chain::find_pinned_snapshots(&local_dir, &drive_labels);
-
-            let mut result = crate::retention::emergency_retention(
-                &snaps,
-                &latest,
-                &pinned,
-                now,
-            );
+        // The shared per-root walk (issue #383): transient skip, snapshot
+        // enumeration, pin read, and `emergency_retention` — one
+        // implementation, also driving `urd emergency`'s assessment.
+        for subvol in emergency::emergency_walk(root, &resolved, &drive_labels, now) {
+            let emergency::EmergencySubvolPlan {
+                inputs, mut result, ..
+            } = subvol;
+            let subvol_name = &inputs.name;
+            let local_dir = &inputs.local_dir;
 
             // Map snap → its emitted event (by snapshot name) so we can
             // persist only events whose underlying delete succeeded.
@@ -2656,6 +2636,7 @@ mod tests {
     };
     use crate::types::Interval;
     use crate::types::{DeleteKind, FullSendReason, PlannedOperation};
+    use std::collections::BTreeSet;
     use std::path::PathBuf;
 
     // ── Mid-op watchdog arming + reserve-create (UPI 033) ──────────────
@@ -3366,6 +3347,60 @@ source = "/data/beta"
             "the only snapshot is the latest — never deleted"
         );
         assert!(!out.any_deleted);
+    }
+
+    #[test]
+    fn emergency_command_and_preflight_offer_the_same_candidates() {
+        // Issue #383: `urd emergency` and this preflight share one walk, so
+        // for the same root they must select the same snapshots. If they
+        // could drift, the interactive surface would confirm one set and the
+        // unattended one delete another.
+        let dir = tempfile::TempDir::new().unwrap();
+        let alpha = dir.path().join("alpha");
+        make_snap_dirs(&alpha, &THREE_SNAPS);
+        let mut config = emergency_config(dir.path());
+        config.drives.push(crate::config::DriveConfig {
+            label: "D1".to_string(),
+            uuid: None,
+            mount_path: std::path::PathBuf::from("/mnt/d1"),
+            snapshot_root: ".snapshots".to_string(),
+            role: crate::types::DriveRole::Offsite,
+            max_usage_percent: None,
+            min_free_bytes: None,
+            rotation_interval: None,
+        });
+        std::fs::write(
+            alpha.join(".last-external-parent-D1"),
+            "20260101-1200-alpha\n",
+        )
+        .unwrap();
+
+        // The unattended surface: what the preflight actually deleted.
+        let mock = crate::btrfs::MockBtrfs::new();
+        run_emergency_preflight_with(&config, pass_now(), &mock, below()).unwrap();
+        let executed: BTreeSet<PathBuf> = deleted_paths(&mock).into_iter().collect();
+
+        // The interactive surface: what `urd emergency` renders and asks the
+        // user to confirm. 400 MB is below both rungs of the ladder.
+        let rendered: BTreeSet<PathBuf> =
+            emergency::assess_roots(&config, pass_now(), below())
+                .iter()
+                .filter(|a| a.assessment.is_critical)
+                .flat_map(|a| a.plans.iter())
+                .flat_map(|p| {
+                    p.result
+                        .delete
+                        .iter()
+                        .map(|d| p.inputs.local_dir.join(d.snapshot.as_str()))
+                })
+                .collect();
+
+        assert_eq!(
+            rendered,
+            BTreeSet::from([alpha.join("20260102-1200-alpha")]),
+            "the pinned oldest and the latest survive on both surfaces"
+        );
+        assert_eq!(rendered, executed, "one walk, one candidate set");
     }
 
     fn make_outcome(
