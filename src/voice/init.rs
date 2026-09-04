@@ -208,3 +208,82 @@ fn format_init_status(status: InitStatus) -> String {
         InitStatus::Error => "ERROR".red().to_string(),
     }
 }
+
+// ── Interactive incomplete-snapshot deletion prompt ────────────────────
+//
+// `urd init` offers to delete unpinned, possibly-interrupted snapshots on
+// external drives one at a time (an interactive TTY loop, so it cannot be
+// folded into `render_init`'s single-shot report). These three renderers
+// carry only the colored text; the command handler still owns the blank
+// line, the `Delete ...? [y/N]` prompt, stdin, and the btrfs call.
+
+/// Header printed once above the per-snapshot warnings.
+#[must_use]
+pub fn render_incomplete_deletion_header() -> String {
+    "Potentially incomplete snapshots on external drives:"
+        .bold()
+        .to_string()
+}
+
+/// Per-snapshot warning line offering deletion.
+#[must_use]
+pub fn render_incomplete_deletion_warning(snapshot: &str, drive: &str) -> String {
+    format!(
+        "  {} {} on {} (not pinned, may be from interrupted transfer)",
+        "WARNING".yellow(),
+        snapshot,
+        drive,
+    )
+}
+
+/// Outcome line after attempting to delete an incomplete snapshot.
+/// `error` carries the formatted failure detail on `Err`.
+#[must_use]
+pub fn render_incomplete_deletion_result(path: &str, result: Result<(), &str>) -> String {
+    match result {
+        Ok(()) => format!("  {} Deleted {path}", "OK".green()),
+        Err(e) => format!("  {} Failed to delete {path}: {e}", "ERROR".red()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::voice::test_fixtures::color_guard;
+
+    #[test]
+    fn incomplete_deletion_header_matches_pinned_text() {
+        let _c = color_guard(false);
+        assert_eq!(
+            render_incomplete_deletion_header(),
+            "Potentially incomplete snapshots on external drives:"
+        );
+    }
+
+    #[test]
+    fn incomplete_deletion_warning_names_snapshot_and_drive() {
+        let _c = color_guard(false);
+        assert_eq!(
+            render_incomplete_deletion_warning("20260904-0100-home", "WD-18TB"),
+            "  WARNING 20260904-0100-home on WD-18TB (not pinned, may be from interrupted transfer)"
+        );
+    }
+
+    #[test]
+    fn incomplete_deletion_result_ok() {
+        let _c = color_guard(false);
+        assert_eq!(
+            render_incomplete_deletion_result("/mnt/snap/home", Ok(())),
+            "  OK Deleted /mnt/snap/home"
+        );
+    }
+
+    #[test]
+    fn incomplete_deletion_result_err() {
+        let _c = color_guard(false);
+        assert_eq!(
+            render_incomplete_deletion_result("/mnt/snap/home", Err("permission denied")),
+            "  ERROR Failed to delete /mnt/snap/home: permission denied"
+        );
+    }
+}

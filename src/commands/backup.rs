@@ -5,8 +5,6 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use colored::Colorize;
-
 use crate::awareness::{PromiseStatus, SubvolAssessment};
 use crate::btrfs::{BtrfsOps, RealBtrfs};
 use crate::cli::BackupArgs;
@@ -171,7 +169,7 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
             let explanation = build_empty_plan_explanation(&backup_plan, &filters);
             print!("{}", crate::voice::render_empty_plan(&explanation));
         } else {
-            println!("{}", "Nothing to do.".dimmed());
+            print!("{}", crate::voice::render_nothing_to_do());
         }
         // ── The run tail, empty-plan exit (UPI 088-b) ──────────────────
         // Gather → decide (pure) → execute, same contract order as the

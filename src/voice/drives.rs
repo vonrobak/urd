@@ -14,11 +14,17 @@ use crate::output::{
 };
 use crate::plan::format_duration_short;
 
-/// Render the drives list output.
+/// Render the drives list output. `now` is the caller's wall-clock reading,
+/// threaded through to compute "absent NNm" ages — the renderer itself
+/// stays a pure function of its input (no `Local::now()` inside `voice/`).
 #[must_use]
-pub fn render_drives_list(data: &DrivesListOutput, mode: OutputMode) -> String {
+pub fn render_drives_list(
+    data: &DrivesListOutput,
+    mode: OutputMode,
+    now: chrono::NaiveDateTime,
+) -> String {
     match mode {
-        OutputMode::Interactive => render_drives_list_interactive(data),
+        OutputMode::Interactive => render_drives_list_interactive(data, now),
         OutputMode::Daemon => {
             serde_json::to_string_pretty(data)
                 .unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
@@ -26,7 +32,7 @@ pub fn render_drives_list(data: &DrivesListOutput, mode: OutputMode) -> String {
     }
 }
 
-fn render_drives_list_interactive(data: &DrivesListOutput) -> String {
+fn render_drives_list_interactive(data: &DrivesListOutput, now: chrono::NaiveDateTime) -> String {
     let mut out = String::new();
 
     if data.drives.is_empty() {
@@ -38,7 +44,7 @@ fn render_drives_list_interactive(data: &DrivesListOutput) -> String {
     let status_strs: Vec<String> = data
         .drives
         .iter()
-        .map(|d| format_drive_status(&d.status))
+        .map(|d| format_drive_status(&d.status, now))
         .collect();
 
     let label_w = data
@@ -79,14 +85,14 @@ fn render_drives_list_interactive(data: &DrivesListOutput) -> String {
     out
 }
 
-fn format_drive_status(status: &DriveStatus) -> String {
+fn format_drive_status(status: &DriveStatus, now: chrono::NaiveDateTime) -> String {
     match status {
         DriveStatus::Connected => "connected".to_string(),
         DriveStatus::UuidMismatch => "uuid mismatch".to_string(),
         DriveStatus::UuidCheckFailed => "uuid unverified".to_string(),
         DriveStatus::Absent { last_seen } => {
             if let Some(ts) = last_seen {
-                if let Some(duration) = format_absent_duration(ts) {
+                if let Some(duration) = format_absent_duration(ts, now) {
                     format!("absent {duration}")
                 } else {
                     "absent".to_string()
@@ -127,14 +133,12 @@ fn color_token_state(state: &TokenState, text: &str) -> String {
     }
 }
 
-/// Format an ISO timestamp as a human-readable absent duration from now.
-/// Reuses `format_duration_short` from plan.rs for consistent formatting.
-fn format_absent_duration(timestamp: &str) -> Option<String> {
+/// Format an ISO timestamp as a human-readable absent duration relative to
+/// `now`. Reuses `format_duration_short` from plan.rs for consistent
+/// formatting.
+fn format_absent_duration(timestamp: &str, now: chrono::NaiveDateTime) -> Option<String> {
     let ts = chrono::NaiveDateTime::parse_from_str(timestamp, "%Y-%m-%dT%H:%M:%S").ok()?;
-    let mins = chrono::Local::now()
-        .naive_local()
-        .signed_duration_since(ts)
-        .num_minutes();
+    let mins = now.signed_duration_since(ts).num_minutes();
     if mins < 1 {
         None
     } else {

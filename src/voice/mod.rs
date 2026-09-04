@@ -68,8 +68,11 @@ pub use encounter::{
 };
 pub use get::render_get;
 pub use history::{render_events, render_history, render_subvolume_history};
-pub use init::{render_init, render_init_first_time};
-pub use plan::{render_empty_plan, render_plan};
+pub use init::{
+    render_incomplete_deletion_header, render_incomplete_deletion_result,
+    render_incomplete_deletion_warning, render_init, render_init_first_time,
+};
+pub use plan::{render_empty_plan, render_nothing_to_do, render_plan};
 pub use retention::render_retention_preview;
 pub use sentinel::render_sentinel_status;
 pub use status::{render_default_status, render_first_time, render_status};
@@ -817,6 +820,27 @@ mod tests {
         TransitionEvent, VerifyCheck, VerifyDrive,
         VerifyOutput, VerifySubvolume,
     };
+
+    /// Fixed "now" for renderer tests that used to read the wall clock
+    /// internally (drives absence / sentinel assessment age). Parsing a
+    /// literal keeps these golden tests deterministic instead of drifting
+    /// with the real calendar.
+    fn fixed_now(iso: &str) -> chrono::NaiveDateTime {
+        chrono::NaiveDateTime::parse_from_str(iso, "%Y-%m-%dT%H:%M:%S")
+            .unwrap_or_else(|e| panic!("bad fixed_now literal {iso:?}: {e}"))
+    }
+
+    /// Fixed "now" for the sentinel status tests (10 minutes after
+    /// `test_sentinel_running`'s `last_assessment`).
+    fn sentinel_now() -> chrono::NaiveDateTime {
+        fixed_now("2026-03-27T13:20:00")
+    }
+
+    /// Fixed "now" for the drives list tests (5 days after
+    /// `test_drives_list`'s absent drive's `last_seen`).
+    fn drives_now() -> chrono::NaiveDateTime {
+        fixed_now("2026-03-29T10:00:00")
+    }
 
     // ── Table primitive tests ───────────────────────────────────────
 
@@ -2821,21 +2845,33 @@ mod tests {
     #[test]
     fn sentinel_running_contains_watching() {
         let _color = color_guard(false);
-        let output = render_sentinel_status(&test_sentinel_running(), OutputMode::Interactive);
+        let output = render_sentinel_status(
+            &test_sentinel_running(),
+            OutputMode::Interactive,
+            sentinel_now(),
+        );
         assert!(output.contains("watching"), "missing 'watching'");
     }
 
     #[test]
     fn sentinel_running_contains_pid() {
         let _color = color_guard(false);
-        let output = render_sentinel_status(&test_sentinel_running(), OutputMode::Interactive);
+        let output = render_sentinel_status(
+            &test_sentinel_running(),
+            OutputMode::Interactive,
+            sentinel_now(),
+        );
         assert!(output.contains("12345"), "missing PID");
     }
 
     #[test]
     fn sentinel_running_contains_tick() {
         let _color = color_guard(false);
-        let output = render_sentinel_status(&test_sentinel_running(), OutputMode::Interactive);
+        let output = render_sentinel_status(
+            &test_sentinel_running(),
+            OutputMode::Interactive,
+            sentinel_now(),
+        );
         assert!(output.contains("15m"), "missing tick interval");
         assert!(output.contains("all promises held"), "missing promise summary");
     }
@@ -2843,7 +2879,11 @@ mod tests {
     #[test]
     fn sentinel_running_contains_drive() {
         let _color = color_guard(false);
-        let output = render_sentinel_status(&test_sentinel_running(), OutputMode::Interactive);
+        let output = render_sentinel_status(
+            &test_sentinel_running(),
+            OutputMode::Interactive,
+            sentinel_now(),
+        );
         assert!(output.contains("WD-18TB"), "missing drive label");
     }
 
@@ -2851,7 +2891,7 @@ mod tests {
     fn sentinel_not_running_shows_message() {
         let _color = color_guard(false);
         let data = SentinelStatusOutput::NotRunning { last_seen: None };
-        let output = render_sentinel_status(&data, OutputMode::Interactive);
+        let output = render_sentinel_status(&data, OutputMode::Interactive, sentinel_now());
         assert!(output.contains("not running"), "missing 'not running'");
         assert!(output.contains("urd sentinel run"), "missing start hint");
     }
@@ -2862,7 +2902,7 @@ mod tests {
         let data = SentinelStatusOutput::NotRunning {
             last_seen: Some("2026-03-27T10:00:00".to_string()),
         };
-        let output = render_sentinel_status(&data, OutputMode::Interactive);
+        let output = render_sentinel_status(&data, OutputMode::Interactive, sentinel_now());
         assert!(output.contains("not running"), "missing 'not running'");
         assert!(output.contains("2026-03-27T10:00:00"), "missing last seen timestamp");
     }
@@ -2927,16 +2967,14 @@ mod tests {
     #[test]
     fn sentinel_assessment_age_is_relative() {
         let _color = color_guard(false);
-        let five_min_ago = (chrono::Local::now().naive_local()
-            - chrono::Duration::minutes(5))
-        .format("%Y-%m-%dT%H:%M:%S")
-        .to_string();
+        let five_min_ago = "2026-03-27T13:15:00".to_string();
+        let now = sentinel_now();
         let mut data = test_sentinel_running();
         let SentinelStatusOutput::Running { ref mut state, .. } = data else {
             unreachable!()
         };
         state.last_assessment = Some(five_min_ago.clone());
-        let output = render_sentinel_status(&data, OutputMode::Interactive);
+        let output = render_sentinel_status(&data, OutputMode::Interactive, now);
         assert!(
             output.contains("5m ago"),
             "assessment age must be relative: {output}"
@@ -2944,6 +2982,31 @@ mod tests {
         assert!(
             !output.contains(&five_min_ago),
             "the raw ISO stamp belongs to JSON mode only: {output}"
+        );
+    }
+
+    /// Golden test (issue #384 part 3): `render_sentinel_status` used to
+    /// call `chrono::Local::now()` internally, which made the assessment
+    /// age line untestable without racing the real clock. With `now`
+    /// threaded through as a parameter, a fixed instant in produces a
+    /// fixed line out.
+    #[test]
+    fn sentinel_assessment_age_golden_line() {
+        let _color = color_guard(false);
+        let now = sentinel_now();
+        let mut data = test_sentinel_running();
+        let SentinelStatusOutput::Running { ref mut state, .. } = data else {
+            unreachable!()
+        };
+        state.last_assessment = Some("2026-03-27T13:15:00".to_string());
+        let output = render_sentinel_status(&data, OutputMode::Interactive, now);
+        assert_eq!(
+            output,
+            "SENTINEL — watching\n\
+             \n\
+             \x20\x20Running       since 3h 12m (PID 12345)\n\
+             \x20\x20Assessment    5m ago (tick: 15m — all promises held)\n\
+             \x20\x20Connected     WD-18TB\n"
         );
     }
 
@@ -2955,7 +3018,11 @@ mod tests {
             unreachable!()
         };
         state.last_assessment = Some("not-a-timestamp".to_string());
-        let output = render_sentinel_status(&data, OutputMode::Interactive);
+        let output = render_sentinel_status(
+            &data,
+            OutputMode::Interactive,
+            sentinel_now(),
+        );
         assert!(
             output.contains("not-a-timestamp"),
             "unparseable stamp renders raw, never panics: {output}"
@@ -2964,7 +3031,11 @@ mod tests {
 
     #[test]
     fn sentinel_daemon_produces_valid_json() {
-        let output = render_sentinel_status(&test_sentinel_running(), OutputMode::Daemon);
+        let output = render_sentinel_status(
+            &test_sentinel_running(),
+            OutputMode::Daemon,
+            sentinel_now(),
+        );
         let parsed: serde_json::Value =
             serde_json::from_str(&output).unwrap_or_else(|e| panic!("invalid JSON: {e}\n{output}"));
         assert_eq!(parsed["status"], "running");
@@ -4220,6 +4291,12 @@ mod tests {
     }
 
     #[test]
+    fn nothing_to_do_renders_dimmed_line() {
+        let _c = test_fixtures::color_guard(false);
+        assert_eq!(render_nothing_to_do(), "Nothing to do.\n");
+    }
+
+    #[test]
     fn pre_action_no_estimates() {
         let summary = PreActionSummary {
             snapshot_count: 3,
@@ -4286,7 +4363,11 @@ mod tests {
     #[test]
     fn drives_list_interactive_columns() {
         let _color = color_guard(false);
-        let output = render_drives_list(&test_drives_list(), OutputMode::Interactive);
+        let output = render_drives_list(
+            &test_drives_list(),
+            OutputMode::Interactive,
+            drives_now(),
+        );
         assert!(output.contains("DRIVE"), "should have header: {output}");
         assert!(output.contains("STATUS"), "should have header: {output}");
         assert!(output.contains("TOKEN"), "should have header: {output}");
@@ -4305,7 +4386,11 @@ mod tests {
     #[test]
     fn drives_list_absent_shows_duration() {
         let _color = color_guard(false);
-        let output = render_drives_list(&test_drives_list(), OutputMode::Interactive);
+        let output = render_drives_list(
+            &test_drives_list(),
+            OutputMode::Interactive,
+            drives_now(),
+        );
         // The absent drive's last_seen is 2026-03-24, so "absent Nd" should appear
         assert!(
             output.contains("absent") && output.contains("d"),
@@ -4316,7 +4401,11 @@ mod tests {
     #[test]
     fn drives_list_uuid_mismatch_shows_status() {
         let _color = color_guard(false);
-        let output = render_drives_list(&test_drives_list(), OutputMode::Interactive);
+        let output = render_drives_list(
+            &test_drives_list(),
+            OutputMode::Interactive,
+            drives_now(),
+        );
         assert!(
             output.contains("uuid mismatch"),
             "uuid mismatch drive should show status: {output}"
@@ -4326,7 +4415,11 @@ mod tests {
     #[test]
     fn drives_list_token_column_uses_ascii() {
         let _color = color_guard(false);
-        let output = render_drives_list(&test_drives_list(), OutputMode::Interactive);
+        let output = render_drives_list(
+            &test_drives_list(),
+            OutputMode::Interactive,
+            drives_now(),
+        );
         assert!(output.contains("ok"), "Verified token should show 'ok': {output}");
         // Token column should not contain Unicode check/cross marks
         assert!(
@@ -4335,9 +4428,29 @@ mod tests {
         );
     }
 
+    /// Golden test (issue #384 part 3): `render_drives_list` used to call
+    /// `chrono::Local::now()` internally to compute the "absent NNd" age,
+    /// which made this line untestable without racing the real clock. With
+    /// `now` threaded through as a parameter, a fixed instant in produces a
+    /// fixed line out.
+    #[test]
+    fn drives_list_absent_duration_golden_line() {
+        let _color = color_guard(false);
+        let now = drives_now();
+        let output = render_drives_list(&test_drives_list(), OutputMode::Interactive, now);
+        assert_eq!(
+            output,
+            "DRIVE        STATUS          TOKEN            FREE   ROLE\n\
+             WD-18TB      connected       ok              4.2TB   primary\n\
+             WD-18TB1     absent 5d       recorded            —   offsite\n\
+             2TB-backup   connected       new             1.1TB   primary\n\
+             BAD-UUID     uuid mismatch   -               500GB   primary\n"
+        );
+    }
+
     #[test]
     fn drives_list_daemon_valid_json() {
-        let output = render_drives_list(&test_drives_list(), OutputMode::Daemon);
+        let output = render_drives_list(&test_drives_list(), OutputMode::Daemon, drives_now());
         let parsed: serde_json::Value =
             serde_json::from_str(&output).expect("should be valid JSON");
         assert!(parsed["drives"].is_array());
