@@ -134,6 +134,7 @@ fn render_doctor_interactive(data: &DoctorOutput) -> String {
         .ok();
         for ds in &data.data_safety {
             if let Some(ref issue) = ds.issue {
+                let issue = super::render_advice_issue(issue);
                 writeln!(out, "    \u{2717} {} {}", ds.name, issue.red()).ok();
                 if let Some(ref suggestion) = ds.suggestion {
                     writeln!(out, "      \u{2192} {suggestion}").ok();

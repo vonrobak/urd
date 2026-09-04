@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::advice;
+use crate::advice::{self, AdviceIssue, IssueDetail};
 use crate::awareness::{self, PromiseStatus};
 use crate::cli::{DoctorArgs, VerifyArgs};
 use crate::commands::world::World;
@@ -209,7 +209,7 @@ pub fn run(config: Config, args: DoctorArgs, output_mode: OutputMode) -> anyhow:
                 PromiseStatus::Unprotected => {
                     advice.as_ref().map(unpack_advice).unwrap_or_else(|| {
                         (
-                            Some("exposed — data may not be recoverable".to_string()),
+                            Some(AdviceIssue::new(a.status, IssueDetail::NoAdvice)),
                             Some("Run `urd backup` or connect a drive.".to_string()),
                             None,
                         )
@@ -218,7 +218,7 @@ pub fn run(config: Config, args: DoctorArgs, output_mode: OutputMode) -> anyhow:
                 PromiseStatus::AtRisk => {
                     advice.as_ref().map(unpack_advice).unwrap_or_else(|| {
                         (
-                            Some("waning".to_string()),
+                            Some(AdviceIssue::new(a.status, IssueDetail::NoAdvice)),
                             Some("Run `urd backup` to refresh.".to_string()),
                             None,
                         )
@@ -965,7 +965,7 @@ fn build_doctor_churn_view_inner(
 /// without a "what do I do" handle.
 fn unpack_advice(
     adv: &advice::ActionableAdvice,
-) -> (Option<String>, Option<String>, Option<String>) {
+) -> (Option<AdviceIssue>, Option<String>, Option<String>) {
     match adv.command.as_ref() {
         Some(c) => (
             Some(adv.issue.clone()),
@@ -1162,12 +1162,28 @@ protection = "recorded"
     fn unpack_advice_keeps_command_as_suggestion_with_reason_context() {
         let adv = advice::ActionableAdvice {
             subvolume: "music".to_string(),
-            issue: "waning — last external send 43h ago".to_string(),
+            issue: AdviceIssue::new(
+                PromiseStatus::AtRisk,
+                IssueDetail::Stale {
+                    external_only: true,
+                    age_secs: Some(43 * 3600),
+                },
+            ),
             command: Some("urd backup --subvolume music".to_string()),
             reason: Some("Drive is mounted; a send closes the gap.".to_string()),
         };
         let (issue, suggestion, reason) = unpack_advice(&adv);
-        assert_eq!(issue.as_deref(), Some("waning — last external send 43h ago"));
+        assert_eq!(
+            issue,
+            Some(AdviceIssue::new(
+                PromiseStatus::AtRisk,
+                IssueDetail::Stale {
+                    external_only: true,
+                    age_secs: Some(43 * 3600),
+                },
+            )),
+            "the advice's structured issue passes through untouched"
+        );
         assert_eq!(
             suggestion.as_deref(),
             Some("Run `urd backup --subvolume music`.")
@@ -1181,7 +1197,13 @@ protection = "recorded"
         // reach the → suggestion slot, not render as dimmed context.
         let adv = advice::ActionableAdvice {
             subvolume: "music".to_string(),
-            issue: "waning — last external send 3d ago".to_string(),
+            issue: AdviceIssue::new(
+                PromiseStatus::AtRisk,
+                IssueDetail::Stale {
+                    external_only: true,
+                    age_secs: Some(3 * 86_400),
+                },
+            ),
             command: None,
             reason: Some("Connect WD-18TB1 and run `urd backup`".to_string()),
         };

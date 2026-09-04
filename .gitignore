@@ -49,6 +49,7 @@ scripts/*
 !scripts/check-docs.sh
 !scripts/check-registry.sh
 !scripts/check-present-not-journey.sh
+!scripts/check-voice-boundary.sh
 !scripts/staging-reset.sh
 !scripts/check.sh
 !scripts/release-preflight.sh

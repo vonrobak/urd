@@ -19,6 +19,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   home (#388).
 
 ### Changed
+- The `issue` field that names what is wrong with a subvolume is now a
+  structured object instead of a rendered sentence, on both `urd status
+  --json` (`advice[].issue`) and `urd doctor --json`
+  (`data_safety[].issue`). It carries the promise state under its semantic
+  name ("AT RISK") together with a tagged shape — `stale`,
+  `no_external_drives`, `all_drives_disconnected`, `chain_broken`,
+  `drive_away`, `no_advice` — and an age in seconds where one applies, so a
+  consumer reads fields instead of parsing prose. The mythic labels
+  (`sealed` / `waning` / `exposed`) no longer reach any machine surface;
+  they are chosen at render time, and a new lint keeps them inside the
+  presentation layer for good. `urd status` and `urd doctor` read exactly
+  as before. The doctor JSON `schema_version` goes 3 → 4 (#384).
 - The voice contract (`voice_contract.rs`) now exercises the `urd
   emergency` renderers in full and 15 of the onboarding/earning-flow
   renderers in `voice/encounter.rs` — the incident and root-granting

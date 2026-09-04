@@ -861,9 +861,22 @@ pub fn render_first_time(mode: OutputMode) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::advice::ActionableAdvice;
+    use crate::advice::{ActionableAdvice, AdviceIssue, IssueDetail};
     use crate::output::{AdaptationSummary, DriveInfo, StatusDriveAssessment};
     use crate::voice::test_fixtures::*;
+
+    /// An AT RISK staleness issue with `age_secs` since the last local backup.
+    /// Status rendering never prints the issue (it renders the subvolume name,
+    /// the command and the reason), so these fixtures only have to be valid.
+    fn at_risk_issue(age_secs: Option<i64>) -> AdviceIssue {
+        AdviceIssue::new(
+            PromiseStatus::AtRisk,
+            IssueDetail::Stale {
+                external_only: false,
+                age_secs,
+            },
+        )
+    }
 
     #[test]
     fn interactive_contains_subvolume_names() {
@@ -1571,7 +1584,7 @@ mod tests {
         let mut data = test_status_output();
         data.advice = vec![ActionableAdvice {
             subvolume: "htpc-docs".to_string(),
-            issue: "waning — last backup 3 hours ago".to_string(),
+            issue: at_risk_issue(Some(3 * 3600)),
             command: Some("urd backup --subvolume htpc-docs".to_string()),
             reason: None,
         }];
@@ -1593,13 +1606,13 @@ mod tests {
         data.advice = vec![
             ActionableAdvice {
                 subvolume: "htpc-docs".to_string(),
-                issue: "waning".to_string(),
+                issue: at_risk_issue(None),
                 command: Some("urd backup --subvolume htpc-docs".to_string()),
                 reason: None,
             },
             ActionableAdvice {
                 subvolume: "htpc-home".to_string(),
-                issue: "exposed".to_string(),
+                issue: AdviceIssue::new(PromiseStatus::Unprotected, IssueDetail::NoAdvice),
                 command: None,
                 reason: Some("Connect WD-18TB".to_string()),
             },
@@ -1628,13 +1641,13 @@ mod tests {
         data.advice = vec![
             ActionableAdvice {
                 subvolume: "htpc-home".to_string(),
-                issue: "waning".to_string(),
+                issue: at_risk_issue(None),
                 command: None,
                 reason: Some(shared.clone()),
             },
             ActionableAdvice {
                 subvolume: "htpc-docs".to_string(),
-                issue: "waning".to_string(),
+                issue: at_risk_issue(None),
                 command: None,
                 reason: Some(shared),
             },
@@ -2259,7 +2272,7 @@ mod tests {
         data.waning_names = vec!["htpc-docs".to_string()];
         data.best_advice = Some(ActionableAdvice {
             subvolume: "htpc-docs".to_string(),
-            issue: "waning — last backup 3 hours ago".to_string(),
+            issue: at_risk_issue(Some(3 * 3600)),
             command: Some("urd backup --subvolume htpc-docs".to_string()),
             reason: None,
         });
@@ -2279,7 +2292,7 @@ mod tests {
         data.exposed_names = vec!["htpc-home".to_string()];
         data.best_advice = Some(ActionableAdvice {
             subvolume: "htpc-home".to_string(),
-            issue: "exposed".to_string(),
+            issue: AdviceIssue::new(PromiseStatus::Unprotected, IssueDetail::NoAdvice),
             command: None,
             reason: Some("Connect WD-18TB".to_string()),
         });
@@ -2305,7 +2318,7 @@ mod tests {
         // Provide advice so the suggestion line renders
         data.advice = vec![ActionableAdvice {
             subvolume: "htpc-docs".to_string(),
-            issue: "waning — last backup 3 hours ago".to_string(),
+            issue: at_risk_issue(Some(3 * 3600)),
             command: Some("urd backup --subvolume htpc-docs".to_string()),
             reason: None,
         }];
