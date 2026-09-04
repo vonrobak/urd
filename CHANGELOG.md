@@ -44,6 +44,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   command and the automatic pre-backup emergency pass now select it through
   one shared walk, so they cannot drift apart (#383).
 
+### Removed
+- The dormant Sentinel active-mode auto-trigger and circuit-breaker
+  machinery is gone — it never advanced past its 2026-03-27 design and had
+  accumulated 16 `dead_code` allows without a single production caller. The
+  `SentinelCircuitBreak` event, its `backup_circuit_breaker_trips_total` /
+  `urd_circuit_breaker_trips_total` metrics, and the sentinel state file's
+  `circuit_breaker` field remain as permanently-zero contract surfaces; a
+  future active-mode design can repopulate them without a contract change
+  (#385).
+
 ### Fixed
 - `urd` now honours the configured `btrfs_path` for its read-only `subvolume
   show` queries too. The generation and received-UUID reads spawned a bare
