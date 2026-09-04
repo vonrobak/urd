@@ -179,11 +179,11 @@ fn sample(out: &mut String, name: &str, labels: &[(&str, &str)], value: impl std
             if i > 0 {
                 out.push(',');
             }
-            write!(out, "{key}=\"{}\"", escape_label_value(val)).unwrap();
+            write!(out, "{key}=\"{}\"", escape_label_value(val)).ok();
         }
         out.push('}');
     }
-    writeln!(out, " {value}").unwrap();
+    writeln!(out, " {value}").ok();
 }
 
 // ── Writer ──────────────────────────────────────────────────────────────
@@ -446,8 +446,8 @@ fn format_metrics(data: &MetricsData) -> String {
         "# HELP {} Backup result: 1=success, 0=failure, 2=schedule-skipped",
         names::BACKUP_SUCCESS
     )
-    .unwrap();
-    writeln!(out, "# TYPE {} gauge", names::BACKUP_SUCCESS).unwrap();
+    .ok();
+    writeln!(out, "# TYPE {} gauge", names::BACKUP_SUCCESS).ok();
     for sv in &data.subvolumes {
         sample(
             &mut out,
@@ -458,14 +458,14 @@ fn format_metrics(data: &MetricsData) -> String {
     }
 
     // backup_last_success_timestamp
-    writeln!(out).unwrap();
+    writeln!(out).ok();
     writeln!(
         out,
         "# HELP {} Unix timestamp of last successful backup",
         names::BACKUP_LAST_SUCCESS_TIMESTAMP
     )
-    .unwrap();
-    writeln!(out, "# TYPE {} gauge", names::BACKUP_LAST_SUCCESS_TIMESTAMP).unwrap();
+    .ok();
+    writeln!(out, "# TYPE {} gauge", names::BACKUP_LAST_SUCCESS_TIMESTAMP).ok();
     for sv in &data.subvolumes {
         if let Some(ts) = sv.last_success_timestamp {
             sample(
@@ -478,14 +478,14 @@ fn format_metrics(data: &MetricsData) -> String {
     }
 
     // backup_duration_seconds
-    writeln!(out).unwrap();
+    writeln!(out).ok();
     writeln!(
         out,
         "# HELP {} Duration of backup operations in seconds",
         names::BACKUP_DURATION_SECONDS
     )
-    .unwrap();
-    writeln!(out, "# TYPE {} gauge", names::BACKUP_DURATION_SECONDS).unwrap();
+    .ok();
+    writeln!(out, "# TYPE {} gauge", names::BACKUP_DURATION_SECONDS).ok();
     for sv in &data.subvolumes {
         sample(
             &mut out,
@@ -496,9 +496,9 @@ fn format_metrics(data: &MetricsData) -> String {
     }
 
     // backup_snapshot_count
-    writeln!(out).unwrap();
-    writeln!(out, "# HELP {} Number of snapshots", names::BACKUP_SNAPSHOT_COUNT).unwrap();
-    writeln!(out, "# TYPE {} gauge", names::BACKUP_SNAPSHOT_COUNT).unwrap();
+    writeln!(out).ok();
+    writeln!(out, "# HELP {} Number of snapshots", names::BACKUP_SNAPSHOT_COUNT).ok();
+    writeln!(out, "# TYPE {} gauge", names::BACKUP_SNAPSHOT_COUNT).ok();
     for sv in &data.subvolumes {
         sample(
             &mut out,
@@ -515,14 +515,14 @@ fn format_metrics(data: &MetricsData) -> String {
     }
 
     // backup_send_type
-    writeln!(out).unwrap();
+    writeln!(out).ok();
     writeln!(
         out,
         "# HELP {} Send type: 0=full, 1=incremental, 2=no send, 3=deferred",
         names::BACKUP_SEND_TYPE
     )
-    .unwrap();
-    writeln!(out, "# TYPE {} gauge", names::BACKUP_SEND_TYPE).unwrap();
+    .ok();
+    writeln!(out, "# TYPE {} gauge", names::BACKUP_SEND_TYPE).ok();
     for sv in &data.subvolumes {
         sample(
             &mut out,
@@ -533,14 +533,14 @@ fn format_metrics(data: &MetricsData) -> String {
     }
 
     // backup_external_expected
-    writeln!(out).unwrap();
+    writeln!(out).ok();
     writeln!(
         out,
         "# HELP {} 1 if the subvolume has an external destination configured (sends enabled and at least one drive in scope). Line absent otherwise.",
         names::BACKUP_EXTERNAL_EXPECTED
     )
-    .unwrap();
-    writeln!(out, "# TYPE {} gauge", names::BACKUP_EXTERNAL_EXPECTED).unwrap();
+    .ok();
+    writeln!(out, "# TYPE {} gauge", names::BACKUP_EXTERNAL_EXPECTED).ok();
     for sv in &data.subvolumes {
         if sv.external_expected {
             sample(
@@ -553,14 +553,14 @@ fn format_metrics(data: &MetricsData) -> String {
     }
 
     // backup_external_drive_mounted
-    writeln!(out).unwrap();
+    writeln!(out).ok();
     writeln!(
         out,
         "# HELP {} Whether an external backup drive is mounted",
         names::BACKUP_EXTERNAL_DRIVE_MOUNTED
     )
-    .unwrap();
-    writeln!(out, "# TYPE {} gauge", names::BACKUP_EXTERNAL_DRIVE_MOUNTED).unwrap();
+    .ok();
+    writeln!(out, "# TYPE {} gauge", names::BACKUP_EXTERNAL_DRIVE_MOUNTED).ok();
     sample(
         &mut out,
         names::BACKUP_EXTERNAL_DRIVE_MOUNTED,
@@ -569,14 +569,14 @@ fn format_metrics(data: &MetricsData) -> String {
     );
 
     // backup_external_free_bytes
-    writeln!(out).unwrap();
+    writeln!(out).ok();
     writeln!(
         out,
         "# HELP {} Free bytes on external backup drive",
         names::BACKUP_EXTERNAL_FREE_BYTES
     )
-    .unwrap();
-    writeln!(out, "# TYPE {} gauge", names::BACKUP_EXTERNAL_FREE_BYTES).unwrap();
+    .ok();
+    writeln!(out, "# TYPE {} gauge", names::BACKUP_EXTERNAL_FREE_BYTES).ok();
     sample(
         &mut out,
         names::BACKUP_EXTERNAL_FREE_BYTES,
@@ -585,14 +585,14 @@ fn format_metrics(data: &MetricsData) -> String {
     );
 
     // backup_script_last_run_timestamp
-    writeln!(out).unwrap();
+    writeln!(out).ok();
     writeln!(
         out,
         "# HELP {} Unix timestamp of last backup run",
         names::BACKUP_SCRIPT_LAST_RUN_TIMESTAMP
     )
-    .unwrap();
-    writeln!(out, "# TYPE {} gauge", names::BACKUP_SCRIPT_LAST_RUN_TIMESTAMP).unwrap();
+    .ok();
+    writeln!(out, "# TYPE {} gauge", names::BACKUP_SCRIPT_LAST_RUN_TIMESTAMP).ok();
     sample(
         &mut out,
         names::BACKUP_SCRIPT_LAST_RUN_TIMESTAMP,
@@ -602,19 +602,19 @@ fn format_metrics(data: &MetricsData) -> String {
 
     // ── Drift telemetry (UPI 030) ─────────────────────────────────
 
-    writeln!(out).unwrap();
+    writeln!(out).ok();
     writeln!(
         out,
         "# HELP {} Rolling time-windowed churn rate per subvolume (bytes/second). Absent for cold-start subvolumes and for subvolumes whose latest in-window send was a full send.",
         names::BACKUP_SUBVOLUME_CHURN_BYTES_PER_SECOND
     )
-    .unwrap();
+    .ok();
     writeln!(
         out,
         "# TYPE {} gauge",
         names::BACKUP_SUBVOLUME_CHURN_BYTES_PER_SECOND
     )
-    .unwrap();
+    .ok();
     for sv in &data.subvolumes {
         if let Some(churn) = sv.churn_bytes_per_second {
             sample(
@@ -626,19 +626,19 @@ fn format_metrics(data: &MetricsData) -> String {
         }
     }
 
-    writeln!(out).unwrap();
+    writeln!(out).ok();
     writeln!(
         out,
         "# HELP {} Bytes of the most recent in-window full send for subvolumes whose latest send was a full send (e.g., transient subvolumes). Absent for incremental-only and cold-start subvolumes.",
         names::BACKUP_SUBVOLUME_LAST_FULL_SEND_BYTES
     )
-    .unwrap();
+    .ok();
     writeln!(
         out,
         "# TYPE {} gauge",
         names::BACKUP_SUBVOLUME_LAST_FULL_SEND_BYTES
     )
-    .unwrap();
+    .ok();
     for sv in &data.subvolumes {
         if let Some(bytes) = sv.last_full_send_bytes {
             sample(
@@ -652,14 +652,14 @@ fn format_metrics(data: &MetricsData) -> String {
 
     // ── Pool observability (UPI 043) ──────────────────────────────
 
-    writeln!(out).unwrap();
+    writeln!(out).ok();
     writeln!(
         out,
         "# HELP {} Free bytes on a BTRFS pool. Snapshot at backup-run cadence; not a live signal.",
         names::BACKUP_POOL_FREE_BYTES
     )
-    .unwrap();
-    writeln!(out, "# TYPE {} gauge", names::BACKUP_POOL_FREE_BYTES).unwrap();
+    .ok();
+    writeln!(out, "# TYPE {} gauge", names::BACKUP_POOL_FREE_BYTES).ok();
     for pool in &data.pools {
         if let Some(bytes) = pool.free_bytes {
             sample(
@@ -675,14 +675,14 @@ fn format_metrics(data: &MetricsData) -> String {
         }
     }
 
-    writeln!(out).unwrap();
+    writeln!(out).ok();
     writeln!(
         out,
         "# HELP {} Total capacity bytes of a BTRFS pool (statvfs). Snapshot at backup-run cadence; not a live signal.",
         names::BACKUP_POOL_TOTAL_BYTES
     )
-    .unwrap();
-    writeln!(out, "# TYPE {} gauge", names::BACKUP_POOL_TOTAL_BYTES).unwrap();
+    .ok();
+    writeln!(out, "# TYPE {} gauge", names::BACKUP_POOL_TOTAL_BYTES).ok();
     for pool in &data.pools {
         if let Some(bytes) = pool.capacity_bytes {
             sample(
@@ -698,19 +698,19 @@ fn format_metrics(data: &MetricsData) -> String {
         }
     }
 
-    writeln!(out).unwrap();
+    writeln!(out).ok();
     writeln!(
         out,
         "# HELP {} BTRFS metadata utilization (0.0–1.0); source or destination.",
         names::BACKUP_POOL_METADATA_UTILIZATION_RATIO
     )
-    .unwrap();
+    .ok();
     writeln!(
         out,
         "# TYPE {} gauge",
         names::BACKUP_POOL_METADATA_UTILIZATION_RATIO
     )
-    .unwrap();
+    .ok();
     for pool in &data.pools {
         if let Some(ratio) = pool.metadata_utilization_ratio {
             sample(
@@ -726,14 +726,14 @@ fn format_metrics(data: &MetricsData) -> String {
         }
     }
 
-    writeln!(out).unwrap();
+    writeln!(out).ok();
     writeln!(
         out,
         "# HELP {} Unix timestamp this pool row was last measured. Equals the run timestamp for a pool measured this run; for a destination pool whose drive is absent this run, the timestamp of the run that last measured it (carried forward from the previous .prom file). Emitted for every pool row, including carried-forward ones.",
         names::BACKUP_POOL_LAST_SEEN_TIMESTAMP
     )
-    .unwrap();
-    writeln!(out, "# TYPE {} gauge", names::BACKUP_POOL_LAST_SEEN_TIMESTAMP).unwrap();
+    .ok();
+    writeln!(out, "# TYPE {} gauge", names::BACKUP_POOL_LAST_SEEN_TIMESTAMP).ok();
     for pool in &data.pools {
         sample(
             &mut out,
@@ -747,19 +747,19 @@ fn format_metrics(data: &MetricsData) -> String {
         );
     }
 
-    writeln!(out).unwrap();
+    writeln!(out).ok();
     writeln!(
         out,
         "# HELP {} Local snapshot count for a subvolume. Line absent when local snapshots are not configured for that subvolume.",
         names::BACKUP_SUBVOLUME_LOCAL_SNAPSHOT_COUNT
     )
-    .unwrap();
+    .ok();
     writeln!(
         out,
         "# TYPE {} gauge",
         names::BACKUP_SUBVOLUME_LOCAL_SNAPSHOT_COUNT
     )
-    .unwrap();
+    .ok();
     for sv in &data.subvolumes {
         if let Some(count) = sv.local_snapshot_count_v4 {
             sample(
@@ -771,19 +771,19 @@ fn format_metrics(data: &MetricsData) -> String {
         }
     }
 
-    writeln!(out).unwrap();
+    writeln!(out).ok();
     writeln!(
         out,
         "# HELP {} Estimated local pinned CoW delta; wire-bytes-derived (mean over incrementals). Understates active periods of bimodal subvolumes; overstates dormancy.",
         names::BACKUP_SUBVOLUME_ESTIMATED_LOCAL_PINNED_DELTA_BYTES
     )
-    .unwrap();
+    .ok();
     writeln!(
         out,
         "# TYPE {} gauge",
         names::BACKUP_SUBVOLUME_ESTIMATED_LOCAL_PINNED_DELTA_BYTES
     )
-    .unwrap();
+    .ok();
     for sv in &data.subvolumes {
         if let Some(bytes) = sv.estimated_local_pinned_delta_bytes {
             sample(
@@ -802,14 +802,14 @@ fn format_metrics(data: &MetricsData) -> String {
     // for a disabled subvolume, which has no promise to report. Mirrors
     // heartbeat v3's own `pin_failures`/`promise_status` population exactly.
 
-    writeln!(out).unwrap();
+    writeln!(out).ok();
     writeln!(
         out,
         "# HELP {} Pin-file write failures for this subvolume in this run (sends that succeeded but whose chain marker could not be written). Emitted for every subvolume this run's awareness assessment covers; absent for disabled subvolumes.",
         names::BACKUP_PIN_FAILURES
     )
-    .unwrap();
-    writeln!(out, "# TYPE {} gauge", names::BACKUP_PIN_FAILURES).unwrap();
+    .ok();
+    writeln!(out, "# TYPE {} gauge", names::BACKUP_PIN_FAILURES).ok();
     for sv in &data.subvolumes {
         if let Some(pin_failures) = sv.pin_failures {
             sample(
@@ -821,14 +821,14 @@ fn format_metrics(data: &MetricsData) -> String {
         }
     }
 
-    writeln!(out).unwrap();
+    writeln!(out).ok();
     writeln!(
         out,
         "# HELP {} Post-run promise status: 0=protected, 1=at_risk, 2=unprotected. Emitted for every subvolume this run's awareness assessment covers; absent for disabled subvolumes.",
         names::BACKUP_PROMISE_STATE
     )
-    .unwrap();
-    writeln!(out, "# TYPE {} gauge", names::BACKUP_PROMISE_STATE).unwrap();
+    .ok();
+    writeln!(out, "# TYPE {} gauge", names::BACKUP_PROMISE_STATE).ok();
     for sv in &data.subvolumes {
         if let Some(promise_state) = sv.promise_state {
             sample(
@@ -844,14 +844,14 @@ fn format_metrics(data: &MetricsData) -> String {
 
     let counters = &data.event_counters;
 
-    writeln!(out).unwrap();
+    writeln!(out).ok();
     writeln!(
         out,
         "# HELP {} Sentinel circuit-breaker open transitions.",
         names::URD_CIRCUIT_BREAKER_TRIPS_TOTAL
     )
-    .unwrap();
-    writeln!(out, "# TYPE {} counter", names::URD_CIRCUIT_BREAKER_TRIPS_TOTAL).unwrap();
+    .ok();
+    writeln!(out, "# TYPE {} counter", names::URD_CIRCUIT_BREAKER_TRIPS_TOTAL).ok();
     sample(
         &mut out,
         names::URD_CIRCUIT_BREAKER_TRIPS_TOTAL,
@@ -859,14 +859,14 @@ fn format_metrics(data: &MetricsData) -> String {
         counters.circuit_breaker_trips,
     );
 
-    writeln!(out).unwrap();
+    writeln!(out).ok();
     writeln!(
         out,
         "# HELP {} Full-send choices, by reason.",
         names::URD_PLANNER_FULL_SENDS_TOTAL
     )
-    .unwrap();
-    writeln!(out, "# TYPE {} counter", names::URD_PLANNER_FULL_SENDS_TOTAL).unwrap();
+    .ok();
+    writeln!(out, "# TYPE {} counter", names::URD_PLANNER_FULL_SENDS_TOTAL).ok();
     if counters.full_sends_by_reason.is_empty() {
         // Emit a zero so consumers can detect the metric exists.
         sample(
@@ -886,14 +886,14 @@ fn format_metrics(data: &MetricsData) -> String {
         }
     }
 
-    writeln!(out).unwrap();
+    writeln!(out).ok();
     writeln!(
         out,
         "# HELP {} Planner deferrals, by scope.",
         names::URD_PLANNER_DEFERS_TOTAL
     )
-    .unwrap();
-    writeln!(out, "# TYPE {} counter", names::URD_PLANNER_DEFERS_TOTAL).unwrap();
+    .ok();
+    writeln!(out, "# TYPE {} counter", names::URD_PLANNER_DEFERS_TOTAL).ok();
     if counters.defers_by_scope.is_empty() {
         sample(
             &mut out,
@@ -912,14 +912,14 @@ fn format_metrics(data: &MetricsData) -> String {
         }
     }
 
-    writeln!(out).unwrap();
+    writeln!(out).ok();
     writeln!(
         out,
         "# HELP {} Snapshots pruned by retention, by rule.",
         names::URD_RETENTION_PRUNES_TOTAL
     )
-    .unwrap();
-    writeln!(out, "# TYPE {} counter", names::URD_RETENTION_PRUNES_TOTAL).unwrap();
+    .ok();
+    writeln!(out, "# TYPE {} counter", names::URD_RETENTION_PRUNES_TOTAL).ok();
     if counters.prunes_by_rule.is_empty() {
         sample(
             &mut out,
@@ -948,15 +948,15 @@ fn format_metrics(data: &MetricsData) -> String {
     // docs/20-reference/metrics.md). Consumers should use `increase()` /
     // `rate()`, which tolerate a counter reset if that ever changes.
 
-    writeln!(out).unwrap();
+    writeln!(out).ok();
     writeln!(
         out,
         "# HELP {} Sentinel circuit-breaker open transitions. Public mirror of {}; same value.",
         names::BACKUP_CIRCUIT_BREAKER_TRIPS_TOTAL,
         names::URD_CIRCUIT_BREAKER_TRIPS_TOTAL,
     )
-    .unwrap();
-    writeln!(out, "# TYPE {} counter", names::BACKUP_CIRCUIT_BREAKER_TRIPS_TOTAL).unwrap();
+    .ok();
+    writeln!(out, "# TYPE {} counter", names::BACKUP_CIRCUIT_BREAKER_TRIPS_TOTAL).ok();
     sample(
         &mut out,
         names::BACKUP_CIRCUIT_BREAKER_TRIPS_TOTAL,
@@ -965,27 +965,27 @@ fn format_metrics(data: &MetricsData) -> String {
     );
 
     let emergency_prunes = counter_value(&counters.prunes_by_rule, "emergency");
-    writeln!(out).unwrap();
+    writeln!(out).ok();
     writeln!(
         out,
         "# HELP {} Snapshots pruned under emergency retention. Public mirror of {}{{rule=\"emergency\"}}; same value, 0 when no such events exist.",
         names::BACKUP_EMERGENCY_PRUNES_TOTAL,
         names::URD_RETENTION_PRUNES_TOTAL,
     )
-    .unwrap();
-    writeln!(out, "# TYPE {} counter", names::BACKUP_EMERGENCY_PRUNES_TOTAL).unwrap();
+    .ok();
+    writeln!(out, "# TYPE {} counter", names::BACKUP_EMERGENCY_PRUNES_TOTAL).ok();
     sample(&mut out, names::BACKUP_EMERGENCY_PRUNES_TOTAL, &[], emergency_prunes);
 
     let chain_broken_full_sends = counter_value(&counters.full_sends_by_reason, "chain_broken");
-    writeln!(out).unwrap();
+    writeln!(out).ok();
     writeln!(
         out,
         "# HELP {} Full sends triggered by a broken incremental chain. Public mirror of {}{{reason=\"chain_broken\"}}; same value, 0 when no such events exist.",
         names::BACKUP_CHAIN_BROKEN_FULL_SENDS_TOTAL,
         names::URD_PLANNER_FULL_SENDS_TOTAL,
     )
-    .unwrap();
-    writeln!(out, "# TYPE {} counter", names::BACKUP_CHAIN_BROKEN_FULL_SENDS_TOTAL).unwrap();
+    .ok();
+    writeln!(out, "# TYPE {} counter", names::BACKUP_CHAIN_BROKEN_FULL_SENDS_TOTAL).ok();
     sample(
         &mut out,
         names::BACKUP_CHAIN_BROKEN_FULL_SENDS_TOTAL,
