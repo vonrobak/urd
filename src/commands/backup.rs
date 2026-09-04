@@ -410,17 +410,22 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     let result = executor.execute(&backup_plan, mode);
     let exec_duration = exec_start.elapsed();
 
-    // Stop progress display
+    // Stop progress display. A panic here costs the progress line and nothing
+    // else, so it is logged (issue #381) and carried no further.
     progress_shutdown.store(true, Ordering::SeqCst);
     if let Some(h) = progress_handle {
-        h.join().ok();
+        let _ = join_logged(h, "progress display");
     }
 
     // ── Mid-op watchdog teardown (UPI 033, pool-scoped by UPI 065-b) ────
     watchdog_shutdown.store(true, Ordering::SeqCst);
-    if let Some(h) = watchdog_handle {
-        h.join().ok(); // may briefly block on an in-progress cross-fs reclaim
-    }
+    // A watchdog that panicked left every send after it running with no
+    // host-survival guard behind it — the one thread whose death the run must
+    // not keep quiet about (issue #381, ADR-113 Layer 2). Told three ways: the
+    // `error!` from `join_logged`, a Critical notification in the firing batch
+    // below, and a warning line in the interactive summary.
+    // The join itself may briefly block on an in-progress cross-fs reclaim.
+    let watchdog_panic = watchdog_handle.and_then(|h| join_logged(h, "storage watchdog"));
     // One firing per tripped pool. Two shapes (UPI 065-b):
     //   • same-filesystem (`send_aborted`): the watchdog cancelled the in-flight
     //     send, which freed no source space — do the post-abort two-tier reclaim
@@ -435,6 +440,13 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
         .map(|mut f| std::mem::take(&mut *f))
         .unwrap_or_default();
     let mut watchdog_notifications = Vec::new();
+    // The panic rides the same batch as the firings (dispatched once after the
+    // loop), so an unattended 04:00 run is not silent about an unguarded tail.
+    // A watchdog that stashed a firing and *then* panicked still gets that
+    // firing handled below — the slot is read after the join, not before.
+    if let Some(message) = &watchdog_panic {
+        watchdog_notifications.push(notify::build_watchdog_panic_notification(message));
+    }
     for fire in &watchdog_firings {
         // Route the response (pure, `run_tail::decide_reclaim`); the act-time
         // I/O — presence re-confirmation and the reclaim itself — threads
@@ -660,6 +672,12 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     summary
         .warnings
         .extend(emergency_reclaim_warnings(&emergency.root_summaries));
+    // A watchdog that died mid-run (issue #381): the same prose the
+    // notification carries, so a TTY user sees inline that the run's later
+    // sends had no storage guard behind them.
+    if let Some(message) = &watchdog_panic {
+        summary.warnings.push(notify::watchdog_panic_prose(message));
+    }
     let output_mode = OutputMode::detect();
     let rendered = crate::voice::render_backup_summary(&summary, output_mode);
     println!("{rendered}");
@@ -1077,6 +1095,35 @@ fn handle_watchdog_trip(
             floor_bytes: pool.floor_bytes,
             send_aborted: false,
             reclaim: Some((outcome, ts)),
+        }
+    }
+}
+
+// ── Worker-thread teardown ──────────────────────────────────────────────
+
+/// Join a worker thread without swallowing a panic (issue #381). `join().ok()`
+/// discarded the payload, so a dead progress or watchdog thread left no trace
+/// anywhere — no log line, no summary line, no notification. This logs an
+/// `error!` naming the thread and hands the panic message back so the caller
+/// can carry it further; the watchdog does (its death means the run continued
+/// without ADR-113's in-flight guard), the cosmetic progress display does not.
+///
+/// Returns `None` when the thread returned normally. The message is the panic
+/// payload's own text — `panic!("literal")` yields a `&str`, a formatted
+/// `panic!` yields a `String`; anything else (`panic_any`) has no printable
+/// form, so the message says that rather than inventing one.
+#[must_use]
+fn join_logged(handle: std::thread::JoinHandle<()>, thread_name: &str) -> Option<String> {
+    match handle.join() {
+        Ok(()) => None,
+        Err(payload) => {
+            let message = payload
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "non-string panic payload".to_string());
+            log::error!("The {thread_name} thread panicked: {message}");
+            Some(message)
         }
     }
 }
@@ -4868,5 +4915,45 @@ source = "/data/beta"
         apply_token_gating(&mut plan, &TokenGating::default());
         // Empty gating touches nothing — no drops, no stamps.
         assert_eq!(plan.operations, before);
+    }
+
+    // ── Worker-thread teardown (issue #381) ────────────────────────────
+
+    #[test]
+    fn join_logged_returns_none_when_the_thread_returns_normally() {
+        let h = std::thread::spawn(|| {});
+        assert_eq!(join_logged(h, "progress display"), None);
+    }
+
+    #[test]
+    fn join_logged_reports_a_literal_panic_payload() {
+        // `panic!("literal")` hands back a `&str` payload.
+        let h = std::thread::spawn(|| panic!("poll loop exploded"));
+        assert_eq!(
+            join_logged(h, "storage watchdog"),
+            Some("poll loop exploded".to_string()),
+        );
+    }
+
+    #[test]
+    fn join_logged_reports_a_formatted_panic_payload() {
+        // A formatted `panic!` hands back a `String` payload instead.
+        let pool = "/data";
+        let h = std::thread::spawn(move || panic!("watchdog lost {pool}"));
+        assert_eq!(
+            join_logged(h, "storage watchdog"),
+            Some("watchdog lost /data".to_string()),
+        );
+    }
+
+    #[test]
+    fn join_logged_names_an_unprintable_panic_payload() {
+        // `panic_any` with a non-string payload has no printable form — say
+        // so rather than invent a message.
+        let h = std::thread::spawn(|| std::panic::panic_any(7u8));
+        assert_eq!(
+            join_logged(h, "storage watchdog"),
+            Some("non-string panic payload".to_string()),
+        );
     }
 }
