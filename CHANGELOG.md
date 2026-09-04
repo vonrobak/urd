@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Every persisted event variant now has a frozen historical-JSON fixture
+  test, so a future wire-form change fails a test instead of silently
+  breaking `urd events` on old rows (#386).
+
 ### Changed
 - The voice contract (`voice_contract.rs`) now exercises the `urd
   emergency` renderers in full and 15 of the onboarding/earning-flow
