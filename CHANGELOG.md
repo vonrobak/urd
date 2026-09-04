@@ -25,6 +25,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   surfaces where a miscalibrated line matters most — under the
   no-falsehood, first-line, and gravity-calibration rules. Test-only;
   no renderer prose changed (#386).
+- `urd emergency` now deletes exactly the snapshots it listed before asking
+  for confirmation, instead of re-reading the snapshot directories after the
+  prompt and deleting whatever it found the second time. What you confirm is
+  what is removed. The set itself is unchanged, and both the interactive
+  command and the automatic pre-backup emergency pass now select it through
+  one shared walk, so they cannot drift apart (#383).
 
 ### Fixed
 - `urd doctor --thorough` no longer reports "N warnings" when the only thing
