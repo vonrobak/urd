@@ -26,6 +26,57 @@
 //   Rule 4 (drive-event part) — sentinel→awareness→voice ack of reconnection
 //   Rule 7 — Repeated-advisory suppression
 //
+// ── Renderer coverage (issue #386) ──────────────────────────────────
+//
+// As introduced (UPI 035) this contract covered 7 renderers:
+// render_backup_summary, render_default_status, render_doctor,
+// render_first_time, render_plan, render_status, render_verify.
+//
+// Extended (issue #386, part 1) to the incident and onboarding/earning
+// surfaces where a miscalibrated line matters most:
+//
+//   - src/voice/emergency.rs — BOTH renderers, in full:
+//     render_emergency (the pre-action crisis assessment) and
+//     render_emergency_result (the post-action report). Checked under
+//     Rule 1 (no falsehoods: the crisis/no-crisis claim, the
+//     per-subvolume delete/keep/snapshot sums, and the ByteSize figures
+//     all traced back to the input struct), Rule 5 (first-line answer),
+//     and Rule 6 (gravity — red only on an earned crisis or a nonzero
+//     `failed` count; the "still critical" advisory stays yellow).
+//
+//   - src/voice/encounter.rs — 15 of ~34 `render_*` functions: the
+//     onboarding entry (`render_prompt` with `PromptKind::Offer`), the
+//     full earning flow (UPI 071 — asking for root: every
+//     `render_earning_*` plus `render_visudo_refusal`), and the two
+//     renderers that close the seal (`render_seal_summary`,
+//     `render_first_thread_already` / `render_first_thread_failed`).
+//     These are the flow's highest-stakes moments — granting root, and
+//     the final "what did/didn't happen" report — checked under Rule 1
+//     and Rule 5 throughout, Rule 6 wherever the renderer carries color.
+//
+//     Deliberately NOT covered in encounter.rs (~19 renderers): the
+//     structural discovery/runestone prompt bodies (the Looking/
+//     DriveResidency/Granularity/Importance/Residence/Runestone arms of
+//     `render_prompt`, `render_invalid_notice`, and the
+//     render_looking/render_runestone/render_gap prose helpers), the
+//     endings (`render_farewell`, `render_confirm_relook`,
+//     `render_empty_report`, `render_post_carve`), the units-scheduling
+//     sub-flow (`render_units_*`, `render_linger_notice`), the
+//     send-offer sub-flow (`render_send_offer`, `render_send_deferred`),
+//     the adoption sub-flow (`render_seal_adoption`,
+//     `render_seal_adoption_skipped`), the data-dir failure
+//     (`render_data_dir_failed`), and the delve-deeper editor loop
+//     (`render_editor_failure`, `render_no_editor`). Each already carries
+//     direct content-presence assertions in encounter.rs's own
+//     `mod tests`; folding all ~34 into the seven-rule contract in one
+//     pass was judged lower value than a first pass on the
+//     highest-stakes subset above — a natural follow-up, not attempted
+//     here.
+//
+// Still entirely outside this contract: the `drives`, `history`, `init`,
+// `calibrate`, `retention`, `sentinel`, `events`, and `get` renderers.
+// Not touched by this pass.
+//
 // Color-override convention:
 //   Every contract test MUST call `helpers::set_color(true|false)` as its
 //   first statement. This is not optional — see PD-11 / R3 in the plan.
@@ -44,8 +95,8 @@ mod contract {
         test_verify_output,
     };
     use crate::voice::{
-        render_backup_summary, render_default_status, render_doctor, render_first_time,
-        render_plan, render_status, render_verify,
+        render_backup_summary, render_default_status, render_doctor, render_emergency,
+        render_emergency_result, render_first_time, render_plan, render_status, render_verify,
     };
 
     mod helpers {
@@ -1743,5 +1794,583 @@ mod contract {
                 "retention preview Debug contains forbidden '{forbidden}' for Count(0): {pruned}"
             );
         }
+    }
+
+    // ── Emergency (issue #386) — no-falsehood, first-line, gravity ─────
+
+    fn test_emergency_output_ok() -> crate::output::EmergencyOutput {
+        crate::output::EmergencyOutput {
+            roots: vec![crate::output::EmergencyRootAssessment {
+                root: std::path::PathBuf::from("/mnt/pool"),
+                free_bytes: 500_000_000_000,
+                min_free_bytes: Some(100_000_000_000),
+                is_critical: false,
+                subvolumes: vec![],
+                unsent_count: 0,
+                drives_needing_full_send: vec![],
+            }],
+        }
+    }
+
+    fn test_emergency_output_crisis() -> crate::output::EmergencyOutput {
+        crate::output::EmergencyOutput {
+            roots: vec![crate::output::EmergencyRootAssessment {
+                root: std::path::PathBuf::from("/mnt/pool"),
+                free_bytes: 1_000_000_000,
+                min_free_bytes: Some(5_000_000_000),
+                is_critical: true,
+                subvolumes: vec![
+                    crate::output::EmergencySubvolDetail {
+                        name: "htpc-home".to_string(),
+                        snapshot_count: 40,
+                        keep_count: 5,
+                        delete_count: 35,
+                        latest: "20260901-0400-htpc-home".to_string(),
+                        pinned_count: 2,
+                    },
+                    crate::output::EmergencySubvolDetail {
+                        name: "htpc-docs".to_string(),
+                        snapshot_count: 10,
+                        keep_count: 3,
+                        delete_count: 7,
+                        latest: "20260901-0400-htpc-docs".to_string(),
+                        pinned_count: 1,
+                    },
+                ],
+                unsent_count: 4,
+                drives_needing_full_send: vec!["WD-18TB".to_string()],
+            }],
+        }
+    }
+
+    fn test_emergency_result_ok() -> crate::output::EmergencyResult {
+        crate::output::EmergencyResult {
+            root: std::path::PathBuf::from("/mnt/pool"),
+            deleted: 42,
+            failed: 0,
+            freed_bytes: 8_200_000_000,
+            remaining_snapshots: 13,
+            remaining_free: 108_200_000_000,
+            still_critical: false,
+        }
+    }
+
+    fn test_emergency_result_still_critical() -> crate::output::EmergencyResult {
+        crate::output::EmergencyResult {
+            root: std::path::PathBuf::from("/mnt/pool"),
+            deleted: 30,
+            failed: 2,
+            freed_bytes: 4_000_000_000,
+            remaining_snapshots: 25,
+            remaining_free: 4_000_000_000,
+            still_critical: true,
+        }
+    }
+
+    #[test]
+    fn rule5_emergency_no_crisis_first_line_says_no_crisis() {
+        let _color = color_guard(false);
+        let output = render_emergency(&test_emergency_output_ok(), OutputMode::Interactive);
+        let first = helpers::non_blank_lines(&output)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("empty emergency output:\n{output}"));
+        assert!(
+            first.contains("No crisis detected"),
+            "first non-blank line of a calm `urd emergency` must answer the question, got: {first}"
+        );
+    }
+
+    #[test]
+    fn rule1_emergency_never_says_no_crisis_when_a_root_is_critical() {
+        let _color = color_guard(false);
+        let output = render_emergency(&test_emergency_output_crisis(), OutputMode::Interactive);
+        assert!(
+            !output.contains("No crisis detected"),
+            "must not claim no crisis when a root is_critical: {output}"
+        );
+        assert!(
+            output.contains("Urd sees a crisis"),
+            "expected the crisis headline: {output}"
+        );
+    }
+
+    #[test]
+    fn rule1_emergency_subvolume_sums_match_the_input_counts() {
+        let _color = color_guard(false);
+        // subvolumes: delete 35+7=42, keep 5+3=8, snapshots 40+10=50.
+        let output = render_emergency(&test_emergency_output_crisis(), OutputMode::Interactive);
+        assert!(
+            output.contains("This will delete 42 snapshots"),
+            "delete-count line must equal the sum of per-subvolume delete_count: {output}"
+        );
+        assert!(
+            output.contains("8 snapshots will remain"),
+            "keep-count line must equal the sum of per-subvolume keep_count: {output}"
+        );
+        assert!(
+            output.contains("50 snapshots across 2 subvolumes"),
+            "snapshot-count line must equal the sum of per-subvolume snapshot_count: {output}"
+        );
+    }
+
+    #[test]
+    fn rule1_emergency_unsent_advisory_names_input_count_and_drive() {
+        let _color = color_guard(false);
+        let output = render_emergency(&test_emergency_output_crisis(), OutputMode::Interactive);
+        assert!(
+            output.contains("4 unsent snapshots will be deleted"),
+            "must surface the exact unsent_count: {output}"
+        );
+        assert!(
+            output.contains("WD-18TB"),
+            "must name the drive from drives_needing_full_send: {output}"
+        );
+    }
+
+    #[test]
+    fn rule6_emergency_no_crisis_renders_zero_red() {
+        let _color = color_guard(true);
+        let output = render_emergency(&test_emergency_output_ok(), OutputMode::Interactive);
+        assert_eq!(
+            helpers::count_red(&output),
+            0,
+            "a calm assessment must never earn red: {output}"
+        );
+    }
+
+    #[test]
+    fn rule6_emergency_crisis_earns_red_headline() {
+        let _color = color_guard(true);
+        let output = render_emergency(&test_emergency_output_crisis(), OutputMode::Interactive);
+        assert!(
+            helpers::count_red(&output) >= 1,
+            "a genuine crisis must earn at least one red (negative control): {output}"
+        );
+    }
+
+    #[test]
+    fn rule5_emergency_result_first_line_answers_what_happened() {
+        let _color = color_guard(false);
+        let output = render_emergency_result(&test_emergency_result_ok(), OutputMode::Interactive);
+        let first = helpers::non_blank_lines(&output)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("empty emergency result output:\n{output}"));
+        assert!(
+            first.contains("Freed"),
+            "first non-blank line of a clean emergency result must answer 'what happened', got: {first}"
+        );
+    }
+
+    #[test]
+    fn rule1_emergency_result_freed_bytes_and_remaining_match_input() {
+        let _color = color_guard(false);
+        let output = render_emergency_result(&test_emergency_result_ok(), OutputMode::Interactive);
+        assert!(
+            output.contains("8.2GB"),
+            "freed_bytes must render as the exact ByteSize of the input: {output}"
+        );
+        assert!(
+            output.contains("13 snapshots remain"),
+            "remaining_snapshots must match input verbatim: {output}"
+        );
+    }
+
+    #[test]
+    fn rule6_emergency_result_zero_failures_renders_zero_red() {
+        let _color = color_guard(true);
+        let output = render_emergency_result(&test_emergency_result_ok(), OutputMode::Interactive);
+        assert_eq!(
+            helpers::count_red(&output),
+            0,
+            "a clean emergency result (failed=0) must never earn red: {output}"
+        );
+    }
+
+    #[test]
+    fn rule6_emergency_result_failures_earn_red_and_still_critical_stays_yellow() {
+        let _color = color_guard(true);
+        let output = render_emergency_result(
+            &test_emergency_result_still_critical(),
+            OutputMode::Interactive,
+        );
+        assert!(
+            helpers::count_red(&output) >= 1,
+            "failed > 0 must earn red on the failure count (negative control): {output}"
+        );
+        let still_critical_line = output
+            .lines()
+            .find(|l| l.contains("Still below threshold"))
+            .unwrap_or_else(|| panic!("expected the still-critical advisory in:\n{output}"));
+        assert_eq!(
+            helpers::count_red(still_critical_line),
+            0,
+            "the still-critical advisory is yellow, not red: {still_critical_line}"
+        );
+        assert!(
+            helpers::count_yellow(still_critical_line) >= 1,
+            "the still-critical advisory must be yellow: {still_critical_line}"
+        );
+    }
+
+    // ── Encounter: onboarding entry + the earning verdicts (issue #386) ──
+    //
+    // Scope and rationale for what's covered/omitted are recorded in the
+    // module doc at the top of this file.
+
+    fn earning_rendered_sudoers() -> &'static str {
+        "urd ALL=(root) NOPASSWD: /usr/sbin/btrfs subvolume snapshot -r *, \\\n\
+         /usr/sbin/btrfs send *, /usr/sbin/btrfs receive *"
+    }
+
+    fn test_seal_summary_full() -> crate::output::SealSummary {
+        crate::output::SealSummary {
+            threads: vec![
+                crate::output::SealThread {
+                    name: "htpc-home".to_string(),
+                    level: Some("sheltered".to_string()),
+                },
+                crate::output::SealThread {
+                    name: "htpc-docs".to_string(),
+                    level: Some("recorded".to_string()),
+                },
+            ],
+            units_enabled: true,
+            next_action: "The nightly timer acts around 04:00.".to_string(),
+            linger_loose: false,
+            first_thread_spun: true,
+            send: crate::output::SealSendState::Sent,
+            uncovered_subvolumes: None,
+        }
+    }
+
+    fn test_seal_summary_partial() -> crate::output::SealSummary {
+        crate::output::SealSummary {
+            threads: vec![crate::output::SealThread {
+                name: "htpc-home".to_string(),
+                level: Some("sheltered".to_string()),
+            }],
+            units_enabled: false,
+            next_action: String::new(),
+            linger_loose: true,
+            first_thread_spun: false,
+            send: crate::output::SealSendState::NotApplicable,
+            uncovered_subvolumes: Some(1),
+        }
+    }
+
+    #[test]
+    fn rule5_encounter_offer_first_line_matches_not_configured_yet() {
+        let _color = color_guard(false);
+        let spec = crate::encounter::PromptSpec {
+            kind: crate::encounter::PromptKind::Offer,
+            choices: vec![
+                crate::encounter::ChoiceId::Begin,
+                crate::encounter::ChoiceId::NotNow,
+            ],
+            default: None,
+        };
+        let output = crate::voice::render_prompt(&spec);
+        let first = helpers::non_blank_lines(&output)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("empty offer prompt output:\n{output}"));
+        assert!(first.contains("not configured yet"), "{first}");
+    }
+
+    #[test]
+    fn rule5_earning_request_first_line_names_root() {
+        let _color = color_guard(false);
+        let output = crate::voice::render_earning_request(
+            earning_rendered_sudoers(),
+            std::path::Path::new("/etc/sudoers.d/urd"),
+        );
+        let first = helpers::non_blank_lines(&output)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("empty earning-request output:\n{output}"));
+        assert!(
+            first.contains("root"),
+            "first non-blank line of the earning ask must name root, got: {first}"
+        );
+    }
+
+    #[test]
+    fn rule1_earning_request_shows_the_exact_rendered_file_and_destination() {
+        let _color = color_guard(false);
+        let dest = std::path::Path::new("/etc/sudoers.d/urd");
+        let rendered = earning_rendered_sudoers();
+        let output = crate::voice::render_earning_request(rendered, dest);
+        for line in rendered.lines() {
+            assert!(
+                output.contains(line),
+                "the asking must show the exact rendered line, missing: {line:?} in:\n{output}"
+            );
+        }
+        assert!(
+            output.contains("/etc/sudoers.d/urd"),
+            "must name the destination path: {output}"
+        );
+    }
+
+    #[test]
+    fn rule1_earning_declined_shows_the_same_content_and_manual_command() {
+        let _color = color_guard(false);
+        let dest = std::path::Path::new("/etc/sudoers.d/urd");
+        let rendered = earning_rendered_sudoers();
+        let output = crate::voice::render_earning_declined(rendered, dest);
+        for line in rendered.lines() {
+            assert!(
+                output.contains(line),
+                "declined path must show the same content as the ask, missing: {line:?} in:\n{output}"
+            );
+        }
+        assert!(
+            output.contains("sudo visudo -f /etc/sudoers.d/urd"),
+            "must name the exact manual command: {output}"
+        );
+    }
+
+    #[test]
+    fn rule1_earning_regrant_names_every_missing_line() {
+        let _color = color_guard(false);
+        let missing = vec!["btrfs send *".to_string(), "btrfs receive *".to_string()];
+        let output = crate::voice::render_earning_regrant(&missing);
+        for line in &missing {
+            assert!(
+                output.contains(line),
+                "regrant must name every missing line, missing: {line:?} in:\n{output}"
+            );
+        }
+    }
+
+    #[test]
+    fn rule5_earning_regrant_first_line_names_the_drift() {
+        let _color = color_guard(false);
+        let output = crate::voice::render_earning_regrant(&["btrfs send *".to_string()]);
+        let first = helpers::non_blank_lines(&output)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("empty regrant output:\n{output}"));
+        assert!(first.contains("grant has drifted"), "{first}");
+    }
+
+    #[test]
+    fn rule1_earning_coverage_unconfirmed_shows_the_exact_reason() {
+        let _color = color_guard(false);
+        let output =
+            crate::voice::render_earning_coverage_unconfirmed("listing unavailable under this session");
+        assert!(
+            output.contains("listing unavailable under this session"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn rule1_earning_verify_failed_shows_the_exact_detail() {
+        let _color = color_guard(false);
+        let output = crate::voice::render_earning_verify_failed("sudo: a password is required");
+        assert!(output.contains("sudo: a password is required"), "{output}");
+    }
+
+    #[test]
+    fn rule1_earning_unavailable_shows_the_exact_detail() {
+        let _color = color_guard(false);
+        let output = crate::voice::render_earning_unavailable("user is not in the sudoers file");
+        assert!(output.contains("user is not in the sudoers file"), "{output}");
+    }
+
+    #[test]
+    fn rule1_earning_blocked_shows_the_exact_reason() {
+        let _color = color_guard(false);
+        let output = crate::voice::render_earning_blocked("btrfs binary not found on PATH");
+        assert!(output.contains("btrfs binary not found on PATH"), "{output}");
+    }
+
+    #[test]
+    fn rule1_visudo_refusal_shows_the_exact_stderr_and_kept_path() {
+        let _color = color_guard(false);
+        let output = crate::voice::render_visudo_refusal(
+            std::path::Path::new("/tmp/urd-sudoers-staged"),
+            "visudo: >>> /tmp/urd-sudoers-staged: syntax error near line 3 <<<\n",
+        );
+        assert!(output.contains("syntax error near line 3"), "{output}");
+        assert!(output.contains("/tmp/urd-sudoers-staged"), "{output}");
+    }
+
+    #[test]
+    fn rule5_earning_verdicts_answer_on_the_first_line() {
+        let _color = color_guard(false);
+        let dest = std::path::Path::new("/etc/sudoers.d/urd");
+        let cases: Vec<(String, &str)> = vec![
+            (crate::voice::render_earning_installed(), "Earned"),
+            (
+                crate::voice::render_earning_coverage_unconfirmed("listing unavailable"),
+                "Earned",
+            ),
+            (
+                crate::voice::render_earning_verify_failed("probe failed"),
+                "Not yet earned",
+            ),
+            (
+                crate::voice::render_earning_declined(earning_rendered_sudoers(), dest),
+                "Nothing installed",
+            ),
+            (crate::voice::render_earning_already(), "Earned"),
+            (crate::voice::render_earning_deferred(), "Nothing installed"),
+            (
+                crate::voice::render_earning_blocked("btrfs missing"),
+                "Couldn't earn",
+            ),
+            (
+                crate::voice::render_earning_unavailable("no sudo"),
+                "Cannot ask",
+            ),
+            (
+                crate::voice::render_visudo_refusal(std::path::Path::new("/tmp/x"), "err"),
+                "Refused",
+            ),
+        ];
+        for (output, expected) in cases {
+            let first = helpers::non_blank_lines(&output)
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| panic!("empty earning-verdict output:\n{output}"));
+            assert!(
+                first.contains(expected),
+                "first non-blank line must answer with '{expected}', got: {first}\nfull:\n{output}"
+            );
+        }
+    }
+
+    #[test]
+    fn rule6_earning_blocked_is_yellow_never_red() {
+        let _color = color_guard(true);
+        let output = crate::voice::render_earning_blocked("btrfs missing from PATH");
+        assert_eq!(
+            helpers::count_red(&output),
+            0,
+            "a blocked earning must never render red: {output}"
+        );
+        assert!(
+            helpers::count_yellow(&output) >= 1,
+            "blocked earning must render yellow: {output}"
+        );
+    }
+
+    #[test]
+    fn rule6_earning_deferred_and_declined_carry_no_color() {
+        let _color = color_guard(true);
+        let dest = std::path::Path::new("/etc/sudoers.d/urd");
+        let deferred = crate::voice::render_earning_deferred();
+        let declined = crate::voice::render_earning_declined(earning_rendered_sudoers(), dest);
+        assert_eq!(
+            helpers::count_red(&deferred),
+            0,
+            "a user 'not now' must never render red: {deferred}"
+        );
+        assert_eq!(
+            helpers::count_red(&declined),
+            0,
+            "a user decline must never render red: {declined}"
+        );
+    }
+
+    #[test]
+    fn rule6_visudo_refusal_carries_no_red_despite_being_a_real_failure() {
+        // Pins the design choice in render_visudo_refusal's doc comment:
+        // this is a bug in Urd's rendering, not the user's answers, so
+        // the failure does not borrow red's gravity.
+        let _color = color_guard(true);
+        let output =
+            crate::voice::render_visudo_refusal(std::path::Path::new("/tmp/x"), "syntax error");
+        assert_eq!(
+            helpers::count_red(&output),
+            0,
+            "visudo refusal is Urd's own bug, not an earned red: {output}"
+        );
+    }
+
+    #[test]
+    fn rule1_seal_summary_names_input_threads_and_levels_verbatim() {
+        let _color = color_guard(false);
+        let output = crate::voice::render_seal_summary(&test_seal_summary_full());
+        assert!(
+            output.contains("htpc-home") && output.contains("sheltered"),
+            "{output}"
+        );
+        assert!(
+            output.contains("htpc-docs") && output.contains("recorded"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn rule1_seal_summary_none_uncovered_renders_silent() {
+        let _color = color_guard(false);
+        let output = crate::voice::render_seal_summary(&test_seal_summary_full());
+        assert!(
+            !output.contains("subvolumes your promises don't cover"),
+            "None uncovered_subvolumes must not invent an advisory: {output}"
+        );
+    }
+
+    #[test]
+    fn rule5_seal_summary_first_line_is_the_seal_header() {
+        let _color = color_guard(false);
+        for summary in [test_seal_summary_full(), test_seal_summary_partial()] {
+            let output = crate::voice::render_seal_summary(&summary);
+            let first = helpers::non_blank_lines(&output)
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| panic!("empty seal summary output:\n{output}"));
+            assert!(first.contains("The seal."), "{first}");
+        }
+    }
+
+    #[test]
+    fn rule6_seal_summary_partial_states_are_yellow_never_red() {
+        let _color = color_guard(true);
+        let output = crate::voice::render_seal_summary(&test_seal_summary_partial());
+        assert_eq!(
+            helpers::count_red(&output),
+            0,
+            "an incomplete-but-carved seal must never render red: {output}"
+        );
+        assert!(
+            helpers::count_yellow(&output) >= 1,
+            "the partial-state advisories must render yellow: {output}"
+        );
+    }
+
+    #[test]
+    fn rule5_first_thread_already_first_line_says_recorded() {
+        let _color = color_guard(false);
+        let output = crate::voice::render_first_thread_already();
+        let first = helpers::non_blank_lines(&output)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("empty output:\n{output}"));
+        assert!(first.contains("Recorded"), "{first}");
+    }
+
+    #[test]
+    fn rule1_first_thread_failed_shows_the_exact_detail() {
+        let _color = color_guard(false);
+        let output =
+            crate::voice::render_first_thread_failed("permission denied creating snapshot home");
+        assert!(
+            output.contains("permission denied creating snapshot home"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn rule6_first_thread_failed_is_yellow_never_red() {
+        let _color = color_guard(true);
+        let output = crate::voice::render_first_thread_failed("permission denied");
+        assert_eq!(helpers::count_red(&output), 0, "{output}");
+        assert!(helpers::count_yellow(&output) >= 1, "{output}");
     }
 }
