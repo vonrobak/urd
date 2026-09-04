@@ -894,7 +894,6 @@ fn build_doctor_recommendation_view_inner(
                 Some(recommendation::headroom_aware_pointer_only(
                     &cur,
                     ShapeRole::Local,
-                    severity_local,
                     reason,
                 ))
             }
@@ -914,7 +913,6 @@ fn build_doctor_recommendation_view_inner(
                 Some(recommendation::headroom_aware_pointer_only(
                     &cur,
                     ShapeRole::External,
-                    severity_external,
                     reason,
                 ))
             }

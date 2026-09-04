@@ -460,19 +460,17 @@ fn tighten(
 /// `suggested == current && both costs zero` and emits only the reason
 /// line — no shape, no recovery tail.
 ///
-/// Severity is restricted to `Pressure`; Healthy/Caution synth is meaningless
-/// and would represent a doctor.rs bug.
+/// Pressure-only by construction: the function sets `severity` to
+/// `HeadroomSeverity::Pressure` itself, so Healthy/Caution synth (which
+/// would represent a doctor.rs bug) is unrepresentable rather than merely
+/// asserted against.
 #[must_use]
 pub fn headroom_aware_pointer_only(
     current: &ResolvedGraduatedRetention,
     role: ShapeRole,
-    severity: HeadroomSeverity,
     reason: AdjustmentReason,
 ) -> HeadroomAwareRecommendation {
-    debug_assert!(
-        matches!(severity, HeadroomSeverity::Pressure),
-        "headroom_aware_pointer_only is only valid for Pressure severity, got {severity:?}",
-    );
+    let severity = HeadroomSeverity::Pressure;
     let zero_cost = CostProjection {
         data_bytes: 0,
         snapshot_count: 0,
@@ -1393,7 +1391,6 @@ mod tests {
         let h = headroom_aware_pointer_only(
             &cur,
             ShapeRole::Local,
-            HeadroomSeverity::Pressure,
             AdjustmentReason::SourcePoolLow { free_ratio: 0.1 },
         );
         assert_eq!(h.recommendation.suggested, h.recommendation.current);
@@ -1409,26 +1406,15 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
-    fn headroom_aware_pointer_only_panics_on_healthy() {
+    fn headroom_aware_pointer_only_severity_is_always_pressure() {
+        // Pressure-only by construction: the function no longer takes a
+        // severity parameter, so Healthy/Caution synth is unrepresentable.
         let cur = shape(24, 60, 52, crate::types::MonthlyCount::Count(24), 0);
-        let _ = headroom_aware_pointer_only(
+        let h = headroom_aware_pointer_only(
             &cur,
             ShapeRole::Local,
-            HeadroomSeverity::Healthy,
             AdjustmentReason::SourcePoolLow { free_ratio: 0.1 },
         );
-    }
-
-    #[test]
-    #[should_panic]
-    fn headroom_aware_pointer_only_panics_on_caution() {
-        let cur = shape(24, 60, 52, crate::types::MonthlyCount::Count(24), 0);
-        let _ = headroom_aware_pointer_only(
-            &cur,
-            ShapeRole::Local,
-            HeadroomSeverity::Caution,
-            AdjustmentReason::SourcePoolLow { free_ratio: 0.1 },
-        );
+        assert_eq!(h.severity, HeadroomSeverity::Pressure);
     }
 }
