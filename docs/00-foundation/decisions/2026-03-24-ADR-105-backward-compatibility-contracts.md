@@ -14,6 +14,8 @@ timestamp: '2026-09-04T10:15:00+02:00'
 > structure, pin files, and Prometheus metrics. External systems (bash script, Grafana,
 > monitoring) depend on them. Urd reads both legacy and current formats but only writes
 > the current format. Breaking these contracts requires a migration plan and an ADR.
+>
+> Amended 2026-09-04 — see the amendment of that date below.
 
 **Date:** 2026-03-22 (formalized 2026-03-24)
 **Status:** Accepted (amended 2026-05-15, `monthly = 0` migration; 2026-05-15, UPI 043
@@ -276,9 +278,9 @@ covered by Contracts 1–4.
 
 | Surface | Version source | Field reference | Consumer |
 |---------|----------------|-----------------|----------|
-| `heartbeat.json` | `SCHEMA_VERSION` in `src/heartbeat.rs` (currently 4) | [docs/20-reference/heartbeat-schema.md](../../20-reference/heartbeat-schema.md) | external monitoring; the homelab stack |
-| `urd doctor [--thorough] --json` | `DOCTOR_OUTPUT_SCHEMA_VERSION` in `src/output.rs` (currently 3) | the `DoctorOutput` struct in `src/output.rs` | scripts and ad-hoc `--json` consumers |
-| `sentinel-state.json` | written as a literal at the `SentinelStateFile` construction site in `src/sentinel_runner.rs` (currently 3); the struct is `output::SentinelStateFile` | the `SentinelStateFile` struct in `src/output.rs` | `urd doctor`'s sentinel section; a planned desktop face (Spindle) |
+| `heartbeat.json` | `SCHEMA_VERSION` in `src/heartbeat.rs` | [docs/20-reference/heartbeat-schema.md](../../20-reference/heartbeat-schema.md) | external monitoring; the homelab stack |
+| `urd doctor [--thorough] --json` | `DOCTOR_OUTPUT_SCHEMA_VERSION` in `src/output.rs` | the `DoctorOutput` struct in `src/output.rs` | scripts and ad-hoc `--json` consumers |
+| `sentinel-state.json` | written as a literal at the `SentinelStateFile` construction site in `src/sentinel_runner.rs` | the `SentinelStateFile` struct in `src/output.rs` | `urd doctor`'s sentinel section; a planned desktop face (Spindle) |
 
 **Bump policy.**
 

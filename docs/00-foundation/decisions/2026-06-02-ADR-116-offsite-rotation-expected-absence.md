@@ -20,6 +20,8 @@ timestamp: '2026-09-04T10:15:00+02:00'
 > not the send interval (UPI 055, future). This refines ADR-110 (promise semantics) and
 > ADR-113 (do-no-harm), and **amends UPI 031-b's unconditional Critical clear-all** to be
 > presence-conditional.
+>
+> Amended 2026-09-04 — see the amendment of that date below.
 
 **Date:** 2026-06-02
 **Status:** Accepted (amended 2026-09-04, code-drift audit)

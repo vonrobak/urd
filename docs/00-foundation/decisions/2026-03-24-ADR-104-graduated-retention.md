@@ -14,6 +14,8 @@ timestamp: '2026-09-04T10:15:00+02:00'
 > progressively with age — instead of fixed snapshot counts. Local retention has four time
 > windows (hourly, daily, weekly, monthly). External retention uses count-based limits with
 > space-governed cleanup. Space pressure mode aggressively thins when the filesystem is low.
+>
+> Amended 2026-09-04 — see the amendment of that date below.
 
 **Date:** 2026-03-22 (formalized 2026-03-24)
 **Status:** Accepted (amended 2026-05-15, yearly window; 2026-09-04, code-drift audit)

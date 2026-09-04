@@ -592,9 +592,9 @@ above:
   Pressure is the only severity that escalates a shape-quiet row into a
   synthesised one.
 - **Synth path (R1).** `recommendation::headroom_aware_pointer_only` is
-  Pressure-only, documented and `debug_assert!`-ed as such; the "severity in
-  `{Pressure, Critical}`" framing reads as Pressure alone. The Pressure-at-MIN
-  case it also serves is unchanged.
+  Pressure-only by construction: the function takes no severity and sets
+  `Pressure` itself. The "severity in `{Pressure, Critical}`" framing reads as
+  Pressure alone. The Pressure-at-MIN case it also serves is unchanged.
 
 `TightnessTier::Critical` is not the same concept under a shared name: the
 surviving Critical is a pool tightness tier that drives behaviour, never a
