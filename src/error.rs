@@ -335,6 +335,43 @@ impl UrdError {
         }
     }
 
+    /// A btrfs subprocess that never ran to completion — spawn, pipe capture,
+    /// or wait failed. There is no exit code and nothing was transferred, so
+    /// only the operation and the reason vary between call sites.
+    #[must_use]
+    pub fn btrfs_spawn(operation: BtrfsOperation, stderr: impl Into<String>) -> Self {
+        Self::Btrfs {
+            context: BtrfsErrorContext {
+                operation,
+                exit_code: None,
+                stderr: stderr.into(),
+                bytes_transferred: None,
+            },
+        }
+    }
+
+    /// A btrfs subprocess that ran and exited non-zero. `exit_code` is
+    /// `Option` because a signalled child reports none.
+    ///
+    /// Both constructors mirror `executor::outcome_success` /
+    /// `outcome_failure`: the mechanical fields are stamped in one place so a
+    /// new call site states only what differs (#387).
+    #[must_use]
+    pub fn btrfs_exit(
+        operation: BtrfsOperation,
+        exit_code: Option<i32>,
+        stderr: impl Into<String>,
+    ) -> Self {
+        Self::Btrfs {
+            context: BtrfsErrorContext {
+                operation,
+                exit_code,
+                stderr: stderr.into(),
+                bytes_transferred: None,
+            },
+        }
+    }
+
     /// Extract the btrfs operation.
     #[must_use]
     pub fn btrfs_operation(&self) -> Option<BtrfsOperation> {
