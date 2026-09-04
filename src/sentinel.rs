@@ -49,8 +49,8 @@ pub enum SentinelAction {
     /// Re-assess promise states, compare with previous, dispatch notifications
     /// if changed, and write the sentinel state file. This is the primary tick.
     Assess,
-    /// Log a drive mount/unmount event. The runner logs and (in Session 3)
-    /// records the event in the drive_connections table.
+    /// Log a drive mount/unmount event. The runner logs it and records it in
+    /// the `events` table (`kind='drive'`).
     LogDriveChange {
         label: String,
         mounted: bool,

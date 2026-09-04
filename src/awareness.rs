@@ -577,7 +577,7 @@ pub struct DriveAssessment {
     #[allow(dead_code)] // consumed by verbose status display (future)
     pub configured_interval: Interval,
     pub role: DriveRole,
-    /// Seconds since the drive's last `Unmount` event in `drive_connections`,
+    /// Seconds since the drive's last `Unmount` event in the `events` table,
     /// populated only when the drive is currently unmounted AND the most
     /// recent physical event is an Unmount. Rule 1 of the voice contract:
     /// stay silent when the sentinel missed the disconnect (last event is
@@ -585,7 +585,7 @@ pub struct DriveAssessment {
     pub absent_duration_secs: Option<i64>,
     /// Seconds since the most recent successful operation targeting this
     /// drive in the operations log. Populated only when the drive is
-    /// unmounted AND `drive_connections` holds *no* events for this drive
+    /// unmounted AND the `events` table holds *no* drive events for this drive
     /// at all — the drive predates sentinel observation. Never mixed with
     /// `absent_duration_secs`.
     pub last_activity_age_secs: Option<i64>,
@@ -4059,7 +4059,7 @@ send_enabled = false
 
     #[test]
     fn drive_assessment_last_activity_from_ops_log_when_no_event() {
-        // drive_connections empty for this drive → fall through to operations log.
+        // No drive events for this drive → fall through to the operations log.
         let config = test_config();
         let now = dt(2026, 3, 23, 14, 0);
         let mut fs = MockFileSystemState::new();

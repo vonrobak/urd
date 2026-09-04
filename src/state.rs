@@ -639,7 +639,7 @@ impl StateDb {
 
     /// Get the timestamp of the most recent successful send (any subvolume) for a
     /// given drive. Used by the D-1 drive-absence cascade to estimate when a
-    /// drive was last actively written to, when `drive_connections` is empty.
+    /// drive was last actively written to, when the drive has no `events` rows.
     pub fn last_successful_operation_at(
         &self,
         drive_label: &str,

@@ -172,7 +172,7 @@ impl SendKind {
 // ── DriveEvent ──────────────────────────────────────────────────────────
 
 /// A drive mount or unmount event recorded by the sentinel daemon.
-/// Sourced from the `drive_connections` table.
+/// Sourced from the `events` table (`kind='drive'`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DriveEvent {
     pub kind: DriveEventKind,

@@ -30,7 +30,7 @@ pub fn run(config: Config, args: EventsArgs, output_mode: OutputMode) -> anyhow:
     let limit = args.limit.clamp(1, LIMIT_MAX);
 
     let since_dt = match args.since.as_deref() {
-        Some(s) => Some(parse_since(s)?),
+        Some(s) => Some(parse_since(chrono::Local::now().naive_local(), s)?),
         None => None,
     };
 
@@ -80,11 +80,13 @@ pub fn run(config: Config, args: EventsArgs, output_mode: OutputMode) -> anyhow:
 /// Parse a `--since` argument like "7d" / "24h" / "30m" / "5w" into the
 /// absolute cutoff `now - duration`. Same suffix vocabulary as
 /// `types::Interval::from_str`.
-fn parse_since(s: &str) -> anyhow::Result<chrono::NaiveDateTime> {
+///
+/// `now` is passed in rather than read here so the subtraction is testable
+/// exactly, instead of against a tolerance window around the wall clock.
+fn parse_since(now: chrono::NaiveDateTime, s: &str) -> anyhow::Result<chrono::NaiveDateTime> {
     let interval: crate::types::Interval = s
         .parse()
         .with_context(|| format!("invalid --since {s:?} (expected like 7d, 24h, 30m, 5w)"))?;
-    let now = chrono::Local::now().naive_local();
     Ok(now - interval.as_chrono())
 }
 
@@ -92,29 +94,44 @@ fn parse_since(s: &str) -> anyhow::Result<chrono::NaiveDateTime> {
 mod tests {
     use super::*;
 
+    fn now() -> chrono::NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(2026, 9, 4)
+            .unwrap()
+            .and_hms_opt(14, 30, 0)
+            .unwrap()
+    }
+
     #[test]
     fn parse_since_accepts_duration_suffixes() {
-        assert!(parse_since("7d").is_ok());
-        assert!(parse_since("24h").is_ok());
-        assert!(parse_since("30m").is_ok());
-        assert!(parse_since("5w").is_ok());
+        assert!(parse_since(now(), "7d").is_ok());
+        assert!(parse_since(now(), "24h").is_ok());
+        assert!(parse_since(now(), "30m").is_ok());
+        assert!(parse_since(now(), "5w").is_ok());
     }
 
     #[test]
     fn parse_since_rejects_garbage() {
-        assert!(parse_since("garbage").is_err());
-        assert!(parse_since("").is_err());
-        assert!(parse_since("0d").is_err()); // zero is not positive
+        assert!(parse_since(now(), "garbage").is_err());
+        assert!(parse_since(now(), "").is_err());
+        assert!(parse_since(now(), "0d").is_err()); // zero is not positive
     }
 
     #[test]
     fn parse_since_subtracts_from_now() {
-        let cutoff = parse_since("1h").unwrap();
-        let now = chrono::Local::now().naive_local();
-        let delta = now.signed_duration_since(cutoff);
-        // ~1h ago ± a few seconds.
-        assert!(delta.num_seconds() >= 3590);
-        assert!(delta.num_seconds() <= 3610);
+        assert_eq!(
+            parse_since(now(), "1h").unwrap(),
+            chrono::NaiveDate::from_ymd_opt(2026, 9, 4)
+                .unwrap()
+                .and_hms_opt(13, 30, 0)
+                .unwrap()
+        );
+        assert_eq!(
+            parse_since(now(), "7d").unwrap(),
+            chrono::NaiveDate::from_ymd_opt(2026, 8, 28)
+                .unwrap()
+                .and_hms_opt(14, 30, 0)
+                .unwrap()
+        );
     }
 
     #[test]

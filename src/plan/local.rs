@@ -23,7 +23,7 @@ pub(super) fn plan_local_snapshot(i: &LocalSnapshotInputs) -> SnapshotOutcome {
     // catastrophic. See 2026-03-24-local-space-exhaustion-postmortem.md.
     let min_free = subvol.min_free_bytes.unwrap_or(0);
     if min_free > 0 {
-        let free = obs.fs.filesystem_free_bytes(local_dir).unwrap_or(u64::MAX);
+        let free = super::free_bytes_fail_open(obs, local_dir);
         if free < min_free {
             use crate::types::ByteSize;
             f.defer(
@@ -262,7 +262,7 @@ pub(super) fn plan_local_retention(i: &LocalRetentionInputs) -> PlanFragment {
         LocalRetentionPolicy::Graduated(retention_config) => {
             // Check space pressure
             let min_free = subvol.min_free_bytes.unwrap_or(0);
-            let free_bytes = obs.fs.filesystem_free_bytes(local_dir).unwrap_or(u64::MAX);
+            let free_bytes = super::free_bytes_fail_open(obs, local_dir);
             let space_pressure = min_free > 0 && free_bytes < min_free;
 
             let mut result = retention::graduated_retention(
@@ -458,7 +458,7 @@ mod tests {
             ..subvol(LocalRetentionPolicy::Transient)
         };
         let e = eff(LocalRetentionPolicy::Transient, true);
-        // No free_bytes entry for local_dir() -> unwrap_or(u64::MAX), fail-open.
+        // No free_bytes entry for local_dir() -> free_bytes_fail_open, fail-open.
         let fs = MockFileSystemState::new();
         let btrfs = MockBtrfs::new();
         let obs = Observation {

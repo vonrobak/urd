@@ -25,7 +25,7 @@ pub(super) fn plan_external_retention(i: &ExternalRetentionInputs) -> PlanFragme
         return f;
     }
 
-    let free_bytes = obs.fs.filesystem_free_bytes(&ext_dir).unwrap_or(u64::MAX);
+    let free_bytes = super::free_bytes_fail_open(obs, &ext_dir);
     let min_free = drive.min_free_bytes.map(|b| b.bytes()).unwrap_or(0);
 
     let mut result = retention::space_governed_retention(

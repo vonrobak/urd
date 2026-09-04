@@ -47,7 +47,7 @@ pub enum Commands {
     RetentionPreview(RetentionPreviewArgs),
     /// Generate shell completion scripts
     Completions(CompletionsArgs),
-    /// Migrate config from legacy schema to v1
+    /// Migrate config to the latest schema (v2)
     Migrate(MigrateArgs),
     /// View the structured event log
     Events(EventsArgs),
