@@ -81,7 +81,6 @@ pub fn acquire_lock(lock_path: &Path, trigger: &str) -> anyhow::Result<LockGuard
 ///
 /// Used by the Sentinel for auto-triggered backups — if another backup is
 /// running, the Sentinel simply skips the trigger (expected during timer overlap).
-#[allow(dead_code)] // Used by sentinel_runner (Session 2)
 pub fn try_acquire_lock(lock_path: &Path, trigger: &str) -> anyhow::Result<Option<LockGuard>> {
     if let Some(parent) = lock_path.parent() {
         std::fs::create_dir_all(parent)?;

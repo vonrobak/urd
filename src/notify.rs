@@ -49,21 +49,18 @@ pub enum NotificationEvent {
     },
     /// Heartbeat is stale — no backup completed within expected window.
     /// Evaluated by the Sentinel (5b), not by `urd backup` itself.
-    #[allow(dead_code)] // Constructed by Sentinel (5b), not backup command
     BackupOverdue {
         last_heartbeat_age_hours: u64,
         stale_after_hours: u64,
     },
     /// A subvolume's operational health worsened (e.g., Healthy -> Degraded).
     /// Separate from PromiseDegraded — health is operational readiness, not data safety.
-    #[allow(dead_code)] // Constructed by Sentinel (VFM-B), not backup command
     HealthDegraded {
         subvolume: String,
         from: String,
         to: String,
     },
     /// A subvolume's operational health improved.
-    #[allow(dead_code)] // Constructed by Sentinel (VFM-B), not backup command
     HealthRecovered {
         subvolume: String,
         from: String,
@@ -163,7 +160,9 @@ impl std::fmt::Display for Urgency {
 /// A notification ready to be dispatched.
 #[derive(Debug, Clone)]
 pub struct Notification {
-    #[allow(dead_code)] // Used in tests for pattern matching; will be used by Sentinel (5b)
+    /// Read only by this module's tests, which pattern-match the event a
+    /// notification was built from; the dispatcher renders title/body.
+    #[allow(dead_code)]
     pub event: NotificationEvent,
     pub urgency: Urgency,
     pub title: String,

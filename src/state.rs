@@ -77,8 +77,12 @@ pub struct DriveConnectionRecord {
 
 /// An operation record returned from database queries.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct OperationRow {
+    /// `id` and `bytes_transferred` complete the row's 1:1 projection of the
+    /// `operations` table. Both queries that build an `OperationRow` select
+    /// all nine columns and share one positional mapper, so dropping either
+    /// field would re-index that mapper without saving the database any work.
+    #[allow(dead_code)]
     pub id: i64,
     pub run_id: i64,
     pub subvolume: String,
@@ -87,6 +91,7 @@ pub struct OperationRow {
     pub duration_secs: Option<f64>,
     pub result: String,
     pub error_message: Option<String>,
+    #[allow(dead_code)]
     pub bytes_transferred: Option<i64>,
 }
 

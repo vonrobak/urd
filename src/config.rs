@@ -26,7 +26,6 @@ pub struct Config {
 }
 
 #[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
-#[allow(dead_code)]
 pub struct GeneralConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub config_version: Option<u32>,
@@ -131,7 +130,6 @@ fn group_subvolumes_by_snapshot_root<'a>(
 }
 
 #[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
-#[allow(dead_code)]
 pub struct DriveConfig {
     pub label: String,
     #[serde(default)]

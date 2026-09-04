@@ -17,9 +17,11 @@ pub use crate::retention::DeleteKind;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Interval(chrono::Duration);
 
-#[allow(dead_code)]
 impl Interval {
+    /// Constructed only by the config tests; production intervals come from
+    /// `FromStr` over the declared strings ("15m", "1h", ...).
     #[must_use]
+    #[allow(dead_code)]
     pub fn minutes(n: i64) -> Self {
         Self(chrono::Duration::minutes(n))
     }
@@ -194,7 +196,6 @@ pub struct SnapshotName {
     short_name: String,
 }
 
-#[allow(dead_code)]
 impl SnapshotName {
     /// Create a new snapshot name from a datetime and short name.
     #[must_use]
@@ -277,7 +278,10 @@ impl SnapshotName {
         self.datetime
     }
 
+    /// Called only by this module's tests; every production caller wants
+    /// the full `datetime()` for ordering.
     #[must_use]
+    #[allow(dead_code)]
     pub fn date(&self) -> NaiveDate {
         self.datetime.date()
     }
@@ -1264,7 +1268,6 @@ pub struct PlannedLifecycle {
 /// carries the planner's per-subvolume lifecycle judgment — the executor
 /// builds its `SubvolumeContext` from this rather than re-deriving.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct BackupPlan {
     pub operations: Vec<PlannedOperation>,
     pub timestamp: NaiveDateTime,
@@ -1273,7 +1276,6 @@ pub struct BackupPlan {
     pub lifecycles: HashMap<String, PlannedLifecycle>,
 }
 
-#[allow(dead_code)]
 impl BackupPlan {
     #[must_use]
     pub fn is_empty(&self) -> bool {

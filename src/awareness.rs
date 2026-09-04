@@ -528,14 +528,12 @@ pub struct DriveAssessment {
     /// recent physical event is an Unmount. Rule 1 of the voice contract:
     /// stay silent when the sentinel missed the disconnect (last event is
     /// Mount but drive is unmounted) — fall through to activity or silence.
-    #[allow(dead_code)] // consumed via StatusDriveAssessment by voice.rs
     pub absent_duration_secs: Option<i64>,
     /// Seconds since the most recent successful operation targeting this
     /// drive in the operations log. Populated only when the drive is
     /// unmounted AND `drive_connections` holds *no* events for this drive
     /// at all — the drive predates sentinel observation. Never mixed with
     /// `absent_duration_secs`.
-    #[allow(dead_code)] // consumed via StatusDriveAssessment by voice.rs
     pub last_activity_age_secs: Option<i64>,
     /// Rotation context for an offsite drive (UPI 056): cadence, last
     /// homecoming, and the pre-computed homecoming forecast. `None` for
