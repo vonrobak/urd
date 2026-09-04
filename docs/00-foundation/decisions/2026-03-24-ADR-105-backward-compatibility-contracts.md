@@ -6,7 +6,7 @@ project: ['[[urd]]']
 sensitivity: public
 status: active
 created: '2026-03-24'
-timestamp: '2026-07-11T09:19:17+02:00'
+timestamp: '2026-09-04T10:15:00+02:00'
 ---
 # ADR-105: Backward Compatibility Contracts
 
@@ -16,7 +16,9 @@ timestamp: '2026-07-11T09:19:17+02:00'
 > the current format. Breaking these contracts requires a migration plan and an ADR.
 
 **Date:** 2026-03-22 (formalized 2026-03-24)
-**Status:** Accepted
+**Status:** Accepted (amended 2026-05-15, `monthly = 0` migration; 2026-05-15, UPI 043
+pool metrics + heartbeat v4; 2026-09-04, code-drift audit — metric inventory moved out,
+Contract 5 added)
 **Supersedes:** None (founding decision)
 
 ## Context
@@ -231,9 +233,81 @@ homelab repo's parser-tolerance test (v3-reader on v4 heartbeat passes
 without erroring) is green. The tolerance test is now contractually
 correct under the softened heartbeat contract above.
 
+## Amendment 2026-09-04: the metric inventory moves out; machine JSON becomes Contract 5
+
+Two corrections. Contract 4 inlines a metric list that is no longer the estate —
+the inventory belongs in a reference doc, and this ADR keeps only the rule. And
+three JSON files carry versioned public shapes that no contract here governs;
+they become Contract 5, so the TL;DR's four load-bearing formats are five.
+
+### Contract 4 governs the rule, not the list
+
+The eight metric names spelled out in Contract 4 are a subset of what
+`src/metrics.rs` writes: the `names` module defines **22** `backup_*` names and
+four `urd_*` names, each exactly once (a guard test pins every name to that one
+definition). Enumerating a growing list inside an immutable document guarantees
+drift; the rule is what belongs here.
+
+The inventory — every name, its labels, its value encoding, and its
+conditional-presence rule — lives in
+[docs/20-reference/metrics.md](../../20-reference/metrics.md), whose source of
+truth is the `names` module. What this ADR governs is unchanged and is restated
+here as the rule alone:
+
+- **`backup_*` is the public contract.** Names, label names, label values, and
+  value semantics are load-bearing. New `backup_*` metrics may be added freely;
+  renames and removals require an ADR-105-grade change with a migration plan and
+  coordinated downstream updates.
+- **`urd_*` is Urd's own namespace** and may evolve without an ADR.
+- **Encodings are part of the contract** wherever a metric's value is an enum
+  code rather than a quantity (`backup_send_type`, `backup_success`,
+  `backup_promise_state`).
+- **The file is written atomically** (temp file + rename) so a scrape never
+  observes a partial document.
+
+Contract 4's bash-compatibility notes stand as written: the global single-drive
+metrics keep their meaning and are not replaced by per-drive or per-pool series.
+
+### Contract 5: machine JSON surfaces
+
+Three JSON files are read by software rather than people. Each carries a
+`schema_version` integer, each has one owning module, and none of them is
+covered by Contracts 1–4.
+
+| Surface | Version source | Field reference | Consumer |
+|---------|----------------|-----------------|----------|
+| `heartbeat.json` | `SCHEMA_VERSION` in `src/heartbeat.rs` (currently 4) | [docs/20-reference/heartbeat-schema.md](../../20-reference/heartbeat-schema.md) | external monitoring; the homelab stack |
+| `urd doctor [--thorough] --json` | `DOCTOR_OUTPUT_SCHEMA_VERSION` in `src/output.rs` (currently 3) | the `DoctorOutput` struct in `src/output.rs` | scripts and ad-hoc `--json` consumers |
+| `sentinel-state.json` | written as a literal at the `SentinelStateFile` construction site in `src/sentinel_runner.rs` (currently 3); the struct is `output::SentinelStateFile` | the `SentinelStateFile` struct in `src/output.rs` | `urd doctor`'s sentinel section; a planned desktop face (Spindle) |
+
+**Bump policy.**
+
+- **Additive fields are free.** A new field carrying
+  `#[serde(default, skip_serializing_if = …)]` does not require an ADR
+  amendment. Whether it also bumps the version is the surface's own
+  convention: `heartbeat.json` and `sentinel-state.json` bump on every added
+  field and record which version introduced it; `urd doctor --json` bumps only
+  on a breaking shape change and evolves additively without one.
+- **A rename, a removal, or a type change is breaking.** It bumps the
+  `schema_version`, gets a CHANGELOG line, and updates the surface's field
+  reference in `docs/20-reference/` where one exists. A breaking change to
+  `heartbeat.json` additionally requires an amendment here and coordination
+  with the downstream monitoring repo, because it is the only one of the three
+  with a cross-repo consumer contract.
+- **Readers tolerate unknown fields.** The heartbeat's softened contract (see
+  the 2026-05-15 UPI 043 amendment above) is the general rule for all three:
+  consumers SHOULD check `schema_version` and MAY refuse a higher one, but
+  serde-default tolerance means an older reader parsing a newer additive
+  payload sees the new fields as absent rather than failing.
+
+**Not a contract.** Human-facing rendered output — the text `urd status`,
+`urd doctor`, and the voice layer produce — is presentation and carries no
+compatibility promise. Only the `--json` shape does.
+
 ## Related
 
-- ADR-020: Daily external backups (established the dual pin file format)
+- The predecessor bash-script tooling's daily-external-backup decision (established the
+  dual pin file format)
 - ADR-104: Graduated retention (Amendment 2026-05-15 — yearly window)
 - ADR-109: Config-boundary validation (v2 rejects `monthly = 0` at parse time)
 - ADR-111: Config system architecture (Amendment 2026-05-15 — `config_version = 2`,

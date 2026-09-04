@@ -6,7 +6,7 @@ project: ['[[urd]]']
 sensitivity: public
 status: active
 created: '2026-03-26'
-timestamp: '2026-05-30T21:25:09+02:00'
+timestamp: '2026-09-04T10:15:00+02:00'
 ---
 # ADR-110: Protection Promises
 
@@ -16,8 +16,8 @@ timestamp: '2026-05-30T21:25:09+02:00'
 > earn opaque status through operational track record. Current taxonomy:
 > recorded/sheltered/fortified (renamed 2026-04-03 from guarded/protected/resilient).
 
-**Date:** 2026-03-26 (revised 2026-03-27, addendum 2026-03-31, vocabulary 2026-04-03, amendments 2026-05-09 / 2026-05-15 / 2026-05-30)
-**Status:** Accepted (taxonomy renamed 2026-04-03 — see Maturity Model; recommendation-layer amendment 2026-05-09 — see [Amendment 2026-05-09](#amendment-2026-05-09-recommendation-layer-as-graduation-evidence-path-adr-115); AT-RISK cap at Critical overturns R4 2026-05-30 — see [Amendment 2026-05-30](#amendment-2026-05-30-at-risk-cap-at-the-critical-tier-upi-031-b--overturns-r4))
+**Date:** 2026-03-26 (revised 2026-03-27, addendum 2026-03-31, vocabulary 2026-04-03, amendments 2026-05-09 / 2026-05-15 / 2026-05-30 / 2026-09-04)
+**Status:** Accepted (taxonomy renamed 2026-04-03 — see Maturity Model; recommendation-layer amendment 2026-05-09 — see [Amendment 2026-05-09](#amendment-2026-05-09-recommendation-layer-as-graduation-evidence-path-adr-115); AT-RISK cap at Critical overturns R4 2026-05-30 — see [Amendment 2026-05-30](#amendment-2026-05-30-at-risk-cap-at-the-critical-tier-upi-031-b--overturns-r4); offsite freshness re-stated against the resolved rotation window 2026-09-04 — see [Amendment 2026-09-04](#amendment-2026-09-04-offsite-freshness-is-window-judged-and-clamped-gates-closed))
 **Depends on:** ADR-100 (planner/executor separation), ADR-108 (pure function modules),
 ADR-109 (config boundary validation), ADR-111 (config system architecture)
 **Amended by:** ADR-115 (Retention shape symmetry and the recommendation layer)
@@ -391,13 +391,13 @@ This ADR is considered implemented when:
 
 - [x] `ProtectionLevel` enum and `derive_policy()` exist in `types.rs`
 - [x] `protection_level`, `drives`, `run_frequency` config fields are parsed and validated
-- [ ] Config validation rejects operational fields alongside named protection levels (v1 schema, ADR-111)
+- [x] Config validation rejects operational fields alongside named protection levels (v1 and v2 schemas; legacy warns — see Amendment 2026-09-04)
 - [x] `resolve_subvolume()` branches on protection level with custom fallthrough
 - [x] Achievability preflight checks are active
 - [x] `--confirm-retention-change` flag gates retention tightening
 - [x] `urd status` shows promise level column
 - [x] Pin-protection safety tests pass with derived retention
-- [ ] Recommendation layer ships and surfaces per-subvolume shape advice (UPI 041 / ADR-115)
+- [x] Recommendation layer ships and surfaces per-subvolume shape advice (UPI 041 / ADR-115)
 
 ## Amendment 2026-05-15: `recorded_external_retention.monthly` correction
 
@@ -468,6 +468,100 @@ proliferation.
 **not** cap the promise (it is lengthened-but-honest). Roomy is unchanged. This is a
 one-notch, bounded, recorded override of R4 — "less protected than declared," surfaced in
 plain language, not a synthetic alarm.
+
+## Amendment 2026-09-04: offsite freshness is window-judged and clamped; gates closed
+
+Three corrections against the code. The offsite freshness table in the 2026-03-31
+addendum is superseded. The two open Implementation Gates above are ticked in
+place. And the outcome-targets table is marked for what it is: stated intent that
+`derive_policy` realises as cadence, not as a field.
+
+### Offsite freshness is judged against the drive's own window
+
+The addendum's fixed 0–30 / 31–90 / >90-day day-count table describes no code
+path. Freshness for an offsite copy is judged against **that drive's resolved
+offsite window** (ADR-116, Consequence 2), which comes from three sources in
+priority order — `rotation::resolve_offsite_window`:
+
+1. the drive's declared `rotation_interval`, which takes precedence: overdue at
+   ×5/4 of the declared cadence, stale at twice that;
+2. the observed cadence (fallback): the median gap between homecomings in the
+   drive's mount history, overdue at ×2 of that median, stale at twice the
+   overdue bound — silent below three completed gaps, so noise never sets a
+   window;
+3. a 30-day overdue / 60-day stale default when neither source speaks. Only in
+   this last case does the addendum's old first threshold survive, and then by
+   coincidence rather than by rule.
+
+`rotation::classify` maps a copy's age onto `OnSchedule` / `Overdue` / `Stale`,
+and `RotationTier::to_promise_status` maps those to PROTECTED / AT RISK /
+UNPROTECTED. `awareness::assess` applies that per-copy verdict on the **data-age**
+clock (time since the last successful send), and only for an offsite drive that
+is away, whose source has changed, and that has a mounted redundancy peer — an
+offsite drive that is the *only* external copy keeps the ordinary send-interval
+judgment, because then its absence is genuinely exposing.
+
+### A stale offsite copy clamps at AT RISK
+
+`advice::overlay_offsite_freshness` is still the post-processing overlay the
+addendum describes, and Invariant 6 still holds — `awareness::assess` remains
+protection-level-blind, and `advice::assess_view` composes the two. What changed
+is the floor. `compute_offsite_freshness` reduces over the offsite copies with
+`max` (the freshest wins) and clamps the result to AT RISK at worst; with no
+offsite-role drive at all it returns AT RISK rather than UNPROTECTED.
+
+**A Fortified subvolume therefore cannot be driven to UNPROTECTED by offsite
+staleness alone.** Stale offsite means site-loss exposure while a current local
+or primary copy is still in hand — that is AT RISK, not "no copy." The genuine
+no-current-copy case is reached independently by the overall
+`min(local, best external)` reduction, where the status is already UNPROTECTED
+and the clamped overlay value is a no-op. The `NoOffsiteProtection` advisory
+keeps the missing-offsite condition visible in prose.
+
+This is the same statement as ADR-116's amendment records; that ADR carries the
+one-line pointer, this section carries the rule.
+
+### Implementation Gates: both remaining gates are closed
+
+- **Opacity validation.** `types::validate_protection_contract` — a pure
+  function shared by every schema parser — rejects a config that sets
+  `snapshot_interval`, `send_interval`, `send_enabled`, `external_retention`,
+  `local_retention`, or `local_snapshots = false` alongside a named level. `v1`
+  and `v2` both call it and refuse to load. The legacy schema (no
+  `config_version`) is the deliberate exception: it predates the contract, so it
+  honours the overrides and emits `legacy_opacity_warnings` naming
+  `urd migrate` as the behaviour-preserving way out. `opacity_violations`
+  exposes the same rule as a list for advisory surfaces.
+- **Recommendation layer.** It ships as `src/recommendation.rs` and surfaces
+  per-subvolume Local and External shape advice under `urd doctor --thorough`
+  (ADR-115). The graduation evidence channel named in the 2026-05-09 amendment
+  is live.
+
+### The outcome-targets table is intent, not a field
+
+`DerivedPolicy` carries `snapshot_interval`, `send_interval`, `send_enabled`,
+`local_retention`, `external_retention`, and `min_external_drives`. It has no
+max-age field, and nothing downstream reads one. The "Local max age" and
+"External max age" columns are the *reasoning* behind the intervals
+`derive_policy` emits, not values the system holds:
+
+- `min_external_drives` (0 / 1 / 2) and the local retention floors are encoded
+  literally — `recorded_retention` and `full_retention` in `derive_policy` match
+  the table's last two columns. The *external* shapes are not the same literals
+  (`full_external_retention` drops the hourly window and keeps monthly
+  unlimited; `recorded_external_retention` keeps no monthly — see the
+  2026-05-15 amendment above).
+- The age columns are realised as cadence. Under `RunFrequency::Timer` every
+  named level snapshots and sends at the timer's own interval; under
+  `RunFrequency::Sentinel` the levels separate (Recorded 4h/4h, Sheltered
+  1h/4h, Fortified 1h/2h snapshot/send).
+- The age at which a copy stops counting as current is then derived by
+  `awareness`, which multiplies the *configured* interval (local ×2 → AT RISK,
+  ×5 → UNPROTECTED; external ×1.5 → AT RISK, ×3 → UNPROTECTED). Change the run
+  frequency and the effective max age moves with it.
+
+Read the table as the promise each level is meant to keep. The code's answer to
+"is this copy current?" is interval-relative.
 
 ## Related
 
