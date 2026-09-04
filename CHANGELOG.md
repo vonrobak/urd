@@ -44,7 +44,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   do-no-harm storage guard — additionally earns a warning line in the
   interactive backup summary and a critical notification in the same batch as
   any watchdog firing, so an unattended nightly run is never silent about an
-  unguarded tail (#381).
+  unguarded tail. A watchdog that stashed a firing and then died while holding
+  its lock no longer loses that firing either — the teardown recovers the
+  poisoned slot, so the tripped pool still gets its emergency reclaim, its
+  event, and its notification (#381).
 
 ## [0.36.0] - 2026-09-03
 

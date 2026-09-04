@@ -435,15 +435,13 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     //     watchdog thread (M1 — no DB connection there); the teardown only records
     //     the stashed outcome on the single main connection.
     // An operator Ctrl-C produces no firing and never reclaims.
-    let watchdog_firings: Vec<WatchdogFiring> = firing
-        .lock()
-        .map(|mut f| std::mem::take(&mut *f))
-        .unwrap_or_default();
+    let watchdog_firings: Vec<WatchdogFiring> = take_firings(&firing);
     let mut watchdog_notifications = Vec::new();
     // The panic rides the same batch as the firings (dispatched once after the
     // loop), so an unattended 04:00 run is not silent about an unguarded tail.
     // A watchdog that stashed a firing and *then* panicked still gets that
-    // firing handled below — the slot is read after the join, not before.
+    // firing handled below — the slot is read after the join, not before, and
+    // `take_firings` recovers it even if the panic poisoned the mutex.
     if let Some(message) = &watchdog_panic {
         watchdog_notifications.push(notify::build_watchdog_panic_notification(message));
     }
@@ -1126,6 +1124,21 @@ fn join_logged(handle: std::thread::JoinHandle<()>, thread_name: &str) -> Option
             Some(message)
         }
     }
+}
+
+/// Drain the watchdog's thread→main firing slot, recovering the stash even
+/// when the mutex is **poisoned** (issue #381). A watchdog that dies while
+/// holding this guard poisons it, and the former `.map(…).unwrap_or_default()`
+/// then discarded exactly the record the panic made most urgent: the pool the
+/// thread had just tripped, whose abort-reclaim, event, and notification all
+/// hang off it. The recovery is the same one [`progress_display_loop`] uses for
+/// its context mutex — a `Vec<WatchdogFiring>` is a plain owned value that a
+/// `push` either completed or did not, so a panic cannot leave it half-written
+/// in a way that makes reading it unsound. Only the thread that held the lock
+/// died; the data behind it is intact.
+fn take_firings(slot: &Mutex<Vec<WatchdogFiring>>) -> Vec<WatchdogFiring> {
+    let mut guard = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    std::mem::take(&mut *guard)
 }
 
 /// On-disk name of the retired emergency reserve file (UPI 033, retired by UPI
@@ -4944,6 +4957,52 @@ source = "/data/beta"
             join_logged(h, "storage watchdog"),
             Some("watchdog lost /data".to_string()),
         );
+    }
+
+    #[test]
+    fn take_firings_recovers_a_stash_from_a_poisoned_slot() {
+        // The exact ordering this fix exists for: the watchdog stashes a
+        // firing and then dies while still holding the guard. The old
+        // `.unwrap_or_default()` dropped the stash on the floor — the abort
+        // reclaim, the WatchdogAbort event, and the notification with it.
+        let slot: Arc<Mutex<Vec<WatchdogFiring>>> = Arc::new(Mutex::new(Vec::new()));
+        let writer = slot.clone();
+        let h = std::thread::spawn(move || {
+            let mut stash = writer.lock().unwrap();
+            stash.push(poisoning_firing());
+            panic!("watchdog died holding the firing slot");
+        });
+        assert!(h.join().is_err(), "the writer must have panicked");
+        assert!(slot.is_poisoned(), "a panic under the guard poisons the mutex");
+
+        let taken = take_firings(&slot);
+
+        assert_eq!(taken.len(), 1, "the stashed firing survives the poisoning");
+        assert_eq!(taken[0].pool_label, "/data");
+        assert!(
+            take_firings(&slot).is_empty(),
+            "the slot is drained, not copied"
+        );
+    }
+
+    #[test]
+    fn take_firings_drains_a_healthy_slot() {
+        let slot: Mutex<Vec<WatchdogFiring>> = Mutex::new(vec![poisoning_firing()]);
+        assert_eq!(take_firings(&slot).len(), 1);
+        assert!(take_firings(&slot).is_empty(), "one drain only");
+    }
+
+    /// A minimal cross-filesystem firing with nothing stashed — enough to
+    /// prove identity through a poisoned slot.
+    fn poisoning_firing() -> WatchdogFiring {
+        WatchdogFiring {
+            pool_label: "/data".to_string(),
+            subvol_names: vec!["home".to_string()],
+            mountpoint: PathBuf::from("/data"),
+            floor_bytes: 4_000_000_000,
+            send_aborted: false,
+            reclaim: None,
+        }
     }
 
     #[test]
