@@ -2138,10 +2138,7 @@ mod tests {
 
     #[test]
     fn from_assessment_propagates_redundancy_advisories() {
-        use crate::awareness::{
-            LocalAssessment, OperationalHealth, PromiseStatus, SubvolAssessment,
-        };
-        use crate::types::Interval;
+        use crate::awareness::{LocalAssessment, PromiseStatus, SubvolAssessment};
 
         let advisory = RedundancyAdvisory {
             kind: RedundancyAdvisoryKind::NoOffsiteProtection,
@@ -2150,25 +2147,9 @@ mod tests {
             detail: "test detail".to_string(),
         };
         let assessment = SubvolAssessment {
-            name: "sv1".to_string(),
-            short_name: "sv1".to_string(),
-            status: PromiseStatus::Protected,
-            health: OperationalHealth::Healthy,
-            health_reasons: vec![],
-            local: LocalAssessment {
-                status: PromiseStatus::Protected,
-                snapshot_count: 5,
-                newest_age: None,
-                configured_interval: Interval::hours(1),
-            },
-            external: vec![],
-            chain_health: vec![],
-            advisories: vec![],
+            local: LocalAssessment::fixture(PromiseStatus::Protected, 5, None),
             redundancy_advisories: vec![advisory.clone()],
-            errors: vec![],
-            storage_posture: None,
-            cadence_adapted: false,
-            effective_send_interval: None,
+            ..SubvolAssessment::fixture("sv1", PromiseStatus::Protected)
         };
 
         let sa = StatusAssessment::incomplete_from_assessment(&assessment);

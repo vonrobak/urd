@@ -686,25 +686,13 @@ drives = ["primary-drive", "offsite-drive"]
         drives: Vec<DriveAssessment>,
     ) -> SubvolAssessment {
         SubvolAssessment {
-            name: name.to_string(),
-            short_name: name.to_string(),
-            status,
-            health: OperationalHealth::Healthy,
-            health_reasons: vec![],
-            local: LocalAssessment {
-                status: PromiseStatus::Protected,
-                snapshot_count: 10,
-                newest_age: Some(Duration::minutes(30)),
-                configured_interval: Interval::hours(1),
-            },
+            local: LocalAssessment::fixture(
+                PromiseStatus::Protected,
+                10,
+                Some(Duration::minutes(30)),
+            ),
             external: drives,
-            chain_health: vec![],
-            advisories: vec![],
-            redundancy_advisories: vec![],
-            errors: vec![],
-            storage_posture: None,
-            cadence_adapted: false,
-            effective_send_interval: None,
+            ..SubvolAssessment::fixture(name, status)
         }
     }
 
@@ -1564,25 +1552,13 @@ local_retention = "transient"
         health: OperationalHealth,
     ) -> SubvolAssessment {
         SubvolAssessment {
-            name: name.to_string(),
-            short_name: name.to_string(),
-            status,
             health,
-            health_reasons: vec![],
-            local: LocalAssessment {
-                status: PromiseStatus::Protected,
-                snapshot_count: 5,
-                newest_age: Some(Duration::hours(2)),
-                configured_interval: Interval::hours(1),
-            },
-            external: vec![],
-            chain_health: vec![],
-            advisories: vec![],
-            redundancy_advisories: vec![],
-            errors: vec![],
-            storage_posture: None,
-            cadence_adapted: false,
-            effective_send_interval: None,
+            local: LocalAssessment::fixture(
+                PromiseStatus::Protected,
+                5,
+                Some(Duration::hours(2)),
+            ),
+            ..SubvolAssessment::fixture(name, status)
         }
     }
 

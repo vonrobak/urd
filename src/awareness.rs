@@ -327,6 +327,41 @@ pub struct SubvolAssessment {
     pub effective_send_interval: Option<Interval>,
 }
 
+#[cfg(test)]
+impl SubvolAssessment {
+    /// Test fixture: a subvolume at `status` with a healthy local history,
+    /// no drives and nothing to say. Call sites state only the axis under
+    /// test via struct-update syntax:
+    ///
+    /// ```ignore
+    /// SubvolAssessment {
+    ///     external: drives,
+    ///     ..SubvolAssessment::fixture("home", PromiseStatus::AtRisk)
+    /// }
+    /// ```
+    ///
+    /// Eleven hand-built literals across the crate used to spell all sixteen
+    /// fields out; a seventeenth field now lands here once (#387).
+    pub(crate) fn fixture(name: &str, status: PromiseStatus) -> Self {
+        Self {
+            name: name.to_string(),
+            short_name: name.to_string(),
+            status,
+            health: OperationalHealth::Healthy,
+            health_reasons: vec![],
+            local: LocalAssessment::fixture(status, 0, None),
+            external: vec![],
+            chain_health: vec![],
+            advisories: vec![],
+            redundancy_advisories: vec![],
+            errors: vec![],
+            storage_posture: None,
+            cadence_adapted: false,
+            effective_send_interval: None,
+        }
+    }
+}
+
 /// Per-subvolume raw storage signal fed into `assess()` (UPI 031-a). Resolved
 /// by the command layer (`commands/storage_signals.rs`) from `pools::pool_space`
 /// (free-ratio), `findmnt /` (host-root), and the persisted prior armed tier;
@@ -466,6 +501,25 @@ pub struct LocalAssessment {
     pub newest_age: Option<Duration>,
     #[allow(dead_code)] // consumed by verbose status display (future)
     pub configured_interval: Interval,
+}
+
+#[cfg(test)]
+impl LocalAssessment {
+    /// Test fixture. Every hand-built fixture in the crate declared the same
+    /// one-hour interval, so only the three axes tests actually vary are
+    /// parameters.
+    pub(crate) fn fixture(
+        status: PromiseStatus,
+        snapshot_count: usize,
+        newest_age: Option<Duration>,
+    ) -> Self {
+        Self {
+            status,
+            snapshot_count,
+            newest_age,
+            configured_interval: Interval::hours(1),
+        }
+    }
 }
 
 /// Per-offsite-drive rotation context, carried alongside the per-copy
@@ -5356,27 +5410,7 @@ source = "/data/sv1"
     // ── diff_promise_states tests ──────────────────────────────────
 
     fn make_assess(name: &str, status: PromiseStatus) -> SubvolAssessment {
-        SubvolAssessment {
-            name: name.to_string(),
-            short_name: name.to_string(),
-            status,
-            health: OperationalHealth::Healthy,
-            health_reasons: vec![],
-            local: LocalAssessment {
-                status,
-                snapshot_count: 0,
-                newest_age: None,
-                configured_interval: Interval::hours(1),
-            },
-            external: vec![],
-            chain_health: vec![],
-            advisories: vec![],
-            redundancy_advisories: vec![],
-            errors: vec![],
-            storage_posture: None,
-            cadence_adapted: false,
-            effective_send_interval: None,
-        }
+        SubvolAssessment::fixture(name, status)
     }
 
     fn make_promise_snapshot(name: &str, status: PromiseStatus) -> PromiseSnapshot {
