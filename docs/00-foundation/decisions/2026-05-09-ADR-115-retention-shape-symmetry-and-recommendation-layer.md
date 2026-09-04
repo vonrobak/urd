@@ -6,7 +6,7 @@ project: ['[[urd]]']
 sensitivity: public
 status: active
 created: '2026-05-14'
-timestamp: '2026-07-11T09:19:17+02:00'
+timestamp: '2026-09-04T10:15:00+02:00'
 ---
 # ADR-115: Retention Shape Symmetry and the Recommendation Layer
 
@@ -24,7 +24,7 @@ timestamp: '2026-07-11T09:19:17+02:00'
 > evidence this layer generates.
 
 **Date:** 2026-05-09
-**Status:** Accepted
+**Status:** Accepted (amended 2026-05-16, headroom-aware recommendations; 2026-09-04, code-drift audit)
 **Depends on:** ADR-108 (pure function modules), ADR-110 (protection promises),
 ADR-113 (do-no-harm invariant), ADR-114 (structured event log)
 **Complemented by:** UPI 030 (drift telemetry — the signal this layer consumes)
@@ -535,3 +535,76 @@ The checkpoint deliverable is an ADR-115 amendment, not a new ADR.
 - **User-tunable thresholds.** Per Invariant 3 (no `[recommendations]`
   config section). Friction floor remains "ignore the suggestion."
 - **Auto-apply.** Long-term north star; future arc.
+
+## Amendment 2026-09-04: module rename, and the retired Critical tier
+
+Two corrections. Every `policy.rs` reference above names a file that no longer
+exists. And the coordination machinery the 2026-05-16 amendment designed around
+a fourth `Critical` severity is gone — the behavioural response keys on
+`TightnessTier` instead — so D7, D10/D14, D16, and the synth path describe
+symbols that no longer exist.
+Everything else in both the original decision and the 2026-05-16 amendment
+stands: the symmetry claim, the thresholds, the tightening multiplier, the
+advisory-only stance, and the invariants are unchanged.
+
+### The module is `src/recommendation.rs`
+
+`src/policy.rs` no longer exists. Read every occurrence above — the
+recommendation-layer pattern, the ADR-108 entry under Related, the synth path's
+`policy::headroom_aware_pointer_only`, and both mentions in the hysteresis note
+— as `src/recommendation.rs` / `recommendation::`. `derive_policy` is unrelated
+and unmoved: it lives in `src/types.rs`, and every `derive_policy()` reference
+above is still correct.
+
+The recommendation module keeps the properties this ADR requires of it: pure
+(ADR-108), no I/O, no persistence, and no mutation of `derive_policy` or config.
+The hysteresis note's conclusion is unchanged too — hysteresis is stateful and
+does not belong in the pure module. It lives in
+`storage_critical::resolve_armed_tier`, over an armed tier persisted between
+runs.
+
+### `HeadroomSeverity::Critical` and the `is_storage_critical` stub are gone
+
+`HeadroomSeverity` is `Healthy | Caution | Pressure`. There is no fourth tier
+and no storage-critical predicate: the behavioural response to a tight pool keys
+on `TightnessTier` rather than on this severity ladder (ADR-113's 2026-05-30
+amendment), so the `Critical` variant and the voice and recommendation paths
+behind it are gone. The specific consequences for the 2026-05-16 amendment
+above:
+
+- **D7.** `classify_headroom_severity` returns the *whole* domain now. The
+  sentence "Critical is **not** in the classify domain; doctor.rs injects it
+  externally" no longer applies — nothing is injected externally.
+- **D8.** The `AdjustmentReason` taxonomy has three variants —
+  `DestinationMetadataPressure`, `SourcePoolLow`, `SourcePoolShrinking` — in
+  that same priority order. The `StorageCritical` variant is deleted.
+- **D10 / D14.** There is no `is_storage_critical` predicate and no closure
+  injection. `build_doctor_recommendation_view_inner` takes three resolvers —
+  pool space, destination metadata, and pool free-bytes trend — and no
+  storage-critical argument. `src/storage_critical.rs` survives, but as the
+  home of the two orthogonal axes that replaced the conflated predicate: the
+  `TightnessTier` ladder (`Roomy / Tight / Critical`, derived from the source
+  pool's free ratio via `recommendation::classify_free_ratio_value`, so the
+  boundaries have one source of truth) and the `host_root` flag. The
+  coordination contract D10 anticipated is settled: the two surfaces are
+  connected by that shared boundary function, not by a predicate.
+- **D16.** The silence-interaction matrix's Critical row is unreachable.
+  Pressure is the only severity that escalates a shape-quiet row into a
+  synthesised one.
+- **Synth path (R1).** `recommendation::headroom_aware_pointer_only` is
+  Pressure-only by construction: the function takes no severity and sets
+  `Pressure` itself. The "severity in `{Pressure, Critical}`" framing reads as
+  Pressure alone. The Pressure-at-MIN case it also serves is unchanged.
+
+`TightnessTier::Critical` is not the same concept under a shared name: the
+surviving Critical is a pool tightness tier that drives behaviour, never a
+recommendation severity.
+
+### Doctor JSON versioning has an owner
+
+The R3 subsection above introduced `schema_version` on `urd doctor --json` and
+recorded v1/v2. That contract lives in ADR-105 as Contract 5 alongside the
+heartbeat and `sentinel-state.json`, with `DOCTOR_OUTPUT_SCHEMA_VERSION` in
+`src/output.rs` as the version's source of truth. R3's rule — bump on a
+breaking shape change, note it in the CHANGELOG, and let `--json` consumers
+branch on the field — is carried forward unchanged.

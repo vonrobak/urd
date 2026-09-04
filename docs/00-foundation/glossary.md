@@ -216,10 +216,16 @@ exact incident that produced Voice Contract Rule 1.
 
 **`DriveRole` — duty determines expected presence (ADR-116).** A drive's role
 declares the disaster it defends against and, with it, how often it is meant to
-be present. A `primary`/`backup` drive defends against **drive failure** and is
-**continuously present** — its absence is a fault to surface. An `offsite` drive
-defends against **site loss** and is **intermittently present by design** — its
-absence is the *normal* operating state, not a fault. This duty distinction (ADR-116
+be present. `DriveRole` has exactly three variants, spelled `primary` /
+`offsite` / `test` in config. A `primary` drive defends against **drive
+failure** and is **continuously present** — its absence is a fault to surface.
+An `offsite` drive defends against **site loss** and is **intermittently present
+by design** — its absence is the *normal* operating state, not a fault. A `test`
+drive defends against nothing: it is a scratch destination that receives sends
+like any other (the planner and executor never branch on role) but is excluded
+from redundancy accounting — the single-point-of-failure advisory counts
+non-`test` drives, and an away offsite drive whose only companion is a test drive
+counts as having no peer. This duty distinction (ADR-116
 "Offsite rotation is expected absence") is why, under storage pressure, Urd sheds
 an *away* drive's pin before it breaks a *connected* drive's chain (see `shed`),
 and why offsite freshness is judged against its rotation cadence (UPI 055; the

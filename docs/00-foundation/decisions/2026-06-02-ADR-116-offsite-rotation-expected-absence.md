@@ -6,7 +6,7 @@ project: ['[[urd]]']
 sensitivity: public
 status: active
 created: '2026-06-02'
-timestamp: '2026-06-15T01:37:42+02:00'
+timestamp: '2026-09-04T10:15:00+02:00'
 ---
 # ADR-116: Offsite Rotation Is Expected Absence
 
@@ -20,9 +20,11 @@ timestamp: '2026-06-15T01:37:42+02:00'
 > not the send interval (UPI 055, future). This refines ADR-110 (promise semantics) and
 > ADR-113 (do-no-harm), and **amends UPI 031-b's unconditional Critical clear-all** to be
 > presence-conditional.
+>
+> Amended 2026-09-04 — see the amendment of that date below.
 
 **Date:** 2026-06-02
-**Status:** Accepted
+**Status:** Accepted (amended 2026-09-04, code-drift audit)
 **Amends:** UPI 031-b's unconditional Critical `clear-all` (now presence-conditional — see
 Consequence 1).
 **Refines:** ADR-110 (protection promises), ADR-113 (do-no-harm invariant — the reclaim
@@ -157,6 +159,58 @@ freshness model (055/056) and this ADR's duty distinction.
   shedding its pin causes no health degradation; reframing the on-return "chain broken" read
   as *expected* is the job of UPI 055/056. 058's surface is the planner policy flip + the
   executor away-shed + the emergency two-tier + the pure helper + this ADR.
+
+## Amendment 2026-09-04: the real role set, and Consequence 2 has shipped
+
+The role-duty principle is unchanged. Two corrections of fact: the role table
+(and the TL;DR and Context passages that echo it) names a variant that does not
+exist and omits one that does, and Consequence 2 is no longer future work.
+
+### `DriveRole` is `Primary | Offsite | Test`
+
+There is no `backup` role. `DriveRole` (`src/types.rs`) has three variants,
+spelled `primary` / `offsite` / `test` in config. Read the role table's
+`primary` / `backup` row as **`primary`** alone, and add a third row:
+
+| Role | Defends against | Expected presence |
+|------|-----------------|-------------------|
+| `test` | **Nothing** — a scratch destination for exercising sends | Whenever the operator plugs it in; no expectation either way |
+
+A `test` drive receives sends like any other configured destination — the
+planner and executor never branch on role — but it does not count as
+protection. `advice`'s single-point-of-failure advisory counts non-`test`
+drives only, and `awareness`'s redundancy-peer check for the offsite relaxation
+requires a mounted non-`test` drive. So a subvolume whose only companion to an
+away offsite drive is a test drive is treated as having no peer, which is the
+conservative reading.
+
+The duty distinction this ADR draws is between `primary` (continuously present;
+absence is a fault) and `offsite` (intermittently present by design; absence is
+the normal state). `test` sits outside it — it makes no promise, so there is
+nothing about its presence to expect.
+
+### Consequence 2 has shipped
+
+Offsite freshness is judged against the drive's rotation cadence today.
+`rotation::resolve_offsite_window` resolves the window from the declared
+`rotation_interval` where the operator declares one, an observed median cadence
+from the drive's mount history otherwise, or a 30-day-overdue / 60-day-stale
+default when neither speaks;
+`rotation::classify` and `RotationTier::to_promise_status` turn a copy's age
+into its promise status; `awareness::assess` applies that per-offsite-copy on
+the data-age clock, for an away drive whose source has changed and that has a
+mounted redundancy peer. The window's provenance rides along in the JSON
+surfaces so a consumer can tell a declared rhythm from an inferred one.
+
+Read Consequence 2's "(UPI 055, future)" heading as shipped.
+
+### A stale offsite copy clamps at AT RISK
+
+`advice::compute_offsite_freshness` clamps the offsite overlay's verdict to
+AT RISK at worst, so a Fortified subvolume cannot be driven to UNPROTECTED by
+offsite staleness alone. The full statement, with its rationale and its
+interaction with the overall `min(local, best external)` reduction, is in
+ADR-110's 2026-09-04 amendment.
 
 ## Related
 

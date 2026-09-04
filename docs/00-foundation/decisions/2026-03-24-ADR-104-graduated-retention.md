@@ -6,7 +6,7 @@ project: ['[[urd]]']
 sensitivity: public
 status: active
 created: '2026-03-24'
-timestamp: '2026-07-11T09:19:17+02:00'
+timestamp: '2026-09-04T10:15:00+02:00'
 ---
 # ADR-104: Graduated Retention Model
 
@@ -14,9 +14,11 @@ timestamp: '2026-07-11T09:19:17+02:00'
 > progressively with age — instead of fixed snapshot counts. Local retention has four time
 > windows (hourly, daily, weekly, monthly). External retention uses count-based limits with
 > space-governed cleanup. Space pressure mode aggressively thins when the filesystem is low.
+>
+> Amended 2026-09-04 — see the amendment of that date below.
 
 **Date:** 2026-03-22 (formalized 2026-03-24)
-**Status:** Accepted
+**Status:** Accepted (amended 2026-05-15, yearly window; 2026-09-04, code-drift audit)
 **Supersedes:** Roadmap's original fixed-count retention (`daily_keep`/`weekly_keep`/`monthly_keep`)
 
 ## Context
@@ -80,7 +82,8 @@ March 2. This prevents the slow drift that accumulates with day-based month appr
 - Fine granularity when most useful (recent) and coarse when acceptable (old)
 - Space pressure prevents the NVMe from filling — critical for system health
 - Offsite drive pin parents survive for ~5 months under graduated retention, supporting
-  quarterly drive rotation without forcing full sends (see ADR-020)
+  quarterly drive rotation without forcing full sends — the rotation cadence the predecessor
+  bash-script tooling's daily-external-backup decision set out to protect
 - External space-governed cleanup adapts to actual snapshot sizes without estimation
 
 ### Negative
@@ -144,9 +147,64 @@ emit yearly suggestions. A future UPI can expand the recommender to 5 slots with
 `RoleParams` once there is evidence of demand. This avoids silently changing UPI 041's
 already-shipped recommendation outputs.
 
+## Amendment 2026-09-04: External retention is graduated, not count-based
+
+The subsection "External retention: count-based + space-governed" above — and the
+TL;DR clause that summarises it — are superseded. External retention uses the
+**same graduated window stack as local retention**; no code path keeps "the last
+N per subvolume." The space-governed half of that subsection is still accurate
+and is restated below in the terms the code uses.
+
+### External retention carries the same shape as local
+
+`ResolvedSubvolume::external_retention` is a `ResolvedGraduatedRetention` — the
+same hourly/daily/weekly/monthly/yearly record local retention resolves to
+(`src/config.rs`, `src/types.rs`). `plan_external_retention`
+(`src/plan/external.rs`, taking `ExternalRetentionInputs`) hands that record to
+`retention::space_governed_retention`, which runs `graduated_retention` over the
+drive's snapshots for that subvolume — the same slot keys, the same calendar-month
+and calendar-year arithmetic, the same pin exclusion.
+
+The one asymmetry: local retention is a `LocalRetentionPolicy`, which also admits
+`Transient`. There is no external counterpart — an external policy is always a
+graduated shape.
+
+This is the retention-side face of ADR-115's symmetry claim: one shape vocabulary
+and one thinning function on both pools, which is also why the recommendation
+engine can emit a Local and an External shape from the same arithmetic.
+
+### Space governance is a second pass over that shape, not the model
+
+Both space passes key on the destination drive's `min_free_bytes` measured against
+the filesystem holding the external snapshot directory:
+
+1. **Thinned graduated pass.** When free bytes are below `min_free_bytes`,
+   `graduated_retention` runs in space-pressure mode — the hourly window keeps 1
+   per hour instead of everything. Identical to the local space-pressure mode
+   described above.
+2. **Oldest-first extras.** If the location is still under pressure after
+   thinning, the oldest surviving unpinned snapshots become additional deletes,
+   always leaving at least the newest snapshot standing.
+
+Every delete carries a `DeleteKind` (`DeleteKind::from_rule`): graduated and
+beyond-window deletes are `Policy`, the space-pressure extras and emergency
+prunes are `SpacePressure`. The executor runs `Policy` deletes unconditionally
+and short-circuits the *remaining* `SpacePressure` deletes for a location once
+its `min_free_bytes` is satisfied. That is the mechanism behind the original
+subsection's "re-checks free space after each deletion" — the planner's
+space-pressure proposals are a ceiling, not a mandate.
+
+### Recommender module name
+
+The "Recommender scope" subsection above names `policy::recommend_shape`. The
+module is `src/recommendation.rs`; the function is
+`recommendation::recommend_shape`. The 4-slot scope statement itself is
+unchanged (see ADR-115's amendment for the rest of that rename).
+
 ## Related
 
-- ADR-020: Daily external backups (graduated retention enables quarterly offsite rotation)
+- The predecessor bash-script tooling's daily-external-backup decision (graduated retention
+  enables the quarterly offsite rotation it assumed)
 - ADR-103: Interval-based scheduling (frequent snapshots require graduated retention)
 - ADR-105: Backward-compatibility contracts (Amendment 2026-05-15 — `monthly = 0` semantic shift)
 - ADR-111: Config system architecture (Amendment 2026-05-15 — `config_version = 2`)
