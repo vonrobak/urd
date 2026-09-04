@@ -223,8 +223,8 @@ impl HeadroomAwareRecommendation {
     /// tightening). Sole callers are the voice and voice-contract tests
     /// that pre-date UPI 044 — production always carries a real headroom
     /// signal, so nothing outside `cfg(test)` builds one of these.
+    #[cfg(test)]
     #[must_use]
-    #[allow(dead_code)]
     pub fn healthy_from(rec: ShapeRecommendation) -> Self {
         Self {
             recommendation: rec,

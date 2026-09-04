@@ -20,8 +20,8 @@ pub struct Interval(chrono::Duration);
 impl Interval {
     /// Constructed only by the config tests; production intervals come from
     /// `FromStr` over the declared strings ("15m", "1h", ...).
+    #[cfg(test)]
     #[must_use]
-    #[allow(dead_code)]
     pub fn minutes(n: i64) -> Self {
         Self(chrono::Duration::minutes(n))
     }
@@ -280,8 +280,8 @@ impl SnapshotName {
 
     /// Called only by this module's tests; every production caller wants
     /// the full `datetime()` for ordering.
+    #[cfg(test)]
     #[must_use]
-    #[allow(dead_code)]
     pub fn date(&self) -> NaiveDate {
         self.datetime.date()
     }
