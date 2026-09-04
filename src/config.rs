@@ -68,9 +68,67 @@ pub struct SnapshotRoot {
     pub min_free_bytes: Option<ByteSize>,
 }
 
-/// Per-root grouping accumulator for the v1/v2 parsers: `(subvolume names,
-/// first-non-None min_free_bytes)`.
-type RootGrouping = (Vec<String>, Option<ByteSize>);
+/// Per-root grouping accumulator for the shared v1/v2 root construction:
+/// `(subvolume names, the declared min_free_bytes and the subvolume that
+/// declared it)`. The threshold slot is filled by the first subvolume under
+/// the root that declares one; a later disagreement is refused rather than
+/// resolved, so the value that survives is the only one declared for the root.
+type RootGrouping<'a> = (Vec<String>, Option<(ByteSize, &'a str)>);
+
+/// Group v1/v2 subvolumes into the `[local_snapshots]` roots the internal
+/// `Config` carries, refusing a config in which two subvolumes share a
+/// `snapshot_root` but declare different `min_free_bytes`.
+///
+/// Grouping and refusal are one operation on purpose: the space check is per
+/// *root*, so two disagreeing thresholds have no honest resolution — whichever
+/// won would silently govern the other subvolume's snapshots. Both
+/// `V1Config::into_config` and `V2Config::into_config` build their roots here,
+/// so the rule cannot hold in one schema and quietly lapse in the other
+/// (ADR-111: three parsers, one shared construction surface).
+///
+/// Roots come back ordered by path, each carrying the single `min_free_bytes`
+/// declared for it — unique or absent, never a first-wins pick among rivals.
+///
+/// # Errors
+///
+/// Returns the structural-error message (ADR-109: the config is *wrong*, so
+/// Urd refuses to start) naming both subvolumes, their shared root, and the
+/// two conflicting values.
+fn group_subvolumes_by_snapshot_root<'a>(
+    subvolumes: impl IntoIterator<Item = (&'a str, &'a Path, Option<ByteSize>)>,
+) -> Result<Vec<SnapshotRoot>, String> {
+    // BTreeMap gives deterministic root ordering.
+    let mut root_map: std::collections::BTreeMap<&Path, RootGrouping<'a>> =
+        std::collections::BTreeMap::new();
+    for (name, snapshot_root, min_free_bytes) in subvolumes {
+        let entry = root_map
+            .entry(snapshot_root)
+            .or_insert_with(|| (Vec::new(), None));
+        entry.0.push(name.to_string());
+        match (entry.1, min_free_bytes) {
+            (Some((declared, declared_by)), Some(new)) if declared != new => {
+                return Err(format!(
+                    "subvolumes {declared_by:?} and {name:?} share snapshot_root {:?} but \
+                     declare different min_free_bytes ({declared} vs {new}). \
+                     Use the same value or move them to separate roots.",
+                    snapshot_root.display()
+                ));
+            }
+            // The first declaration for the root wins; agreeing repeats are
+            // no-ops, and disagreement never reaches here.
+            (None, Some(new)) => entry.1 = Some((new, name)),
+            _ => {}
+        }
+    }
+    Ok(root_map
+        .into_iter()
+        .map(|(path, (subvolumes, declared))| SnapshotRoot {
+            path: path.to_path_buf(),
+            subvolumes,
+            min_free_bytes: declared.map(|(bytes, _)| bytes),
+        })
+        .collect())
+}
 
 #[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[allow(dead_code)]
@@ -680,29 +738,20 @@ impl V1Config {
     ///
     /// Synthesizes `LocalSnapshotsConfig` and `DefaultsConfig` so all downstream
     /// code (executor, chain, commands) continues working without changes.
-    fn into_config(self) -> Config {
+    ///
+    /// # Errors
+    ///
+    /// Returns the shared root-grouping refusal when two subvolumes share a
+    /// `snapshot_root` but declare different `min_free_bytes`.
+    fn into_config(self) -> Result<Config, String> {
         // Build LocalSnapshotsConfig by grouping subvolumes by snapshot_root.
-        // BTreeMap gives deterministic root ordering. The tuple carries the
-        // first-non-None min_free_bytes for the root.
-        let mut root_map: std::collections::BTreeMap<PathBuf, RootGrouping> =
-            std::collections::BTreeMap::new();
-        for sv in &self.subvolumes {
-            let entry = root_map
-                .entry(sv.snapshot_root.clone())
-                .or_insert_with(|| (Vec::new(), None));
-            entry.0.push(sv.name.clone());
-            if entry.1.is_none() {
-                entry.1 = sv.min_free_bytes;
-            }
-        }
-        let roots: Vec<SnapshotRoot> = root_map
-            .into_iter()
-            .map(|(path, (subvolumes, min_free_bytes))| SnapshotRoot {
-                path,
-                subvolumes,
-                min_free_bytes,
-            })
-            .collect();
+        let roots = group_subvolumes_by_snapshot_root(self.subvolumes.iter().map(|sv| {
+            (
+                sv.name.as_str(),
+                sv.snapshot_root.as_path(),
+                sv.min_free_bytes,
+            )
+        }))?;
 
         let defaults = parser_fallback_defaults();
 
@@ -734,7 +783,7 @@ impl V1Config {
             })
             .collect();
 
-        Config {
+        Ok(Config {
             general: GeneralConfig {
                 config_version: Some(self.general.config_version),
                 state_db: self.general.state_db,
@@ -749,7 +798,7 @@ impl V1Config {
             drives: self.drives,
             subvolumes,
             notifications: self.notifications,
-        }
+        })
     }
 }
 
@@ -809,30 +858,9 @@ impl V1Config {
             }
         }
 
-        // Reject conflicting min_free_bytes on subvolumes sharing a snapshot_root
-        let mut root_thresholds: std::collections::HashMap<&Path, (Option<ByteSize>, &str)> =
-            std::collections::HashMap::new();
-        for sv in &self.subvolumes {
-            let entry = root_thresholds
-                .entry(&sv.snapshot_root)
-                .or_insert((sv.min_free_bytes, &sv.name));
-            if let (Some(existing), Some(new)) = (entry.0, sv.min_free_bytes)
-                && existing != new
-            {
-                return Err(format!(
-                    "subvolumes {:?} and {:?} share snapshot_root {:?} but declare \
-                     different min_free_bytes ({existing} vs {new}). \
-                     Use the same value or move them to separate roots.",
-                    entry.1,
-                    sv.name,
-                    sv.snapshot_root.display()
-                ));
-            }
-            // Promote None → Some if a later subvolume specifies a value
-            if entry.0.is_none() && sv.min_free_bytes.is_some() {
-                entry.0 = sv.min_free_bytes;
-            }
-        }
+        // Conflicting min_free_bytes on subvolumes sharing a snapshot_root is
+        // refused where the roots are built — group_subvolumes_by_snapshot_root(),
+        // called from into_config() — so v1 and v2 enforce it from one site.
 
         Ok(())
     }
@@ -926,7 +954,7 @@ fn parse_legacy(raw: &str) -> Result<Config, String> {
 fn parse_v1(raw: &str) -> Result<Config, String> {
     let v1: V1Config = toml::from_str(raw).map_err(|e| e.to_string())?;
     v1.validate_v1()?;
-    Ok(v1.into_config())
+    v1.into_config()
 }
 
 // ── V2 wire types (UPI 042) ─────────────────────────────────────────────
@@ -1101,27 +1129,20 @@ struct V2SubvolumeConfig {
 impl V2Config {
     /// Convert v2 config into the internal Config representation. Mirrors
     /// `V1Config::into_config()` shape.
-    fn into_config(self) -> Config {
-        // Mirrors V1::into_config: first-non-None min_free_bytes per root.
-        let mut root_map: std::collections::BTreeMap<PathBuf, RootGrouping> =
-            std::collections::BTreeMap::new();
-        for sv in &self.subvolumes {
-            let entry = root_map
-                .entry(sv.snapshot_root.clone())
-                .or_insert_with(|| (Vec::new(), None));
-            entry.0.push(sv.name.clone());
-            if entry.1.is_none() {
-                entry.1 = sv.min_free_bytes;
-            }
-        }
-        let roots: Vec<SnapshotRoot> = root_map
-            .into_iter()
-            .map(|(path, (subvolumes, min_free_bytes))| SnapshotRoot {
-                path,
-                subvolumes,
-                min_free_bytes,
-            })
-            .collect();
+    ///
+    /// # Errors
+    ///
+    /// Returns the shared root-grouping refusal when two subvolumes share a
+    /// `snapshot_root` but declare different `min_free_bytes`.
+    fn into_config(self) -> Result<Config, String> {
+        // Same shared grouping as v1: one declared min_free_bytes per root.
+        let roots = group_subvolumes_by_snapshot_root(self.subvolumes.iter().map(|sv| {
+            (
+                sv.name.as_str(),
+                sv.snapshot_root.as_path(),
+                sv.min_free_bytes,
+            )
+        }))?;
 
         let defaults = parser_fallback_defaults();
 
@@ -1153,7 +1174,7 @@ impl V2Config {
             })
             .collect();
 
-        Config {
+        Ok(Config {
             general: GeneralConfig {
                 config_version: Some(self.general.config_version),
                 state_db: self.general.state_db,
@@ -1168,7 +1189,7 @@ impl V2Config {
             drives: self.drives,
             subvolumes,
             notifications: self.notifications,
-        }
+        })
     }
 
     /// Validate v2-specific rules. Same shape as V1::validate_v1.
@@ -1208,7 +1229,7 @@ impl V2Config {
 fn parse_v2(raw: &str) -> Result<Config, String> {
     let v2: V2Config = toml::from_str(raw).map_err(|e| e.to_string())?;
     v2.validate_v2()?;
-    Ok(v2.into_config())
+    v2.into_config()
 }
 
 // ── Utilities ───────────────────────────────────────────────────────────
@@ -3870,6 +3891,104 @@ source = "/docs"
 snapshot_root = "/snap"
 "#;
         parse_v1(config_str).unwrap();
+    }
+
+    // The min_free_bytes conflict rule reached v2 through the shared root
+    // construction (issue #378). Both schemas group roots with the same
+    // function, so they must refuse — and accept — the same configs.
+
+    #[test]
+    fn v2_rejects_conflicting_min_free_bytes_in_same_root() {
+        let body = r#"
+[[subvolumes]]
+name = "home"
+source = "/home"
+snapshot_root = "/snap"
+min_free_bytes = "10GB"
+
+[[subvolumes]]
+name = "docs"
+source = "/docs"
+snapshot_root = "/snap"
+min_free_bytes = "50GB"
+"#;
+        let v2_err = parse_v2(&format!("[general]\nconfig_version = 2\n{body}")).unwrap_err();
+        let v1_err = parse_v1(&format!("[general]\nconfig_version = 1\n{body}")).unwrap_err();
+        assert!(v2_err.contains("different min_free_bytes"), "{v2_err}");
+        // Same rule, same words — the refusal cannot drift between schemas.
+        assert_eq!(v2_err, v1_err);
+    }
+
+    #[test]
+    fn v2_allows_same_min_free_bytes_in_same_root() {
+        let config = parse_v2(r#"
+[general]
+config_version = 2
+
+[[subvolumes]]
+name = "home"
+source = "/home"
+snapshot_root = "/snap"
+min_free_bytes = "10GB"
+
+[[subvolumes]]
+name = "docs"
+source = "/docs"
+snapshot_root = "/snap"
+min_free_bytes = "10GB"
+"#).unwrap();
+        assert_eq!(config.root_min_free_bytes("docs"), Some(10_000_000_000));
+    }
+
+    #[test]
+    fn v2_allows_mixed_none_and_some_min_free_bytes() {
+        let config = parse_v2(r#"
+[general]
+config_version = 2
+
+[[subvolumes]]
+name = "home"
+source = "/home"
+snapshot_root = "/snap"
+min_free_bytes = "10GB"
+
+[[subvolumes]]
+name = "docs"
+source = "/docs"
+snapshot_root = "/snap"
+"#).unwrap();
+        // The one declared threshold governs the whole root.
+        assert_eq!(config.root_min_free_bytes("home"), Some(10_000_000_000));
+        assert_eq!(config.root_min_free_bytes("docs"), Some(10_000_000_000));
+    }
+
+    #[test]
+    fn min_free_bytes_conflict_names_the_declaring_subvolumes() {
+        // The first subvolume under the root declares nothing, so the message
+        // must name the two that actually disagree — not the first listed.
+        let err = parse_v2(r#"
+[general]
+config_version = 2
+
+[[subvolumes]]
+name = "quiet"
+source = "/quiet"
+snapshot_root = "/snap"
+
+[[subvolumes]]
+name = "home"
+source = "/home"
+snapshot_root = "/snap"
+min_free_bytes = "10GB"
+
+[[subvolumes]]
+name = "docs"
+source = "/docs"
+snapshot_root = "/snap"
+min_free_bytes = "50GB"
+"#).unwrap_err();
+        assert!(err.contains("subvolumes \"home\" and \"docs\""), "{err}");
+        assert!(!err.contains("quiet"), "{err}");
     }
 
     // ── cleanup_budget residual-key tolerance (UPI 068, ADR-111 amendment

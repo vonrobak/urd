@@ -13,6 +13,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   containing a backslash, newline, tab, or other control character
   produces valid JSON instead of a silently malformed payload — the exact
   content that shows up in watchdog and storage-pressure alerts (#379).
+- A v2 config in which two subvolumes share a `snapshot_root` but declare
+  different `min_free_bytes` is now refused at load, with the same message v1
+  has always given. Before, the first-listed value silently governed the whole
+  root, so one subvolume's space guard quietly ran at the other's threshold.
+  Both schemas now build their snapshot roots through the same grouping
+  function, so the rule cannot hold in one and lapse in the other; the refusal
+  also names the two subvolumes that actually disagree rather than whichever
+  was listed first. Legacy configs declare `min_free_bytes` once per root and
+  cannot express the conflict (#378).
 
 ## [0.36.0] - 2026-09-03
 
