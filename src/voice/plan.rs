@@ -29,6 +29,14 @@ pub fn render_empty_plan(explanation: &crate::output::EmptyPlanExplanation) -> S
     out
 }
 
+/// Render the terse "nothing to do" line for a manual backup whose plan
+/// came up empty with no skipped subvolumes to explain (see
+/// `render_empty_plan` for the richer case).
+#[must_use]
+pub fn render_nothing_to_do() -> String {
+    format!("{}\n", "Nothing to do.".dimmed())
+}
+
 /// Render plan output according to the given mode.
 ///
 /// `verbose` gates the per-operation wall (UPI 028): the default output is

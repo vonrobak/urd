@@ -484,8 +484,6 @@ fn handle_incomplete_deletions(
     config: &Config,
     incompletes: &[InitIncomplete],
 ) -> anyhow::Result<Vec<String>> {
-    use colored::Colorize;
-
     let mut deleted = Vec::new();
 
     if incompletes.is_empty() {
@@ -493,10 +491,7 @@ fn handle_incomplete_deletions(
     }
 
     println!();
-    println!(
-        "{}",
-        "Potentially incomplete snapshots on external drives:".bold()
-    );
+    println!("{}", crate::voice::render_incomplete_deletion_header());
 
     let sys = crate::btrfs::SystemBtrfs::probe(&config.general.btrfs_path);
     let btrfs = RealBtrfs::new(
@@ -507,10 +502,8 @@ fn handle_incomplete_deletions(
 
     for inc in incompletes {
         println!(
-            "  {} {} on {} (not pinned, may be from interrupted transfer)",
-            "WARNING".yellow(),
-            inc.snapshot,
-            inc.drive,
+            "{}",
+            crate::voice::render_incomplete_deletion_warning(&inc.snapshot, &inc.drive)
         );
 
         print!("  Delete {}? [y/N] ", inc.path);
@@ -520,14 +513,18 @@ fn handle_incomplete_deletions(
         std::io::stdin().read_line(&mut input)?;
         if input.trim().eq_ignore_ascii_case("y") {
             let path = std::path::Path::new(&inc.path);
-            match btrfs.delete_subvolume(path) {
-                Ok(()) => {
-                    println!("  {} Deleted {}", "OK".green(), inc.path);
-                    deleted.push(inc.path.clone());
-                }
-                Err(e) => {
-                    println!("  {} Failed to delete {}: {e}", "ERROR".red(), inc.path);
-                }
+            let result = btrfs.delete_subvolume(path);
+            let ok = result.is_ok();
+            let error_detail = result.as_ref().err().map(std::string::ToString::to_string);
+            println!(
+                "{}",
+                crate::voice::render_incomplete_deletion_result(
+                    &inc.path,
+                    error_detail.as_deref().map_or(Ok(()), Err),
+                )
+            );
+            if ok {
+                deleted.push(inc.path.clone());
             }
         }
     }

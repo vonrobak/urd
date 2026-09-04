@@ -31,7 +31,8 @@ pub fn status(config: Config, output_mode: OutputMode) -> anyhow::Result<()> {
         None => SentinelStatusOutput::NotRunning { last_seen: None },
     };
 
-    let rendered = voice::render_sentinel_status(&status_output, output_mode);
+    let now = chrono::Local::now().naive_local();
+    let rendered = voice::render_sentinel_status(&status_output, output_mode, now);
     print!("{rendered}");
 
     Ok(())

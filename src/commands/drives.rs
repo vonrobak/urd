@@ -112,7 +112,8 @@ pub fn run_drives_list(config: &Config, output_mode: OutputMode) -> anyhow::Resu
     }
 
     let output = DrivesListOutput { drives: entries };
-    print!("{}", voice::render_drives_list(&output, output_mode));
+    let now = chrono::Local::now().naive_local();
+    print!("{}", voice::render_drives_list(&output, output_mode, now));
     Ok(())
 }
 

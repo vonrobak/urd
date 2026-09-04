@@ -9,11 +9,18 @@ use colored::Colorize;
 use crate::awareness::PromiseStatus;
 use crate::output::{OutputMode, SentinelStatusOutput};
 
-/// Render sentinel status output according to the given mode.
+/// Render sentinel status output according to the given mode. `now` is the
+/// caller's wall-clock reading, threaded through to compute the relative
+/// assessment age — the renderer itself stays a pure function of its input
+/// (no `Local::now()` inside `voice/`).
 #[must_use]
-pub fn render_sentinel_status(data: &SentinelStatusOutput, mode: OutputMode) -> String {
+pub fn render_sentinel_status(
+    data: &SentinelStatusOutput,
+    mode: OutputMode,
+    now: chrono::NaiveDateTime,
+) -> String {
     match mode {
-        OutputMode::Interactive => render_sentinel_status_interactive(data),
+        OutputMode::Interactive => render_sentinel_status_interactive(data, now),
         OutputMode::Daemon => {
             serde_json::to_string_pretty(data)
                 .unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
@@ -21,7 +28,10 @@ pub fn render_sentinel_status(data: &SentinelStatusOutput, mode: OutputMode) -> 
     }
 }
 
-fn render_sentinel_status_interactive(data: &SentinelStatusOutput) -> String {
+fn render_sentinel_status_interactive(
+    data: &SentinelStatusOutput,
+    now: chrono::NaiveDateTime,
+) -> String {
     let mut out = String::new();
 
     match data {
@@ -44,7 +54,7 @@ fn render_sentinel_status_interactive(data: &SentinelStatusOutput) -> String {
                     out,
                     "  {:<14}{} (tick: {})",
                     "Assessment",
-                    humanize_assessment_age(last),
+                    humanize_assessment_age(last, now),
                     tick_desc
                 )
                 .ok();
@@ -78,16 +88,13 @@ fn render_sentinel_status_interactive(data: &SentinelStatusOutput) -> String {
 }
 
 /// Format the sentinel state file's ISO `last_assessment` stamp as a
-/// relative age ("5m ago"). Falls back to the raw string when it doesn't
-/// parse (hand-edited state file) — degraded, never wrong.
-fn humanize_assessment_age(timestamp: &str) -> String {
+/// relative age ("5m ago") from `now`. Falls back to the raw string when it
+/// doesn't parse (hand-edited state file) — degraded, never wrong.
+fn humanize_assessment_age(timestamp: &str, now: chrono::NaiveDateTime) -> String {
     let Ok(ts) = chrono::NaiveDateTime::parse_from_str(timestamp, "%Y-%m-%dT%H:%M:%S") else {
         return timestamp.to_string();
     };
-    let mins = chrono::Local::now()
-        .naive_local()
-        .signed_duration_since(ts)
-        .num_minutes();
+    let mins = now.signed_duration_since(ts).num_minutes();
     if mins < 1 {
         "just now".to_string()
     } else {
