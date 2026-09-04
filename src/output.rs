@@ -936,6 +936,89 @@ impl DoctorVerdict {
     }
 }
 
+/// Derive the doctor verdict from the assembled output — a pure fold, no
+/// side counters (#382).
+///
+/// Precedence is unchanged from UPI 045: any error wins (`Issues`), then
+/// any warning (`Warnings`), then any protected-but-unhealthy subvolume
+/// (`Degraded`), else `Healthy`. The count is a sum across every
+/// contributing section, which is why it is not filterable from a single
+/// field on `DoctorOutput`.
+///
+/// What counts:
+/// - `config_checks` / `infra_checks` / `retention_checks`: `Warn` and `Error`.
+/// - `data_safety`: `Unprotected` is an error, `AtRisk` a warning.
+/// - `sentinel`: a stopped daemon is a warning (absent section says nothing).
+/// - `verify` (`--thorough`): every `warn` / `fail` check, plus its
+///   preflight warnings — **except** absent-drive rows
+///   ([`VerifyCheck::is_expected_condition`]). An unmounted drive is not a
+///   finding: data safety already reports it as the cause of `Degraded`,
+///   and counting it as a warning masked that verdict.
+#[must_use]
+pub fn verdict(output: &DoctorOutput) -> DoctorVerdict {
+    let mut warnings: usize = 0;
+    let mut errors: usize = 0;
+
+    let groups = [
+        &output.config_checks,
+        &output.infra_checks,
+        &output.retention_checks,
+    ];
+    for check in groups.into_iter().flatten() {
+        match check.status {
+            DoctorCheckStatus::Warn => warnings += 1,
+            DoctorCheckStatus::Error => errors += 1,
+            DoctorCheckStatus::Ok => {}
+        }
+    }
+
+    for row in &output.data_safety {
+        match row.status {
+            PromiseStatus::Unprotected => errors += 1,
+            PromiseStatus::AtRisk => warnings += 1,
+            PromiseStatus::Protected => {}
+        }
+    }
+
+    if output.sentinel.as_ref().is_some_and(|s| !s.running) {
+        warnings += 1;
+    }
+
+    if let Some(verify) = &output.verify {
+        warnings += verify.preflight_warnings.len();
+        for check in verify
+            .subvolumes
+            .iter()
+            .flat_map(|sv| &sv.drives)
+            .flat_map(|d| &d.checks)
+        {
+            if check.is_warning_finding() {
+                warnings += 1;
+            } else if check.is_failure() {
+                errors += 1;
+            }
+        }
+    }
+
+    // "Protected but not healthy" — the drive-absent posture. `health` is
+    // `OperationalHealth`'s Display form; "healthy" is the only clean value.
+    let degraded = output
+        .data_safety
+        .iter()
+        .filter(|d| d.status == PromiseStatus::Protected && d.health != "healthy")
+        .count();
+
+    if errors > 0 {
+        DoctorVerdict::issues(errors)
+    } else if warnings > 0 {
+        DoctorVerdict::warnings(warnings)
+    } else if degraded > 0 {
+        DoctorVerdict::degraded(degraded)
+    } else {
+        DoctorVerdict::healthy()
+    }
+}
+
 // ── GetOutput ──────────────────────────────────────────────────────────
 
 /// Structured output for the `urd get` command (metadata, not file content).
@@ -1465,6 +1548,20 @@ impl VerifyCheck {
     pub fn is_expected_condition(&self) -> bool {
         self.name == Self::DRIVE_MOUNTED && self.status == "warn"
     }
+
+    /// Returns true if this check is a warning that names a real finding —
+    /// a `warn` that is not an expected condition. The doctor verdict counts
+    /// these; absent-drive rows are reported by data safety instead (#382).
+    #[must_use]
+    pub fn is_warning_finding(&self) -> bool {
+        self.status == "warn" && !self.is_expected_condition()
+    }
+
+    /// Returns true if this check failed.
+    #[must_use]
+    pub fn is_failure(&self) -> bool {
+        self.status == "fail"
+    }
 }
 
 // ── Init output ─────────────────────────────────────────────────────────
@@ -1843,6 +1940,191 @@ mod tests {
             assert_eq!(verdict.status, status);
             assert_eq!(verdict.count, count);
         }
+    }
+
+    // ── verdict() — the verdict as a pure fold over the output (#382) ──
+    //
+    // Doctor no longer keeps a parallel tally: every finding it reports is
+    // a row in `DoctorOutput`, and the verdict counts those rows. These
+    // tests pin the precedence (Issues > Warnings > Degraded > Healthy) and
+    // the one classification that matters — an absent drive under
+    // `--thorough` is an expected condition, not a warning.
+
+    fn blank_doctor_output() -> DoctorOutput {
+        DoctorOutput {
+            schema_version: DOCTOR_OUTPUT_SCHEMA_VERSION,
+            config_checks: Vec::new(),
+            infra_checks: Vec::new(),
+            data_safety: Vec::new(),
+            sentinel: None,
+            schema_status: None,
+            verify: None,
+            churn: None,
+            recommendations: None,
+            retention_checks: Vec::new(),
+            verdict: DoctorVerdict::healthy(),
+        }
+    }
+
+    fn doctor_check(status: DoctorCheckStatus) -> DoctorCheck {
+        DoctorCheck {
+            name: "check".to_string(),
+            status,
+            detail: None,
+            suggestion: None,
+        }
+    }
+
+    fn safety_row(status: PromiseStatus, health: &str) -> DoctorDataSafety {
+        DoctorDataSafety {
+            name: "opptak".to_string(),
+            status,
+            health: health.to_string(),
+            issue: None,
+            suggestion: None,
+            reason: None,
+            storage_posture: None,
+        }
+    }
+
+    fn verify_check(name: &str, status: &str) -> VerifyCheck {
+        VerifyCheck {
+            name: name.to_string(),
+            status: status.to_string(),
+            detail: None,
+            suggestion: None,
+        }
+    }
+
+    /// A `--thorough` verify section carrying these checks on one
+    /// subvolume/drive pair. Its own `warn_count` / `fail_count` are set to
+    /// values the verdict must ignore: it folds the rows, not the tallies.
+    fn verify_section(checks: Vec<VerifyCheck>, preflight: Vec<String>) -> VerifyOutput {
+        VerifyOutput {
+            subvolumes: vec![VerifySubvolume {
+                name: "opptak".to_string(),
+                drives: vec![VerifyDrive {
+                    label: "WD-EXT".to_string(),
+                    checks,
+                }],
+            }],
+            preflight_warnings: preflight,
+            ok_count: 0,
+            warn_count: 99,
+            fail_count: 99,
+        }
+    }
+
+    #[test]
+    fn verdict_healthy_when_no_section_speaks() {
+        let output = blank_doctor_output();
+        assert_eq!(verdict(&output), DoctorVerdict::healthy());
+    }
+
+    #[test]
+    fn verdict_healthy_ignores_ok_rows_and_a_running_sentinel() {
+        let mut output = blank_doctor_output();
+        output.config_checks = vec![doctor_check(DoctorCheckStatus::Ok)];
+        output.infra_checks = vec![doctor_check(DoctorCheckStatus::Ok)];
+        output.data_safety = vec![safety_row(PromiseStatus::Protected, "healthy")];
+        output.sentinel = Some(DoctorSentinelStatus {
+            running: true,
+            pid: Some(1),
+            uptime: None,
+        });
+        assert_eq!(verdict(&output), DoctorVerdict::healthy());
+    }
+
+    #[test]
+    fn verdict_counts_warnings_from_every_contributing_section() {
+        let mut output = blank_doctor_output();
+        output.config_checks = vec![doctor_check(DoctorCheckStatus::Warn)];
+        output.infra_checks = vec![doctor_check(DoctorCheckStatus::Warn)];
+        output.retention_checks = vec![doctor_check(DoctorCheckStatus::Warn)];
+        output.data_safety = vec![safety_row(PromiseStatus::AtRisk, "degraded")];
+        output.sentinel = Some(DoctorSentinelStatus {
+            running: false,
+            pid: None,
+            uptime: None,
+        });
+        output.verify = Some(verify_section(
+            vec![verify_check("stale-pin", "warn")],
+            vec!["interval weakens the named level".to_string()],
+        ));
+        // config + infra + retention + at-risk + sentinel + verify + verify
+        // preflight = 7.
+        assert_eq!(verdict(&output), DoctorVerdict::warnings(7));
+    }
+
+    #[test]
+    fn verdict_errors_win_and_count_only_errors() {
+        let mut output = blank_doctor_output();
+        output.infra_checks = vec![
+            doctor_check(DoctorCheckStatus::Error),
+            doctor_check(DoctorCheckStatus::Warn),
+        ];
+        output.data_safety = vec![
+            safety_row(PromiseStatus::Unprotected, "blocked"),
+            safety_row(PromiseStatus::AtRisk, "degraded"),
+        ];
+        output.verify = Some(verify_section(
+            vec![verify_check("pin-exists-drive", "fail")],
+            Vec::new(),
+        ));
+        assert_eq!(verdict(&output), DoctorVerdict::issues(3));
+    }
+
+    #[test]
+    fn verdict_degraded_when_protected_subvolumes_are_unhealthy_and_nothing_warns() {
+        let mut output = blank_doctor_output();
+        output.data_safety = vec![
+            safety_row(PromiseStatus::Protected, "degraded"),
+            safety_row(PromiseStatus::Protected, "degraded"),
+            safety_row(PromiseStatus::Protected, "healthy"),
+        ];
+        assert_eq!(verdict(&output), DoctorVerdict::degraded(2));
+    }
+
+    #[test]
+    fn verdict_warnings_outrank_degraded() {
+        let mut output = blank_doctor_output();
+        output.data_safety = vec![safety_row(PromiseStatus::Protected, "degraded")];
+        output.infra_checks = vec![doctor_check(DoctorCheckStatus::Warn)];
+        assert_eq!(verdict(&output), DoctorVerdict::warnings(1));
+    }
+
+    /// Regression (#382): under `--thorough`, verify emits one
+    /// `drive-mounted` warn per absent drive. Those used to be counted as
+    /// verdict warnings, which outranked and hid the Degraded verdict that
+    /// data safety had already earned for exactly the same absent drive.
+    #[test]
+    fn verdict_absent_drive_under_thorough_does_not_mask_degraded() {
+        let mut output = blank_doctor_output();
+        output.data_safety = vec![
+            safety_row(PromiseStatus::Protected, "degraded"),
+            safety_row(PromiseStatus::Protected, "degraded"),
+        ];
+        output.verify = Some(verify_section(
+            vec![
+                verify_check(VerifyCheck::DRIVE_MOUNTED, "warn"),
+                verify_check("pin-file", "ok"),
+            ],
+            Vec::new(),
+        ));
+        assert_eq!(verdict(&output), DoctorVerdict::degraded(2));
+    }
+
+    #[test]
+    fn verdict_absent_drive_does_not_inflate_a_real_warning_count() {
+        let mut output = blank_doctor_output();
+        output.verify = Some(verify_section(
+            vec![
+                verify_check(VerifyCheck::DRIVE_MOUNTED, "warn"),
+                verify_check("orphans", "warn"),
+            ],
+            Vec::new(),
+        ));
+        assert_eq!(verdict(&output), DoctorVerdict::warnings(1));
     }
 
     // ── RedundancyAdvisory tests ────────────────────────────────────────
