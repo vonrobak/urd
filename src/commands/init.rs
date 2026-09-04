@@ -513,18 +513,21 @@ fn handle_incomplete_deletions(
         std::io::stdin().read_line(&mut input)?;
         if input.trim().eq_ignore_ascii_case("y") {
             let path = std::path::Path::new(&inc.path);
-            let result = btrfs.delete_subvolume(path);
-            let ok = result.is_ok();
-            let error_detail = result.as_ref().err().map(std::string::ToString::to_string);
-            println!(
-                "{}",
-                crate::voice::render_incomplete_deletion_result(
-                    &inc.path,
-                    error_detail.as_deref().map_or(Ok(()), Err),
-                )
-            );
-            if ok {
-                deleted.push(inc.path.clone());
+            match btrfs.delete_subvolume(path) {
+                Ok(()) => {
+                    println!(
+                        "{}",
+                        crate::voice::render_incomplete_deletion_result(&inc.path, Ok(()))
+                    );
+                    deleted.push(inc.path.clone());
+                }
+                Err(e) => println!(
+                    "{}",
+                    crate::voice::render_incomplete_deletion_result(
+                        &inc.path,
+                        Err(&e.to_string())
+                    )
+                ),
             }
         }
     }
