@@ -222,7 +222,7 @@ pub(super) fn plan_external_send(i: &SendInputs) -> PlanFragment {
             subvolume_name: subvol.name.clone(),
             pin_on_success: pin_info,
             reason,
-            token_verified: false, // stamped by backup.rs after plan creation
+            token_verified: false, // stamped by backup.rs; see ADR-100 amendment 2026-09-04
         });
         // PlannerSendChoice only on full sends — incrementals are routine
         // and covered by the operations log.

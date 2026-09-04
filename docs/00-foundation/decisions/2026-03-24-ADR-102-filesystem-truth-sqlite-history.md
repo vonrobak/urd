@@ -6,7 +6,7 @@ project: ['[[urd]]']
 sensitivity: public
 status: active
 created: '2026-03-24'
-timestamp: '2026-07-11T09:19:17+02:00'
+timestamp: '2026-09-04T15:03:12+02:00'
 ---
 # ADR-102: Filesystem as Source of Truth, SQLite as History
 
@@ -16,7 +16,7 @@ timestamp: '2026-07-11T09:19:17+02:00'
 > failures must never prevent backups from running.
 
 **Date:** 2026-03-22 (formalized 2026-03-24)
-**Status:** Accepted
+**Status:** Accepted (amended 2026-09-04 — see [Amendment 2026-09-04](#amendment-2026-09-04-the-current-table-inventory))
 **Supersedes:** None (founding decision; supersedes early roadmap's `snapshots` table)
 
 ## Context
@@ -87,3 +87,34 @@ made historical queries impossible ("when did the last backup run? how long did 
 - Roadmap (`docs/96-project-supervisor/roadmap.md`) §SQLite Schema — documents the decision
   to remove the `snapshots` table
 - Phase 2 journal (`docs/98-journals/2026-03-22-urd-phase02.md`) — state.rs implementation
+
+## Amendment 2026-09-04: the current table inventory
+
+The axis is unchanged — the filesystem answers *what exists*, SQLite answers *what
+happened* — but the Decision section names only `runs` and `operations`. The schema
+(`init_schema`, `src/state.rs`) creates seven tables:
+
+| Table | Records | Read by |
+|---|---|---|
+| `runs` | One row per backup run: start, finish, mode, result | `urd history`, `urd status` (last-run info) |
+| `operations` | Per-subvolume operations: kind, drive, duration, bytes transferred, error | `urd history`, space estimation, the drift backfill |
+| `subvolume_sizes` | Calibration measurements (`urd calibrate`): estimated bytes, method, when measured | The planner's size ladder for full sends (`calibrated_size`, behind `HistoryQuery`) |
+| `drive_tokens` | Per-drive identity tokens: value, first seen, last verified | Drive adoption and the token gating in `commands/backup.rs` |
+| `events` | The ADR-114 typed decision log: kind, payload, run anchor, subvolume, drive | `urd events`, post-hoc analysis |
+| `drift_samples` | Per-run churn samples: bytes, interval since previous send, source free bytes | `drift.rs` (ADR-113 Layer 0) |
+| `pool_armed_tier` | Per-pool armed tightness tier and the timestamp it was reached | The pre-plan arming resolve (ADR-113 Layer 1) |
+
+`drive_connections` is gone: `init_schema` subsumes any surviving rows into `events` as
+`DriveMounted` / `DriveUnmounted` and drops the table (best-effort, idempotent — a failed
+migration logs and the next run retries).
+
+**Two of these are read back into decisions, and both degrade safely.**
+`subvolume_sizes` supplies estimates, never existence — the original Constraints section
+already says so, and the fail-open posture (ADR-107) covers its absence.
+`pool_armed_tier` is newer and deserves the same sentence: it is a hysteresis memo, not a
+truth claim. The armed-tier read is `.unwrap_or_default()` on an unavailable DB, so a
+lost or unreadable table means the tier is classified fresh from live pool signals — the
+"flagged since" timestamp restarts, but no decision is made on stale or invented data.
+
+No table is ever consulted to determine what snapshots exist. That still comes from
+snapshot directories and pin files.

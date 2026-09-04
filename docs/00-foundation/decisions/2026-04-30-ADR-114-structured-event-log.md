@@ -6,7 +6,7 @@ project: ['[[urd]]']
 sensitivity: public
 status: active
 created: '2026-04-30'
-timestamp: '2026-05-29T18:25:12+02:00'
+timestamp: '2026-09-04T15:03:12+02:00'
 ---
 # ADR-114: Structured Event Log for Decisions and State Transitions
 
@@ -18,8 +18,8 @@ timestamp: '2026-05-29T18:25:12+02:00'
 > data-driven development possible.
 
 **Date:** 2026-04-30
-**Status:** Accepted (principle); implementation pending UPI 036 (`PromiseStatus`
-serialized-form amendment 2026-05-29 — see [Amendment 2026-05-29](#amendment-2026-05-29-promisestatus-serialized-form))
+**Status:** Accepted (principle); implemented in UPI 036 (`PromiseStatus`
+serialized-form amendment 2026-05-29 — see [Amendment 2026-05-29](#amendment-2026-05-29-promisestatus-serialized-form); stamp seam, drive lifecycle, and events retention amended 2026-09-04 — see [Amendment 2026-09-04](#amendment-2026-09-04-the-stamp-seam-drive-lifecycle-and-events-retention))
 **Complements:** UPI 030 (drift_samples — quantitative per-run signal)
 
 ## Context
@@ -264,3 +264,70 @@ thing that changes (`at_risk` → `AT RISK` for new rows) — no external consum
 reads the events payload (design Assumption #4), and the `urd events --format
 ndjson` sibling render is documented internal-only. No `schema_version` bump: the
 sentinel state file and heartbeat **write-forms are byte-identical** to before.
+
+## Amendment 2026-09-04: the stamp seam, drive lifecycle, and events retention
+
+UPI 036 shipped the event log; UPI 088-c hardened Constraint 3 from a convention into a
+compile fact. This amendment records the resulting seam, closes the `drive_connections`
+question the Decision section deferred, and decides Open Concern 1.
+
+### The stamp seam
+
+Constraint 3 says *pure modules emit; impure modules persist*. It is now enforced by the
+type system rather than by review (`src/events.rs`):
+
+- **`Event::pure(occurred_at, payload)` returns an `UnstampedEvent`, not an `Event`.**
+  Pure emitters — the planner, retention, awareness, the sentinel state machine — cannot
+  produce a persistable value at all.
+- **`RunContext` carries the run anchor.** `RunContext::for_run(run_id)` for events inside
+  a backup run (`run_id` is `Option`, `None` when the state DB is unavailable — ADR-102);
+  `RunContext::outside_run()` for sentinel rounds, the pre-run emergency preflight, and
+  drive detection. `run_id: None` is never a silent default — it is only reachable through
+  that explicit constructor.
+- **`UnstampedEvent::stamp(&RunContext) -> Event` is the only bridge.** It sets `run_id`
+  and nothing else — `occurred_at` is the producer's semantic clock and is never
+  overwritten. There is deliberately **no** accessor returning `&Event`: one would hand
+  back a cloneable `Event` and reopen the bypass. `stamp` is
+  `#[must_use = "a dropped stamp() is a discarded event"]`.
+- **Direct `Event` struct literals are read-side only.** An emit path building one by hand
+  is bypassing the stamp, and that is a bug rather than a style preference.
+- **`recorder.rs` is the one path to persistence.** `Recorder` owns the whole dance:
+  stamp every event with the caller's `RunContext`, persist best-effort (a SQLite failure
+  never blocks the caller or suppresses a notification — ADR-102), then dispatch
+  notifications per `DispatchPolicy::{Immediate, GateOnSentinel}`. Notification *content*
+  is always computed caller-side by pure builders; the recorder never invents it.
+
+### `drive_connections`: subsumed, question closed
+
+The Decision section left drive lifecycle open — "either subsumed into events or
+referenced. Resolution belongs to `/design`." It is **subsumed**. `init_schema`
+(`src/state.rs`) migrates any surviving `drive_connections` rows into `events` and drops
+the table; the migration is best-effort (a failure logs and the next run retries) and
+idempotent (a fresh or already-migrated DB skips it). Drive lifecycle now travels as
+`EventPayload::DriveMounted` / `DriveUnmounted`, classified `EventKind::Drive` at
+`Severity::Info`. Nothing reads `drive_connections` any more.
+
+### Open Concern 1 (unbounded growth): accepted, explicitly
+
+`state.rs` contains no `DELETE FROM events`, and none is planned. **Unbounded growth of
+the events table is accepted as a deliberate decision, not an oversight.** Three reasons:
+
+1. **The volume is small.** Events are emitted for non-trivial decisions — retention
+   prunes, planner defers, full-send choices, promise transitions, watchdog and eject
+   firings, drive lifecycle — not for every code path. A nightly run over a handful of
+   subvolumes writes on the order of tens of rows, so a year of nightly operation is on
+   the order of 10^4 rows. That is not a size at which SQLite needs help.
+2. **SQLite is history, not truth (ADR-102).** An operator who wants the table smaller can
+   truncate it with no effect on data safety: the filesystem still says what exists, pin
+   files still say what the chain is, and the next backup runs identically. A retention
+   policy is therefore a convenience, not a safety requirement.
+3. **Automatic deletion is fail-closed territory (ADR-107).** Urd deleting its own audit
+   trail on a schedule is exactly the class of automatic destructive behavior that has
+   burned this project before. If it is ever built, it must be designed — an amendment to
+   this ADR stating what is deleted, on what evidence, and what proves the deletion safe —
+   never added as an incidental cleanup query.
+
+**Revisit trigger.** Reopen this when either holds: `urd.db` exceeds 100 MB, or
+`urd events` becomes perceptibly slow to return a page. Either is a falsifiable signal
+that the volume estimate above was wrong, and the design session starts from measurements
+rather than from this projection.

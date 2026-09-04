@@ -6,7 +6,7 @@ project: ['[[urd]]']
 sensitivity: public
 status: active
 created: '2026-03-28'
-timestamp: '2026-03-28T15:15:38+01:00'
+timestamp: '2026-09-04T15:03:12+02:00'
 ---
 # ADR-112: SemVer Versioning and Release Workflow
 
@@ -15,7 +15,7 @@ timestamp: '2026-03-28T15:15:38+01:00'
 > published via annotated git tags. The `/release` skill automates the workflow.
 
 **Date:** 2026-03-28
-**Status:** Accepted
+**Status:** Accepted (amended 2026-09-04 — see [Amendment 2026-09-04](#amendment-2026-09-04-the-tag-push-future-is-adr-117))
 **Supersedes:** Ad-hoc date-based versioning (`0.3.2026-03-27` style)
 
 ## Context
@@ -132,3 +132,29 @@ Three retroactive tags were created to establish version history:
   breaking on-disk data format changes. Pre-1.0, any MINOR bump may break compatibility.
 - **ADR-111 (Config system):** `config_version` in the config file is a data format
   version, independent of the application SemVer version.
+
+## Amendment 2026-09-04: the tag-push future is ADR-117
+
+Two forward-looking sentences in the Decision section — "Future: GitHub Actions will
+trigger on tag push to create GitHub Releases" under *Git tags*, and the seven-step
+*Release workflow* list that ends at "User pushes manually" — have been realized, and
+what they were pointing at is now specified in full by
+[ADR-117](2026-07-11-ADR-117-release-artifact-contract.md).
+
+Everything this ADR decides still holds: `Cargo.toml` is the single source of truth,
+annotated SSH-signed tags are the release mechanism, `CHANGELOG.md` follows Keep a
+Changelog, and the push is never automated. ADR-117 adds what happens *after* the push,
+and it is a contract rather than an implementation detail:
+
+- Tag push triggers `.github/workflows/release.yml`, which builds a statically linked
+  `x86_64-unknown-linux-musl` binary named `urd-x86_64-linux`, checksums it into a single
+  `SHA256SUMS` manifest, attests it (keyless sigstore build provenance), and attaches both
+  assets to the Release.
+- **CI never creates releases.** The human-driven release flow remains the only publisher,
+  and it creates the Release *without* the *latest* mark, promoting it only after the
+  assets verify — so the `releases/latest/download/` URLs the README carries can never
+  resolve to a failed build.
+- Asset names and those URLs are part of the backward-compatibility surface (ADR-105);
+  renaming one is a breaking change with its own ADR and migration note.
+
+Read the workflow list above as the tag-and-publish half. ADR-117 owns the rest.

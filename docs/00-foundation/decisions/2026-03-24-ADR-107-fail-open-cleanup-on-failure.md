@@ -6,7 +6,7 @@ project: ['[[urd]]']
 sensitivity: public
 status: active
 created: '2026-03-24'
-timestamp: '2026-07-11T09:19:17+02:00'
+timestamp: '2026-09-04T15:03:12+02:00'
 ---
 # ADR-107: Fail-Open for Backups, Clean Up on Failure
 
@@ -16,7 +16,7 @@ timestamp: '2026-07-11T09:19:17+02:00'
 > exception: operations that could delete data fail closed.
 
 **Date:** 2026-03-22 (implicit in Phase 2; crystallized in space estimation review 2026-03-23)
-**Status:** Accepted
+**Status:** Accepted (amended 2026-09-04 — see [Amendment 2026-09-04](#amendment-2026-09-04-partial-cleanup-is-proof-based-not-pin-inferred))
 **Supersedes:** None (crystallized across space estimation and awareness model reviews)
 
 ## Context
@@ -112,3 +112,36 @@ fail-open was constrained to prevent masking a real problem.
 - Awareness model design review (`docs/99-reports/2026-03-23-awareness-model-design-review.md`) —
   clock skew exception
 - Phase 2 journal (`docs/98-journals/2026-03-22-urd-phase02.md`) — crash recovery design
+
+## Amendment 2026-09-04: partial cleanup is proof-based, not pin-inferred
+
+The last paragraph of "Cleanup, not resumption" reads:
+
+> On subsequent startup, the executor checks for pre-existing snapshots at the
+> destination. If the pin file doesn't reference them, they're treated as partials from
+> an interrupted prior run and deleted before proceeding.
+
+That inference is superseded. Absence from the pin file is not evidence of
+incompleteness — a send that completed and then failed to write its pin looks identical
+to an abandoned receive under that rule, and the ADR's own "deletion operations fail
+closed" principle forbids deleting on a guess.
+
+The executor's pre-send sweep (`sweep_abandoned_partials`, `src/executor.rs`) requires
+**proof** instead. Candidates are this subvolume's destination snapshots strictly newer
+than the pin (the pin and everything older are confirmed parents by construction; with no
+pin file, no sweep runs at all). A candidate is deleted only when
+`BtrfsRead::received_uuid` returns `None` — the destination subvolume has no
+`Received UUID`, which means `btrfs receive` never finalized it. A **present** UUID means
+a completed send whose pin write failed: that snapshot is logged and left alone. A failed
+UUID query skips the candidate.
+
+Presence of the `Received UUID` is the only positive proof a destination snapshot is a
+complete backup, and its absence the only positive proof it is not. Grounding the sweep
+there makes it fail closed on every uncertainty — an unreadable pin file, an unlistable
+destination directory, an unparseable name, or a failing query all mean *sweep nothing* —
+while the old heuristic failed open in the one direction a backup tool cannot afford.
+
+The sweep also keeps the awareness model honest: promise freshness reads destination
+snapshot listings, so an unswept partial would count as a real backup and mask staleness.
+`urd verify` does not check `Received UUID` today; adding it there would be defense in
+depth, not a substitute.
