@@ -304,10 +304,6 @@ pub enum UrdError {
     #[error("Thread error: {0}")]
     Chain(String),
 
-    #[error("Retention error: {0}")]
-    #[allow(dead_code)]
-    Retention(String),
-
     #[error("btrfs command failed: {context}")]
     Btrfs { context: BtrfsErrorContext },
 
