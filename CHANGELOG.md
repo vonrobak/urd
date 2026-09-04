@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- The voice contract (`voice_contract.rs`) now exercises the `urd
+  emergency` renderers in full and 15 of the onboarding/earning-flow
+  renderers in `voice/encounter.rs` — the incident and root-granting
+  surfaces where a miscalibrated line matters most — under the
+  no-falsehood, first-line, and gravity-calibration rules. Test-only;
+  no renderer prose changed (#386).
+
 ### Fixed
 - The default webhook notification body is now built with `serde_json`
   instead of hand-escaping only double quotes, so a title or body
