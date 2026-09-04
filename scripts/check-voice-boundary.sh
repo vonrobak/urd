@@ -18,9 +18,10 @@
 # src/voice_contract.rs is exempt: it is the voice's own golden-test suite, asserting on
 # rendered output, and lives outside the directory only because it spans every renderer.
 #
-# TODO(#384): the sibling guards from the same issue land once parts 2 and 3 merge —
-#   no `colored::Colorize` use in src/commands/, and no `Local::now()` / `Utc::now()`
-#   in src/voice/ non-test code.
+# Two sibling guards from the same issue hold the boundary from the other directions:
+# no `colored` styling in src/commands/ (a command handler prints what voice returns —
+# it never colors), and no wall clock in src/voice/ (a renderer is a pure function of
+# its input; the caller passes `now`, so every renderer stays golden-testable).
 #
 # Usage: scripts/check-voice-boundary.sh
 #   exit 0 = clean, exit 1 = violations found.
@@ -30,31 +31,51 @@ set -euo pipefail
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "$REPO_ROOT"
 
-# The frozen voice vocabulary (glossary → "Cluster: Voice labels").
-pattern='"(sealed|waning|exposed)"'
+status=0
 
-# Files searched: all Rust sources outside the presentation layer, minus the exemption.
-mapfile -t targets < <(
+# lint <label> <pattern> <file...>: report code lines (whole-line comments stripped)
+# matching the pattern; sets status=1 on any hit.
+lint() {
+    local label="$1" pattern="$2"; shift 2
+    if [[ $# -eq 0 ]]; then
+        echo "FAIL: no files to lint for ${label} — is this the repo root?"
+        status=1
+        return
+    fi
+    local hits
+    hits="$(grep -nE "$pattern" "$@" | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' || true)"
+    if [[ -n "$hits" ]]; then
+        echo "ERROR: ${label}:"
+        printf '%s\n' "$hits" | sed 's/^/       /'
+        status=1
+    else
+        echo "PASS: ${label} ($# file(s))."
+    fi
+}
+
+# 1. The frozen voice vocabulary (glossary → "Cluster: Voice labels") stays inside
+#    src/voice/. Identifiers (`sealed_count`) are untouched; only a string literal counts.
+mapfile -t outside_voice < <(
     find src -name '*.rs' -not -path 'src/voice/*' -not -path 'src/voice_contract.rs' | sort
 )
+lint "no mythic voice labels outside src/voice/" '"(sealed|waning|exposed)"' "${outside_voice[@]}"
 
-if [[ ${#targets[@]} -eq 0 ]]; then
-    echo "FAIL: no Rust sources found outside src/voice/ — is this the repo root?"
-    exit 1
-fi
+# 2. Command handlers never color: no `colored` import or styling call in src/commands/.
+mapfile -t commands < <(find src/commands -name '*.rs' | sort)
+lint "no colored output in src/commands/" \
+    'colored::|\.(bold|dimmed|italic|underline|red|green|yellow|blue|cyan|magenta|white|bright_[a-z]+)\(\)' \
+    "${commands[@]}"
 
-# `grep -n` emits `file:line:content`; drop the hits whose content is a whole-line
-# comment, so prose that quotes the vocabulary does not trip the lint.
-hits="$(grep -nE "$pattern" "${targets[@]}" | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' || true)"
+# 3. Renderers never read the clock: no `Local::now()` / `Utc::now()` in src/voice/.
+#    Test modules are not exempt on purpose — a test that reads the wall clock is a
+#    flaky golden, which is the same defect one step removed.
+mapfile -t voice < <(find src/voice -name '*.rs' | sort)
+lint "no wall clock in src/voice/" '(Local|Utc)::now\(' "${voice[@]}"
 
-if [[ -n "$hits" ]]; then
-    echo "ERROR: mythic voice labels found outside src/voice/:"
-    printf '%s\n' "$hits" | sed 's/^/       /'
+if [[ $status -ne 0 ]]; then
     echo
-    echo "FAIL: 'sealed' / 'waning' / 'exposed' are presentation, not data. Carry the"
-    echo "      PromiseStatus instead and let voice/mod.rs::exposure_label choose the word."
+    echo "FAIL: the voice boundary is crossed. Presentation (words, color) belongs in"
+    echo "      src/voice/; data (PromiseStatus, ages, 'now') is what crosses into it."
     exit 1
 fi
-
-echo "Linted ${#targets[@]} Rust source(s) outside src/voice/ for voice-label leaks."
-echo "PASS: No mythic voice labels outside the presentation layer."
+echo "PASS: voice boundary holds."
