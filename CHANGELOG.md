@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- The default webhook notification body is now built with `serde_json`
+  instead of hand-escaping only double quotes, so a title or body
+  containing a backslash, newline, tab, or other control character
+  produces valid JSON instead of a silently malformed payload — the exact
+  content that shows up in watchdog and storage-pressure alerts (#379).
+
 ## [0.36.0] - 2026-09-03
 
 ### Added
