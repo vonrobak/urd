@@ -566,21 +566,30 @@ pub fn parse_subvolume_list(output: &str) -> crate::error::Result<Vec<PathBuf>> 
     Ok(paths)
 }
 
+/// The `sudo -n <btrfs_path> subvolume show <path>` invocation, built apart
+/// from running it so a test can assert the *configured* binary reaches the
+/// command line without needing sudo.
+///
+/// `-n`: never prompt. Reachable pre-grant from `urd status`/`doctor`/`plan`
+/// (via `subvolume_generation`) on a configured-but-unsealed machine —
+/// without `-n` this pops an interactive PIN+FIDO prompt from a read-only
+/// fail-open call (field visit 2026-07-06, #274). Callers already treat an
+/// Err here as "no generation info" and proceed without the optimization.
+fn show_command(btrfs_path: &str, path: &Path) -> Command {
+    let mut cmd = Command::new("sudo");
+    cmd.env("LC_ALL", "C")
+        .arg("-n")
+        .arg(btrfs_path)
+        .args(["subvolume", "show"])
+        .arg(path);
+    cmd
+}
+
 /// Run `sudo btrfs subvolume show` and return its stdout. Shared by the
 /// `BtrfsRead` field readers (`subvolume_generation`, `received_uuid`) — one
 /// invocation, one sudoers surface.
-fn subvolume_show(path: &Path) -> crate::error::Result<String> {
-    // `-n`: never prompt. Reachable pre-grant from `urd status`/`doctor`/`plan`
-    // (via `subvolume_generation`) on a configured-but-unsealed machine —
-    // without `-n` this pops an interactive PIN+FIDO prompt from a read-only
-    // fail-open call (field visit 2026-07-06, #274). Callers already treat an
-    // Err here as "no generation info" and proceed without the optimization.
-    let output = Command::new("sudo")
-        .env("LC_ALL", "C")
-        .arg("-n")
-        .arg("btrfs")
-        .args(["subvolume", "show"])
-        .arg(path)
+fn subvolume_show(btrfs_path: &str, path: &Path) -> crate::error::Result<String> {
+    let output = show_command(btrfs_path, path)
         .output()
         .map_err(|e| UrdError::btrfs_spawn(BtrfsOperation::Show, e.to_string()))?;
 
@@ -600,7 +609,7 @@ impl BtrfsRead for RealBtrfs {
     ///
     /// All btrfs subprocess calls remain in `btrfs.rs` (invariant #2).
     fn subvolume_generation(&self, path: &Path) -> crate::error::Result<u64> {
-        let stdout = subvolume_show(path)?;
+        let stdout = subvolume_show(&self.btrfs_path, path)?;
         parse_generation(&stdout).ok_or_else(|| {
             UrdError::btrfs_spawn(
                 BtrfsOperation::Show,
@@ -610,7 +619,7 @@ impl BtrfsRead for RealBtrfs {
     }
 
     fn received_uuid(&self, path: &Path) -> crate::error::Result<Option<String>> {
-        let stdout = subvolume_show(path)?;
+        let stdout = subvolume_show(&self.btrfs_path, path)?;
         Ok(parse_received_uuid(&stdout))
     }
 
@@ -1121,6 +1130,30 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("mock: create snapshot failed")
+        );
+    }
+
+    #[test]
+    fn subvolume_show_uses_the_configured_btrfs_path() {
+        // Every other invocation in this file passes `self.btrfs_path`; the
+        // read-only `subvolume show` used to hardcode "btrfs", so a host with
+        // the binary anywhere but the default path silently lost the
+        // generation and received-UUID reads (#387).
+        let cmd = show_command("/opt/btrfs-progs/bin/btrfs", Path::new("/data/sv1"));
+        assert_eq!(cmd.get_program(), "sudo");
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "-n",
+                "/opt/btrfs-progs/bin/btrfs",
+                "subvolume",
+                "show",
+                "/data/sv1"
+            ]
         );
     }
 
