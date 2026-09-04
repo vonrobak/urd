@@ -537,26 +537,33 @@ impl StateDb {
             .map_err(|e| UrdError::State(format!("failed to read operations: {e}")))
     }
 
-    /// Get the bytes_transferred from the most recent successful send of a given type
-    /// for a subvolume to a specific drive. Returns None if no matching history exists.
-    pub fn last_successful_send_size(
+    /// Bytes transferred by the most recent send of `send_type` for `subvol`
+    /// that ended in `result` (`"success"` / `"failure"`), optionally narrowed
+    /// to one drive. `None` when no matching operation recorded a byte count.
+    ///
+    /// The four public readers below are this query with its two axes pinned:
+    /// success or failure, one drive or any drive. `NULL` for `drive` disables
+    /// the drive predicate rather than matching a NULL `drive_label`.
+    fn send_size(
         &self,
         subvol: &str,
-        drive: &str,
+        drive: Option<&str>,
         send_type: &str,
+        result: &str,
     ) -> crate::error::Result<Option<u64>> {
         let mut stmt = self
             .conn
             .prepare(
                 "SELECT bytes_transferred FROM operations
-                 WHERE subvolume = ?1 AND drive_label = ?2 AND operation = ?3
-                   AND result = 'success' AND bytes_transferred IS NOT NULL
+                 WHERE subvolume = ?1 AND operation = ?2 AND result = ?3
+                   AND bytes_transferred IS NOT NULL
+                   AND (?4 IS NULL OR drive_label = ?4)
                  ORDER BY id DESC LIMIT 1",
             )
             .map_err(|e| UrdError::State(format!("query failed: {e}")))?;
 
         let mut rows = stmt
-            .query_map(rusqlite::params![subvol, drive, send_type], |row| {
+            .query_map(rusqlite::params![subvol, send_type, result, drive], |row| {
                 let bytes: i64 = row.get(0)?;
                 Ok(bytes as u64)
             })
@@ -570,6 +577,17 @@ impl StateDb {
     }
 
     /// Get the bytes_transferred from the most recent successful send of a given type
+    /// for a subvolume to a specific drive. Returns None if no matching history exists.
+    pub fn last_successful_send_size(
+        &self,
+        subvol: &str,
+        drive: &str,
+        send_type: &str,
+    ) -> crate::error::Result<Option<u64>> {
+        self.send_size(subvol, Some(drive), send_type, "success")
+    }
+
+    /// Get the bytes_transferred from the most recent successful send of a given type
     /// for a subvolume across **all** drives. Returns None if no matching history exists.
     /// Used as a cross-drive fallback when the target drive has no history (e.g., drive swap).
     pub fn last_successful_send_size_any_drive(
@@ -577,28 +595,7 @@ impl StateDb {
         subvol: &str,
         send_type: &str,
     ) -> crate::error::Result<Option<u64>> {
-        let mut stmt = self
-            .conn
-            .prepare(
-                "SELECT bytes_transferred FROM operations
-                 WHERE subvolume = ?1 AND operation = ?2
-                   AND result = 'success' AND bytes_transferred IS NOT NULL
-                 ORDER BY id DESC LIMIT 1",
-            )
-            .map_err(|e| UrdError::State(format!("query failed: {e}")))?;
-
-        let mut rows = stmt
-            .query_map(rusqlite::params![subvol, send_type], |row| {
-                let bytes: i64 = row.get(0)?;
-                Ok(bytes as u64)
-            })
-            .map_err(|e| UrdError::State(format!("query failed: {e}")))?;
-
-        match rows.next() {
-            Some(Ok(size)) => Ok(Some(size)),
-            Some(Err(e)) => Err(UrdError::State(format!("failed to read send size: {e}"))),
-            None => Ok(None),
-        }
+        self.send_size(subvol, None, send_type, "success")
     }
 
     /// Get the timestamp of the most recent successful send (full or incremental)
@@ -820,28 +817,7 @@ impl StateDb {
         drive: &str,
         send_type: &str,
     ) -> crate::error::Result<Option<u64>> {
-        let mut stmt = self
-            .conn
-            .prepare(
-                "SELECT bytes_transferred FROM operations
-                 WHERE subvolume = ?1 AND drive_label = ?2 AND operation = ?3
-                   AND result = 'failure' AND bytes_transferred IS NOT NULL
-                 ORDER BY id DESC LIMIT 1",
-            )
-            .map_err(|e| UrdError::State(format!("query failed: {e}")))?;
-
-        let mut rows = stmt
-            .query_map(rusqlite::params![subvol, drive, send_type], |row| {
-                let bytes: i64 = row.get(0)?;
-                Ok(bytes as u64)
-            })
-            .map_err(|e| UrdError::State(format!("query failed: {e}")))?;
-
-        match rows.next() {
-            Some(Ok(size)) => Ok(Some(size)),
-            Some(Err(e)) => Err(UrdError::State(format!("failed to read send size: {e}"))),
-            None => Ok(None),
-        }
+        self.send_size(subvol, Some(drive), send_type, "failure")
     }
 
     /// Get the bytes_transferred from the most recent failed send of a given type
@@ -852,28 +828,7 @@ impl StateDb {
         subvol: &str,
         send_type: &str,
     ) -> crate::error::Result<Option<u64>> {
-        let mut stmt = self
-            .conn
-            .prepare(
-                "SELECT bytes_transferred FROM operations
-                 WHERE subvolume = ?1 AND operation = ?2
-                   AND result = 'failure' AND bytes_transferred IS NOT NULL
-                 ORDER BY id DESC LIMIT 1",
-            )
-            .map_err(|e| UrdError::State(format!("query failed: {e}")))?;
-
-        let mut rows = stmt
-            .query_map(rusqlite::params![subvol, send_type], |row| {
-                let bytes: i64 = row.get(0)?;
-                Ok(bytes as u64)
-            })
-            .map_err(|e| UrdError::State(format!("query failed: {e}")))?;
-
-        match rows.next() {
-            Some(Ok(size)) => Ok(Some(size)),
-            Some(Err(e)) => Err(UrdError::State(format!("failed to read send size: {e}"))),
-            None => Ok(None),
-        }
+        self.send_size(subvol, None, send_type, "failure")
     }
 
     // ── Drive connection methods ─────────────────────────────────────
@@ -2019,6 +1974,38 @@ mod tests {
             db.last_successful_send_size_any_drive("sv1", "send_full")
                 .unwrap(),
             Some(200_000)
+        );
+    }
+
+    #[test]
+    fn drive_scoped_query_ignores_rows_without_a_drive_label() {
+        // The shared `send_size` query disables its drive predicate on NULL
+        // rather than matching a NULL `drive_label`: a drive-scoped read must
+        // never claim a driveless operation's bytes as that drive's history.
+        let db = StateDb::open_memory().unwrap();
+        let run_id = db.begin_run("full").unwrap();
+
+        db.record_operation(&OperationRecord {
+            run_id,
+            subvolume: "sv1".to_string(),
+            operation: "send_full".to_string(),
+            drive_label: None,
+            duration_secs: Some(10.0),
+            result: "success".to_string(),
+            error_message: None,
+            bytes_transferred: Some(100_000),
+        })
+        .unwrap();
+
+        assert_eq!(
+            db.last_successful_send_size("sv1", "DriveA", "send_full")
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            db.last_successful_send_size_any_drive("sv1", "send_full")
+                .unwrap(),
+            Some(100_000)
         );
     }
 
