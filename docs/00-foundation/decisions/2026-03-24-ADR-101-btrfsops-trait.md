@@ -138,12 +138,10 @@ callers want out of `btrfs subvolume show` are exposed as `subvolume_generation`
 > `sudo -n -l` privilege-listing probe.
 
 `grep -rn "Command::new" src/` finds 35 sites. Ten are in `btrfs.rs`: eight
-`sudo -n btrfs …` invocations serving the two traits (seven through the configured
-`btrfs_path`; the eighth is the shared `subvolume show` reader behind
-`subvolume_generation` and `received_uuid`, which spells the binary name literally), one
-unprivileged `btrfs send --help` capability probe, and one `sudo -n true` availability
-gate inside `#[cfg(test)]`. The other 25 sites (23 outside test modules) spawn other
-binaries and perform no backup work:
+`sudo -n btrfs …` invocations serving the two traits, through the configured
+`btrfs_path`; one unprivileged `btrfs send --help` capability probe; and one
+`sudo -n true` availability gate inside `#[cfg(test)]`. The other 25 sites (23 outside
+test modules) spawn other binaries and perform no backup work:
 
 | Where | Production sites | What |
 |---|---|---|

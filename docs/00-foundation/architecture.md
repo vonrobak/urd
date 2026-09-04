@@ -126,11 +126,12 @@ ADR in parentheses is the canonical statement (full list of invariants in
    the planner or the surfaces, but never mutate.
 
 2. **Every btrfs call goes through one trait (ADR-101).** `BtrfsOps` is the only
-   path to `sudo btrfs`. No other module spawns subprocesses. Read-only
-   generation reads go through the `BtrfsRead` supertrait (`BtrfsOps: BtrfsRead`)
-   so pure planners get a non-mutating seam. Tests inject `MockBtrfs`; production
-   injects the real wrapper. The trait is a hard boundary — it makes the
-   executor's blast radius auditable in one file.
+   path to `sudo btrfs`. No other module invokes the btrfs binary to do work; the only
+   other privileged subprocesses are the sudoers earning in `commands/seal.rs` and the
+   `sudo -n -l` probe. Read-only generation reads go through the `BtrfsRead`
+   supertrait (`BtrfsOps: BtrfsRead`) so pure planners get a non-mutating seam.
+   Tests inject `MockBtrfs`; production injects the real wrapper. The trait is a
+   hard boundary — it makes the executor's blast radius auditable in one file.
 
 3. **Filesystem is truth, SQLite is history (ADR-102).** Pin files and snapshot
    directories are authoritative for "what exists." The state DB records what
