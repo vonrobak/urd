@@ -5454,7 +5454,6 @@ mod tests {
         let h = crate::recommendation::headroom_aware_pointer_only(
             &cur,
             crate::recommendation::ShapeRole::Local,
-            crate::recommendation::HeadroomSeverity::Pressure,
             crate::recommendation::AdjustmentReason::SourcePoolLow { free_ratio: 0.10 },
         );
         let view = crate::output::DoctorRecommendationView {
@@ -5530,7 +5529,6 @@ mod tests {
         let h = crate::recommendation::headroom_aware_pointer_only(
             &cur,
             crate::recommendation::ShapeRole::Local,
-            crate::recommendation::HeadroomSeverity::Pressure,
             crate::recommendation::AdjustmentReason::SourcePoolLow { free_ratio: 0.10 },
         );
         let view = crate::output::DoctorRecommendationView {

@@ -48,6 +48,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its lock no longer loses that firing either — the teardown recovers the
   poisoned slot, so the tripped pool still gets its emergency reclaim, its
   event, and its notification (#381).
+- The pointer-only recommendation `urd doctor --thorough` emits for a
+  subvolume under source-pool pressure is now Pressure-only by
+  construction, rather than by a debug-only assertion that release builds
+  skipped. The quality gate (`scripts/check.sh` and CI) now also runs the
+  test suite under the release profile, so a debug/release behaviour gap
+  cannot reopen unnoticed (#380).
 
 ## [0.36.0] - 2026-09-03
 

@@ -2,7 +2,9 @@
 # check.sh — the /check quality gate as one command with a compact roll-up.
 #
 # Gates, in order: clippy (--all-targets, warnings are errors), unit tests,
-# release build, then the present-not-journey doc lint (independent of
+# release-mode tests (also builds the release binary; debug assertions are
+# off here, closing the gap `debug_assert!`/`#[should_panic]` can hide in
+# debug-only runs), then the present-not-journey doc lint (independent of
 # compilation, always runs). Prints one verdict line per gate plus a test
 # count computed from cargo's own summary lines — never hand-typed.
 #
@@ -72,13 +74,15 @@ fi
 if run_gate "clippy" "$WORK/clippy.log" cargo clippy --all-targets -- -D warnings; then
     if run_gate "tests" "$WORK/tests.log" cargo test; then
         LINES[1]="$(printf '%-9s PASS  %s' "tests" "$(test_counts "$WORK/tests.log")")"
-        run_gate "build" "$WORK/build.log" cargo build --release || true
+        if run_gate "release" "$WORK/release.log" cargo test --release; then
+            LINES[2]="$(printf '%-9s PASS  %s' "release" "$(test_counts "$WORK/release.log")")"
+        fi
     else
-        LINES+=("$(printf '%-9s SKIP  (tests failed)' "build")")
+        LINES+=("$(printf '%-9s SKIP  (tests failed)' "release")")
     fi
 else
     LINES+=("$(printf '%-9s SKIP  (clippy failed)' "tests")")
-    LINES+=("$(printf '%-9s SKIP  (clippy failed)' "build")")
+    LINES+=("$(printf '%-9s SKIP  (clippy failed)' "release")")
 fi
 
 run_gate "doc-lint" "$WORK/doclint.log" ./scripts/check-present-not-journey.sh || true
