@@ -755,14 +755,36 @@ fn dispatch_webhook(notification: &Notification, url: &str, template: Option<&st
     }
 }
 
+/// Wire shape for the default webhook payload. A plain struct (rather than
+/// `serde_json::json!`) so field order is guaranteed without depending on
+/// serde_json's `preserve_order` feature.
+#[derive(Serialize)]
+struct WebhookPayload<'a> {
+    title: &'a str,
+    body: &'a str,
+    urgency: Urgency,
+}
+
 fn default_webhook_body(notification: &Notification) -> String {
-    // Simple JSON payload compatible with most webhook receivers
-    format!(
-        r#"{{"title":"{}","body":"{}","urgency":"{}"}}"#,
-        notification.title.replace('"', "\\\""),
-        notification.body.replace('"', "\\\""),
-        notification.urgency,
-    )
+    // Simple JSON payload compatible with most webhook receivers. Built via
+    // serde_json so title/body are escaped correctly for any content
+    // (backslashes, newlines, control characters), not just double quotes.
+    let payload = WebhookPayload {
+        title: &notification.title,
+        body: &notification.body,
+        urgency: notification.urgency,
+    };
+    serde_json::to_string(&payload).unwrap_or_else(|e| {
+        // Serializing a struct of String/enum fields cannot fail in
+        // practice; this fallback exists only to avoid unwrap() in
+        // library code. It still carries the real urgency rather than a
+        // hard-coded "info", so a critical alert doesn't get silently
+        // downgraded if this branch ever fires — Urgency's Display output
+        // is plain lowercase ASCII, so it's always safe to inline
+        // unescaped. The failure itself is logged so it isn't silent.
+        log::error!("Failed to serialize webhook payload: {e}");
+        format!(r#"{{"title":"","body":"","urgency":"{}"}}"#, notification.urgency)
+    })
 }
 
 fn dispatch_command(notification: &Notification, path: &PathBuf, args: &[String]) -> bool {
@@ -1421,6 +1443,26 @@ mod tests {
         let body = default_webhook_body(&notification);
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed["urgency"], "critical");
+    }
+
+    #[test]
+    fn webhook_body_escapes_special_characters() {
+        // Backslash, newline, tab, double quote, and a non-ASCII character —
+        // a hand-escaped format! that only handles `"` mangles all of these.
+        let title = "back\\slash \"quoted\" title";
+        let body = "line one\nline two\twith tab and caf\u{e9}";
+        let notification = Notification {
+            event: NotificationEvent::AllUnprotected,
+            urgency: Urgency::Warning,
+            title: title.to_string(),
+            body: body.to_string(),
+        };
+        let serialized = default_webhook_body(&notification);
+        let parsed: serde_json::Value = serde_json::from_str(&serialized)
+            .expect("webhook body must be valid JSON even with special characters");
+        assert_eq!(parsed["title"], title);
+        assert_eq!(parsed["body"], body);
+        assert_eq!(parsed["urgency"], "warning");
     }
 
     // ── Drive reconnection notifications ──────────────────────────────
