@@ -4,13 +4,14 @@
 # Gates, in order: clippy (--all-targets, warnings are errors), unit tests,
 # release-mode tests (also builds the release binary; debug assertions are
 # off here, closing the gap `debug_assert!`/`#[should_panic]` can hide in
-# debug-only runs), then the present-not-journey doc lint (independent of
-# compilation, always runs). Prints one verdict line per gate plus a test
+# debug-only runs), then two source-text lints — present-not-journey for the
+# governed docs and the voice-boundary guard for src/. Both are independent of
+# compilation and always run. Prints one verdict line per gate plus a test
 # count computed from cargo's own summary lines — never hand-typed.
 #
 # On the green path only the roll-up is printed. When a gate fails, its full
 # output is replayed after the roll-up (the fix needs it); cargo gates after
-# a failed cargo gate are skipped, the doc lint still runs, exit code is 1.
+# a failed cargo gate are skipped, the text lints still run, exit code is 1.
 #
 # Usage: scripts/check.sh [test-filter]
 #   With a filter, runs only `cargo test <filter>` and reports that one gate.
@@ -86,5 +87,6 @@ else
 fi
 
 run_gate "doc-lint" "$WORK/doclint.log" ./scripts/check-present-not-journey.sh || true
+run_gate "voice" "$WORK/voice.log" ./scripts/check-voice-boundary.sh || true
 
 finish

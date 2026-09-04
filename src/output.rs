@@ -7,7 +7,7 @@ use std::io::IsTerminal;
 
 use serde::{Deserialize, Serialize};
 
-use crate::advice::{ActionableAdvice, RedundancyAdvisory, RedundancyAdvisoryKind};
+use crate::advice::{ActionableAdvice, AdviceIssue, RedundancyAdvisory, RedundancyAdvisoryKind};
 use crate::awareness::{DriveAssessment, PromiseStatus, SubvolAssessment};
 use crate::config::ResolvedSubvolume;
 use crate::rotation::WindowSource;
@@ -659,8 +659,12 @@ pub struct EmergencyResult {
 /// v2 has `local: Option<HeadroomAwareRecommendation>` (nested
 /// `.recommendation` plus headroom fields). v3 (#125) adds the optional
 /// `retention_checks` array (orphan/legacy pin advisories; absent when empty).
+/// v4 (#384) retypes each `data_safety[].issue` from a rendered sentence to a
+/// structured `AdviceIssue` object — `{"status": "AT RISK", "detail": {"kind":
+/// "stale", ...}}` — so the JSON carries the semantic promise name and a tagged
+/// issue shape instead of the interactive voice label.
 /// Bump for any future breaking JSON shape change; document in CHANGELOG.
-pub const DOCTOR_OUTPUT_SCHEMA_VERSION: u32 = 3;
+pub const DOCTOR_OUTPUT_SCHEMA_VERSION: u32 = 4;
 
 /// Full output for the `urd doctor` command.
 #[derive(Debug, Serialize)]
@@ -867,8 +871,11 @@ pub struct DoctorDataSafety {
     /// Promise status (serializes SCREAMING: "PROTECTED" / "AT RISK" / "UNPROTECTED").
     pub status: PromiseStatus,
     pub health: String,
+    /// What is wrong, structured (schema v4). `voice::render_advice_issue`
+    /// turns it into the line `urd doctor` prints; JSON consumers read
+    /// `issue.status` and `issue.detail.kind` instead of parsing prose.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub issue: Option<String>,
+    pub issue: Option<AdviceIssue>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub suggestion: Option<String>,
     /// Why this command is suggested, or what physical action to take.
@@ -2785,7 +2792,7 @@ source = "/data/sv2"
             verdict: DoctorVerdict::healthy(),
         };
         let value = serde_json::to_value(&output).unwrap();
-        assert_eq!(value.get("schema_version"), Some(&serde_json::Value::from(3)));
+        assert_eq!(value.get("schema_version"), Some(&serde_json::Value::from(4)));
         // Empty retention_checks is omitted from JSON (no false gravity, #125).
         assert_eq!(value.get("retention_checks"), None);
     }

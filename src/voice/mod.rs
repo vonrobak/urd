@@ -11,6 +11,7 @@ use std::fmt::Write;
 
 use colored::Colorize;
 
+use crate::advice::{AdviceIssue, IssueDetail};
 use crate::awareness::{OperationalHealth, PromiseStatus};
 use crate::output::{SkipCategory, VerifyCheck, VerifyOutput};
 // Test-only imports — moved-renderer types still referenced by parent tests
@@ -125,6 +126,71 @@ pub(super) fn exposure_label(status: PromiseStatus) -> String {
         PromiseStatus::Protected => "sealed".to_string(),
         PromiseStatus::AtRisk => "waning".to_string(),
         PromiseStatus::Unprotected => "exposed".to_string(),
+    }
+}
+
+/// Render an [`AdviceIssue`] as the phrase interactive surfaces print
+/// ("waning — last external send 2 days ago").
+///
+/// The one home of that phrasing. `advice.rs` builds the issue from machine
+/// values alone, so the voice label enters through [`exposure_label`] here and
+/// nowhere else — the glossary's "daemon JSON keeps the semantic names" holds
+/// by construction rather than by discipline.
+pub(super) fn render_advice_issue(issue: &AdviceIssue) -> String {
+    match &issue.detail {
+        IssueDetail::NoExternalDrives => format!(
+            "{} \u{2014} no external drives configured",
+            exposure_label(issue.status)
+        ),
+        IssueDetail::AllDrivesDisconnected => format!(
+            "{} \u{2014} all drives disconnected",
+            exposure_label(issue.status)
+        ),
+        IssueDetail::Stale {
+            external_only,
+            age_secs,
+        } => format!(
+            "{}{}",
+            exposure_label(issue.status),
+            render_age_suffix(*external_only, *age_secs)
+        ),
+        // A broken chain and a documented-absent drive describe operational
+        // health, not the promise — these rows are PROTECTED — so the phrase
+        // leads with "degraded" rather than the exposure label.
+        IssueDetail::ChainBroken { drive } => {
+            format!("degraded \u{2014} thread to {drive} broken")
+        }
+        IssueDetail::DriveAway { drive } => format!("degraded \u{2014} {drive} away"),
+        // No remedy to name. An unwhole promise still earns its label; a broken
+        // one earns the warning that comes with it.
+        IssueDetail::NoAdvice => match issue.status {
+            PromiseStatus::Unprotected => format!(
+                "{} \u{2014} data may not be recoverable",
+                exposure_label(issue.status)
+            ),
+            PromiseStatus::AtRisk | PromiseStatus::Protected => exposure_label(issue.status),
+        },
+    }
+}
+
+/// " — last backup 2 hours ago" / " — last external send 2 days ago",
+/// or empty when no copy's age is known. Days once past a day, hours below it —
+/// truncating, so "2 days ago" means at least two.
+fn render_age_suffix(external_only: bool, age_secs: Option<i64>) -> String {
+    match age_secs {
+        Some(secs) => {
+            let label = if external_only {
+                "last external send"
+            } else {
+                "last backup"
+            };
+            if secs >= 86400 {
+                format!(" \u{2014} {label} {} days ago", secs / 86400)
+            } else {
+                format!(" \u{2014} {label} {} hours ago", secs / 3600)
+            }
+        }
+        None => String::new(),
     }
 }
 
@@ -3053,6 +3119,102 @@ mod tests {
         assert_eq!(exposure_label(PromiseStatus::Unprotected), "exposed");
     }
 
+    /// Byte-for-byte goldens for every issue shape (#384). These strings are
+    /// the ones `urd doctor` printed when the issue was still a preformatted
+    /// `String` built in `advice.rs`; the refactor that moved the phrasing here
+    /// must not have moved a single character of it.
+    #[test]
+    fn render_advice_issue_goldens() {
+        let stale = |status, external_only, age_secs| {
+            AdviceIssue::new(
+                status,
+                IssueDetail::Stale {
+                    external_only,
+                    age_secs,
+                },
+            )
+        };
+
+        // Age-carrying shapes: the exposure label leads, the aged copy follows.
+        assert_eq!(
+            render_advice_issue(&stale(PromiseStatus::AtRisk, false, Some(2 * 3600))),
+            "waning \u{2014} last backup 2 hours ago"
+        );
+        assert_eq!(
+            render_advice_issue(&stale(PromiseStatus::AtRisk, true, Some(48 * 3600))),
+            "waning \u{2014} last external send 2 days ago"
+        );
+        assert_eq!(
+            render_advice_issue(&stale(PromiseStatus::Unprotected, false, Some(2 * 3600))),
+            "exposed \u{2014} last backup 2 hours ago"
+        );
+        // Exactly a day crosses from hours to days.
+        assert_eq!(
+            render_advice_issue(&stale(PromiseStatus::AtRisk, false, Some(86_400))),
+            "waning \u{2014} last backup 1 days ago"
+        );
+        assert_eq!(
+            render_advice_issue(&stale(PromiseStatus::AtRisk, false, Some(86_399))),
+            "waning \u{2014} last backup 23 hours ago"
+        );
+        // No age known: the label alone, never "0 hours ago".
+        assert_eq!(
+            render_advice_issue(&stale(PromiseStatus::AtRisk, false, None)),
+            "waning"
+        );
+
+        assert_eq!(
+            render_advice_issue(&AdviceIssue::new(
+                PromiseStatus::Unprotected,
+                IssueDetail::NoExternalDrives
+            )),
+            "exposed \u{2014} no external drives configured"
+        );
+        assert_eq!(
+            render_advice_issue(&AdviceIssue::new(
+                PromiseStatus::Unprotected,
+                IssueDetail::AllDrivesDisconnected
+            )),
+            "exposed \u{2014} all drives disconnected"
+        );
+
+        // Health-shaped issues lead with "degraded": the promise still holds.
+        assert_eq!(
+            render_advice_issue(&AdviceIssue::new(
+                PromiseStatus::Protected,
+                IssueDetail::ChainBroken {
+                    drive: "WD-18TB".to_string()
+                }
+            )),
+            "degraded \u{2014} thread to WD-18TB broken"
+        );
+        assert_eq!(
+            render_advice_issue(&AdviceIssue::new(
+                PromiseStatus::Protected,
+                IssueDetail::DriveAway {
+                    drive: "WD-18TB1".to_string()
+                }
+            )),
+            "degraded \u{2014} WD-18TB1 away"
+        );
+
+        // Doctor's no-remedy rows.
+        assert_eq!(
+            render_advice_issue(&AdviceIssue::new(
+                PromiseStatus::Unprotected,
+                IssueDetail::NoAdvice
+            )),
+            "exposed \u{2014} data may not be recoverable"
+        );
+        assert_eq!(
+            render_advice_issue(&AdviceIssue::new(
+                PromiseStatus::AtRisk,
+                IssueDetail::NoAdvice
+            )),
+            "waning"
+        );
+    }
+
     /// Pins the colored `exposure_cell` output for every `PromiseStatus`
     /// variant (#305). The old string-relay design (`exposure_label` then a
     /// re-match in `color_exposure_str`) let a future label change silently
@@ -3285,7 +3447,10 @@ mod tests {
             name: "htpc-docs".to_string(),
             status: PromiseStatus::Unprotected,
             health: "blocked".to_string(),
-            issue: Some("exposed — data may not be recoverable".to_string()),
+            issue: Some(AdviceIssue::new(
+                PromiseStatus::Unprotected,
+                IssueDetail::NoAdvice,
+            )),
             suggestion: Some("Run `urd backup` or connect a drive.".to_string()),
             reason: None,
             storage_posture: None,
@@ -3582,7 +3747,10 @@ mod tests {
         let mut data = test_doctor_output();
         data.data_safety[0].status = PromiseStatus::Unprotected;
         data.data_safety[0].health = "blocked".to_string();
-        data.data_safety[0].issue = Some("exposed".to_string());
+        data.data_safety[0].issue = Some(AdviceIssue::new(
+            PromiseStatus::Unprotected,
+            IssueDetail::NoAdvice,
+        ));
         data.verdict = DoctorVerdict::issues(1);
         let output = render_doctor(&data, OutputMode::Interactive);
         assert!(
@@ -3674,7 +3842,13 @@ mod tests {
             name: "htpc-home".to_string(),
             status: PromiseStatus::AtRisk,
             health: "degraded".to_string(),
-            issue: Some("waning — last backup 48 hours ago".to_string()),
+            issue: Some(AdviceIssue::new(
+                PromiseStatus::AtRisk,
+                IssueDetail::Stale {
+                    external_only: false,
+                    age_secs: Some(48 * 3600),
+                },
+            )),
             suggestion: Some("Run `urd backup --force-full --subvolume htpc-home`.".to_string()),
             reason: Some("thread to WD-18TB broken (pin missing locally)".to_string()),
             storage_posture: None,
@@ -3699,7 +3873,10 @@ mod tests {
             name: "htpc-home".to_string(),
             status: PromiseStatus::Unprotected,
             health: "blocked".to_string(),
-            issue: Some("exposed — all drives disconnected".to_string()),
+            issue: Some(AdviceIssue::new(
+                PromiseStatus::Unprotected,
+                IssueDetail::AllDrivesDisconnected,
+            )),
             suggestion: None,
             reason: Some("Connect WD-18TB to restore protection".to_string()),
             storage_posture: None,
