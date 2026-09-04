@@ -1444,28 +1444,11 @@ source = "/"
     }
 
     fn mk_assess(name: &str, posture: Option<StoragePosture>) -> SubvolAssessment {
-        use crate::awareness::{LocalAssessment, OperationalHealth, PromiseStatus};
-        use crate::types::Interval;
+        use crate::awareness::{LocalAssessment, PromiseStatus};
         SubvolAssessment {
-            name: name.to_string(),
-            short_name: name.to_string(),
-            status: PromiseStatus::Protected,
-            health: OperationalHealth::Healthy,
-            health_reasons: vec![],
-            local: LocalAssessment {
-                status: PromiseStatus::Protected,
-                snapshot_count: 1,
-                newest_age: None,
-                configured_interval: Interval::hours(1),
-            },
-            external: vec![],
-            chain_health: vec![],
-            advisories: vec![],
-            redundancy_advisories: vec![],
-            errors: vec![],
+            local: LocalAssessment::fixture(PromiseStatus::Protected, 1, None),
             storage_posture: posture,
-            cadence_adapted: false,
-            effective_send_interval: None,
+            ..SubvolAssessment::fixture(name, PromiseStatus::Protected)
         }
     }
 
@@ -1499,7 +1482,7 @@ source = "/"
         effective_secs: Option<i64>,
         has_external: bool,
     ) -> SubvolAssessment {
-        use crate::awareness::{DriveAssessment, LocalAssessment, OperationalHealth, PromiseStatus};
+        use crate::awareness::{DriveAssessment, LocalAssessment, PromiseStatus};
         use crate::types::{DriveRole, Interval};
         let external = if has_external {
             vec![DriveAssessment {
@@ -1519,26 +1502,12 @@ source = "/"
             vec![]
         };
         SubvolAssessment {
-            name: name.to_string(),
-            short_name: name.to_string(),
-            status,
-            health: OperationalHealth::Healthy,
-            health_reasons: vec![],
-            local: LocalAssessment {
-                status: PromiseStatus::Protected,
-                snapshot_count: 1,
-                newest_age: None,
-                configured_interval: Interval::hours(1),
-            },
+            local: LocalAssessment::fixture(PromiseStatus::Protected, 1, None),
             external,
-            chain_health: vec![],
-            advisories: vec![],
-            redundancy_advisories: vec![],
-            errors: vec![],
-            storage_posture: None,
             cadence_adapted,
             effective_send_interval: effective_secs
                 .map(|s| Interval::from_chrono(chrono::Duration::seconds(s))),
+            ..SubvolAssessment::fixture(name, status)
         }
     }
 

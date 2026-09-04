@@ -48,29 +48,35 @@ pub(super) fn plan_external_send(i: &SendInputs) -> PlanFragment {
         .external_snapshots(drive, &subvol.name)
         .unwrap_or_default();
 
-    // Check send interval
+    // Check send interval. `Some(mins)` exactly when a newest external
+    // snapshot exists and its interval has *not* elapsed — the minutes until
+    // it does. `None` means send: forced, no external snapshot yet (send the
+    // first one), or the interval has elapsed.
     let newest_ext = ext_snaps.iter().max();
-    let should_send = if force || skip_intervals {
-        true
-    } else if let Some(newest) = newest_ext {
-        let elapsed = now.signed_duration_since(newest.datetime());
-        super::interval_elapsed(elapsed, eff.send_interval.as_chrono())
+    let interval_pending_mins = if force || skip_intervals {
+        None
     } else {
-        true // No external snapshots — send first one
+        newest_ext.and_then(|newest| {
+            let elapsed = now.signed_duration_since(newest.datetime());
+            let interval = eff.send_interval.as_chrono();
+            if super::interval_elapsed(elapsed, interval) {
+                None
+            } else {
+                Some((interval - elapsed).num_minutes())
+            }
+        })
     };
 
-    if !should_send {
-        let next_in = eff.send_interval.as_chrono()
-            - now.signed_duration_since(newest_ext.unwrap().datetime());
+    if let Some(mins) = interval_pending_mins {
         f.defer(
             &subvol.name,
             Some(&drive.label),
             format!(
                 "send to {} not due (next in ~{})",
                 drive.label,
-                super::format_duration_short(next_in.num_minutes())
+                super::format_duration_short(mins)
             ),
-            Some(next_in.num_minutes()),
+            Some(mins),
             DeferScope::Drive,
             now,
         );
@@ -109,16 +115,16 @@ pub(super) fn plan_external_send(i: &SendInputs) -> PlanFragment {
 
     // Resolve parent for incremental send
     let pin = obs.fs.read_pin_file(local_dir, &drive.label).unwrap_or(None);
-    let is_incremental = if let Some(ref parent_name) = pin {
-        // Parent must exist both locally and on the external drive
+    // `Some` only when the pinned parent exists both locally and on the
+    // external drive — an incremental send needs both ends of the chain.
+    let incremental_parent = pin.as_ref().filter(|parent_name| {
         let parent_exists_local = local_snaps
             .iter()
             .any(|s| s.as_str() == parent_name.as_str());
         let parent_exists_ext = ext_snaps.iter().any(|s| s.as_str() == parent_name.as_str());
         parent_exists_local && parent_exists_ext
-    } else {
-        false
-    };
+    });
+    let is_incremental = incremental_parent.is_some();
 
     // Space estimation: skip if estimated send size exceeds available space.
     // One cascade (#210/#304): same-drive history > cross-drive history >
@@ -195,8 +201,7 @@ pub(super) fn plan_external_send(i: &SendInputs) -> PlanFragment {
         ))
     };
 
-    if is_incremental {
-        let parent_name = pin.unwrap();
+    if let Some(parent_name) = incremental_parent {
         let parent_path = local_dir.join(parent_name.as_str());
         f.push_operation(PlannedOperation::SendIncremental {
             parent: parent_path,

@@ -105,7 +105,8 @@ pub trait HistoryQuery {
         drive_label: &str,
     ) -> Option<NaiveDateTime>;
 
-    /// Most recent mount/unmount event for a drive from `drive_connections`.
+    /// Most recent mount/unmount event for a drive, from the `events` table
+    /// (`kind='drive'`).
     /// None if no event recorded (drive never seen by sentinel).
     fn last_drive_event(&self, drive_label: &str) -> Option<DriveEvent>;
 

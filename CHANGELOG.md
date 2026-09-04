@@ -45,6 +45,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one shared walk, so they cannot drift apart (#383).
 
 ### Fixed
+- `urd` now honours the configured `btrfs_path` for its read-only `subvolume
+  show` queries too. The generation and received-UUID reads spawned a bare
+  `btrfs`, so on a host where the binary lives outside `PATH` they failed
+  while every other btrfs call succeeded — costing the unchanged-source
+  snapshot skip and the completeness check with no visible error (#387).
 - `urd doctor --thorough` no longer reports "N warnings" when the only thing
   wrong is that a drive is away. Verify's one skipped-check row per absent
   drive used to be counted as a warning, and a warning outranks the

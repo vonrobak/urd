@@ -15,10 +15,12 @@ pub fn run(config: Config, args: RetentionPreviewArgs, mode: OutputMode) -> anyh
     let targets: Vec<_> = if args.all {
         resolved.iter().filter(|sv| sv.enabled).collect()
     } else if let Some(ref name) = args.subvolume {
+        // `require_known_subvolume` above already rejected an unknown name;
+        // this arm is the structural restatement, not a second validation.
         let sv = resolved
             .iter()
             .find(|sv| sv.name == *name)
-            .expect("validated by require_known_subvolume");
+            .ok_or_else(|| anyhow::anyhow!("unknown subvolume: {name}"))?;
         vec![sv]
     } else if resolved.len() == 1 {
         vec![&resolved[0]]

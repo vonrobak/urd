@@ -28,6 +28,18 @@ mod tests;
 #[cfg(test)]
 pub use testkit::MockFileSystemState;
 
+/// Free bytes on the filesystem holding `path`, or `u64::MAX` when the read
+/// fails.
+///
+/// Backups fail open (ADR-107): an unreadable free count must never stand in
+/// for "full". `u64::MAX` reads as unlimited room, so every space guard above
+/// it degrades to a no-op and the snapshot or send proceeds — the opposite
+/// fallback would let one failed `statvfs` quietly stop protecting data.
+/// Deletions fail closed and do not go through here.
+pub(super) fn free_bytes_fail_open(obs: &Observation, path: &Path) -> u64 {
+    obs.fs.filesystem_free_bytes(path).unwrap_or(u64::MAX)
+}
+
 /// Send-space guard (UPI 054-a): returns the defer reason when the source
 /// pool's free space is below the host-survival floor (`min_free +
 /// cleanup_budget` — the same `guard::source_floor_bytes` the mid-op watchdog
@@ -49,7 +61,7 @@ fn send_floor_defer_reason(
 ) -> Option<String> {
     let capacity = obs.fs.filesystem_capacity_bytes(local_dir).unwrap_or(0);
     let floor = crate::guard::source_floor_bytes(subvol.min_free_bytes.unwrap_or(0), capacity);
-    let free = obs.fs.filesystem_free_bytes(local_dir).unwrap_or(u64::MAX);
+    let free = free_bytes_fail_open(obs, local_dir);
     if free < floor {
         use crate::types::ByteSize;
         Some(format!(
@@ -704,10 +716,7 @@ fn exceeds_available_space(
     obs: &Observation,
 ) -> Option<(u64, u64, u64, u64)> {
     let estimated = (raw_bytes as f64 * 1.2) as u64; // 20% safety margin
-    let free = obs
-        .fs
-        .filesystem_free_bytes(&drive.mount_path)
-        .unwrap_or(u64::MAX);
+    let free = free_bytes_fail_open(obs, &drive.mount_path);
     let min_free = drive.min_free_bytes.map(|b| b.bytes()).unwrap_or(0);
     let available = free.saturating_sub(min_free);
     if estimated > available {
@@ -928,14 +937,14 @@ fn drive_record_to_event(record: &crate::state::DriveConnectionRecord) -> Option
         "mounted" => DriveEventKind::Mount,
         "unmounted" => DriveEventKind::Unmount,
         other => {
-            log::warn!("unknown drive_connections.event_type {other:?} — ignoring");
+            log::warn!("unknown drive event_type {other:?} — ignoring");
             return None;
         }
     };
     let at = chrono::NaiveDateTime::parse_from_str(&record.timestamp, "%Y-%m-%dT%H:%M:%S")
         .inspect_err(|e| {
             log::warn!(
-                "failed to parse drive_connections.timestamp {:?}: {e}",
+                "failed to parse drive event timestamp {:?}: {e}",
                 record.timestamp
             );
         })

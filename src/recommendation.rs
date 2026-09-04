@@ -218,12 +218,13 @@ pub enum AdjustmentReason {
 }
 
 impl HeadroomAwareRecommendation {
-    /// Test/fixture helper: wrap a plain `ShapeRecommendation` as a
+    /// Test fixture helper: wrap a plain `ShapeRecommendation` as a
     /// Healthy `HeadroomAwareRecommendation` (no adjustment, no
-    /// tightening). Used by voice tests that pre-date UPI 044, and by
-    /// doctor.rs when no headroom signal is observed.
+    /// tightening). Sole callers are the voice and voice-contract tests
+    /// that pre-date UPI 044 — production always carries a real headroom
+    /// signal, so nothing outside `cfg(test)` builds one of these.
+    #[cfg(test)]
     #[must_use]
-    #[allow(dead_code)]
     pub fn healthy_from(rec: ShapeRecommendation) -> Self {
         Self {
             recommendation: rec,

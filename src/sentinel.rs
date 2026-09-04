@@ -49,8 +49,8 @@ pub enum SentinelAction {
     /// Re-assess promise states, compare with previous, dispatch notifications
     /// if changed, and write the sentinel state file. This is the primary tick.
     Assess,
-    /// Log a drive mount/unmount event. The runner logs and (in Session 3)
-    /// records the event in the drive_connections table.
+    /// Log a drive mount/unmount event. The runner logs it and records it in
+    /// the `events` table (`kind='drive'`).
     LogDriveChange {
         label: String,
         mounted: bool,
@@ -1076,25 +1076,8 @@ mod tests {
 
     fn make_assessment(name: &str, status: PromiseStatus) -> SubvolAssessment {
         SubvolAssessment {
-            name: name.to_string(),
-            short_name: name.to_string(),
-            status,
-            health: OperationalHealth::Healthy,
-            health_reasons: vec![],
-            local: LocalAssessment {
-                status,
-                snapshot_count: 5,
-                newest_age: None,
-                configured_interval: Interval::hours(1),
-            },
-            external: vec![],
-            chain_health: vec![],
-            advisories: vec![],
-            redundancy_advisories: vec![],
-            errors: vec![],
-            storage_posture: None,
-            cadence_adapted: false,
-            effective_send_interval: None,
+            local: LocalAssessment::fixture(status, 5, None),
+            ..SubvolAssessment::fixture(name, status)
         }
     }
 
@@ -1105,17 +1088,7 @@ mod tests {
         drive_status: PromiseStatus,
     ) -> SubvolAssessment {
         SubvolAssessment {
-            name: name.to_string(),
-            short_name: name.to_string(),
-            status,
-            health: OperationalHealth::Healthy,
-            health_reasons: vec![],
-            local: LocalAssessment {
-                status: PromiseStatus::Protected,
-                snapshot_count: 5,
-                newest_age: None,
-                configured_interval: Interval::hours(1),
-            },
+            local: LocalAssessment::fixture(PromiseStatus::Protected, 5, None),
             external: vec![DriveAssessment {
                 drive_label: drive_label.to_string(),
                 status: drive_status,
@@ -1129,13 +1102,7 @@ mod tests {
                 last_activity_age_secs: None,
                 rotation: None,
             }],
-            chain_health: vec![],
-            advisories: vec![],
-            redundancy_advisories: vec![],
-            errors: vec![],
-            storage_posture: None,
-            cadence_adapted: false,
-            effective_send_interval: None,
+            ..SubvolAssessment::fixture(name, status)
         }
     }
 

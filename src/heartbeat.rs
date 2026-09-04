@@ -277,7 +277,7 @@ pub fn mark_dispatched(path: &Path) -> crate::error::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::awareness::{DriveAssessment, LocalAssessment, OperationalHealth, PromiseStatus};
+    use crate::awareness::{DriveAssessment, LocalAssessment, PromiseStatus};
     use crate::config::{
         Config, DefaultsConfig, GeneralConfig, LocalSnapshotsConfig, SnapshotRoot, SubvolumeConfig,
     };
@@ -356,17 +356,11 @@ mod tests {
     fn test_assessments() -> Vec<SubvolAssessment> {
         vec![
             SubvolAssessment {
-                name: "home".to_string(),
-                short_name: "home".to_string(),
-                status: PromiseStatus::Protected,
-                health: OperationalHealth::Healthy,
-                health_reasons: vec![],
-                local: LocalAssessment {
-                    status: PromiseStatus::Protected,
-                    snapshot_count: 24,
-                    newest_age: Some(chrono::Duration::minutes(30)),
-                    configured_interval: Interval::hours(1),
-                },
+                local: LocalAssessment::fixture(
+                    PromiseStatus::Protected,
+                    24,
+                    Some(chrono::Duration::minutes(30)),
+                ),
                 external: vec![DriveAssessment {
                     drive_label: "WD-18TB".to_string(),
                     status: PromiseStatus::Protected,
@@ -380,34 +374,15 @@ mod tests {
                     last_activity_age_secs: None,
                     rotation: None,
                 }],
-                chain_health: vec![],
-                advisories: vec![],
-                redundancy_advisories: vec![],
-                errors: vec![],
-                storage_posture: None,
-                cadence_adapted: false,
-                effective_send_interval: None,
+                ..SubvolAssessment::fixture("home", PromiseStatus::Protected)
             },
             SubvolAssessment {
-                name: "docs".to_string(),
-                short_name: "docs".to_string(),
-                status: PromiseStatus::AtRisk,
-                health: OperationalHealth::Healthy,
-                health_reasons: vec![],
-                local: LocalAssessment {
-                    status: PromiseStatus::AtRisk,
-                    snapshot_count: 5,
-                    newest_age: Some(chrono::Duration::hours(3)),
-                    configured_interval: Interval::hours(1),
-                },
-                external: vec![],
-                chain_health: vec![],
-                advisories: vec![],
-                redundancy_advisories: vec![],
-                errors: vec![],
-                storage_posture: None,
-                cadence_adapted: false,
-                effective_send_interval: None,
+                local: LocalAssessment::fixture(
+                    PromiseStatus::AtRisk,
+                    5,
+                    Some(chrono::Duration::hours(3)),
+                ),
+                ..SubvolAssessment::fixture("docs", PromiseStatus::AtRisk)
             },
         ]
     }

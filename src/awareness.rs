@@ -327,6 +327,41 @@ pub struct SubvolAssessment {
     pub effective_send_interval: Option<Interval>,
 }
 
+#[cfg(test)]
+impl SubvolAssessment {
+    /// Test fixture: a subvolume at `status` with a healthy local history,
+    /// no drives and nothing to say. Call sites state only the axis under
+    /// test via struct-update syntax:
+    ///
+    /// ```ignore
+    /// SubvolAssessment {
+    ///     external: drives,
+    ///     ..SubvolAssessment::fixture("home", PromiseStatus::AtRisk)
+    /// }
+    /// ```
+    ///
+    /// Eleven hand-built literals across the crate used to spell all sixteen
+    /// fields out; a seventeenth field now lands here once (#387).
+    pub(crate) fn fixture(name: &str, status: PromiseStatus) -> Self {
+        Self {
+            name: name.to_string(),
+            short_name: name.to_string(),
+            status,
+            health: OperationalHealth::Healthy,
+            health_reasons: vec![],
+            local: LocalAssessment::fixture(status, 0, None),
+            external: vec![],
+            chain_health: vec![],
+            advisories: vec![],
+            redundancy_advisories: vec![],
+            errors: vec![],
+            storage_posture: None,
+            cadence_adapted: false,
+            effective_send_interval: None,
+        }
+    }
+}
+
 /// Per-subvolume raw storage signal fed into `assess()` (UPI 031-a). Resolved
 /// by the command layer (`commands/storage_signals.rs`) from `pools::pool_space`
 /// (free-ratio), `findmnt /` (host-root), and the persisted prior armed tier;
@@ -468,6 +503,25 @@ pub struct LocalAssessment {
     pub configured_interval: Interval,
 }
 
+#[cfg(test)]
+impl LocalAssessment {
+    /// Test fixture. Every hand-built fixture in the crate declared the same
+    /// one-hour interval, so only the three axes tests actually vary are
+    /// parameters.
+    pub(crate) fn fixture(
+        status: PromiseStatus,
+        snapshot_count: usize,
+        newest_age: Option<Duration>,
+    ) -> Self {
+        Self {
+            status,
+            snapshot_count,
+            newest_age,
+            configured_interval: Interval::hours(1),
+        }
+    }
+}
+
 /// Per-offsite-drive rotation context, carried alongside the per-copy
 /// `status` for UPI 056's forecast voice. **Forecast/cadence context only —
 /// deliberately no `tier`.** Gravity has exactly one source, the per-copy
@@ -523,19 +577,17 @@ pub struct DriveAssessment {
     #[allow(dead_code)] // consumed by verbose status display (future)
     pub configured_interval: Interval,
     pub role: DriveRole,
-    /// Seconds since the drive's last `Unmount` event in `drive_connections`,
+    /// Seconds since the drive's last `Unmount` event in the `events` table,
     /// populated only when the drive is currently unmounted AND the most
     /// recent physical event is an Unmount. Rule 1 of the voice contract:
     /// stay silent when the sentinel missed the disconnect (last event is
     /// Mount but drive is unmounted) — fall through to activity or silence.
-    #[allow(dead_code)] // consumed via StatusDriveAssessment by voice.rs
     pub absent_duration_secs: Option<i64>,
     /// Seconds since the most recent successful operation targeting this
     /// drive in the operations log. Populated only when the drive is
-    /// unmounted AND `drive_connections` holds *no* events for this drive
+    /// unmounted AND the `events` table holds *no* drive events for this drive
     /// at all — the drive predates sentinel observation. Never mixed with
     /// `absent_duration_secs`.
-    #[allow(dead_code)] // consumed via StatusDriveAssessment by voice.rs
     pub last_activity_age_secs: Option<i64>,
     /// Rotation context for an offsite drive (UPI 056): cadence, last
     /// homecoming, and the pre-computed homecoming forecast. `None` for
@@ -4007,7 +4059,7 @@ send_enabled = false
 
     #[test]
     fn drive_assessment_last_activity_from_ops_log_when_no_event() {
-        // drive_connections empty for this drive → fall through to operations log.
+        // No drive events for this drive → fall through to the operations log.
         let config = test_config();
         let now = dt(2026, 3, 23, 14, 0);
         let mut fs = MockFileSystemState::new();
@@ -5358,27 +5410,7 @@ source = "/data/sv1"
     // ── diff_promise_states tests ──────────────────────────────────
 
     fn make_assess(name: &str, status: PromiseStatus) -> SubvolAssessment {
-        SubvolAssessment {
-            name: name.to_string(),
-            short_name: name.to_string(),
-            status,
-            health: OperationalHealth::Healthy,
-            health_reasons: vec![],
-            local: LocalAssessment {
-                status,
-                snapshot_count: 0,
-                newest_age: None,
-                configured_interval: Interval::hours(1),
-            },
-            external: vec![],
-            chain_health: vec![],
-            advisories: vec![],
-            redundancy_advisories: vec![],
-            errors: vec![],
-            storage_posture: None,
-            cadence_adapted: false,
-            effective_send_interval: None,
-        }
+        SubvolAssessment::fixture(name, status)
     }
 
     fn make_promise_snapshot(name: &str, status: PromiseStatus) -> PromiseSnapshot {

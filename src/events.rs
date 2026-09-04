@@ -391,13 +391,6 @@ impl Event {
     pub fn kind(&self) -> EventKind {
         self.payload.kind()
     }
-
-    /// Convenience: derive severity from the payload.
-    #[must_use]
-    #[allow(dead_code)]
-    pub fn severity(&self) -> Severity {
-        self.payload.severity()
-    }
 }
 
 // ── Run context + the emit-side stamp (UPI 088-c) ─────────────────────
@@ -723,7 +716,6 @@ mod tests {
         };
         let event = event_with(payload.clone());
         assert_eq!(event.kind(), payload.kind());
-        assert_eq!(event.severity(), payload.severity());
     }
 
     // ── Roundtrip tests (per-variant serde stability) ─────────────────

@@ -440,7 +440,7 @@ mod tests {
     use super::*;
     use crate::awareness::{
         ChainBreakReason, ChainStatus, DriveAssessment, DriveChainHealth, LocalAssessment,
-        OperationalHealth, PromiseStatus, SubvolAssessment,
+        PromiseStatus, SubvolAssessment,
     };
     use crate::heartbeat::SubvolumeHeartbeat;
     use crate::types::{DriveRole, Interval};
@@ -1005,25 +1005,10 @@ source = "/data/alpha"
         external: Vec<DriveAssessment>,
     ) -> SubvolAssessment {
         SubvolAssessment {
-            name: name.to_string(),
-            short_name: name.to_string(),
-            status,
-            health: OperationalHealth::Healthy,
-            health_reasons: vec![],
-            local: LocalAssessment {
-                status: PromiseStatus::Protected,
-                snapshot_count: 10,
-                newest_age: None,
-                configured_interval: Interval::hours(1),
-            },
+            local: LocalAssessment::fixture(PromiseStatus::Protected, 10, None),
             external,
             chain_health,
-            advisories: vec![],
-            redundancy_advisories: vec![],
-            errors: vec![],
-            storage_posture: None,
-            cadence_adapted: false,
-            effective_send_interval: None,
+            ..SubvolAssessment::fixture(name, status)
         }
     }
 

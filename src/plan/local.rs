@@ -23,7 +23,7 @@ pub(super) fn plan_local_snapshot(i: &LocalSnapshotInputs) -> SnapshotOutcome {
     // catastrophic. See 2026-03-24-local-space-exhaustion-postmortem.md.
     let min_free = subvol.min_free_bytes.unwrap_or(0);
     if min_free > 0 {
-        let free = obs.fs.filesystem_free_bytes(local_dir).unwrap_or(u64::MAX);
+        let free = super::free_bytes_fail_open(obs, local_dir);
         if free < min_free {
             use crate::types::ByteSize;
             f.defer(
@@ -61,96 +61,25 @@ pub(super) fn plan_local_snapshot(i: &LocalSnapshotInputs) -> SnapshotOutcome {
         );
     }
 
-    let should_create = if force || filters.skip_intervals {
-        true
-    } else if let Some(newest) = newest {
-        let elapsed = now.signed_duration_since(newest.datetime());
-        super::interval_elapsed(elapsed, subvol.snapshot_interval.as_chrono())
+    // `Some(mins)` exactly when the interval has *not* elapsed: the minutes
+    // until it does, computed while `newest` is in hand so the deferral below
+    // needs no second lookup. `None` means create — forced, no snapshot exists
+    // yet, or the interval has elapsed.
+    let interval_pending_mins = if force || filters.skip_intervals {
+        None
     } else {
-        true // No snapshots exist — create first one
+        newest.and_then(|newest| {
+            let elapsed = now.signed_duration_since(newest.datetime());
+            let interval = subvol.snapshot_interval.as_chrono();
+            if super::interval_elapsed(elapsed, interval) {
+                None
+            } else {
+                Some((interval - elapsed).num_minutes())
+            }
+        })
     };
 
-    if should_create {
-        // Generation comparison: skip if subvolume hasn't changed since last snapshot.
-        // Fail open — if either generation query fails, proceed with snapshot.
-        if !filters.force_snapshot
-            && !force
-            && let Some(newest) = newest
-        {
-            let snap_path = local_dir.join(newest.as_str());
-            match (
-                obs.btrfs.subvolume_generation(&subvol.source),
-                obs.btrfs.subvolume_generation(&snap_path),
-            ) {
-                (Ok(sg), Ok(ng)) if sg == ng => {
-                    let elapsed = now.signed_duration_since(newest.datetime());
-                    let mins = elapsed.num_minutes();
-                    f.defer(
-                        &subvol.name,
-                        None,
-                        format!(
-                            "unchanged \u{2014} no changes since last snapshot ({} ago)",
-                            super::format_duration_short(mins)
-                        ),
-                        None,
-                        DeferScope::Subvolume,
-                        now,
-                    );
-                    return SnapshotOutcome {
-                        planned: None,
-                        fragment: f,
-                    };
-                }
-                (Err(e1), Err(e2)) => {
-                    log::warn!("{}: failed to read source generation: {e1}", subvol.name);
-                    log::warn!("{}: failed to read snapshot generation: {e2}", subvol.name);
-                }
-                (Err(e), _) => {
-                    log::warn!(
-                        "{}: failed to read source generation, proceeding: {e}",
-                        subvol.name
-                    );
-                }
-                (_, Err(e)) => {
-                    log::warn!(
-                        "{}: failed to read snapshot generation, proceeding: {e}",
-                        subvol.name
-                    );
-                }
-                _ => {} // generations differ — proceed
-            }
-        }
-
-        let snap_name = SnapshotName::new(now, &subvol.short_name);
-        // Check if this exact snapshot already exists
-        if local_snaps.iter().any(|s| s.as_str() == snap_name.as_str()) {
-            f.defer(
-                &subvol.name,
-                None,
-                "snapshot already exists".to_string(),
-                None,
-                DeferScope::Subvolume,
-                now,
-            );
-            return SnapshotOutcome {
-                planned: None,
-                fragment: f,
-            };
-        }
-        f.push_operation(PlannedOperation::CreateSnapshot {
-            source: subvol.source.clone(),
-            dest: local_dir.join(snap_name.as_str()),
-            subvolume_name: subvol.name.clone(),
-        });
-        // Invariant: returned name matches CreateSnapshot.dest filename
-        SnapshotOutcome {
-            planned: Some(snap_name),
-            fragment: f,
-        }
-    } else {
-        let next_in = subvol.snapshot_interval.as_chrono()
-            - now.signed_duration_since(newest.unwrap().datetime());
-        let mins = next_in.num_minutes();
+    if let Some(mins) = interval_pending_mins {
         f.defer(
             &subvol.name,
             None,
@@ -162,10 +91,87 @@ pub(super) fn plan_local_snapshot(i: &LocalSnapshotInputs) -> SnapshotOutcome {
             DeferScope::Subvolume,
             now,
         );
-        SnapshotOutcome {
+        return SnapshotOutcome {
             planned: None,
             fragment: f,
+        };
+    }
+
+    // Generation comparison: skip if subvolume hasn't changed since last snapshot.
+    // Fail open — if either generation query fails, proceed with snapshot.
+    if !filters.force_snapshot
+        && !force
+        && let Some(newest) = newest
+    {
+        let snap_path = local_dir.join(newest.as_str());
+        match (
+            obs.btrfs.subvolume_generation(&subvol.source),
+            obs.btrfs.subvolume_generation(&snap_path),
+        ) {
+            (Ok(sg), Ok(ng)) if sg == ng => {
+                let elapsed = now.signed_duration_since(newest.datetime());
+                let mins = elapsed.num_minutes();
+                f.defer(
+                    &subvol.name,
+                    None,
+                    format!(
+                        "unchanged \u{2014} no changes since last snapshot ({} ago)",
+                        super::format_duration_short(mins)
+                    ),
+                    None,
+                    DeferScope::Subvolume,
+                    now,
+                );
+                return SnapshotOutcome {
+                    planned: None,
+                    fragment: f,
+                };
+            }
+            (Err(e1), Err(e2)) => {
+                log::warn!("{}: failed to read source generation: {e1}", subvol.name);
+                log::warn!("{}: failed to read snapshot generation: {e2}", subvol.name);
+            }
+            (Err(e), _) => {
+                log::warn!(
+                    "{}: failed to read source generation, proceeding: {e}",
+                    subvol.name
+                );
+            }
+            (_, Err(e)) => {
+                log::warn!(
+                    "{}: failed to read snapshot generation, proceeding: {e}",
+                    subvol.name
+                );
+            }
+            _ => {} // generations differ — proceed
         }
+    }
+
+    let snap_name = SnapshotName::new(now, &subvol.short_name);
+    // Check if this exact snapshot already exists
+    if local_snaps.iter().any(|s| s.as_str() == snap_name.as_str()) {
+        f.defer(
+            &subvol.name,
+            None,
+            "snapshot already exists".to_string(),
+            None,
+            DeferScope::Subvolume,
+            now,
+        );
+        return SnapshotOutcome {
+            planned: None,
+            fragment: f,
+        };
+    }
+    f.push_operation(PlannedOperation::CreateSnapshot {
+        source: subvol.source.clone(),
+        dest: local_dir.join(snap_name.as_str()),
+        subvolume_name: subvol.name.clone(),
+    });
+    // Invariant: returned name matches CreateSnapshot.dest filename
+    SnapshotOutcome {
+        planned: Some(snap_name),
+        fragment: f,
     }
 }
 
@@ -256,7 +262,7 @@ pub(super) fn plan_local_retention(i: &LocalRetentionInputs) -> PlanFragment {
         LocalRetentionPolicy::Graduated(retention_config) => {
             // Check space pressure
             let min_free = subvol.min_free_bytes.unwrap_or(0);
-            let free_bytes = obs.fs.filesystem_free_bytes(local_dir).unwrap_or(u64::MAX);
+            let free_bytes = super::free_bytes_fail_open(obs, local_dir);
             let space_pressure = min_free > 0 && free_bytes < min_free;
 
             let mut result = retention::graduated_retention(
@@ -452,7 +458,7 @@ mod tests {
             ..subvol(LocalRetentionPolicy::Transient)
         };
         let e = eff(LocalRetentionPolicy::Transient, true);
-        // No free_bytes entry for local_dir() -> unwrap_or(u64::MAX), fail-open.
+        // No free_bytes entry for local_dir() -> free_bytes_fail_open, fail-open.
         let fs = MockFileSystemState::new();
         let btrfs = MockBtrfs::new();
         let obs = Observation {

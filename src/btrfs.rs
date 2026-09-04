@@ -11,7 +11,7 @@ use std::time::Duration;
 use nix::fcntl::{FcntlArg, OFlag, fcntl};
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 
-use crate::error::{BtrfsErrorContext, BtrfsOperation, SendReceiveErrorContext, UrdError};
+use crate::error::{BtrfsOperation, SendReceiveErrorContext, UrdError};
 use crate::guard::WATCHDOG_POLL_MS;
 
 // ── BtrfsOps trait ──────────────────────────────────────────────────────
@@ -177,25 +177,19 @@ impl BtrfsOps for RealBtrfs {
             .arg(source)
             .arg(dest)
             .output()
-            .map_err(|e| UrdError::Btrfs {
-                context: BtrfsErrorContext {
-                    operation: BtrfsOperation::Snapshot,
-                    exit_code: None,
-                    stderr: format!("failed to spawn btrfs: {e}"),
-                    bytes_transferred: None,
-                },
+            .map_err(|e| {
+                UrdError::btrfs_spawn(
+                    BtrfsOperation::Snapshot,
+                    format!("failed to spawn btrfs: {e}"),
+                )
             })?;
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-            return Err(UrdError::Btrfs {
-                context: BtrfsErrorContext {
-                    operation: BtrfsOperation::Snapshot,
-                    exit_code: output.status.code(),
-                    stderr,
-                    bytes_transferred: None,
-                },
-            });
+            return Err(UrdError::btrfs_exit(
+                BtrfsOperation::Snapshot,
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr),
+            ));
         }
         Ok(())
     }
@@ -232,33 +226,27 @@ impl BtrfsOps for RealBtrfs {
             snapshot.display()
         );
 
-        let mut send_child = send_cmd.spawn().map_err(|e| UrdError::Btrfs {
-            context: BtrfsErrorContext {
-                operation: BtrfsOperation::Send,
-                exit_code: None,
-                stderr: format!("failed to spawn btrfs send: {e}"),
-                bytes_transferred: None,
-            },
+        let mut send_child = send_cmd.spawn().map_err(|e| {
+            UrdError::btrfs_spawn(
+                BtrfsOperation::Send,
+                format!("failed to spawn btrfs send: {e}"),
+            )
         })?;
 
         // Take send's stdout to pipe into receive's stdin
-        let mut send_stdout = send_child.stdout.take().ok_or_else(|| UrdError::Btrfs {
-            context: BtrfsErrorContext {
-                operation: BtrfsOperation::Send,
-                exit_code: None,
-                stderr: "failed to capture btrfs send stdout".to_string(),
-                bytes_transferred: None,
-            },
+        let mut send_stdout = send_child.stdout.take().ok_or_else(|| {
+            UrdError::btrfs_spawn(
+                BtrfsOperation::Send,
+                "failed to capture btrfs send stdout",
+            )
         })?;
 
         // Take send's stderr to drain in a thread
-        let send_stderr = send_child.stderr.take().ok_or_else(|| UrdError::Btrfs {
-            context: BtrfsErrorContext {
-                operation: BtrfsOperation::Send,
-                exit_code: None,
-                stderr: "failed to capture btrfs send stderr".to_string(),
-                bytes_transferred: None,
-            },
+        let send_stderr = send_child.stderr.take().ok_or_else(|| {
+            UrdError::btrfs_spawn(
+                BtrfsOperation::Send,
+                "failed to capture btrfs send stderr",
+            )
         })?;
 
         // Drain send stderr in a background thread to prevent deadlock
@@ -286,42 +274,34 @@ impl BtrfsOps for RealBtrfs {
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|e| UrdError::Btrfs {
-                context: BtrfsErrorContext {
-                    operation: BtrfsOperation::Receive,
-                    exit_code: None,
-                    stderr: format!("failed to spawn btrfs receive: {e}"),
-                    bytes_transferred: None,
-                },
+            .map_err(|e| {
+                UrdError::btrfs_spawn(
+                    BtrfsOperation::Receive,
+                    format!("failed to spawn btrfs receive: {e}"),
+                )
             })?;
 
-        let mut recv_stdin = recv_child.stdin.take().ok_or_else(|| UrdError::Btrfs {
-            context: BtrfsErrorContext {
-                operation: BtrfsOperation::Receive,
-                exit_code: None,
-                stderr: "failed to capture btrfs receive stdin".to_string(),
-                bytes_transferred: None,
-            },
+        let mut recv_stdin = recv_child.stdin.take().ok_or_else(|| {
+            UrdError::btrfs_spawn(
+                BtrfsOperation::Receive,
+                "failed to capture btrfs receive stdin",
+            )
         })?;
 
         // Non-blocking writes so a full pipe (wedged receive) cannot park the
         // copy thread past the watchdog's cancel (UPI 054-b).
-        set_nonblocking(&recv_stdin).map_err(|e| UrdError::Btrfs {
-            context: BtrfsErrorContext {
-                operation: BtrfsOperation::Receive,
-                exit_code: None,
-                stderr: format!("failed to set receive stdin non-blocking: {e}"),
-                bytes_transferred: None,
-            },
+        set_nonblocking(&recv_stdin).map_err(|e| {
+            UrdError::btrfs_spawn(
+                BtrfsOperation::Receive,
+                format!("failed to set receive stdin non-blocking: {e}"),
+            )
         })?;
 
-        let recv_stderr = recv_child.stderr.take().ok_or_else(|| UrdError::Btrfs {
-            context: BtrfsErrorContext {
-                operation: BtrfsOperation::Receive,
-                exit_code: None,
-                stderr: "failed to capture btrfs receive stderr".to_string(),
-                bytes_transferred: None,
-            },
+        let recv_stderr = recv_child.stderr.take().ok_or_else(|| {
+            UrdError::btrfs_spawn(
+                BtrfsOperation::Receive,
+                "failed to capture btrfs receive stderr",
+            )
         })?;
 
         // Drain receive stderr in a background thread (mirror of send's): the
@@ -367,26 +347,22 @@ impl BtrfsOps for RealBtrfs {
         // it is already closed.
         let recv_wait =
             wait_child_cancellable(|| recv_child.try_wait(), &self.cancel, grace, poll_interval)
-                .map_err(|e| UrdError::Btrfs {
-                    context: BtrfsErrorContext {
-                        operation: BtrfsOperation::Receive,
-                        exit_code: None,
-                        stderr: format!("failed to wait for btrfs receive: {e}"),
-                        bytes_transferred: None,
-                    },
+                .map_err(|e| {
+                    UrdError::btrfs_spawn(
+                        BtrfsOperation::Receive,
+                        format!("failed to wait for btrfs receive: {e}"),
+                    )
                 })?;
         let (recv_status, recv_stderr_str) = settle_wait(recv_wait, recv_stderr_thread, "receive");
 
         // Send normally dies fast on EPIPE once its stdout pipe drops.
         let send_wait =
             wait_child_cancellable(|| send_child.try_wait(), &self.cancel, grace, poll_interval)
-                .map_err(|e| UrdError::Btrfs {
-                    context: BtrfsErrorContext {
-                        operation: BtrfsOperation::Send,
-                        exit_code: None,
-                        stderr: format!("failed to wait for btrfs send: {e}"),
-                        bytes_transferred: None,
-                    },
+                .map_err(|e| {
+                    UrdError::btrfs_spawn(
+                        BtrfsOperation::Send,
+                        format!("failed to wait for btrfs send: {e}"),
+                    )
                 })?;
         let (send_status, send_stderr_str) = settle_wait(send_wait, send_stderr_thread, "send");
 
@@ -458,25 +434,19 @@ impl BtrfsOps for RealBtrfs {
             .args(["subvolume", "delete"])
             .arg(path)
             .output()
-            .map_err(|e| UrdError::Btrfs {
-                context: BtrfsErrorContext {
-                    operation: BtrfsOperation::Delete,
-                    exit_code: None,
-                    stderr: format!("failed to spawn btrfs: {e}"),
-                    bytes_transferred: None,
-                },
+            .map_err(|e| {
+                UrdError::btrfs_spawn(
+                    BtrfsOperation::Delete,
+                    format!("failed to spawn btrfs: {e}"),
+                )
             })?;
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-            return Err(UrdError::Btrfs {
-                context: BtrfsErrorContext {
-                    operation: BtrfsOperation::Delete,
-                    exit_code: output.status.code(),
-                    stderr,
-                    bytes_transferred: None,
-                },
-            });
+            return Err(UrdError::btrfs_exit(
+                BtrfsOperation::Delete,
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr),
+            ));
         }
         Ok(())
     }
@@ -515,25 +485,19 @@ impl BtrfsOps for RealBtrfs {
             .args(["subvolume", "sync"])
             .arg(path)
             .output()
-            .map_err(|e| UrdError::Btrfs {
-                context: BtrfsErrorContext {
-                    operation: BtrfsOperation::Sync,
-                    exit_code: None,
-                    stderr: format!("failed to spawn btrfs: {e}"),
-                    bytes_transferred: None,
-                },
+            .map_err(|e| {
+                UrdError::btrfs_spawn(
+                    BtrfsOperation::Sync,
+                    format!("failed to spawn btrfs: {e}"),
+                )
             })?;
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-            return Err(UrdError::Btrfs {
-                context: BtrfsErrorContext {
-                    operation: BtrfsOperation::Sync,
-                    exit_code: output.status.code(),
-                    stderr,
-                    bytes_transferred: None,
-                },
-            });
+            return Err(UrdError::btrfs_exit(
+                BtrfsOperation::Sync,
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr),
+            ));
         }
         Ok(())
     }
@@ -592,55 +556,49 @@ pub fn parse_subvolume_list(output: &str) -> crate::error::Result<Vec<PathBuf>> 
         match path {
             Some(p) if !p.is_empty() => paths.push(PathBuf::from(p)),
             _ => {
-                return Err(UrdError::Btrfs {
-                    context: BtrfsErrorContext {
-                        operation: BtrfsOperation::List,
-                        exit_code: None,
-                        stderr: format!("unrecognized subvolume list line: {line}"),
-                        bytes_transferred: None,
-                    },
-                });
+                return Err(UrdError::btrfs_spawn(
+                    BtrfsOperation::List,
+                    format!("unrecognized subvolume list line: {line}"),
+                ));
             }
         }
     }
     Ok(paths)
 }
 
+/// The `sudo -n <btrfs_path> subvolume show <path>` invocation, built apart
+/// from running it so a test can assert the *configured* binary reaches the
+/// command line without needing sudo.
+///
+/// `-n`: never prompt. Reachable pre-grant from `urd status`/`doctor`/`plan`
+/// (via `subvolume_generation`) on a configured-but-unsealed machine —
+/// without `-n` this pops an interactive PIN+FIDO prompt from a read-only
+/// fail-open call (field visit 2026-07-06, #274). Callers already treat an
+/// Err here as "no generation info" and proceed without the optimization.
+fn show_command(btrfs_path: &str, path: &Path) -> Command {
+    let mut cmd = Command::new("sudo");
+    cmd.env("LC_ALL", "C")
+        .arg("-n")
+        .arg(btrfs_path)
+        .args(["subvolume", "show"])
+        .arg(path);
+    cmd
+}
+
 /// Run `sudo btrfs subvolume show` and return its stdout. Shared by the
 /// `BtrfsRead` field readers (`subvolume_generation`, `received_uuid`) — one
 /// invocation, one sudoers surface.
-fn subvolume_show(path: &Path) -> crate::error::Result<String> {
-    // `-n`: never prompt. Reachable pre-grant from `urd status`/`doctor`/`plan`
-    // (via `subvolume_generation`) on a configured-but-unsealed machine —
-    // without `-n` this pops an interactive PIN+FIDO prompt from a read-only
-    // fail-open call (field visit 2026-07-06, #274). Callers already treat an
-    // Err here as "no generation info" and proceed without the optimization.
-    let output = Command::new("sudo")
-        .env("LC_ALL", "C")
-        .arg("-n")
-        .arg("btrfs")
-        .args(["subvolume", "show"])
-        .arg(path)
+fn subvolume_show(btrfs_path: &str, path: &Path) -> crate::error::Result<String> {
+    let output = show_command(btrfs_path, path)
         .output()
-        .map_err(|e| UrdError::Btrfs {
-            context: BtrfsErrorContext {
-                operation: BtrfsOperation::Show,
-                exit_code: None,
-                stderr: e.to_string(),
-                bytes_transferred: None,
-            },
-        })?;
+        .map_err(|e| UrdError::btrfs_spawn(BtrfsOperation::Show, e.to_string()))?;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        return Err(UrdError::Btrfs {
-            context: BtrfsErrorContext {
-                operation: BtrfsOperation::Show,
-                exit_code: output.status.code(),
-                stderr,
-                bytes_transferred: None,
-            },
-        });
+        return Err(UrdError::btrfs_exit(
+            BtrfsOperation::Show,
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr),
+        ));
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
@@ -651,19 +609,17 @@ impl BtrfsRead for RealBtrfs {
     ///
     /// All btrfs subprocess calls remain in `btrfs.rs` (invariant #2).
     fn subvolume_generation(&self, path: &Path) -> crate::error::Result<u64> {
-        let stdout = subvolume_show(path)?;
-        parse_generation(&stdout).ok_or_else(|| UrdError::Btrfs {
-            context: BtrfsErrorContext {
-                operation: BtrfsOperation::Show,
-                exit_code: None,
-                stderr: "Generation field not found in btrfs subvolume show output".to_string(),
-                bytes_transferred: None,
-            },
+        let stdout = subvolume_show(&self.btrfs_path, path)?;
+        parse_generation(&stdout).ok_or_else(|| {
+            UrdError::btrfs_spawn(
+                BtrfsOperation::Show,
+                "Generation field not found in btrfs subvolume show output",
+            )
         })
     }
 
     fn received_uuid(&self, path: &Path) -> crate::error::Result<Option<String>> {
-        let stdout = subvolume_show(path)?;
+        let stdout = subvolume_show(&self.btrfs_path, path)?;
         Ok(parse_received_uuid(&stdout))
     }
 
@@ -681,25 +637,14 @@ impl BtrfsRead for RealBtrfs {
             .args(["subvolume", "list"])
             .arg(path)
             .output()
-            .map_err(|e| UrdError::Btrfs {
-                context: BtrfsErrorContext {
-                    operation: BtrfsOperation::List,
-                    exit_code: None,
-                    stderr: e.to_string(),
-                    bytes_transferred: None,
-                },
-            })?;
+            .map_err(|e| UrdError::btrfs_spawn(BtrfsOperation::List, e.to_string()))?;
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-            return Err(UrdError::Btrfs {
-                context: BtrfsErrorContext {
-                    operation: BtrfsOperation::List,
-                    exit_code: output.status.code(),
-                    stderr,
-                    bytes_transferred: None,
-                },
-            });
+            return Err(UrdError::btrfs_exit(
+                BtrfsOperation::List,
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr),
+            ));
         }
 
         parse_subvolume_list(&String::from_utf8_lossy(&output.stdout))
@@ -1073,14 +1018,11 @@ impl BtrfsOps for MockBtrfs {
             dest: dest.to_path_buf(),
         });
         if self.fail_creates.borrow().contains(dest) {
-            return Err(UrdError::Btrfs {
-                context: BtrfsErrorContext {
-                    operation: BtrfsOperation::Snapshot,
-                    exit_code: Some(1),
-                    stderr: format!("mock: create snapshot failed for {}", dest.display()),
-                    bytes_transferred: None,
-                },
-            });
+            return Err(UrdError::btrfs_exit(
+                BtrfsOperation::Snapshot,
+                Some(1),
+                format!("mock: create snapshot failed for {}", dest.display()),
+            ));
         }
         Ok(())
     }
@@ -1119,14 +1061,11 @@ impl BtrfsOps for MockBtrfs {
                 path: path.to_path_buf(),
             });
         if self.fail_deletes.borrow().contains(path) {
-            return Err(UrdError::Btrfs {
-                context: BtrfsErrorContext {
-                    operation: BtrfsOperation::Delete,
-                    exit_code: Some(1),
-                    stderr: format!("mock: delete failed for {}", path.display()),
-                    bytes_transferred: None,
-                },
-            });
+            return Err(UrdError::btrfs_exit(
+                BtrfsOperation::Delete,
+                Some(1),
+                format!("mock: delete failed for {}", path.display()),
+            ));
         }
         Ok(())
     }
@@ -1146,14 +1085,11 @@ impl BtrfsOps for MockBtrfs {
                 path: path.to_path_buf(),
             });
         if self.fail_syncs.borrow().contains(path) {
-            return Err(UrdError::Btrfs {
-                context: BtrfsErrorContext {
-                    operation: BtrfsOperation::Sync,
-                    exit_code: Some(1),
-                    stderr: format!("mock: sync failed for {}", path.display()),
-                    bytes_transferred: None,
-                },
-            });
+            return Err(UrdError::btrfs_exit(
+                BtrfsOperation::Sync,
+                Some(1),
+                format!("mock: sync failed for {}", path.display()),
+            ));
         }
         Ok(())
     }
@@ -1194,6 +1130,30 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("mock: create snapshot failed")
+        );
+    }
+
+    #[test]
+    fn subvolume_show_uses_the_configured_btrfs_path() {
+        // Every other invocation in this file passes `self.btrfs_path`; the
+        // read-only `subvolume show` used to hardcode "btrfs", so a host with
+        // the binary anywhere but the default path silently lost the
+        // generation and received-UUID reads (#387).
+        let cmd = show_command("/opt/btrfs-progs/bin/btrfs", Path::new("/data/sv1"));
+        assert_eq!(cmd.get_program(), "sudo");
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "-n",
+                "/opt/btrfs-progs/bin/btrfs",
+                "subvolume",
+                "show",
+                "/data/sv1"
+            ]
         );
     }
 

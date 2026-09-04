@@ -275,7 +275,7 @@ pub fn graduated_retention(
                 &mut delete,
                 &mut events,
             );
-        } else if monthly_cutoff.is_none() || dt >= monthly_cutoff.unwrap() {
+        } else if monthly_cutoff.is_none_or(|cutoff| dt >= cutoff) {
             let month_key = (dt.date().year(), dt.date().month());
             let slot_was_empty = monthly_slots.insert(month_key);
             apply_slot_thinning(
@@ -288,7 +288,7 @@ pub fn graduated_retention(
                 &mut delete,
                 &mut events,
             );
-        } else if yearly_cutoff.is_some() && dt >= yearly_cutoff.unwrap() {
+        } else if yearly_cutoff.is_some_and(|cutoff| dt >= cutoff) {
             let year_key = dt.date().year();
             let slot_was_empty = yearly_slots.insert(year_key);
             apply_slot_thinning(
