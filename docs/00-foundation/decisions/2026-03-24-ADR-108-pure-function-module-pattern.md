@@ -6,7 +6,7 @@ project: ['[[urd]]']
 sensitivity: public
 status: active
 created: '2026-03-24'
-timestamp: '2026-07-11T09:19:17+02:00'
+timestamp: '2026-09-04T15:03:12+02:00'
 ---
 # ADR-108: Pure-Function Module Pattern
 
@@ -16,7 +16,7 @@ timestamp: '2026-07-11T09:19:17+02:00'
 > and is now the required pattern for new logic modules.
 
 **Date:** 2026-03-22 (established by planner; pattern recognized 2026-03-23)
-**Status:** Accepted
+**Status:** Accepted (amended 2026-09-04 — see [Amendment 2026-09-04](#amendment-2026-09-04-the-module-roster-moves-to-architecturemd))
 **Supersedes:** None (crystallized across awareness model and presentation layer reviews)
 
 ## Context
@@ -59,12 +59,8 @@ Tests are deterministic — same inputs always produce same outputs.
 
 ### Modules that follow this pattern
 
-| Module | Function | Inputs | Output |
-|--------|----------|--------|--------|
-| `plan.rs` | `plan()` | Config, time, FileSystemState | BackupPlan |
-| `awareness.rs` | `assess()` | Config, time, FileSystemState | Vec\<SubvolAssessment\> |
-| `retention.rs` | `graduated_retention()` | Snapshots, config, time | Keep/delete lists |
-| `voice.rs` | `render_status()` | StatusOutput, OutputMode | String |
+Retired as a list — see [Amendment 2026-09-04](#amendment-2026-09-04-the-module-roster-moves-to-architecturemd). The authoritative
+module roster lives in [`docs/00-foundation/architecture.md`](../architecture.md).
 
 ### Modules that are intentionally NOT pure
 
@@ -113,3 +109,32 @@ Tests are deterministic — same inputs always produce same outputs.
   "commands produce structured types, not formatted strings"
 - Vision architecture review (`docs/99-reports/2026-03-23-vision-architecture-review.md`) §2 —
   awareness model must work without Sentinel
+
+## Amendment 2026-09-04: the module roster moves to architecture.md
+
+The rule this ADR states is unchanged and remains binding: **modules that compute,
+decide, or transform are pure functions** — config, time, and observed state in;
+structured values out; no I/O, no globals, no wall clock read from inside.
+
+What is retired is the *enumeration*. The "Modules that follow this pattern" table listed
+four modules by name, function signature, and input types; each of those three columns has
+since drifted, and every drift is a false statement in a document whose ADRs are immutable
+by design. Enumerating a volatile roster inside an immutable decision record is the wrong
+shape for the fact.
+
+[`docs/00-foundation/architecture.md`](../architecture.md) owns the roster. Its
+module-responsibility table carries every module with an explicit *Does* / *Does NOT*
+column — strictly more information than the retired table, in the one document that is
+maintained as the present system rather than as a record of a decision.
+
+Two things stay here, because they are decisions rather than inventory:
+
+- **The impure-by-design list.** `executor.rs`, `btrfs.rs`, `state.rs`, and `commands/`
+  are impure *deliberately*; naming them is how "everything else must be pure" stays
+  falsifiable. `recorder.rs` joined them as the impure seam through which events reach
+  persistence (ADR-114).
+- **The trait boundary.** Extending a pure module's awareness means extending the read
+  trait it depends on, never adding an I/O call. That trait is no longer
+  `FileSystemState`: the read side is split along the ADR-102 axis into `FilesystemQuery`
+  and `HistoryQuery`, bundled as `Observation` (see ADR-100's amendment of the same date).
+  The rule is unchanged; only the name is.

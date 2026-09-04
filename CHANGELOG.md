@@ -11,6 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Every persisted event variant now has a frozen historical-JSON fixture
   test, so a future wire-form change fails a test instead of silently
   breaking `urd events` on old rows (#386).
+- ADR-119 "Lint-enforced seams" records the three `clippy.toml`
+  `disallowed-methods` guards as architecture rather than lint trivia — each
+  guard names its one sanctioned caller, and the ADR's table is the registry
+  that must change in step with `clippy.toml`. It also gives the World prelude
+  and the single-writer rule for the storage-posture writeback a documented
+  home (#388).
 
 ### Changed
 - The voice contract (`voice_contract.rs`) now exercises the `urd

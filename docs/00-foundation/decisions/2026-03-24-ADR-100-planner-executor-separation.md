@@ -6,7 +6,7 @@ project: ['[[urd]]']
 sensitivity: public
 status: active
 created: '2026-03-24'
-timestamp: '2026-07-11T09:19:17+02:00'
+timestamp: '2026-09-04T15:03:12+02:00'
 ---
 # ADR-100: Planner/Executor Separation
 
@@ -17,7 +17,7 @@ timestamp: '2026-07-11T09:19:17+02:00'
 > that plagued the bash script.
 
 **Date:** 2026-03-22 (formalized 2026-03-24)
-**Status:** Accepted
+**Status:** Accepted (amended 2026-09-04 — see [Amendment 2026-09-04](#amendment-2026-09-04-planner-surface-and-the-post-plan-stamp))
 **Supersedes:** None (founding decision from project inception)
 
 ## Context
@@ -87,3 +87,73 @@ the send/pin dependency is structural, not implicit.
 - Phase 1 journal (`docs/98-journals/2026-03-22-urd-phase01.md`) — original implementation
 - Phase 2 journal (`docs/98-journals/2026-03-22-urd-phase02.md`) — Executor Contract
 - ADR-101: BtrfsOps trait (the executor's interface to btrfs)
+
+## Amendment 2026-09-04: planner surface and the post-plan stamp
+
+The separation itself is unchanged. Three names in the Decision section have moved, and
+one narrow post-`plan()` mutation is load-bearing enough to state as a rule rather than
+leave to a code comment.
+
+### Renamed surfaces
+
+- **`plan.rs` → `plan/`.** The planner is a directory module: `src/plan/mod.rs` plus the
+  `local`, `external`, `send`, and `transient` regions and the `fragment` accumulator
+  every region pushes operations, deferrals, and events into. `plan::plan()` is still
+  the single entry point; the regions are internal decomposition, not additional
+  decision surfaces.
+- **`FileSystemState` → `Observation`.** The planner's window into the world is
+  `Observation` (`src/observation.rs`), which bundles two traits split along the ADR-102
+  axis — `FilesystemQuery` (snapshot directories, pin files, mounts, free and total
+  bytes) and `HistoryQuery` (send sizes, calibration, send/drive timestamps) — alongside
+  a read-only `BtrfsRead` handle for generation counters (ADR-101). Extending the
+  planner's awareness still means extending a trait on this boundary, never adding an
+  I/O call inside the planner.
+- **Signature.** `plan(config, now, filters, obs: &Observation, arming: &RunArming)`.
+  `MockFileSystemState` remains the test double behind `Observation`.
+
+### `RunArming`: the ADR-113 Layer-1 input
+
+`RunArming` (`src/commands/storage_signals.rs`) is the storage posture the planner plans
+against: the per-subvolume armed tier (`armed_tier_map`), the resolved per-pool tiers,
+and the away-sheddable pin view (`away_shed`). It is resolved **once per run, pre-lock**
+by `RunArming::resolve(&signals, &config, &fs_state)` — in `commands/backup.rs` and in
+`commands/plan_cmd.rs`, so the preview and the run plan against the same posture — and is
+read back everywhere else: the planner, the emergency re-plan, the executor (through the
+plan's `lifecycles`), the post-execution assessment, and the armed-tier writeback.
+
+Re-resolving mid-run is a bug, not an optimization. A clear-all frees space during the
+run, so a second gather would see a higher free ratio and de-escalate the tier the plan
+was built against — desyncing the effective send interval the planner timed against from
+the one awareness judges staleness against, and surfacing a correctly-adapting subvolume
+as a false AT RISK.
+
+This does not weaken purity: `RunArming` is data, resolved by the impure command layer
+and handed to the planner as an argument like `config` and `now`. `RunArming::default()`
+is the all-`Roomy` identity — declared behavior, byte-identical plans — which is what
+hand-built test plans pass.
+
+### Post-plan stamps: what the command layer may still touch
+
+`plan()` returning is not quite the end of plan construction. Between `plan()` and
+execution, `commands/backup.rs` mutates the plan twice, and both mutations are bounded.
+
+**Removal is allowed.** `apply_token_gating` drops `SendFull` / `SendIncremental`
+operations targeting drives whose identity token failed (retention `Delete*` operations
+are deliberately left alone — a clone's snapshots are redundant copies, and blocking
+deletes would cause space exhaustion for no safety gain), and `filter_promise_retention`
+drops retention deletions for promise-level subvolumes absent
+`--confirm-retention-change` (ADR-107 fail-closed). Both strictly shrink the plan;
+neither invents work the planner did not authorize.
+
+**Exactly one field may be written: `token_verified`.** The planner emits
+`PlannedOperation::SendFull { token_verified: false, .. }` (`src/plan/send.rs`) because
+drive-token verification is an I/O question it cannot answer. `apply_token_gating` sets
+it to `true` for drives whose token file exists and matches, so the executor's
+chain-break gate may proceed on a known-good drive.
+
+The rule: **`token_verified` may only widen permission — `false` → `true`, never the
+reverse.** A stamp that could narrow permission would be the command layer deciding
+*what to do*, which is the planner's job; a stamp that can only widen leaves the plan, at
+worst, at the planner's own conservative default. No other field of any
+`PlannedOperation` may be set after `plan()`. A second such stamp would need its own
+amendment here and the same widening-only argument.
