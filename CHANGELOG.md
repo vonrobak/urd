@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.37.0] - 2026-09-04
+
 ### Added
 - Every persisted event variant now has a frozen historical-JSON fixture
   test, so a future wire-form change fails a test instead of silently
@@ -1892,7 +1894,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Defense-in-depth pin file protection for unsent snapshots
 - Per-subvolume error isolation in executor
 
-[Unreleased]: https://github.com/vonrobak/urd/compare/v0.36.0...HEAD
+[Unreleased]: https://github.com/vonrobak/urd/compare/v0.37.0...HEAD
+[0.37.0]: https://github.com/vonrobak/urd/compare/v0.36.0...v0.37.0
 [0.36.0]: https://github.com/vonrobak/urd/compare/v0.35.0...v0.36.0
 [0.35.0]: https://github.com/vonrobak/urd/compare/v0.34.0...v0.35.0
 [0.34.0]: https://github.com/vonrobak/urd/compare/v0.33.4...v0.34.0
