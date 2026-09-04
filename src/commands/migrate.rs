@@ -161,6 +161,8 @@ struct V1RawConfig {
     notifications: Option<toml::Value>,
 }
 
+// Field parity with `config::GeneralConfig` is enforced by
+// `migrate_general_fields_match_config` below — add new fields to both.
 #[derive(serde::Deserialize)]
 struct V1RawGeneral {
     // config_version is read by extract_version() upstream and is silently
@@ -179,6 +181,8 @@ struct V1RawGeneral {
     run_frequency: Option<String>,
 }
 
+// Field parity with `config::V1SubvolumeConfig` is enforced by
+// `migrate_v1_subvolume_fields_match_config` below — add new fields to both.
 #[derive(serde::Deserialize)]
 struct V1RawSubvolume {
     name: String,
@@ -310,6 +314,8 @@ struct LegacyConfig {
     notifications: Option<toml::Value>,
 }
 
+// Field parity with `config::GeneralConfig` is enforced by
+// `migrate_general_fields_match_config` below — add new fields to both.
 #[derive(serde::Deserialize)]
 struct LegacyGeneral {
     #[serde(default)]
@@ -353,6 +359,8 @@ struct LegacyDefaults {
     external_retention: Option<toml::Value>,
 }
 
+// Field parity with `config::DriveConfig` is enforced by
+// `migrate_drive_fields_match_config` below — add new fields to both.
 #[derive(serde::Deserialize, Clone)]
 struct LegacyDrive {
     label: String,
@@ -365,6 +373,8 @@ struct LegacyDrive {
     max_usage_percent: Option<u8>,
     #[serde(default)]
     min_free_bytes: Option<String>,
+    #[serde(default)]
+    rotation_interval: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -782,6 +792,9 @@ fn render_drive(out: &mut String, drive: &LegacyDrive) {
     if let Some(ref mfb) = drive.min_free_bytes {
         out.push_str(&format!("min_free_bytes = \"{mfb}\"\n"));
     }
+    if let Some(ref ri) = drive.rotation_interval {
+        out.push_str(&format!("rotation_interval = \"{ri}\"\n"));
+    }
     out.push('\n');
 }
 
@@ -1146,6 +1159,122 @@ fn print_changes(result: &MigrationResult) {
 mod tests {
     use super::*;
 
+    // ── Field-name parity harness (Deserialize field enumeration) ───────
+    //
+    // Enumerates the serde field names a `#[derive(Deserialize)]` struct
+    // declares to `deserialize_struct`, without needing a live TOML value.
+    // Used below to assert every field on a real `config.rs` struct has a
+    // matching field on migrate.rs's raw copy of it, so a field added to one
+    // and forgotten on the other (this issue's bug) fails loudly instead of
+    // silently round-tripping to nothing. Only works for structs whose
+    // Deserialize impl is derive-generated and goes through
+    // `deserialize_struct` — no `#[serde(flatten)]`, no hand-written
+    // Deserialize. Every struct compared below is a plain derive.
+
+    #[derive(Debug)]
+    struct FieldCaptureError;
+
+    impl std::fmt::Display for FieldCaptureError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("field capture probe (not a real deserialize failure)")
+        }
+    }
+
+    impl std::error::Error for FieldCaptureError {}
+
+    impl serde::de::Error for FieldCaptureError {
+        fn custom<T: std::fmt::Display>(_msg: T) -> Self {
+            FieldCaptureError
+        }
+    }
+
+    struct FieldCapture<'a> {
+        fields: &'a std::cell::RefCell<Vec<&'static str>>,
+    }
+
+    impl<'de, 'a> serde::Deserializer<'de> for FieldCapture<'a> {
+        type Error = FieldCaptureError;
+
+        fn deserialize_any<V: serde::de::Visitor<'de>>(
+            self,
+            _visitor: V,
+        ) -> Result<V::Value, Self::Error> {
+            Err(FieldCaptureError)
+        }
+
+        fn deserialize_struct<V: serde::de::Visitor<'de>>(
+            self,
+            _name: &'static str,
+            fields: &'static [&'static str],
+            _visitor: V,
+        ) -> Result<V::Value, Self::Error> {
+            *self.fields.borrow_mut() = fields.to_vec();
+            Err(FieldCaptureError)
+        }
+
+        serde::forward_to_deserialize_any! {
+            bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+            bytes byte_buf option unit unit_struct newtype_struct seq tuple
+            tuple_struct map enum identifier ignored_any
+        }
+    }
+
+    /// Enumerate the serde field names of a `#[derive(Deserialize)]` struct
+    /// (see harness note above).
+    fn serde_field_names<'de, T: serde::Deserialize<'de>>() -> Vec<&'static str> {
+        let fields: std::cell::RefCell<Vec<&'static str>> = std::cell::RefCell::new(Vec::new());
+        let _ = T::deserialize(FieldCapture { fields: &fields });
+        fields.into_inner()
+    }
+
+    /// Assert every name in `config_fields` also appears in `raw_fields`,
+    /// except names in `exclude`. The raw struct may carry extra fields the
+    /// config struct doesn't have.
+    fn assert_raw_carries_config_fields(
+        config_fields: &[&str],
+        raw_fields: &[&str],
+        exclude: &[&str],
+    ) {
+        for f in config_fields {
+            if exclude.contains(f) {
+                continue;
+            }
+            assert!(
+                raw_fields.contains(f),
+                "config field `{f}` has no matching field on the raw migration \
+                 struct (raw fields: {raw_fields:?}) — migrate.rs would silently \
+                 drop it on migration"
+            );
+        }
+    }
+
+    #[test]
+    fn migrate_drive_fields_match_config() {
+        let config_fields = serde_field_names::<crate::config::DriveConfig>();
+        let raw_fields = serde_field_names::<LegacyDrive>();
+        assert_raw_carries_config_fields(&config_fields, &raw_fields, &[]);
+    }
+
+    #[test]
+    fn migrate_v1_subvolume_fields_match_config() {
+        let config_fields = serde_field_names::<crate::config::V1SubvolumeConfig>();
+        let raw_fields = serde_field_names::<V1RawSubvolume>();
+        assert_raw_carries_config_fields(&config_fields, &raw_fields, &[]);
+    }
+
+    #[test]
+    fn migrate_general_fields_match_config() {
+        let config_fields = serde_field_names::<crate::config::GeneralConfig>();
+        let raw_fields_v1 = serde_field_names::<V1RawGeneral>();
+        let raw_fields_legacy = serde_field_names::<LegacyGeneral>();
+        // config_version is read upstream by extract_version() and is
+        // deliberately not part of either raw struct (see V1RawGeneral's
+        // doc comment) — not a migration gap.
+        let exclude = ["config_version"];
+        assert_raw_carries_config_fields(&config_fields, &raw_fields_v1, &exclude);
+        assert_raw_carries_config_fields(&config_fields, &raw_fields_legacy, &exclude);
+    }
+
     fn example_legacy_toml() -> &'static str {
         r#"
 [general]
@@ -1439,6 +1568,79 @@ snapshot_interval = "1w"
         assert!(v1.contains("label = \"WD-18TB\""));
         assert!(v1.contains("uuid = \"647693ed"));
         assert!(v1.contains("role = \"primary\""));
+    }
+
+    #[test]
+    fn migrate_legacy_preserves_drive_rotation_interval() {
+        // Issue #377: legacy [[drives]] rotation_interval was silently
+        // dropped by the migration.
+        let toml = r#"
+[general]
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp/logs"
+run_frequency = "daily"
+
+[local_snapshots]
+roots = [{ path = "/snap", subvolumes = ["sv"] }]
+
+[[drives]]
+label = "OFFSITE"
+mount_path = "/mnt/offsite"
+snapshot_root = ".snapshots"
+role = "offsite"
+rotation_interval = "3mo"
+
+[[subvolumes]]
+name = "sv"
+short_name = "sv"
+source = "/sv"
+"#;
+        let legacy: LegacyConfig = toml::from_str(toml).unwrap();
+        let v2 = render_v2(&legacy);
+
+        assert!(
+            v2.contains("rotation_interval = \"3mo\""),
+            "rotation_interval should survive legacy → v2 migration:\n{v2}"
+        );
+        crate::config::Config::from_str(&v2).expect("migrated v2 must re-parse cleanly");
+    }
+
+    #[test]
+    fn migrate_v1_preserves_drive_rotation_interval() {
+        // Issue #377: v1 [[drives]] rotation_interval was silently dropped
+        // by the migration (v1's DriveConfig carries the field legitimately).
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_path = dir.path().join("urd.toml");
+        let v1_toml = r#"[general]
+config_version = 1
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp/logs"
+run_frequency = "daily"
+
+[[drives]]
+label = "OFFSITE"
+mount_path = "/mnt/offsite"
+snapshot_root = ".snapshots"
+role = "offsite"
+rotation_interval = "3mo"
+
+[[subvolumes]]
+name = "sv"
+source = "/sv"
+snapshot_root = "/snap"
+"#;
+        std::fs::write(&config_path, v1_toml).unwrap();
+        let args = MigrateArgs { dry_run: false };
+        run(Some(config_path.as_path()), &args).expect("migrate should succeed");
+
+        let v2_content = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            v2_content.contains("rotation_interval = \"3mo\""),
+            "rotation_interval should survive v1 → v2 migration:\n{v2_content}"
+        );
+        crate::config::Config::from_str(&v2_content).expect("migrated v2 must re-parse cleanly");
     }
 
     #[test]

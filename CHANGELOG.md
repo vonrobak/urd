@@ -30,6 +30,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   also names the two subvolumes that actually disagree rather than whichever
   was listed first. Legacy configs declare `min_free_bytes` once per root and
   cannot express the conflict (#378).
+- `urd migrate` no longer silently drops a drive's `rotation_interval`
+  (ADR-116) when migrating a legacy or v1 config to v2 — an offsite drive's
+  declared rotation cadence now survives the hop intact (#377).
 
 ## [0.36.0] - 2026-09-03
 

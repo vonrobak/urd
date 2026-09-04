@@ -676,8 +676,11 @@ fn default_v1_log_dir() -> PathBuf {
     PathBuf::from("~/.local/share/urd/logs")
 }
 
+// Visibility widened to pub(crate) so migrate.rs's field-parity test
+// (`migrate_v1_subvolume_fields_match_config`) can enumerate its serde field
+// names against the migration module's raw copy (#377).
 #[derive(Debug, Deserialize)]
-struct V1SubvolumeConfig {
+pub(crate) struct V1SubvolumeConfig {
     name: String,
     source: PathBuf,
     snapshot_root: PathBuf,
