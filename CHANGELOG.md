@@ -27,6 +27,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no renderer prose changed (#386).
 
 ### Fixed
+- `urd doctor --thorough` no longer reports "N warnings" when the only thing
+  wrong is that a drive is away. Verify's one skipped-check row per absent
+  drive used to be counted as a warning, and a warning outranks the
+  "subvolumes degraded — data is safe, drives are absent" verdict, so the
+  reassuring answer was hidden behind an alarming count. The verdict is now
+  derived once from the assembled report rather than from a tally kept by
+  hand alongside it, so a row that the report itself calls an expected
+  condition can no longer masquerade as a finding (#382).
 - The default webhook notification body is now built with `serde_json`
   instead of hand-escaping only double quotes, so a title or body
   containing a backslash, newline, tab, or other control character

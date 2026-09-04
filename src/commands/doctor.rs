@@ -26,9 +26,6 @@ use crate::voice;
 use crate::commands::{init, verify};
 
 pub fn run(config: Config, args: DoctorArgs, output_mode: OutputMode) -> anyhow::Result<()> {
-    let mut warn_count: usize = 0;
-    let mut error_count: usize = 0;
-
     // ── 1. Config checks (preflight — pure, instant) ──────────────
     let preflight_results = preflight::preflight_checks(&config);
     let config_checks: Vec<DoctorCheck> = if preflight_results.is_empty() {
@@ -42,7 +39,6 @@ pub fn run(config: Config, args: DoctorArgs, output_mode: OutputMode) -> anyhow:
         // nothing to protect. Surface as a config warning so the verdict
         // becomes Warnings rather than the misleading Healthy.
         if subvol_count == 0 {
-            warn_count += 1;
             vec![DoctorCheck {
                 name: "No subvolumes configured.".to_string(),
                 status: DoctorCheckStatus::Warn,
@@ -64,7 +60,6 @@ pub fn run(config: Config, args: DoctorArgs, output_mode: OutputMode) -> anyhow:
         preflight_results
             .iter()
             .map(|c| {
-                warn_count += 1;
                 let suggestion = match c.name {
                     "weakening-override" => {
                         Some("Reduce the interval to match, or change protection to custom".to_string())
@@ -89,14 +84,8 @@ pub fn run(config: Config, args: DoctorArgs, output_mode: OutputMode) -> anyhow:
         .map(|c| {
             let status = match c.status {
                 InitStatus::Ok => DoctorCheckStatus::Ok,
-                InitStatus::Warn => {
-                    warn_count += 1;
-                    DoctorCheckStatus::Warn
-                }
-                InitStatus::Error => {
-                    error_count += 1;
-                    DoctorCheckStatus::Error
-                }
+                InitStatus::Warn => DoctorCheckStatus::Warn,
+                InitStatus::Error => DoctorCheckStatus::Error,
             };
             DoctorCheck {
                 name: c.name,
@@ -130,13 +119,6 @@ pub fn run(config: Config, args: DoctorArgs, output_mode: OutputMode) -> anyhow:
             build_sudoers_drift_checks(&config, listing.as_deref())
         }
     };
-    for check in &drift_checks {
-        match check.status {
-            DoctorCheckStatus::Warn => warn_count += 1,
-            DoctorCheckStatus::Error => error_count += 1,
-            DoctorCheckStatus::Ok => {}
-        }
-    }
     infra_checks.extend(drift_checks);
 
     // ── Units drift + linger (UPI 075) ───────────────────────────
@@ -161,18 +143,10 @@ pub fn run(config: Config, args: DoctorArgs, output_mode: OutputMode) -> anyhow:
     {
         units_checks.extend(linger_check());
     }
-    for check in &units_checks {
-        match check.status {
-            DoctorCheckStatus::Warn => warn_count += 1,
-            DoctorCheckStatus::Error => error_count += 1,
-            DoctorCheckStatus::Ok => {}
-        }
-    }
     infra_checks.extend(units_checks);
 
     // UUID fingerprinting checks for mounted drives
     for (label, _uuid, snippet) in drives::check_missing_uuids(&config.drives) {
-        warn_count += 1;
         infra_checks.push(DoctorCheck {
             name: format!("{label}: no UUID configured"),
             status: DoctorCheckStatus::Warn,
@@ -190,7 +164,6 @@ pub fn run(config: Config, args: DoctorArgs, output_mode: OutputMode) -> anyhow:
         if let Ok(free) = drives::filesystem_free_bytes(&root.path)
             && free < min_free * 2
         {
-            warn_count += 1;
             let free_display = crate::types::ByteSize(free);
             let threshold_display = crate::types::ByteSize(min_free);
             infra_checks.push(DoctorCheck {
@@ -234,7 +207,6 @@ pub fn run(config: Config, args: DoctorArgs, output_mode: OutputMode) -> anyhow:
                 }
                 PromiseStatus::Protected => advice.as_ref().map(unpack_advice).unwrap_or_default(),
                 PromiseStatus::Unprotected => {
-                    error_count += 1;
                     advice.as_ref().map(unpack_advice).unwrap_or_else(|| {
                         (
                             Some("exposed — data may not be recoverable".to_string()),
@@ -244,7 +216,6 @@ pub fn run(config: Config, args: DoctorArgs, output_mode: OutputMode) -> anyhow:
                     })
                 }
                 PromiseStatus::AtRisk => {
-                    warn_count += 1;
                     advice.as_ref().map(unpack_advice).unwrap_or_else(|| {
                         (
                             Some("waning".to_string()),
@@ -298,7 +269,6 @@ pub fn run(config: Config, args: DoctorArgs, output_mode: OutputMode) -> anyhow:
                 }
             }
             _ => {
-                warn_count += 1;
                 DoctorSentinelStatus {
                     running: false,
                     pid: None,
@@ -322,11 +292,6 @@ pub fn run(config: Config, args: DoctorArgs, output_mode: OutputMode) -> anyhow:
         None
     };
 
-    if let Some(ref v) = verify_output {
-        warn_count += v.warn_count as usize;
-        error_count += v.fail_count as usize;
-    }
-
     // ── 5.5 Churn (UPI 030 — only with --thorough) ────────────────
     let churn_view = if args.thorough {
         Some(build_doctor_churn_view(&config, world.db()))
@@ -347,27 +312,6 @@ pub fn run(config: Config, args: DoctorArgs, output_mode: OutputMode) -> anyhow:
     } else {
         Vec::new()
     };
-    warn_count += retention_checks.len();
-
-    // ── 6. Verdict ────────────────────────────────────────────────
-    let degraded_count = data_safety
-        .iter()
-        .filter(|d| d.status == PromiseStatus::Protected && d.health != "healthy")
-        .count();
-
-    // NOTE: When --thorough is used, verify's drive-mounted warnings inflate warn_count.
-    // This can mask the Degraded verdict when absent drives are the only issue.
-    // Accepted trade-off: plain `urd doctor` (where status directs users) works correctly.
-    // The --thorough path may show Warnings instead of Degraded in this scenario.
-    let verdict = if error_count > 0 {
-        DoctorVerdict::issues(error_count)
-    } else if warn_count > 0 {
-        DoctorVerdict::warnings(warn_count)
-    } else if degraded_count > 0 {
-        DoctorVerdict::degraded(degraded_count)
-    } else {
-        DoctorVerdict::healthy()
-    };
 
     // UPI 042 Branch G: surface a soft notice when loaded config is older
     // than the current schema. Build SchemaStatus only when there's
@@ -381,7 +325,7 @@ pub fn run(config: Config, args: DoctorArgs, output_mode: OutputMode) -> anyhow:
         }),
     };
 
-    let output = DoctorOutput {
+    let mut output = DoctorOutput {
         schema_version: crate::output::DOCTOR_OUTPUT_SCHEMA_VERSION,
         config_checks,
         infra_checks,
@@ -392,8 +336,16 @@ pub fn run(config: Config, args: DoctorArgs, output_mode: OutputMode) -> anyhow:
         churn: churn_view,
         recommendations: recommendation_view,
         retention_checks,
-        verdict,
+        // Placeholder — overwritten on the next line, before anything reads it.
+        verdict: DoctorVerdict::healthy(),
     };
+
+    // ── 6. Verdict ─────────────────────────────────────────────────
+    // Derived once, as a pure fold over the assembled output (#382): every
+    // finding this run reports is already a row somewhere above, so the
+    // verdict reads those rows instead of a parallel tally that has to be
+    // kept honest by hand.
+    output.verdict = crate::output::verdict(&output);
 
     print!("{}", voice::render_doctor(&output, output_mode));
 
