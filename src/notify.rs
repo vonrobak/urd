@@ -110,6 +110,13 @@ pub enum NotificationEvent {
         pool_label: String,
         snapshots_reclaimed: u32,
     },
+    /// The mid-op watchdog thread died mid-run (issue #381, ADR-113 Layer 2):
+    /// every send after the panic ran with no in-flight host-survival guard.
+    /// Dispatched best-effort by `urd backup` in the same batch as any firing
+    /// the thread stashed before it died. `message` is the panic payload's text.
+    WatchdogStopped {
+        message: String,
+    },
     /// The always-on sentinel shed Urd-owned local snapshots while idle to keep a
     /// source pool above the host-survival floor (UPI 034, ADR-113 Layer 3).
     /// Dispatched best-effort by the sentinel only when at least one snapshot was
@@ -502,6 +509,36 @@ pub fn build_watchdog_abort_notification(
         urgency: Urgency::Critical,
         title,
         body,
+    }
+}
+
+/// The single prose for a mid-op watchdog that died mid-run (issue #381),
+/// shared verbatim by the notification body and the interactive backup
+/// summary's warning line so the two surfaces cannot drift — the same pairing
+/// [`emergency_retention_prose`] gives the emergency pre-flight. States the
+/// consequence, not the mechanism: whatever the run sent after the panic ran
+/// without the in-flight guard.
+#[must_use]
+pub fn watchdog_panic_prose(message: &str) -> String {
+    format!("Storage watchdog stopped mid-run ({message}); the remaining sends ran unguarded.")
+}
+
+/// Build the notification for a mid-op watchdog thread that panicked (issue
+/// #381). `Critical`, the same urgency as a watchdog abort: the guard ADR-113
+/// leans on for host survival was absent for part of the run, and an
+/// unattended run must say so before the next one starts.
+#[must_use]
+pub fn build_watchdog_panic_notification(message: &str) -> Notification {
+    Notification {
+        event: NotificationEvent::WatchdogStopped {
+            message: message.to_string(),
+        },
+        urgency: Urgency::Critical,
+        title: "Storage watchdog stopped".to_string(),
+        body: format!(
+            "{} Please check free space on the source drives before the next backup.",
+            watchdog_panic_prose(message)
+        ),
     }
 }
 
@@ -909,6 +946,45 @@ mod tests {
         let n = build_watchdog_abort_notification("/home", 0, false);
         assert!(n.body.contains("couldn't fully reclaim"));
         assert!(n.body.contains("left untouched"));
+    }
+
+    // ── Watchdog panic notification (issue #381) ───────────────────
+
+    #[test]
+    fn watchdog_panic_notification_is_critical_and_names_the_consequence() {
+        let n = build_watchdog_panic_notification("poll thread exploded");
+        assert_eq!(
+            n.urgency,
+            Urgency::Critical,
+            "an unguarded run is a host-survival event, like an abort"
+        );
+        assert!(n.title.contains("Storage watchdog stopped"));
+        assert!(
+            n.body.starts_with(&watchdog_panic_prose("poll thread exploded")),
+            "body must open with the shared prose: {}",
+            n.body
+        );
+        assert!(n.body.contains("poll thread exploded"), "carries the panic message");
+        assert!(
+            n.body.contains("check free space"),
+            "says what the operator should do: {}",
+            n.body
+        );
+        assert!(matches!(
+            n.event,
+            NotificationEvent::WatchdogStopped { ref message } if message == "poll thread exploded"
+        ));
+    }
+
+    #[test]
+    fn watchdog_panic_prose_states_the_sends_ran_unguarded() {
+        let prose = watchdog_panic_prose("lock poisoned");
+        assert!(prose.contains("lock poisoned"));
+        assert!(prose.contains("ran unguarded"));
+        assert!(
+            !prose.contains("aborted"),
+            "a panic stopped the guard, not a send: {prose}"
+        );
     }
 
     // ── Emergency eject notification (UPI 034) ─────────────────────

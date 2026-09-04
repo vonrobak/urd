@@ -38,6 +38,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `urd migrate` no longer silently drops a drive's `rotation_interval`
   (ADR-116) when migrating a legacy or v1 config to v2 — an offsite drive's
   declared rotation cadence now survives the hop intact (#377).
+- A panic in `urd backup`'s progress-display or storage-watchdog thread is no
+  longer swallowed when the run joins it. Both now log the panic and name the
+  thread; a dead watchdog — which means every send after it ran without the
+  do-no-harm storage guard — additionally earns a warning line in the
+  interactive backup summary and a critical notification in the same batch as
+  any watchdog firing, so an unattended nightly run is never silent about an
+  unguarded tail. A watchdog that stashed a firing and then died while holding
+  its lock no longer loses that firing either — the teardown recovers the
+  poisoned slot, so the tripped pool still gets its emergency reclaim, its
+  event, and its notification (#381).
 
 ## [0.36.0] - 2026-09-03
 
