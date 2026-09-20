@@ -209,6 +209,26 @@ pub fn compute_advice(
         });
     }
 
+    // Branch 6b: Unprotected + a drive is mounted + no chain break — the
+    // recoverable exposure. Branches 2 and 3 cover the Unprotected cases where
+    // nothing can be done (no drives configured; every drive absent); this is
+    // the case where everything needed is present and one send closes the gap.
+    // Without it, the worst promise state got *less* help than At Risk did:
+    // the 2026-09-20 silent-absence incident ended with eight exposed
+    // subvolumes, the offsite drive connected, threads intact — and no advice
+    // at all. Same shape as branch 6, which handles the At Risk twin.
+    if assessment.status == PromiseStatus::Unprotected {
+        if !earned {
+            return None;
+        }
+        return Some(ActionableAdvice {
+            subvolume: name.clone(),
+            issue: stale_issue(assessment, external_only),
+            command: Some(format!("urd backup --subvolume {name}")),
+            reason: None,
+        });
+    }
+
     // Branch 7: Protected + Degraded + chain broken on mounted drive
     if assessment.status == PromiseStatus::Protected
         && assessment.health == OperationalHealth::Degraded
@@ -1607,6 +1627,71 @@ local_retention = "transient"
         );
         assert!(advice.command.is_none());
         assert!(advice.reason.unwrap().contains("Connect WD-18TB"));
+    }
+
+    // ── Branch 6b: the recoverable exposure ────────────────────────────
+    //
+    // The 2026-09-20 silent-absence incident state: the promise is broken,
+    // but a drive is physically here and the thread is intact. One send
+    // closes it, so Urd must say so.
+
+    #[test]
+    fn advice_unprotected_with_mounted_drive_recommends_backup() {
+        let mut a = test_assessment_for_advice("sv1", PromiseStatus::Unprotected, OperationalHealth::Healthy);
+        a.external = vec![drive_assessment("WD-18TB1", true, Some(50 * 24))];
+        a.chain_health = vec![DriveChainHealth {
+            drive_label: "WD-18TB1".to_string(),
+            status: ChainStatus::Intact {
+                pin_parent: "20260731-1618-opptak".to_string(),
+            },
+        }];
+        let advice = compute_advice(&a, true, true, false).expect("recoverable exposure is advisable");
+        assert_eq!(
+            advice.command.as_deref(),
+            Some("urd backup --subvolume sv1"),
+            "a mounted drive and an intact thread make this one command away"
+        );
+        assert_eq!(advice.issue.status, PromiseStatus::Unprotected);
+    }
+
+    #[test]
+    fn advice_unprotected_with_one_of_two_drives_mounted_recommends_backup() {
+        // The incident exactly: primary absent, offsite connected. The absent
+        // drive must not suppress the advice the present one makes possible —
+        // branch 3 only fires when *every* drive is away.
+        let mut a = test_assessment_for_advice("sv1", PromiseStatus::Unprotected, OperationalHealth::Blocked);
+        a.external = vec![
+            drive_assessment("WD-18TB", false, None),
+            drive_assessment("WD-18TB1", true, Some(50 * 24)),
+        ];
+        let advice = compute_advice(&a, true, true, false).expect("one present drive is enough to act");
+        assert_eq!(advice.command.as_deref(), Some("urd backup --subvolume sv1"));
+    }
+
+    #[test]
+    fn advice_unprotected_with_mounted_drive_stays_silent_when_unearned() {
+        // Command-producing advice is suppressed on an unearned machine, the
+        // same guard branch 6 carries for the At Risk twin.
+        let mut a = test_assessment_for_advice("sv1", PromiseStatus::Unprotected, OperationalHealth::Healthy);
+        a.external = vec![drive_assessment("WD-18TB1", true, Some(50 * 24))];
+        assert!(compute_advice(&a, false, true, false).is_none());
+    }
+
+    #[test]
+    fn advice_unprotected_broken_chain_still_prefers_force_full() {
+        // Branch 4 must keep winning over 6b — a broken thread needs
+        // --force-full, not a plain backup that would fail the same way.
+        let mut a = test_assessment_for_advice("sv1", PromiseStatus::Unprotected, OperationalHealth::Degraded);
+        a.external = vec![drive_assessment("WD-18TB1", true, Some(50 * 24))];
+        a.chain_health = vec![DriveChainHealth {
+            drive_label: "WD-18TB1".to_string(),
+            status: ChainStatus::Broken {
+                reason: ChainBreakReason::PinMissingLocally,
+                pin_parent: None,
+            },
+        }];
+        let advice = compute_advice(&a, true, true, false).expect("broken chain is advisable");
+        assert!(advice.command.as_deref().unwrap().contains("--force-full"));
     }
 
     #[test]

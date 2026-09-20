@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `urd` and `urd status` now recommend a backup when a subvolume is exposed,
+  a drive is connected, and the thread is intact. Advice previously covered
+  only the exposed cases where *nothing* could be done — no drives configured,
+  or every drive absent — so the worst promise state got less help than "at
+  risk" did. Surfaced by the 2026-09-20 silent drive-absence incident, which
+  ended with eight exposed subvolumes, a connected drive, and no advice at all.
+
 ## [0.37.0] - 2026-09-04
 
 ### Added
