@@ -54,6 +54,10 @@ pub fn read_pin_file(
 /// Collect all pinned snapshot names across all drives.
 /// Errors are logged but do not propagate — returns whatever was found.
 ///
+/// Lenient, so never a delete gate: an unreadable pin is indistinguishable from
+/// an absent one here. The pre-delete re-check uses
+/// [`find_pinned_snapshots_strict`] instead (#402).
+///
 /// The legacy unlabeled `.last-external-parent` pin is consulted only as a
 /// *per-drive* fallback inside `read_pin_file`, for a drive that has no
 /// drive-specific pin yet (a mid-cutover host). Once every configured drive has
@@ -68,8 +72,8 @@ pub fn find_pinned_snapshots(
 ) -> HashSet<SnapshotName> {
     let mut pinned = HashSet::new();
 
-    for label in drive_labels {
-        match read_pin_file(local_snapshot_dir, label) {
+    for (label, read) in pin_reads(local_snapshot_dir, drive_labels) {
+        match read {
             Ok(Some(result)) => {
                 pinned.insert(result.name);
             }
@@ -84,6 +88,30 @@ pub fn find_pinned_snapshots(
     }
 
     pinned
+}
+
+/// Strict variant of [`find_pinned_snapshots`]: an absent pin file is `Ok`
+/// (no pin for that drive), but a pin file that exists and cannot be read or
+/// parsed is an `Err` — the first one encountered. For callers that must fail
+/// closed on an unreadable pin (ADR-107), i.e. [`is_pinned_at_delete_time`].
+pub fn find_pinned_snapshots_strict(
+    local_snapshot_dir: &Path,
+    drive_labels: &[String],
+) -> crate::error::Result<HashSet<SnapshotName>> {
+    pin_reads(local_snapshot_dir, drive_labels)
+        .filter_map(|(_, read)| read.transpose())
+        .map(|read| read.map(|result| result.name))
+        .collect()
+}
+
+/// Per-drive pin reads shared by the lenient and strict collectors.
+fn pin_reads<'a>(
+    local_snapshot_dir: &'a Path,
+    drive_labels: &'a [String],
+) -> impl Iterator<Item = (&'a String, crate::error::Result<Option<PinResult>>)> + 'a {
+    drive_labels
+        .iter()
+        .map(move |label| (label, read_pin_file(local_snapshot_dir, label)))
 }
 
 /// A drive-specific pin file discovered on disk: the drive label parsed from
@@ -160,7 +188,9 @@ pub fn orphan_pins(discovered: &[DiscoveredPin], configured_labels: &[String]) -
 /// Single implementation — one place to update if pin file format evolves.
 ///
 /// Fails closed (ADR-107): if the snapshot name can't be parsed, the local dir
-/// can't be resolved, or pin files can't be read, returns `true` (keep snapshot).
+/// can't be resolved, or any configured drive's pin file exists but can't be
+/// read or parsed, returns `true` (keep snapshot). An absent pin file is not a
+/// failure — it means that drive pins nothing.
 #[must_use]
 pub fn is_pinned_at_delete_time(
     snapshot_path: &Path,
@@ -178,8 +208,18 @@ pub fn is_pinned_at_delete_time(
     let Some(local_dir) = config.local_snapshot_dir(subvolume_name) else {
         return true; // fail-closed: can't find local dir
     };
-    let pinned = find_pinned_snapshots(&local_dir, &drive_labels);
-    pinned.contains(&snap)
+    match find_pinned_snapshots_strict(&local_dir, &drive_labels) {
+        Ok(pinned) => pinned.contains(&snap),
+        Err(e) => {
+            log::warn!(
+                "Cannot confirm {} is unpinned — pin file unreadable in {}: {e}; \
+                 keeping it (fail closed)",
+                snap.as_str(),
+                local_dir.display()
+            );
+            true
+        }
+    }
 }
 
 /// Write the pin file for a specific drive in a local snapshot directory.
@@ -522,6 +562,20 @@ mod tests {
     // ── is_pinned_at_delete_time tests ─────────────────────────────────
 
     fn pin_recheck_config(snap_root: &Path) -> Config {
+        pin_recheck_config_drives(snap_root, &["D1"])
+    }
+
+    fn pin_recheck_config_drives(snap_root: &Path, labels: &[&str]) -> Config {
+        let drives_toml: String = labels
+            .iter()
+            .map(|label| {
+                format!(
+                    "[[drives]]\nlabel = \"{label}\"\nmount_path = \"/mnt/{label}\"\n\
+                     snapshot_root = \".snapshots\"\nrole = \"offsite\"\n"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
         let config_str = format!(
             r#"
 [general]
@@ -542,11 +596,7 @@ hourly = 24
 [defaults.external_retention]
 daily = 30
 
-[[drives]]
-label = "D1"
-mount_path = "/mnt/d1"
-snapshot_root = ".snapshots"
-role = "offsite"
+{drives_toml}
 
 [[subvolumes]]
 name = "sv-a"
@@ -598,5 +648,115 @@ source = "/data/a"
         // Subvolume "unknown" has no local dir → fail-closed (true = keep)
         let snap_path = dir.path().join("unknown/20260322-1200-a");
         assert!(is_pinned_at_delete_time(&snap_path, "unknown", &config));
+    }
+
+    // ── Unreadable pins fail closed at delete time (#402) ──────────────
+
+    #[test]
+    fn pin_recheck_allows_delete_when_no_pin_file_exists() {
+        let dir = TempDir::new().unwrap();
+        let local_dir = dir.path().join("sv-a");
+        fs::create_dir(&local_dir).unwrap();
+
+        let config = pin_recheck_config(dir.path());
+        let snap_path = local_dir.join("20260322-1200-a");
+        assert!(
+            !is_pinned_at_delete_time(&snap_path, "sv-a", &config),
+            "an absent pin file is not a read failure — the delete may proceed"
+        );
+    }
+
+    #[test]
+    fn pin_recheck_fails_closed_when_pin_file_is_unreadable() {
+        let dir = TempDir::new().unwrap();
+        let local_dir = dir.path().join("sv-a");
+        fs::create_dir(&local_dir).unwrap();
+        // Exists but cannot be read as a file.
+        fs::create_dir(local_dir.join(".last-external-parent-D1")).unwrap();
+
+        let config = pin_recheck_config(dir.path());
+        let snap_path = local_dir.join("20260322-1200-a");
+        assert!(
+            is_pinned_at_delete_time(&snap_path, "sv-a", &config),
+            "an unreadable pin must keep the snapshot (fail closed)"
+        );
+    }
+
+    #[test]
+    fn pin_recheck_fails_closed_when_any_drive_pin_is_unreadable() {
+        // D1's pin is readable and names a *different* snapshot; D2's pin is
+        // unreadable. D2 might pin the target, so the delete must be refused.
+        let dir = TempDir::new().unwrap();
+        let local_dir = dir.path().join("sv-a");
+        fs::create_dir(&local_dir).unwrap();
+        fs::write(
+            local_dir.join(".last-external-parent-D1"),
+            "20260321-1200-a",
+        )
+        .unwrap();
+        fs::create_dir(local_dir.join(".last-external-parent-D2")).unwrap();
+
+        let config = pin_recheck_config_drives(dir.path(), &["D1", "D2"]);
+        let snap_path = local_dir.join("20260322-1200-a");
+        assert!(is_pinned_at_delete_time(&snap_path, "sv-a", &config));
+    }
+
+    #[test]
+    fn pin_recheck_fails_closed_when_legacy_fallback_is_unreadable() {
+        // No drive-specific pin, so read_pin_file falls back to the legacy
+        // unlabeled pin — which exists but is unreadable.
+        let dir = TempDir::new().unwrap();
+        let local_dir = dir.path().join("sv-a");
+        fs::create_dir(&local_dir).unwrap();
+        fs::create_dir(local_dir.join(".last-external-parent")).unwrap();
+
+        let config = pin_recheck_config(dir.path());
+        let snap_path = local_dir.join("20260322-1200-a");
+        assert!(is_pinned_at_delete_time(&snap_path, "sv-a", &config));
+    }
+
+    #[test]
+    fn pin_recheck_fails_closed_when_pin_file_is_malformed() {
+        let dir = TempDir::new().unwrap();
+        let local_dir = dir.path().join("sv-a");
+        fs::create_dir(&local_dir).unwrap();
+        fs::write(local_dir.join(".last-external-parent-D1"), "not-a-snapshot").unwrap();
+
+        let config = pin_recheck_config(dir.path());
+        let snap_path = local_dir.join("20260322-1200-a");
+        assert!(is_pinned_at_delete_time(&snap_path, "sv-a", &config));
+    }
+
+    #[test]
+    fn strict_find_distinguishes_absent_from_unreadable() {
+        let dir = TempDir::new().unwrap();
+        let labels = vec!["D1".to_string(), "D2".to_string()];
+
+        // Nothing on disk → Ok, empty.
+        assert!(find_pinned_snapshots_strict(dir.path(), &labels).unwrap().is_empty());
+
+        // One readable pin → Ok, that pin.
+        fs::write(dir.path().join(".last-external-parent-D1"), "20260322-1200-a").unwrap();
+        let pinned = find_pinned_snapshots_strict(dir.path(), &labels).unwrap();
+        assert_eq!(pinned.len(), 1);
+        assert!(pinned.iter().any(|s| s.as_str() == "20260322-1200-a"));
+
+        // Plus one unreadable pin → Err, not a partial set.
+        fs::create_dir(dir.path().join(".last-external-parent-D2")).unwrap();
+        assert!(find_pinned_snapshots_strict(dir.path(), &labels).is_err());
+    }
+
+    #[test]
+    fn lenient_find_still_skips_unreadable_pins() {
+        // The lenient reader's contract is unchanged: it returns the readable
+        // pins and omits (logs) the unreadable one.
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join(".last-external-parent-D1"), "20260322-1200-a").unwrap();
+        fs::create_dir(dir.path().join(".last-external-parent-D2")).unwrap();
+
+        let labels = vec!["D1".to_string(), "D2".to_string()];
+        let pinned = find_pinned_snapshots(dir.path(), &labels);
+        assert_eq!(pinned.len(), 1);
+        assert!(pinned.iter().any(|s| s.as_str() == "20260322-1200-a"));
     }
 }
