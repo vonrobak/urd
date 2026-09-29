@@ -528,9 +528,10 @@ pub fn detect_simultaneous_chain_breaks(
 // went away while no sentinel was watching, so its unmount is *inferred*.
 // Rule: witnessed absence beats inferred absence, and an inferred absence
 // starts at the latest moment the drive's presence was last witnessed (state
-// file, drive event, or successful send) — never at sentinel start. An inferred absence may over-state (it is bounded by when
-// presence was last seen), never under-state: a drive gone twenty days must
-// not start reporting "away 0d" after a restart.
+// file, drive event, or successful send) — never at sentinel start. An
+// inferred absence may over-state (it is bounded by when presence was last
+// seen), never under-state: a drive gone twenty days must not start reporting
+// "away 0d" after a restart.
 
 /// Mount tracking restored from the previous instance's state file.
 #[derive(Debug, Clone, PartialEq, Eq)]
