@@ -106,7 +106,8 @@ pub struct SubvolumeMetrics {
     /// 0 = failure, 1 = success, 2 = schedule-skipped, 3 = deferred (nothing
     /// reached a destination — ADR-105 amendment 2026-09-29)
     pub success: u8,
-    /// Unix timestamp; only set when success == 1
+    /// Unix timestamp. Set to the run time only when success == 1; any row
+    /// without one may receive the previous value from carry-forward.
     pub last_success_timestamp: Option<i64>,
     pub duration_seconds: u64,
     pub local_snapshot_count: usize,

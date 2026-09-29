@@ -51,6 +51,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A run filtered with `--subvolume` used to rewrite the file without the other
   subvolumes, erasing their `backup_last_success_timestamp` series so the next
   run had nothing to carry forward (#409).
+- The heartbeat's per-subvolume `send_completed` is now `true` when a send
+  completed and a later send to another drive was gated; it previously read
+  `false`. No schema change (#409).
+- The sentinel's overdue notification now says "no run" rather than "no
+  backup": it checks that a run happened, not that data was protected (#410).
 - `urd status` no longer dates a drive's absence from a stale record. When a
   backup succeeded to a drive after its last recorded disconnect, the drive
   came back and left again unwatched, so the old disconnect is ignored and

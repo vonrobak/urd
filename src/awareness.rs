@@ -603,7 +603,6 @@ pub struct DriveAssessment {
     /// `compute_health` to suppress "drive away" degradation when the absent
     /// drive's data is already fully current.
     pub source_unchanged: bool,
-    #[allow(dead_code)] // consumed by verbose status display (future)
     pub configured_interval: Interval,
     pub role: DriveRole,
     /// Seconds since the drive's last `Unmount` event in the `events` table,
