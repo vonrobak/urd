@@ -120,7 +120,7 @@ host, without sudo.
 | `--local-only` / `--external-only` | Restrict to local or external operations. |
 | `--force-snapshot` | Include snapshot creation even for unchanged subvolumes. |
 
-**Output.** Interactive — table per subvolume. Daemon — JSON.
+**Output.** Interactive — table per subvolume; per-operation size estimates appear only with `--verbose`. Daemon — JSON.
 
 **Exit codes.** `0` on success; `1` on config or filesystem read failure.
 
@@ -144,7 +144,7 @@ the planner refuses to create local snapshots when free space is below
 | Flag | Semantics |
 |------|-----------|
 | `--dry-run` | Plan + simulate; no btrfs operations executed, no state writes. |
-| `--auto` | Automated run mode — apply interval gating, suppress non-essential output. Used by the systemd timer. |
+| `--auto` | Automated run mode (used by the systemd timer). Applies interval gating, and omits the pre-run briefing and the empty-plan explanation. The run summary is unaffected: text on a terminal, JSON otherwise. |
 | `--confirm-retention-change` | Required to delete snapshots whose protection level was relaxed in this config session. Fail-closed: without the flag, retention is skipped for affected subvolumes. |
 | `--force-full` | Force full sends for chain-broken subvolumes. Without this, chain-break full sends are skipped in `--auto` mode (avoids surprise multi-TB sends from the timer). |
 | `--priority <1-3>`, `--subvolume <name>`, `--local-only`, `--external-only`, `--force-snapshot` | Same scoping as `plan`. |

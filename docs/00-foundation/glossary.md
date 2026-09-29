@@ -288,20 +288,21 @@ incremental will use.
 | `—` | No data yet (drive has never been written to). |
 
 Mended/established/intact are the three transition phrases used after a successful
-send (`voice.rs::render_transitions`).
+send (`voice/backup.rs::render_transitions`).
 
 **In context (post-backup transition summary):**
 
 ```
   subvol3-opptak: thread to WD-18TB mended.
   htpc-root: first thread to WD-18TB1 established.
-  All threads intact. 4 subvolumes verified, 4 checks OK.
+  All threads hold.
 ```
 
 `mended` = was broken, now incremental again. `established` = first send to this
-drive. `intact` = the steady-state assertion at the end of a clean run. The verb
-`hold` ("All threads hold") appears in shorter status output for the same
-condition.
+drive. `hold` = the steady-state assertion at the end of a clean `urd backup`
+(`All threads hold.`, the all-sealed transition). `intact` is the word `urd verify`
+(`All threads intact. 4 subvolumes verified, 4 checks OK.`) and `urd doctor`
+(`All threads intact (4 checks OK)`) use for a clean check.
 
 **Offsite-freshness weave (UPI 056).** A register describing how the *offsite*
 thread wears as its copy ages past the rotation window — distinct from the chain
