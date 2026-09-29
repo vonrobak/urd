@@ -81,7 +81,7 @@ pub(crate) fn emergency_candidates(
 /// Read the emergency inputs for one snapshot root: each non-transient
 /// subvolume's snapshot list and pin set.
 ///
-/// Two skips, both in the safe direction for a walk whose only product is
+/// Three skips, all in the safe direction for a walk whose only product is
 /// deletions:
 /// - **Transient subvolumes** are skipped outright — their own retention
 ///   already deletes down to the working set, so there is nothing for an
@@ -90,6 +90,9 @@ pub(crate) fn emergency_candidates(
 ///   isolation). Fail-open for the *assessment* is fail-closed for the
 ///   *deletion*: a subvolume Urd cannot enumerate contributes no candidates,
 ///   so an I/O failure can never widen the delete set.
+/// - **An unreadable pin file** is logged and skipped the same way (#419): the
+///   pin may protect any snapshot, so the subvolume offers nothing rather than
+///   candidates the layer-3 re-check would then refuse.
 fn gather_emergency_inputs(
     root: &SnapshotRoot,
     resolved: &[ResolvedSubvolume],
@@ -120,7 +123,15 @@ fn gather_emergency_inputs(
             continue;
         }
 
-        let pinned = chain::find_pinned_snapshots(&local_dir, drive_labels);
+        let pinned = match chain::find_pinned_snapshots_strict(&local_dir, drive_labels) {
+            Ok(p) => p,
+            Err(e) => {
+                log::warn!(
+                    "Emergency: pin file unreadable for {subvol_name}: {e} — skipping"
+                );
+                continue;
+            }
+        };
 
         inputs.push(EmergencySubvolInputs {
             name: subvol_name.clone(),
@@ -602,6 +613,25 @@ source = "/data/alpha"
             inputs.is_empty(),
             "a subvolume Urd cannot enumerate contributes no deletion candidates"
         );
+    }
+
+    #[test]
+    fn gather_skips_a_subvolume_with_an_unreadable_pin() {
+        // #419: an unreadable pin may protect any snapshot, so the subvolume
+        // offers nothing — not candidates the layer-3 re-check then refuses.
+        let dir = tempfile::TempDir::new().unwrap();
+        let alpha = dir.path().join("alpha");
+        make_snap_dirs(&alpha, &THREE_SNAPS);
+        std::fs::write(alpha.join(".last-external-parent-D1"), "garbage\n").unwrap();
+        let config = emergency_config(dir.path());
+
+        let inputs = gather_emergency_inputs(
+            &config.local_snapshots.roots[0],
+            &config.resolved_subvolumes(),
+            &config.drive_labels(),
+        );
+
+        assert!(inputs.is_empty(), "an unreadable pin contributes no deletion candidates");
     }
 
     #[test]

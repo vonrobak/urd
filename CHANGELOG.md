@@ -40,6 +40,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   backup" age that stands in for it) to the nearest day instead of rounding
   down, so a drive gone 2 days 21 hours reads "away 3d", not "away 2d". Ages
   under a day still show in hours (#411).
+- Emergency space reclaim now leaves a subvolume's snapshots and pins alone
+  when any of its pin files exists but cannot be read. Previously an
+  unreadable pin was treated as no pin, so reclaim could delete the parent a
+  connected drive's incremental send depends on. The cleanup that deletes a
+  transient subvolume's old parent right after a send now makes the same
+  check (#418).
+- `urd emergency` and the automatic emergency cleanup before a backup no
+  longer offer a subvolume's snapshots for deletion when one of its pin files
+  cannot be read. Previously `urd emergency` listed them and asked to confirm,
+  then refused every delete; the unreadable pin is now logged as a warning
+  and the subvolume is left out (#419).
+- A pin file that exists but is empty is now treated as unreadable rather
+  than as no pin, so the last check before deleting a local snapshot keeps
+  it; backups still go ahead, as a full send where needed. Pin files are now
+  flushed to disk before they replace the old pin, so a crash or power loss
+  can no longer leave one empty (#420).
 
 ## [0.37.0] - 2026-09-04
 

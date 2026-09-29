@@ -751,6 +751,53 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn unreadable_pin_still_plans_a_full_send() {
+        use crate::observation::FilesystemQuery;
+        // Backups fail open (ADR-107): a pin read error — which is what an
+        // empty pin file now is (#420) — plans the same full send as no pin.
+        let pin_dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(pin_dir.path().join(".last-external-parent-D1"), "").unwrap();
+        let real = crate::plan::RealFileSystemState { state: None };
+        assert!(real.read_pin_file(pin_dir.path(), "D1").is_err(), "empty pin → Err");
+
+        let sv = subvol();
+        let e = eff(true, false);
+        let d = drive();
+        let newest = snap("20260322-1500-one");
+        let mut fs = MockFileSystemState::new();
+        fs.external_snapshots
+            .insert(("D1".to_string(), "sv1".to_string()), vec![snap("20260320-0400-one")]);
+        fs.fail_pin_reads.insert((local_dir(), "D1".to_string()));
+        let btrfs = MockBtrfs::new();
+        let obs = Observation {
+            fs: &fs,
+            history: &fs,
+            btrfs: &btrfs,
+        };
+        let (ops, _skipped, _events) = run(&SendInputs {
+            core: SubvolInputs {
+                subvol: &sv,
+                eff: &e,
+                local_dir: &local_dir(),
+                local_snaps: &[newest],
+                now: now(),
+                obs: &obs,
+            },
+            drive: &d,
+            planned_snap: None,
+            force: true,
+            skip_intervals: false,
+        });
+        assert!(matches!(
+            ops[0],
+            PlannedOperation::SendFull {
+                reason: FullSendReason::NoPinFile,
+                ..
+            }
+        ));
+    }
+
     // ── Critical pin-withholding ─────────────────────────────────────
 
     #[test]
