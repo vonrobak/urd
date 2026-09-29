@@ -36,9 +36,8 @@ pub fn run(config: Config, args: EventsArgs, output_mode: OutputMode) -> anyhow:
 
     let kind = match args.kind.as_deref() {
         Some(s) => Some(EventKind::from_str(s).with_context(|| {
-            format!(
-                "unknown --kind {s:?}; supported: retention | planner | promise | sentinel | config | drive | watchdog | emergency_eject"
-            )
+            let supported: Vec<&str> = EventKind::ALL.iter().map(|k| k.as_str()).collect();
+            format!("unknown --kind {s:?}; supported: {}", supported.join(" | "))
         })?),
         None => None,
     };

@@ -94,6 +94,7 @@ pub struct EventsArgs {
     pub since: Option<String>,
 
     /// Filter by event kind: retention | planner | promise | sentinel | config | drive
+    /// | watchdog | emergency_eject | rotation | storage
     #[arg(long)]
     pub kind: Option<String>,
 
@@ -276,6 +277,19 @@ pub struct VerifyArgs {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn events_help_lists_every_event_kind() {
+        use clap::CommandFactory;
+        let mut cmd = Cli::command();
+        let events = cmd.find_subcommand_mut("events").expect("events subcommand");
+        let help = events.render_long_help().to_string();
+        // clap wraps long help text, so compare with whitespace collapsed.
+        let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        for kind in crate::events::EventKind::ALL {
+            assert!(flat.contains(kind.as_str()), "--kind help omits {}", kind.as_str());
+        }
+    }
 
     #[test]
     fn bare_urd_parses_to_none() {
