@@ -15,12 +15,12 @@ timestamp: '2026-09-29T22:30:00+02:00'
 > monitoring) depend on them. Urd reads both legacy and current formats but only writes
 > the current format. Breaking these contracts requires a migration plan and an ADR.
 >
-> Amended 2026-09-04 — see the amendment of that date below.
+> Amended 2026-09-04 and 2026-09-29 — see the amendments of those dates below.
 
 **Date:** 2026-03-22 (formalized 2026-03-24)
 **Status:** Accepted (amended 2026-05-15, `monthly = 0` migration; 2026-05-15, UPI 043
 pool metrics + heartbeat v4; 2026-09-04, code-drift audit — metric inventory moved out,
-Contract 5 added)
+Contract 5 added; 2026-09-29, retirement criterion, unlabeled pin retired)
 **Supersedes:** None (founding decision)
 
 ## Context
@@ -360,7 +360,7 @@ form read as a per-drive fallback. It is retired.
    retention. The cost of a stray file is therefore one full send. Nothing on the drive is
    touched, and the rule that a subvolume with no pin at all keeps every local snapshot
    (ADR-106 layer 1) is unchanged.
-3. **Naming.** `urd doctor` reports an unlabeled `.last-external-parent` file in a snapshot
+3. **Naming.** `urd doctor --thorough` reports an unlabeled `.last-external-parent` file in a snapshot
    directory and recommends removing it.
 
 The contract after this amendment: **the pin file form is `.last-external-parent-{LABEL}`,
