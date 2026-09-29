@@ -40,6 +40,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   backup" age that stands in for it) to the nearest day instead of rounding
   down, so a drive gone 2 days 21 hours reads "away 3d", not "away 2d". Ages
   under a day still show in hours (#411).
+- Emergency space reclaim now leaves a subvolume's snapshots and pins alone
+  when any of its pin files exists but cannot be read. Previously an
+  unreadable pin was treated as no pin, so reclaim could delete the parent a
+  connected drive's incremental send depends on (#418).
 
 ## [0.37.0] - 2026-09-04
 

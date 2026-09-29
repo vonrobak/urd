@@ -1814,8 +1814,20 @@ impl<'a> Executor<'a> {
         // (0) Never-the-only-copy gate — a subvol with NO pin has never had a
         // send confirmed offsite, so its local snapshots are its sole stored
         // backup; clearing them is forbidden even at the catastrophic floor
-        // (ADR-106/107). Read pins BEFORE removing any.
-        let pinned_before = chain::find_pinned_snapshots(local_dir, drive_labels);
+        // (ADR-106/107). Read pins BEFORE removing any, strictly: a pin that
+        // exists but cannot be read may protect a snapshot we cannot see, so
+        // refuse this subvol before any pin is removed (#418). This also covers
+        // an unreadable pin in `pins_to_remove` — we never shed what we cannot read.
+        let pinned_before = match chain::find_pinned_snapshots_strict(local_dir, drive_labels) {
+            Ok(p) => p,
+            Err(e) => {
+                log::warn!(
+                    "Emergency reclaim for {name}: pin file unreadable: {e} \
+                     — refusing this subvol's deletions this pass (fail closed)",
+                );
+                return (0, None, None, Vec::new());
+            }
+        };
         if pinned_before.is_empty() {
             log::warn!(
                 "Emergency reclaim: {name} has no confirmed offsite copy (no pin) \
@@ -1855,7 +1867,17 @@ impl<'a> Executor<'a> {
 
         // (2) Re-read pins AFTER removal (fail-closed: never delete something we
         // can still see pinned — e.g. a connected pin Tier 1 deliberately kept).
-        let pinned = chain::find_pinned_snapshots(local_dir, drive_labels);
+        // Strict: a pin that became unreadable since step (0) refuses the pass.
+        let pinned = match chain::find_pinned_snapshots_strict(local_dir, drive_labels) {
+            Ok(p) => p,
+            Err(e) => {
+                log::warn!(
+                    "Emergency reclaim for {name}: pin file unreadable after removal: {e} \
+                     — refusing this subvol's deletions this pass (fail closed)",
+                );
+                return (0, None, None, Vec::new());
+            }
+        };
 
         // (3) Delete every on-disk snapshot not in the pinned set. Names that do
         // not parse are skipped by `read_snapshot_dir` (fail-closed). The
@@ -4970,9 +4992,9 @@ local_retention = "transient"
 
     #[test]
     fn emergency_reclaim_unreadable_pin_preserves_subvol() {
-        // A pin that cannot even be read (here: it is a directory) yields no
-        // confirmed offsite copy, so the offsite gate preserves the subvol's
-        // snapshots rather than risking the only stored copy. (The pin-removal
+        // A pin that cannot even be read (here: it is a directory) is not a
+        // confirmed offsite copy, so the strict read at the offsite gate refuses
+        // the subvol rather than risking the only stored copy (#418). (The pin-removal
         // refusal remains as defense-in-depth for a readable-but-unremovable pin;
         // its logic is shared with 031-b's clear-all, covered by
         // `clear_all_pin_removal_failure_skips_all_deletions`.)
@@ -4982,7 +5004,7 @@ local_retention = "transient"
         std::fs::create_dir_all(&sv_dir).unwrap();
         let snap = sv_dir.join("20260322-1430-t");
         std::fs::create_dir(&snap).unwrap();
-        // An unreadable pin (a directory) → find_pinned_snapshots sees no pin.
+        // An unreadable pin (a directory) → the strict pin read fails.
         std::fs::create_dir(sv_dir.join(".last-external-parent-DRIVE-A")).unwrap();
 
         let config = transient_config_n_drives(
@@ -5308,6 +5330,68 @@ local_retention = "transient"
         assert_eq!(outcome.releases()[0].subvolume, "sv-t");
         assert_eq!(outcome.releases()[0].drive, "OFFSITE");
         assert_eq!(outcome.releases()[0].parent.as_str(), "20260101-0900-t");
+    }
+
+    #[test]
+    fn emergency_reclaim_refuses_when_a_kept_drives_pin_is_unreadable() {
+        // #418: PRIMARY's pin is readable and kept, OFFSITE is away-shed, and
+        // SPARE's pin exists but cannot be parsed — it may name any snapshot.
+        // The lenient read dropped SPARE from the pinned set, so its parent was
+        // deleted. Now both tiers refuse before any pin is removed.
+        let (snap, primary_dir, offsite_dir, _, connected, away, primary_pin, offsite_pin) =
+            away_shed_fixture();
+        let spare_dir = tempfile::TempDir::new().unwrap();
+        let sv_dir = snap.path().join("sv-t");
+        let middle = sv_dir.join("20260201-0900-t");
+        std::fs::create_dir(&middle).unwrap();
+        let spare_pin = sv_dir.join(".last-external-parent-SPARE");
+        std::fs::write(&spare_pin, "garbage\n").unwrap();
+        let config = transient_config_n_drives(
+            snap.path(),
+            &[
+                ("PRIMARY", primary_dir.path(), "primary"),
+                ("OFFSITE", offsite_dir.path(), "offsite"),
+                ("SPARE", spare_dir.path(), "offsite"),
+            ],
+        );
+        let mock = MockBtrfs::new();
+        let shutdown = no_shutdown();
+        let executor = Executor::new(&mock, None, &config, &shutdown);
+
+        let floor = 100;
+        let outcome = executor.emergency_reclaim_pool(
+            &["sv-t".to_string()],
+            &away_map("sv-t", &["OFFSITE"]),
+            floor,
+            || Some(floor - 1), // below floor throughout → Tier 1 then Tier 2
+        );
+
+        assert_eq!(outcome, ReclaimOutcome::Nothing);
+        assert!(delete_calls(&mock).is_empty(), "unreadable pin → no deletes, either tier");
+        assert!(connected.exists() && away.exists() && middle.exists());
+        assert!(primary_pin.exists(), "kept pin untouched");
+        assert!(offsite_pin.exists(), "refused before the away pin was removed");
+        assert!(spare_pin.exists(), "unreadable pin untouched");
+    }
+
+    #[test]
+    fn emergency_reclaim_refuses_when_a_pin_to_shed_is_unreadable() {
+        // A pin chosen for removal that cannot be parsed is not shed either:
+        // the strict read before removal refuses the subvol (never shed what
+        // cannot be read). Tier 2 blanket, two drives, one malformed pin.
+        let (_snap, _p, _o, config, connected, away, primary_pin, offsite_pin) =
+            away_shed_fixture();
+        std::fs::write(&offsite_pin, "garbage\n").unwrap();
+        let mock = MockBtrfs::new();
+        let shutdown = no_shutdown();
+        let executor = Executor::new(&mock, None, &config, &shutdown);
+
+        let outcome = reclaim_blanket(&executor, &["sv-t".to_string()]);
+
+        assert_eq!(outcome, ReclaimOutcome::Nothing);
+        assert!(delete_calls(&mock).is_empty());
+        assert!(connected.exists() && away.exists());
+        assert!(primary_pin.exists() && offsite_pin.exists(), "no pin removed");
     }
 
     #[test]
