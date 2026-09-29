@@ -12,6 +12,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   naming how many were held back and the span they cover, instead of one line
   per snapshot. Existing event rows are untouched and still display as before
   (#412).
+- Size estimates are now written at the precision they have: two significant
+  figures (`~190GB`, not `~194.6GB`) in `urd plan`, `urd backup --dry-run`, the
+  pre-run briefing and the live progress line. Measured sizes are unchanged
+  (#413).
+- An incremental send's estimate is no longer shown when the drive's last
+  successful send is more than twice the send interval old. The estimate is
+  the size of the previous incremental send, so after a long absence it
+  described a different interval than the one being sent (#413).
+- The pre-run briefing now says when its size total covers only some of the
+  sends, as `urd plan` already did: `~53GB estimated for 1 of 2` (#425).
+- When several subvolumes recover the same promise state in one run, the run
+  summary prints one line (`8 subvolumes: exposed → sealed.`) instead of one
+  per subvolume (#413).
+- The run header and each subvolume's duration in the run summary now use the
+  same `m:ss` form as the live send line, not `35.8s` (#413).
 
 ### Fixed
 - `urd status` no longer dates a drive's absence from a stale record. When a

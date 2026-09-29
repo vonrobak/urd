@@ -12,9 +12,8 @@ use colored::Colorize;
 
 use crate::output::{OutputMode, PlanOutput, SkipCategory, SkippedSubvolume};
 use crate::plan::format_duration_short;
-use crate::types::ByteSize;
 
-use super::{SuggestionContext, append_suggestion, pluralize, skip_tag};
+use super::{SuggestionContext, append_suggestion, approx_size, pluralize, skip_tag};
 
 /// Render an explanation for why a manual backup produced an empty plan.
 #[must_use]
@@ -100,13 +99,13 @@ fn render_plan_interactive(data: &PlanOutput, verbose: bool) -> String {
             format!(
                 "{} (~{} total)",
                 pluralize(data.summary.sends, "send", "sends"),
-                ByteSize(total)
+                approx_size(total)
             )
         } else {
             format!(
                 "{} (~{} estimated for {} of {})",
                 pluralize(data.summary.sends, "send", "sends"),
-                ByteSize(total),
+                approx_size(total),
                 sends_with_estimates,
                 data.summary.sends
             )
@@ -173,8 +172,8 @@ fn render_plan_interactive(data: &PlanOutput, verbose: bool) -> String {
                 other => format!("[{other}]"),
             };
             let size_annotation = match (entry.estimated_bytes, entry.is_full_send) {
-                (Some(bytes), Some(true)) => format!(" ~{}", ByteSize(bytes)),
-                (Some(bytes), Some(false)) => format!(" last: ~{}", ByteSize(bytes)),
+                (Some(bytes), Some(true)) => format!(" ~{}", approx_size(bytes)),
+                (Some(bytes), Some(false)) => format!(" last: ~{}", approx_size(bytes)),
                 _ => String::new(),
             };
             // UPI 028: local and external retention can delete the same

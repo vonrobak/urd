@@ -35,6 +35,7 @@ use crate::storage_critical::TightnessTier;
 use crate::preflight;
 use crate::state::StateDb;
 use crate::types::{BackupPlan, ByteSize, PlannedOperation, ProtectionLevel, SendKind};
+use crate::voice::{approx_size, format_elapsed};
 use crate::recorder::{DispatchPolicy, Recorder, Recording};
 use crate::run_tail::{
     self, MetricsSpec, PoolObservability, ReclaimDecision, TailExit, TailInputs, WatchdogFiring,
@@ -2051,7 +2052,7 @@ fn format_progress_line(
             format!(
                 " {} (est ~{}) @ {}/s  [{}]",
                 ByteSize(bytes),
-                ByteSize(est),
+                approx_size(est),
                 ByteSize(rate as u64),
                 elapsed_str,
             )
@@ -2063,7 +2064,7 @@ fn format_progress_line(
                 Some(remaining) => format!(
                     " {} / ~{} @ {}/s  [{}, ~{} left]",
                     ByteSize(bytes),
-                    ByteSize(est),
+                    approx_size(est),
                     ByteSize(rate as u64),
                     elapsed_str,
                     format_elapsed(remaining),
@@ -2071,7 +2072,7 @@ fn format_progress_line(
                 None => format!(
                     " {} / ~{} @ {}/s  [{}]",
                     ByteSize(bytes),
-                    ByteSize(est),
+                    approx_size(est),
                     ByteSize(rate as u64),
                     elapsed_str,
                 ),
@@ -2082,7 +2083,7 @@ fn format_progress_line(
             format!(
                 " {} / ~{} @ {}/s  [{}]",
                 ByteSize(bytes),
-                ByteSize(est),
+                approx_size(est),
                 ByteSize(rate as u64),
                 elapsed_str,
             )
@@ -2279,19 +2280,6 @@ fn progress_display_loop(
 
     // Shutdown: clear any active progress line
     eprint!("\r\x1b[2K");
-}
-
-fn format_elapsed(d: Duration) -> String {
-    let total_secs = d.as_secs();
-    let hours = total_secs / 3600;
-    let mins = (total_secs % 3600) / 60;
-    let secs = total_secs % 60;
-
-    if hours > 0 {
-        format!("{hours}:{mins:02}:{secs:02}")
-    } else {
-        format!("{mins}:{secs:02}")
-    }
 }
 
 /// Emergency pre-flight: check each snapshot root for critical space conditions.
@@ -4180,7 +4168,7 @@ source = "/data/beta"
             Some(47_600_000_000),
         );
         assert!(line.contains("[3/6]"));
-        assert!(line.contains("23.1GB / ~47.6GB"));
+        assert!(line.contains("23.1GB / ~48GB"));
         assert!(line.contains("left"));
     }
 
@@ -4204,7 +4192,7 @@ source = "/data/beta"
             Duration::from_secs(250),
             Some(47_600_000_000),
         );
-        assert!(line.contains("50.1GB (est ~47.6GB)"));
+        assert!(line.contains("50.1GB (est ~48GB)"));
         assert!(!line.contains("left"), "ETA should not show when exceeded");
     }
 

@@ -1346,6 +1346,8 @@ pub struct PreActionSummary {
 pub struct PreActionDriveSummary {
     pub drive_label: String,
     pub subvolume_count: usize,
+    /// How many of `subvolume_count` sends carry a size estimate.
+    pub estimated_count: usize,
     pub estimated_bytes: Option<u64>,
 }
 
@@ -1374,24 +1376,26 @@ pub fn build_pre_action_summary(
 ) -> PreActionSummary {
     let snapshot_count = plan_output.summary.snapshots;
 
-    let mut drive_map: std::collections::BTreeMap<String, (usize, Option<u64>)> =
+    let mut drive_map: std::collections::BTreeMap<String, (usize, usize, Option<u64>)> =
         std::collections::BTreeMap::new();
     for op in &plan_output.operations {
         if op.operation == "send"
             && let Some(ref label) = op.drive_label
         {
-            let entry = drive_map.entry(label.clone()).or_insert((0, None));
+            let entry = drive_map.entry(label.clone()).or_insert((0, 0, None));
             entry.0 += 1;
             if let Some(bytes) = op.estimated_bytes {
-                *entry.1.get_or_insert(0) += bytes;
+                entry.1 += 1;
+                *entry.2.get_or_insert(0) += bytes;
             }
         }
     }
     let send_plan: Vec<PreActionDriveSummary> = drive_map
         .into_iter()
-        .map(|(label, (count, bytes))| PreActionDriveSummary {
+        .map(|(label, (count, estimated, bytes))| PreActionDriveSummary {
             drive_label: label,
             subvolume_count: count,
+            estimated_count: estimated,
             estimated_bytes: bytes,
         })
         .collect();

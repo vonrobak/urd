@@ -121,6 +121,38 @@ pub(super) fn pluralize(count: usize, singular: &str, plural: &str) -> String {
     }
 }
 
+/// A size ESTIMATE, written at the precision it has: two significant figures,
+/// in `ByteSize`'s decimal units. Measured byte counts keep `ByteSize`. Public
+/// because the live progress line (`commands/backup.rs`) shows estimates too;
+/// it is a number formatter, not voice.
+#[must_use]
+pub fn approx_size(bytes: u64) -> String {
+    let digits = bytes.checked_ilog10().map_or(1, |d| d + 1);
+    let rounded = if digits <= 2 {
+        bytes
+    } else {
+        let step = 10u64.pow(digits - 2);
+        bytes.saturating_add(step / 2) / step * step
+    };
+    crate::types::ByteSize(rounded).to_string()
+}
+
+/// Elapsed time as `m:ss`, or `h:mm:ss` from an hour up — the one duration
+/// convention for the streamed send line, the run header and the run tail.
+#[must_use]
+pub fn format_elapsed(d: std::time::Duration) -> String {
+    let total_secs = d.as_secs();
+    let hours = total_secs / 3600;
+    let mins = (total_secs % 3600) / 60;
+    let secs = total_secs % 60;
+
+    if hours > 0 {
+        format!("{hours}:{mins:02}:{secs:02}")
+    } else {
+        format!("{mins}:{secs:02}")
+    }
+}
+
 pub(super) fn exposure_label(status: PromiseStatus) -> String {
     match status {
         PromiseStatus::Protected => "sealed".to_string(),
@@ -1048,7 +1080,7 @@ mod tests {
         let output = render_backup_summary(&test_backup_summary(), OutputMode::Interactive);
         assert!(output.contains("success"), "missing result in header");
         assert!(output.contains("#47"), "missing run ID");
-        assert!(output.contains("12.3"), "missing duration");
+        assert!(output.contains("0:12"), "missing duration");
     }
 
     #[test]
@@ -2058,7 +2090,7 @@ mod tests {
         };
         let output = render_plan(&data, OutputMode::Interactive, true);
         assert!(
-            output.contains("2 sends (~54.2GB total)"),
+            output.contains("2 sends (~54GB total)"),
             "summary should show total estimate: {output}"
         );
         // Size annotation rendered by voice, not embedded in detail
@@ -4229,6 +4261,95 @@ mod tests {
         );
     }
 
+    fn recovered(name: &str, from: PromiseStatus, to: PromiseStatus) -> TransitionEvent {
+        TransitionEvent::PromiseRecovered {
+            subvolume: name.to_string(),
+            from,
+            to,
+        }
+    }
+
+    fn render_transitions_of(transitions: Vec<TransitionEvent>) -> String {
+        let _color = color_guard(false);
+        let mut summary = test_backup_summary();
+        summary.transitions = transitions;
+        render_backup_summary(&summary, OutputMode::Interactive)
+    }
+
+    #[test]
+    fn identical_recoveries_collapse_to_one_line() {
+        let all: Vec<_> = (1..=8)
+            .map(|i| {
+                recovered(&format!("sv{i}"), PromiseStatus::Unprotected, PromiseStatus::Protected)
+            })
+            .collect();
+        let output = render_transitions_of(all);
+        assert!(output.contains("  8 subvolumes: exposed \u{2192} sealed.\n"), "{output}");
+        assert!(!output.contains("sv1:"), "{output}");
+    }
+
+    #[test]
+    fn single_recovery_renders_as_before() {
+        let output = render_transitions_of(vec![recovered(
+            "sv1",
+            PromiseStatus::Unprotected,
+            PromiseStatus::Protected,
+        )]);
+        assert!(output.contains("  sv1: exposed \u{2192} sealed.\n"), "{output}");
+    }
+
+    #[test]
+    fn recovery_groups_keep_first_appearance_order() {
+        let output = render_transitions_of(vec![
+            recovered("a", PromiseStatus::AtRisk, PromiseStatus::Protected),
+            recovered("b", PromiseStatus::Unprotected, PromiseStatus::Protected),
+            recovered("c", PromiseStatus::AtRisk, PromiseStatus::Protected),
+            recovered("d", PromiseStatus::Unprotected, PromiseStatus::Protected),
+        ]);
+        let first = output.find("2 subvolumes: waning \u{2192} sealed.").expect(&output);
+        let second = output.find("2 subvolumes: exposed \u{2192} sealed.").expect(&output);
+        assert!(first < second, "{output}");
+    }
+
+    #[test]
+    fn other_transitions_are_untouched_beside_grouped_recoveries() {
+        let output = render_transitions_of(vec![
+            TransitionEvent::ThreadRestored {
+                subvolume: "a".to_string(),
+                drive: "D1".to_string(),
+            },
+            recovered("a", PromiseStatus::Unprotected, PromiseStatus::Protected),
+            recovered("b", PromiseStatus::Unprotected, PromiseStatus::Protected),
+            TransitionEvent::ThreadRestored {
+                subvolume: "b".to_string(),
+                drive: "D1".to_string(),
+            },
+            TransitionEvent::AllSealed,
+        ]);
+        let lines = [
+            "  a: thread to D1 mended.",
+            "  2 subvolumes: exposed \u{2192} sealed.",
+            "  b: thread to D1 mended.",
+            "  All threads hold.",
+        ];
+        let mut at = 0;
+        for line in lines {
+            let found = output[at..].find(line).unwrap_or_else(|| panic!("{line}: {output}"));
+            at += found + line.len();
+        }
+    }
+
+    #[test]
+    fn backup_durations_use_the_elapsed_convention() {
+        let _color = color_guard(false);
+        let mut summary = test_backup_summary();
+        summary.duration_secs = 274.6;
+        summary.subvolumes[0].duration_secs = 35.8;
+        let output = render_backup_summary(&summary, OutputMode::Interactive);
+        assert!(output.contains("[run #47, 4:34]"), "{output}");
+        assert!(output.contains("htpc-home  [0:35]"), "{output}");
+    }
+
     #[test]
     fn no_transitions_no_output() {
         let _color = color_guard(false);
@@ -4254,6 +4375,7 @@ mod tests {
             send_plan: vec![crate::output::PreActionDriveSummary {
                 drive_label: "WD-18TB".to_string(),
                 subvolume_count: 7,
+                estimated_count: 7,
                 estimated_bytes: Some(53_000_000_000),
             }],
             disconnected_drives: vec![],
@@ -4280,11 +4402,13 @@ mod tests {
                 crate::output::PreActionDriveSummary {
                     drive_label: "WD-18TB".to_string(),
                     subvolume_count: 7,
+                    estimated_count: 0,
                     estimated_bytes: None,
                 },
                 crate::output::PreActionDriveSummary {
                     drive_label: "WD-18TB1".to_string(),
                     subvolume_count: 7,
+                    estimated_count: 0,
                     estimated_bytes: None,
                 },
             ],
@@ -4328,6 +4452,7 @@ mod tests {
             send_plan: vec![crate::output::PreActionDriveSummary {
                 drive_label: "WD-18TB".to_string(),
                 subvolume_count: 3,
+                estimated_count: 3,
                 estimated_bytes: Some(10_000_000_000),
             }],
             disconnected_drives: vec![],
@@ -4352,6 +4477,7 @@ mod tests {
             send_plan: vec![crate::output::PreActionDriveSummary {
                 drive_label: "WD-18TB".to_string(),
                 subvolume_count: 1,
+                estimated_count: 1,
                 estimated_bytes: Some(500_000_000),
             }],
             disconnected_drives: vec![],
@@ -4375,6 +4501,7 @@ mod tests {
             send_plan: vec![crate::output::PreActionDriveSummary {
                 drive_label: "WD-18TB".to_string(),
                 subvolume_count: 7,
+                estimated_count: 0,
                 estimated_bytes: None,
             }],
             disconnected_drives: vec![DisconnectedDrive {
@@ -4489,12 +4616,77 @@ mod tests {
     }
 
     #[test]
+    fn pre_action_qualifies_a_partial_estimate() {
+        let summary = PreActionSummary {
+            snapshot_count: 2,
+            send_plan: vec![crate::output::PreActionDriveSummary {
+                drive_label: "WD-18TB".to_string(),
+                subvolume_count: 2,
+                estimated_count: 1,
+                estimated_bytes: Some(53_200_000_000),
+            }],
+            disconnected_drives: vec![],
+            filters: crate::output::PreActionFilters {
+                local_only: false,
+                external_only: false,
+                subvolume: None,
+            },
+        };
+        let output = render_pre_action(&summary);
+        assert!(output.contains("~53GB estimated for 1 of 2"), "{output}");
+    }
+
+    #[test]
+    fn pre_action_complete_estimate_is_unqualified() {
+        let summary = PreActionSummary {
+            snapshot_count: 2,
+            send_plan: vec![crate::output::PreActionDriveSummary {
+                drive_label: "WD-18TB".to_string(),
+                subvolume_count: 2,
+                estimated_count: 2,
+                estimated_bytes: Some(53_200_000_000),
+            }],
+            disconnected_drives: vec![],
+            filters: crate::output::PreActionFilters {
+                local_only: false,
+                external_only: false,
+                subvolume: None,
+            },
+        };
+        let output = render_pre_action(&summary);
+        assert!(output.contains("2 sends, ~53GB\n"), "{output}");
+        assert!(!output.contains("estimated for"), "{output}");
+    }
+
+    #[test]
+    fn approx_size_rounds_to_two_significant_figures() {
+        assert_eq!(approx_size(194_600_000_000), "190GB");
+        assert_eq!(approx_size(53_200_000_000), "53GB");
+        assert_eq!(approx_size(5_540_000), "5.5MB");
+        assert_eq!(approx_size(1_520_000_000_000), "1.5TB");
+        assert_eq!(approx_size(9_960_000_000), "10GB");
+        assert_eq!(approx_size(999), "1KB");
+        assert_eq!(approx_size(0), "0B");
+        assert_eq!(approx_size(45), "45B");
+        assert_eq!(approx_size(u64::MAX), "18000000TB");
+    }
+
+    #[test]
+    fn format_elapsed_is_minutes_seconds_then_hours() {
+        use std::time::Duration;
+        assert_eq!(format_elapsed(Duration::from_secs(35)), "0:35");
+        assert_eq!(format_elapsed(Duration::from_secs(274)), "4:34");
+        assert_eq!(format_elapsed(Duration::from_secs(3_725)), "1:02:05");
+    }
+
+    #[test]
     fn pre_action_no_estimates() {
         let summary = PreActionSummary {
             snapshot_count: 3,
             send_plan: vec![crate::output::PreActionDriveSummary {
                 drive_label: "WD-18TB".to_string(),
                 subvolume_count: 3,
+                estimated_count: 0,
                 estimated_bytes: None,
             }],
             disconnected_drives: vec![],
