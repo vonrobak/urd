@@ -4,15 +4,16 @@
 //! (away / last-backup / disconnected) and the offsite rotation voice
 //! (hibernating / due home / absent). Pure presentation — takes pre-computed
 //! ages and forecasts, renders mythic-voice strings. The shared duration
-//! primitive `humanize_duration` stays in the parent (`super`); only drive-row
-//! vocabulary lives here.
+//! primitives (`humanize_duration`, and `humanize_away_age` for the
+//! away/last-backup ages, which rounds days rather than flooring) stay in the
+//! parent (`super`); only drive-row vocabulary lives here.
 
 use colored::Colorize;
 
 use crate::awareness::PromiseStatus;
 use crate::output::StatusAssessment;
 
-use super::humanize_duration;
+use super::{humanize_away_age, humanize_duration};
 
 /// Single-pass aggregation of per-drive presentation fields. The drive-level
 /// fields (`absent_duration_secs`, `last_activity_age_secs`) co-travel across
@@ -118,7 +119,7 @@ fn format_drive_age_label(
     worst_status: PromiseStatus,
     phrase: &str,
 ) -> String {
-    let age_str = humanize_duration(age_secs);
+    let age_str = humanize_away_age(age_secs);
     match worst_status {
         PromiseStatus::Unprotected => format!(
             "{} {phrase} {age_str} — protection aging",
@@ -234,7 +235,7 @@ fn offsite_absent_label(
     else {
         return format!("{} absent — {suffix}", drive_label.bold());
     };
-    let age = humanize_duration(age_secs);
+    let age = humanize_away_age(age_secs);
     let age = if band == PromiseStatus::Unprotected {
         age.red().to_string()
     } else {
@@ -450,6 +451,24 @@ mod tests {
             !label.contains("last backup"),
             "must not use ops-log label when event exists: {label}"
         );
+    }
+
+    #[test]
+    fn away_age_rounds_to_nearest_day_not_floor() {
+        // #411: a drive gone 2d21h rendered "away 2d". Both cascade renderers
+        // (plain away/last-backup and the offsite "absent" band) round.
+        let _color = color_guard(false);
+        let age = 2 * 86400 + 21 * 3600;
+        let away = unmounted_drive_label("WD-18TB", Some(age), None, PromiseStatus::AtRisk);
+        assert!(away.contains("away 3d"), "rounds up past the half day: {away}");
+        let backup = unmounted_drive_label("WD-18TB", None, Some(age), PromiseStatus::AtRisk);
+        assert!(backup.contains("last backup 3d"), "fallback rounds too: {backup}");
+        let r = rot(Some(86400), None);
+        let absent = offsite_drive_label("Off", PromiseStatus::AtRisk, &r, Some(age), Some(age), None);
+        assert!(absent.contains("absent 3d"), "offsite absent rounds: {absent}");
+        // Under a day stays in hours — never rounded up to "1d".
+        let fresh = unmounted_drive_label("WD-18TB", Some(23 * 3600), None, PromiseStatus::AtRisk);
+        assert!(fresh.contains("away 23h"), "sub-day unchanged: {fresh}");
     }
 
     // ── UPI 056: offsite rotation voice helpers ───────────────────────

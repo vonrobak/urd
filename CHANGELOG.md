@@ -19,6 +19,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Previously an unreadable pin was treated as no pin, so retention and
   emergency cleanup could delete the parent an incremental send depends on
   (#402).
+- The sentinel now remembers which drives were mounted across a restart. A
+  drive that went away while the sentinel was not running is recorded as
+  gone, dated to when it was last seen mounted — never to the restart — so
+  `urd status` keeps saying how long it has been away instead of falling
+  silent, and a drive gone for weeks never starts over at "away 0d" (#411).
+- `urd status` now rounds how long a drive has been away (and the "last
+  backup" age that stands in for it) to the nearest day instead of rounding
+  down, so a drive gone 2 days 21 hours reads "away 3d", not "away 2d". Ages
+  under a day still show in hours (#411).
 
 ## [0.37.0] - 2026-09-04
 

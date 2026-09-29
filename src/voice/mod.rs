@@ -279,6 +279,21 @@ pub(super) fn humanize_duration(secs: i64) -> String {
     }
 }
 
+/// Humanize how long a drive has been away (or since its last backup) —
+/// `humanize_duration`, except that once past a day it rounds to the nearest
+/// day instead of flooring (#411). Flooring understates on exactly the wrong
+/// side: a drive gone 2d21h read "away 2d", the most optimistic age consistent
+/// with the truth. Below a day it defers to `humanize_duration` unchanged, so
+/// the hour→day switch stays at 24h and nothing under a day reads "1d":
+/// 23h → "23h", 36h → "2d", 2d11h → "2d", 2d12h → "3d", 2d21h → "3d".
+/// Presentation only — the stored age and every threshold stay untouched.
+pub(super) fn humanize_away_age(secs: i64) -> String {
+    if secs < 86400 {
+        return humanize_duration(secs);
+    }
+    format!("{}d", secs.saturating_add(43_200) / 86400)
+}
+
 /// Humanize a *cadence* without `humanize_duration`'s lossy day-flooring. The
 /// tight-tier stretch multiplies the declared interval (e.g. daily × 1.5 = 36h);
 /// flooring that to "1d" makes the slowed cadence read identically to the
@@ -4821,6 +4836,29 @@ mod tests {
     }
 
     // ── humanize_duration tests ────────────────────────────────────────
+
+    #[test]
+    fn humanize_away_age_rounds_days_and_keeps_the_hour_boundary() {
+        // #411: day-granular ages round to nearest instead of flooring.
+        let h = 3600;
+        let d = 86400;
+        // Below a day: unchanged hour rendering, never rounded up to "1d".
+        assert_eq!(humanize_away_age(0), "<1s");
+        assert_eq!(humanize_away_age(15 * 60), "15m");
+        assert_eq!(humanize_away_age(23 * h), "23h");
+        assert_eq!(humanize_away_age(d - 1), "23h");
+        // At and past a day: nearest whole day, halves round up.
+        assert_eq!(humanize_away_age(d), "1d");
+        assert_eq!(humanize_away_age(36 * h - 1), "1d");
+        assert_eq!(humanize_away_age(36 * h), "2d");
+        assert_eq!(humanize_away_age(2 * d + 11 * h), "2d");
+        assert_eq!(humanize_away_age(2 * d + 12 * h), "3d");
+        assert_eq!(humanize_away_age(2 * d + 21 * h), "3d"); // the incident: was "2d"
+        assert_eq!(humanize_away_age(30 * d), "30d");
+        assert_eq!(humanize_away_age(i64::MAX), format!("{}d", i64::MAX / d));
+        // The shared humanizer keeps flooring for its other surfaces.
+        assert_eq!(humanize_duration(2 * d + 21 * h), "2d");
+    }
 
     #[test]
     fn humanize_duration_zero_returns_less_than_one() {

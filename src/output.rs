@@ -1702,6 +1702,10 @@ pub struct VisualState {
 
 // ── SentinelStatusOutput ─────────────────────────────────────────────────
 
+/// The `SentinelStateFile` schema version the runner writes. A startup restore
+/// of mount tracking (#411) trusts only a file of this version.
+pub const SENTINEL_STATE_SCHEMA_VERSION: u32 = 3;
+
 /// Sentinel state file schema — written atomically by the runner, read by
 /// `urd sentinel status`. Also serves as a "running" indicator (PID check).
 #[derive(Debug, Clone, Serialize, Deserialize)]
