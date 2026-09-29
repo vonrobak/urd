@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use crate::awareness::{PromiseStatus, SubvolAssessment};
 use crate::config::Config;
 use crate::error::UrdError;
-use crate::executor::{ExecutionResult, SendType};
+use crate::executor::ExecutionResult;
 use crate::output::{ChurnHeartbeatFields, SubvolumeExtras};
 
 /// Current schema version. Bump when adding fields (never remove fields).
@@ -177,9 +177,9 @@ fn build_subvolume_entries(
                 r.subvolume_results.iter().find(|sv| sv.name == a.name)
             });
 
-            let send_completed = sv_result.is_some_and(|sv| {
-                matches!(sv.send_type, SendType::Full | SendType::Incremental)
-            });
+            // From the operations, not `send_type`: that is last-write-wins,
+            // so a gated send after a successful one would read `Deferred`.
+            let send_completed = sv_result.is_some_and(|sv| sv.send_succeeded());
 
             let churn = churn_views.get(&a.name).copied().unwrap_or_default();
             let extras = subvol_extras.get(&a.name).cloned().unwrap_or_default();
@@ -394,7 +394,10 @@ mod tests {
                 SubvolumeResult {
                     name: "home".to_string(),
                     success: true,
-                    operations: vec![],
+                    operations: vec![make_operation(
+                        SendKind::Incremental.as_db_str(),
+                        crate::executor::OpResult::Success,
+                    )],
                     duration: std::time::Duration::from_secs(5),
                     send_type: SendType::Incremental,
                     pin_failures: 0,
@@ -448,12 +451,12 @@ mod tests {
         assert_eq!(parsed.subvolumes[0].name, "home");
         assert_eq!(parsed.subvolumes[0].backup_success, Some(true));
         assert_eq!(parsed.subvolumes[0].promise_status, PromiseStatus::Protected);
-        // "home" has send_type: Incremental → send_completed: true
+        // "home" has a successful incremental send → send_completed: true
         assert!(parsed.subvolumes[0].send_completed);
         assert_eq!(parsed.subvolumes[1].name, "docs");
         assert_eq!(parsed.subvolumes[1].backup_success, Some(false));
         assert_eq!(parsed.subvolumes[1].promise_status, PromiseStatus::AtRisk);
-        // "docs" has send_type: NoSend → send_completed: false
+        // "docs" has no send operation → send_completed: false
         assert!(!parsed.subvolumes[1].send_completed);
     }
 
@@ -890,6 +893,55 @@ mod tests {
             &HashMap::new(),
         );
         assert!(!hb.subvolumes[0].send_completed);
+    }
+
+    #[test]
+    fn heartbeat_send_completed_true_when_later_gated_send_leaves_send_type_deferred() {
+        // Incremental to one drive succeeds, then a chain-break full send to
+        // another is gated: `send_type` ends `Deferred` (last write wins),
+        // but a send completed.
+        let config = test_config(&[("home", "1h")]);
+        let now =
+            NaiveDateTime::parse_from_str("2026-03-24T02:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
+        let assessments = test_assessments();
+        let mut gated = make_operation(
+            SendKind::Full.as_db_str(),
+            crate::executor::OpResult::Deferred,
+        );
+        gated.drive_label = Some("OFFSITE".to_string());
+
+        let result = ExecutionResult {
+            overall: RunResult::Success,
+            subvolume_results: vec![SubvolumeResult {
+                name: "home".to_string(),
+                success: true,
+                operations: vec![
+                    make_operation(
+                        SendKind::Incremental.as_db_str(),
+                        crate::executor::OpResult::Success,
+                    ),
+                    gated,
+                ],
+                duration: std::time::Duration::from_secs(5),
+                send_type: SendType::Deferred,
+                pin_failures: 0,
+                transient_cleanup: TransientCleanupOutcome::NotApplicable,
+                offsite_releases: Vec::new(),
+            }],
+            run_id: Some(1),
+        };
+
+        let hb = build(
+            &config,
+            now,
+            Some(&result),
+            &assessments,
+            &HashMap::new(),
+            Vec::new(),
+            Vec::new(),
+            &HashMap::new(),
+        );
+        assert!(hb.subvolumes[0].send_completed);
     }
 
     #[test]
