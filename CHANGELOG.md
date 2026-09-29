@@ -28,6 +28,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The run header and each subvolume's duration in the run summary now use the
   same `m:ss` form as the live send line, not `35.8s` (#413).
 
+### Removed
+- Urd no longer reads the unlabeled `.last-external-parent` pin file left by
+  the pre-Urd bash script; only drive-specific `.last-external-parent-{LABEL}`
+  pins count. `urd doctor --thorough` reports an unlabeled one if it finds
+  it, so you can remove it. A drive that had only that pin sends in full
+  once (#363).
+
 ### Fixed
 - `urd events --kind` help and error text now list every kind it accepts, including
   `watchdog`, `emergency_eject`, `rotation` and `storage` (#423).

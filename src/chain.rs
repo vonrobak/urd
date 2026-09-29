@@ -5,51 +5,16 @@ use crate::config::Config;
 use crate::error::UrdError;
 use crate::types::SnapshotName;
 
-/// Source of a pin file read — drive-specific or legacy fallback.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PinSource {
-    /// Pin came from `.last-external-parent-{DRIVE_LABEL}`.
-    DriveSpecific,
-    /// Pin came from legacy `.last-external-parent` (not drive-scoped).
-    Legacy,
-}
-
-/// Pin file read result — the snapshot name and where it came from.
-#[derive(Debug, Clone)]
-pub struct PinResult {
-    pub name: SnapshotName,
-    pub source: PinSource,
-}
-
-/// Read the pin file for a specific drive from a local snapshot directory.
-///
-/// Checks drive-specific file first (`.last-external-parent-{LABEL}`),
-/// then falls back to legacy file (`.last-external-parent`).
+/// Read the pin file for a specific drive from a local snapshot directory:
+/// `.last-external-parent-{LABEL}`, the only pin form Urd reads (ADR-105,
+/// amendment 2026-09-29).
 /// Returns `Ok(None)` if no pin file exists. A pin file that exists but is
 /// empty, unreadable, or malformed is an `Err` (#402, #420).
 pub fn read_pin_file(
     local_snapshot_dir: &Path,
     drive_label: &str,
-) -> crate::error::Result<Option<PinResult>> {
-    // Drive-specific pin file takes precedence
-    let drive_specific = local_snapshot_dir.join(format!(".last-external-parent-{drive_label}"));
-    if let Some(name) = try_read_pin(&drive_specific)? {
-        return Ok(Some(PinResult {
-            name,
-            source: PinSource::DriveSpecific,
-        }));
-    }
-
-    // Legacy fallback
-    let legacy = local_snapshot_dir.join(".last-external-parent");
-    if let Some(name) = try_read_pin(&legacy)? {
-        return Ok(Some(PinResult {
-            name,
-            source: PinSource::Legacy,
-        }));
-    }
-
-    Ok(None)
+) -> crate::error::Result<Option<SnapshotName>> {
+    try_read_pin(&local_snapshot_dir.join(format!("{PIN_PREFIX}{drive_label}")))
 }
 
 /// Collect all pinned snapshot names across all drives.
@@ -58,14 +23,6 @@ pub fn read_pin_file(
 /// Lenient, so never a delete gate: an unreadable pin is indistinguishable from
 /// an absent one here. The pre-delete re-check uses
 /// [`find_pinned_snapshots_strict`] instead (#402).
-///
-/// The legacy unlabeled `.last-external-parent` pin is consulted only as a
-/// *per-drive* fallback inside `read_pin_file`, for a drive that has no
-/// drive-specific pin yet (a mid-cutover host). Once every configured drive has
-/// its own `.last-external-parent-{LABEL}` pin, the legacy file is by
-/// construction stale — it can only name a pre-cutover snapshot — and is
-/// ignored here. Reading it unconditionally used to anchor retention to that
-/// stale snapshot, silently overriding the configured shape (#133).
 #[must_use]
 pub fn find_pinned_snapshots(
     local_snapshot_dir: &Path,
@@ -75,8 +32,8 @@ pub fn find_pinned_snapshots(
 
     for (label, read) in pin_reads(local_snapshot_dir, drive_labels) {
         match read {
-            Ok(Some(result)) => {
-                pinned.insert(result.name);
+            Ok(Some(name)) => {
+                pinned.insert(name);
             }
             Ok(None) => {}
             Err(e) => {
@@ -101,7 +58,6 @@ pub fn find_pinned_snapshots_strict(
 ) -> crate::error::Result<HashSet<SnapshotName>> {
     pin_reads(local_snapshot_dir, drive_labels)
         .filter_map(|(_, read)| read.transpose())
-        .map(|read| read.map(|result| result.name))
         .collect()
 }
 
@@ -109,7 +65,7 @@ pub fn find_pinned_snapshots_strict(
 fn pin_reads<'a>(
     local_snapshot_dir: &'a Path,
     drive_labels: &'a [String],
-) -> impl Iterator<Item = (&'a String, crate::error::Result<Option<PinResult>>)> + 'a {
+) -> impl Iterator<Item = (&'a String, crate::error::Result<Option<SnapshotName>>)> + 'a {
     drive_labels
         .iter()
         .map(move |label| (label, read_pin_file(local_snapshot_dir, label)))
@@ -131,8 +87,8 @@ const PIN_PREFIX: &str = ".last-external-parent-";
 /// List every drive-specific pin file in a local snapshot directory, parsing the
 /// drive label from each `.last-external-parent-{LABEL}` filename.
 ///
-/// Advisory scan only (#125 doctor surface), not a safety gate: the legacy
-/// unlabeled `.last-external-parent` is skipped (it carries no label), `.tmp`
+/// Advisory scan only (#125 doctor surface), not a safety gate: the unlabeled
+/// `.last-external-parent` is skipped (see [`unlabeled_pin_file`]), `.tmp`
 /// atomic-write leftovers are skipped, and an unreadable/empty/malformed pin is
 /// skipped rather than erroring. A missing or unreadable directory yields an
 /// empty list. Ordered by label for stable output.
@@ -147,7 +103,7 @@ pub fn discover_pin_files(local_snapshot_dir: &Path) -> Vec<DiscoveredPin> {
         let file_name = entry.file_name();
         let name = file_name.to_string_lossy();
         let Some(label) = name.strip_prefix(PIN_PREFIX) else {
-            continue; // not a drive-specific pin (legacy `.last-external-parent`, snapshots, …)
+            continue; // not a drive-specific pin (unlabeled `.last-external-parent`, snapshots, …)
         };
         if label.ends_with(".tmp") || label.is_empty() {
             continue; // atomic-write leftover, or a stray `.last-external-parent-`
@@ -165,6 +121,15 @@ pub fn discover_pin_files(local_snapshot_dir: &Path) -> Vec<DiscoveredPin> {
     }
     pins.sort_by(|a, b| a.label.cmp(&b.label));
     pins
+}
+
+/// The unlabeled `.last-external-parent` left by the pre-Urd bash script, if
+/// present. Urd no longer reads it (ADR-105, amendment 2026-09-29); doctor
+/// names it so the operator can remove it. Presence only — never read.
+#[must_use]
+pub fn unlabeled_pin_file(local_snapshot_dir: &Path) -> Option<PathBuf> {
+    let path = local_snapshot_dir.join(".last-external-parent");
+    path.symlink_metadata().is_ok().then_some(path)
 }
 
 /// Pure: which discovered pins name a drive label not in the configured set.
@@ -324,34 +289,55 @@ mod tests {
         .unwrap();
 
         let result = read_pin_file(dir.path(), "WD-18TB").unwrap().unwrap();
-        assert_eq!(result.name.as_str(), "20260322-opptak");
-        assert_eq!(result.source, PinSource::DriveSpecific);
+        assert_eq!(result.as_str(), "20260322-opptak");
+    }
+
+    /// Run `check` against each stray unlabeled pin shape in `dir`: well-formed,
+    /// empty, malformed, and unreadable (a directory). Urd reads none of them
+    /// (ADR-105, amendment 2026-09-29).
+    fn for_each_unlabeled_pin(dir: &Path, check: impl Fn(&str)) {
+        let unlabeled = dir.join(".last-external-parent");
+        for (shape, content) in [
+            ("well-formed", Some("20260322-1200-a")),
+            ("empty", Some("")),
+            ("malformed", Some("not-a-snapshot")),
+            ("directory", None),
+        ] {
+            match content {
+                Some(content) => fs::write(&unlabeled, content).unwrap(),
+                None => fs::create_dir(&unlabeled).unwrap(),
+            }
+            check(shape);
+            match content {
+                Some(_) => fs::remove_file(&unlabeled).unwrap(),
+                None => fs::remove_dir(&unlabeled).unwrap(),
+            }
+        }
     }
 
     #[test]
-    fn read_legacy_fallback() {
+    fn unlabeled_pin_is_not_read() {
         let dir = TempDir::new().unwrap();
-        fs::write(dir.path().join(".last-external-parent"), "20260322-opptak").unwrap();
-
-        // No drive-specific file, should fall back to legacy
-        let result = read_pin_file(dir.path(), "WD-18TB").unwrap().unwrap();
-        assert_eq!(result.name.as_str(), "20260322-opptak");
-        assert_eq!(result.source, PinSource::Legacy);
+        for_each_unlabeled_pin(dir.path(), |shape| {
+            assert!(
+                read_pin_file(dir.path(), "WD-18TB").unwrap().is_none(),
+                "{shape} unlabeled pin must read as no pin"
+            );
+        });
     }
 
     #[test]
-    fn drive_specific_takes_precedence() {
+    fn unlabeled_pin_beside_drive_pin_is_ignored() {
         let dir = TempDir::new().unwrap();
         fs::write(
             dir.path().join(".last-external-parent-WD-18TB"),
             "20260322-1400-opptak",
         )
         .unwrap();
-        fs::write(dir.path().join(".last-external-parent"), "20260321-opptak").unwrap();
-
-        let result = read_pin_file(dir.path(), "WD-18TB").unwrap().unwrap();
-        assert_eq!(result.name.as_str(), "20260322-1400-opptak");
-        assert_eq!(result.source, PinSource::DriveSpecific);
+        for_each_unlabeled_pin(dir.path(), |shape| {
+            let result = read_pin_file(dir.path(), "WD-18TB").unwrap().unwrap();
+            assert_eq!(result.as_str(), "20260322-1400-opptak", "{shape}");
+        });
     }
 
     #[test]
@@ -387,8 +373,9 @@ mod tests {
     }
 
     #[test]
-    fn empty_drive_pin_does_not_fall_back_to_legacy() {
-        // The legacy pin cannot stand in for a drive pin whose name is lost.
+    fn empty_drive_pin_errs_beside_unlabeled_pin() {
+        // A well-formed unlabeled pin cannot stand in for a drive pin whose
+        // name is lost: the drive pin still fails closed.
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join(".last-external-parent-WD-18TB"), "").unwrap();
         fs::write(dir.path().join(".last-external-parent"), "20260321-opptak").unwrap();
@@ -417,7 +404,7 @@ mod tests {
     }
 
     #[test]
-    fn discover_pin_files_parses_labels_skips_legacy_and_tmp() {
+    fn discover_pin_files_parses_labels_skips_unlabeled_and_tmp() {
         let dir = TempDir::new().unwrap();
         fs::write(
             dir.path().join(".last-external-parent-WD-18TB"),
@@ -429,7 +416,7 @@ mod tests {
             "20260402-1925-containers",
         )
         .unwrap();
-        // Skipped: legacy unlabeled, atomic-write leftover, a real snapshot dir.
+        // Skipped: unlabeled, atomic-write leftover, a real snapshot dir.
         fs::write(dir.path().join(".last-external-parent"), "20260324-containers").unwrap();
         fs::write(dir.path().join(".last-external-parent-WD-18TB.tmp"), "x").unwrap();
         fs::create_dir(dir.path().join("20260516-0401-containers")).unwrap();
@@ -491,55 +478,45 @@ mod tests {
     }
 
     #[test]
-    fn legacy_ignored_when_all_drives_have_specific_pins() {
-        // Every configured drive has its own pin; a stale legacy pin points at an
-        // older snapshot. The legacy pin must NOT join the pinned set — otherwise
-        // it becomes the oldest-pin retention anchor and over-retains (#133).
+    fn unlabeled_pin_file_detects_presence_only() {
         let dir = TempDir::new().unwrap();
+        assert_eq!(unlabeled_pin_file(dir.path()), None);
+
+        // A drive-specific pin is not the unlabeled one.
         fs::write(
             dir.path().join(".last-external-parent-WD-18TB"),
             "20260516-0401-opptak",
         )
         .unwrap();
-        fs::write(
-            dir.path().join(".last-external-parent-WD-18TB1"),
-            "20260514-1546-opptak",
-        )
-        .unwrap();
-        // Stale legacy pin from the bash→Urd cutover, older than both.
-        fs::write(dir.path().join(".last-external-parent"), "20260324-opptak").unwrap();
+        assert_eq!(unlabeled_pin_file(dir.path()), None);
 
-        let labels = vec!["WD-18TB".to_string(), "WD-18TB1".to_string()];
-        let pinned = find_pinned_snapshots(dir.path(), &labels);
-
-        assert_eq!(pinned.len(), 2);
-        assert!(pinned.iter().any(|s| s.as_str() == "20260516-0401-opptak"));
-        assert!(pinned.iter().any(|s| s.as_str() == "20260514-1546-opptak"));
-        assert!(
-            !pinned.iter().any(|s| s.as_str() == "20260324-opptak"),
-            "stale legacy pin must not anchor retention when every drive has a specific pin"
-        );
+        let unlabeled = dir.path().join(".last-external-parent");
+        for_each_unlabeled_pin(dir.path(), |shape| {
+            assert_eq!(unlabeled_pin_file(dir.path()), Some(unlabeled.clone()), "{shape}");
+        });
     }
 
     #[test]
-    fn legacy_still_used_when_drive_lacks_specific_pin() {
-        // Mid-cutover host: a drive with no drive-specific pin must still fall back
-        // to the legacy pin (via read_pin_file), so the chain stays protected.
+    fn unlabeled_pin_never_joins_pinned_set() {
+        // WD-18TB has its own pin; WD-18TB1 has none. The unlabeled pin names
+        // an older snapshot. It must neither anchor retention (#133) nor stand
+        // in for WD-18TB1's missing pin, in the lenient or the strict reader.
         let dir = TempDir::new().unwrap();
         fs::write(
             dir.path().join(".last-external-parent-WD-18TB"),
             "20260516-0401-opptak",
         )
         .unwrap();
-        fs::write(dir.path().join(".last-external-parent"), "20260324-opptak").unwrap();
 
-        // WD-18TB1 has no drive-specific pin → falls back to legacy.
         let labels = vec!["WD-18TB".to_string(), "WD-18TB1".to_string()];
-        let pinned = find_pinned_snapshots(dir.path(), &labels);
-
-        assert_eq!(pinned.len(), 2);
-        assert!(pinned.iter().any(|s| s.as_str() == "20260516-0401-opptak"));
-        assert!(pinned.iter().any(|s| s.as_str() == "20260324-opptak"));
+        for_each_unlabeled_pin(dir.path(), |shape| {
+            let lenient = find_pinned_snapshots(dir.path(), &labels);
+            let strict = find_pinned_snapshots_strict(dir.path(), &labels).unwrap();
+            for pinned in [lenient, strict] {
+                assert_eq!(pinned.len(), 1, "{shape}");
+                assert!(pinned.iter().any(|s| s.as_str() == "20260516-0401-opptak"));
+            }
+        });
     }
 
     #[test]
@@ -550,8 +527,7 @@ mod tests {
         write_pin_file(dir.path(), "WD-18TB", &name).unwrap();
 
         let result = read_pin_file(dir.path(), "WD-18TB").unwrap().unwrap();
-        assert_eq!(result.name.as_str(), "20260322-1430-opptak");
-        assert_eq!(result.source, PinSource::DriveSpecific);
+        assert_eq!(result.as_str(), "20260322-1430-opptak");
     }
 
     #[test]
@@ -564,7 +540,7 @@ mod tests {
         write_pin_file(dir.path(), "WD-18TB", &new).unwrap();
 
         let result = read_pin_file(dir.path(), "WD-18TB").unwrap().unwrap();
-        assert_eq!(result.name.as_str(), "20260322-1430-opptak");
+        assert_eq!(result.as_str(), "20260322-1430-opptak");
     }
 
     #[test]
@@ -588,7 +564,7 @@ mod tests {
         .unwrap();
 
         let result = read_pin_file(dir.path(), "WD-18TB").unwrap().unwrap();
-        assert_eq!(result.name.as_str(), "20260322-opptak");
+        assert_eq!(result.as_str(), "20260322-opptak");
     }
 
     // ── is_pinned_at_delete_time tests ─────────────────────────────────
@@ -734,13 +710,28 @@ source = "/data/a"
     }
 
     #[test]
-    fn pin_recheck_fails_closed_when_legacy_fallback_is_unreadable() {
-        // No drive-specific pin, so read_pin_file falls back to the legacy
-        // unlabeled pin — which exists but is unreadable.
+    fn pin_recheck_ignores_unlabeled_pin() {
+        // No drive-specific pin. The unlabeled pin — even one naming the target,
+        // or one that is empty or unreadable — neither pins nor refuses.
         let dir = TempDir::new().unwrap();
         let local_dir = dir.path().join("sv-a");
         fs::create_dir(&local_dir).unwrap();
-        fs::create_dir(local_dir.join(".last-external-parent")).unwrap();
+
+        let config = pin_recheck_config(dir.path());
+        let snap_path = local_dir.join("20260322-1200-a");
+        for_each_unlabeled_pin(&local_dir, |shape| {
+            assert!(!is_pinned_at_delete_time(&snap_path, "sv-a", &config), "{shape}");
+        });
+    }
+
+    #[test]
+    fn pin_recheck_still_fails_closed_on_drive_pin_beside_unlabeled_pin() {
+        // A well-formed unlabeled pin cannot rescue an unreadable drive pin.
+        let dir = TempDir::new().unwrap();
+        let local_dir = dir.path().join("sv-a");
+        fs::create_dir(&local_dir).unwrap();
+        fs::write(local_dir.join(".last-external-parent"), "20260321-1200-a").unwrap();
+        fs::create_dir(local_dir.join(".last-external-parent-D1")).unwrap();
 
         let config = pin_recheck_config(dir.path());
         let snap_path = local_dir.join("20260322-1200-a");

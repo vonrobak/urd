@@ -290,7 +290,7 @@ fn render_doctor_interactive(data: &DoctorOutput) -> String {
         }
     }
 
-    // Retention section (--thorough only). #125 orphan/legacy pin advisories.
+    // Retention section (--thorough only). #125 orphan/unlabeled pin advisories.
     // Rendered only when something is wrong — no header, no false gravity, on a
     // clean scan (Voice Contract Rule 5).
     if !data.retention_checks.is_empty() {

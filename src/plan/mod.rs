@@ -796,7 +796,7 @@ impl FilesystemQuery for RealFileSystemState<'_> {
         local_dir: &Path,
         drive_label: &str,
     ) -> crate::error::Result<Option<SnapshotName>> {
-        crate::chain::read_pin_file(local_dir, drive_label).map(|opt| opt.map(|r| r.name))
+        crate::chain::read_pin_file(local_dir, drive_label)
     }
 
     fn pinned_snapshots(&self, local_dir: &Path, drive_labels: &[String]) -> HashSet<SnapshotName> {

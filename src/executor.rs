@@ -606,14 +606,12 @@ impl<'a> Executor<'a> {
             && let Some(local_dir) = self.config.local_snapshot_dir(subvol_name)
         {
             for drive_label in &shed_away_drives {
-                // (F3) Read the pin BEFORE removal: emit only for a *present
-                // drive-specific* pin. A `NotFound`→`Ok` remove or a legacy pin
-                // (which `remove_pin_file` does not actually delete) would make the
-                // event a phantom — this is an honesty surface, so guard it.
-                let present_drive_pin = match chain::read_pin_file(&local_dir, drive_label) {
-                    Ok(Some(p)) if p.source == chain::PinSource::DriveSpecific => Some(p.name),
-                    _ => None,
-                };
+                // (F3) Read the pin BEFORE removal: emit only for a *present*
+                // pin. A `NotFound`→`Ok` remove would make the event a phantom —
+                // this is an honesty surface, so guard it.
+                let present_drive_pin = chain::read_pin_file(&local_dir, drive_label)
+                    .ok()
+                    .flatten();
                 match chain::remove_pin_file(&local_dir, drive_label) {
                     Ok(()) => {
                         if let Some(parent) = present_drive_pin {
@@ -952,7 +950,7 @@ impl<'a> Executor<'a> {
             return;
         };
         let pin = match chain::read_pin_file(pin_dir, drive_label) {
-            Ok(pin) => pin.map(|r| r.name),
+            Ok(pin) => pin,
             Err(e) => {
                 log::warn!(
                     "partial sweep: failed to read pin file for {drive_label}: {e} — skipping sweep (fail closed)"
@@ -1110,7 +1108,7 @@ impl<'a> Executor<'a> {
                 if let Some((pin_path, _)) = pin_on_success
                     && let Some(pin_dir) = pin_path.parent()
                     && let Ok(Some(pinned)) = chain::read_pin_file(pin_dir, drive_label)
-                    && pinned.name.as_str() == snap_name.to_string_lossy()
+                    && pinned.as_str() == snap_name.to_string_lossy()
                 {
                     log::info!(
                         "Snapshot {} already exists at dest and is pinned, skipping send",
@@ -1831,10 +1829,7 @@ impl<'a> Executor<'a> {
         // removal so a released chain is recorded honestly (never a phantom).
         let mut releases: Vec<OffsiteChainRelease> = Vec::new();
         for label in pins_to_remove {
-            let drive_pin = match chain::read_pin_file(local_dir, label) {
-                Ok(Some(p)) if p.source == chain::PinSource::DriveSpecific => Some(p.name),
-                _ => None,
-            };
+            let drive_pin = chain::read_pin_file(local_dir, label).ok().flatten();
             if let Err(e) = chain::remove_pin_file(local_dir, label) {
                 log::warn!(
                     "Emergency reclaim for {name}: pin removal failed for {label}: {e} \

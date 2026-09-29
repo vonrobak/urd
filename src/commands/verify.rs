@@ -106,18 +106,11 @@ pub(crate) fn collect_verify_output(config: &Config, args: &VerifyArgs) -> Verif
 
             // 1. Pin file readable
             match chain::read_pin_file(&local_dir, &drive.label) {
-                Ok(Some(pin_result)) => {
-                    let pin = &pin_result.name;
-                    let is_legacy = pin_result.source == chain::PinSource::Legacy;
-                    let pin_label = if is_legacy {
-                        format!("{pin} (legacy \u{2014} not drive-specific)")
-                    } else {
-                        pin.to_string()
-                    };
+                Ok(Some(pin)) => {
                     checks.push(VerifyCheck {
                         name: "pin-file".to_string(),
                         status: "ok".to_string(),
-                        detail: Some(format!("Pin: {pin_label}")),
+                        detail: Some(format!("Pin: {pin}")),
                         suggestion: None,
                     });
                     total_ok += 1;
@@ -132,16 +125,6 @@ pub(crate) fn collect_verify_output(config: &Config, args: &VerifyArgs) -> Verif
                             suggestion: None,
                         });
                         total_ok += 1;
-                    } else if is_legacy {
-                        checks.push(VerifyCheck {
-                            name: "pin-exists-local".to_string(),
-                            status: "warn".to_string(),
-                            detail: Some(format!(
-                                "Pinned snapshot missing locally: {pin} (legacy pin \u{2014} may not apply to this drive)"
-                            )),
-                            suggestion: None,
-                        });
-                        total_warn += 1;
                     } else {
                         checks.push(VerifyCheck {
                             name: "pin-exists-local".to_string(),
@@ -165,16 +148,6 @@ pub(crate) fn collect_verify_output(config: &Config, args: &VerifyArgs) -> Verif
                             suggestion: None,
                         });
                         total_ok += 1;
-                    } else if is_legacy {
-                        checks.push(VerifyCheck {
-                            name: "pin-exists-drive".to_string(),
-                            status: "warn".to_string(),
-                            detail: Some(format!(
-                                "Pinned snapshot not on this drive: {pin} (legacy pin \u{2014} run urd backup to establish drive-specific chain)"
-                            )),
-                            suggestion: None,
-                        });
-                        total_warn += 1;
                     } else {
                         checks.push(VerifyCheck {
                             name: "pin-exists-drive".to_string(),
@@ -191,14 +164,12 @@ pub(crate) fn collect_verify_output(config: &Config, args: &VerifyArgs) -> Verif
                     let ext_snaps = fs_state
                         .external_snapshots(drive, &subvol.name)
                         .unwrap_or_default();
-                    let orphan = orphan_checks(pin, &ext_snaps);
+                    let orphan = orphan_checks(&pin, &ext_snaps);
                     tally(&orphan, &mut total_ok, &mut total_warn);
                     checks.extend(orphan);
 
-                    // 5. Stale pin detection (only meaningful for drive-specific pins)
-                    if !is_legacy
-                        && let Some(mtime) = pin_file_mtime(&local_dir, &drive.label)
-                    {
+                    // 5. Stale pin detection
+                    if let Some(mtime) = pin_file_mtime(&local_dir, &drive.label) {
                         let stale =
                             stale_pin_checks(mtime, &subvol.send_interval, SystemTime::now());
                         tally(&stale, &mut total_ok, &mut total_warn);

@@ -6,7 +6,7 @@ project: ['[[urd]]']
 sensitivity: public
 status: active
 created: '2026-03-24'
-timestamp: '2026-09-04T10:15:00+02:00'
+timestamp: '2026-09-29T22:30:00+02:00'
 ---
 # ADR-105: Backward Compatibility Contracts
 
@@ -317,3 +317,56 @@ compatibility promise. Only the `--json` shape does.
 - Roadmap (`docs/96-project-supervisor/roadmap.md`) §Backward Compatibility, §Prometheus Metrics
 - Pre-cutover hardening journal (`docs/98-journals/2026-03-24-pre-cutover-hardening.md`) —
   legacy pin handling refinement
+
+## Amendment 2026-09-29: retiring a legacy on-disk form; the unlabeled pin file is retired
+
+This ADR says Urd reads legacy formats and writes only current ones. It never said when a
+legacy reader may be removed, so every legacy form was kept by default, indefinitely. This
+amendment states the criterion and applies it to the first case.
+
+### Retirement criterion
+
+The reader for a legacy on-disk form may be removed **iff all three hold**:
+
+1. **The population is empty.** Urd has never written the form, or stopped writing it in a
+   named release, and an inventory of every known deployment finds no instance. The
+   inventory is recorded with its date.
+2. **The fallback is safe for data.** After removal, a stray instance of the form is
+   ignored. Ignoring it must never cause a deletion that reading it would have prevented
+   from destroying the only copy of anything, and must never stop a backup.
+3. **A stray instance is named, not silently ignored.** `urd doctor` reports any instance
+   it finds and says what to do with it. Urd does not delete the artifact itself: removing
+   it is the operator's act.
+
+Removal is then an ordinary code change recorded by an amendment like this one. It needs
+no migration command, because criterion 1 says there is nothing to migrate.
+
+A form that fails criterion 1 is not retired; it gets a migration first (ADR-111's
+`urd migrate` is the reference shape), and is retired once the migration has emptied the
+population.
+
+### Applied: the unlabeled `.last-external-parent` pin
+
+Contract 3 lists `.last-external-parent` (no drive label, single-drive era) as a legacy
+form read as a per-drive fallback. It is retired.
+
+1. **Population.** Urd has never written the unlabeled form; it was written by the bash
+   script Urd replaced. Inventories of the one known deployment on 2026-09-03 and
+   2026-09-29 found zero unlabeled pin files and a drive-specific pin for every subvolume
+   and drive (16 of 16 on the second date).
+2. **Fallback.** With the reader gone, a drive that has only an unlabeled pin reads as
+   having no pin. The planner then sends in full rather than incrementally (backups fail
+   open, ADR-107), and the snapshot the stray file names is no longer held back from
+   retention. The cost of a stray file is therefore one full send. Nothing on the drive is
+   touched, and the rule that a subvolume with no pin at all keeps every local snapshot
+   (ADR-106 layer 1) is unchanged.
+3. **Naming.** `urd doctor` reports an unlabeled `.last-external-parent` file in a snapshot
+   directory and recommends removing it.
+
+The contract after this amendment: **the pin file form is `.last-external-parent-{LABEL}`,
+and it is the only form Urd reads.** `PinSource` and the legacy arm of `urd verify` go with
+the reader. The second bullet under Negative consequences ("legacy pin files should
+eventually be cleaned up") is discharged.
+
+Legacy snapshot names (`YYYYMMDD-shortname`) are not retired: the population is not empty,
+since old snapshots keep their names for as long as they exist.
