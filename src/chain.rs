@@ -25,7 +25,8 @@ pub struct PinResult {
 ///
 /// Checks drive-specific file first (`.last-external-parent-{LABEL}`),
 /// then falls back to legacy file (`.last-external-parent`).
-/// Returns `Ok(None)` if no pin file exists.
+/// Returns `Ok(None)` if no pin file exists. A pin file that exists but is
+/// empty, unreadable, or malformed is an `Err` (#402, #420).
 pub fn read_pin_file(
     local_snapshot_dir: &Path,
     drive_label: &str,
@@ -91,8 +92,8 @@ pub fn find_pinned_snapshots(
 }
 
 /// Strict variant of [`find_pinned_snapshots`]: an absent pin file is `Ok`
-/// (no pin for that drive), but a pin file that exists and cannot be read or
-/// parsed is an `Err` — the first one encountered. For callers that must fail
+/// (no pin for that drive), but a pin file that exists and cannot be read,
+/// parsed, or is empty is an `Err` — the first one encountered. For callers that must fail
 /// closed on an unreadable pin (ADR-107), i.e. [`is_pinned_at_delete_time`].
 pub fn find_pinned_snapshots_strict(
     local_snapshot_dir: &Path,
@@ -225,26 +226,41 @@ pub fn is_pinned_at_delete_time(
 
 /// Write the pin file for a specific drive in a local snapshot directory.
 /// Records the last successfully sent snapshot name.
-/// Uses atomic write (temp file + rename) to prevent corruption.
+/// Uses atomic write (temp file + rename) to prevent corruption, and fsyncs
+/// the temp file before the rename so a crash cannot leave the pin empty
+/// (#420). The directory is fsynced after the rename so the rename itself
+/// survives a crash; that failing only warns, since the pin is already written.
 pub fn write_pin_file(
     local_snapshot_dir: &Path,
     drive_label: &str,
     snapshot_name: &SnapshotName,
 ) -> crate::error::Result<()> {
+    use std::io::Write;
+
     let final_path = local_snapshot_dir.join(format!(".last-external-parent-{drive_label}"));
     let tmp_path = local_snapshot_dir.join(format!(".last-external-parent-{drive_label}.tmp"));
 
-    std::fs::write(&tmp_path, format!("{}\n", snapshot_name.as_str())).map_err(|e| {
-        UrdError::Io {
+    std::fs::File::create(&tmp_path)
+        .and_then(|mut file| {
+            file.write_all(format!("{}\n", snapshot_name.as_str()).as_bytes())?;
+            file.sync_all()
+        })
+        .map_err(|e| UrdError::Io {
             path: tmp_path.clone(),
             source: e,
-        }
-    })?;
+        })?;
 
     std::fs::rename(&tmp_path, &final_path).map_err(|e| UrdError::Io {
         path: final_path,
         source: e,
     })?;
+
+    if let Err(e) = std::fs::File::open(local_snapshot_dir).and_then(|dir| dir.sync_all()) {
+        log::warn!(
+            "Pin for {drive_label} written, but fsync of {} failed: {e}",
+            local_snapshot_dir.display()
+        );
+    }
 
     Ok(())
 }
@@ -272,7 +288,10 @@ fn try_read_pin(path: &Path) -> crate::error::Result<Option<SnapshotName>> {
         Ok(content) => {
             let trimmed = content.trim();
             if trimmed.is_empty() {
-                return Ok(None);
+                // Exists but names nothing — e.g. a pin write cut short by a
+                // crash. The name it held is unknown, so this is not "no pin"
+                // (#420): strict readers fail closed, lenient ones skip it.
+                return Err(UrdError::Chain(format!("empty pin file {}", path.display())));
             }
             let name = SnapshotName::parse(trimmed).map_err(|e| {
                 UrdError::Chain(format!("malformed pin file {}: {e}", path.display()))
@@ -356,12 +375,24 @@ mod tests {
     }
 
     #[test]
-    fn empty_pin_file() {
+    fn empty_pin_file_is_an_error_not_no_pin() {
+        // #420: an existing pin that names nothing is unknown, not absent.
         let dir = TempDir::new().unwrap();
-        fs::write(dir.path().join(".last-external-parent-WD-18TB"), "  \n  ").unwrap();
+        let pin = dir.path().join(".last-external-parent-WD-18TB");
+        fs::write(&pin, "  \n  ").unwrap();
+        assert!(read_pin_file(dir.path(), "WD-18TB").is_err(), "whitespace-only");
 
-        let result = read_pin_file(dir.path(), "WD-18TB").unwrap();
-        assert!(result.is_none());
+        fs::write(&pin, "").unwrap();
+        assert!(read_pin_file(dir.path(), "WD-18TB").is_err(), "zero-length");
+    }
+
+    #[test]
+    fn empty_drive_pin_does_not_fall_back_to_legacy() {
+        // The legacy pin cannot stand in for a drive pin whose name is lost.
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join(".last-external-parent-WD-18TB"), "").unwrap();
+        fs::write(dir.path().join(".last-external-parent"), "20260321-opptak").unwrap();
+        assert!(read_pin_file(dir.path(), "WD-18TB").is_err());
     }
 
     #[test]
@@ -722,6 +753,31 @@ source = "/data/a"
         let local_dir = dir.path().join("sv-a");
         fs::create_dir(&local_dir).unwrap();
         fs::write(local_dir.join(".last-external-parent-D1"), "not-a-snapshot").unwrap();
+
+        let config = pin_recheck_config(dir.path());
+        let snap_path = local_dir.join("20260322-1200-a");
+        assert!(is_pinned_at_delete_time(&snap_path, "sv-a", &config));
+    }
+
+    #[test]
+    fn pin_recheck_fails_closed_when_pin_file_is_empty() {
+        // #420: a crash can leave a first-time pin write zero-length.
+        let dir = TempDir::new().unwrap();
+        let local_dir = dir.path().join("sv-a");
+        fs::create_dir(&local_dir).unwrap();
+        fs::write(local_dir.join(".last-external-parent-D1"), "").unwrap();
+
+        let config = pin_recheck_config(dir.path());
+        let snap_path = local_dir.join("20260322-1200-a");
+        assert!(is_pinned_at_delete_time(&snap_path, "sv-a", &config));
+    }
+
+    #[test]
+    fn pin_recheck_fails_closed_when_pin_file_is_whitespace_only() {
+        let dir = TempDir::new().unwrap();
+        let local_dir = dir.path().join("sv-a");
+        fs::create_dir(&local_dir).unwrap();
+        fs::write(local_dir.join(".last-external-parent-D1"), " \n\t\n").unwrap();
 
         let config = pin_recheck_config(dir.path());
         let snap_path = local_dir.join("20260322-1200-a");

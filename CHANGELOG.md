@@ -49,6 +49,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cannot be read. Previously `urd emergency` listed them and asked to confirm,
   then refused every delete; the unreadable pin is now logged as a warning
   and the subvolume is left out (#419).
+- A pin file that exists but is empty is now treated as unreadable rather
+  than as no pin, so the last check before deleting a local snapshot keeps
+  it; backups still go ahead, as a full send where needed. Pin files are now
+  flushed to disk before they replace the old pin, so a crash or power loss
+  can no longer leave one empty (#420).
 
 ## [0.37.0] - 2026-09-04
 
