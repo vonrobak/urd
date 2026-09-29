@@ -103,15 +103,17 @@ pub struct EventCounters {
 /// Per-subvolume metrics for a backup run.
 pub struct SubvolumeMetrics {
     pub name: String,
-    /// 0 = failure, 1 = success, 2 = schedule-skipped
+    /// 0 = failure, 1 = success, 2 = schedule-skipped, 3 = deferred (nothing
+    /// reached a destination — ADR-105 amendment 2026-09-29)
     pub success: u8,
-    /// Unix timestamp; only set when success == 1
+    /// Unix timestamp. Set to the run time only when success == 1; any row
+    /// without one may receive the previous value from carry-forward.
     pub last_success_timestamp: Option<i64>,
     pub duration_seconds: u64,
     pub local_snapshot_count: usize,
     /// Count from first mounted drive (for bash compat)
     pub external_snapshot_count: usize,
-    /// 0 = full, 1 = incremental, 2 = no send
+    /// 0 = full, 1 = incremental, 2 = no send, 3 = deferred
     pub send_type: u8,
     /// True when the subvolume has an external destination configured (sends
     /// enabled and ≥1 configured drive in scope). Config-derived, independent
@@ -443,7 +445,7 @@ fn format_metrics(data: &MetricsData) -> String {
     // backup_success
     writeln!(
         out,
-        "# HELP {} Backup result: 1=success, 0=failure, 2=schedule-skipped",
+        "# HELP {} Backup result: 1=success, 0=failure, 2=schedule-skipped, 3=deferred",
         names::BACKUP_SUCCESS
     )
     .ok();
@@ -2111,12 +2113,13 @@ mod tests {
     // ADR-021). It is WRITE-ONCE except for a deliberate, documented
     // contract addition: a mismatch from touching unrelated formatter code
     // is a bug in the formatter, not in the file — never regenerate to paper
-    // over that. Two such additions have landed by hand, each reviewed as a
+    // over that. Three such additions have landed by hand, each reviewed as a
     // diff against the prior fixture rather than regenerated wholesale: issue
-    // #339 added the backup_pool_last_seen_timestamp block, and issues
+    // #339 added the backup_pool_last_seen_timestamp block, issues
     // #337/#338 added the backup_pin_failures/backup_promise_state/
     // backup_circuit_breaker_trips_total/backup_emergency_prunes_total/
-    // backup_chain_broken_full_sends_total blocks.
+    // backup_chain_broken_full_sends_total blocks, and issue #409 added
+    // `3=deferred` to the backup_success HELP line.
 
     fn golden_data() -> MetricsData {
         MetricsData {

@@ -271,7 +271,7 @@ fn check_drive_availability(
 /// Grace is 5% of the interval, capped at 15 minutes. This is small enough
 /// to keep short intervals tight (15 min interval → 45s grace) while
 /// handling the typical multi-minute drift on daily runs.
-fn interval_elapsed(elapsed: chrono::Duration, interval: chrono::Duration) -> bool {
+pub(crate) fn interval_elapsed(elapsed: chrono::Duration, interval: chrono::Duration) -> bool {
     let grace = (interval / 20).min(chrono::Duration::minutes(15));
     elapsed >= interval - grace
 }

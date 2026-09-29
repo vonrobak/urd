@@ -603,7 +603,6 @@ pub struct DriveAssessment {
     /// `compute_health` to suppress "drive away" degradation when the absent
     /// drive's data is already fully current.
     pub source_unchanged: bool,
-    #[allow(dead_code)] // consumed by verbose status display (future)
     pub configured_interval: Interval,
     pub role: DriveRole,
     /// Seconds since the drive's last `Unmount` event in the `events` table,
@@ -625,6 +624,28 @@ pub struct DriveAssessment {
     /// voice reads this to enrich the drive-row wording *within* the gravity
     /// band set by `status`; it never sets gravity itself (S1).
     pub rotation: Option<DriveRotation>,
+}
+
+#[cfg(test)]
+impl DriveAssessment {
+    /// Test fixture: a mounted primary drive on a daily send interval, never
+    /// sent to. Call sites state only the axes under test via struct-update
+    /// syntax, as with [`SubvolAssessment::fixture`].
+    pub(crate) fn fixture(label: &str) -> Self {
+        Self {
+            drive_label: label.to_string(),
+            status: PromiseStatus::Unprotected,
+            mounted: true,
+            snapshot_count: None,
+            last_send_age: None,
+            source_unchanged: false,
+            configured_interval: Interval::days(1),
+            role: DriveRole::Primary,
+            absent_duration_secs: None,
+            last_activity_age_secs: None,
+            rotation: None,
+        }
+    }
 }
 
 // ── Promise snapshots and transition detection (UPI 088-a) ─────────────

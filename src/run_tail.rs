@@ -20,9 +20,8 @@ use crate::output::{ChurnHeartbeatFields, SubvolumeExtras, TransitionEvent};
 use crate::recorder::{DispatchPolicy, Recording};
 
 /// UPI 043: bundled outputs from a single pool-observability pass. Threaded
-/// into both metrics emission (`write_metrics_after_execution` /
-/// `write_metrics_for_skipped`) and heartbeat construction
-/// (`heartbeat::build`). Gathered by `commands/backup.rs` (the I/O); lives
+/// into both metrics emission (`write_metrics_per_spec`) and heartbeat
+/// construction (`heartbeat::build`). Gathered by `commands/backup.rs` (the I/O); lives
 /// here as the tail's input bundle (UPI 088-b).
 pub struct PoolObservability {
     pub pools_heartbeat: Vec<PoolHeartbeat>,
@@ -78,10 +77,49 @@ pub struct TailInputs<'a> {
 /// needs, so the adapter's match is total on both exits — no impossible arm.
 #[derive(Clone, Copy)]
 pub enum MetricsSpec<'a> {
-    /// Empty-plan exit: `write_metrics_for_skipped`.
+    /// Empty-plan exit: every subvolume reported as not executed.
     Skipped,
-    /// Executed exit: `write_metrics_after_execution` over this result.
+    /// Executed exit: rows for this result, then the unexecuted subvolumes.
     AfterExecution(&'a ExecutionResult),
+}
+
+/// Whether a subvolume is *deferred* in this run: expected to have an
+/// external copy, yet nothing reached a destination and no drive holds a
+/// copy that is current or fresh (ADR-105 amendment 2026-09-29). The rule
+/// does not ask why nothing was sent — absent drive, token mismatch, space
+/// guard and gated chain-break full send all end the same way for the data.
+///
+/// `send_succeeded` / `op_failed` describe this run's operations for the
+/// subvolume; both are `false` for a subvolume the run did not execute.
+/// Without an assessment (awareness assesses enabled subvolumes only) there
+/// is nothing to judge the drive copies by, so the answer is `false`.
+///
+/// A copy is "fresh" when a send to that drive is not yet due, by the
+/// planner's own definition of due ([`crate::plan::interval_elapsed`], with
+/// its timer-drift grace), measured against the same interval awareness
+/// judges the drive copy against — the effective send interval when the
+/// pool is adapted, else the declared one. A drive never sent to
+/// (`last_send_age` is `None`) holds no fresh copy.
+#[must_use]
+pub fn is_deferred(
+    externally_expected: bool,
+    send_succeeded: bool,
+    op_failed: bool,
+    assessment: Option<&SubvolAssessment>,
+) -> bool {
+    if !externally_expected || send_succeeded || op_failed {
+        return false;
+    }
+    let Some(a) = assessment else {
+        return false;
+    };
+    !a.external.iter().any(|drive| {
+        let interval = a.effective_send_interval.unwrap_or(drive.configured_interval);
+        drive.source_unchanged
+            || drive.last_send_age.is_some_and(|age| {
+                !crate::plan::interval_elapsed(age, interval.as_chrono())
+            })
+    })
 }
 
 /// The decided tail: the adapter executes these effects in the contract
@@ -1313,5 +1351,137 @@ source = "/data/alpha"
             }),
             "should not fire FirstSendToDrive for previously unmounted drive"
         );
+    }
+
+    // ── is_deferred (ADR-105 amendment 2026-09-29) ──────────────────────
+
+    fn drive(label: &str, age_hours: Option<i64>, current: bool) -> DriveAssessment {
+        DriveAssessment {
+            last_send_age: age_hours.map(chrono::Duration::hours),
+            source_unchanged: current,
+            ..DriveAssessment::fixture(label)
+        }
+    }
+
+    /// A stale-or-fresh copy by minutes since the last send, not current.
+    fn drive_min(label: &str, age_minutes: i64) -> DriveAssessment {
+        DriveAssessment {
+            last_send_age: Some(chrono::Duration::minutes(age_minutes)),
+            ..DriveAssessment::fixture(label)
+        }
+    }
+
+    fn assessed(drives: Vec<DriveAssessment>) -> SubvolAssessment {
+        SubvolAssessment {
+            external: drives,
+            ..SubvolAssessment::fixture("alpha", PromiseStatus::AtRisk)
+        }
+    }
+
+    /// (case, externally_expected, send_succeeded, op_failed, assessment, want)
+    type DeferredCase = (&'static str, bool, bool, bool, Option<SubvolAssessment>, bool);
+
+    #[test]
+    fn is_deferred_table() {
+        // Drive fixtures sit on a daily send interval.
+        let adapted = SubvolAssessment {
+            effective_send_interval: Some(Interval::days(7)),
+            ..assessed(vec![drive("primary", Some(48), false)])
+        };
+        let cases: Vec<DeferredCase> = vec![
+            ("local-only", false, false, false, Some(assessed(vec![])), false),
+            ("send succeeded", true, true, false, Some(assessed(vec![])), false),
+            ("op failed", true, false, true, Some(assessed(vec![])), false),
+            ("no assessment", true, false, false, None, false),
+            ("no drive assessed", true, false, false, Some(assessed(vec![])), true),
+            (
+                "never sent",
+                true,
+                false,
+                false,
+                Some(assessed(vec![drive("primary", None, false)])),
+                true,
+            ),
+            (
+                "stale",
+                true,
+                false,
+                false,
+                Some(assessed(vec![drive("primary", Some(30), false)])),
+                true,
+            ),
+            // Daily interval: the planner's grace is min(24h / 20, 15m) = 15m,
+            // so a send is due from 23h45m.
+            (
+                "just inside interval minus grace is fresh",
+                true,
+                false,
+                false,
+                Some(assessed(vec![drive_min("primary", 23 * 60 + 44)])),
+                false,
+            ),
+            (
+                "at interval minus grace a send is due",
+                true,
+                false,
+                false,
+                Some(assessed(vec![drive_min("primary", 23 * 60 + 45)])),
+                true,
+            ),
+            (
+                "daily timer drift: 23h58m after the last send is not fresh",
+                true,
+                false,
+                false,
+                Some(assessed(vec![drive_min("primary", 23 * 60 + 58)])),
+                true,
+            ),
+            (
+                "fresh",
+                true,
+                false,
+                false,
+                Some(assessed(vec![drive("primary", Some(12), false)])),
+                false,
+            ),
+            (
+                "current though stale",
+                true,
+                false,
+                false,
+                Some(assessed(vec![drive("primary", Some(500), true)])),
+                false,
+            ),
+            (
+                "stale primary, fresh offsite",
+                true,
+                false,
+                false,
+                Some(assessed(vec![
+                    drive("primary", Some(30), false),
+                    drive("offsite", Some(2), false),
+                ])),
+                false,
+            ),
+            (
+                "stale primary, never-sent offsite",
+                true,
+                false,
+                false,
+                Some(assessed(vec![
+                    drive("primary", Some(30), false),
+                    drive("offsite", None, false),
+                ])),
+                true,
+            ),
+            ("adapted interval governs freshness", true, false, false, Some(adapted), false),
+        ];
+        for (case, expected, sent, failed, assessment, want) in cases {
+            assert_eq!(
+                is_deferred(expected, sent, failed, assessment.as_ref()),
+                want,
+                "{case}"
+            );
+        }
     }
 }
