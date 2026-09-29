@@ -1184,10 +1184,10 @@ pub fn check_backup_overdue(
             stale_after_hours: stale_hours,
         },
         urgency: Urgency::Warning,
-        title: format!("Urd: no backup in {age_hours}h"),
+        title: format!("Urd: no run in {age_hours}h"),
         body: format!(
             "The last run was {age_hours}h ago — expected within {stale_hours}h. \
-             The spindle sits idle. Check that the timer is running."
+             The spindle sits idle: the timer has not run. Check that it is enabled."
         ),
     })
 }
@@ -1976,6 +1976,13 @@ mod tests {
             }
             _ => panic!("expected BackupOverdue event"),
         }
+        // The check watches the run, not the data (#410): say so.
+        assert_eq!(notification.title, "Urd: no run in 6h");
+        assert_eq!(
+            notification.body,
+            "The last run was 6h ago — expected within 2h. \
+             The spindle sits idle: the timer has not run. Check that it is enabled."
+        );
     }
 
     #[test]
