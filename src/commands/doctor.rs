@@ -602,6 +602,9 @@ fn linger_check() -> Vec<DoctorCheck> {
 ///
 /// Pure decision (`chain::orphan_pins`) over filesystem-scanned input
 /// (`chain::discover_pin_files`); advisory only — nothing is deleted.
+///
+/// Also names a stray unlabeled `.last-external-parent`, which Urd no longer
+/// reads (ADR-105, amendment 2026-09-29), so the operator can remove it.
 fn build_retention_checks(config: &Config) -> Vec<DoctorCheck> {
     let configured = config.drive_labels();
     let mut checks = Vec::new();
@@ -610,6 +613,18 @@ fn build_retention_checks(config: &Config) -> Vec<DoctorCheck> {
         let Some(local_dir) = config.local_snapshot_dir(&sv.name) else {
             continue;
         };
+        if crate::chain::unlabeled_pin_file(&local_dir).is_some() {
+            checks.push(DoctorCheck {
+                name: format!("unlabeled pin: {}", sv.name),
+                status: DoctorCheckStatus::Warn,
+                detail: Some(format!(
+                    "{} holds an unlabeled .last-external-parent, which Urd no longer reads \
+                     \u{2014} remove it.",
+                    local_dir.display(),
+                )),
+                suggestion: None,
+            });
+        }
         let discovered = crate::chain::discover_pin_files(&local_dir);
         for orphan in crate::chain::orphan_pins(&discovered, &configured) {
             checks.push(DoctorCheck {
@@ -1367,6 +1382,32 @@ source = "/data/gamma"
             build_retention_checks(&config).is_empty(),
             "no orphan pins → no false gravity"
         );
+    }
+
+    #[test]
+    fn retention_checks_names_unlabeled_pin() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut config = cfg();
+        config.local_snapshots.roots[0].path = dir.path().to_path_buf();
+        config.drives.push(drive("WD-18TB"));
+
+        let alpha = dir.path().join("alpha");
+        std::fs::create_dir_all(&alpha).unwrap();
+        std::fs::write(
+            alpha.join(".last-external-parent-WD-18TB"),
+            "20260516-0401-alpha\n",
+        )
+        .unwrap();
+        // Content is never read: an empty file is reported like any other.
+        std::fs::write(alpha.join(".last-external-parent"), "").unwrap();
+
+        let checks = build_retention_checks(&config);
+        assert_eq!(checks.len(), 1, "only the unlabeled pin should warn");
+        assert_eq!(checks[0].status, DoctorCheckStatus::Warn);
+        assert!(checks[0].name.contains("alpha"));
+        let detail = checks[0].detail.as_ref().unwrap();
+        assert!(detail.contains(&alpha.display().to_string()));
+        assert!(detail.contains("remove it"));
     }
 
     // ── UPI 041 Recommendations builder ────────────────────────────

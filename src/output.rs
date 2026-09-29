@@ -658,7 +658,7 @@ pub struct EmergencyResult {
 /// shape v1). v1 had row-level `local: Option<ShapeRecommendation>`;
 /// v2 has `local: Option<HeadroomAwareRecommendation>` (nested
 /// `.recommendation` plus headroom fields). v3 (#125) adds the optional
-/// `retention_checks` array (orphan/legacy pin advisories; absent when empty).
+/// `retention_checks` array (orphan/unlabeled pin advisories; absent when empty).
 /// v4 (#384) retypes each `data_safety[].issue` from a rendered sentence to a
 /// structured `AdviceIssue` object — `{"status": "AT RISK", "detail": {"kind":
 /// "stale", ...}}` — so the JSON carries the semantic promise name and a tagged
@@ -696,7 +696,7 @@ pub struct DoctorOutput {
     /// `urd doctor --thorough` (UPI 041, ADR-115). Advisory only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recommendations: Option<DoctorRecommendationView>,
-    /// Orphan/legacy pin-file advisories under `urd doctor --thorough` (#125):
+    /// Orphan/unlabeled pin-file advisories under `urd doctor --thorough` (#125):
     /// pin files whose drive label is not in `[[drives]]`, which silently anchor
     /// local retention against the configured shape. Empty when none found (no
     /// false gravity); omitted from JSON when empty. Schema v3.

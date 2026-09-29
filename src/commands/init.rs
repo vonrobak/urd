@@ -352,12 +352,12 @@ fn collect_pin_files(config: &Config) -> Vec<InitPinFile> {
             let local_dir = root.path.join(subvol_name);
             for label in &drive_labels {
                 match chain::read_pin_file(&local_dir, label) {
-                    Ok(Some(result)) => {
+                    Ok(Some(name)) => {
                         pin_files.push(InitPinFile {
                             subvolume: subvol_name.clone(),
                             drive: label.clone(),
                             status: InitStatus::Ok,
-                            snapshot_name: Some(result.name.to_string()),
+                            snapshot_name: Some(name.to_string()),
                             error: None,
                         });
                     }
@@ -413,10 +413,7 @@ fn collect_incomplete_snapshots(
                 continue;
             }
 
-            let pinned = chain::read_pin_file(&local_dir, &drive.label)
-                .ok()
-                .flatten()
-                .map(|r| r.name);
+            let pinned = chain::read_pin_file(&local_dir, &drive.label).ok().flatten();
 
             let newest = external_snaps.iter().max();
             if let Some(newest_snap) = newest {

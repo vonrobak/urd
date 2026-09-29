@@ -752,6 +752,55 @@ mod tests {
     }
 
     #[test]
+    fn unlabeled_pin_only_plans_a_full_send() {
+        use crate::observation::FilesystemQuery;
+        // ADR-105 amendment 2026-09-29: the unlabeled pin is not read. It names
+        // a parent present on both ends, yet the drive has no pin: full send.
+        let parent = snap("20260320-0400-one");
+        let pin_dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(pin_dir.path().join(".last-external-parent"), parent.as_str()).unwrap();
+        let real = crate::plan::RealFileSystemState { state: None };
+        let pin = real.read_pin_file(pin_dir.path(), "D1").unwrap();
+
+        let sv = subvol();
+        let e = eff(true, false);
+        let d = drive();
+        let mut fs = MockFileSystemState::new();
+        fs.external_snapshots
+            .insert(("D1".to_string(), "sv1".to_string()), vec![parent.clone()]);
+        if let Some(pin) = pin {
+            fs.pin_files.insert((local_dir(), "D1".to_string()), pin);
+        }
+        let btrfs = MockBtrfs::new();
+        let obs = Observation {
+            fs: &fs,
+            history: &fs,
+            btrfs: &btrfs,
+        };
+        let (ops, _skipped, _events) = run(&SendInputs {
+            core: SubvolInputs {
+                subvol: &sv,
+                eff: &e,
+                local_dir: &local_dir(),
+                local_snaps: &[parent, snap("20260322-1500-one")],
+                now: now(),
+                obs: &obs,
+            },
+            drive: &d,
+            planned_snap: None,
+            force: true,
+            skip_intervals: false,
+        });
+        assert!(matches!(
+            ops[0],
+            PlannedOperation::SendFull {
+                reason: FullSendReason::NoPinFile,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn unreadable_pin_still_plans_a_full_send() {
         use crate::observation::FilesystemQuery;
         // Backups fail open (ADR-107): a pin read error — which is what an

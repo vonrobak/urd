@@ -408,7 +408,7 @@ self-diagnoses). With the units in place, `Linger=no` earns one Warn naming
 
 | Flag | Semantics |
 |------|-----------|
-| `--thorough` | Add thread-verification (`urd verify`), churn, retention-shape recommendations, and the orphan-pin retention scan to the battery. Slower; reads every pin file. |
+| `--thorough` | Add thread-verification (`urd verify`), churn, retention-shape recommendations, and the retention scan for orphan and unlabeled pin files to the battery. Slower; reads every pin file. |
 
 **Output.** Interactive — voice-rendered diagnostic block with severity
 icons and suggested next steps. Daemon — JSON.
