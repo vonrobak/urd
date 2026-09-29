@@ -356,6 +356,58 @@ fn est_incremental_never_uses_calibrated() {
     assert_eq!(estimated_send_size(&fs, "sv1", "D1", false), None);
 }
 
+fn displayed_estimate_fs(last_send_days_ago: Option<i64>) -> (MockFileSystemState, NaiveDateTime) {
+    let now = NaiveDate::from_ymd_opt(2026, 9, 29)
+        .unwrap()
+        .and_hms_opt(4, 0, 0)
+        .unwrap();
+    let mut fs = MockFileSystemState::new();
+    for kind in [SendKind::Full, SendKind::Incremental] {
+        fs.send_sizes
+            .insert(("sv1".into(), "D1".into(), kind), 194_600_000_000);
+    }
+    if let Some(days) = last_send_days_ago {
+        fs.send_times
+            .insert(("sv1".into(), "D1".into()), now - chrono::Duration::days(days));
+    }
+    (fs, now)
+}
+
+#[test]
+fn displayed_estimate_incremental_fresh_is_shown() {
+    let (fs, now) = displayed_estimate_fs(Some(1));
+    let shown = displayed_send_estimate(&fs, "sv1", "D1", false, now, Some(Interval::days(1)));
+    assert_eq!(shown, Some(194_600_000_000));
+}
+
+#[test]
+fn displayed_estimate_incremental_older_than_twice_interval_is_withheld() {
+    let (fs, now) = displayed_estimate_fs(Some(3));
+    let shown = displayed_send_estimate(&fs, "sv1", "D1", false, now, Some(Interval::days(1)));
+    assert_eq!(shown, None);
+}
+
+#[test]
+fn displayed_estimate_incremental_exactly_twice_interval_is_shown() {
+    let (fs, now) = displayed_estimate_fs(Some(2));
+    let shown = displayed_send_estimate(&fs, "sv1", "D1", false, now, Some(Interval::days(1)));
+    assert_eq!(shown, Some(194_600_000_000));
+}
+
+#[test]
+fn displayed_estimate_full_send_ignores_staleness() {
+    let (fs, now) = displayed_estimate_fs(Some(50));
+    let shown = displayed_send_estimate(&fs, "sv1", "D1", true, now, Some(Interval::days(1)));
+    assert_eq!(shown, Some(194_600_000_000));
+}
+
+#[test]
+fn displayed_estimate_without_last_send_time_is_unchanged() {
+    let (fs, now) = displayed_estimate_fs(None);
+    let shown = displayed_send_estimate(&fs, "sv1", "D1", false, now, Some(Interval::days(1)));
+    assert_eq!(shown, Some(194_600_000_000));
+}
+
 #[test]
 fn est_returns_none_when_no_data() {
     let fs = MockFileSystemState::new();

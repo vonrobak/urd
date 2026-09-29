@@ -6,6 +6,7 @@
 //! the briefing shown before a manual backup begins.
 
 use std::fmt::Write;
+use std::time::Duration;
 
 use colored::Colorize;
 
@@ -14,8 +15,8 @@ use crate::output::{BackupSummary, OutputMode, PreActionSummary, SkipCategory};
 use crate::types::{ByteSize, DriveRole};
 
 use super::{
-    SuggestionContext, append_suggestion, color_result, exposure_cell, exposure_label,
-    format_table, pluralize, skip_tag,
+    SuggestionContext, append_suggestion, approx_size, color_result, exposure_cell,
+    exposure_label, format_elapsed, format_table, pluralize, skip_tag,
 };
 
 /// Render post-backup summary according to the given mode.
@@ -69,8 +70,8 @@ fn render_backup_interactive(data: &BackupSummary) -> String {
         out,
         "{}",
         format!(
-            "── Urd backup: {result_colored} ── [{run_info}{:.1}s] ──{count_suffix}",
-            data.duration_secs,
+            "── Urd backup: {result_colored} ── [{run_info}{}] ──{count_suffix}",
+            format_elapsed(Duration::from_secs(data.duration_secs as u64)),
         )
         .bold()
     )
@@ -95,10 +96,10 @@ fn render_backup_interactive(data: &BackupSummary) -> String {
             let send_info = format_send_info(&sv.sends);
             writeln!(
                 out,
-                "  {:<6} {}  [{:.1}s]{}",
+                "  {:<6} {}  [{}]{}",
                 status,
                 sv.name.bold(),
-                sv.duration_secs,
+                format_elapsed(Duration::from_secs(sv.duration_secs as u64)),
                 send_info,
             )
             .ok();
@@ -250,7 +251,14 @@ fn render_transitions(transitions: &[crate::output::TransitionEvent], out: &mut 
         return;
     }
     writeln!(out).ok();
-    for t in transitions {
+    // Recoveries sharing a (from, to) pair collapse into one line at the first
+    // of them: a recovery run would otherwise print one identical line per
+    // subvolume.
+    let recovered = |t: &TransitionEvent| match t {
+        TransitionEvent::PromiseRecovered { from, to, .. } => Some((*from, *to)),
+        _ => None,
+    };
+    for (i, t) in transitions.iter().enumerate() {
         match t {
             TransitionEvent::ThreadRestored { subvolume, drive } => {
                 writeln!(out, "  {}: thread to {} mended.", subvolume, drive).ok();
@@ -266,10 +274,20 @@ fn render_transitions(transitions: &[crate::output::TransitionEvent], out: &mut 
                 from,
                 to,
             } => {
+                let pair = Some((*from, *to));
+                if transitions[..i].iter().any(|e| recovered(e) == pair) {
+                    continue;
+                }
+                let n = transitions.iter().filter(|e| recovered(e) == pair).count();
+                let who = if n == 1 {
+                    subvolume.clone()
+                } else {
+                    format!("{n} subvolumes")
+                };
                 writeln!(
                     out,
                     "  {}: {} \u{2192} {}.",
-                    subvolume,
+                    who,
                     exposure_label(*from),
                     exposure_label(*to),
                 )
@@ -484,10 +502,18 @@ pub fn render_pre_action(summary: &PreActionSummary) -> String {
         if sum > 0 { Some(sum) } else { None }
     };
 
-    // Size annotation
-    let size_str = total_bytes
-        .map(|b| format!(", ~{}", ByteSize(b)))
-        .unwrap_or_default();
+    // Size annotation — qualified when only some sends have an estimate, as in
+    // the `urd plan` summary (#425).
+    let sends_total: usize = summary.send_plan.iter().map(|d| d.subvolume_count).sum();
+    let sends_estimated: usize = summary.send_plan.iter().map(|d| d.estimated_count).sum();
+    let size_str = match total_bytes {
+        Some(b) if sends_estimated == sends_total => format!(", ~{}", approx_size(b)),
+        Some(b) => format!(
+            ", ~{} estimated for {sends_estimated} of {sends_total}",
+            approx_size(b)
+        ),
+        None => String::new(),
+    };
 
     // Main line depends on filters
     if summary.filters.local_only {
