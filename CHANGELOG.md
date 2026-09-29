@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- `urd events` now shows one line per retention pass for protected snapshots,
+  naming how many were held back and the span they cover, instead of one line
+  per snapshot. Existing event rows are untouched and still display as before
+  (#412).
+
 ### Fixed
 - `urd` and `urd status` now recommend a backup when a subvolume is exposed,
   a drive is connected, and the thread is intact. Advice previously covered

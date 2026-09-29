@@ -6,7 +6,7 @@ project: ['[[urd]]']
 sensitivity: public
 status: active
 created: '2026-04-30'
-timestamp: '2026-09-04T15:03:12+02:00'
+timestamp: '2026-09-29T21:30:00+02:00'
 ---
 # ADR-114: Structured Event Log for Decisions and State Transitions
 
@@ -331,3 +331,59 @@ the events table is accepted as a deliberate decision, not an oversight.** Three
 `urd events` becomes perceptibly slow to return a page. Either is a falsifiable signal
 that the volume estimate above was wrong, and the design session starts from measurements
 rather than from this projection.
+
+## Amendment 2026-09-29: protections are recorded per decision, not per snapshot
+
+The Decision section lists "every protection (with reason: pinned, recent, etc.)" among
+the retention decisions the log records. As shipped, that meant one `RetentionProtect` row
+per protected snapshot per retention pass. This amendment changes the unit of record: **a
+protection is recorded once per retention pass and reason, carrying the count and the span
+of the snapshots it covers.** Prunes are unchanged and stay one row per snapshot.
+
+### Why
+
+Measured on a six-month live database (2026-09-29): 13,950 rows, of which 7,722 (55%) are
+`RetentionProtect`, every one of them `pin_overrode_thinning`. A single night wrote about
+200, nearly all restating an unchanged verdict about unchanged snapshots. The 235
+`PromiseTransition` rows that narrate an incident are 1.7% of the table. The log records
+decisions so they can be read afterwards, and enumeration at this ratio defeats that.
+
+The volume estimate in the 2026-09-04 amendment ("on the order of tens of rows" per run)
+was written against the taxonomy, not against a measurement. It holds again once
+protections are recorded per decision.
+
+### What is recorded
+
+`EventPayload::RetentionProtectSummary { reason, count, oldest, newest }`: one row for each
+reason that fired in a retention pass, stamped with the pass's subvolume and drive like
+any retention event. `oldest` and `newest` name the first and last protected snapshot, so
+the span is readable without the enumeration.
+
+The rationale the log exists to keep is the *reason* a snapshot outlived its slot. That is
+one fact per pass. Which snapshots it covered is reconstructible: the snapshot directories
+and pin files are the authority (ADR-102), and the span bounds the set.
+
+### Why prunes stay per snapshot
+
+A prune is destructive and leaves nothing on disk to reconstruct it from. The
+`RetentionPrune` rows are the only durable record of which snapshots Urd deleted, and the
+`urd_retention_prunes_total` and `backup_emergency_prunes_total` counters are counts of
+those rows (`docs/20-reference/metrics.md`). Both reasons are absent for protections:
+nothing is destroyed, and no counter or command other than `urd events` reads them.
+
+### What does not change
+
+- **No row is deleted or rewritten.** Existing `RetentionProtect` rows stay as written. The
+  table remains append-only, and the 2026-09-04 decision on unbounded growth stands: this
+  amendment changes what is written from now on, not what is kept.
+- **No external surface changes.** The events table is internal (Constraint 5). No metric,
+  heartbeat field or JSON contract moves.
+- **The schema is additive.** `RetentionProtectSummary` is a new variant with its own
+  frozen fixture; older readers skip a row they cannot decode.
+
+### Retirement of the per-snapshot form
+
+`RetentionProtect` stops being written and remains as a read-side decoder so `urd events`
+can still render the rows already on disk. It is retired, decoder and fixture together,
+when no database that Urd supports upgrading from can still hold such a row. Until then
+the variant must not be removed or renamed.
