@@ -98,6 +98,19 @@ fn summary_for(payload: &EventPayload) -> String {
         EventPayload::RetentionProtect { snapshot, reason } => {
             format!("stayed her hand on {snapshot}  ({})", protect_phrase(*reason))
         }
+        EventPayload::RetentionProtectSummary {
+            reason,
+            count,
+            oldest,
+            newest,
+        } => {
+            let phrase = protect_phrase(*reason);
+            if *count == 1 {
+                format!("stayed her hand on {oldest}  ({phrase})")
+            } else {
+                format!("stayed her hand on {count} snapshots, {oldest} … {newest}  ({phrase})")
+            }
+        }
         EventPayload::PlannerSendChoice {
             send_kind: _,
             reason,
@@ -332,6 +345,46 @@ mod tests {
         let line = format_row(&row);
         assert!(line.contains("stayed her hand"));
         assert!(line.contains("pin overrode window"));
+    }
+
+    #[test]
+    fn render_retention_protect_summary_single_matches_old_line() {
+        let _color = setup();
+        let row = make_row(
+            EventPayload::RetentionProtectSummary {
+                reason: ProtectReason::PinOverrodeThinning,
+                count: 1,
+                oldest: "20260801-0400-htpc-home".into(),
+                newest: "20260801-0400-htpc-home".into(),
+            },
+            Some("htpc-home"),
+            None,
+        );
+        let line = format_row(&row);
+        assert!(
+            line.contains("stayed her hand on 20260801-0400-htpc-home  (pin overrode thinning)")
+        );
+        assert!(!line.contains("snapshots"));
+    }
+
+    #[test]
+    fn render_retention_protect_summary_many_shows_count_and_span() {
+        let _color = setup();
+        let row = make_row(
+            EventPayload::RetentionProtectSummary {
+                reason: ProtectReason::PinOverrodeThinning,
+                count: 34,
+                oldest: "20260801-0400-htpc-home".into(),
+                newest: "20260928-0400-htpc-home".into(),
+            },
+            Some("htpc-home"),
+            None,
+        );
+        let line = format_row(&row);
+        assert!(line.contains(
+            "stayed her hand on 34 snapshots, 20260801-0400-htpc-home … \
+             20260928-0400-htpc-home  (pin overrode thinning)"
+        ));
     }
 
     #[test]

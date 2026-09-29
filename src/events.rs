@@ -169,9 +169,20 @@ pub enum EventPayload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tier: Option<String>,
     },
+    /// One protected snapshot. No longer written: retention now records
+    /// [`Self::RetentionProtectSummary`] once per pass and reason. Kept as a
+    /// read-side decoder for rows already on disk (ADR-114 amendment 2026-09-29).
     RetentionProtect {
         snapshot: String,
         reason: ProtectReason,
+    },
+    /// All snapshots protected for one `reason` in one retention pass.
+    /// `oldest`/`newest` name the chronologically first and last of them.
+    RetentionProtectSummary {
+        reason: ProtectReason,
+        count: u32,
+        oldest: String,
+        newest: String,
     },
     PlannerSendChoice {
         send_kind: SendKind,
@@ -283,7 +294,9 @@ impl EventPayload {
     #[must_use]
     pub fn kind(&self) -> EventKind {
         match self {
-            Self::RetentionPrune { .. } | Self::RetentionProtect { .. } => EventKind::Retention,
+            Self::RetentionPrune { .. }
+            | Self::RetentionProtect { .. }
+            | Self::RetentionProtectSummary { .. } => EventKind::Retention,
             Self::PlannerSendChoice { .. } | Self::PlannerDefer { .. } => EventKind::Planner,
             Self::PromiseTransition { .. } => EventKind::Promise,
             Self::SentinelCircuitBreak { .. } | Self::SentinelAnomaly { .. } => EventKind::Sentinel,
@@ -306,7 +319,9 @@ impl EventPayload {
                 PruneRule::Emergency | PruneRule::SpacePressure => Severity::Notice,
                 _ => Severity::Info,
             },
-            Self::RetentionProtect { .. } => Severity::Notice,
+            Self::RetentionProtect { .. } | Self::RetentionProtectSummary { .. } => {
+                Severity::Notice
+            }
             Self::PlannerSendChoice { reason, .. } => match reason {
                 FullSendReason::ChainBroken => Severity::Notice,
                 FullSendReason::FirstSend | FullSendReason::NoPinFile => Severity::Info,
@@ -508,6 +523,15 @@ mod tests {
                 EventPayload::RetentionProtect {
                     snapshot: "s".into(),
                     reason: ProtectReason::PinOverrodeThinning,
+                },
+                EventKind::Retention,
+            ),
+            (
+                EventPayload::RetentionProtectSummary {
+                    reason: ProtectReason::PinOverrodeThinning,
+                    count: 2,
+                    oldest: "a".into(),
+                    newest: "b".into(),
                 },
                 EventKind::Retention,
             ),
@@ -737,6 +761,12 @@ mod tests {
             snapshot: "20240101-htpc-home".into(),
             reason: ProtectReason::PinOverrodeWindow,
         });
+        roundtrip(&EventPayload::RetentionProtectSummary {
+            reason: ProtectReason::PinOverrodeThinning,
+            count: 34,
+            oldest: "20260801-0400-home".into(),
+            newest: "20260928-0400-home".into(),
+        });
         roundtrip(&EventPayload::PlannerSendChoice {
             send_kind: SendKind::Full,
             reason: FullSendReason::ChainBroken,
@@ -950,6 +980,16 @@ mod tests {
                 },
             ),
             (
+                "RetentionProtectSummary",
+                r#"{"type":"RetentionProtectSummary","reason":"pin_overrode_thinning","count":34,"oldest":"20260801-0400-home","newest":"20260928-0400-home"}"#,
+                EventPayload::RetentionProtectSummary {
+                    reason: ProtectReason::PinOverrodeThinning,
+                    count: 34,
+                    oldest: "20260801-0400-home".into(),
+                    newest: "20260928-0400-home".into(),
+                },
+            ),
+            (
                 "PlannerSendChoice",
                 r#"{"type":"PlannerSendChoice","send_kind":"full","reason":"chain_broken","drive_label":"WD-18TB"}"#,
                 EventPayload::PlannerSendChoice {
@@ -1103,6 +1143,7 @@ mod tests {
         match payload {
             EventPayload::RetentionPrune { .. }
             | EventPayload::RetentionProtect { .. }
+            | EventPayload::RetentionProtectSummary { .. }
             | EventPayload::PlannerSendChoice { .. }
             | EventPayload::PlannerDefer { .. }
             | EventPayload::PromiseTransition { .. }
