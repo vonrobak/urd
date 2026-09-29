@@ -14,6 +14,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (#412).
 
 ### Fixed
+- `urd status` no longer dates a drive's absence from a stale record. When a
+  backup succeeded to a drive after its last recorded disconnect, the drive
+  came back and left again unwatched, so the old disconnect is ignored and
+  the age is reported as "last backup". A drive whose newest record is a
+  connect but which is absent now also shows its last backup age instead of
+  going silent (#427).
 - `urd` and `urd status` now recommend a backup when a subvolume is exposed,
   a drive is connected, and the thread is intact. Advice previously covered
   only the exposed cases where *nothing* could be done — no drives configured,

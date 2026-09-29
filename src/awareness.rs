@@ -16,7 +16,7 @@ use crate::config::{Config, DriveConfig};
 use crate::observation::Observation;
 use crate::plan;
 use crate::types::{
-    DriveEventKind, DriveRole, Interval, LocalRetentionPolicy, SnapshotName,
+    DriveEvent, DriveEventKind, DriveRole, Interval, LocalRetentionPolicy, SnapshotName,
 };
 
 /// Shared test fixtures for assessment and advice tests.
@@ -178,6 +178,35 @@ pub(crate) fn cascade_age_source(
         (Some(absent), _) => Some((absent, "away")),
         (None, Some(fallback)) => Some((fallback.max(0), "last backup")),
         (None, None) => None,
+    }
+}
+
+/// Absence signal `(absent_duration_secs, last_activity_age_secs)` for a drive
+/// that is NOT currently mounted. Pure; a mounted drive is `(None, None)` and
+/// never reaches here.
+///
+/// Drive events are written only by the sentinel; successful sends are written
+/// by backup runs. A successful send witnesses that the drive was present, so:
+/// - newest event is an `Unmount` and no send is newer (equal counts as not
+///   newer) → `(Some(now - unmount), None)`: physical absence.
+/// - newest event is an `Unmount` but the last send is newer → the unmount is
+///   stale (the drive came back and left unwatched); absence is unwitnessed,
+///   so fall back to `(None, Some(now - last_send))`.
+/// - newest event is a `Mount`, or there is no event → `(None, last_send age)`.
+fn drive_absence_signal(
+    now: NaiveDateTime,
+    last_event: Option<DriveEvent>,
+    last_send: Option<NaiveDateTime>,
+) -> (Option<i64>, Option<i64>) {
+    let send_age = last_send.map(|t| (now - t).num_seconds());
+    match last_event {
+        Some(DriveEvent {
+            kind: DriveEventKind::Unmount,
+            at,
+        }) if last_send.is_none_or(|sent| sent <= at) => {
+            (Some((now - at).num_seconds()), None)
+        }
+        _ => (None, send_age),
     }
 }
 
@@ -578,15 +607,16 @@ pub struct DriveAssessment {
     pub configured_interval: Interval,
     pub role: DriveRole,
     /// Seconds since the drive's last `Unmount` event in the `events` table,
-    /// populated only when the drive is currently unmounted AND the most
-    /// recent physical event is an Unmount. Rule 1 of the voice contract:
-    /// stay silent when the sentinel missed the disconnect (last event is
-    /// Mount but drive is unmounted) — fall through to activity or silence.
+    /// populated only when the drive is currently unmounted, the most recent
+    /// physical event is an Unmount, AND no successful send is newer than it
+    /// (a newer send means the unmount is stale). Otherwise the age falls
+    /// through to `last_activity_age_secs`, or stays silent.
     pub absent_duration_secs: Option<i64>,
     /// Seconds since the most recent successful operation targeting this
     /// drive in the operations log. Populated only when the drive is
-    /// unmounted AND the `events` table holds *no* drive events for this drive
-    /// at all — the drive predates sentinel observation. Never mixed with
+    /// unmounted AND `absent_duration_secs` is not: no drive events at all, a
+    /// Mount as the newest event (the sentinel missed the disconnect), or a
+    /// successful send newer than the last Unmount. Never mixed with
     /// `absent_duration_secs`.
     pub last_activity_age_secs: Option<i64>,
     /// Rotation context for an offsite drive (UPI 056): cadence, last
@@ -788,18 +818,11 @@ pub fn assess(
             let signal = if obs.fs.is_drive_mounted(d) {
                 (None, None)
             } else {
-                match obs.history.last_drive_event(&d.label) {
-                    Some(event) => match event.kind {
-                        DriveEventKind::Unmount => {
-                            (Some((now - event.at).num_seconds()), None)
-                        }
-                        DriveEventKind::Mount => (None, None),
-                    },
-                    None => match obs.history.last_successful_operation_at(&d.label) {
-                        Some(op_time) => (None, Some((now - op_time).num_seconds())),
-                        None => (None, None),
-                    },
-                }
+                drive_absence_signal(
+                    now,
+                    obs.history.last_drive_event(&d.label),
+                    obs.history.last_successful_operation_at(&d.label),
+                )
             };
             (d.label.clone(), signal)
         })
@@ -4027,9 +4050,9 @@ send_enabled = false
     }
 
     #[test]
-    fn drive_assessment_absent_duration_none_when_last_event_is_mount_but_drive_unmounted() {
-        // Sentinel missed the disconnect. Rule 1: stay silent rather than
-        // emit a confident falsehood. Must NOT fall through to ops-log.
+    fn drive_assessment_last_activity_from_ops_log_when_last_event_is_mount_but_drive_unmounted() {
+        // Sentinel missed the disconnect. The absence is unwitnessed, so no
+        // "away" age; the ops log dates the last backup instead (#427).
         use crate::types::{DriveEvent, DriveEventKind};
         let config = test_config();
         let now = dt(2026, 3, 23, 14, 0);
@@ -4044,7 +4067,6 @@ send_enabled = false
                 at: dt(2026, 3, 22, 8, 0),
             },
         );
-        // Ops log has data, but cascade must not consult it (an event exists).
         fs.last_successful_ops
             .insert("WD-18TB".to_string(), dt(2026, 3, 22, 10, 0));
 
@@ -4052,9 +4074,65 @@ send_enabled = false
         let drive = &results[0].external[0];
         assert_eq!(drive.absent_duration_secs, None);
         assert_eq!(
-            drive.last_activity_age_secs, None,
-            "must not fall through to ops-log when any drive event exists"
+            drive.last_activity_age_secs,
+            Some(28 * 3600),
+            "Mount-newest and absent: fall back to the last successful send"
         );
+    }
+
+    #[test]
+    fn drive_absence_signal_table() {
+        use crate::types::{DriveEvent, DriveEventKind};
+        let now = dt(2026, 3, 23, 14, 0);
+        let ev = |kind, at| Some(DriveEvent { kind, at });
+        let unmount = dt(2026, 3, 23, 8, 0); // 6h ago
+        let older = dt(2026, 3, 20, 8, 0); // 3d 6h ago
+        let newer = dt(2026, 3, 23, 10, 0); // 4h ago
+        let (h6, h4, d3h6) = (6 * 3600, 4 * 3600, (3 * 24 + 6) * 3600);
+        let cases = [
+            // (label, event, last send, expected)
+            (
+                "unmount, no send",
+                ev(DriveEventKind::Unmount, unmount),
+                None,
+                (Some(h6), None),
+            ),
+            (
+                "unmount newer than send",
+                ev(DriveEventKind::Unmount, unmount),
+                Some(older),
+                (Some(h6), None),
+            ),
+            (
+                "send newer than unmount: stale unmount",
+                ev(DriveEventKind::Unmount, unmount),
+                Some(newer),
+                (None, Some(h4)),
+            ),
+            (
+                "equal timestamps: unmount stays current",
+                ev(DriveEventKind::Unmount, unmount),
+                Some(unmount),
+                (Some(h6), None),
+            ),
+            (
+                "mount newest, send on record",
+                ev(DriveEventKind::Mount, unmount),
+                Some(older),
+                (None, Some(d3h6)),
+            ),
+            (
+                "mount newest, no send",
+                ev(DriveEventKind::Mount, unmount),
+                None,
+                (None, None),
+            ),
+            ("no event, send on record", None, Some(older), (None, Some(d3h6))),
+            ("no event, no send", None, None, (None, None)),
+        ];
+        for (label, event, send, expected) in cases {
+            assert_eq!(drive_absence_signal(now, event, send), expected, "{label}");
+        }
     }
 
     #[test]
