@@ -94,11 +94,12 @@ pub enum MetricsSpec<'a> {
 /// Without an assessment (awareness assesses enabled subvolumes only) there
 /// is nothing to judge the drive copies by, so the answer is `false`.
 ///
-/// "Fresh" is judged against the same interval awareness judges the drive
-/// copy against — the effective send interval when the pool is adapted,
-/// else the declared one — so the metric and the promise state agree on
-/// what "within interval" means. A drive never sent to (`last_send_age` is
-/// `None`) holds no fresh copy.
+/// A copy is "fresh" when a send to that drive is not yet due, by the
+/// planner's own definition of due ([`crate::plan::interval_elapsed`], with
+/// its timer-drift grace), measured against the same interval awareness
+/// judges the drive copy against — the effective send interval when the
+/// pool is adapted, else the declared one. A drive never sent to
+/// (`last_send_age` is `None`) holds no fresh copy.
 #[must_use]
 pub fn is_deferred(
     externally_expected: bool,
@@ -115,9 +116,9 @@ pub fn is_deferred(
     !a.external.iter().any(|drive| {
         let interval = a.effective_send_interval.unwrap_or(drive.configured_interval);
         drive.source_unchanged
-            || drive
-                .last_send_age
-                .is_some_and(|age| age < interval.as_chrono())
+            || drive.last_send_age.is_some_and(|age| {
+                !crate::plan::interval_elapsed(age, interval.as_chrono())
+            })
     })
 }
 
@@ -1362,6 +1363,14 @@ source = "/data/alpha"
         }
     }
 
+    /// A stale-or-fresh copy by minutes since the last send, not current.
+    fn drive_min(label: &str, age_minutes: i64) -> DriveAssessment {
+        DriveAssessment {
+            last_send_age: Some(chrono::Duration::minutes(age_minutes)),
+            ..DriveAssessment::fixture(label)
+        }
+    }
+
     fn assessed(drives: Vec<DriveAssessment>) -> SubvolAssessment {
         SubvolAssessment {
             external: drives,
@@ -1401,12 +1410,30 @@ source = "/data/alpha"
                 Some(assessed(vec![drive("primary", Some(30), false)])),
                 true,
             ),
+            // Daily interval: the planner's grace is min(24h / 20, 15m) = 15m,
+            // so a send is due from 23h45m.
             (
-                "age equal to interval is not fresh",
+                "just inside interval minus grace is fresh",
                 true,
                 false,
                 false,
-                Some(assessed(vec![drive("primary", Some(24), false)])),
+                Some(assessed(vec![drive_min("primary", 23 * 60 + 44)])),
+                false,
+            ),
+            (
+                "at interval minus grace a send is due",
+                true,
+                false,
+                false,
+                Some(assessed(vec![drive_min("primary", 23 * 60 + 45)])),
+                true,
+            ),
+            (
+                "daily timer drift: 23h58m after the last send is not fresh",
+                true,
+                false,
+                false,
+                Some(assessed(vec![drive_min("primary", 23 * 60 + 58)])),
                 true,
             ),
             (
@@ -1414,7 +1441,7 @@ source = "/data/alpha"
                 true,
                 false,
                 false,
-                Some(assessed(vec![drive("primary", Some(23), false)])),
+                Some(assessed(vec![drive("primary", Some(12), false)])),
                 false,
             ),
             (

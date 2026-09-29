@@ -119,12 +119,26 @@ from `0` to keep cold subvolumes from firing failure alerts.
 `3` means the subvolume is expected to have an external copy, but nothing
 reached a destination: no send for it succeeded, no operation for it failed,
 and no drive it sends to holds a copy that is current (the drive's pin names
-the present source generation) or fresh (last successful send younger than
-the send interval). The cause does not matter — absent drive, token mismatch,
-space guard, gated chain-break full send. An unplugged drive is a condition,
-not an error, so a `backup_success == 0` rule does not fire; staleness alerts
-on `backup_last_success_timestamp` do. See the
+the present source generation) or fresh (a send to that drive is not yet
+due, by the planner's definition: the last successful send is younger than
+the send interval less a timer-drift grace of 5% of the interval, at most 15
+minutes). The cause does not matter — absent drive, token mismatch, space
+guard, gated chain-break full send. An unplugged drive is a condition, not an
+error, so a `backup_success == 0` rule does not fire; staleness alerts on
+`backup_last_success_timestamp` do. See the
 [ADR-105 amendment of 2026-09-29](../00-foundation/decisions/2026-03-24-ADR-105-backward-compatibility-contracts.md).
+
+Freshness reads the send history in the state database. When that database
+is unavailable, a subvolume that sent nothing this run and whose drive copy is
+not current is reported as `3`; its timestamp is carried forward unchanged, so
+a single such night does not trip a staleness alert. `backup_promise_state`
+reports the same subvolume as unprotected on the same missing input.
+
+`backup_promise_state` and `backup_success` can differ in the other direction:
+a drive whose pin names the current source generation counts as holding a
+current copy even when no send to it is on record, so the subvolume is not
+deferred, while the promise state, which requires the send history, may read
+unprotected.
 
 ### `backup_last_success_timestamp`
 

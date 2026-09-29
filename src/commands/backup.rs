@@ -5402,6 +5402,96 @@ enabled = false
     }
 
     #[test]
+    fn success_when_one_send_succeeded_and_a_later_one_was_gated() {
+        // No drive copy is current or fresh; only the run's successful send
+        // keeps this from reading deferred. `send_type` stays last-write-wins.
+        let sent = make_outcome(
+            SendKind::Incremental.as_db_str(),
+            Some("primary"),
+            OpResult::Success,
+            None,
+            Some(1024),
+        );
+        let gated = make_outcome(
+            SendKind::Full.as_db_str(),
+            Some("offsite"),
+            OpResult::Deferred,
+            Some("chain-break full send gated"),
+            None,
+        );
+        let result = executed(vec![make_subvol_result(
+            "alpha",
+            true,
+            vec![snapshot_ok(), sent, gated],
+            SendType::Deferred,
+            0,
+        )]);
+        let a = [assessed(
+            "alpha",
+            vec![
+                copy("primary", true, Some(30), false),
+                copy("offsite", false, Some(480), false),
+            ],
+        )];
+        assert_eq!(
+            outcome_rows(Some(&result), &empty_plan(), &a)["alpha"],
+            (1, 3, Some(RUN_TS))
+        );
+    }
+
+    #[test]
+    fn written_file_carries_deferred_and_completeness_timestamps() {
+        // Through the writer itself: a deferred executed subvolume (alpha)
+        // and a completeness row (beta, in neither the result nor the plan)
+        // both re-emit the previous file's timestamp.
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut config = metrics_config();
+        config.general.metrics_file = dir.path().join("backup.prom");
+        config.general.state_db = dir.path().join("urd.db");
+        std::fs::write(
+            &config.general.metrics_file,
+            format!(
+                "backup_last_success_timestamp{{subvolume=\"alpha\"}} {PREV_TS}\n\
+                 backup_last_success_timestamp{{subvolume=\"beta\"}} {PREV_TS}\n"
+            ),
+        )
+        .unwrap();
+        let result = executed(vec![make_subvol_result(
+            "alpha",
+            true,
+            vec![snapshot_ok()],
+            SendType::NoSend,
+            0,
+        )]);
+        let a = [
+            assessed("alpha", vec![copy("primary", false, Some(30), false)]),
+            assessed("beta", vec![copy("primary", false, Some(30), true)]),
+        ];
+        let fs = crate::plan::MockFileSystemState::new();
+        write_metrics_per_spec(
+            &config,
+            &MetricsSpec::AfterExecution(&result),
+            &empty_plan(),
+            chrono::DateTime::from_timestamp(RUN_TS, 0).unwrap().naive_utc(),
+            &fs,
+            &HashMap::new(),
+            &empty_observability(),
+            &a,
+        )
+        .unwrap();
+
+        let written = std::fs::read_to_string(&config.general.metrics_file).unwrap();
+        for line in [
+            "backup_success{subvolume=\"alpha\"} 3".to_string(),
+            format!("backup_last_success_timestamp{{subvolume=\"alpha\"}} {PREV_TS}"),
+            "backup_success{subvolume=\"beta\"} 2".to_string(),
+            format!("backup_last_success_timestamp{{subvolume=\"beta\"}} {PREV_TS}"),
+        ] {
+            assert!(written.lines().any(|l| l == line), "missing {line:?} in:\n{written}");
+        }
+    }
+
+    #[test]
     fn not_deferred_retention_only_run_with_current_pin() {
         let delete = make_outcome("delete", Some("primary"), OpResult::Success, None, None);
         let result = executed(vec![make_subvol_result(
