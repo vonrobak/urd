@@ -6,7 +6,7 @@ project: ['[[urd]]']
 sensitivity: public
 status: active
 created: '2026-05-02'
-timestamp: '2026-09-04T10:15:00+02:00'
+timestamp: '2026-09-29T22:00:00+02:00'
 ---
 # Heartbeat Schema Reference
 
@@ -79,7 +79,7 @@ timestamp: '2026-09-04T10:15:00+02:00'
 | Field | Type | Nullable | Notes |
 |-------|------|----------|-------|
 | `name` | string | no | Subvolume `name` (the directory under the snapshot root, not `short_name`). |
-| `backup_success` | bool | yes | `null` if not attempted in this run (skipped or `empty`); `true` / `false` if attempted. |
+| `backup_success` | bool | yes | `null` if not attempted in this run (skipped or `empty`); `true` / `false` if attempted. Describes the run (attempted without error), so it can be `true` for a subvolume the metrics report as deferred (`backup_success 3`). |
 | `promise_status` | string | no | One of `PROTECTED`, `AT RISK`, `UNPROTECTED`. From the awareness model. |
 | `pin_failures` | integer | no | Count of sends that succeeded but whose pin file write failed. Defaults to `0` for backward-compat with pre-pin-tracking heartbeats. |
 | `send_completed` | bool | no | `true` when at least one `Full` or `Incremental` send completed for this subvolume in this run. `false` for deferred / no-send / skipped. Defaults to `true` for v1 backward-compat. |

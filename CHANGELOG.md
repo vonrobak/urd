@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- `backup_success` gains the value `3` (deferred): the subvolume is expected to
+  have an external copy, but nothing reached a destination this run and no
+  drive holds a current or fresh copy — for example, the drive is unplugged.
+  Such a subvolume previously read `1`. `backup_send_type` now reads `3` for it
+  (previously `2`, the value staleness rules use to excuse a cold subvolume),
+  and `backup_last_success_timestamp` is carried forward instead of advancing,
+  so a staleness alert on it now fires when data stops reaching a destination.
+  A `backup_success == 0` rule is unaffected; a dashboard that maps
+  `backup_success` values needs an entry for `3` (#409).
 - `urd events` now shows one line per retention pass for protected snapshots,
   naming how many were held back and the span they cover, instead of one line
   per snapshot. Existing event rows are untouched and still display as before
@@ -38,6 +47,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - `urd events --kind` help and error text now list every kind it accepts, including
   `watchdog`, `emergency_eject`, `rotation` and `storage` (#423).
+- Every enabled subvolume is now reported in the metrics file on every run.
+  A run filtered with `--subvolume` used to rewrite the file without the other
+  subvolumes, erasing their `backup_last_success_timestamp` series so the next
+  run had nothing to carry forward (#409).
 - `urd status` no longer dates a drive's absence from a stale record. When a
   backup succeeded to a drive after its last recorded disconnect, the drive
   came back and left again unwatched, so the old disconnect is ignored and

@@ -154,6 +154,20 @@ pub struct SubvolumeResult {
     pub offsite_releases: Vec<OffsiteChainRelease>,
 }
 
+impl SubvolumeResult {
+    /// Whether any send for this subvolume succeeded in this run, read from
+    /// the operations themselves. `send_type` cannot answer this: it is
+    /// last-write-wins across the subvolume's sends, so a gated chain-break
+    /// full send after a successful send to another drive leaves it
+    /// `Deferred` although data did reach a destination.
+    #[must_use]
+    pub fn send_succeeded(&self) -> bool {
+        self.operations.iter().any(|o| {
+            o.result == OpResult::Success && SendKind::from_db_str(&o.operation).is_some()
+        })
+    }
+}
+
 /// One offsite incremental chain released under Critical pressure (UPI 064-b).
 /// Carries everything the `OffsiteChainReleased` event/notification need without
 /// re-reading the (now-removed) pin file. Emitted only for a *present

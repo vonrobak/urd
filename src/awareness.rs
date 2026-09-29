@@ -627,6 +627,28 @@ pub struct DriveAssessment {
     pub rotation: Option<DriveRotation>,
 }
 
+#[cfg(test)]
+impl DriveAssessment {
+    /// Test fixture: a mounted primary drive on a daily send interval, never
+    /// sent to. Call sites state only the axes under test via struct-update
+    /// syntax, as with [`SubvolAssessment::fixture`].
+    pub(crate) fn fixture(label: &str) -> Self {
+        Self {
+            drive_label: label.to_string(),
+            status: PromiseStatus::Unprotected,
+            mounted: true,
+            snapshot_count: None,
+            last_send_age: None,
+            source_unchanged: false,
+            configured_interval: Interval::days(1),
+            role: DriveRole::Primary,
+            absent_duration_secs: None,
+            last_activity_age_secs: None,
+            rotation: None,
+        }
+    }
+}
+
 // ── Promise snapshots and transition detection (UPI 088-a) ─────────────
 
 /// A snapshot of promise state from a single assessment, used for

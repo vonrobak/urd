@@ -6,7 +6,7 @@ project: ['[[urd]]']
 sensitivity: public
 status: active
 created: '2026-03-24'
-timestamp: '2026-09-29T22:30:00+02:00'
+timestamp: '2026-09-29T23:30:00+02:00'
 ---
 # ADR-105: Backward Compatibility Contracts
 
@@ -20,7 +20,8 @@ timestamp: '2026-09-29T22:30:00+02:00'
 **Date:** 2026-03-22 (formalized 2026-03-24)
 **Status:** Accepted (amended 2026-05-15, `monthly = 0` migration; 2026-05-15, UPI 043
 pool metrics + heartbeat v4; 2026-09-04, code-drift audit — metric inventory moved out,
-Contract 5 added; 2026-09-29, retirement criterion, unlabeled pin retired)
+Contract 5 added; 2026-09-29, retirement criterion, unlabeled pin retired; 2026-09-29,
+deferred subvolumes in the success metrics)
 **Supersedes:** None (founding decision)
 
 ## Context
@@ -370,3 +371,132 @@ eventually be cleaned up") is discharged.
 
 Legacy snapshot names (`YYYYMMDD-shortname`) are not retired: the population is not empty,
 since old snapshots keep their names for as long as they exist.
+
+## Amendment 2026-09-29: a subvolume whose data reached no destination is deferred, not successful
+
+During a three-night outage (2026-09-17 to 2026-09-20) in which the primary drive was
+absent and nothing was sent anywhere, the metrics file reported `backup_success 1` and an
+advancing `backup_last_success_timestamp` for every subvolume, every night. The natural
+external alert, "no successful backup in two days", was told that every backup had just
+succeeded. This amendment corrects what those two metrics mean and brings
+`backup_send_type` into line with its documented encoding.
+
+It deliberately overrides, for `backup_success` and `backup_last_success_timestamp` only,
+the Constraints bullet above that says existing metric semantics must not change. The old
+semantics were the defect.
+
+### The defect
+
+A send that cannot happen is never a planned operation. An absent drive is dropped at the
+planner's drive gate; a drive whose token does not match has its sends removed after
+planning; a send refused by the space guard is a skip. In each case the subvolume finishes
+with no failed operation, which the metrics rendered as success, with `backup_send_type 2`
+(no send). Value `3` (deferred) was documented as covering these cases, but the code
+produced it only for a gated chain-break full send.
+
+`backup_send_type 2` is also the value downstream staleness rules use to excuse a cold
+subvolume. So the outage was reported in the one encoding that tells a monitor not to
+worry.
+
+### The rule
+
+The question is asked of the destination copy, not of the run. A subvolume is **deferred**
+in a run when all of these hold:
+
+1. it is expected to have an external copy (the set `backup_external_expected` reports);
+2. no send for it succeeded in this run;
+3. no operation for it failed in this run (a failure is a failure, and is reported as one);
+4. no drive it sends to holds a copy that is either *current* (the drive's pin names the
+   snapshot of the present source generation) or *fresh* (a send to that drive is not yet
+   due).
+
+"Due" is the planner's own definition, including its grace for timer drift: a daily send
+is due from 23 hours 45 minutes after the last one. The rule uses that definition rather
+than a bare comparison with the interval, because a nightly run lands within minutes of
+the interval on either side. Without the grace, the first night of an outage would be
+reported as fresh about half the time, and the staleness window would start a day late.
+
+For such a subvolume the metrics are:
+
+| Metric | Value |
+|---|---|
+| `backup_success` | `3` (deferred: nothing reached a destination) |
+| `backup_send_type` | `3` (deferred) |
+| `backup_last_success_timestamp` | not advanced; the previous value is carried forward |
+
+The rule does not ask why nothing was sent. An absent drive, a token mismatch, a refusal by
+the space guard and a gated chain-break full send all end the same way for the data, and
+are reported the same way. It does not ask whether the run did any work for the subvolume
+either: a snapshot left unsent from an earlier night is still unsent on a night when the
+source did not change.
+
+The facts in condition 4 are the ones awareness already computes for promise states, read
+from pin files and send history, so they hold whether or not a drive is plugged in.
+
+Consequences worth stating:
+
+- **Offsite rotation is not deferral.** With one drive away and the other present and
+  current, condition 4 fails and the subvolume is reported as before.
+- **A cold subvolume is not deferred** while any drive holds its current generation,
+  whether or not that drive is plugged in.
+- **A send interval longer than the run interval is respected.** A weekly send is not
+  deferred on the nights between sends.
+- **A local-only subvolume** is outside condition 1 and is judged on its snapshot, as before.
+
+### Every configured subvolume is reported every run
+
+The rule makes the carried-forward timestamp load-bearing: it is what a staleness alert
+reads during an outage. Carry-forward reads the previous metrics file, so a run that writes
+no row for a subvolume erases its series, and Prometheus does not fire on a series that is
+absent. A run filtered with `--subvolume` did exactly that to every other subvolume.
+
+Every enabled, configured subvolume therefore gets a row in every run. One the run did not
+touch is reported as schedule-skipped (`backup_success 2`, `backup_send_type 2`) with its
+timestamp carried forward, unless the rule above makes it deferred.
+
+### What this changes in the contract
+
+- **`backup_success` gains the value `3`.** Additive. `0`, `1` and `2` keep their meaning.
+  A rule on `backup_success == 0` is unaffected.
+- **`backup_send_type 3` means what it was documented to mean**: a send was wanted and did
+  not happen. `docs/20-reference/metrics.md` lists what produces it.
+- **`backup_last_success_timestamp` narrows.** It advances when a run leaves the subvolume
+  protected, not merely free of errors.
+
+### Effect on the downstream consumer
+
+The homelab's `BackupStale` rule is
+`(time() - backup_last_success_timestamp) > 2d unless backup_send_type == 2`. Under this
+amendment it fires, unmodified, two days after a subvolume's data last reached a
+destination, and it stays quiet through offsite rotation. `BackupFailed`
+(`backup_success == 0`) does not fire for a deferred subvolume: an unplugged drive is a
+condition, not an error.
+
+No downstream rule has to change for this to be correct, so there is no ordering
+constraint between the two repositories. The homelab's ADR-021 is amended to record the
+new value and the narrowed meaning; a dashboard that maps `backup_success` values to
+colours needs an entry for `3`.
+
+### What deliberately does not change
+
+- **The run result** (`runs.result`, `heartbeat.run_result`) and the **process exit code**.
+  A run result describes whether the run's operations completed; it is `success` when
+  nothing errored. Making an absent drive a `partial` run would exit non-zero and mark the
+  systemd unit failed every night a drive is unplugged, which turns an ordinary condition
+  into an alarm and teaches the operator to ignore it. Whether data is protected is the
+  business of promise states and of the per-subvolume metrics above, not of the run result.
+- **The heartbeat.** No field is added, removed or redefined. Its per-subvolume
+  `backup_success` stays a boolean meaning "attempted without error", and can be `true`
+  for a subvolume the metrics report as deferred. That difference is intended: the
+  heartbeat describes the run, the metric describes the outcome for the data.
+- **Metric names and labels.**
+
+### Migration
+
+None is needed on disk. The metrics file is rewritten whole on every run, so the first run
+after upgrade emits the new values. A subvolume that is deferred on that first run carries
+forward the timestamp written by the last run before the upgrade, which may have been
+advanced by the defect; the staleness window therefore starts, at worst, from that run. A
+subvolume with no previous timestamp and no successful send has no timestamp series, as
+before; `backup_snapshot_count{location="external"}` and `backup_external_expected` cover
+that case.

@@ -6,7 +6,7 @@ project: ['[[urd]]']
 sensitivity: public
 status: active
 created: '2026-05-02'
-timestamp: '2026-09-03T13:15:00+02:00'
+timestamp: '2026-09-29T22:00:00+02:00'
 ---
 # Prometheus Metrics Reference
 
@@ -38,7 +38,8 @@ These properties are guaranteed and load-bearing for downstream consumers
    reserved for Urd internals and may evolve freely.
 2. **Encoding stability.** `backup_send_type`'s value mapping
    (`0=full / 1=incremental / 2=no-send / 3=deferred`),
-   `backup_success`'s mapping (`0=failure / 1=success / 2=schedule-skipped`),
+   `backup_success`'s mapping (`0=failure / 1=success / 2=schedule-skipped /
+   3=deferred`; `3` added by the ADR-105 amendment of 2026-09-29),
    and `backup_promise_state`'s mapping (`0=protected / 1=at_risk /
    2=unprotected`, `PromiseStatus::metric_value` in `src/awareness.rs`) are
    part of the contract. A consumer that filters on `backup_send_type == 2`
@@ -60,9 +61,11 @@ These properties are guaranteed and load-bearing for downstream consumers
    (full / incremental respectively). The `# HELP` text states this explicitly;
    alerts must not assume the series exists.
 7. **Carry-forward of `backup_last_success_timestamp` and the pool gauges.**
-   When a subvolume is not attempted in a run (interval gating, skip), its
-   previous timestamp is read from the existing `.prom` file and re-emitted
-   unchanged. The series does not disappear during quiet periods.
+   When a subvolume is not attempted in a run (interval gating, skip), or is
+   deferred, its previous timestamp is read from the existing `.prom` file and
+   re-emitted unchanged. Every enabled, configured subvolume gets a row in
+   every run, including one a `--subvolume` filter left out, so the series
+   does not disappear during quiet periods or after a filtered run.
 
    The same mechanism covers a configured destination drive that isn't
    mounted this run (the offsite rotation drive being the motivating case,
@@ -107,19 +110,33 @@ All carry `subvolume="<name>"` as the primary label.
 
 ### `backup_success`
 
-Gauge. Value: `0=failure`, `1=success`, `2=schedule-skipped`.
+Gauge. Value: `0=failure`, `1=success`, `2=schedule-skipped`, `3=deferred`.
 
 The subvolume's outcome for the most recent run. `2` means the planner
 skipped this subvolume (interval gating, disabled, no work) — distinguished
 from `0` to keep cold subvolumes from firing failure alerts.
+
+`3` means the subvolume is expected to have an external copy, but nothing
+reached a destination: no send for it succeeded, no operation for it failed,
+and no drive it sends to holds a copy that is current (the drive's pin names
+the present source generation) or fresh (last successful send younger than
+the send interval). The cause does not matter — absent drive, token mismatch,
+space guard, gated chain-break full send. An unplugged drive is a condition,
+not an error, so a `backup_success == 0` rule does not fire; staleness alerts
+on `backup_last_success_timestamp` do. See the
+[ADR-105 amendment of 2026-09-29](../00-foundation/decisions/2026-03-24-ADR-105-backward-compatibility-contracts.md).
 
 ### `backup_last_success_timestamp`
 
 Gauge. Unix epoch seconds. Emitted only for subvolumes with a recorded
 successful backup.
 
-Carried forward from the previous `.prom` file when a subvolume was not
-attempted in this run, so the series does not vanish during interval gaps.
+Set to the run time when the run worked on the subvolume without error
+(`backup_success == 1`), never when it is deferred (`backup_success == 3`):
+it advances when a run leaves the subvolume protected, not merely free of
+errors. Carried forward from the previous `.prom` file when a subvolume was
+not attempted in this run or was deferred, so the series does not vanish
+during interval gaps and stops advancing while nothing reaches a destination.
 Used by staleness alerts to detect "this subvolume hasn't backed up in N days."
 
 ### `backup_duration_seconds`
@@ -144,9 +161,12 @@ not currently mounted are not counted.
 
 Gauge. Value: `0=full`, `1=incremental`, `2=no-send`, `3=deferred`.
 
-What the planner decided for this subvolume in this run. `2` means no send
-was scheduled (cold subvolume, interval not elapsed); `3` means a send was
-scheduled but deferred (drive absent, lock held, predictive guard tripped).
+What happened to this subvolume's sends in this run. `2` means no send was
+scheduled (cold subvolume, interval not elapsed). `3` means a send was wanted
+and did not happen: the subvolume is deferred (`backup_success == 3` —
+absent drive, token mismatch, space guard, gated chain-break full send), or
+a chain-break full send for it was gated in autonomous mode and no later send
+in the run succeeded.
 
 The encoding is part of the contract. Downstream alerts use
 `backup_send_type == 2` to exclude cold subvolumes from staleness rules

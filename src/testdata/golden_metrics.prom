@@ -1,4 +1,4 @@
-# HELP backup_success Backup result: 1=success, 0=failure, 2=schedule-skipped
+# HELP backup_success Backup result: 1=success, 0=failure, 2=schedule-skipped, 3=deferred
 # TYPE backup_success gauge
 backup_success{subvolume="subvol3-opptak"} 1
 backup_success{subvolume="htpc-home"} 2
