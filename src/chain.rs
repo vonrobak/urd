@@ -184,8 +184,9 @@ pub fn orphan_pins(discovered: &[DiscoveredPin], configured_labels: &[String]) -
 /// Defense-in-depth (ADR-106 layer 3): re-check pin status immediately before
 /// deletion. Returns `true` if the snapshot is pinned and must NOT be deleted.
 ///
-/// Called by both the executor's delete path and the emergency command.
-/// Single implementation — one place to update if pin file format evolves.
+/// Called by the executor's delete path, `urd emergency`, and the backup
+/// emergency preflight. Single implementation — one place to update if pin
+/// file format evolves.
 ///
 /// Fails closed (ADR-107): if the snapshot name can't be parsed, the local dir
 /// can't be resolved, or any configured drive's pin file exists but can't be

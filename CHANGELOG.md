@@ -44,6 +44,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   when any of its pin files exists but cannot be read. Previously an
   unreadable pin was treated as no pin, so reclaim could delete the parent a
   connected drive's incremental send depends on (#418).
+- `urd emergency` and the automatic emergency cleanup before a backup no
+  longer offer a subvolume's snapshots for deletion when one of its pin files
+  cannot be read. Previously `urd emergency` listed them and asked to confirm,
+  then refused every delete; the unreadable pin is now logged as a warning
+  and the subvolume is left out (#419).
 
 ## [0.37.0] - 2026-09-04
 

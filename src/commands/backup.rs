@@ -3228,9 +3228,9 @@ source = "/data/beta"
 
     #[test]
     fn emergency_refuses_deletes_when_a_pin_file_is_unreadable() {
-        // #402: the walk's lenient pin read omits an unreadable pin, so it
-        // offers every non-latest snapshot. The layer-3 re-check cannot confirm
-        // any of them unpinned and must refuse each delete (fail closed).
+        // #402/#419: the shared walk reads pins strictly, so a subvolume with
+        // an unreadable pin is not offered at all, and nothing is deleted. (The
+        // layer-3 re-check would refuse each delete anyway.)
         let dir = tempfile::TempDir::new().unwrap();
         let alpha = dir.path().join("alpha");
         make_snap_dirs(&alpha, &THREE_SNAPS);
@@ -3246,6 +3246,14 @@ source = "/data/beta"
             rotation_interval: None,
         });
         std::fs::create_dir(alpha.join(".last-external-parent-D1")).unwrap();
+
+        let walk = emergency::emergency_walk(
+            &config.local_snapshots.roots[0],
+            &config.resolved_subvolumes(),
+            &config.drive_labels(),
+            pass_now(),
+        );
+        assert!(walk.is_empty(), "unreadable pin → subvolume not offered");
 
         let mock = crate::btrfs::MockBtrfs::new();
         let out = run_emergency_preflight_with(&config, pass_now(), &mock, below()).unwrap();
