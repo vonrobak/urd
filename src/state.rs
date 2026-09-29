@@ -842,6 +842,26 @@ impl StateDb {
         event_type: DriveEventType,
         detected_by: DriveEventSource,
     ) -> crate::error::Result<()> {
+        self.record_drive_event_at(
+            drive_label,
+            event_type,
+            detected_by,
+            chrono::Local::now().naive_local(),
+        )
+    }
+
+    /// Record a drive event with an explicit `occurred_at` instead of now.
+    /// For an absence the sentinel *infers* at startup (#411): the drive went
+    /// away while no sentinel was watching, so the event is stamped at the
+    /// moment its presence was last witnessed. Same row shape as
+    /// `record_drive_event` — only the timestamp differs.
+    pub fn record_drive_event_at(
+        &self,
+        drive_label: &str,
+        event_type: DriveEventType,
+        detected_by: DriveEventSource,
+        occurred_at: chrono::NaiveDateTime,
+    ) -> crate::error::Result<()> {
         let payload = match event_type {
             DriveEventType::Mounted => EventPayload::DriveMounted { detected_by },
             DriveEventType::Unmounted => EventPayload::DriveUnmounted { detected_by },
@@ -849,7 +869,7 @@ impl StateDb {
         // Not a dance site: no notification, error-propagating granular
         // wrapper (pre-088-c contract). Drive detection happens outside
         // any backup run, so the stamp is an explicit outside_run.
-        let mut event = Event::pure(chrono::Local::now().naive_local(), payload);
+        let mut event = Event::pure(occurred_at, payload);
         event.fill_drive_label(Some(drive_label.to_string()));
         let event = event.stamp(&crate::events::RunContext::outside_run());
         self.record_events_inner(&[event])
@@ -2647,6 +2667,25 @@ mod tests {
         let record = db.last_drive_connection("WD-18TB").unwrap().unwrap();
         assert_eq!(record.event_type, "mounted");
         assert_eq!(record.detected_by, "sentinel");
+    }
+
+    #[test]
+    fn record_drive_event_at_stamps_the_given_time() {
+        // #411: an inferred startup unmount is stamped at last-witnessed
+        // presence, not at now — the row must carry exactly that time.
+        let db = StateDb::open_memory().unwrap();
+        let at = chrono::NaiveDateTime::parse_from_str("2026-09-01T03:04:05", "%Y-%m-%dT%H:%M:%S")
+            .unwrap();
+        db.record_drive_event_at(
+            "WD-18TB",
+            DriveEventType::Unmounted,
+            DriveEventSource::Sentinel,
+            at,
+        )
+        .unwrap();
+        let record = db.last_drive_connection("WD-18TB").unwrap().unwrap();
+        assert_eq!(record.event_type, "unmounted");
+        assert_eq!(record.timestamp, "2026-09-01T03:04:05");
     }
 
     #[test]

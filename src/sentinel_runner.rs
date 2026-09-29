@@ -8,7 +8,7 @@
 // Design: docs/95-ideas/2026-03-27-design-sentinel-session2.md
 // Review: docs/99-reports/2026-03-27-sentinel-session2-design-review.md
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -106,6 +106,10 @@ impl SentinelRunner {
         })?;
 
         log::warn!("Sentinel starting");
+
+        // #411: seed mount tracking from the previous instance before the
+        // first scan (and before our first state-file write overwrites it).
+        self.restore_mount_tracking();
 
         // M2 fix: route initial drive scan through the state machine.
         let initial_events = self.detect_drive_events();
@@ -250,14 +254,94 @@ impl SentinelRunner {
 
     // ── Event detection ─────────────────────────────────────────────────
 
-    fn detect_drive_events(&self) -> Vec<SentinelEvent> {
-        let current: BTreeSet<String> = self
-            .config
+    /// Labels of configured drives that are mounted and verified right now.
+    fn present_drives(&self) -> BTreeSet<String> {
+        self.config
             .drives
             .iter()
             .filter(|d| drives::drive_availability(d) == DriveAvailability::Available)
             .map(|d| d.label.clone())
-            .collect();
+            .collect()
+    }
+
+    /// Restore mount tracking from the previous instance's state file and
+    /// record the unmounts it implies (#411). Without this, a drive that went
+    /// away while no sentinel was watching is never recorded as gone.
+    ///
+    /// The decision is `sentinel::reconcile_restored_mounts`; this is its I/O.
+    /// Best-effort throughout: a missing, corrupt or other-schema state file
+    /// restores nothing (a cold start, as before), and an unreadable DB
+    /// records nothing (ADR-102) — the restored set is still reconciled
+    /// against what is present, so the first scan stays correct.
+    fn restore_mount_tracking(&mut self) {
+        let config_labels: BTreeSet<String> =
+            self.config.drives.iter().map(|d| d.label.clone()).collect();
+        let file = read_sentinel_state_file(&self.state_file_path);
+        let Some(restored) = sentinel::restorable_mounts(file.as_ref(), &config_labels) else {
+            return;
+        };
+        let present = self.present_drives();
+        let absent: Vec<&String> = restored.drives.difference(&present).collect();
+
+        let db = if absent.is_empty() {
+            None
+        } else {
+            StateDb::open(&self.config.general.state_db)
+                .inspect_err(|e| {
+                    log::warn!("Failed to open state DB for startup drive reconciliation: {e}");
+                })
+                .ok()
+        };
+
+        // Newest history event per absent label; a label left out of the map
+        // (unreadable row or query failure) is one the verdict won't touch.
+        let mut latest_events = BTreeMap::new();
+        if let Some(db) = &db {
+            for label in &absent {
+                match db.last_drive_connection(label) {
+                    Ok(None) => {
+                        latest_events.insert((*label).clone(), None);
+                    }
+                    Ok(Some(record)) => {
+                        if let Some(event) = crate::plan::drive_record_to_event(&record) {
+                            latest_events.insert((*label).clone(), Some(event));
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to read drive history for {label}: {e}");
+                    }
+                }
+            }
+        }
+
+        let now = chrono::Local::now().naive_local();
+        let verdict =
+            sentinel::reconcile_restored_mounts(&restored, &present, &latest_events, now);
+
+        if let Some(db) = &db {
+            use crate::state::{DriveEventSource, DriveEventType};
+            for unmount in &verdict.inferred_unmounts {
+                let at = unmount.at.format("%Y-%m-%dT%H:%M:%S");
+                log::warn!(
+                    "Drive unmounted while sentinel was down: {} — last seen mounted {at}",
+                    unmount.label,
+                );
+                if let Err(e) = db.record_drive_event_at(
+                    &unmount.label,
+                    DriveEventType::Unmounted,
+                    DriveEventSource::Sentinel,
+                    unmount.at,
+                ) {
+                    log::warn!("Failed to record drive event: {e}");
+                }
+            }
+        }
+
+        self.state.mounted_drives = verdict.mounted_drives;
+    }
+
+    fn detect_drive_events(&self) -> Vec<SentinelEvent> {
+        let current = self.present_drives();
 
         let mut events = Vec::new();
         for label in current.difference(&self.state.mounted_drives) {
@@ -926,7 +1010,7 @@ impl SentinelRunner {
         advisory_summary: Option<crate::output::AdvisorySummary>,
     ) -> anyhow::Result<()> {
         let state_file = SentinelStateFile {
-            schema_version: 3,
+            schema_version: crate::output::SENTINEL_STATE_SCHEMA_VERSION,
             pid: std::process::id(),
             started: self.started.format("%Y-%m-%dT%H:%M:%S").to_string(),
             last_assessment: Some(now.format("%Y-%m-%dT%H:%M:%S").to_string()),
@@ -2268,5 +2352,220 @@ protection = "recorded"
         runner.drive_eject_protocol();
         assert_eq!(runner.eject.last_space_check, Some(first));
         assert_eq!(runner.eject.phase, EjectPhase::Idle);
+    }
+
+    // ── Mount tracking across a restart (#411) ─────────────────────────
+
+    /// A config with two drives: `D1` (never mounted — its mount path is a
+    /// plain temp dir) and `P1` (mount path `/`, always mounted, no UUID →
+    /// Available). One sheltered subvolume sends to `D1`, so `D1`'s absence
+    /// age surfaces on its drive assessment.
+    fn write_drive_test_config(path: &std::path::Path, dir: &std::path::Path) {
+        let source = dir.join("source");
+        let snap_root = dir.join("snapshots");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&snap_root).unwrap();
+
+        let config_text = format!(
+            r#"[general]
+config_version = 1
+run_frequency = "daily"
+state_db = "{dir}/urd.db"
+metrics_file = "{dir}/backup.prom"
+heartbeat_file = "{dir}/heartbeat.json"
+
+[[drives]]
+label = "D1"
+mount_path = "{dir}/d1-mnt"
+snapshot_root = ".snapshots"
+role = "primary"
+
+[[drives]]
+label = "P1"
+mount_path = "/"
+snapshot_root = ".snapshots"
+role = "primary"
+
+[[subvolumes]]
+name = "test-sv"
+source = "{source}"
+snapshot_root = "{snap_root}"
+min_free_bytes = "1GB"
+protection = "sheltered"
+drives = ["D1"]
+"#,
+            dir = dir.display(),
+            source = source.display(),
+            snap_root = snap_root.display(),
+        );
+        std::fs::write(path, config_text).unwrap();
+    }
+
+    /// Stand in for the previous sentinel instance's last state-file write.
+    fn write_previous_state_file(
+        runner: &SentinelRunner,
+        mounted: &[&str],
+        last_assessment: NaiveDateTime,
+    ) {
+        let file = SentinelStateFile {
+            schema_version: crate::output::SENTINEL_STATE_SCHEMA_VERSION,
+            pid: 1,
+            started: (last_assessment - chrono::Duration::days(1))
+                .format("%Y-%m-%dT%H:%M:%S")
+                .to_string(),
+            last_assessment: Some(last_assessment.format("%Y-%m-%dT%H:%M:%S").to_string()),
+            mounted_drives: mounted.iter().map(|s| (*s).to_string()).collect(),
+            tick_interval_secs: 900,
+            promise_states: vec![],
+            circuit_breaker: SentinelCircuitState {
+                state: "closed".to_string(),
+                failure_count: 0,
+            },
+            visual_state: None,
+            advisory_summary: None,
+        };
+        std::fs::write(
+            &runner.state_file_path,
+            serde_json::to_string_pretty(&file).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Whole seconds, matching the resolution of state-file and event stamps.
+    fn now_secs() -> NaiveDateTime {
+        let now = chrono::Local::now().naive_local();
+        dt(&now.format("%Y-%m-%dT%H:%M:%S").to_string())
+    }
+
+    /// `D1`'s absence age as assessment derives it from the DB (via the
+    /// sentinel's own door, `world::assess`) — what `urd status` renders as
+    /// "away Nd".
+    fn d1_absent_secs(runner: &SentinelRunner, now: NaiveDateTime) -> Option<i64> {
+        let db = StateDb::open(&runner.config.general.state_db).unwrap();
+        let fs = RealFileSystemState { state: Some(&db) };
+        let btrfs = crate::btrfs::MockBtrfs::new();
+        let obs = Observation {
+            fs: &fs,
+            history: &fs,
+            btrfs: &btrfs,
+        };
+        let assessments = world::assess(&runner.config, now, &obs, &HashMap::new());
+        assessments
+            .iter()
+            .flat_map(|a| &a.external)
+            .find(|d| d.drive_label == "D1")
+            .expect("test-sv sends to D1")
+            .absent_duration_secs
+    }
+
+    fn drive_rows(runner: &SentinelRunner, label: &str) -> Vec<crate::state::DriveConnectionRecord> {
+        StateDb::open(&runner.config.general.state_db)
+            .unwrap()
+            .drive_connection_history(label)
+            .unwrap()
+    }
+
+    #[test]
+    fn restart_after_unwatched_unmount_stamps_absence_at_last_witness() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("urd.toml");
+        write_drive_test_config(&config_path, dir.path());
+        let mut runner = make_test_runner(&config_path);
+
+        // The previous instance last saw D1 and P1 mounted twenty days ago
+        // (plus a drive since removed from config); D1 left while no
+        // sentinel was running.
+        let witnessed = now_secs() - chrono::Duration::days(20);
+        write_previous_state_file(&runner, &["D1", "P1", "REMOVED"], witnessed);
+
+        runner.restore_mount_tracking();
+
+        // P1 (restored, present) stays tracked; D1 (absent) and REMOVED
+        // (not in config) do not.
+        assert_eq!(runner.state.mounted_drives, BTreeSet::from(["P1".to_string()]));
+        // …so the first scan emits nothing: no spurious DriveMounted for P1,
+        // and D1's unmount was already accounted for.
+        assert!(runner.detect_drive_events().is_empty());
+
+        // D1's inferred unmount is stamped at the last witness, not at now.
+        let d1 = drive_rows(&runner, "D1");
+        assert_eq!(d1.len(), 1);
+        assert_eq!(d1[0].event_type, "unmounted");
+        assert_eq!(d1[0].timestamp, witnessed.format("%Y-%m-%dT%H:%M:%S").to_string());
+        assert!(drive_rows(&runner, "P1").is_empty(), "present drive: no event");
+        assert!(drive_rows(&runner, "REMOVED").is_empty(), "removed drive: no event");
+
+        // The absence age awareness derives is ~20 days, not ~0.
+        let now = now_secs();
+        let absent = d1_absent_secs(&runner, now).expect("away, not disconnected");
+        assert_eq!(absent, (now - witnessed).num_seconds());
+        assert!(absent >= 20 * 86400);
+
+        // A further restart does not reset it: this instance's own state
+        // file no longer lists D1, so nothing new is recorded.
+        runner.write_state_file(now, &[], None).unwrap();
+        let mut second = make_test_runner(&config_path);
+        second.restore_mount_tracking();
+        assert_eq!(drive_rows(&second, "D1").len(), 1, "no new row on restart");
+        assert_eq!(d1_absent_secs(&second, now), Some(absent));
+    }
+
+    #[test]
+    fn restart_keeps_a_witnessed_weeks_long_absence() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("urd.toml");
+        write_drive_test_config(&config_path, dir.path());
+        let mut runner = make_test_runner(&config_path);
+
+        // A sentinel witnessed D1 leave twenty days ago; an older state file
+        // (twenty-one days) still lists it as mounted.
+        let unmounted_at = now_secs() - chrono::Duration::days(20);
+        StateDb::open(&runner.config.general.state_db)
+            .unwrap()
+            .record_drive_event_at(
+                "D1",
+                crate::state::DriveEventType::Unmounted,
+                crate::state::DriveEventSource::Sentinel,
+                unmounted_at,
+            )
+            .unwrap();
+        write_previous_state_file(&runner, &["D1"], unmounted_at - chrono::Duration::days(1));
+
+        runner.restore_mount_tracking();
+
+        assert!(runner.state.mounted_drives.is_empty());
+        assert_eq!(drive_rows(&runner, "D1").len(), 1, "witnessed absence wins");
+        let now = now_secs();
+        assert_eq!(
+            d1_absent_secs(&runner, now),
+            Some((now - unmounted_at).num_seconds()),
+            "absence age does not reset on restart",
+        );
+    }
+
+    #[test]
+    fn restart_without_usable_state_file_is_a_cold_start() {
+        for contents in [None, Some("{ not json")] {
+            let dir = tempfile::tempdir().unwrap();
+            let config_path = dir.path().join("urd.toml");
+            write_drive_test_config(&config_path, dir.path());
+            let mut runner = make_test_runner(&config_path);
+            if let Some(text) = contents {
+                std::fs::write(&runner.state_file_path, text).unwrap();
+            }
+
+            runner.restore_mount_tracking();
+
+            // Today's behavior: nothing restored, nothing recorded, and the
+            // first scan reports every present drive as newly mounted.
+            assert!(runner.state.mounted_drives.is_empty(), "{contents:?}");
+            let events = runner.detect_drive_events();
+            assert_eq!(events.len(), 1, "{contents:?}");
+            assert!(
+                matches!(&events[0], SentinelEvent::DriveMounted { label } if label == "P1"),
+                "{contents:?}"
+            );
+            assert!(drive_rows(&runner, "D1").is_empty(), "{contents:?}");
+        }
     }
 }

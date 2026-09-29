@@ -932,7 +932,9 @@ impl RealFileSystemState<'_> {
 /// This is the read-side composition pattern: granular `state.rs` wrappers, with
 /// the domain shaping localized once at the adapter (see also `drift_samples`).
 /// Keep `state.rs` itself one-method-per-query — composition lives here.
-fn drive_record_to_event(record: &crate::state::DriveConnectionRecord) -> Option<DriveEvent> {
+pub(crate) fn drive_record_to_event(
+    record: &crate::state::DriveConnectionRecord,
+) -> Option<DriveEvent> {
     let kind = match record.event_type.as_str() {
         "mounted" => DriveEventKind::Mount,
         "unmounted" => DriveEventKind::Unmount,
