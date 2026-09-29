@@ -10,8 +10,8 @@ use crate::error::UrdError;
 use crate::events::DeferScope;
 use crate::storage_critical;
 use crate::types::{
-    BackupPlan, DriveEvent, DriveEventKind, Interval, PlannedLifecycle, PlannedOperation, PlannedSkip,
-    SendKind, SnapshotName,
+    BackupPlan, DriveEvent, DriveEventKind, Interval, PlannedLifecycle, PlannedOperation,
+    PlannedSkip, SendKind, SnapshotName,
 };
 
 mod external;
