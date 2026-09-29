@@ -527,8 +527,8 @@ pub fn detect_simultaneous_chain_breaks(
 // which drives it last saw mounted. A restored drive that is absent at startup
 // went away while no sentinel was watching, so its unmount is *inferred*.
 // Rule: witnessed absence beats inferred absence, and an inferred absence
-// starts at the latest moment the drive's presence was last witnessed — never
-// at sentinel start. An inferred absence may over-state (it is bounded by when
+// starts at the latest moment the drive's presence was last witnessed (state
+// file, drive event, or successful send) — never at sentinel start. An inferred absence may over-state (it is bounded by when
 // presence was last seen), never under-state: a drive gone twenty days must
 // not start reporting "away 0d" after a restart.
 
@@ -598,22 +598,37 @@ pub struct StartupReconciliation {
 
 /// Decide what a restart must record for restored drives. Pure.
 ///
+/// Presence has three witnesses: the state file (`restored.witnessed_at`),
+/// the newest drive event in history, and the last successful send to the
+/// drive. The first two are both written by the sentinel and go stale
+/// together while it is down; sends are recorded by backup runs, so a drive
+/// that kept receiving nightly sends while the sentinel was off must not be
+/// dated back to the sentinel's last sighting.
+///
 /// `latest_events` holds, per restored-and-absent label, the newest drive
 /// event in history (`None` = no event on record). A label **missing** from
-/// the map means history could not be read — nothing is recorded for it, so
+/// it means event history could not be read — nothing is recorded for it, so
 /// an unreadable DB can never produce an event that post-dates, and thereby
 /// masks, a witnessed unmount.
 ///
-/// For each restored drive absent now, the absence starts at the later of the
-/// state-file witness time and the newest history event — unless that newest
-/// event is an unmount at or after the witness time (already witnessed:
-/// record nothing). The stamp is clamped to `now` so a backwards clock step
-/// cannot yield a future-dated absence.
+/// `last_sends` holds the last successful send per label. A label missing
+/// from it (no send on record, or send history unreadable) simply drops that
+/// witness — the other two still decide.
+///
+/// For each restored drive absent now, the absence starts at the latest
+/// presence witness — the state file, the newest event, or the last send —
+/// unless the newest event is an unmount at or after every presence witness
+/// (already witnessed: record nothing). A send *after* a witnessed unmount
+/// means the drive came back unseen and has since gone again, so that unmount
+/// no longer dates the absence in effect: a fresh one is recorded at the send.
+/// The stamp is clamped to `now` so a backwards clock step cannot yield a
+/// future-dated absence.
 #[must_use]
 pub fn reconcile_restored_mounts(
     restored: &RestoredMounts,
     present: &BTreeSet<String>,
     latest_events: &BTreeMap<String, Option<DriveEvent>>,
+    last_sends: &BTreeMap<String, NaiveDateTime>,
     now: NaiveDateTime,
 ) -> StartupReconciliation {
     let mounted_drives = restored.drives.intersection(present).cloned().collect();
@@ -621,14 +636,19 @@ pub fn reconcile_restored_mounts(
 
     for label in restored.drives.difference(present) {
         let Some(latest) = latest_events.get(label) else {
-            continue; // history unreadable — never guess
+            continue; // event history unreadable — never guess
+        };
+        // Latest presence witness outside the event log.
+        let seen = match last_sends.get(label) {
+            Some(&sent) => restored.witnessed_at.max(sent),
+            None => restored.witnessed_at,
         };
         let at = match latest {
-            Some(ev) if ev.kind == DriveEventKind::Unmount && ev.at >= restored.witnessed_at => {
+            Some(ev) if ev.kind == DriveEventKind::Unmount && ev.at >= seen => {
                 continue; // witnessed absence wins
             }
-            Some(ev) => ev.at.max(restored.witnessed_at),
-            None => restored.witnessed_at,
+            Some(ev) => ev.at.max(seen),
+            None => seen,
         };
         inferred_unmounts.push(InferredUnmount {
             label: label.clone(),
@@ -2255,6 +2275,7 @@ mod tests {
                 &restored(&["WD-18TB"]),
                 &labels(&[]),
                 &latest_events,
+                &BTreeMap::new(),
                 ts(NOW),
             );
             let want: Vec<InferredUnmount> = expected
@@ -2271,12 +2292,104 @@ mod tests {
     }
 
     #[test]
+    fn reconcile_last_send_is_a_presence_witness() {
+        use DriveEventKind::{Mount, Unmount};
+        // Sends are recorded by backup runs, independently of the sentinel,
+        // so they witness presence while the state file and event log go
+        // stale together. (case, newest event, last send, expected stamp)
+        type Case = (&'static str, Option<DriveEvent>, Option<&'static str>, Option<&'static str>);
+        let cases: Vec<Case> = vec![
+            (
+                "send newer than file and event → the send",
+                event(Mount, "2026-09-10T12:10:00"),
+                Some("2026-09-28T04:00:00"),
+                Some("2026-09-28T04:00:00"),
+            ),
+            (
+                "send newer than file, no event → the send",
+                None,
+                Some("2026-09-28T04:00:00"),
+                Some("2026-09-28T04:00:00"),
+            ),
+            (
+                "send older than file → unchanged (file time)",
+                None,
+                Some("2026-09-05T04:00:00"),
+                Some(FILE_AT),
+            ),
+            (
+                "send older than a newer Mount → unchanged (the mount)",
+                event(Mount, "2026-09-10T12:10:00"),
+                Some("2026-09-10T04:00:00"),
+                Some("2026-09-10T12:10:00"),
+            ),
+            ("no send on record → unchanged (file time)", None, None, Some(FILE_AT)),
+            (
+                "send older than a witnessed Unmount → unmount still wins, nothing",
+                event(Unmount, "2026-09-12T00:00:00"),
+                Some("2026-09-11T04:00:00"),
+                None,
+            ),
+            (
+                "send at a witnessed Unmount's time → unmount still wins, nothing",
+                event(Unmount, "2026-09-12T00:00:00"),
+                Some("2026-09-12T00:00:00"),
+                None,
+            ),
+            (
+                "send newer than a witnessed Unmount → drive came back unseen; \
+                 the absence in effect starts at the send",
+                event(Unmount, "2026-09-12T00:00:00"),
+                Some("2026-09-28T04:00:00"),
+                Some("2026-09-28T04:00:00"),
+            ),
+        ];
+        for (case, latest, sent, expected) in cases {
+            let latest_events = BTreeMap::from([("WD-18TB".to_string(), latest)]);
+            let last_sends: BTreeMap<String, NaiveDateTime> = sent
+                .map(|at| ("WD-18TB".to_string(), ts(at)))
+                .into_iter()
+                .collect();
+            let v = reconcile_restored_mounts(
+                &restored(&["WD-18TB"]),
+                &labels(&[]),
+                &latest_events,
+                &last_sends,
+                ts(NOW),
+            );
+            let want: Vec<InferredUnmount> = expected
+                .map(|at| InferredUnmount {
+                    label: "WD-18TB".to_string(),
+                    at: ts(at),
+                })
+                .into_iter()
+                .collect();
+            assert_eq!(v.inferred_unmounts, want, "{case}");
+        }
+    }
+
+    #[test]
+    fn reconcile_send_does_not_override_unreadable_event_history() {
+        // Event history unreadable → record nothing, even with a known send:
+        // the unread log may hold a newer witnessed unmount.
+        let v = reconcile_restored_mounts(
+            &restored(&["WD-18TB"]),
+            &labels(&[]),
+            &BTreeMap::new(),
+            &BTreeMap::from([("WD-18TB".to_string(), ts("2026-09-28T04:00:00"))]),
+            ts(NOW),
+        );
+        assert!(v.inferred_unmounts.is_empty());
+    }
+
+    #[test]
     fn reconcile_never_stamps_at_now_for_a_long_absence() {
         // The issue's trap: a drive gone twenty days must not read "away 0d".
         let v = reconcile_restored_mounts(
             &restored(&["WD-18TB"]),
             &labels(&[]),
             &BTreeMap::from([("WD-18TB".to_string(), None)]),
+            &BTreeMap::new(),
             ts(NOW),
         );
         assert_eq!(v.inferred_unmounts[0].at, ts(FILE_AT));
@@ -2291,6 +2404,7 @@ mod tests {
             &restored(&["WD-18TB"]),
             &labels(&["WD-18TB", "NEW"]),
             &BTreeMap::new(),
+            &BTreeMap::new(),
             ts(NOW),
         );
         assert_eq!(v.mounted_drives, labels(&["WD-18TB"]));
@@ -2303,6 +2417,7 @@ mod tests {
         let v = reconcile_restored_mounts(
             &restored(&["WD-18TB"]),
             &labels(&[]),
+            &BTreeMap::new(),
             &BTreeMap::new(),
             ts(NOW),
         );
@@ -2321,6 +2436,7 @@ mod tests {
             &r,
             &labels(&[]),
             &BTreeMap::from([("WD-18TB".to_string(), None)]),
+            &BTreeMap::new(),
             ts(NOW),
         );
         assert_eq!(v.inferred_unmounts[0].at, ts(NOW));

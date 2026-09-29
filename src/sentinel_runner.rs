@@ -314,9 +314,32 @@ impl SentinelRunner {
             }
         }
 
+        // Last successful send per absent label — a presence witness the
+        // backup run records even while no sentinel is running. Unreadable
+        // or absent → that witness drops out; the other two still decide.
+        let mut last_sends = BTreeMap::new();
+        if let Some(db) = &db {
+            for label in &absent {
+                match db.last_successful_operation_at(label) {
+                    Ok(Some(at)) => {
+                        last_sends.insert((*label).clone(), at);
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        log::warn!("Failed to read send history for {label}: {e}");
+                    }
+                }
+            }
+        }
+
         let now = chrono::Local::now().naive_local();
-        let verdict =
-            sentinel::reconcile_restored_mounts(&restored, &present, &latest_events, now);
+        let verdict = sentinel::reconcile_restored_mounts(
+            &restored,
+            &present,
+            &latest_events,
+            &last_sends,
+            now,
+        );
 
         if let Some(db) = &db {
             use crate::state::{DriveEventSource, DriveEventType};
@@ -2508,6 +2531,48 @@ drives = ["D1"]
         second.restore_mount_tracking();
         assert_eq!(drive_rows(&second, "D1").len(), 1, "no new row on restart");
         assert_eq!(d1_absent_secs(&second, now), Some(absent));
+    }
+
+    #[test]
+    fn restart_dates_absence_from_a_send_made_while_sentinel_was_off() {
+        // The sentinel was stopped (state file survives) three months ago and
+        // stayed off while the nightly timer kept sending to D1; D1 has since
+        // been unplugged. The absence must run from the last send, not from
+        // the stale state file.
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("urd.toml");
+        write_drive_test_config(&config_path, dir.path());
+        let mut runner = make_test_runner(&config_path);
+
+        let stale = now_secs() - chrono::Duration::days(90);
+        write_previous_state_file(&runner, &["D1"], stale);
+        let sent_at = {
+            let db = StateDb::open(&runner.config.general.state_db).unwrap();
+            let run = db.begin_run("incremental").unwrap();
+            db.record_operation(&crate::state::OperationRecord {
+                run_id: run,
+                subvolume: "test-sv".to_string(),
+                operation: "send_incremental".to_string(),
+                drive_label: Some("D1".to_string()),
+                duration_secs: Some(1.0),
+                result: "success".to_string(),
+                error_message: None,
+                bytes_transferred: Some(100),
+            })
+            .unwrap();
+            db.last_successful_operation_at("D1").unwrap().unwrap()
+        };
+
+        runner.restore_mount_tracking();
+
+        let d1 = drive_rows(&runner, "D1");
+        assert_eq!(d1.len(), 1);
+        assert_eq!(d1[0].event_type, "unmounted");
+        assert_eq!(d1[0].timestamp, sent_at.format("%Y-%m-%dT%H:%M:%S").to_string());
+        let now = now_secs().max(sent_at);
+        let absent = d1_absent_secs(&runner, now).expect("away, not disconnected");
+        assert_eq!(absent, (now - sent_at).num_seconds());
+        assert!(absent < 86400, "measured from the send, not the 90-day-old file");
     }
 
     #[test]
