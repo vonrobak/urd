@@ -5000,6 +5000,48 @@ local_retention = "transient"
     }
 
     #[test]
+    fn planned_delete_refused_when_a_pin_file_is_unreadable() {
+        // ADR-106 layer 3 (#402): the planner's lenient pin read omits an
+        // unreadable pin, so a delete of the snapshot it may protect can reach
+        // the executor. The pre-delete re-check must fail closed and skip it.
+        let snap_dir = tempfile::TempDir::new().unwrap();
+        let drive_dir = tempfile::TempDir::new().unwrap();
+        let sv_dir = snap_dir.path().join("sv-t");
+        std::fs::create_dir_all(&sv_dir).unwrap();
+        let target = sv_dir.join("20260321-t");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::create_dir(sv_dir.join(".last-external-parent-DRIVE-A")).unwrap();
+
+        let config = transient_config_n_drives(
+            snap_dir.path(),
+            &[("DRIVE-A", drive_dir.path(), "primary")],
+        );
+        let mock = MockBtrfs::new();
+        let shutdown = no_shutdown();
+        let executor = Executor::new(&mock, None, &config, &shutdown);
+
+        let plan = BackupPlan {
+            lifecycles: HashMap::new(),
+            operations: vec![PlannedOperation::DeleteSnapshot {
+                path: target.clone(),
+                reason: "expired".to_string(),
+                subvolume_name: "sv-t".to_string(),
+                kind: DeleteKind::Policy,
+            }],
+            timestamp: test_ts(),
+            skipped: vec![],
+            events: Vec::new(),
+        };
+
+        let result = executor.execute(&plan, "full");
+
+        let op = &result.subvolume_results[0].operations[0];
+        assert_eq!(op.result, OpResult::Skipped);
+        assert_eq!(op.error.as_deref(), Some("snapshot is pinned"));
+        assert!(delete_calls(&mock).is_empty(), "unreadable pin → no delete");
+    }
+
+    #[test]
     fn emergency_reclaim_preserves_subvol_with_no_offsite_copy() {
         // Finding A: a subvol that has never been sent offsite (no pin) keeps ALL
         // its local snapshots — they are its only stored copy, and the reactive

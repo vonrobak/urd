@@ -14,6 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or every drive absent — so the worst promise state got less help than "at
   risk" did. Surfaced by the 2026-09-20 silent drive-absence incident, which
   ended with eight exposed subvolumes, a connected drive, and no advice at all.
+- The last safety check before deleting a local snapshot now keeps the
+  snapshot when a drive's pin file exists but cannot be read or parsed.
+  Previously an unreadable pin was treated as no pin, so retention and
+  emergency cleanup could delete the parent an incremental send depends on
+  (#402).
 
 ## [0.37.0] - 2026-09-04
 

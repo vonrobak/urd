@@ -3227,6 +3227,34 @@ source = "/data/beta"
     }
 
     #[test]
+    fn emergency_refuses_deletes_when_a_pin_file_is_unreadable() {
+        // #402: the walk's lenient pin read omits an unreadable pin, so it
+        // offers every non-latest snapshot. The layer-3 re-check cannot confirm
+        // any of them unpinned and must refuse each delete (fail closed).
+        let dir = tempfile::TempDir::new().unwrap();
+        let alpha = dir.path().join("alpha");
+        make_snap_dirs(&alpha, &THREE_SNAPS);
+        let mut config = emergency_config(dir.path());
+        config.drives.push(crate::config::DriveConfig {
+            label: "D1".to_string(),
+            uuid: None,
+            mount_path: std::path::PathBuf::from("/mnt/d1"),
+            snapshot_root: ".snapshots".to_string(),
+            role: crate::types::DriveRole::Offsite,
+            max_usage_percent: None,
+            min_free_bytes: None,
+            rotation_interval: None,
+        });
+        std::fs::create_dir(alpha.join(".last-external-parent-D1")).unwrap();
+
+        let mock = crate::btrfs::MockBtrfs::new();
+        let out = run_emergency_preflight_with(&config, pass_now(), &mock, below()).unwrap();
+
+        assert!(deleted_paths(&mock).is_empty(), "unreadable pin → no deletes");
+        assert!(!out.any_deleted);
+    }
+
+    #[test]
     fn emergency_skips_transient_subvol() {
         let dir = tempfile::TempDir::new().unwrap();
         let alpha = dir.path().join("alpha");
