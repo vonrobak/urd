@@ -213,8 +213,8 @@ Prometheus owns gauges (current state over time). The `events` table in SQLite
 owns typed state changes and decisions with rationale: *"retention pruned snapshot
 X because daily slot was full"*, *"promise transitioned PROTECTED → AT RISK on
 drive Y"*. Pure modules emit `EventPayload` values; impure callers persist them
-(ADR-108). The events table is best-effort (ADR-102) and additive (ADR-105) —
-schema changes never break older readers.
+(ADR-108). The events table is best-effort (ADR-102) and append-only (ADR-114) —
+rows are never rewritten, so every payload form ever written must still decode.
 
 ## What's *not* in the diagram
 

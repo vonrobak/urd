@@ -47,6 +47,21 @@ pub enum EventKind {
 }
 
 impl EventKind {
+    /// Every kind, in the order `--kind` help and errors list them. The
+    /// `event_kind_all_lists_every_variant` test fails if a variant is missing.
+    pub const ALL: [EventKind; 10] = [
+        Self::Retention,
+        Self::Planner,
+        Self::Promise,
+        Self::Sentinel,
+        Self::Config,
+        Self::Drive,
+        Self::Watchdog,
+        Self::EmergencyEject,
+        Self::Rotation,
+        Self::Storage,
+    ];
+
     /// Lower-case wire form used when writing to SQLite's `kind` column.
     #[must_use]
     pub fn as_str(self) -> &'static str {
@@ -934,10 +949,11 @@ mod tests {
         }
     }
 
-    // ── Historical-fixture contract (ADR-105) ────────────────────────────
+    // ── Historical-fixture contract (ADR-114) ────────────────────────────
     //
-    // ADR-105 treats persisted event JSON as an additive on-disk contract:
-    // a row written years ago must still deserialize under today's code.
+    // ADR-114 makes event rows append-only and immutable: they are never
+    // rewritten, so every payload form ever written must still deserialize
+    // under today's code. (The table is internal, not a public contract.)
     // Every fixture below is a *literal* JSON string, hand-captured from the
     // current wire form (`#[serde(tag = "type")]`; the enum carries no
     // `rename_all`, so the tag is the PascalCase variant name) — never
@@ -980,6 +996,22 @@ mod tests {
                 },
             ),
             (
+                "RetentionProtect (pin_overrode_window)",
+                r#"{"type":"RetentionProtect","snapshot":"20260101-0400-home","reason":"pin_overrode_window"}"#,
+                EventPayload::RetentionProtect {
+                    snapshot: "20260101-0400-home".into(),
+                    reason: ProtectReason::PinOverrodeWindow,
+                },
+            ),
+            (
+                "RetentionProtect (clock_skew_future)",
+                r#"{"type":"RetentionProtect","snapshot":"20260101-0400-home","reason":"clock_skew_future"}"#,
+                EventPayload::RetentionProtect {
+                    snapshot: "20260101-0400-home".into(),
+                    reason: ProtectReason::ClockSkewFuture,
+                },
+            ),
+            (
                 "RetentionProtectSummary",
                 r#"{"type":"RetentionProtectSummary","reason":"pin_overrode_thinning","count":34,"oldest":"20260801-0400-home","newest":"20260928-0400-home"}"#,
                 EventPayload::RetentionProtectSummary {
@@ -1004,6 +1036,22 @@ mod tests {
                 EventPayload::PlannerDefer {
                     reason: "drive not mounted".into(),
                     scope: DeferScope::Drive,
+                },
+            ),
+            (
+                "PlannerDefer (scope subvolume)",
+                r#"{"type":"PlannerDefer","reason":"send disabled","scope":"subvolume"}"#,
+                EventPayload::PlannerDefer {
+                    reason: "send disabled".into(),
+                    scope: DeferScope::Subvolume,
+                },
+            ),
+            (
+                "PlannerDefer (scope run)",
+                r#"{"type":"PlannerDefer","reason":"lock held","scope":"run"}"#,
+                EventPayload::PlannerDefer {
+                    reason: "lock held".into(),
+                    scope: DeferScope::Run,
                 },
             ),
             (
@@ -1206,6 +1254,24 @@ mod tests {
     }
 
     #[test]
+    fn protect_reason_wire_form_is_snake_case() {
+        let cases = [
+            (ProtectReason::PinOverrodeThinning, "pin_overrode_thinning"),
+            (ProtectReason::PinOverrodeWindow, "pin_overrode_window"),
+            (ProtectReason::ClockSkewFuture, "clock_skew_future"),
+        ];
+        for (reason, expected) in cases {
+            let payload = EventPayload::RetentionProtect {
+                snapshot: "s".into(),
+                reason,
+            };
+            let json = serde_json::to_value(&payload).unwrap();
+            let actual = json.get("reason").and_then(|v| v.as_str()).unwrap();
+            assert_eq!(actual, expected, "wire form for {reason:?} drifted");
+        }
+    }
+
+    #[test]
     fn defer_scope_wire_form_is_snake_case() {
         let cases = [
             (DeferScope::Subvolume, "subvolume"),
@@ -1261,6 +1327,49 @@ mod tests {
         ] {
             assert_eq!(EventKind::from_str(kind.as_str()), Some(kind));
         }
+    }
+
+    #[test]
+    fn event_kind_all_lists_every_variant() {
+        // Wildcard-free match: adding a variant fails the build here until it
+        // gets an arm, and its arm asserts membership in `ALL`.
+        fn in_all(kind: EventKind) -> bool {
+            let all = EventKind::ALL;
+            match kind {
+                EventKind::Retention => all.contains(&EventKind::Retention),
+                EventKind::Planner => all.contains(&EventKind::Planner),
+                EventKind::Promise => all.contains(&EventKind::Promise),
+                EventKind::Sentinel => all.contains(&EventKind::Sentinel),
+                EventKind::Config => all.contains(&EventKind::Config),
+                EventKind::Drive => all.contains(&EventKind::Drive),
+                EventKind::Watchdog => all.contains(&EventKind::Watchdog),
+                EventKind::EmergencyEject => all.contains(&EventKind::EmergencyEject),
+                EventKind::Rotation => all.contains(&EventKind::Rotation),
+                EventKind::Storage => all.contains(&EventKind::Storage),
+            }
+        }
+        // Keep in step with the match above: a new variant needs an arm there
+        // (compiler-enforced) and an entry here (which `in_all` then checks).
+        let variants = [
+            EventKind::Retention,
+            EventKind::Planner,
+            EventKind::Promise,
+            EventKind::Sentinel,
+            EventKind::Config,
+            EventKind::Drive,
+            EventKind::Watchdog,
+            EventKind::EmergencyEject,
+            EventKind::Rotation,
+            EventKind::Storage,
+        ];
+        for kind in variants {
+            assert!(in_all(kind), "{kind:?} missing from EventKind::ALL");
+        }
+        assert_eq!(EventKind::ALL.len(), variants.len());
+        let mut names: Vec<&str> = EventKind::ALL.iter().map(|k| k.as_str()).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), EventKind::ALL.len(), "duplicate in EventKind::ALL");
     }
 
     #[test]

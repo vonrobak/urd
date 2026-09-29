@@ -469,7 +469,7 @@ and prints filtered events. Read-only.
 | Flag | Semantics |
 |------|-----------|
 | `--since <DURATION>` | Only events from the last duration (e.g., `7d`, `24h`, `30m`). |
-| `--kind <KIND>` | Filter by kind: `retention`, `planner`, `promise`, `sentinel`, `config`, `drive`. |
+| `--kind <KIND>` | Filter by kind: `retention`, `planner`, `promise`, `sentinel`, `config`, `drive`, `watchdog`, `emergency_eject`, `rotation`, `storage`. |
 | `--subvolume <name>` | Filter by subvolume. |
 | `--drive <label>` | Filter by drive label. |
 | `--limit <N>` | Maximum events to display. Default `50`, max `1000`. |

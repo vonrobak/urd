@@ -29,6 +29,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   same `m:ss` form as the live send line, not `35.8s` (#413).
 
 ### Fixed
+- `urd events --kind` help and error text now list every kind it accepts, including
+  `watchdog`, `emergency_eject`, `rotation` and `storage` (#423).
 - `urd status` no longer dates a drive's absence from a stale record. When a
   backup succeeded to a drive after its last recorded disconnect, the drive
   came back and left again unwatched, so the old disconnect is ignored and
