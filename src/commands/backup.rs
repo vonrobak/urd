@@ -346,7 +346,7 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
 
     // Build progress context after token filtering so counters reflect actual work.
     let total_sends = backup_plan.summary().sends as u32;
-    let size_estimates = build_size_estimates(&backup_plan, &fs_state);
+    let size_estimates = build_size_estimates(&backup_plan, &fs_state, &config);
     let progress_ctx = Arc::new(Mutex::new(ProgressContext {
         subvolume_name: String::new(),
         drive_label: String::new(),
@@ -1985,7 +1985,11 @@ pub(crate) type SizeEstimates = HashMap<(String, String), Option<u64>>;
 fn build_size_estimates(
     plan: &BackupPlan,
     fs_state: &dyn HistoryQuery,
+    config: &Config,
 ) -> SizeEstimates {
+    let resolved = config.resolved_subvolumes();
+    let send_interval =
+        |name: &str| resolved.iter().find(|r| r.name == name).map(|r| r.send_interval);
     let mut estimates = HashMap::new();
     for op in &plan.operations {
         match op {
@@ -1994,7 +1998,14 @@ fn build_size_estimates(
                 drive_label,
                 ..
             } => {
-                let est = crate::plan::estimated_send_size(fs_state, subvolume_name, drive_label, true);
+                let est = crate::plan::displayed_send_estimate(
+                    fs_state,
+                    subvolume_name,
+                    drive_label,
+                    true,
+                    plan.timestamp,
+                    send_interval(subvolume_name),
+                );
                 estimates.insert((subvolume_name.clone(), drive_label.clone()), est);
             }
             PlannedOperation::SendIncremental {
@@ -2002,7 +2013,14 @@ fn build_size_estimates(
                 drive_label,
                 ..
             } => {
-                let est = crate::plan::estimated_send_size(fs_state, subvolume_name, drive_label, false);
+                let est = crate::plan::displayed_send_estimate(
+                    fs_state,
+                    subvolume_name,
+                    drive_label,
+                    false,
+                    plan.timestamp,
+                    send_interval(subvolume_name),
+                );
                 estimates.insert((subvolume_name.clone(), drive_label.clone()), est);
             }
             _ => {}
@@ -4456,7 +4474,7 @@ source = "/data/beta"
             5_500_000,
         );
 
-        let estimates = build_size_estimates(&plan, &fs);
+        let estimates = build_size_estimates(&plan, &fs, &no_subvol_config());
 
         // Full send should have estimate
         assert_eq!(
@@ -4493,7 +4511,7 @@ source = "/data/beta"
         };
 
         let fs = MockFileSystemState::new();
-        let estimates = build_size_estimates(&plan, &fs);
+        let estimates = build_size_estimates(&plan, &fs, &no_subvol_config());
 
         assert_eq!(
             estimates[&("sv1".to_string(), "new-drive".to_string())],
@@ -4529,7 +4547,7 @@ source = "/data/beta"
             50_000_000_000,
         );
 
-        let estimates = build_size_estimates(&plan, &fs);
+        let estimates = build_size_estimates(&plan, &fs, &no_subvol_config());
         assert_eq!(
             estimates[&("sv1".to_string(), "new-drive".to_string())],
             Some(50_000_000_000),
@@ -4559,7 +4577,7 @@ source = "/data/beta"
             skipped: vec![],
             events: Vec::new(),
         };
-        let est_full = build_size_estimates(&plan_full, &fs);
+        let est_full = build_size_estimates(&plan_full, &fs, &no_subvol_config());
         assert_eq!(est_full[&("sv1".to_string(), "d1".to_string())], Some(45_000_000_000));
 
         // Incremental send: should NOT use calibrated (two-tier only)
@@ -4577,8 +4595,84 @@ source = "/data/beta"
             skipped: vec![],
             events: Vec::new(),
         };
-        let est_inc = build_size_estimates(&plan_inc, &fs);
+        let est_inc = build_size_estimates(&plan_inc, &fs, &no_subvol_config());
         assert_eq!(est_inc[&("sv1".to_string(), "d1".to_string())], None);
+    }
+
+    fn no_subvol_config() -> Config {
+        config_with_state_db(std::path::Path::new("/tmp"))
+    }
+
+    #[test]
+    fn build_size_estimates_withholds_stale_incremental() {
+        use crate::plan::MockFileSystemState;
+
+        let now = chrono::NaiveDate::from_ymd_opt(2026, 9, 29)
+            .unwrap()
+            .and_hms_opt(4, 0, 0)
+            .unwrap();
+        let mut config = no_subvol_config();
+        config.subvolumes = toml::from_str::<Config>(
+            r#"
+[general]
+state_db = "/tmp/urd.db"
+metrics_file = "/tmp/backup.prom"
+log_dir = "/tmp"
+[local_snapshots]
+roots = [{ path = "/snap", subvolumes = ["sv1"] }]
+[defaults]
+snapshot_interval = "1h"
+send_interval = "1d"
+send_enabled = true
+enabled = true
+[defaults.local_retention]
+daily = 30
+[defaults.external_retention]
+daily = 30
+[[drives]]
+label = "d1"
+mount_path = "/mnt/d"
+snapshot_root = ".snapshots"
+role = "primary"
+[[subvolumes]]
+name = "sv1"
+short_name = "sv1"
+source = "/data/sv1"
+"#,
+        )
+        .unwrap()
+        .subvolumes;
+        let plan = BackupPlan {
+            lifecycles: HashMap::new(),
+            operations: vec![PlannedOperation::SendIncremental {
+                parent: PathBuf::from("/snaps/sv1/old"),
+                snapshot: PathBuf::from("/snaps/sv1/new"),
+                dest_dir: PathBuf::from("/mnt/d/sv1"),
+                drive_label: "d1".to_string(),
+                subvolume_name: "sv1".to_string(),
+                pin_on_success: None,
+            }],
+            timestamp: now,
+            skipped: vec![],
+            events: Vec::new(),
+        };
+        let mut fs = MockFileSystemState::new();
+        fs.send_sizes.insert(
+            ("sv1".to_string(), "d1".to_string(), SendKind::Incremental),
+            194_600_000_000,
+        );
+        let key = ("sv1".to_string(), "d1".to_string());
+
+        fs.send_times
+            .insert(key.clone(), now - chrono::Duration::days(1));
+        assert_eq!(
+            build_size_estimates(&plan, &fs, &config)[&key],
+            Some(194_600_000_000),
+        );
+
+        fs.send_times
+            .insert(key.clone(), now - chrono::Duration::days(3));
+        assert_eq!(build_size_estimates(&plan, &fs, &config)[&key], None);
     }
 
     /// Build a minimal Config with state_db pointing into the given directory.

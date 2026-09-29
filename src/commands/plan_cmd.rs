@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use crate::cli::PlanArgs;
 use crate::commands::storage_signals;
 use crate::commands::world::World;
-use crate::config::{Config, DriveConfig};
+use crate::config::{Config, DriveConfig, ResolvedSubvolume};
 use crate::drives;
 use crate::output::{
     OutputMode, PlanOperationEntry, PlanOutput, PlanSummaryOutput, SkipCategory,
@@ -55,10 +55,13 @@ pub fn build_plan_output(
 ) -> PlanOutput {
     let summary = backup_plan.summary();
 
+    let resolved = config.resolved_subvolumes();
     let operations: Vec<PlanOperationEntry> = backup_plan
         .operations
         .iter()
-        .map(|op| build_operation_entry(op, fs_state, &config.drives))
+        .map(|op| {
+            build_operation_entry(op, fs_state, &config.drives, backup_plan.timestamp, &resolved)
+        })
         .collect();
 
     let skipped = collapse_skipped(&backup_plan.skipped);
@@ -173,7 +176,11 @@ fn build_operation_entry(
     op: &PlannedOperation,
     fs_state: &dyn HistoryQuery,
     drives: &[DriveConfig],
+    now: chrono::NaiveDateTime,
+    resolved: &[ResolvedSubvolume],
 ) -> PlanOperationEntry {
+    let send_interval =
+        |name: &str| resolved.iter().find(|r| r.name == name).map(|r| r.send_interval);
     match op {
         PlannedOperation::CreateSnapshot {
             source,
@@ -204,8 +211,14 @@ fn build_operation_entry(
                 ""
             };
 
-            let estimated_bytes =
-                plan::estimated_send_size(fs_state, subvolume_name, drive_label, false);
+            let estimated_bytes = plan::displayed_send_estimate(
+                fs_state,
+                subvolume_name,
+                drive_label,
+                false,
+                now,
+                send_interval(subvolume_name),
+            );
 
             PlanOperationEntry {
                 subvolume: subvolume_name.clone(),
@@ -234,8 +247,14 @@ fn build_operation_entry(
                 ""
             };
 
-            let estimated_bytes =
-                plan::estimated_send_size(fs_state, subvolume_name, drive_label, true);
+            let estimated_bytes = plan::displayed_send_estimate(
+                fs_state,
+                subvolume_name,
+                drive_label,
+                true,
+                now,
+                send_interval(subvolume_name),
+            );
 
             PlanOperationEntry {
                 subvolume: subvolume_name.clone(),
@@ -348,6 +367,17 @@ source = "/data/htpc-docs"
         }
     }
 
+    fn test_now() -> chrono::NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(2026, 3, 29)
+            .unwrap()
+            .and_hms_opt(4, 0, 0)
+            .unwrap()
+    }
+
+    fn entry_for(op: &PlannedOperation, fs: &MockFileSystemState) -> PlanOperationEntry {
+        build_operation_entry(op, fs, &[], test_now(), &[])
+    }
+
     fn mock_send_incremental(subvol: &str, drive: &str) -> PlannedOperation {
         PlannedOperation::SendIncremental {
             snapshot: PathBuf::from(format!("/snapshots/{subvol}/20260329-0404-{subvol}")),
@@ -371,7 +401,7 @@ source = "/data/htpc-docs"
             ("htpc-home".into(), "WD-18TB".into(), SendKind::Full),
             53_000_000_000,
         );
-        let entry = build_operation_entry(&mock_send_full("htpc-home", "WD-18TB"), &fs, &[]);
+        let entry = entry_for(&mock_send_full("htpc-home", "WD-18TB"), &fs);
         assert_eq!(entry.estimated_bytes, Some(53_000_000_000));
         assert_eq!(entry.is_full_send, Some(true));
         // Size is NOT in detail — voice.rs renders it from estimated_bytes.
@@ -387,7 +417,7 @@ source = "/data/htpc-docs"
             ("htpc-home".into(), "OTHER-DRIVE".into(), SendKind::Full),
             50_000_000_000,
         );
-        let entry = build_operation_entry(&mock_send_full("htpc-home", "WD-18TB"), &fs, &[]);
+        let entry = entry_for(&mock_send_full("htpc-home", "WD-18TB"), &fs);
         assert_eq!(entry.estimated_bytes, Some(50_000_000_000));
     }
 
@@ -398,7 +428,7 @@ source = "/data/htpc-docs"
             "htpc-home".into(),
             (45_000_000_000, "2026-03-28".into()),
         );
-        let entry = build_operation_entry(&mock_send_full("htpc-home", "WD-18TB"), &fs, &[]);
+        let entry = entry_for(&mock_send_full("htpc-home", "WD-18TB"), &fs);
         assert_eq!(entry.estimated_bytes, Some(45_000_000_000));
     }
 
@@ -417,14 +447,14 @@ source = "/data/htpc-docs"
             "htpc-home".into(),
             (45_000_000_000, "2026-03-28".into()),
         );
-        let entry = build_operation_entry(&mock_send_full("htpc-home", "WD-18TB"), &fs, &[]);
+        let entry = entry_for(&mock_send_full("htpc-home", "WD-18TB"), &fs);
         assert_eq!(entry.estimated_bytes, Some(53_000_000_000));
     }
 
     #[test]
     fn full_send_no_data() {
         let fs = MockFileSystemState::new();
-        let entry = build_operation_entry(&mock_send_full("htpc-home", "WD-18TB"), &fs, &[]);
+        let entry = entry_for(&mock_send_full("htpc-home", "WD-18TB"), &fs);
         assert_eq!(entry.estimated_bytes, None);
         assert!(entry.detail.contains("(full"), "detail: {}", entry.detail);
         assert!(!entry.detail.contains('~'), "should not have size annotation");
@@ -437,7 +467,7 @@ source = "/data/htpc-docs"
             ("htpc-home".into(), "WD-18TB".into(), SendKind::Incremental),
             5_500_000,
         );
-        let entry = build_operation_entry(&mock_send_incremental("htpc-home", "WD-18TB"), &fs, &[]);
+        let entry = entry_for(&mock_send_incremental("htpc-home", "WD-18TB"), &fs);
         assert_eq!(entry.estimated_bytes, Some(5_500_000));
         assert_eq!(entry.is_full_send, Some(false));
         // Size is NOT in detail — voice.rs renders it from estimated_bytes.
@@ -451,8 +481,27 @@ source = "/data/htpc-docs"
             ("htpc-home".into(), "OTHER".into(), SendKind::Incremental),
             3_000_000,
         );
-        let entry = build_operation_entry(&mock_send_incremental("htpc-home", "WD-18TB"), &fs, &[]);
+        let entry = entry_for(&mock_send_incremental("htpc-home", "WD-18TB"), &fs);
         assert_eq!(entry.estimated_bytes, Some(3_000_000));
+    }
+
+    #[test]
+    fn stale_incremental_estimate_is_withheld_from_the_entry() {
+        let mut fs = MockFileSystemState::new();
+        fs.send_sizes.insert(
+            ("htpc-home".into(), "WD-18TB".into(), SendKind::Incremental),
+            194_600_000_000,
+        );
+        fs.send_times.insert(
+            ("htpc-home".into(), "WD-18TB".into()),
+            test_now() - chrono::Duration::days(3),
+        );
+        let resolved = test_config().resolved_subvolumes();
+        let op = mock_send_incremental("htpc-home", "WD-18TB");
+        let entry = build_operation_entry(&op, &fs, &[], test_now(), &resolved);
+        assert_eq!(entry.estimated_bytes, None);
+        let json = serde_json::to_value(&entry).unwrap();
+        assert!(json.get("estimated_bytes").is_none_or(|v| v.is_null()));
     }
 
     #[test]
@@ -463,7 +512,7 @@ source = "/data/htpc-docs"
             "htpc-home".into(),
             (45_000_000_000, "2026-03-28".into()),
         );
-        let entry = build_operation_entry(&mock_send_incremental("htpc-home", "WD-18TB"), &fs, &[]);
+        let entry = entry_for(&mock_send_incremental("htpc-home", "WD-18TB"), &fs);
         assert_eq!(entry.estimated_bytes, None);
     }
 
@@ -664,7 +713,7 @@ source = "/data/htpc-docs"
             subvolume_name: "htpc-home".to_string(),
             kind: crate::types::DeleteKind::Policy,
         };
-        let entry = build_operation_entry(&op, &fs, &config.drives);
+        let entry = build_operation_entry(&op, &fs, &config.drives, test_now(), &[]);
         assert_eq!(entry.drive_label.as_deref(), Some("WD-18TB"));
     }
 
@@ -678,7 +727,7 @@ source = "/data/htpc-docs"
             subvolume_name: "htpc-home".to_string(),
             kind: crate::types::DeleteKind::Policy,
         };
-        let entry = build_operation_entry(&op, &fs, &config.drives);
+        let entry = build_operation_entry(&op, &fs, &config.drives, test_now(), &[]);
         assert_eq!(entry.drive_label, None, "local delete carries no drive label");
     }
 

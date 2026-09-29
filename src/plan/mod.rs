@@ -10,7 +10,7 @@ use crate::error::UrdError;
 use crate::events::DeferScope;
 use crate::storage_critical;
 use crate::types::{
-    BackupPlan, DriveEvent, DriveEventKind, PlannedLifecycle, PlannedOperation, PlannedSkip,
+    BackupPlan, DriveEvent, DriveEventKind, Interval, PlannedLifecycle, PlannedOperation, PlannedSkip,
     SendKind, SnapshotName,
 };
 
@@ -153,6 +153,33 @@ pub fn estimated_send_size(
 ) -> Option<u64> {
     estimated_send_size_with_source(history, subvol_name, drive_label, needs_full)
         .map(|(bytes, _)| bytes)
+}
+
+/// The size estimate to show a human for the next send. An incremental send's
+/// estimate is the size of the previous incremental send, so when the last
+/// successful send to this drive is more than twice the send interval old, it
+/// answers a question about a different interval and is withheld (#413). Full
+/// sends and subvolumes with no send history are unaffected. Display only: the
+/// planner's space gate keeps using `estimated_send_size_with_source`.
+#[must_use]
+pub fn displayed_send_estimate(
+    history: &dyn HistoryQuery,
+    subvol_name: &str,
+    drive_label: &str,
+    needs_full: bool,
+    now: NaiveDateTime,
+    send_interval: Option<Interval>,
+) -> Option<u64> {
+    if !needs_full
+        && let (Some(last), Some(interval)) = (
+            history.last_successful_send_time(subvol_name, drive_label),
+            send_interval,
+        )
+        && now - last > interval.as_chrono() * 2
+    {
+        return None;
+    }
+    estimated_send_size(history, subvol_name, drive_label, needs_full)
 }
 
 // ── PlanFilters ─────────────────────────────────────────────────────────
