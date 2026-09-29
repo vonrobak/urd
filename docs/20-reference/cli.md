@@ -146,7 +146,7 @@ the planner refuses to create local snapshots when free space is below
 | `--dry-run` | Plan + simulate; no btrfs operations executed, no state writes. |
 | `--auto` | Automated run mode (used by the systemd timer). Applies interval gating, and omits the pre-run briefing and the empty-plan explanation. The run summary is unaffected: text on a terminal, JSON otherwise. |
 | `--confirm-retention-change` | Required to delete snapshots whose protection level was relaxed in this config session. Fail-closed: without the flag, retention is skipped for affected subvolumes. |
-| `--force-full` | Force full sends for chain-broken subvolumes. Without this, chain-break full sends are skipped in `--auto` mode (avoids surprise multi-TB sends from the timer). |
+| `--force-full` | Force full sends for chain-broken subvolumes. Without this, chain-break full sends are skipped when Urd runs under systemd, whether or not `--auto` is given (avoids surprise multi-TB sends from the timer). |
 | `--priority <1-3>`, `--subvolume <name>`, `--local-only`, `--external-only`, `--force-snapshot` | Same scoping as `plan`. |
 
 **Output.** Interactive — per-subvolume summary plus an aggregated voice
