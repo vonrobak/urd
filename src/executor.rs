@@ -1552,14 +1552,6 @@ impl<'a> Executor<'a> {
             }
         }
 
-        // Condition 5: re-read pin files AFTER any clear-all removal, so the
-        // fail-closed check below reflects the post-removal pin state.
-        let drive_labels = self.config.drive_labels();
-        let current_pinned = local_dir
-            .as_ref()
-            .map(|dir| chain::find_pinned_snapshots(dir, &drive_labels))
-            .unwrap_or_default();
-
         // Build the deletion set: old pin parents (retain-one + Critical entry),
         // plus — for clear-all — the just-sent snapshot(s), leaving zero locals.
         // Unique (drives may share a parent) and existing-on-disk only.
@@ -1578,19 +1570,13 @@ impl<'a> Executor<'a> {
         let mut first_failure: Option<(String, String)> = None;
 
         for path in &existing {
-            // Condition 5: fail-closed — only delete if we can verify it's NOT
-            // pinned. Unparseable names default to "don't delete" (ADR-107).
-            let is_safe_to_delete = path
-                .file_name()
-                .and_then(|name| {
-                    crate::types::SnapshotName::parse(&name.to_string_lossy()).ok()
-                })
-                .map(|snap| !current_pinned.contains(&snap))
-                .unwrap_or(false);
-
-            if !is_safe_to_delete {
+            // Condition 5: fail-closed re-check, read AFTER any clear-all pin
+            // removal — the shared ADR-106 layer 3. A pinned snapshot, an
+            // unparseable name, or any unreadable pin file keeps it (ADR-107).
+            if chain::is_pinned_at_delete_time(path, &context.name, self.config) {
                 log::warn!(
-                    "Transient cleanup: refusing to delete {} (still pinned or unparseable)",
+                    "Transient cleanup: refusing to delete {} (pinned, pin unreadable, \
+                     or unparseable)",
                     path.display(),
                 );
                 continue;
@@ -3868,6 +3854,61 @@ local_retention = "transient"
             .unwrap()
             .and_hms_opt(14, 30, 0)
             .unwrap()
+    }
+
+    #[test]
+    fn transient_cleanup_refuses_when_another_drives_pin_is_unreadable() {
+        // #418 sibling: DRIVE-A's send succeeds and advances its pin past the old
+        // parent, but DRIVE-B's pin exists and cannot be read — it may name that
+        // parent. The lenient re-read dropped DRIVE-B, so the parent was deleted.
+        let snap_dir = tempfile::TempDir::new().unwrap();
+        let drive_a = tempfile::TempDir::new().unwrap();
+        let drive_b = tempfile::TempDir::new().unwrap();
+        let sv_dir = snap_dir.path().join("sv-t");
+        std::fs::create_dir_all(&sv_dir).unwrap();
+        let old_parent = sv_dir.join("20260321-t");
+        std::fs::create_dir(&old_parent).unwrap();
+        chain::write_pin_file(&sv_dir, "DRIVE-A", &SnapshotName::parse("20260321-t").unwrap())
+            .unwrap();
+        std::fs::create_dir(sv_dir.join(".last-external-parent-DRIVE-B")).unwrap();
+
+        let config = transient_config_n_drives(
+            snap_dir.path(),
+            &[
+                ("DRIVE-A", drive_a.path(), "primary"),
+                ("DRIVE-B", drive_b.path(), "offsite"),
+            ],
+        );
+        let mock = MockBtrfs::new();
+        let shutdown = no_shutdown();
+        let executor = Executor::new(&mock, None, &config, &shutdown);
+
+        let plan = BackupPlan {
+            lifecycles: HashMap::new(),
+            operations: vec![PlannedOperation::SendIncremental {
+                parent: old_parent.clone(),
+                snapshot: sv_dir.join("20260322-1430-t"),
+                dest_dir: drive_a.path().join(".snapshots/sv-t"),
+                drive_label: "DRIVE-A".to_string(),
+                subvolume_name: "sv-t".to_string(),
+                pin_on_success: Some((
+                    sv_dir.join(".last-external-parent-DRIVE-A"),
+                    SnapshotName::parse("20260322-1430-t").unwrap(),
+                )),
+            }],
+            timestamp: test_ts(),
+            skipped: vec![],
+            events: Vec::new(),
+        };
+
+        let result = executor.execute(&plan, "full");
+
+        assert!(result.subvolume_results[0].success, "the send itself is unaffected");
+        assert_eq!(
+            result.subvolume_results[0].transient_cleanup,
+            TransientCleanupOutcome::NotApplicable,
+        );
+        assert!(delete_calls(&mock).is_empty(), "unreadable pin → no delete");
     }
 
     #[test]

@@ -43,7 +43,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Emergency space reclaim now leaves a subvolume's snapshots and pins alone
   when any of its pin files exists but cannot be read. Previously an
   unreadable pin was treated as no pin, so reclaim could delete the parent a
-  connected drive's incremental send depends on (#418).
+  connected drive's incremental send depends on. The cleanup that deletes a
+  transient subvolume's old parent right after a send now makes the same
+  check (#418).
 - `urd emergency` and the automatic emergency cleanup before a backup no
   longer offer a subvolume's snapshots for deletion when one of its pin files
   cannot be read. Previously `urd emergency` listed them and asked to confirm,
