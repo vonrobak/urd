@@ -4611,8 +4611,7 @@ source = "/data/beta"
             .unwrap()
             .and_hms_opt(4, 0, 0)
             .unwrap();
-        let mut config = no_subvol_config();
-        config.subvolumes = toml::from_str::<Config>(
+        let config: Config = toml::from_str(
             r#"
 [general]
 state_db = "/tmp/urd.db"
@@ -4640,8 +4639,7 @@ short_name = "sv1"
 source = "/data/sv1"
 "#,
         )
-        .unwrap()
-        .subvolumes;
+        .unwrap();
         let plan = BackupPlan {
             lifecycles: HashMap::new(),
             operations: vec![PlannedOperation::SendIncremental {
