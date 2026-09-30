@@ -13,7 +13,7 @@ use crate::types::ByteSize;
 pub fn render_emergency(data: &EmergencyOutput, mode: OutputMode) -> String {
     match mode {
         OutputMode::Interactive => render_emergency_interactive(data),
-        OutputMode::Daemon => serde_json::to_string_pretty(data).unwrap_or_default(),
+        OutputMode::Daemon => super::render_json(data),
     }
 }
 
@@ -151,7 +151,7 @@ fn render_emergency_interactive(data: &EmergencyOutput) -> String {
 pub fn render_emergency_result(data: &EmergencyResult, mode: OutputMode) -> String {
     match mode {
         OutputMode::Interactive => render_emergency_result_interactive(data),
-        OutputMode::Daemon => serde_json::to_string_pretty(data).unwrap_or_default(),
+        OutputMode::Daemon => super::render_json(data),
     }
 }
 

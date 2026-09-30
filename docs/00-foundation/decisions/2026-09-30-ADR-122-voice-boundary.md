@@ -152,9 +152,6 @@ lists which renderers are covered and which are not.
   about half the renderers. The rest are held by their own content tests and by review.
 - Two duration formatters live outside `voice/` because machine surfaces need them. The
   rule "all durations in one place" has a stated exception rather than being absolute.
-- `voice/emergency.rs` serializes its two daemon outputs with `serde_json` directly
-  rather than through `render_json`, so a serialization failure there yields an empty
-  string. It is the one place the JSON rule is not yet followed.
 
 ### Neutral
 
