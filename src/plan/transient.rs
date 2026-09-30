@@ -254,9 +254,9 @@ mod tests {
     use crate::plan::testkit::MockFileSystemState;
     use crate::plan::PlanFilters;
     use crate::storage_critical::EffectivePolicy;
+    use crate::plan::{PlannedOperation, PlannedSkip};
     use crate::types::{
-        Interval, LocalRetentionPolicy, MonthlyCount, PlannedOperation, PlannedSkip,
-        ResolvedGraduatedRetention, SnapshotName,
+        Interval, LocalRetentionPolicy, MonthlyCount, ResolvedGraduatedRetention, SnapshotName,
     };
 
     use super::*;

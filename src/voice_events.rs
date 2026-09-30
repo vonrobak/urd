@@ -466,8 +466,8 @@ mod tests {
         let _color = setup();
         let row = make_row(
             EventPayload::SentinelCircuitBreak {
-                from: crate::sentinel::CircuitState::Closed,
-                to: crate::sentinel::CircuitState::Open,
+                from: crate::events::CircuitState::Closed,
+                to: crate::events::CircuitState::Open,
                 reason: "3 consecutive failures".into(),
                 backoff_secs: 900,
             },

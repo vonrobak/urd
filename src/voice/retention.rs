@@ -172,7 +172,8 @@ pub fn retention_change_pending_line(change: &RetentionChangePending) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::output::{DiskEstimate, EstimateMethod, RetentionPreview, TransientComparison};
+    use crate::output::RetentionPreview;
+    use crate::retention::{DiskEstimate, EstimateMethod, TransientComparison};
     use crate::voice::test_fixtures::color_guard;
 
     // ── Retention-change gate prose (ADR-110) ────────────────────────

@@ -16,7 +16,12 @@ mod retention;
 mod runs;
 mod schema;
 
-pub use events::{EventQueryFilter, EventQueryRow};
+pub use events::EventQueryFilter;
+
+// `DriveEventSource` is event-payload wire vocabulary (`DriveMounted` /
+// `DriveUnmounted.detected_by`); it lives in `events.rs` and is re-exported
+// here so `crate::state::DriveEventSource` keeps resolving.
+pub use crate::events::DriveEventSource;
 
 // ── Types ───────────────────────────────────────────────────────────────
 
@@ -51,30 +56,6 @@ pub struct RunRecord {
 pub enum DriveEventType {
     Mounted,
     Unmounted,
-}
-
-/// What detected the drive event.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize,
-)]
-#[serde(rename_all = "snake_case")]
-#[allow(dead_code)] // Backup variant wired when backup records drive events
-pub enum DriveEventSource {
-    Sentinel,
-    Backup,
-}
-
-impl DriveEventSource {
-    /// Wire form for the legacy `DriveConnectionRecord.detected_by`
-    /// projection — preserved post-UPI-036 so consumers (notably
-    /// `RealFileSystemState::last_drive_event`) keep matching against
-    /// the "sentinel" / "backup" strings.
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::Sentinel => "sentinel",
-            Self::Backup => "backup",
-        }
-    }
 }
 
 /// A drive connection event returned from database queries.

@@ -1,5 +1,6 @@
 use crate::error::UrdError;
 use crate::events::{Event, EventKind, EventPayload};
+use crate::output::EventRow;
 
 use super::{StateDb, db_err};
 
@@ -202,8 +203,8 @@ pub struct EventQueryFilter {
 }
 
 /// One row returned from `StateDb::query_events` with the payload
-/// already deserialized. Presentation projection (`output::EventRow`)
-/// wraps this for the `urd events` subcommand.
+/// already deserialized. Presentation projection (`output::EventRow`,
+/// via the `From` impl below) wraps this for the `urd events` subcommand.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(dead_code)]
 pub struct EventQueryRow {
@@ -214,6 +215,20 @@ pub struct EventQueryRow {
     pub subvolume: Option<String>,
     pub drive_label: Option<String>,
     pub payload: EventPayload,
+}
+
+impl From<EventQueryRow> for EventRow {
+    fn from(row: EventQueryRow) -> Self {
+        Self {
+            id: row.id,
+            kind: row.kind,
+            occurred_at: row.occurred_at,
+            run_id: row.run_id,
+            subvolume: row.subvolume,
+            drive_label: row.drive_label,
+            payload: row.payload,
+        }
+    }
 }
 
 #[cfg(test)]

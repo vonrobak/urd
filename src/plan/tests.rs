@@ -7,7 +7,8 @@ use crate::observation::RealFileSystemState;
 use crate::storage_critical::{ArmedTierMap, TightnessTier};
 use crate::btrfs::MockBtrfs;
 use crate::events::{EventPayload, UnstampedEvent};
-use crate::types::{FullSendReason, NothingNew, SendKind};
+use crate::plan::NothingNew;
+use crate::types::{FullSendReason, SendKind};
 use chrono::NaiveDate;
 
 fn test_config() -> Config {

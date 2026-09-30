@@ -52,7 +52,7 @@ pub fn run(config: Config, output_mode: OutputMode) -> anyhow::Result<()> {
         .collect();
 
     // ── Last run ────────────────────────────────────────────────────
-    let last_run = world.db().and_then(|db| db.last_run_info());
+    let last_run = world.db().and_then(|db| db.last_run_info()).map(LastRunInfo::from);
 
     // ── Pin count ───────────────────────────────────────────────────
     let total_pins: usize = config

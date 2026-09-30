@@ -15,8 +15,6 @@ use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
 
 use crate::types::PromiseStatus;
-use crate::sentinel::CircuitState;
-use crate::state::DriveEventSource;
 use crate::types::{FullSendReason, SendKind};
 
 // ── Top-level kind ─────────────────────────────────────────────────────
@@ -165,6 +163,55 @@ pub enum ProtectReason {
     PinOverrodeWindow,
     /// Future-dated snapshot kept by clock-skew guard.
     ClockSkewFuture,
+}
+
+/// What detected the drive event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[allow(dead_code)] // Backup variant wired when backup records drive events
+pub enum DriveEventSource {
+    Sentinel,
+    Backup,
+}
+
+impl DriveEventSource {
+    /// Wire form for the legacy `DriveConnectionRecord.detected_by`
+    /// projection — preserved post-UPI-036 so consumers (notably
+    /// `RealFileSystemState::last_drive_event`) keep matching against
+    /// the "sentinel" / "backup" strings.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Sentinel => "sentinel",
+            Self::Backup => "backup",
+        }
+    }
+}
+
+/// The circuit-breaker state carried on the `SentinelCircuitBreak` event
+/// (ADR-105 on-disk contract — old event rows must keep deserializing).
+///
+/// The decision machinery that used to populate this (auto-trigger
+/// evaluation, backoff, half-open trials) was deleted as dormant, dead
+/// code — see #385. This type, the event variant, and the
+/// `backup_circuit_breaker_trips_total` / `urd_circuit_breaker_trips_total`
+/// metrics remain as permanently-zero contract surfaces; a future
+/// active-mode design can repopulate them without a contract change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CircuitState {
+    Closed,
+    Open,
+    HalfOpen,
+}
+
+impl std::fmt::Display for CircuitState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Closed => write!(f, "closed"),
+            Self::Open => write!(f, "open"),
+            Self::HalfOpen => write!(f, "half-open"),
+        }
+    }
 }
 
 // ── Event payload ──────────────────────────────────────────────────────

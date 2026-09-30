@@ -1,16 +1,14 @@
 use std::collections::{HashMap, HashSet};
 
 use chrono::{Datelike, Months, NaiveDateTime, Timelike};
+use serde::Serialize;
 
 use crate::config::ResolvedSubvolume;
 use crate::events::{Event, EventPayload, ProtectReason, PruneRule, UnstampedEvent};
-use crate::plan::PlanFilters;
-use crate::output::{
-    DiskEstimate, EstimateMethod, RecoveryWindow, RetentionPreview, TransientComparison,
-};
+use crate::plan::{BackupPlan, PlanFilters, PlannedOperation};
 use crate::types::{
-    BackupPlan, Interval, LocalRetentionPolicy, MonthlyCount, PlannedOperation, ProtectionLevel,
-    ResolvedGraduatedRetention, SnapshotName,
+    Interval, LocalRetentionPolicy, MonthlyCount, ProtectionLevel, ResolvedGraduatedRetention,
+    SnapshotName,
 };
 
 /// Classifies a delete by what motivates it. Carried from `retention.rs` through
@@ -475,6 +473,67 @@ pub fn space_governed_retention(
 }
 
 // ── Retention Preview ──────────────────────────────────────────────────
+
+/// Retention policy preview for a single subvolume.
+#[derive(Debug, Clone, Serialize)]
+pub struct RetentionPreview {
+    pub subvolume_name: String,
+    pub policy_description: String,
+    pub snapshot_interval: String,
+    pub recovery_windows: Vec<RecoveryWindow>,
+    /// Disk usage estimate (absent when no calibration data and no snapshots).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estimated_disk_usage: Option<DiskEstimate>,
+    /// Comparison to the alternate retention mode (graduated vs transient).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transient_comparison: Option<TransientComparison>,
+}
+
+/// A single recovery window in the cascading retention chain.
+#[derive(Debug, Clone, Serialize)]
+pub struct RecoveryWindow {
+    /// Granularity label: "hourly", "daily", "weekly", "monthly".
+    pub granularity: &'static str,
+    /// Number of snapshots kept in this bucket.
+    pub count: u32,
+    /// Cumulative days from now (for compact formatting).
+    pub cumulative_days: f64,
+    /// Cumulative description from now, e.g. "daily snapshots back 31 days".
+    pub cumulative_description: String,
+}
+
+/// Estimated disk usage for retained snapshots.
+#[derive(Debug, Clone, Serialize)]
+pub struct DiskEstimate {
+    pub method: EstimateMethod,
+    pub per_snapshot_bytes: u64,
+    pub total_bytes: u64,
+    pub total_count: u32,
+}
+
+/// How the disk estimate was derived.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EstimateMethod {
+    /// Measured from actual snapshot sizes on disk.
+    Calibrated,
+}
+
+/// Comparison between graduated and transient retention.
+#[derive(Debug, Clone, Serialize)]
+pub struct TransientComparison {
+    pub graduated_count: u32,
+    pub transient_count: u32,
+    /// Byte-based totals (only when calibrated data exists).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub graduated_total_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transient_total_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub savings_bytes: Option<u64>,
+    /// What the user loses by switching to transient.
+    pub lost_window: String,
+}
 
 /// Compute a human-readable preview of a retention policy's consequences.
 ///
@@ -1836,7 +1895,7 @@ mod tests {
         let preview = compute_retention_preview("test", &policy, &interval, Some(1_500_000_000), now());
 
         let estimate = preview.estimated_disk_usage.unwrap();
-        assert_eq!(estimate.method, crate::output::EstimateMethod::Calibrated);
+        assert_eq!(estimate.method, EstimateMethod::Calibrated);
         assert_eq!(estimate.per_snapshot_bytes, 1_500_000_000);
         assert_eq!(estimate.total_count, 30); // daily only
         assert_eq!(estimate.total_bytes, 30 * 1_500_000_000);

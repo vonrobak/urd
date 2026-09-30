@@ -2,7 +2,8 @@ use std::collections::HashSet;
 
 use crate::events::DeferScope;
 use crate::retention;
-use crate::types::{DeleteKind, LocalRetentionPolicy, PlannedOperation, SnapshotName};
+use crate::plan::{DeleteKind, PlannedOperation};
+use crate::types::{LocalRetentionPolicy, SnapshotName};
 
 use super::fragment::{self, LocalRetentionInputs, LocalSnapshotInputs, PlanFragment, SnapshotOutcome};
 

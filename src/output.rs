@@ -5,9 +5,9 @@
 
 use std::io::IsTerminal;
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
-use crate::advice::{ActionableAdvice, AdviceIssue, RedundancyAdvisory, RedundancyAdvisoryKind};
+use crate::advice::{ActionableAdvice, AdviceIssue, RedundancyAdvisory};
 use crate::awareness::{DriveAssessment, PromiseStatus, SubvolAssessment};
 use crate::config::ResolvedSubvolume;
 use crate::rotation::WindowSource;
@@ -81,35 +81,16 @@ impl std::fmt::Display for ChainHealth {
     }
 }
 
-// ── Redundancy Advisory Summary ────────────────────────────────────────
+// ── Sentinel state file (ADR-105) ───────────────────────────────────
 
-/// Summary of redundancy advisories for the sentinel state file.
-/// `None` in the state file means "unknown, not zero" (backward compat with v2).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AdvisorySummary {
-    /// Count of non-informational advisories.
-    pub count: usize,
-    /// Worst advisory kind (for badge/icon decisions).
-    pub worst: Option<RedundancyAdvisoryKind>,
-}
-
-impl AdvisorySummary {
-    /// Build from a list of advisories. Returns `None` when the list is empty.
-    /// Informational advisories (`TransientNoLocalRecovery`) are excluded from `count`.
-    #[must_use]
-    pub fn from_advisories(advisories: &[RedundancyAdvisory]) -> Option<Self> {
-        if advisories.is_empty() {
-            return None;
-        }
-        // Exclude informational advisories from both count and worst.
-        // count == 0 && worst == None means "only informational advisories exist."
-        let is_actionable =
-            |a: &&RedundancyAdvisory| a.kind != RedundancyAdvisoryKind::TransientNoLocalRecovery;
-        let count = advisories.iter().filter(is_actionable).count();
-        let worst = advisories.iter().filter(is_actionable).map(|a| a.kind).min();
-        Some(Self { count, worst })
-    }
-}
+// The sentinel state-file schema (`SentinelStateFile`, its version, the
+// visual-state and advisory-summary blocks) and the `urd sentinel status`
+// output that wraps it live in `sentinel.rs`; re-exported so
+// `crate::output::X` paths resolve.
+pub use crate::sentinel::{
+    AdvisorySummary, SENTINEL_STATE_SCHEMA_VERSION, SentinelCircuitState, SentinelPromiseState,
+    SentinelStateFile, SentinelStatusOutput,
+};
 
 // ── PoolPostureSummary ──────────────────────────────────────────────────
 
@@ -479,23 +460,6 @@ impl LastRunInfo {
     }
 }
 
-/// Compose the presentation summary from the raw `runs` row: `duration` is
-/// the humanized span when the run finished, `None` while it is running.
-impl From<crate::state::RunRecord> for LastRunInfo {
-    fn from(run: crate::state::RunRecord) -> Self {
-        let duration = run
-            .finished_at
-            .as_ref()
-            .and_then(|f| crate::types::format_run_duration(&run.started_at, f));
-        Self {
-            id: run.id,
-            started_at: run.started_at,
-            result: run.result,
-            duration,
-        }
-    }
-}
-
 // ── DefaultStatusOutput ────────────────────────────────────────────────
 
 /// Structured output for bare `urd` — one-sentence status.
@@ -583,71 +547,14 @@ impl From<&crate::retention::RetentionChange> for RetentionChangePending {
 
 // ── RetentionPreview ──────────────────────────────────────────────────
 
+// The per-subvolume preview types are computed by `retention.rs` and live
+// there; re-exported so `crate::output::{RetentionPreview, ..}` paths resolve.
+pub use crate::retention::{RecoveryWindow, RetentionPreview};
+
 /// Full output for the `urd retention-preview` command.
 #[derive(Debug, Clone, Serialize)]
 pub struct RetentionPreviewOutput {
     pub previews: Vec<RetentionPreview>,
-}
-
-/// Retention policy preview for a single subvolume.
-#[derive(Debug, Clone, Serialize)]
-pub struct RetentionPreview {
-    pub subvolume_name: String,
-    pub policy_description: String,
-    pub snapshot_interval: String,
-    pub recovery_windows: Vec<RecoveryWindow>,
-    /// Disk usage estimate (absent when no calibration data and no snapshots).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub estimated_disk_usage: Option<DiskEstimate>,
-    /// Comparison to the alternate retention mode (graduated vs transient).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub transient_comparison: Option<TransientComparison>,
-}
-
-/// A single recovery window in the cascading retention chain.
-#[derive(Debug, Clone, Serialize)]
-pub struct RecoveryWindow {
-    /// Granularity label: "hourly", "daily", "weekly", "monthly".
-    pub granularity: &'static str,
-    /// Number of snapshots kept in this bucket.
-    pub count: u32,
-    /// Cumulative days from now (for compact formatting).
-    pub cumulative_days: f64,
-    /// Cumulative description from now, e.g. "daily snapshots back 31 days".
-    pub cumulative_description: String,
-}
-
-/// Estimated disk usage for retained snapshots.
-#[derive(Debug, Clone, Serialize)]
-pub struct DiskEstimate {
-    pub method: EstimateMethod,
-    pub per_snapshot_bytes: u64,
-    pub total_bytes: u64,
-    pub total_count: u32,
-}
-
-/// How the disk estimate was derived.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EstimateMethod {
-    /// Measured from actual snapshot sizes on disk.
-    Calibrated,
-}
-
-/// Comparison between graduated and transient retention.
-#[derive(Debug, Clone, Serialize)]
-pub struct TransientComparison {
-    pub graduated_count: u32,
-    pub transient_count: u32,
-    /// Byte-based totals (only when calibrated data exists).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub graduated_total_bytes: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub transient_total_bytes: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub savings_bytes: Option<u64>,
-    /// What the user loses by switching to transient.
-    pub lost_window: String,
 }
 
 // ── EmergencyOutput ───────────────────────────────────────────────────
@@ -848,54 +755,11 @@ pub enum ChurnRender {
     FullSendOnlyFirst { bytes: u64 },
 }
 
-/// Pure mapping from raw aggregates (`drift::ChurnEstimate`) to the
-/// presentation enum (`ChurnRender`). No I/O.
-#[must_use]
-pub fn render_churn(estimate: &crate::drift::ChurnEstimate) -> ChurnRender {
-    use ChurnRender::*;
-    match (estimate.incremental_count, estimate.full_count) {
-        (0, 0) => NotMeasured,
-        (0, 1) => FullSendOnlyFirst {
-            bytes: estimate.latest_full_bytes.unwrap_or(0),
-        },
-        (0, _) => FullSendOnly {
-            bytes_per_send: estimate.median_full_bytes.unwrap_or(0),
-            seconds_between: estimate.latest_full_interval_secs.unwrap_or(0),
-        },
-        (1, _) => FirstMeasurement {
-            bytes_per_second: estimate.mean_bytes_per_second.unwrap_or(0.0),
-        },
-        (_, _) => Incremental {
-            bytes_per_second: estimate.mean_bytes_per_second.unwrap_or(0.0),
-        },
-    }
-}
-
-/// Heartbeat / metrics projection of a single subvolume's churn state.
-/// `commands/backup.rs` builds a `HashMap<String, ChurnHeartbeatFields>` and
-/// passes it to both `heartbeat::build` and
-/// `backup::write_metrics_per_spec` so both surfaces share the same
-/// policy: incremental → `churn_bytes_per_second`; full-only →
-/// `last_full_send_bytes`. Cold-start subvolumes have both `None`.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct ChurnHeartbeatFields {
-    pub churn_bytes_per_second: Option<f64>,
-    pub last_full_send_bytes: Option<u64>,
-    /// Arithmetic mean of `bytes_transferred` over in-window incrementals.
-    /// Used by UPI 043's pinned-delta computation in `gather_pool_observability`.
-    pub mean_incremental_bytes: Option<u64>,
-}
-
-/// Per-subvolume "extras" populated by `gather_pool_observability` and threaded
-/// to both `heartbeat::build` and `backup::write_metrics_per_spec`
-/// so both surfaces share the same `pool_uuid`, `local_snapshot_count`, and
-/// `estimated_local_pinned_delta_bytes` values for a given run (UPI 043).
-#[derive(Debug, Clone, Default)]
-pub struct SubvolumeExtras {
-    pub pool_uuid: Option<String>,
-    pub local_snapshot_count: Option<u32>,
-    pub estimated_local_pinned_delta_bytes: Option<u64>,
-}
+// `render_churn` (the `ChurnEstimate` → `ChurnRender` mapping) lives in
+// `drift.rs`; the heartbeat/metrics churn projection and per-subvolume extras
+// live in `heartbeat.rs`. Re-exported so `crate::output::X` paths resolve.
+pub use crate::drift::render_churn;
+pub use crate::heartbeat::{ChurnHeartbeatFields, SubvolumeExtras};
 
 /// A single diagnostic check result.
 #[derive(Debug, Clone, Serialize)]
@@ -1094,7 +958,8 @@ pub struct GetOutput {
 // ── EventsView ────────────────────────────────────────────────────────
 
 /// Presentation projection of one event log row, ready for rendering.
-/// Wraps `state::EventQueryRow` for serde + voice consumption.
+/// Built from `state::EventQueryRow` (the `From` impl lives in
+/// `state/events.rs`) for serde + voice consumption.
 #[derive(Debug, Clone, Serialize)]
 pub struct EventRow {
     pub id: i64,
@@ -1107,20 +972,6 @@ pub struct EventRow {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub drive_label: Option<String>,
     pub payload: crate::events::EventPayload,
-}
-
-impl From<crate::state::EventQueryRow> for EventRow {
-    fn from(row: crate::state::EventQueryRow) -> Self {
-        Self {
-            id: row.id,
-            kind: row.kind,
-            occurred_at: row.occurred_at,
-            run_id: row.run_id,
-            subvolume: row.subvolume,
-            drive_label: row.drive_label,
-            payload: row.payload,
-        }
-    }
 }
 
 /// Top-level output for `urd events`. Holds the rows plus an echo of
@@ -1707,131 +1558,6 @@ pub struct InitSnapshotCount {
     pub external_counts: Vec<(String, usize)>,
 }
 
-// ── Visual state types (VFM-B) ──────────────────────────────────────────
-
-/// Icon state for tray icon consumers. Four states, each maps to a static
-/// SVG icon file. The tray applet selects by name: `urd-icon-ok.svg`, etc.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum VisualIcon {
-    /// All safe, all healthy.
-    Ok,
-    /// Safety ok but health degraded, or safety aging.
-    Warning,
-    /// Data gap exists (any subvolume UNPROTECTED).
-    Critical,
-    /// Backup currently running (reserved, not yet produced).
-    Active,
-}
-
-/// Safety axis counts using tray-friendly vocabulary.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SafetyCounts {
-    pub ok: usize,
-    pub aging: usize,
-    pub gap: usize,
-}
-
-/// Health axis counts.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HealthCounts {
-    pub healthy: usize,
-    pub degraded: usize,
-    pub blocked: usize,
-}
-
-/// Structured visual state for tray icon and external consumers.
-/// No pre-computed text — consumers render their own tooltips/summaries
-/// from this structured data (design review S2).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VisualState {
-    pub icon: VisualIcon,
-    /// Worst promise status across subvolumes (serializes SCREAMING).
-    pub worst_safety: PromiseStatus,
-    /// Worst operational health across subvolumes. Stays `String`:
-    /// `OperationalHealth` has no SCREAMING serde form and is out of scope for
-    /// UPI 053 — the `worst_safety: PromiseStatus` / `worst_health: String`
-    /// asymmetry is deliberate, not an omission.
-    pub worst_health: String,
-    pub safety_counts: SafetyCounts,
-    pub health_counts: HealthCounts,
-}
-
-// ── SentinelStatusOutput ─────────────────────────────────────────────────
-
-/// The `SentinelStateFile` schema version the runner writes. A startup restore
-/// of mount tracking (#411) trusts only a file of this version.
-pub const SENTINEL_STATE_SCHEMA_VERSION: u32 = 3;
-
-/// Sentinel state file schema — written atomically by the runner, read by
-/// `urd sentinel status`. Also serves as a "running" indicator (PID check).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SentinelStateFile {
-    pub schema_version: u32,
-    pub pid: u32,
-    pub started: String,
-    pub last_assessment: Option<String>,
-    pub mounted_drives: Vec<String>,
-    pub tick_interval_secs: u64,
-    pub promise_states: Vec<SentinelPromiseState>,
-    pub circuit_breaker: SentinelCircuitState,
-    /// Visual state for tray icon and external consumers (VFM-B, schema v2+).
-    /// `None` when reading schema v1 files for backward compatibility.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub visual_state: Option<VisualState>,
-    /// Redundancy advisory summary (schema v3+). `None` means "unknown, not zero."
-    /// Absent in v2 files; consumers must treat `None` as "advisories not computed."
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub advisory_summary: Option<AdvisorySummary>,
-}
-
-/// Per-subvolume promise state in the sentinel state file.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SentinelPromiseState {
-    pub name: String,
-    /// Promise status (serializes SCREAMING: "PROTECTED" / "AT RISK" / "UNPROTECTED").
-    /// Deserialization accepts the closed `PromiseStatus` set plus legacy
-    /// `snake_case` aliases; an out-of-set value fails the whole state-file
-    /// parse, which the reader treats as absent (fail-open via `.ok()`).
-    pub status: PromiseStatus,
-    /// Operational health (VFM-B, schema v2+). Defaults to "healthy" for v1 files.
-    #[serde(default = "default_healthy")]
-    pub health: String,
-    /// Reasons for non-healthy status. Omitted from JSON when empty.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub health_reasons: Vec<String>,
-}
-
-fn default_healthy() -> String {
-    "healthy".to_string()
-}
-
-/// Circuit breaker summary in the sentinel state file.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SentinelCircuitState {
-    pub state: String,
-    pub failure_count: u32,
-}
-
-/// Structured output for `urd sentinel status`.
-#[derive(Debug, Serialize)]
-#[serde(tag = "status")]
-pub enum SentinelStatusOutput {
-    /// Sentinel is running (PID alive, state file present).
-    #[serde(rename = "running")]
-    Running {
-        state: Box<SentinelStateFile>,
-        /// Human-readable uptime (e.g., "3h 12m").
-        uptime: String,
-    },
-    /// Sentinel is not running (no state file, or stale file cleaned up).
-    #[serde(rename = "not_running")]
-    NotRunning {
-        /// If a stale state file was found, when the sentinel was last seen.
-        last_seen: Option<String>,
-    },
-}
-
 // ── DrivesListOutput ──────────────────────────────────────────────────
 
 /// Structured output for `urd drives`.
@@ -1945,6 +1671,7 @@ pub enum SealSendState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::advice::RedundancyAdvisoryKind;
 
     #[test]
     fn chain_health_ordering() {
@@ -2682,112 +2409,7 @@ source = "/data/sv2"
         assert!(!json.contains("last_seen"));
     }
 
-    // ── UPI 030: render_churn mapping table + JSON omission ────────
-
-    fn drift_estimate(
-        incr: usize,
-        full: usize,
-        mean: Option<f64>,
-        median_full: Option<u64>,
-        latest_full: Option<u64>,
-        latest_full_secs: Option<i64>,
-    ) -> crate::drift::ChurnEstimate {
-        crate::drift::ChurnEstimate {
-            mean_bytes_per_second: mean,
-            mean_incremental_bytes: None,
-            incremental_count: incr,
-            full_count: full,
-            median_full_bytes: median_full,
-            latest_full_bytes: latest_full,
-            latest_full_interval_secs: latest_full_secs,
-        }
-    }
-
-    #[test]
-    fn render_churn_table() {
-        // Cold start: all zero.
-        assert_eq!(
-            render_churn(&drift_estimate(0, 0, None, None, None, None)),
-            ChurnRender::NotMeasured
-        );
-
-        // Single incremental: FirstMeasurement.
-        assert_eq!(
-            render_churn(&drift_estimate(1, 0, Some(100.0), None, None, None)),
-            ChurnRender::FirstMeasurement {
-                bytes_per_second: 100.0
-            }
-        );
-
-        // Two incrementals: Incremental.
-        assert_eq!(
-            render_churn(&drift_estimate(2, 0, Some(123.4), None, None, None)),
-            ChurnRender::Incremental {
-                bytes_per_second: 123.4
-            }
-        );
-
-        // Single full: FullSendOnlyFirst.
-        assert_eq!(
-            render_churn(&drift_estimate(
-                0,
-                1,
-                None,
-                Some(12_000_000_000),
-                Some(12_000_000_000),
-                Some(86_400),
-            )),
-            ChurnRender::FullSendOnlyFirst {
-                bytes: 12_000_000_000
-            }
-        );
-
-        // Two fulls: FullSendOnly with median + latest interval.
-        assert_eq!(
-            render_churn(&drift_estimate(
-                0,
-                2,
-                None,
-                Some(14_000_000_000),
-                Some(14_000_000_000),
-                Some(93_600),
-            )),
-            ChurnRender::FullSendOnly {
-                bytes_per_send: 14_000_000_000,
-                seconds_between: 93_600
-            }
-        );
-
-        // Mixed (1 incr, 1 full): incrementals win → FirstMeasurement.
-        assert_eq!(
-            render_churn(&drift_estimate(
-                1,
-                1,
-                Some(50.0),
-                Some(10_000_000_000),
-                Some(10_000_000_000),
-                Some(86_400),
-            )),
-            ChurnRender::FirstMeasurement {
-                bytes_per_second: 50.0
-            }
-        );
-
-        // Mixed (2 incr, 1 full): incrementals win → Incremental.
-        assert_eq!(
-            render_churn(&drift_estimate(
-                2,
-                1,
-                Some(75.0),
-                Some(10_000_000_000),
-                Some(10_000_000_000),
-                Some(86_400),
-            )),
-            ChurnRender::Incremental {
-                bytes_per_second: 75.0
-            }
-        );
-    }
+    // ── UPI 030: DoctorOutput churn JSON omission ───────────────────
 
     #[test]
     fn doctor_output_serializes_with_omitted_churn_when_none() {

@@ -8,15 +8,20 @@ use crate::config::{Config, DriveConfig, ResolvedSubvolume};
 use crate::drives::DriveAvailability;
 use crate::events::DeferScope;
 use crate::storage_critical;
-use crate::types::{
-    BackupPlan, Interval, PlannedLifecycle, PlannedOperation, PlannedSkip, SnapshotName,
-};
+use crate::types::{Interval, SnapshotName};
 
 mod external;
 mod fragment;
 mod local;
 mod send;
 mod transient;
+mod types;
+
+// The planner's output vocabulary (`types.rs`); `crate::types` re-exports
+// these too, so both paths resolve.
+pub use types::{
+    BackupPlan, DeleteKind, NothingNew, PlannedLifecycle, PlannedOperation, PlannedSkip,
+};
 
 #[cfg(test)]
 mod testkit;

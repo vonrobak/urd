@@ -2169,7 +2169,8 @@ fn group_by_subvolume(ops: &[PlannedOperation]) -> Vec<(String, Vec<&PlannedOper
 mod tests {
     use super::*;
     use crate::btrfs::{MockBtrfs, MockBtrfsCall};
-    use crate::types::{PlannedLifecycle, SnapshotName};
+    use crate::plan::PlannedLifecycle;
+    use crate::types::SnapshotName;
     use chrono::NaiveDate;
     use std::path::{Path, PathBuf};
 

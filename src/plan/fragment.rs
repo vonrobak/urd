@@ -6,7 +6,8 @@ use chrono::NaiveDateTime;
 use crate::config::{DriveConfig, ResolvedSubvolume};
 use crate::events::{DeferScope, Event, EventPayload, UnstampedEvent};
 use crate::storage_critical::EffectivePolicy;
-use crate::types::{NothingNew, PlannedOperation, PlannedSkip, SnapshotName};
+use crate::plan::{NothingNew, PlannedOperation, PlannedSkip};
+use crate::types::SnapshotName;
 
 use super::{Observation, PlanFilters};
 
@@ -237,7 +238,7 @@ mod tests {
             path: "/pre-existing".into(),
             reason: "prefix".to_string(),
             subvolume_name: "pre".to_string(),
-            kind: crate::types::DeleteKind::Policy,
+            kind: crate::plan::DeleteKind::Policy,
         });
         accumulator
             .skipped
@@ -248,7 +249,7 @@ mod tests {
             path: "/new".into(),
             reason: "new".to_string(),
             subvolume_name: "sv1".to_string(),
-            kind: crate::types::DeleteKind::Policy,
+            kind: crate::plan::DeleteKind::Policy,
         });
         fragment.defer(
             "sv1",

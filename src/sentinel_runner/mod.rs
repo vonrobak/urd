@@ -302,16 +302,16 @@ mod tests {
                 state: "closed".to_string(),
                 failure_count: 0,
             },
-            visual_state: Some(crate::output::VisualState {
-                icon: crate::output::VisualIcon::Warning,
+            visual_state: Some(crate::sentinel::VisualState {
+                icon: crate::sentinel::VisualIcon::Warning,
                 worst_safety: PromiseStatus::Protected,
                 worst_health: "degraded".to_string(),
-                safety_counts: crate::output::SafetyCounts {
+                safety_counts: crate::sentinel::SafetyCounts {
                     ok: 1,
                     aging: 0,
                     gap: 0,
                 },
-                health_counts: crate::output::HealthCounts {
+                health_counts: crate::sentinel::HealthCounts {
                     healthy: 0,
                     degraded: 1,
                     blocked: 0,
@@ -335,7 +335,7 @@ mod tests {
         assert!(parsed.visual_state.is_some());
         assert_eq!(
             parsed.visual_state.unwrap().icon,
-            crate::output::VisualIcon::Warning
+            crate::sentinel::VisualIcon::Warning
         );
     }
 

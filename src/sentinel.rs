@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use crate::awareness::{
     ChainStatus, OperationalHealth, PromiseSnapshot, PromiseStatus, SubvolAssessment,
 };
+use crate::advice::{RedundancyAdvisory, RedundancyAdvisoryKind};
 use crate::guard::{self, PoolPressureSample};
 use crate::types::{DriveEvent, DriveEventKind};
 
@@ -112,30 +113,156 @@ impl Default for SentinelState {
     }
 }
 
-/// The circuit-breaker state carried on the `SentinelCircuitBreak` event
-/// (ADR-105 on-disk contract — old event rows must keep deserializing).
-///
-/// The decision machinery that used to populate this (auto-trigger
-/// evaluation, backoff, half-open trials) was deleted as dormant, dead
-/// code — see #385. This type, the event variant, and the
-/// `backup_circuit_breaker_trips_total` / `urd_circuit_breaker_trips_total`
-/// metrics remain as permanently-zero contract surfaces; a future
-/// active-mode design can repopulate them without a contract change.
+// ── Sentinel state file (ADR-105 contract) ─────────────────────────────
+
+// Visual state types (VFM-B).
+
+/// Icon state for tray icon consumers. Four states, each maps to a static
+/// SVG icon file. The tray applet selects by name: `urd-icon-ok.svg`, etc.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum CircuitState {
-    Closed,
-    Open,
-    HalfOpen,
+pub enum VisualIcon {
+    /// All safe, all healthy.
+    Ok,
+    /// Safety ok but health degraded, or safety aging.
+    Warning,
+    /// Data gap exists (any subvolume UNPROTECTED).
+    Critical,
+    /// Backup currently running (reserved, not yet produced).
+    Active,
 }
 
-impl std::fmt::Display for CircuitState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Closed => write!(f, "closed"),
-            Self::Open => write!(f, "open"),
-            Self::HalfOpen => write!(f, "half-open"),
+/// Safety axis counts using tray-friendly vocabulary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SafetyCounts {
+    pub ok: usize,
+    pub aging: usize,
+    pub gap: usize,
+}
+
+/// Health axis counts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HealthCounts {
+    pub healthy: usize,
+    pub degraded: usize,
+    pub blocked: usize,
+}
+
+/// Structured visual state for tray icon and external consumers.
+/// No pre-computed text — consumers render their own tooltips/summaries
+/// from this structured data (design review S2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VisualState {
+    pub icon: VisualIcon,
+    /// Worst promise status across subvolumes (serializes SCREAMING).
+    pub worst_safety: PromiseStatus,
+    /// Worst operational health across subvolumes. Stays `String`:
+    /// `OperationalHealth` has no SCREAMING serde form and is out of scope for
+    /// UPI 053 — the `worst_safety: PromiseStatus` / `worst_health: String`
+    /// asymmetry is deliberate, not an omission.
+    pub worst_health: String,
+    pub safety_counts: SafetyCounts,
+    pub health_counts: HealthCounts,
+}
+
+/// The `SentinelStateFile` schema version the runner writes. A startup restore
+/// of mount tracking (#411) trusts only a file of this version.
+pub const SENTINEL_STATE_SCHEMA_VERSION: u32 = 3;
+
+/// Sentinel state file schema — written atomically by the runner, read by
+/// `urd sentinel status`. Also serves as a "running" indicator (PID check).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SentinelStateFile {
+    pub schema_version: u32,
+    pub pid: u32,
+    pub started: String,
+    pub last_assessment: Option<String>,
+    pub mounted_drives: Vec<String>,
+    pub tick_interval_secs: u64,
+    pub promise_states: Vec<SentinelPromiseState>,
+    pub circuit_breaker: SentinelCircuitState,
+    /// Visual state for tray icon and external consumers (VFM-B, schema v2+).
+    /// `None` when reading schema v1 files for backward compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visual_state: Option<VisualState>,
+    /// Redundancy advisory summary (schema v3+). `None` means "unknown, not zero."
+    /// Absent in v2 files; consumers must treat `None` as "advisories not computed."
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advisory_summary: Option<AdvisorySummary>,
+}
+
+/// Per-subvolume promise state in the sentinel state file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SentinelPromiseState {
+    pub name: String,
+    /// Promise status (serializes SCREAMING: "PROTECTED" / "AT RISK" / "UNPROTECTED").
+    /// Deserialization accepts the closed `PromiseStatus` set plus legacy
+    /// `snake_case` aliases; an out-of-set value fails the whole state-file
+    /// parse, which the reader treats as absent (fail-open via `.ok()`).
+    pub status: PromiseStatus,
+    /// Operational health (VFM-B, schema v2+). Defaults to "healthy" for v1 files.
+    #[serde(default = "default_healthy")]
+    pub health: String,
+    /// Reasons for non-healthy status. Omitted from JSON when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub health_reasons: Vec<String>,
+}
+
+fn default_healthy() -> String {
+    "healthy".to_string()
+}
+
+/// Circuit breaker summary in the sentinel state file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SentinelCircuitState {
+    pub state: String,
+    pub failure_count: u32,
+}
+
+/// Structured output for `urd sentinel status`.
+#[derive(Debug, Serialize)]
+#[serde(tag = "status")]
+pub enum SentinelStatusOutput {
+    /// Sentinel is running (PID alive, state file present).
+    #[serde(rename = "running")]
+    Running {
+        state: Box<SentinelStateFile>,
+        /// Human-readable uptime (e.g., "3h 12m").
+        uptime: String,
+    },
+    /// Sentinel is not running (no state file, or stale file cleaned up).
+    #[serde(rename = "not_running")]
+    NotRunning {
+        /// If a stale state file was found, when the sentinel was last seen.
+        last_seen: Option<String>,
+    },
+}
+
+/// Summary of redundancy advisories for the sentinel state file.
+/// `None` in the state file means "unknown, not zero" (backward compat with v2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdvisorySummary {
+    /// Count of non-informational advisories.
+    pub count: usize,
+    /// Worst advisory kind (for badge/icon decisions).
+    pub worst: Option<RedundancyAdvisoryKind>,
+}
+
+impl AdvisorySummary {
+    /// Build from a list of advisories. Returns `None` when the list is empty.
+    /// Informational advisories (`TransientNoLocalRecovery`) are excluded from `count`.
+    #[must_use]
+    pub fn from_advisories(advisories: &[RedundancyAdvisory]) -> Option<Self> {
+        if advisories.is_empty() {
+            return None;
         }
+        // Exclude informational advisories from both count and worst.
+        // count == 0 && worst == None means "only informational advisories exist."
+        let is_actionable =
+            |a: &&RedundancyAdvisory| a.kind != RedundancyAdvisoryKind::TransientNoLocalRecovery;
+        let count = advisories.iter().filter(is_actionable).count();
+        let worst = advisories.iter().filter(is_actionable).map(|a| a.kind).min();
+        Some(Self { count, worst })
     }
 }
 
@@ -413,8 +540,7 @@ pub fn snapshot_health(assessments: &[SubvolAssessment]) -> Vec<HealthSnapshot> 
 /// any Degraded/Blocked) > Ok (all Protected and all Healthy).
 /// The `Active` state is reserved for backup-in-progress detection (future).
 #[must_use]
-pub fn compute_visual_state(assessments: &[SubvolAssessment]) -> crate::output::VisualState {
-    use crate::output::{HealthCounts, SafetyCounts, VisualIcon, VisualState};
+pub fn compute_visual_state(assessments: &[SubvolAssessment]) -> VisualState {
 
     let mut safety_counts = SafetyCounts {
         ok: 0,
@@ -610,11 +736,11 @@ pub struct RestoredMounts {
 /// over-stating by the previous instance's whole uptime.
 #[must_use]
 pub fn restorable_mounts(
-    file: Option<&crate::output::SentinelStateFile>,
+    file: Option<&SentinelStateFile>,
     config_labels: &BTreeSet<String>,
 ) -> Option<RestoredMounts> {
     let file = file?;
-    if file.schema_version != crate::output::SENTINEL_STATE_SCHEMA_VERSION {
+    if file.schema_version != SENTINEL_STATE_SCHEMA_VERSION {
         return None;
     }
     let witnessed_at =
@@ -1602,7 +1728,7 @@ mod tests {
             make_assessment("sv2", PromiseStatus::Protected),
         ];
         let vs = compute_visual_state(&assessments);
-        assert_eq!(vs.icon, crate::output::VisualIcon::Ok);
+        assert_eq!(vs.icon, VisualIcon::Ok);
         assert_eq!(vs.safety_counts.ok, 2);
         assert_eq!(vs.health_counts.healthy, 2);
     }
@@ -1614,7 +1740,7 @@ mod tests {
             make_assessment("sv2", PromiseStatus::AtRisk),
         ];
         let vs = compute_visual_state(&assessments);
-        assert_eq!(vs.icon, crate::output::VisualIcon::Warning);
+        assert_eq!(vs.icon, VisualIcon::Warning);
         assert_eq!(vs.safety_counts.aging, 1);
         assert_eq!(vs.worst_safety, PromiseStatus::AtRisk);
     }
@@ -1626,7 +1752,7 @@ mod tests {
             make_assessment("sv2", PromiseStatus::Unprotected),
         ];
         let vs = compute_visual_state(&assessments);
-        assert_eq!(vs.icon, crate::output::VisualIcon::Critical);
+        assert_eq!(vs.icon, VisualIcon::Critical);
         assert_eq!(vs.safety_counts.gap, 1);
     }
 
@@ -1635,7 +1761,7 @@ mod tests {
         let mut a = make_assessment("sv1", PromiseStatus::Protected);
         a.health = OperationalHealth::Degraded;
         let vs = compute_visual_state(&[a]);
-        assert_eq!(vs.icon, crate::output::VisualIcon::Warning);
+        assert_eq!(vs.icon, VisualIcon::Warning);
         assert_eq!(vs.worst_health, "degraded");
         assert_eq!(vs.health_counts.degraded, 1);
     }
@@ -1645,7 +1771,7 @@ mod tests {
         let mut a = make_assessment("sv1", PromiseStatus::Protected);
         a.health = OperationalHealth::Blocked;
         let vs = compute_visual_state(&[a]);
-        assert_eq!(vs.icon, crate::output::VisualIcon::Critical);
+        assert_eq!(vs.icon, VisualIcon::Critical);
         assert_eq!(vs.health_counts.blocked, 1);
     }
 
@@ -1655,13 +1781,13 @@ mod tests {
         a1.health = OperationalHealth::Blocked;
         let a2 = make_assessment("sv2", PromiseStatus::Protected);
         let vs = compute_visual_state(&[a1, a2]);
-        assert_eq!(vs.icon, crate::output::VisualIcon::Warning);
+        assert_eq!(vs.icon, VisualIcon::Warning);
     }
 
     #[test]
     fn visual_state_empty_assessments_is_ok() {
         let vs = compute_visual_state(&[]);
-        assert_eq!(vs.icon, crate::output::VisualIcon::Ok);
+        assert_eq!(vs.icon, VisualIcon::Ok);
         assert_eq!(vs.safety_counts.ok, 0);
         assert_eq!(vs.health_counts.healthy, 0);
     }
@@ -1671,7 +1797,7 @@ mod tests {
         let mut a1 = make_assessment("sv1", PromiseStatus::Unprotected);
         a1.health = OperationalHealth::Degraded;
         let vs = compute_visual_state(&[a1]);
-        assert_eq!(vs.icon, crate::output::VisualIcon::Critical);
+        assert_eq!(vs.icon, VisualIcon::Critical);
     }
 
     #[test]
@@ -2230,8 +2356,8 @@ mod tests {
         schema_version: u32,
         last_assessment: Option<&str>,
         mounted: &[&str],
-    ) -> crate::output::SentinelStateFile {
-        crate::output::SentinelStateFile {
+    ) -> SentinelStateFile {
+        SentinelStateFile {
             schema_version,
             pid: 1,
             started: "2026-09-01T00:00:00".to_string(),
@@ -2239,7 +2365,7 @@ mod tests {
             mounted_drives: mounted.iter().map(|s| (*s).to_string()).collect(),
             tick_interval_secs: 900,
             promise_states: vec![],
-            circuit_breaker: crate::output::SentinelCircuitState {
+            circuit_breaker: SentinelCircuitState {
                 state: "closed".to_string(),
                 failure_count: 0,
             },
@@ -2265,7 +2391,7 @@ mod tests {
     #[test]
     fn restorable_mounts_intersects_with_config_and_reads_witness_time() {
         let file = state_file(
-            crate::output::SENTINEL_STATE_SCHEMA_VERSION,
+            SENTINEL_STATE_SCHEMA_VERSION,
             Some(FILE_AT),
             &["WD-18TB", "REMOVED"],
         );
@@ -2278,7 +2404,7 @@ mod tests {
     #[test]
     fn restorable_mounts_restores_nothing_without_a_trustworthy_file() {
         let cfg = labels(&["WD-18TB"]);
-        let current = crate::output::SENTINEL_STATE_SCHEMA_VERSION;
+        let current = SENTINEL_STATE_SCHEMA_VERSION;
         // No file.
         assert_eq!(restorable_mounts(None, &cfg), None);
         // Old schema.

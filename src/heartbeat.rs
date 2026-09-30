@@ -23,7 +23,6 @@ use crate::awareness::{PromiseStatus, SubvolAssessment};
 use crate::config::Config;
 use crate::error::UrdError;
 use crate::executor::ExecutionResult;
-use crate::output::{ChurnHeartbeatFields, SubvolumeExtras};
 
 /// Current schema version. Bump when adding fields (never remove fields).
 const SCHEMA_VERSION: u32 = 4;
@@ -124,6 +123,32 @@ pub struct SubvolumeHeartbeat {
     /// (`local_snapshot_count > 0` and `mean_incremental_bytes` unknown);
     /// `Some(count × mean)` otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_local_pinned_delta_bytes: Option<u64>,
+}
+
+/// Heartbeat / metrics projection of a single subvolume's churn state.
+/// `commands/backup.rs` builds a `HashMap<String, ChurnHeartbeatFields>` and
+/// passes it to both `heartbeat::build` and
+/// `backup::write_metrics_per_spec` so both surfaces share the same
+/// policy: incremental → `churn_bytes_per_second`; full-only →
+/// `last_full_send_bytes`. Cold-start subvolumes have both `None`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ChurnHeartbeatFields {
+    pub churn_bytes_per_second: Option<f64>,
+    pub last_full_send_bytes: Option<u64>,
+    /// Arithmetic mean of `bytes_transferred` over in-window incrementals.
+    /// Used by UPI 043's pinned-delta computation in `gather_pool_observability`.
+    pub mean_incremental_bytes: Option<u64>,
+}
+
+/// Per-subvolume "extras" populated by `gather_pool_observability` and threaded
+/// to both `heartbeat::build` and `backup::write_metrics_per_spec`
+/// so both surfaces share the same `pool_uuid`, `local_snapshot_count`, and
+/// `estimated_local_pinned_delta_bytes` values for a given run (UPI 043).
+#[derive(Debug, Clone, Default)]
+pub struct SubvolumeExtras {
+    pub pool_uuid: Option<String>,
+    pub local_snapshot_count: Option<u32>,
     pub estimated_local_pinned_delta_bytes: Option<u64>,
 }
 

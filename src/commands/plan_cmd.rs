@@ -369,8 +369,8 @@ fn build_operation_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plan::MockFileSystemState;
-    use crate::types::{BackupPlan, NothingNew, SendKind, SnapshotName};
+    use crate::plan::{MockFileSystemState, NothingNew};
+    use crate::types::{BackupPlan, SendKind, SnapshotName};
     use std::path::PathBuf;
 
     fn dummy_snap(subvol: &str) -> SnapshotName {

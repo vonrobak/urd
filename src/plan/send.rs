@@ -1,5 +1,6 @@
 use crate::events::{DeferScope, Event, EventPayload};
-use crate::types::{FullSendReason, NothingNew, PlannedOperation, SendKind, SnapshotName};
+use crate::plan::{NothingNew, PlannedOperation};
+use crate::types::{FullSendReason, SendKind, SnapshotName};
 
 use super::fragment::{PlanFragment, SendInputs, SubvolInputs};
 
@@ -261,9 +262,9 @@ mod tests {
     use crate::output::SkipCategory;
     use crate::plan::testkit::MockFileSystemState;
     use crate::storage_critical::EffectivePolicy;
+    use crate::plan::PlannedSkip;
     use crate::types::{
-        DriveRole, Interval, LocalRetentionPolicy, MonthlyCount, PlannedSkip,
-        ResolvedGraduatedRetention,
+        DriveRole, Interval, LocalRetentionPolicy, MonthlyCount, ResolvedGraduatedRetention,
     };
 
     use super::*;
