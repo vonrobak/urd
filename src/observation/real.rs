@@ -198,7 +198,7 @@ impl HistoryQuery for RealFileSystemState<'_> {
 /// Drift-history composition — the single home for the "fetch rows → map to
 /// `DriftSample` → fail-open (ADR-102)" sequence that command callers used to
 /// re-assemble inline. Mirrors `drive_mount_history`/`drive_record_to_event`:
-/// granular `state.rs` wrappers, with the domain shape localized once at the
+/// granular `state/` wrappers, with the domain shape localized once at the
 /// adapter. Inherent (not on `HistoryQuery`) because every drift consumer is a
 /// command-layer path holding `Option<&StateDb>`; no pure function reaches drift
 /// through `Observation`. Empty results feed the pure aggregators unchanged —
@@ -255,9 +255,9 @@ impl RealFileSystemState<'_> {
 /// `last_drive_event` (one row) and `drive_mount_history` (all rows). The parse
 /// format matches the sentinel's write format (`%Y-%m-%dT%H:%M:%S`).
 ///
-/// This is the read-side composition pattern: granular `state.rs` wrappers, with
+/// This is the read-side composition pattern: granular `state/` wrappers, with
 /// the domain shaping localized once at the adapter (see also `drift_samples`).
-/// Keep `state.rs` itself one-method-per-query — composition lives here.
+/// Keep `state/` itself one-method-per-query — composition lives here.
 pub(crate) fn drive_record_to_event(
     record: &crate::state::DriveConnectionRecord,
 ) -> Option<DriveEvent> {
