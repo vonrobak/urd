@@ -12,7 +12,7 @@
 //! to keep watching or abort the in-flight send (the definitive host-survival
 //! action). No I/O, no clock — the command layer samples `pools::pool_space` on
 //! the watchdog thread and feeds the readings in; the cancel plumbing and the
-//! abort-reclaim live in `btrfs.rs`/`executor.rs`/`commands/backup.rs`.
+//! abort-reclaim live in `btrfs.rs`/`executor/`/`commands/backup/`.
 //!
 //! **Single trigger — the absolute floor (floor-only since UPI 067).** Free
 //! dropped below `floor_bytes` (`min_free + cleanup_budget`) → abort. The earlier
@@ -27,7 +27,7 @@
 //! / ENOSPC) never severs a backup chain.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::types::SnapshotName;
 
@@ -38,7 +38,7 @@ pub const WATCHDOG_POLL_MS: u64 = 250;
 /// the config field of the same name was retired in UPI 068 — the budget is
 /// always derived now). 1.5 % scales across hardware — ~1.77 GB on a 118 GB htpc
 /// NVMe — and is the working room the floor sits above `min_free`. Applied at
-/// watchdog setup (`commands/backup.rs`), not in `config.rs`, because it needs
+/// watchdog setup (`commands/backup/`), not in `config/`, because it needs
 /// the pool capacity to resolve.
 pub const CLEANUP_BUDGET_CAPACITY_FRACTION: f64 = 0.015;
 
@@ -74,6 +74,44 @@ pub fn evaluate(free_bytes: u64, floor_bytes: u64) -> WatchdogAction {
     } else {
         WatchdogAction::Continue
     }
+}
+
+/// Pure per-pool watchdog decision (UPI 033, refined by UPI 054-a, floor-only
+/// since UPI 067). For a pool that *started* below the absolute floor
+/// (`min_free + cleanup_budget`), the floor **degrades to bare `min_free`** rather
+/// than firing immediately or vanishing: the planner's send-floor guard now owns
+/// "too tight to start" (UPI 054-a), so a started-below send is a plan→start
+/// TOCTOU residual — it must not instantly self-abort a run the planner allowed
+/// (round-2 adversary Finding B), but it must still abort before reaching zero
+/// (full suppression to 0 would leave a slow fill to zero unwatched — ADR-113's
+/// catastrophic scenario). A pool that started above the floor keeps the floor at
+/// full strength. Delegates the level comparison to [`evaluate`].
+#[must_use]
+pub fn watchdog_step(
+    free_bytes: u64,
+    floor_bytes: u64,
+    min_free_bytes: u64,
+    started_below_floor: bool,
+) -> WatchdogAction {
+    let effective_floor = if started_below_floor {
+        min_free_bytes
+    } else {
+        floor_bytes
+    };
+    evaluate(free_bytes, effective_floor)
+}
+
+/// Route a watchdog trip on one pool (UPI 065-b — the ADR-113 2026-06-17
+/// amendment): `true` when the response is **same-filesystem** (abort the
+/// in-flight send), `false` when it is **cross-filesystem** (leave that send
+/// running; reclaim the tripped pool concurrently). Pure (ADR-108).
+///
+/// Membership, NOT path-equality (C1): a UUID-pool can span several snapshot
+/// roots, so the in-flight root is tested against the pool's *whole* root-set.
+/// `None` (no send in flight) is same-fs — nothing to cross-pool-harm.
+#[must_use]
+pub fn trip_is_same_filesystem(in_flight: Option<&Path>, pool_roots: &HashSet<PathBuf>) -> bool {
+    in_flight.is_none_or(|r| pool_roots.contains(r))
 }
 
 /// The source-pool host-survival floor shared by Layer 2 (the mid-op watchdog,
@@ -259,6 +297,70 @@ mod tests {
     fn zero_free_aborts() {
         // A fully-consumed pool is unambiguously below any positive floor.
         assert_eq!(evaluate(0, FLOOR), WatchdogAction::Abort);
+    }
+
+    #[test]
+    fn watchdog_step_started_above_floor_fires_on_floor() {
+        // Started above floor: a below-floor reading aborts (floor-only since 067).
+        assert_eq!(watchdog_step(GB, 2 * GB, GB / 2, false), WatchdogAction::Abort);
+    }
+
+    #[test]
+    fn watchdog_step_started_below_floor_suppresses_floor() {
+        // Finding B, refined by UPI 054-a: started below floor → the floor degrades
+        // to bare min_free. A reading below the floor but above min_free is Continue
+        // (the run the planner allowed proceeds).
+        // GB is below the 2 GB floor but above the 512 MB min_free.
+        assert_eq!(watchdog_step(GB, 2 * GB, GB / 2, true), WatchdogAction::Continue);
+    }
+
+    #[test]
+    fn watchdog_step_started_below_floor_fires_below_min_free() {
+        // UPI 054-a: the degraded floor still bites. A started-below pool whose free
+        // then falls under bare min_free aborts — this closes the slow-fill-to-zero
+        // gap full suppression (floor → 0) opened.
+        // GB/4 (256 MB) is below the 512 MB min_free.
+        assert_eq!(watchdog_step(GB / 4, 2 * GB, GB / 2, true), WatchdogAction::Abort);
+    }
+
+    #[test]
+    fn watchdog_step_started_below_crosses_min_free_aborts() {
+        // G3 ①: the G1 backstop proof — a started-below pool's degraded floor
+        // (bare min_free) still bites at the boundary. `free == min_free` is not
+        // below it → Continue; one byte under → Abort. Independent of the
+        // above-floor boundary `evaluate_free_equals_floor_continues` proves.
+        assert_eq!(
+            watchdog_step(GB / 2, 2 * GB, GB / 2, true),
+            WatchdogAction::Continue,
+            "free == the degraded floor (min_free) is not below it"
+        );
+        assert_eq!(
+            watchdog_step(GB / 2 - 1, 2 * GB, GB / 2, true),
+            WatchdogAction::Abort,
+            "one byte under the degraded floor aborts"
+        );
+    }
+
+    #[test]
+    fn trip_same_filesystem_is_root_set_membership() {
+        // (in-flight root, same-fs?) against one UUID-pool spanning two roots —
+        // UPI 065-b C1: membership in the whole root-set, never equality with one
+        // representative root.
+        let roots: HashSet<PathBuf> =
+            HashSet::from([PathBuf::from("/snap-a"), PathBuf::from("/snap-b")]);
+        let cases: [(Option<&str>, bool); 4] = [
+            (None, true),            // no send in flight
+            (Some("/snap-a"), true), // the representative root
+            (Some("/snap-b"), true), // another root of the same pool
+            (Some("/other/fs/.snapshots"), false), // a disjoint filesystem
+        ];
+        for (in_flight, want) in cases {
+            assert_eq!(
+                trip_is_same_filesystem(in_flight.map(Path::new), &roots),
+                want,
+                "in_flight = {in_flight:?}"
+            );
+        }
     }
 
     #[test]

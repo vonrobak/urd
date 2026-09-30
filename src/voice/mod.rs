@@ -28,6 +28,7 @@ mod get;
 mod history;
 mod init;
 mod plan;
+mod progress;
 mod retention;
 mod sentinel;
 mod status;
@@ -62,6 +63,7 @@ pub use init::{
     render_incomplete_deletion_warning, render_init, render_init_first_time,
 };
 pub use plan::{render_empty_plan, render_nothing_to_do, render_plan};
+pub(crate) use progress::{format_completion_line, format_progress_line};
 pub use retention::{
     render_retention_preview, retention_change_pending_line, retention_hold_warning,
 };
@@ -119,8 +121,8 @@ pub(super) fn render_json<T: serde::Serialize>(value: &T) -> String {
 }
 
 /// A size ESTIMATE, written at the precision it has: two significant figures,
-/// in `ByteSize`'s decimal units. Measured byte counts keep `ByteSize`. Public
-/// because the live progress line (`commands/backup.rs`) shows estimates too;
+/// in `ByteSize`'s decimal units. Measured byte counts keep `ByteSize`. Shared
+/// by the plan and backup renderers and the live progress line (`progress.rs`);
 /// it is a number formatter, not voice.
 #[must_use]
 pub fn approx_size(bytes: u64) -> String {

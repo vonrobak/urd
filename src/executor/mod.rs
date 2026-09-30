@@ -8,12 +8,14 @@ use std::time::Duration;
 
 use crate::btrfs::BtrfsOps;
 use crate::chain;
-use crate::commands::backup::{format_completion_line, ProgressContext, SizeEstimates, WatchdogCoord};
 use crate::config::Config;
 use crate::drives;
 use crate::error::{BtrfsOperation, UrdError};
 use crate::state::{DriftSampleRow, OperationRecord, StateDb};
 use crate::types::{BackupPlan, DeleteKind, FullSendReason, PlannedOperation, SendKind, SnapshotName};
+
+mod coord;
+pub(crate) use coord::*;
 
 // ── Types ───────────────────────────────────────────────────────────────
 
@@ -304,6 +306,9 @@ pub struct Executor<'a> {
     shutdown: &'a AtomicBool,
     progress_context: Option<Arc<Mutex<ProgressContext>>>,
     size_estimates: Option<SizeEstimates>,
+    /// The command's completion sink: called once per finished send (> 1 s)
+    /// under the progress-context lock. The executor reports; the command renders.
+    completion_sink: Option<CompletionSink>,
     full_send_policy: FullSendPolicy,
     /// The shared executor↔watchdog coordination cell (UPI 065-b). When set, the
     /// executor publishes each send's snapshot root into `in_flight` and refuses a
@@ -334,6 +339,7 @@ impl<'a> Executor<'a> {
             shutdown,
             progress_context: None,
             size_estimates: None,
+            completion_sink: None,
             full_send_policy: FullSendPolicy::Allow,
             watchdog_coord: None,
             watchdog_cancel: None,
@@ -358,14 +364,17 @@ impl<'a> Executor<'a> {
         self.full_send_policy = policy;
     }
 
-    /// Set progress context for rich progress display.
+    /// Set progress context for rich progress display, and the sink each
+    /// completed send is reported to.
     pub fn set_progress(
         &mut self,
         context: Arc<Mutex<ProgressContext>>,
         estimates: SizeEstimates,
+        on_complete: CompletionSink,
     ) {
         self.progress_context = Some(context);
         self.size_estimates = Some(estimates);
+        self.completion_sink = Some(on_complete);
     }
 
     /// Execute the backup plan, returning results.
@@ -1373,27 +1382,25 @@ impl<'a> Executor<'a> {
                 // Same pattern as pin-on-success: failure is logged, not fatal.
                 self.maybe_write_drive_token(drive_label);
 
-                // Print completion line for sends >1s (mutex protocol: lock → clear → print → release)
+                // Report the completion of sends >1s to the command's sink
+                // (mutex protocol: lock → sink clears + prints → release)
                 let elapsed = start.elapsed();
                 if elapsed > Duration::from_secs(1)
                     && let Some(ref ctx) = self.progress_context
+                    && let Some(ref on_complete) = self.completion_sink
                     && let Ok(_guard) = ctx.lock()
                 {
-                    eprint!("\r\x1b[2K");
-                    eprintln!(
-                        "{}",
-                        format_completion_line(
-                            subvol_name,
-                            drive_label,
-                            result.bytes_transferred.unwrap_or(0),
-                            elapsed,
-                            if parent.is_some() {
-                                SendType::Incremental
-                            } else {
-                                SendType::Full
-                            },
-                        )
-                    );
+                    on_complete(&CompletionReport {
+                        subvolume_name: subvol_name,
+                        drive_label,
+                        bytes_transferred: result.bytes_transferred.unwrap_or(0),
+                        elapsed,
+                        send_type: if parent.is_some() {
+                            SendType::Incremental
+                        } else {
+                            SendType::Full
+                        },
+                    });
                 }
 
                 (
