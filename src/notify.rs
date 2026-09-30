@@ -171,7 +171,7 @@ impl std::fmt::Display for Urgency {
 pub struct Notification {
     /// Read only by this module's tests, which pattern-match the event a
     /// notification was built from; the dispatcher renders title/body.
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub event: NotificationEvent,
     pub urgency: Urgency,
     pub title: String,
@@ -1860,7 +1860,6 @@ mod sentinel_path_tests {
     use crate::awareness::{LocalAssessment, OperationalHealth, PromiseStatus};
     use crate::heartbeat;
     use crate::sentinel;
-    use crate::types::Interval;
 
     fn make_assessment(name: &str, status: PromiseStatus) -> SubvolAssessment {
         SubvolAssessment {
@@ -1873,7 +1872,6 @@ mod sentinel_path_tests {
                 status,
                 snapshot_count: 5,
                 newest_age: None,
-                configured_interval: Interval::hours(1),
             },
             external: vec![],
             chain_health: vec![],

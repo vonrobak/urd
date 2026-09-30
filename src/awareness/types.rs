@@ -166,8 +166,6 @@ pub struct LocalAssessment {
     pub status: PromiseStatus,
     pub snapshot_count: usize,
     pub newest_age: Option<Duration>,
-    #[allow(dead_code)] // consumed by verbose status display (future)
-    pub configured_interval: Interval,
 }
 
 #[cfg(test)]
@@ -184,7 +182,6 @@ impl LocalAssessment {
             status,
             snapshot_count,
             newest_age,
-            configured_interval: Interval::hours(1),
         }
     }
 }

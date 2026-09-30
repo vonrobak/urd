@@ -280,7 +280,6 @@ local_retention = "transient"
                 status: PromiseStatus::Protected,
                 snapshot_count: 5,
                 newest_age: None,
-                configured_interval: Interval::hours(1),
             },
             external: vec![],
             chain_health: vec![],

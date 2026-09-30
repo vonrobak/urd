@@ -56,7 +56,6 @@ pub(super) fn assess_local(
                 status: PromiseStatus::Protected,
                 snapshot_count: count,
                 newest_age,
-                configured_interval: interval,
             },
             advisory,
         );
@@ -68,7 +67,6 @@ pub(super) fn assess_local(
                 status: PromiseStatus::Unprotected,
                 snapshot_count: 0,
                 newest_age: None,
-                configured_interval: interval,
             },
             None,
         );
@@ -103,7 +101,6 @@ pub(super) fn assess_local(
             status,
             snapshot_count: count,
             newest_age: Some(age),
-            configured_interval: interval,
         },
         advisory,
     )
@@ -261,7 +258,6 @@ mod tests {
             status: PromiseStatus::Protected,
             snapshot_count: 5,
             newest_age: Some(Duration::minutes(30)),
-            configured_interval: Interval::hours(1),
         };
         assert_eq!(
             compute_overall_status(&local, &[]),
@@ -272,7 +268,6 @@ mod tests {
             status: PromiseStatus::AtRisk,
             snapshot_count: 5,
             newest_age: Some(Duration::hours(3)),
-            configured_interval: Interval::hours(1),
         };
         assert_eq!(
             compute_overall_status(&local_risk, &[]),

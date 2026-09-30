@@ -9,7 +9,7 @@ use crate::commands::storage_signals;
 use crate::config::Config;
 use crate::executor::{OpResult, OperationOutcome, SendType, SubvolumeResult, TransientCleanupOutcome};
 use crate::storage_critical::TightnessTier;
-use crate::types::{BackupPlan, Interval};
+use crate::types::BackupPlan;
 
 pub(super) fn wd_config() -> Config {
     let toml_str = r#"
@@ -133,7 +133,6 @@ pub(super) fn sample_assessments() -> Vec<SubvolAssessment> {
             status: PromiseStatus::Protected,
             snapshot_count: 10,
             newest_age: None,
-            configured_interval: Interval::hours(1),
         },
         external: vec![],
         chain_health: vec![],

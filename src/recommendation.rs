@@ -324,11 +324,11 @@ pub fn project_cost(
 /// Recommend a retention shape for the given role under observed `churn`.
 /// Thin wrapper around `recommend_shape_with_headroom` with an empty
 /// `HeadroomContext` — when no headroom signals are available, the result
-/// is the UPI-041 churn-fit recommendation unchanged. Retained for tests
-/// that pre-date UPI 044 and for external callers that don't need the
-/// headroom decoration.
+/// is the UPI-041 churn-fit recommendation unchanged. Retained for the tests
+/// that pre-date UPI 044; production callers go through the headroom-aware
+/// entry point.
+#[cfg(test)]
 #[must_use]
-#[allow(dead_code)]
 pub fn recommend_shape(
     current: &ResolvedGraduatedRetention,
     churn: &ChurnEstimate,

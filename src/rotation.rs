@@ -55,7 +55,6 @@ const DEFAULT_STALE_DAYS: i64 = 60;
 /// in-progress absence since `last_home` is deliberately not a completed gap
 /// (RD3). `last_home`/`gaps_observed` are carried for UPI 056's forecast.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // last_home / gaps_observed feed UPI 056's forecast.
 pub struct RotationObservation {
     pub last_home: NaiveDateTime,
     pub median_gap: Duration,
@@ -80,8 +79,8 @@ pub enum WindowSource {
 pub struct OffsiteWindow {
     pub overdue_after: Duration,
     pub stale_after: Duration,
-    /// Provenance, for UPI 056. Resolved here but unread by 055.
-    #[allow(dead_code)]
+    /// Provenance, for UPI 056: carried onto the `rotation` JSON block
+    /// (`DriveRotation.source`).
     pub source: WindowSource,
 }
 

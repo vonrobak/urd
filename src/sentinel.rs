@@ -1087,7 +1087,6 @@ fn eject_advance(
 mod tests {
     use super::*;
     use crate::awareness::{DriveChainHealth, LocalAssessment, OperationalHealth};
-    use crate::types::Interval;
 
     fn fresh_state() -> SentinelState {
         SentinelState::new()
@@ -1433,7 +1432,6 @@ mod tests {
                 status: PromiseStatus::Protected,
                 snapshot_count: 5,
                 newest_age: None,
-                configured_interval: Interval::hours(1),
             },
             external: vec![],
             chain_health,

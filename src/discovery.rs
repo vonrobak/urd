@@ -83,8 +83,7 @@ pub struct DiscoveredPool {
     pub label: Option<String>,
     // The runestone names bearers via `CandidateDrive.device` (top-level
     // disks, the vocabulary a user recognizes) — these raw btrfs-bearing
-    // nodes serve the privileged second look instead.
-    #[allow(dead_code)] // Consumed by UPI 075 (second look).
+    // nodes serve the privileged second look instead (UPI 075).
     pub device_names: Vec<String>,
     pub mountpoints: Vec<PathBuf>,
     /// One space fact per pool (arc grill decision 4), measured at the

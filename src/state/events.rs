@@ -206,7 +206,6 @@ pub struct EventQueryFilter {
 /// already deserialized. Presentation projection (`output::EventRow`,
 /// via the `From` impl below) wraps this for the `urd events` subcommand.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub struct EventQueryRow {
     pub id: i64,
     pub kind: EventKind,

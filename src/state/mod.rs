@@ -65,7 +65,7 @@ pub struct DriveConnectionRecord {
     pub timestamp: String,
     /// Read only by migration tests — verifies the legacy projection
     /// preserves sentinel/backup attribution (UPI 036).
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub detected_by: String,
 }
 

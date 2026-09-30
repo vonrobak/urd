@@ -146,7 +146,6 @@ pub fn assess(
                     status: PromiseStatus::Unprotected,
                     snapshot_count: 0,
                     newest_age: None,
-                    configured_interval: subvol.snapshot_interval,
                 },
                 external: Vec::new(),
                 chain_health: Vec::new(),
