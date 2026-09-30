@@ -433,7 +433,7 @@ The invariant, the probabilistic contract, and "defer, never refuse" are unchang
 amendment blocks at the head of this ADR each changed part of the stack, and the
 Decision's table and the Implementation list were written before most of them. This
 amendment states the whole stack once, as the code has it, and corrects the names that
-have gone stale. Where it disagrees with an earlier block, it is the later statement.
+have gone stale.
 
 ### The defenses
 
@@ -460,9 +460,8 @@ deletes with no human present, so it waits until the root is unambiguously in tr
   The budget is always the derived 1.5 %, resolved in `guard.rs` because it needs the pool
   capacity. The 2026-06-14 block's `min_free + cleanup_budget` should be read the same way.
 - **The reserve file is gone.** `.urd-emergency-reserve` and its fast bridge were deleted
-  with the cliff (the 2026-06-26 block). The only code that still names the file is the
-  sweep that removes leftovers, recorded as an exception in ADR-105's amendment of this
-  date.
+  with the cliff (the 2026-06-26 block). The one-release sweep that removed leftover
+  files has also been removed, so no code names the file.
 - **`classify_free_ratio_value`** and the `FREE_RATIO_*` constants are defined in
   `storage_critical.rs`, not `recommendation.rs` (ADR-115's amendment of this date).
 - **The watchdog's wiring** is `commands/backup/watchdog.rs`, not `commands/backup.rs`:
@@ -471,7 +470,7 @@ deletes with no human present, so it waits until the root is unambiguously in tr
   list, and an owned `Config`). The coordination cell itself, `WatchdogCoord` (the
   in-flight root and the tripped-pool set), is `src/executor/coord.rs`, because the
   executor reads it before every send. The teardown's same-filesystem vs
-  cross-filesystem reclaim decision is `run_tail::decide_reclaim` (ADR-121).
+  cross-filesystem reclaim decision is `run_tail::decide_reclaim`.
 - **Awareness** is the directory `src/awareness/`, not `awareness.rs` (Implementation
   item 1).
 

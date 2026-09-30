@@ -70,7 +70,7 @@ timestamp: '2026-09-29T22:00:00+02:00'
 | `run_result` | string | no | One of `success`, `partial`, `failure`, `empty`. `empty` means no execution result (no work scheduled). |
 | `run_id` | integer | yes | SQLite `runs.id` for this execution. `null` for `empty` runs and when the state DB is unavailable. |
 | `subvolumes` | array | no | One entry per configured subvolume (see below). |
-| `notifications_dispatched` | bool | no | `false` immediately after write; `true` once notifications have been dispatched. A reader seeing `false` knows the run's notifications may not have reached the user; Urd itself never reads the flag back or re-sends on it (ADR-114). Defaults to `true` when absent (pre-notification heartbeats). |
+| `notifications_dispatched` | bool | no | Written `false` by a backup run; set `true` once the run's notifications were delivered, there was nothing to deliver, or delivery was left to a running Sentinel (ADR-114). A reader seeing `false` knows the run's notifications may not have reached the user. Defaults to `true` when absent (pre-notification heartbeats). |
 | `pools` | array | no | Deduplicated BTRFS pools: every source pool, plus every mounted destination pool that is not already a source (v4). **Omitted** when empty (`skip_serializing_if`) — e.g. on a host where pool detection found nothing. |
 | `drives` | array | no | One entry per configured `[[drives]]` entry, mounted or not (v4). **Omitted** when empty. |
 

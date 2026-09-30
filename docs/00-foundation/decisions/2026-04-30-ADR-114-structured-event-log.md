@@ -19,7 +19,7 @@ timestamp: '2026-09-30T12:00:00+02:00'
 
 **Date:** 2026-04-30
 **Status:** Accepted (principle); implemented in UPI 036 (`PromiseStatus`
-serialized-form amendment 2026-05-29 — see [Amendment 2026-05-29](#amendment-2026-05-29-promisestatus-serialized-form); stamp seam, drive lifecycle, and events retention amended 2026-09-04 — see [Amendment 2026-09-04](#amendment-2026-09-04-the-stamp-seam-drive-lifecycle-and-events-retention); wire types, decoders, and the heartbeat as dispatch mailbox amended 2026-09-30 — see [Amendment 2026-09-30](#amendment-2026-09-30-wire-types-permanent-decoders-and-the-dispatch-mailbox))
+serialized-form amendment 2026-05-29 — see [Amendment 2026-05-29](#amendment-2026-05-29-promisestatus-serialized-form); stamp seam, drive lifecycle, and events retention amended 2026-09-04 — see [Amendment 2026-09-04](#amendment-2026-09-04-the-stamp-seam-drive-lifecycle-and-events-retention); wire types, decoders, and the heartbeat as dispatch mailbox amended 2026-09-30 — see [Amendment 2026-09-30](#amendment-2026-09-30-wire-types-retired-decoders-and-the-dispatch-mailbox))
 **Complements:** UPI 030 (drift_samples — quantitative per-run signal)
 
 ## Context
@@ -388,9 +388,10 @@ can still render the rows already on disk. It is retired, decoder and fixture to
 when no database that Urd supports upgrading from can still hold such a row. Until then
 the variant must not be removed or renamed.
 
-## Amendment 2026-09-30: wire types, permanent decoders, and the dispatch mailbox
+## Amendment 2026-09-30: wire types, retired decoders, and the dispatch mailbox
 
-Four corrections and one decision that was made in code without being recorded.
+Corrections, one new payload, one open item, and one decision that was made in code
+without being recorded.
 
 ### Where the vocabulary lives
 
@@ -420,24 +421,23 @@ this date). `previous` and `current` are the canonical strings of the two
 `RetentionShape`s; the subvolume rides the event's `subvolume` column. It is additive
 under Constraint 2 and has its own frozen fixture.
 
-### Decoders are permanent
+### Open: when a decoder-only variant can retire
 
-The 2026-09-29 amendment retires the `RetentionProtect` decoder "when no database that
-Urd supports upgrading from can still hold such a row". Under the 2026-09-04 decision
-that nothing deletes from `events`, every database that ever held such a row still holds
-it. The condition cannot become true, so the decoder is permanent. The same holds for
-every payload variant that is no longer written:
+Two payload variants are no longer written and remain only as decoders:
 
-- **`SentinelCircuitBreak`** is decoder-only. The circuit-breaker machinery that emitted
-  it was deleted as dormant (#385). The variant, `CircuitState`, and the two
-  circuit-breaker trip counters remain as permanently-zero contract surfaces, so a future
-  active-mode design can repopulate them without a contract change.
-- **`RetentionProtect`** is decoder-only (the 2026-09-29 amendment).
+- **`RetentionProtect`** (the 2026-09-29 amendment).
+- **`SentinelCircuitBreak`**. The circuit-breaker machinery that emitted it was deleted
+  as dormant (#385). The variant, `CircuitState`, and the two circuit-breaker trip
+  counters remain as zero-valued contract surfaces.
 
-A payload variant, once written to a user's database, is therefore never removed or
-renamed, and its fixture stays. Retiring one would need the retention policy the
-2026-09-04 amendment declined to build, and that amendment already says such a policy
-must be designed rather than added incidentally.
+The 2026-09-29 amendment retires `RetentionProtect` "when no database that Urd supports
+upgrading from can still hold such a row". Under the 2026-09-04 decision that nothing
+deletes from `events`, a database that once held such a row still holds it, so the
+condition does not become true on its own. It becomes true only by a deliberate act:
+either a row migration that rewrites or drops those rows (the "migration first" path of
+ADR-105's 2026-09-29 amendment), or a declared minimum version that Urd supports
+upgrading from. Neither is planned. Until one is, both decoders and their fixtures stay,
+and neither variant is renamed.
 
 ### The heartbeat is the cross-process dispatch mailbox
 
@@ -467,10 +467,13 @@ the heartbeat file, not through the events table or a socket:
 
 The flag is an external contract (`docs/20-reference/heartbeat-schema.md`,
 ADR-105 Contract 5): a reader that sees `false` knows a run's notifications may not have
-reached the user. No code in Urd reads the flag back. A sentinel started after a failed
-delivery does not re-send it, because the sentinel's first assessment establishes a
-baseline and notifies nothing. The flag records whether a delivery happened. Nothing
-in Urd retries on it.
+reached the user.
+
+**Known gap: nothing reads the flag.** It is written as described above, and no code in
+Urd reads it back today. The original sentinel design intended a re-send when the flag
+is `false`; that retry was not built. A sentinel started after a failed delivery does not
+re-send it, because the sentinel's first assessment establishes a baseline and notifies
+nothing. Whether to implement the retry or retire the flag is open.
 
 This is recorded as a decision because it couples two processes through a file whose
 primary job is monitoring. The coupling is deliberate. The heartbeat is already written

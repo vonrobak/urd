@@ -196,6 +196,30 @@ the first and be refused by the second; the scope floor and `#` are the common c
 checks sit where the medium is known, in the pure function that produces the artifact, so
 the artifact cannot be produced without them.
 
+## Alternatives Considered
+
+- **A broad wildcard grant** (`<btrfs> *`, or `subvolume delete *`). One line, never
+  drifts, needs no oracle. Rejected: any process running as the user could delete any
+  subvolume on the host, live data included, and a path-construction bug in Urd would be
+  bounded by nothing. Scoping deletion to snapshot directories is the point of the grant.
+- **Escape every config value instead of refusing any.** Urd does escape what escaping
+  can neutralize (`escape_cmnd_token`). Rejected as the whole answer: a newline or other
+  control character, `#`, and the word `ALL` do not make a token odd, they change what the
+  line *is* (a continuation, a comment, a grant to everyone). An escaping rule that must
+  anticipate every such construct cannot be shown total, and a gap in it is a root grant
+  nobody asked for. Refusal is total by construction and costs only a config edit. Shallow
+  scopes are refused for a different reason that no escaping would address.
+- **Run Urd as root** (a system unit) **or through a privileged helper** (setuid binary,
+  polkit action). Rejected: running as root widens the root-running surface from a
+  handful of btrfs command shapes to the whole program, config parsing and rendering
+  included. A helper adds a privileged component that has to be written, secured,
+  packaged and installed separately, which is more to trust than a sudoers file the user
+  can read line by line.
+- **A hand-maintained sudoers file** (the state before the earning). Rejected: it drifts
+  from the config as drives and snapshot roots are added, the drift is invisible because
+  the file is root-only, and the first sign is a sudo refusal at 04:00. It fails in all
+  three ways the Context describes.
+
 ## Consequences
 
 ### Positive

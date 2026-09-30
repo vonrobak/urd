@@ -196,7 +196,7 @@ Its limits are those of a textual check:
   (`chain::read_pin_file`, say) passes the lint. The trait boundary below is what keeps
   that out, and review is what enforces the trait boundary.
 - **`voice/` is not in its list.** The renderers' clock half is held by
-  `scripts/check-voice-boundary.sh` (ADR-122), whose wall-clock check does not exempt
+  `scripts/check-voice-boundary.sh`, whose wall-clock check does not exempt
   tests.
 
 This is a hygiene lint in ADR-119's sense: it has no sanctioned caller, so it is not a

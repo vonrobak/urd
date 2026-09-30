@@ -185,15 +185,17 @@ Two shell lints now hold architectural boundaries in CI's `docs` job and in
   primitive in the production code of the pure modules (ADR-108's amendment of this date).
 - **`scripts/check-voice-boundary.sh`**: no mythic exposure label as a string literal
   outside `src/voice/`, no `colored` styling in `src/commands/`, and no wall clock in
-  `src/voice/` (ADR-122).
+  `src/voice/`.
 
 They are not rows in the registry, and this is deliberate. Rule 3 above admits a guard
 only when the rule is "one sanctioned caller". Both script lints ban a primitive across a
 set of modules and have no sanctioned caller. That makes them hygiene lints in this ADR's
 sense, even though what they protect is architectural. Their registries are their own:
 the purity script's list of pure modules follows architecture.md's pure rows, and the
-voice script's scope is the `src/voice/` directory. Each is described in the ADR that owns
-its boundary. Registering them here would give each rule two lists to keep in sync, and
+voice script's scope is the `src/voice/` directory. The purity lint is described in
+ADR-108's amendment of this date. The voice lint is described here and in its script's
+header; what the rendered voice may say is tested separately, in `src/voice_contract.rs`.
+Registering them here would give each rule two lists to keep in sync, and
 rule 2 exists to prevent exactly that.
 
 They share this ADR's accepted trade: the architecture is enforced from a file a reader

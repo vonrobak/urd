@@ -625,31 +625,54 @@ always were. This amendment records the gate as it now exists.
 Urd records, per subvolume, the effective retention shape under which its retention
 deletions were last applied: the local and external graduated tier counts as resolved on
 `ResolvedSubvolume` (state DB table `retention_shapes`, one upserted row, best-effort per
-ADR-102). At plan time a pure detector (`retention::tightened_since_recorded`) compares
-the configured shape with the recorded one. Retention has *tightened* when any local or
-external tier keeps fewer snapshots than before. That includes a tier dropping to none,
-bounded monthly after unlimited, and graduated-to-transient local.
+ADR-102). At plan time a pure decision in `retention.rs` compares the configured shape
+with the recorded one. Retention has *tightened* when any local or external tier keeps
+fewer snapshots than before. That includes a tier dropping to none, bounded monthly after
+unlimited, and graduated-to-transient local.
 
-For a named-level subvolume that tightened, a run without `--confirm-retention-change`
-proceeds with snapshots and sends (ADR-107 fail-open) but withholds that subvolume's
-retention deletions (`retention::decide_retention_gate`, `retention::apply_retention_gate`).
-It records a `RetentionChangeHeld` event carrying both shapes and the held count, and names
-the subvolume in the run summary, `urd plan`, `urd status` and `urd doctor`. A run with
-the flag applies the deletions and records the new shape, so the confirmation is needed
+**A held subvolume is pruned as the more generous policy would.** A named-level
+subvolume whose recorded shape is tighter than its current one is *held* until a run with
+`--confirm-retention-change`. While it is held, the run proceeds with snapshots and sends
+(ADR-107 fail-open), and a planned deletion is withheld only when the recorded (previous)
+retention would still keep that snapshot. Deletions the previous policy would also make
+proceed. During a hold, retention therefore behaves as it did before the change, and only
+the extra deletions the tightening causes wait. The hold is judged per half: a tightened
+external half never holds local deletions, and a tightened local half never holds
+external ones.
+
+**What is never held.** Space-pressure deletions (`DeleteKind::SpacePressure`: hourly
+thinning under pressure, space-governed external extras) always proceed. So do the local
+half's deletions while the pool is armed Tight or Critical: the storage tiers make local
+retention transient regardless of the declared shape (ADR-113), so the previous policy
+would delete them too. The emergency pre-flight, the watchdog reclaim and `urd emergency`
+are not gated.
+
+A held run records a `RetentionChangeHeld` event carrying both shapes and the held count,
+and names the subvolume in the run summary, `urd plan`, `urd status` and `urd doctor`. A
+run with the flag applies the new shape and records it, so the confirmation is needed
 once per tightening.
 
 Unchanged, loosened, custom and never-recorded subvolumes are recorded without being held.
-The first run after upgrade therefore gates nothing, and a custom-to-named switch is judged
-against the custom retention it replaced. A run records only the subvolumes in its filter
-scope, and only the halves it applied (`--local-only` the local half, `--external-only`
-the external half). The other half keeps its previous value or stays absent. A subvolume
-with sends disabled is judged on local retention only.
+The first run after upgrade therefore holds nothing, and a custom-to-named switch is
+judged against the custom retention it replaced. A run records only the subvolumes in its
+filter scope, and only the halves it applied (`--local-only` the local half,
+`--external-only` the external half). The other half keeps its previous value or stays
+absent. A subvolume with sends disabled is judged on local retention only.
 
 The scheduled unit (`systemd/urd-backup.service`, `urd backup --auto`) does not pass the
-flag; a tightening is confirmed by a person, once. If the history DB cannot be read,
-nothing is held (ADR-102) and the run logs a warning that no retention-tightening gate
-applies. `urd plan` and `urd backup --dry-run` apply the same decision read-only (ADR-100's
-amendment of this date).
+flag; a tightening is confirmed by a person, once. If the history DB cannot be read, the
+baseline is unknown: nothing is held, nothing is recorded (ADR-102), and the run logs a
+warning that no retention-tightening gate applies. `urd plan` and `urd backup --dry-run`
+apply the same decision read-only (ADR-100's amendment of this date).
+
+**Trade-off: a lost baseline releases a pending hold.** If the state DB is deleted or
+recreated, the baseline is empty, every subvolume counts as first seen, and a pending
+tightening applies without a hold. This is accepted. The DB is expendable history
+(ADR-102), and failing closed on an unknown baseline would mean holding deletions with no
+bound.
+
+**Known gap.** A hold is surfaced in `urd status`, `urd doctor`, `urd plan`, the run
+summary and the event log, but not yet as a notification.
 
 The Risks bullet "mitigated by `--confirm-retention-change` flag and fail-open retention
 skip" and the Implementation Gates item "`--confirm-retention-change` flag gates retention

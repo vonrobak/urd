@@ -32,8 +32,10 @@ Urd fills that gap:
 - **Space-aware.** Pre-send size estimation prevents multi-hour transfers from failing
   at 99% due to insufficient space on the target drive.
 - **Plan before execute.** `urd plan` previews what `urd backup` would do, including any
-  retention deletions it would hold. `urd backup --dry-run` plans and gates the run the same
-  way, prints the plan, and exits without touching the filesystem.
+  retention deletions it would hold. `urd backup --dry-run` applies the same retention hold,
+  prints the plan, and exits without touching the filesystem. A drive whose identity check
+  fails is named in the preview, but its sends still appear in the plan; they are blocked
+  only in a real run.
 - **Promise-based monitoring.** Assign protection levels to subvolumes. Urd derives
   retention schedules, send intervals, and drive requirements — then tells you whether
   those promises are being kept.

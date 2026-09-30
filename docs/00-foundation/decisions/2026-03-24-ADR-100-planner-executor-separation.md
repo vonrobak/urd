@@ -197,7 +197,8 @@ deletion for every promise-level subvolume on any run without
 `--confirm-retention-change`, whether or not retention had changed. Its replacement is
 the retention-change gate (ADR-110's amendment of this date): `retention::decide_retention_gate`
 decides, from the recorded retention shapes, which subvolumes' retention *tightened*;
-`retention::apply_retention_gate` removes only those subvolumes' retention deletions.
+`retention::apply_retention_gate` removes, for those subvolumes only, the retention
+deletions the recorded (previous) retention would not have made.
 Both are pure. The removal rule from the 2026-09-04 amendment still holds: the gate only
 shrinks the plan.
 

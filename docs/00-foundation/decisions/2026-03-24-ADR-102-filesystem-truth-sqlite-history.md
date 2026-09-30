@@ -131,9 +131,9 @@ The schema is in `src/state/schema.rs` (`init_schema`); the 2026-09-04 inventory
 The `drive_tokens` row's "token gating in `commands/backup.rs`" is
 `commands/backup/gating.rs`.
 
-The 2026-09-04 amendment says two tables are read back into decisions. With this table
-there are three, and `drive_tokens` was already a fourth. Each degrades in a stated
-direction:
+The 2026-09-04 amendment says two tables are read back into decisions (`subvolume_sizes`
+and `pool_armed_tier`). Four are: that list omitted `drive_tokens`, which token gating
+reads, and `retention_shapes` is new. Each degrades in a stated direction:
 
 - **`subvolume_sizes`** and **`pool_armed_tier`**: as the 2026-09-04 amendment says, an
   estimate and a hysteresis memo. Their loss makes the next decision from live signals.

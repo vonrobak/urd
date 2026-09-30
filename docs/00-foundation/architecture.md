@@ -56,6 +56,9 @@ flowchart LR
         btrfsproc{{"sudo btrfs<br/>(snapshot · send · receive · delete)"}}
         chain["chain.rs<br/>pin files"]
         probes["probes.rs<br/>read-only process probes<br/>(findmnt · lsblk · sudo -n -l)"]
+        pools["pools.rs<br/>pool UUID · free space"]
+        signals["commands/storage_signals.rs<br/>gather pool signals"]
+        backupcmd["commands/backup/<br/>run driver"]
         lock["lock.rs<br/>exclusive flock"]
         recorder["recorder.rs<br/>stamp · persist · dispatch"]
     end
@@ -80,12 +83,14 @@ flowchart LR
     %% Edges — main pipeline
     cfg --> plan
     obs --> plan
-    probes -.pool signals.-> storagecrit
+    probes --> pools --> signals
+    signals -.pool signals.-> arming
     storagecrit --> arming
     arming --> plan
     db --> plan
     plan --> executor
-    lock -.held by.-> executor
+    backupcmd -.acquire.-> lock
+    backupcmd --> executor
     executor --> btrfs --> btrfsproc
     executor --> chain
     executor --> db
@@ -200,7 +205,7 @@ Test-only support modules (`testkit`) are omitted.
 | `chain.rs` | Track incremental chain parents (pin files) | Send snapshots |
 | `state/` | Record history in SQLite — granular SQL wrappers (one method per query), one `impl StateDb` file per table family (`schema`, `runs`, `calibration`, `drives`, `drift`, `posture`, `retention`, `events`); a SQLite failure is `UrdError::State` with the `rusqlite::Error` as its source | Decide; it supplies recorded facts the planner and the gates consult (the armed-tier memo `pool_armed_tier`, `drive_tokens`, `retention_shapes`, send history) and never blocks a backup when it cannot; compose domain-shaped answers (callers compose primitives) |
 | `preflight.rs` | Validate config achievability (pure, advisory) | Block backups |
-| `heartbeat.rs` | Write the JSON health signal after each run; read the previous heartbeat (the run tail's notification baseline, the sentinel's overdue check) and mark it dispatched (`mark_dispatched`) — the file is also the backup↔sentinel dispatch mailbox (ADR-114); define the per-subvolume projections it shares with metrics (`ChurnHeartbeatFields`, `SubvolumeExtras`) | Block backups on failure; retry an undelivered notification (nothing reads the dispatched flag back) |
+| `heartbeat.rs` | Write the JSON health signal after each run; read the previous heartbeat (the run tail's notification baseline, the sentinel's overdue check) and mark it dispatched (`mark_dispatched`) — the file is also the backup↔sentinel dispatch mailbox (ADR-114); define the per-subvolume projections it shares with metrics (`ChurnHeartbeatFields`, `SubvolumeExtras`) | Block backups on failure; retry an undelivered notification (nothing reads the dispatched flag today; an open gap, ADR-114) |
 | `metrics.rs` | Write Prometheus `.prom` files; read the previous file for carry-forward (`read_existing_timestamps`, `read_existing_pool_rows`), so a subvolume or absent drive's last-seen values survive a run that did not measure them | Read metrics from anywhere but its own previous file; decide anything |
 | `notify.rs` | Compute and dispatch notifications (consumes awareness) — both the backup path's heartbeat diff and the sentinel path's content builders (promise and health changes, backup overdue, drive anomaly) | Decide promise states; decide *when* the sentinel notifies (first-run suppression, debounce and change detection are the runner's and `sentinel.rs`'s) |
 | `drift.rs` | Pure: rolling time-windowed churn aggregation from `drift_samples`; `render_churn` maps the estimate onto `output::ChurnRender` | Perform I/O or persist |
@@ -228,13 +233,13 @@ Test-only support modules (`testkit`) are omitted.
 | `error.rs` | Error types; `translate_btrfs_error()` for actionable messages | Recovery logic |
 | `commands/world.rs` | The observed-world prelude: `World::open` owns the best-effort `StateDb` + read-only `RealBtrfs`; Layer 1 `world.view()` returns an owned `WorldView { signals, assessments }` for `status`/`default`/`doctor`; Layer 2 `world.fs()`/`world.observation()` serve `plan_cmd`/`backup`, which hold the `Observation` for their own timing; the sole sanctioned production door onto `advice::assess_view` (clippy `disallowed-methods` guard) via `world::assess` | Compute or decide anything; cache signals across calls |
 | `commands/emergency.rs` | `urd emergency` and the shared emergency walk: gathers each non-transient subvolume's snapshots and strict pin set and applies the pure `emergency_candidates` decision (`emergency_walk`, which the backup's emergency pre-flight also selects through), assesses each root against the interactive rung (`assess_roots`), renders through voice, asks for confirmation, and deletes exactly the confirmed set through `Executor::delete_candidates` | Call `delete_subvolume` itself (the executor owns the deletion loop and its layer-3 re-check); decide the crisis thresholds (`guard.rs`) |
-| `commands/backup/` | The `urd backup` run: `run` (`mod.rs`) sequences plan → gate → execute → run tail in contract order; its sub-modules hold the I/O wiring it delegates to — the watchdog thread and trip response (`watchdog.rs`), worker-thread teardown (`threads.rs`), the progress display and completion sink (`progress.rs`), the emergency pre-flight (`preflight.rs`), token probes/gating and the retention baseline record (`gating.rs`), the metrics and pool-observability gather (`observability.rs`), the summaries (`summary.rs`), the orphaned-reserve sweep (`reserve.rs`) | Decide the watchdog's response (`guard.rs`) or the run tail (`run_tail.rs`); format the send progress and completion lines (`voice/progress.rs`) |
+| `commands/backup/` | The `urd backup` run: `run` (`mod.rs`) sequences plan → gate → execute → run tail in contract order; its sub-modules hold the I/O wiring it delegates to — the watchdog thread and trip response (`watchdog.rs`), worker-thread teardown (`threads.rs`), the progress display and completion sink (`progress.rs`), the emergency pre-flight (`preflight.rs`), token probes/gating and the retention baseline record (`gating.rs`), the metrics and pool-observability gather (`observability.rs`), and the summaries (`summary.rs`) | Decide the watchdog's response (`guard.rs`) or the run tail (`run_tail.rs`); format the send progress and completion lines (`voice/progress.rs`) |
 | `commands/storage_signals.rs` | The storage-signal I/O boundary: `gather` reads each source pool's UUID, mountpoint, and free ratio (through `pools.rs`) and the persisted prior armed tier, into the `PoolSignal`s `RunArming::resolve` reads and the per-subvolume signal map `assess()` reads; the read paths' display aggregators (`aggregate`, `aggregate_adaptations`); `pool_floor_bytes`; the `writeback` submodule, which only `urd backup` calls after execution to advance and persist the armed tier (clippy-guarded) | Derive tiers or arming (`storage_critical.rs`, `arming.rs`); advance hysteresis on a read path |
 | `commands/encounter.rs` | The Encounter's I/O: the stdin loop driving the pure `encounter.rs` state machine, the delve-deeper editor loop, `fix_invalid_config` (the TTY fix-it loop), and the carve (`carve_config`: self-check the generated config, refuse anything dishonest, publish atomically without clobbering) | Decide the conversation (`encounter.rs`); render TOML (`config_render.rs`); render text (`voice/encounter.rs`) |
 | `commands/migrate.rs` | `urd migrate`: rewrite a legacy or v1 config file to the v2 schema in one hop (`--dry-run` prints the result instead), before any config load (ADR-111) | Run with a loaded `Config`; touch backups or state |
 | `commands/init.rs` | `urd init`: with no config, offer the Encounter (or print the pointer and exit 3 without a terminal); with an invalid one, the fix-it loop; with a loadable one, the seal gap gate (`seal::seal_gap_deep`) — resuming an incomplete seal through `seal::resume_seal` when a human is on both ends — then the infrastructure checks (`collect_infrastructure_checks`) | Own the seal's stages (`commands/seal.rs`); render text (`voice/init.rs`) |
 | `commands/` | CLI subcommand handlers (wire pure modules to I/O) | Core logic (delegate to the modules above) |
-| `main.rs` | Parse the CLI and dispatch every command from one exhaustive match: the config-free commands (`completions`, `migrate`), the fallible-load doorsteps (bare `urd`, `urd init`), and the rest behind one config load; map results to the exit-code contract (ADR-121: 0 done, 1 failure, 2 usage, 3 not configured via `CliExit`) | Contain command logic; panic |
+| `main.rs` | Parse the CLI and dispatch every command from one exhaustive match: the config-free commands (`completions`, `migrate`), the fallible-load doorsteps (bare `urd`, `urd init`), and the rest behind one config load; map results to the exit codes (`docs/20-reference/cli.md`: 0 done, 1 failure, 2 usage, 3 not configured via `CliExit`) | Contain command logic; panic |
 
 ## What the events table is for (ADR-114)
 
