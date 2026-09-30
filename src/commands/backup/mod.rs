@@ -50,7 +50,7 @@ use self::progress::{build_size_estimates, print_completion_line, progress_displ
 use self::reserve::sweep_orphaned_reserves;
 use self::summary::{build_backup_summary, build_empty_plan_explanation, emergency_reclaim_warnings};
 use self::threads::{join_logged, take_firings};
-use self::watchdog::{arm_watchdog_pools, watchdog_loop};
+use self::watchdog::{arm_watchdog_pools, watchdog_loop, WatchdogCtx};
 
 pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     // Share one config across the run AND the watchdog thread (UPI 065-b): the
@@ -414,28 +414,21 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
         None
     } else {
         let pools = armed_pools.clone();
-        let abort = watchdog_abort.clone();
-        let coord = watchdog_coord.clone();
-        let wd_shutdown = watchdog_shutdown.clone();
-        let firing_slot = firing.clone();
         // Cross-filesystem reclaim plumbing owned by the thread (M1 — NO DB
         // connection moves here): a maintenance btrfs handle + an owned config
         // build a transient `Executor` at reclaim time; the away map is the
         // spawn-time snapshot, re-filtered to still-unmounted drives (S3).
+        let wd_ctx = WatchdogCtx {
+            abort: watchdog_abort.clone(),
+            coord: watchdog_coord.clone(),
+            shutdown: watchdog_shutdown.clone(),
+            firings: firing.clone(),
+            config: Arc::clone(&config),
+        };
         let maint_btrfs = RealBtrfs::for_maintenance(&config.general.btrfs_path);
-        let wd_config = Arc::clone(&config);
         let wd_away = arming.away_shed.clone();
         Some(std::thread::spawn(move || {
-            watchdog_loop(
-                &pools,
-                &abort,
-                &coord,
-                &wd_shutdown,
-                &firing_slot,
-                &maint_btrfs,
-                &wd_config,
-                &wd_away,
-            );
+            watchdog_loop(&pools, &wd_ctx, &maint_btrfs, &wd_away);
         }))
     };
 

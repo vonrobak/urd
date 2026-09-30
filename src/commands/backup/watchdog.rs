@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -52,6 +52,24 @@ pub(super) struct ArmedPool {
     label: String,
     /// Send-enabled subvolumes on this pool, for the Step-5b abort-reclaim.
     subvol_names: Vec<String>,
+}
+
+/// The shared cells the watchdog thread reads and writes, bundled so the loop
+/// and the trip response take one context instead of five loose handles. Owned
+/// `Arc`s (cheap `Clone`): the spawning thread keeps its own clones of the cells
+/// it later reads back (`abort` via the executor, `firings` via `take_firings`).
+#[derive(Clone)]
+pub(super) struct WatchdogCtx {
+    /// The executor's send-cancel flag; set on a same-filesystem trip.
+    pub(super) abort: Arc<AtomicBool>,
+    /// Trip-then-read coordination cell shared with the executor (C2).
+    pub(super) coord: Arc<Mutex<WatchdogCoord>>,
+    /// Main-thread teardown signal: the loop returns once it is set.
+    pub(super) shutdown: Arc<AtomicBool>,
+    /// One `WatchdogFiring` per tripped pool, drained by the teardown.
+    pub(super) firings: Arc<Mutex<Vec<WatchdogFiring>>>,
+    /// Owned config for the cross-filesystem transient `Executor` (UPI 065-b).
+    pub(super) config: Arc<Config>,
 }
 
 /// Build the armed-pool list from the pre-plan gather (UPI 033). Production
@@ -201,20 +219,15 @@ fn arm_watchdog_pools_with(
 /// keeps polling after a trip (each pool fires at most once — `done`), so an
 /// independent pool's pressure is still caught. The absolute floor is suppressed
 /// for a pool that started below it (see `guard::watchdog_step`).
-#[allow(clippy::too_many_arguments)]
 pub(super) fn watchdog_loop(
     pools: &[ArmedPool],
-    abort: &AtomicBool,
-    coord: &Mutex<WatchdogCoord>,
-    watchdog_shutdown: &AtomicBool,
-    firing: &Mutex<Vec<WatchdogFiring>>,
+    ctx: &WatchdogCtx,
     // Cross-filesystem reclaim plumbing (UPI 065-b, M1 — NO DB connection moves to
-    // this thread): a maintenance btrfs handle and the config build a transient
-    // `Executor` that calls the existing `emergency_reclaim_pool`; the away map is
-    // the spawn-time snapshot, re-filtered to still-unmounted drives at reclaim
-    // time (S3).
+    // this thread): a maintenance btrfs handle and the config (`ctx.config`) build
+    // a transient `Executor` that calls the existing `emergency_reclaim_pool`; the
+    // away map is the spawn-time snapshot, re-filtered to still-unmounted drives at
+    // reclaim time (S3).
     maint_btrfs: &dyn BtrfsOps,
-    config: &Config,
     away_at_spawn: &HashMap<String, Vec<String>>,
 ) {
     let mut started_below: HashMap<PathBuf, bool> = HashMap::new();
@@ -223,7 +236,7 @@ pub(super) fn watchdog_loop(
     // *other* independent pools without re-processing this one.
     let mut done: HashSet<PathBuf> = HashSet::new();
     loop {
-        if watchdog_shutdown.load(Ordering::Relaxed) {
+        if ctx.shutdown.load(Ordering::Relaxed) {
             return;
         }
         for pool in pools {
@@ -251,17 +264,10 @@ pub(super) fn watchdog_loop(
             match guard::watchdog_step(space.free_bytes, pool.floor_bytes, pool.min_free_bytes, below) {
                 WatchdogAction::Continue => {}
                 WatchdogAction::Abort => {
-                    let firing_record = handle_watchdog_trip(
-                        pool,
-                        abort,
-                        coord,
-                        maint_btrfs,
-                        config,
-                        away_at_spawn,
-                    );
+                    let firing_record = handle_watchdog_trip(pool, ctx, maint_btrfs, away_at_spawn);
                     // Recover a poisoned slot (as `take_firings` does): dropping the
                     // record would lose the trip's reclaim, event, and notification.
-                    firing
+                    ctx.firings
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .push(firing_record);
@@ -291,14 +297,13 @@ pub(super) fn watchdog_loop(
 #[must_use]
 fn handle_watchdog_trip(
     pool: &ArmedPool,
-    abort: &AtomicBool,
-    coord: &Mutex<WatchdogCoord>,
+    ctx: &WatchdogCtx,
     maint_btrfs: &dyn BtrfsOps,
-    config: &Config,
     away_at_spawn: &HashMap<String, Vec<String>>,
 ) -> WatchdogFiring {
+    let config: &Config = &ctx.config;
     let in_flight = {
-        let mut g = coord.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut g = ctx.coord.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         for r in &pool.roots {
             g.tripped.insert(r.clone());
         }
@@ -312,7 +317,7 @@ fn handle_watchdog_trip(
             "Watchdog: {} below floor — aborting in-flight send (same-filesystem; host survival)",
             pool.label
         );
-        abort.store(true, Ordering::SeqCst);
+        ctx.abort.store(true, Ordering::SeqCst);
         WatchdogFiring {
             pool_label: pool.label.clone(),
             subvol_names: pool.subvol_names.clone(),
@@ -492,25 +497,30 @@ mod tests {
     /// plumbing (`RealBtrfs::for_maintenance` — Send, unlike the `RefCell`-backed
     /// `MockBtrfs`; `wd_config`; empty away) is inert for these no-trip cases.
     fn run_loop_briefly(pool: ArmedPool) -> (bool, Vec<WatchdogFiring>) {
-        let abort = Arc::new(AtomicBool::new(false));
-        let coord = Arc::new(Mutex::new(WatchdogCoord::default()));
-        let wd_shutdown = Arc::new(AtomicBool::new(false));
-        let firing: Arc<Mutex<Vec<WatchdogFiring>>> = Arc::new(Mutex::new(Vec::new()));
-        let a = abort.clone();
-        let c = coord.clone();
-        let wd = wd_shutdown.clone();
-        let f = firing.clone();
+        let ctx = test_ctx(WatchdogCoord::default());
+        let thread_ctx = ctx.clone();
         let handle = std::thread::spawn(move || {
             let maint = RealBtrfs::for_maintenance("/usr/sbin/btrfs");
-            let cfg = wd_config();
             let away: HashMap<String, Vec<String>> = HashMap::new();
-            watchdog_loop(&[pool], &a, &c, &wd, &f, &maint, &cfg, &away);
+            watchdog_loop(&[pool], &thread_ctx, &maint, &away);
         });
         std::thread::sleep(Duration::from_millis(50)); // ≥1 poll
-        wd_shutdown.store(true, Ordering::SeqCst);
+        ctx.shutdown.store(true, Ordering::SeqCst);
         handle.join().unwrap();
-        let firings = firing.lock().unwrap().clone();
-        (abort.load(Ordering::SeqCst), firings)
+        let firings = ctx.firings.lock().unwrap().clone();
+        (ctx.abort.load(Ordering::SeqCst), firings)
+    }
+
+    /// A fresh `WatchdogCtx` over `wd_config()` with the given coordination cell
+    /// (abort/shutdown clear, no firings).
+    fn test_ctx(coord: WatchdogCoord) -> WatchdogCtx {
+        WatchdogCtx {
+            abort: Arc::new(AtomicBool::new(false)),
+            coord: Arc::new(Mutex::new(coord)),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            firings: Arc::new(Mutex::new(Vec::new())),
+            config: Arc::new(wd_config()),
+        }
     }
 
     #[test]
@@ -567,19 +577,17 @@ mod tests {
             u64::MAX,
             vec!["alpha".to_string()],
         );
-        let abort = AtomicBool::new(false);
-        let coord = Mutex::new(WatchdogCoord {
+        let ctx = test_ctx(WatchdogCoord {
             in_flight: Some(other_root.clone()), // ≠ poll_path, but IS a pool root
             tripped: HashSet::new(),
         });
         let mock = crate::btrfs::MockBtrfs::new();
-        let cfg = wd_config();
         let away = HashMap::new();
-        let firing = handle_watchdog_trip(&pool, &abort, &coord, &mock, &cfg, &away);
-        assert!(abort.load(Ordering::SeqCst), "same-fs (by membership) must abort the in-flight send");
+        let firing = handle_watchdog_trip(&pool, &ctx, &mock, &away);
+        assert!(ctx.abort.load(Ordering::SeqCst), "same-fs (by membership) must abort the in-flight send");
         assert!(firing.send_aborted);
         assert!(firing.reclaim.is_none(), "same-fs reclaim is deferred to teardown");
-        let g = coord.lock().unwrap();
+        let g = ctx.coord.lock().unwrap();
         assert!(
             g.tripped.contains(&poll) && g.tripped.contains(&other_root),
             "all of the pool's roots are gated"
@@ -594,13 +602,11 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let poll = dir.path().to_path_buf();
         let pool = test_armed_pool(poll.clone(), vec![poll], u64::MAX, vec!["alpha".to_string()]);
-        let abort = AtomicBool::new(false);
-        let coord = Mutex::new(WatchdogCoord::default()); // in_flight = None
+        let ctx = test_ctx(WatchdogCoord::default()); // in_flight = None
         let mock = crate::btrfs::MockBtrfs::new();
-        let cfg = wd_config();
         let away = HashMap::new();
-        let firing = handle_watchdog_trip(&pool, &abort, &coord, &mock, &cfg, &away);
-        assert!(abort.load(Ordering::SeqCst));
+        let firing = handle_watchdog_trip(&pool, &ctx, &mock, &away);
+        assert!(ctx.abort.load(Ordering::SeqCst));
         assert!(firing.send_aborted);
     }
 
@@ -618,22 +624,20 @@ mod tests {
             u64::MAX,
             vec!["alpha".to_string()],
         );
-        let abort = AtomicBool::new(false);
-        let coord = Mutex::new(WatchdogCoord {
+        let ctx = test_ctx(WatchdogCoord {
             in_flight: Some(foreign.clone()),
             tripped: HashSet::new(),
         });
         let mock = crate::btrfs::MockBtrfs::new();
-        let cfg = wd_config();
         let away = HashMap::new();
-        let firing = handle_watchdog_trip(&pool, &abort, &coord, &mock, &cfg, &away);
-        assert!(!abort.load(Ordering::SeqCst), "cross-fs must NOT abort the unrelated send");
+        let firing = handle_watchdog_trip(&pool, &ctx, &mock, &away);
+        assert!(!ctx.abort.load(Ordering::SeqCst), "cross-fs must NOT abort the unrelated send");
         assert!(!firing.send_aborted);
         assert!(
             firing.reclaim.is_some(),
             "cross-fs reclaims this pool concurrently on the watchdog thread"
         );
-        let g = coord.lock().unwrap();
+        let g = ctx.coord.lock().unwrap();
         assert!(g.tripped.contains(&poll), "this pool's roots are gated");
         assert!(!g.tripped.contains(&foreign), "the in-flight (foreign) pool is NEVER gated");
     }
@@ -646,8 +650,8 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let poll = dir.path().to_path_buf();
         let pool = test_armed_pool(poll.clone(), vec![poll.clone()], u64::MAX, vec!["alpha".to_string()]);
-        let abort = AtomicBool::new(false);
-        let coord = Mutex::new(WatchdogCoord::default());
+        let ctx = test_ctx(WatchdogCoord::default());
+        let coord = &ctx.coord;
         std::thread::scope(|s| {
             let _ = s
                 .spawn(|| {
@@ -658,9 +662,8 @@ mod tests {
         });
         assert!(coord.is_poisoned());
         let mock = crate::btrfs::MockBtrfs::new();
-        let cfg = wd_config();
         let away = HashMap::new();
-        let firing = handle_watchdog_trip(&pool, &abort, &coord, &mock, &cfg, &away);
+        let firing = handle_watchdog_trip(&pool, &ctx, &mock, &away);
         assert!(firing.send_aborted, "no send in flight → same-fs abort path");
         let g = coord.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         assert!(g.tripped.contains(&poll), "a poisoned lock must not drop the trip");
