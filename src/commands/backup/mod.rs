@@ -11,7 +11,6 @@ mod gating;
 mod observability;
 mod preflight;
 mod progress;
-mod reserve;
 mod summary;
 #[cfg(test)]
 mod test_fixtures;
@@ -48,7 +47,6 @@ use self::gating::{apply_token_gating, probe_drive_tokens, record_retention_shap
 use self::observability::{build_churn_views, gather_pool_observability, write_metrics_per_spec};
 use self::preflight::run_emergency_preflight;
 use self::progress::{build_size_estimates, print_completion_line, progress_display_loop};
-use self::reserve::sweep_orphaned_reserves;
 use self::summary::{build_backup_summary, build_empty_plan_explanation, emergency_reclaim_warnings};
 use self::threads::{join_logged, take_firings};
 use self::watchdog::{arm_watchdog_pools, watchdog_loop, WatchdogCtx};
@@ -729,16 +727,6 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     let output_mode = OutputMode::detect();
     let rendered = crate::voice::render_backup_summary(&summary, output_mode);
     println!("{rendered}");
-
-    // ── Orphaned-reserve sweep (UPI 067, one-release cleanup) ──────────
-    // The fast-bridge reserve lifecycle (UPI 033) is retired with the cliff:
-    // nothing creates a `.urd-emergency-reserve` any more, and the code that
-    // unlinked one is gone. Pools that were Tight/Roomy at an earlier run still
-    // carry the `fallocate`'d footprint on disk — so sweep them best-effort here,
-    // where reserve creation used to run. Unconditional (orphans must be reclaimed
-    // even on a failed or watchdog-fired run); idempotent. Self-removes one release
-    // after 067 ships (see registry follow-up).
-    sweep_orphaned_reserves(&config, &signals);
 
     // Exit with appropriate code
     if tail.run_failed {
