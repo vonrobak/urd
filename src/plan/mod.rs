@@ -21,6 +21,7 @@ mod types;
 // these too, so both paths resolve.
 pub use types::{
     BackupPlan, DeleteKind, NothingNew, PlannedLifecycle, PlannedOperation, PlannedSkip,
+    SkipReason,
 };
 
 #[cfg(test)]
@@ -61,17 +62,16 @@ fn send_floor_defer_reason(
     subvol: &ResolvedSubvolume,
     local_dir: &Path,
     obs: &Observation,
-) -> Option<String> {
+) -> Option<SkipReason> {
     let capacity = obs.fs.filesystem_capacity_bytes(local_dir).unwrap_or(0);
     let floor = crate::guard::source_floor_bytes(subvol.min_free_bytes.unwrap_or(0), capacity);
     let free = free_bytes_fail_open(obs, local_dir);
     if free < floor {
         use crate::types::ByteSize;
-        Some(format!(
-            "source pool below the host-survival floor ({} free, {} required) — deferring send",
-            ByteSize(free),
-            ByteSize(floor),
-        ))
+        Some(SkipReason::SourceBelowFloor {
+            free: ByteSize(free),
+            required: ByteSize(floor),
+        })
     } else {
         None
     }
@@ -173,10 +173,11 @@ fn check_drive_availability(
     obs: &Observation,
     now: NaiveDateTime,
 ) -> DriveGate {
-    // Every defer arm is drive-scoped with no next-due — only the reason prose
+    // Every defer arm is drive-scoped with no next-due — only the reason
     // differs. One closure keeps the shape single-homed and the reasons the
     // only per-arm variation.
-    let deferred = |reason: String| {
+    let label = || drive.label.clone();
+    let deferred = |reason: SkipReason| {
         let mut f = fragment::PlanFragment::default();
         f.defer(
             subvol_name,
@@ -190,22 +191,30 @@ fn check_drive_availability(
     };
     match obs.fs.drive_availability(drive) {
         DriveAvailability::Available => DriveGate::Ready,
-        DriveAvailability::NotMounted => deferred(format!("drive {} not mounted", drive.label)),
-        DriveAvailability::UuidMismatch { expected, found } => deferred(format!(
-            "drive {} UUID mismatch (expected {}, found {})",
-            drive.label, expected, found
-        )),
-        DriveAvailability::UuidCheckFailed(reason) => {
-            deferred(format!("drive {} UUID check failed: {}", drive.label, reason))
+        DriveAvailability::NotMounted => deferred(SkipReason::DriveNotMounted { drive: label() }),
+        DriveAvailability::UuidMismatch { expected, found } => {
+            deferred(SkipReason::DriveUuidMismatch {
+                drive: label(),
+                expected,
+                found,
+            })
         }
-        DriveAvailability::TokenMismatch { expected, found } => deferred(format!(
-            "drive {} token mismatch (expected {}, found {}) — possible drive swap",
-            drive.label, expected, found
-        )),
-        DriveAvailability::TokenExpectedButMissing => deferred(format!(
-            "drive {} token expected but missing \u{2014} run `urd drives adopt {}`",
-            drive.label, drive.label
-        )),
+        DriveAvailability::UuidCheckFailed(error) => {
+            deferred(SkipReason::DriveUuidCheckFailed {
+                drive: label(),
+                error,
+            })
+        }
+        DriveAvailability::TokenMismatch { expected, found } => {
+            deferred(SkipReason::DriveTokenMismatch {
+                drive: label(),
+                expected,
+                found,
+            })
+        }
+        DriveAvailability::TokenExpectedButMissing => {
+            deferred(SkipReason::DriveTokenExpectedButMissing { drive: label() })
+        }
         // Benign: first use or pre-token drive. Proceed with send.
         DriveAvailability::TokenMissing => DriveGate::Ready,
     }
@@ -252,8 +261,8 @@ pub fn plan(
 ) -> crate::error::Result<BackupPlan> {
     // The run's single accumulator (UPI 089-c): every region fragment is
     // absorbed and every body defer recorded here, in emission order.
-    // Skip reason strings are classified by output::SkipCategory::from_reason().
-    // When adding new patterns, update output::tests::classify_all_18_patterns.
+    // Skip reasons are typed (`SkipReason`); a new variant must choose its
+    // prose (`Display`) and its `SkipCategory` in plan/types.rs.
     let mut f = fragment::PlanFragment::default();
     let mut judgments: Vec<SubvolJudgment> = Vec::new();
     let mut lifecycles: std::collections::HashMap<String, PlannedLifecycle> =
@@ -268,7 +277,7 @@ pub fn plan(
             f.defer(
                 &subvol.name,
                 None,
-                "disabled".to_string(),
+                SkipReason::Disabled,
                 None,
                 DeferScope::Subvolume,
                 now,
@@ -292,7 +301,7 @@ pub fn plan(
             f.defer(
                 &subvol.name,
                 None,
-                "no snapshot root configured".to_string(),
+                SkipReason::NoSnapshotRoot,
                 None,
                 DeferScope::Subvolume,
                 now,
@@ -476,7 +485,7 @@ pub fn plan(
             f.defer(
                 &subvol.name,
                 None,
-                "local only".to_string(),
+                SkipReason::LocalOnly,
                 None,
                 DeferScope::Subvolume,
                 now,
@@ -582,7 +591,8 @@ fn orphan_invariant_violations(
             violations.push(format!(
                 "{} has CreateSnapshot alongside a nothing-new-to-send defer ({:?}) — \
                  the send planner did not see tonight's snapshot; it will be stranded",
-                j.name, skip.reason
+                j.name,
+                skip.reason.to_string()
             ));
         }
     }

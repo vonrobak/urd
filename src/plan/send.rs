@@ -1,5 +1,5 @@
 use crate::events::{DeferScope, Event, EventPayload};
-use crate::plan::{NothingNew, PlannedOperation};
+use crate::plan::{NothingNew, PlannedOperation, SkipReason};
 use crate::types::{FullSendReason, SendKind, SnapshotName};
 
 use super::fragment::{PlanFragment, SendInputs, SubvolInputs};
@@ -72,11 +72,10 @@ pub(super) fn plan_external_send(i: &SendInputs) -> PlanFragment {
         f.defer(
             &subvol.name,
             Some(&drive.label),
-            format!(
-                "send to {} not due (next in ~{})",
-                drive.label,
-                super::format_duration_short(mins)
-            ),
+            SkipReason::SendNotDue {
+                drive: drive.label.clone(),
+                next_in_minutes: mins,
+            },
             Some(mins),
             DeferScope::Drive,
             now,
@@ -139,42 +138,32 @@ pub(super) fn plan_external_send(i: &SendInputs) -> PlanFragment {
     {
         use crate::types::ByteSize;
         let reason = if source == super::SizeEstimateSource::Calibrated {
-            let staleness = obs
+            let stale_calibration_days = obs
                 .history
                 .calibrated_size(&subvol.name)
-                .map(|(_, measured_at)| {
+                .and_then(|(_, measured_at)| {
                     // Age against the planner's `now`, never the wall clock
                     // (ADR-108): the same inputs word the same note.
                     let age_days =
                         chrono::NaiveDateTime::parse_from_str(&measured_at, "%Y-%m-%dT%H:%M:%S")
                             .map(|ts| (now - ts).num_days())
                             .unwrap_or(365); // corrupt timestamp → treat as stale, not fresh
-                    if age_days > 30 {
-                        format!(
-                            " (calibrated {} days ago — run `urd calibrate` to refresh)",
-                            age_days
-                        )
-                    } else {
-                        String::new()
-                    }
-                })
-                .unwrap_or_default();
-            format!(
-                "send to {} skipped: calibrated size ~{} exceeds {} available{}",
-                drive.label,
-                ByteSize(estimated),
-                ByteSize(available),
-                staleness,
-            )
+                    (age_days > 30).then_some(age_days)
+                });
+            SkipReason::CalibratedSizeExceedsSpace {
+                drive: drive.label.clone(),
+                estimated: ByteSize(estimated),
+                available: ByteSize(available),
+                stale_calibration_days,
+            }
         } else {
-            format!(
-                "send to {} skipped: estimated ~{} exceeds {} available (free: {}, min_free: {})",
-                drive.label,
-                ByteSize(estimated),
-                ByteSize(available),
-                ByteSize(free),
-                ByteSize(min_free),
-            )
+            SkipReason::EstimatedSizeExceedsSpace {
+                drive: drive.label.clone(),
+                estimated: ByteSize(estimated),
+                available: ByteSize(available),
+                free: ByteSize(free),
+                min_free: ByteSize(min_free),
+            }
         };
         f.defer(
             &subvol.name,
@@ -376,10 +365,10 @@ mod tests {
         });
         assert!(ops.is_empty());
         assert!(skipped[0].is_nothing_new());
-        assert_eq!(skipped[0].reason, "external-only \u{2014} sends on next backup");
+        assert_eq!(skipped[0].reason.to_string(), "external-only \u{2014} sends on next backup");
         // The transient prose classifies as ExternalOnly, NOT NoSnapshotsAvailable.
         assert_eq!(
-            SkipCategory::from_reason(&skipped[0].reason),
+            SkipCategory::from(&skipped[0].reason),
             SkipCategory::ExternalOnly
         );
     }
@@ -412,10 +401,10 @@ mod tests {
         });
         assert!(ops.is_empty());
         assert!(skipped[0].is_nothing_new());
-        assert_eq!(skipped[0].reason, "no local snapshots to send");
+        assert_eq!(skipped[0].reason.to_string(), "no local snapshots to send");
         // The non-transient prose classifies differently — a real gap.
         assert_eq!(
-            SkipCategory::from_reason(&skipped[0].reason),
+            SkipCategory::from(&skipped[0].reason),
             SkipCategory::NoSnapshotsAvailable
         );
     }
@@ -451,7 +440,7 @@ mod tests {
         });
         assert!(ops.is_empty());
         assert!(skipped[0].is_nothing_new());
-        assert_eq!(skipped[0].reason, "20260322-1330-one already on D1");
+        assert_eq!(skipped[0].reason.to_string(), "20260322-1330-one already on D1");
     }
 
     /// THE 2026-05-02 stranded-snapshot shape, now a region test: a caught-up
@@ -559,7 +548,7 @@ mod tests {
         assert!(!skipped[0].is_nothing_new());
         assert!(skipped[0].next_due_minutes.is_some());
         assert_eq!(
-            SkipCategory::from_reason(&skipped[0].reason),
+            SkipCategory::from(&skipped[0].reason),
             SkipCategory::IntervalNotElapsed
         );
     }
@@ -960,7 +949,7 @@ mod tests {
         assert!(ops.is_empty(), "over-budget send is deferred");
         assert!(!skipped[0].is_nothing_new());
         assert_eq!(
-            SkipCategory::from_reason(&skipped[0].reason),
+            SkipCategory::from(&skipped[0].reason),
             SkipCategory::SpaceExceeded
         );
     }

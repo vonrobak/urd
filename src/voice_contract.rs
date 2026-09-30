@@ -1085,6 +1085,7 @@ mod contract {
             name: "htpc-docs".to_string(),
             reason: "interval not elapsed".to_string(),
             category: crate::output::SkipCategory::IntervalNotElapsed,
+            drive: None,
         }];
         data.summary = crate::output::PlanSummaryOutput {
             snapshots: 0,

@@ -10,7 +10,7 @@ use crate::output::{
     OutputMode, PlanOperationEntry, PlanOutput, PlanSummaryOutput, SkipCategory,
     SkippedSubvolume,
 };
-use crate::plan::{self, HistoryQuery, PlanFilters};
+use crate::plan::{self, HistoryQuery, NothingNew, PlanFilters, SkipReason};
 use crate::state::StateDb;
 use crate::types::{PlannedOperation, PlannedSkip};
 use crate::voice;
@@ -186,29 +186,29 @@ pub fn build_plan_output(
 #[must_use]
 pub(crate) fn collapse_skipped(skipped: &[PlannedSkip]) -> Vec<SkippedSubvolume> {
     let mut out: Vec<SkippedSubvolume> = Vec::new();
-    let mut unchanged_idx: HashMap<&str, usize> = HashMap::new();
+    // Per subvolume: the index of its `unchanged` record, and whether an
+    // `already on` drive has been merged into it yet.
+    let mut unchanged_idx: HashMap<&str, (usize, bool)> = HashMap::new();
     for skip in skipped {
-        let category = SkipCategory::from_reason(&skip.reason);
+        let category = SkipCategory::from(&skip.reason);
         if category == SkipCategory::Unchanged {
-            unchanged_idx.insert(skip.name.as_str(), out.len());
+            unchanged_idx.insert(skip.name.as_str(), (out.len(), false));
         } else if skip.is_nothing_new()
-            && let Some((_, drive)) = skip.reason.split_once(" already on ")
-            && let Some(&idx) = unchanged_idx.get(skip.name.as_str())
+            && let SkipReason::NothingNew(NothingNew::AlreadyOn { drive, .. }) = &skip.reason
+            && let Some((idx, merged_any)) = unchanged_idx.get_mut(skip.name.as_str())
         {
-            let merged = &mut out[idx];
-            merged.reason.push_str(if merged.reason.contains("; already on ") {
-                ", "
-            } else {
-                "; already on "
-            });
+            let merged = &mut out[*idx];
+            merged.reason.push_str(if *merged_any { ", " } else { "; already on " });
             merged.reason.push_str(drive);
+            *merged_any = true;
             continue;
         }
         out.push(SkippedSubvolume {
             name: skip.name.clone(),
             category,
-            reason: skip.reason.clone(),
+            reason: skip.reason.to_string(),
             next_due_minutes: skip.next_due_minutes,
+            drive: skip.reason.drive().map(str::to_string),
         });
     }
     out
@@ -652,11 +652,8 @@ source = "/data/htpc-docs"
     // ── Skip-collapse tests (#212 / 079-b §6) ─────────────────────────
 
     fn unchanged_skip(name: &str) -> PlannedSkip {
-        PlannedSkip::deferred(
-            name,
-            "unchanged \u{2014} no changes since last snapshot (3d ago)".to_string(),
-            None,
-        )
+        // 3 days — renders "(3d ago)".
+        PlannedSkip::deferred(name, SkipReason::Unchanged { since_minutes: 3 * 1440 }, None)
     }
 
     fn already_on_skip(name: &str, drive: &str) -> PlannedSkip {
@@ -708,7 +705,9 @@ source = "/data/htpc-docs"
         let skips = vec![
             PlannedSkip::deferred(
                 "htpc-home",
-                "interval not elapsed (next in ~2h)".to_string(),
+                SkipReason::IntervalNotElapsed {
+                    next_in_minutes: 120,
+                },
                 Some(120),
             ),
             already_on_skip("htpc-home", "WD-18TB"),
@@ -741,7 +740,10 @@ source = "/data/htpc-docs"
             already_on_skip("htpc-home", "WD-18TB"),
             PlannedSkip::deferred(
                 "htpc-home",
-                "send to WD-18TB1 not due (next in ~4h)".to_string(),
+                SkipReason::SendNotDue {
+                    drive: "WD-18TB1".to_string(),
+                    next_in_minutes: 240,
+                },
                 Some(240),
             ),
         ];

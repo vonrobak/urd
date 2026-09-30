@@ -6,7 +6,7 @@ use chrono::NaiveDateTime;
 use crate::config::{DriveConfig, ResolvedSubvolume};
 use crate::events::{DeferScope, Event, EventPayload, UnstampedEvent};
 use crate::storage_critical::EffectivePolicy;
-use crate::plan::{NothingNew, PlannedOperation, PlannedSkip};
+use crate::plan::{NothingNew, PlannedOperation, PlannedSkip, SkipReason};
 use crate::types::SnapshotName;
 
 use super::{Observation, PlanFilters};
@@ -42,7 +42,7 @@ impl PlanFragment {
         &mut self,
         subvol: &str,
         drive: Option<&str>,
-        reason: String,
+        reason: SkipReason,
         next_due: Option<i64>,
         scope: DeferScope,
         now: NaiveDateTime,
@@ -53,7 +53,7 @@ impl PlanFragment {
     }
 
     /// The ONLY path to a marker-true skip: takes a sanctioned [`NothingNew`]
-    /// conclusion, derives its prose (via [`NothingNew::reason`]) and its defer
+    /// conclusion, derives its reason (via [`PlannedSkip::nothing_new`]) and its defer
     /// coordinates (drive scope) from the variant, and emits the skip +
     /// `PlannerDefer` event as one unit. The internal exhaustive `match` — no
     /// wildcard — is the second compile-fail guard on the variant set (the
@@ -66,9 +66,9 @@ impl PlanFragment {
             NothingNew::AlreadyOn { drive, .. } => (Some(drive.as_str()), DeferScope::Drive),
             NothingNew::NoLocalSnapshots { .. } => (None, DeferScope::Subvolume),
         };
-        // `nothing_new` derives the reason once; the event reuses it.
+        // `nothing_new` derives the reason once; the event reuses its prose.
         let skip = PlannedSkip::nothing_new(subvol, &why);
-        let event = defer_event(subvol, drive_label, &skip.reason, scope, now);
+        let event = defer_event(subvol, drive_label, &skip.reason.to_string(), scope, now);
         self.skipped.push(skip);
         self.events.push(event);
     }
@@ -106,14 +106,14 @@ impl PlanFragment {
 pub(super) fn defer_parts(
     subvol_name: &str,
     drive_label: Option<&str>,
-    reason: String,
+    reason: SkipReason,
     next_due_minutes: Option<i64>,
     scope: DeferScope,
     now: NaiveDateTime,
 ) -> (PlannedSkip, UnstampedEvent) {
-    // Build the event first (borrowing `reason`), then move `reason` into the
-    // skip — one allocation.
-    let event = defer_event(subvol_name, drive_label, &reason, scope, now);
+    // The event records the reason's prose (`PlannerDefer.reason` is a
+    // string on the wire); the skip keeps the typed reason.
+    let event = defer_event(subvol_name, drive_label, &reason.to_string(), scope, now);
     let skip = PlannedSkip::deferred(subvol_name, reason, next_due_minutes);
     (skip, event)
 }
@@ -242,7 +242,7 @@ mod tests {
         });
         accumulator
             .skipped
-            .push(PlannedSkip::deferred("pre", "prefix".to_string(), None));
+            .push(PlannedSkip::deferred("pre", SkipReason::Disabled, None));
 
         let mut fragment = PlanFragment::default();
         fragment.push_operation(PlannedOperation::DeleteSnapshot {
@@ -254,7 +254,7 @@ mod tests {
         fragment.defer(
             "sv1",
             None,
-            "deferred".to_string(),
+            SkipReason::LocalOnly,
             None,
             DeferScope::Subvolume,
             now(),
@@ -277,7 +277,10 @@ mod tests {
         fragment.defer(
             "sv1",
             Some("D1"),
-            "not due".to_string(),
+            SkipReason::SendNotDue {
+                drive: "D1".to_string(),
+                next_in_minutes: 42,
+            },
             Some(42),
             DeferScope::Drive,
             now(),
@@ -287,7 +290,7 @@ mod tests {
 
         assert_eq!(skipped.len(), 1);
         assert_eq!(skipped[0].name, "sv1");
-        assert_eq!(skipped[0].reason, "not due");
+        assert_eq!(skipped[0].reason.to_string(), "send to D1 not due (next in ~42m)");
         assert_eq!(skipped[0].next_due_minutes, Some(42));
 
         assert_eq!(events.len(), 1);
@@ -297,7 +300,7 @@ mod tests {
         assert_eq!(stamped.drive_label.as_deref(), Some("D1"));
         match &stamped.payload {
             EventPayload::PlannerDefer { reason, scope } => {
-                assert_eq!(reason, "not due");
+                assert_eq!(reason, "send to D1 not due (next in ~42m)");
                 assert_eq!(*scope, DeferScope::Drive);
             }
             other => panic!("expected PlannerDefer, got {other:?}"),
@@ -310,7 +313,7 @@ mod tests {
         fragment.defer(
             "sv1",
             None,
-            "reason".to_string(),
+            SkipReason::SnapshotAlreadyExists,
             None,
             DeferScope::Subvolume,
             now(),
@@ -333,7 +336,7 @@ mod tests {
         let (_operations, skipped, events) = fragment.into_parts();
 
         assert!(skipped[0].is_nothing_new());
-        assert_eq!(skipped[0].reason, "20260322-1330-one already on D1");
+        assert_eq!(skipped[0].reason.to_string(), "20260322-1330-one already on D1");
 
         let ctx = crate::events::RunContext::outside_run();
         let stamped = events[0].clone().stamp(&ctx);
@@ -364,7 +367,16 @@ mod tests {
         let (_operations, _skipped, events) = fragment.into_parts();
 
         // Same coordinates through the ordinary-defer path.
-        let (_, direct) = defer_parts("sv1", Some("D1"), why.reason(), None, DeferScope::Drive, now());
+        // (Test-only: production never passes a `NothingNew` reason through
+        // `defer_parts` — this pins that both paths build the same event.)
+        let (_, direct) = defer_parts(
+            "sv1",
+            Some("D1"),
+            SkipReason::NothingNew(why),
+            None,
+            DeferScope::Drive,
+            now(),
+        );
 
         let ctx = crate::events::RunContext::outside_run();
         assert_eq!(

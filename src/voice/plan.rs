@@ -259,15 +259,10 @@ fn render_plan_skipped_grouped(skipped: &[SkippedSubvolume], out: &mut String) {
 
 /// Render DriveNotMounted skips, sub-grouped by drive label with subvolume counts.
 fn render_drive_not_mounted_group(items: &[&SkippedSubvolume], out: &mut String) {
-    // Extract drive label from reason: "drive {label} not mounted"
+    // The unmounted drive's label is carried typed on the record.
     let mut drives: Vec<(String, usize)> = Vec::new();
     for item in items {
-        let label = item
-            .reason
-            .strip_prefix("drive ")
-            .and_then(|r| r.strip_suffix(" not mounted"))
-            .unwrap_or("unknown")
-            .to_string();
+        let label = item.drive.as_deref().unwrap_or("unknown").to_string();
         if let Some(entry) = drives.iter_mut().find(|(l, _)| *l == label) {
             entry.1 += 1;
         } else {
@@ -457,6 +452,7 @@ mod tests {
             name: "htpc-docs".to_string(),
             reason: "disabled".to_string(),
             category: SkipCategory::Disabled,
+            drive: None,
         }];
         data.summary.skipped = 1;
         let output = render_plan(&data, OutputMode::Interactive, true);
@@ -479,6 +475,7 @@ mod tests {
             name: "htpc-docs".to_string(),
             reason: "disabled".to_string(),
             category: SkipCategory::Disabled,
+            drive: None,
         }];
         data.summary = PlanSummaryOutput {
             snapshots: 0,
@@ -572,6 +569,7 @@ mod tests {
                 name: "htpc-docs".to_string(),
                 reason: "disabled".to_string(),
                 category: SkipCategory::Disabled,
+                drive: None,
             }],
             summary: PlanSummaryOutput {
                 snapshots: 0,
@@ -602,6 +600,7 @@ mod tests {
                 name: "htpc-docs".to_string(),
                 reason: "disabled".to_string(),
                 category: SkipCategory::Disabled,
+                drive: None,
             }],
             summary: PlanSummaryOutput {
                 snapshots: 0,
@@ -640,18 +639,21 @@ mod tests {
                     name: "htpc-home".to_string(),
                     reason: "drive WD-18TB1 not mounted".to_string(),
                     category: SkipCategory::DriveNotMounted,
+                    drive: Some("WD-18TB1".to_string()),
                 },
                 SkippedSubvolume {
                     next_due_minutes: None,
                     name: "htpc-docs".to_string(),
                     reason: "drive WD-18TB1 not mounted".to_string(),
                     category: SkipCategory::DriveNotMounted,
+                    drive: Some("WD-18TB1".to_string()),
                 },
                 SkippedSubvolume {
                     next_due_minutes: None,
                     name: "htpc-home".to_string(),
                     reason: "drive 2TB-backup not mounted".to_string(),
                     category: SkipCategory::DriveNotMounted,
+                    drive: Some("2TB-backup".to_string()),
                 },
             ],
             summary: PlanSummaryOutput {
@@ -698,18 +700,21 @@ mod tests {
                     name: "htpc-home".to_string(),
                     reason: "interval not elapsed (next in ~14h6m)".to_string(),
                     category: SkipCategory::IntervalNotElapsed,
+                    drive: None,
                 },
                 SkippedSubvolume {
                     next_due_minutes: Some(150),
                     name: "htpc-docs".to_string(),
                     reason: "interval not elapsed (next in ~2h30m)".to_string(),
                     category: SkipCategory::IntervalNotElapsed,
+                    drive: None,
                 },
                 SkippedSubvolume {
                     next_due_minutes: Some(1200),
                     name: "htpc-tmp".to_string(),
                     reason: "send to WD-18TB not due (next in ~20h0m)".to_string(),
                     category: SkipCategory::IntervalNotElapsed,
+                    drive: None,
                 },
             ],
             summary: PlanSummaryOutput {
@@ -750,12 +755,14 @@ mod tests {
                     name: "subvol-a".to_string(),
                     reason: "interval not elapsed (next in ~9d)".to_string(),
                     category: SkipCategory::IntervalNotElapsed,
+                    drive: None,
                 },
                 SkippedSubvolume {
                     next_due_minutes: Some(150),
                     name: "subvol-b".to_string(),
                     reason: "interval not elapsed (next in ~2h30m)".to_string(),
                     category: SkipCategory::IntervalNotElapsed,
+                    drive: None,
                 },
             ],
             summary: PlanSummaryOutput {
@@ -788,18 +795,21 @@ mod tests {
                     name: "htpc-root".to_string(),
                     reason: "disabled".to_string(),
                     category: SkipCategory::Disabled,
+                    drive: None,
                 },
                 SkippedSubvolume {
                     next_due_minutes: None,
                     name: "subvol4-multimedia".to_string(),
                     reason: "disabled".to_string(),
                     category: SkipCategory::Disabled,
+                    drive: None,
                 },
                 SkippedSubvolume {
                     next_due_minutes: None,
                     name: "subvol6-tmp".to_string(),
                     reason: "local only".to_string(),
                     category: SkipCategory::LocalOnly,
+                    drive: None,
                 },
             ],
             summary: PlanSummaryOutput {
@@ -847,6 +857,7 @@ mod tests {
                 reason: "send to WD-18TB skipped: estimated ~4.5 GB exceeds WD-18TB available"
                     .to_string(),
                 category: SkipCategory::SpaceExceeded,
+                drive: None,
             }],
             summary: PlanSummaryOutput {
                 snapshots: 0,
@@ -880,6 +891,7 @@ mod tests {
                 name: "htpc-root".to_string(),
                 reason: "external-only \u{2014} sends on next backup".to_string(),
                 category: SkipCategory::ExternalOnly,
+                drive: None,
             }],
             summary: PlanSummaryOutput {
                 snapshots: 0,
@@ -918,18 +930,21 @@ mod tests {
                     name: "sub-a".to_string(),
                     reason: "disabled".to_string(),
                     category: SkipCategory::Disabled,
+                    drive: None,
                 },
                 SkippedSubvolume {
                     next_due_minutes: None,
                     name: "sub-b".to_string(),
                     reason: "drive WD-18TB not mounted".to_string(),
                     category: SkipCategory::DriveNotMounted,
+                    drive: Some("WD-18TB".to_string()),
                 },
                 SkippedSubvolume {
                     next_due_minutes: None,
                     name: "sub-c".to_string(),
                     reason: "interval not elapsed (next in ~5m)".to_string(),
                     category: SkipCategory::IntervalNotElapsed,
+                    drive: None,
                 },
             ],
             summary: PlanSummaryOutput {
@@ -966,6 +981,7 @@ mod tests {
                 name: "htpc-home".to_string(),
                 reason: "disabled".to_string(),
                 category: SkipCategory::Disabled,
+                drive: None,
             }],
             summary: PlanSummaryOutput {
                 snapshots: 0,
@@ -1412,6 +1428,7 @@ mod tests {
                 name: "subvol4-multimedia".to_string(),
                 reason: "local only".to_string(),
                 category: SkipCategory::LocalOnly,
+                drive: None,
             }],
             summary: PlanSummaryOutput {
                 snapshots: 0,
@@ -1516,6 +1533,7 @@ mod tests {
                 name: "sv1".to_string(),
                 reason: "unchanged \u{2014} no changes since last snapshot (21h ago)".to_string(),
                 category: SkipCategory::Unchanged,
+                drive: None,
             }],
             summary: PlanSummaryOutput {
                 snapshots: 0,

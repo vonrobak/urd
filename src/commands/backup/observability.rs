@@ -495,7 +495,8 @@ mod tests {
     use std::collections::BTreeSet;
     use crate::awareness::{DriveAssessment, PromiseStatus};
     use crate::executor::{ExecutionResult, OpResult, OperationOutcome, RunResult, SendType, SubvolumeResult};
-    use crate::types::{BackupPlan, Interval, SendKind};
+    use crate::plan::SkipReason;
+    use crate::types::{BackupPlan, ByteSize, Interval, SendKind};
     use crate::commands::backup::test_fixtures::*;
 
     // ── assessment_lookup (backup_pin_failures / backup_promise_state,
@@ -662,11 +663,17 @@ enabled = false
         }
     }
 
-    fn plan_skipping(names: &[(&str, &str)]) -> BackupPlan {
+    fn not_mounted(drive: &str) -> SkipReason {
+        SkipReason::DriveNotMounted {
+            drive: drive.to_string(),
+        }
+    }
+
+    fn plan_skipping(names: &[(&str, SkipReason)]) -> BackupPlan {
         BackupPlan {
             skipped: names
                 .iter()
-                .map(|(n, r)| crate::types::PlannedSkip::deferred(*n, r.to_string(), None))
+                .map(|(n, r)| crate::types::PlannedSkip::deferred(*n, r.clone(), None))
                 .collect(),
             ..empty_plan()
         }
@@ -724,7 +731,7 @@ enabled = false
             SendType::NoSend,
             0,
         )]);
-        let plan = plan_skipping(&[("alpha", "drive primary not mounted")]);
+        let plan = plan_skipping(&[("alpha", not_mounted("primary"))]);
         let a = [assessed(
             "alpha",
             vec![
@@ -747,14 +754,14 @@ enabled = false
             SendType::NoSend,
             0,
         )]);
-        let plan = plan_skipping(&[("alpha", "drive primary not mounted")]);
+        let plan = plan_skipping(&[("alpha", not_mounted("primary"))]);
         let a = [assessed("alpha", vec![copy("primary", false, Some(48), false)])];
         assert_eq!(outcome_rows(Some(&result), &plan, &a)["alpha"], DEFERRED);
     }
 
     #[test]
     fn deferred_transient_subvolume_without_drive() {
-        let plan = plan_skipping(&[("tr", "drive primary not mounted")]);
+        let plan = plan_skipping(&[("tr", not_mounted("primary"))]);
         let a = [assessed(
             "tr",
             vec![copy("primary", false, Some(30), false), copy("offsite", false, None, false)],
@@ -766,8 +773,8 @@ enabled = false
     fn deferred_on_empty_plan_exit_during_outage() {
         // Empty-plan exit (no execution result): these rows were 2 / 2.
         let plan = plan_skipping(&[
-            ("alpha", "drive primary not mounted"),
-            ("beta", "drive primary not mounted"),
+            ("alpha", not_mounted("primary")),
+            ("beta", not_mounted("primary")),
         ]);
         let a = [
             assessed("alpha", vec![copy("primary", false, Some(30), false)]),
@@ -807,7 +814,13 @@ enabled = false
             SendType::NoSend,
             0,
         )]);
-        let plan = plan_skipping(&[("alpha", "send space guard: source pool below floor")]);
+        let plan = plan_skipping(&[(
+            "alpha",
+            SkipReason::SourceBelowFloor {
+                free: ByteSize(1),
+                required: ByteSize(2),
+            },
+        )]);
         let a = [assessed(
             "alpha",
             vec![copy("primary", true, Some(30), false), copy("offsite", false, Some(480), false)],
@@ -963,7 +976,7 @@ enabled = false
             SendType::Incremental,
             0,
         )]);
-        let plan = plan_skipping(&[("beta", "drive offsite not mounted")]);
+        let plan = plan_skipping(&[("beta", not_mounted("offsite"))]);
         let a = [
             assessed(
                 "alpha",
@@ -987,7 +1000,12 @@ enabled = false
 
     #[test]
     fn not_deferred_weekly_send_between_sends() {
-        let plan = plan_skipping(&[("alpha", "interval not elapsed")]);
+        let plan = plan_skipping(&[(
+            "alpha",
+            SkipReason::IntervalNotElapsed {
+                next_in_minutes: 60,
+            },
+        )]);
         let weekly = DriveAssessment {
             configured_interval: Interval::days(7),
             ..copy("primary", true, Some(48), false)
@@ -1033,13 +1051,13 @@ enabled = false
             outcome_rows(Some(&result), &empty_plan(), &a)["loc"],
             (1, 2, Some(RUN_TS))
         );
-        let plan = plan_skipping(&[("loc", "local only")]);
+        let plan = plan_skipping(&[("loc", SkipReason::LocalOnly)]);
         assert_eq!(outcome_rows(None, &plan, &a)["loc"], (2, 2, Some(PREV_TS)));
     }
 
     #[test]
     fn not_deferred_cold_subvolume_with_absent_current_drive() {
-        let plan = plan_skipping(&[("alpha", "unchanged")]);
+        let plan = plan_skipping(&[("alpha", SkipReason::Unchanged { since_minutes: 60 })]);
         let a = [assessed("alpha", vec![copy("primary", false, Some(720), true)])];
         assert_eq!(outcome_rows(None, &plan, &a)["alpha"], (2, 2, Some(PREV_TS)));
     }
@@ -1111,7 +1129,7 @@ enabled = false
             SendType::Incremental,
             0,
         )]);
-        let rows = run(Some(&filtered), &plan_skipping(&[("off", "disabled")]));
+        let rows = run(Some(&filtered), &plan_skipping(&[("off", SkipReason::Disabled)]));
         let names: BTreeSet<&str> = rows.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(names, BTreeSet::from(["alpha", "beta", "tr", "loc", "off"]));
         for r in &rows {
@@ -1136,7 +1154,7 @@ enabled = false
 
         // The following full run executes nothing new; every timestamp
         // survives the filtered run and is carried forward again.
-        let rows = run(None, &plan_skipping(&[("off", "disabled")]));
+        let rows = run(None, &plan_skipping(&[("off", SkipReason::Disabled)]));
         let carried: HashMap<&str, Option<i64>> = rows
             .iter()
             .map(|r| (r.name.as_str(), r.last_success_timestamp))

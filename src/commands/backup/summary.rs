@@ -233,7 +233,7 @@ pub(super) fn build_empty_plan_explanation(
     let mut has_interval = false;
 
     for skip in &plan.skipped {
-        match SkipCategory::from_reason(&skip.reason) {
+        match SkipCategory::from(&skip.reason) {
             SkipCategory::Disabled | SkipCategory::LocalOnly => has_disabled = true,
             SkipCategory::SpaceExceeded => has_space = true,
             SkipCategory::DriveNotMounted => has_not_mounted = true,
@@ -310,6 +310,7 @@ mod tests {
     use std::path::PathBuf;
     use crate::awareness::{PromiseStatus, SubvolAssessment};
     use crate::executor::{RunResult, SendType};
+    use crate::plan::{NothingNew, SkipReason};
     use crate::types::{DeleteKind, Interval, PlannedOperation, ProtectionLevel};
     use crate::commands::backup::test_fixtures::*;
 
@@ -786,10 +787,12 @@ mod tests {
             skipped: vec![
                 crate::types::PlannedSkip::deferred(
                     "htpc-home",
-                    "drive WD-18TB not mounted".to_string(),
+                    SkipReason::DriveNotMounted {
+                        drive: "WD-18TB".to_string(),
+                    },
                     None,
                 ),
-                crate::types::PlannedSkip::deferred("htpc-docs", "disabled".to_string(), None),
+                crate::types::PlannedSkip::deferred("htpc-docs", SkipReason::Disabled, None),
             ],
             events: Vec::new(),
         };
@@ -899,7 +902,7 @@ mod tests {
 
     // ── Deferred synthesis tests ──────────────────────────────────────
 
-    fn empty_plan_with_skips(skipped: Vec<(&str, &str)>) -> BackupPlan {
+    fn empty_plan_with_skips(skipped: Vec<(&str, SkipReason)>) -> BackupPlan {
         use chrono::NaiveDate;
         BackupPlan {
             lifecycles: HashMap::new(),
@@ -910,7 +913,11 @@ mod tests {
                 .unwrap(),
             skipped: skipped
                 .into_iter()
-                .map(|(n, r)| crate::types::PlannedSkip::deferred(n, r.to_string(), None))
+                .map(|(n, r)| match r {
+                    // A nothing-new conclusion has its own constructor.
+                    SkipReason::NothingNew(why) => crate::types::PlannedSkip::nothing_new(n, &why),
+                    r => crate::types::PlannedSkip::deferred(n, r, None),
+                })
                 .collect(),
             events: Vec::new(),
         }
@@ -920,7 +927,10 @@ mod tests {
     fn no_snapshots_skip_produces_deferred_on_existing_summary() {
         // Subvolume has a CreateSnapshot result but no sends (the deadlock scenario)
         let plan = empty_plan_with_skips(vec![
-            ("htpc-root", "no local snapshots to send"),
+            (
+                "htpc-root",
+                SkipReason::NothingNew(NothingNew::NoLocalSnapshots { transient: false }),
+            ),
         ]);
         // Add a CreateSnapshot operation to the plan so executor produces a SubvolumeResult
         let plan = BackupPlan {
@@ -957,7 +967,10 @@ mod tests {
     fn no_snapshots_skip_creates_synthetic_summary() {
         // Subvolume has zero operations (space guard blocked everything)
         let plan = empty_plan_with_skips(vec![
-            ("htpc-root", "no local snapshots to send"),
+            (
+                "htpc-root",
+                SkipReason::NothingNew(NothingNew::NoLocalSnapshots { transient: false }),
+            ),
         ]);
         let result = ExecutionResult {
             overall: RunResult::Success,
@@ -978,7 +991,7 @@ mod tests {
 
     #[test]
     fn local_only_skip_does_not_produce_deferred() {
-        let plan = empty_plan_with_skips(vec![("sv", "local only")]);
+        let plan = empty_plan_with_skips(vec![("sv", SkipReason::LocalOnly)]);
         let result = ExecutionResult {
             overall: RunResult::Success,
             subvolume_results: vec![],
@@ -999,7 +1012,13 @@ mod tests {
     #[test]
     fn interval_skip_does_not_produce_deferred() {
         let plan = empty_plan_with_skips(vec![
-            ("sv", "send to WD-18TB not due (next in ~2h30m)"),
+            (
+                "sv",
+                SkipReason::SendNotDue {
+                    drive: "WD-18TB".to_string(),
+                    next_in_minutes: 150,
+                },
+            ),
         ]);
         let result = ExecutionResult {
             overall: RunResult::Success,
@@ -1018,7 +1037,12 @@ mod tests {
     #[test]
     fn drive_unmounted_skip_does_not_produce_deferred() {
         let plan = empty_plan_with_skips(vec![
-            ("sv", "drive WD-18TB not mounted"),
+            (
+                "sv",
+                SkipReason::DriveNotMounted {
+                    drive: "WD-18TB".to_string(),
+                },
+            ),
         ]);
         let result = ExecutionResult {
             overall: RunResult::Success,

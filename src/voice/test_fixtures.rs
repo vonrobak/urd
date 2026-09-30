@@ -176,12 +176,14 @@ pub(crate) fn test_backup_summary() -> BackupSummary {
                 name: "htpc-home".to_string(),
                 reason: "drive 2TB-backup not mounted".to_string(),
                 category: SkipCategory::DriveNotMounted,
+                drive: Some("2TB-backup".to_string()),
             },
             SkippedSubvolume {
                 next_due_minutes: None,
                 name: "htpc-docs".to_string(),
                 reason: "drive 2TB-backup not mounted".to_string(),
                 category: SkipCategory::DriveNotMounted,
+                drive: Some("2TB-backup".to_string()),
             },
         ],
         assessments: vec![StatusAssessment {

@@ -1098,8 +1098,8 @@ pub struct SendSummary {
 /// Classification of why a subvolume/send was skipped.
 ///
 /// Used for grouped rendering in plan output and structured JSON for daemon consumers.
-/// Classification happens at the output boundary via `from_reason()`, keeping plan.rs
-/// skip reasons as free-text strings.
+/// Classified from the planner's typed `SkipReason` by the total
+/// `impl From<&SkipReason> for SkipCategory` in plan/types.rs — no prose matching.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SkipCategory {
@@ -1119,43 +1119,6 @@ pub enum SkipCategory {
     Other,
 }
 
-impl SkipCategory {
-    /// Classify a skip reason string into a category.
-    ///
-    /// Matches against the 17 known patterns from plan.rs. Unknown patterns
-    /// fall to `Other`. A completeness test in the test module ensures all
-    /// known patterns classify correctly.
-    #[must_use]
-    pub fn from_reason(reason: &str) -> Self {
-        if reason == "disabled" {
-            Self::Disabled
-        } else if reason == "local only" {
-            Self::LocalOnly
-        } else if reason.starts_with("drive ")
-            && reason.ends_with(" not mounted")
-        {
-            Self::DriveNotMounted
-        } else if reason.starts_with("interval not elapsed")
-            || reason.contains("not due (next in")
-        {
-            Self::IntervalNotElapsed
-        } else if reason.starts_with("local filesystem low on space")
-            || reason.contains("skipped: estimated ~")
-            || reason.contains("skipped: calibrated size ~")
-        {
-            Self::SpaceExceeded
-        } else if reason == "no local snapshots to send" {
-            Self::NoSnapshotsAvailable
-        } else if reason.starts_with("external-only") {
-            Self::ExternalOnly
-        } else if reason.starts_with("unchanged") {
-            Self::Unchanged
-        } else {
-            Self::Other
-        }
-    }
-}
-
 /// A planner-skipped subvolume/send with reason.
 #[derive(Debug, Serialize)]
 pub struct SkippedSubvolume {
@@ -1167,6 +1130,12 @@ pub struct SkippedSubvolume {
     /// out of the prose reason.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_due_minutes: Option<i64>,
+    /// The one drive this skip is scoped to, when it is (`SkipReason::drive`)
+    /// — carried typed so renderers read the unmounted drive's label instead
+    /// of parsing `reason`. Not serialized: `urd plan --json` keeps its
+    /// `name`/`reason`/`category`/`next_due_minutes` shape (ADR-105).
+    #[serde(skip)]
+    pub drive: Option<String>,
 }
 
 // ── PlanOutput ─────────────────────────────────────────────────────────
@@ -1311,12 +1280,7 @@ pub fn build_pre_action_summary(
         .iter()
         .filter(|s| s.category == SkipCategory::DriveNotMounted)
         .filter_map(|s| {
-            // Extract drive label from reason: "drive {label} not mounted"
-            let label = s
-                .reason
-                .strip_prefix("drive ")?
-                .strip_suffix(" not mounted")?
-                .to_string();
+            let label = s.drive.clone()?;
             if !seen_labels.insert(label.clone()) {
                 return None;
             }
@@ -2034,188 +1998,6 @@ mod tests {
         assert_eq!(kinds.into_iter().min(), Some(NoOffsiteProtection));
     }
 
-    // ── SkipCategory classification tests ──────────────────────────────
-
-    #[test]
-    fn classify_disabled() {
-        assert_eq!(SkipCategory::from_reason("disabled"), SkipCategory::Disabled);
-    }
-
-    #[test]
-    fn classify_local_only() {
-        assert_eq!(
-            SkipCategory::from_reason("local only"),
-            SkipCategory::LocalOnly
-        );
-    }
-
-    #[test]
-    fn classify_drive_not_mounted() {
-        assert_eq!(
-            SkipCategory::from_reason("drive WD-18TB not mounted"),
-            SkipCategory::DriveNotMounted
-        );
-        assert_eq!(
-            SkipCategory::from_reason("drive 2TB-backup not mounted"),
-            SkipCategory::DriveNotMounted
-        );
-    }
-
-    #[test]
-    fn classify_interval_not_elapsed() {
-        assert_eq!(
-            SkipCategory::from_reason("interval not elapsed (next in ~14h6m)"),
-            SkipCategory::IntervalNotElapsed
-        );
-        assert_eq!(
-            SkipCategory::from_reason("send to WD-18TB not due (next in ~2h30m)"),
-            SkipCategory::IntervalNotElapsed
-        );
-    }
-
-    #[test]
-    fn classify_space_exceeded() {
-        assert_eq!(
-            SkipCategory::from_reason(
-                "local filesystem low on space (1.2 GB free, 5.0 GB required)"
-            ),
-            SkipCategory::SpaceExceeded
-        );
-        assert_eq!(
-            SkipCategory::from_reason(
-                "send to WD-18TB skipped: estimated ~4.5 GB exceeds WD-18TB available (free: 2.1 GB, min_free: 50.0 GB)"
-            ),
-            SkipCategory::SpaceExceeded
-        );
-        assert_eq!(
-            SkipCategory::from_reason(
-                "send to WD-18TB skipped: calibrated size ~4.5 GB exceeds WD-18TB available"
-            ),
-            SkipCategory::SpaceExceeded
-        );
-    }
-
-    #[test]
-    fn classify_no_snapshots_available() {
-        assert_eq!(
-            SkipCategory::from_reason("no local snapshots to send"),
-            SkipCategory::NoSnapshotsAvailable
-        );
-    }
-
-    #[test]
-    fn classify_other() {
-        assert_eq!(
-            SkipCategory::from_reason(
-                "drive WD-18TB UUID mismatch (expected abc, found def)"
-            ),
-            SkipCategory::Other
-        );
-        assert_eq!(
-            SkipCategory::from_reason("drive WD-18TB UUID check failed: io error"),
-            SkipCategory::Other
-        );
-        assert_eq!(
-            SkipCategory::from_reason(
-                "drive WD-18TB token mismatch (expected abc, found def) — possible drive swap"
-            ),
-            SkipCategory::Other
-        );
-        assert_eq!(
-            SkipCategory::from_reason("snapshot already exists"),
-            SkipCategory::Other
-        );
-        assert_eq!(
-            SkipCategory::from_reason("no local snapshots to send"),
-            SkipCategory::NoSnapshotsAvailable
-        );
-        assert_eq!(
-            SkipCategory::from_reason("20260329-0404-htpc-home already on WD-18TB"),
-            SkipCategory::Other
-        );
-    }
-
-    #[test]
-    fn classify_unknown_falls_to_other() {
-        assert_eq!(
-            SkipCategory::from_reason("some completely unknown reason"),
-            SkipCategory::Other
-        );
-    }
-
-    /// Completeness test: all 18 known plan.rs skip patterns classify to their
-    /// expected category. Prevents silent regressions when new patterns are added.
-    #[test]
-    fn classify_all_18_patterns() {
-        let patterns = vec![
-            ("disabled", SkipCategory::Disabled),
-            ("local only", SkipCategory::LocalOnly),
-            ("drive WD-18TB not mounted", SkipCategory::DriveNotMounted),
-            (
-                "drive WD-18TB UUID mismatch (expected abc, found def)",
-                SkipCategory::Other,
-            ),
-            (
-                "drive WD-18TB UUID check failed: io error",
-                SkipCategory::Other,
-            ),
-            (
-                "drive WD-18TB token mismatch (expected abc, found def) \u{2014} possible drive swap",
-                SkipCategory::Other,
-            ),
-            (
-                "drive WD-18TB token expected but missing \u{2014} run `urd drives adopt WD-18TB`",
-                SkipCategory::Other,
-            ),
-            (
-                "local filesystem low on space (1.2 GB free, 5.0 GB required)",
-                SkipCategory::SpaceExceeded,
-            ),
-            ("snapshot already exists", SkipCategory::Other),
-            (
-                "interval not elapsed (next in ~14h6m)",
-                SkipCategory::IntervalNotElapsed,
-            ),
-            (
-                "send to WD-18TB not due (next in ~2h30m)",
-                SkipCategory::IntervalNotElapsed,
-            ),
-            ("no local snapshots to send", SkipCategory::NoSnapshotsAvailable),
-            (
-                "external-only \u{2014} sends on next backup",
-                SkipCategory::ExternalOnly,
-            ),
-            (
-                "20260329-0404-htpc-home already on WD-18TB",
-                SkipCategory::Other,
-            ),
-            (
-                "send to WD-18TB skipped: estimated ~4.5 GB exceeds WD-18TB available (free: 2.1 GB, min_free: 50.0 GB)",
-                SkipCategory::SpaceExceeded,
-            ),
-            (
-                "send to WD-18TB skipped: calibrated size ~4.5 GB exceeds WD-18TB available",
-                SkipCategory::SpaceExceeded,
-            ),
-            (
-                "unchanged \u{2014} no changes since last snapshot (21h ago)",
-                SkipCategory::Unchanged,
-            ),
-            (
-                "transient \u{2014} no drives available for send",
-                SkipCategory::Other,
-            ),
-        ];
-
-        for (reason, expected) in patterns {
-            assert_eq!(
-                SkipCategory::from_reason(reason),
-                expected,
-                "pattern: {reason}"
-            );
-        }
-    }
-
     #[test]
     fn build_pre_action_from_plan_output() {
         let plan_output = PlanOutput {
@@ -2255,12 +2037,14 @@ mod tests {
                     name: "sv1".to_string(),
                     reason: "drive D2 not mounted".to_string(),
                     category: SkipCategory::DriveNotMounted,
+                    drive: Some("D2".to_string()),
                 },
                 SkippedSubvolume {
                     next_due_minutes: None,
                     name: "sv2".to_string(),
                     reason: "drive D2 not mounted".to_string(),
                     category: SkipCategory::DriveNotMounted,
+                    drive: Some("D2".to_string()),
                 },
             ],
             summary: PlanSummaryOutput {
