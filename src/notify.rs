@@ -12,7 +12,7 @@
 // `check_backup_overdue`, `build_drive_anomaly_notification`) live here
 // too; the runner only decides when to call them and dispatches.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde::{Deserialize, Serialize};
@@ -989,7 +989,7 @@ fn default_webhook_body(notification: &Notification) -> String {
     })
 }
 
-fn dispatch_command(notification: &Notification, path: &PathBuf, args: &[String]) -> bool {
+fn dispatch_command(notification: &Notification, path: &Path, args: &[String]) -> bool {
     let result = Command::new(path)
         .args(args)
         .env("URD_NOTIFICATION_TITLE", &notification.title)
