@@ -19,7 +19,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   never gated and manual runs always were. The unit no longer passes the flag;
   `urd doctor` reports the installed unit as drifted until `urd init` re-seals
   it. The first run after upgrading records the current shapes and holds
-  nothing.
+  nothing. If the recorded shapes cannot be read, nothing is held, the run
+  logs a warning, and no shapes are recorded, so the next readable run still
+  sees the tightening.
+- `urd emergency --json` now reports a serialization failure as an
+  `{"error": …}` object like every other daemon surface, instead of an empty
+  string.
+- The sentinel is no longer described as retrying notifications the backup
+  run could not dispatch; it re-derives them from its own baseline. Log and
+  heartbeat wording now say so. No schema change.
 
 ### Fixed
 - A destination snapshot that already carries the name about to be sent is no
