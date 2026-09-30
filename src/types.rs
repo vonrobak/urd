@@ -410,6 +410,176 @@ impl Ord for SnapshotName {
     }
 }
 
+// ── DriveLabel / SubvolName ─────────────────────────────────────────────
+
+// Defines a transparent string newtype for a config-declared name. The two
+// names Urd threads through every layer — a drive's label and a subvolume's
+// name — are both plain strings on the wire and in the DB, and before these
+// types nothing in a signature said which `String` was which (a
+// `HashMap<String, Vec<String>>` could be either way round).
+//
+// Construction is unvalidated on purpose: the names are checked once, at the
+// config boundary (`validate_name_safe`, ADR-109), and trusted afterwards.
+// These types say *which* name a value is, not that it is safe — a value built
+// from a DB row or a test literal is exactly as trusted as the string it wraps.
+//
+// Wire and text forms are the inner string, byte for byte (ADR-105):
+// `#[serde(transparent)]`, `Display` pads the string (so `{:<12}` lays out as
+// it did), and `Debug` is the string's own `Debug` (`"WD-18TB"`), so a `{:?}`
+// that used to format the `String` field reads the same. `Deref<Target = str>`
+// and `Borrow<str>` let `&str` call sites and `HashMap::get(&str)` lookups keep
+// working; the `PartialEq` impls against `str`/`String` let comparisons with
+// literals and DB strings read as they did.
+macro_rules! config_name_newtype {
+    ($(#[$meta:meta])* $name:ident) => {
+        $(#[$meta])*
+        #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Default, Deserialize, Serialize)]
+        #[serde(transparent)]
+        pub struct $name(String);
+
+        impl $name {
+            /// Wrap a name. Unvalidated — validation is the config boundary's
+            /// job (ADR-109).
+            #[must_use]
+            pub fn new(name: impl Into<String>) -> Self {
+                Self(name.into())
+            }
+
+            /// The name as a string slice.
+            #[must_use]
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+
+            /// Unwrap into the owned string (the wire/DB form).
+            #[must_use]
+            pub fn into_string(self) -> String {
+                self.0
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.pad(&self.0)
+            }
+        }
+
+        impl fmt::Debug for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                fmt::Debug::fmt(&self.0, f)
+            }
+        }
+
+        impl std::ops::Deref for $name {
+            type Target = str;
+
+            fn deref(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl AsRef<str> for $name {
+            fn as_ref(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl AsRef<std::path::Path> for $name {
+            fn as_ref(&self) -> &std::path::Path {
+                std::path::Path::new(&self.0)
+            }
+        }
+
+        impl std::borrow::Borrow<str> for $name {
+            fn borrow(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl From<String> for $name {
+            fn from(name: String) -> Self {
+                Self(name)
+            }
+        }
+
+        impl From<&str> for $name {
+            fn from(name: &str) -> Self {
+                Self(name.to_string())
+            }
+        }
+
+        impl From<&$name> for $name {
+            fn from(name: &$name) -> Self {
+                name.clone()
+            }
+        }
+
+        impl From<&String> for $name {
+            fn from(name: &String) -> Self {
+                Self(name.clone())
+            }
+        }
+
+        impl From<$name> for String {
+            fn from(name: $name) -> Self {
+                name.0
+            }
+        }
+
+        impl PartialEq<str> for $name {
+            fn eq(&self, other: &str) -> bool {
+                self.0 == other
+            }
+        }
+
+        impl PartialEq<&str> for $name {
+            fn eq(&self, other: &&str) -> bool {
+                self.0 == *other
+            }
+        }
+
+        impl PartialEq<String> for $name {
+            fn eq(&self, other: &String) -> bool {
+                &self.0 == other
+            }
+        }
+
+        impl PartialEq<$name> for str {
+            fn eq(&self, other: &$name) -> bool {
+                self == other.0
+            }
+        }
+
+        impl PartialEq<$name> for &str {
+            fn eq(&self, other: &$name) -> bool {
+                *self == other.0
+            }
+        }
+
+        impl PartialEq<$name> for String {
+            fn eq(&self, other: &$name) -> bool {
+                *self == other.0
+            }
+        }
+    };
+}
+
+config_name_newtype!(
+    /// A drive's configured label (`[[drives]] label`): the drive's identity
+    /// in config, in the history DB `drive_label` columns, in heartbeat and
+    /// metrics label strings, and in pin-file names. Unvalidated at
+    /// construction — `validate_name_safe` checks it at config load (ADR-109).
+    DriveLabel
+);
+
+config_name_newtype!(
+    /// A subvolume's configured name (`[[subvolumes]] name`): its identity in
+    /// config, in the history DB `subvolume` columns, and in every output
+    /// struct. Not the snapshot `short_name`. Unvalidated at construction —
+    /// `validate_name_safe` checks it at config load (ADR-109).
+    SubvolName
+);
+
 // ── DriveRole ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -2668,5 +2838,55 @@ weekly = 4
                 PromiseStatus::Unprotected
             );
         }
+    }
+
+    // ── DriveLabel / SubvolName tests ───────────────────────────────
+
+    #[test]
+    fn config_names_serde_is_transparent() {
+        // Wire bytes are the bare string (ADR-105): the newtypes replaced
+        // `String` fields in serialized structs and must not add a wrapper.
+        let label = DriveLabel::from("WD-18TB");
+        let json = serde_json::to_string(&label).unwrap();
+        assert_eq!(json, "\"WD-18TB\"");
+        assert_eq!(serde_json::from_str::<DriveLabel>(&json).unwrap(), label);
+
+        let name = SubvolName::from("htpc-home");
+        let json = serde_json::to_string(&name).unwrap();
+        assert_eq!(json, "\"htpc-home\"");
+        assert_eq!(serde_json::from_str::<SubvolName>(&json).unwrap(), name);
+
+        #[derive(serde::Deserialize)]
+        struct Row {
+            label: DriveLabel,
+        }
+        let row: Row = toml::from_str("label = \"2TB-backup\"").unwrap();
+        assert_eq!(row.label, "2TB-backup");
+    }
+
+    #[test]
+    fn config_names_display_and_debug_match_the_string() {
+        let label = DriveLabel::from("WD-18TB");
+        assert_eq!(label.to_string(), "WD-18TB");
+        // Width specs pad as they did on the `String` field.
+        assert_eq!(format!("[{label:<9}]"), "[WD-18TB  ]");
+        assert_eq!(format!("{label:?}"), format!("{:?}", "WD-18TB"));
+        let name = SubvolName::from("sv1".to_string());
+        assert_eq!(format!("{name}/{name:?}"), "sv1/\"sv1\"");
+    }
+
+    #[test]
+    fn config_names_borrow_str_for_map_lookup() {
+        use std::collections::{BTreeSet, HashMap};
+
+        let mut by_drive: HashMap<DriveLabel, u32> = HashMap::new();
+        by_drive.insert(DriveLabel::from("D1"), 7);
+        assert_eq!(by_drive.get("D1"), Some(&7));
+        assert_eq!(by_drive.get("D2"), None);
+
+        let names: BTreeSet<SubvolName> = ["b", "a"].into_iter().map(SubvolName::from).collect();
+        assert!(names.contains("a"));
+        // Ord is the string's order.
+        assert_eq!(names.iter().next().unwrap(), "a");
     }
 }
