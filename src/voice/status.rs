@@ -21,7 +21,7 @@ use crate::types::{ByteSize, DriveRole};
 use super::drive_row::{aggregate_drive_info, offsite_drive_label, unmounted_drive_label};
 use super::{
     SuggestionContext, append_suggestion, color_result, exposure_cell, format_table,
-    humanize_duration, pluralize,
+    humanize_duration, pluralize, render_json,
 };
 
 // ── Status ──────────────────────────────────────────────────────────────
@@ -36,7 +36,7 @@ pub fn render_status(data: &StatusOutput, mode: OutputMode) -> String {
 }
 
 pub(super) fn render_status_daemon(data: &StatusOutput) -> String {
-    serde_json::to_string_pretty(data).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
+    render_json(data)
 }
 
 pub(super) fn render_status_interactive(data: &StatusOutput) -> String {
@@ -774,7 +774,7 @@ pub fn render_default_status(data: &DefaultStatusOutput, mode: OutputMode) -> St
 }
 
 fn render_default_status_daemon(data: &DefaultStatusOutput) -> String {
-    serde_json::to_string_pretty(data).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
+    render_json(data)
 }
 
 fn render_default_status_interactive(data: &DefaultStatusOutput) -> String {

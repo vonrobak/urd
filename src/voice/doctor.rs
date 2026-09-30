@@ -19,6 +19,7 @@ use crate::storage_critical::TightnessTier;
 
 use super::{
     SuggestionContext, append_suggestion, classify_verify_checks, exposure_label, pluralize,
+    render_json,
 };
 
 // ── Doctor ────────────────────────────────────────────────────────────
@@ -28,8 +29,7 @@ use super::{
 pub fn render_doctor(data: &DoctorOutput, mode: OutputMode) -> String {
     match mode {
         OutputMode::Interactive => render_doctor_interactive(data),
-        OutputMode::Daemon => serde_json::to_string_pretty(data)
-            .unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}")),
+        OutputMode::Daemon => render_json(data),
     }
 }
 
@@ -636,7 +636,7 @@ fn render_advice_issue(issue: &AdviceIssue) -> String {
                 "{} \u{2014} data may not be recoverable",
                 exposure_label(issue.status)
             ),
-            PromiseStatus::AtRisk | PromiseStatus::Protected => exposure_label(issue.status),
+            PromiseStatus::AtRisk | PromiseStatus::Protected => exposure_label(issue.status).to_string(),
         },
     }
 }

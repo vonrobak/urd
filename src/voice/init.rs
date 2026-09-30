@@ -11,6 +11,8 @@ use colored::Colorize;
 use crate::output::{InitOutput, InitStatus, OutputMode};
 use crate::types::{ByteSize, DriveRole};
 
+use super::render_json;
+
 /// First-run pointer when `urd init` finds no config and cannot offer
 /// the Encounter (no terminal on stdin or stdout). A missing config is
 /// the expected starting state — greet and point, never error.
@@ -39,7 +41,7 @@ pub fn render_init(data: &InitOutput, mode: OutputMode) -> String {
 }
 
 fn render_init_daemon(data: &InitOutput) -> String {
-    serde_json::to_string_pretty(data).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
+    render_json(data)
 }
 
 fn render_init_interactive(data: &InitOutput) -> String {

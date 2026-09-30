@@ -12,7 +12,7 @@ use colored::Colorize;
 
 use crate::output::{HistoryOutput, OutputMode, SubvolumeHistoryOutput};
 
-use super::{format_history_table, truncate_str};
+use super::{format_history_table, render_json, truncate_str};
 
 /// Render the `urd events` view. Delegates to `voice_events` for the
 /// per-variant columnar / NDJSON formatting.
@@ -29,9 +29,7 @@ pub fn render_events(view: &crate::output::EventsView, mode: OutputMode) -> Stri
 pub fn render_history(data: &HistoryOutput, mode: OutputMode) -> String {
     match mode {
         OutputMode::Interactive => render_history_interactive(data),
-        OutputMode::Daemon => {
-            serde_json::to_string_pretty(data).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
-        }
+        OutputMode::Daemon => render_json(data),
     }
 }
 
@@ -73,9 +71,7 @@ fn render_history_interactive(data: &HistoryOutput) -> String {
 pub fn render_subvolume_history(data: &SubvolumeHistoryOutput, mode: OutputMode) -> String {
     match mode {
         OutputMode::Interactive => render_subvolume_history_interactive(data),
-        OutputMode::Daemon => {
-            serde_json::to_string_pretty(data).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
-        }
+        OutputMode::Daemon => render_json(data),
     }
 }
 

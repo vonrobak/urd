@@ -14,7 +14,8 @@ use crate::output::{OutputMode, PlanOutput, SkipCategory, SkippedSubvolume};
 use crate::plan::format_duration_short;
 
 use super::{
-    SuggestionContext, append_suggestion, approx_size, pad_visible, pluralize, skip_tag,
+    SuggestionContext, append_suggestion, approx_size, pad_visible, pluralize, render_json,
+    skip_tag,
 };
 
 /// Render an explanation for why a manual backup produced an empty plan.
@@ -47,9 +48,7 @@ pub fn render_nothing_to_do() -> String {
 pub fn render_plan(data: &PlanOutput, mode: OutputMode, verbose: bool) -> String {
     match mode {
         OutputMode::Interactive => render_plan_interactive(data, verbose),
-        OutputMode::Daemon => {
-            serde_json::to_string_pretty(data).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
-        }
+        OutputMode::Daemon => render_json(data),
     }
 }
 

@@ -14,7 +14,7 @@ use crate::output::{
 };
 use crate::plan::format_duration_short;
 
-use super::pad_visible;
+use super::{pad_visible, render_json};
 
 /// Render the drives list output. `now` is the caller's wall-clock reading,
 /// threaded through to compute "absent NNm" ages — the renderer itself
@@ -27,10 +27,7 @@ pub fn render_drives_list(
 ) -> String {
     match mode {
         OutputMode::Interactive => render_drives_list_interactive(data, now),
-        OutputMode::Daemon => {
-            serde_json::to_string_pretty(data)
-                .unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
-        }
+        OutputMode::Daemon => render_json(data),
     }
 }
 
@@ -159,10 +156,7 @@ fn format_absent_duration(timestamp: &str, now: chrono::NaiveDateTime) -> Option
 pub fn render_drives_adopt(data: &DriveAdoptOutput, mode: OutputMode) -> String {
     match mode {
         OutputMode::Interactive => render_drives_adopt_interactive(data),
-        OutputMode::Daemon => {
-            serde_json::to_string_pretty(data)
-                .unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
-        }
+        OutputMode::Daemon => render_json(data),
     }
 }
 

@@ -16,7 +16,7 @@ use crate::types::{ByteSize, DriveRole};
 
 use super::{
     SuggestionContext, append_suggestion, approx_size, color_result, exposure_cell,
-    exposure_label, format_elapsed, format_table, pad_visible, pluralize, skip_tag,
+    exposure_label, format_elapsed, format_table, pad_visible, pluralize, render_json, skip_tag,
 };
 
 /// Render post-backup summary according to the given mode.
@@ -29,7 +29,7 @@ pub fn render_backup_summary(data: &BackupSummary, mode: OutputMode) -> String {
 }
 
 fn render_backup_daemon(data: &BackupSummary) -> String {
-    serde_json::to_string_pretty(data).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
+    render_json(data)
 }
 
 /// Render each warning with the `WARNING:` prefix, one per line. Shared by

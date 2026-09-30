@@ -7,6 +7,8 @@
 use crate::output::{GetOutput, OutputMode};
 use crate::types::ByteSize;
 
+use super::render_json;
+
 /// Render get metadata according to the given mode (for stderr, not content).
 #[must_use]
 pub fn render_get(data: &GetOutput, mode: OutputMode) -> String {
@@ -17,7 +19,7 @@ pub fn render_get(data: &GetOutput, mode: OutputMode) -> String {
 }
 
 fn render_get_daemon(data: &GetOutput) -> String {
-    serde_json::to_string_pretty(data).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
+    render_json(data)
 }
 
 fn render_get_interactive(data: &GetOutput) -> String {

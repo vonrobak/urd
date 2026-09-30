@@ -109,6 +109,13 @@ pub(super) fn pluralize(count: usize, singular: &str, plural: &str) -> String {
     }
 }
 
+/// Daemon-mode rendering: pretty JSON of the structured output. Should
+/// serialization ever fail, the daemon still gets one parseable-looking
+/// object naming the error rather than a panic or an empty line.
+pub(super) fn render_json<T: serde::Serialize>(value: &T) -> String {
+    serde_json::to_string_pretty(value).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
+}
+
 /// A size ESTIMATE, written at the precision it has: two significant figures,
 /// in `ByteSize`'s decimal units. Measured byte counts keep `ByteSize`. Public
 /// because the live progress line (`commands/backup.rs`) shows estimates too;
@@ -141,11 +148,11 @@ pub fn format_elapsed(d: std::time::Duration) -> String {
     }
 }
 
-pub(super) fn exposure_label(status: PromiseStatus) -> String {
+pub(super) fn exposure_label(status: PromiseStatus) -> &'static str {
     match status {
-        PromiseStatus::Protected => "sealed".to_string(),
-        PromiseStatus::AtRisk => "waning".to_string(),
-        PromiseStatus::Unprotected => "exposed".to_string(),
+        PromiseStatus::Protected => "sealed",
+        PromiseStatus::AtRisk => "waning",
+        PromiseStatus::Unprotected => "exposed",
     }
 }
 

@@ -9,13 +9,14 @@ use colored::Colorize;
 use crate::output::{OutputMode, RecoveryWindow, RetentionPreviewOutput};
 use crate::types::ByteSize;
 
+use super::render_json;
+
 /// Render retention preview output.
 #[must_use]
 pub fn render_retention_preview(data: &RetentionPreviewOutput, mode: OutputMode) -> String {
     match mode {
         OutputMode::Interactive => render_retention_preview_interactive(data),
-        OutputMode::Daemon => serde_json::to_string_pretty(data)
-            .unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}")),
+        OutputMode::Daemon => render_json(data),
     }
 }
 

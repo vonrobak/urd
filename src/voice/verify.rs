@@ -14,7 +14,7 @@ use crate::output::{FailuresOutput, OutputMode, VerifyOutput};
 
 use super::{
     SuggestionContext, append_suggestion, classify_verify_checks, format_history_table, pluralize,
-    truncate_str,
+    render_json, truncate_str,
 };
 
 /// Render failures output.
@@ -22,9 +22,7 @@ use super::{
 pub fn render_failures(data: &FailuresOutput, mode: OutputMode) -> String {
     match mode {
         OutputMode::Interactive => render_failures_interactive(data),
-        OutputMode::Daemon => {
-            serde_json::to_string_pretty(data).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
-        }
+        OutputMode::Daemon => render_json(data),
     }
 }
 
@@ -74,9 +72,7 @@ fn render_failures_interactive(data: &FailuresOutput) -> String {
 pub fn render_verify(data: &VerifyOutput, mode: OutputMode, detail: bool) -> String {
     match mode {
         OutputMode::Interactive => render_verify_interactive(data, detail),
-        OutputMode::Daemon => {
-            serde_json::to_string_pretty(data).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
-        }
+        OutputMode::Daemon => render_json(data),
     }
 }
 

@@ -9,14 +9,14 @@ use colored::Colorize;
 use crate::output::{CalibrateOutput, CalibrateResult, OutputMode};
 use crate::types::ByteSize;
 
+use super::render_json;
+
 /// Render calibrate output according to the given mode.
 #[must_use]
 pub fn render_calibrate(data: &CalibrateOutput, mode: OutputMode) -> String {
     match mode {
         OutputMode::Interactive => render_calibrate_interactive(data),
-        OutputMode::Daemon => {
-            serde_json::to_string_pretty(data).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
-        }
+        OutputMode::Daemon => render_json(data),
     }
 }
 

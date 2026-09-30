@@ -9,6 +9,8 @@ use colored::Colorize;
 use crate::awareness::PromiseStatus;
 use crate::output::{OutputMode, SentinelStatusOutput};
 
+use super::render_json;
+
 /// Render sentinel status output according to the given mode. `now` is the
 /// caller's wall-clock reading, threaded through to compute the relative
 /// assessment age — the renderer itself stays a pure function of its input
@@ -21,10 +23,7 @@ pub fn render_sentinel_status(
 ) -> String {
     match mode {
         OutputMode::Interactive => render_sentinel_status_interactive(data, now),
-        OutputMode::Daemon => {
-            serde_json::to_string_pretty(data)
-                .unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
-        }
+        OutputMode::Daemon => render_json(data),
     }
 }
 
