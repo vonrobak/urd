@@ -1297,6 +1297,7 @@ pub fn apply_retention_gate(plan: &mut BackupPlan, gate: &RetentionGate) -> Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::fixed_now as now;
     use chrono::NaiveDate;
 
     fn make_snap(date_str: &str, time_str: &str, name: &str) -> SnapshotName {
@@ -1308,13 +1309,6 @@ mod tests {
         // Legacy format for convenience
         let s = format!("{date_str}-{name}");
         SnapshotName::parse(&s).unwrap()
-    }
-
-    fn now() -> NaiveDateTime {
-        NaiveDate::from_ymd_opt(2026, 3, 22)
-            .unwrap()
-            .and_hms_opt(15, 0, 0)
-            .unwrap()
     }
 
     fn default_config() -> ResolvedGraduatedRetention {

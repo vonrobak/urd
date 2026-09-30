@@ -292,28 +292,16 @@ pub(super) fn plan_local_retention(i: &LocalRetentionInputs) -> PlanFragment {
 mod tests {
     use std::path::PathBuf;
 
-    use chrono::{NaiveDate, NaiveDateTime};
-
     use crate::btrfs::MockBtrfs;
     use crate::config::ResolvedSubvolume;
     use crate::observation::Observation;
     use crate::plan::PlanFilters;
     use crate::plan::testkit::MockFileSystemState;
     use crate::storage_critical::EffectivePolicy;
+    use crate::testkit::{fixed_now as now, snap};
     use crate::types::{Interval, MonthlyCount, ResolvedGraduatedRetention};
 
     use super::*;
-
-    fn now() -> NaiveDateTime {
-        NaiveDate::from_ymd_opt(2026, 3, 22)
-            .unwrap()
-            .and_hms_opt(15, 0, 0)
-            .unwrap()
-    }
-
-    fn snap(s: &str) -> SnapshotName {
-        SnapshotName::parse(s).unwrap()
-    }
 
     fn local_dir() -> PathBuf {
         PathBuf::from("/snap/sv1")

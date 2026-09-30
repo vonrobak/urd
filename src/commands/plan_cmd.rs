@@ -370,6 +370,7 @@ fn build_operation_entry(
 mod tests {
     use super::*;
     use crate::plan::{MockFileSystemState, NothingNew};
+    use crate::testkit::ConfigBuilder;
     use crate::types::{BackupPlan, SendKind, SnapshotName};
     use std::path::PathBuf;
 
@@ -378,49 +379,9 @@ mod tests {
     }
 
     fn test_config() -> Config {
-        let toml_str = r#"
-[general]
-state_db = "/tmp/urd.db"
-metrics_file = "/tmp/backup.prom"
-log_dir = "/tmp"
-
-[local_snapshots]
-roots = [
-  { path = "/snap", subvolumes = ["htpc-home", "htpc-docs"] }
-]
-
-[defaults]
-snapshot_interval = "1h"
-send_interval = "1d"
-send_enabled = true
-enabled = true
-[defaults.local_retention]
-hourly = 24
-daily = 30
-weekly = 26
-monthly = 12
-[defaults.external_retention]
-daily = 30
-weekly = 26
-monthly = 0
-
-[[drives]]
-label = "WD-18TB"
-mount_path = "/mnt/wd"
-snapshot_root = ".snapshots"
-role = "primary"
-
-[[subvolumes]]
-name = "htpc-home"
-short_name = "htpc-home"
-source = "/data/htpc-home"
-
-[[subvolumes]]
-name = "htpc-docs"
-short_name = "htpc-docs"
-source = "/data/htpc-docs"
-"#;
-        toml::from_str(toml_str).expect("test config should parse")
+        ConfigBuilder::new()
+            .subvolumes(&["htpc-home", "htpc-docs"])
+            .build()
     }
 
     fn mock_send_full(subvol: &str, drive: &str) -> PlannedOperation {

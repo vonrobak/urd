@@ -236,8 +236,6 @@ mod tests {
     use std::collections::HashSet;
     use std::path::PathBuf;
 
-    use chrono::{NaiveDate, NaiveDateTime};
-
     use crate::btrfs::MockBtrfs;
     use crate::config::{Config, ResolvedSubvolume};
     use crate::events::{EventPayload, UnstampedEvent};
@@ -245,23 +243,13 @@ mod tests {
     use crate::plan::testkit::MockFileSystemState;
     use crate::plan::PlanFilters;
     use crate::storage_critical::EffectivePolicy;
+    use crate::testkit::{fixed_now as now, snap};
     use crate::plan::{PlannedOperation, PlannedSkip};
     use crate::types::{
         Interval, LocalRetentionPolicy, MonthlyCount, ResolvedGraduatedRetention, SnapshotName,
     };
 
     use super::*;
-
-    fn now() -> NaiveDateTime {
-        NaiveDate::from_ymd_opt(2026, 3, 22)
-            .unwrap()
-            .and_hms_opt(15, 0, 0)
-            .unwrap()
-    }
-
-    fn snap(s: &str) -> SnapshotName {
-        SnapshotName::parse(s).unwrap()
-    }
 
     fn local_dir() -> PathBuf {
         PathBuf::from("/snap/sv1")

@@ -213,83 +213,22 @@ fn assemble_status_output(
 mod tests {
     use super::*;
     use crate::awareness::test_support::dt;
-    use crate::awareness::{
-        DriveAssessment, DriveChainHealth, LocalAssessment, OperationalHealth,
-        PromiseStatus,
-    };
+    use crate::awareness::{DriveAssessment, DriveChainHealth, PromiseStatus};
+    use crate::testkit::{ConfigBuilder, subvol_assessment};
     use crate::types::{DriveRole, Interval};
 
     /// sv1: sheltered (named level, default retention). sv2: transient local
     /// retention with sends enabled (external-only mode). One primary drive.
     fn test_config() -> Config {
-        let toml_str = r#"
-[general]
-state_db = "/tmp/urd.db"
-metrics_file = "/tmp/backup.prom"
-log_dir = "/tmp"
-
-[local_snapshots]
-roots = [
-  { path = "/snap", subvolumes = ["sv1", "sv2"] }
-]
-
-[defaults]
-snapshot_interval = "1h"
-send_interval = "1d"
-send_enabled = true
-enabled = true
-[defaults.local_retention]
-hourly = 24
-daily = 30
-weekly = 26
-monthly = 12
-[defaults.external_retention]
-daily = 30
-weekly = 26
-monthly = 0
-
-[[drives]]
-label = "ext-drive"
-mount_path = "/mnt/ext"
-snapshot_root = ".snapshots"
-role = "primary"
-
-[[subvolumes]]
-name = "sv1"
-short_name = "sv1"
-source = "/data/sv1"
-protection_level = "sheltered"
-
-[[subvolumes]]
-name = "sv2"
-short_name = "sv2"
-source = "/data/sv2"
-local_retention = "transient"
-"#;
-        toml::from_str(toml_str).expect("test config should parse")
+        ConfigBuilder::new()
+            .drives(&[("ext-drive", "/mnt/ext", "primary")])
+            .subvolume_line("sv1", r#"protection_level = "sheltered""#)
+            .subvolume_line("sv2", r#"local_retention = "transient""#)
+            .build()
     }
 
     fn assessment(name: &str) -> SubvolAssessment {
-        SubvolAssessment {
-            name: name.to_string(),
-            short_name: name.to_string(),
-            status: PromiseStatus::Protected,
-            health: OperationalHealth::Healthy,
-            health_reasons: vec![],
-            local: LocalAssessment {
-                status: PromiseStatus::Protected,
-                snapshot_count: 5,
-                newest_age: None,
-            },
-            external: vec![],
-            chain_health: vec![],
-            advisories: vec![],
-            redundancy_advisories: vec![],
-            errors: vec![],
-            storage_posture: None,
-            cadence_adapted: false,
-            effective_send_interval: None,
-        }
+        subvol_assessment(name, PromiseStatus::Protected)
     }
 
     fn mounted_drive(label: &str) -> DriveAssessment {

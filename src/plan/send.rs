@@ -242,8 +242,6 @@ pub(super) fn plan_external_send(i: &SendInputs) -> PlanFragment {
 mod tests {
     use std::path::PathBuf;
 
-    use chrono::{NaiveDate, NaiveDateTime};
-
     use crate::btrfs::MockBtrfs;
     use crate::config::{DriveConfig, ResolvedSubvolume};
     use crate::events::UnstampedEvent;
@@ -251,23 +249,13 @@ mod tests {
     use crate::output::SkipCategory;
     use crate::plan::testkit::MockFileSystemState;
     use crate::storage_critical::EffectivePolicy;
+    use crate::testkit::{drive_config, fixed_now as now, snap};
     use crate::plan::PlannedSkip;
     use crate::types::{
         DriveRole, Interval, LocalRetentionPolicy, MonthlyCount, ResolvedGraduatedRetention,
     };
 
     use super::*;
-
-    fn now() -> NaiveDateTime {
-        NaiveDate::from_ymd_opt(2026, 3, 22)
-            .unwrap()
-            .and_hms_opt(15, 0, 0)
-            .unwrap()
-    }
-
-    fn snap(s: &str) -> SnapshotName {
-        SnapshotName::parse(s).unwrap()
-    }
 
     fn local_dir() -> PathBuf {
         PathBuf::from("/snap/sv1")
@@ -318,16 +306,7 @@ mod tests {
     }
 
     fn drive() -> DriveConfig {
-        DriveConfig {
-            label: "D1".to_string(),
-            uuid: None,
-            mount_path: PathBuf::from("/mnt/d1"),
-            snapshot_root: ".snapshots".to_string(),
-            role: DriveRole::Primary,
-            max_usage_percent: None,
-            min_free_bytes: None,
-            rotation_interval: None,
-        }
+        drive_config("D1", "/mnt/d1", DriveRole::Primary)
     }
 
     /// Run `plan_external_send` and split its fragment into flat vecs.

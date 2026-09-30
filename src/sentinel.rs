@@ -1087,16 +1087,10 @@ fn eject_advance(
 mod tests {
     use super::*;
     use crate::awareness::{DriveChainHealth, LocalAssessment, OperationalHealth};
+    use crate::testkit::subvol_assessment as make_assessment;
 
     fn fresh_state() -> SentinelState {
         SentinelState::new()
-    }
-
-    fn make_assessment(name: &str, status: PromiseStatus) -> SubvolAssessment {
-        SubvolAssessment {
-            local: LocalAssessment::fixture(status, 5, None),
-            ..SubvolAssessment::fixture(name, status)
-        }
     }
 
     // ── State machine transitions ───────────────────────────────────────

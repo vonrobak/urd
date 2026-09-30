@@ -5,6 +5,7 @@ use super::*;
 use crate::arming::away_shed_map;
 use crate::observation::RealFileSystemState;
 use crate::storage_critical::{ArmedTierMap, TightnessTier};
+use crate::testkit::{fixed_now as now, snap};
 use crate::btrfs::MockBtrfs;
 use crate::events::{EventPayload, UnstampedEvent};
 use crate::plan::NothingNew;
@@ -63,17 +64,6 @@ source = "/data/sv2"
 priority = 2
 "#;
     toml::from_str(toml_str).unwrap()
-}
-
-fn now() -> NaiveDateTime {
-    NaiveDate::from_ymd_opt(2026, 3, 22)
-        .unwrap()
-        .and_hms_opt(15, 0, 0)
-        .unwrap()
-}
-
-fn snap(s: &str) -> SnapshotName {
-    SnapshotName::parse(s).unwrap()
 }
 
 // ── drive_scopes (UPI 058 F5) ──────────────────────────────────────

@@ -637,6 +637,7 @@ mod tests {
     use crate::btrfs::MockBtrfs;
     use crate::observation::Observation;
     use crate::plan::MockFileSystemState;
+    use crate::testkit::ConfigBuilder;
     use crate::types::Interval;
     use chrono::Duration;
 
@@ -650,53 +651,21 @@ mod tests {
 
     // ── Offsite freshness overlay tests ─��───────────────────────────
 
+    /// Resilient `sv1` sending to a primary and an offsite drive.
+    fn fortified_builder() -> ConfigBuilder {
+        ConfigBuilder::new()
+            .drives(&[
+                ("primary-drive", "/mnt/primary", "primary"),
+                ("offsite-drive", "/mnt/offsite", "offsite"),
+            ])
+            .subvolumes(&["sv1"])
+            .subvolume_source("sv1", "/data")
+            .subvolume_line("sv1", r#"protection_level = "resilient""#)
+            .subvolume_line("sv1", r#"drives = ["primary-drive", "offsite-drive"]"#)
+    }
+
     fn fortified_config() -> Config {
-        let toml_str = r#"
-[general]
-state_db = "/tmp/urd.db"
-metrics_file = "/tmp/backup.prom"
-log_dir = "/tmp"
-
-[local_snapshots]
-roots = [
-  { path = "/snap", subvolumes = ["sv1"] }
-]
-
-[defaults]
-snapshot_interval = "1h"
-send_interval = "1d"
-send_enabled = true
-enabled = true
-[defaults.local_retention]
-hourly = 24
-daily = 30
-weekly = 26
-monthly = 12
-[defaults.external_retention]
-daily = 30
-weekly = 26
-monthly = 0
-
-[[drives]]
-label = "primary-drive"
-mount_path = "/mnt/primary"
-snapshot_root = ".snapshots"
-role = "primary"
-
-[[drives]]
-label = "offsite-drive"
-mount_path = "/mnt/offsite"
-snapshot_root = ".snapshots"
-role = "offsite"
-
-[[subvolumes]]
-name = "sv1"
-short_name = "sv1"
-source = "/data"
-protection_level = "resilient"
-drives = ["primary-drive", "offsite-drive"]
-"#;
-        toml::from_str(toml_str).expect("test config should parse")
+        fortified_builder().build()
     }
 
     fn make_assessment(
@@ -931,53 +900,9 @@ drives = ["primary-drive", "offsite-drive"]
 
     /// Like `fortified_config` but the offsite drive declares a 3-month rotation.
     fn fortified_rotation_config() -> Config {
-        let toml_str = r#"
-[general]
-state_db = "/tmp/urd.db"
-metrics_file = "/tmp/backup.prom"
-log_dir = "/tmp"
-
-[local_snapshots]
-roots = [
-  { path = "/snap", subvolumes = ["sv1"] }
-]
-
-[defaults]
-snapshot_interval = "1h"
-send_interval = "1d"
-send_enabled = true
-enabled = true
-[defaults.local_retention]
-hourly = 24
-daily = 30
-weekly = 26
-monthly = 12
-[defaults.external_retention]
-daily = 30
-weekly = 26
-monthly = 0
-
-[[drives]]
-label = "primary-drive"
-mount_path = "/mnt/primary"
-snapshot_root = ".snapshots"
-role = "primary"
-
-[[drives]]
-label = "offsite-drive"
-mount_path = "/mnt/offsite"
-snapshot_root = ".snapshots"
-role = "offsite"
-rotation_interval = "3mo"
-
-[[subvolumes]]
-name = "sv1"
-short_name = "sv1"
-source = "/data"
-protection_level = "resilient"
-drives = ["primary-drive", "offsite-drive"]
-"#;
-        toml::from_str(toml_str).expect("test config should parse")
+        fortified_builder()
+            .drive_line("offsite-drive", r#"rotation_interval = "3mo""#)
+            .build()
     }
 
     #[test]
@@ -1080,52 +1005,13 @@ drives = ["primary-drive", "offsite-drive"]
 
     /// Config with fortified subvolume but only primary drives (no offsite).
     fn fortified_no_offsite_config() -> Config {
-        let toml_str = r#"
-[general]
-state_db = "/tmp/urd.db"
-metrics_file = "/tmp/backup.prom"
-log_dir = "/tmp"
-
-[local_snapshots]
-roots = [
-  { path = "/snap", subvolumes = ["sv1"] }
-]
-
-[defaults]
-snapshot_interval = "1h"
-send_interval = "1d"
-send_enabled = true
-enabled = true
-[defaults.local_retention]
-hourly = 24
-daily = 30
-weekly = 26
-monthly = 12
-[defaults.external_retention]
-daily = 30
-weekly = 26
-monthly = 0
-
-[[drives]]
-label = "drive-a"
-mount_path = "/mnt/a"
-snapshot_root = ".snapshots"
-role = "primary"
-
-[[drives]]
-label = "drive-b"
-mount_path = "/mnt/b"
-snapshot_root = ".snapshots"
-role = "primary"
-
-[[subvolumes]]
-name = "sv1"
-short_name = "sv1"
-source = "/data"
-protection_level = "resilient"
-drives = ["drive-a", "drive-b"]
-"#;
-        toml::from_str(toml_str).expect("test config should parse")
+        ConfigBuilder::new()
+            .drives(&[("drive-a", "/mnt/a", "primary"), ("drive-b", "/mnt/b", "primary")])
+            .subvolumes(&["sv1"])
+            .subvolume_source("sv1", "/data")
+            .subvolume_line("sv1", r#"protection_level = "resilient""#)
+            .subvolume_line("sv1", r#"drives = ["drive-a", "drive-b"]"#)
+            .build()
     }
 
     #[test]
@@ -1296,45 +1182,12 @@ drives = ["drive-a", "drive-b"]
 
     /// Config with protected subvolume and exactly 1 drive.
     fn sheltered_single_drive_config() -> Config {
-        let toml_str = r#"
-[general]
-state_db = "/tmp/urd.db"
-metrics_file = "/tmp/backup.prom"
-log_dir = "/tmp"
-
-[local_snapshots]
-roots = [
-  { path = "/snap", subvolumes = ["sv1"] }
-]
-
-[defaults]
-snapshot_interval = "1h"
-send_interval = "1d"
-send_enabled = true
-enabled = true
-[defaults.local_retention]
-hourly = 24
-daily = 30
-weekly = 26
-monthly = 12
-[defaults.external_retention]
-daily = 30
-weekly = 26
-monthly = 0
-
-[[drives]]
-label = "only-drive"
-mount_path = "/mnt/only"
-snapshot_root = ".snapshots"
-role = "primary"
-
-[[subvolumes]]
-name = "sv1"
-short_name = "sv1"
-source = "/data"
-protection_level = "protected"
-"#;
-        toml::from_str(toml_str).expect("test config should parse")
+        ConfigBuilder::new()
+            .drives(&[("only-drive", "/mnt/only", "primary")])
+            .subvolumes(&["sv1"])
+            .subvolume_source("sv1", "/data")
+            .subvolume_line("sv1", r#"protection_level = "protected""#)
+            .build()
     }
 
     #[test]
@@ -1442,45 +1295,12 @@ protection_level = "guarded"
 
     /// Config with transient subvolume and one external drive.
     fn transient_single_drive_config() -> Config {
-        let toml_str = r#"
-[general]
-state_db = "/tmp/urd.db"
-metrics_file = "/tmp/backup.prom"
-log_dir = "/tmp"
-
-[local_snapshots]
-roots = [
-  { path = "/snap", subvolumes = ["sv1"] }
-]
-
-[defaults]
-snapshot_interval = "1h"
-send_interval = "1d"
-send_enabled = true
-enabled = true
-[defaults.local_retention]
-hourly = 24
-daily = 30
-weekly = 26
-monthly = 12
-[defaults.external_retention]
-daily = 30
-weekly = 26
-monthly = 0
-
-[[drives]]
-label = "ext-drive"
-mount_path = "/mnt/ext"
-snapshot_root = ".snapshots"
-role = "primary"
-
-[[subvolumes]]
-name = "sv1"
-short_name = "sv1"
-source = "/data"
-local_retention = "transient"
-"#;
-        toml::from_str(toml_str).expect("test config should parse")
+        ConfigBuilder::new()
+            .drives(&[("ext-drive", "/mnt/ext", "primary")])
+            .subvolumes(&["sv1"])
+            .subvolume_source("sv1", "/data")
+            .subvolume_line("sv1", r#"local_retention = "transient""#)
+            .build()
     }
 
     #[test]

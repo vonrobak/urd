@@ -117,39 +117,15 @@ pub fn assess(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::ConfigBuilder;
 
     fn test_config(state_db_path: &std::path::Path) -> Config {
-        let toml_str = format!(
-            r#"
-drives = []
-subvolumes = []
-
-[general]
-state_db = "{}"
-metrics_file = "/tmp/urd-world-test.prom"
-log_dir = "/tmp"
-
-[local_snapshots]
-roots = []
-
-[defaults]
-snapshot_interval = "1h"
-send_interval = "1d"
-send_enabled = true
-enabled = true
-[defaults.local_retention]
-hourly = 24
-daily = 30
-weekly = 26
-monthly = 12
-[defaults.external_retention]
-daily = 30
-weekly = 26
-monthly = 0
-"#,
-            state_db_path.display()
-        );
-        toml::from_str(&toml_str).expect("test config should parse")
+        ConfigBuilder::new()
+            .state_db(state_db_path)
+            .metrics_file("/tmp/urd-world-test.prom")
+            .drives(&[])
+            .subvolumes(&[])
+            .build()
     }
 
     #[test]
