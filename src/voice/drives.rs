@@ -14,6 +14,8 @@ use crate::output::{
 };
 use crate::plan::format_duration_short;
 
+use super::pad_visible;
+
 /// Render the drives list output. `now` is the caller's wall-clock reading,
 /// threaded through to compute "absent NNm" ages — the renderer itself
 /// stays a pure function of its input (no `Local::now()` inside `voice/`).
@@ -74,10 +76,16 @@ fn render_drives_list_interactive(data: &DrivesListOutput, now: chrono::NaiveDat
         };
         let role_str = entry.role.to_string();
 
+        // STATUS and TOKEN are pre-colored: pad them by visible width, not
+        // byte length, or their ANSI codes eat the padding on a TTY.
         writeln!(
             out,
-            "{:<label_w$}   {:<status_w$}   {:<10}   {:>8}   {}",
-            entry.label, status_colored, token_colored, free_str, role_str,
+            "{:<label_w$}   {}   {}   {:>8}   {}",
+            entry.label,
+            pad_visible(&status_colored, status_w),
+            pad_visible(&token_colored, 10),
+            free_str,
+            role_str,
         )
         .ok();
     }
@@ -240,6 +248,25 @@ mod tests {
                 },
             ],
         }
+    }
+
+    /// Regression: STATUS and TOKEN are pre-colored, and `{:<w$}` counted
+    /// their ANSI bytes as width, so on a TTY every column after them drifted.
+    /// The colored render, stripped of escapes, must lay out exactly like the
+    /// plain one.
+    #[test]
+    fn drives_list_colored_aligns_like_plain() {
+        let data = test_drives_list();
+        let plain = {
+            let _color = color_guard(false);
+            render_drives_list(&data, OutputMode::Interactive, drives_now())
+        };
+        let colored = {
+            let _color = color_guard(true);
+            render_drives_list(&data, OutputMode::Interactive, drives_now())
+        };
+        assert_ne!(colored, plain, "color must actually be on: {colored:?}");
+        assert_eq!(strip_ansi(&colored), plain);
     }
 
     #[test]

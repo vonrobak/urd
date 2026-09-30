@@ -16,7 +16,7 @@ use crate::types::{ByteSize, DriveRole};
 
 use super::{
     SuggestionContext, append_suggestion, approx_size, color_result, exposure_cell,
-    exposure_label, format_elapsed, format_table, pluralize, skip_tag,
+    exposure_label, format_elapsed, format_table, pad_visible, pluralize, skip_tag,
 };
 
 /// Render post-backup summary according to the given mode.
@@ -96,8 +96,8 @@ fn render_backup_interactive(data: &BackupSummary) -> String {
             let send_info = format_send_info(&sv.sends);
             writeln!(
                 out,
-                "  {:<6} {}  [{}]{}",
-                status,
+                "  {} {}  [{}]{}",
+                pad_visible(&status, 6),
                 sv.name.bold(),
                 format_elapsed(Duration::from_secs(sv.duration_secs as u64)),
                 send_info,
@@ -1147,6 +1147,25 @@ mod tests {
         let output = render_backup_summary(&data, OutputMode::Interactive);
         assert!(output.contains("1 failed"), "header should show failed count");
         assert!(output.contains("1 deferred"), "header should show deferred count");
+    }
+
+    /// Regression: the colored OK/FAILED status was padded with `{:<6}`,
+    /// which counts ANSI bytes, so on a TTY the subvolume names lost their
+    /// alignment. Stripped of escapes, the colored render must match the
+    /// plain one.
+    #[test]
+    fn backup_colored_status_aligns_like_plain() {
+        let data = test_backup_summary();
+        let plain = {
+            let _color = color_guard(false);
+            render_backup_summary(&data, OutputMode::Interactive)
+        };
+        let colored = {
+            let _color = color_guard(true);
+            render_backup_summary(&data, OutputMode::Interactive)
+        };
+        assert_ne!(colored, plain, "color must actually be on: {colored:?}");
+        assert_eq!(strip_ansi(&colored), plain);
     }
 
     #[test]

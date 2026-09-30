@@ -354,3 +354,22 @@ pub(crate) fn fixed_now(iso: &str) -> chrono::NaiveDateTime {
     chrono::NaiveDateTime::parse_from_str(iso, "%Y-%m-%dT%H:%M:%S")
         .unwrap_or_else(|e| panic!("bad fixed_now literal {iso:?}: {e}"))
 }
+
+/// Strip ANSI SGR sequences (`ESC[ … m`) — what a TTY user actually sees.
+/// Lets a test render once colored and once plain and assert the two lay out
+/// identically, which catches cells padded by byte length instead of
+/// visible width.
+pub(crate) fn strip_ansi(s: &str) -> String {
+    let mut out = String::new();
+    let mut in_escape = false;
+    for c in s.chars() {
+        if in_escape {
+            in_escape = c != 'm';
+        } else if c == '\x1b' {
+            in_escape = true;
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}

@@ -13,7 +13,9 @@ use colored::Colorize;
 use crate::output::{OutputMode, PlanOutput, SkipCategory, SkippedSubvolume};
 use crate::plan::format_duration_short;
 
-use super::{SuggestionContext, append_suggestion, approx_size, pluralize, skip_tag};
+use super::{
+    SuggestionContext, append_suggestion, approx_size, pad_visible, pluralize, skip_tag,
+};
 
 /// Render an explanation for why a manual backup produced an empty plan.
 #[must_use]
@@ -185,8 +187,8 @@ fn render_plan_interactive(data: &PlanOutput, verbose: bool) -> String {
             };
             writeln!(
                 out,
-                "  {:<10} {}{}{}",
-                label,
+                "  {} {}{}{}",
+                pad_visible(&label, 10),
                 entry.detail,
                 size_annotation.dimmed(),
                 location.dimmed()
@@ -411,6 +413,25 @@ mod tests {
             "hiding detail is only honest with a pointer to it: {output}"
         );
         assert!(output.contains("Summary:"), "summary must survive: {output}");
+    }
+
+    /// Regression: the colored `[CREATE]`/`[SEND]` tag was padded with
+    /// `{:<10}`, which counts ANSI bytes, so on a TTY the detail column lost
+    /// its alignment. Stripped of escapes, the colored render must match the
+    /// plain one.
+    #[test]
+    fn plan_verbose_colored_aligns_like_plain() {
+        let data = test_plan_output();
+        let plain = {
+            let _color = color_guard(false);
+            render_plan(&data, OutputMode::Interactive, true)
+        };
+        let colored = {
+            let _color = color_guard(true);
+            render_plan(&data, OutputMode::Interactive, true)
+        };
+        assert_ne!(colored, plain, "color must actually be on: {colored:?}");
+        assert_eq!(strip_ansi(&colored), plain);
     }
 
     #[test]

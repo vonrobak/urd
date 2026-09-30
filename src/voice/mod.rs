@@ -289,6 +289,18 @@ pub(super) fn format_table(
     }
 }
 
+/// Left-align a possibly pre-colored cell to `width` visible columns.
+///
+/// `format!("{:<w$}")` counts the ANSI escape bytes of a colored string as
+/// width, so a colored cell gets under-padded on a TTY and every later column
+/// shifts. Hand-laid rows that can't use `format_table` (fixed gutters,
+/// right-aligned columns, an unbolded header) pad their colored cells through
+/// this instead. With color off it is byte-identical to `{:<w$}`.
+pub(super) fn pad_visible(cell: &str, width: usize) -> String {
+    let padding = width.saturating_sub(strip_ansi_len(cell));
+    format!("{cell}{:padding$}", "")
+}
+
 /// Get visible (non-ANSI) length of a string.
 fn strip_ansi_len(s: &str) -> usize {
     // ANSI escape sequences: ESC[ ... m
