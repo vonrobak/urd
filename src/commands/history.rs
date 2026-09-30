@@ -98,18 +98,7 @@ fn show_failures(db: &StateDb, limit: usize, mode: OutputMode) -> anyhow::Result
 
 #[cfg(test)]
 mod tests {
-    fn truncate_str(s: &str, max_len: usize) -> String {
-        if s.len() <= max_len {
-            return s.to_string();
-        }
-        let end = s
-            .char_indices()
-            .take_while(|(i, _)| *i < max_len.saturating_sub(3))
-            .last()
-            .map(|(i, c)| i + c.len_utf8())
-            .unwrap_or(0);
-        format!("{}...", &s[..end])
-    }
+    use crate::voice::truncate_str;
 
     #[test]
     fn truncate_short_string_unchanged() {
