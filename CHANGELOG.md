@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- A destination snapshot that already carries the name about to be sent is no
+  longer deleted on inference. It is kept when its pin names it (as before) or
+  when it has a Received UUID — a send that completed and crashed before its
+  pin write — in which case the pin is written and the send counts as done. It
+  is deleted only when the missing Received UUID proves the receive never
+  finalized. An unreadable pin or a failed UUID query leaves it in place and
+  fails the send instead (ADR-107).
+- A watchdog trip is no longer lost if the watchdog thread panics while holding
+  its coordination lock. The executor and the trip handler now recover the
+  poisoned lock and treat the pool as tripped; they previously read it as
+  "not tripped" and kept sending (ADR-113).
+- A stray non-ASCII entry in a snapshot directory (for example `2026010é-x`)
+  no longer crashes a backup or the sentinel; it is reported as an unparseable
+  snapshot name.
+- A drive mounted at a path containing a space, tab, newline or backslash is
+  now detected as mounted (`/proc/mounts` escapes these), and a trailing slash
+  on the configured mount path no longer prevents the match.
+- `urd history` now fails with "failed to open state DB" when the database
+  cannot be opened; it previously printed an empty history and exited 0.
+- Every best-effort open of the state database now logs a warning when it
+  fails, including the five sites that were silent (sentinel assessments,
+  global metrics, retention preview).
+- `urd drives list`, `urd plan --verbose` and the run summary align their
+  colored status columns on a terminal; the color codes were counted as width.
+- `urd get` no longer panics on an unknown subvolume in its production path.
+
 ## [0.38.0] - 2026-09-29
 
 ### Changed
