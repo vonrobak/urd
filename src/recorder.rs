@@ -30,9 +30,12 @@ pub enum DispatchPolicy {
     Immediate,
     /// The sentinel gate (promise-transition notifications only): if the
     /// sentinel is running, mark the heartbeat dispatched and let the
-    /// sentinel deliver; otherwise dispatch and mark **iff** delivery
-    /// succeeded (or nothing needed dispatching at all) — total failure
-    /// leaves the flag unset so the sentinel retries.
+    /// sentinel deliver (it computes the same transitions from its own
+    /// baseline); otherwise dispatch and mark **iff** delivery succeeded
+    /// (or nothing needed dispatching at all). Total failure leaves the
+    /// flag unset — a record for external readers of the heartbeat
+    /// (ADR-105 Contract 5). Nothing in Urd reads the flag back or retries
+    /// on it (ADR-114 amendment 2026-09-30).
     GateOnSentinel,
 }
 
@@ -109,8 +112,9 @@ impl<'a> Recorder<'a> {
     ///
     /// The empty check is **caller-level**, not eligibility-level: a
     /// non-empty batch that `notify::dispatch` filters entirely below
-    /// `min_urgency` returns `false` and must NOT mark — the sentinel
-    /// retries, exactly as before this seam existed.
+    /// `min_urgency` returns `false` and must NOT mark — the flag then
+    /// tells a heartbeat reader nothing was delivered, exactly as before
+    /// this seam existed.
     fn gate_dispatch(&self, notifications: &[Notification]) {
         if (self.sentinel_probe)(self.config) {
             log::info!("Sentinel is running — deferring notification dispatch");
@@ -128,8 +132,7 @@ impl<'a> Recorder<'a> {
             self.mark_dispatched_best_effort();
         } else {
             log::warn!(
-                "All notification channels failed — heartbeat not marked as dispatched \
-                 (Sentinel will retry)"
+                "All notification channels failed — heartbeat not marked as dispatched"
             );
         }
     }
@@ -432,7 +435,7 @@ source = "/data/alpha"
 
         assert!(
             !dispatched_flag(&config),
-            "total delivery failure leaves the flag unset — the sentinel retries"
+            "total delivery failure leaves the flag unset"
         );
     }
 
@@ -440,8 +443,8 @@ source = "/data/alpha"
     fn gate_idle_below_min_urgency_leaves_unmarked() {
         // The min-urgency trap: notifications are NON-empty, but every one
         // filters below min_urgency, so dispatch returns false. Today's
-        // caller-level semantics do NOT mark (sentinel retries) — marking
-        // here would be the eligibility-level misreading.
+        // caller-level semantics do NOT mark (nothing was delivered) —
+        // marking here would be the eligibility-level misreading.
         let dir = tempfile::TempDir::new().unwrap();
         let config = test_config(dir.path(), log_channel(Urgency::Critical));
         seed_heartbeat(&config);
@@ -458,7 +461,7 @@ source = "/data/alpha"
 
         assert!(
             !dispatched_flag(&config),
-            "below-min_urgency batch is dispatch-false ⇒ NOT marked (sentinel retries)"
+            "below-min_urgency batch is dispatch-false ⇒ NOT marked"
         );
     }
 }

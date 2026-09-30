@@ -39,8 +39,9 @@ pub struct Heartbeat {
     pub run_result: String,
     pub run_id: Option<i64>,
     pub subvolumes: Vec<SubvolumeHeartbeat>,
-    /// Whether notifications were dispatched for this heartbeat.
-    /// Used for crash recovery: if false on next read, re-compute and re-send.
+    /// Whether notifications were dispatched for this heartbeat — a record
+    /// for external readers (ADR-105 Contract 5). Urd writes it and never
+    /// reads it back; nothing re-sends on `false` (ADR-114 amendment 2026-09-30).
     /// Defaults to true for backward compat with pre-notification heartbeats.
     #[serde(default = "default_true")]
     pub notifications_dispatched: bool,
