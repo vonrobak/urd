@@ -69,9 +69,11 @@ pub fn run(config_path: Option<&Path>, output_mode: OutputMode) -> anyhow::Resul
             let sv = resolved.iter().find(|sv| sv.name == a.name)?;
             advice::compute_advice(
                 a,
-                posture.earned,
-                sv.send_enabled,
-                sv.local_retention.is_transient(),
+                advice::AdviceContext {
+                    earned: posture.earned,
+                    send_enabled: sv.send_enabled,
+                    external_only: sv.local_retention.is_transient(),
+                },
             )
         })
         .collect();

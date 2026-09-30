@@ -178,7 +178,14 @@ fn assemble_status_output(
         .iter()
         .filter_map(|a| {
             let sv = resolved.iter().find(|sv| sv.name == a.name)?;
-            advice::compute_advice(a, earned, sv.send_enabled, sv.local_retention.is_transient())
+            advice::compute_advice(
+                a,
+                advice::AdviceContext {
+                    earned,
+                    send_enabled: sv.send_enabled,
+                    external_only: sv.local_retention.is_transient(),
+                },
+            )
         })
         .collect();
 

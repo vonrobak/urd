@@ -120,9 +120,11 @@ fn subvolume_metric_rows(
         let assessment = assessment_by_name.get(sv_result.name.as_str()).copied();
         let expected = external_expected.contains(&sv_result.name);
         let deferred = run_tail::is_deferred(
-            expected,
-            sv_result.send_succeeded(),
-            !sv_result.success,
+            run_tail::DeferralFacts {
+                externally_expected: expected,
+                send_succeeded: sv_result.send_succeeded(),
+                op_failed: !sv_result.success,
+            },
             assessment,
         );
         let (success_val, send_type, last_success_ts) = if deferred {
@@ -180,7 +182,8 @@ fn subvolume_metric_rows(
         let assessment = assessment_by_name.get(name.as_str()).copied();
         let expected = external_expected.contains(&name);
         // Not executed: no send succeeded and no operation failed.
-        let deferred = run_tail::is_deferred(expected, false, false, assessment);
+        let deferred =
+            run_tail::is_deferred(run_tail::DeferralFacts::not_executed(expected), assessment);
         let (success_val, send_type) = if deferred { (3, 3) } else { (2, 2) };
 
         subvolume_metrics.push(SubvolumeMetrics {

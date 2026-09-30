@@ -205,7 +205,14 @@ pub fn run(config: Config, args: DoctorArgs, output_mode: OutputMode) -> anyhow:
             let send_enabled = sv_config.is_none_or(|sv| sv.send_enabled);
             let external_only = sv_config.is_some_and(|sv| sv.local_retention.is_transient());
             let earned = sudo_probe.0 == crate::sudoers::GrantProbe::Granted;
-            let advice = advice::compute_advice(a, earned, send_enabled, external_only);
+            let advice = advice::compute_advice(
+                a,
+                advice::AdviceContext {
+                    earned,
+                    send_enabled,
+                    external_only,
+                },
+            );
 
             // Extract structured advice into doctor display fields.
             let (issue, suggestion, reason) = match a.status {

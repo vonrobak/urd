@@ -83,6 +83,31 @@ pub enum MetricsSpec<'a> {
     AfterExecution(&'a ExecutionResult),
 }
 
+/// This run's facts about one subvolume that [`is_deferred`] judges, named so
+/// the call site reads as prose rather than three positional bools.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeferralFacts {
+    /// The subvolume is expected to have an external copy.
+    pub externally_expected: bool,
+    /// A send for the subvolume reached a destination this run.
+    pub send_succeeded: bool,
+    /// An operation for the subvolume failed this run.
+    pub op_failed: bool,
+}
+
+impl DeferralFacts {
+    /// A subvolume the run did not execute: no send succeeded and no
+    /// operation failed.
+    #[must_use]
+    pub fn not_executed(externally_expected: bool) -> Self {
+        Self {
+            externally_expected,
+            send_succeeded: false,
+            op_failed: false,
+        }
+    }
+}
+
 /// Whether a subvolume is *deferred* in this run: expected to have an
 /// external copy, yet nothing reached a destination and no drive holds a
 /// copy that is current or fresh (ADR-105 amendment 2026-09-29). The rule
@@ -90,7 +115,8 @@ pub enum MetricsSpec<'a> {
 /// guard and gated chain-break full send all end the same way for the data.
 ///
 /// `send_succeeded` / `op_failed` describe this run's operations for the
-/// subvolume; both are `false` for a subvolume the run did not execute.
+/// subvolume; both are `false` for a subvolume the run did not execute
+/// ([`DeferralFacts::not_executed`]).
 /// Without an assessment (awareness assesses enabled subvolumes only) there
 /// is nothing to judge the drive copies by, so the answer is `false`.
 ///
@@ -101,12 +127,12 @@ pub enum MetricsSpec<'a> {
 /// pool is adapted, else the declared one. A drive never sent to
 /// (`last_send_age` is `None`) holds no fresh copy.
 #[must_use]
-pub fn is_deferred(
-    externally_expected: bool,
-    send_succeeded: bool,
-    op_failed: bool,
-    assessment: Option<&SubvolAssessment>,
-) -> bool {
+pub fn is_deferred(facts: DeferralFacts, assessment: Option<&SubvolAssessment>) -> bool {
+    let DeferralFacts {
+        externally_expected,
+        send_succeeded,
+        op_failed,
+    } = facts;
     if !externally_expected || send_succeeded || op_failed {
         return false;
     }
@@ -1478,7 +1504,14 @@ source = "/data/alpha"
         ];
         for (case, expected, sent, failed, assessment, want) in cases {
             assert_eq!(
-                is_deferred(expected, sent, failed, assessment.as_ref()),
+                is_deferred(
+                    DeferralFacts {
+                        externally_expected: expected,
+                        send_succeeded: sent,
+                        op_failed: failed,
+                    },
+                    assessment.as_ref()
+                ),
                 want,
                 "{case}"
             );

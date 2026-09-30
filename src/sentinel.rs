@@ -431,6 +431,16 @@ pub fn has_health_changes(
     has_changes(previous, current, |p| &p.name, |p, a| p.health != a.health)
 }
 
+/// The sentinel's state for [`should_record_transitions`]: whether it has a
+/// baseline to diff against, and whether a backup run holds the lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordingWindow {
+    /// The sentinel has taken its first assessment (a baseline exists).
+    pub has_initial_assessment: bool,
+    /// A backup run holds the lock right now.
+    pub backup_active: bool,
+}
+
 /// Should this assess record promise-transition events? (UPI 063)
 ///
 /// Encodes the ownership rule backup.rs states ("Backup is canonical for
@@ -443,11 +453,10 @@ pub fn has_health_changes(
 /// event), and the run's own pre/post diff is the honest attribution.
 #[must_use]
 pub fn should_record_transitions(
-    has_initial_assessment: bool,
     trigger: Option<crate::events::TransitionTrigger>,
-    backup_active: bool,
+    window: RecordingWindow,
 ) -> bool {
-    has_initial_assessment && trigger.is_some() && !backup_active
+    window.has_initial_assessment && trigger.is_some() && !window.backup_active
 }
 
 /// Pick the originating `TransitionTrigger` for promise-transition events
@@ -1268,9 +1277,11 @@ mod tests {
     fn records_on_tick_when_initialized_and_no_backup() {
         use crate::events::TransitionTrigger;
         assert!(should_record_transitions(
-            true,
             Some(TransitionTrigger::Tick),
-            false
+            RecordingWindow {
+                has_initial_assessment: true,
+                backup_active: false,
+            }
         ));
     }
 
@@ -1279,7 +1290,13 @@ mod tests {
         use crate::events::TransitionTrigger;
         for trigger in [None, Some(TransitionTrigger::Tick)] {
             for backup_active in [false, true] {
-                assert!(!should_record_transitions(false, trigger, backup_active));
+                assert!(!should_record_transitions(
+                    trigger,
+                    RecordingWindow {
+                        has_initial_assessment: false,
+                        backup_active,
+                    }
+                ));
             }
         }
     }
@@ -1289,7 +1306,13 @@ mod tests {
         // BackupCompleted-only cycles arrive as trigger=None — the backup
         // already recorded with trigger=Run.
         for backup_active in [false, true] {
-            assert!(!should_record_transitions(true, None, backup_active));
+            assert!(!should_record_transitions(
+                None,
+                RecordingWindow {
+                    has_initial_assessment: true,
+                    backup_active,
+                }
+            ));
         }
     }
 
@@ -1304,7 +1327,13 @@ mod tests {
             TransitionTrigger::DriveMounted,
             TransitionTrigger::ConfigChanged,
         ] {
-            assert!(!should_record_transitions(true, Some(trigger), true));
+            assert!(!should_record_transitions(
+                Some(trigger),
+                RecordingWindow {
+                    has_initial_assessment: true,
+                    backup_active: true,
+                }
+            ));
         }
     }
 

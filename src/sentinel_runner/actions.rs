@@ -77,9 +77,11 @@ impl SentinelRunner {
         // it) and notifications keep their timing (grill D).
         if let Some(t) = trigger
             && sentinel::should_record_transitions(
-                self.state.has_initial_assessment,
                 trigger,
-                self.backup_run_active(),
+                sentinel::RecordingWindow {
+                    has_initial_assessment: self.state.has_initial_assessment,
+                    backup_active: self.backup_run_active(),
+                },
             )
         {
             audit_events.extend(awareness::diff_promise_states(
