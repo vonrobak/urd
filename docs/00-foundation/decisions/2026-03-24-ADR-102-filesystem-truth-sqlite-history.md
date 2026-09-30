@@ -6,7 +6,7 @@ project: ['[[urd]]']
 sensitivity: public
 status: active
 created: '2026-03-24'
-timestamp: '2026-09-04T15:03:12+02:00'
+timestamp: '2026-09-30T12:00:00+02:00'
 ---
 # ADR-102: Filesystem as Source of Truth, SQLite as History
 
@@ -16,7 +16,7 @@ timestamp: '2026-09-04T15:03:12+02:00'
 > failures must never prevent backups from running.
 
 **Date:** 2026-03-22 (formalized 2026-03-24)
-**Status:** Accepted (amended 2026-09-04 — see [Amendment 2026-09-04](#amendment-2026-09-04-the-current-table-inventory))
+**Status:** Accepted (amended 2026-09-04 — see [Amendment 2026-09-04](#amendment-2026-09-04-the-current-table-inventory); amended 2026-09-30 — see [Amendment 2026-09-30](#amendment-2026-09-30-retention_shapes-and-the-tables-read-into-decisions))
 **Supersedes:** None (founding decision; supersedes early roadmap's `snapshots` table)
 
 ## Context
@@ -118,3 +118,40 @@ lost or unreadable table means the tier is classified fresh from live pool signa
 
 No table is ever consulted to determine what snapshots exist. That still comes from
 snapshot directories and pin files.
+
+## Amendment 2026-09-30: `retention_shapes`, and the tables read into decisions
+
+The schema is in `src/state/schema.rs` (`init_schema`); the 2026-09-04 inventory's
+"`src/state.rs`" reads as that file. It now creates eight tables. The eighth is:
+
+| Table | Records | Read by |
+|---|---|---|
+| `retention_shapes` | Per subvolume, the local and external retention shape under which its retention deletions were last applied, and when | The retention-change gate (ADR-110's amendment of this date), `urd plan`, `urd status`, `urd doctor` |
+
+The `drive_tokens` row's "token gating in `commands/backup.rs`" is
+`commands/backup/gating.rs`.
+
+The 2026-09-04 amendment says two tables are read back into decisions (`subvolume_sizes`
+and `pool_armed_tier`). Four are: that list omitted `drive_tokens`, which token gating
+reads, and `retention_shapes` is new. Each degrades in a stated direction:
+
+- **`subvolume_sizes`** and **`pool_armed_tier`**: as the 2026-09-04 amendment says, an
+  estimate and a hysteresis memo. Their loss makes the next decision from live signals.
+- **`drive_tokens`**: read into token gating, which blocks sends to a drive whose token
+  file is missing or does not match. With no state DB, no gating runs and sends proceed
+  (ADR-107). A drive whose token cannot be verified is never marked `token_verified`, so
+  the executor's chain-break gate stays at the planner's conservative default (ADR-100).
+- **`retention_shapes`**: read into the retention-change gate. If the table cannot be
+  read, nothing is held and the run logs a warning that no retention-tightening gate
+  applies (`plan_cmd::retention_baseline_or_warn`). **This is the one table whose loss
+  widens what Urd deletes.** A tightening that coincides with an unreadable baseline is
+  applied without confirmation for that run, but the run records no shapes, so the old
+  baseline survives and holds the tightening on the next run that reads it. It is accepted because the alternative, holding every
+  promise-level subvolume's retention whenever SQLite hiccups, makes history a
+  precondition for the retention that keeps pools from filling. That is the coupling this
+  ADR forbids. The deletions that do run are still ordinary retention: pin-protected
+  (ADR-106) and bounded by the configured policy. What is lost is only the one-time
+  confirmation.
+
+No table is consulted to determine what snapshots exist. That still comes from snapshot
+directories and pin files.

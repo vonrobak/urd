@@ -3,6 +3,7 @@
 //! pure classification and plan mutation, and the run-end retention-shape
 //! record the next run's gate compares against.
 
+use crate::commands::plan_cmd::BaselineRead;
 use crate::config::Config;
 use crate::drives;
 use crate::plan::{BackupPlan, PlannedOperation};
@@ -133,14 +134,21 @@ pub(super) fn apply_token_gating(plan: &mut BackupPlan, gating: &TokenGating) {
 /// deletions this run did not withhold (ADR-110 transition safety): the
 /// baseline the next run's gate compares against. Best-effort (ADR-102) —
 /// with no state DB nothing is recorded, and the next run gates nothing.
+/// A run whose baseline read failed ([`BaselineRead::Unreadable`]) records
+/// nothing either: its gate held nothing, so recording would silently accept
+/// any tightening it let through; the old rows stay to hold it next run.
 pub(super) fn record_retention_shapes(
     db: Option<&StateDb>,
     gate: &crate::retention::RetentionGate,
+    baseline: BaselineRead,
     recorded_at: chrono::NaiveDateTime,
 ) {
     let Some(db) = db else {
         return;
     };
+    if baseline == BaselineRead::Unreadable {
+        return;
+    }
     for (subvolume, shape) in &gate.record {
         db.upsert_retention_shape_best_effort(subvolume, shape, recorded_at);
     }
@@ -251,7 +259,7 @@ source = "/data/beta"
         // First run on an upgraded install: no record → nothing held, all recorded.
         let gate = gate_for(&resolved, &db, false, &full);
         assert!(gate.held.is_empty());
-        record_retention_shapes(Some(&db), &gate, gate_t());
+        record_retention_shapes(Some(&db), &gate, BaselineRead::Read, gate_t());
         assert_eq!(db.all_retention_shapes().unwrap()["alpha"], alpha_now);
 
         // The level changed since: alpha used to keep far more.
@@ -259,7 +267,7 @@ source = "/data/beta"
         let gate = gate_for(&resolved, &db, false, &full);
         assert_eq!(gate.held.len(), 1);
         assert_eq!(gate.held[0].subvolume, "alpha");
-        record_retention_shapes(Some(&db), &gate, gate_t());
+        record_retention_shapes(Some(&db), &gate, BaselineRead::Read, gate_t());
         assert_eq!(
             db.all_retention_shapes().unwrap()["alpha"],
             roomy_shape(),
@@ -271,7 +279,7 @@ source = "/data/beta"
         // local half had tightened, so the next unconfirmed run holds nothing.
         let gate = gate_for(&resolved, &db, true, &full);
         assert!(gate.held.is_empty());
-        record_retention_shapes(Some(&db), &gate, gate_t());
+        record_retention_shapes(Some(&db), &gate, BaselineRead::Read, gate_t());
         assert_eq!(
             db.all_retention_shapes().unwrap()["alpha"],
             RecordedRetention {
@@ -298,7 +306,7 @@ source = "/data/beta"
         let gate = gate_for(&resolved, &db, true, &scoped);
         let recorded: Vec<&str> = gate.record.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(recorded, vec!["beta"]);
-        record_retention_shapes(Some(&db), &gate, gate_t());
+        record_retention_shapes(Some(&db), &gate, BaselineRead::Read, gate_t());
         assert_eq!(db.all_retention_shapes().unwrap()["alpha"], roomy_shape());
 
         let next = gate_for(&resolved, &db, false, &PlanFilters::default());
@@ -322,15 +330,81 @@ source = "/data/beta"
             held: vec![],
             record: vec![(svname("alpha"), roomy_shape())],
         };
-        record_retention_shapes(None, &gate, chrono::NaiveDateTime::default());
+        record_retention_shapes(None, &gate, BaselineRead::Read, chrono::NaiveDateTime::default());
     }
 
     #[test]
     fn unreadable_retention_baseline_gates_nothing() {
         // No DB: the baseline is unknown, so nothing is held (ADR-102) — the
         // helper warns once; the empty map is what the gate sees.
-        assert!(crate::commands::plan_cmd::retention_baseline_or_warn(None).is_empty());
+        let baseline = crate::commands::plan_cmd::retention_baseline_or_warn(None);
+        assert!(baseline.shapes.is_empty());
+        assert_eq!(baseline.read, BaselineRead::Unreadable);
         assert!(crate::commands::plan_cmd::recorded_retention_shapes(None).is_none());
+    }
+
+    /// A row whose `shape` is a BLOB fails the typed read, so the whole
+    /// baseline read errors while writes to the table still succeed.
+    fn poison_retention_baseline(db: &StateDb) {
+        db.conn
+            .execute(
+                "INSERT INTO retention_shapes (subvolume, shape, recorded_at)
+                 VALUES ('ghost', X'00', '2026-09-01T04:00:00')",
+                [],
+            )
+            .unwrap();
+    }
+
+    fn retention_shape_rows(db: &StateDb, subvolume: &str) -> i64 {
+        db.conn
+            .query_row(
+                "SELECT COUNT(*) FROM retention_shapes WHERE subvolume = ?1",
+                [subvolume],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn unreadable_retention_baseline_records_no_shapes() {
+        // The run-path sequence: read the baseline, decide, record at run end.
+        let config = gate_config();
+        let resolved = config.resolved_subvolumes();
+        let db = StateDb::open_memory().unwrap();
+        poison_retention_baseline(&db);
+
+        let baseline = crate::commands::plan_cmd::retention_baseline_or_warn(Some(&db));
+        assert_eq!(baseline.read, BaselineRead::Unreadable);
+        let gate = crate::retention::decide_retention_gate(
+            &resolved,
+            &baseline.shapes,
+            false,
+            crate::retention::RecordScope { filters: &PlanFilters::default() },
+        );
+        assert!(gate.held.is_empty(), "an unknown baseline holds nothing");
+        assert!(!gate.record.is_empty(), "the gate would have recorded");
+        record_retention_shapes(Some(&db), &gate, baseline.read, gate_t());
+        assert_eq!(retention_shape_rows(&db, "alpha"), 0);
+        assert_eq!(retention_shape_rows(&db, "beta"), 0);
+    }
+
+    #[test]
+    fn readable_retention_baseline_records_shapes() {
+        let config = gate_config();
+        let resolved = config.resolved_subvolumes();
+        let db = StateDb::open_memory().unwrap();
+
+        let baseline = crate::commands::plan_cmd::retention_baseline_or_warn(Some(&db));
+        assert_eq!(baseline.read, BaselineRead::Read);
+        let gate = crate::retention::decide_retention_gate(
+            &resolved,
+            &baseline.shapes,
+            false,
+            crate::retention::RecordScope { filters: &PlanFilters::default() },
+        );
+        record_retention_shapes(Some(&db), &gate, baseline.read, gate_t());
+        assert_eq!(retention_shape_rows(&db, "alpha"), 1);
+        assert_eq!(retention_shape_rows(&db, "beta"), 1);
     }
 
     // ── Token gating (UPI 059-b) ───────────────────────────────────────

@@ -6,7 +6,7 @@ project: ['[[urd]]']
 sensitivity: public
 status: active
 created: '2026-03-24'
-timestamp: '2026-09-04T15:03:12+02:00'
+timestamp: '2026-09-30T12:00:00+02:00'
 ---
 # ADR-107: Fail-Open for Backups, Clean Up on Failure
 
@@ -16,7 +16,7 @@ timestamp: '2026-09-04T15:03:12+02:00'
 > exception: operations that could delete data fail closed.
 
 **Date:** 2026-03-22 (implicit in Phase 2; crystallized in space estimation review 2026-03-23)
-**Status:** Accepted (amended 2026-09-04 — see [Amendment 2026-09-04](#amendment-2026-09-04-partial-cleanup-is-proof-based-not-pin-inferred))
+**Status:** Accepted (amended 2026-09-04 — see [Amendment 2026-09-04](#amendment-2026-09-04-partial-cleanup-is-proof-based-not-pin-inferred); amended 2026-09-30 — see [Amendment 2026-09-30](#amendment-2026-09-30-the-same-name-crash-recovery-check-uses-the-proof-too))
 **Supersedes:** None (crystallized across space estimation and awareness model reviews)
 
 ## Context
@@ -145,3 +145,41 @@ The sweep also keeps the awareness model honest: promise freshness reads destina
 snapshot listings, so an unswept partial would count as a real backup and mask staleness.
 `urd verify` does not check `Received UUID` today; adding it there would be defense in
 depth, not a substitute.
+
+## Amendment 2026-09-30: the same-name crash-recovery check uses the proof too
+
+The 2026-09-04 amendment moved the pre-send sweep onto the `Received UUID` proof but left
+the same-name crash-recovery check in `execute_send` on the pin inference. A destination
+snapshot bearing the name about to be sent was deleted whenever the pin did not name it,
+including when the pin file could not be read. That check now follows the same rule
+(`src/executor/send.rs`, where `sweep_abandoned_partials` also lives):
+
+- A pin that names the snapshot means the send is done; it is skipped as a success.
+- A pin that cannot be read refuses the delete and fails the send (the fail-closed pin
+  reads of #430).
+- Otherwise the destination is asked. A present `Received UUID` means a completed send
+  whose pin write never happened. The snapshot is kept, the send counts as a success, and
+  the pin (and the drive token, if absent) is written as a fresh success would write it
+  (`write_pin_on_success`, `maybe_write_drive_token`). An absent UUID proves a partial,
+  which is deleted before the send is retried. A failed query refuses the delete and
+  fails the send.
+
+No automatic path that deletes a destination snapshot now does so on inference. One
+interactive path still does: `urd init`'s incomplete-snapshot cleanup
+(`commands/init.rs`) offers a drive's newest destination snapshot that the pin does not
+name as a possible partial, and deletes it only on an explicit per-snapshot `y`. The
+operator decides there, not the inference; routing it through the same proof is the open
+item named in ADR-100's amendment of this date.
+
+### The sanctioned destructive fail-open
+
+One destructive fail-open remains, and it is sanctioned. `Executor::emergency_reclaim_pool`
+(`src/executor/reclaim.rs`) treats an unreadable free-space level as *not* at or above the
+floor and proceeds with pin-shedding reclaim. Host survival outranks chain continuity when
+the pool's level is unknown (ADR-113 and its amendments). Its reclaim still keeps the
+never-the-only-copy gate and the strict, fail-closed pin reads of
+`shed_and_delete_unpinned`. What fails open is only the decision that pressure is genuine;
+which snapshots may be deleted is still decided fail-closed.
+
+This is the exception to "Deletion operations fail closed" above. It is listed here
+because a reader of this ADR would otherwise take that section as having none.

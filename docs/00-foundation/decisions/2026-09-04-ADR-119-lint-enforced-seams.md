@@ -6,7 +6,7 @@ project: ['[[urd]]']
 sensitivity: public
 status: active
 created: '2026-09-04'
-timestamp: '2026-09-04T15:03:12+02:00'
+timestamp: '2026-09-30T12:00:00+02:00'
 ---
 # ADR-119: Lint-Enforced Seams
 
@@ -18,7 +18,7 @@ timestamp: '2026-09-04T15:03:12+02:00'
 > request.
 
 **Date:** 2026-09-04
-**Status:** Accepted
+**Status:** Accepted (amended 2026-09-30 — see [Amendment 2026-09-30](#amendment-2026-09-30-the-sanctioned-callers-path-and-the-script-lints))
 
 ## Context
 
@@ -159,3 +159,45 @@ consumer of storage signals reads.
 - **ADR-113** — The Do-No-Harm invariant, whose Layer-1 posture state is what
   `advance_and_writeback` persists.
 - **ADR-114** — Structured event log, for the contrasting type-enforced seam.
+
+## Amendment 2026-09-30: the sanctioned caller's path, and the script lints
+
+### The writeback's sanctioned caller
+
+`commands/backup.rs` is the directory `commands/backup/`. The registry row and "The
+single-writer rule for storage posture" name the file; the sanctioned caller of
+`storage_signals::writeback::advance_and_writeback` is `src/commands/backup/mod.rs`, once,
+post-execution. `clippy.toml` is unchanged, since its guard names the guarded path and not
+the caller.
+
+The `#[allow(clippy::disallowed_methods)]` sites are still exactly as the Decision
+describes. There are three sanctioned callers (`advice.rs`'s `assess_view`,
+`commands/world.rs`'s `world::assess`, `commands/backup/mod.rs`'s writeback) and three
+test modules (`awareness/mod.rs`, `advice.rs`, `commands/storage_signals.rs`), each
+calling its own guarded function.
+
+### Related lints: the purity and voice boundaries
+
+Two shell lints now hold architectural boundaries in CI's `docs` job and in
+`scripts/check.sh`:
+
+- **`scripts/check-purity-boundary.sh`**: no filesystem, subprocess, wall-clock, or SQLite
+  primitive in the production code of the pure modules (ADR-108's amendment of this date).
+- **`scripts/check-voice-boundary.sh`**: no mythic exposure label as a string literal
+  outside `src/voice/`, no `colored` styling in `src/commands/`, and no wall clock in
+  `src/voice/`.
+
+They are not rows in the registry, and this is deliberate. Rule 3 above admits a guard
+only when the rule is "one sanctioned caller". Both script lints ban a primitive across a
+set of modules and have no sanctioned caller. That makes them hygiene lints in this ADR's
+sense, even though what they protect is architectural. Their registries are their own:
+the purity script's list of pure modules follows architecture.md's pure rows, and the
+voice script's scope is the `src/voice/` directory. The purity lint is described in
+ADR-108's amendment of this date. The voice lint is described here and in its script's
+header; what the rendered voice may say is tested separately, in `src/voice_contract.rs`.
+Registering them here would give each rule two lists to keep in sync, and
+rule 2 exists to prevent exactly that.
+
+They share this ADR's accepted trade: the architecture is enforced from a file a reader
+does not look in first. They are also weaker than a clippy guard, because they match text.
+Each script's header states its textual limits.

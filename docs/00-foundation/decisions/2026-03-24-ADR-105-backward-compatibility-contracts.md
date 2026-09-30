@@ -6,7 +6,7 @@ project: ['[[urd]]']
 sensitivity: public
 status: active
 created: '2026-03-24'
-timestamp: '2026-09-29T23:30:00+02:00'
+timestamp: '2026-09-30T12:00:00+02:00'
 ---
 # ADR-105: Backward Compatibility Contracts
 
@@ -15,13 +15,14 @@ timestamp: '2026-09-29T23:30:00+02:00'
 > monitoring) depend on them. Urd reads both legacy and current formats but only writes
 > the current format. Breaking these contracts requires a migration plan and an ADR.
 >
-> Amended 2026-09-04 and 2026-09-29 — see the amendments of those dates below.
+> Amended 2026-09-04, 2026-09-29 and 2026-09-30 — see the amendments of those dates below.
 
 **Date:** 2026-03-22 (formalized 2026-03-24)
 **Status:** Accepted (amended 2026-05-15, `monthly = 0` migration; 2026-05-15, UPI 043
 pool metrics + heartbeat v4; 2026-09-04, code-drift audit — metric inventory moved out,
 Contract 5 added; 2026-09-29, retirement criterion, unlabeled pin retired; 2026-09-29,
-deferred subvolumes in the success metrics)
+deferred subvolumes in the success metrics; 2026-09-30 — see
+[Amendment 2026-09-30](#amendment-2026-09-30-contract-5-owners))
 **Supersedes:** None (founding decision)
 
 ## Context
@@ -500,3 +501,32 @@ advanced by the defect; the staleness window therefore starts, at worst, from th
 subvolume with no previous timestamp and no successful send has no timestamp series, as
 before; `backup_snapshot_count{location="external"}` and `backup_external_expected` cover
 that case.
+
+## Amendment 2026-09-30: Contract 5 owners
+
+Two corrections to the Contract 5 table.
+
+### `sentinel-state.json` has a named version constant
+
+The Contract 5 row for `sentinel-state.json` says its version is "written as a literal
+at the `SentinelStateFile` construction site in `src/sentinel_runner.rs`", with the struct
+in `src/output.rs`. Both have moved, and the literal is gone:
+
+| Surface | Version source | Field reference |
+|---------|----------------|-----------------|
+| `sentinel-state.json` | `SENTINEL_STATE_SCHEMA_VERSION` in `src/sentinel.rs` | the `SentinelStateFile` struct in `src/sentinel.rs` |
+
+The runner writes it from `src/sentinel_runner/state_file.rs` (`write_state_file`), and
+the pure restore of mount tracking at startup (`sentinel.rs`) trusts only a file whose
+`schema_version` equals the constant. `crate::output` re-exports both names. The bump
+policy is unchanged: the file bumps on every added field.
+
+### A field can be typed without joining the contract
+
+`SkippedSubvolume` (`src/output.rs`), the `skipped[]` element of `urd plan --json`,
+carries a `drive: Option<String>` so renderers read an unmounted drive's label as data
+rather than parsing it out of `reason`. The field is `#[serde(skip)]`. It is in-process
+data, not part of the JSON shape, and adding it changed nothing a consumer sees. That is
+how a machine-surface struct gains a field its renderers need without a version bump:
+by not serializing it. The `reason` prose it stands beside stays a contract, and the
+planner's `SkipReason` `Display` is what produces it (ADR-100's amendment of this date).

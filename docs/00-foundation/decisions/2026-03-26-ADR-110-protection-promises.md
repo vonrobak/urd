@@ -6,7 +6,7 @@ project: ['[[urd]]']
 sensitivity: public
 status: active
 created: '2026-03-26'
-timestamp: '2026-09-04T10:15:00+02:00'
+timestamp: '2026-09-30T12:00:00+02:00'
 ---
 # ADR-110: Protection Promises
 
@@ -16,8 +16,8 @@ timestamp: '2026-09-04T10:15:00+02:00'
 > earn opaque status through operational track record. Current taxonomy:
 > recorded/sheltered/fortified (renamed 2026-04-03 from guarded/protected/resilient).
 
-**Date:** 2026-03-26 (revised 2026-03-27, addendum 2026-03-31, vocabulary 2026-04-03, amendments 2026-05-09 / 2026-05-15 / 2026-05-30 / 2026-09-04)
-**Status:** Accepted (taxonomy renamed 2026-04-03 — see Maturity Model; recommendation-layer amendment 2026-05-09 — see [Amendment 2026-05-09](#amendment-2026-05-09-recommendation-layer-as-graduation-evidence-path-adr-115); AT-RISK cap at Critical overturns R4 2026-05-30 — see [Amendment 2026-05-30](#amendment-2026-05-30-at-risk-cap-at-the-critical-tier-upi-031-b--overturns-r4); offsite freshness re-stated against the resolved rotation window 2026-09-04 — see [Amendment 2026-09-04](#amendment-2026-09-04-offsite-freshness-is-window-judged-and-clamped-gates-closed))
+**Date:** 2026-03-26 (revised 2026-03-27, addendum 2026-03-31, vocabulary 2026-04-03, amendments 2026-05-09 / 2026-05-15 / 2026-05-30 / 2026-09-04 / 2026-09-30)
+**Status:** Accepted (taxonomy renamed 2026-04-03 — see Maturity Model; recommendation-layer amendment 2026-05-09 — see [Amendment 2026-05-09](#amendment-2026-05-09-recommendation-layer-as-graduation-evidence-path-adr-115); AT-RISK cap at Critical overturns R4 2026-05-30 — see [Amendment 2026-05-30](#amendment-2026-05-30-at-risk-cap-at-the-critical-tier-upi-031-b--overturns-r4); offsite freshness re-stated against the resolved rotation window 2026-09-04 — see [Amendment 2026-09-04](#amendment-2026-09-04-offsite-freshness-is-window-judged-and-clamped-gates-closed); Sentinel-mode cadence, transition safety as implemented, and achievability-as-advisory 2026-09-30 — see [Sentinel cadence](#amendment-2026-09-30-sentinel-mode-cadence-derives-from-the-timer), [transition safety](#amendment-2026-09-30-transition-safety-as-implemented), [achievability](#amendment-2026-09-30-achievability-failures-are-advisories-not-errors))
 **Depends on:** ADR-100 (planner/executor separation), ADR-108 (pure function modules),
 ADR-109 (config boundary validation), ADR-111 (config system architecture)
 **Amended by:** ADR-115 (Retention shape symmetry and the recommendation layer)
@@ -572,3 +572,154 @@ Read the table as the promise each level is meant to keep. The code's answer to
 - Design review: `docs/99-reports/2026-03-26-protection-promises-design-review.md`
 - Config design review: `docs/98-journals/2026-03-27-config-design-review.md`
 - Test strategy review: `docs/99-reports/2026-03-26-test-strategy-review.md`
+
+## Amendment 2026-09-30: Sentinel-mode cadence derives from the timer
+
+`derive_policy()` gave `RunFrequency::Sentinel` sub-daily intervals: snapshots every
+1h/1h/4h and sends every 2h/4h/4h for fortified/sheltered/recorded. Nothing installed
+fulfils that cadence. Sentinel mode installs the same nightly `urd-backup.timer` (04:00)
+as Timer mode, plus `urd-sentinel.service` (`systemd_units::expected_units`). The sentinel
+assesses, notifies and ejects, but does not trigger backups: its active-mode trigger
+machinery was deleted as dormant pending a re-grilled active-mode design (#406).
+Awareness therefore judged Sentinel-mode subvolumes against an interval a nightly run can
+never satisfy, and they read AT RISK most of every day. That is the false alarm the
+Achievability validation section exists to prevent: a promise's derived policy must be
+fulfillable by what is actually installed.
+
+`RunFrequency::Sentinel` now means "sentinel service installed; timer cadence". For every
+named level it derives the same policy as `Timer { interval: 1d }`, including snapshot and
+send intervals, and a unit test pins this
+(`derive_policy_sentinel_mode_derives_nightly_timer_cadence`, `src/types.rs`). Following
+ADR-103, the timer is the trigger and the intervals are the filter, so the derived
+intervals are the cadence of the only trigger that exists. Retention, `send_enabled` and
+`min_external_drives` are unchanged, and Sentinel mode still selects the sentinel service
+unit. Named levels are opaque, so existing Sentinel-mode configs pick this up at load;
+`custom` subvolumes are unaffected.
+
+Two statements above are superseded by this:
+
+- The `RunFrequency` sketch in "Pure derivation function" ("Sentinel daemon, sub-hourly
+  checks"). The sentinel watches continuously, but backups run on the timer.
+- The 2026-09-04 amendment's "under `RunFrequency::Sentinel` the levels separate
+  (Recorded 4h/4h, Sheltered 1h/4h, Fortified 1h/2h snapshot/send)". Under both run
+  frequencies every named level now snapshots and sends at the timer's interval.
+
+*Alternative considered:* install an hourly `urd-backup.timer` in Sentinel mode, so the
+sub-daily intervals become achievable through the ADR-103 timer path. It was deferred
+because it would decide, before that design is re-grilled, what triggers sub-daily work in
+Sentinel mode, how often, and under which do-no-harm guards (ADR-113). That is the question
+#406 left open. When an active mode exists, Sentinel mode's derived cadence can tighten to
+whatever that mode actually delivers. The same class of mismatch exists for
+`Timer { interval }` values other than one day, since the installed timer is fixed at
+04:00; that is an open question for the same re-grill.
+
+## Amendment 2026-09-30: transition safety, as implemented
+
+The Transition safety section promised that retention is skipped "for affected
+subvolumes" on "the first run after retention tightening". What shipped under that name
+dropped every retention deletion for every promise-level subvolume on every run without
+the flag, whether or not anything had tightened, and nothing detected tightening at all.
+The scheduled unit always passed the flag, so timer runs were never gated and manual runs
+always were. This amendment records the gate as it now exists.
+
+Urd records, per subvolume, the effective retention shape under which its retention
+deletions were last applied: the local and external graduated tier counts as resolved on
+`ResolvedSubvolume` (state DB table `retention_shapes`, one upserted row, best-effort per
+ADR-102). At plan time a pure decision in `retention.rs` compares the configured shape
+with the recorded one. Retention has *tightened* when any local or external tier keeps
+fewer snapshots than before. That includes a tier dropping to none, bounded monthly after
+unlimited, and graduated-to-transient local.
+
+**A held subvolume is pruned as the more generous policy would.** A named-level
+subvolume whose recorded shape is tighter than its current one is *held* until a run with
+`--confirm-retention-change`. While it is held, the run proceeds with snapshots and sends
+(ADR-107 fail-open), and a planned deletion is withheld only when the recorded (previous)
+retention would still keep that snapshot. Deletions the previous policy would also make
+proceed. During a hold, retention therefore behaves as it did before the change, and only
+the extra deletions the tightening causes wait. The hold is judged per half: a tightened
+external half never holds local deletions, and a tightened local half never holds
+external ones.
+
+**What is never held.** Space-pressure deletions (`DeleteKind::SpacePressure`: hourly
+thinning under pressure, space-governed external extras) always proceed. So do the local
+half's deletions while the pool is armed Tight or Critical: the storage tiers make local
+retention transient regardless of the declared shape (ADR-113), so the previous policy
+would delete them too. The emergency pre-flight, the watchdog reclaim and `urd emergency`
+are not gated.
+
+A held run records a `RetentionChangeHeld` event carrying both shapes and the held count,
+and names the subvolume in the run summary, `urd plan`, `urd status` and `urd doctor`. A
+run with the flag applies the new shape and records it, so the confirmation is needed
+once per tightening.
+
+Unchanged, loosened, custom and never-recorded subvolumes are recorded without being held.
+The first run after upgrade therefore holds nothing, and a custom-to-named switch is
+judged against the custom retention it replaced. A run records only the subvolumes in its
+filter scope, and only the halves it applied (`--local-only` the local half,
+`--external-only` the external half). The other half keeps its previous value or stays
+absent. A subvolume with sends disabled is judged on local retention only.
+
+The scheduled unit (`systemd/urd-backup.service`, `urd backup --auto`) does not pass the
+flag; a tightening is confirmed by a person, once. If the history DB cannot be read, the
+baseline is unknown: nothing is held, nothing is recorded (ADR-102), and the run logs a
+warning that no retention-tightening gate applies. `urd plan` and `urd backup --dry-run`
+apply the same decision read-only (ADR-100's amendment of this date).
+
+**Trade-off: a lost baseline releases a pending hold.** If the state DB is deleted or
+recreated, the baseline is empty, every subvolume counts as first seen, and a pending
+tightening applies without a hold. This is accepted. The DB is expendable history
+(ADR-102), and failing closed on an unknown baseline would mean holding deletions with no
+bound.
+
+**Known gap.** A hold is surfaced in `urd status`, `urd doctor`, `urd plan`, the run
+summary and the event log, but not yet as a notification.
+
+The Risks bullet "mitigated by `--confirm-retention-change` flag and fail-open retention
+skip" and the Implementation Gates item "`--confirm-retention-change` flag gates retention
+tightening" are true as of this amendment, in the sense stated here.
+
+## Amendment 2026-09-30: achievability failures are advisories, not errors
+
+The Achievability validation section classes "a `fortified` subvolume with only 1 drive in
+its `drives` list" and "a named level with `drives` omitted when the level requires
+external sends" as **structural unachievability (hard error — refuse to start)**, caught by
+`Config::validate()`. The code draws the line elsewhere, closer to Invariant 5 of this
+same ADR: *achievability is advisory, not blocking.*
+
+**Hard errors at config load.** The v1 and v2 parsers share one contract check,
+`validate_protection_contract` (`src/types.rs`). The drive rules it enforces are
+structural: they reject a config that cannot mean anything, not one that is merely short
+of hardware.
+
+- `drives = []`, an explicitly empty list, on `sheltered` or `fortified`.
+- `sheltered` with no drive in scope at all: no `drives` list and no `[[drives]]`
+  configured.
+- `local_snapshots = false` with no drive in scope.
+
+A v1 config additionally refuses `fortified` without an offsite drive (`validate_v1`,
+`src/config/v1.rs`). v2, the schema `urd migrate` writes, deliberately does not.
+
+**Advisories.** Everything else about drive topology is a preflight advisory
+(`src/preflight.rs`, `preflight_checks`), reported by `urd backup`, `urd doctor`,
+`urd verify` and `urd init`, and by the config generator's self-check. It applies to every
+schema:
+
+- `drive-count-vs-promise`: fewer drives in scope than the level's
+  `min_external_drives`. This covers `fortified` with one drive, and `fortified` with none.
+- `fortified-without-offsite`: a `fortified` subvolume with no drive of
+  `role = "offsite"` in scope.
+
+A named level with `drives` omitted takes every configured drive into scope, and the
+advisories judge that set. The run proceeds and does what it can. The user may be
+mid-migration, with a second drive not yet bought, and refusing to back up to the first
+drive would work against the promise's intent.
+
+Operational fields alongside a named level (Invariant 1) and the path and name checks of
+ADR-109 remain hard errors. ADR-111's error-message section carries the same
+misclassification for "fortified without offsite" and is corrected in its amendment of
+this date.
+
+**A stale citation.** The 2026-05-15 amendment's "Verified at `plan.rs:470, 511`" now
+refers to `plan::plan` in `src/plan/mod.rs`. External planning, retention included, runs
+only inside its `!filters.local_only && subvol.send_enabled` branch, so the claim that
+`recorded`'s external retention is never exercised still holds.

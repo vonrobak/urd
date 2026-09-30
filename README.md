@@ -31,8 +31,11 @@ Urd fills that gap:
   run a backup, rotate offsite. Urd tracks each drive's send history separately.
 - **Space-aware.** Pre-send size estimation prevents multi-hour transfers from failing
   at 99% due to insufficient space on the target drive.
-- **Plan before execute.** `urd plan` shows exactly what would happen. `urd backup --dry-run`
-  runs the full pipeline without touching the filesystem.
+- **Plan before execute.** `urd plan` previews what `urd backup` would do, including any
+  retention deletions it would hold. `urd backup --dry-run` applies the same retention hold,
+  prints the plan, and exits without touching the filesystem. A drive whose identity check
+  fails is named in the preview, but its sends still appear in the plan; they are blocked
+  only in a real run.
 - **Promise-based monitoring.** Assign protection levels to subvolumes. Urd derives
   retention schedules, send intervals, and drive requirements — then tells you whether
   those promises are being kept.
@@ -137,12 +140,12 @@ config schema, systemd units — see the [operating guide](docs/00-foundation/gu
 | `urd get FILE --at DATE` | Restore a file from a past snapshot |
 | `urd verify` | Check incremental chain integrity and pin health |
 | `urd doctor` | Run health diagnostics |
-| `urd sentinel run` | Start the passive monitoring daemon |
+| `urd sentinel run` | Start the monitoring daemon (drive changes, overdue backups, idle emergency space net) |
 | `urd drives` | Manage and inspect backup drives |
 | `urd history` | Browse backup history |
 | `urd calibrate` | Measure snapshot sizes for send estimates |
 | `urd emergency` | Guided emergency space recovery |
-| `urd init` | Initialize state database and validate readiness |
+| `urd init` | Set up Urd (the guided first run, or resume an unfinished setup) and verify the environment |
 
 ## How it works
 
@@ -161,7 +164,9 @@ config  ->  plan (pure)  ->  execute (I/O)  ->  record (SQLite)
 3. **Record.** Results stored in SQLite. Promise states reassessed. Heartbeat written for
    external monitoring.
 4. **Watch.** The Sentinel daemon (optional) monitors for drive changes and overdue backups,
-   reassesses promise states, and surfaces problems before they become emergencies.
+   reassesses promise states, and surfaces problems before they become emergencies. If a
+   source pool falls below its catastrophic free-space floor while no backup is running, it
+   sheds local snapshots whose data is confirmed on an external drive, to keep the host alive.
 
 ### Retention
 
@@ -170,9 +175,11 @@ Local snapshots use graduated retention:
 - Weeks 3–8: keep one per ISO week
 - Months 3–5: keep one per month
 
-External snapshots use count-based retention. Pinned parent snapshots (incremental chain
-anchors) are **never** deleted, regardless of age or policy — this is enforced by three
-independent protection layers.
+External snapshots use count-based retention. Retention **never** deletes a pinned parent
+snapshot (an incremental chain anchor), regardless of age or policy — this is enforced by
+three independent protection layers. The one exception is Urd's response to a source pool
+running critically low on space (ADR-113, ADR-116): it may release a pin to keep the host
+alive, and the next send to that drive is then a full send.
 
 ### Safety principles
 

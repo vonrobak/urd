@@ -79,8 +79,8 @@ pub fn acquire_lock(lock_path: &Path, trigger: &str) -> anyhow::Result<LockGuard
 
 /// Try to acquire the lock without blocking. Returns `None` if already held.
 ///
-/// Used by the Sentinel for auto-triggered backups — if another backup is
-/// running, the Sentinel simply skips the trigger (expected during timer overlap).
+/// Used by the Sentinel's idle emergency eject (ADR-113 Layer 3) — if a
+/// backup holds the lock, the eject defers to it for this cycle.
 pub fn try_acquire_lock(lock_path: &Path, trigger: &str) -> anyhow::Result<Option<LockGuard>> {
     if let Some(parent) = lock_path.parent() {
         std::fs::create_dir_all(parent)?;

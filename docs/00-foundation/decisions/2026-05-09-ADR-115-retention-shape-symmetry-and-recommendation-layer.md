@@ -6,7 +6,7 @@ project: ['[[urd]]']
 sensitivity: public
 status: active
 created: '2026-05-14'
-timestamp: '2026-09-04T10:15:00+02:00'
+timestamp: '2026-09-30T12:00:00+02:00'
 ---
 # ADR-115: Retention Shape Symmetry and the Recommendation Layer
 
@@ -24,7 +24,7 @@ timestamp: '2026-09-04T10:15:00+02:00'
 > evidence this layer generates.
 
 **Date:** 2026-05-09
-**Status:** Accepted (amended 2026-05-16, headroom-aware recommendations; 2026-09-04, code-drift audit)
+**Status:** Accepted (amended 2026-05-16, headroom-aware recommendations; 2026-09-04, code-drift audit; 2026-09-30 — see [Amendment 2026-09-30](#amendment-2026-09-30-the-free-ratio-primitives-live-with-storage-state))
 **Depends on:** ADR-108 (pure function modules), ADR-110 (protection promises),
 ADR-113 (do-no-harm invariant), ADR-114 (structured event log)
 **Complemented by:** UPI 030 (drift telemetry — the signal this layer consumes)
@@ -608,3 +608,24 @@ heartbeat and `sentinel-state.json`, with `DOCTOR_OUTPUT_SCHEMA_VERSION` in
 `src/output.rs` as the version's source of truth. R3's rule — bump on a
 breaking shape change, note it in the CHANGELOG, and let `--json` consumers
 branch on the field — is carried forward unchanged.
+
+## Amendment 2026-09-30: the free-ratio primitives live with storage state
+
+One correction of location. The decision is unchanged.
+
+`HeadroomSeverity`, `classify_free_ratio_value`, and the two free-ratio thresholds
+`FREE_RATIO_CAUTION` (0.25) and `FREE_RATIO_PRESSURE` (0.15) are defined in
+`src/storage_critical.rs`, not `src/recommendation.rs`. Read the D7 text and the
+2026-09-04 amendment's "via `recommendation::classify_free_ratio_value`" with that
+location. `recommendation.rs` re-exports the severity and the classifier, so the
+`recommendation::` paths still resolve, and it keeps what is its own: the composite
+`classify_headroom_severity` (free ratio, time-to-empty, destination metadata), the
+time-to-empty and metadata thresholds, and the shape recommendations.
+
+The move follows the dependency. Two consumers read the free-ratio boundaries: this
+layer's composite classifier, and the tightness tier that drives behaviour
+(`storage_critical::resolve_armed_tier`, ADR-113 Layer 1). Keeping the boundaries in the
+recommendation layer made the behavioural module depend on the advisory one. With the
+primitives in `storage_critical.rs`, the advisory layer depends on storage state and not
+the reverse. The two surfaces still share one boundary function, which is the
+coordination contract the 2026-09-04 amendment names.

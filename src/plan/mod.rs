@@ -17,8 +17,8 @@ mod send;
 mod transient;
 mod types;
 
-// The planner's output vocabulary (`types.rs`); `crate::types` re-exports
-// these too, so both paths resolve.
+// The planner's output vocabulary (`plan/types.rs`), re-exported so callers
+// name it as `crate::plan::…`.
 pub use types::{
     BackupPlan, DeleteKind, NothingNew, PlannedLifecycle, PlannedOperation, PlannedSkip,
     SkipReason,

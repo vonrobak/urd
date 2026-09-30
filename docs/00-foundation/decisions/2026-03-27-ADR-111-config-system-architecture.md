@@ -6,7 +6,7 @@ project: ['[[urd]]']
 sensitivity: public
 status: active
 created: '2026-03-27'
-timestamp: '2026-07-02T01:04:01+02:00'
+timestamp: '2026-09-30T12:00:00+02:00'
 ---
 # ADR-111: Config System Architecture
 
@@ -21,7 +21,8 @@ timestamp: '2026-07-02T01:04:01+02:00'
 migration spec, validation messages)
 **Status:** Accepted — fully implemented. The tri-parser (`parse_legacy` / `parse_v1` /
 `parse_v2` in `config.rs`) and `urd migrate` all ship; see the 2026-05-15 amendment for v2
-(`config_version = 2`).
+(`config_version = 2`). Amended 2026-09-30 — see
+[Amendment 2026-09-30](#amendment-2026-09-30-the-config-directory-the-advisory-correction-and-the-gates).
 **Depends on:** ADR-108 (pure function modules), ADR-109 (config boundary validation)
 **Partially supersedes:** ADR-110 (override semantics replaced; see ADR-110 revision)
 **Modifies:** ADR-103 (defaults inheritance removed), ADR-104 (defaults inheritance removed)
@@ -710,3 +711,83 @@ drives the operator had constrained. Fails both criteria.
 - Design: `docs/95-ideas/2026-05-09-design-042-schema-evolution.md` — v2 schema evolution
 - Plan: `docs/97-plans/2026-05-15-plan-042-schema-evolution.md` — v2 implementation plan
 - Journal: `docs/98-journals/2026-03-27-config-design-review.md` — original design discussion
+
+## Amendment 2026-09-30: the `config/` directory, the advisory correction, and the gates
+
+The architecture is unchanged. This amendment corrects three statements: where the
+parsers live, one validation error message that the code does not produce, and an
+Implementation Gates checklist whose "Remaining" items have mostly shipped.
+
+### `config.rs` → `config/`
+
+The Status line names "`parse_legacy` / `parse_v1` / `parse_v2` in `config.rs`". Config is
+a directory module:
+
+| File | Holds |
+|---|---|
+| `config/mod.rs` | `Config` and its nested types, `Config::load` / `from_str`, and `parse_versioned`, the one `config_version` → parser table both entry points share |
+| `config/legacy.rs` | The version pre-parse (`extract_config_version`) and the legacy schema, with opacity *warnings* for overridden named levels |
+| `config/v1.rs`, `config/v2.rs` | The two versioned schemas; each parses and converts into `Config` |
+| `config/validate.rs` | `Config::validate`, the structural checks of ADR-109, run once after path expansion |
+| `config/resolve.rs` | `ResolvedSubvolume`: every optional field filled from the level's derived policy or the defaults |
+
+`Config::load` reads the file, dispatches through `parse_versioned`, expands paths, and
+validates, in that order. The rules on named-level opacity shared by v1 and v2 live in
+one function, `validate_protection_contract` (`src/types.rs`), which both parsers call.
+The legacy parser warns through `opacity_violations` instead of refusing.
+
+The 2026-05-15 amendment's note about "call-sites in `main.rs`, `sentinel_runner.rs`, and
+`commands/default.rs`" refers to what is now `sentinel_runner/`. The point it makes, that
+`Config::load` has no warnings side-channel, still holds.
+
+### "Fortified without offsite" is not a config error in v2
+
+The "Validation Error Messages (v1)" section shows
+`Config error: fortified protection needs at least one offsite drive`. That rule is a
+**v1-only** parse error (`validate_v1`, `src/config/v1.rs`). In v2, the schema
+`urd migrate` writes, it is deliberately absent. The same condition is reported for every
+schema by the preflight advisory `fortified-without-offsite` (`src/preflight.rs`), and
+the run proceeds. Drive count against a level's `min_external_drives` was never a load
+error and is the advisory `drive-count-vs-promise`. See ADR-110's amendment of this date
+for the full line between structural errors and advisories. The other example messages
+still describe what the code enforces. The shipped wording differs from the examples, but
+each shipped message names the field and the fix.
+
+### Implementation Gates, re-checked
+
+Each item below was checked against the tree on this date.
+
+- [x] `config_version` field in `[general]`; parser branches on version (`parse_versioned`)
+- [x] v1 parser: `[general]` fields defaultable (`state_db`, `metrics_file`, `log_dir`,
+  `heartbeat_file` carry serde defaults in `V1GeneralConfig`)
+- [x] v1 parser: `snapshot_root` and `min_free_bytes` on subvolume blocks; `[local_snapshots]`
+  eliminated (synthesized internally from the subvolume blocks)
+- [x] v1 parser: `[defaults]` eliminated; custom subvolumes use hardcoded fallbacks
+  (`parser_fallback_defaults`, matching `derive_policy`'s full shapes)
+- [x] v1 parser: `short_name` optional, defaults to `name`
+- [x] v1 parser: `protection` field (renamed from `protection_level`)
+- [x] v1 parser: `enabled` optional, resolved to `true` by default
+- [x] v1 validation: reject operational fields alongside named `protection`
+  (`validate_protection_contract`)
+- [x] v1 validation: error messages guide the user (each names the field and the fix; the
+  wording differs from the examples above)
+- [x] `ResolvedSubvolume` carries `snapshot_root` and `min_free_bytes` (both `Option`,
+  `None` when no snapshot root lists the subvolume)
+- [x] `Config` and its nested types derive `Serialize`
+- [x] `urd migrate`, superseded in shape by the 2026-05-15 amendment: one hop to v2, the
+  original kept verbatim as a `.legacy` / `.v1` backup
+- [x] `--confirm-retention-change` gates retention tightening on level changes (ADR-110's
+  amendment of this date)
+
+Two items remain open:
+
+- [ ] **All callers of `snapshot_root_for()` / `local_snapshot_dir()` /
+  `root_min_free_bytes()` migrated to `ResolvedSubvolume`.** About fifty call sites across
+  `config/`, `executor/`, `commands/`, `plan/`'s tests, `strategy.rs` and
+  `config_render.rs` still resolve a subvolume's root through the `Config` lookups. The
+  lookups and the resolved fields cannot disagree: `Config::resolved_subvolumes` fills
+  the resolved fields by calling those same lookups. The gate is about callers holding one
+  resolved value, not about a known disagreement.
+- [ ] **Hardcoded fallback values documented in help text.** The fallbacks exist
+  (`parser_fallback_defaults`), but neither the CLI help nor the reference docs state
+  them.

@@ -6,7 +6,7 @@ project: ['[[urd]]']
 sensitivity: public
 status: active
 created: '2026-03-24'
-timestamp: '2026-09-04T15:03:12+02:00'
+timestamp: '2026-09-30T12:00:00+02:00'
 ---
 # ADR-108: Pure-Function Module Pattern
 
@@ -16,7 +16,7 @@ timestamp: '2026-09-04T15:03:12+02:00'
 > and is now the required pattern for new logic modules.
 
 **Date:** 2026-03-22 (established by planner; pattern recognized 2026-03-23)
-**Status:** Accepted (amended 2026-09-04 — see [Amendment 2026-09-04](#amendment-2026-09-04-the-module-roster-moves-to-architecturemd))
+**Status:** Accepted (amended 2026-09-04 — see [Amendment 2026-09-04](#amendment-2026-09-04-the-module-roster-moves-to-architecturemd); amended 2026-09-30 — see [Amendment 2026-09-30](#amendment-2026-09-30-the-impure-list-completed-and-the-rule-linted))
 **Supersedes:** None (crystallized across awareness model and presentation layer reviews)
 
 ## Context
@@ -138,3 +138,85 @@ Two things stay here, because they are decisions rather than inventory:
   `FileSystemState`: the read side is split along the ADR-102 axis into `FilesystemQuery`
   and `HistoryQuery`, bundled as `Observation` (see ADR-100's amendment of the same date).
   The rule is unchanged; only the name is.
+
+## Amendment 2026-09-30: the impure list completed, and the rule linted
+
+The rule is unchanged. Three things this ADR states have become false or incomplete: the
+impure-by-design list, the claim that the rule is upheld only by convention, and the
+pattern block.
+
+### The impure-by-design list
+
+The list kept by the 2026-09-04 amendment named four modules and `recorder.rs`. It is
+falsifiable only if it is complete, and it was not. Every module below performs I/O by
+design; everything not listed that computes, decides, or transforms is pure.
+
+| Module | Why it is impure |
+|--------|------------------|
+| `executor/` | Runs the plan: btrfs through `BtrfsOps`, pin files, drive tokens, SQLite writes |
+| `btrfs.rs` | The btrfs subprocess boundary (ADR-101) |
+| `probes.rs` | The read-only non-btrfs system probes: `findmnt`, `lsblk`, `loginctl`, `sudo -n -l`, `du` |
+| `observation/real.rs` | `RealFileSystemState`, the production adapter behind `Observation`: snapshot directories, pin files, mounts, pool space, SQLite history |
+| `state/` | SQLite persistence (ADR-102) |
+| `recorder.rs` | The seam through which events reach persistence and notifications are dispatched (ADR-114) |
+| `chain.rs` | Pin file reads and writes (ADR-105 Contract 3) |
+| `drives.rs` | Mount detection, `statvfs`, drive identity token files |
+| `pools.rs` | Pool identity and space: `findmnt` via `probes.rs`, sysfs, `statvfs` |
+| `discovery.rs` | The Encounter's inventory gather; its parsers and aggregator are pure, its entry point calls `probes.rs` |
+| `notify.rs` | Notification dispatch: `notify-send`, webhook, hook command. Its content builders are pure |
+| `heartbeat.rs` | Writes and reads `heartbeat.json`, including the dispatch marks (ADR-114's amendment of this date) |
+| `metrics.rs` | Writes the Prometheus textfile and reads the previous one for carry-forward (ADR-105) |
+| `lock.rs` | The run lock (`flock`) and its metadata (ADR-100's amendment of this date) |
+| `sentinel_runner/` | The sentinel daemon's I/O loop; `sentinel.rs` is its pure state machine |
+| `config/` loading | `Config::load` reads the file; `parse_versioned` and everything after it is pure |
+| `commands/` | CLI handlers that gather inputs, call pure modules, and act on the result |
+
+[`docs/00-foundation/architecture.md`](../architecture.md) draws the same line as its
+"I/O boundary" group. Where the two disagree, the architecture document describes the
+present system and this table is to be amended.
+
+### The rule is linted
+
+`scripts/check-purity-boundary.sh` enforces the no-I/O, no-wall-clock half of the rule on
+the pure modules. It runs in CI's `docs` job and in `scripts/check.sh`. It fails when
+production code in a listed pure module names a direct I/O or clock primitive:
+`std::fs`, `std::process::Command` / `Command::new`, `Local::now(` / `Utc::now(`, or
+`rusqlite`. Whole-line comments are stripped first. The module list is kept in the
+script, and it follows architecture.md's pure rows.
+
+Its limits are those of a textual check:
+
+- **Test code is exempted textually, not by parsing.** A `#[cfg(test)]` that opens an
+  inline module exempts that module until its braces balance. Any other `#[cfg(test)]`
+  exempts one line. A file declared as `#[cfg(test)] mod name;` from its parent is
+  skipped entirely. A multi-line test-only `fn` or `impl` outside a test module is linted
+  from its second line and fails loudly. That failure is the intended pressure to move it
+  into the test module.
+- **It catches names, not effects.** A pure module that calls an impure crate function
+  (`chain::read_pin_file`, say) passes the lint. The trait boundary below is what keeps
+  that out, and review is what enforces the trait boundary.
+- **`voice/` is not in its list.** The renderers' clock half is held by
+  `scripts/check-voice-boundary.sh`, whose wall-clock check does not exempt
+  tests.
+
+This is a hygiene lint in ADR-119's sense: it has no sanctioned caller, so it is not a
+row in that ADR's registry (see ADR-119's amendment of this date).
+
+### The pattern block
+
+The block in the Decision section shows `fs: &dyn FileSystemState`. The current shapes
+are:
+
+```rust
+pub fn plan(config: &Config, now: NaiveDateTime, filters: &PlanFilters,
+            obs: &Observation, arming: &RunArming) -> Result<BackupPlan>
+
+pub fn assess(config: &Config, now: NaiveDateTime, obs: &Observation,
+              storage_signals: &StorageSignalMap) -> Vec<SubvolAssessment>
+
+pub fn render_status(data: &StatusOutput, mode: OutputMode) -> String
+```
+
+The pattern is the same: everything the function knows arrives as an argument, and `now`
+is always one of them. The "216 tests" in Consequences is retired as a number; see
+ADR-100's amendment of this date.

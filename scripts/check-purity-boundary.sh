@@ -9,11 +9,13 @@
 #
 # This lint fails when production code in a pure module names a direct I/O or clock
 # primitive:
-#   std::fs            filesystem reads/writes (the adapter is observation/real.rs)
+#   std::fs            filesystem reads/writes (the adapter is observation/real.rs),
+#                      also when imported through a one-line group (`use std::{fs, ..}`)
 #   std::process::Command / Command::new
 #                      subprocesses (btrfs goes through BtrfsOps; probes live in I/O modules)
-#   Local::now( / Utc::now(
+#   Local::now( / Utc::now( / SystemTime::now( / Instant::now(
 #                      the wall clock (the caller passes `now`)
+#   std::env           the process environment (config is an input, not a lookup)
 #   rusqlite           the history DB (state.rs is the persistence boundary)
 # Whole-line comments are stripped first — doc comments cite these names legitimately.
 #
@@ -27,7 +29,9 @@
 #     or `pub use ..;` declaration);
 #   - a file declared from its parent as `#[cfg(test)] mod name;` (plan/testkit.rs,
 #     plan/tests.rs) is skipped entirely.
-# Limitations: a multi-line `#[cfg(test)]` item that is not an inline module (a
+# Limitations: a `use std::{..}` group split across lines is not seen, and a call
+# into an impure crate module (say `crate::drives::`) is invisible to a text lint —
+# those stay review's job. A multi-line `#[cfg(test)]` item that is not an inline module (a
 # test-only fn or impl) is linted from its second line on — it fails loudly; move it
 # into the test module. An unbalanced brace in a char literal or a multi-line string
 # inside a test module shifts where the exemption ends.
@@ -66,7 +70,7 @@ PURE=(
     src/output.rs
 )
 
-PATTERN='std::fs\b|std::process::Command|Command::new|(Local|Utc)::now\(|rusqlite'
+PATTERN='std::fs\b|std::\{[^}]*\b(fs|process|env)\b|std::process::Command|Command::new|(Local|Utc|SystemTime|Instant)::now\(|std::env\b|rusqlite'
 
 # Files a parent declares as `#[cfg(test)] mod name;` — test-only in their entirety.
 test_only_files() {

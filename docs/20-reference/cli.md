@@ -145,7 +145,7 @@ the planner refuses to create local snapshots when free space is below
 |------|-----------|
 | `--dry-run` | Plan + simulate; no btrfs operations executed, no state writes. |
 | `--auto` | Automated run mode (used by the systemd timer). Applies interval gating, and omits the pre-run briefing and the empty-plan explanation. The run summary is unaffected: text on a terminal, JSON otherwise. |
-| `--confirm-retention-change` | Applies a retention tightening. Urd records, per subvolume, the retention its deletions were last applied under. When a promise-level (named `protection_level`, not `custom`) subvolume's retention is now tighter — any local or external tier keeps fewer snapshots — a run without this flag still takes its snapshots and sends but holds that subvolume's retention deletions, and records a `RetentionChangeHeld` event. The run summary, `urd plan`, `urd status` and `urd doctor` name the held subvolume. One run with the flag applies the deletions and records the new retention; later runs need no flag. A run records only the subvolumes inside its `--subvolume` / `--priority` scope, and only the half it applied: `--local-only` records local retention, `--external-only` external, and a subvolume with sends disabled records (and is judged on) local retention only. The first run after upgrading, and the first run for a new subvolume, record without holding. If the state DB cannot be read, nothing is held and the run logs a warning. The systemd timer never passes the flag. |
+| `--confirm-retention-change` | Applies a retention tightening. Urd records, per subvolume, the retention its deletions were last applied under. When a subvolume on a named protection level (`protection` in v2 config, not `custom`) now has tighter retention — any local or external tier keeps fewer snapshots — it is held: a run without this flag still takes its snapshots and sends, and still makes every deletion the previous retention would also have made, but withholds the extra deletions the tightening causes, and records a `RetentionChangeHeld` event. The hold is per half: a tightened external half never holds local deletions, and vice versa. Space-pressure deletions, and local deletions while the pool is armed Tight or Critical, are never held. The run summary, `urd plan`, `urd status` and `urd doctor` name the held subvolume. One run with the flag applies the new retention and records it; later runs need no flag. A run records only the subvolumes inside its `--subvolume` / `--priority` scope, and only the half it applied: `--local-only` records local retention, `--external-only` external, and a subvolume with sends disabled records (and is judged on) local retention only. The first run after upgrading, and the first run for a new subvolume, record without holding. If the state DB cannot be read, nothing is held or recorded and the run logs a warning. If the state DB is deleted or recreated, every subvolume counts as first seen, so a pending tightening applies without a hold. The systemd timer never passes the flag. |
 | `--force-full` | Force full sends for chain-broken subvolumes. Without this, chain-break full sends are skipped when Urd runs under systemd, whether or not `--auto` is given (avoids surprise multi-TB sends from the timer). |
 | `--priority <1-3>`, `--subvolume <name>`, `--local-only`, `--external-only`, `--force-snapshot` | Same scoping as `plan`. |
 
@@ -157,6 +157,13 @@ output mode.
 or was legitimately skipped). `1` for `Partial` (some subvolume failed) or
 `Failure` (run-level failure). Distinguishing partial vs total failure
 requires reading the heartbeat or metrics, not the exit code.
+
+The exit code says whether the run's operations completed, not whether the
+data is protected. A subvolume deferred because its drive is away is not a
+failure: nothing errored, so the run is `Success` and exits `0` (ADR-105's
+2026-09-29 amendment). So does an empty plan. Whether the data reached a
+destination is reported by promise states (`urd status`), the heartbeat and
+the per-subvolume metrics (`backup_success 3` for a deferred subvolume).
 
 ---
 

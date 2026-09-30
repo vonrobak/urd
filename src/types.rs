@@ -1484,6 +1484,65 @@ impl Serialize for ByteSize {
     }
 }
 
+// ── TightnessTier ───────────────────────────────────────────────────────
+
+/// Source-pool tightness, free-ratio only (UPI 031-a). Distinct from
+/// `HeadroomSeverity` as `recommendation` composes it (free-ratio + trend +
+/// destination metadata): the tier is the imperative-bundle axis that drives
+/// Do-No-Harm response. Ordering is load-bearing (`Roomy < Tight < Critical`):
+/// hysteresis and aggregation compare and `.max()` tiers.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum TightnessTier {
+    /// Roomy enough that Urd says nothing.
+    #[default]
+    Roomy,
+    /// "tight" — below the caution threshold (< 25% free). Watch it.
+    Tight,
+    /// "critical" — below the pressure threshold (< 15% free).
+    Critical,
+}
+
+impl TightnessTier {
+    /// Canonical string form persisted in `pool_armed_tier.armed_tier`.
+    /// Parallels `SendKind::as_db_str`.
+    #[must_use]
+    pub const fn as_db_str(self) -> &'static str {
+        match self {
+            TightnessTier::Roomy => "roomy",
+            TightnessTier::Tight => "tight",
+            TightnessTier::Critical => "critical",
+        }
+    }
+
+    /// Parse the canonical DB form. Returns `None` for any string that does
+    /// not match `as_db_str()` exactly (an unparseable row is skipped, not
+    /// guessed — best-effort, fail toward stateless).
+    #[must_use]
+    pub fn from_db_str(s: &str) -> Option<Self> {
+        match s {
+            "roomy" => Some(TightnessTier::Roomy),
+            "tight" => Some(TightnessTier::Tight),
+            "critical" => Some(TightnessTier::Critical),
+            _ => None,
+        }
+    }
+
+    /// True iff `to` is a worse (tighter) tier than `from`, both as DB-strings —
+    /// the escalation direction for a `StorageTierTransition` (UPI 064-b).
+    /// Unparseable inputs → `false`. The single owner of this comparison, read by
+    /// both the event severity (`events.rs`) and its render (`voice_events.rs`).
+    #[must_use]
+    pub fn escalated_from_db_str(from: &str, to: &str) -> bool {
+        matches!(
+            (Self::from_db_str(from), Self::from_db_str(to)),
+            (Some(f), Some(t)) if t > f
+        )
+    }
+}
+
 // ── Display helpers ─────────────────────────────────────────────────────
 
 /// Format a number of seconds as a human-readable duration string (e.g., "2m 15s", "45s").
@@ -2888,5 +2947,26 @@ weekly = 4
         assert!(names.contains("a"));
         // Ord is the string's order.
         assert_eq!(names.iter().next().unwrap(), "a");
+    }
+
+    // ── TightnessTier ───────────────────────────────────────────────────
+
+    #[test]
+    fn tier_ordering_is_roomy_tight_critical() {
+        assert!(TightnessTier::Roomy < TightnessTier::Tight);
+        assert!(TightnessTier::Tight < TightnessTier::Critical);
+    }
+
+    #[test]
+    fn tier_db_str_round_trip() {
+        for tier in [
+            TightnessTier::Roomy,
+            TightnessTier::Tight,
+            TightnessTier::Critical,
+        ] {
+            assert_eq!(TightnessTier::from_db_str(tier.as_db_str()), Some(tier));
+        }
+        assert_eq!(TightnessTier::from_db_str("garbage"), None);
+        assert_eq!(TightnessTier::from_db_str(""), None);
     }
 }

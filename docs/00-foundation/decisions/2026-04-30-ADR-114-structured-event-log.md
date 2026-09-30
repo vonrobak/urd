@@ -6,7 +6,7 @@ project: ['[[urd]]']
 sensitivity: public
 status: active
 created: '2026-04-30'
-timestamp: '2026-09-29T21:30:00+02:00'
+timestamp: '2026-09-30T12:00:00+02:00'
 ---
 # ADR-114: Structured Event Log for Decisions and State Transitions
 
@@ -19,7 +19,7 @@ timestamp: '2026-09-29T21:30:00+02:00'
 
 **Date:** 2026-04-30
 **Status:** Accepted (principle); implemented in UPI 036 (`PromiseStatus`
-serialized-form amendment 2026-05-29 — see [Amendment 2026-05-29](#amendment-2026-05-29-promisestatus-serialized-form); stamp seam, drive lifecycle, and events retention amended 2026-09-04 — see [Amendment 2026-09-04](#amendment-2026-09-04-the-stamp-seam-drive-lifecycle-and-events-retention))
+serialized-form amendment 2026-05-29 — see [Amendment 2026-05-29](#amendment-2026-05-29-promisestatus-serialized-form); stamp seam, drive lifecycle, and events retention amended 2026-09-04 — see [Amendment 2026-09-04](#amendment-2026-09-04-the-stamp-seam-drive-lifecycle-and-events-retention); wire types, decoders, and the heartbeat as dispatch mailbox amended 2026-09-30 — see [Amendment 2026-09-30](#amendment-2026-09-30-wire-types-retired-decoders-and-the-dispatch-mailbox))
 **Complements:** UPI 030 (drift_samples — quantitative per-run signal)
 
 ## Context
@@ -387,3 +387,97 @@ nothing is destroyed, and no counter or command other than `urd events` reads th
 can still render the rows already on disk. It is retired, decoder and fixture together,
 when no database that Urd supports upgrading from can still hold such a row. Until then
 the variant must not be removed or renamed.
+
+## Amendment 2026-09-30: wire types, retired decoders, and the dispatch mailbox
+
+Corrections, one new payload, one open item, and one decision that was made in code
+without being recorded.
+
+### Where the vocabulary lives
+
+- **`DriveEventSource` and `CircuitState`** are defined in `src/events.rs`, beside the
+  payloads that carry them. They used to live in the state and sentinel modules;
+  `crate::state::DriveEventSource` still resolves through a re-export. `events.rs` depends only on `types.rs`, so the wire vocabulary of an
+  event row sits in one module, and changing that module is visibly a change to what old
+  rows must still decode to.
+- **`PromiseStatus`**, whose serialized form the 2026-05-29 amendment fixes, is defined in
+  `src/types.rs`, not `awareness.rs`.
+- **The persistence side** is the directory `src/state/`: the `events` table and the
+  `drive_connections` subsumption migration are in `state/schema.rs` (`init_schema`,
+  `subsume_drive_connections`), and the best-effort writer is `state/events.rs`
+  (`record_events_best_effort`). The 2026-09-04 amendment's "`src/state.rs`" and
+  "`state.rs` contains no `DELETE FROM events`" read against that directory, and the
+  latter still holds.
+- Constraint 3's persistence list ("`executor.rs`, `state.rs`, `commands/`,
+  `sentinel_runner.rs`") reads `executor/`, `state/`, `commands/`, `sentinel_runner/`,
+  and `recorder.rs`, the one path to persistence named in the 2026-09-04 amendment.
+
+### `RetentionChangeHeld`
+
+A new payload, `EventPayload::RetentionChangeHeld { previous, current, held_deletions }`
+(`EventKind::Retention`, `Severity::Notice`), records a run that withheld a promise-level
+subvolume's retention deletions because its retention tightened (ADR-110's amendment of
+this date). `previous` and `current` are the canonical strings of the two
+`RetentionShape`s; the subvolume rides the event's `subvolume` column. It is additive
+under Constraint 2 and has its own frozen fixture.
+
+### Open: when a decoder-only variant can retire
+
+Two payload variants are no longer written and remain only as decoders:
+
+- **`RetentionProtect`** (the 2026-09-29 amendment).
+- **`SentinelCircuitBreak`**. The circuit-breaker machinery that emitted it was deleted
+  as dormant (#385). The variant, `CircuitState`, and the two circuit-breaker trip
+  counters remain as zero-valued contract surfaces.
+
+The 2026-09-29 amendment retires `RetentionProtect` "when no database that Urd supports
+upgrading from can still hold such a row". Under the 2026-09-04 decision that nothing
+deletes from `events`, a database that once held such a row still holds it, so the
+condition does not become true on its own. It becomes true only by a deliberate act:
+either a row migration that rewrites or drops those rows (the "migration first" path of
+ADR-105's 2026-09-29 amendment), or a declared minimum version that Urd supports
+upgrading from. Neither is planned. Until one is, both decoders and their fixtures stay,
+and neither variant is renamed.
+
+### The heartbeat is the cross-process dispatch mailbox
+
+`urd backup` and `urd sentinel` are separate processes that can both announce a promise
+transition, and the user must hear it once. The coordination between them runs through
+the heartbeat file, not through the events table or a socket:
+
+- **The write is the signal.** A backup's run tail writes `heartbeat.json` with
+  `notifications_dispatched: false`. The sentinel watches the file's mtime
+  (`sentinel_runner/detect.rs`) and treats a newer heartbeat as `BackupCompleted`, which
+  triggers a fresh assessment. The backup has already recorded its transition events with
+  `trigger = Run`, so the sentinel refreshes its baseline without recording them again.
+- **The previous heartbeat is the backup's baseline.** The run tail reads the heartbeat
+  before overwriting it, and `notify::compute_notifications(previous, current)` diffs the
+  promise states of the two. The backup's promise-change notifications are therefore
+  relative to the last heartbeat any run wrote, not to the events table.
+- **`DispatchPolicy::GateOnSentinel`** (`src/recorder.rs`) is the backup's one gated
+  dispatch site, the promise-transition notifications computed by `run_tail::decide_tail`.
+  If a sentinel is running (`sentinel_runner::sentinel_is_running`), the backup marks the
+  heartbeat dispatched (`heartbeat::mark_dispatched`) and leaves delivery to the sentinel,
+  which computes the same transitions from its own baseline. Otherwise the backup
+  dispatches itself and marks the heartbeat only if delivery succeeded, or if there was
+  nothing to deliver.
+- **`DispatchPolicy::Immediate`** never touches the flag. Watchdog aborts, emergency
+  reclaims, and the sentinel's own notices are owned outright by the process that
+  observed them.
+
+The flag is an external contract (`docs/20-reference/heartbeat-schema.md`,
+ADR-105 Contract 5): a reader that sees `false` knows a run's notifications may not have
+reached the user.
+
+**Known gap: nothing reads the flag.** It is written as described above, and no code in
+Urd reads it back today. The original sentinel design intended a re-send when the flag
+is `false`; that retry was not built. A sentinel started after a failed delivery does not
+re-send it, because the sentinel's first assessment establishes a baseline and notifies
+nothing. Whether to implement the retry or retire the flag is open.
+
+This is recorded as a decision because it couples two processes through a file whose
+primary job is monitoring. The coupling is deliberate. The heartbeat is already written
+at the end of every run, it is atomic, and the sentinel already watches it. A second
+channel would need its own crash semantics. The cost is that the heartbeat's mtime is
+load-bearing for the sentinel: a heartbeat write that is not a completed run would be
+read as one.

@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use chrono::{Datelike, Months, NaiveDateTime, Timelike};
 use serde::Serialize;
@@ -7,8 +8,8 @@ use crate::config::ResolvedSubvolume;
 use crate::events::{Event, EventPayload, ProtectReason, PruneRule, UnstampedEvent};
 use crate::plan::{BackupPlan, PlanFilters, PlannedOperation};
 use crate::types::{
-    Interval, LocalRetentionPolicy, MonthlyCount, ProtectionLevel, ResolvedGraduatedRetention,
-    SnapshotName, SubvolName,
+    DriveLabel, Interval, LocalRetentionPolicy, MonthlyCount, ProtectionLevel,
+    ResolvedGraduatedRetention, SnapshotName, SubvolName,
 };
 
 /// Classifies a delete by what motivates it. Carried from `retention.rs` through
@@ -1026,16 +1027,22 @@ fn local_tiers(policy: &LocalRetentionPolicy) -> ResolvedGraduatedRetention {
 
 /// True when any tier of `current` keeps fewer than `previous` did. A tier
 /// that kept snapshots and now keeps none is the limiting case of the same
-/// rule; bounded monthly after `unlimited` is a decrease.
+/// rule; bounded monthly after `unlimited` is a decrease. Under unlimited
+/// monthly the yearly tier is inert (`cascade_cutoffs` keeps every month),
+/// so its count is compared only where it takes effect.
 fn tiers_tightened(
     previous: &ResolvedGraduatedRetention,
     current: &ResolvedGraduatedRetention,
 ) -> bool {
+    let effective_yearly = |g: &ResolvedGraduatedRetention| match g.monthly {
+        MonthlyCount::Unlimited => u32::MAX,
+        MonthlyCount::Count(_) => g.yearly,
+    };
     current.hourly < previous.hourly
         || current.daily < previous.daily
         || current.weekly < previous.weekly
         || current.monthly.is_weaker_than(previous.monthly)
-        || current.yearly < previous.yearly
+        || effective_yearly(current) < effective_yearly(previous)
 }
 
 /// Has the local half of the retention shape tightened? An absent recorded
@@ -1074,14 +1081,17 @@ pub fn retention_tightened(previous: &RecordedRetention, current: &RetentionShap
 //
 // Changing a subvolume's protection level (or its retention) can make the
 // derived policy tighter than the one its snapshots were kept under, and the
-// next run would retroactively delete the difference. The gate holds those
-// deletions until the operator confirms once with `--confirm-retention-change`.
-// Backups proceed either way (ADR-107 fail-open); only the destructive half —
-// retention deletions — is held, and only for the subvolume that tightened.
+// next run would retroactively delete the difference. The gate holds that
+// difference until the operator confirms once with `--confirm-retention-change`.
+// Backups proceed either way (ADR-107 fail-open), and so does every deletion
+// the previous shape would also make: a held subvolume is pruned as the more
+// generous of its old and new policy would prune it, per half. Space-pressure
+// deletes and a tier-adapted pool's local deletes are never held — they answer
+// the host's state, not the declared shape (ADR-113: the host wins).
 //
 // Pure: the command reads the recorded shapes, calls `decide_retention_gate`,
-// applies it with `apply_retention_gate`, and writes `RetentionGate::record`
-// back at run end. `urd plan` / `backup --dry-run` apply the same decision
+// lists the held subvolumes' snapshots, applies it with `apply_retention_gate`,
+// and writes `RetentionGate::record` back at run end. `urd plan` / `backup --dry-run` apply the same decision
 // read-only (ADR-100 preview parity).
 
 impl RetentionShape {
@@ -1250,30 +1260,173 @@ pub struct RetentionHold {
     pub held_deletions: u32,
 }
 
-/// Apply the gate to a plan: drop every `DeleteSnapshot` of each held
-/// subvolume (and the `RetentionPrune` rows that explained them — a prune
-/// that will not happen is not history), then emit one
-/// `RetentionChangeHeld` event per subvolume that actually lost deletions.
-/// Returns those holds for the run summary. Strictly shrinks the plan
-/// (ADR-100): sends and snapshots are untouched.
-pub fn apply_retention_gate(plan: &mut BackupPlan, gate: &RetentionGate) -> Vec<RetentionHold> {
+/// The local snapshots a graduated retention run protects: every pinned
+/// snapshot, plus — for a subvolume that sends — every snapshot newer than
+/// the oldest pin (not yet on every drive), or all of them when there is no
+/// pin (nothing has been sent). The planner's graduated branch and the
+/// retention gate's previous-shape keep test share it.
+#[must_use]
+pub fn graduated_protected(
+    local_snaps: &[SnapshotName],
+    pinned: &HashSet<SnapshotName>,
+    send_enabled: bool,
+) -> HashSet<SnapshotName> {
+    let mut protected = pinned.clone();
+    if send_enabled {
+        match pinned.iter().min() {
+            Some(oldest) => protected.extend(local_snaps.iter().filter(|s| *s > oldest).cloned()),
+            None => protected.extend(local_snaps.iter().cloned()),
+        }
+    }
+    protected
+}
+
+/// One place a held subvolume's snapshots live, listed for the gate's
+/// previous-policy keep test: the local snapshot directory (`drive: None`)
+/// or one drive's snapshot directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldLocation {
+    pub dir: PathBuf,
+    pub drive: Option<DriveLabel>,
+    /// The location's snapshots; `None` when listing them failed, and the
+    /// gate then withholds the location's policy deletes (fail closed).
+    pub snapshots: Option<Vec<SnapshotName>>,
+    /// What the previous shape's retention run would protect here: for the
+    /// local directory, the graduated protected set ([`graduated_protected`]
+    /// — pins and everything not yet sent), because a transient current shape
+    /// protects less; for a drive, the pins the planner protects there.
+    pub protected: HashSet<SnapshotName>,
+}
+
+/// What [`apply_retention_gate`] needs to know about one held subvolume
+/// beyond the plan: where its snapshots are, and whether its local half is
+/// tier-adapted this run. Built at the I/O boundary from the same
+/// observation and arming the planner read.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HeldSubvolumeView {
+    /// Every location the planner could delete in. A delete whose directory
+    /// is not here, or whose listing failed, is withheld (fail closed).
+    pub locations: Vec<HeldLocation>,
+    /// The source pool is armed Tight or Critical and the subvolume sends,
+    /// so its local retention is transient whatever the declared shape
+    /// (`storage_critical::derive_effective_policy`). Those deletions answer
+    /// the pool's state, not the tightening, so they are never held — the
+    /// host wins (ADR-113), as for space-pressure deletes.
+    pub local_tier_adapted: bool,
+}
+
+/// Should the gate withhold this delete of a held subvolume? Only a
+/// `Policy` delete in a tightened half that the previous shape would still
+/// keep — the extra deletion the tightening causes. Everything the old
+/// policy would also have deleted proceeds, so a held subvolume is pruned as
+/// the more generous of its old and new policy would prune it.
+fn withholds(
+    change: &RetentionChange,
+    view: Option<&HeldSubvolumeView>,
+    kept_by_previous: &mut HashMap<PathBuf, HashSet<SnapshotName>>,
+    now: NaiveDateTime,
+    path: &Path,
+    kind: DeleteKind,
+) -> bool {
+    // Space-pressure deletes answer the pool's state, not the declared
+    // shape: holding them would leave the pool to fill (ADR-113).
+    if kind == DeleteKind::SpacePressure {
+        return false;
+    }
+    let (Some(view), Some(dir), Some(name)) = (
+        view,
+        path.parent(),
+        path.file_name().and_then(|n| n.to_str()),
+    ) else {
+        return true;
+    };
+    let Some(location) = view.locations.iter().find(|l| l.dir == dir) else {
+        return true;
+    };
+    let Some(snapshots) = &location.snapshots else {
+        return true;
+    };
+    let previous = match &location.drive {
+        None if !change.local_tightened() || view.local_tier_adapted => return false,
+        None => change.previous.local.as_ref().map(local_tiers),
+        Some(_) if !change.external_tightened() => return false,
+        Some(_) => change.previous.external,
+    };
+    // A tightened half always has a recorded previous value; if it somehow
+    // does not, there is nothing to prove the delete safe against.
+    let Some(previous) = previous else {
+        return true;
+    };
+    let keep = kept_by_previous.entry(location.dir.clone()).or_insert_with(|| {
+        graduated_retention(snapshots, now, &previous, &location.protected, false)
+            .keep
+            .into_iter()
+            .collect()
+    });
+    keep.iter().any(|s| s.as_str() == name)
+}
+
+/// Apply the gate to a plan: for each held subvolume, drop the
+/// `DeleteSnapshot`s [`withholds`] selects (and the `RetentionPrune` rows
+/// that explained them — a prune that will not happen is not history), then
+/// emit one `RetentionChangeHeld` event per subvolume that actually lost
+/// deletions. `views` carries each held subvolume's listed snapshots (see
+/// [`HeldSubvolumeView`]). Returns the holds for the run summary. Strictly
+/// shrinks the plan (ADR-100): sends and snapshots are untouched.
+pub fn apply_retention_gate(
+    plan: &mut BackupPlan,
+    gate: &RetentionGate,
+    views: &HashMap<SubvolName, HeldSubvolumeView>,
+) -> Vec<RetentionHold> {
     let mut holds = Vec::new();
     for change in &gate.held {
         let name = change.subvolume.as_str();
-        let before = plan.operations.len();
+        let view = views.get(&change.subvolume);
+        let mut kept_by_previous = HashMap::new();
+        // (drive, snapshot) of each withheld delete, to drop its prune row.
+        let mut withheld: Vec<(Option<DriveLabel>, String)> = Vec::new();
+        let now = plan.timestamp;
         plan.operations.retain(|op| {
-            !matches!(op, PlannedOperation::DeleteSnapshot { subvolume_name, .. }
-                if subvolume_name == name)
+            let PlannedOperation::DeleteSnapshot {
+                subvolume_name,
+                path,
+                kind,
+                ..
+            } = op
+            else {
+                return true;
+            };
+            if subvolume_name != name
+                || !withholds(change, view, &mut kept_by_previous, now, path, *kind)
+            {
+                return true;
+            }
+            let drive = view.and_then(|v| {
+                v.locations
+                    .iter()
+                    .find(|l| Some(l.dir.as_path()) == path.parent())
+                    .and_then(|l| l.drive.clone())
+            });
+            let snapshot = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            withheld.push((drive, snapshot));
+            false
         });
-        let removed = before - plan.operations.len();
-        if removed == 0 {
+        if withheld.is_empty() {
             continue;
         }
         plan.events.retain(|e| {
+            let EventPayload::RetentionPrune { snapshot, .. } = e.payload() else {
+                return true;
+            };
             !(e.subvolume() == Some(name)
-                && matches!(e.payload(), EventPayload::RetentionPrune { .. }))
+                && withheld.iter().any(|(drive, snap)| {
+                    snap == snapshot && e.drive_label() == drive.as_ref().map(DriveLabel::as_str)
+                }))
         });
-        let held_deletions = u32::try_from(removed).unwrap_or(u32::MAX);
+        let held_deletions = u32::try_from(withheld.len()).unwrap_or(u32::MAX);
         let mut event = Event::pure(
             plan.timestamp,
             EventPayload::RetentionChangeHeld {
@@ -1297,7 +1450,7 @@ pub fn apply_retention_gate(plan: &mut BackupPlan, gate: &RetentionGate) -> Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testkit::svname;
+    use crate::testkit::{dlabel, svname};
     use crate::testkit::fixed_now as now;
     use chrono::NaiveDate;
 
@@ -2713,7 +2866,16 @@ mod tests {
                 with_external(tiers(0, 30, 26, MonthlyCount::Count(120), 5)),
                 true,
             ),
-            ("external yearly down", with_external(tiers(0, 30, 26, MonthlyCount::Unlimited, 1)), true),
+            (
+                "external yearly down under unlimited monthly (inert tier)",
+                with_external(tiers(0, 30, 26, MonthlyCount::Unlimited, 1)),
+                false,
+            ),
+            (
+                "external unlimited monthly to bounded with yearly up still tightens",
+                with_external(tiers(0, 30, 26, MonthlyCount::Count(12), 50)),
+                true,
+            ),
             (
                 "local loosened",
                 with_local(tiers(48, 60, 52, MonthlyCount::Unlimited, 10)),
@@ -2851,6 +3013,29 @@ mod tests {
             ],
             lifecycles: std::collections::HashMap::new(),
         }
+    }
+
+    /// home's local directory, listing both snapshots `gate_plan` deletes.
+    fn home_view() -> HashMap<SubvolName, HeldSubvolumeView> {
+        HashMap::from([(
+            svname("home"),
+            HeldSubvolumeView {
+                locations: vec![HeldLocation {
+                    dir: std::path::PathBuf::from("/snap/home"),
+                    drive: None,
+                    snapshots: Some(vec![
+                        snap("20260301-1200-home"),
+                        snap("20260302-1200-home"),
+                    ]),
+                    protected: HashSet::new(),
+                }],
+                local_tier_adapted: false,
+            },
+        )])
+    }
+
+    fn snap(name: &str) -> SnapshotName {
+        SnapshotName::parse(name).unwrap()
     }
 
     fn recorded(entries: &[(&str, RetentionShape)]) -> HashMap<SubvolName, RecordedRetention> {
@@ -3081,7 +3266,7 @@ mod tests {
         let prev = recorded(&[("home", base_shape()), ("docs", base_shape())]);
         let gate = decide_retention_gate(&subvols, &prev, false, full_run());
         let mut plan = gate_plan();
-        let holds = apply_retention_gate(&mut plan, &gate);
+        let holds = apply_retention_gate(&mut plan, &gate, &home_view());
 
         assert_eq!(holds.len(), 1);
         assert_eq!(holds[0].change.subvolume, "home");
@@ -3121,9 +3306,329 @@ mod tests {
         let gate = decide_retention_gate(&subvols, &prev, false, full_run());
         assert_eq!(gate.held.len(), 1, "still pending — status/doctor keep saying so");
         let mut plan = gate_plan();
-        let holds = apply_retention_gate(&mut plan, &gate);
+        let holds = apply_retention_gate(&mut plan, &gate, &home_view());
         assert!(holds.is_empty());
         assert_eq!(plan.operations.len(), 4);
         assert_eq!(plan.events.len(), 3);
+    }
+
+    // ── The gate withholds only the tightening's extra deletions ───────
+
+    const EXT_DIR: &str = "/mnt/d1/.snapshots/home";
+
+    /// A delete of `name` in `dir` for home, with its prune row stamped to
+    /// the drive when external.
+    fn delete_in(dir: &str, name: &str, kind: DeleteKind) -> PlannedOperation {
+        PlannedOperation::DeleteSnapshot {
+            path: std::path::PathBuf::from(format!("{dir}/{name}")),
+            reason: "test".to_string(),
+            subvolume_name: svname("home"),
+            kind,
+        }
+    }
+
+    fn prune_in(name: &str, drive: Option<&str>) -> UnstampedEvent {
+        let mut e = prune_event("home", name);
+        e.fill_drive_label(drive.map(str::to_string));
+        e
+    }
+
+    fn plan_of(operations: Vec<PlannedOperation>, events: Vec<UnstampedEvent>) -> BackupPlan {
+        BackupPlan {
+            operations,
+            timestamp: now(),
+            skipped: vec![],
+            events,
+            lifecycles: std::collections::HashMap::new(),
+        }
+    }
+
+    /// home listed locally (`/snap/home`) and on drive D1, each holding
+    /// `names`.
+    fn view_both(names: &[&str], local_tier_adapted: bool) -> HashMap<SubvolName, HeldSubvolumeView> {
+        let snaps: Vec<SnapshotName> = names.iter().map(|n| snap(n)).collect();
+        HashMap::from([(
+            svname("home"),
+            HeldSubvolumeView {
+                locations: vec![
+                    HeldLocation {
+                        dir: std::path::PathBuf::from("/snap/home"),
+                        drive: None,
+                        snapshots: Some(snaps.clone()),
+                        protected: HashSet::new(),
+                    },
+                    HeldLocation {
+                        dir: std::path::PathBuf::from(EXT_DIR),
+                        drive: Some(dlabel("D1")),
+                        snapshots: Some(snaps),
+                        protected: HashSet::new(),
+                    },
+                ],
+                local_tier_adapted,
+            },
+        )])
+    }
+
+    fn held_gate(current: RetentionShape) -> RetentionGate {
+        let subvols = vec![resolved("home", Some(ProtectionLevel::Sheltered), current)];
+        decide_retention_gate(&subvols, &recorded(&[("home", base_shape())]), false, full_run())
+    }
+
+    fn deleted_paths(plan: &BackupPlan) -> Vec<String> {
+        plan.operations
+            .iter()
+            .filter_map(|op| match op {
+                PlannedOperation::DeleteSnapshot { path, .. } => Some(path.display().to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn gate_lets_through_a_delete_the_previous_shape_would_also_make() {
+        // base keeps ~2.5 years locally; a 2020 snapshot is beyond every
+        // window of both shapes, so deleting it is not the tightening's doing.
+        let names = ["20200101-1200-home", "20260301-1200-home"];
+        let mut plan = plan_of(
+            vec![
+                delete_in("/snap/home", names[0], DeleteKind::Policy),
+                delete_in("/snap/home", names[1], DeleteKind::Policy),
+            ],
+            vec![prune_in(names[0], None), prune_in(names[1], None)],
+        );
+        let holds = apply_retention_gate(&mut plan, &held_gate(tighter_shape()), &view_both(&names, false));
+        assert_eq!(deleted_paths(&plan), vec!["/snap/home/20200101-1200-home"]);
+        assert_eq!(holds.len(), 1);
+        assert_eq!(holds[0].held_deletions, 1);
+        // Only the withheld delete's prune row is dropped.
+        let prunes: Vec<&str> = plan
+            .events
+            .iter()
+            .filter_map(|e| match e.payload() {
+                EventPayload::RetentionPrune { snapshot, .. } => Some(snapshot.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(prunes, vec!["20200101-1200-home"]);
+    }
+
+    #[test]
+    fn gate_never_holds_space_pressure_deletes() {
+        let names = ["20260301-1200-home"];
+        let mut plan = plan_of(
+            vec![
+                delete_in("/snap/home", names[0], DeleteKind::SpacePressure),
+                delete_in(EXT_DIR, names[0], DeleteKind::SpacePressure),
+            ],
+            vec![],
+        );
+        let tighter_both = RetentionShape {
+            external: tiers(0, 7, 4, MonthlyCount::Count(1), 0),
+            ..tighter_shape()
+        };
+        let holds = apply_retention_gate(&mut plan, &held_gate(tighter_both), &view_both(&names, false));
+        assert!(holds.is_empty());
+        assert_eq!(deleted_paths(&plan).len(), 2);
+    }
+
+    #[test]
+    fn gate_never_holds_local_deletes_while_the_pool_is_tier_adapted() {
+        // Tight/Critical make local retention transient whatever the shape:
+        // the previous shape would have deleted these too.
+        let names = ["20260301-1200-home"];
+        let mut plan = plan_of(vec![delete_in("/snap/home", names[0], DeleteKind::Policy)], vec![]);
+        let holds = apply_retention_gate(&mut plan, &held_gate(tighter_shape()), &view_both(&names, true));
+        assert!(holds.is_empty());
+        assert_eq!(deleted_paths(&plan).len(), 1);
+    }
+
+    #[test]
+    fn gate_holds_per_half() {
+        // Only the external half tightened: local deletes proceed, the
+        // external delete the previous shape keeps is withheld, and only
+        // its (drive-stamped) prune row is dropped.
+        let names = ["20260301-1200-home"];
+        let external_tighter = RetentionShape {
+            external: tiers(0, 7, 4, MonthlyCount::Count(1), 0),
+            ..base_shape()
+        };
+        let mut plan = plan_of(
+            vec![
+                delete_in("/snap/home", names[0], DeleteKind::Policy),
+                delete_in(EXT_DIR, names[0], DeleteKind::Policy),
+            ],
+            vec![prune_in(names[0], None), prune_in(names[0], Some("D1"))],
+        );
+        let holds = apply_retention_gate(&mut plan, &held_gate(external_tighter), &view_both(&names, false));
+        assert_eq!(deleted_paths(&plan), vec!["/snap/home/20260301-1200-home"]);
+        assert_eq!(holds[0].held_deletions, 1);
+        let prune_drives: Vec<Option<&str>> = plan
+            .events
+            .iter()
+            .filter(|e| matches!(e.payload(), EventPayload::RetentionPrune { .. }))
+            .map(UnstampedEvent::drive_label)
+            .collect();
+        assert_eq!(prune_drives, vec![None]);
+
+        // The same plan with the local half tightened too holds both.
+        let mut plan = plan_of(
+            vec![
+                delete_in("/snap/home", names[0], DeleteKind::Policy),
+                delete_in(EXT_DIR, names[0], DeleteKind::Policy),
+            ],
+            vec![],
+        );
+        let both = RetentionShape {
+            external: tiers(0, 7, 4, MonthlyCount::Count(1), 0),
+            ..tighter_shape()
+        };
+        apply_retention_gate(&mut plan, &held_gate(both), &view_both(&names, false));
+        assert!(deleted_paths(&plan).is_empty());
+    }
+
+    #[test]
+    fn gate_fails_closed_without_a_listing() {
+        let names = ["20200101-1200-home"];
+        let ops = || vec![delete_in("/snap/home", names[0], DeleteKind::Policy)];
+        // No view at all for the held subvolume.
+        let mut plan = plan_of(ops(), vec![]);
+        let holds = apply_retention_gate(&mut plan, &held_gate(tighter_shape()), &HashMap::new());
+        assert!(deleted_paths(&plan).is_empty());
+        assert_eq!(holds[0].held_deletions, 1);
+        // A view whose listing of this directory failed.
+        let mut views = view_both(&names, false);
+        views.get_mut("home").unwrap().locations[0].snapshots = None;
+        let mut plan = plan_of(ops(), vec![]);
+        apply_retention_gate(&mut plan, &held_gate(tighter_shape()), &views);
+        assert!(deleted_paths(&plan).is_empty());
+        // Space pressure still proceeds without a listing.
+        let mut plan = plan_of(vec![delete_in("/snap/home", names[0], DeleteKind::SpacePressure)], vec![]);
+        apply_retention_gate(&mut plan, &held_gate(tighter_shape()), &HashMap::new());
+        assert_eq!(deleted_paths(&plan).len(), 1);
+    }
+
+    #[test]
+    fn gate_prunes_a_held_subvolume_as_the_more_generous_policy_would() {
+        // Thirty consecutive dailies. The new shape keeps 7 dailies, base
+        // keeps 30: every delete the new shape plans for this month is one
+        // base would keep, so all are withheld; nothing base would delete
+        // survives the gate that the new shape wanted gone.
+        let names: Vec<String> = (1..=30)
+            .map(|d| format!("202602{:02}-1200-home", d.min(28)))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let snaps: Vec<SnapshotName> = names.iter().map(|n| snap(n)).collect();
+        let current = tighter_shape();
+        let LocalRetentionPolicy::Graduated(current_tiers) = current.local else {
+            unreachable!()
+        };
+        let planned = graduated_retention(&snaps, now(), &current_tiers, &HashSet::new(), false);
+        let base_keep: HashSet<SnapshotName> = graduated_retention(
+            &snaps,
+            now(),
+            &local_tiers(&base_shape().local),
+            &HashSet::new(),
+            false,
+        )
+        .keep
+        .into_iter()
+        .collect();
+        let mut plan = plan_of(
+            planned
+                .delete
+                .iter()
+                .map(|d| delete_in("/snap/home", d.snapshot.as_str(), d.kind))
+                .collect(),
+            vec![],
+        );
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        apply_retention_gate(&mut plan, &held_gate(current), &view_both(&refs, false));
+        let survivors = deleted_paths(&plan);
+        assert!(
+            !survivors.is_empty() && survivors.len() < planned.delete.len(),
+            "fixture must exercise both outcomes: {} of {} deletes survive",
+            survivors.len(),
+            planned.delete.len(),
+        );
+        for d in &planned.delete {
+            let path = format!("/snap/home/{}", d.snapshot);
+            assert_eq!(
+                survivors.contains(&path),
+                !base_keep.contains(&d.snapshot),
+                "{path}: deleted iff the previous shape would delete it too",
+            );
+        }
+    }
+
+    #[test]
+    fn gate_keeps_what_the_previous_shape_protected_as_unsent() {
+        // The local half moves from graduated to transient while the only
+        // drive is away. The planner's transient branch protects the away pin
+        // A but expands the unsent set only from a *mounted* pin, so it plans
+        // to delete everything newer than A. The previous graduated shape
+        // protected all of it as unsent: the gate must withhold every one,
+        // not just the snapshots its tiers would keep.
+        let away_pin = "20260310-1200-home";
+        // Two a day: the previous tiers keep one per day, so only its unsent
+        // protection keeps the other.
+        let recent: Vec<String> = (11..=20)
+            .flat_map(|d| [format!("202603{d:02}-0000-home"), format!("202603{d:02}-1200-home")])
+            .collect();
+        let mut names = vec!["20200101-1200-home", away_pin];
+        names.extend(recent.iter().map(String::as_str));
+        let snaps: Vec<SnapshotName> = names.iter().map(|n| snap(n)).collect();
+        let pinned = HashSet::from([snap(away_pin)]);
+
+        let current = RetentionShape {
+            local: LocalRetentionPolicy::Transient,
+            ..base_shape()
+        };
+        let mut view = view_both(&names, false);
+        view.get_mut("home").unwrap().locations[0].protected =
+            graduated_protected(&snaps, &pinned, true);
+        let mut plan = plan_of(
+            names
+                .iter()
+                .filter(|n| **n != away_pin)
+                .map(|n| delete_in("/snap/home", n, DeleteKind::Policy))
+                .collect(),
+            vec![],
+        );
+        let holds = apply_retention_gate(&mut plan, &held_gate(current), &view);
+        // Only the snapshot older than the pin, which the previous shape
+        // would also delete, goes.
+        assert_eq!(deleted_paths(&plan), vec!["/snap/home/20200101-1200-home"]);
+        assert_eq!(holds[0].held_deletions, 20);
+    }
+
+    #[test]
+    fn graduated_protected_table() {
+        let snaps = vec![
+            snap("20260301-1200-home"),
+            snap("20260302-1200-home"),
+            snap("20260303-1200-home"),
+        ];
+        let pin = HashSet::from([snap("20260302-1200-home")]);
+        let names = |set: HashSet<SnapshotName>| {
+            let mut v: Vec<String> = set.into_iter().map(|s| s.to_string()).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(
+            names(graduated_protected(&snaps, &pin, true)),
+            vec!["20260302-1200-home", "20260303-1200-home"],
+            "the pin and everything newer (unsent)",
+        );
+        assert_eq!(
+            names(graduated_protected(&snaps, &HashSet::new(), true)).len(),
+            3,
+            "nothing sent yet"
+        );
+        assert_eq!(
+            names(graduated_protected(&snaps, &pin, false)),
+            vec!["20260302-1200-home"],
+            "local-only: pins"
+        );
     }
 }

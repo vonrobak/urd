@@ -15,7 +15,7 @@ use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
 
 use crate::types::PromiseStatus;
-use crate::types::{FullSendReason, SendKind};
+use crate::types::{FullSendReason, SendKind, TightnessTier};
 
 // ── Top-level kind ─────────────────────────────────────────────────────
 
@@ -425,7 +425,7 @@ impl EventPayload {
             // Tier transitions: Notice on escalation (worsening), Info on
             // de-escalation (mirrors PromiseTransition's direction logic).
             Self::StorageTierTransition { from, to, .. } => {
-                if crate::storage_critical::TightnessTier::escalated_from_db_str(from, to) {
+                if TightnessTier::escalated_from_db_str(from, to) {
                     Severity::Notice
                 } else {
                     Severity::Info
@@ -551,6 +551,14 @@ impl UnstampedEvent {
     #[must_use]
     pub fn subvolume(&self) -> Option<&str> {
         self.event.subvolume.as_deref()
+    }
+
+    /// Read-only access to the semantic-origin drive label, for the same
+    /// emit-side matching as [`subvolume`](Self::subvolume): a local prune
+    /// row has none, an external one names its drive.
+    #[must_use]
+    pub fn drive_label(&self) -> Option<&str> {
+        self.event.drive_label.as_deref()
     }
 
     /// Set the semantic-origin subvolume if not already set. `None` is a

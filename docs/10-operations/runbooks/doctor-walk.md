@@ -69,7 +69,7 @@ weakening overrides, level/interval mismatches). Pure function from
 |--------|---------------|--------|
 | `ok` (single line: "N subvolumes, M drives") | Config parses and passes preflight. | None. |
 | `warn — weakening-override` | A subvolume's `protection` is named but operational fields are mixed in (forbidden in v1; see ADR-110/111). | Reduce the interval to match the level, or change `protection` to `custom`. |
-| `warn — <subvolume>: … retention tightened since it was last applied` | A promise-level subvolume now keeps fewer snapshots than the retention its deletions were last applied under (ADR-110 transition safety). Backups continue; its retention deletions are held. | If the tighter retention is intended, run `urd backup --confirm-retention-change` once. If not, restore the previous `protection_level`. |
+| `warn — <subvolume>: … retention tightened since it was last applied` | A promise-level subvolume now keeps fewer snapshots than the retention its deletions were last applied under (ADR-110 transition safety). Backups continue; only the extra deletions the tightening causes are held. | If the tighter retention is intended, run `urd backup --confirm-retention-change` once. If not, restore the previous `protection` level. |
 | Other `warn` | Various preflight advisories. | Read the message; usually a config nudge. |
 
 Preflight never errors — by design, structural problems block at config

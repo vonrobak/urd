@@ -6,7 +6,7 @@ project: ['[[urd]]']
 sensitivity: public
 status: active
 created: '2026-03-24'
-timestamp: '2026-09-04T10:15:00+02:00'
+timestamp: '2026-09-30T12:00:00+02:00'
 ---
 # ADR-104: Graduated Retention Model
 
@@ -18,7 +18,7 @@ timestamp: '2026-09-04T10:15:00+02:00'
 > Amended 2026-09-04 — see the amendment of that date below.
 
 **Date:** 2026-03-22 (formalized 2026-03-24)
-**Status:** Accepted (amended 2026-05-15, yearly window; 2026-09-04, code-drift audit)
+**Status:** Accepted (amended 2026-05-15, yearly window; 2026-09-04, code-drift audit; 2026-09-30 — see [Amendment 2026-09-30](#amendment-2026-09-30-the-pin-parent-constraint-is-a-retention-rule))
 **Supersedes:** Roadmap's original fixed-count retention (`daily_keep`/`weekly_keep`/`monthly_keep`)
 
 ## Context
@@ -211,3 +211,21 @@ unchanged (see ADR-115's amendment for the rest of that rename).
 - ADR-115: Retention shape symmetry and the recommendation layer (4-slot recommender scope)
 - Phase 1 journal (`docs/98-journals/2026-03-22-urd-phase01.md`) — retention redesign
 - Roadmap (`docs/96-project-supervisor/roadmap.md`) — original flat retention specification
+
+## Amendment 2026-09-30: the pin-parent constraint is a retention rule
+
+The first Constraint says retention must never delete a snapshot that is the current pin
+parent for any drive. That still holds, for retention. It does not hold for Urd as a
+whole: under storage pressure, ADR-113 and ADR-116 authorize shedding a pin and then
+deleting the snapshot it protected. Examples are the Critical clear-all, the in-run
+away-pin shed, and `Executor::emergency_reclaim_pool`. ADR-106's amendment of this date
+lists those paths and the rule that bounds them: host survival only, and never the only
+copy.
+
+The executor-level re-check the Constraint refers to is `chain::is_pinned_at_delete_time`,
+the single Layer 3 implementation (ADR-106's amendment of this date). Retention
+deletions also pass through the retention-change gate (ADR-110's amendment of this date),
+which can hold a promise-level subvolume's deletions for a run. It never adds deletions.
+
+The 2026-09-04 amendment's "`src/config.rs`" for `ResolvedSubvolume` reads
+`src/config/resolve.rs`.
