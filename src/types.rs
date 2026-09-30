@@ -217,13 +217,20 @@ impl SnapshotName {
     /// Parse a snapshot name string. Accepts both:
     /// - `YYYYMMDD-HHMM-shortname` (new format)
     /// - `YYYYMMDD-shortname` (legacy, treated as midnight)
+    ///
+    /// Every slice below is `str::get`, never `&s[..]`: `read_snapshot_dir` feeds this
+    /// every non-hidden directory entry, and the length checks count bytes, so a stray
+    /// non-ASCII entry (`2026010é-x`) would otherwise panic on a char boundary. Non-ASCII
+    /// is not rejected outright — `validate_name_safe` permits it in a `short_name`.
     pub fn parse(s: &str) -> crate::error::Result<Self> {
         let s = s.trim();
         if s.len() < 10 {
             return Err(UrdError::Parse(format!("snapshot name too short: {s:?}")));
         }
 
-        let date_str = &s[..8];
+        let date_str = s
+            .get(..8)
+            .ok_or_else(|| UrdError::Parse(format!("invalid date in snapshot name: {s:?}")))?;
         let date = NaiveDate::parse_from_str(date_str, "%Y%m%d")
             .map_err(|e| UrdError::Parse(format!("invalid date in snapshot name {s:?}: {e}")))?;
 
@@ -234,16 +241,17 @@ impl SnapshotName {
             )));
         }
 
-        let rest = &s[9..];
+        // Byte 8 is the ASCII '-' just checked, so byte 9 is a char boundary.
+        let rest = s.get(9..).unwrap_or_default();
 
         // Try new format: HHMM-shortname (rest starts with 4 digits then '-')
-        if rest.len() >= 5
-            && rest.as_bytes()[4] == b'-'
-            && let (Ok(hour), Ok(minute)) = (rest[..2].parse::<u32>(), rest[2..4].parse::<u32>())
+        if rest.as_bytes().get(4) == Some(&b'-')
+            && let (Some(hh), Some(mm), Some(short_name)) =
+                (rest.get(..2), rest.get(2..4), rest.get(5..))
+            && let (Ok(hour), Ok(minute)) = (hh.parse::<u32>(), mm.parse::<u32>())
             && hour < 24
             && minute < 60
         {
-            let short_name = &rest[5..];
             if short_name.is_empty() {
                 return Err(UrdError::Parse(format!(
                     "empty short name in snapshot name: {s:?}"
@@ -1680,6 +1688,29 @@ mod tests {
                 .and_hms_opt(9, 30, 0)
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn parse_non_ascii_in_date_is_error_not_panic() {
+        // 'é' straddles byte 8: a byte slice there would panic on a char boundary.
+        assert!(SnapshotName::parse("2026010é-x").is_err());
+    }
+
+    #[test]
+    fn parse_non_ascii_in_time_falls_back_to_legacy_not_panic() {
+        // 'é' straddles byte 2 of the HHMM field; not a time, so it parses as legacy
+        // exactly as any other non-digit HHMM field would.
+        let sn = SnapshotName::parse("20260101-1é3-x").unwrap();
+        assert_eq!(sn.short_name(), "1é3-x");
+        assert_eq!(sn.datetime().time(), NaiveTime::from_hms_opt(0, 0, 0).unwrap());
+    }
+
+    #[test]
+    fn parse_non_ascii_short_name_round_trips() {
+        // validate_name_safe permits non-ASCII short names; they must keep parsing.
+        let sn = SnapshotName::parse("20260322-1430-bilder-ø").unwrap();
+        assert_eq!(sn.short_name(), "bilder-ø");
+        assert_eq!(sn.datetime().time(), NaiveTime::from_hms_opt(14, 30, 0).unwrap());
     }
 
     #[test]
