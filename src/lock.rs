@@ -125,23 +125,27 @@ pub fn read_lock_info(lock_path: &Path) -> Option<LockInfo> {
 }
 
 /// Write PID + timestamp + trigger to the lock file after acquisition.
-/// Best-effort — failure to write metadata doesn't affect the lock itself.
+/// Best-effort — failure to write metadata doesn't affect the lock itself, but it
+/// is logged: without it a contending run cannot say who holds the lock.
 fn write_lock_metadata(file: &File, trigger: &str) {
     let info = LockInfo {
         pid: std::process::id(),
         started: chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
         trigger: trigger.to_string(),
     };
-    // Write to the same file handle that holds the flock.
-    let Ok(mut writer) = file.try_clone() else {
-        return;
-    };
-    // Truncate and rewrite
-    if nix::unistd::ftruncate(&writer, 0).is_ok() {
-        use std::io::Seek;
-        let _ = writer.seek(std::io::SeekFrom::Start(0));
-        let _ = serde_json::to_writer(&mut writer, &info);
+    if let Err(e) = write_lock_info(file, &info) {
+        log::warn!("Failed to write lock metadata (the lock itself is held): {e}");
     }
+}
+
+/// Truncate and rewrite `info` through the same file handle that holds the flock.
+fn write_lock_info(file: &File, info: &LockInfo) -> std::io::Result<()> {
+    use std::io::Seek;
+    let mut writer = file.try_clone()?;
+    nix::unistd::ftruncate(&writer, 0)?;
+    writer.seek(std::io::SeekFrom::Start(0))?;
+    serde_json::to_writer(&mut writer, info)?;
+    Ok(())
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
@@ -150,6 +154,39 @@ fn write_lock_metadata(file: &File, trigger: &str) {
 mod tests {
     use super::*;
     use std::io::Write as IoWrite;
+
+    #[test]
+    fn write_lock_info_reports_failure_instead_of_discarding_it() {
+        // A read-only handle cannot be truncated or written, even as root. The
+        // former `let _ =` chain swallowed this; now it surfaces (and is logged).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.lock");
+        File::create(&path).unwrap();
+        let read_only = File::open(&path).unwrap();
+        let info = LockInfo {
+            pid: 1,
+            started: "2026-03-27T10:00:00".to_string(),
+            trigger: "manual".to_string(),
+        };
+        assert!(write_lock_info(&read_only, &info).is_err());
+    }
+
+    #[test]
+    fn write_lock_info_round_trips_through_read_lock_info() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.lock");
+        std::fs::write(&path, b"stale longer contents than the new json record").unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let info = LockInfo {
+            pid: 42,
+            started: "2026-03-27T10:00:00".to_string(),
+            trigger: "timer".to_string(),
+        };
+        write_lock_info(&file, &info).unwrap();
+        let read = read_lock_info(&path).unwrap();
+        assert_eq!(read.pid, 42);
+        assert_eq!(read.trigger, "timer");
+    }
 
     #[test]
     fn read_lock_info_valid_json() {
