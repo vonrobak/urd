@@ -44,7 +44,7 @@ pub fn status(config: Config, output_mode: OutputMode) -> anyhow::Result<()> {
 /// `urd sentinel status --json` as well as the interactive line.
 fn format_uptime(started: &str, now: chrono::NaiveDateTime) -> String {
     let Ok(started_dt) =
-        chrono::NaiveDateTime::parse_from_str(started, "%Y-%m-%dT%H:%M:%S")
+        chrono::NaiveDateTime::parse_from_str(started, crate::types::TIMESTAMP_FORMAT)
     else {
         return "unknown".to_string();
     };

@@ -252,12 +252,17 @@ pub fn run(config: Config, args: DoctorArgs, output_mode: OutputMode) -> anyhow:
         let state_path = sentinel_runner::sentinel_state_path(&config);
         Some(match sentinel_runner::read_sentinel_state_file(&state_path) {
             Some(state) if sentinel_runner::is_pid_alive(state.pid) => {
+                // Tolerated space-separated form. No in-tree writer has ever
+                // produced it — the sentinel state file has always written
+                // `TIMESTAMP_FORMAT` — but a hand-edited or foreign state file
+                // in chrono's `Display` shape still yields an uptime.
+                const LEGACY_SPACE_SEPARATED_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
                 // Compute uptime from started timestamp
                 let uptime =
-                    chrono::NaiveDateTime::parse_from_str(&state.started, "%Y-%m-%dT%H:%M:%S")
+                    chrono::NaiveDateTime::parse_from_str(&state.started, crate::types::TIMESTAMP_FORMAT)
                         .ok()
                         .or_else(|| {
-                            chrono::NaiveDateTime::parse_from_str(&state.started, "%Y-%m-%d %H:%M:%S")
+                            chrono::NaiveDateTime::parse_from_str(&state.started, LEGACY_SPACE_SEPARATED_FORMAT)
                                 .ok()
                         })
                         .map(|started| {
@@ -1322,7 +1327,7 @@ source = "/data/gamma"
         let db = StateDb::open_memory().unwrap();
         let now = chrono::NaiveDateTime::parse_from_str(
             "2026-05-01T12:00:00",
-            "%Y-%m-%dT%H:%M:%S",
+            crate::types::TIMESTAMP_FORMAT,
         )
         .unwrap();
 
@@ -1543,7 +1548,7 @@ source = "/data/docs"
     }
 
     fn now_fixed() -> chrono::NaiveDateTime {
-        chrono::NaiveDateTime::parse_from_str("2026-05-01T12:00:00", "%Y-%m-%dT%H:%M:%S").unwrap()
+        chrono::NaiveDateTime::parse_from_str("2026-05-01T12:00:00", crate::types::TIMESTAMP_FORMAT).unwrap()
     }
 
     /// Helper that calls `build_doctor_recommendation_view_inner` with

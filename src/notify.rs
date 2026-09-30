@@ -715,14 +715,14 @@ pub fn check_backup_overdue(
     now: NaiveDateTime,
 ) -> Option<Notification> {
     let stale_after =
-        NaiveDateTime::parse_from_str(&heartbeat.stale_after, "%Y-%m-%dT%H:%M:%S").ok()?;
+        NaiveDateTime::parse_from_str(&heartbeat.stale_after, crate::types::TIMESTAMP_FORMAT).ok()?;
 
     if now <= stale_after {
         return None;
     }
 
     let timestamp =
-        NaiveDateTime::parse_from_str(&heartbeat.timestamp, "%Y-%m-%dT%H:%M:%S").ok()?;
+        NaiveDateTime::parse_from_str(&heartbeat.timestamp, crate::types::TIMESTAMP_FORMAT).ok()?;
 
     let age_hours = (now.signed_duration_since(timestamp).num_minutes() as u64 + 30) / 60;
     let stale_hours =
@@ -2099,7 +2099,7 @@ mod sentinel_path_tests {
     // ── check_backup_overdue (S2: pure function with tests) ─────────
 
     fn dt(s: &str) -> NaiveDateTime {
-        NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S").unwrap()
+        NaiveDateTime::parse_from_str(s, crate::types::TIMESTAMP_FORMAT).unwrap()
     }
 
     fn make_heartbeat(timestamp: &str, stale_after: &str) -> heartbeat::Heartbeat {

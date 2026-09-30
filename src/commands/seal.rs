@@ -453,7 +453,7 @@ fn adopt_drives(config: &Config) {
             None
         }
     };
-    let now = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+    let now = chrono::Local::now().format(crate::types::TIMESTAMP_FORMAT).to_string();
 
     for drive in &config.drives {
         let reason = match drives::drive_availability(drive) {

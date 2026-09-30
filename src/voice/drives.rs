@@ -142,7 +142,7 @@ fn color_token_state(state: &TokenState, text: &str) -> String {
 /// `now`, in the `Short` style the planner's skip reasons use, for consistent
 /// formatting. Under a minute there is no span worth naming.
 fn format_absent_duration(timestamp: &str, now: chrono::NaiveDateTime) -> Option<String> {
-    let ts = chrono::NaiveDateTime::parse_from_str(timestamp, "%Y-%m-%dT%H:%M:%S").ok()?;
+    let ts = chrono::NaiveDateTime::parse_from_str(timestamp, crate::types::TIMESTAMP_FORMAT).ok()?;
     let secs = now.signed_duration_since(ts).num_seconds();
     if secs < 60 {
         None

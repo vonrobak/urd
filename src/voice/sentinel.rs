@@ -91,7 +91,7 @@ fn render_sentinel_status_interactive(
 /// relative age ("5m ago") from `now`. Falls back to the raw string when it
 /// doesn't parse (hand-edited state file) — degraded, never wrong.
 fn humanize_assessment_age(timestamp: &str, now: chrono::NaiveDateTime) -> String {
-    let Ok(ts) = chrono::NaiveDateTime::parse_from_str(timestamp, "%Y-%m-%dT%H:%M:%S") else {
+    let Ok(ts) = chrono::NaiveDateTime::parse_from_str(timestamp, crate::types::TIMESTAMP_FORMAT) else {
         return timestamp.to_string();
     };
     DurationStyle::Ago.render(now.signed_duration_since(ts).num_seconds())

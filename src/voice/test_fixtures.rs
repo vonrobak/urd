@@ -354,7 +354,7 @@ pub(crate) fn recommendations_doctor_output(
 /// literal keeps these golden tests deterministic instead of drifting
 /// with the real calendar.
 pub(crate) fn fixed_now(iso: &str) -> chrono::NaiveDateTime {
-    chrono::NaiveDateTime::parse_from_str(iso, "%Y-%m-%dT%H:%M:%S")
+    chrono::NaiveDateTime::parse_from_str(iso, crate::types::TIMESTAMP_FORMAT)
         .unwrap_or_else(|e| panic!("bad fixed_now literal {iso:?}: {e}"))
 }
 
