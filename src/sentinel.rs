@@ -1,7 +1,7 @@
 // Sentinel — pure state machine for the Urd backup awareness daemon.
 //
 // This module contains only types and pure functions. No I/O. The runner
-// (sentinel_runner.rs, Session 2) translates real-world events into
+// (sentinel_runner/, Session 2) translates real-world events into
 // SentinelEvents and executes the SentinelActions returned by transitions.
 //
 // Design: follows ADR-108 (pure-function module pattern), same as planner,
@@ -57,7 +57,7 @@ pub enum SentinelAction {
         mounted: bool,
     },
     /// Notify the user that a drive reconnected (runner checks token state
-    /// before dispatching — see sentinel_runner.rs execute_drive_reconnection_notification).
+    /// before dispatching — see sentinel_runner/actions.rs execute_drive_reconnection_notification).
     NotifyDriveReconnected {
         label: String,
     },
