@@ -12,8 +12,8 @@ use colored::Colorize;
 use crate::output::{
     AdoptAction, DriveAdoptOutput, DriveStatus, DrivesListOutput, OutputMode, TokenState,
 };
-use crate::plan::format_duration_short;
 
+use super::duration::DurationStyle;
 use super::{pad_visible, render_json};
 
 /// Render the drives list output. `now` is the caller's wall-clock reading,
@@ -139,15 +139,15 @@ fn color_token_state(state: &TokenState, text: &str) -> String {
 }
 
 /// Format an ISO timestamp as a human-readable absent duration relative to
-/// `now`. Reuses `format_duration_short` from plan.rs for consistent
-/// formatting.
+/// `now`, in the `Short` style the planner's skip reasons use, for consistent
+/// formatting. Under a minute there is no span worth naming.
 fn format_absent_duration(timestamp: &str, now: chrono::NaiveDateTime) -> Option<String> {
     let ts = chrono::NaiveDateTime::parse_from_str(timestamp, "%Y-%m-%dT%H:%M:%S").ok()?;
-    let mins = now.signed_duration_since(ts).num_minutes();
-    if mins < 1 {
+    let secs = now.signed_duration_since(ts).num_seconds();
+    if secs < 60 {
         None
     } else {
-        Some(format_duration_short(mins))
+        Some(DurationStyle::Short.render(secs))
     }
 }
 

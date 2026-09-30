@@ -14,13 +14,13 @@ use colored::Colorize;
 use crate::advice::{AdviceIssue, IssueDetail};
 use crate::awareness::{PromiseRollup, PromiseStatus};
 use crate::output::{DoctorCheck, DoctorCheckStatus, DoctorOutput, DoctorVerdictStatus, OutputMode};
-use crate::plan::format_duration_short;
 use crate::storage_critical::TightnessTier;
 
 use super::{
     SuggestionContext, append_suggestion, classify_verify_checks, exposure_label, pluralize,
     render_json,
 };
+use super::duration::DurationStyle;
 
 // ── Doctor ────────────────────────────────────────────────────────────
 
@@ -351,7 +351,7 @@ fn format_churn_row(
         } => format!(
             "{pad}    ~{}/full-send   {}",
             ByteSize(*bytes_per_send),
-            format!("(every ~{})", format_duration_short(*seconds_between / 60)).dimmed()
+            format!("(every ~{})", DurationStyle::Short.render(*seconds_between)).dimmed()
         ),
         FullSendOnlyFirst { bytes } => format!(
             "{pad}    ~{} recorded     {}",

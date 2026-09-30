@@ -11,12 +11,12 @@ use std::fmt::Write;
 use colored::Colorize;
 
 use crate::output::{OutputMode, PlanOutput, SkipCategory, SkippedSubvolume};
-use crate::plan::format_duration_short;
 
 use super::{
     SuggestionContext, append_suggestion, approx_size, pad_visible, pluralize, render_json,
     skip_tag,
 };
+use super::duration::DurationStyle;
 
 /// Render an explanation for why a manual backup produced an empty plan.
 #[must_use]
@@ -291,7 +291,7 @@ fn render_interval_group(items: &[&SkippedSubvolume], out: &mut String) {
     let shortest = items.iter().filter_map(|s| s.next_due_minutes).min();
 
     let suffix = if let Some(mins) = shortest {
-        format!(" (next in ~{})", format_duration_short(mins))
+        format!(" (next in ~{})", DurationStyle::Short.render(mins.saturating_mul(60)))
     } else {
         String::new()
     };

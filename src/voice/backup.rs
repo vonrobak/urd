@@ -16,8 +16,9 @@ use crate::types::{ByteSize, DriveRole};
 
 use super::{
     SuggestionContext, append_suggestion, approx_size, color_result, exposure_cell,
-    exposure_label, format_elapsed, format_table, pad_visible, pluralize, render_json, skip_tag,
+    exposure_label, format_table, pad_visible, pluralize, render_json, skip_tag,
 };
+use super::duration::clock;
 
 /// Render post-backup summary according to the given mode.
 #[must_use]
@@ -71,7 +72,7 @@ fn render_backup_interactive(data: &BackupSummary) -> String {
         "{}",
         format!(
             "── Urd backup: {result_colored} ── [{run_info}{}] ──{count_suffix}",
-            format_elapsed(Duration::from_secs(data.duration_secs as u64)),
+            clock(Duration::from_secs(data.duration_secs as u64)),
         )
         .bold()
     )
@@ -99,7 +100,7 @@ fn render_backup_interactive(data: &BackupSummary) -> String {
                 "  {} {}  [{}]{}",
                 pad_visible(&status, 6),
                 sv.name.bold(),
-                format_elapsed(Duration::from_secs(sv.duration_secs as u64)),
+                clock(Duration::from_secs(sv.duration_secs as u64)),
                 send_info,
             )
             .ok();

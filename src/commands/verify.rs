@@ -284,7 +284,7 @@ fn stale_pin_checks(
     let threshold_secs = stale_threshold_secs(send_interval);
     if age.as_secs() > threshold_secs as u64 {
         let days = age.as_secs() / 86400;
-        let threshold_str = format_threshold(threshold_secs);
+        let threshold_str = voice::DurationStyle::Threshold.render(threshold_secs);
         vec![VerifyCheck {
             name: "stale-pin".to_string(),
             status: "warn".to_string(),
@@ -329,15 +329,6 @@ fn stale_threshold_secs(send_interval: &crate::types::Interval) -> i64 {
     (send_interval.as_secs() * 2).max(86400)
 }
 
-/// Format a threshold in seconds as a human-readable string.
-fn format_threshold(secs: i64) -> String {
-    let days = secs / 86400;
-    if days > 0 {
-        format!("{days} day(s)")
-    } else {
-        format!("{}h", secs / 3600)
-    }
-}
 
 // ── Tests ───────────────────────────────────────────────────────────────
 
@@ -356,18 +347,6 @@ mod tests {
     fn stale_threshold_doubles_large_interval() {
         let interval = Interval::days(2);
         assert_eq!(stale_threshold_secs(&interval), 345600);
-    }
-
-    #[test]
-    fn format_threshold_days() {
-        assert_eq!(format_threshold(86400), "1 day(s)");
-        assert_eq!(format_threshold(172800), "2 day(s)");
-    }
-
-    #[test]
-    fn format_threshold_hours() {
-        assert_eq!(format_threshold(7200), "2h");
-        assert_eq!(format_threshold(3600), "1h");
     }
 
     // ── orphan_checks (pure) ───────────────────────────────────────────

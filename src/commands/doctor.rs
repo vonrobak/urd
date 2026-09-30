@@ -267,14 +267,7 @@ pub fn run(config: Config, args: DoctorArgs, output_mode: OutputMode) -> anyhow:
                                 .ok()
                         })
                         .map(|started| {
-                            let dur = now - started;
-                            let hours = dur.num_hours();
-                            let minutes = dur.num_minutes() % 60;
-                            if hours > 0 {
-                                format!("{hours}h {minutes}m")
-                            } else {
-                                format!("{minutes}m")
-                            }
+                            voice::DurationStyle::HoursMinutes.render((now - started).num_seconds())
                         });
                 DoctorSentinelStatus {
                     running: true,

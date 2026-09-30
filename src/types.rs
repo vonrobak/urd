@@ -1888,6 +1888,24 @@ weekly = 4
         assert_eq!(format_duration_secs(135), "2m 15s");
     }
 
+    /// The duration-style inventory table (see `voice/duration.rs`): this
+    /// "2m 15s" style stays here because it feeds `urd history --json` and the
+    /// status `LastRunInfo.duration` field — a machine surface below `voice/`.
+    #[test]
+    fn format_duration_secs_inventory_table() {
+        let got: Vec<String> = [0, 59, 61, 3599, 3661, 90061, 129600, 2595661, -61]
+            .iter()
+            .map(|&s| format_duration_secs(s))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                "<1s", "59s", "1m 1s", "59m 59s", "61m 1s", "1501m 1s", "2160m 0s", "43261m 1s",
+                "<1s",
+            ]
+        );
+    }
+
     #[test]
     fn local_retention_policy_as_graduated() {
         let graduated = LocalRetentionPolicy::Graduated(ResolvedGraduatedRetention {

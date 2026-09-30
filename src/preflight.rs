@@ -352,7 +352,10 @@ fn check_rotation_interval_on_offsite(config: &Config, checks: &mut Vec<Prefligh
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
-/// Format hours into a human-readable duration string.
+/// Format hours into a human-readable duration string ("1d 12h"). The
+/// duration-style inventory lives in `voice/duration.rs`; this style stays
+/// here because preflight messages are data (they reach `urd verify --json`),
+/// and a pure module below the voice layer does not import `voice/`.
 fn format_hours(hours: i64) -> String {
     if hours >= 24 && hours % 24 == 0 {
         let days = hours / 24;
@@ -1165,5 +1168,16 @@ mod tests {
             .collect();
 
         assert!(results.is_empty());
+    }
+
+    /// The duration-style inventory table (see `voice/duration.rs`), on the
+    /// shared inputs converted to whole hours as the caller does.
+    #[test]
+    fn format_hours_inventory_table() {
+        let got: Vec<String> = [0i64, 59, 61, 3599, 3661, 90061, 129600, 2595661, -61]
+            .iter()
+            .map(|&s| format_hours(s / 3600))
+            .collect();
+        assert_eq!(got, ["0h", "0h", "0h", "0h", "1h", "1d 1h", "1d 12h", "30d 1h", "0h"]);
     }
 }
