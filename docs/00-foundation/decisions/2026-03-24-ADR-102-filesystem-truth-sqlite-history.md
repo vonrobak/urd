@@ -145,7 +145,8 @@ direction:
   read, nothing is held and the run logs a warning that no retention-tightening gate
   applies (`plan_cmd::retention_baseline_or_warn`). **This is the one table whose loss
   widens what Urd deletes.** A tightening that coincides with an unreadable baseline is
-  applied without confirmation. It is accepted because the alternative, holding every
+  applied without confirmation for that run, but the run records no shapes, so the old
+  baseline survives and holds the tightening on the next run that reads it. It is accepted because the alternative, holding every
   promise-level subvolume's retention whenever SQLite hiccups, makes history a
   precondition for the retention that keeps pools from filling. That is the coupling this
   ADR forbids. The deletions that do run are still ordinary retention: pin-protected

@@ -117,11 +117,13 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     // decision read-only. At run end (`record_retention_shapes`, never on a
     // dry run) each subvolume that is NOT held and was inside this run's
     // filter scope records the halves of its shape this run applied. An
-    // unreadable baseline gates nothing and is warned about once, here.
-    let recorded_shapes = crate::commands::plan_cmd::retention_baseline_or_warn(world.db());
+    // unreadable baseline gates nothing, is warned about once, here, and
+    // suppresses the run-end record (`retention_baseline.read`) so the old
+    // baseline survives to hold the tightening on a later run.
+    let retention_baseline = crate::commands::plan_cmd::retention_baseline_or_warn(world.db());
     let retention_gate = crate::retention::decide_retention_gate(
         &config.resolved_subvolumes(),
-        &recorded_shapes,
+        &retention_baseline.shapes,
         args.confirm_retention_change,
         crate::retention::RecordScope { filters: &filters },
     );
@@ -226,7 +228,7 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
             print!("{}", crate::voice::render_warning_lines(&warnings));
             println!();
         }
-        record_retention_shapes(world.db(), &retention_gate, now);
+        record_retention_shapes(world.db(), &retention_gate, retention_baseline.read, now);
         // Empty plan: no operations to execute. This includes plans where all subvolumes
         // were skipped (drives disconnected, space guard, etc.). Previously this case fell
         // through to the executor which ran zero operations and reported run_result "success".
@@ -711,7 +713,7 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
         .extend(crate::commands::plan_cmd::retention_hold_warnings(&retention_holds));
     // Record the shapes whose deletions this run did not withhold, before
     // the failure exit below can skip it.
-    record_retention_shapes(world.db(), &retention_gate, now);
+    record_retention_shapes(world.db(), &retention_gate, retention_baseline.read, now);
     let output_mode = OutputMode::detect();
     let rendered = crate::voice::render_backup_summary(&summary, output_mode);
     println!("{rendered}");

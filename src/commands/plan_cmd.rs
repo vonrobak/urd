@@ -43,7 +43,7 @@ pub fn run(config: Config, args: PlanArgs, mode: OutputMode) -> anyhow::Result<(
     let mut backup_plan = plan::plan(&config, now, &filters, &observation, &arming)?;
     // `urd plan` has no confirmation flag: it previews what `urd backup`
     // without --confirm-retention-change would do.
-    let recorded = retention_baseline_or_warn(world.db());
+    let recorded = retention_baseline_or_warn(world.db()).shapes;
     let holds = gate_preview(&mut backup_plan, &config, &recorded, &filters, false);
 
     let mut output = build_plan_output(&backup_plan, &fs_state, &config);
@@ -85,23 +85,49 @@ pub(crate) fn recorded_retention_shapes(
     db?.all_retention_shapes().ok()
 }
 
+/// Whether a run's retention baseline (ADR-110) was read. Carried from the
+/// read to the run-end record: a run that could not read the baseline must
+/// not overwrite it, or a tightening that slipped through this run's
+/// fail-open gate would be recorded as already applied (ADR-102 amendment).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BaselineRead {
+    /// The recorded shapes were read (an empty table included).
+    Read,
+    /// No state DB, or the read failed: the gate saw no baseline.
+    Unreadable,
+}
+
+/// The retention shapes a gating run judges against, and whether they were
+/// actually read — see [`BaselineRead`].
+#[derive(Debug)]
+pub(crate) struct RetentionBaseline {
+    pub(crate) shapes: HashMap<SubvolName, crate::retention::RecordedRetention>,
+    pub(crate) read: BaselineRead,
+}
+
 /// [`recorded_retention_shapes`] for the paths that gate (`urd backup`,
 /// `urd plan`): an unknown baseline gates nothing, which is the fail-open
 /// reading for deletions — so say so, once per run, rather than silently.
 #[must_use]
-pub(crate) fn retention_baseline_or_warn(
-    db: Option<&StateDb>,
-) -> HashMap<SubvolName, crate::retention::RecordedRetention> {
+pub(crate) fn retention_baseline_or_warn(db: Option<&StateDb>) -> RetentionBaseline {
     let cause = match db.map(StateDb::all_retention_shapes) {
-        Some(Ok(shapes)) => return shapes,
+        Some(Ok(shapes)) => {
+            return RetentionBaseline {
+                shapes,
+                read: BaselineRead::Read,
+            };
+        }
         Some(Err(e)) => e.to_string(),
         None => "the state DB is unavailable".to_string(),
     };
     log::warn!(
         "Retention baseline could not be read ({cause}) — no retention-tightening \
-         gate (ADR-110) applies this run"
+         gate (ADR-110) applies this run, and this run records no retention shapes"
     );
-    HashMap::new()
+    RetentionBaseline {
+        shapes: HashMap::new(),
+        read: BaselineRead::Unreadable,
+    }
 }
 
 /// One warning line per subvolume whose deletions the retention gate held —
@@ -882,7 +908,7 @@ mod tests {
             // The preview path (`urd plan` passes false; `backup --dry-run`
             // passes its flag) …
             let mut preview = make_plan();
-            let recorded = retention_baseline_or_warn(Some(&db));
+            let recorded = retention_baseline_or_warn(Some(&db)).shapes;
             let holds = gate_preview(&mut preview, &config, &recorded, &filters, confirmed);
             let mut output = build_plan_output(&preview, &fs, &config);
             output.warnings.extend(retention_hold_warnings(&holds));
