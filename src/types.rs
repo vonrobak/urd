@@ -909,7 +909,7 @@ impl<'de> Deserialize<'de> for MonthlyCount {
     ///  - any other string → error
     ///
     /// V2 (UPI 042) closes the `monthly = 0` footgun via
-    /// `deserialize_monthly_count_strict_opt` — see `parse_v2` in config.rs.
+    /// `deserialize_monthly_count_strict_opt` — see `parse_v2` in config/v2.rs.
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         struct MonthlyCountVisitor;
 

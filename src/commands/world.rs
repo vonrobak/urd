@@ -48,7 +48,7 @@ pub struct WorldView {
 
 impl World {
     /// Open the world: best-effort state DB (warn-and-continue on failure,
-    /// exactly `backup.rs`'s existing semantics) and a read-only btrfs handle.
+    /// via [`open_state_best_effort`]) and a read-only btrfs handle.
     #[must_use]
     pub fn open(config: &Config) -> Self {
         let state_db = open_state_best_effort(&config.general.state_db, "history");
@@ -131,8 +131,8 @@ mod tests {
     #[test]
     fn open_with_missing_state_db_degrades_to_none_without_panic() {
         // State DB open failure (e.g. an unwritable path) must warn and
-        // continue, never panic — `World::open` mirrors backup.rs's
-        // existing best-effort semantics exactly.
+        // continue, never panic — `World::open` is the best-effort
+        // door every command (backup included) opens through.
         let unwritable = std::path::PathBuf::from("/nonexistent-dir-for-urd-test/urd.db");
         let config = test_config(&unwritable);
         let world = World::open(&config);

@@ -276,7 +276,7 @@ pub fn canonical_mountpoint_label(mountpoints: &[PathBuf]) -> String {
 }
 
 /// Construct a `DriveResolution` from a config drive plus its observed mount
-/// state. Intended for callers in `commands/backup.rs` (slice 5); kept here
+/// state. Called from `commands/backup/observability.rs`; kept here
 /// so all pool-input bundling lives next to the pure helper that consumes it.
 #[must_use]
 pub fn resolve_drive(

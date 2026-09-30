@@ -1163,7 +1163,7 @@ mod tests {
     //
     // Enumerates the serde field names a `#[derive(Deserialize)]` struct
     // declares to `deserialize_struct`, without needing a live TOML value.
-    // Used below to assert every field on a real `config.rs` struct has a
+    // Used below to assert every field on a real `config/` struct has a
     // matching field on migrate.rs's raw copy of it, so a field added to one
     // and forgotten on the other (this issue's bug) fails loudly instead of
     // silently round-tripping to nothing. Only works for structs whose

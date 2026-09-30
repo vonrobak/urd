@@ -209,7 +209,7 @@ pub(super) fn render_summary_line(data: &StatusOutput, out: &mut String) {
             .filter(|a| a.health == "degraded")
             .count();
         // Collect all unique health reasons across degraded/blocked assessments.
-        // awareness.rs guarantees health_reasons is non-empty for non-healthy
+        // awareness/health.rs guarantees health_reasons is non-empty for non-healthy
         // assessments; if violated, reasons_part is safely empty.
         let unique_reasons: Vec<&str> = data
             .assessments
@@ -2452,7 +2452,7 @@ mod tests {
 
     /// `OperationalHealth::from_label` must round-trip every variant's
     /// `Display` string exactly (#361) — the two mappings are hand-written
-    /// in different spots (`awareness.rs`) and only this test would catch
+    /// in different spots (`awareness/types.rs`) and only this test would catch
     /// them drifting apart.
     #[test]
     fn operational_health_from_label_round_trips_display() {

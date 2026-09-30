@@ -128,8 +128,8 @@ pub struct SubvolumeHeartbeat {
 }
 
 /// Heartbeat / metrics projection of a single subvolume's churn state.
-/// `commands/backup.rs` builds a `HashMap<String, ChurnHeartbeatFields>` and
-/// passes it to both `heartbeat::build` and
+/// `commands/backup/observability.rs` builds a
+/// `HashMap<String, ChurnHeartbeatFields>` and passes it to both `heartbeat::build` and
 /// `backup::write_metrics_per_spec` so both surfaces share the same
 /// policy: incremental → `churn_bytes_per_second`; full-only →
 /// `last_full_send_bytes`. Cold-start subvolumes have both `None`.

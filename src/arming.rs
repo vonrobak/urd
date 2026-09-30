@@ -94,7 +94,7 @@ pub struct RunArming {
     pub armed_tier_map: ArmedTierMap,
     pub pools: Vec<ResolvedPoolTier>,
     /// Subvol name → away drive labels whose pin is away-only (UPI 058). See
-    /// [`away_shed_map`]: the SAME source `plan.rs`'s
+    /// [`away_shed_map`]: the SAME source `plan/`'s
     /// `mounted_pins` derives from, so the executor's `has_away_pin` and
     /// away-shed cannot diverge from the planner's `clear_all` decision.
     pub away_shed: HashMap<String, Vec<String>>,
@@ -179,7 +179,7 @@ pub fn resolve_armed_tiers(signal_pools: &[PoolSignal]) -> RunArming {
 /// away) so away-only pins can be detected by [`crate::guard::away_sheddable_pins`].
 ///
 /// Called by the planner (to derive `mounted_pins`) **and** by [`away_shed_map`]
-/// (which `commands/backup.rs` and the sentinel use to build the executor's
+/// (which `commands/backup/` and the sentinel use to build the executor's
 /// away-shed map), so the executor's `has_away_pin` cannot diverge from the
 /// planner's `clear_all` decision — coherence by construction, not discipline
 /// (R1). A pin-read error is logged and treated as "no pin" (the same fail-soft

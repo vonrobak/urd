@@ -436,7 +436,7 @@ mod tests {
         let entry = entry_for(&mock_send_full("htpc-home", "WD-18TB"), &fs);
         assert_eq!(entry.estimated_bytes, Some(53_000_000_000));
         assert_eq!(entry.is_full_send, Some(true));
-        // Size is NOT in detail — voice.rs renders it from estimated_bytes.
+        // Size is NOT in detail — voice/ renders it from estimated_bytes.
         assert!(!entry.detail.contains('~'), "size should not be in detail");
         assert!(entry.detail.contains("(full"), "detail: {}", entry.detail);
     }
@@ -502,7 +502,7 @@ mod tests {
         let entry = entry_for(&mock_send_incremental("htpc-home", "WD-18TB"), &fs);
         assert_eq!(entry.estimated_bytes, Some(5_500_000));
         assert_eq!(entry.is_full_send, Some(false));
-        // Size is NOT in detail — voice.rs renders it from estimated_bytes.
+        // Size is NOT in detail — voice/ renders it from estimated_bytes.
         assert!(!entry.detail.contains('~'), "size should not be in detail");
     }
 

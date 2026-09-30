@@ -81,8 +81,9 @@ pub fn classify_headroom_severity(ctx: HeadroomContext) -> HeadroomSeverity {
 
 /// Classify pool tightness from free/capacity by free-ratio alone.
 ///
-/// Reused by the storage-critical wiring (UPI 031) as the free-ratio-only
-/// tightness gate (Branch E) — no trend or metadata signal, no new constant.
+/// Same thresholds as the storage-critical wiring's free-ratio-only
+/// tightness gate (UPI 031, Branch E), which classifies an already-computed
+/// ratio via `storage_critical::classify_free_ratio_value`.
 /// Unmeasurable inputs (either `None`, zero capacity, non-finite ratio) fail
 /// toward `Healthy`.
 #[must_use]

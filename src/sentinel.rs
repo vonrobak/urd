@@ -443,7 +443,7 @@ pub struct RecordingWindow {
 
 /// Should this assess record promise-transition events? (UPI 063)
 ///
-/// Encodes the ownership rule backup.rs states ("Backup is canonical for
+/// Encodes the ownership rule `commands/backup/` states ("Backup is canonical for
 /// in-run promise transitions, trigger=Run") for the window the trigger
 /// suppression alone misses: a sentinel tick landing INSIDE a backup run
 /// would diff mid-run state against the sentinel's private baseline and
@@ -514,7 +514,7 @@ pub fn reconnection_worth_notifying(absent_minutes: i64) -> bool {
 }
 
 // ── Snapshot extractors ───────────────────────────────────────────────
-// (`snapshot_promises` moved to awareness.rs with `PromiseSnapshot`,
+// (`snapshot_promises` moved to awareness/transitions.rs with `PromiseSnapshot`,
 // UPI 088-a — the health twin below stays: `HealthSnapshot` is
 // sentinel-only state.)
 

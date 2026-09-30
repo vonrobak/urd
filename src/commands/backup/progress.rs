@@ -345,7 +345,7 @@ mod tests {
         let line2 = state
             .tick(&s2, 5_000_000, t0 + Duration::from_secs(33))
             .expect("send 2 should render after >=1s on its own anchor");
-        // Elapsed shows minutes:seconds via format_elapsed; should be "0:02".
+        // Elapsed shows minutes:seconds via voice::duration::clock; should be "0:02".
         assert!(
             line2.contains("[0:02]") || line2.contains("0:02"),
             "expected ~2s elapsed for send 2, got: {line2}",

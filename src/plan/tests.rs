@@ -4576,7 +4576,7 @@ priority = 1
 #[test]
 fn critical_creation_is_gated_on_send_due_not_snapshot_interval() {
     // M1 invariant: at Critical the send interval is floored to weekly, and
-    // snapshot CREATION is gated on a send being due (plan.rs Phase 2). With
+    // snapshot CREATION is gated on a send being due (plan/mod.rs Phase 2). With
     // the last send only ~2 days old (< the weekly floor), NO snapshot is
     // created this run even though the declared DAILY snapshot_interval has
     // elapsed — so locals can't accumulate seven-deep between weekly sends.

@@ -322,7 +322,7 @@ pub fn plan(
         // Per-drive scope: the single source of the presence predicate (UPI 058
         // F5/R1). `mounted_pins` (transient retention scope) is derived from the
         // SAME scopes the executor's away-shed map is built from
-        // (`commands/backup.rs`), so the executor's `has_away_pin` cannot diverge
+        // (`arming::away_shed_map`), so the executor's `has_away_pin` cannot diverge
         // from the planner's `clear_all` decision. Mounted-only pins scope
         // transient retention — an absent drive's pin is not protected
         // indefinitely (that is what causes space exhaustion on a tight pool).
@@ -337,7 +337,7 @@ pub fn plan(
         // Resolve the source pool's armed tier (Roomy default for an absent
         // key → declared behavior) and derive the effective lifecycle / send
         // interval / clear-all signal. Planner and awareness both derive from
-        // the SAME armed tier (the single pre-plan gather in backup.rs), so the
+        // the SAME armed tier (the single pre-plan gather in commands/backup/), so the
         // effective send interval they judge against agrees.
         let armed = arming.armed_tier_map.get(&subvol.name).copied().unwrap_or_default();
         // Presence-conditional Critical clear-all (UPI 058 A1, ADR-116): an
@@ -601,7 +601,7 @@ fn orphan_invariant_violations(
 
 /// Format a duration in minutes to a short human-readable string.
 ///
-/// Used by the planner for skip reasons and by voice.rs for grouped rendering.
+/// Used by the planner for skip reasons and by voice/ for grouped rendering.
 /// Produces: `"45m"`, `"2h30m"`, `"3d"`.
 #[must_use]
 pub fn format_duration_short(minutes: i64) -> String {

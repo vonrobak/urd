@@ -37,7 +37,7 @@ impl Executor<'_> {
     /// ≤ pin by definition), preserving the pin defense layers (ADR-106).
     ///
     /// Verified at build time (plan Slice 3): awareness freshness reads
-    /// `external_snapshots` listings (`awareness.rs`, mounted-drive arm), so
+    /// `external_snapshots` listings (`awareness/mod.rs`, mounted-drive arm), so
     /// an unswept partial *would* masquerade in promise states — this sweep
     /// is what keeps those listings honest. `urd verify` does not check
     /// `Received UUID` today (its drive checks are pin/existence based); a

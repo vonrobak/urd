@@ -18,7 +18,7 @@
 //!   voice/stakes orthogonally (pressure here risks the host, not just
 //!   retention).
 //!
-//! A persisted per-pool **armed tier** (`state.rs`) plus the pure hysteresis in
+//! A persisted per-pool **armed tier** (`state/posture.rs`) plus the pure hysteresis in
 //! `resolve_armed_tier` give told-not-silent *transitions* and anti-flap
 //! stability. The posture (`StoragePosture`) is the per-subvolume cell the
 //! awareness surface carries; transitions are computed **only** at the backup

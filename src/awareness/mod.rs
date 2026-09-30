@@ -939,8 +939,8 @@ source = "/data/sv1"
     fn pre_post_diff_under_one_judgment_is_empty() {
         // UPI 063 — the phantom-transition reproducer, fixed half. Pre and
         // post snapshots judged under the SAME signal map with no underlying
-        // change produce no transitions. This is what backup.rs's pre/post
-        // diff does after posture parity.
+        // change produce no transitions. This is what `commands/backup/`'s
+        // pre/post diff does after posture parity.
         let (config, now, fs, signals) = capped_fixture(dt(2026, 3, 21, 22, 0), 0.20);
         let obs = Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() };
 
@@ -963,7 +963,7 @@ source = "/data/sv1"
         // posture-blind pre against a posture-judged post fabricates a
         // transition from the judgment mismatch alone (40h send age, Tight
         // pool: blind says AT RISK, judged says PROTECTED — no filesystem
-        // change between the two). This is what backup.rs's diff did before
+        // change between the two). This is what `commands/backup/`'s diff did before
         // posture parity.
         let (config, now, fs, signals) = capped_fixture(dt(2026, 3, 21, 22, 0), 0.20);
         let obs = Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() };

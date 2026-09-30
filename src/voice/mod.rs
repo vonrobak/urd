@@ -371,7 +371,7 @@ pub(crate) fn truncate_str(s: &str, max_len: usize) -> String {
 // ── Next-Action Suggestions (4b) ──────────────────────────────────────
 
 /// Context for generating next-action suggestions after commands.
-/// Internal to voice.rs — constructed by render functions from their output data.
+/// Internal to voice/ — constructed by render functions from their output data.
 enum SuggestionContext {
     /// Bare `urd` (default command).
     Default { has_issues: bool },

@@ -3,7 +3,7 @@
 //! These guards run *before* the planner, state queries, or any other core logic.
 //! Their job is to convert a user-supplied string into a name we know exists in
 //! the configuration, or refuse with a helpful error. The planner's contract
-//! (`plan.rs`) trusts that `filters.subvolume` refers to a real subvolume; that
+//! (`plan/`) trusts that `filters.subvolume` refers to a real subvolume; that
 //! trust is established here.
 //!
 //! See GitHub #134 for the failure mode that motivated this module: an unknown

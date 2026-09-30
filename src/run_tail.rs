@@ -1,6 +1,6 @@
 //! The run tail — pure decisions for `backup::run`'s closing sequence (UPI 088-b).
 //!
-//! Inputs in, typed effects out: the adapter in `commands/backup.rs` gathers
+//! Inputs in, typed effects out: the adapter in `commands/backup/` gathers
 //! (I/O), calls the decisions here, and performs the resulting effects in a
 //! documented order through the recorder. Nothing in this module performs
 //! I/O, reads a clock, or touches a thread — the deliberate thread wiring
@@ -21,7 +21,7 @@ use crate::recorder::{DispatchPolicy, Recording};
 
 /// UPI 043: bundled outputs from a single pool-observability pass. Threaded
 /// into both metrics emission (`write_metrics_per_spec`) and heartbeat
-/// construction (`heartbeat::build`). Gathered by `commands/backup.rs` (the I/O); lives
+/// construction (`heartbeat::build`). Gathered by `commands/backup/` (the I/O); lives
 /// here as the tail's input bundle (UPI 088-b).
 pub struct PoolObservability {
     pub pools_heartbeat: Vec<PoolHeartbeat>,
@@ -73,7 +73,7 @@ pub struct TailInputs<'a> {
 }
 
 /// Which metrics writer the adapter runs. The writers stay in
-/// `commands/backup.rs` (they are I/O); the variant carries what its writer
+/// `commands/backup/observability.rs` (they are I/O); the variant carries what its writer
 /// needs, so the adapter's match is total on both exits — no impossible arm.
 #[derive(Clone, Copy)]
 pub enum MetricsSpec<'a> {
@@ -249,7 +249,7 @@ pub fn decide_tail<'a>(i: &TailInputs<'a>) -> TailPlan<'a> {
 /// Thread→main record written when the watchdog fires (UPI 033, pool-scoped by
 /// UPI 065-b). Carries everything the abort-reclaim, event, and notification need.
 /// One firing per tripped pool; the teardown iterates the accumulated `Vec`.
-/// Constructed by `handle_watchdog_trip` in `commands/backup.rs`; consumed here
+/// Constructed by `handle_watchdog_trip` in `commands/backup/watchdog.rs`; consumed here
 /// by [`decide_reclaim`] / [`firing_recordings`] (UPI 088-b).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WatchdogFiring {

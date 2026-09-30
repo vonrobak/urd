@@ -14,7 +14,7 @@
 //
 // Cadence-agnostic obligation (RD-2): the time-weighted mean is computed as
 // `sum(bytes) / sum(intervals)`. This is correct only after F1 dedup
-// (one row per `(run_id, subvolume)`) — see executor.rs.
+// (one row per `(run_id, subvolume)`) — see executor/mod.rs.
 
 use chrono::{Duration, NaiveDateTime};
 

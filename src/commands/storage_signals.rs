@@ -243,7 +243,7 @@ fn gather_with(
 
 /// The write half of storage-signal handling (UPI 082-b, Branch E): the sole
 /// production caller is `backup`'s single post-execution writeback
-/// (`commands/backup.rs`), sanctioned via a clippy `disallowed-methods` allow
+/// (`commands/backup/mod.rs`), sanctioned via a clippy `disallowed-methods` allow
 /// — the same structural guard `world.rs` uses for `assess_view`. Read paths
 /// (`status`, bare `urd`, `doctor`, `urd plan`) never advance state (S1); this
 /// module is where that boundary is enforced, not just documented.
@@ -479,7 +479,8 @@ pub fn aggregate_adaptations(
 }
 
 // Module-under-test calls its own writeback::advance_and_writeback directly
-// (clippy disallowed-methods guard — backup.rs is the sanctioned production door).
+// (clippy disallowed-methods guard — commands/backup/mod.rs is the sanctioned
+// production door).
 #[allow(clippy::disallowed_methods)]
 #[cfg(test)]
 mod tests {
@@ -885,7 +886,7 @@ source = "/"
     fn run_arming_resolve_composes_away_view() {
         // UPI 082, Branches C/D/G: RunArming::resolve = today's tiers fan-out
         // (resolve_armed_tiers) + arming::away_shed_map, composed pre-lock from
-        // ONE artifact. Same away-only-pin shape as plan.rs's
+        // ONE artifact. Same away-only-pin shape as plan/'s
         // upi058_planner_and_executor_agree_on_away_shed, proving the artifact
         // reaches the same away view the planner's own scopes derive.
         use crate::plan::MockFileSystemState;

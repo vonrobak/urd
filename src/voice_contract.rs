@@ -141,7 +141,7 @@ mod contract {
         ///   "Last backup <N><unit>"
         /// where `<unit>` is one of `s m h d w y`. A trailing " ago" is
         /// permitted but not required. Does NOT handle compound durations
-        /// like "1y6m" — those don't appear in voice.rs's current rendering.
+        /// like "1y6m" — those don't appear in voice/'s current rendering.
         pub(super) fn extract_label_age_pairs(s: &str) -> Vec<(String, String)> {
             let stripped = strip_ansi(s);
             let mut pairs = Vec::new();

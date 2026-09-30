@@ -446,7 +446,7 @@ impl EventPayload {
 /// dispatch per policy. Two sanctioned exceptions to "everything goes
 /// through the recorder": `StateDb::record_drive_event` stamps
 /// `outside_run` internally (a granular, error-propagating wrapper with
-/// no notification — not a dance site), and the read side (`state.rs`
+/// no notification — not a dance site), and the read side (`state/`
 /// row hydration, `urd events`) constructs `Event` directly from stored
 /// rows. **Direct `Event` struct literals are read-side only** — an emit
 /// path building one by hand is bypassing the stamp and is a bug.
@@ -1189,7 +1189,7 @@ mod tests {
                 },
             ),
             (
-                // Real producer values (sentinel_runner.rs's config-reload
+                // Real producer values (sentinel_runner/detect.rs's config-reload
                 // handler): config_version is Config.general.config_version
                 // .map(|v| v.to_string()).unwrap_or("legacy"); source is
                 // self.config_path.display().to_string() — a filesystem path.

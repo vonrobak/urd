@@ -28,7 +28,7 @@ timestamp: '2026-07-05T15:58:56+02:00'
 Urd auto-detects its output mode from stdout:
 
 - **Interactive (TTY):** human-readable text, colored, with the mythic voice
-  carried in `voice.rs`. Format may evolve across versions.
+  carried in `voice/`. Format may evolve across versions.
 - **Daemon (non-TTY):** machine-readable JSON, no ANSI codes. Schema is
   internal but stable enough for monitoring scripts.
 

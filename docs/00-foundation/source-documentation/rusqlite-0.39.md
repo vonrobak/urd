@@ -94,7 +94,7 @@ named_params!{"@name": val}     // named
 
 ## Urd-Specific Concerns
 
-Urd's `state.rs` uses straightforward open/execute/query patterns. Key things:
+Urd's `state/` module uses straightforward open/execute/query patterns. Key things:
 - Verify no multi-statement `execute()` calls exist (use `execute_batch()` if so)
 - Verify no `u64`/`usize` values stored without casting to `i64`
 - The `bundled` feature bundles SQLite 3.51.3 — no system SQLite dependency

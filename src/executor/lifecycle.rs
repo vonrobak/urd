@@ -1274,7 +1274,7 @@ mod tests {
         // M3: the executor derives is_transient via derive_effective_policy
         // (empty map → Roomy → declared) instead of a raw-config check. Prove the
         // two agree on the non-obvious case — a NAMED level + explicit transient
-        // resolves to Transient (config.rs:182-184), while a named level alone
+        // resolves to Transient (`SubvolumeConfig::resolved`), while a named level alone
         // never does — so the switch is behavior-neutral for every config.
         use crate::storage_critical::{derive_effective_policy, TightnessTier};
         let config_str = r#"

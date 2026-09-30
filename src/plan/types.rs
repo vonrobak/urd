@@ -46,7 +46,7 @@ pub enum PlannedOperation {
         /// Why this is a full send instead of incremental.
         reason: FullSendReason,
         /// Whether the target drive's identity has been verified via drive session token.
-        /// Set by `commands/backup.rs` after plan creation (planner doesn't access tokens).
+        /// Set by `commands/backup/gating.rs` after plan creation (planner doesn't access tokens).
         /// When true, the executor's chain-break gate allows the send to proceed.
         token_verified: bool,
     },

@@ -2,8 +2,8 @@
 //! issue, a recommended command, a reason. The "what should the user do?"
 //! surface. Rule-based; the volatile layer where product refinements land.
 //!
-//! The issue is data, not prose: `voice::render_advice_issue` picks the words,
-//! so the mythic exposure labels never enter this module or the JSON it feeds.
+//! The issue is data, not prose: `voice::doctor::render_advice_issue` picks
+//! the words, so the mythic exposure labels never enter this module or the JSON it feeds.
 //!
 //! Sibling to [`crate::awareness`], which observes promise state. This
 //! module turns observations into prescriptions.
@@ -32,7 +32,7 @@ pub use crate::awareness::{RedundancyAdvisory, RedundancyAdvisoryKind};
 /// for the unwhole promise the advice rules have no remedy for (`urd doctor`
 /// still shows that row). Every field is a machine value — a drive label, an
 /// age in seconds, a scope flag — never a rendered phrase: the prose, and the
-/// voice label that leads it, are `voice::render_advice_issue`'s to choose
+/// voice label that leads it, are `voice::doctor::render_advice_issue`'s to choose
 /// (glossary: daemon JSON keeps the semantic names).
 ///
 /// Serializes internally tagged, so a consumer reads
@@ -67,7 +67,7 @@ pub enum IssueDetail {
 /// of what is wrong.
 ///
 /// `status` serializes SCREAMING ("AT RISK") like every other promise-state
-/// surface; `detail` carries the specifics. `voice::render_advice_issue`
+/// surface; `detail` carries the specifics. `voice::doctor::render_advice_issue`
 /// turns the pair into the phrase `urd doctor` prints — this type never
 /// holds the phrase itself.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1727,8 +1727,8 @@ protection_level = "guarded"
     /// Every branch of [`compute_advice`] maps to exactly one [`IssueDetail`]
     /// shape, and every field on it is a machine value — a status, a drive
     /// label, an age in seconds. Nothing here reads as prose; the phrase is
-    /// `voice::render_advice_issue`'s, and its byte-for-byte golden lives
-    /// beside it in `voice/mod.rs`.
+    /// `voice::doctor::render_advice_issue`'s, and its byte-for-byte golden
+    /// lives beside it in `voice/doctor.rs`.
     #[test]
     fn compute_advice_issue_shape_per_branch() {
         let stale = |external_only, age_secs| IssueDetail::Stale {

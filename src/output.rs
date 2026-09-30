@@ -787,9 +787,10 @@ pub struct DoctorDataSafety {
     /// Promise status (serializes SCREAMING: "PROTECTED" / "AT RISK" / "UNPROTECTED").
     pub status: PromiseStatus,
     pub health: String,
-    /// What is wrong, structured (schema v4). `voice::render_advice_issue`
-    /// turns it into the line `urd doctor` prints; JSON consumers read
-    /// `issue.status` and `issue.detail.kind` instead of parsing prose.
+    /// What is wrong, structured (schema v4).
+    /// `voice::doctor::render_advice_issue` turns it into the line `urd doctor`
+    /// prints; JSON consumers read `issue.status` and `issue.detail.kind`
+    /// instead of parsing prose.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub issue: Option<AdviceIssue>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1418,7 +1419,7 @@ pub struct VerifyCheck {
 }
 
 impl VerifyCheck {
-    /// Check name for absent-drive warnings — used by voice.rs to classify expected conditions.
+    /// Check name for absent-drive warnings — used by voice/ to classify expected conditions.
     pub const DRIVE_MOUNTED: &str = "drive-mounted";
 
     /// Returns true if this check is an expected condition (absent drive), not a real finding.
