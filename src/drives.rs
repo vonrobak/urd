@@ -300,7 +300,7 @@ pub fn read_drive_token(drive: &DriveConfig) -> crate::error::Result<Option<Stri
 pub fn write_drive_token(drive: &DriveConfig, token: &str) -> crate::error::Result<()> {
     let path = token_file_path(drive);
     let tmp_path = path.with_extension("tmp");
-    let now = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S");
+    let now = crate::types::Timestamp::from(chrono::Local::now().naive_local());
 
     let contents = format!(
         "# Urd drive session token — do not edit\n\
@@ -405,9 +405,7 @@ pub fn verify_drive_token(drive: &DriveConfig, state: &StateDb) -> DriveAvailabi
         Ok(Some(t)) => t,
         Ok(None) => {
             // Drive has a token but SQLite doesn't. Self-healing: store it.
-            let now = chrono::Local::now()
-                .format("%Y-%m-%dT%H:%M:%S")
-                .to_string();
+            let now = crate::types::Timestamp::from(chrono::Local::now().naive_local()).to_string();
             if let Err(e) = state.store_drive_token(&drive.label, &drive_token, &now) {
                 log::warn!(
                     "Self-heal: failed to store drive token for {}: {e}",
@@ -428,9 +426,7 @@ pub fn verify_drive_token(drive: &DriveConfig, state: &StateDb) -> DriveAvailabi
 
     if drive_token == stored_token {
         // Match — touch the last_verified timestamp.
-        let now = chrono::Local::now()
-            .format("%Y-%m-%dT%H:%M:%S")
-            .to_string();
+        let now = crate::types::Timestamp::from(chrono::Local::now().naive_local()).to_string();
         if let Err(e) = state.touch_drive_token(&drive.label, &now) {
             log::warn!(
                 "Failed to touch drive token timestamp for {}: {e}",

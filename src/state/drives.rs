@@ -420,8 +420,7 @@ mod tests {
         // #411: an inferred startup unmount is stamped at last-witnessed
         // presence, not at now — the row must carry exactly that time.
         let db = StateDb::open_memory().unwrap();
-        let at = chrono::NaiveDateTime::parse_from_str("2026-09-01T03:04:05", "%Y-%m-%dT%H:%M:%S")
-            .unwrap();
+        let at = "2026-09-01T03:04:05".parse::<crate::types::Timestamp>().unwrap().as_naive();
         db.record_drive_event_at(
             "WD-18TB",
             DriveEventType::Unmounted,

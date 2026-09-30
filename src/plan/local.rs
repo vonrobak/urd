@@ -57,7 +57,7 @@ pub(super) fn plan_local_snapshot(i: &LocalSnapshotInputs) -> SnapshotOutcome {
              automatic snapshots will be suppressed until clock catches up",
             subvol.name,
             newest,
-            newest.datetime().format("%Y-%m-%d %H:%M"),
+            newest.datetime().format(crate::types::DISPLAY_MINUTE_FORMAT),
         );
     }
 

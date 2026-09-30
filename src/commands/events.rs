@@ -54,7 +54,7 @@ pub fn run(config: Config, args: EventsArgs, output_mode: OutputMode) -> anyhow:
     let events: Vec<EventRow> = rows.into_iter().map(EventRow::from).collect();
 
     let applied = AppliedEventFilter {
-        since: since_dt.map(|dt| dt.format("%Y-%m-%dT%H:%M:%S").to_string()),
+        since: since_dt.map(|dt| crate::types::Timestamp::from(dt).to_string()),
         kind: kind.map(|k| k.as_str().to_string()),
         subvolume: args.subvolume,
         drive: args.drive,

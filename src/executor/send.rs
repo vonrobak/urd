@@ -542,9 +542,7 @@ impl Executor<'_> {
         }
 
         let token = drives::generate_drive_token();
-        let now = chrono::Local::now()
-            .format("%Y-%m-%dT%H:%M:%S")
-            .to_string();
+        let now = crate::types::Timestamp::from(chrono::Local::now().naive_local()).to_string();
 
         if let Err(e) = drives::write_drive_token(drive, &token) {
             log::warn!("Failed to write drive token for {drive_label}: {e}");

@@ -1,4 +1,5 @@
 use super::{StateDb, db_err};
+use crate::types::Timestamp;
 
 impl StateDb {
     // ── Pool armed-tier methods (UPI 031-a, ADR-113) ────────────────
@@ -55,8 +56,8 @@ impl StateDb {
             log::warn!("skipping armed-tier row with unknown tier {tier_s:?}");
             return None;
         };
-        match chrono::NaiveDateTime::parse_from_str(since_s, "%Y-%m-%dT%H:%M:%S") {
-            Ok(since) => Some((tier, since)),
+        match since_s.parse::<Timestamp>() {
+            Ok(since) => Some((tier, since.as_naive())),
             Err(e) => {
                 log::warn!("skipping armed-tier row with unparseable since {since_s:?}: {e}");
                 None
@@ -97,7 +98,7 @@ impl StateDb {
                 rusqlite::params![
                     pool_uuid,
                     tier.as_db_str(),
-                    since.format("%Y-%m-%dT%H:%M:%S").to_string(),
+                    Timestamp::from(since).to_string(),
                 ],
             )
             .map_err(db_err("failed to upsert armed tier"))?;

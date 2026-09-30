@@ -752,9 +752,12 @@ pub fn restorable_mounts(
     if file.schema_version != SENTINEL_STATE_SCHEMA_VERSION {
         return None;
     }
-    let witnessed_at =
-        NaiveDateTime::parse_from_str(file.last_assessment.as_deref()?, "%Y-%m-%dT%H:%M:%S")
-            .ok()?;
+    let witnessed_at = file
+        .last_assessment
+        .as_deref()?
+        .parse::<crate::types::Timestamp>()
+        .ok()?
+        .as_naive();
     let drives = file
         .mounted_drives
         .iter()
@@ -2366,7 +2369,7 @@ mod tests {
     // ── Startup mount reconciliation (#411) ─────────────────────────────
 
     fn ts(s: &str) -> NaiveDateTime {
-        NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S").unwrap()
+        NaiveDateTime::parse_from_str(s, crate::types::TIMESTAMP_FORMAT).unwrap()
     }
 
     fn labels(names: &[&str]) -> BTreeSet<String> {

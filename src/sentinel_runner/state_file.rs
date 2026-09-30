@@ -10,6 +10,7 @@ use crate::awareness::SubvolAssessment;
 use crate::config::Config;
 use crate::output::{SentinelCircuitState, SentinelPromiseState, SentinelStateFile};
 use crate::sentinel;
+use crate::types::Timestamp;
 
 use super::SentinelRunner;
 
@@ -25,8 +26,8 @@ impl SentinelRunner {
         let state_file = SentinelStateFile {
             schema_version: crate::output::SENTINEL_STATE_SCHEMA_VERSION,
             pid: std::process::id(),
-            started: self.started.format("%Y-%m-%dT%H:%M:%S").to_string(),
-            last_assessment: Some(now.format("%Y-%m-%dT%H:%M:%S").to_string()),
+            started: Timestamp::from(self.started).to_string(),
+            last_assessment: Some(Timestamp::from(now).to_string()),
             mounted_drives: self.state.mounted_drives.iter().cloned().collect(),
             tick_interval_secs: self.tick_interval.as_secs(),
             promise_states: self

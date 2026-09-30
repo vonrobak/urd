@@ -489,7 +489,7 @@ mod tests {
     use crate::storage_critical::{StoragePosture, TightnessTier};
 
     fn dt(s: &str) -> NaiveDateTime {
-        NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S").unwrap()
+        NaiveDateTime::parse_from_str(s, crate::types::TIMESTAMP_FORMAT).unwrap()
     }
 
     /// Two subvolumes `alpha` + `beta` sharing one pool (source `/data`), plus

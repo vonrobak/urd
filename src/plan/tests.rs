@@ -287,7 +287,7 @@ fn est_full_needed_uses_same_drive_history_first() {
     fs.send_sizes
         .insert(("sv1".into(), "OTHER".into(), SendKind::Full), 10_000_000_000);
     fs.calibrated_sizes
-        .insert("sv1".into(), (999_999_999_999, "2026-04-01".into()));
+        .insert("sv1".into(), (999_999_999_999, None));
     assert_eq!(estimated_send_size(&fs, "sv1", "D1", true), Some(50_000_000_000));
 }
 
@@ -317,7 +317,7 @@ fn est_any_drive_prefers_recency_over_value() {
 fn est_full_needed_falls_back_calibrated_when_no_history() {
     let mut fs = MockFileSystemState::new();
     fs.calibrated_sizes
-        .insert("sv1".into(), (42_000_000_000, "2026-04-01".into()));
+        .insert("sv1".into(), (42_000_000_000, None));
     assert_eq!(estimated_send_size(&fs, "sv1", "D1", true), Some(42_000_000_000));
 }
 
@@ -345,7 +345,7 @@ fn est_incremental_falls_back_cross_drive() {
 fn est_incremental_never_uses_calibrated() {
     let mut fs = MockFileSystemState::new();
     fs.calibrated_sizes
-        .insert("sv1".into(), (999_999_999_999, "2026-04-01".into()));
+        .insert("sv1".into(), (999_999_999_999, None));
     assert_eq!(estimated_send_size(&fs, "sv1", "D1", false), None);
 }
 
@@ -1278,7 +1278,7 @@ fn calibrated_size_skips_send_when_too_large() {
     // No send history (Tier 1), but calibrated size says 1TB
     fs.calibrated_sizes.insert(
         "sv1".to_string(),
-        (1_000_000_000_000, "2026-03-22T12:00:00".to_string()),
+        (1_000_000_000_000, Some("2026-03-22T12:00:00".parse().unwrap())),
     );
     // Drive has only 500GB free
     fs.free_bytes
@@ -1305,7 +1305,8 @@ fn calibrated_size_skips_send_when_too_large() {
 }
 
 /// The calibrated-size skip reason for `sv1` when the calibration was taken
-/// at `measured_at` and the planner runs at `now()`.
+/// at `measured_at` and the planner runs at `now()`. An unparseable string
+/// arrives as `None`, as `StateDb::calibrated_size` reports it.
 fn calibrated_skip_reason(measured_at: &str) -> String {
     let config = test_config();
     let mut fs = MockFileSystemState::new();
@@ -1314,7 +1315,7 @@ fn calibrated_skip_reason(measured_at: &str) -> String {
     fs.mounted_drives.insert("D1".to_string());
     fs.calibrated_sizes.insert(
         "sv1".to_string(),
-        (1_000_000_000_000, measured_at.to_string()),
+        (1_000_000_000_000, measured_at.parse().ok()),
     );
     fs.free_bytes
         .insert(PathBuf::from("/mnt/d1"), 500_000_000_000);
@@ -1367,7 +1368,7 @@ fn tier1_overrides_calibrated_size() {
     // Calibrated says 1TB (would block if used)
     fs.calibrated_sizes.insert(
         "sv1".to_string(),
-        (1_000_000_000_000, "2026-03-22T12:00:00".to_string()),
+        (1_000_000_000_000, Some("2026-03-22T12:00:00".parse().unwrap())),
     );
     // Drive has 500GB free — enough for Tier 1 estimate, not for calibrated
     fs.free_bytes
@@ -4876,7 +4877,7 @@ fn marker_false_space_guards() {
     fs.send_sizes.clear();
     fs.calibrated_sizes.insert(
         "sv1".to_string(),
-        (200_000_000_000, "2026-03-20T00:00:00".to_string()),
+        (200_000_000_000, Some("2026-03-20T00:00:00".parse().unwrap())),
     );
     let result = plan(
         &config,

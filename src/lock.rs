@@ -130,7 +130,7 @@ pub fn read_lock_info(lock_path: &Path) -> Option<LockInfo> {
 fn write_lock_metadata(file: &File, trigger: &str) {
     let info = LockInfo {
         pid: std::process::id(),
-        started: chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
+        started: crate::types::Timestamp::from(chrono::Local::now().naive_local()).to_string(),
         trigger: trigger.to_string(),
     };
     if let Err(e) = write_lock_info(file, &info) {

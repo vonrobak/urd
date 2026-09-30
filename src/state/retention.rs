@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use super::{StateDb, db_err};
 use crate::retention::RecordedRetention;
+use crate::types::Timestamp;
 
 impl StateDb {
     // ── Applied retention shapes (ADR-110 transition safety) ────────
@@ -76,7 +77,7 @@ impl StateDb {
                 rusqlite::params![
                     subvolume,
                     shape.to_canonical(),
-                    recorded_at.format("%Y-%m-%dT%H:%M:%S").to_string(),
+                    Timestamp::from(recorded_at).to_string(),
                 ],
             )
             .map_err(db_err("failed to upsert retention shape"))?;

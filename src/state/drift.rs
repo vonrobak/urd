@@ -1,4 +1,5 @@
 use super::{DriftSampleRow, StateDb, db_err};
+use crate::types::Timestamp;
 
 impl StateDb {
     // ── Drift-sample methods ────────────────────────────────────────
@@ -23,7 +24,7 @@ impl StateDb {
                 rusqlite::params![
                     sample.run_id,
                     sample.subvolume,
-                    sample.sampled_at.format("%Y-%m-%dT%H:%M:%S").to_string(),
+                    Timestamp::from(sample.sampled_at).to_string(),
                     sample.seconds_since_prev_send,
                     sample.bytes_transferred as i64,
                     sample.source_free_bytes.map(|b| b as i64),
@@ -54,7 +55,7 @@ impl StateDb {
             )
             .map_err(db_err("query failed"))?;
 
-        let since_str = since.format("%Y-%m-%dT%H:%M:%S").to_string();
+        let since_str = Timestamp::from(since).to_string();
         let rows = stmt
             .query_map(
                 rusqlite::params![subvolume, since_str],
@@ -102,7 +103,7 @@ impl StateDb {
              WHERE subvolume IN ({placeholders}) AND sampled_at >= ?
              ORDER BY sampled_at DESC"
         );
-        let since_str = since.format("%Y-%m-%dT%H:%M:%S").to_string();
+        let since_str = Timestamp::from(since).to_string();
 
         let mut stmt = self
             .conn
@@ -139,11 +140,8 @@ impl StateDb {
         let source_free_bytes: Option<i64> = row.get(5)?;
         let send_type_s: String = row.get(6)?;
 
-        let sampled_at = match chrono::NaiveDateTime::parse_from_str(
-            &sampled_at_s,
-            "%Y-%m-%dT%H:%M:%S",
-        ) {
-            Ok(dt) => dt,
+        let sampled_at = match sampled_at_s.parse::<Timestamp>() {
+            Ok(ts) => ts.as_naive(),
             Err(e) => {
                 log::warn!("skipping drift row with unparseable sampled_at {sampled_at_s:?}: {e}");
                 return Ok(None);
@@ -529,5 +527,32 @@ mod tests {
             .unwrap();
         assert_eq!(op_str, drift_str);
         assert_eq!(op_str, "send_full");
+    }
+
+    #[test]
+    fn drift_row_in_the_persisted_form_reads_back() {
+        // A row as every Urd version has written it (ADR-102: existing rows must
+        // keep parsing). The literal strings are the contract — both the stored
+        // `sampled_at` and the `since` bound compare as text in SQL.
+        let db = StateDb::open_memory().unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO drift_samples (run_id, subvolume, sampled_at,
+                     seconds_since_prev_send, bytes_transferred,
+                     source_free_bytes, send_type)
+                 VALUES (NULL, 'home', '2026-04-30T04:00:00', 86400, 1000, NULL,
+                     'send_incremental')",
+                [],
+            )
+            .unwrap();
+        let rows = db
+            .drift_samples_for_subvolume("home", drift_dt("2026-04-30T04:00:00"))
+            .unwrap();
+        assert_eq!(rows.len(), 1, "inclusive since bound matches the stored text");
+        assert_eq!(rows[0].sampled_at, drift_dt("2026-04-30T04:00:00"));
+        let later = db
+            .drift_samples_for_subvolume("home", drift_dt("2026-04-30T04:00:01"))
+            .unwrap();
+        assert!(later.is_empty());
     }
 }

@@ -578,7 +578,7 @@ mod tests {
     use super::*;
 
     fn now() -> NaiveDateTime {
-        NaiveDateTime::parse_from_str("2026-04-30T03:14:22", "%Y-%m-%dT%H:%M:%S").unwrap()
+        "2026-04-30T03:14:22".parse::<crate::types::Timestamp>().unwrap().as_naive()
     }
 
     fn event_with(payload: EventPayload) -> Event {

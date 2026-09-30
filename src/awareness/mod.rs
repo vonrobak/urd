@@ -2567,7 +2567,7 @@ send_enabled = false
             .insert(std::path::PathBuf::from("/mnt/wd"), 106_000_000_000);
         // Calibrated = 10TB, but incremental history says 5GB — incremental fits easily.
         fs.calibrated_sizes
-            .insert("sv1".to_string(), (10_000_000_000_000, "2026-04-01".to_string()));
+            .insert("sv1".to_string(), (10_000_000_000_000, None));
         fs.send_sizes.insert(
             ("sv1".to_string(), "WD-18TB".to_string(), crate::types::SendKind::Incremental),
             5_000_000_000,
@@ -2643,7 +2643,7 @@ send_enabled = false
         fs.free_bytes
             .insert(std::path::PathBuf::from("/mnt/wd"), 2_700_000_000_000);
         fs.calibrated_sizes
-            .insert("sv1".to_string(), (10_000_000_000_000, "2026-04-01".to_string()));
+            .insert("sv1".to_string(), (10_000_000_000_000, None));
         fs.send_sizes.insert(
             ("sv1".to_string(), "WD-18TB".to_string(), crate::types::SendKind::Incremental),
             50_000_000_000,

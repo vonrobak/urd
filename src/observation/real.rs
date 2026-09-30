@@ -13,7 +13,7 @@ use super::{FilesystemQuery, HistoryQuery};
 use crate::config::DriveConfig;
 use crate::drives::DriveAvailability;
 use crate::error::UrdError;
-use crate::types::{DriveEvent, DriveEventKind, SendKind, SnapshotName};
+use crate::types::{DriveEvent, DriveEventKind, SendKind, SnapshotName, Timestamp};
 
 // ── RealFileSystemState ─────────────────────────────────────────────────
 
@@ -133,7 +133,7 @@ impl HistoryQuery for RealFileSystemState<'_> {
         })
     }
 
-    fn calibrated_size(&self, subvol_name: &str) -> Option<(u64, String)> {
+    fn calibrated_size(&self, subvol_name: &str) -> Option<(u64, Option<Timestamp>)> {
         self.state.and_then(|db| {
             best_effort(
                 "calibrated_size",
@@ -253,7 +253,7 @@ impl RealFileSystemState<'_> {
 /// Map a persisted `DriveConnectionRecord` to a `DriveEvent`, or `None` for an
 /// unknown event type / unparseable timestamp (logged). Shared by
 /// `last_drive_event` (one row) and `drive_mount_history` (all rows). The parse
-/// format matches the sentinel's write format (`%Y-%m-%dT%H:%M:%S`).
+/// is `Timestamp`'s persisted form, the same one the event writer produces.
 ///
 /// This is the read-side composition pattern: granular `state/` wrappers, with
 /// the domain shaping localized once at the adapter (see also `drift_samples`).
@@ -269,14 +269,17 @@ pub(crate) fn drive_record_to_event(
             return None;
         }
     };
-    let at = chrono::NaiveDateTime::parse_from_str(&record.timestamp, "%Y-%m-%dT%H:%M:%S")
+    let at = record
+        .timestamp
+        .parse::<Timestamp>()
         .inspect_err(|e| {
             log::warn!(
                 "failed to parse drive event timestamp {:?}: {e}",
                 record.timestamp
             );
         })
-        .ok()?;
+        .ok()?
+        .as_naive();
     Some(DriveEvent { kind, at })
 }
 
@@ -372,7 +375,7 @@ mod tests {
     }
 
     fn drift_at(s: &str) -> NaiveDateTime {
-        NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S").unwrap()
+        NaiveDateTime::parse_from_str(s, crate::types::TIMESTAMP_FORMAT).unwrap()
     }
 
     #[test]

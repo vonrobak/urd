@@ -12,7 +12,7 @@ use crate::output::{
 };
 use crate::plan::{self, HistoryQuery, NothingNew, PlanFilters, SkipReason};
 use crate::state::StateDb;
-use crate::types::{PlannedOperation, PlannedSkip};
+use crate::types::{DISPLAY_MINUTE_FORMAT, PlannedOperation, PlannedSkip};
 use crate::voice;
 
 pub fn run(config: Config, args: PlanArgs, mode: OutputMode) -> anyhow::Result<()> {
@@ -158,7 +158,7 @@ pub fn build_plan_output(
         .count();
 
     PlanOutput {
-        timestamp: backup_plan.timestamp.format("%Y-%m-%d %H:%M").to_string(),
+        timestamp: backup_plan.timestamp.format(DISPLAY_MINUTE_FORMAT).to_string(),
         operations,
         skipped,
         summary: PlanSummaryOutput {
@@ -458,7 +458,7 @@ mod tests {
         let mut fs = MockFileSystemState::new();
         fs.calibrated_sizes.insert(
             "htpc-home".into(),
-            (45_000_000_000, "2026-03-28".into()),
+            (45_000_000_000, None),
         );
         let entry = entry_for(&mock_send_full("htpc-home", "WD-18TB"), &fs);
         assert_eq!(entry.estimated_bytes, Some(45_000_000_000));
@@ -477,7 +477,7 @@ mod tests {
         );
         fs.calibrated_sizes.insert(
             "htpc-home".into(),
-            (45_000_000_000, "2026-03-28".into()),
+            (45_000_000_000, None),
         );
         let entry = entry_for(&mock_send_full("htpc-home", "WD-18TB"), &fs);
         assert_eq!(entry.estimated_bytes, Some(53_000_000_000));
@@ -542,7 +542,7 @@ mod tests {
         // Only calibration data — should NOT be used for incrementals
         fs.calibrated_sizes.insert(
             "htpc-home".into(),
-            (45_000_000_000, "2026-03-28".into()),
+            (45_000_000_000, None),
         );
         let entry = entry_for(&mock_send_incremental("htpc-home", "WD-18TB"), &fs);
         assert_eq!(entry.estimated_bytes, None);

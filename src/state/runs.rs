@@ -1,12 +1,13 @@
 use crate::error::UrdError;
 use crate::output::LastRunInfo;
+use crate::types::Timestamp;
 
 use super::{OperationRecord, OperationRow, RunRecord, StateDb, db_err};
 
 impl StateDb {
     /// Begin a new backup run. Returns the run ID.
     pub fn begin_run(&self, mode: &str) -> crate::error::Result<i64> {
-        let now = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+        let now = Timestamp::from(chrono::Local::now().naive_local()).to_string();
         self.conn
             .execute(
                 "INSERT INTO runs (started_at, mode, result) VALUES (?1, ?2, 'running')",
@@ -48,7 +49,7 @@ impl StateDb {
     /// Without this, a zombie row stays `running`/`finished_at = NULL` forever and
     /// can hold the max id, so `last_run` reports a long-dead run as "(running)".
     pub fn reap_stale_runs(&self) -> crate::error::Result<usize> {
-        let now = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+        let now = Timestamp::from(chrono::Local::now().naive_local()).to_string();
         let reaped = self
             .conn
             .execute(
@@ -61,7 +62,7 @@ impl StateDb {
 
     /// Finish a run with the given result ("success", "partial", "failure").
     pub fn finish_run(&self, run_id: i64, result: &str) -> crate::error::Result<()> {
-        let now = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+        let now = Timestamp::from(chrono::Local::now().naive_local()).to_string();
         self.conn
             .execute(
                 "UPDATE runs SET finished_at = ?1, result = ?2 WHERE id = ?3",
@@ -292,11 +293,10 @@ impl StateDb {
 
         match rows.next() {
             Some(Ok(ts)) => {
-                let parsed = chrono::NaiveDateTime::parse_from_str(&ts, "%Y-%m-%dT%H:%M:%S")
-                    .map_err(|e| {
-                        UrdError::StateData(format!("failed to parse send timestamp {ts:?}: {e}"))
-                    })?;
-                Ok(Some(parsed))
+                let parsed = ts.parse::<Timestamp>().map_err(|e| {
+                    UrdError::StateData(format!("failed to parse send timestamp {ts:?}: {e}"))
+                })?;
+                Ok(Some(parsed.as_naive()))
             }
             Some(Err(e)) => Err(db_err("failed to read send time")(e)),
             None => Ok(None),
@@ -330,11 +330,10 @@ impl StateDb {
 
         match rows.next() {
             Some(Ok(Some(ts))) => {
-                let parsed = chrono::NaiveDateTime::parse_from_str(&ts, "%Y-%m-%dT%H:%M:%S")
-                    .map_err(|e| {
-                        UrdError::StateData(format!("failed to parse operation timestamp {ts:?}: {e}"))
-                    })?;
-                Ok(Some(parsed))
+                let parsed = ts.parse::<Timestamp>().map_err(|e| {
+                    UrdError::StateData(format!("failed to parse operation timestamp {ts:?}: {e}"))
+                })?;
+                Ok(Some(parsed.as_naive()))
             }
             Some(Ok(None)) => Ok(None),
             Some(Err(e)) => Err(db_err("failed to read operation time")(e)),
@@ -996,7 +995,7 @@ mod tests {
         assert!(t2 > t1, "run2 should have later started_at than run1");
 
         let got = db.last_successful_operation_at("WD-18TB").unwrap().unwrap();
-        let expected = chrono::NaiveDateTime::parse_from_str(&t2, "%Y-%m-%dT%H:%M:%S").unwrap();
+        let expected = t2.parse::<crate::types::Timestamp>().unwrap().as_naive();
         assert_eq!(got, expected);
     }
 
@@ -1034,5 +1033,29 @@ mod tests {
         })
         .unwrap();
         assert_eq!(db.last_successful_operation_at("WD-18TB").unwrap(), None);
+    }
+
+    #[test]
+    fn run_rows_in_the_persisted_form_read_back() {
+        // Rows as every Urd version has written them (ADR-102: existing rows must
+        // keep parsing). The literal `started_at` is the contract.
+        let db = StateDb::open_memory().unwrap();
+        db.conn
+            .execute_batch(
+                "INSERT INTO runs (id, started_at, finished_at, mode, result)
+                     VALUES (7, '2026-03-24T02:05:00', '2026-03-24T02:07:15', 'full', 'success');
+                 INSERT INTO operations (run_id, subvolume, operation, drive_label, result)
+                     VALUES (7, 'sv1', 'send_incremental', 'WD-18TB', 'success');",
+            )
+            .unwrap();
+        let expected = chrono::NaiveDate::from_ymd_opt(2026, 3, 24)
+            .unwrap()
+            .and_hms_opt(2, 5, 0)
+            .unwrap();
+        assert_eq!(db.last_successful_operation_at("WD-18TB").unwrap(), Some(expected));
+        assert_eq!(db.last_successful_send_time("sv1", "WD-18TB").unwrap(), Some(expected));
+        let info = crate::output::LastRunInfo::from(db.last_run().unwrap().unwrap());
+        assert_eq!(info.started_at, "2026-03-24T02:05:00");
+        assert_eq!(info.duration.as_deref(), Some("2m 15s"));
     }
 }

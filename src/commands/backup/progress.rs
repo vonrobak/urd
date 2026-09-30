@@ -496,7 +496,7 @@ mod tests {
         use crate::plan::MockFileSystemState;
 
         let mut fs = MockFileSystemState::new();
-        fs.calibrated_sizes.insert("sv1".to_string(), (45_000_000_000, "2026-03-29".to_string()));
+        fs.calibrated_sizes.insert("sv1".to_string(), (45_000_000_000, None));
 
         // Full send: should fall through to calibrated
         let plan_full = BackupPlan {

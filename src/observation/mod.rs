@@ -21,7 +21,7 @@ use chrono::NaiveDateTime;
 
 use crate::config::DriveConfig;
 use crate::drives::DriveAvailability;
-use crate::types::{DriveEvent, SendKind, SnapshotName};
+use crate::types::{DriveEvent, SendKind, SnapshotName, Timestamp};
 
 pub mod estimate;
 mod real;
@@ -107,8 +107,9 @@ pub trait HistoryQuery {
     ) -> Option<u64>;
 
     /// Get a calibrated size estimate for a subvolume (from `urd calibrate`).
-    /// Returns `(estimated_bytes, measured_at)` or None if not calibrated.
-    fn calibrated_size(&self, subvol_name: &str) -> Option<(u64, String)>;
+    /// Returns `(estimated_bytes, measured_at)` or None if not calibrated;
+    /// `measured_at` is None when the stored timestamp does not parse.
+    fn calibrated_size(&self, subvol_name: &str) -> Option<(u64, Option<Timestamp>)>;
 
     /// Get the timestamp of the most recent successful send (full or incremental)
     /// for a subvolume to a specific drive. Returns None if no send history exists.

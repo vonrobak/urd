@@ -103,7 +103,7 @@ impl SentinelRunner {
         if let Some(db) = &db {
             use crate::state::{DriveEventSource, DriveEventType};
             for unmount in &verdict.inferred_unmounts {
-                let at = unmount.at.format("%Y-%m-%dT%H:%M:%S");
+                let at = crate::types::Timestamp::from(unmount.at);
                 log::warn!(
                     "Drive unmounted while sentinel was down: {} — last seen mounted {at}",
                     unmount.label,

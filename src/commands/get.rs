@@ -8,7 +8,7 @@ use crate::cli::GetArgs;
 use crate::config::{Config, SubvolumeConfig, expand_tilde};
 use crate::output::{GetOutput, OutputMode};
 use crate::plan::read_snapshot_dir;
-use crate::types::SnapshotName;
+use crate::types::{DISPLAY_MINUTE_FORMAT, SnapshotName};
 use crate::voice;
 
 pub fn run(config: Config, args: GetArgs, output_mode: OutputMode) -> anyhow::Result<()> {
@@ -71,9 +71,9 @@ pub fn run(config: Config, args: GetArgs, output_mode: OutputMode) -> anyhow::Re
         let earliest = &snapshots[0];
         anyhow!(
             "no snapshot found before {}. Earliest available: {} ({})",
-            target_date.format("%Y-%m-%d %H:%M"),
+            target_date.format(DISPLAY_MINUTE_FORMAT),
             earliest.as_str(),
-            earliest.datetime().format("%Y-%m-%d %H:%M"),
+            earliest.datetime().format(DISPLAY_MINUTE_FORMAT),
         )
     })?;
 
@@ -125,7 +125,7 @@ pub fn run(config: Config, args: GetArgs, output_mode: OutputMode) -> anyhow::Re
     let get_output = GetOutput {
         subvolume: subvol.name.clone(),
         snapshot: snapshot.as_str().to_string(),
-        snapshot_date: snapshot.datetime().format("%Y-%m-%d %H:%M").to_string(),
+        snapshot_date: snapshot.datetime().format(DISPLAY_MINUTE_FORMAT).to_string(),
         file_path: relative_path.display().to_string(),
         file_size: metadata.len(),
     };
@@ -234,7 +234,7 @@ fn parse_date_reference(s: &str, now: NaiveDateTime) -> anyhow::Result<NaiveDate
         }
         _ => {
             // Try YYYY-MM-DD HH:MM
-            if let Ok(dt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M") {
+            if let Ok(dt) = NaiveDateTime::parse_from_str(s, DISPLAY_MINUTE_FORMAT) {
                 return Ok(dt);
             }
             // Try YYYY-MM-DD

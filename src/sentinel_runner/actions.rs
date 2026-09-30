@@ -5,8 +5,6 @@
 
 use std::time::{Duration, Instant};
 
-use chrono::NaiveDateTime;
-
 use crate::advice;
 use crate::awareness;
 // gather + the ADR-119 `world::assess` door — the sanctioned prelude, see mod.rs.
@@ -16,6 +14,7 @@ use crate::heartbeat;
 use crate::notify;
 use crate::observation::{Observation, RealFileSystemState};
 use crate::sentinel;
+use crate::types::Timestamp;
 
 use super::{SentinelRunner, is_pid_alive};
 
@@ -281,8 +280,7 @@ impl SentinelRunner {
             .ok()
             .flatten()
             .and_then(|ts| {
-                let parsed =
-                    NaiveDateTime::parse_from_str(&ts, "%Y-%m-%dT%H:%M:%S").ok()?;
+                let parsed = ts.parse::<Timestamp>().ok()?.as_naive();
                 let now = chrono::Local::now().naive_local();
                 Some(now.signed_duration_since(parsed).num_minutes())
             });

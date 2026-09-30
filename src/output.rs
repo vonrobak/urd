@@ -453,8 +453,7 @@ impl LastRunInfo {
     /// cannot be parsed or the result would be negative (clock skew).
     #[must_use]
     pub fn age_secs(&self, now: chrono::NaiveDateTime) -> Option<i64> {
-        let dt = chrono::NaiveDateTime::parse_from_str(&self.started_at, "%Y-%m-%dT%H:%M:%S")
-            .ok()?;
+        let dt = self.started_at.parse::<crate::types::Timestamp>().ok()?.as_naive();
         let age = now.signed_duration_since(dt).num_seconds();
         if age >= 0 { Some(age) } else { None }
     }

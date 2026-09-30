@@ -78,7 +78,7 @@ pub struct MockFileSystemState {
     /// Same insertion-ordered shape as `send_sizes`; kept as a separate store
     /// since production tracks them via a distinct `result = 'failure'` query.
     pub failed_send_floors: SendSizeHistory,
-    pub calibrated_sizes: std::collections::HashMap<String, (u64, String)>,
+    pub calibrated_sizes: std::collections::HashMap<String, (u64, Option<crate::types::Timestamp>)>,
     pub send_times: std::collections::HashMap<(String, String), NaiveDateTime>,
     pub drive_events: std::collections::HashMap<String, DriveEvent>,
     /// Full ordered mount/unmount history per drive (UPI 055). Additive
@@ -236,8 +236,8 @@ impl HistoryQuery for MockFileSystemState {
             })
     }
 
-    fn calibrated_size(&self, subvol_name: &str) -> Option<(u64, String)> {
-        self.calibrated_sizes.get(subvol_name).cloned()
+    fn calibrated_size(&self, subvol_name: &str) -> Option<(u64, Option<crate::types::Timestamp>)> {
+        self.calibrated_sizes.get(subvol_name).copied()
     }
 
     fn last_successful_send_time(

@@ -144,10 +144,9 @@ pub(super) fn plan_external_send(i: &SendInputs) -> PlanFragment {
                 .and_then(|(_, measured_at)| {
                     // Age against the planner's `now`, never the wall clock
                     // (ADR-108): the same inputs word the same note.
-                    let age_days =
-                        chrono::NaiveDateTime::parse_from_str(&measured_at, "%Y-%m-%dT%H:%M:%S")
-                            .map(|ts| (now - ts).num_days())
-                            .unwrap_or(365); // corrupt timestamp → treat as stale, not fresh
+                    let age_days = measured_at
+                        .map(|ts| (now - ts.as_naive()).num_days())
+                        .unwrap_or(365); // corrupt timestamp → treat as stale, not fresh
                     (age_days > 30).then_some(age_days)
                 });
             SkipReason::CalibratedSizeExceedsSpace {

@@ -162,9 +162,7 @@ pub fn run_drives_adopt(
     let state = StateDb::open(&config.general.state_db)?;
     let sqlite_token = state.get_drive_token(label)?;
 
-    let now = chrono::Local::now()
-        .format("%Y-%m-%dT%H:%M:%S")
-        .to_string();
+    let now = crate::types::Timestamp::from(chrono::Local::now().naive_local()).to_string();
 
     let action = match crate::drives::decide_adoption(
         on_disk_token.as_deref(),

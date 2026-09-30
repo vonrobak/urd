@@ -510,7 +510,7 @@ mod tests {
     use crate::types::{DriveRole, Interval};
 
     fn ts() -> chrono::NaiveDateTime {
-        chrono::NaiveDateTime::parse_from_str("2026-07-12T21:00:00", "%Y-%m-%dT%H:%M:%S").unwrap()
+        "2026-07-12T21:00:00".parse::<crate::types::Timestamp>().unwrap().as_naive()
     }
 
     /// Minimal config for `decide_tail` — the paths are never touched

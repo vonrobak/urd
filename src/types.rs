@@ -189,6 +189,92 @@ pub enum DriveEventKind {
     Unmount,
 }
 
+// ── Timestamp ───────────────────────────────────────────────────────────
+
+/// The persisted timestamp form: local wall time, second precision, no zone
+/// (`2026-03-24T02:05:00`). Every history DB timestamp column (ADR-102), the
+/// heartbeat `timestamp`/`stale_after` fields (ADR-105), the sentinel state file,
+/// and event payloads (ADR-114) carry exactly this form — existing rows and files
+/// are parsed with it, so it can never change without a migration. The one
+/// spelling of the format lives here; everything else goes through this const or
+/// [`Timestamp`].
+pub const TIMESTAMP_FORMAT: &str = "%Y-%m-%dT%H:%M:%S";
+
+/// Minute-precision form for human-facing text (`2026-03-24 02:05`): the plan
+/// header, `urd get` messages, and the `urd get --at` input form. Never stored,
+/// and [`Timestamp`] does not parse it — but it reaches `--json` output in
+/// `PlanOutput.timestamp` and `GetOutput.snapshot_date`, so it is not free to
+/// change either.
+pub const DISPLAY_MINUTE_FORMAT: &str = "%Y-%m-%d %H:%M";
+
+/// A timestamp in its persisted form ([`TIMESTAMP_FORMAT`]).
+///
+/// `Display` writes the persisted form and `FromStr` parses that form (no zone,
+/// no fractional seconds) with the same chrono call every reader used before this
+/// type, so `t.to_string().parse() == Ok(t)` and no stored row reads differently.
+/// Sub-second precision is dropped at construction for the same reason: the
+/// persisted form cannot carry it, and a value that compares unequal to its own
+/// round trip would be a trap. Serde uses the same string, so a `Timestamp` field
+/// is wire-identical to the `String` fields it replaces. The parse error is
+/// chrono's own, so messages built from it read as they did before this type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Timestamp(NaiveDateTime);
+
+impl Timestamp {
+    /// Wrap a datetime, dropping sub-second precision.
+    #[must_use]
+    pub fn new(datetime: NaiveDateTime) -> Self {
+        Self(datetime.with_nanosecond(0).unwrap_or(datetime))
+    }
+
+    /// The wrapped datetime (whole seconds).
+    #[must_use]
+    pub const fn as_naive(self) -> NaiveDateTime {
+        self.0
+    }
+}
+
+impl From<NaiveDateTime> for Timestamp {
+    fn from(datetime: NaiveDateTime) -> Self {
+        Self::new(datetime)
+    }
+}
+
+impl fmt::Display for Timestamp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0.format(TIMESTAMP_FORMAT))
+    }
+}
+
+impl FromStr for Timestamp {
+    type Err = chrono::ParseError;
+
+    /// Parse the persisted form. This is the reader for every stored timestamp,
+    /// so it accepts exactly what the writers produce and nothing looser.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        NaiveDateTime::parse_from_str(s, TIMESTAMP_FORMAT).map(Self::new)
+    }
+}
+
+impl<'de> Deserialize<'de> for Timestamp {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        s.parse().map_err(de::Error::custom)
+    }
+}
+
+impl Serialize for Timestamp {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.collect_str(self)
+    }
+}
+
 // ── SnapshotName ────────────────────────────────────────────────────────
 
 /// A snapshot name in the format `YYYYMMDD-HHMM-shortname`.
@@ -1251,8 +1337,8 @@ pub fn format_duration_secs(secs: i64) -> String {
 /// Returns `None` if either timestamp fails to parse.
 #[must_use]
 pub fn format_run_duration(started: &str, finished: &str) -> Option<String> {
-    let start = NaiveDateTime::parse_from_str(started, "%Y-%m-%dT%H:%M:%S").ok()?;
-    let end = NaiveDateTime::parse_from_str(finished, "%Y-%m-%dT%H:%M:%S").ok()?;
+    let start = NaiveDateTime::parse_from_str(started, TIMESTAMP_FORMAT).ok()?;
+    let end = NaiveDateTime::parse_from_str(finished, TIMESTAMP_FORMAT).ok()?;
     Some(format_duration_secs((end - start).num_seconds()))
 }
 
@@ -1342,6 +1428,73 @@ mod tests {
     #[test]
     fn send_kind_db_str_incremental() {
         assert_eq!(SendKind::Incremental.as_db_str(), "send_incremental");
+    }
+
+    // ── Timestamp tests ─────────────────────────────────────────────
+
+    #[test]
+    fn timestamp_round_trips_the_persisted_form() {
+        let t: Timestamp = "2026-03-24T02:05:09".parse().unwrap();
+        assert_eq!(t.to_string(), "2026-03-24T02:05:09");
+        assert_eq!(
+            t.as_naive(),
+            NaiveDate::from_ymd_opt(2026, 3, 24).unwrap().and_hms_opt(2, 5, 9).unwrap()
+        );
+        assert_eq!(t.to_string().parse::<Timestamp>().unwrap(), t);
+    }
+
+    #[test]
+    fn timestamp_display_matches_the_format_literal() {
+        // The writers used `dt.format(TIMESTAMP_FORMAT)` before this type existed;
+        // Display must produce the same bytes, including for sub-second inputs.
+        let dt = NaiveDate::from_ymd_opt(2026, 1, 2)
+            .unwrap()
+            .and_hms_milli_opt(3, 4, 5, 678)
+            .unwrap();
+        assert_eq!(Timestamp::from(dt).to_string(), dt.format(TIMESTAMP_FORMAT).to_string());
+        assert_eq!(Timestamp::new(dt).to_string(), "2026-01-02T03:04:05");
+    }
+
+    #[test]
+    fn timestamp_drops_sub_second_precision() {
+        let dt = NaiveDate::from_ymd_opt(2026, 1, 2)
+            .unwrap()
+            .and_hms_milli_opt(3, 4, 5, 678)
+            .unwrap();
+        let t = Timestamp::new(dt);
+        assert_eq!(t.as_naive(), dt.with_nanosecond(0).unwrap());
+        assert_eq!(t.to_string().parse::<Timestamp>().unwrap(), t);
+    }
+
+    #[test]
+    fn timestamp_rejects_display_minute_form_and_garbage() {
+        assert!("2026-03-24 02:05".parse::<Timestamp>().is_err());
+        assert!("2026-03-24 02:05:00".parse::<Timestamp>().is_err());
+        assert!("2026-03-24T02:05".parse::<Timestamp>().is_err());
+        assert!("2026-03-24T02:05:00.5".parse::<Timestamp>().is_err());
+        assert!("2026-03-24T02:05:00+02:00".parse::<Timestamp>().is_err());
+        assert!("".parse::<Timestamp>().is_err());
+        assert!("not a timestamp".parse::<Timestamp>().is_err());
+    }
+
+    #[test]
+    fn timestamp_orders_chronologically() {
+        let a: Timestamp = "2026-03-24T02:05:00".parse().unwrap();
+        let b: Timestamp = "2026-03-24T02:05:01".parse().unwrap();
+        let c: Timestamp = "2027-01-01T00:00:00".parse().unwrap();
+        assert!(a < b && b < c);
+        let mut v = vec![c, a, b];
+        v.sort();
+        assert_eq!(v, vec![a, b, c]);
+    }
+
+    #[test]
+    fn timestamp_serde_is_the_persisted_string() {
+        let t: Timestamp = "2026-03-24T02:05:00".parse().unwrap();
+        let json = serde_json::to_string(&t).unwrap();
+        assert_eq!(json, "\"2026-03-24T02:05:00\"");
+        assert_eq!(serde_json::from_str::<Timestamp>(&json).unwrap(), t);
+        assert!(serde_json::from_str::<Timestamp>("\"2026-03-24 02:05\"").is_err());
     }
 
     // ── SnapshotName tests ──────────────────────────────────────────
