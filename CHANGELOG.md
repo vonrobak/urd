@@ -9,25 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - `--confirm-retention-change` now means what ADR-110 says. Urd records the
-  retention shape under which each subvolume's deletions were last applied and
-  holds a named-level subvolume's deletions only when its retention has
-  tightened since — snapshots and sends still run. Run `urd backup
-  --confirm-retention-change` once to apply the tighter retention; the hold is
-  named in the run summary, `urd plan`, `urd status`, `urd doctor` and an
-  `events` row. Previously every run without the flag held every promise-level
+  retention shape under which each subvolume's deletions were last applied.
+  When a named-level subvolume's retention has tightened since, Urd holds only
+  the extra deletions the tightening causes: it keeps pruning the subvolume as
+  the old retention would, and snapshots and sends still run. The hold is
+  judged separately for local and external retention, and it never holds
+  space-pressure deletions or the local deletions of a pool that is Tight or
+  Critical. Run `urd backup --confirm-retention-change` once to apply the
+  tighter retention; the hold is named in the run summary, `urd plan`, `urd
+  status`, `urd doctor` and an `events` row. Previously every run without the flag held every promise-level
   deletion, and the scheduled unit always passed the flag, so timer runs were
   never gated and manual runs always were. The unit no longer passes the flag;
   `urd doctor` reports the installed unit as drifted until `urd init` re-seals
   it. The first run after upgrading records the current shapes and holds
   nothing. If the recorded shapes cannot be read, nothing is held, the run
   logs a warning, and no shapes are recorded, so the next readable run still
-  sees the tightening.
+  sees the tightening. Under `monthly = "unlimited"` the yearly count has no
+  effect, so changing it no longer counts as a tightening.
+- A named protection level (`recorded`, `sheltered`, `fortified`) with
+  `run_frequency = "sentinel"` now derives daily snapshot and send intervals,
+  the same as the nightly timer, instead of 1–4 hours. The sentinel does not
+  trigger backups; only the nightly timer does, so the sub-daily intervals
+  could never be met and such subvolumes read AT RISK most of each day. The
+  first-run runestone now says backups run nightly in sentinel mode, with the
+  sentinel keeping watch between runs. Subvolumes with explicit `custom`
+  intervals are unchanged.
 - `urd emergency --json` now reports a serialization failure as an
   `{"error": …}` object like every other daemon surface, instead of an empty
   string.
 - The sentinel is no longer described as retrying notifications the backup
   run could not dispatch; it re-derives them from its own baseline. Log and
   heartbeat wording now say so. No schema change.
+
+### Removed
+- The sweep that deleted leftover `.urd-emergency-reserve` files at the end of
+  each backup. The reserve layer was removed in 0.27.1 and every run since has
+  swept; a file that somehow remains holds no data and can be deleted by hand.
 
 ### Fixed
 - A destination snapshot that already carries the name about to be sent is no
@@ -55,14 +72,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `urd drives list`, `urd plan --verbose` and the run summary align their
   colored status columns on a terminal; the color codes were counted as width.
 - `urd get` no longer panics on an unknown subvolume in its production path.
-- A named protection level (`recorded`, `sheltered`, `fortified`) with
-  `run_frequency = "sentinel"` now derives daily snapshot and send intervals,
-  the same as the nightly timer, instead of 1–4 hours. The sentinel does not
-  trigger backups; only the nightly timer does, so the sub-daily intervals
-  could never be met and such subvolumes read AT RISK most of each day. The
-  first-run runestone now says backups run nightly in sentinel mode, with the
-  sentinel keeping watch between runs. Subvolumes with explicit `custom`
-  intervals are unchanged.
+- When the check for an existing subvolume fails for a reason other than
+  "not found" (a sudo refusal, a missing binary), Urd now logs a warning naming
+  the path. It still treats the subvolume as absent, as before.
 
 ## [0.38.0] - 2026-09-29
 
