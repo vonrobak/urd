@@ -26,6 +26,9 @@ impl Interval {
         Self(chrono::Duration::minutes(n))
     }
 
+    /// Constructed only by tests; production intervals come from `FromStr`
+    /// (`derive_policy` names no sub-daily literal — see its Cadence note).
+    #[cfg(test)]
     #[must_use]
     pub fn hours(n: i64) -> Self {
         Self(chrono::Duration::hours(n))
@@ -383,7 +386,9 @@ impl fmt::Display for ProtectionLevel {
 // ── RunFrequency ────────────────────────────────────────────────────────
 
 /// How often Urd runs — determines derived snapshot/send intervals.
-/// `Timer` = systemd timer at a fixed interval. `Sentinel` = sub-hourly daemon.
+/// `Timer` = systemd timer at a fixed interval. `Sentinel` = the nightly timer
+/// plus the sentinel watch daemon; the sentinel does not trigger backups, so
+/// Sentinel mode derives the nightly timer's cadence (see `derive_policy`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunFrequency {
     Timer { interval: Interval },
@@ -497,53 +502,45 @@ pub fn derive_policy(level: ProtectionLevel, freq: RunFrequency) -> Option<Deriv
         yearly: 0,
     };
 
-    match (level, freq) {
-        // ── Timer mode ──────────────────────────────────────────────
-        (ProtectionLevel::Recorded, RunFrequency::Timer { interval }) => Some(DerivedPolicy {
-            snapshot_interval: interval,
-            send_interval: interval,
-            send_enabled: false,
-            local_retention: recorded_retention,
-            external_retention: recorded_external_retention,
-            min_external_drives: 0,
-        }),
-        (ProtectionLevel::Sheltered, RunFrequency::Timer { interval }) => Some(DerivedPolicy {
-            snapshot_interval: interval,
-            send_interval: interval,
-            send_enabled: true,
-            local_retention: full_retention,
-            external_retention: full_external_retention,
-            min_external_drives: 1,
-        }),
-        (ProtectionLevel::Fortified, RunFrequency::Timer { interval }) => Some(DerivedPolicy {
-            snapshot_interval: interval,
-            send_interval: interval,
-            send_enabled: true,
-            local_retention: full_retention,
-            external_retention: full_external_retention,
-            min_external_drives: 2,
-        }),
+    // ── Cadence ─────────────────────────────────────────────────────
+    // The timer is the trigger; the intervals are the filter (ADR-103). A
+    // named level's intervals are the cadence of whatever actually triggers
+    // runs, so the derived promise stays achievable (ADR-110 achievability).
+    //
+    // Sentinel mode derives the nightly timer's cadence: the sentinel
+    // watches, assesses, notifies and ejects, but does not trigger backups —
+    // its active-mode trigger machinery was deleted as dormant pending a
+    // re-grilled design (#406). The nightly `urd-backup.timer` is the only
+    // trigger in either mode, so a sub-daily interval here would be a promise
+    // nothing fulfils and awareness would read AT RISK most of every day.
+    // Sentinel mode still selects the sentinel service unit
+    // (`systemd_units::expected_units`); only the cadence is the timer's,
+    // until an active mode exists.
+    let interval = match freq {
+        RunFrequency::Timer { interval } => interval,
+        RunFrequency::Sentinel => Interval::days(1),
+    };
 
-        // ── Sentinel mode ───────────────────────────────────────────
-        (ProtectionLevel::Recorded, RunFrequency::Sentinel) => Some(DerivedPolicy {
-            snapshot_interval: Interval::hours(4),
-            send_interval: Interval::hours(4),
+    match level {
+        ProtectionLevel::Recorded => Some(DerivedPolicy {
+            snapshot_interval: interval,
+            send_interval: interval,
             send_enabled: false,
             local_retention: recorded_retention,
             external_retention: recorded_external_retention,
             min_external_drives: 0,
         }),
-        (ProtectionLevel::Sheltered, RunFrequency::Sentinel) => Some(DerivedPolicy {
-            snapshot_interval: Interval::hours(1),
-            send_interval: Interval::hours(4),
+        ProtectionLevel::Sheltered => Some(DerivedPolicy {
+            snapshot_interval: interval,
+            send_interval: interval,
             send_enabled: true,
             local_retention: full_retention,
             external_retention: full_external_retention,
             min_external_drives: 1,
         }),
-        (ProtectionLevel::Fortified, RunFrequency::Sentinel) => Some(DerivedPolicy {
-            snapshot_interval: Interval::hours(1),
-            send_interval: Interval::hours(2),
+        ProtectionLevel::Fortified => Some(DerivedPolicy {
+            snapshot_interval: interval,
+            send_interval: interval,
             send_enabled: true,
             local_retention: full_retention,
             external_retention: full_external_retention,
@@ -551,7 +548,7 @@ pub fn derive_policy(level: ProtectionLevel, freq: RunFrequency) -> Option<Deriv
         }),
 
         // Custom handled above with early return
-        (ProtectionLevel::Custom, _) => unreachable!(),
+        ProtectionLevel::Custom => unreachable!(),
     }
 }
 
@@ -2044,21 +2041,46 @@ mod tests {
 
     #[test]
     fn derive_policy_sentinel_variants() {
+        // The sentinel does not trigger backups (#406); the nightly timer is
+        // the only trigger, so Sentinel mode derives daily intervals.
         let recorded = derive_policy(ProtectionLevel::Recorded, RunFrequency::Sentinel).unwrap();
-        assert_eq!(recorded.snapshot_interval, Interval::hours(4));
+        assert_eq!(recorded.snapshot_interval, Interval::days(1));
         assert!(!recorded.send_enabled);
+        assert_eq!(recorded.min_external_drives, 0);
 
         let sheltered =
             derive_policy(ProtectionLevel::Sheltered, RunFrequency::Sentinel).unwrap();
-        assert_eq!(sheltered.snapshot_interval, Interval::hours(1));
-        assert_eq!(sheltered.send_interval, Interval::hours(4));
+        assert_eq!(sheltered.snapshot_interval, Interval::days(1));
+        assert_eq!(sheltered.send_interval, Interval::days(1));
         assert!(sheltered.send_enabled);
+        assert_eq!(sheltered.min_external_drives, 1);
 
         let fortified =
             derive_policy(ProtectionLevel::Fortified, RunFrequency::Sentinel).unwrap();
-        assert_eq!(fortified.snapshot_interval, Interval::hours(1));
-        assert_eq!(fortified.send_interval, Interval::hours(2));
+        assert_eq!(fortified.snapshot_interval, Interval::days(1));
+        assert_eq!(fortified.send_interval, Interval::days(1));
         assert_eq!(fortified.min_external_drives, 2);
+    }
+
+    #[test]
+    fn derive_policy_sentinel_mode_derives_nightly_timer_cadence() {
+        // Invariant (ADR-110 achievability): Sentinel mode promises nothing
+        // the nightly timer cannot fulfil — for every named level it derives
+        // the same policy as the daily timer, intervals included.
+        let nightly = RunFrequency::Timer {
+            interval: Interval::days(1),
+        };
+        for level in [
+            ProtectionLevel::Recorded,
+            ProtectionLevel::Sheltered,
+            ProtectionLevel::Fortified,
+        ] {
+            let sentinel = derive_policy(level, RunFrequency::Sentinel).unwrap();
+            let timer = derive_policy(level, nightly).unwrap();
+            assert_eq!(sentinel.snapshot_interval, timer.snapshot_interval, "{level}");
+            assert_eq!(sentinel.send_interval, timer.send_interval, "{level}");
+            assert_eq!(sentinel, timer, "{level}");
+        }
     }
 
     #[test]

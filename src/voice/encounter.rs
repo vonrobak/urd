@@ -366,8 +366,11 @@ fn render_runestone(view: &RunestoneView) -> String {
 
     let cadence = match view.run_frequency {
         RunFrequency::Timer { .. } => "Backups run nightly, around 04:00.",
+        // The sentinel never snapshots (#406) — same truth as
+        // `describe_next_action`: the nightly timer acts, the sentinel watches.
         RunFrequency::Sentinel => {
-            "The sentinel watches continuously — snapshots follow your changes through the day."
+            "Backups run nightly, around 04:00; between runs the sentinel keeps watch \
+             and speaks when a promise weakens."
         }
     };
     writeln!(out, "\n  {cadence}").ok();
@@ -1392,7 +1395,10 @@ mod tests {
         };
         let out = render_prompt(&spec);
         assert!(out.contains("sentinel"), "{out}");
-        assert!(!out.contains("04:00"), "{out}");
+        // The nightly timer is the only trigger in sentinel mode (#406):
+        // the runestone names it and never promises sub-daily snapshots.
+        assert!(out.contains("04:00"), "{out}");
+        assert!(!out.contains("through the day"), "{out}");
     }
 
     #[test]

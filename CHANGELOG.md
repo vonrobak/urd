@@ -33,6 +33,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `urd drives list`, `urd plan --verbose` and the run summary align their
   colored status columns on a terminal; the color codes were counted as width.
 - `urd get` no longer panics on an unknown subvolume in its production path.
+- A named protection level (`recorded`, `sheltered`, `fortified`) with
+  `run_frequency = "sentinel"` now derives daily snapshot and send intervals,
+  the same as the nightly timer, instead of 1–4 hours. The sentinel does not
+  trigger backups; only the nightly timer does, so the sub-daily intervals
+  could never be met and such subvolumes read AT RISK most of each day. The
+  first-run runestone now says backups run nightly in sentinel mode, with the
+  sentinel keeping watch between runs. Subvolumes with explicit `custom`
+  intervals are unchanged.
 
 ## [0.38.0] - 2026-09-29
 
