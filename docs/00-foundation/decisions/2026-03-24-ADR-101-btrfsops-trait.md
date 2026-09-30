@@ -6,7 +6,7 @@ project: ['[[urd]]']
 sensitivity: public
 status: active
 created: '2026-03-24'
-timestamp: '2026-09-04T15:03:12+02:00'
+timestamp: '2026-09-30T12:00:00+02:00'
 ---
 # ADR-101: BtrfsOps Trait as Sole Btrfs Interface
 
@@ -17,7 +17,7 @@ timestamp: '2026-09-04T15:03:12+02:00'
 > root privileges.
 
 **Date:** 2026-03-22 (formalized 2026-03-24)
-**Status:** Accepted (amended 2026-09-04 — see [Amendment 2026-09-04](#amendment-2026-09-04-the-trait-pair-and-the-precise-subprocess-boundary))
+**Status:** Accepted (amended 2026-09-04 — see [Amendment 2026-09-04](#amendment-2026-09-04-the-trait-pair-and-the-precise-subprocess-boundary); amended 2026-09-30 — see [Amendment 2026-09-30](#amendment-2026-09-30-the-subprocess-census-after-probesrs))
 **Supersedes:** None (founding decision)
 
 ## Context
@@ -166,3 +166,54 @@ No script enforces the boundary by grep today; it is upheld by review. Adding on
 considered and declined — a grep gate over `Command::new` would have to encode the
 seal-and-probe exemptions, and a lint that must be taught its own exceptions is weaker
 evidence than the audit above.
+
+## Amendment 2026-09-30: the subprocess census after `probes.rs`
+
+The invariant from the 2026-09-04 amendment is unchanged: **no module other than
+`btrfs.rs` invokes the btrfs binary to do work.** The census that supported it has
+changed shape, because the read-only system probes now live in one module and every
+privileged btrfs call is built in one place.
+
+### The census
+
+`grep -rn "Command::new" src/` finds 28 sites, 25 of them outside test code:
+
+| Where | Production sites | Test sites | What |
+|---|---|---|---|
+| `btrfs.rs` | 4 | 1 | `btrfs_command`, the one builder for `LC_ALL=C sudo -n <btrfs_path> …` that every run-to-completion call goes through (`run_btrfs`); the `send` and `receive` children of the two-process pipeline; the unprivileged `btrfs send --help` capability probe (`SystemBtrfs::probe`). The test site is the `sudo -n true` availability gate |
+| `commands/seal.rs` | 11 | 2 | The sudoers earning (ADR-120): `visudo -c -f` on the unprivileged temp file; `sudo install` / `cat` / `visudo -c -f` / `mv` / `rm` against the staged file; `sudo -k`; `sudo install -d` for snapshot roots; `probe_grant`; two `systemctl --user` calls. The test sites run `visudo` on fixtures |
+| `probes.rs` | 6 | 0 | `findmnt --target` (`findmnt_target`, `findmnt_locus`), `run_probe` (`lsblk -J`, `findmnt -t btrfs -J`), `loginctl show-user`, `sudo -n -l` (`sudo_privilege_listing`), `du -sb` |
+| `notify.rs` | 3 | 0 | `notify-send`, `curl` (webhook), the user's configured notify hook |
+| `commands/encounter.rs` | 1 | 0 | The user's `$VISUAL` / `$EDITOR` on the config file |
+
+`commands/doctor.rs`, `discovery.rs`, `pools.rs`, and `commands/calibrate.rs` spawn
+nothing themselves; they call `probes.rs`. The privileged non-btrfs surface is therefore
+`commands/seal.rs` plus `probes::sudo_privilege_listing`, which both the seal's
+`effective_coverage` and `urd doctor`'s drift rows read.
+
+**One production site invokes the btrfs binary outside `btrfs.rs`, deliberately, as
+before:** `seal.rs::probe_grant` runs `LC_ALL=C sudo -n <btrfs_path> filesystem show /`
+to classify whether the grant works. It touches no subvolume and reads nothing Urd acts
+on.
+
+### Two precisions
+
+- **`MockBtrfs` is `#[cfg(test)]`** (with `MockBtrfsCall`). The production binary
+  carries one implementation of the trait pair, `RealBtrfs`.
+- **The read-only guarantee is at the type the consumer holds, not the constructor.**
+  `RealBtrfs::for_reads` returns a full `RealBtrfs`, and `World` stores that value
+  (`commands/world.rs`). What cannot mutate is the `&dyn BtrfsRead` that
+  `World::observation` coerces it to and the planner and awareness receive. The
+  guarantee from the 2026-09-04 amendment holds for every pure consumer; a command
+  handler holding the `World` still owns the full handle.
+
+### `subvolume_exists` is a `bool` that logs its ambiguity
+
+`subvolume_exists` answers from `btrfs subvolume show`. The `bool` cannot say "don't
+know", so a sudo refusal or a spawn failure reads as absent, the same as a clean
+absence. `RealBtrfs::subvolume_exists` therefore logs a warning whenever the failure is
+not recognizably "not a subvolume" (`show_failure_means_absent`) or the process could
+not be spawned. Its one production caller, the executor's same-name crash-recovery check
+(`execute_send`, ADR-107), treats absence as the non-destructive answer: it only reaches
+its delete branch when the snapshot *exists*. A `Result` return is the fuller fix and would be a trait change under
+this ADR's Constraints.

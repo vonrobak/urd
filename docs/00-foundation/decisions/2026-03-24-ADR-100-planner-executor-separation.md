@@ -6,7 +6,7 @@ project: ['[[urd]]']
 sensitivity: public
 status: active
 created: '2026-03-24'
-timestamp: '2026-09-04T15:03:12+02:00'
+timestamp: '2026-09-30T12:00:00+02:00'
 ---
 # ADR-100: Planner/Executor Separation
 
@@ -17,7 +17,7 @@ timestamp: '2026-09-04T15:03:12+02:00'
 > that plagued the bash script.
 
 **Date:** 2026-03-22 (formalized 2026-03-24)
-**Status:** Accepted (amended 2026-09-04 — see [Amendment 2026-09-04](#amendment-2026-09-04-planner-surface-and-the-post-plan-stamp))
+**Status:** Accepted (amended 2026-09-04 — see [Amendment 2026-09-04](#amendment-2026-09-04-planner-surface-and-the-post-plan-stamp); amended 2026-09-30 — see [Amendment 2026-09-30](#amendment-2026-09-30-the-pure-planner-sanctioned-executor-paths-and-the-lock))
 **Supersedes:** None (founding decision from project inception)
 
 ## Context
@@ -157,3 +157,112 @@ reverse.** A stamp that could narrow permission would be the command layer decid
 worst, at the planner's own conservative default. No other field of any
 `PlannedOperation` may be set after `plan()`. A second such stamp would need its own
 amendment here and the same widening-only argument.
+
+## Amendment 2026-09-30: the pure planner, sanctioned executor paths, and the lock
+
+The separation is unchanged. This amendment brings three names from the 2026-09-04
+amendment up to date, replaces the second post-plan removal it named, and states two
+facts the original Constraints section left false: which executor paths run without a
+plan, and when the run lock is taken.
+
+### Planner surface
+
+- **Planner output types** live in `src/plan/types.rs` and are re-exported from `plan`:
+  `BackupPlan`, `PlannedOperation`, `PlannedSkip`,
+  `PlannedLifecycle`, `DeleteKind`. A skip carries a typed `SkipReason`, one variant per
+  reason shape with its data (the unmounted drive, the caught-up drive). Its `Display` is
+  the reason prose and is an ADR-105 contract (`urd plan --json`'s `skipped[].reason`);
+  consumers classify with a total `match`, and nothing parses the prose back.
+- **`Observation`** lives in `src/observation/` (`mod.rs` holds the `FilesystemQuery` and
+  `HistoryQuery` traits and the bundle). The production adapter, `RealFileSystemState`,
+  is `observation/real.rs` — the I/O half of the read boundary, constructed by the
+  command layer, the sentinel runner, and the executor, and no longer part of `plan/`.
+  The send-size estimator the planner's space gate uses is `observation/estimate.rs`,
+  pure over `HistoryQuery`.
+- **`RunArming`** lives in `src/arming.rs`, not `commands/storage_signals.rs`. It is
+  resolved by a pure function the command layer calls:
+  `RunArming::resolve(&signals.pools, &config, &fs_state)` in `commands/backup/mod.rs`
+  and `commands/plan_cmd.rs`. The command layer gathers the `PoolSignal`s
+  (`storage_signals::gather`: `findmnt`, `statvfs`, SQLite); `arming.rs` only fans the
+  resolved tiers out and composes the away-shed pin view. The once-per-run,
+  never-re-resolve rule is unchanged.
+- **`scripts/check-purity-boundary.sh`** now holds `plan/` (with the other pure modules,
+  ADR-108) to the no-I/O, no-wall-clock rule in CI, so the Decision's "it never calls
+  btrfs, writes files, … or performs I/O" is checked mechanically rather than by review.
+
+### Post-plan stamps today
+
+The removal `filter_promise_retention` performed is gone. It dropped every retention
+deletion for every promise-level subvolume on any run without
+`--confirm-retention-change`, whether or not retention had changed. Its replacement is
+the retention-change gate (ADR-110's amendment of this date): `retention::decide_retention_gate`
+decides, from the recorded retention shapes, which subvolumes' retention *tightened*;
+`retention::apply_retention_gate` removes only those subvolumes' retention deletions.
+Both are pure. The removal rule from the 2026-09-04 amendment still holds: the gate only
+shrinks the plan.
+
+The command layer's post-plan mutations are now:
+
+| Mutation | Where | Kind |
+|---|---|---|
+| `apply_retention_gate` | `commands/backup/mod.rs`, re-applied to the emergency re-plan | Removal |
+| `apply_token_gating` | `commands/backup/gating.rs`, under the lock | Removal, plus the `token_verified` widening stamp |
+
+**Preview parity.** `urd plan` and `urd backup --dry-run` apply the same retention-gate
+decision to the plan they print (`plan_cmd::gate_preview`, read-only: a preview never
+records a shape), so "`urd plan` gives the user a preview of exactly what `urd backup`
+will do" holds again for retention. Token gating is reported, not applied, in a preview:
+`plan_cmd::populate_token_warnings` names a drive whose identity token is missing or
+mismatched and says its sends are blocked, while the operation list still shows those
+sends. The token probe reads the drive and the state DB, and `apply_token_gating` runs
+after the lock is taken, which a preview never takes.
+
+### Executor paths that run without a plan
+
+"No module may bypass the plan to execute btrfs operations directly" is narrowed to
+this: **every btrfs mutation outside a plan goes through a named `Executor` method that
+re-checks pins at delete time**, except one interactive path.
+
+- **`Executor::emergency_reclaim_pool`** (`src/executor/reclaim.rs`) — the pool reclaim
+  after a mid-send watchdog abort (ADR-113 Layer 2, `commands/backup/mod.rs` and
+  `commands/backup/watchdog.rs`) and after an idle eject (Layer 3,
+  `sentinel_runner/eject.rs`). It sheds pins by design, so its re-check is the
+  fail-closed ordering in `shed_and_delete_unpinned`: strict pin read, never-the-only-copy
+  gate, drop the chosen pins, strict re-read, delete only what is now unpinned.
+- **`Executor::delete_candidates`** (`src/executor/reclaim.rs`) — the single deletion
+  loop behind the backup's emergency pre-flight (`commands/backup/preflight.rs`) and
+  `urd emergency` (`commands/emergency.rs`). Both choose candidates through
+  `commands::emergency::emergency_walk`; the loop runs the ADR-106 Layer-3 check
+  (`chain::is_pinned_at_delete_time`) immediately before each delete.
+- **`commands/init.rs`'s incomplete-snapshot cleanup** (`handle_incomplete_deletions`)
+  still calls `BtrfsOps::delete_subvolume` directly. It offers each drive's newest
+  destination snapshot that the pin does not name as a possible partial, and deletes it
+  only after an explicit per-snapshot `y` at the terminal. It is the one remaining direct
+  call: the operator is the decider, and the delete is on the destination, where the
+  local pin re-check does not apply. Routing it through the executor with ADR-107's
+  `Received UUID` proof is the open item.
+
+These paths exist because their trigger is not "time for a backup": host survival
+(ADR-113) and explicit operator action. They make no decision the planner could have
+made at plan time.
+
+### The run lock
+
+`urd backup` takes an **exclusive**, non-blocking `flock` (`lock::acquire_lock`) on
+`<state_db>.lock` **after** planning, arming, and the retention-gate decision, and before
+the emergency pre-flight, the re-plan, token gating, and execution
+(`commands/backup/mod.rs`). Everything before the lock is reads; everything after it can
+delete. A held lock fails the run and names the holder from the JSON metadata written
+after acquisition (PID, start time, trigger). `--dry-run` returns before the lock.
+
+The sentinel's idle eject uses `lock::try_acquire_lock` with trigger `"sentinel-eject"`
+(`sentinel_runner/eject.rs`): a held lock means a backup is running, and the eject
+defers to that run's own watchdog rather than waiting or failing. `acquire_lock`'s branch
+for a holder whose trigger is `"sentinel"` is unreachable, because nothing writes that
+trigger since the sentinel stopped triggering backups (ADR-110's amendment of this date).
+
+### Numbers
+
+"216 tests at time of writing" in Consequences was a snapshot and is retired. The claim
+that stands is qualitative: the planner, the executor (through `MockBtrfs`), and every
+pure module are tested without root, btrfs, or a real pool.

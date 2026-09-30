@@ -6,7 +6,7 @@ project: ['[[urd]]']
 sensitivity: public
 status: active
 created: '2026-03-24'
-timestamp: '2026-09-29T23:30:00+02:00'
+timestamp: '2026-09-30T12:00:00+02:00'
 ---
 # ADR-105: Backward Compatibility Contracts
 
@@ -15,13 +15,14 @@ timestamp: '2026-09-29T23:30:00+02:00'
 > monitoring) depend on them. Urd reads both legacy and current formats but only writes
 > the current format. Breaking these contracts requires a migration plan and an ADR.
 >
-> Amended 2026-09-04 and 2026-09-29 — see the amendments of those dates below.
+> Amended 2026-09-04, 2026-09-29 and 2026-09-30 — see the amendments of those dates below.
 
 **Date:** 2026-03-22 (formalized 2026-03-24)
 **Status:** Accepted (amended 2026-05-15, `monthly = 0` migration; 2026-05-15, UPI 043
 pool metrics + heartbeat v4; 2026-09-04, code-drift audit — metric inventory moved out,
 Contract 5 added; 2026-09-29, retirement criterion, unlabeled pin retired; 2026-09-29,
-deferred subvolumes in the success metrics)
+deferred subvolumes in the success metrics; 2026-09-30 — see
+[Amendment 2026-09-30](#amendment-2026-09-30-contract-5-owners-and-the-reserve-sweep))
 **Supersedes:** None (founding decision)
 
 ## Context
@@ -500,3 +501,55 @@ advanced by the defect; the staleness window therefore starts, at worst, from th
 subvolume with no previous timestamp and no successful send has no timestamp series, as
 before; `backup_snapshot_count{location="external"}` and `backup_external_expected` cover
 that case.
+
+## Amendment 2026-09-30: Contract 5 owners, and the reserve sweep
+
+Two corrections to the Contract 5 table and one exception to the retirement criterion's
+third clause.
+
+### `sentinel-state.json` has a named version constant
+
+The Contract 5 row for `sentinel-state.json` says its version is "written as a literal
+at the `SentinelStateFile` construction site in `src/sentinel_runner.rs`", with the struct
+in `src/output.rs`. Both have moved, and the literal is gone:
+
+| Surface | Version source | Field reference |
+|---------|----------------|-----------------|
+| `sentinel-state.json` | `SENTINEL_STATE_SCHEMA_VERSION` in `src/sentinel.rs` | the `SentinelStateFile` struct in `src/sentinel.rs` |
+
+The runner writes it from `src/sentinel_runner/state_file.rs` (`write_state_file`), and
+the pure restore of mount tracking at startup (`sentinel.rs`) trusts only a file whose
+`schema_version` equals the constant. `crate::output` re-exports both names. The bump
+policy is unchanged: the file bumps on every added field.
+
+### A field can be typed without joining the contract
+
+`SkippedSubvolume` (`src/output.rs`), the `skipped[]` element of `urd plan --json`,
+carries a `drive: Option<String>` so renderers read an unmounted drive's label as data
+rather than parsing it out of `reason`. The field is `#[serde(skip)]`. It is in-process
+data, not part of the JSON shape, and adding it changed nothing a consumer sees. That is
+how a machine-surface struct gains a field its renderers need without a version bump:
+by not serializing it. The `reason` prose it stands beside stays a contract, and the
+planner's `SkipReason` `Display` is what produces it (ADR-100's amendment of this date).
+
+### The one legacy artifact Urd deletes: `.urd-emergency-reserve`
+
+Criterion 3 of the 2026-09-29 amendment says Urd does not delete a legacy artifact
+itself; removing one is the operator's act. One sweep does delete one.
+`sweep_orphaned_reserves` (`src/commands/backup/reserve.rs`) unlinks
+`.urd-emergency-reserve` from every send-enabled pool's snapshot root at the end of each
+backup run, best-effort and silent (`debug` logging only).
+
+It is an exception, not a violation, because the reserve file is outside what this ADR
+governs. It is not a data format any contract names, and it holds no data. It was a
+`fallocate`'d block of zeroes that Urd itself created as disposable headroom (ADR-113's
+retired reserve layer) and that Urd itself once deleted on demand. Criterion 3 protects
+artifacts that may name or hold something an operator cares about. A pin file, for
+example, may be the only record of which snapshot is a chain parent. An empty reserve is
+only space that the code which would free it no longer exists to free. Leaving it for the
+operator would strand the space on every pool that ever held one.
+
+The sweep is declared one-release scaffolding in its own doc comment. The reserve layer
+was removed in 0.27.1, so the sweep has outlived that declaration. Removing the sweep
+and `RESERVE_FILENAME` needs no amendment. Until then, this is the only path by which Urd
+deletes an artifact it no longer writes.
