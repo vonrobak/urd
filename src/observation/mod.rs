@@ -11,7 +11,8 @@
 //! advice depend on them and nothing else. The production adapter that
 //! implements them — [`RealFileSystemState`], plus the snapshot-directory
 //! reader [`read_snapshot_dir`] — lives in the `real` submodule and is the
-//! only I/O in this module.
+//! only I/O in this module. The `estimate` submodule is a pure consumer of
+//! [`HistoryQuery`]: the send-size estimator the planner and awareness share.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -22,6 +23,7 @@ use crate::config::DriveConfig;
 use crate::drives::DriveAvailability;
 use crate::types::{DriveEvent, SendKind, SnapshotName};
 
+pub mod estimate;
 mod real;
 
 pub use real::RealFileSystemState;

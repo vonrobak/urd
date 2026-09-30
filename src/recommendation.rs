@@ -24,14 +24,18 @@ use serde::Serialize;
 use crate::drift::ChurnEstimate;
 use crate::types::ResolvedGraduatedRetention;
 
+// The free-ratio primitives belong to storage state (`storage_critical.rs`);
+// this module consumes them. Re-exported so `crate::recommendation::
+// HeadroomSeverity` / `classify_free_ratio_value` paths keep resolving.
+pub use crate::storage_critical::{HeadroomSeverity, classify_free_ratio_value};
+
 // ── UPI 044 thresholds (ADR-115 amendment 2026-05-16) ─────────────────
 // N=1-calibrated from the 2026-05-09 retention-tuning report. Soft —
 // post-UPI-044 30-day checkpoint revises (ADR amendment, not new ADR).
 // Boundaries are strict (`<` / `>`): exact-threshold values land in the
-// lower tier (e.g., free_ratio == 0.25 → Healthy).
+// lower tier (e.g., free_ratio == 0.25 → Healthy). The free-ratio pair
+// (`FREE_RATIO_CAUTION` / `FREE_RATIO_PRESSURE`) lives in `storage_critical.rs`.
 
-pub const FREE_RATIO_CAUTION: f64 = 0.25;
-pub const FREE_RATIO_PRESSURE: f64 = 0.15;
 const TIME_TO_EMPTY_CAUTION_DAYS: f64 = 90.0;
 const TIME_TO_EMPTY_PRESSURE_DAYS: f64 = 30.0;
 const METADATA_CAUTION: f64 = 0.85;
@@ -51,23 +55,6 @@ pub struct HeadroomContext {
     pub source_pool_capacity_bytes: Option<u64>,
     pub source_pool_trend_bytes_per_day: Option<i64>,
     pub destination_metadata_ratio: Option<f64>,
-}
-
-/// Per-(subvolume, role) headroom severity (UPI 044). Ordering is
-/// load-bearing: `.iter().max()` yields the dominant tier when multiple
-/// signals fire.
-///
-/// UPI 031 retired the doctor-side Critical *injection*; UPI 031-b's
-/// tier-graded ephemeral spine confirmed the behavioral bundle keys on
-/// `TightnessTier`, not this severity ladder, so the dormant `Critical`
-/// variant (and its dead voice/recommendation paths) were deleted (AB5).
-/// `classify_headroom_severity` emits only `Healthy | Caution | Pressure`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum HeadroomSeverity {
-    Healthy,
-    Caution,
-    Pressure,
 }
 
 /// Compute the headroom severity from a `HeadroomContext`. Returns
@@ -109,26 +96,6 @@ pub fn classify_free_ratio(free: Option<u64>, capacity: Option<u64>) -> Headroom
     #[allow(clippy::cast_precision_loss)]
     let ratio = free as f64 / capacity as f64;
     classify_free_ratio_value(ratio)
-}
-
-/// Classify a pre-computed free-ratio by free-ratio alone. Boundaries are
-/// strict (`<`): exact-threshold values land in the lower (roomier) tier
-/// (e.g. `0.25` → `Healthy`). Non-finite ratios fail toward `Healthy`.
-///
-/// Shared with `storage_critical::resolve_armed_tier` (UPI 031-a) so the
-/// tightness-tier boundaries have a single source of truth.
-#[must_use]
-pub fn classify_free_ratio_value(ratio: f64) -> HeadroomSeverity {
-    if !ratio.is_finite() {
-        return HeadroomSeverity::Healthy;
-    }
-    if ratio < FREE_RATIO_PRESSURE {
-        HeadroomSeverity::Pressure
-    } else if ratio < FREE_RATIO_CAUTION {
-        HeadroomSeverity::Caution
-    } else {
-        HeadroomSeverity::Healthy
-    }
 }
 
 fn classify_time_to_empty(free: Option<u64>, trend: Option<i64>) -> HeadroomSeverity {

@@ -35,7 +35,7 @@ flowchart LR
     subgraph pure["Pure functions (no I/O)"]
         direction TB
         plan["plan/<br/>decide operations"]
-        awareness["awareness.rs<br/>compute promise states"]
+        awareness["awareness/<br/>compute promise states"]
         advice["advice.rs<br/>assessment → advice"]
         retention["retention.rs<br/>which snapshots to drop"]
         recommendation["recommendation.rs<br/>retention-shape advice"]
@@ -95,6 +95,7 @@ flowchart LR
     drift --> awareness
     db --> drift
     storagecrit --> awareness
+    storagecrit --> recommendation
     awareness --> advice
     awareness --> recommendation
     advice --> output
@@ -149,10 +150,12 @@ ADR in parentheses is the canonical statement (full list of invariants in
    knowing the data may be incomplete. The read-side split lives in
    `observation/`: `FilesystemQuery` for the filesystem-of-truth surface,
    `HistoryQuery` for the SQLite-history surface, and `RealFileSystemState`
-   (`observation/real.rs`), the production adapter implementing both.
+   (`observation/real.rs`), the production adapter implementing both;
+   `observation/estimate.rs` is the pure send-size estimator over `HistoryQuery`
+   that the planner and awareness share.
 
 The ring of pure observers feeds the surfaces without ever touching btrfs.
-`awareness.rs` answers "is my data safe?"; `advice.rs` answers "what should I do?";
+`awareness/` answers "is my data safe?"; `advice.rs` answers "what should I do?";
 `recommendation.rs` answers "what retention shape fits my headroom?"; `drift.rs`
 aggregates churn for the Do-No-Harm arc (ADR-113); `storage_critical.rs` derives
 storage-state tiers for the same arc; `preflight.rs` issues advisories for
@@ -174,16 +177,16 @@ the documentation convention in `contributing-internal.md`).
 | `config/` | Parse TOML (legacy/v1/v2 parsers behind one version dispatch), validate, expand paths, resolve subvolumes | Touch filesystem beyond path checks |
 | `cli.rs` | Define the `clap` command surface (argument parsing) | Contain command logic (`commands/` does that) |
 | `cli_validation.rs` | CLI-boundary guards: resolve a user string to a known config name before the planner, or refuse with help | Run core logic; let unvalidated input reach the planner |
-| `types.rs` | Domain types, parsing, `Display`, `derive_policy()`, `validate_protection_contract()` (the ADR-110 opacity contract) | Contain business logic |
+| `types.rs` | Domain types (including the `PromiseStatus` vocabulary awareness computes and rotation, events, and surfaces speak), parsing, `Display`, `derive_policy()`, `validate_protection_contract()` (the ADR-110 opacity contract) | Contain business logic |
 | `plan/` | Decide what operations to run (pure function; regions with typed interfaces — `*Inputs` in, `PlanFragment` out — one module per lifecycle path, local/transient/send/external, composed by `plan()` into a single fragment); stamps each subvolume's lifecycle judgment (`PlannedLifecycle`: is_transient, clear_all, shed_away_drives) onto `BackupPlan.lifecycles` for the executor to read back; reads the world only through `Observation` and takes `now` and `RunArming` as arguments | Execute anything or call btrfs; perform I/O or read the wall clock (the adapter is `observation/real.rs`; `scripts/check-purity-boundary.sh` enforces this for every pure module) |
 | `executor.rs` | Execute planned operations, isolate errors per subvolume; build each `SubvolumeContext` from the plan's `PlannedLifecycle` (no tier/away-shed setters — the planner is the sole `derive_effective_policy` caller); host the gated clear-all and the `emergency_reclaim_pool` never-the-only-copy reclaim that both the watchdog abort (ADR-113 Layer 2) and the idle eject (Layer 3) reuse | Decide what to do (the planner's job); re-derive a lifecycle the plan already carries |
 | `btrfs.rs` | Wrap `sudo btrfs` calls via `BtrfsOps`; read-only reads via the `BtrfsRead` supertrait (`BtrfsOps: BtrfsRead`) | Know about retention, plans, config |
-| `observation/` | Define read-side query traits on the ADR-102 axis: `FilesystemQuery` (filesystem of truth) + `HistoryQuery` (SQLite history), bundled as `Observation` (`mod.rs`); host the production adapter (`real.rs`): `RealFileSystemState` — snapshot directories via `read_snapshot_dir`, drive availability, pool space, pin files, and best-effort SQLite history reads whose errors degrade to "no history" and are logged (ADR-102) — plus the drift-sample composition command paths read | Decide anything; perform I/O outside `real.rs` (the traits are what pure modules depend on; the command layer, sentinel runner, and executor construct the adapter and hand it in) |
+| `observation/` | Define read-side query traits on the ADR-102 axis: `FilesystemQuery` (filesystem of truth) + `HistoryQuery` (SQLite history), bundled as `Observation` (`mod.rs`); host the production adapter (`real.rs`): `RealFileSystemState` — snapshot directories via `read_snapshot_dir`, drive availability, pool space, pin files, and best-effort SQLite history reads whose errors degrade to "no history" and are logged (ADR-102) — plus the drift-sample composition command paths read; the pure send-size estimator over `HistoryQuery` (`estimate.rs`), shared by the planner and awareness | Decide anything; perform I/O outside `real.rs` (the traits are what pure modules depend on; the command layer, sentinel runner, and executor construct the adapter and hand it in) |
 | `retention.rs` | Compute which snapshots to keep/delete (pure) | Delete anything (returns lists) |
-| `awareness.rs` | Pure: observe promise state (PROTECTED / AT RISK / UNPROTECTED) — the "is my data safe right now?" surface | Perform I/O; translate to advice (`advice.rs`) or recommend shapes (`recommendation.rs`) |
-| `advice.rs` | Pure: compose the assessment view (`assess_view` = raw assess + every product overlay — the only input surfaces render promise state from, clippy-guarded); translate an assessment into actionable advice (issue/command/reason) and redundancy advisories — the "what should the user do?" surface; the volatile product layer | Perform I/O; assess promise state (delegates to `awareness.rs`); gather signals |
-| `recommendation.rs` | Pure: headroom-aware retention-shape recommendations and cost projections (ADR-115) | Perform I/O; assess promise state; mutate config; run in the backup hot path |
-| `storage_critical.rs` | Pure: storage-state detection for the Do-No-Harm arc (ADR-113) — tightness tier, host-root flag, hysteresis tier resolution, per-subvolume posture, effective-policy derivation; `effective_send_interval` extracts the tier-adapted interval alone, shared by `derive_effective_policy` (planner) and awareness's read-path judgment | Perform I/O (the command layer resolves the signals at the boundary) |
+| `awareness/` | Pure: observe promise state (PROTECTED / AT RISK / UNPROTECTED) — the "is my data safe right now?" surface. `assess()` and the re-exports in `mod.rs`; the assessment types, including the `RedundancyAdvisory` values advice attaches (`types.rs`); freshness judgment and its thresholds (`freshness.rs`); chain health (`chain.rs`); operational health and the drive-absence cascade (`health.rs`); promise snapshots, change detection, rollup, and transition events (`transitions.rs`) | Perform I/O; translate to advice (`advice.rs`) or recommend shapes (`recommendation.rs`) |
+| `advice.rs` | Pure: compose the assessment view (`assess_view` = raw assess + every product overlay — the only input surfaces render promise state from, clippy-guarded); translate an assessment into actionable advice (issue/command/reason) and redundancy advisories — the "what should the user do?" surface; the volatile product layer | Perform I/O; assess promise state (delegates to `awareness/`); gather signals |
+| `recommendation.rs` | Pure: headroom-aware retention-shape recommendations and cost projections (ADR-115); composes `HeadroomSeverity` from the free-ratio primitives `storage_critical.rs` owns plus time-to-empty and metadata signals | Perform I/O; assess promise state; mutate config; run in the backup hot path |
+| `storage_critical.rs` | Pure: storage-state detection for the Do-No-Harm arc (ADR-113) — the free-ratio classification primitives (`FREE_RATIO_*`, `HeadroomSeverity`, `classify_free_ratio_value`), tightness tier, host-root flag, hysteresis tier resolution, the per-subvolume `ResolvedStorageSignal` / `StorageSignalMap` fed to `assess()`, per-subvolume posture, effective-policy derivation; `effective_send_interval` extracts the tier-adapted interval alone, shared by `derive_effective_policy` (planner) and awareness's read-path judgment | Perform I/O (the command layer resolves the signals at the boundary) |
 | `arming.rs` | Pure: the run's storage arming (ADR-113 Layer 1) — `RunArming` (per-subvolume armed tier map, per-pool `ResolvedPoolTier` rows for the writeback, the away-sheddable pin view) resolved once per run, pre-lock, by `RunArming::resolve` from the gathered `PoolSignal`s, `Config`, and a `FilesystemQuery`; owns `drive_scopes`, the presence predicate the planner and the away-shed view share | Perform I/O (`commands/storage_signals.rs` gathers the signals); re-resolve mid-run; derive tiers (`storage_critical.rs` does) |
 | `guard.rs` | Pure do-no-harm decision cores: the mid-op watchdog (ADR-113 Layer 2) `evaluate(free_bytes, floor_bytes) -> WatchdogAction` (floor-only), and the idle emergency-eject (Layer 3) `evaluate_idle_eject(samples) -> pools below the floor`, over the shared `source_floor_bytes` floor both layers compute | Perform I/O; poll (the watchdog thread in `commands/backup.rs` and the sentinel runner sample and act) |
 | `chain.rs` | Track incremental chain parents (pin files) | Send snapshots |

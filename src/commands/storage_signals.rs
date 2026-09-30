@@ -24,12 +24,13 @@ use std::path::{Path, PathBuf};
 
 use chrono::NaiveDateTime;
 
-use crate::awareness::{PromiseStatus, ResolvedStorageSignal, StorageSignalMap, SubvolAssessment};
+use crate::awareness::SubvolAssessment;
 use crate::config::Config;
 use crate::output::{AdaptationSummary, PoolPostureSummary};
 use crate::pools::{self, PoolSpace};
 use crate::state::StateDb;
-use crate::storage_critical::{self, TightnessTier};
+use crate::storage_critical::{self, ResolvedStorageSignal, StorageSignalMap, TightnessTier};
+use crate::types::PromiseStatus;
 
 // The run's arming (`RunArming`, its `resolve`, and the per-pool rows it is
 // built from) is pure and lives in `crate::arming`; re-exported here so

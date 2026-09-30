@@ -14,7 +14,7 @@
 use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
 
-use crate::awareness::PromiseStatus;
+use crate::types::PromiseStatus;
 use crate::sentinel::CircuitState;
 use crate::state::DriveEventSource;
 use crate::types::{FullSendReason, SendKind};

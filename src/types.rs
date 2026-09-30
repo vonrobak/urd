@@ -383,6 +383,66 @@ impl fmt::Display for ProtectionLevel {
     }
 }
 
+// ── PromiseStatus ───────────────────────────────────────────────────────
+// Vocabulary, not judgment: awareness computes it, and rotation, events, and
+// every surface speak it. Re-exported as `crate::awareness::PromiseStatus`.
+
+/// Promise status for a subvolume or assessment dimension.
+/// Ordered worst-to-best so `min()` yields the worst status.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+pub enum PromiseStatus {
+    // Serialized form is SCREAMING on every surface, matching `Display` and the
+    // glossary's "SCREAMING on every machine surface, including NDJSON" rule
+    // (UPI 053, ADR-114 amendment 2026-05-29). The lower-case `alias` reads
+    // legacy `snake_case` rows written before the unification — events are
+    // append-only, so those rows live indefinitely; the alias is permanent.
+    // Variant order is worst-to-best so `min()`/`<` yields the worst status —
+    // do not reorder.
+    #[serde(rename = "UNPROTECTED", alias = "unprotected")]
+    Unprotected,
+    #[serde(rename = "AT RISK", alias = "at_risk")]
+    AtRisk,
+    #[serde(rename = "PROTECTED", alias = "protected")]
+    Protected,
+}
+
+impl PromiseStatus {
+    /// Did the promise worsen relative to `prev`?
+    ///
+    /// The single home of the `to < from` direction test (UPI 088-a) —
+    /// every degradation/recovery decision delegates here. Rides the
+    /// enum's worst-to-best `Ord`; the "do not reorder" contract above
+    /// is what makes this comparison meaningful.
+    #[must_use]
+    pub fn worsened_from(self, prev: Self) -> bool {
+        self < prev
+    }
+
+    /// Prometheus metric value for `backup_promise_state`: 0=protected,
+    /// 1=at_risk, 2=unprotected. The encoding is part of the `backup_*`
+    /// contract (`docs/20-reference/metrics.md`) — do not renumber.
+    #[must_use]
+    pub fn metric_value(self) -> u8 {
+        match self {
+            Self::Protected => 0,
+            Self::AtRisk => 1,
+            Self::Unprotected => 2,
+        }
+    }
+}
+
+impl std::fmt::Display for PromiseStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unprotected => write!(f, "UNPROTECTED"),
+            Self::AtRisk => write!(f, "AT RISK"),
+            Self::Protected => write!(f, "PROTECTED"),
+        }
+    }
+}
+
 // ── RunFrequency ────────────────────────────────────────────────────────
 
 /// How often Urd runs — determines derived snapshot/send intervals.
@@ -2738,5 +2798,105 @@ weekly = 4
             ..contract_view(ProtectionLevel::Custom)
         };
         assert!(opacity_violations(&view).is_empty());
+    }
+
+    // ── PromiseStatus::worsened_from (UPI 088-a) ────────────────────
+    // Moved from notify.rs (`is_degradation_follows_ord`) when the
+    // direction test got its single home next to the Ord it rides.
+
+    #[test]
+    fn worsened_from_follows_ord() {
+        // Worsening (to < from) is a degradation; improving is not.
+        assert!(PromiseStatus::AtRisk.worsened_from(PromiseStatus::Protected));
+        assert!(PromiseStatus::Unprotected.worsened_from(PromiseStatus::AtRisk));
+        assert!(!PromiseStatus::Protected.worsened_from(PromiseStatus::AtRisk));
+        assert!(!PromiseStatus::Protected.worsened_from(PromiseStatus::Protected));
+    }
+
+    // ── PromiseStatus::metric_value (backup_promise_state, issue #337) ──
+
+    #[test]
+    fn metric_value_matches_contract_encoding() {
+        assert_eq!(PromiseStatus::Protected.metric_value(), 0);
+        assert_eq!(PromiseStatus::AtRisk.metric_value(), 1);
+        assert_eq!(PromiseStatus::Unprotected.metric_value(), 2);
+    }
+
+    // ── PromiseStatus ordering ─────────────────────────────────────
+
+    #[test]
+    fn promise_status_ordering() {
+        assert!(PromiseStatus::Unprotected < PromiseStatus::AtRisk);
+        assert!(PromiseStatus::AtRisk < PromiseStatus::Protected);
+        assert_eq!(
+            PromiseStatus::Protected.min(PromiseStatus::AtRisk),
+            PromiseStatus::AtRisk
+        );
+        assert_eq!(
+            PromiseStatus::AtRisk.min(PromiseStatus::Unprotected),
+            PromiseStatus::Unprotected
+        );
+    }
+
+    #[test]
+    fn promise_status_max_for_best_drive() {
+        assert_eq!(
+            PromiseStatus::Unprotected.max(PromiseStatus::Protected),
+            PromiseStatus::Protected
+        );
+        assert_eq!(
+            PromiseStatus::AtRisk.max(PromiseStatus::Protected),
+            PromiseStatus::Protected
+        );
+    }
+
+    #[test]
+    fn promise_status_display() {
+        assert_eq!(PromiseStatus::Protected.to_string(), "PROTECTED");
+        assert_eq!(PromiseStatus::AtRisk.to_string(), "AT RISK");
+        assert_eq!(PromiseStatus::Unprotected.to_string(), "UNPROTECTED");
+    }
+
+    #[test]
+    fn promise_status_serializes_screaming() {
+        // Serialized form must match `Display` (SCREAMING) on every wire surface
+        // (UPI 053). This is the write-form byte-identity guarantee.
+        assert_eq!(
+            serde_json::to_string(&PromiseStatus::Protected).unwrap(),
+            "\"PROTECTED\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PromiseStatus::AtRisk).unwrap(),
+            "\"AT RISK\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PromiseStatus::Unprotected).unwrap(),
+            "\"UNPROTECTED\""
+        );
+    }
+
+    #[test]
+    fn promise_status_deserializes_screaming_and_legacy_alias() {
+        // Both the current SCREAMING form and the legacy snake_case alias must
+        // decode to the same variant — the permanent back-compat contract for
+        // append-only event rows (ADR-114 amendment 2026-05-29).
+        for json in ["\"PROTECTED\"", "\"protected\""] {
+            assert_eq!(
+                serde_json::from_str::<PromiseStatus>(json).unwrap(),
+                PromiseStatus::Protected
+            );
+        }
+        for json in ["\"AT RISK\"", "\"at_risk\""] {
+            assert_eq!(
+                serde_json::from_str::<PromiseStatus>(json).unwrap(),
+                PromiseStatus::AtRisk
+            );
+        }
+        for json in ["\"UNPROTECTED\"", "\"unprotected\""] {
+            assert_eq!(
+                serde_json::from_str::<PromiseStatus>(json).unwrap(),
+                PromiseStatus::Unprotected
+            );
+        }
     }
 }

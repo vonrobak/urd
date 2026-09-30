@@ -41,7 +41,7 @@ These properties are guaranteed and load-bearing for downstream consumers
    `backup_success`'s mapping (`0=failure / 1=success / 2=schedule-skipped /
    3=deferred`; `3` added by the ADR-105 amendment of 2026-09-29),
    and `backup_promise_state`'s mapping (`0=protected / 1=at_risk /
-   2=unprotected`, `PromiseStatus::metric_value` in `src/awareness.rs`) are
+   2=unprotected`, `PromiseStatus::metric_value` in `src/types.rs`) are
    part of the contract. A consumer that filters on `backup_send_type == 2`
    to suppress alerts on cold subvolumes will silently break if the encoding shifts.
 3. **`backup_script_last_run_timestamp` is the heartbeat.** Updated on every

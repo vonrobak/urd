@@ -16,8 +16,7 @@
 
 use chrono::{Duration, NaiveDateTime};
 
-use crate::awareness::PromiseStatus;
-use crate::types::{DriveEvent, DriveEventKind, Interval};
+use crate::types::{DriveEvent, DriveEventKind, Interval, PromiseStatus};
 
 // ── Constants ──────────────────────────────────────────────────────────
 

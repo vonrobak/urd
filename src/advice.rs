@@ -9,15 +9,20 @@
 //! module turns observations into prescriptions.
 
 use chrono::{Duration, NaiveDateTime};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::awareness::{
-    ChainStatus, DriveAssessment, DriveChainHealth, OperationalHealth, PromiseStatus,
-    StorageSignalMap, SubvolAssessment,
+    ChainStatus, DriveAssessment, DriveChainHealth, OperationalHealth, SubvolAssessment,
 };
 use crate::config::Config;
 use crate::observation::Observation;
-use crate::types::{DriveRole, ProtectionLevel};
+use crate::storage_critical::StorageSignalMap;
+use crate::types::{DriveRole, PromiseStatus, ProtectionLevel};
+
+// The redundancy advisory types live beside `SubvolAssessment`, which carries
+// them (`awareness/types.rs`); this module computes them. Re-exported so
+// `crate::advice::RedundancyAdvisory{,Kind}` paths keep resolving.
+pub use crate::awareness::{RedundancyAdvisory, RedundancyAdvisoryKind};
 
 // ── Actionable Advice ─────────────────────────────────────────────────
 
@@ -364,34 +369,6 @@ fn stale_issue(assessment: &SubvolAssessment, external_only: bool) -> AdviceIssu
             age_secs: issue_age_secs(assessment, external_only),
         },
     )
-}
-
-// ── Redundancy advisories ──────────────────────────────────────────────
-
-/// Redundancy advisory kind, ordered worst-first so `min()` yields most severe.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RedundancyAdvisoryKind {
-    /// All drives are local for a resilient subvolume — no offsite protection.
-    NoOffsiteProtection,
-    /// Offsite drive not seen in > threshold days.
-    OffsiteDriveStale,
-    /// Single external drive for a protected/resilient subvolume.
-    SinglePointOfFailure,
-    /// Informational: transient subvolume with all drives unmounted.
-    TransientNoLocalRecovery,
-}
-
-/// A structured redundancy advisory produced by `compute_redundancy_advisories()`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct RedundancyAdvisory {
-    pub kind: RedundancyAdvisoryKind,
-    pub subvolume: String,
-    /// Affected drive label (for offsite-stale and single-point advisories).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub drive: Option<String>,
-    /// Human-readable detail for voice rendering.
-    pub detail: String,
 }
 
 // ── Assessment view ────────────────────────────────────────────────────
