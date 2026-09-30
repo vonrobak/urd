@@ -1044,6 +1044,23 @@ impl<'a> Executor<'a> {
         coord.lock().map(|g| g.tripped.contains(&root)).unwrap_or(false)
     }
 
+    /// Write the pin a successful send carries, if any. Returns `pin_failed`:
+    /// true when the write failed (logged, not fatal — the send still counts).
+    /// Shared by a fresh send and crash recovery's completed-but-unpinned case.
+    fn write_pin_on_success(
+        pin_on_success: Option<&(PathBuf, SnapshotName)>,
+        drive_label: &str,
+    ) -> bool {
+        if let Some((pin_path, pin_name)) = pin_on_success
+            && let Some(pin_dir) = pin_path.parent()
+            && let Err(e) = chain::write_pin_file(pin_dir, drive_label, pin_name)
+        {
+            log::warn!("Send succeeded but pin file write failed for {drive_label}: {e}");
+            return true;
+        }
+        false
+    }
+
     /// Returns (outcome, pin_failed) where pin_failed is true if send succeeded
     /// but pin file write failed.
     #[allow(clippy::too_many_arguments)]
@@ -1114,34 +1131,120 @@ impl<'a> Executor<'a> {
             }
         }
 
-        // Crash recovery: check if snapshot already exists at destination
+        // Crash recovery: check if snapshot already exists at destination.
+        // Deleting it requires proof it is partial (ADR-107 amendment): absence
+        // from the pin is not evidence — a send that completed and then failed
+        // to write its pin looks identical. Same proof as the sweep below: an
+        // absent `Received UUID` means the receive never finalized. Every
+        // uncertainty (unreadable pin, failed query) leaves it in place.
         if let Some(snap_name) = snapshot.file_name() {
             let dest_snap = dest_dir.join(snap_name);
             if self.btrfs.subvolume_exists(&dest_snap) {
-                // Check if pin references this snapshot — if so, it's already done
+                // Check if pin references this snapshot — if so, it's already done.
+                // An unreadable pin may name it, so it refuses the delete (#430).
                 if let Some((pin_path, _)) = pin_on_success
                     && let Some(pin_dir) = pin_path.parent()
-                    && let Ok(Some(pinned)) = chain::read_pin_file(pin_dir, drive_label)
-                    && pinned.as_str() == snap_name.to_string_lossy()
                 {
-                    log::info!(
-                        "Snapshot {} already exists at dest and is pinned, skipping send",
-                        snap_name.to_string_lossy()
-                    );
-                    return (
-                        outcome_success(
-                            op_name,
-                            Some(drive_label.to_string()),
-                            None,
-                            start.elapsed(),
-                        ),
-                        false,
-                    );
+                    match chain::read_pin_file(pin_dir, drive_label) {
+                        Ok(Some(pinned)) if pinned.as_str() == snap_name.to_string_lossy() => {
+                            log::info!(
+                                "Snapshot {} already exists at dest and is pinned, skipping send",
+                                snap_name.to_string_lossy()
+                            );
+                            return (
+                                outcome_success(
+                                    op_name,
+                                    Some(drive_label.to_string()),
+                                    None,
+                                    start.elapsed(),
+                                ),
+                                false,
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            log::warn!(
+                                "Crash recovery: failed to read pin file for {drive_label}: {e} \
+                                 — leaving existing snapshot at {} (fail closed)",
+                                dest_snap.display()
+                            );
+                            return (
+                                OperationOutcome {
+                                    operation: op_name.to_string(),
+                                    drive_label: Some(drive_label.to_string()),
+                                    result: OpResult::Failure,
+                                    duration: start.elapsed(),
+                                    error: Some(format!(
+                                        "pin file for {drive_label} could not be read: {e} \
+                                         — existing destination snapshot at {} left in place \
+                                         (fail closed, ADR-107)",
+                                        dest_snap.display()
+                                    )),
+                                    bytes_transferred: None,
+                                    btrfs_operation: None,
+                                    btrfs_stderr: None,
+                                },
+                                false,
+                            );
+                        }
+                    }
                 }
 
-                // Not pinned — delete as partial from interrupted run
+                // Not pinned — ask the destination whether the receive finalized.
+                match self.btrfs.received_uuid(&dest_snap) {
+                    Ok(Some(_)) => {
+                        // A complete backup whose pin write never happened (crash
+                        // between receive and pin). Never delete it; finish the
+                        // send's bookkeeping the way a fresh success would.
+                        log::info!(
+                            "Snapshot {} already exists at dest with a Received UUID \
+                             — a completed send whose pin write did not happen; \
+                             pinning it, skipping send",
+                            dest_snap.display()
+                        );
+                        let pin_failed = Self::write_pin_on_success(pin_on_success, drive_label);
+                        return (
+                            outcome_success(
+                                op_name,
+                                Some(drive_label.to_string()),
+                                None,
+                                start.elapsed(),
+                            ),
+                            pin_failed,
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        log::warn!(
+                            "Crash recovery: received_uuid query failed for {}: {e} \
+                             — leaving it (fail closed)",
+                            dest_snap.display()
+                        );
+                        return (
+                            OperationOutcome {
+                                operation: op_name.to_string(),
+                                drive_label: Some(drive_label.to_string()),
+                                result: OpResult::Failure,
+                                duration: start.elapsed(),
+                                error: Some(format!(
+                                    "completeness of existing destination snapshot at {} \
+                                     could not be determined: {e} — left in place \
+                                     (fail closed, ADR-107)",
+                                    dest_snap.display()
+                                )),
+                                bytes_transferred: None,
+                                btrfs_operation: None,
+                                btrfs_stderr: None,
+                            },
+                            false,
+                        );
+                    }
+                }
+
+                // No Received UUID — the receive never finalized: provably partial.
                 log::warn!(
-                    "Deleting partial snapshot at {} from interrupted prior run",
+                    "Deleting partial snapshot at {} from interrupted prior run \
+                     (no Received UUID — the receive never finalized)",
                     dest_snap.display()
                 );
                 if let Err(e) = self.btrfs.delete_subvolume(&dest_snap) {
@@ -1257,14 +1360,7 @@ impl<'a> Executor<'a> {
         match send_result {
             Ok(result) => {
                 // Pin-on-success
-                let mut pin_failed = false;
-                if let Some((pin_path, pin_name)) = pin_on_success
-                    && let Some(pin_dir) = pin_path.parent()
-                    && let Err(e) = chain::write_pin_file(pin_dir, drive_label, pin_name)
-                {
-                    log::warn!("Send succeeded but pin file write failed for {drive_label}: {e}");
-                    pin_failed = true;
-                }
+                let pin_failed = Self::write_pin_on_success(pin_on_success, drive_label);
 
                 // Token-on-success: write drive session token if not already present.
                 // Same pattern as pin-on-success: failure is logged, not fatal.
@@ -3151,6 +3247,8 @@ source = "/data/b"
         mock.existing_subvolumes
             .borrow_mut()
             .insert(dest_snap.clone());
+        // Never finalized by a receive — the proof deletion requires (ADR-107).
+        mock.received_uuids.borrow_mut().insert(dest_snap.clone(), None);
 
         let config = test_config();
         let shutdown = no_shutdown();
@@ -3363,6 +3461,165 @@ source = "/data/b"
 
         assert_eq!(result.overall, RunResult::Success);
         assert!(delete_calls_of(&mock).is_empty());
+    }
+
+    // ── Same-name crash recovery: Received-UUID proof (ADR-107) ─────────
+    //
+    // `sweep_fixture`'s send is `20260611-1430-sv-a`; listing that name in
+    // `dest_entries` and in `existing_subvolumes` puts a same-named snapshot at
+    // the destination. The sweep skips the current name, so every delete or
+    // refusal seen here is the crash-recovery check's.
+
+    const SAME_NAME: &str = "20260611-1430-sv-a";
+
+    fn same_name_pin_path(fx: &SweepFixture) -> PathBuf {
+        fx.dest_dir
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("local/sv-a/.last-external-parent-TEST-DRIVE")
+    }
+
+    fn same_name_mock(fx: &SweepFixture) -> (MockBtrfs, PathBuf) {
+        let mock = MockBtrfs::new();
+        let dest_snap = fx.dest_dir.join(SAME_NAME);
+        mock.existing_subvolumes
+            .borrow_mut()
+            .insert(dest_snap.clone());
+        (mock, dest_snap)
+    }
+
+    #[test]
+    fn same_name_unreadable_pin_fails_closed() {
+        let fx = sweep_fixture(None, &[SAME_NAME]);
+        // Malformed pin content: read_pin_file reports Err (#420 shape).
+        let pin_path = same_name_pin_path(&fx);
+        std::fs::write(&pin_path, "not-a-snapshot-name\n").unwrap();
+        let (mock, dest_snap) = same_name_mock(&fx);
+        // Even a provable partial is left: the pin read gates first.
+        mock.received_uuids.borrow_mut().insert(dest_snap, None);
+
+        let config = test_config();
+        let shutdown = no_shutdown();
+        let executor = Executor::new(&mock, None, &config, &shutdown);
+        let result = executor.execute(&fx.plan, "full");
+
+        let op = &result.subvolume_results[0].operations[0];
+        assert_eq!(op.result, OpResult::Failure);
+        let err = op.error.as_deref().unwrap();
+        assert!(err.contains("pin file for TEST-DRIVE could not be read"), "{err}");
+        assert!(err.contains("left in place"), "{err}");
+        assert!(mock.calls().is_empty(), "no delete, no send: {:?}", mock.calls());
+        assert_eq!(
+            std::fs::read_to_string(&pin_path).unwrap(),
+            "not-a-snapshot-name\n"
+        );
+    }
+
+    #[test]
+    fn same_name_pinned_is_done() {
+        let fx = sweep_fixture(Some(SAME_NAME), &[SAME_NAME]);
+        // No received_uuid configured: consulting it would error (fail closed)
+        // and turn this into a Failure — the pinned arm must not ask.
+        let (mock, _) = same_name_mock(&fx);
+
+        let config = test_config();
+        let shutdown = no_shutdown();
+        let executor = Executor::new(&mock, None, &config, &shutdown);
+        let result = executor.execute(&fx.plan, "full");
+
+        assert_eq!(result.overall, RunResult::Success);
+        assert_eq!(
+            result.subvolume_results[0].operations[0].result,
+            OpResult::Success
+        );
+        assert!(mock.calls().is_empty(), "no delete, no send: {:?}", mock.calls());
+    }
+
+    #[test]
+    fn same_name_with_received_uuid_is_kept_and_pinned() {
+        let fx = sweep_fixture(
+            Some("20260609-0400-sv-a"),
+            &["20260609-0400-sv-a", SAME_NAME],
+        );
+        let (mock, dest_snap) = same_name_mock(&fx);
+        // The receive finalized; the crash hit between receive and pin write.
+        mock.received_uuids.borrow_mut().insert(
+            dest_snap,
+            Some("9c8b7a6d-aaaa-bbbb-cccc-def012345678".to_string()),
+        );
+
+        let config = test_config();
+        let shutdown = no_shutdown();
+        let executor = Executor::new(&mock, None, &config, &shutdown);
+        let result = executor.execute(&fx.plan, "full");
+
+        assert_eq!(result.overall, RunResult::Success);
+        let sv = &result.subvolume_results[0];
+        assert_eq!(sv.operations[0].result, OpResult::Success);
+        assert_eq!(sv.pin_failures, 0);
+        assert!(mock.calls().is_empty(), "no delete, no send: {:?}", mock.calls());
+        // Pinned the way a fresh successful send would.
+        assert_eq!(
+            std::fs::read_to_string(same_name_pin_path(&fx)).unwrap(),
+            format!("{SAME_NAME}\n")
+        );
+    }
+
+    #[test]
+    fn same_name_without_received_uuid_is_deleted_and_resent() {
+        let fx = sweep_fixture(
+            Some("20260609-0400-sv-a"),
+            &["20260609-0400-sv-a", SAME_NAME],
+        );
+        let (mock, dest_snap) = same_name_mock(&fx);
+        // Never finalized by a receive — provably partial.
+        mock.received_uuids
+            .borrow_mut()
+            .insert(dest_snap.clone(), None);
+
+        let config = test_config();
+        let shutdown = no_shutdown();
+        let executor = Executor::new(&mock, None, &config, &shutdown);
+        let result = executor.execute(&fx.plan, "full");
+
+        assert_eq!(result.overall, RunResult::Success);
+        assert_eq!(delete_calls_of(&mock), vec![dest_snap.clone()]);
+        let calls = mock.calls();
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert!(matches!(&calls[0], MockBtrfsCall::DeleteSubvolume { path } if path == &dest_snap));
+        assert!(matches!(&calls[1], MockBtrfsCall::SendReceive { .. }));
+        assert_eq!(
+            std::fs::read_to_string(same_name_pin_path(&fx)).unwrap(),
+            format!("{SAME_NAME}\n")
+        );
+    }
+
+    #[test]
+    fn same_name_received_uuid_query_error_fails_closed() {
+        let fx = sweep_fixture(
+            Some("20260609-0400-sv-a"),
+            &["20260609-0400-sv-a", SAME_NAME],
+        );
+        let (mock, dest_snap) = same_name_mock(&fx);
+        mock.fail_received_uuids.borrow_mut().insert(dest_snap);
+
+        let config = test_config();
+        let shutdown = no_shutdown();
+        let executor = Executor::new(&mock, None, &config, &shutdown);
+        let result = executor.execute(&fx.plan, "full");
+
+        let op = &result.subvolume_results[0].operations[0];
+        assert_eq!(op.result, OpResult::Failure);
+        let err = op.error.as_deref().unwrap();
+        assert!(err.contains("could not be determined"), "{err}");
+        assert!(mock.calls().is_empty(), "no delete, no send: {:?}", mock.calls());
+        // Pin untouched.
+        assert_eq!(
+            std::fs::read_to_string(same_name_pin_path(&fx)).unwrap(),
+            "20260609-0400-sv-a\n"
+        );
     }
 
     #[test]
