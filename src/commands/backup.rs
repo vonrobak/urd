@@ -4086,53 +4086,6 @@ source = "/data/beta"
         assert!(summary.subvolumes[0].sends.is_empty());
     }
 
-    // ── Sentinel detection tests ────────────────────────────────────
-
-    #[test]
-    fn sentinel_is_running_no_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = config_with_state_db(dir.path());
-        assert!(!crate::sentinel_runner::sentinel_is_running(&config));
-    }
-
-    #[test]
-    fn sentinel_is_running_stale_pid() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = config_with_state_db(dir.path());
-        let state_path = crate::sentinel_runner::sentinel_state_path(&config);
-        write_sentinel_state_file(&state_path, 99_999_999);
-        assert!(!crate::sentinel_runner::sentinel_is_running(&config));
-    }
-
-    #[test]
-    fn sentinel_is_running_live_pid() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = config_with_state_db(dir.path());
-        let state_path = crate::sentinel_runner::sentinel_state_path(&config);
-        write_sentinel_state_file(&state_path, std::process::id());
-        assert!(crate::sentinel_runner::sentinel_is_running(&config));
-    }
-
-    fn write_sentinel_state_file(path: &std::path::Path, pid: u32) {
-        let state = crate::output::SentinelStateFile {
-            schema_version: 2,
-            pid,
-            started: "2026-03-29T10:00:00".to_string(),
-            last_assessment: None,
-            mounted_drives: vec![],
-            tick_interval_secs: 120,
-            promise_states: vec![],
-            circuit_breaker: crate::output::SentinelCircuitState {
-                state: "closed".to_string(),
-                failure_count: 0,
-            },
-            visual_state: None,
-            advisory_summary: None,
-        };
-        let content = serde_json::to_string_pretty(&state).unwrap();
-        std::fs::write(path, content).unwrap();
-    }
-
     // ── Progress display tests ─────────────────────────────────────
 
     #[test]

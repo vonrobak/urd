@@ -15,6 +15,7 @@ mod v1;
 mod v2;
 mod validate;
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -370,6 +371,19 @@ impl Config {
             .collect();
         resolved.sort_by_key(|sv| sv.priority);
         resolved
+    }
+
+    /// The set of send-enabled subvolume names (`enabled` AND `send_enabled`) —
+    /// the subvolumes with an ephemeral lifecycle / a watchdog and idle-eject
+    /// scope. One accessor so the predicate cannot drift between the backup's
+    /// arming walk and the sentinel's eject sampling.
+    #[must_use]
+    pub(crate) fn send_enabled_names(&self) -> HashSet<String> {
+        self.resolved_subvolumes()
+            .into_iter()
+            .filter(|sv| sv.enabled && sv.send_enabled)
+            .map(|sv| sv.name)
+            .collect()
     }
 
     pub(crate) fn expand_paths(&mut self) {

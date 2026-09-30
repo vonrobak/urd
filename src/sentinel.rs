@@ -323,6 +323,60 @@ pub fn should_record_transitions(
     has_initial_assessment && trigger.is_some() && !backup_active
 }
 
+/// Pick the originating `TransitionTrigger` for promise-transition events
+/// emitted during this cycle. Returns `None` when `BackupCompleted` fired
+/// without an explicit trigger event — the backup itself emitted promise
+/// transitions with `trigger=Run` and the sentinel must not duplicate them.
+///
+/// `BackupCompleted` suppresses a coalesced routine Tick too (UPI 063): the
+/// run's pid is already dead when the completion is detected, so the
+/// backup-lock probe cannot see this window — a Tick landing in the same
+/// poll cycle would diff against the pre-run baseline and re-record the
+/// run's transitions. The baseline refresh absorbs the post-run state
+/// instead.
+///
+/// Precedence (when multiple events fire in the same cycle): an explicit
+/// trigger event (DriveMounted, ConfigChanged) wins over everything — a
+/// drive event coalesced with a completion is a real external change and
+/// keeps its trigger.
+#[must_use]
+pub fn pick_transition_trigger(
+    events: &[SentinelEvent],
+) -> Option<crate::events::TransitionTrigger> {
+    let mut saw_tick = false;
+    let mut saw_backup_completed = false;
+    for event in events {
+        match event {
+            SentinelEvent::DriveMounted { .. } => {
+                return Some(crate::events::TransitionTrigger::DriveMounted);
+            }
+            SentinelEvent::ConfigChanged => {
+                return Some(crate::events::TransitionTrigger::ConfigChanged);
+            }
+            SentinelEvent::AssessmentTick => saw_tick = true,
+            SentinelEvent::BackupCompleted => saw_backup_completed = true,
+            // DriveUnmounted, Shutdown — no diff trigger.
+            _ => {}
+        }
+    }
+    (saw_tick && !saw_backup_completed).then_some(crate::events::TransitionTrigger::Tick)
+}
+
+// ── Drive reconnection suppression ─────────────────────────────────────
+
+/// Absences shorter than this produce no reconnection notification — a
+/// brief unplug/replug is not news.
+pub const MIN_ABSENT_MINUTES: i64 = 60;
+
+/// Is an absence of `absent_minutes` long enough to announce the drive's
+/// reconnection? The runner computes the absence from the drive token's
+/// `last_verified` stamp; when that stamp is missing it has no absence to
+/// speak of and does not ask.
+#[must_use]
+pub fn reconnection_worth_notifying(absent_minutes: i64) -> bool {
+    absent_minutes >= MIN_ABSENT_MINUTES
+}
+
 // ── Snapshot extractors ───────────────────────────────────────────────
 // (`snapshot_promises` moved to awareness.rs with `PromiseSnapshot`,
 // UPI 088-a — the health twin below stays: `HealthSnapshot` is
@@ -2441,5 +2495,104 @@ mod tests {
             ts(NOW),
         );
         assert_eq!(v.inferred_unmounts[0].at, ts(NOW));
+    }
+
+    // ── pick_transition_trigger tests ──────────────────────────────
+
+    #[test]
+    fn trigger_drive_mounted_wins_over_tick() {
+        let events = vec![
+            SentinelEvent::AssessmentTick,
+            SentinelEvent::DriveMounted {
+                label: "WD-18TB".into(),
+            },
+        ];
+        assert_eq!(
+            pick_transition_trigger(&events),
+            Some(crate::events::TransitionTrigger::DriveMounted)
+        );
+    }
+
+    #[test]
+    fn trigger_config_changed_wins_over_tick() {
+        let events = vec![
+            SentinelEvent::AssessmentTick,
+            SentinelEvent::ConfigChanged,
+        ];
+        assert_eq!(
+            pick_transition_trigger(&events),
+            Some(crate::events::TransitionTrigger::ConfigChanged)
+        );
+    }
+
+    #[test]
+    fn trigger_tick_when_alone() {
+        let events = vec![SentinelEvent::AssessmentTick];
+        assert_eq!(
+            pick_transition_trigger(&events),
+            Some(crate::events::TransitionTrigger::Tick)
+        );
+    }
+
+    #[test]
+    fn trigger_none_for_backup_completed_only() {
+        // BackupCompleted by itself does not yield a trigger — the backup
+        // itself emitted the promise transitions with Run.
+        let events = vec![SentinelEvent::BackupCompleted];
+        assert_eq!(pick_transition_trigger(&events), None);
+    }
+
+    #[test]
+    fn trigger_none_for_drive_unmounted_alone() {
+        let events = vec![SentinelEvent::DriveUnmounted {
+            label: "WD-18TB".into(),
+        }];
+        assert_eq!(pick_transition_trigger(&events), None);
+    }
+
+    #[test]
+    fn trigger_backup_completed_suppresses_coalesced_tick() {
+        // UPI 063: a Tick in the same poll cycle as the completion would diff
+        // against the pre-run baseline and re-record the run's transitions —
+        // the run's pid is already dead, so the lock probe can't catch it.
+        // Order must not matter.
+        for events in [
+            vec![SentinelEvent::BackupCompleted, SentinelEvent::AssessmentTick],
+            vec![SentinelEvent::AssessmentTick, SentinelEvent::BackupCompleted],
+        ] {
+            assert_eq!(pick_transition_trigger(&events), None);
+        }
+    }
+
+    #[test]
+    fn trigger_explicit_events_survive_backup_completed() {
+        // A drive event coalesced with a completion is a real external change
+        // and keeps its trigger.
+        let events = vec![
+            SentinelEvent::BackupCompleted,
+            SentinelEvent::DriveMounted {
+                label: "WD-18TB".into(),
+            },
+        ];
+        assert_eq!(
+            pick_transition_trigger(&events),
+            Some(crate::events::TransitionTrigger::DriveMounted)
+        );
+
+        let events = vec![SentinelEvent::BackupCompleted, SentinelEvent::ConfigChanged];
+        assert_eq!(
+            pick_transition_trigger(&events),
+            Some(crate::events::TransitionTrigger::ConfigChanged)
+        );
+    }
+
+    // ── Drive reconnection suppression ─────────────────────────────
+
+    #[test]
+    fn reconnection_threshold_is_one_hour_inclusive() {
+        assert!(!reconnection_worth_notifying(0));
+        assert!(!reconnection_worth_notifying(MIN_ABSENT_MINUTES - 1));
+        assert!(reconnection_worth_notifying(MIN_ABSENT_MINUTES));
+        assert!(reconnection_worth_notifying(3 * 24 * 60));
     }
 }
