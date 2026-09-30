@@ -1032,8 +1032,11 @@ impl<'a> Executor<'a> {
 
     /// True if this subvolume's source pool is currently tripped by the watchdog
     /// (UPI 065-b). Backs the non-authoritative early group skip in `execute`; an
-    /// absent coordination cell, an unresolvable root, or a poisoned lock all read
-    /// `false` so the authoritative per-send gate in `execute_send` decides.
+    /// absent coordination cell or an unresolvable root reads `false` so the
+    /// authoritative per-send gate in `execute_send` decides. A poisoned lock is
+    /// recovered, not read as "not tripped": the trip set is a plain `HashSet` an
+    /// `insert` either completed or did not, and a trip is an ADR-113 safety signal
+    /// that must survive a panic on the watchdog thread (fail closed).
     fn pool_tripped(&self, subvol_name: &str) -> bool {
         let Some(coord) = &self.watchdog_coord else {
             return false;
@@ -1041,7 +1044,11 @@ impl<'a> Executor<'a> {
         let Some(root) = self.config.snapshot_root_for(subvol_name) else {
             return false;
         };
-        coord.lock().map(|g| g.tripped.contains(&root)).unwrap_or(false)
+        coord
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .tripped
+            .contains(&root)
     }
 
     /// Write the pin a successful send carries, if any. Returns `pin_failed`:
@@ -1314,15 +1321,15 @@ impl<'a> Executor<'a> {
         // once the watchdog can read this root it may set the cancel flag for a
         // same-fs trip, and that set must survive (not be clobbered by a later
         // reset). The lock makes the check+publish atomic with the watchdog's
-        // trip+read; a poisoned lock fails OPEN (proceeds), per the "backups fail
-        // open" invariant.
+        // trip+read. A poisoned lock is recovered, not skipped: skipping it would
+        // both ignore a recorded trip and leave the in-flight root unpublished, so
+        // the watchdog would misread this send as cross-filesystem (fail closed).
         if let Some(cancel) = &self.watchdog_cancel {
             cancel.store(false, Ordering::SeqCst);
         }
         let coord_root = self.config.snapshot_root_for(subvol_name);
-        if let (Some(coord), Some(root)) = (&self.watchdog_coord, &coord_root)
-            && let Ok(mut g) = coord.lock()
-        {
+        if let (Some(coord), Some(root)) = (&self.watchdog_coord, &coord_root) {
+            let mut g = coord.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if g.tripped.contains(root) {
                 log::warn!(
                     "Skipping {op_name} for {subvol_name}: source pool under watchdog pressure"
@@ -1350,11 +1357,11 @@ impl<'a> Executor<'a> {
         // but only if it is still *our* root — a later send may already have
         // published its own (sequential execution means it cannot, but the guard
         // keeps the invariant local and obvious).
-        if let (Some(coord), Some(root)) = (&self.watchdog_coord, &coord_root)
-            && let Ok(mut g) = coord.lock()
-            && g.in_flight.as_deref() == Some(root.as_path())
-        {
-            g.in_flight = None;
+        if let (Some(coord), Some(root)) = (&self.watchdog_coord, &coord_root) {
+            let mut g = coord.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if g.in_flight.as_deref() == Some(root.as_path()) {
+                g.in_flight = None;
+            }
         }
 
         match send_result {
@@ -2513,6 +2520,41 @@ source = "/data/b"
                 .iter()
                 .any(|c| matches!(c, MockBtrfsCall::SendReceive { .. })),
             "a tripped pool's send must be skipped, not sent"
+        );
+    }
+
+    #[test]
+    fn poisoned_watchdog_coord_still_reports_trip_and_gates_send() {
+        // A panic on the watchdog thread while it holds the coordination lock
+        // poisons it. The recorded trip must survive (fail closed, ADR-113): the
+        // former `.unwrap_or(false)` / `if let Ok(..)` read a poisoned lock as "not
+        // tripped" and sent to the tripped pool anyway.
+        let mock = MockBtrfs::new();
+        let config = test_config();
+        let shutdown = no_shutdown();
+        let mut executor = Executor::new(&mock, None, &config, &shutdown);
+        let coord = Arc::new(Mutex::new(WatchdogCoord {
+            in_flight: None,
+            tripped: [PathBuf::from("/nonexistent-urd/snap")].into_iter().collect(),
+        }));
+        let poisoner = coord.clone();
+        let _ = std::thread::spawn(move || {
+            let _g = poisoner.lock().unwrap();
+            panic!("poison the coordination lock");
+        })
+        .join();
+        assert!(coord.is_poisoned());
+        executor.set_watchdog_coord(coord);
+
+        assert!(executor.pool_tripped("sv-a"), "a poisoned lock must not hide the trip");
+
+        executor.execute(&send_full_plan_for_sv_a(), "full");
+        assert!(
+            !mock
+                .calls()
+                .iter()
+                .any(|c| matches!(c, MockBtrfsCall::SendReceive { .. })),
+            "a tripped pool's send must be skipped even behind a poisoned lock"
         );
     }
 

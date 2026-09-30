@@ -1006,9 +1006,12 @@ fn watchdog_loop(
                         config,
                         away_at_spawn,
                     );
-                    if let Ok(mut slot) = firing.lock() {
-                        slot.push(firing_record);
-                    }
+                    // Recover a poisoned slot (as `take_firings` does): dropping the
+                    // record would lose the trip's reclaim, event, and notification.
+                    firing
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(firing_record);
                     done.insert(pool.poll_path.clone());
                     // Keep polling: independence means an unrelated pool's pressure
                     // must still be caught after this one fired.
@@ -1028,9 +1031,10 @@ fn watchdog_loop(
 /// it marks every one of `pool.roots` tripped (gating that pool's new sends) and
 /// reads the executor's published `in_flight` root. Same lock the executor
 /// publishes/checks through ⇒ only two orderings exist, and neither both starts a
-/// send on this pool and concurrently reclaims it. A poisoned lock degrades to
-/// `None` → same-filesystem → abort: the recoverable error direction (a wrongful
-/// concurrent reclaim under a live send is not).
+/// send on this pool and concurrently reclaims it. A poisoned lock is recovered
+/// (`PoisonError::into_inner`), never skipped: the coordination cell is a plain set
+/// and option, and skipping would leave the pool untripped so the executor keeps
+/// sending to it — the ADR-113 gate failing open.
 #[must_use]
 fn handle_watchdog_trip(
     pool: &ArmedPool,
@@ -1040,14 +1044,12 @@ fn handle_watchdog_trip(
     config: &Config,
     away_at_spawn: &HashMap<String, Vec<String>>,
 ) -> WatchdogFiring {
-    let in_flight = match coord.lock() {
-        Ok(mut g) => {
-            for r in &pool.roots {
-                g.tripped.insert(r.clone());
-            }
-            g.in_flight.clone()
+    let in_flight = {
+        let mut g = coord.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        for r in &pool.roots {
+            g.tripped.insert(r.clone());
         }
-        Err(_) => None,
+        g.in_flight.clone()
     };
     // Membership, NOT path-equality (C1): a UUID-pool can span several snapshot
     // roots, so the in-flight root must be tested against the pool's *whole*
@@ -3009,6 +3011,34 @@ source = "/data/beta"
         let g = coord.lock().unwrap();
         assert!(g.tripped.contains(&poll), "this pool's roots are gated");
         assert!(!g.tripped.contains(&foreign), "the in-flight (foreign) pool is NEVER gated");
+    }
+
+    #[test]
+    fn trip_on_poisoned_coord_still_gates_the_pool() {
+        // A panic on another thread while holding the coordination lock poisons it.
+        // The trip must still be recorded (fail closed): an `Err(_) => None` here
+        // left the pool out of `tripped`, so the executor kept sending to it.
+        let dir = tempfile::TempDir::new().unwrap();
+        let poll = dir.path().to_path_buf();
+        let pool = test_armed_pool(poll.clone(), vec![poll.clone()], u64::MAX, vec!["alpha".to_string()]);
+        let abort = AtomicBool::new(false);
+        let coord = Mutex::new(WatchdogCoord::default());
+        std::thread::scope(|s| {
+            let _ = s
+                .spawn(|| {
+                    let _g = coord.lock().unwrap();
+                    panic!("poison the coordination lock");
+                })
+                .join();
+        });
+        assert!(coord.is_poisoned());
+        let mock = crate::btrfs::MockBtrfs::new();
+        let cfg = wd_config();
+        let away = HashMap::new();
+        let firing = handle_watchdog_trip(&pool, &abort, &coord, &mock, &cfg, &away);
+        assert!(firing.send_aborted, "no send in flight → same-fs abort path");
+        let g = coord.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(g.tripped.contains(&poll), "a poisoned lock must not drop the trip");
     }
 
     // ── Emergency preflight reclaim (UPI 059-a) ────────────────────────
