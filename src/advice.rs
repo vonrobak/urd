@@ -2,8 +2,8 @@
 //! issue, a recommended command, a reason. The "what should the user do?"
 //! surface. Rule-based; the volatile layer where product refinements land.
 //!
-//! The issue is data, not prose: `voice::render_advice_issue` picks the words,
-//! so the mythic exposure labels never enter this module or the JSON it feeds.
+//! The issue is data, not prose: `voice::doctor::render_advice_issue` picks
+//! the words, so the mythic exposure labels never enter this module or the JSON it feeds.
 //!
 //! Sibling to [`crate::awareness`], which observes promise state. This
 //! module turns observations into prescriptions.
@@ -17,7 +17,7 @@ use crate::awareness::{
 use crate::config::Config;
 use crate::observation::Observation;
 use crate::storage_critical::StorageSignalMap;
-use crate::types::{DriveRole, PromiseStatus, ProtectionLevel};
+use crate::types::{DriveLabel, DriveRole, PromiseStatus, ProtectionLevel};
 
 // The redundancy advisory types live beside `SubvolAssessment`, which carries
 // them (`awareness/types.rs`); this module computes them. Re-exported so
@@ -32,7 +32,7 @@ pub use crate::awareness::{RedundancyAdvisory, RedundancyAdvisoryKind};
 /// for the unwhole promise the advice rules have no remedy for (`urd doctor`
 /// still shows that row). Every field is a machine value — a drive label, an
 /// age in seconds, a scope flag — never a rendered phrase: the prose, and the
-/// voice label that leads it, are `voice::render_advice_issue`'s to choose
+/// voice label that leads it, are `voice::doctor::render_advice_issue`'s to choose
 /// (glossary: daemon JSON keeps the semantic names).
 ///
 /// Serializes internally tagged, so a consumer reads
@@ -67,7 +67,7 @@ pub enum IssueDetail {
 /// of what is wrong.
 ///
 /// `status` serializes SCREAMING ("AT RISK") like every other promise-state
-/// surface; `detail` carries the specifics. `voice::render_advice_issue`
+/// surface; `detail` carries the specifics. `voice::doctor::render_advice_issue`
 /// turns the pair into the phrase `urd doctor` prints — this type never
 /// holds the phrase itself.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -146,7 +146,7 @@ pub fn compute_advice(
                 return None;
             }
             return Some(ActionableAdvice {
-                subvolume: name.clone(),
+                subvolume: name.to_string(),
                 // `external_only` is moot here: with sends off, the local
                 // snapshot is the only copy there is to age.
                 issue: stale_issue(assessment, false),
@@ -161,7 +161,7 @@ pub fn compute_advice(
     // Branch 2: Unprotected + no external drives configured
     if assessment.status == PromiseStatus::Unprotected && assessment.external.is_empty() {
         return Some(ActionableAdvice {
-            subvolume: name.clone(),
+            subvolume: name.to_string(),
             issue: AdviceIssue::new(assessment.status, IssueDetail::NoExternalDrives),
             command: None,
             reason: Some(
@@ -177,7 +177,7 @@ pub fn compute_advice(
     {
         let first_label = &assessment.external[0].drive_label;
         return Some(ActionableAdvice {
-            subvolume: name.clone(),
+            subvolume: name.to_string(),
             issue: AdviceIssue::new(assessment.status, IssueDetail::AllDrivesDisconnected),
             command: None,
             reason: Some(format!("Connect {first_label} to restore protection")),
@@ -193,7 +193,7 @@ pub fn compute_advice(
             return None;
         }
         return Some(ActionableAdvice {
-            subvolume: name.clone(),
+            subvolume: name.to_string(),
             issue: stale_issue(assessment, external_only),
             command: Some(format!("urd backup --force-full --subvolume {name}")),
             reason: Some(chain_break_reason_text(broken)),
@@ -205,7 +205,7 @@ pub fn compute_advice(
         && let Some(absent) = assessment.external.iter().find(|d| !d.mounted)
     {
         return Some(ActionableAdvice {
-            subvolume: name.clone(),
+            subvolume: name.to_string(),
             issue: stale_issue(assessment, external_only),
             command: None,
             reason: Some(format!(
@@ -221,7 +221,7 @@ pub fn compute_advice(
             return None;
         }
         return Some(ActionableAdvice {
-            subvolume: name.clone(),
+            subvolume: name.to_string(),
             issue: stale_issue(assessment, external_only),
             command: Some(format!("urd backup --subvolume {name}")),
             reason: None,
@@ -241,7 +241,7 @@ pub fn compute_advice(
             return None;
         }
         return Some(ActionableAdvice {
-            subvolume: name.clone(),
+            subvolume: name.to_string(),
             issue: stale_issue(assessment, external_only),
             command: Some(format!("urd backup --subvolume {name}")),
             reason: None,
@@ -261,11 +261,11 @@ pub fn compute_advice(
                 return None;
             }
             return Some(ActionableAdvice {
-                subvolume: name.clone(),
+                subvolume: name.to_string(),
                 issue: AdviceIssue::new(
                     assessment.status,
                     IssueDetail::ChainBroken {
-                        drive: broken.drive_label.clone(),
+                        drive: broken.drive_label.to_string(),
                     },
                 ),
                 command: Some(format!("urd backup --force-full --subvolume {name}")),
@@ -285,11 +285,11 @@ pub fn compute_advice(
             !d.mounted && drive_absence_is_health_cause(&d.drive_label, &assessment.health_reasons)
         }) {
             return Some(ActionableAdvice {
-                subvolume: name.clone(),
+                subvolume: name.to_string(),
                 issue: AdviceIssue::new(
                     assessment.status,
                     IssueDetail::DriveAway {
-                        drive: absent.drive_label.clone(),
+                        drive: absent.drive_label.to_string(),
                     },
                 ),
                 command: None,
@@ -331,7 +331,7 @@ pub fn count_distinct_causes(advice: &[ActionableAdvice]) -> usize {
 /// days"). The leading-token (`"{label} "`) match is deliberate: it excludes the
 /// "space tight on {label}" reason (label not leading) and never confuses a
 /// label that is a prefix of another (`WD-18TB` vs `WD-18TB1`). See #120.
-fn drive_absence_is_health_cause(drive_label: &str, health_reasons: &[String]) -> bool {
+fn drive_absence_is_health_cause(drive_label: &DriveLabel, health_reasons: &[String]) -> bool {
     let prefix = format!("{drive_label} ");
     health_reasons.iter().any(|r| r.starts_with(&prefix))
 }
@@ -509,7 +509,7 @@ pub fn compute_redundancy_advisories(
             if !has_offsite {
                 advisories.push(RedundancyAdvisory {
                     kind: RedundancyAdvisoryKind::NoOffsiteProtection,
-                    subvolume: assessment.name.clone(),
+                    subvolume: assessment.name.to_string(),
                     drive: None,
                     detail: format!(
                         "{} seeks resilience, but all drives share the same fate",
@@ -567,8 +567,8 @@ pub fn compute_redundancy_advisories(
                     };
                     advisories.push(RedundancyAdvisory {
                         kind: RedundancyAdvisoryKind::OffsiteDriveStale,
-                        subvolume: assessment.name.clone(),
-                        drive: Some(da.drive_label.clone()),
+                        subvolume: assessment.name.to_string(),
+                        drive: Some(da.drive_label.to_string()),
                         detail,
                     });
                 }
@@ -590,8 +590,8 @@ pub fn compute_redundancy_advisories(
             {
                 advisories.push(RedundancyAdvisory {
                     kind: RedundancyAdvisoryKind::SinglePointOfFailure,
-                    subvolume: assessment.name.clone(),
-                    drive: Some(only.drive_label.clone()),
+                    subvolume: assessment.name.to_string(),
+                    drive: Some(only.drive_label.to_string()),
                     detail: format!(
                         "{} rests on a single external drive",
                         assessment.name,
@@ -608,7 +608,7 @@ pub fn compute_redundancy_advisories(
             if all_unmounted {
                 advisories.push(RedundancyAdvisory {
                     kind: RedundancyAdvisoryKind::TransientNoLocalRecovery,
-                    subvolume: assessment.name.clone(),
+                    subvolume: assessment.name.to_string(),
                     drive: None,
                     detail: format!(
                         "{} lives only on external drives \u{2014} local snapshots are disabled",
@@ -632,11 +632,13 @@ pub fn compute_redundancy_advisories(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::dlabel;
     use crate::awareness::{ChainBreakReason, DriveChainHealth, LocalAssessment};
     use crate::awareness::test_support::{dt, offsite_test_config, snap, test_config};
     use crate::btrfs::MockBtrfs;
     use crate::observation::Observation;
     use crate::plan::MockFileSystemState;
+    use crate::testkit::ConfigBuilder;
     use crate::types::Interval;
     use chrono::Duration;
 
@@ -650,53 +652,21 @@ mod tests {
 
     // ── Offsite freshness overlay tests ─��───────────────────────────
 
+    /// Resilient `sv1` sending to a primary and an offsite drive.
+    fn fortified_builder() -> ConfigBuilder {
+        ConfigBuilder::new()
+            .drives(&[
+                ("primary-drive", "/mnt/primary", "primary"),
+                ("offsite-drive", "/mnt/offsite", "offsite"),
+            ])
+            .subvolumes(&["sv1"])
+            .subvolume_source("sv1", "/data")
+            .subvolume_line("sv1", r#"protection_level = "resilient""#)
+            .subvolume_line("sv1", r#"drives = ["primary-drive", "offsite-drive"]"#)
+    }
+
     fn fortified_config() -> Config {
-        let toml_str = r#"
-[general]
-state_db = "/tmp/urd.db"
-metrics_file = "/tmp/backup.prom"
-log_dir = "/tmp"
-
-[local_snapshots]
-roots = [
-  { path = "/snap", subvolumes = ["sv1"] }
-]
-
-[defaults]
-snapshot_interval = "1h"
-send_interval = "1d"
-send_enabled = true
-enabled = true
-[defaults.local_retention]
-hourly = 24
-daily = 30
-weekly = 26
-monthly = 12
-[defaults.external_retention]
-daily = 30
-weekly = 26
-monthly = 0
-
-[[drives]]
-label = "primary-drive"
-mount_path = "/mnt/primary"
-snapshot_root = ".snapshots"
-role = "primary"
-
-[[drives]]
-label = "offsite-drive"
-mount_path = "/mnt/offsite"
-snapshot_root = ".snapshots"
-role = "offsite"
-
-[[subvolumes]]
-name = "sv1"
-short_name = "sv1"
-source = "/data"
-protection_level = "resilient"
-drives = ["primary-drive", "offsite-drive"]
-"#;
-        toml::from_str(toml_str).expect("test config should parse")
+        fortified_builder().build()
     }
 
     fn make_assessment(
@@ -717,7 +687,7 @@ drives = ["primary-drive", "offsite-drive"]
 
     fn offsite_drive_assessment(status: PromiseStatus, mounted: bool) -> DriveAssessment {
         DriveAssessment {
-            drive_label: "offsite-drive".to_string(),
+            drive_label: dlabel("offsite-drive"),
             status,
             mounted,
             snapshot_count: if mounted { Some(5) } else { None },
@@ -735,7 +705,7 @@ drives = ["primary-drive", "offsite-drive"]
 
     fn primary_drive_assessment() -> DriveAssessment {
         DriveAssessment {
-            drive_label: "primary-drive".to_string(),
+            drive_label: dlabel("primary-drive"),
             status: PromiseStatus::Protected,
             mounted: true,
             snapshot_count: Some(100),
@@ -882,7 +852,7 @@ drives = ["primary-drive", "offsite-drive"]
         // alongside a Protected copy leaves the headline Protected.
         let config = fortified_config();
         let stale_offsite = DriveAssessment {
-            drive_label: "offsite-old".to_string(),
+            drive_label: dlabel("offsite-old"),
             status: PromiseStatus::Unprotected,
             mounted: false,
             snapshot_count: None,
@@ -931,53 +901,9 @@ drives = ["primary-drive", "offsite-drive"]
 
     /// Like `fortified_config` but the offsite drive declares a 3-month rotation.
     fn fortified_rotation_config() -> Config {
-        let toml_str = r#"
-[general]
-state_db = "/tmp/urd.db"
-metrics_file = "/tmp/backup.prom"
-log_dir = "/tmp"
-
-[local_snapshots]
-roots = [
-  { path = "/snap", subvolumes = ["sv1"] }
-]
-
-[defaults]
-snapshot_interval = "1h"
-send_interval = "1d"
-send_enabled = true
-enabled = true
-[defaults.local_retention]
-hourly = 24
-daily = 30
-weekly = 26
-monthly = 12
-[defaults.external_retention]
-daily = 30
-weekly = 26
-monthly = 0
-
-[[drives]]
-label = "primary-drive"
-mount_path = "/mnt/primary"
-snapshot_root = ".snapshots"
-role = "primary"
-
-[[drives]]
-label = "offsite-drive"
-mount_path = "/mnt/offsite"
-snapshot_root = ".snapshots"
-role = "offsite"
-rotation_interval = "3mo"
-
-[[subvolumes]]
-name = "sv1"
-short_name = "sv1"
-source = "/data"
-protection_level = "resilient"
-drives = ["primary-drive", "offsite-drive"]
-"#;
-        toml::from_str(toml_str).expect("test config should parse")
+        fortified_builder()
+            .drive_line("offsite-drive", r#"rotation_interval = "3mo""#)
+            .build()
     }
 
     #[test]
@@ -1080,52 +1006,13 @@ drives = ["primary-drive", "offsite-drive"]
 
     /// Config with fortified subvolume but only primary drives (no offsite).
     fn fortified_no_offsite_config() -> Config {
-        let toml_str = r#"
-[general]
-state_db = "/tmp/urd.db"
-metrics_file = "/tmp/backup.prom"
-log_dir = "/tmp"
-
-[local_snapshots]
-roots = [
-  { path = "/snap", subvolumes = ["sv1"] }
-]
-
-[defaults]
-snapshot_interval = "1h"
-send_interval = "1d"
-send_enabled = true
-enabled = true
-[defaults.local_retention]
-hourly = 24
-daily = 30
-weekly = 26
-monthly = 12
-[defaults.external_retention]
-daily = 30
-weekly = 26
-monthly = 0
-
-[[drives]]
-label = "drive-a"
-mount_path = "/mnt/a"
-snapshot_root = ".snapshots"
-role = "primary"
-
-[[drives]]
-label = "drive-b"
-mount_path = "/mnt/b"
-snapshot_root = ".snapshots"
-role = "primary"
-
-[[subvolumes]]
-name = "sv1"
-short_name = "sv1"
-source = "/data"
-protection_level = "resilient"
-drives = ["drive-a", "drive-b"]
-"#;
-        toml::from_str(toml_str).expect("test config should parse")
+        ConfigBuilder::new()
+            .drives(&[("drive-a", "/mnt/a", "primary"), ("drive-b", "/mnt/b", "primary")])
+            .subvolumes(&["sv1"])
+            .subvolume_source("sv1", "/data")
+            .subvolume_line("sv1", r#"protection_level = "resilient""#)
+            .subvolume_line("sv1", r#"drives = ["drive-a", "drive-b"]"#)
+            .build()
     }
 
     #[test]
@@ -1296,45 +1183,12 @@ drives = ["drive-a", "drive-b"]
 
     /// Config with protected subvolume and exactly 1 drive.
     fn sheltered_single_drive_config() -> Config {
-        let toml_str = r#"
-[general]
-state_db = "/tmp/urd.db"
-metrics_file = "/tmp/backup.prom"
-log_dir = "/tmp"
-
-[local_snapshots]
-roots = [
-  { path = "/snap", subvolumes = ["sv1"] }
-]
-
-[defaults]
-snapshot_interval = "1h"
-send_interval = "1d"
-send_enabled = true
-enabled = true
-[defaults.local_retention]
-hourly = 24
-daily = 30
-weekly = 26
-monthly = 12
-[defaults.external_retention]
-daily = 30
-weekly = 26
-monthly = 0
-
-[[drives]]
-label = "only-drive"
-mount_path = "/mnt/only"
-snapshot_root = ".snapshots"
-role = "primary"
-
-[[subvolumes]]
-name = "sv1"
-short_name = "sv1"
-source = "/data"
-protection_level = "protected"
-"#;
-        toml::from_str(toml_str).expect("test config should parse")
+        ConfigBuilder::new()
+            .drives(&[("only-drive", "/mnt/only", "primary")])
+            .subvolumes(&["sv1"])
+            .subvolume_source("sv1", "/data")
+            .subvolume_line("sv1", r#"protection_level = "protected""#)
+            .build()
     }
 
     #[test]
@@ -1442,45 +1296,12 @@ protection_level = "guarded"
 
     /// Config with transient subvolume and one external drive.
     fn transient_single_drive_config() -> Config {
-        let toml_str = r#"
-[general]
-state_db = "/tmp/urd.db"
-metrics_file = "/tmp/backup.prom"
-log_dir = "/tmp"
-
-[local_snapshots]
-roots = [
-  { path = "/snap", subvolumes = ["sv1"] }
-]
-
-[defaults]
-snapshot_interval = "1h"
-send_interval = "1d"
-send_enabled = true
-enabled = true
-[defaults.local_retention]
-hourly = 24
-daily = 30
-weekly = 26
-monthly = 12
-[defaults.external_retention]
-daily = 30
-weekly = 26
-monthly = 0
-
-[[drives]]
-label = "ext-drive"
-mount_path = "/mnt/ext"
-snapshot_root = ".snapshots"
-role = "primary"
-
-[[subvolumes]]
-name = "sv1"
-short_name = "sv1"
-source = "/data"
-local_retention = "transient"
-"#;
-        toml::from_str(toml_str).expect("test config should parse")
+        ConfigBuilder::new()
+            .drives(&[("ext-drive", "/mnt/ext", "primary")])
+            .subvolumes(&["sv1"])
+            .subvolume_source("sv1", "/data")
+            .subvolume_line("sv1", r#"local_retention = "transient""#)
+            .build()
     }
 
     #[test]
@@ -1583,7 +1404,7 @@ local_retention = "transient"
 
     fn drive_assessment(label: &str, mounted: bool, send_age_hours: Option<i64>) -> DriveAssessment {
         DriveAssessment {
-            drive_label: label.to_string(),
+            drive_label: label.into(),
             status: PromiseStatus::Protected,
             mounted,
             snapshot_count: Some(5),
@@ -1639,7 +1460,7 @@ local_retention = "transient"
         let mut a = test_assessment_for_advice("sv1", PromiseStatus::Unprotected, OperationalHealth::Healthy);
         a.external = vec![drive_assessment("WD-18TB1", true, Some(50 * 24))];
         a.chain_health = vec![DriveChainHealth {
-            drive_label: "WD-18TB1".to_string(),
+            drive_label: dlabel("WD-18TB1"),
             status: ChainStatus::Intact {
                 pin_parent: "20260731-1618-opptak".to_string(),
             },
@@ -1683,7 +1504,7 @@ local_retention = "transient"
         let mut a = test_assessment_for_advice("sv1", PromiseStatus::Unprotected, OperationalHealth::Degraded);
         a.external = vec![drive_assessment("WD-18TB1", true, Some(50 * 24))];
         a.chain_health = vec![DriveChainHealth {
-            drive_label: "WD-18TB1".to_string(),
+            drive_label: dlabel("WD-18TB1"),
             status: ChainStatus::Broken {
                 reason: ChainBreakReason::PinMissingLocally,
                 pin_parent: None,
@@ -1698,7 +1519,7 @@ local_retention = "transient"
         let mut a = test_assessment_for_advice("sv1", PromiseStatus::AtRisk, OperationalHealth::Degraded);
         a.external = vec![drive_assessment("WD-18TB", true, Some(48))];
         a.chain_health = vec![DriveChainHealth {
-            drive_label: "WD-18TB".to_string(),
+            drive_label: dlabel("WD-18TB"),
             status: ChainStatus::Broken {
                 reason: ChainBreakReason::PinMissingLocally,
                 pin_parent: None,
@@ -1733,7 +1554,7 @@ local_retention = "transient"
         let mut a = test_assessment_for_advice("sv1", PromiseStatus::Protected, OperationalHealth::Degraded);
         a.external = vec![drive_assessment("WD-18TB", true, Some(6))];
         a.chain_health = vec![DriveChainHealth {
-            drive_label: "WD-18TB".to_string(),
+            drive_label: dlabel("WD-18TB"),
             status: ChainStatus::Broken {
                 reason: ChainBreakReason::NoPinFile,
                 pin_parent: None,
@@ -1849,7 +1670,7 @@ local_retention = "transient"
         let mut a = test_assessment_for_advice("sv1", PromiseStatus::AtRisk, OperationalHealth::Degraded);
         a.external = vec![drive_assessment("WD-18TB", true, Some(48))];
         a.chain_health = vec![DriveChainHealth {
-            drive_label: "WD-18TB".to_string(),
+            drive_label: dlabel("WD-18TB"),
             status: ChainStatus::Broken {
                 reason: ChainBreakReason::PinMissingLocally,
                 pin_parent: None,
@@ -1870,7 +1691,7 @@ local_retention = "transient"
         let mut a = test_assessment_for_advice("sv1", PromiseStatus::Protected, OperationalHealth::Degraded);
         a.external = vec![drive_assessment("WD-18TB", true, Some(6))];
         a.chain_health = vec![DriveChainHealth {
-            drive_label: "WD-18TB".to_string(),
+            drive_label: dlabel("WD-18TB"),
             status: ChainStatus::Broken {
                 reason: ChainBreakReason::NoPinFile,
                 pin_parent: None,
@@ -1907,8 +1728,8 @@ local_retention = "transient"
     /// Every branch of [`compute_advice`] maps to exactly one [`IssueDetail`]
     /// shape, and every field on it is a machine value — a status, a drive
     /// label, an age in seconds. Nothing here reads as prose; the phrase is
-    /// `voice::render_advice_issue`'s, and its byte-for-byte golden lives
-    /// beside it in `voice/mod.rs`.
+    /// `voice::doctor::render_advice_issue`'s, and its byte-for-byte golden
+    /// lives beside it in `voice/doctor.rs`.
     #[test]
     fn compute_advice_issue_shape_per_branch() {
         let stale = |external_only, age_secs| IssueDetail::Stale {
@@ -1946,7 +1767,7 @@ local_retention = "transient"
         let mut a = test_assessment_for_advice("sv1", PromiseStatus::AtRisk, OperationalHealth::Degraded);
         a.external = vec![drive_assessment("WD-18TB", true, Some(48))];
         a.chain_health = vec![DriveChainHealth {
-            drive_label: "WD-18TB".to_string(),
+            drive_label: dlabel("WD-18TB"),
             status: ChainStatus::Broken {
                 reason: ChainBreakReason::PinMissingLocally,
                 pin_parent: None,
@@ -1992,7 +1813,7 @@ local_retention = "transient"
         let mut a = test_assessment_for_advice("sv1", PromiseStatus::Protected, OperationalHealth::Degraded);
         a.external = vec![drive_assessment("WD-18TB", true, Some(6))];
         a.chain_health = vec![DriveChainHealth {
-            drive_label: "WD-18TB".to_string(),
+            drive_label: dlabel("WD-18TB"),
             status: ChainStatus::Broken {
                 reason: ChainBreakReason::NoPinFile,
                 pin_parent: None,

@@ -289,7 +289,7 @@ fn collect_subvolume_sources(config: &Config) -> Vec<InitCheck> {
         .map(|sv| {
             let exists = sv.source.exists();
             InitCheck {
-                name: sv.name.clone(),
+                name: sv.name.to_string(),
                 status: if exists {
                     InitStatus::Ok
                 } else {
@@ -333,7 +333,7 @@ fn collect_drive_status(config: &Config) -> Vec<InitDriveStatus> {
                 None
             };
             InitDriveStatus {
-                label: drive.label.clone(),
+                label: drive.label.to_string(),
                 role: drive.role,
                 mount_path: drive.mount_path.display().to_string(),
                 mounted,
@@ -345,7 +345,7 @@ fn collect_drive_status(config: &Config) -> Vec<InitDriveStatus> {
 
 fn collect_pin_files(config: &Config) -> Vec<InitPinFile> {
     let mut pin_files = Vec::new();
-    let drive_labels: Vec<String> = config.drives.iter().map(|d| d.label.clone()).collect();
+    let drive_labels = config.drive_labels();
 
     for root in &config.local_snapshots.roots {
         for subvol_name in &root.subvolumes {
@@ -354,8 +354,8 @@ fn collect_pin_files(config: &Config) -> Vec<InitPinFile> {
                 match chain::read_pin_file(&local_dir, label) {
                     Ok(Some(name)) => {
                         pin_files.push(InitPinFile {
-                            subvolume: subvol_name.clone(),
-                            drive: label.clone(),
+                            subvolume: subvol_name.to_string(),
+                            drive: label.to_string(),
                             status: InitStatus::Ok,
                             snapshot_name: Some(name.to_string()),
                             error: None,
@@ -363,8 +363,8 @@ fn collect_pin_files(config: &Config) -> Vec<InitPinFile> {
                     }
                     Ok(None) => {
                         pin_files.push(InitPinFile {
-                            subvolume: subvol_name.clone(),
-                            drive: label.clone(),
+                            subvolume: subvol_name.to_string(),
+                            drive: label.to_string(),
                             status: InitStatus::Warn,
                             snapshot_name: None,
                             error: None,
@@ -372,8 +372,8 @@ fn collect_pin_files(config: &Config) -> Vec<InitPinFile> {
                     }
                     Err(e) => {
                         pin_files.push(InitPinFile {
-                            subvolume: subvol_name.clone(),
-                            drive: label.clone(),
+                            subvolume: subvol_name.to_string(),
+                            drive: label.to_string(),
                             status: InitStatus::Error,
                             snapshot_name: None,
                             error: Some(e.to_string()),
@@ -425,8 +425,8 @@ fn collect_incomplete_snapshots(
                     let dest_dir = drives::external_snapshot_dir(drive, &sv.name);
                     let partial_path = dest_dir.join(newest_snap.as_str());
                     incompletes.push(InitIncomplete {
-                        subvolume: sv.name.clone(),
-                        drive: drive.label.clone(),
+                        subvolume: sv.name.to_string(),
+                        drive: drive.label.to_string(),
                         snapshot: newest_snap.to_string(),
                         path: partial_path.display().to_string(),
                     });
@@ -462,12 +462,12 @@ fn collect_snapshot_counts(
                         .external_snapshots(d, &sv.name)
                         .map(|s| s.len())
                         .unwrap_or(0);
-                    (d.label.clone(), count)
+                    (d.label.to_string(), count)
                 })
                 .collect();
 
             InitSnapshotCount {
-                subvolume: sv.name.clone(),
+                subvolume: sv.name.to_string(),
                 local_count,
                 external_counts,
             }

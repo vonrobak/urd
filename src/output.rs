@@ -318,7 +318,7 @@ impl StatusAssessment {
     /// Reached in production only through `rows()`'s impossible-miss arm.
     fn incomplete_from_assessment(a: &SubvolAssessment) -> Self {
         Self {
-            name: a.name.clone(),
+            name: a.name.to_string(),
             short_name: a.short_name.clone(),
             status: a.status,
             health: a.health.to_string(),
@@ -410,7 +410,7 @@ impl StatusDriveAssessment {
     #[must_use]
     pub fn from_assessment(a: &DriveAssessment) -> Self {
         Self {
-            drive_label: a.drive_label.clone(),
+            drive_label: a.drive_label.to_string(),
             status: a.status,
             mounted: a.mounted,
             snapshot_count: a.snapshot_count,
@@ -453,8 +453,7 @@ impl LastRunInfo {
     /// cannot be parsed or the result would be negative (clock skew).
     #[must_use]
     pub fn age_secs(&self, now: chrono::NaiveDateTime) -> Option<i64> {
-        let dt = chrono::NaiveDateTime::parse_from_str(&self.started_at, "%Y-%m-%dT%H:%M:%S")
-            .ok()?;
+        let dt = self.started_at.parse::<crate::types::Timestamp>().ok()?.as_naive();
         let age = now.signed_duration_since(dt).num_seconds();
         if age >= 0 { Some(age) } else { None }
     }
@@ -536,7 +535,7 @@ pub struct RetentionChangePending {
 impl From<&crate::retention::RetentionChange> for RetentionChangePending {
     fn from(change: &crate::retention::RetentionChange) -> Self {
         Self {
-            subvolume: change.subvolume.clone(),
+            subvolume: change.subvolume.to_string(),
             local_tightened: change.local_tightened(),
             external_tightened: change.external_tightened(),
             previous: change.previous.to_canonical(),
@@ -758,7 +757,6 @@ pub enum ChurnRender {
 // `render_churn` (the `ChurnEstimate` → `ChurnRender` mapping) lives in
 // `drift.rs`; the heartbeat/metrics churn projection and per-subvolume extras
 // live in `heartbeat.rs`. Re-exported so `crate::output::X` paths resolve.
-pub use crate::drift::render_churn;
 pub use crate::heartbeat::{ChurnHeartbeatFields, SubvolumeExtras};
 
 /// A single diagnostic check result.
@@ -788,9 +786,10 @@ pub struct DoctorDataSafety {
     /// Promise status (serializes SCREAMING: "PROTECTED" / "AT RISK" / "UNPROTECTED").
     pub status: PromiseStatus,
     pub health: String,
-    /// What is wrong, structured (schema v4). `voice::render_advice_issue`
-    /// turns it into the line `urd doctor` prints; JSON consumers read
-    /// `issue.status` and `issue.detail.kind` instead of parsing prose.
+    /// What is wrong, structured (schema v4).
+    /// `voice::doctor::render_advice_issue` turns it into the line `urd doctor`
+    /// prints; JSON consumers read `issue.status` and `issue.detail.kind`
+    /// instead of parsing prose.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub issue: Option<AdviceIssue>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1419,7 +1418,7 @@ pub struct VerifyCheck {
 }
 
 impl VerifyCheck {
-    /// Check name for absent-drive warnings — used by voice.rs to classify expected conditions.
+    /// Check name for absent-drive warnings — used by voice/ to classify expected conditions.
     pub const DRIVE_MOUNTED: &str = "drive-mounted";
 
     /// Returns true if this check is an expected condition (absent drive), not a real finding.
@@ -1635,6 +1634,7 @@ pub enum SealSendState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::dlabel;
     use crate::advice::RedundancyAdvisoryKind;
 
     #[test]
@@ -1918,7 +1918,7 @@ mod tests {
     ) -> DriveAssessment {
         use crate::types::Interval;
         DriveAssessment {
-            drive_label: "Offsite-4TB".to_string(),
+            drive_label: dlabel("Offsite-4TB"),
             status: PromiseStatus::Protected,
             mounted: false,
             snapshot_count: Some(3),

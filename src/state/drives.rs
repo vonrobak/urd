@@ -2,6 +2,7 @@ use crate::error::UrdError;
 use crate::events::{Event, EventPayload};
 
 use super::{DriveConnectionRecord, DriveEventSource, DriveEventType, StateDb, db_err};
+use crate::types::DriveLabel;
 
 impl StateDb {
     // ── Drive token methods ─────────────────────────────────────────
@@ -15,7 +16,7 @@ impl StateDb {
     /// authoritative creation timestamp if needed.
     pub fn store_drive_token(
         &self,
-        label: &str,
+        label: &DriveLabel,
         token: &str,
         now: &str,
     ) -> crate::error::Result<()> {
@@ -25,7 +26,7 @@ impl StateDb {
                  VALUES (?1, ?2, ?3, ?3)
                  ON CONFLICT(drive_label) DO UPDATE SET
                    token = ?2, last_verified = ?3",
-                rusqlite::params![label, token, now],
+                rusqlite::params![label.as_str(), token, now],
             )
             .map_err(db_err("failed to store drive token"))?;
         Ok(())
@@ -33,14 +34,14 @@ impl StateDb {
 
     /// Look up a stored drive session token by drive label.
     /// Returns None if no token is stored for this drive.
-    pub fn get_drive_token(&self, label: &str) -> crate::error::Result<Option<String>> {
+    pub fn get_drive_token(&self, label: &DriveLabel) -> crate::error::Result<Option<String>> {
         let mut stmt = self
             .conn
             .prepare("SELECT token FROM drive_tokens WHERE drive_label = ?1")
             .map_err(db_err("query failed"))?;
 
         let mut rows = stmt
-            .query_map(rusqlite::params![label], |row| row.get(0))
+            .query_map(rusqlite::params![label.as_str()], |row| row.get(0))
             .map_err(db_err("query failed"))?;
 
         match rows.next() {
@@ -54,7 +55,7 @@ impl StateDb {
     /// Returns the ISO timestamp string, or None if no record exists.
     pub fn get_drive_token_last_verified(
         &self,
-        label: &str,
+        label: &DriveLabel,
     ) -> crate::error::Result<Option<String>> {
         let mut stmt = self
             .conn
@@ -62,7 +63,7 @@ impl StateDb {
             .map_err(db_err("query failed"))?;
 
         let mut rows = stmt
-            .query_map(rusqlite::params![label], |row| row.get(0))
+            .query_map(rusqlite::params![label.as_str()], |row| row.get(0))
             .map_err(db_err("query failed"))?;
 
         match rows.next() {
@@ -73,11 +74,11 @@ impl StateDb {
     }
 
     /// Update the last_verified timestamp for a drive token.
-    pub fn touch_drive_token(&self, label: &str, now: &str) -> crate::error::Result<()> {
+    pub fn touch_drive_token(&self, label: &DriveLabel, now: &str) -> crate::error::Result<()> {
         self.conn
             .execute(
                 "UPDATE drive_tokens SET last_verified = ?1 WHERE drive_label = ?2",
-                rusqlite::params![now, label],
+                rusqlite::params![now, label.as_str()],
             )
             .map_err(db_err("failed to touch drive token"))?;
         Ok(())
@@ -90,7 +91,7 @@ impl StateDb {
     /// preserved so callers (executor, sentinel_runner) need no change.
     pub fn record_drive_event(
         &self,
-        drive_label: &str,
+        drive_label: &DriveLabel,
         event_type: DriveEventType,
         detected_by: DriveEventSource,
     ) -> crate::error::Result<()> {
@@ -109,7 +110,7 @@ impl StateDb {
     /// `record_drive_event` — only the timestamp differs.
     pub fn record_drive_event_at(
         &self,
-        drive_label: &str,
+        drive_label: &DriveLabel,
         event_type: DriveEventType,
         detected_by: DriveEventSource,
         occurred_at: chrono::NaiveDateTime,
@@ -134,7 +135,7 @@ impl StateDb {
     /// callers (`RealFileSystemState::last_drive_event`) keep working.
     pub fn last_drive_connection(
         &self,
-        drive_label: &str,
+        drive_label: &DriveLabel,
     ) -> crate::error::Result<Option<DriveConnectionRecord>> {
         let mut stmt = self
             .conn
@@ -147,7 +148,7 @@ impl StateDb {
             .map_err(db_err("query failed"))?;
 
         let mut rows = stmt
-            .query(rusqlite::params![drive_label])
+            .query(rusqlite::params![drive_label.as_str()])
             .map_err(db_err("query failed"))?;
 
         match rows
@@ -203,7 +204,7 @@ impl StateDb {
     /// `LIMIT`/time-window only if a flapping drive ever bloats the row count.
     pub fn drive_connection_history(
         &self,
-        drive_label: &str,
+        drive_label: &DriveLabel,
     ) -> crate::error::Result<Vec<DriveConnectionRecord>> {
         let mut stmt = self
             .conn
@@ -216,7 +217,7 @@ impl StateDb {
             .map_err(db_err("query failed"))?;
 
         let mut rows = stmt
-            .query(rusqlite::params![drive_label])
+            .query(rusqlite::params![drive_label.as_str()])
             .map_err(db_err("query failed"))?;
 
         let mut records = Vec::new();
@@ -260,6 +261,7 @@ impl StateDb {
 #[cfg(test)]
 mod tests {
     use crate::state::*;
+    use crate::testkit::dlabel;
 
     // ── drive token tests ────────────────────────���────────────────────
 
@@ -267,28 +269,28 @@ mod tests {
     fn store_and_get_drive_token() {
         let db = StateDb::open_memory().unwrap();
 
-        db.store_drive_token("WD-18TB1", "abc-123", "2026-03-29T10:00:00")
+        db.store_drive_token(&dlabel("WD-18TB1"), "abc-123", "2026-03-29T10:00:00")
             .unwrap();
-        let token = db.get_drive_token("WD-18TB1").unwrap();
+        let token = db.get_drive_token(&dlabel("WD-18TB1")).unwrap();
         assert_eq!(token, Some("abc-123".to_string()));
     }
 
     #[test]
     fn get_drive_token_returns_none_for_unknown() {
         let db = StateDb::open_memory().unwrap();
-        assert_eq!(db.get_drive_token("nonexistent").unwrap(), None);
+        assert_eq!(db.get_drive_token(&dlabel("nonexistent")).unwrap(), None);
     }
 
     #[test]
     fn store_drive_token_overwrites() {
         let db = StateDb::open_memory().unwrap();
 
-        db.store_drive_token("D1", "old-token", "2026-03-29T10:00:00")
+        db.store_drive_token(&dlabel("D1"), "old-token", "2026-03-29T10:00:00")
             .unwrap();
-        db.store_drive_token("D1", "new-token", "2026-03-29T11:00:00")
+        db.store_drive_token(&dlabel("D1"), "new-token", "2026-03-29T11:00:00")
             .unwrap();
 
-        let token = db.get_drive_token("D1").unwrap();
+        let token = db.get_drive_token(&dlabel("D1")).unwrap();
         assert_eq!(token, Some("new-token".to_string()));
 
         // first_seen should be preserved (ON CONFLICT keeps original row's first_seen)
@@ -307,9 +309,9 @@ mod tests {
     fn touch_drive_token_updates_timestamp() {
         let db = StateDb::open_memory().unwrap();
 
-        db.store_drive_token("D1", "tok", "2026-03-29T10:00:00")
+        db.store_drive_token(&dlabel("D1"), "tok", "2026-03-29T10:00:00")
             .unwrap();
-        db.touch_drive_token("D1", "2026-03-29T12:00:00").unwrap();
+        db.touch_drive_token(&dlabel("D1"), "2026-03-29T12:00:00").unwrap();
 
         let last_verified: String = db
             .conn
@@ -325,11 +327,11 @@ mod tests {
     #[test]
     fn get_drive_token_last_verified_returns_timestamp() {
         let db = StateDb::open_memory().unwrap();
-        db.store_drive_token("D1", "tok", "2026-03-29T10:00:00")
+        db.store_drive_token(&dlabel("D1"), "tok", "2026-03-29T10:00:00")
             .unwrap();
-        db.touch_drive_token("D1", "2026-04-01T08:00:00").unwrap();
+        db.touch_drive_token(&dlabel("D1"), "2026-04-01T08:00:00").unwrap();
 
-        let result = db.get_drive_token_last_verified("D1").unwrap();
+        let result = db.get_drive_token_last_verified(&dlabel("D1")).unwrap();
         assert_eq!(result, Some("2026-04-01T08:00:00".to_string()));
     }
 
@@ -337,7 +339,7 @@ mod tests {
     fn get_drive_token_last_verified_returns_none_for_unknown() {
         let db = StateDb::open_memory().unwrap();
         assert_eq!(
-            db.get_drive_token_last_verified("nonexistent").unwrap(),
+            db.get_drive_token_last_verified(&dlabel("nonexistent")).unwrap(),
             None
         );
     }
@@ -347,10 +349,14 @@ mod tests {
     #[test]
     fn record_drive_mount_event() {
         let db = StateDb::open_memory().unwrap();
-        db.record_drive_event("WD-18TB", DriveEventType::Mounted, DriveEventSource::Sentinel)
-            .unwrap();
+        db.record_drive_event(
+            &dlabel("WD-18TB"),
+            DriveEventType::Mounted,
+            DriveEventSource::Sentinel,
+        )
+        .unwrap();
 
-        let record = db.last_drive_connection("WD-18TB").unwrap().unwrap();
+        let record = db.last_drive_connection(&dlabel("WD-18TB")).unwrap().unwrap();
         assert_eq!(record.event_type, "mounted");
         assert_eq!(record.detected_by, "sentinel");
         assert!(!record.timestamp.is_empty());
@@ -359,29 +365,41 @@ mod tests {
     #[test]
     fn record_drive_unmount_event() {
         let db = StateDb::open_memory().unwrap();
-        db.record_drive_event("WD-18TB1", DriveEventType::Unmounted, DriveEventSource::Sentinel)
-            .unwrap();
+        db.record_drive_event(
+            &dlabel("WD-18TB1"),
+            DriveEventType::Unmounted,
+            DriveEventSource::Sentinel,
+        )
+        .unwrap();
 
-        let record = db.last_drive_connection("WD-18TB1").unwrap().unwrap();
+        let record = db.last_drive_connection(&dlabel("WD-18TB1")).unwrap().unwrap();
         assert_eq!(record.event_type, "unmounted");
     }
 
     #[test]
     fn last_drive_connection_returns_most_recent() {
         let db = StateDb::open_memory().unwrap();
-        db.record_drive_event("WD-18TB", DriveEventType::Mounted, DriveEventSource::Sentinel)
-            .unwrap();
-        db.record_drive_event("WD-18TB", DriveEventType::Unmounted, DriveEventSource::Sentinel)
-            .unwrap();
+        db.record_drive_event(
+            &dlabel("WD-18TB"),
+            DriveEventType::Mounted,
+            DriveEventSource::Sentinel,
+        )
+        .unwrap();
+        db.record_drive_event(
+            &dlabel("WD-18TB"),
+            DriveEventType::Unmounted,
+            DriveEventSource::Sentinel,
+        )
+        .unwrap();
 
-        let record = db.last_drive_connection("WD-18TB").unwrap().unwrap();
+        let record = db.last_drive_connection(&dlabel("WD-18TB")).unwrap().unwrap();
         assert_eq!(record.event_type, "unmounted");
     }
 
     #[test]
     fn last_drive_connection_none_for_unknown() {
         let db = StateDb::open_memory().unwrap();
-        assert!(db.last_drive_connection("nonexistent").unwrap().is_none());
+        assert!(db.last_drive_connection(&dlabel("nonexistent")).unwrap().is_none());
     }
 
     // (test `drive_connection_count` removed — function deleted in
@@ -392,7 +410,7 @@ mod tests {
     fn record_drive_event_writes_to_events_table() {
         let db = StateDb::open_memory().unwrap();
         db.record_drive_event(
-            "WD-18TB",
+            &dlabel("WD-18TB"),
             DriveEventType::Mounted,
             DriveEventSource::Sentinel,
         )
@@ -410,7 +428,7 @@ mod tests {
         assert_eq!(kind, "drive");
 
         // Backward-compat read API still works.
-        let record = db.last_drive_connection("WD-18TB").unwrap().unwrap();
+        let record = db.last_drive_connection(&dlabel("WD-18TB")).unwrap().unwrap();
         assert_eq!(record.event_type, "mounted");
         assert_eq!(record.detected_by, "sentinel");
     }
@@ -420,16 +438,15 @@ mod tests {
         // #411: an inferred startup unmount is stamped at last-witnessed
         // presence, not at now — the row must carry exactly that time.
         let db = StateDb::open_memory().unwrap();
-        let at = chrono::NaiveDateTime::parse_from_str("2026-09-01T03:04:05", "%Y-%m-%dT%H:%M:%S")
-            .unwrap();
+        let at = "2026-09-01T03:04:05".parse::<crate::types::Timestamp>().unwrap().as_naive();
         db.record_drive_event_at(
-            "WD-18TB",
+            &dlabel("WD-18TB"),
             DriveEventType::Unmounted,
             DriveEventSource::Sentinel,
             at,
         )
         .unwrap();
-        let record = db.last_drive_connection("WD-18TB").unwrap().unwrap();
+        let record = db.last_drive_connection(&dlabel("WD-18TB")).unwrap().unwrap();
         assert_eq!(record.event_type, "unmounted");
         assert_eq!(record.timestamp, "2026-09-01T03:04:05");
     }
@@ -438,12 +455,12 @@ mod tests {
     fn record_drive_event_unmount_payload_decoded_correctly() {
         let db = StateDb::open_memory().unwrap();
         db.record_drive_event(
-            "WD-18TB",
+            &dlabel("WD-18TB"),
             DriveEventType::Unmounted,
             DriveEventSource::Backup,
         )
         .unwrap();
-        let record = db.last_drive_connection("WD-18TB").unwrap().unwrap();
+        let record = db.last_drive_connection(&dlabel("WD-18TB")).unwrap().unwrap();
         assert_eq!(record.event_type, "unmounted");
         assert_eq!(record.detected_by, "backup");
     }
@@ -452,18 +469,18 @@ mod tests {
     fn last_drive_connection_returns_most_recent_via_events() {
         let db = StateDb::open_memory().unwrap();
         db.record_drive_event(
-            "WD-18TB",
+            &dlabel("WD-18TB"),
             DriveEventType::Mounted,
             DriveEventSource::Sentinel,
         )
         .unwrap();
         db.record_drive_event(
-            "WD-18TB",
+            &dlabel("WD-18TB"),
             DriveEventType::Unmounted,
             DriveEventSource::Sentinel,
         )
         .unwrap();
-        let record = db.last_drive_connection("WD-18TB").unwrap().unwrap();
+        let record = db.last_drive_connection(&dlabel("WD-18TB")).unwrap().unwrap();
         assert_eq!(record.event_type, "unmounted"); // most recent wins
     }
 
@@ -471,21 +488,33 @@ mod tests {
     fn drive_connection_history_returns_all_ordered_and_empty_for_unknown() {
         // UPI 055: the rotation view needs the full arrival stream, oldest-first.
         let db = StateDb::open_memory().unwrap();
-        db.record_drive_event("WD-18TB", DriveEventType::Mounted, DriveEventSource::Sentinel)
-            .unwrap();
-        db.record_drive_event("WD-18TB", DriveEventType::Unmounted, DriveEventSource::Sentinel)
-            .unwrap();
-        db.record_drive_event("WD-18TB", DriveEventType::Mounted, DriveEventSource::Sentinel)
-            .unwrap();
+        db.record_drive_event(
+            &dlabel("WD-18TB"),
+            DriveEventType::Mounted,
+            DriveEventSource::Sentinel,
+        )
+        .unwrap();
+        db.record_drive_event(
+            &dlabel("WD-18TB"),
+            DriveEventType::Unmounted,
+            DriveEventSource::Sentinel,
+        )
+        .unwrap();
+        db.record_drive_event(
+            &dlabel("WD-18TB"),
+            DriveEventType::Mounted,
+            DriveEventSource::Sentinel,
+        )
+        .unwrap();
         // A different drive's events must not bleed into the result.
-        db.record_drive_event("OTHER", DriveEventType::Mounted, DriveEventSource::Sentinel)
+        db.record_drive_event(&dlabel("OTHER"), DriveEventType::Mounted, DriveEventSource::Sentinel)
             .unwrap();
 
-        let history = db.drive_connection_history("WD-18TB").unwrap();
+        let history = db.drive_connection_history(&dlabel("WD-18TB")).unwrap();
         let kinds: Vec<&str> = history.iter().map(|r| r.event_type.as_str()).collect();
         assert_eq!(kinds, vec!["mounted", "unmounted", "mounted"]);
 
         // Unknown drive → empty Vec, not an error.
-        assert!(db.drive_connection_history("never-seen").unwrap().is_empty());
+        assert!(db.drive_connection_history(&dlabel("never-seen")).unwrap().is_empty());
     }
 }

@@ -1,3 +1,4 @@
+use crate::commands::world;
 use crate::config::Config;
 use crate::drives::{
     DriveAvailability, drive_availability, filesystem_free_bytes, generate_drive_token,
@@ -13,13 +14,7 @@ use crate::voice;
 
 /// List all configured drives with status and token state.
 pub fn run_drives_list(config: &Config, output_mode: OutputMode) -> anyhow::Result<()> {
-    let state = match StateDb::open(&config.general.state_db) {
-        Ok(db) => Some(db),
-        Err(e) => {
-            log::warn!("Failed to open state DB for drives list: {e}");
-            None
-        }
-    };
+    let state = world::open_state_best_effort(&config.general.state_db, "drives list");
     let mut entries = Vec::new();
 
     for drive in &config.drives {
@@ -41,7 +36,7 @@ pub fn run_drives_list(config: &Config, output_mode: OutputMode) -> anyhow::Resu
                 };
                 let free = filesystem_free_bytes(&drive.mount_path).ok();
                 DriveListEntry {
-                    label: drive.label.clone(),
+                    label: drive.label.to_string(),
                     status: DriveStatus::Connected,
                     token_state,
                     free_space: free.map(ByteSize),
@@ -52,7 +47,7 @@ pub fn run_drives_list(config: &Config, output_mode: OutputMode) -> anyhow::Resu
             DriveAvailability::UuidMismatch { .. } => {
                 let free = filesystem_free_bytes(&drive.mount_path).ok();
                 DriveListEntry {
-                    label: drive.label.clone(),
+                    label: drive.label.to_string(),
                     status: DriveStatus::UuidMismatch,
                     token_state: TokenState::Unknown,
                     free_space: free.map(ByteSize),
@@ -63,7 +58,7 @@ pub fn run_drives_list(config: &Config, output_mode: OutputMode) -> anyhow::Resu
             DriveAvailability::UuidCheckFailed(_) => {
                 let free = filesystem_free_bytes(&drive.mount_path).ok();
                 DriveListEntry {
-                    label: drive.label.clone(),
+                    label: drive.label.to_string(),
                     status: DriveStatus::UuidCheckFailed,
                     token_state: TokenState::Unknown,
                     free_space: free.map(ByteSize),
@@ -88,7 +83,7 @@ pub fn run_drives_list(config: &Config, output_mode: OutputMode) -> anyhow::Resu
                     None => (TokenState::Unknown, None),
                 };
                 DriveListEntry {
-                    label: drive.label.clone(),
+                    label: drive.label.to_string(),
                     status: DriveStatus::Absent { last_seen },
                     token_state,
                     free_space: None,
@@ -100,7 +95,7 @@ pub fn run_drives_list(config: &Config, output_mode: OutputMode) -> anyhow::Resu
             DriveAvailability::TokenMissing
             | DriveAvailability::TokenMismatch { .. }
             | DriveAvailability::TokenExpectedButMissing => DriveListEntry {
-                label: drive.label.clone(),
+                label: drive.label.to_string(),
                 status: DriveStatus::Connected,
                 token_state: TokenState::Unknown,
                 free_space: None,
@@ -160,11 +155,9 @@ pub fn run_drives_adopt(
     // Read both tokens before deciding what to do.
     let on_disk_token = read_drive_token(drive)?;
     let state = StateDb::open(&config.general.state_db)?;
-    let sqlite_token = state.get_drive_token(label)?;
+    let sqlite_token = state.get_drive_token(&drive.label)?;
 
-    let now = chrono::Local::now()
-        .format("%Y-%m-%dT%H:%M:%S")
-        .to_string();
+    let now = crate::types::Timestamp::from(chrono::Local::now().naive_local()).to_string();
 
     let action = match crate::drives::decide_adoption(
         on_disk_token.as_deref(),
@@ -174,13 +167,13 @@ pub fn run_drives_adopt(
         crate::drives::AdoptDecision::AdoptExisting => {
             let disk_token = on_disk_token
                 .ok_or_else(|| anyhow::anyhow!("AdoptExisting implies an on-disk token"))?;
-            state.store_drive_token(label, &disk_token, &now)?;
+            state.store_drive_token(&drive.label, &disk_token, &now)?;
             AdoptAction::AdoptedExisting { token: disk_token }
         }
         crate::drives::AdoptDecision::GenerateNew => {
             let token = generate_drive_token();
             write_drive_token(drive, &token)?;
-            state.store_drive_token(label, &token, &now)?;
+            state.store_drive_token(&drive.label, &token, &now)?;
             AdoptAction::GeneratedNew { token }
         }
     };
@@ -196,6 +189,7 @@ pub fn run_drives_adopt(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::dlabel;
     use crate::config::DriveConfig;
     use crate::types::DriveRole;
     use std::path::PathBuf;
@@ -204,7 +198,7 @@ mod tests {
         let snap_root = "snapshots";
         std::fs::create_dir_all(dir.join(snap_root)).unwrap();
         DriveConfig {
-            label: "TEST-DRIVE".to_string(),
+            label: dlabel("TEST-DRIVE"),
             uuid: None,
             mount_path: dir.to_path_buf(),
             snapshot_root: snap_root.to_string(),
@@ -269,16 +263,16 @@ mod tests {
     #[test]
     fn list_unmounted_with_sqlite_record() {
         let db = StateDb::open_memory().unwrap();
-        db.store_drive_token("ABSENT-DRIVE", "tok", "2026-03-29T10:00:00")
+        db.store_drive_token(&dlabel("ABSENT-DRIVE"), "tok", "2026-03-29T10:00:00")
             .unwrap();
-        db.touch_drive_token("ABSENT-DRIVE", "2026-04-01T08:00:00")
+        db.touch_drive_token(&dlabel("ABSENT-DRIVE"), "2026-04-01T08:00:00")
             .unwrap();
 
-        let has_record = db.get_drive_token("ABSENT-DRIVE").unwrap();
+        let has_record = db.get_drive_token(&dlabel("ABSENT-DRIVE")).unwrap();
         assert!(has_record.is_some());
 
         let last_seen = db
-            .get_drive_token_last_verified("ABSENT-DRIVE")
+            .get_drive_token_last_verified(&dlabel("ABSENT-DRIVE"))
             .unwrap();
         assert_eq!(last_seen, Some("2026-04-01T08:00:00".to_string()));
         // Maps to Recorded + Absent { last_seen }
@@ -287,7 +281,7 @@ mod tests {
     #[test]
     fn list_unmounted_no_record() {
         let db = StateDb::open_memory().unwrap();
-        let has_record = db.get_drive_token("UNKNOWN-DRIVE").unwrap();
+        let has_record = db.get_drive_token(&dlabel("UNKNOWN-DRIVE")).unwrap();
         assert!(has_record.is_none());
         // Maps to Unknown + Absent { last_seen: None }
     }
@@ -363,7 +357,7 @@ mod tests {
     fn adopt_unmounted_drive_would_fail() {
         // drive_availability for a non-existent path returns NotMounted
         let drive = DriveConfig {
-            label: "GHOST".to_string(),
+            label: dlabel("GHOST"),
             uuid: None,
             mount_path: PathBuf::from("/nonexistent/path/that/does/not/exist"),
             snapshot_root: ".snapshots".to_string(),

@@ -8,7 +8,8 @@ use chrono::NaiveDate;
 
 use crate::btrfs::{MockBtrfs, MockBtrfsCall};
 use crate::config::Config;
-use crate::types::{BackupPlan, DeleteKind, PlannedOperation};
+use crate::plan::{BackupPlan, DeleteKind, PlannedOperation};
+use crate::testkit::{dlabel, svname};
 
 /// Shutdown flag that never triggers — used for all tests that don't test signal handling.
 pub(super) fn no_shutdown() -> AtomicBool {
@@ -66,20 +67,20 @@ pub(super) fn simple_plan() -> BackupPlan {
             PlannedOperation::CreateSnapshot {
                 source: PathBuf::from("/data/a"),
                 dest: PathBuf::from("/nonexistent-urd/snap/sv-a/20260322-1430-a"),
-                subvolume_name: "sv-a".to_string(),
+                subvolume_name: svname("sv-a"),
             },
             PlannedOperation::SendIncremental {
                 parent: PathBuf::from("/nonexistent-urd/snap/sv-a/20260321-a"),
                 snapshot: PathBuf::from("/nonexistent-urd/snap/sv-a/20260322-1430-a"),
                 dest_dir: PathBuf::from("/mnt/test/.snapshots/sv-a"),
-                drive_label: "TEST-DRIVE".to_string(),
-                subvolume_name: "sv-a".to_string(),
+                drive_label: dlabel("TEST-DRIVE"),
+                subvolume_name: svname("sv-a"),
                 pin_on_success: None,
             },
             PlannedOperation::DeleteSnapshot {
                 path: PathBuf::from("/nonexistent-urd/snap/sv-a/20260310-a"),
                 reason: "expired".to_string(),
-                subvolume_name: "sv-a".to_string(),
+                subvolume_name: svname("sv-a"),
                 kind: DeleteKind::Policy,
             },
         ],

@@ -48,7 +48,7 @@ pub struct WorldView {
 
 impl World {
     /// Open the world: best-effort state DB (warn-and-continue on failure,
-    /// exactly `backup.rs`'s existing semantics) and a read-only btrfs handle.
+    /// via [`open_state_best_effort`]) and a read-only btrfs handle.
     #[must_use]
     pub fn open(config: &Config) -> Self {
         let state_db = open_state_best_effort(&config.general.state_db, "history");
@@ -117,46 +117,22 @@ pub fn assess(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::ConfigBuilder;
 
     fn test_config(state_db_path: &std::path::Path) -> Config {
-        let toml_str = format!(
-            r#"
-drives = []
-subvolumes = []
-
-[general]
-state_db = "{}"
-metrics_file = "/tmp/urd-world-test.prom"
-log_dir = "/tmp"
-
-[local_snapshots]
-roots = []
-
-[defaults]
-snapshot_interval = "1h"
-send_interval = "1d"
-send_enabled = true
-enabled = true
-[defaults.local_retention]
-hourly = 24
-daily = 30
-weekly = 26
-monthly = 12
-[defaults.external_retention]
-daily = 30
-weekly = 26
-monthly = 0
-"#,
-            state_db_path.display()
-        );
-        toml::from_str(&toml_str).expect("test config should parse")
+        ConfigBuilder::new()
+            .state_db(state_db_path)
+            .metrics_file("/tmp/urd-world-test.prom")
+            .drives(&[])
+            .subvolumes(&[])
+            .build()
     }
 
     #[test]
     fn open_with_missing_state_db_degrades_to_none_without_panic() {
         // State DB open failure (e.g. an unwritable path) must warn and
-        // continue, never panic — `World::open` mirrors backup.rs's
-        // existing best-effort semantics exactly.
+        // continue, never panic — `World::open` is the best-effort
+        // door every command (backup included) opens through.
         let unwritable = std::path::PathBuf::from("/nonexistent-dir-for-urd-test/urd.db");
         let config = test_config(&unwritable);
         let world = World::open(&config);

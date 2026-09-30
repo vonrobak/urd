@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 use super::{Executor, OffsiteChainRelease, SubvolumeContext, TransientCleanupOutcome};
 use crate::chain;
 use crate::drives;
+use crate::types::DriveLabel;
 
 impl Executor<'_> {
     /// Attempt transient immediate cleanup after all sends succeed for a
@@ -36,10 +37,10 @@ impl Executor<'_> {
     pub(super) fn attempt_transient_cleanup(
         &self,
         context: &SubvolumeContext,
-        old_pin_parents: &HashMap<String, std::path::PathBuf>,
-        sent_snapshots: &HashMap<String, std::path::PathBuf>,
-        sends_succeeded: &HashSet<String>,
-        planned_send_drives: &HashSet<String>,
+        old_pin_parents: &HashMap<DriveLabel, std::path::PathBuf>,
+        sent_snapshots: &HashMap<DriveLabel, std::path::PathBuf>,
+        sends_succeeded: &HashSet<DriveLabel>,
+        planned_send_drives: &HashSet<DriveLabel>,
         pin_failures: u32,
     ) -> TransientCleanupOutcome {
         // Condition 1: subvolume uses transient retention
@@ -170,7 +171,7 @@ impl Executor<'_> {
         // to hold its pin rather than invent a connected chain (closes the
         // pre-existing hours-wide window). No-ops for the common case: the
         // real probe (`/proc/mounts`) never reports a TempDir path mounted.
-        let shed_away_drives: Vec<String> = if context.shed_away_drives.is_empty() {
+        let shed_away_drives: Vec<DriveLabel> = if context.shed_away_drives.is_empty() {
             Vec::new()
         } else {
             let mut spawn_map = HashMap::new();
@@ -179,7 +180,7 @@ impl Executor<'_> {
                 .remove(subvol_name)
                 .unwrap_or_default();
             if reconfirmed.len() < context.shed_away_drives.len() {
-                let reconnected: Vec<&String> = context
+                let reconnected: Vec<&DriveLabel> = context
                     .shed_away_drives
                     .iter()
                     .filter(|d| !reconfirmed.contains(d))
@@ -205,7 +206,7 @@ impl Executor<'_> {
                     Ok(()) => {
                         if let Some(parent) = present_drive_pin {
                             offsite_releases.push(OffsiteChainRelease {
-                                subvolume: subvol_name.to_string(),
+                                subvolume: subvol_name.clone(),
                                 drive: drive_label.clone(),
                                 parent,
                             });
@@ -230,11 +231,13 @@ impl Executor<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::SubvolName;
+    use crate::testkit::{dlabel, svname};
     use crate::btrfs::{MockBtrfs, MockBtrfsCall};
     use crate::config::Config;
     use crate::executor::testkit::*;
-    use crate::plan::PlannedLifecycle;
-    use crate::types::{BackupPlan, DeleteKind, FullSendReason, PlannedOperation, SnapshotName};
+    use crate::plan::{BackupPlan, DeleteKind, PlannedLifecycle, PlannedOperation};
+    use crate::types::{FullSendReason, SnapshotName};
     use std::path::PathBuf;
 
     // ── Transient immediate cleanup tests ──────────────────────────────
@@ -251,8 +254,12 @@ mod tests {
         std::fs::create_dir_all(&sv_dir).unwrap();
         let old_parent = sv_dir.join("20260321-t");
         std::fs::create_dir(&old_parent).unwrap();
-        chain::write_pin_file(&sv_dir, "DRIVE-A", &SnapshotName::parse("20260321-t").unwrap())
-            .unwrap();
+        chain::write_pin_file(
+            &sv_dir,
+            &dlabel("DRIVE-A"),
+            &SnapshotName::parse("20260321-t").unwrap(),
+        )
+        .unwrap();
         std::fs::create_dir(sv_dir.join(".last-external-parent-DRIVE-B")).unwrap();
 
         let config = transient_config_n_drives(
@@ -272,8 +279,8 @@ mod tests {
                 parent: old_parent.clone(),
                 snapshot: sv_dir.join("20260322-1430-t"),
                 dest_dir: drive_a.path().join(".snapshots/sv-t"),
-                drive_label: "DRIVE-A".to_string(),
-                subvolume_name: "sv-t".to_string(),
+                drive_label: dlabel("DRIVE-A"),
+                subvolume_name: svname("sv-t"),
                 pin_on_success: Some((
                     sv_dir.join(".last-external-parent-DRIVE-A"),
                     SnapshotName::parse("20260322-1430-t").unwrap(),
@@ -306,8 +313,12 @@ mod tests {
         std::fs::create_dir(&old_parent).unwrap();
 
         // Write pin file pointing to old parent (will be advanced by send)
-        chain::write_pin_file(&sv_dir, "DRIVE-A", &SnapshotName::parse("20260321-t").unwrap())
-            .unwrap();
+        chain::write_pin_file(
+            &sv_dir,
+            &dlabel("DRIVE-A"),
+            &SnapshotName::parse("20260321-t").unwrap(),
+        )
+        .unwrap();
 
         let config = transient_config_n_drives(
             snap_dir.path(),
@@ -326,8 +337,8 @@ mod tests {
                 parent: old_parent.clone(),
                 snapshot: sv_dir.join("20260322-1430-t"),
                 dest_dir: drive_dir.path().join(".snapshots/sv-t"),
-                drive_label: "DRIVE-A".to_string(),
-                subvolume_name: "sv-t".to_string(),
+                drive_label: dlabel("DRIVE-A"),
+                subvolume_name: svname("sv-t"),
                 pin_on_success: Some((new_pin_path, new_snap_name)),
             }],
             timestamp: test_ts(),
@@ -370,10 +381,18 @@ mod tests {
         let snap_for_b = sv_dir.join("20260322-1430-t-b");
         std::fs::create_dir(&snap_for_b).unwrap();
 
-        chain::write_pin_file(&sv_dir, "DRIVE-A", &SnapshotName::parse("20260321-t").unwrap())
-            .unwrap();
-        chain::write_pin_file(&sv_dir, "DRIVE-B", &SnapshotName::parse("20260321-t").unwrap())
-            .unwrap();
+        chain::write_pin_file(
+            &sv_dir,
+            &dlabel("DRIVE-A"),
+            &SnapshotName::parse("20260321-t").unwrap(),
+        )
+        .unwrap();
+        chain::write_pin_file(
+            &sv_dir,
+            &dlabel("DRIVE-B"),
+            &SnapshotName::parse("20260321-t").unwrap(),
+        )
+        .unwrap();
 
         let config = transient_config_n_drives(
             snap_dir.path(),
@@ -399,16 +418,16 @@ mod tests {
                     parent: old_parent.clone(),
                     snapshot: sv_dir.join("20260322-1430-t"),
                     dest_dir: drive_a_dir.path().join(".snapshots/sv-t"),
-                    drive_label: "DRIVE-A".to_string(),
-                    subvolume_name: "sv-t".to_string(),
+                    drive_label: dlabel("DRIVE-A"),
+                    subvolume_name: svname("sv-t"),
                     pin_on_success: Some((pin_a, snap_name.clone())),
                 },
                 PlannedOperation::SendIncremental {
                     parent: old_parent.clone(),
                     snapshot: snap_for_b,
                     dest_dir: drive_b_dir.path().join(".snapshots/sv-t"),
-                    drive_label: "DRIVE-B".to_string(),
-                    subvolume_name: "sv-t".to_string(),
+                    drive_label: dlabel("DRIVE-B"),
+                    subvolume_name: svname("sv-t"),
                     pin_on_success: Some((pin_b, snap_name)),
                 },
             ],
@@ -437,8 +456,12 @@ mod tests {
         let old_parent = sv_dir.join("20260321-t");
         std::fs::create_dir(&old_parent).unwrap();
 
-        chain::write_pin_file(&sv_dir, "DRIVE-A", &SnapshotName::parse("20260321-t").unwrap())
-            .unwrap();
+        chain::write_pin_file(
+            &sv_dir,
+            &dlabel("DRIVE-A"),
+            &SnapshotName::parse("20260321-t").unwrap(),
+        )
+        .unwrap();
 
         let config = transient_config_n_drives(
             snap_dir.path(),
@@ -458,8 +481,8 @@ mod tests {
                 parent: old_parent.clone(),
                 snapshot: sv_dir.join("20260322-1430-t"),
                 dest_dir: drive_dir.path().join(".snapshots/sv-t"),
-                drive_label: "DRIVE-A".to_string(),
-                subvolume_name: "sv-t".to_string(),
+                drive_label: dlabel("DRIVE-A"),
+                subvolume_name: svname("sv-t"),
                 pin_on_success: Some((bad_pin_path, snap_name)),
             }],
             timestamp: test_ts(),
@@ -507,10 +530,18 @@ mod tests {
         std::fs::create_dir(&old_parent_a).unwrap();
         std::fs::create_dir(&old_parent_b).unwrap();
 
-        chain::write_pin_file(&sv_dir, "DRIVE-A", &SnapshotName::parse("20260320-t").unwrap())
-            .unwrap();
-        chain::write_pin_file(&sv_dir, "DRIVE-B", &SnapshotName::parse("20260321-t").unwrap())
-            .unwrap();
+        chain::write_pin_file(
+            &sv_dir,
+            &dlabel("DRIVE-A"),
+            &SnapshotName::parse("20260320-t").unwrap(),
+        )
+        .unwrap();
+        chain::write_pin_file(
+            &sv_dir,
+            &dlabel("DRIVE-B"),
+            &SnapshotName::parse("20260321-t").unwrap(),
+        )
+        .unwrap();
 
         let config = transient_config_n_drives(
             snap_dir.path(),
@@ -534,16 +565,16 @@ mod tests {
                     parent: old_parent_a.clone(),
                     snapshot: sv_dir.join("20260322-1430-t"),
                     dest_dir: drive_a_dir.path().join(".snapshots/sv-t"),
-                    drive_label: "DRIVE-A".to_string(),
-                    subvolume_name: "sv-t".to_string(),
+                    drive_label: dlabel("DRIVE-A"),
+                    subvolume_name: svname("sv-t"),
                     pin_on_success: Some((pin_a, snap_name.clone())),
                 },
                 PlannedOperation::SendIncremental {
                     parent: old_parent_b.clone(),
                     snapshot: sv_dir.join("20260322-1430-t"),
                     dest_dir: drive_b_dir.path().join(".snapshots/sv-t"),
-                    drive_label: "DRIVE-B".to_string(),
-                    subvolume_name: "sv-t".to_string(),
+                    drive_label: dlabel("DRIVE-B"),
+                    subvolume_name: svname("sv-t"),
                     pin_on_success: Some((pin_b, snap_name)),
                 },
             ],
@@ -578,8 +609,12 @@ mod tests {
         let old_parent = sv_dir.join("20260321-t");
         // Don't create it — simulates already deleted
 
-        chain::write_pin_file(&sv_dir, "DRIVE-A", &SnapshotName::parse("20260321-t").unwrap())
-            .unwrap();
+        chain::write_pin_file(
+            &sv_dir,
+            &dlabel("DRIVE-A"),
+            &SnapshotName::parse("20260321-t").unwrap(),
+        )
+        .unwrap();
 
         let config = transient_config_n_drives(
             snap_dir.path(),
@@ -598,8 +633,8 @@ mod tests {
                 parent: old_parent,
                 snapshot: sv_dir.join("20260322-1430-t"),
                 dest_dir: drive_dir.path().join(".snapshots/sv-t"),
-                drive_label: "DRIVE-A".to_string(),
-                subvolume_name: "sv-t".to_string(),
+                drive_label: dlabel("DRIVE-A"),
+                subvolume_name: svname("sv-t"),
                 pin_on_success: Some((pin_path, snap_name)),
             }],
             timestamp: test_ts(),
@@ -640,8 +675,8 @@ mod tests {
             operations: vec![PlannedOperation::SendFull {
                 snapshot: sv_dir.join("20260322-1430-t"),
                 dest_dir: drive_dir.path().join(".snapshots/sv-t"),
-                drive_label: "DRIVE-A".to_string(),
-                subvolume_name: "sv-t".to_string(),
+                drive_label: dlabel("DRIVE-A"),
+                subvolume_name: svname("sv-t"),
                 pin_on_success: Some((pin_path, snap_name)),
                 reason: FullSendReason::FirstSend,
                 token_verified: false,
@@ -676,10 +711,18 @@ mod tests {
         std::fs::create_dir(&old_parent).unwrap();
 
         // DRIVE-A pins old parent, DRIVE-B pins something else
-        chain::write_pin_file(&sv_dir, "DRIVE-A", &SnapshotName::parse("20260321-t").unwrap())
-            .unwrap();
-        chain::write_pin_file(&sv_dir, "DRIVE-B", &SnapshotName::parse("20260320-t").unwrap())
-            .unwrap();
+        chain::write_pin_file(
+            &sv_dir,
+            &dlabel("DRIVE-A"),
+            &SnapshotName::parse("20260321-t").unwrap(),
+        )
+        .unwrap();
+        chain::write_pin_file(
+            &sv_dir,
+            &dlabel("DRIVE-B"),
+            &SnapshotName::parse("20260320-t").unwrap(),
+        )
+        .unwrap();
 
         let config = transient_config_n_drives(
             snap_dir.path(),
@@ -705,15 +748,15 @@ mod tests {
                     parent: old_parent.clone(),
                     snapshot: sv_dir.join("20260322-1430-t"),
                     dest_dir: drive_a_dir.path().join(".snapshots/sv-t"),
-                    drive_label: "DRIVE-A".to_string(),
-                    subvolume_name: "sv-t".to_string(),
+                    drive_label: dlabel("DRIVE-A"),
+                    subvolume_name: svname("sv-t"),
                     pin_on_success: Some((pin_a, snap_name.clone())),
                 },
                 PlannedOperation::SendFull {
                     snapshot: sv_dir.join("20260322-1430-t"),
                     dest_dir: drive_b_dir.path().join(".snapshots/sv-t"),
-                    drive_label: "DRIVE-B".to_string(),
-                    subvolume_name: "sv-t".to_string(),
+                    drive_label: dlabel("DRIVE-B"),
+                    subvolume_name: svname("sv-t"),
                     pin_on_success: Some((pin_b, snap_name)),
                     reason: FullSendReason::FirstSend,
                     token_verified: false,
@@ -758,7 +801,7 @@ mod tests {
 
         chain::write_pin_file(
             &sv_dir,
-            "DRIVE-A",
+            &dlabel("DRIVE-A"),
             &SnapshotName::parse("20260321-t").unwrap(),
         )
         .unwrap();
@@ -780,8 +823,8 @@ mod tests {
                 parent: old_parent.clone(),
                 snapshot: sv_dir.join("20260322-1430-t"),
                 dest_dir: drive_dir.path().join(".snapshots/sv-t"),
-                drive_label: "DRIVE-A".to_string(),
-                subvolume_name: "sv-t".to_string(),
+                drive_label: dlabel("DRIVE-A"),
+                subvolume_name: svname("sv-t"),
                 pin_on_success: Some((pin_path, snap_name)),
             }],
             timestamp: test_ts(),
@@ -813,14 +856,14 @@ mod tests {
     /// `set_away_shed_pins` test seam. `is_transient` is always `true` here:
     /// every fixture below declares `local_retention = "transient"`, and
     /// Tight/Critical force transience regardless.
-    fn lifecycle_map(clear_all: bool, shed: &[&str]) -> HashMap<String, PlannedLifecycle> {
+    fn lifecycle_map(clear_all: bool, shed: &[&str]) -> HashMap<SubvolName, PlannedLifecycle> {
         let mut m = HashMap::new();
         m.insert(
-            "sv-t".to_string(),
+            svname("sv-t"),
             PlannedLifecycle {
                 is_transient: true,
                 clear_all,
-                shed_away_drives: shed.iter().map(|s| (*s).to_string()).collect(),
+                shed_away_drives: shed.iter().map(|s| dlabel(s)).collect(),
             },
         );
         m
@@ -854,8 +897,8 @@ mod tests {
             operations: vec![PlannedOperation::SendFull {
                 snapshot: snap.clone(),
                 dest_dir: drive_dir.path().join(".snapshots/sv-t"),
-                drive_label: "DRIVE-A".to_string(),
-                subvolume_name: "sv-t".to_string(),
+                drive_label: dlabel("DRIVE-A"),
+                subvolume_name: svname("sv-t"),
                 pin_on_success: None, // Critical writes no pin
                 reason: FullSendReason::FirstSend,
                 token_verified: false,
@@ -900,8 +943,8 @@ mod tests {
             operations: vec![PlannedOperation::SendFull {
                 snapshot: snap.clone(),
                 dest_dir: drive_dir.path().join(".snapshots/sv-t"),
-                drive_label: "DRIVE-A".to_string(),
-                subvolume_name: "sv-t".to_string(),
+                drive_label: dlabel("DRIVE-A"),
+                subvolume_name: svname("sv-t"),
                 pin_on_success: None,
                 reason: FullSendReason::FirstSend,
                 token_verified: false,
@@ -938,8 +981,12 @@ mod tests {
         std::fs::create_dir(&old_parent).unwrap();
         let snap = sv_dir.join("20260322-1430-t");
         std::fs::create_dir(&snap).unwrap();
-        chain::write_pin_file(&sv_dir, "DRIVE-A", &SnapshotName::parse("20260321-t").unwrap())
-            .unwrap();
+        chain::write_pin_file(
+            &sv_dir,
+            &dlabel("DRIVE-A"),
+            &SnapshotName::parse("20260321-t").unwrap(),
+        )
+        .unwrap();
         let pin_path = sv_dir.join(".last-external-parent-DRIVE-A");
         assert!(pin_path.exists());
 
@@ -957,8 +1004,8 @@ mod tests {
                 parent: old_parent.clone(),
                 snapshot: snap.clone(),
                 dest_dir: drive_dir.path().join(".snapshots/sv-t"),
-                drive_label: "DRIVE-A".to_string(),
-                subvolume_name: "sv-t".to_string(),
+                drive_label: dlabel("DRIVE-A"),
+                subvolume_name: svname("sv-t"),
                 pin_on_success: None, // Critical writes no pin
             }],
             timestamp: test_ts(),
@@ -1009,8 +1056,8 @@ mod tests {
                 parent: old_parent.clone(),
                 snapshot: snap.clone(),
                 dest_dir: drive_dir.path().join(".snapshots/sv-t"),
-                drive_label: "DRIVE-A".to_string(),
-                subvolume_name: "sv-t".to_string(),
+                drive_label: dlabel("DRIVE-A"),
+                subvolume_name: svname("sv-t"),
                 pin_on_success: None,
             }],
             timestamp: test_ts(),
@@ -1064,16 +1111,16 @@ mod tests {
                     parent: old_parent.clone(),
                     snapshot: snap.clone(),
                     dest_dir: drive_a.path().join(".snapshots/sv-t"),
-                    drive_label: "DRIVE-A".to_string(),
-                    subvolume_name: "sv-t".to_string(),
+                    drive_label: dlabel("DRIVE-A"),
+                    subvolume_name: svname("sv-t"),
                     pin_on_success: None,
                 },
                 PlannedOperation::SendIncremental {
                     parent: old_parent.clone(),
                     snapshot: snap_b.clone(),
                     dest_dir: drive_b.path().join(".snapshots/sv-t"),
-                    drive_label: "DRIVE-B".to_string(),
-                    subvolume_name: "sv-t".to_string(),
+                    drive_label: dlabel("DRIVE-B"),
+                    subvolume_name: svname("sv-t"),
                     pin_on_success: None,
                 },
             ],
@@ -1104,8 +1151,12 @@ mod tests {
         std::fs::create_dir(&old_parent).unwrap();
         let snap = sv_dir.join("20260322-1430-t");
         std::fs::create_dir(&snap).unwrap();
-        chain::write_pin_file(&sv_dir, "DRIVE-A", &SnapshotName::parse("20260321-t").unwrap())
-            .unwrap();
+        chain::write_pin_file(
+            &sv_dir,
+            &dlabel("DRIVE-A"),
+            &SnapshotName::parse("20260321-t").unwrap(),
+        )
+        .unwrap();
 
         let config = transient_config_n_drives(
             snap_dir.path(),
@@ -1122,8 +1173,8 @@ mod tests {
                 parent: old_parent.clone(),
                 snapshot: snap.clone(),
                 dest_dir: drive_dir.path().join(".snapshots/sv-t"),
-                drive_label: "DRIVE-A".to_string(),
-                subvolume_name: "sv-t".to_string(),
+                drive_label: dlabel("DRIVE-A"),
+                subvolume_name: svname("sv-t"),
                 pin_on_success: Some((
                     new_pin_path.clone(),
                     SnapshotName::parse("20260322-1430-t").unwrap(),
@@ -1162,8 +1213,12 @@ mod tests {
         std::fs::create_dir(&old_parent).unwrap();
         let snap = sv_dir.join("20260322-1430-t");
         std::fs::create_dir(&snap).unwrap();
-        chain::write_pin_file(&sv_dir, "DRIVE-A", &SnapshotName::parse("20260321-t").unwrap())
-            .unwrap();
+        chain::write_pin_file(
+            &sv_dir,
+            &dlabel("DRIVE-A"),
+            &SnapshotName::parse("20260321-t").unwrap(),
+        )
+        .unwrap();
 
         let config = transient_config_n_drives(
             snap_dir.path(),
@@ -1180,8 +1235,8 @@ mod tests {
                 parent: old_parent.clone(),
                 snapshot: snap.clone(),
                 dest_dir: drive_dir.path().join(".snapshots/sv-t"),
-                drive_label: "DRIVE-A".to_string(),
-                subvolume_name: "sv-t".to_string(),
+                drive_label: dlabel("DRIVE-A"),
+                subvolume_name: svname("sv-t"),
                 pin_on_success: Some((
                     new_pin_path.clone(),
                     SnapshotName::parse("20260322-1430-t").unwrap(),
@@ -1217,8 +1272,12 @@ mod tests {
         std::fs::create_dir_all(&sv_dir).unwrap();
         let away_snap = sv_dir.join("20260101-0900-t");
         std::fs::create_dir(&away_snap).unwrap();
-        chain::write_pin_file(&sv_dir, "RECONNECTED", &SnapshotName::parse("20260101-0900-t").unwrap())
-            .unwrap();
+        chain::write_pin_file(
+            &sv_dir,
+            &dlabel("RECONNECTED"),
+            &SnapshotName::parse("20260101-0900-t").unwrap(),
+        )
+        .unwrap();
         let reconnected_pin = sv_dir.join(".last-external-parent-RECONNECTED");
         assert!(reconnected_pin.exists());
 
@@ -1230,7 +1289,7 @@ mod tests {
         // every other drive fixture in this file (TempDir paths, never
         // mounted). This is what makes the real probe report it mounted.
         config.drives.push(crate::config::DriveConfig {
-            label: "RECONNECTED".to_string(),
+            label: dlabel("RECONNECTED"),
             uuid: None,
             mount_path: PathBuf::from("/"),
             snapshot_root: ".snapshots".to_string(),
@@ -1248,7 +1307,7 @@ mod tests {
             operations: vec![PlannedOperation::DeleteSnapshot {
                 path: away_snap.clone(),
                 reason: "transient: not pinned".to_string(),
-                subvolume_name: "sv-t".to_string(),
+                subvolume_name: svname("sv-t"),
                 kind: DeleteKind::Policy,
             }],
             timestamp: test_ts(),
@@ -1274,7 +1333,7 @@ mod tests {
         // M3: the executor derives is_transient via derive_effective_policy
         // (empty map → Roomy → declared) instead of a raw-config check. Prove the
         // two agree on the non-obvious case — a NAMED level + explicit transient
-        // resolves to Transient (config.rs:182-184), while a named level alone
+        // resolves to Transient (`SubvolumeConfig::resolved`), while a named level alone
         // never does — so the switch is behavior-neutral for every config.
         use crate::storage_critical::{derive_effective_policy, TightnessTier};
         let config_str = r#"
@@ -1370,10 +1429,18 @@ protection_level = "sheltered"
         std::fs::create_dir(&connected_new).unwrap();
         let away_snap = sv_dir.join("20260101-0900-t");
         std::fs::create_dir(&away_snap).unwrap();
-        chain::write_pin_file(&sv_dir, "PRIMARY", &SnapshotName::parse("20260320-t").unwrap())
-            .unwrap();
-        chain::write_pin_file(&sv_dir, "OFFSITE", &SnapshotName::parse("20260101-0900-t").unwrap())
-            .unwrap();
+        chain::write_pin_file(
+            &sv_dir,
+            &dlabel("PRIMARY"),
+            &SnapshotName::parse("20260320-t").unwrap(),
+        )
+        .unwrap();
+        chain::write_pin_file(
+            &sv_dir,
+            &dlabel("OFFSITE"),
+            &SnapshotName::parse("20260101-0900-t").unwrap(),
+        )
+        .unwrap();
         let primary_pin = sv_dir.join(".last-external-parent-PRIMARY");
         let offsite_pin = sv_dir.join(".last-external-parent-OFFSITE");
 
@@ -1396,8 +1463,8 @@ protection_level = "sheltered"
                     parent: old_parent.clone(),
                     snapshot: connected_new.clone(),
                     dest_dir: primary_dir.path().join(".snapshots/sv-t"),
-                    drive_label: "PRIMARY".to_string(),
-                    subvolume_name: "sv-t".to_string(),
+                    drive_label: dlabel("PRIMARY"),
+                    subvolume_name: svname("sv-t"),
                     pin_on_success: Some((
                         primary_pin.clone(),
                         SnapshotName::parse("20260322-1430-t").unwrap(),
@@ -1408,7 +1475,7 @@ protection_level = "sheltered"
                 PlannedOperation::DeleteSnapshot {
                     path: away_snap.clone(),
                     reason: "transient: not pinned".to_string(),
-                    subvolume_name: "sv-t".to_string(),
+                    subvolume_name: svname("sv-t"),
                     kind: DeleteKind::Policy,
                 },
             ],
@@ -1460,10 +1527,18 @@ protection_level = "sheltered"
         std::fs::create_dir(&connected).unwrap();
         let away_snap = sv_dir.join("20260101-0900-t");
         std::fs::create_dir(&away_snap).unwrap();
-        chain::write_pin_file(&sv_dir, "PRIMARY", &SnapshotName::parse("20260322-1430-t").unwrap())
-            .unwrap();
-        chain::write_pin_file(&sv_dir, "OFFSITE", &SnapshotName::parse("20260101-0900-t").unwrap())
-            .unwrap();
+        chain::write_pin_file(
+            &sv_dir,
+            &dlabel("PRIMARY"),
+            &SnapshotName::parse("20260322-1430-t").unwrap(),
+        )
+        .unwrap();
+        chain::write_pin_file(
+            &sv_dir,
+            &dlabel("OFFSITE"),
+            &SnapshotName::parse("20260101-0900-t").unwrap(),
+        )
+        .unwrap();
         let offsite_pin = sv_dir.join(".last-external-parent-OFFSITE");
 
         let config = transient_config_n_drives(
@@ -1486,7 +1561,7 @@ protection_level = "sheltered"
             operations: vec![PlannedOperation::DeleteSnapshot {
                 path: away_snap.clone(),
                 reason: "transient: not pinned".to_string(),
-                subvolume_name: "sv-t".to_string(),
+                subvolume_name: svname("sv-t"),
                 kind: DeleteKind::Policy,
             }],
             timestamp: test_ts(),
@@ -1529,8 +1604,12 @@ protection_level = "sheltered"
         let away_snap = sv_dir.join("20260101-0900-t");
         std::fs::create_dir(&away_snap).unwrap();
         // PRIMARY pin only — no OFFSITE drive-specific pin file.
-        chain::write_pin_file(&sv_dir, "PRIMARY", &SnapshotName::parse("20260322-1430-t").unwrap())
-            .unwrap();
+        chain::write_pin_file(
+            &sv_dir,
+            &dlabel("PRIMARY"),
+            &SnapshotName::parse("20260322-1430-t").unwrap(),
+        )
+        .unwrap();
 
         let config = transient_config_n_drives(
             snap_dir.path(),
@@ -1549,7 +1628,7 @@ protection_level = "sheltered"
             operations: vec![PlannedOperation::DeleteSnapshot {
                 path: away_snap.clone(),
                 reason: "transient: not pinned".to_string(),
-                subvolume_name: "sv-t".to_string(),
+                subvolume_name: svname("sv-t"),
                 kind: DeleteKind::Policy,
             }],
             timestamp: test_ts(),
@@ -1574,8 +1653,12 @@ protection_level = "sheltered"
         std::fs::create_dir_all(&sv_dir).unwrap();
         let away_snap = sv_dir.join("20260101-0900-t");
         std::fs::create_dir(&away_snap).unwrap();
-        chain::write_pin_file(&sv_dir, "OFFSITE", &SnapshotName::parse("20260101-0900-t").unwrap())
-            .unwrap();
+        chain::write_pin_file(
+            &sv_dir,
+            &dlabel("OFFSITE"),
+            &SnapshotName::parse("20260101-0900-t").unwrap(),
+        )
+        .unwrap();
 
         let config = transient_config_n_drives(
             snap_dir.path(),
@@ -1594,7 +1677,7 @@ protection_level = "sheltered"
             operations: vec![PlannedOperation::DeleteSnapshot {
                 path: away_snap.clone(),
                 reason: "transient: not pinned".to_string(),
-                subvolume_name: "sv-t".to_string(),
+                subvolume_name: svname("sv-t"),
                 kind: DeleteKind::Policy,
             }],
             timestamp: test_ts(),
@@ -1622,10 +1705,18 @@ protection_level = "sheltered"
         let shared = sv_dir.join("20260322-1430-t");
         std::fs::create_dir(&shared).unwrap();
         // Shared parent: pinned by BOTH the connected and the away drive.
-        chain::write_pin_file(&sv_dir, "PRIMARY", &SnapshotName::parse("20260322-1430-t").unwrap())
-            .unwrap();
-        chain::write_pin_file(&sv_dir, "OFFSITE", &SnapshotName::parse("20260322-1430-t").unwrap())
-            .unwrap();
+        chain::write_pin_file(
+            &sv_dir,
+            &dlabel("PRIMARY"),
+            &SnapshotName::parse("20260322-1430-t").unwrap(),
+        )
+        .unwrap();
+        chain::write_pin_file(
+            &sv_dir,
+            &dlabel("OFFSITE"),
+            &SnapshotName::parse("20260322-1430-t").unwrap(),
+        )
+        .unwrap();
         let primary_pin = sv_dir.join(".last-external-parent-PRIMARY");
         let offsite_pin = sv_dir.join(".last-external-parent-OFFSITE");
         let new_snap = sv_dir.join("20260323-1430-t");
@@ -1648,8 +1739,8 @@ protection_level = "sheltered"
                 parent: shared.clone(),
                 snapshot: new_snap.clone(),
                 dest_dir: primary_dir.path().join(".snapshots/sv-t"),
-                drive_label: "PRIMARY".to_string(),
-                subvolume_name: "sv-t".to_string(),
+                drive_label: dlabel("PRIMARY"),
+                subvolume_name: svname("sv-t"),
                 pin_on_success: None, // Critical clear-all writes no pin
             }],
             timestamp: test_ts(),

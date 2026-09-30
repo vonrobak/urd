@@ -56,42 +56,22 @@ mod tests {
     use std::collections::HashSet;
     use std::path::PathBuf;
 
-    use chrono::{NaiveDate, NaiveDateTime};
-
     use crate::btrfs::MockBtrfs;
     use crate::config::{DriveConfig, ResolvedSubvolume};
     use crate::events::RunContext;
     use crate::observation::Observation;
     use crate::plan::testkit::MockFileSystemState;
+    use crate::testkit::{drive_config, fixed_now as now, snap};
     use crate::types::{
         DriveRole, Interval, LocalRetentionPolicy, MonthlyCount, ResolvedGraduatedRetention,
         SnapshotName,
     };
 
     use super::*;
-
-    fn now() -> NaiveDateTime {
-        NaiveDate::from_ymd_opt(2026, 3, 22)
-            .unwrap()
-            .and_hms_opt(15, 0, 0)
-            .unwrap()
-    }
-
-    fn snap(s: &str) -> SnapshotName {
-        SnapshotName::parse(s).unwrap()
-    }
+    use crate::testkit::svname;
 
     fn drive() -> DriveConfig {
-        DriveConfig {
-            label: "D1".to_string(),
-            uuid: None,
-            mount_path: PathBuf::from("/mnt/d1"),
-            snapshot_root: ".snapshots".to_string(),
-            role: DriveRole::Primary,
-            max_usage_percent: None,
-            min_free_bytes: None,
-            rotation_interval: None,
-        }
+        drive_config("D1", "/mnt/d1", DriveRole::Primary)
     }
 
     /// A subvolume whose external retention keeps nothing — every non-pinned
@@ -99,7 +79,7 @@ mod tests {
     /// function for the region's delete-emission path).
     fn subvol_keep_nothing() -> ResolvedSubvolume {
         ResolvedSubvolume {
-            name: "sv1".to_string(),
+            name: svname("sv1"),
             short_name: "one".to_string(),
             source: PathBuf::from("/data/sv1"),
             priority: 1,

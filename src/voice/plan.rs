@@ -11,23 +11,23 @@ use std::fmt::Write;
 use colored::Colorize;
 
 use crate::output::{OutputMode, PlanOutput, SkipCategory, SkippedSubvolume};
-use crate::plan::format_duration_short;
 
 use super::{
     SuggestionContext, append_suggestion, approx_size, pad_visible, pluralize, render_json,
     skip_tag,
 };
+use super::duration::DurationStyle;
 
 /// Render an explanation for why a manual backup produced an empty plan.
 #[must_use]
 pub fn render_empty_plan(explanation: &crate::output::EmptyPlanExplanation) -> String {
     let mut out = String::new();
     let reasons = explanation.reasons.join("; ");
-    let _ = write!(out, "Nothing to back up — {reasons}.");
+    write!(out, "Nothing to back up — {reasons}.").ok();
     if let Some(ref suggestion) = explanation.suggestion {
-        let _ = write!(out, "\n  {suggestion}");
+        write!(out, "\n  {suggestion}").ok();
     }
-    let _ = writeln!(out);
+    writeln!(out).ok();
     out
 }
 
@@ -291,7 +291,7 @@ fn render_interval_group(items: &[&SkippedSubvolume], out: &mut String) {
     let shortest = items.iter().filter_map(|s| s.next_due_minutes).min();
 
     let suffix = if let Some(mins) = shortest {
-        format!(" (next in ~{})", format_duration_short(mins))
+        format!(" (next in ~{})", DurationStyle::Short.render(mins.saturating_mul(60)))
     } else {
         String::new()
     };

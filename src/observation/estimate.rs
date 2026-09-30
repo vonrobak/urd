@@ -6,7 +6,7 @@
 //! and awareness's operational-health space check.
 
 use super::HistoryQuery;
-use crate::types::SendKind;
+use crate::types::{DriveLabel, SendKind, SubvolName};
 
 /// Which cascade tier `estimated_send_size_with_source` resolved to — lets a
 /// caller reconstruct tier-specific display detail (the calibrated-staleness
@@ -33,8 +33,8 @@ pub enum SizeEstimateSource {
 #[must_use]
 pub fn estimated_send_size_with_source(
     history: &dyn HistoryQuery,
-    subvol_name: &str,
-    drive_label: &str,
+    subvol_name: &SubvolName,
+    drive_label: &DriveLabel,
     needs_full: bool,
 ) -> Option<(u64, SizeEstimateSource)> {
     let send_kind = if needs_full {
@@ -73,8 +73,8 @@ pub fn estimated_send_size_with_source(
 #[must_use]
 pub fn estimated_send_size(
     history: &dyn HistoryQuery,
-    subvol_name: &str,
-    drive_label: &str,
+    subvol_name: &SubvolName,
+    drive_label: &DriveLabel,
     needs_full: bool,
 ) -> Option<u64> {
     estimated_send_size_with_source(history, subvol_name, drive_label, needs_full)

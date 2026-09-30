@@ -106,7 +106,7 @@ After restart:
 | State | Survives? | Source |
 |-------|-----------|--------|
 | Backup history | Yes | SQLite `runs`, `subvolume_results` |
-| Promise states | Yes (recomputed from filesystem on next read) | `awareness.rs` |
+| Promise states | Yes (recomputed from filesystem on next read) | `awareness/` |
 | Pin files (chain parents) | Yes | Filesystem (`.last-external-parent-<LABEL>`) |
 | Drive UUID adoption | Yes | SQLite `drive_identities` |
 | Notification dispatch ledger | Yes | Heartbeat `notifications_dispatched` field |

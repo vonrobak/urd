@@ -16,7 +16,7 @@ use crate::voice;
 
 pub fn run(config: Config, output_mode: OutputMode) -> anyhow::Result<()> {
     let world = World::open(&config);
-    let drive_labels: Vec<String> = config.drives.iter().map(|d| d.label.clone()).collect();
+    let drive_labels = config.drive_labels();
 
     // ── The seal (UPI 071/075/081) ──────────────────────────────────
     // An incomplete seal stage is a named state, not a degraded render.
@@ -40,7 +40,7 @@ pub fn run(config: Config, output_mode: OutputMode) -> anyhow::Result<()> {
         .map(|d| {
             let mounted = drives::is_drive_mounted(d);
             DriveInfo {
-                label: d.label.clone(),
+                label: d.label.to_string(),
                 mounted,
                 free_bytes: if mounted {
                     drives::filesystem_free_bytes(&d.mount_path).ok()
@@ -156,7 +156,7 @@ fn assemble_status_output(
                 })
                 .min();
             worst.map(|health| ChainHealthEntry {
-                subvolume: a.name.clone(),
+                subvolume: a.name.to_string(),
                 health,
             })
         })
@@ -212,89 +212,29 @@ fn assemble_status_output(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::dlabel;
     use crate::awareness::test_support::dt;
-    use crate::awareness::{
-        DriveAssessment, DriveChainHealth, LocalAssessment, OperationalHealth,
-        PromiseStatus,
-    };
+    use crate::awareness::{DriveAssessment, DriveChainHealth, PromiseStatus};
+    use crate::testkit::{ConfigBuilder, subvol_assessment};
     use crate::types::{DriveRole, Interval};
 
     /// sv1: sheltered (named level, default retention). sv2: transient local
     /// retention with sends enabled (external-only mode). One primary drive.
     fn test_config() -> Config {
-        let toml_str = r#"
-[general]
-state_db = "/tmp/urd.db"
-metrics_file = "/tmp/backup.prom"
-log_dir = "/tmp"
-
-[local_snapshots]
-roots = [
-  { path = "/snap", subvolumes = ["sv1", "sv2"] }
-]
-
-[defaults]
-snapshot_interval = "1h"
-send_interval = "1d"
-send_enabled = true
-enabled = true
-[defaults.local_retention]
-hourly = 24
-daily = 30
-weekly = 26
-monthly = 12
-[defaults.external_retention]
-daily = 30
-weekly = 26
-monthly = 0
-
-[[drives]]
-label = "ext-drive"
-mount_path = "/mnt/ext"
-snapshot_root = ".snapshots"
-role = "primary"
-
-[[subvolumes]]
-name = "sv1"
-short_name = "sv1"
-source = "/data/sv1"
-protection_level = "sheltered"
-
-[[subvolumes]]
-name = "sv2"
-short_name = "sv2"
-source = "/data/sv2"
-local_retention = "transient"
-"#;
-        toml::from_str(toml_str).expect("test config should parse")
+        ConfigBuilder::new()
+            .drives(&[("ext-drive", "/mnt/ext", "primary")])
+            .subvolume_line("sv1", r#"protection_level = "sheltered""#)
+            .subvolume_line("sv2", r#"local_retention = "transient""#)
+            .build()
     }
 
     fn assessment(name: &str) -> SubvolAssessment {
-        SubvolAssessment {
-            name: name.to_string(),
-            short_name: name.to_string(),
-            status: PromiseStatus::Protected,
-            health: OperationalHealth::Healthy,
-            health_reasons: vec![],
-            local: LocalAssessment {
-                status: PromiseStatus::Protected,
-                snapshot_count: 5,
-                newest_age: None,
-            },
-            external: vec![],
-            chain_health: vec![],
-            advisories: vec![],
-            redundancy_advisories: vec![],
-            errors: vec![],
-            storage_posture: None,
-            cadence_adapted: false,
-            effective_send_interval: None,
-        }
+        subvol_assessment(name, PromiseStatus::Protected)
     }
 
     fn mounted_drive(label: &str) -> DriveAssessment {
         DriveAssessment {
-            drive_label: label.to_string(),
+            drive_label: label.into(),
             status: PromiseStatus::Protected,
             mounted: true,
             snapshot_count: Some(3),
@@ -382,7 +322,7 @@ local_retention = "transient"
     fn chain_health_intact_only_pins_incremental() {
         let mut a = assessment("sv1");
         a.chain_health = vec![DriveChainHealth {
-            drive_label: "ext-drive".to_string(),
+            drive_label: dlabel("ext-drive"),
             status: ChainStatus::Intact {
                 pin_parent: "20260610-0400-sv1".to_string(),
             },
@@ -400,7 +340,7 @@ local_retention = "transient"
     fn chain_health_no_drive_data_maps_to_no_drive_data() {
         let mut a = assessment("sv1");
         a.chain_health = vec![DriveChainHealth {
-            drive_label: "ext-drive".to_string(),
+            drive_label: dlabel("ext-drive"),
             status: ChainStatus::Broken {
                 reason: ChainBreakReason::NoDriveData,
                 pin_parent: None,
@@ -417,13 +357,13 @@ local_retention = "transient"
         let mut a = assessment("sv1");
         a.chain_health = vec![
             DriveChainHealth {
-                drive_label: "drive-a".to_string(),
+                drive_label: dlabel("drive-a"),
                 status: ChainStatus::Intact {
                     pin_parent: "20260610-0400-sv1".to_string(),
                 },
             },
             DriveChainHealth {
-                drive_label: "drive-b".to_string(),
+                drive_label: dlabel("drive-b"),
                 status: ChainStatus::Broken {
                     reason: ChainBreakReason::NoPinFile,
                     pin_parent: None,
@@ -440,14 +380,14 @@ local_retention = "transient"
         let mut b = assessment("sv2");
         b.chain_health = vec![
             DriveChainHealth {
-                drive_label: "drive-a".to_string(),
+                drive_label: dlabel("drive-a"),
                 status: ChainStatus::Broken {
                     reason: ChainBreakReason::NoPinFile,
                     pin_parent: None,
                 },
             },
             DriveChainHealth {
-                drive_label: "drive-b".to_string(),
+                drive_label: dlabel("drive-b"),
                 status: ChainStatus::Broken {
                     reason: ChainBreakReason::NoDriveData,
                     pin_parent: None,

@@ -91,7 +91,7 @@ pub struct PoolMetric {
 }
 
 /// Prometheus counter family derived from the events table by
-/// `state.rs::count_*` helpers.
+/// `StateDb::count_*` helpers (`state/events.rs`).
 #[derive(Debug, Default, Clone)]
 pub struct EventCounters {
     pub circuit_breaker_trips: u64,

@@ -11,7 +11,7 @@ use chrono::NaiveDateTime;
 
 use crate::events::UnstampedEvent;
 use crate::output::SkipCategory;
-use crate::types::{ByteSize, FullSendReason, SnapshotName};
+use crate::types::{ByteSize, DriveLabel, FullSendReason, SnapshotName, SubvolName};
 
 // `DeleteKind` is defined by retention (it tags each deletion decision) and
 // carried on `PlannedOperation::DeleteSnapshot`.
@@ -25,35 +25,35 @@ pub enum PlannedOperation {
     CreateSnapshot {
         source: PathBuf,
         dest: PathBuf,
-        subvolume_name: String,
+        subvolume_name: SubvolName,
     },
     SendIncremental {
         parent: PathBuf,
         snapshot: PathBuf,
         dest_dir: PathBuf,
-        drive_label: String,
-        subvolume_name: String,
+        drive_label: DriveLabel,
+        subvolume_name: SubvolName,
         /// Pin file to write on successful send: (pin_file_path, snapshot_name_to_write)
         pin_on_success: Option<(PathBuf, SnapshotName)>,
     },
     SendFull {
         snapshot: PathBuf,
         dest_dir: PathBuf,
-        drive_label: String,
-        subvolume_name: String,
+        drive_label: DriveLabel,
+        subvolume_name: SubvolName,
         /// Pin file to write on successful send: (pin_file_path, snapshot_name_to_write)
         pin_on_success: Option<(PathBuf, SnapshotName)>,
         /// Why this is a full send instead of incremental.
         reason: FullSendReason,
         /// Whether the target drive's identity has been verified via drive session token.
-        /// Set by `commands/backup.rs` after plan creation (planner doesn't access tokens).
+        /// Set by `commands/backup/gating.rs` after plan creation (planner doesn't access tokens).
         /// When true, the executor's chain-break gate allows the send to proceed.
         token_verified: bool,
     },
     DeleteSnapshot {
         path: PathBuf,
         reason: String,
-        subvolume_name: String,
+        subvolume_name: SubvolName,
         /// Distinguishes policy-driven retention from space-pressure-driven retention.
         /// The executor's space-recovery short-circuit applies only to `SpacePressure`
         /// deletes; `Policy` deletes always execute (subject to pin re-check).
@@ -143,23 +143,23 @@ pub enum SkipReason {
     /// host-survival floor, so no send starts this run.
     SourceBelowFloor { free: ByteSize, required: ByteSize },
     /// The drive's mount path is not mounted.
-    DriveNotMounted { drive: String },
+    DriveNotMounted { drive: DriveLabel },
     /// A different filesystem is mounted at the drive's path.
     DriveUuidMismatch {
-        drive: String,
+        drive: DriveLabel,
         expected: String,
         found: String,
     },
     /// The drive's UUID could not be verified.
-    DriveUuidCheckFailed { drive: String, error: String },
+    DriveUuidCheckFailed { drive: DriveLabel, error: String },
     /// The drive's session token does not match the stored reference.
     DriveTokenMismatch {
-        drive: String,
+        drive: DriveLabel,
         expected: String,
         found: String,
     },
     /// The drive has no token although SQLite holds one for its label.
-    DriveTokenExpectedButMissing { drive: String },
+    DriveTokenExpectedButMissing { drive: DriveLabel },
     /// Local space guard: the source filesystem is below `min_free_bytes`.
     LocalLowOnSpace { free: ByteSize, required: ByteSize },
     /// The snapshot interval has not elapsed; the next snapshot is due in
@@ -170,24 +170,24 @@ pub enum SkipReason {
     /// A snapshot with this run's name already exists.
     SnapshotAlreadyExists,
     /// The send interval to `drive` has not elapsed.
-    SendNotDue { drive: String, next_in_minutes: i64 },
+    SendNotDue { drive: DriveLabel, next_in_minutes: i64 },
     /// Transient lifecycle: no sendable drive is due — one `(drive, minutes
     /// until due)` entry per sendable drive, rendered as one reason.
-    SendsNotDue { drives: Vec<(String, i64)> },
+    SendsNotDue { drives: Vec<(DriveLabel, i64)> },
     /// Transient lifecycle: no drive is available to send to.
     TransientNoDrives,
     /// The calibrated size (the full-send estimate) exceeds the drive's
     /// available space. `stale_calibration_days` is `Some` only when the
     /// planner judged the calibration stale (older than 30 days).
     CalibratedSizeExceedsSpace {
-        drive: String,
+        drive: DriveLabel,
         estimated: ByteSize,
         available: ByteSize,
         stale_calibration_days: Option<i64>,
     },
     /// The history-estimated send size exceeds the drive's available space.
     EstimatedSizeExceedsSpace {
-        drive: String,
+        drive: DriveLabel,
         estimated: ByteSize,
         available: ByteSize,
         free: ByteSize,
@@ -204,7 +204,7 @@ impl SkipReason {
     /// subvolume-scoped reasons, including the transient multi-drive
     /// [`SkipReason::SendsNotDue`].
     #[must_use]
-    pub fn drive(&self) -> Option<&str> {
+    pub fn drive(&self) -> Option<&DriveLabel> {
         match self {
             Self::DriveNotMounted { drive }
             | Self::DriveUuidMismatch { drive, .. }
@@ -232,7 +232,11 @@ impl SkipReason {
 
 /// `send to {drive} not due (next in ~{duration})` — shared by the single-drive
 /// [`SkipReason::SendNotDue`] and each entry of [`SkipReason::SendsNotDue`].
-fn write_send_not_due(f: &mut fmt::Formatter<'_>, drive: &str, minutes: i64) -> fmt::Result {
+fn write_send_not_due(
+    f: &mut fmt::Formatter<'_>,
+    drive: &DriveLabel,
+    minutes: i64,
+) -> fmt::Result {
     write!(
         f,
         "send to {} not due (next in ~{})",
@@ -386,7 +390,7 @@ impl From<&SkipReason> for SkipCategory {
 /// structured so renderers never re-parse it out of the prose reason.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlannedSkip {
-    pub name: String,
+    pub name: SubvolName,
     pub reason: SkipReason,
     pub next_due_minutes: Option<i64>,
     /// True when send planning concluded the source offers nothing new for a
@@ -413,7 +417,7 @@ pub enum NothingNew {
     /// The chosen snapshot is already on the drive ("caught up").
     AlreadyOn {
         snapshot: SnapshotName,
-        drive: String,
+        drive: DriveLabel,
     },
     /// No local snapshots exist to choose from. `transient` selects the
     /// lifecycle-appropriate prose: transient reads as routine (sends resume
@@ -448,7 +452,7 @@ impl PlannedSkip {
     /// [`SkipReason::NothingNew`] here.
     #[must_use]
     pub fn deferred(
-        name: impl Into<String>,
+        name: impl Into<SubvolName>,
         reason: SkipReason,
         next_due_minutes: Option<i64>,
     ) -> Self {
@@ -464,7 +468,7 @@ impl PlannedSkip {
     /// `true` and the reason is [`SkipReason::NothingNew`] built from `why` —
     /// the two cannot drift. The only true-constructor of the arm-2 marker.
     #[must_use]
-    pub fn nothing_new(name: impl Into<String>, why: &NothingNew) -> Self {
+    pub fn nothing_new(name: impl Into<SubvolName>, why: &NothingNew) -> Self {
         Self {
             name: name.into(),
             reason: SkipReason::NothingNew(why.clone()),
@@ -490,7 +494,7 @@ impl PlannedSkip {
 pub struct PlannedLifecycle {
     pub is_transient: bool,
     pub clear_all: bool,
-    pub shed_away_drives: Vec<String>,
+    pub shed_away_drives: Vec<DriveLabel>,
 }
 
 /// The complete output of the backup planner.
@@ -507,7 +511,7 @@ pub struct BackupPlan {
     pub timestamp: NaiveDateTime,
     pub skipped: Vec<PlannedSkip>,
     pub events: Vec<UnstampedEvent>,
-    pub lifecycles: HashMap<String, PlannedLifecycle>,
+    pub lifecycles: HashMap<SubvolName, PlannedLifecycle>,
 }
 
 impl BackupPlan {
@@ -556,6 +560,7 @@ impl fmt::Display for PlanSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::{dlabel, svname};
     use chrono::NaiveDate;
 
     // ── NothingNew / PlannedSkip constructor tests (UPI 089-b) ──────
@@ -568,7 +573,7 @@ mod tests {
     fn nothing_new_reason_already_on_is_byte_stable() {
         let why = NothingNew::AlreadyOn {
             snapshot: SnapshotName::parse("20260430-0402-one").expect("valid"),
-            drive: "WD-18TB".to_string(),
+            drive: dlabel("WD-18TB"),
         };
         assert_eq!(why.reason(), "20260430-0402-one already on WD-18TB");
     }
@@ -592,7 +597,7 @@ mod tests {
         let skip = PlannedSkip::deferred(
             "sv1",
             SkipReason::DriveNotMounted {
-                drive: "D1".to_string(),
+                drive: dlabel("D1"),
             },
             None,
         );
@@ -618,7 +623,7 @@ mod tests {
     fn planned_skip_nothing_new_always_sets_marker_and_derives_reason() {
         let why = NothingNew::AlreadyOn {
             snapshot: SnapshotName::parse("20260322-1330-one").expect("valid"),
-            drive: "D1".to_string(),
+            drive: dlabel("D1"),
         };
         let skip = PlannedSkip::nothing_new("sv1", &why);
         assert!(skip.is_nothing_new());
@@ -637,7 +642,7 @@ mod tests {
         for why in [
             NothingNew::AlreadyOn {
                 snapshot: SnapshotName::parse("20260322-1330-one").expect("valid"),
-                drive: "D1".to_string(),
+                drive: dlabel("D1"),
             },
             NothingNew::NoLocalSnapshots { transient: true },
             NothingNew::NoLocalSnapshots { transient: false },
@@ -711,7 +716,7 @@ mod tests {
     fn skip_reason_display_drive_not_mounted() {
         let label = "WD-18TB";
         let reason = SkipReason::DriveNotMounted {
-            drive: label.to_string(),
+            drive: label.into(),
         };
         assert_eq!(reason.to_string(), format!("drive {} not mounted", label));
         assert_eq!(reason.to_string(), "drive WD-18TB not mounted");
@@ -721,7 +726,7 @@ mod tests {
     fn skip_reason_display_drive_uuid_mismatch() {
         let (label, expected, found) = ("WD-18TB", "abc", "def");
         let reason = SkipReason::DriveUuidMismatch {
-            drive: label.to_string(),
+            drive: label.into(),
             expected: expected.to_string(),
             found: found.to_string(),
         };
@@ -742,7 +747,7 @@ mod tests {
     fn skip_reason_display_drive_uuid_check_failed() {
         let (label, error) = ("WD-18TB", "io error");
         let reason = SkipReason::DriveUuidCheckFailed {
-            drive: label.to_string(),
+            drive: label.into(),
             error: error.to_string(),
         };
         assert_eq!(
@@ -756,7 +761,7 @@ mod tests {
     fn skip_reason_display_drive_token_mismatch() {
         let (label, expected, found) = ("WD-18TB", "abc", "def");
         let reason = SkipReason::DriveTokenMismatch {
-            drive: label.to_string(),
+            drive: label.into(),
             expected: expected.to_string(),
             found: found.to_string(),
         };
@@ -777,7 +782,7 @@ mod tests {
     fn skip_reason_display_drive_token_expected_but_missing() {
         let label = "WD-18TB";
         let reason = SkipReason::DriveTokenExpectedButMissing {
-            drive: label.to_string(),
+            drive: label.into(),
         };
         assert_eq!(
             reason.to_string(),
@@ -860,7 +865,7 @@ mod tests {
     fn skip_reason_display_send_not_due() {
         let (label, mins) = ("WD-18TB", 150);
         let reason = SkipReason::SendNotDue {
-            drive: label.to_string(),
+            drive: label.into(),
             next_in_minutes: mins,
         };
         assert_eq!(
@@ -876,8 +881,8 @@ mod tests {
 
     #[test]
     fn skip_reason_display_sends_not_due_joins_per_drive() {
-        let next_dues: Vec<(String, i64)> =
-            vec![("WD-18TB".to_string(), 150), ("2TB-backup".to_string(), 3 * 1440)];
+        let next_dues: Vec<(DriveLabel, i64)> =
+            vec![(dlabel("WD-18TB"), 150), (dlabel("2TB-backup"), 3 * 1440)];
         // The pre-change transient.rs construction, verbatim.
         let skip_msg = next_dues
             .iter()
@@ -899,7 +904,7 @@ mod tests {
         // One drive reads exactly like the single-drive variant.
         assert_eq!(
             SkipReason::SendsNotDue {
-                drives: vec![("WD-18TB".to_string(), 150)]
+                drives: vec![(dlabel("WD-18TB"), 150)]
             }
             .to_string(),
             "send to WD-18TB not due (next in ~2h30m)"
@@ -936,7 +941,7 @@ mod tests {
         };
         for stale in [None, Some(45)] {
             let reason = SkipReason::CalibratedSizeExceedsSpace {
-                drive: label.to_string(),
+                drive: label.into(),
                 estimated: ByteSize(estimated),
                 available: ByteSize(available),
                 stale_calibration_days: stale,
@@ -945,7 +950,7 @@ mod tests {
         }
         assert_eq!(
             SkipReason::CalibratedSizeExceedsSpace {
-                drive: label.to_string(),
+                drive: label.into(),
                 estimated: ByteSize(estimated),
                 available: ByteSize(available),
                 stale_calibration_days: Some(45),
@@ -962,7 +967,7 @@ mod tests {
         let (estimated, available, free, min_free) =
             (4_500_000_000u64, 2_100_000_000u64, 52_100_000_000u64, gb(50).0);
         let reason = SkipReason::EstimatedSizeExceedsSpace {
-            drive: label.to_string(),
+            drive: label.into(),
             estimated: ByteSize(estimated),
             available: ByteSize(available),
             free: ByteSize(free),
@@ -991,7 +996,7 @@ mod tests {
         for why in [
             NothingNew::AlreadyOn {
                 snapshot: SnapshotName::parse("20260329-0404-htpc-home").expect("valid"),
-                drive: "WD-18TB".to_string(),
+                drive: dlabel("WD-18TB"),
             },
             NothingNew::NoLocalSnapshots { transient: true },
             NothingNew::NoLocalSnapshots { transient: false },
@@ -1022,12 +1027,12 @@ mod tests {
                 SkipCategory::Other,
             ),
             (
-                SkipReason::DriveNotMounted { drive: drive() },
+                SkipReason::DriveNotMounted { drive: drive().into() },
                 SkipCategory::DriveNotMounted,
             ),
             (
                 SkipReason::DriveUuidMismatch {
-                    drive: drive(),
+                    drive: drive().into(),
                     expected: "abc".to_string(),
                     found: "def".to_string(),
                 },
@@ -1035,21 +1040,21 @@ mod tests {
             ),
             (
                 SkipReason::DriveUuidCheckFailed {
-                    drive: drive(),
+                    drive: drive().into(),
                     error: "io error".to_string(),
                 },
                 SkipCategory::Other,
             ),
             (
                 SkipReason::DriveTokenMismatch {
-                    drive: drive(),
+                    drive: drive().into(),
                     expected: "abc".to_string(),
                     found: "def".to_string(),
                 },
                 SkipCategory::Other,
             ),
             (
-                SkipReason::DriveTokenExpectedButMissing { drive: drive() },
+                SkipReason::DriveTokenExpectedButMissing { drive: drive().into() },
                 SkipCategory::Other,
             ),
             (
@@ -1074,21 +1079,21 @@ mod tests {
             (SkipReason::SnapshotAlreadyExists, SkipCategory::Other),
             (
                 SkipReason::SendNotDue {
-                    drive: drive(),
+                    drive: drive().into(),
                     next_in_minutes: 150,
                 },
                 SkipCategory::IntervalNotElapsed,
             ),
             (
                 SkipReason::SendsNotDue {
-                    drives: vec![(drive(), 150), ("2TB-backup".to_string(), 60)],
+                    drives: vec![(drive().into(), 150), (dlabel("2TB-backup"), 60)],
                 },
                 SkipCategory::IntervalNotElapsed,
             ),
             (SkipReason::TransientNoDrives, SkipCategory::Other),
             (
                 SkipReason::CalibratedSizeExceedsSpace {
-                    drive: drive(),
+                    drive: drive().into(),
                     estimated: gb(4),
                     available: gb(2),
                     stale_calibration_days: None,
@@ -1097,7 +1102,7 @@ mod tests {
             ),
             (
                 SkipReason::EstimatedSizeExceedsSpace {
-                    drive: drive(),
+                    drive: drive().into(),
                     estimated: gb(4),
                     available: gb(2),
                     free: gb(52),
@@ -1116,7 +1121,7 @@ mod tests {
             (
                 SkipReason::NothingNew(NothingNew::AlreadyOn {
                     snapshot: snap,
-                    drive: drive(),
+                    drive: drive().into(),
                 }),
                 SkipCategory::Other,
             ),
@@ -1129,28 +1134,28 @@ mod tests {
     #[test]
     fn skip_reason_drive_names_the_scoped_drive_only() {
         let d = || "D1".to_string();
-        assert_eq!(SkipReason::DriveNotMounted { drive: d() }.drive(), Some("D1"));
+        assert_eq!(SkipReason::DriveNotMounted { drive: d().into() }.drive(), Some(&dlabel("D1")));
         assert_eq!(
             SkipReason::SendNotDue {
-                drive: d(),
+                drive: d().into(),
                 next_in_minutes: 5
             }
             .drive(),
-            Some("D1")
+            Some(&dlabel("D1"))
         );
         assert_eq!(
             SkipReason::NothingNew(NothingNew::AlreadyOn {
                 snapshot: SnapshotName::parse("20260322-1330-one").expect("valid"),
-                drive: d(),
+                drive: d().into(),
             })
             .drive(),
-            Some("D1")
+            Some(&dlabel("D1"))
         );
         // Subvolume-scoped, including the transient multi-drive deferral.
         assert_eq!(SkipReason::Disabled.drive(), None);
         assert_eq!(
             SkipReason::SendsNotDue {
-                drives: vec![(d(), 5)]
+                drives: vec![(d().into(), 5)]
             }
             .drive(),
             None
@@ -1167,18 +1172,18 @@ mod tests {
                 PlannedOperation::CreateSnapshot {
                     source: PathBuf::from("/home"),
                     dest: PathBuf::from("/snap/20260322-1430-home"),
-                    subvolume_name: "htpc-home".to_string(),
+                    subvolume_name: svname("htpc-home"),
                 },
                 PlannedOperation::DeleteSnapshot {
                     path: PathBuf::from("/snap/old"),
                     reason: "expired".to_string(),
-                    subvolume_name: "htpc-home".to_string(),
+                    subvolume_name: svname("htpc-home"),
                     kind: DeleteKind::Policy,
                 },
                 PlannedOperation::DeleteSnapshot {
                     path: PathBuf::from("/snap/old2"),
                     reason: "expired".to_string(),
-                    subvolume_name: "htpc-home".to_string(),
+                    subvolume_name: svname("htpc-home"),
                     kind: DeleteKind::Policy,
                 },
             ],

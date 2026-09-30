@@ -10,12 +10,12 @@ use crate::config::{Config, ResolvedSubvolume, SnapshotRoot};
 use crate::drives;
 use crate::executor::{CandidateDeletion, DeleteCandidate, Executor};
 use crate::guard;
+use crate::observation;
 use crate::output::{
     EmergencyOutput, EmergencyResult, EmergencyRootAssessment, EmergencySubvolDetail, OutputMode,
 };
-use crate::plan;
 use crate::retention::{self, RetentionResult};
-use crate::types::SnapshotName;
+use crate::types::{DriveLabel, SnapshotName, SubvolName};
 use crate::voice;
 
 /// One subvolume's already-read emergency inputs: the snapshots present in
@@ -25,7 +25,7 @@ use crate::voice;
 /// decision stays pure (ADR-108) and testable without a filesystem.
 #[derive(Debug, Clone)]
 pub(crate) struct EmergencySubvolInputs {
-    pub(crate) name: String,
+    pub(crate) name: SubvolName,
     pub(crate) local_dir: PathBuf,
     pub(crate) snapshots: Vec<SnapshotName>,
     pub(crate) pinned: HashSet<SnapshotName>,
@@ -97,7 +97,7 @@ pub(crate) fn emergency_candidates(
 fn gather_emergency_inputs(
     root: &SnapshotRoot,
     resolved: &[ResolvedSubvolume],
-    drive_labels: &[String],
+    drive_labels: &[DriveLabel],
 ) -> Vec<EmergencySubvolInputs> {
     let mut inputs = Vec::new();
 
@@ -109,7 +109,7 @@ fn gather_emergency_inputs(
         }
 
         let local_dir = root.path.join(subvol_name);
-        let snapshots = match plan::read_snapshot_dir(&local_dir) {
+        let snapshots = match observation::read_snapshot_dir(&local_dir) {
             Ok(s) => s,
             Err(e) => {
                 log::warn!(
@@ -156,7 +156,7 @@ fn gather_emergency_inputs(
 pub(crate) fn emergency_walk(
     root: &SnapshotRoot,
     resolved: &[ResolvedSubvolume],
-    drive_labels: &[String],
+    drive_labels: &[DriveLabel],
     now: chrono::NaiveDateTime,
 ) -> Vec<EmergencySubvolPlan> {
     let inputs = gather_emergency_inputs(root, resolved, drive_labels);
@@ -220,7 +220,7 @@ pub(crate) fn assess_roots(
             for subvol in &plans {
                 total_unsent += unsent_count(subvol);
                 subvol_details.push(EmergencySubvolDetail {
-                    name: subvol.inputs.name.clone(),
+                    name: subvol.inputs.name.to_string(),
                     snapshot_count: subvol.inputs.snapshots.len(),
                     keep_count: subvol.result.keep.len(),
                     delete_count: subvol.result.delete.len(),
@@ -239,7 +239,7 @@ pub(crate) fn assess_roots(
                         matches!(chain::read_pin_file(&local_dir, &drive.label), Ok(Some(_)))
                     });
                     if has_pin {
-                        drives_needing_full.push(drive.label.clone());
+                        drives_needing_full.push(drive.label.to_string());
                     }
                 }
             }
@@ -368,7 +368,7 @@ pub fn run(config: Config, output_mode: OutputMode) -> anyhow::Result<()> {
             .plans
             .iter()
             .map(|subvol| {
-                plan::read_snapshot_dir(&subvol.inputs.local_dir)
+                observation::read_snapshot_dir(&subvol.inputs.local_dir)
                     .map(|s| s.len())
                     .unwrap_or(0)
             })
@@ -393,6 +393,7 @@ pub fn run(config: Config, output_mode: OutputMode) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::snap;
 
     /// A config with one snapshot root under `root`, one subvolume `alpha`,
     /// one drive `D1`, and a 1 GB `min_free_bytes` — so the interactive crisis
@@ -449,13 +450,9 @@ source = "/data/alpha"
         "20260103-1200-alpha",
     ];
 
-    fn snap(name: &str) -> SnapshotName {
-        SnapshotName::parse(name).unwrap()
-    }
-
     fn subvol_inputs(name: &str, snapshots: &[&str], pins: &[&str]) -> EmergencySubvolInputs {
         EmergencySubvolInputs {
-            name: name.to_string(),
+            name: name.into(),
             local_dir: PathBuf::from("/snap").join(name),
             snapshots: snapshots.iter().map(|s| snap(s)).collect(),
             pinned: pins.iter().map(|s| snap(s)).collect(),

@@ -23,6 +23,7 @@ use crate::awareness::{PromiseStatus, SubvolAssessment};
 use crate::config::Config;
 use crate::error::UrdError;
 use crate::executor::ExecutionResult;
+use crate::types::Timestamp;
 
 /// Current schema version. Bump when adding fields (never remove fields).
 const SCHEMA_VERSION: u32 = 4;
@@ -127,8 +128,8 @@ pub struct SubvolumeHeartbeat {
 }
 
 /// Heartbeat / metrics projection of a single subvolume's churn state.
-/// `commands/backup.rs` builds a `HashMap<String, ChurnHeartbeatFields>` and
-/// passes it to both `heartbeat::build` and
+/// `commands/backup/observability.rs` builds a
+/// `HashMap<String, ChurnHeartbeatFields>` and passes it to both `heartbeat::build` and
 /// `backup::write_metrics_per_spec` so both surfaces share the same
 /// policy: incremental → `churn_bytes_per_second`; full-only →
 /// `last_full_send_bytes`. Cold-start subvolumes have both `None`.
@@ -186,10 +187,8 @@ pub fn build(inputs: HeartbeatInputs<'_>) -> Heartbeat {
 
     Heartbeat {
         schema_version: SCHEMA_VERSION,
-        timestamp: now.format("%Y-%m-%dT%H:%M:%S").to_string(),
-        stale_after: compute_stale_after(config, now)
-            .format("%Y-%m-%dT%H:%M:%S")
-            .to_string(),
+        timestamp: Timestamp::from(now).to_string(),
+        stale_after: Timestamp::from(compute_stale_after(config, now)).to_string(),
         run_result: result
             .map_or_else(|| "empty".to_string(), |r| r.overall.as_str().to_string()),
         run_id: result.and_then(|r| r.run_id),
@@ -217,11 +216,11 @@ fn build_subvolume_entries(
             // so a gated send after a successful one would read `Deferred`.
             let send_completed = sv_result.is_some_and(|sv| sv.send_succeeded());
 
-            let churn = churn_views.get(&a.name).copied().unwrap_or_default();
-            let extras = subvol_extras.get(&a.name).cloned().unwrap_or_default();
+            let churn = churn_views.get(a.name.as_str()).copied().unwrap_or_default();
+            let extras = subvol_extras.get(a.name.as_str()).cloned().unwrap_or_default();
 
             SubvolumeHeartbeat {
-                name: a.name.clone(),
+                name: a.name.to_string(),
                 backup_success: sv_result.map(|sv| sv.success),
                 promise_status: a.status,
                 pin_failures: sv_result.map(|sv| sv.pin_failures).unwrap_or(0),
@@ -313,6 +312,7 @@ pub fn mark_dispatched(path: &Path) -> crate::error::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::{dlabel, svname};
     use crate::awareness::{DriveAssessment, LocalAssessment, PromiseStatus};
     use crate::config::{
         Config, DefaultsConfig, GeneralConfig, LocalSnapshotsConfig, SnapshotRoot, SubvolumeConfig,
@@ -322,6 +322,7 @@ mod tests {
     };
     use crate::types::{
         DriveRole, GraduatedRetention, Interval, MonthlyCount, RunFrequency, SendKind,
+        TIMESTAMP_FORMAT,
     };
     use std::path::PathBuf;
 
@@ -329,7 +330,7 @@ mod tests {
         let subvolumes: Vec<SubvolumeConfig> = intervals
             .iter()
             .map(|(name, interval)| SubvolumeConfig {
-                name: name.to_string(),
+                name: svname(name),
                 short_name: name.to_string(),
                 source: PathBuf::from("/test"),
                 priority: 2,
@@ -359,7 +360,7 @@ mod tests {
             local_snapshots: LocalSnapshotsConfig {
                 roots: vec![SnapshotRoot {
                     path: PathBuf::from("/tmp/snapshots"),
-                    subvolumes: intervals.iter().map(|(n, _)| n.to_string()).collect(),
+                    subvolumes: intervals.iter().map(|(n, _)| svname(n)).collect(),
                     min_free_bytes: None,
                 }],
             },
@@ -398,7 +399,7 @@ mod tests {
                     Some(chrono::Duration::minutes(30)),
                 ),
                 external: vec![DriveAssessment {
-                    drive_label: "WD-18TB".to_string(),
+                    drive_label: dlabel("WD-18TB"),
                     status: PromiseStatus::Protected,
                     mounted: true,
                     snapshot_count: Some(10),
@@ -428,7 +429,7 @@ mod tests {
             overall: RunResult::Partial,
             subvolume_results: vec![
                 SubvolumeResult {
-                    name: "home".to_string(),
+                    name: svname("home"),
                     success: true,
                     operations: vec![make_operation(
                         SendKind::Incremental.as_db_str(),
@@ -441,7 +442,7 @@ mod tests {
                     offsite_releases: Vec::new(),
                 },
                 SubvolumeResult {
-                    name: "docs".to_string(),
+                    name: svname("docs"),
                     success: false,
                     operations: vec![],
                     duration: std::time::Duration::from_secs(1),
@@ -461,7 +462,7 @@ mod tests {
     fn schema_roundtrip() {
         let config = test_config(&[("home", "1h"), ("docs", "1h")]);
         let now =
-            NaiveDateTime::parse_from_str("2026-03-24T02:05:00", "%Y-%m-%dT%H:%M:%S").unwrap();
+            NaiveDateTime::parse_from_str("2026-03-24T02:05:00", TIMESTAMP_FORMAT).unwrap();
         let assessments = test_assessments();
         let result = test_execution_result();
 
@@ -506,7 +507,7 @@ mod tests {
         use crate::storage_critical::{StoragePosture, TightnessTier};
         let config = test_config(&[("home", "1h"), ("docs", "1h")]);
         let now =
-            NaiveDateTime::parse_from_str("2026-03-24T02:05:00", "%Y-%m-%dT%H:%M:%S").unwrap();
+            NaiveDateTime::parse_from_str("2026-03-24T02:05:00", TIMESTAMP_FORMAT).unwrap();
         let mut assessments = test_assessments();
         assessments[0].storage_posture = Some(StoragePosture {
             tier: TightnessTier::Critical,
@@ -541,7 +542,7 @@ mod tests {
     fn stale_after_picks_minimum_interval() {
         let config = test_config(&[("fast", "15m"), ("slow", "1d")]);
         let now =
-            NaiveDateTime::parse_from_str("2026-03-24T02:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
+            NaiveDateTime::parse_from_str("2026-03-24T02:00:00", TIMESTAMP_FORMAT).unwrap();
 
         let stale = compute_stale_after(&config, now);
         // 15m * 2 = 30m
@@ -554,7 +555,7 @@ mod tests {
         let mut config = test_config(&[("only", "1h")]);
         config.subvolumes[0].enabled = Some(false);
         let now =
-            NaiveDateTime::parse_from_str("2026-03-24T02:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
+            NaiveDateTime::parse_from_str("2026-03-24T02:00:00", TIMESTAMP_FORMAT).unwrap();
 
         let stale = compute_stale_after(&config, now);
         let expected = now + chrono::Duration::hours(24);
@@ -567,7 +568,7 @@ mod tests {
     fn empty_run_heartbeat() {
         let config = test_config(&[("home", "1h")]);
         let now =
-            NaiveDateTime::parse_from_str("2026-03-24T02:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
+            NaiveDateTime::parse_from_str("2026-03-24T02:00:00", TIMESTAMP_FORMAT).unwrap();
         let assessments = test_assessments();
 
         let heartbeat = build(HeartbeatInputs {
@@ -601,7 +602,7 @@ mod tests {
 
         let config = test_config(&[("home", "1h")]);
         let now =
-            NaiveDateTime::parse_from_str("2026-03-24T02:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
+            NaiveDateTime::parse_from_str("2026-03-24T02:00:00", TIMESTAMP_FORMAT).unwrap();
         let assessments = test_assessments();
 
         let heartbeat = build(HeartbeatInputs {
@@ -631,7 +632,7 @@ mod tests {
 
         let config = test_config(&[("home", "1h")]);
         let now =
-            NaiveDateTime::parse_from_str("2026-03-24T02:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
+            NaiveDateTime::parse_from_str("2026-03-24T02:00:00", TIMESTAMP_FORMAT).unwrap();
         let heartbeat = build(HeartbeatInputs {
             config: &config,
             now,
@@ -653,7 +654,7 @@ mod tests {
     fn heartbeat_serializes_at_schema_version_4() {
         let config = test_config(&[("home", "1h")]);
         let now =
-            NaiveDateTime::parse_from_str("2026-04-30T03:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
+            NaiveDateTime::parse_from_str("2026-04-30T03:00:00", TIMESTAMP_FORMAT).unwrap();
         let heartbeat = build(HeartbeatInputs {
             config: &config,
             now,
@@ -673,7 +674,7 @@ mod tests {
     fn heartbeat_roundtrip_with_churn_field_present() {
         let config = test_config(&[("home", "1h")]);
         let now =
-            NaiveDateTime::parse_from_str("2026-04-30T03:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
+            NaiveDateTime::parse_from_str("2026-04-30T03:00:00", TIMESTAMP_FORMAT).unwrap();
         let mut churn = HashMap::new();
         churn.insert(
             "home".to_string(),
@@ -705,7 +706,7 @@ mod tests {
     fn heartbeat_roundtrip_with_last_full_send_bytes_field_present() {
         let config = test_config(&[("home", "1h")]);
         let now =
-            NaiveDateTime::parse_from_str("2026-04-30T03:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
+            NaiveDateTime::parse_from_str("2026-04-30T03:00:00", TIMESTAMP_FORMAT).unwrap();
         let mut churn = HashMap::new();
         churn.insert(
             "home".to_string(),
@@ -763,7 +764,7 @@ mod tests {
     fn heartbeat_omits_churn_field_when_none() {
         let config = test_config(&[("home", "1h")]);
         let now =
-            NaiveDateTime::parse_from_str("2026-04-30T03:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
+            NaiveDateTime::parse_from_str("2026-04-30T03:00:00", TIMESTAMP_FORMAT).unwrap();
         let hb = build(HeartbeatInputs {
             config: &config,
             now,
@@ -785,7 +786,7 @@ mod tests {
     fn heartbeat_omits_last_full_send_bytes_when_none() {
         let config = test_config(&[("home", "1h")]);
         let now =
-            NaiveDateTime::parse_from_str("2026-04-30T03:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
+            NaiveDateTime::parse_from_str("2026-04-30T03:00:00", TIMESTAMP_FORMAT).unwrap();
         let hb = build(HeartbeatInputs {
             config: &config,
             now,
@@ -845,7 +846,7 @@ mod tests {
     fn make_operation(name: &str, result: crate::executor::OpResult) -> crate::executor::OperationOutcome {
         crate::executor::OperationOutcome {
             operation: name.to_string(),
-            drive_label: Some("TEST".to_string()),
+            drive_label: Some(dlabel("TEST")),
             result,
             duration: std::time::Duration::ZERO,
             error: None,
@@ -859,13 +860,13 @@ mod tests {
     fn heartbeat_send_completed_true_on_successful_send() {
         let config = test_config(&[("home", "1h")]);
         let now =
-            NaiveDateTime::parse_from_str("2026-03-24T02:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
+            NaiveDateTime::parse_from_str("2026-03-24T02:00:00", TIMESTAMP_FORMAT).unwrap();
         let assessments = test_assessments();
 
         let result = ExecutionResult {
             overall: RunResult::Success,
             subvolume_results: vec![SubvolumeResult {
-                name: "home".to_string(),
+                name: svname("home"),
                 success: true,
                 operations: vec![make_operation(
                     SendKind::Incremental.as_db_str(),
@@ -897,13 +898,13 @@ mod tests {
     fn heartbeat_send_completed_false_on_deferred_send() {
         let config = test_config(&[("home", "1h")]);
         let now =
-            NaiveDateTime::parse_from_str("2026-03-24T02:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
+            NaiveDateTime::parse_from_str("2026-03-24T02:00:00", TIMESTAMP_FORMAT).unwrap();
         let assessments = test_assessments();
 
         let result = ExecutionResult {
             overall: RunResult::Success,
             subvolume_results: vec![SubvolumeResult {
-                name: "home".to_string(),
+                name: svname("home"),
                 success: true,
                 operations: vec![make_operation(
                     SendKind::Full.as_db_str(),
@@ -938,18 +939,18 @@ mod tests {
         // but a send completed.
         let config = test_config(&[("home", "1h")]);
         let now =
-            NaiveDateTime::parse_from_str("2026-03-24T02:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
+            NaiveDateTime::parse_from_str("2026-03-24T02:00:00", TIMESTAMP_FORMAT).unwrap();
         let assessments = test_assessments();
         let mut gated = make_operation(
             SendKind::Full.as_db_str(),
             crate::executor::OpResult::Deferred,
         );
-        gated.drive_label = Some("OFFSITE".to_string());
+        gated.drive_label = Some(dlabel("OFFSITE"));
 
         let result = ExecutionResult {
             overall: RunResult::Success,
             subvolume_results: vec![SubvolumeResult {
-                name: "home".to_string(),
+                name: svname("home"),
                 success: true,
                 operations: vec![
                     make_operation(
@@ -984,13 +985,13 @@ mod tests {
     fn heartbeat_send_completed_false_on_no_send_operations() {
         let config = test_config(&[("home", "1h")]);
         let now =
-            NaiveDateTime::parse_from_str("2026-03-24T02:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
+            NaiveDateTime::parse_from_str("2026-03-24T02:00:00", TIMESTAMP_FORMAT).unwrap();
         let assessments = test_assessments();
 
         let result = ExecutionResult {
             overall: RunResult::Success,
             subvolume_results: vec![SubvolumeResult {
-                name: "home".to_string(),
+                name: svname("home"),
                 success: true,
                 operations: vec![make_operation(
                     "snapshot",
@@ -1101,7 +1102,7 @@ mod tests {
     fn heartbeat_v4_omits_empty_pools_and_drives_lists() {
         let config = test_config(&[("home", "1h")]);
         let now =
-            NaiveDateTime::parse_from_str("2026-05-15T03:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
+            NaiveDateTime::parse_from_str("2026-05-15T03:00:00", TIMESTAMP_FORMAT).unwrap();
         let hb = build(HeartbeatInputs {
             config: &config,
             now,
@@ -1124,7 +1125,7 @@ mod tests {
     fn heartbeat_v4_serializes_pools_with_mountpoints_preserved() {
         let config = test_config(&[("home", "1h")]);
         let now =
-            NaiveDateTime::parse_from_str("2026-05-15T03:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
+            NaiveDateTime::parse_from_str("2026-05-15T03:00:00", TIMESTAMP_FORMAT).unwrap();
         let pools = vec![PoolHeartbeat {
             uuid: "uuid-a".to_string(),
             mountpoints: vec![PathBuf::from("/b"), PathBuf::from("/a")],
@@ -1155,7 +1156,7 @@ mod tests {
     fn subvolume_heartbeat_omits_pool_uuid_when_none() {
         let config = test_config(&[("home", "1h")]);
         let now =
-            NaiveDateTime::parse_from_str("2026-05-15T03:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
+            NaiveDateTime::parse_from_str("2026-05-15T03:00:00", TIMESTAMP_FORMAT).unwrap();
         let hb = build(HeartbeatInputs {
             config: &config,
             now,
@@ -1174,7 +1175,7 @@ mod tests {
     fn subvolume_heartbeat_serializes_pool_uuid_when_some() {
         let config = test_config(&[("home", "1h")]);
         let now =
-            NaiveDateTime::parse_from_str("2026-05-15T03:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
+            NaiveDateTime::parse_from_str("2026-05-15T03:00:00", TIMESTAMP_FORMAT).unwrap();
         let mut extras = HashMap::new();
         extras.insert(
             "home".to_string(),
@@ -1206,7 +1207,7 @@ mod tests {
     fn drive_heartbeat_serializes_role_as_string() {
         let config = test_config(&[("home", "1h")]);
         let now =
-            NaiveDateTime::parse_from_str("2026-05-15T03:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
+            NaiveDateTime::parse_from_str("2026-05-15T03:00:00", TIMESTAMP_FORMAT).unwrap();
         let drives = vec![DriveHeartbeat {
             label: "WD-18TB".to_string(),
             uuid: Some("uuid-x".to_string()),
@@ -1243,7 +1244,7 @@ mod tests {
         }];
         let config = test_config(&[("home", "1h")]);
         let now =
-            NaiveDateTime::parse_from_str("2026-05-15T03:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
+            NaiveDateTime::parse_from_str("2026-05-15T03:00:00", TIMESTAMP_FORMAT).unwrap();
         let hb = build(HeartbeatInputs {
             config: &config,
             now,

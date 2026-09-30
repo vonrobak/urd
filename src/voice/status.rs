@@ -1,9 +1,9 @@
 //! Status renderer — `urd status` command output.
 //!
 //! Sub-module of `crate::voice`. Cross-renderer helpers (`exposure_label`,
-//! `humanize_duration`, `format_table`, `color_*`) live in the
-//! parent and are imported via `super`. Status-private helpers (per-section
-//! formatters, table builders) live here.
+//! `format_table`, `color_*`) live in the parent and are imported via
+//! `super`; durations are written through `super::duration`. Status-private
+//! helpers (per-section formatters, table builders) live here.
 
 use std::fmt::Write;
 
@@ -20,9 +20,10 @@ use crate::types::{ByteSize, DriveRole};
 
 use super::drive_row::{aggregate_drive_info, offsite_drive_label, unmounted_drive_label};
 use super::{
-    SuggestionContext, append_suggestion, color_result, exposure_cell, format_table,
-    humanize_duration, pluralize, render_json,
+    SuggestionContext, append_suggestion, color_result, exposure_cell, format_table, pluralize,
+    render_json,
 };
+use super::duration::DurationStyle;
 
 // ── Status ──────────────────────────────────────────────────────────────
 
@@ -208,7 +209,7 @@ pub(super) fn render_summary_line(data: &StatusOutput, out: &mut String) {
             .filter(|a| a.health == "degraded")
             .count();
         // Collect all unique health reasons across degraded/blocked assessments.
-        // awareness.rs guarantees health_reasons is non-empty for non-healthy
+        // awareness/health.rs guarantees health_reasons is non-empty for non-healthy
         // assessments; if violated, reasons_part is safely empty.
         let unique_reasons: Vec<&str> = data
             .assessments
@@ -240,27 +241,6 @@ pub(super) fn render_summary_line(data: &StatusOutput, out: &mut String) {
     };
 
     writeln!(out, "{safety_part}{health_part}").ok();
-}
-
-/// Humanize a *cadence* without `humanize_duration`'s lossy day-flooring. The
-/// tight-tier stretch multiplies the declared interval (e.g. daily × 1.5 = 36h);
-/// flooring that to "1d" makes the slowed cadence read identically to the
-/// declared one, hiding the very adaptation the voice is trying to narrate
-/// (#195). Whole numbers of days stay "Nd"; a sub-two-day cadence that isn't a
-/// whole day shows hours ("36h"); anything else with a fractional day shows one
-/// decimal ("2.5d"). Sub-day cadences fall back to `humanize_duration`.
-fn humanize_cadence(secs: i64) -> String {
-    // Sub-day (incl. zero/negative) → the plain humanizer handles it.
-    if secs < 86400 {
-        return humanize_duration(secs);
-    }
-    if secs % 86400 == 0 {
-        return format!("{}d", secs / 86400);
-    }
-    if secs < 2 * 86400 && secs % 3600 == 0 {
-        return format!("{}h", secs / 3600);
-    }
-    format!("{:.1}d", secs as f64 / 86400.0)
 }
 
 /// Render storage-adaptation prose (UPI 031-b AB3.1; grouped per UPI 079-a §2).
@@ -296,10 +276,11 @@ pub(super) fn render_storage_adaptations(data: &StatusOutput, out: &mut String) 
                 "  {names}: source pool is tight \u{2014} keeping less local history to protect the host.{suffix}",
             )
         } else {
-            // `humanize_cadence`, not `humanize_duration`: a 36h tight-stretch must
-            // not floor to "1d" (identical to the declared daily), which would make
+            // `Cadence`, not `Coarse`: a 36h tight-stretch must not floor
+            // to "1d" (identical to the declared daily), which would make
             // the sparing invisible (#195). Non-local groups always carry a cadence.
-            let cadence = s.cadence_secs.map(humanize_cadence).unwrap_or_default();
+            let cadence =
+                s.cadence_secs.map(|c| DurationStyle::Cadence.render(c)).unwrap_or_default();
             // Declared-Graduated subvols had graduated local history; the tier
             // reduced it to retain-one (Tight) or cleared it (Critical). Transient
             // (external-only) groups have no local history to reduce.
@@ -349,7 +330,7 @@ fn storage_posture_line(p: &PoolPostureSummary) -> colored::ColoredString {
         );
     }
     if let Some(secs) = p.since_secs.filter(|s| *s >= 0) {
-        write!(line, " (flagged {} ago)", humanize_duration(secs)).ok();
+        write!(line, " (flagged {} ago)", DurationStyle::Coarse.render(secs)).ok();
     }
     match p.tier {
         TightnessTier::Critical => line.red(),
@@ -555,7 +536,7 @@ pub(super) fn render_thread_status(health: &ChainHealth) -> String {
 /// Format a snapshot count with optional age: "10 (2h)" or just "10".
 pub(super) fn format_count_with_age(count: usize, age_secs: Option<i64>) -> String {
     match age_secs {
-        Some(secs) if secs >= 0 => format!("{} ({})", count, humanize_duration(secs)),
+        Some(secs) if secs >= 0 => format!("{} ({})", count, DurationStyle::Coarse.render(secs)),
         _ => count.to_string(),
     }
 }
@@ -768,7 +749,7 @@ pub(super) fn render_last_run(data: &StatusOutput, out: &mut String) {
                 .unwrap_or_default();
             let time_str = data
                 .last_run_age_secs
-                .map(|secs| format!("{} ago", humanize_duration(secs)))
+                .map(|secs| format!("{} ago", DurationStyle::Coarse.render(secs)))
                 .unwrap_or_else(|| run.started_at.clone());
             writeln!(
                 out,
@@ -867,7 +848,7 @@ fn render_default_status_interactive(data: &DefaultStatusOutput) -> String {
 
     // Last backup age (pre-computed by command handler to keep voice pure)
     if let Some(age_secs) = data.last_run_age_secs {
-        write!(out, " Last backup {} ago.", humanize_duration(age_secs)).ok();
+        write!(out, " Last backup {} ago.", DurationStyle::Coarse.render(age_secs)).ok();
     }
 
     writeln!(out).ok();
@@ -2471,7 +2452,7 @@ mod tests {
 
     /// `OperationalHealth::from_label` must round-trip every variant's
     /// `Display` string exactly (#361) — the two mappings are hand-written
-    /// in different spots (`awareness.rs`) and only this test would catch
+    /// in different spots (`awareness/types.rs`) and only this test would catch
     /// them drifting apart.
     #[test]
     fn operational_health_from_label_round_trips_display() {
@@ -2519,20 +2500,5 @@ mod tests {
             status::render_thread_status(&ChainHealth::Full("no pin".to_string())),
             "broken \u{2014} full send (no pin)"
         );
-    }
-
-    #[test]
-    fn humanize_cadence_does_not_floor_sub_two_day_stretch() {
-        // #195: the lossy floor that hid the tight-stretch.
-        assert_eq!(humanize_cadence(129600), "36h"); // daily × 1.5
-        assert_eq!(humanize_duration(129600), "1d"); // the old, misleading form
-        // Whole days stay clean.
-        assert_eq!(humanize_cadence(86400), "1d");
-        assert_eq!(humanize_cadence(7 * 86400), "7d");
-        // Beyond two days, a non-whole cadence shows one decimal.
-        assert_eq!(humanize_cadence(216000), "2.5d");
-        // Sub-day falls back to the plain humanizer.
-        assert_eq!(humanize_cadence(3600), "1h");
-        assert_eq!(humanize_cadence(0), "<1s");
     }
 }

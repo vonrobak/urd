@@ -1,12 +1,13 @@
 use crate::error::UrdError;
 use crate::output::LastRunInfo;
+use crate::types::{DriveLabel, SubvolName, Timestamp};
 
 use super::{OperationRecord, OperationRow, RunRecord, StateDb, db_err};
 
 impl StateDb {
     /// Begin a new backup run. Returns the run ID.
     pub fn begin_run(&self, mode: &str) -> crate::error::Result<i64> {
-        let now = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+        let now = Timestamp::from(chrono::Local::now().naive_local()).to_string();
         self.conn
             .execute(
                 "INSERT INTO runs (started_at, mode, result) VALUES (?1, ?2, 'running')",
@@ -48,7 +49,7 @@ impl StateDb {
     /// Without this, a zombie row stays `running`/`finished_at = NULL` forever and
     /// can hold the max id, so `last_run` reports a long-dead run as "(running)".
     pub fn reap_stale_runs(&self) -> crate::error::Result<usize> {
-        let now = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+        let now = Timestamp::from(chrono::Local::now().naive_local()).to_string();
         let reaped = self
             .conn
             .execute(
@@ -61,7 +62,7 @@ impl StateDb {
 
     /// Finish a run with the given result ("success", "partial", "failure").
     pub fn finish_run(&self, run_id: i64, result: &str) -> crate::error::Result<()> {
-        let now = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+        let now = Timestamp::from(chrono::Local::now().naive_local()).to_string();
         self.conn
             .execute(
                 "UPDATE runs SET finished_at = ?1, result = ?2 WHERE id = ?3",
@@ -140,7 +141,7 @@ impl StateDb {
     /// Get recent operations for a specific subvolume.
     pub fn subvolume_history(
         &self,
-        name: &str,
+        name: &SubvolName,
         limit: usize,
     ) -> crate::error::Result<Vec<OperationRow>> {
         let mut stmt = self
@@ -153,7 +154,7 @@ impl StateDb {
 
         let rows = stmt
             .query_map(
-                rusqlite::params![name, limit as i64],
+                rusqlite::params![name.as_str(), limit as i64],
                 Self::map_operation_row,
             )
             .map_err(db_err("query failed"))?;
@@ -189,8 +190,8 @@ impl StateDb {
     /// the drive predicate rather than matching a NULL `drive_label`.
     fn send_size(
         &self,
-        subvol: &str,
-        drive: Option<&str>,
+        subvol: &SubvolName,
+        drive: Option<&DriveLabel>,
         send_type: &str,
         result: &str,
     ) -> crate::error::Result<Option<u64>> {
@@ -205,8 +206,9 @@ impl StateDb {
             )
             .map_err(db_err("query failed"))?;
 
+        let drive = drive.map(DriveLabel::as_str);
         let mut rows = stmt
-            .query_map(rusqlite::params![subvol, send_type, result, drive], |row| {
+            .query_map(rusqlite::params![subvol.as_str(), send_type, result, drive], |row| {
                 let bytes: i64 = row.get(0)?;
                 Ok(bytes as u64)
             })
@@ -223,8 +225,8 @@ impl StateDb {
     /// for a subvolume to a specific drive. Returns None if no matching history exists.
     pub fn last_successful_send_size(
         &self,
-        subvol: &str,
-        drive: &str,
+        subvol: &SubvolName,
+        drive: &DriveLabel,
         send_type: &str,
     ) -> crate::error::Result<Option<u64>> {
         self.send_size(subvol, Some(drive), send_type, "success")
@@ -235,7 +237,7 @@ impl StateDb {
     /// Used as a cross-drive fallback when the target drive has no history (e.g., drive swap).
     pub fn last_successful_send_size_any_drive(
         &self,
-        subvol: &str,
+        subvol: &SubvolName,
         send_type: &str,
     ) -> crate::error::Result<Option<u64>> {
         self.send_size(subvol, None, send_type, "success")
@@ -246,8 +248,8 @@ impl StateDb {
     /// This serves as a lower bound: the actual size is at least this large.
     pub fn last_failed_send_size(
         &self,
-        subvol: &str,
-        drive: &str,
+        subvol: &SubvolName,
+        drive: &DriveLabel,
         send_type: &str,
     ) -> crate::error::Result<Option<u64>> {
         self.send_size(subvol, Some(drive), send_type, "failure")
@@ -258,7 +260,7 @@ impl StateDb {
     /// Cross-drive fallback counterpart of `last_failed_send_size()`.
     pub fn last_failed_send_size_any_drive(
         &self,
-        subvol: &str,
+        subvol: &SubvolName,
         send_type: &str,
     ) -> crate::error::Result<Option<u64>> {
         self.send_size(subvol, None, send_type, "failure")
@@ -268,8 +270,8 @@ impl StateDb {
     /// for a subvolume to a specific drive. Returns the run's started_at timestamp.
     pub fn last_successful_send_time(
         &self,
-        subvol: &str,
-        drive: &str,
+        subvol: &SubvolName,
+        drive: &DriveLabel,
     ) -> crate::error::Result<Option<chrono::NaiveDateTime>> {
         let mut stmt = self
             .conn
@@ -284,7 +286,7 @@ impl StateDb {
             .map_err(db_err("query failed"))?;
 
         let mut rows = stmt
-            .query_map(rusqlite::params![subvol, drive], |row| {
+            .query_map(rusqlite::params![subvol.as_str(), drive.as_str()], |row| {
                 let ts: String = row.get(0)?;
                 Ok(ts)
             })
@@ -292,11 +294,10 @@ impl StateDb {
 
         match rows.next() {
             Some(Ok(ts)) => {
-                let parsed = chrono::NaiveDateTime::parse_from_str(&ts, "%Y-%m-%dT%H:%M:%S")
-                    .map_err(|e| {
-                        UrdError::StateData(format!("failed to parse send timestamp {ts:?}: {e}"))
-                    })?;
-                Ok(Some(parsed))
+                let parsed = ts.parse::<Timestamp>().map_err(|e| {
+                    UrdError::StateData(format!("failed to parse send timestamp {ts:?}: {e}"))
+                })?;
+                Ok(Some(parsed.as_naive()))
             }
             Some(Err(e)) => Err(db_err("failed to read send time")(e)),
             None => Ok(None),
@@ -308,7 +309,7 @@ impl StateDb {
     /// drive was last actively written to, when the drive has no `events` rows.
     pub fn last_successful_operation_at(
         &self,
-        drive_label: &str,
+        drive_label: &DriveLabel,
     ) -> crate::error::Result<Option<chrono::NaiveDateTime>> {
         let mut stmt = self
             .conn
@@ -322,7 +323,7 @@ impl StateDb {
             .map_err(db_err("query failed"))?;
 
         let mut rows = stmt
-            .query_map(rusqlite::params![drive_label], |row| {
+            .query_map(rusqlite::params![drive_label.as_str()], |row| {
                 let ts: Option<String> = row.get(0)?;
                 Ok(ts)
             })
@@ -330,11 +331,10 @@ impl StateDb {
 
         match rows.next() {
             Some(Ok(Some(ts))) => {
-                let parsed = chrono::NaiveDateTime::parse_from_str(&ts, "%Y-%m-%dT%H:%M:%S")
-                    .map_err(|e| {
-                        UrdError::StateData(format!("failed to parse operation timestamp {ts:?}: {e}"))
-                    })?;
-                Ok(Some(parsed))
+                let parsed = ts.parse::<Timestamp>().map_err(|e| {
+                    UrdError::StateData(format!("failed to parse operation timestamp {ts:?}: {e}"))
+                })?;
+                Ok(Some(parsed.as_naive()))
             }
             Some(Ok(None)) => Ok(None),
             Some(Err(e)) => Err(db_err("failed to read operation time")(e)),
@@ -377,6 +377,7 @@ impl From<RunRecord> for LastRunInfo {
 #[cfg(test)]
 mod tests {
     use crate::state::*;
+    use crate::testkit::{dlabel, svname};
 
     #[test]
     fn begin_and_finish_run() {
@@ -578,11 +579,11 @@ mod tests {
         let db = StateDb::open_memory().unwrap();
         seed_db(&db);
 
-        let home_ops = db.subvolume_history("htpc-home", 10).unwrap();
+        let home_ops = db.subvolume_history(&svname("htpc-home"), 10).unwrap();
         assert_eq!(home_ops.len(), 2);
         assert!(home_ops.iter().all(|o| o.subvolume == "htpc-home"));
 
-        let opptak_ops = db.subvolume_history("subvol3-opptak", 10).unwrap();
+        let opptak_ops = db.subvolume_history(&svname("subvol3-opptak"), 10).unwrap();
         assert_eq!(opptak_ops.len(), 1);
         assert_eq!(opptak_ops[0].result, "failure");
     }
@@ -606,7 +607,7 @@ mod tests {
         seed_db(&db); // htpc-home send_incremental to WD-18TB = 1_000_000 bytes
 
         let size = db
-            .last_successful_send_size("htpc-home", "WD-18TB", "send_incremental")
+            .last_successful_send_size(&svname("htpc-home"), &dlabel("WD-18TB"), "send_incremental")
             .unwrap();
         assert_eq!(size, Some(1_000_000));
     }
@@ -617,7 +618,7 @@ mod tests {
         seed_db(&db); // subvol3-opptak send_full to WD-18TB failed
 
         let size = db
-            .last_successful_send_size("subvol3-opptak", "WD-18TB", "send_full")
+            .last_successful_send_size(&svname("subvol3-opptak"), &dlabel("WD-18TB"), "send_full")
             .unwrap();
         assert_eq!(size, None);
     }
@@ -627,7 +628,7 @@ mod tests {
         let db = StateDb::open_memory().unwrap();
 
         let size = db
-            .last_successful_send_size("nonexistent", "WD-18TB", "send_full")
+            .last_successful_send_size(&svname("nonexistent"), &dlabel("WD-18TB"), "send_full")
             .unwrap();
         assert_eq!(size, None);
     }
@@ -662,17 +663,17 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            db.last_successful_send_size("htpc-home", "DRIVE-A", "send_full")
+            db.last_successful_send_size(&svname("htpc-home"), &dlabel("DRIVE-A"), "send_full")
                 .unwrap(),
             Some(500_000)
         );
         assert_eq!(
-            db.last_successful_send_size("htpc-home", "DRIVE-B", "send_full")
+            db.last_successful_send_size(&svname("htpc-home"), &dlabel("DRIVE-B"), "send_full")
                 .unwrap(),
             Some(600_000)
         );
         assert_eq!(
-            db.last_successful_send_size("htpc-home", "DRIVE-C", "send_full")
+            db.last_successful_send_size(&svname("htpc-home"), &dlabel("DRIVE-C"), "send_full")
                 .unwrap(),
             None
         );
@@ -709,7 +710,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            db.last_successful_send_size("sv1", "D", "send_full")
+            db.last_successful_send_size(&svname("sv1"), &dlabel("D"), "send_full")
                 .unwrap(),
             Some(999)
         );
@@ -735,7 +736,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            db.last_failed_send_size("subvol5-music", "2TB-backup", "send_full")
+            db.last_failed_send_size(&svname("subvol5-music"), &dlabel("2TB-backup"), "send_full")
                 .unwrap(),
             Some(1_100_000_000_000)
         );
@@ -760,7 +761,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            db.last_failed_send_size("sv1", "D", "send_full").unwrap(),
+            db.last_failed_send_size(&svname("sv1"), &dlabel("D"), "send_full").unwrap(),
             None
         );
     }
@@ -783,7 +784,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            db.last_failed_send_size("sv1", "D", "send_full").unwrap(),
+            db.last_failed_send_size(&svname("sv1"), &dlabel("D"), "send_full").unwrap(),
             None
         );
     }
@@ -823,7 +824,7 @@ mod tests {
 
         // Cross-drive query returns most recent (DriveB)
         assert_eq!(
-            db.last_successful_send_size_any_drive("sv1", "send_full")
+            db.last_successful_send_size_any_drive(&svname("sv1"), "send_full")
                 .unwrap(),
             Some(200_000)
         );
@@ -850,12 +851,12 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            db.last_successful_send_size("sv1", "DriveA", "send_full")
+            db.last_successful_send_size(&svname("sv1"), &dlabel("DriveA"), "send_full")
                 .unwrap(),
             None
         );
         assert_eq!(
-            db.last_successful_send_size_any_drive("sv1", "send_full")
+            db.last_successful_send_size_any_drive(&svname("sv1"), "send_full")
                 .unwrap(),
             Some(100_000)
         );
@@ -865,12 +866,12 @@ mod tests {
     fn any_drive_returns_none_when_no_history() {
         let db = StateDb::open_memory().unwrap();
         assert_eq!(
-            db.last_successful_send_size_any_drive("sv1", "send_full")
+            db.last_successful_send_size_any_drive(&svname("sv1"), "send_full")
                 .unwrap(),
             None
         );
         assert_eq!(
-            db.last_failed_send_size_any_drive("sv1", "send_full")
+            db.last_failed_send_size_any_drive(&svname("sv1"), "send_full")
                 .unwrap(),
             None
         );
@@ -895,7 +896,7 @@ mod tests {
 
         // Different subvolume should not see sv1's data
         assert_eq!(
-            db.last_successful_send_size_any_drive("sv2", "send_full")
+            db.last_successful_send_size_any_drive(&svname("sv2"), "send_full")
                 .unwrap(),
             None
         );
@@ -919,7 +920,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            db.last_failed_send_size_any_drive("sv1", "send_full")
+            db.last_failed_send_size_any_drive(&svname("sv1"), "send_full")
                 .unwrap(),
             Some(75_000)
         );
@@ -930,7 +931,7 @@ mod tests {
     #[test]
     fn last_successful_operation_at_returns_none_when_empty() {
         let db = StateDb::open_memory().unwrap();
-        assert_eq!(db.last_successful_operation_at("WD-18TB").unwrap(), None);
+        assert_eq!(db.last_successful_operation_at(&dlabel("WD-18TB")).unwrap(), None);
     }
 
     #[test]
@@ -948,7 +949,7 @@ mod tests {
             bytes_transferred: None,
         })
         .unwrap();
-        assert_eq!(db.last_successful_operation_at("WD-18TB").unwrap(), None);
+        assert_eq!(db.last_successful_operation_at(&dlabel("WD-18TB")).unwrap(), None);
     }
 
     #[test]
@@ -995,8 +996,8 @@ mod tests {
             .unwrap();
         assert!(t2 > t1, "run2 should have later started_at than run1");
 
-        let got = db.last_successful_operation_at("WD-18TB").unwrap().unwrap();
-        let expected = chrono::NaiveDateTime::parse_from_str(&t2, "%Y-%m-%dT%H:%M:%S").unwrap();
+        let got = db.last_successful_operation_at(&dlabel("WD-18TB")).unwrap().unwrap();
+        let expected = t2.parse::<crate::types::Timestamp>().unwrap().as_naive();
         assert_eq!(got, expected);
     }
 
@@ -1015,7 +1016,7 @@ mod tests {
             bytes_transferred: Some(10),
         })
         .unwrap();
-        assert_eq!(db.last_successful_operation_at("WD-18TB").unwrap(), None);
+        assert_eq!(db.last_successful_operation_at(&dlabel("WD-18TB")).unwrap(), None);
     }
 
     #[test]
@@ -1033,6 +1034,34 @@ mod tests {
             bytes_transferred: None,
         })
         .unwrap();
-        assert_eq!(db.last_successful_operation_at("WD-18TB").unwrap(), None);
+        assert_eq!(db.last_successful_operation_at(&dlabel("WD-18TB")).unwrap(), None);
+    }
+
+    #[test]
+    fn run_rows_in_the_persisted_form_read_back() {
+        // Rows as every Urd version has written them (ADR-102: existing rows must
+        // keep parsing). The literal `started_at` is the contract.
+        let db = StateDb::open_memory().unwrap();
+        db.conn
+            .execute_batch(
+                "INSERT INTO runs (id, started_at, finished_at, mode, result)
+                     VALUES (7, '2026-03-24T02:05:00', '2026-03-24T02:07:15', 'full', 'success');
+                 INSERT INTO operations (run_id, subvolume, operation, drive_label, result)
+                     VALUES (7, 'sv1', 'send_incremental', 'WD-18TB', 'success');",
+            )
+            .unwrap();
+        let expected = chrono::NaiveDate::from_ymd_opt(2026, 3, 24)
+            .unwrap()
+            .and_hms_opt(2, 5, 0)
+            .unwrap();
+        assert_eq!(db.last_successful_operation_at(&dlabel("WD-18TB")).unwrap(), Some(expected));
+        assert_eq!(
+            db.last_successful_send_time(&svname("sv1"), &dlabel("WD-18TB"))
+                .unwrap(),
+            Some(expected)
+        );
+        let info = crate::output::LastRunInfo::from(db.last_run().unwrap().unwrap());
+        assert_eq!(info.started_at, "2026-03-24T02:05:00");
+        assert_eq!(info.duration.as_deref(), Some("2m 15s"));
     }
 }

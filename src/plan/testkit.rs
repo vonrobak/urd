@@ -5,7 +5,7 @@ use chrono::NaiveDateTime;
 
 use crate::config::DriveConfig;
 use crate::drives::DriveAvailability;
-use crate::types::{DriveEvent, SendKind, SnapshotName};
+use crate::types::{DriveEvent, DriveLabel, SendKind, SnapshotName, SubvolName};
 
 use super::{FilesystemQuery, HistoryQuery};
 
@@ -49,7 +49,7 @@ impl SendSizeHistory {
 
     /// Most recently (re-)inserted entry for `subvol_name`/`send_kind`
     /// across any drive — the mock's analogue of `ORDER BY id DESC LIMIT 1`.
-    fn most_recent_any_drive(&self, subvol_name: &str, send_kind: SendKind) -> Option<u64> {
+    fn most_recent_any_drive(&self, subvol_name: &SubvolName, send_kind: SendKind) -> Option<u64> {
         self.order
             .iter()
             .rev()
@@ -78,7 +78,7 @@ pub struct MockFileSystemState {
     /// Same insertion-ordered shape as `send_sizes`; kept as a separate store
     /// since production tracks them via a distinct `result = 'failure'` query.
     pub failed_send_floors: SendSizeHistory,
-    pub calibrated_sizes: std::collections::HashMap<String, (u64, String)>,
+    pub calibrated_sizes: std::collections::HashMap<String, (u64, Option<crate::types::Timestamp>)>,
     pub send_times: std::collections::HashMap<(String, String), NaiveDateTime>,
     pub drive_events: std::collections::HashMap<String, DriveEvent>,
     /// Full ordered mount/unmount history per drive (UPI 055). Additive
@@ -121,9 +121,9 @@ impl FilesystemQuery for MockFileSystemState {
     fn local_snapshots(
         &self,
         _root: &Path,
-        subvol_name: &str,
+        subvol_name: &SubvolName,
     ) -> crate::error::Result<Vec<SnapshotName>> {
-        if self.fail_local_snapshots.contains(subvol_name) {
+        if self.fail_local_snapshots.contains(subvol_name.as_str()) {
             return Err(crate::error::UrdError::Io {
                 path: std::path::PathBuf::from(format!("/snap/{subvol_name}")),
                 source: std::io::Error::new(
@@ -134,7 +134,7 @@ impl FilesystemQuery for MockFileSystemState {
         }
         Ok(self
             .local_snapshots
-            .get(subvol_name)
+            .get(subvol_name.as_str())
             .cloned()
             .unwrap_or_default())
     }
@@ -142,9 +142,9 @@ impl FilesystemQuery for MockFileSystemState {
     fn external_snapshots(
         &self,
         drive: &DriveConfig,
-        subvol_name: &str,
+        subvol_name: &SubvolName,
     ) -> crate::error::Result<Vec<SnapshotName>> {
-        let key = (drive.label.clone(), subvol_name.to_string());
+        let key = (drive.label.to_string(), subvol_name.to_string());
         Ok(self
             .external_snapshots
             .get(&key)
@@ -153,11 +153,11 @@ impl FilesystemQuery for MockFileSystemState {
     }
 
     fn drive_availability(&self, drive: &DriveConfig) -> DriveAvailability {
-        if let Some(status) = self.drive_availability_overrides.get(&drive.label) {
+        if let Some(status) = self.drive_availability_overrides.get(drive.label.as_str()) {
             return status.clone();
         }
         // Backward compat: fall back to mounted_drives set
-        if self.mounted_drives.contains(&drive.label) {
+        if self.mounted_drives.contains(drive.label.as_str()) {
             DriveAvailability::Available
         } else {
             DriveAvailability::NotMounted
@@ -175,7 +175,7 @@ impl FilesystemQuery for MockFileSystemState {
     fn read_pin_file(
         &self,
         local_dir: &Path,
-        drive_label: &str,
+        drive_label: &DriveLabel,
     ) -> crate::error::Result<Option<SnapshotName>> {
         let key = (local_dir.to_path_buf(), drive_label.to_string());
         if self.fail_pin_reads.contains(&key) {
@@ -190,12 +190,16 @@ impl FilesystemQuery for MockFileSystemState {
         Ok(self.pin_files.get(&key).cloned())
     }
 
-    fn pinned_snapshots(&self, local_dir: &Path, drive_labels: &[String]) -> HashSet<SnapshotName> {
+    fn pinned_snapshots(
+        &self,
+        local_dir: &Path,
+        drive_labels: &[DriveLabel],
+    ) -> HashSet<SnapshotName> {
         let mut pinned: HashSet<SnapshotName> = HashSet::new();
         for label in drive_labels {
             if let Some(name) = self
                 .pin_files
-                .get(&(local_dir.to_path_buf(), label.clone()))
+                .get(&(local_dir.to_path_buf(), label.to_string()))
             {
                 pinned.insert(name.clone());
             }
@@ -208,22 +212,26 @@ impl FilesystemQuery for MockFileSystemState {
 impl HistoryQuery for MockFileSystemState {
     fn last_send_size(
         &self,
-        subvol_name: &str,
-        drive_label: &str,
+        subvol_name: &SubvolName,
+        drive_label: &DriveLabel,
         send_kind: SendKind,
     ) -> Option<u64> {
         self.send_sizes
             .get(&(subvol_name.to_string(), drive_label.to_string(), send_kind))
     }
 
-    fn last_send_size_any_drive(&self, subvol_name: &str, send_kind: SendKind) -> Option<u64> {
+    fn last_send_size_any_drive(
+        &self,
+        subvol_name: &SubvolName,
+        send_kind: SendKind,
+    ) -> Option<u64> {
         self.send_sizes.most_recent_any_drive(subvol_name, send_kind)
     }
 
     fn last_failed_send_floor(
         &self,
-        subvol_name: &str,
-        drive_label: &str,
+        subvol_name: &SubvolName,
+        drive_label: &DriveLabel,
         send_kind: SendKind,
     ) -> Option<u64> {
         // This-drive preferred, then any drive — mirrors RealFileSystemState's
@@ -236,33 +244,36 @@ impl HistoryQuery for MockFileSystemState {
             })
     }
 
-    fn calibrated_size(&self, subvol_name: &str) -> Option<(u64, String)> {
-        self.calibrated_sizes.get(subvol_name).cloned()
+    fn calibrated_size(
+        &self,
+        subvol_name: &SubvolName,
+    ) -> Option<(u64, Option<crate::types::Timestamp>)> {
+        self.calibrated_sizes.get(subvol_name.as_str()).copied()
     }
 
     fn last_successful_send_time(
         &self,
-        subvol_name: &str,
-        drive_label: &str,
+        subvol_name: &SubvolName,
+        drive_label: &DriveLabel,
     ) -> Option<NaiveDateTime> {
         self.send_times
             .get(&(subvol_name.to_string(), drive_label.to_string()))
             .copied()
     }
 
-    fn last_drive_event(&self, drive_label: &str) -> Option<DriveEvent> {
-        self.drive_events.get(drive_label).cloned()
+    fn last_drive_event(&self, drive_label: &DriveLabel) -> Option<DriveEvent> {
+        self.drive_events.get(drive_label.as_str()).cloned()
     }
 
-    fn drive_mount_history(&self, drive_label: &str) -> Vec<DriveEvent> {
+    fn drive_mount_history(&self, drive_label: &DriveLabel) -> Vec<DriveEvent> {
         self.drive_event_history
-            .get(drive_label)
+            .get(drive_label.as_str())
             .cloned()
             .unwrap_or_default()
     }
 
-    fn last_successful_operation_at(&self, drive_label: &str) -> Option<NaiveDateTime> {
-        self.last_successful_ops.get(drive_label).copied()
+    fn last_successful_operation_at(&self, drive_label: &DriveLabel) -> Option<NaiveDateTime> {
+        self.last_successful_ops.get(drive_label.as_str()).copied()
     }
 }
 

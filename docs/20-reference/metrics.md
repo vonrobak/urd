@@ -95,7 +95,7 @@ These properties are guaranteed and load-bearing for downstream consumers
     and their `urd_*` siblings) is a `COUNT(*)` over the structured event log
     ([ADR-114](../00-foundation/decisions/2026-04-30-ADR-114-structured-event-log.md)),
     not a delta since the last run. They are monotonic for as long as the
-    events table is never pruned — true today (`src/state.rs` has no
+    events table is never pruned — true today (`src/state/` has no
     events-table delete path). If a future retention policy starts pruning
     old events, these counters would drop rather than only ever climb;
     consumers should query them with `increase()` or `rate()`, both of which

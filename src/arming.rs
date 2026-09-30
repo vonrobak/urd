@@ -21,6 +21,7 @@ use crate::config::{Config, DriveConfig, ResolvedSubvolume};
 use crate::drives::DriveAvailability;
 use crate::observation::FilesystemQuery;
 use crate::storage_critical::{ArmedTierMap, TightnessTier};
+use crate::types::{DriveLabel, SubvolName};
 
 // ── Per-pool signal ─────────────────────────────────────────────────────
 
@@ -35,7 +36,7 @@ pub struct PoolSignal {
     /// Human display label (the source pool mountpoint, e.g. `/` or `/mnt/data`).
     pub label: String,
     /// Enabled subvolume names whose source resolves to this pool (Min1).
-    pub subvol_names: Vec<String>,
+    pub subvol_names: Vec<SubvolName>,
     /// Source free / capacity ratio; `None` when unmeasurable. Retained
     /// alongside `free_bytes` (it is derivable) to avoid churning the
     /// display/test reads — the ratio classifier path is unchanged.
@@ -94,10 +95,10 @@ pub struct RunArming {
     pub armed_tier_map: ArmedTierMap,
     pub pools: Vec<ResolvedPoolTier>,
     /// Subvol name → away drive labels whose pin is away-only (UPI 058). See
-    /// [`away_shed_map`]: the SAME source `plan.rs`'s
+    /// [`away_shed_map`]: the SAME source `plan/`'s
     /// `mounted_pins` derives from, so the executor's `has_away_pin` and
     /// away-shed cannot diverge from the planner's `clear_all` decision.
-    pub away_shed: HashMap<String, Vec<String>>,
+    pub away_shed: HashMap<SubvolName, Vec<DriveLabel>>,
 }
 
 impl RunArming {
@@ -179,7 +180,7 @@ pub fn resolve_armed_tiers(signal_pools: &[PoolSignal]) -> RunArming {
 /// away) so away-only pins can be detected by [`crate::guard::away_sheddable_pins`].
 ///
 /// Called by the planner (to derive `mounted_pins`) **and** by [`away_shed_map`]
-/// (which `commands/backup.rs` and the sentinel use to build the executor's
+/// (which `commands/backup/` and the sentinel use to build the executor's
 /// away-shed map), so the executor's `has_away_pin` cannot diverge from the
 /// planner's `clear_all` decision — coherence by construction, not discipline
 /// (R1). A pin-read error is logged and treated as "no pin" (the same fail-soft
@@ -232,7 +233,7 @@ pub(crate) fn drive_scopes(
 pub(crate) fn away_shed_map(
     config: &Config,
     fs: &dyn FilesystemQuery,
-) -> std::collections::HashMap<String, Vec<String>> {
+) -> std::collections::HashMap<SubvolName, Vec<DriveLabel>> {
     let mut map = std::collections::HashMap::new();
     for sv in config.resolved_subvolumes() {
         let Some(local_dir) = config.local_snapshot_dir(&sv.name) else {

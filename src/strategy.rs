@@ -783,7 +783,7 @@ fn unique(base: String, taken: &mut BTreeSet<String>) -> String {
 /// Shared test scaffolding: inventory builders and the answer × inventory
 /// property grid. Lifted from `mod tests` so config_render's acceptance
 /// property (UPI 074) sweeps the same grid strategy.rs's own properties
-/// sweep — the awareness.rs `test_support` precedent, single grid, no drift.
+/// sweep — the `awareness::test_support` precedent, single grid, no drift.
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;

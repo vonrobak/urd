@@ -14,12 +14,13 @@ use crate::output::{ChurnHeartbeatFields, ChurnRender, SubvolumeExtras};
 use crate::pools;
 use crate::run_tail::{self, MetricsSpec, PoolObservability};
 use crate::state::StateDb;
+use crate::types::SubvolName;
 
 /// Names of subvolumes with an external destination configured: sends enabled
 /// and at least one configured drive in scope. Uses the same
 /// `ResolvedSubvolume::accepts_drive` predicate as the planner's send gate, so
 /// `backup_external_expected` cannot drift from what actually gets sent.
-fn externally_expected_subvolumes(config: &Config) -> HashSet<String> {
+fn externally_expected_subvolumes(config: &Config) -> HashSet<SubvolName> {
     config
         .resolved_subvolumes()
         .into_iter()
@@ -48,7 +49,7 @@ pub(super) fn write_metrics_per_spec(
     config: &Config,
     state_db: Option<&StateDb>,
     spec: &MetricsSpec<'_>,
-    plan: &crate::types::BackupPlan,
+    plan: &crate::plan::BackupPlan,
     now: chrono::NaiveDateTime,
     fs_state: &dyn FilesystemQuery,
     churn_views: &HashMap<String, ChurnHeartbeatFields>,
@@ -97,7 +98,7 @@ pub(super) fn write_metrics_per_spec(
 fn subvolume_metric_rows(
     config: &Config,
     result: Option<&crate::executor::ExecutionResult>,
-    plan: &crate::types::BackupPlan,
+    plan: &crate::plan::BackupPlan,
     now_ts: i64,
     fs_state: &dyn FilesystemQuery,
     churn_views: &HashMap<String, ChurnHeartbeatFields>,
@@ -112,7 +113,7 @@ fn subvolume_metric_rows(
     // Metrics for executed subvolumes
     let executed = result.map_or(&[][..], |r| r.subvolume_results.as_slice());
     for sv_result in executed {
-        emitted.insert(sv_result.name.clone());
+        emitted.insert(sv_result.name.to_string());
         // `Some` iff this subvolume has an assessment this run (always true for
         // an executed subvolume in practice — the executor only runs enabled
         // subvolumes, and assess() covers every enabled one). Ties pin_failures'
@@ -137,11 +138,11 @@ fn subvolume_metric_rows(
 
         let local_count = count_local_snapshots(config, &sv_result.name, fs_state);
         let external_count = count_external_snapshots(config, &sv_result.name, fs_state);
-        let churn = churn_views.get(&sv_result.name).copied().unwrap_or_default();
-        let extras = observability.subvol_extras.get(&sv_result.name);
+        let churn = churn_views.get(sv_result.name.as_str()).copied().unwrap_or_default();
+        let extras = observability.subvol_extras.get(sv_result.name.as_str());
 
         subvolume_metrics.push(SubvolumeMetrics {
-            name: sv_result.name.clone(),
+            name: sv_result.name.to_string(),
             success: success_val,
             last_success_timestamp: last_success_ts,
             duration_seconds: sv_result.duration.as_secs(),
@@ -167,14 +168,14 @@ fn subvolume_metric_rows(
         .map(|sv| sv.name);
     let unexecuted = plan.skipped.iter().map(|skip| skip.name.clone()).chain(enabled);
     for name in unexecuted {
-        if !emitted.insert(name.clone()) {
+        if !emitted.insert(name.to_string()) {
             continue; // already emitted by execution results or an earlier entry
         }
 
         let local_count = count_local_snapshots(config, &name, fs_state);
         let external_count = count_external_snapshots(config, &name, fs_state);
-        let churn = churn_views.get(&name).copied().unwrap_or_default();
-        let extras = observability.subvol_extras.get(&name);
+        let churn = churn_views.get(name.as_str()).copied().unwrap_or_default();
+        let extras = observability.subvol_extras.get(name.as_str());
         // A skipped subvolume was never executed, so any pin failure is
         // impossible — 0 whenever it was assessed (mirrors heartbeat's
         // `sv_result.map(...).unwrap_or(0)`, where `sv_result` is always
@@ -187,7 +188,7 @@ fn subvolume_metric_rows(
         let (success_val, send_type) = if deferred { (3, 3) } else { (2, 2) };
 
         subvolume_metrics.push(SubvolumeMetrics {
-            name,
+            name: name.into_string(),
             success: success_val,
             last_success_timestamp: None,
             duration_seconds: 0,
@@ -234,7 +235,7 @@ pub(super) fn build_churn_views(
         let samples = fs.drift_samples(&sv.name, now - window);
         let estimate = crate::drift::compute_rolling_churn(&samples, window, now);
         let mean_incremental_bytes = estimate.mean_incremental_bytes;
-        let fields = match crate::output::render_churn(&estimate) {
+        let fields = match crate::drift::render_churn(&estimate) {
             ChurnRender::NotMeasured => ChurnHeartbeatFields {
                 mean_incremental_bytes,
                 ..Default::default()
@@ -256,7 +257,7 @@ pub(super) fn build_churn_views(
                 mean_incremental_bytes,
             },
         };
-        out.insert(sv.name.clone(), fields);
+        out.insert(sv.name.to_string(), fields);
     }
     out
 }
@@ -285,7 +286,7 @@ pub(super) fn gather_pool_observability(
         };
         let resolved = pools::resolve_drive(drive, mounted, detected_uuid);
         drives_heartbeat.push(DriveHeartbeat {
-            label: drive.label.clone(),
+            label: drive.label.to_string(),
             uuid: resolved.uuid.clone(),
             role: drive.role.to_string(),
             mounted,
@@ -351,7 +352,7 @@ pub(super) fn gather_pool_observability(
         );
     }
 
-    let pool_for_subvol: HashMap<String, String> = source_pools
+    let pool_for_subvol: HashMap<SubvolName, String> = source_pools
         .iter()
         .flat_map(|p| {
             p.subvolume_names
@@ -370,12 +371,12 @@ pub(super) fn gather_pool_observability(
             None
         };
         let mean_incremental_bytes = churn_views
-            .get(&sv.name)
+            .get(sv.name.as_str())
             .and_then(|c| c.mean_incremental_bytes);
         let estimated_local_pinned_delta_bytes =
             compute_pinned_delta(local_snapshot_count, mean_incremental_bytes);
         subvol_extras.insert(
-            sv.name.clone(),
+            sv.name.to_string(),
             SubvolumeExtras {
                 pool_uuid,
                 local_snapshot_count,
@@ -424,7 +425,7 @@ fn write_global_metrics(
     // the subvolume timestamp carry-forward above. A drive removed from
     // config is never carried; `apply_carried_forward_pools` checks that.
     let configured_destination_labels: HashSet<String> =
-        config.drives.iter().map(|d| d.label.clone()).collect();
+        config.drives.iter().map(|d| d.label.to_string()).collect();
     let carried_pools = metrics::read_existing_pool_rows(&config.general.metrics_file);
     metrics::apply_carried_forward_pools(
         &mut pool_metrics,
@@ -459,7 +460,7 @@ fn write_global_metrics(
 
 fn count_local_snapshots(
     config: &Config,
-    subvol_name: &str,
+    subvol_name: &SubvolName,
     fs_state: &dyn FilesystemQuery,
 ) -> usize {
     if let Some(root) = config.snapshot_root_for(subvol_name) {
@@ -474,7 +475,7 @@ fn count_local_snapshots(
 
 fn count_external_snapshots(
     config: &Config,
-    subvol_name: &str,
+    subvol_name: &SubvolName,
     fs_state: &dyn FilesystemQuery,
 ) -> usize {
     // First mounted drive's count (for bash compat)
@@ -495,8 +496,8 @@ mod tests {
     use std::collections::BTreeSet;
     use crate::awareness::{DriveAssessment, PromiseStatus};
     use crate::executor::{ExecutionResult, OpResult, OperationOutcome, RunResult, SendType, SubvolumeResult};
-    use crate::plan::SkipReason;
-    use crate::types::{BackupPlan, ByteSize, Interval, SendKind};
+    use crate::plan::{BackupPlan, SkipReason};
+    use crate::types::{ByteSize, Interval, SendKind};
     use crate::commands::backup::test_fixtures::*;
 
     // ── assessment_lookup (backup_pin_failures / backup_promise_state,
@@ -665,7 +666,7 @@ enabled = false
 
     fn not_mounted(drive: &str) -> SkipReason {
         SkipReason::DriveNotMounted {
-            drive: drive.to_string(),
+            drive: drive.into(),
         }
     }
 
@@ -673,7 +674,7 @@ enabled = false
         BackupPlan {
             skipped: names
                 .iter()
-                .map(|(n, r)| crate::types::PlannedSkip::deferred(*n, r.clone(), None))
+                .map(|(n, r)| crate::plan::PlannedSkip::deferred(*n, r.clone(), None))
                 .collect(),
             ..empty_plan()
         }

@@ -27,6 +27,7 @@ use crate::config::{
 use crate::strategy::{
     ExclusionReason, Gap, GapKind, IntentionAnchor, ProposedStrategy, UnusableReason,
 };
+use crate::types::{DriveLabel, SubvolName};
 
 /// The carving's two halves: the `Config` the rendered TOML must reload to,
 /// and the rendered TOML itself. `commands/encounter.rs` self-checks one
@@ -56,12 +57,12 @@ pub fn generate_config(strategy: &ProposedStrategy, today: NaiveDate) -> Generat
 /// (named levels are opaque — ADR-110; `validate_protection_contract`
 /// rejects overrides outright).
 fn strategy_to_config(strategy: &ProposedStrategy) -> Config {
-    let mut root_map: BTreeMap<PathBuf, Vec<String>> = BTreeMap::new();
+    let mut root_map: BTreeMap<PathBuf, Vec<SubvolName>> = BTreeMap::new();
     for sv in &strategy.subvolumes {
         root_map
             .entry(sv.snapshot_root.clone())
             .or_default()
-            .push(sv.name.clone());
+            .push(SubvolName::from(&sv.name));
     }
     let roots: Vec<SnapshotRoot> = root_map
         .into_iter()
@@ -76,7 +77,7 @@ fn strategy_to_config(strategy: &ProposedStrategy) -> Config {
         .subvolumes
         .iter()
         .map(|sv| SubvolumeConfig {
-            name: sv.name.clone(),
+            name: SubvolName::from(&sv.name),
             short_name: sv.name.clone(),
             source: sv.source.clone(),
             priority: default_priority(),
@@ -97,7 +98,7 @@ fn strategy_to_config(strategy: &ProposedStrategy) -> Config {
         .drives
         .iter()
         .map(|d| DriveConfig {
-            label: d.label.clone(),
+            label: DriveLabel::from(&d.label),
             uuid: Some(d.uuid.clone()),
             mount_path: d.mount_path.clone(),
             snapshot_root: d.snapshot_root.clone(),

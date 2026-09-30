@@ -1,4 +1,5 @@
 use super::{DriftSampleRow, StateDb, db_err};
+use crate::types::{SubvolName, Timestamp};
 
 impl StateDb {
     // ── Drift-sample methods ────────────────────────────────────────
@@ -23,7 +24,7 @@ impl StateDb {
                 rusqlite::params![
                     sample.run_id,
                     sample.subvolume,
-                    sample.sampled_at.format("%Y-%m-%dT%H:%M:%S").to_string(),
+                    Timestamp::from(sample.sampled_at).to_string(),
                     sample.seconds_since_prev_send,
                     sample.bytes_transferred as i64,
                     sample.source_free_bytes.map(|b| b as i64),
@@ -40,7 +41,7 @@ impl StateDb {
     /// off-by-one fudging.
     pub fn drift_samples_for_subvolume(
         &self,
-        subvolume: &str,
+        subvolume: &SubvolName,
         since: chrono::NaiveDateTime,
     ) -> crate::error::Result<Vec<DriftSampleRow>> {
         let mut stmt = self
@@ -54,10 +55,10 @@ impl StateDb {
             )
             .map_err(db_err("query failed"))?;
 
-        let since_str = since.format("%Y-%m-%dT%H:%M:%S").to_string();
+        let since_str = Timestamp::from(since).to_string();
         let rows = stmt
             .query_map(
-                rusqlite::params![subvolume, since_str],
+                rusqlite::params![subvolume.as_str(), since_str],
                 Self::map_drift_sample_row,
             )
             .map_err(db_err("query failed"))?;
@@ -85,7 +86,7 @@ impl StateDb {
     /// style (UPI 044, R6).
     pub fn drift_samples_for_subvolumes(
         &self,
-        subvolumes: &[String],
+        subvolumes: &[SubvolName],
         since: chrono::NaiveDateTime,
     ) -> crate::error::Result<Vec<DriftSampleRow>> {
         if subvolumes.is_empty() {
@@ -102,14 +103,15 @@ impl StateDb {
              WHERE subvolume IN ({placeholders}) AND sampled_at >= ?
              ORDER BY sampled_at DESC"
         );
-        let since_str = since.format("%Y-%m-%dT%H:%M:%S").to_string();
+        let since_str = Timestamp::from(since).to_string();
 
         let mut stmt = self
             .conn
             .prepare(&sql)
             .map_err(db_err("query failed"))?;
 
-        let mut params: Vec<&dyn rusqlite::ToSql> = subvolumes
+        let names: Vec<&str> = subvolumes.iter().map(SubvolName::as_str).collect();
+        let mut params: Vec<&dyn rusqlite::ToSql> = names
             .iter()
             .map(|s| s as &dyn rusqlite::ToSql)
             .collect();
@@ -139,11 +141,8 @@ impl StateDb {
         let source_free_bytes: Option<i64> = row.get(5)?;
         let send_type_s: String = row.get(6)?;
 
-        let sampled_at = match chrono::NaiveDateTime::parse_from_str(
-            &sampled_at_s,
-            "%Y-%m-%dT%H:%M:%S",
-        ) {
-            Ok(dt) => dt,
+        let sampled_at = match sampled_at_s.parse::<Timestamp>() {
+            Ok(ts) => ts.as_naive(),
             Err(e) => {
                 log::warn!("skipping drift row with unparseable sampled_at {sampled_at_s:?}: {e}");
                 return Ok(None);
@@ -186,6 +185,7 @@ impl From<DriftSampleRow> for crate::drift::DriftSample {
 mod tests {
     use crate::state::*;
     use crate::state::testkit::drift_dt;
+    use crate::testkit::svname;
 
     // ── Drift sample tests (UPI 030) ─────────────────────────────────
 
@@ -376,7 +376,7 @@ mod tests {
         }
 
         let since = drift_dt("2026-04-20T00:00:00");
-        let result = db.drift_samples_for_subvolume("home", since).unwrap();
+        let result = db.drift_samples_for_subvolume(&svname("home"), since).unwrap();
         assert_eq!(result.len(), 2);
         // Newest first.
         assert_eq!(result[0].sampled_at, drift_dt("2026-04-30T04:00:00"));
@@ -387,7 +387,7 @@ mod tests {
     fn drift_samples_for_subvolume_returns_empty_vec_when_none() {
         let db = StateDb::open_memory().unwrap();
         let result = db
-            .drift_samples_for_subvolume("nope", drift_dt("2026-01-01T00:00:00"))
+            .drift_samples_for_subvolume(&svname("nope"), drift_dt("2026-01-01T00:00:00"))
             .unwrap();
         assert!(result.is_empty());
     }
@@ -415,7 +415,7 @@ mod tests {
                 crate::types::SendKind::Incremental,
             ));
         }
-        let names = vec!["a".to_string(), "b".to_string()];
+        let names = vec![svname("a"), svname("b")];
         let result = db
             .drift_samples_for_subvolumes(&names, drift_dt("2026-01-01T00:00:00"))
             .unwrap();
@@ -442,7 +442,7 @@ mod tests {
         // since=2026-04-20T00:00:00 (inclusive) → expect 2 rows.
         let result = db
             .drift_samples_for_subvolumes(
-                &["home".to_string()],
+                &[svname("home")],
                 drift_dt("2026-04-20T00:00:00"),
             )
             .unwrap();
@@ -482,7 +482,7 @@ mod tests {
             None,
             crate::types::SendKind::Incremental,
         ));
-        let names = vec!["home".to_string(), "nope".to_string()];
+        let names = vec![svname("home"), svname("nope")];
         let result = db
             .drift_samples_for_subvolumes(&names, drift_dt("2026-01-01T00:00:00"))
             .unwrap();
@@ -529,5 +529,32 @@ mod tests {
             .unwrap();
         assert_eq!(op_str, drift_str);
         assert_eq!(op_str, "send_full");
+    }
+
+    #[test]
+    fn drift_row_in_the_persisted_form_reads_back() {
+        // A row as every Urd version has written it (ADR-102: existing rows must
+        // keep parsing). The literal strings are the contract — both the stored
+        // `sampled_at` and the `since` bound compare as text in SQL.
+        let db = StateDb::open_memory().unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO drift_samples (run_id, subvolume, sampled_at,
+                     seconds_since_prev_send, bytes_transferred,
+                     source_free_bytes, send_type)
+                 VALUES (NULL, 'home', '2026-04-30T04:00:00', 86400, 1000, NULL,
+                     'send_incremental')",
+                [],
+            )
+            .unwrap();
+        let rows = db
+            .drift_samples_for_subvolume(&svname("home"), drift_dt("2026-04-30T04:00:00"))
+            .unwrap();
+        assert_eq!(rows.len(), 1, "inclusive since bound matches the stored text");
+        assert_eq!(rows[0].sampled_at, drift_dt("2026-04-30T04:00:00"));
+        let later = db
+            .drift_samples_for_subvolume(&svname("home"), drift_dt("2026-04-30T04:00:01"))
+            .unwrap();
+        assert!(later.is_empty());
     }
 }

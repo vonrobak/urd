@@ -17,6 +17,7 @@ use crate::observation::RealFileSystemState;
 use crate::sentinel::{self, EjectAction, EjectEvent, EjectPhase, EjectTransition};
 
 use super::SentinelRunner;
+use crate::types::{DriveLabel, SubvolName};
 
 impl SentinelRunner {
     // ── Idle emergency eject (ADR-113 Layer 3; decisions in sentinel.rs) ──
@@ -113,7 +114,7 @@ impl SentinelRunner {
                         // idle-eject floor matches the gate/watchdog floor exactly. `first`
                         // is the pool's first send-enabled subvol, so it is in `send_enabled`
                         // and the `None` arm is unreachable (0 is the inert fallback).
-                        let one = [first.to_string()];
+                        let one = [first.clone()];
                         storage_signals::pool_floor_bytes(
                             &self.config,
                             &one,
@@ -268,7 +269,7 @@ impl SentinelRunner {
 struct EjectContext {
     _guard: crate::lock::LockGuard,
     btrfs: crate::btrfs::RealBtrfs,
-    away: HashMap<String, Vec<String>>,
+    away: HashMap<SubvolName, Vec<DriveLabel>>,
     now: NaiveDateTime,
     audit_events: Vec<crate::events::UnstampedEvent>,
     notifications: Vec<Notification>,
@@ -283,13 +284,13 @@ struct EjectContext {
 /// without live statvfs (C2 regression guard).
 pub(super) fn pressure_samples_from(
     pools: Vec<crate::pools::SourcePool>,
-    send_enabled: &HashSet<String>,
+    send_enabled: &HashSet<SubvolName>,
     mut space: impl FnMut(&Path) -> Option<crate::pools::PoolSpace>,
-    mut floor: impl FnMut(&str, u64) -> u64,
+    mut floor: impl FnMut(&SubvolName, u64) -> u64,
 ) -> Vec<crate::guard::PoolPressureSample> {
     let mut samples = Vec::new();
     for pool in pools {
-        let send_subvols: Vec<String> = pool
+        let send_subvols: Vec<SubvolName> = pool
             .subvolume_names
             .iter()
             .filter(|n| send_enabled.contains(*n))

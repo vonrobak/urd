@@ -9,6 +9,7 @@ use colored::Colorize;
 use crate::awareness::PromiseStatus;
 use crate::output::{OutputMode, SentinelStatusOutput};
 
+use super::duration::DurationStyle;
 use super::render_json;
 
 /// Render sentinel status output according to the given mode. `now` is the
@@ -90,15 +91,10 @@ fn render_sentinel_status_interactive(
 /// relative age ("5m ago") from `now`. Falls back to the raw string when it
 /// doesn't parse (hand-edited state file) — degraded, never wrong.
 fn humanize_assessment_age(timestamp: &str, now: chrono::NaiveDateTime) -> String {
-    let Ok(ts) = chrono::NaiveDateTime::parse_from_str(timestamp, "%Y-%m-%dT%H:%M:%S") else {
+    let Ok(ts) = chrono::NaiveDateTime::parse_from_str(timestamp, crate::types::TIMESTAMP_FORMAT) else {
         return timestamp.to_string();
     };
-    let mins = now.signed_duration_since(ts).num_minutes();
-    if mins < 1 {
-        "just now".to_string()
-    } else {
-        format!("{} ago", crate::plan::format_duration_short(mins))
-    }
+    DurationStyle::Ago.render(now.signed_duration_since(ts).num_seconds())
 }
 
 fn format_tick_description(tick_secs: u64, promise_states: &[crate::output::SentinelPromiseState]) -> String {

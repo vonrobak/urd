@@ -18,7 +18,7 @@
 //!   voice/stakes orthogonally (pressure here risks the host, not just
 //!   retention).
 //!
-//! A persisted per-pool **armed tier** (`state.rs`) plus the pure hysteresis in
+//! A persisted per-pool **armed tier** (`state/posture.rs`) plus the pure hysteresis in
 //! `resolve_armed_tier` give told-not-silent *transitions* and anti-flap
 //! stability. The posture (`StoragePosture`) is the per-subvolume cell the
 //! awareness surface carries; transitions are computed **only** at the backup
@@ -39,7 +39,7 @@ use std::collections::HashMap;
 use chrono::NaiveDateTime;
 use serde::Serialize;
 
-use crate::types::{Interval, LocalRetentionPolicy};
+use crate::types::{Interval, LocalRetentionPolicy, SubvolName};
 
 // ── Free-ratio classification (UPI 044 thresholds, ADR-115 amendment 2026-05-16) ──
 // N=1-calibrated from the 2026-05-09 retention-tuning report. Soft —
@@ -150,7 +150,7 @@ pub const CRITICAL_INTERVAL_FLOOR_DAYS: i64 = 7;
 /// from the same gathered inputs. An absent key defaults to `Roomy`
 /// (`get(..).copied().unwrap_or_default()`) → declared behavior → zero behavior
 /// change (the regression firewall).
-pub type ArmedTierMap = HashMap<String, TightnessTier>;
+pub type ArmedTierMap = HashMap<SubvolName, TightnessTier>;
 
 /// Source-pool tightness, free-ratio only (UPI 031-a). Distinct from
 /// `HeadroomSeverity` as `recommendation` composes it (free-ratio + trend +
@@ -461,7 +461,7 @@ impl ResolvedStorageSignal {
 /// seams stay narrow (parallels the 032 churn-map decision, arc R8). Subvolumes
 /// absent from the map get no posture.
 pub type StorageSignalMap =
-    std::collections::HashMap<String, ResolvedStorageSignal>;
+    std::collections::HashMap<SubvolName, ResolvedStorageSignal>;
 
 // ── Transitions and posture ────────────────────────────────────────────
 

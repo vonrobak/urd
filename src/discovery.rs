@@ -3,8 +3,8 @@
 //! Builds a [`SystemInventory`] — btrfs pools, mounted subvolumes, candidate
 //! drives, and discovery notes — from **unprivileged** probes only:
 //! `lsblk -J`, `findmnt -t btrfs -J`, and statvfs. No sudo, no `BtrfsOps`,
-//! no config, no state DB. Pure parsers and a pure aggregator with thin I/O
-//! shims beside them, following the `pools.rs` precedent (ADR-108).
+//! no config, no state DB. Pure parsers and a pure aggregator; the probe
+//! subprocesses themselves live in `probes.rs` (ADR-108).
 //!
 //! The inventory is observational and unprivileged; any privileged consumer
 //! (UPI 075 drive adoption) must re-verify device identity at action time —
@@ -17,12 +17,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use serde::Deserialize;
 
 use crate::error::UrdError;
 use crate::pools::{canonical_mountpoint_label, PoolSpace};
+use crate::probes;
 
 /// lsblk column set — shared by the production shim and the golden-fixture
 /// guard test so a typo'd or renamed column becomes a red test instead of a
@@ -697,52 +697,13 @@ fn build_inventory(
     }
 }
 
-// ── I/O probe edge (thin shims) ────────────────────────────────────────
-
-/// Run one probe command. Error mapping per the pools.rs convention:
-/// spawn failure → `Io` with the binary name as path; non-zero exit with
-/// stdout content or stderr → `Io`. `tolerate_empty_failure` maps non-zero
-/// exit with empty stdout to `Ok("")` — required for `findmnt -t btrfs`,
-/// which exits non-zero on a machine with zero btrfs mounts; lsblk has no
-/// such legitimate empty failure, so there it stays an error.
-fn run_probe(cmd: &str, args: &[&str], tolerate_empty_failure: bool) -> crate::error::Result<String> {
-    let output = Command::new(cmd)
-        .env("LC_ALL", "C")
-        .args(args)
-        .output()
-        .map_err(|e| UrdError::Io {
-            path: PathBuf::from(cmd),
-            source: e,
-        })?;
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    if !output.status.success() {
-        if tolerate_empty_failure && stdout.trim().is_empty() && output.stderr.is_empty() {
-            return Ok(String::new());
-        }
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(UrdError::Io {
-            path: PathBuf::from(cmd),
-            source: std::io::Error::other(format!("{cmd} failed: {}", stderr.trim())),
-        });
-    }
-    Ok(stdout)
-}
-
-fn run_lsblk() -> crate::error::Result<String> {
-    run_probe("lsblk", &["-J", "-o", LSBLK_COLUMNS], false)
-}
-
-fn run_findmnt() -> crate::error::Result<String> {
-    run_probe("findmnt", &["-t", "btrfs", "-J"], true)
-}
-
 /// Probe the system and build the inventory. Never fails: a failed probe
 /// degrades the inventory and leaves a [`DiscoveryNote::ProbeDegraded`]
 /// so 072 can say so (fail open, observable).
 #[must_use]
 pub fn discover() -> SystemInventory {
     let mut probe_notes = Vec::new();
-    let devices = match run_lsblk().and_then(|out| parse_lsblk(&out)) {
+    let devices = match probes::lsblk_json(LSBLK_COLUMNS).and_then(|out| parse_lsblk(&out)) {
         Ok(devices) => devices,
         Err(e) => {
             probe_notes.push(DiscoveryNote::ProbeDegraded {
@@ -752,7 +713,7 @@ pub fn discover() -> SystemInventory {
             Vec::new()
         }
     };
-    let mounts = match run_findmnt().and_then(|out| parse_findmnt(&out)) {
+    let mounts = match probes::findmnt_btrfs_json().and_then(|out| parse_findmnt(&out)) {
         Ok(mounts) => mounts,
         Err(e) => {
             probe_notes.push(DiscoveryNote::ProbeDegraded {
@@ -772,7 +733,7 @@ pub fn discover() -> SystemInventory {
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
         .map(|path| {
-            let pool_uuid = crate::pools::findmnt_probe_target(&path)
+            let pool_uuid = crate::probes::findmnt_target(&path)
                 .ok()
                 .and_then(|entry| btrfs_pool_uuid(&entry));
             DiscoveredHome { path, pool_uuid }
@@ -780,13 +741,13 @@ pub fn discover() -> SystemInventory {
     inventory
 }
 
-/// Gate a [`pools::FindmntEntry`] to its UUID only when the filesystem is
+/// Gate a [`probes::FindmntEntry`](crate::probes::FindmntEntry) to its UUID only when the filesystem is
 /// btrfs — an ext4 `/home` over a btrfs `/` must not be attributed to the
 /// pool (a home-relative snapshot root there would cross filesystems). This
 /// gate is specific to discovery's zero-state home-pool lookup, so it stays
-/// here rather than in the shared probe in `pools.rs` (UPI 084).
+/// here rather than in the shared probe in `probes.rs` (UPI 084).
 #[must_use]
-fn btrfs_pool_uuid(entry: &crate::pools::FindmntEntry) -> Option<String> {
+fn btrfs_pool_uuid(entry: &crate::probes::FindmntEntry) -> Option<String> {
     if entry.fstype.as_deref() == Some("btrfs") {
         entry.uuid.clone()
     } else {
@@ -814,7 +775,7 @@ mod tests {
 
     #[test]
     fn btrfs_pool_uuid_btrfs_yields_pool_uuid() {
-        let entry = crate::pools::FindmntEntry {
+        let entry = crate::probes::FindmntEntry {
             target: Some(PathBuf::from("/home")),
             fstype: Some("btrfs".to_string()),
             uuid: Some(SYSTEM_POOL.to_string()),
@@ -826,7 +787,7 @@ mod tests {
     fn btrfs_pool_uuid_non_btrfs_yields_none() {
         // An ext4 /home over a btrfs / must not be attributed to the pool
         // — a home-relative snapshot root there would cross filesystems.
-        let entry = crate::pools::FindmntEntry {
+        let entry = crate::probes::FindmntEntry {
             target: Some(PathBuf::from("/home")),
             fstype: Some("ext4".to_string()),
             uuid: Some(SYSTEM_POOL.to_string()),
@@ -836,9 +797,9 @@ mod tests {
 
     #[test]
     fn btrfs_pool_uuid_degraded_entry_yields_none() {
-        assert_eq!(btrfs_pool_uuid(&crate::pools::FindmntEntry::default()), None);
+        assert_eq!(btrfs_pool_uuid(&crate::probes::FindmntEntry::default()), None);
         assert_eq!(
-            btrfs_pool_uuid(&crate::pools::FindmntEntry {
+            btrfs_pool_uuid(&crate::probes::FindmntEntry {
                 target: Some(PathBuf::from("/")),
                 fstype: Some("btrfs".to_string()),
                 uuid: None,

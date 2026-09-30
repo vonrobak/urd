@@ -7,11 +7,6 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::error::UrdError;
 
-// The planner-output types live in `plan/types.rs`; re-exported so existing
-// `crate::types::{BackupPlan, PlannedOperation, ..}` paths keep resolving.
-// A path alias only — nothing in this module names them.
-pub use crate::plan::{BackupPlan, DeleteKind, PlannedOperation, PlannedSkip};
-
 // ── Interval ────────────────────────────────────────────────────────────
 
 /// A duration parsed from human-readable strings like "15m", "1h", "1d", "1w".
@@ -189,6 +184,92 @@ pub enum DriveEventKind {
     Unmount,
 }
 
+// ── Timestamp ───────────────────────────────────────────────────────────
+
+/// The persisted timestamp form: local wall time, second precision, no zone
+/// (`2026-03-24T02:05:00`). Every history DB timestamp column (ADR-102), the
+/// heartbeat `timestamp`/`stale_after` fields (ADR-105), the sentinel state file,
+/// and event payloads (ADR-114) carry exactly this form — existing rows and files
+/// are parsed with it, so it can never change without a migration. The one
+/// spelling of the format lives here; everything else goes through this const or
+/// [`Timestamp`].
+pub const TIMESTAMP_FORMAT: &str = "%Y-%m-%dT%H:%M:%S";
+
+/// Minute-precision form for human-facing text (`2026-03-24 02:05`): the plan
+/// header, `urd get` messages, and the `urd get --at` input form. Never stored,
+/// and [`Timestamp`] does not parse it — but it reaches `--json` output in
+/// `PlanOutput.timestamp` and `GetOutput.snapshot_date`, so it is not free to
+/// change either.
+pub const DISPLAY_MINUTE_FORMAT: &str = "%Y-%m-%d %H:%M";
+
+/// A timestamp in its persisted form ([`TIMESTAMP_FORMAT`]).
+///
+/// `Display` writes the persisted form and `FromStr` parses that form (no zone,
+/// no fractional seconds) with the same chrono call every reader used before this
+/// type, so `t.to_string().parse() == Ok(t)` and no stored row reads differently.
+/// Sub-second precision is dropped at construction for the same reason: the
+/// persisted form cannot carry it, and a value that compares unequal to its own
+/// round trip would be a trap. Serde uses the same string, so a `Timestamp` field
+/// is wire-identical to the `String` fields it replaces. The parse error is
+/// chrono's own, so messages built from it read as they did before this type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Timestamp(NaiveDateTime);
+
+impl Timestamp {
+    /// Wrap a datetime, dropping sub-second precision.
+    #[must_use]
+    pub fn new(datetime: NaiveDateTime) -> Self {
+        Self(datetime.with_nanosecond(0).unwrap_or(datetime))
+    }
+
+    /// The wrapped datetime (whole seconds).
+    #[must_use]
+    pub const fn as_naive(self) -> NaiveDateTime {
+        self.0
+    }
+}
+
+impl From<NaiveDateTime> for Timestamp {
+    fn from(datetime: NaiveDateTime) -> Self {
+        Self::new(datetime)
+    }
+}
+
+impl fmt::Display for Timestamp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0.format(TIMESTAMP_FORMAT))
+    }
+}
+
+impl FromStr for Timestamp {
+    type Err = chrono::ParseError;
+
+    /// Parse the persisted form. This is the reader for every stored timestamp,
+    /// so it accepts exactly what the writers produce and nothing looser.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        NaiveDateTime::parse_from_str(s, TIMESTAMP_FORMAT).map(Self::new)
+    }
+}
+
+impl<'de> Deserialize<'de> for Timestamp {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        s.parse().map_err(de::Error::custom)
+    }
+}
+
+impl Serialize for Timestamp {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.collect_str(self)
+    }
+}
+
 // ── SnapshotName ────────────────────────────────────────────────────────
 
 /// A snapshot name in the format `YYYYMMDD-HHMM-shortname`.
@@ -328,6 +409,176 @@ impl Ord for SnapshotName {
             .then_with(|| self.short_name.cmp(&other.short_name))
     }
 }
+
+// ── DriveLabel / SubvolName ─────────────────────────────────────────────
+
+// Defines a transparent string newtype for a config-declared name. The two
+// names Urd threads through every layer — a drive's label and a subvolume's
+// name — are both plain strings on the wire and in the DB, and before these
+// types nothing in a signature said which `String` was which (a
+// `HashMap<String, Vec<String>>` could be either way round).
+//
+// Construction is unvalidated on purpose: the names are checked once, at the
+// config boundary (`validate_name_safe`, ADR-109), and trusted afterwards.
+// These types say *which* name a value is, not that it is safe — a value built
+// from a DB row or a test literal is exactly as trusted as the string it wraps.
+//
+// Wire and text forms are the inner string, byte for byte (ADR-105):
+// `#[serde(transparent)]`, `Display` pads the string (so `{:<12}` lays out as
+// it did), and `Debug` is the string's own `Debug` (`"WD-18TB"`), so a `{:?}`
+// that used to format the `String` field reads the same. `Deref<Target = str>`
+// and `Borrow<str>` let `&str` call sites and `HashMap::get(&str)` lookups keep
+// working; the `PartialEq` impls against `str`/`String` let comparisons with
+// literals and DB strings read as they did.
+macro_rules! config_name_newtype {
+    ($(#[$meta:meta])* $name:ident) => {
+        $(#[$meta])*
+        #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Default, Deserialize, Serialize)]
+        #[serde(transparent)]
+        pub struct $name(String);
+
+        impl $name {
+            /// Wrap a name. Unvalidated — validation is the config boundary's
+            /// job (ADR-109).
+            #[must_use]
+            pub fn new(name: impl Into<String>) -> Self {
+                Self(name.into())
+            }
+
+            /// The name as a string slice.
+            #[must_use]
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+
+            /// Unwrap into the owned string (the wire/DB form).
+            #[must_use]
+            pub fn into_string(self) -> String {
+                self.0
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.pad(&self.0)
+            }
+        }
+
+        impl fmt::Debug for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                fmt::Debug::fmt(&self.0, f)
+            }
+        }
+
+        impl std::ops::Deref for $name {
+            type Target = str;
+
+            fn deref(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl AsRef<str> for $name {
+            fn as_ref(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl AsRef<std::path::Path> for $name {
+            fn as_ref(&self) -> &std::path::Path {
+                std::path::Path::new(&self.0)
+            }
+        }
+
+        impl std::borrow::Borrow<str> for $name {
+            fn borrow(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl From<String> for $name {
+            fn from(name: String) -> Self {
+                Self(name)
+            }
+        }
+
+        impl From<&str> for $name {
+            fn from(name: &str) -> Self {
+                Self(name.to_string())
+            }
+        }
+
+        impl From<&$name> for $name {
+            fn from(name: &$name) -> Self {
+                name.clone()
+            }
+        }
+
+        impl From<&String> for $name {
+            fn from(name: &String) -> Self {
+                Self(name.clone())
+            }
+        }
+
+        impl From<$name> for String {
+            fn from(name: $name) -> Self {
+                name.0
+            }
+        }
+
+        impl PartialEq<str> for $name {
+            fn eq(&self, other: &str) -> bool {
+                self.0 == other
+            }
+        }
+
+        impl PartialEq<&str> for $name {
+            fn eq(&self, other: &&str) -> bool {
+                self.0 == *other
+            }
+        }
+
+        impl PartialEq<String> for $name {
+            fn eq(&self, other: &String) -> bool {
+                &self.0 == other
+            }
+        }
+
+        impl PartialEq<$name> for str {
+            fn eq(&self, other: &$name) -> bool {
+                self == other.0
+            }
+        }
+
+        impl PartialEq<$name> for &str {
+            fn eq(&self, other: &$name) -> bool {
+                *self == other.0
+            }
+        }
+
+        impl PartialEq<$name> for String {
+            fn eq(&self, other: &$name) -> bool {
+                *self == other.0
+            }
+        }
+    };
+}
+
+config_name_newtype!(
+    /// A drive's configured label (`[[drives]] label`): the drive's identity
+    /// in config, in the history DB `drive_label` columns, in heartbeat and
+    /// metrics label strings, and in pin-file names. Unvalidated at
+    /// construction — `validate_name_safe` checks it at config load (ADR-109).
+    DriveLabel
+);
+
+config_name_newtype!(
+    /// A subvolume's configured name (`[[subvolumes]] name`): its identity in
+    /// config, in the history DB `subvolume` columns, and in every output
+    /// struct. Not the snapshot `short_name`. Unvalidated at construction —
+    /// `validate_name_safe` checks it at config load (ADR-109).
+    SubvolName
+);
 
 // ── DriveRole ───────────────────────────────────────────────────────────
 
@@ -823,7 +1074,7 @@ impl<'de> Deserialize<'de> for MonthlyCount {
     ///  - any other string → error
     ///
     /// V2 (UPI 042) closes the `monthly = 0` footgun via
-    /// `deserialize_monthly_count_strict_opt` — see `parse_v2` in config.rs.
+    /// `deserialize_monthly_count_strict_opt` — see `parse_v2` in config/v2.rs.
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         struct MonthlyCountVisitor;
 
@@ -1251,8 +1502,8 @@ pub fn format_duration_secs(secs: i64) -> String {
 /// Returns `None` if either timestamp fails to parse.
 #[must_use]
 pub fn format_run_duration(started: &str, finished: &str) -> Option<String> {
-    let start = NaiveDateTime::parse_from_str(started, "%Y-%m-%dT%H:%M:%S").ok()?;
-    let end = NaiveDateTime::parse_from_str(finished, "%Y-%m-%dT%H:%M:%S").ok()?;
+    let start = NaiveDateTime::parse_from_str(started, TIMESTAMP_FORMAT).ok()?;
+    let end = NaiveDateTime::parse_from_str(finished, TIMESTAMP_FORMAT).ok()?;
     Some(format_duration_secs((end - start).num_seconds()))
 }
 
@@ -1342,6 +1593,73 @@ mod tests {
     #[test]
     fn send_kind_db_str_incremental() {
         assert_eq!(SendKind::Incremental.as_db_str(), "send_incremental");
+    }
+
+    // ── Timestamp tests ─────────────────────────────────────────────
+
+    #[test]
+    fn timestamp_round_trips_the_persisted_form() {
+        let t: Timestamp = "2026-03-24T02:05:09".parse().unwrap();
+        assert_eq!(t.to_string(), "2026-03-24T02:05:09");
+        assert_eq!(
+            t.as_naive(),
+            NaiveDate::from_ymd_opt(2026, 3, 24).unwrap().and_hms_opt(2, 5, 9).unwrap()
+        );
+        assert_eq!(t.to_string().parse::<Timestamp>().unwrap(), t);
+    }
+
+    #[test]
+    fn timestamp_display_matches_the_format_literal() {
+        // The writers used `dt.format(TIMESTAMP_FORMAT)` before this type existed;
+        // Display must produce the same bytes, including for sub-second inputs.
+        let dt = NaiveDate::from_ymd_opt(2026, 1, 2)
+            .unwrap()
+            .and_hms_milli_opt(3, 4, 5, 678)
+            .unwrap();
+        assert_eq!(Timestamp::from(dt).to_string(), dt.format(TIMESTAMP_FORMAT).to_string());
+        assert_eq!(Timestamp::new(dt).to_string(), "2026-01-02T03:04:05");
+    }
+
+    #[test]
+    fn timestamp_drops_sub_second_precision() {
+        let dt = NaiveDate::from_ymd_opt(2026, 1, 2)
+            .unwrap()
+            .and_hms_milli_opt(3, 4, 5, 678)
+            .unwrap();
+        let t = Timestamp::new(dt);
+        assert_eq!(t.as_naive(), dt.with_nanosecond(0).unwrap());
+        assert_eq!(t.to_string().parse::<Timestamp>().unwrap(), t);
+    }
+
+    #[test]
+    fn timestamp_rejects_display_minute_form_and_garbage() {
+        assert!("2026-03-24 02:05".parse::<Timestamp>().is_err());
+        assert!("2026-03-24 02:05:00".parse::<Timestamp>().is_err());
+        assert!("2026-03-24T02:05".parse::<Timestamp>().is_err());
+        assert!("2026-03-24T02:05:00.5".parse::<Timestamp>().is_err());
+        assert!("2026-03-24T02:05:00+02:00".parse::<Timestamp>().is_err());
+        assert!("".parse::<Timestamp>().is_err());
+        assert!("not a timestamp".parse::<Timestamp>().is_err());
+    }
+
+    #[test]
+    fn timestamp_orders_chronologically() {
+        let a: Timestamp = "2026-03-24T02:05:00".parse().unwrap();
+        let b: Timestamp = "2026-03-24T02:05:01".parse().unwrap();
+        let c: Timestamp = "2027-01-01T00:00:00".parse().unwrap();
+        assert!(a < b && b < c);
+        let mut v = vec![c, a, b];
+        v.sort();
+        assert_eq!(v, vec![a, b, c]);
+    }
+
+    #[test]
+    fn timestamp_serde_is_the_persisted_string() {
+        let t: Timestamp = "2026-03-24T02:05:00".parse().unwrap();
+        let json = serde_json::to_string(&t).unwrap();
+        assert_eq!(json, "\"2026-03-24T02:05:00\"");
+        assert_eq!(serde_json::from_str::<Timestamp>(&json).unwrap(), t);
+        assert!(serde_json::from_str::<Timestamp>("\"2026-03-24 02:05\"").is_err());
     }
 
     // ── SnapshotName tests ──────────────────────────────────────────
@@ -1886,6 +2204,24 @@ weekly = 4
     fn format_duration_secs_minutes() {
         assert_eq!(format_duration_secs(60), "1m 0s");
         assert_eq!(format_duration_secs(135), "2m 15s");
+    }
+
+    /// The duration-style inventory table (see `voice/duration.rs`): this
+    /// "2m 15s" style stays here because it feeds `urd history --json` and the
+    /// status `LastRunInfo.duration` field — a machine surface below `voice/`.
+    #[test]
+    fn format_duration_secs_inventory_table() {
+        let got: Vec<String> = [0, 59, 61, 3599, 3661, 90061, 129600, 2595661, -61]
+            .iter()
+            .map(|&s| format_duration_secs(s))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                "<1s", "59s", "1m 1s", "59m 59s", "61m 1s", "1501m 1s", "2160m 0s", "43261m 1s",
+                "<1s",
+            ]
+        );
     }
 
     #[test]
@@ -2502,5 +2838,55 @@ weekly = 4
                 PromiseStatus::Unprotected
             );
         }
+    }
+
+    // ── DriveLabel / SubvolName tests ───────────────────────────────
+
+    #[test]
+    fn config_names_serde_is_transparent() {
+        // Wire bytes are the bare string (ADR-105): the newtypes replaced
+        // `String` fields in serialized structs and must not add a wrapper.
+        let label = DriveLabel::from("WD-18TB");
+        let json = serde_json::to_string(&label).unwrap();
+        assert_eq!(json, "\"WD-18TB\"");
+        assert_eq!(serde_json::from_str::<DriveLabel>(&json).unwrap(), label);
+
+        let name = SubvolName::from("htpc-home");
+        let json = serde_json::to_string(&name).unwrap();
+        assert_eq!(json, "\"htpc-home\"");
+        assert_eq!(serde_json::from_str::<SubvolName>(&json).unwrap(), name);
+
+        #[derive(serde::Deserialize)]
+        struct Row {
+            label: DriveLabel,
+        }
+        let row: Row = toml::from_str("label = \"2TB-backup\"").unwrap();
+        assert_eq!(row.label, "2TB-backup");
+    }
+
+    #[test]
+    fn config_names_display_and_debug_match_the_string() {
+        let label = DriveLabel::from("WD-18TB");
+        assert_eq!(label.to_string(), "WD-18TB");
+        // Width specs pad as they did on the `String` field.
+        assert_eq!(format!("[{label:<9}]"), "[WD-18TB  ]");
+        assert_eq!(format!("{label:?}"), format!("{:?}", "WD-18TB"));
+        let name = SubvolName::from("sv1".to_string());
+        assert_eq!(format!("{name}/{name:?}"), "sv1/\"sv1\"");
+    }
+
+    #[test]
+    fn config_names_borrow_str_for_map_lookup() {
+        use std::collections::{BTreeSet, HashMap};
+
+        let mut by_drive: HashMap<DriveLabel, u32> = HashMap::new();
+        by_drive.insert(DriveLabel::from("D1"), 7);
+        assert_eq!(by_drive.get("D1"), Some(&7));
+        assert_eq!(by_drive.get("D2"), None);
+
+        let names: BTreeSet<SubvolName> = ["b", "a"].into_iter().map(SubvolName::from).collect();
+        assert!(names.contains("a"));
+        // Ord is the string's order.
+        assert_eq!(names.iter().next().unwrap(), "a");
     }
 }

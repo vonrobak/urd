@@ -149,7 +149,7 @@ mod tests {
     use crate::notify::{NotificationChannel, NotificationConfig, NotificationEvent, Urgency};
 
     fn ts() -> chrono::NaiveDateTime {
-        chrono::NaiveDateTime::parse_from_str("2026-07-11T04:00:00", "%Y-%m-%dT%H:%M:%S").unwrap()
+        "2026-07-11T04:00:00".parse::<crate::types::Timestamp>().unwrap().as_naive()
     }
 
     fn unstamped_pair() -> Vec<UnstampedEvent> {

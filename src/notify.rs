@@ -12,7 +12,7 @@
 // `check_backup_overdue`, `build_drive_anomaly_notification`) live here
 // too; the runner only decides when to call them and dispatches.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde::{Deserialize, Serialize};
@@ -26,6 +26,7 @@ use crate::awareness::{
 use crate::heartbeat::{Heartbeat, SubvolumeHeartbeat};
 use crate::sentinel::HealthSnapshot;
 use crate::storage_critical::{TightnessTier, Transition};
+use crate::types::SubvolName;
 
 // ── Event types ────────────────────────────────────────────────────────
 
@@ -249,7 +250,7 @@ pub fn compute_notifications(
         subvolumes
             .iter()
             .map(|sv| PromiseSnapshot {
-                name: sv.name.clone(),
+                name: SubvolName::from(&sv.name),
                 status: sv.promise_status,
             })
             .collect()
@@ -265,7 +266,7 @@ pub fn compute_notifications(
         None => Vec::new(),
     };
     let all_unprotected =
-        PromiseRollup::from_pairs(current_snaps.iter().map(|s| (s.name.clone(), s.status)))
+        PromiseRollup::from_pairs(current_snaps.iter().map(|s| (s.name.to_string(), s.status)))
             .all_unprotected();
 
     let mut notifications = build_promise_change_notifications(&changes, all_unprotected);
@@ -347,7 +348,7 @@ pub fn build_promise_change_notifications(
         if change.to.worsened_from(change.from) {
             notifications.push(Notification {
                 event: NotificationEvent::PromiseDegraded {
-                    subvolume: change.name.clone(),
+                    subvolume: change.name.to_string(),
                     from: change.from.to_string(),
                     to: change.to.to_string(),
                 },
@@ -362,7 +363,7 @@ pub fn build_promise_change_notifications(
         } else {
             notifications.push(Notification {
                 event: NotificationEvent::PromiseRecovered {
-                    subvolume: change.name.clone(),
+                    subvolume: change.name.to_string(),
                     from: change.from.to_string(),
                     to: change.to.to_string(),
                 },
@@ -715,14 +716,14 @@ pub fn check_backup_overdue(
     now: NaiveDateTime,
 ) -> Option<Notification> {
     let stale_after =
-        NaiveDateTime::parse_from_str(&heartbeat.stale_after, "%Y-%m-%dT%H:%M:%S").ok()?;
+        NaiveDateTime::parse_from_str(&heartbeat.stale_after, crate::types::TIMESTAMP_FORMAT).ok()?;
 
     if now <= stale_after {
         return None;
     }
 
     let timestamp =
-        NaiveDateTime::parse_from_str(&heartbeat.timestamp, "%Y-%m-%dT%H:%M:%S").ok()?;
+        NaiveDateTime::parse_from_str(&heartbeat.timestamp, crate::types::TIMESTAMP_FORMAT).ok()?;
 
     let age_hours = (now.signed_duration_since(timestamp).num_minutes() as u64 + 30) / 60;
     let stale_hours =
@@ -772,7 +773,7 @@ pub fn build_health_notifications(
                 };
                 notifications.push(Notification {
                     event: NotificationEvent::HealthDegraded {
-                        subvolume: assess.name.clone(),
+                        subvolume: assess.name.to_string(),
                         from: from.clone(),
                         to: to.clone(),
                     },
@@ -786,7 +787,7 @@ pub fn build_health_notifications(
             } else {
                 notifications.push(Notification {
                     event: NotificationEvent::HealthRecovered {
-                        subvolume: assess.name.clone(),
+                        subvolume: assess.name.to_string(),
                         from: from.clone(),
                         to: to.clone(),
                     },
@@ -989,7 +990,7 @@ fn default_webhook_body(notification: &Notification) -> String {
     })
 }
 
-fn dispatch_command(notification: &Notification, path: &PathBuf, args: &[String]) -> bool {
+fn dispatch_command(notification: &Notification, path: &Path, args: &[String]) -> bool {
     let result = Command::new(path)
         .args(args)
         .env("URD_NOTIFICATION_TITLE", &notification.title)
@@ -1857,39 +1858,18 @@ mod tests {
 #[cfg(test)]
 mod sentinel_path_tests {
     use super::*;
-    use crate::awareness::{LocalAssessment, OperationalHealth, PromiseStatus};
+    use crate::awareness::{OperationalHealth, PromiseStatus};
     use crate::heartbeat;
     use crate::sentinel;
-
-    fn make_assessment(name: &str, status: PromiseStatus) -> SubvolAssessment {
-        SubvolAssessment {
-            name: name.to_string(),
-            short_name: name.to_string(),
-            status,
-            health: OperationalHealth::Healthy,
-            health_reasons: vec![],
-            local: LocalAssessment {
-                status,
-                snapshot_count: 5,
-                newest_age: None,
-            },
-            external: vec![],
-            chain_health: vec![],
-            advisories: vec![],
-            redundancy_advisories: vec![],
-            errors: vec![],
-            storage_posture: None,
-            cadence_adapted: false,
-            effective_send_interval: None,
-        }
-    }
+    use crate::testkit::subvol_assessment as make_assessment;
+    use crate::testkit::svname;
 
     // ── build_notifications ─────────────────────────────────────────
 
     #[test]
     fn notifications_degradation_produces_warning() {
         let previous = vec![PromiseSnapshot {
-            name: "home".to_string(),
+            name: svname("home"),
             status: PromiseStatus::Protected,
         }];
         let current = vec![make_assessment("home", PromiseStatus::AtRisk)];
@@ -1908,7 +1888,7 @@ mod sentinel_path_tests {
     #[test]
     fn notifications_recovery_produces_info() {
         let previous = vec![PromiseSnapshot {
-            name: "home".to_string(),
+            name: svname("home"),
             status: PromiseStatus::AtRisk,
         }];
         let current = vec![make_assessment("home", PromiseStatus::Protected)];
@@ -1927,11 +1907,11 @@ mod sentinel_path_tests {
     fn notifications_all_unprotected_is_critical() {
         let previous = vec![
             PromiseSnapshot {
-                name: "home".to_string(),
+                name: svname("home"),
                 status: PromiseStatus::Protected,
             },
             PromiseSnapshot {
-                name: "docs".to_string(),
+                name: svname("docs"),
                 status: PromiseStatus::Protected,
             },
         ];
@@ -1953,7 +1933,7 @@ mod sentinel_path_tests {
     #[test]
     fn notifications_never_produces_backup_only_events() {
         let previous = vec![PromiseSnapshot {
-            name: "home".to_string(),
+            name: svname("home"),
             status: PromiseStatus::Protected,
         }];
         let current = vec![make_assessment("home", PromiseStatus::Unprotected)];
@@ -1975,7 +1955,7 @@ mod sentinel_path_tests {
     #[test]
     fn notifications_no_change_produces_empty() {
         let previous = vec![PromiseSnapshot {
-            name: "home".to_string(),
+            name: svname("home"),
             status: PromiseStatus::Protected,
         }];
         let current = vec![make_assessment("home", PromiseStatus::Protected)];
@@ -1993,7 +1973,7 @@ mod sentinel_path_tests {
     #[test]
     fn golden_twin_degraded_prose_exact() {
         let previous = vec![PromiseSnapshot {
-            name: "home".to_string(),
+            name: svname("home"),
             status: PromiseStatus::Protected,
         }];
         let current = vec![make_assessment("home", PromiseStatus::AtRisk)];
@@ -2017,7 +1997,7 @@ mod sentinel_path_tests {
     #[test]
     fn golden_twin_recovered_prose_exact() {
         let previous = vec![PromiseSnapshot {
-            name: "home".to_string(),
+            name: svname("home"),
             status: PromiseStatus::AtRisk,
         }];
         let current = vec![make_assessment("home", PromiseStatus::Protected)];
@@ -2041,11 +2021,11 @@ mod sentinel_path_tests {
     fn golden_twin_all_unprotected_prose_exact() {
         let previous = vec![
             PromiseSnapshot {
-                name: "home".to_string(),
+                name: svname("home"),
                 status: PromiseStatus::Protected,
             },
             PromiseSnapshot {
-                name: "docs".to_string(),
+                name: svname("docs"),
                 status: PromiseStatus::Protected,
             },
         ];
@@ -2098,9 +2078,7 @@ mod sentinel_path_tests {
 
     // ── check_backup_overdue (S2: pure function with tests) ─────────
 
-    fn dt(s: &str) -> NaiveDateTime {
-        NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S").unwrap()
-    }
+    use crate::testkit::parse_dt as dt;
 
     fn make_heartbeat(timestamp: &str, stale_after: &str) -> heartbeat::Heartbeat {
         heartbeat::Heartbeat {
@@ -2177,7 +2155,7 @@ mod sentinel_path_tests {
 
     fn make_health_snapshot(name: &str, health: OperationalHealth) -> sentinel::HealthSnapshot {
         sentinel::HealthSnapshot {
-            name: name.to_string(),
+            name: name.into(),
             health,
             health_reasons: vec![],
         }

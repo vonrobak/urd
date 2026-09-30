@@ -10,9 +10,11 @@ use crate::output::{
     OutputMode, PlanOperationEntry, PlanOutput, PlanSummaryOutput, SkipCategory,
     SkippedSubvolume,
 };
-use crate::plan::{self, HistoryQuery, NothingNew, PlanFilters, SkipReason};
+use crate::plan::{
+    self, HistoryQuery, NothingNew, PlanFilters, PlannedOperation, PlannedSkip, SkipReason,
+};
 use crate::state::StateDb;
-use crate::types::{PlannedOperation, PlannedSkip};
+use crate::types::{DISPLAY_MINUTE_FORMAT, SubvolName};
 use crate::voice;
 
 pub fn run(config: Config, args: PlanArgs, mode: OutputMode) -> anyhow::Result<()> {
@@ -21,7 +23,7 @@ pub fn run(config: Config, args: PlanArgs, mode: OutputMode) -> anyhow::Result<(
     let now = chrono::Local::now().naive_local();
     let filters = PlanFilters {
         priority: args.priority,
-        subvolume: args.subvolume,
+        subvolume: args.subvolume.map(SubvolName::from),
         local_only: args.local_only,
         external_only: args.external_only,
         skip_intervals: !args.auto,
@@ -56,9 +58,9 @@ pub fn run(config: Config, args: PlanArgs, mode: OutputMode) -> anyhow::Result<(
 /// pure decision `urd backup` makes (ADR-100 preview parity), read-only: a
 /// preview never records a shape. Returns the holds for the warning lines.
 pub(crate) fn gate_preview(
-    backup_plan: &mut crate::types::BackupPlan,
+    backup_plan: &mut crate::plan::BackupPlan,
     config: &Config,
-    recorded: &HashMap<String, crate::retention::RecordedRetention>,
+    recorded: &HashMap<SubvolName, crate::retention::RecordedRetention>,
     filters: &PlanFilters,
     confirmed: bool,
 ) -> Vec<crate::retention::RetentionHold> {
@@ -79,7 +81,7 @@ pub(crate) fn gate_preview(
 #[must_use]
 pub(crate) fn recorded_retention_shapes(
     db: Option<&StateDb>,
-) -> Option<HashMap<String, crate::retention::RecordedRetention>> {
+) -> Option<HashMap<SubvolName, crate::retention::RecordedRetention>> {
     db?.all_retention_shapes().ok()
 }
 
@@ -89,7 +91,7 @@ pub(crate) fn recorded_retention_shapes(
 #[must_use]
 pub(crate) fn retention_baseline_or_warn(
     db: Option<&StateDb>,
-) -> HashMap<String, crate::retention::RecordedRetention> {
+) -> HashMap<SubvolName, crate::retention::RecordedRetention> {
     let cause = match db.map(StateDb::all_retention_shapes) {
         Some(Ok(shapes)) => return shapes,
         Some(Err(e)) => e.to_string(),
@@ -120,7 +122,7 @@ pub(crate) fn retention_hold_warnings(holds: &[crate::retention::RetentionHold])
 /// Build PlanOutput from a BackupPlan. Shared by `urd plan` and `urd backup --dry-run`.
 #[must_use]
 pub fn build_plan_output(
-    backup_plan: &crate::types::BackupPlan,
+    backup_plan: &crate::plan::BackupPlan,
     fs_state: &dyn HistoryQuery,
     config: &Config,
 ) -> PlanOutput {
@@ -158,7 +160,7 @@ pub fn build_plan_output(
         .count();
 
     PlanOutput {
-        timestamp: backup_plan.timestamp.format("%Y-%m-%d %H:%M").to_string(),
+        timestamp: backup_plan.timestamp.format(DISPLAY_MINUTE_FORMAT).to_string(),
         operations,
         skipped,
         summary: PlanSummaryOutput {
@@ -204,11 +206,11 @@ pub(crate) fn collapse_skipped(skipped: &[PlannedSkip]) -> Vec<SkippedSubvolume>
             continue;
         }
         out.push(SkippedSubvolume {
-            name: skip.name.clone(),
+            name: skip.name.to_string(),
             category,
             reason: skip.reason.to_string(),
             next_due_minutes: skip.next_due_minutes,
-            drive: skip.reason.drive().map(str::to_string),
+            drive: skip.reason.drive().map(ToString::to_string),
         });
     }
     out
@@ -251,14 +253,14 @@ fn build_operation_entry(
     resolved: &[ResolvedSubvolume],
 ) -> PlanOperationEntry {
     let send_interval =
-        |name: &str| resolved.iter().find(|r| r.name == name).map(|r| r.send_interval);
+        |name: &SubvolName| resolved.iter().find(|r| r.name == *name).map(|r| r.send_interval);
     match op {
         PlannedOperation::CreateSnapshot {
             source,
             dest,
             subvolume_name,
         } => PlanOperationEntry {
-            subvolume: subvolume_name.clone(),
+            subvolume: subvolume_name.to_string(),
             operation: "create".to_string(),
             detail: format!("{} -> {}", source.display(), dest.display()),
             drive_label: None,
@@ -292,12 +294,12 @@ fn build_operation_entry(
             );
 
             PlanOperationEntry {
-                subvolume: subvolume_name.clone(),
+                subvolume: subvolume_name.to_string(),
                 operation: "send".to_string(),
                 detail: format!(
                     "{snap_name} -> {drive_label} (incremental, parent: {parent_name}){pin_suffix}"
                 ),
-                drive_label: Some(drive_label.clone()),
+                drive_label: Some(drive_label.to_string()),
                 estimated_bytes,
                 is_full_send: Some(false),
                 full_send_reason: None,
@@ -328,12 +330,12 @@ fn build_operation_entry(
             );
 
             PlanOperationEntry {
-                subvolume: subvolume_name.clone(),
+                subvolume: subvolume_name.to_string(),
                 operation: "send".to_string(),
                 detail: format!(
                     "{snap_name} -> {drive_label} (full \u{2014} {reason}){pin_suffix}"
                 ),
-                drive_label: Some(drive_label.clone()),
+                drive_label: Some(drive_label.to_string()),
                 estimated_bytes,
                 is_full_send: Some(true),
                 full_send_reason: Some(reason.to_string()),
@@ -352,9 +354,9 @@ fn build_operation_entry(
             let drive_label = drives
                 .iter()
                 .find(|d| path.starts_with(&d.mount_path))
-                .map(|d| d.label.clone());
+                .map(|d| d.label.to_string());
             PlanOperationEntry {
-                subvolume: subvolume_name.clone(),
+                subvolume: subvolume_name.to_string(),
                 operation: "delete".to_string(),
                 detail: format!("{snap_name} ({reason})"),
                 drive_label,
@@ -369,8 +371,10 @@ fn build_operation_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plan::{MockFileSystemState, NothingNew};
-    use crate::types::{BackupPlan, SendKind, SnapshotName};
+    use crate::plan::{BackupPlan, MockFileSystemState, NothingNew};
+    use crate::testkit::{dlabel, svname};
+    use crate::testkit::ConfigBuilder;
+    use crate::types::{SendKind, SnapshotName};
     use std::path::PathBuf;
 
     fn dummy_snap(subvol: &str) -> SnapshotName {
@@ -378,61 +382,21 @@ mod tests {
     }
 
     fn test_config() -> Config {
-        let toml_str = r#"
-[general]
-state_db = "/tmp/urd.db"
-metrics_file = "/tmp/backup.prom"
-log_dir = "/tmp"
-
-[local_snapshots]
-roots = [
-  { path = "/snap", subvolumes = ["htpc-home", "htpc-docs"] }
-]
-
-[defaults]
-snapshot_interval = "1h"
-send_interval = "1d"
-send_enabled = true
-enabled = true
-[defaults.local_retention]
-hourly = 24
-daily = 30
-weekly = 26
-monthly = 12
-[defaults.external_retention]
-daily = 30
-weekly = 26
-monthly = 0
-
-[[drives]]
-label = "WD-18TB"
-mount_path = "/mnt/wd"
-snapshot_root = ".snapshots"
-role = "primary"
-
-[[subvolumes]]
-name = "htpc-home"
-short_name = "htpc-home"
-source = "/data/htpc-home"
-
-[[subvolumes]]
-name = "htpc-docs"
-short_name = "htpc-docs"
-source = "/data/htpc-docs"
-"#;
-        toml::from_str(toml_str).expect("test config should parse")
+        ConfigBuilder::new()
+            .subvolumes(&["htpc-home", "htpc-docs"])
+            .build()
     }
 
     fn mock_send_full(subvol: &str, drive: &str) -> PlannedOperation {
         PlannedOperation::SendFull {
             snapshot: PathBuf::from(format!("/snapshots/{subvol}/20260329-0404-{subvol}")),
             dest_dir: PathBuf::from(format!("/mnt/{drive}/{subvol}")),
-            drive_label: drive.to_string(),
+            drive_label: drive.into(),
             pin_on_success: Some((
                 PathBuf::from(format!("/snapshots/{subvol}/.last-external-parent-{drive}")),
                 dummy_snap(subvol),
             )),
-            subvolume_name: subvol.to_string(),
+            subvolume_name: subvol.into(),
             reason: crate::types::FullSendReason::FirstSend,
             token_verified: false,
         }
@@ -454,12 +418,12 @@ source = "/data/htpc-docs"
             snapshot: PathBuf::from(format!("/snapshots/{subvol}/20260329-0404-{subvol}")),
             parent: PathBuf::from(format!("/snapshots/{subvol}/20260328-0404-{subvol}")),
             dest_dir: PathBuf::from(format!("/mnt/{drive}/{subvol}")),
-            drive_label: drive.to_string(),
+            drive_label: drive.into(),
             pin_on_success: Some((
                 PathBuf::from(format!("/snapshots/{subvol}/.last-external-parent-{drive}")),
                 dummy_snap(subvol),
             )),
-            subvolume_name: subvol.to_string(),
+            subvolume_name: subvol.into(),
         }
     }
 
@@ -475,7 +439,7 @@ source = "/data/htpc-docs"
         let entry = entry_for(&mock_send_full("htpc-home", "WD-18TB"), &fs);
         assert_eq!(entry.estimated_bytes, Some(53_000_000_000));
         assert_eq!(entry.is_full_send, Some(true));
-        // Size is NOT in detail — voice.rs renders it from estimated_bytes.
+        // Size is NOT in detail — voice/ renders it from estimated_bytes.
         assert!(!entry.detail.contains('~'), "size should not be in detail");
         assert!(entry.detail.contains("(full"), "detail: {}", entry.detail);
     }
@@ -497,7 +461,7 @@ source = "/data/htpc-docs"
         let mut fs = MockFileSystemState::new();
         fs.calibrated_sizes.insert(
             "htpc-home".into(),
-            (45_000_000_000, "2026-03-28".into()),
+            (45_000_000_000, None),
         );
         let entry = entry_for(&mock_send_full("htpc-home", "WD-18TB"), &fs);
         assert_eq!(entry.estimated_bytes, Some(45_000_000_000));
@@ -516,7 +480,7 @@ source = "/data/htpc-docs"
         );
         fs.calibrated_sizes.insert(
             "htpc-home".into(),
-            (45_000_000_000, "2026-03-28".into()),
+            (45_000_000_000, None),
         );
         let entry = entry_for(&mock_send_full("htpc-home", "WD-18TB"), &fs);
         assert_eq!(entry.estimated_bytes, Some(53_000_000_000));
@@ -541,7 +505,7 @@ source = "/data/htpc-docs"
         let entry = entry_for(&mock_send_incremental("htpc-home", "WD-18TB"), &fs);
         assert_eq!(entry.estimated_bytes, Some(5_500_000));
         assert_eq!(entry.is_full_send, Some(false));
-        // Size is NOT in detail — voice.rs renders it from estimated_bytes.
+        // Size is NOT in detail — voice/ renders it from estimated_bytes.
         assert!(!entry.detail.contains('~'), "size should not be in detail");
     }
 
@@ -581,7 +545,7 @@ source = "/data/htpc-docs"
         // Only calibration data — should NOT be used for incrementals
         fs.calibrated_sizes.insert(
             "htpc-home".into(),
-            (45_000_000_000, "2026-03-28".into()),
+            (45_000_000_000, None),
         );
         let entry = entry_for(&mock_send_incremental("htpc-home", "WD-18TB"), &fs);
         assert_eq!(entry.estimated_bytes, None);
@@ -600,7 +564,7 @@ source = "/data/htpc-docs"
             ("htpc-docs".into(), "WD-18TB".into(), SendKind::Full),
             1_200_000_000,
         );
-        let plan = crate::types::BackupPlan {
+        let plan = crate::plan::BackupPlan {
             lifecycles: HashMap::new(),
             timestamp: chrono::NaiveDateTime::default(),
             operations: vec![
@@ -621,7 +585,7 @@ source = "/data/htpc-docs"
             ("htpc-home".into(), "WD-18TB".into(), SendKind::Full),
             53_000_000_000,
         );
-        let plan = crate::types::BackupPlan {
+        let plan = crate::plan::BackupPlan {
             lifecycles: HashMap::new(),
             timestamp: chrono::NaiveDateTime::default(),
             operations: vec![
@@ -638,7 +602,7 @@ source = "/data/htpc-docs"
     #[test]
     fn summary_no_estimates_is_none() {
         let fs = MockFileSystemState::new();
-        let plan = crate::types::BackupPlan {
+        let plan = crate::plan::BackupPlan {
             lifecycles: HashMap::new(),
             timestamp: chrono::NaiveDateTime::default(),
             operations: vec![mock_send_full("htpc-home", "WD-18TB")],
@@ -661,7 +625,7 @@ source = "/data/htpc-docs"
             name,
             &NothingNew::AlreadyOn {
                 snapshot: SnapshotName::parse(&format!("20260329-0404-{name}")).expect("valid"),
-                drive: drive.to_string(),
+                drive: drive.into(),
             },
         )
     }
@@ -741,7 +705,7 @@ source = "/data/htpc-docs"
             PlannedSkip::deferred(
                 "htpc-home",
                 SkipReason::SendNotDue {
-                    drive: "WD-18TB1".to_string(),
+                    drive: dlabel("WD-18TB1"),
                     next_in_minutes: 240,
                 },
                 Some(240),
@@ -783,8 +747,8 @@ source = "/data/htpc-docs"
         let op = PlannedOperation::DeleteSnapshot {
             path: PathBuf::from("/mnt/wd/htpc-home/20260322-1430-htpc-home"),
             reason: "beyond retention window".to_string(),
-            subvolume_name: "htpc-home".to_string(),
-            kind: crate::types::DeleteKind::Policy,
+            subvolume_name: svname("htpc-home"),
+            kind: crate::plan::DeleteKind::Policy,
         };
         let entry = build_operation_entry(&op, &fs, &config.drives, test_now(), &[]);
         assert_eq!(entry.drive_label.as_deref(), Some("WD-18TB"));
@@ -797,8 +761,8 @@ source = "/data/htpc-docs"
         let op = PlannedOperation::DeleteSnapshot {
             path: PathBuf::from("/snap/htpc-home/20260322-1430-htpc-home"),
             reason: "graduated: daily thinning".to_string(),
-            subvolume_name: "htpc-home".to_string(),
-            kind: crate::types::DeleteKind::Policy,
+            subvolume_name: svname("htpc-home"),
+            kind: crate::plan::DeleteKind::Policy,
         };
         let entry = build_operation_entry(&op, &fs, &config.drives, test_now(), &[]);
         assert_eq!(entry.drive_label, None, "local delete carries no drive label");
@@ -811,14 +775,14 @@ source = "/data/htpc-docs"
         // byte-identical Display output and byte-identical PlanOperationEntry.
         // This guards the on-disk / monitoring contract (ADR-105) against
         // accidental kind-leaks via Display, plan_cmd, or downstream renderers.
-        use crate::types::DeleteKind;
+        use crate::plan::DeleteKind;
 
         let make_plan = |kind: DeleteKind| BackupPlan {
             lifecycles: HashMap::new(),
             operations: vec![PlannedOperation::DeleteSnapshot {
                 path: PathBuf::from("/snap/htpc-home/20260329-0404-htpc-home"),
                 reason: "graduated: weekly thinning".to_string(),
-                subvolume_name: "htpc-home".to_string(),
+                subvolume_name: svname("htpc-home"),
                 kind,
             }],
             timestamp: chrono::NaiveDate::from_ymd_opt(2026, 3, 22)
@@ -887,9 +851,9 @@ source = "/data/htpc-docs"
             external: roomy,
         });
         let db = StateDb::open_memory().unwrap();
-        db.upsert_retention_shape_best_effort("htpc-home", &roomy, test_now());
+        db.upsert_retention_shape_best_effort(&svname("htpc-home"), &roomy, test_now());
         db.upsert_retention_shape_best_effort(
-            "htpc-docs",
+            &svname("htpc-docs"),
             &RetentionShape::of(&resolved[1]).into(),
             test_now(),
         );
@@ -897,8 +861,8 @@ source = "/data/htpc-docs"
         let delete = |subvol: &str| PlannedOperation::DeleteSnapshot {
             path: PathBuf::from(format!("/snap/{subvol}/20260301-0404-{subvol}")),
             reason: "graduated: daily thinning".to_string(),
-            subvolume_name: subvol.to_string(),
-            kind: crate::types::DeleteKind::Policy,
+            subvolume_name: subvol.into(),
+            kind: crate::plan::DeleteKind::Policy,
         };
         let make_plan = || BackupPlan {
             lifecycles: HashMap::new(),

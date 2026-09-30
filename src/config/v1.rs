@@ -12,8 +12,9 @@ use super::{
 };
 use crate::notify::NotificationConfig;
 use crate::types::{
-    ByteSize, DriveRole, GraduatedRetention, Interval, LocalRetentionConfig, LocalRetentionKind,
-    ProtectionContractView, ProtectionLevel, RunFrequency, validate_protection_contract,
+    ByteSize, DriveLabel, DriveRole, GraduatedRetention, Interval, LocalRetentionConfig,
+    LocalRetentionKind, ProtectionContractView, ProtectionLevel, RunFrequency, SubvolName,
+    validate_protection_contract,
 };
 
 // ── V1 config structs ──────────────────────────────────────────────────
@@ -132,7 +133,7 @@ impl V1Config {
                 };
                 SubvolumeConfig {
                     short_name: sv.short_name.unwrap_or_else(|| sv.name.clone()),
-                    name: sv.name,
+                    name: SubvolName::from(sv.name),
                     source: sv.source,
                     priority: sv.priority,
                     enabled: sv.enabled,
@@ -142,7 +143,7 @@ impl V1Config {
                     local_retention,
                     external_retention: sv.external_retention,
                     protection_level: sv.protection,
-                    drives: sv.drives,
+                    drives: sv.drives.map(|d| d.into_iter().map(DriveLabel::from).collect()),
                 }
             })
             .collect();
@@ -242,6 +243,7 @@ pub(super) fn parse_v1(raw: &str) -> Result<Config, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::svname;
     use std::path::Path;
 
     use crate::types::MonthlyCount;
@@ -436,19 +438,19 @@ protection = "sheltered"
         assert_eq!(config.local_snapshots.roots.len(), 1);
         assert_eq!(config.local_snapshots.roots[0].path, PathBuf::from("/snap"));
         let subvols = &config.local_snapshots.roots[0].subvolumes;
-        assert!(subvols.contains(&"home".to_string()));
-        assert!(subvols.contains(&"docs".to_string()));
+        assert!(subvols.contains(&svname("home")));
+        assert!(subvols.contains(&svname("docs")));
     }
 
     #[test]
     fn v1_snapshot_root_for_works_via_synthesized_config() {
         let config = parse_v1(v1_config_str()).unwrap();
         assert_eq!(
-            config.snapshot_root_for("home"),
+            config.snapshot_root_for(&svname("home")),
             Some(PathBuf::from("/snap"))
         );
         assert_eq!(
-            config.snapshot_root_for("docs"),
+            config.snapshot_root_for(&svname("docs")),
             Some(PathBuf::from("/snap"))
         );
     }
@@ -479,11 +481,11 @@ min_free_bytes = "50GB"
         let config = parse_v1(config_str).unwrap();
         assert_eq!(config.local_snapshots.roots.len(), 2);
         assert_eq!(
-            config.snapshot_root_for("home"),
+            config.snapshot_root_for(&svname("home")),
             Some(PathBuf::from("/snap-home"))
         );
         assert_eq!(
-            config.snapshot_root_for("data"),
+            config.snapshot_root_for(&svname("data")),
             Some(PathBuf::from("/snap-data"))
         );
         // min_free_bytes propagated to the root
@@ -993,7 +995,7 @@ cleanup_budget = "2GB"
 "#;
         let config = parse_v1(config_str).unwrap();
         // The neighbouring field is unaffected by the residual key.
-        assert_eq!(config.root_min_free_bytes("home"), Some(10_000_000_000));
+        assert_eq!(config.root_min_free_bytes(&svname("home")), Some(10_000_000_000));
     }
 
     // ── V1 full validation chain tests ────────────────────────────────

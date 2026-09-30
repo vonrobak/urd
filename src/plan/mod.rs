@@ -8,7 +8,7 @@ use crate::config::{Config, DriveConfig, ResolvedSubvolume};
 use crate::drives::DriveAvailability;
 use crate::events::DeferScope;
 use crate::storage_critical;
-use crate::types::{Interval, SnapshotName};
+use crate::types::{DriveLabel, Interval, SnapshotName, SubvolName};
 
 mod external;
 mod fragment;
@@ -82,12 +82,6 @@ fn send_floor_defer_reason(
 // so existing `crate::plan::{FilesystemQuery, HistoryQuery, ..}` import paths
 // keep resolving (UPI 052).
 pub use crate::observation::{FilesystemQuery, HistoryQuery, Observation};
-// The production adapter lives with the traits it implements
-// (`observation/real.rs`); re-exported so `crate::plan::{RealFileSystemState,
-// read_snapshot_dir}` keep resolving for the command handlers that still
-// import them from here. Neither is used by the planner itself.
-pub use crate::observation::RealFileSystemState;
-pub(crate) use crate::observation::read_snapshot_dir;
 
 // ── Size estimation helper ──────────────────────────────────────────────
 
@@ -108,8 +102,8 @@ pub use crate::observation::estimate::{
 #[must_use]
 pub fn displayed_send_estimate(
     history: &dyn HistoryQuery,
-    subvol_name: &str,
-    drive_label: &str,
+    subvol_name: &SubvolName,
+    drive_label: &DriveLabel,
     needs_full: bool,
     now: NaiveDateTime,
     send_interval: Option<Interval>,
@@ -131,7 +125,7 @@ pub fn displayed_send_estimate(
 #[derive(Debug, Default)]
 pub struct PlanFilters {
     pub priority: Option<u8>,
-    pub subvolume: Option<String>,
+    pub subvolume: Option<SubvolName>,
     pub local_only: bool,
     pub external_only: bool,
     /// When true, bypass interval gating for snapshots and sends.
@@ -168,7 +162,7 @@ enum DriveGate {
 /// `DriveAvailability` variants: `Available` and `TokenMissing` (benign: first
 /// use or pre-token drive) are ready; the other five defer, drive-scoped.
 fn check_drive_availability(
-    subvol_name: &str,
+    subvol_name: &SubvolName,
     drive: &DriveConfig,
     obs: &Observation,
     now: NaiveDateTime,
@@ -265,11 +259,11 @@ pub fn plan(
     // prose (`Display`) and its `SkipCategory` in plan/types.rs.
     let mut f = fragment::PlanFragment::default();
     let mut judgments: Vec<SubvolJudgment> = Vec::new();
-    let mut lifecycles: std::collections::HashMap<String, PlannedLifecycle> =
+    let mut lifecycles: std::collections::HashMap<SubvolName, PlannedLifecycle> =
         std::collections::HashMap::new();
 
     let resolved = config.resolved_subvolumes();
-    let drive_labels: Vec<String> = config.drives.iter().map(|d| d.label.clone()).collect();
+    let drive_labels = config.drive_labels();
 
     for subvol in &resolved {
         // Filter: enabled
@@ -322,7 +316,7 @@ pub fn plan(
         // Per-drive scope: the single source of the presence predicate (UPI 058
         // F5/R1). `mounted_pins` (transient retention scope) is derived from the
         // SAME scopes the executor's away-shed map is built from
-        // (`commands/backup.rs`), so the executor's `has_away_pin` cannot diverge
+        // (`arming::away_shed_map`), so the executor's `has_away_pin` cannot diverge
         // from the planner's `clear_all` decision. Mounted-only pins scope
         // transient retention — an absent drive's pin is not protected
         // indefinitely (that is what causes space exhaustion on a tight pool).
@@ -337,7 +331,7 @@ pub fn plan(
         // Resolve the source pool's armed tier (Roomy default for an absent
         // key → declared behavior) and derive the effective lifecycle / send
         // interval / clear-all signal. Planner and awareness both derive from
-        // the SAME armed tier (the single pre-plan gather in backup.rs), so the
+        // the SAME armed tier (the single pre-plan gather in commands/backup/), so the
         // effective send interval they judge against agrees.
         let armed = arming.armed_tier_map.get(&subvol.name).copied().unwrap_or_default();
         // Presence-conditional Critical clear-all (UPI 058 A1, ADR-116): an
@@ -521,7 +515,7 @@ pub fn plan(
 /// never diverge.
 #[derive(Debug)]
 struct SubvolJudgment {
-    name: String,
+    name: SubvolName,
     effective_transient: bool,
     send_enabled: bool,
 }
@@ -601,7 +595,7 @@ fn orphan_invariant_violations(
 
 /// Format a duration in minutes to a short human-readable string.
 ///
-/// Used by the planner for skip reasons and by voice.rs for grouped rendering.
+/// Used by the planner for skip reasons and by voice/ for grouped rendering.
 /// Produces: `"45m"`, `"2h30m"`, `"3d"`.
 #[must_use]
 pub fn format_duration_short(minutes: i64) -> String {

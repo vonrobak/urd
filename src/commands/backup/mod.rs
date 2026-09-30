@@ -42,6 +42,7 @@ use crate::plan::{self, PlanFilters};
 use crate::pools;
 use crate::recorder::{DispatchPolicy, Recorder, Recording};
 use crate::run_tail::{self, ReclaimDecision, TailExit, TailInputs, WatchdogFiring};
+use crate::types::{DriveLabel, SubvolName};
 
 use self::gating::{apply_token_gating, probe_drive_tokens, record_retention_shapes, resolve_token_gating};
 use self::observability::{build_churn_views, gather_pool_observability, write_metrics_per_spec};
@@ -65,7 +66,7 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     let now = chrono::Local::now().naive_local();
     let filters = PlanFilters {
         priority: args.priority,
-        subvolume: args.subvolume,
+        subvolume: args.subvolume.map(SubvolName::from),
         local_only: args.local_only,
         external_only: args.external_only,
         skip_intervals: !args.auto,
@@ -307,7 +308,7 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
         let pre_filters = crate::output::PreActionFilters {
             local_only: filters.local_only,
             external_only: filters.external_only,
-            subvolume: filters.subvolume.clone(),
+            subvolume: filters.subvolume.as_ref().map(ToString::to_string),
         };
         let summary =
             crate::output::build_pre_action_summary(&plan_output, &config, pre_filters);
@@ -383,8 +384,8 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     let total_sends = backup_plan.summary().sends as u32;
     let size_estimates = build_size_estimates(&backup_plan, &fs_state, &config);
     let progress_ctx = Arc::new(Mutex::new(ProgressContext {
-        subvolume_name: String::new(),
-        drive_label: String::new(),
+        subvolume_name: SubvolName::default(),
+        drive_label: DriveLabel::default(),
         send_type: SendType::Full,
         send_index: 0,
         total_sends,

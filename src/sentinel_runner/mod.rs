@@ -268,6 +268,9 @@ impl SentinelRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::svname;
+    use crate::types::SubvolName;
+    use crate::testkit::dlabel;
     use super::actions::backup_run_active_at;
     use super::eject::pressure_samples_from;
     use crate::observation::{Observation, RealFileSystemState};
@@ -276,10 +279,7 @@ mod tests {
     use std::collections::{BTreeSet, HashMap, HashSet};
     use crate::awareness::PromiseStatus;
     use crate::state::StateDb;
-
-    fn dt(s: &str) -> NaiveDateTime {
-        NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S").unwrap()
-    }
+    use crate::types::Timestamp;
 
     // ── State file I/O ──────────────────────────────────────────────
 
@@ -791,7 +791,7 @@ protection = "recorded"
                 subvolume_names: vec!["scratch-sv".into()],
             },
         ];
-        let send_enabled: HashSet<String> = ["sent".to_string()].into_iter().collect();
+        let send_enabled: HashSet<SubvolName> = [svname("sent")].into_iter().collect();
 
         let samples = pressure_samples_from(
             pools,
@@ -822,7 +822,7 @@ protection = "recorded"
             mountpoints: vec![PathBuf::from("/data")],
             subvolume_names: vec!["sent".into()],
         }];
-        let send_enabled: HashSet<String> = ["sent".to_string()].into_iter().collect();
+        let send_enabled: HashSet<SubvolName> = [svname("sent")].into_iter().collect();
 
         let samples =
             pressure_samples_from(pools, &send_enabled, |_mp| None, |_first, _cap| 5_000);
@@ -911,10 +911,8 @@ drives = ["D1"]
         let file = SentinelStateFile {
             schema_version: crate::output::SENTINEL_STATE_SCHEMA_VERSION,
             pid: 1,
-            started: (last_assessment - chrono::Duration::days(1))
-                .format("%Y-%m-%dT%H:%M:%S")
-                .to_string(),
-            last_assessment: Some(last_assessment.format("%Y-%m-%dT%H:%M:%S").to_string()),
+            started: Timestamp::from(last_assessment - chrono::Duration::days(1)).to_string(),
+            last_assessment: Some(Timestamp::from(last_assessment).to_string()),
             mounted_drives: mounted.iter().map(|s| (*s).to_string()).collect(),
             tick_interval_secs: 900,
             promise_states: vec![],
@@ -935,7 +933,7 @@ drives = ["D1"]
     /// Whole seconds, matching the resolution of state-file and event stamps.
     fn now_secs() -> NaiveDateTime {
         let now = chrono::Local::now().naive_local();
-        dt(&now.format("%Y-%m-%dT%H:%M:%S").to_string())
+        Timestamp::new(now).as_naive()
     }
 
     /// `D1`'s absence age as assessment derives it from the DB (via the
@@ -962,7 +960,7 @@ drives = ["D1"]
     fn drive_rows(runner: &SentinelRunner, label: &str) -> Vec<crate::state::DriveConnectionRecord> {
         StateDb::open(&runner.config.general.state_db)
             .unwrap()
-            .drive_connection_history(label)
+            .drive_connection_history(&dlabel(label))
             .unwrap()
     }
 
@@ -983,7 +981,7 @@ drives = ["D1"]
 
         // P1 (restored, present) stays tracked; D1 (absent) and REMOVED
         // (not in config) do not.
-        assert_eq!(runner.state.mounted_drives, BTreeSet::from(["P1".to_string()]));
+        assert_eq!(runner.state.mounted_drives, BTreeSet::from([dlabel("P1")]));
         // …so the first scan emits nothing: no spurious DriveMounted for P1,
         // and D1's unmount was already accounted for.
         assert!(runner.detect_drive_events().is_empty());
@@ -992,7 +990,7 @@ drives = ["D1"]
         let d1 = drive_rows(&runner, "D1");
         assert_eq!(d1.len(), 1);
         assert_eq!(d1[0].event_type, "unmounted");
-        assert_eq!(d1[0].timestamp, witnessed.format("%Y-%m-%dT%H:%M:%S").to_string());
+        assert_eq!(d1[0].timestamp, Timestamp::from(witnessed).to_string());
         assert!(drive_rows(&runner, "P1").is_empty(), "present drive: no event");
         assert!(drive_rows(&runner, "REMOVED").is_empty(), "removed drive: no event");
 
@@ -1038,7 +1036,7 @@ drives = ["D1"]
                 bytes_transferred: Some(100),
             })
             .unwrap();
-            db.last_successful_operation_at("D1").unwrap().unwrap()
+            db.last_successful_operation_at(&dlabel("D1")).unwrap().unwrap()
         };
 
         runner.restore_mount_tracking();
@@ -1046,7 +1044,7 @@ drives = ["D1"]
         let d1 = drive_rows(&runner, "D1");
         assert_eq!(d1.len(), 1);
         assert_eq!(d1[0].event_type, "unmounted");
-        assert_eq!(d1[0].timestamp, sent_at.format("%Y-%m-%dT%H:%M:%S").to_string());
+        assert_eq!(d1[0].timestamp, Timestamp::from(sent_at).to_string());
         let now = now_secs().max(sent_at);
         let absent = d1_absent_secs(&runner, now).expect("away, not disconnected");
         assert_eq!(absent, (now - sent_at).num_seconds());
@@ -1066,7 +1064,7 @@ drives = ["D1"]
         StateDb::open(&runner.config.general.state_db)
             .unwrap()
             .record_drive_event_at(
-                "D1",
+                &dlabel("D1"),
                 crate::state::DriveEventType::Unmounted,
                 crate::state::DriveEventSource::Sentinel,
                 unmounted_at,

@@ -6,9 +6,9 @@ use chrono::{NaiveDate, NaiveDateTime};
 
 use crate::cli::GetArgs;
 use crate::config::{Config, SubvolumeConfig, expand_tilde};
+use crate::observation::read_snapshot_dir;
 use crate::output::{GetOutput, OutputMode};
-use crate::plan::read_snapshot_dir;
-use crate::types::SnapshotName;
+use crate::types::{DISPLAY_MINUTE_FORMAT, SnapshotName};
 use crate::voice;
 
 pub fn run(config: Config, args: GetArgs, output_mode: OutputMode) -> anyhow::Result<()> {
@@ -71,9 +71,9 @@ pub fn run(config: Config, args: GetArgs, output_mode: OutputMode) -> anyhow::Re
         let earliest = &snapshots[0];
         anyhow!(
             "no snapshot found before {}. Earliest available: {} ({})",
-            target_date.format("%Y-%m-%d %H:%M"),
+            target_date.format(DISPLAY_MINUTE_FORMAT),
             earliest.as_str(),
-            earliest.datetime().format("%Y-%m-%d %H:%M"),
+            earliest.datetime().format(DISPLAY_MINUTE_FORMAT),
         )
     })?;
 
@@ -123,9 +123,9 @@ pub fn run(config: Config, args: GetArgs, output_mode: OutputMode) -> anyhow::Re
         .with_context(|| format!("failed to read metadata: {}", snapshot_file.display()))?;
 
     let get_output = GetOutput {
-        subvolume: subvol.name.clone(),
+        subvolume: subvol.name.to_string(),
         snapshot: snapshot.as_str().to_string(),
-        snapshot_date: snapshot.datetime().format("%Y-%m-%d %H:%M").to_string(),
+        snapshot_date: snapshot.datetime().format(DISPLAY_MINUTE_FORMAT).to_string(),
         file_path: relative_path.display().to_string(),
         file_size: metadata.len(),
     };
@@ -234,7 +234,7 @@ fn parse_date_reference(s: &str, now: NaiveDateTime) -> anyhow::Result<NaiveDate
         }
         _ => {
             // Try YYYY-MM-DD HH:MM
-            if let Ok(dt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M") {
+            if let Ok(dt) = NaiveDateTime::parse_from_str(s, DISPLAY_MINUTE_FORMAT) {
                 return Ok(dt);
             }
             // Try YYYY-MM-DD
@@ -276,6 +276,7 @@ fn validate_no_traversal(path: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::svname;
     use chrono::NaiveDate;
 
     // ── Date parsing ────────────────────────────────────────────────
@@ -351,7 +352,7 @@ mod tests {
     fn make_subvolumes() -> Vec<SubvolumeConfig> {
         vec![
             SubvolumeConfig {
-                name: "htpc-root".to_string(),
+                name: svname("htpc-root"),
                 short_name: "htpc-root".to_string(),
                 source: PathBuf::from("/"),
                 priority: 3,
@@ -365,7 +366,7 @@ mod tests {
                 drives: None,
             },
             SubvolumeConfig {
-                name: "htpc-home".to_string(),
+                name: svname("htpc-home"),
                 short_name: "htpc-home".to_string(),
                 source: PathBuf::from("/home"),
                 priority: 1,
@@ -379,7 +380,7 @@ mod tests {
                 drives: None,
             },
             SubvolumeConfig {
-                name: "subvol3-opptak".to_string(),
+                name: svname("subvol3-opptak"),
                 short_name: "opptak".to_string(),
                 source: PathBuf::from("/mnt/btrfs-pool/subvol3-opptak"),
                 priority: 1,
@@ -438,7 +439,7 @@ mod tests {
     fn subvolume_no_match_without_root() {
         // Without a root subvolume, unmatched paths return None
         let svs = vec![SubvolumeConfig {
-            name: "htpc-home".to_string(),
+            name: svname("htpc-home"),
             short_name: "htpc-home".to_string(),
             source: PathBuf::from("/home"),
             priority: 1,

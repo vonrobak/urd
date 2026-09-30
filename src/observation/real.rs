@@ -13,7 +13,9 @@ use super::{FilesystemQuery, HistoryQuery};
 use crate::config::DriveConfig;
 use crate::drives::DriveAvailability;
 use crate::error::UrdError;
-use crate::types::{DriveEvent, DriveEventKind, SendKind, SnapshotName};
+use crate::types::{
+    DriveEvent, DriveEventKind, DriveLabel, SendKind, SnapshotName, SubvolName, Timestamp,
+};
 
 // ── RealFileSystemState ─────────────────────────────────────────────────
 
@@ -27,7 +29,7 @@ impl FilesystemQuery for RealFileSystemState<'_> {
     fn local_snapshots(
         &self,
         root: &Path,
-        subvol_name: &str,
+        subvol_name: &SubvolName,
     ) -> crate::error::Result<Vec<SnapshotName>> {
         read_snapshot_dir(&root.join(subvol_name))
     }
@@ -35,7 +37,7 @@ impl FilesystemQuery for RealFileSystemState<'_> {
     fn external_snapshots(
         &self,
         drive: &DriveConfig,
-        subvol_name: &str,
+        subvol_name: &SubvolName,
     ) -> crate::error::Result<Vec<SnapshotName>> {
         let dir = crate::drives::external_snapshot_dir(drive, subvol_name);
         read_snapshot_dir(&dir)
@@ -56,12 +58,16 @@ impl FilesystemQuery for RealFileSystemState<'_> {
     fn read_pin_file(
         &self,
         local_dir: &Path,
-        drive_label: &str,
+        drive_label: &DriveLabel,
     ) -> crate::error::Result<Option<SnapshotName>> {
         crate::chain::read_pin_file(local_dir, drive_label)
     }
 
-    fn pinned_snapshots(&self, local_dir: &Path, drive_labels: &[String]) -> HashSet<SnapshotName> {
+    fn pinned_snapshots(
+        &self,
+        local_dir: &Path,
+        drive_labels: &[DriveLabel],
+    ) -> HashSet<SnapshotName> {
         crate::chain::find_pinned_snapshots(local_dir, drive_labels)
     }
 }
@@ -84,8 +90,8 @@ fn best_effort<T: Default>(
 impl HistoryQuery for RealFileSystemState<'_> {
     fn last_send_size(
         &self,
-        subvol_name: &str,
-        drive_label: &str,
+        subvol_name: &SubvolName,
+        drive_label: &DriveLabel,
         send_kind: SendKind,
     ) -> Option<u64> {
         // Successful sends only. A failed/aborted send's bytes are an under-count
@@ -100,7 +106,11 @@ impl HistoryQuery for RealFileSystemState<'_> {
         })
     }
 
-    fn last_send_size_any_drive(&self, subvol_name: &str, send_kind: SendKind) -> Option<u64> {
+    fn last_send_size_any_drive(
+        &self,
+        subvol_name: &SubvolName,
+        send_kind: SendKind,
+    ) -> Option<u64> {
         self.state.and_then(|db| {
             best_effort(
                 "last_successful_send_size_any_drive",
@@ -112,8 +122,8 @@ impl HistoryQuery for RealFileSystemState<'_> {
 
     fn last_failed_send_floor(
         &self,
-        subvol_name: &str,
-        drive_label: &str,
+        subvol_name: &SubvolName,
+        drive_label: &DriveLabel,
         send_kind: SendKind,
     ) -> Option<u64> {
         self.state.and_then(|db| {
@@ -133,7 +143,7 @@ impl HistoryQuery for RealFileSystemState<'_> {
         })
     }
 
-    fn calibrated_size(&self, subvol_name: &str) -> Option<(u64, String)> {
+    fn calibrated_size(&self, subvol_name: &SubvolName) -> Option<(u64, Option<Timestamp>)> {
         self.state.and_then(|db| {
             best_effort(
                 "calibrated_size",
@@ -145,8 +155,8 @@ impl HistoryQuery for RealFileSystemState<'_> {
 
     fn last_successful_send_time(
         &self,
-        subvol_name: &str,
-        drive_label: &str,
+        subvol_name: &SubvolName,
+        drive_label: &DriveLabel,
     ) -> Option<NaiveDateTime> {
         self.state.and_then(|db| {
             best_effort(
@@ -157,7 +167,7 @@ impl HistoryQuery for RealFileSystemState<'_> {
         })
     }
 
-    fn last_drive_event(&self, drive_label: &str) -> Option<DriveEvent> {
+    fn last_drive_event(&self, drive_label: &DriveLabel) -> Option<DriveEvent> {
         let record = self.state.and_then(|db| {
             best_effort(
                 "last_drive_connection",
@@ -168,7 +178,7 @@ impl HistoryQuery for RealFileSystemState<'_> {
         drive_record_to_event(&record)
     }
 
-    fn drive_mount_history(&self, drive_label: &str) -> Vec<DriveEvent> {
+    fn drive_mount_history(&self, drive_label: &DriveLabel) -> Vec<DriveEvent> {
         // No state DB (e.g. SQLite open failed) → empty history, never blocks
         // (ADR-102). Unparseable rows are dropped by `drive_record_to_event`.
         let Some(db) = self.state else {
@@ -184,7 +194,7 @@ impl HistoryQuery for RealFileSystemState<'_> {
         .collect()
     }
 
-    fn last_successful_operation_at(&self, drive_label: &str) -> Option<NaiveDateTime> {
+    fn last_successful_operation_at(&self, drive_label: &DriveLabel) -> Option<NaiveDateTime> {
         self.state.and_then(|db| {
             best_effort(
                 "last_successful_operation_at",
@@ -209,7 +219,11 @@ impl RealFileSystemState<'_> {
     /// or query error → empty, never an error that could block a backup
     /// (ADR-102). Feeds `drift::compute_rolling_churn`.
     #[must_use]
-    pub fn drift_samples(&self, subvol_name: &str, since: NaiveDateTime) -> Vec<crate::drift::DriftSample> {
+    pub fn drift_samples(
+        &self,
+        subvol_name: &SubvolName,
+        since: NaiveDateTime,
+    ) -> Vec<crate::drift::DriftSample> {
         let Some(db) = self.state else {
             return Vec::new();
         };
@@ -231,7 +245,7 @@ impl RealFileSystemState<'_> {
     #[must_use]
     pub fn drift_samples_multi(
         &self,
-        subvol_names: &[String],
+        subvol_names: &[SubvolName],
         since: NaiveDateTime,
     ) -> Vec<crate::drift::DriftSample> {
         let Some(db) = self.state else {
@@ -253,7 +267,7 @@ impl RealFileSystemState<'_> {
 /// Map a persisted `DriveConnectionRecord` to a `DriveEvent`, or `None` for an
 /// unknown event type / unparseable timestamp (logged). Shared by
 /// `last_drive_event` (one row) and `drive_mount_history` (all rows). The parse
-/// format matches the sentinel's write format (`%Y-%m-%dT%H:%M:%S`).
+/// is `Timestamp`'s persisted form, the same one the event writer produces.
 ///
 /// This is the read-side composition pattern: granular `state/` wrappers, with
 /// the domain shaping localized once at the adapter (see also `drift_samples`).
@@ -269,14 +283,17 @@ pub(crate) fn drive_record_to_event(
             return None;
         }
     };
-    let at = chrono::NaiveDateTime::parse_from_str(&record.timestamp, "%Y-%m-%dT%H:%M:%S")
+    let at = record
+        .timestamp
+        .parse::<Timestamp>()
         .inspect_err(|e| {
             log::warn!(
                 "failed to parse drive event timestamp {:?}: {e}",
                 record.timestamp
             );
         })
-        .ok()?;
+        .ok()?
+        .as_naive();
     Some(DriveEvent { kind, at })
 }
 
@@ -316,6 +333,7 @@ mod tests {
     use chrono::NaiveDateTime;
 
     use super::*;
+    use crate::testkit::{dlabel, svname};
     use crate::types::DriveEventKind;
 
     #[test]
@@ -325,14 +343,14 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let db = StateDb::open(&dir.path().join("urd.db")).unwrap();
-        db.record_drive_event("D1", DriveEventType::Mounted, DriveEventSource::Sentinel)
+        db.record_drive_event(&dlabel("D1"), DriveEventType::Mounted, DriveEventSource::Sentinel)
             .unwrap();
-        db.record_drive_event("D1", DriveEventType::Unmounted, DriveEventSource::Sentinel)
+        db.record_drive_event(&dlabel("D1"), DriveEventType::Unmounted, DriveEventSource::Sentinel)
             .unwrap();
 
         let fs = RealFileSystemState { state: Some(&db) };
         let event = fs
-            .last_drive_event("D1")
+            .last_drive_event(&dlabel("D1"))
             .expect("round-trip must yield an event — guards schema/parser drift");
         assert!(matches!(event.kind, DriveEventKind::Unmount));
     }
@@ -347,15 +365,15 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let db = StateDb::open(&dir.path().join("urd.db")).unwrap();
-        db.record_drive_event("D1", DriveEventType::Mounted, DriveEventSource::Sentinel)
+        db.record_drive_event(&dlabel("D1"), DriveEventType::Mounted, DriveEventSource::Sentinel)
             .unwrap();
-        db.record_drive_event("D1", DriveEventType::Unmounted, DriveEventSource::Sentinel)
+        db.record_drive_event(&dlabel("D1"), DriveEventType::Unmounted, DriveEventSource::Sentinel)
             .unwrap();
-        db.record_drive_event("D1", DriveEventType::Mounted, DriveEventSource::Sentinel)
+        db.record_drive_event(&dlabel("D1"), DriveEventType::Mounted, DriveEventSource::Sentinel)
             .unwrap();
 
         let fs = RealFileSystemState { state: Some(&db) };
-        let history = fs.drive_mount_history("D1");
+        let history = fs.drive_mount_history(&dlabel("D1"));
         let kinds: Vec<DriveEventKind> = history.iter().map(|e| e.kind).collect();
         assert_eq!(
             kinds,
@@ -368,11 +386,11 @@ mod tests {
         );
 
         // Unknown drive → empty (never blocks).
-        assert!(fs.drive_mount_history("nope").is_empty());
+        assert!(fs.drive_mount_history(&dlabel("nope")).is_empty());
     }
 
     fn drift_at(s: &str) -> NaiveDateTime {
-        NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S").unwrap()
+        NaiveDateTime::parse_from_str(s, crate::types::TIMESTAMP_FORMAT).unwrap()
     }
 
     #[test]
@@ -383,8 +401,8 @@ mod tests {
         // is `None`, so empty here reproduces the prior explicit fallbacks.
         let fs = RealFileSystemState { state: None };
         let since = drift_at("2026-05-01T00:00:00");
-        assert!(fs.drift_samples("home", since).is_empty());
-        assert!(fs.drift_samples_multi(&["home".to_string()], since).is_empty());
+        assert!(fs.drift_samples(&svname("home"), since).is_empty());
+        assert!(fs.drift_samples_multi(&[svname("home")], since).is_empty());
     }
 
     #[test]
@@ -406,11 +424,11 @@ mod tests {
 
         let fs = RealFileSystemState { state: Some(&db) };
         let since = drift_at("2026-05-01T00:00:00");
-        let one = fs.drift_samples("home", since);
+        let one = fs.drift_samples(&svname("home"), since);
         assert_eq!(one.len(), 1);
         assert_eq!(one[0].bytes_transferred, 4_096);
         // Batched variant sees the same row; unrelated names stay empty.
-        assert_eq!(fs.drift_samples_multi(&["home".to_string()], since).len(), 1);
-        assert!(fs.drift_samples("photos", since).is_empty());
+        assert_eq!(fs.drift_samples_multi(&[svname("home")], since).len(), 1);
+        assert!(fs.drift_samples(&svname("photos"), since).is_empty());
     }
 }

@@ -20,7 +20,7 @@ use crate::pools::{self, PoolSpace};
 use crate::preflight;
 use crate::sentinel_runner;
 use crate::state::StateDb;
-use crate::types::{LocalRetentionPolicy, ProtectionLevel};
+use crate::types::{DriveLabel, LocalRetentionPolicy, ProtectionLevel, SubvolName};
 use crate::voice;
 
 use crate::commands::{init, verify};
@@ -109,13 +109,7 @@ pub fn run(config: Config, args: DoctorArgs, output_mode: OutputMode) -> anyhow:
             sudo_probe.1
         ))],
         crate::sudoers::GrantProbe::Granted => {
-            let listing = std::process::Command::new("sudo")
-                .env("LC_ALL", "C")
-                .args(["-n", "-l"])
-                .output()
-                .ok()
-                .filter(|o| o.status.success())
-                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+            let listing = crate::probes::sudo_privilege_listing().ok().flatten();
             build_sudoers_drift_checks(&config, listing.as_deref())
         }
     };
@@ -240,7 +234,7 @@ pub fn run(config: Config, args: DoctorArgs, output_mode: OutputMode) -> anyhow:
                 }
             };
             DoctorDataSafety {
-                name: a.name.clone(),
+                name: a.name.to_string(),
                 status: a.status,
                 health: a.health.to_string(),
                 issue,
@@ -258,23 +252,21 @@ pub fn run(config: Config, args: DoctorArgs, output_mode: OutputMode) -> anyhow:
         let state_path = sentinel_runner::sentinel_state_path(&config);
         Some(match sentinel_runner::read_sentinel_state_file(&state_path) {
             Some(state) if sentinel_runner::is_pid_alive(state.pid) => {
+                // Tolerated space-separated form. No in-tree writer has ever
+                // produced it — the sentinel state file has always written
+                // `TIMESTAMP_FORMAT` — but a hand-edited or foreign state file
+                // in chrono's `Display` shape still yields an uptime.
+                const LEGACY_SPACE_SEPARATED_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
                 // Compute uptime from started timestamp
                 let uptime =
-                    chrono::NaiveDateTime::parse_from_str(&state.started, "%Y-%m-%dT%H:%M:%S")
+                    chrono::NaiveDateTime::parse_from_str(&state.started, crate::types::TIMESTAMP_FORMAT)
                         .ok()
                         .or_else(|| {
-                            chrono::NaiveDateTime::parse_from_str(&state.started, "%Y-%m-%d %H:%M:%S")
+                            chrono::NaiveDateTime::parse_from_str(&state.started, LEGACY_SPACE_SEPARATED_FORMAT)
                                 .ok()
                         })
                         .map(|started| {
-                            let dur = now - started;
-                            let hours = dur.num_hours();
-                            let minutes = dur.num_minutes() % 60;
-                            if hours > 0 {
-                                format!("{hours}h {minutes}m")
-                            } else {
-                                format!("{minutes}m")
-                            }
+                            voice::DurationStyle::HoursMinutes.render((now - started).num_seconds())
                         });
                 DoctorSentinelStatus {
                     running: true,
@@ -572,6 +564,8 @@ fn build_units_drift_checks(
 /// an unanswerable loginctl → an honest skip; `Linger=yes` → silence (a
 /// real pass needs no row).
 fn linger_check() -> Vec<DoctorCheck> {
+    use crate::probes::Linger;
+
     let row = |status, detail: String, suggestion: Option<String>| {
         vec![DoctorCheck {
             name: "session lingering".to_string(),
@@ -587,37 +581,26 @@ fn linger_check() -> Vec<DoctorCheck> {
             None,
         );
     };
-    match std::process::Command::new("loginctl")
-        .env("LC_ALL", "C")
-        .args(["show-user", &user, "--property=Linger"])
-        .output()
-    {
-        Ok(out) if out.status.success() => {
-            match String::from_utf8_lossy(&out.stdout).trim() {
-                "Linger=no" => row(
-                    DoctorCheckStatus::Warn,
-                    "lingering is off: backups run only while you are logged in \
-                     (missed nights catch up at next login)"
-                        .to_string(),
-                    Some(format!("Run `loginctl enable-linger {user}` to free them.")),
-                ),
-                "Linger=yes" => Vec::new(),
-                other => row(
-                    DoctorCheckStatus::Warn,
-                    format!("could not read the lingering state: {other:?}"),
-                    None,
-                ),
-            }
-        }
-        Ok(out) => row(
+    match crate::probes::loginctl_linger(&user) {
+        Linger::Off => row(
             DoctorCheckStatus::Warn,
-            format!(
-                "loginctl could not answer: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            ),
+            "lingering is off: backups run only while you are logged in \
+             (missed nights catch up at next login)"
+                .to_string(),
+            Some(format!("Run `loginctl enable-linger {user}` to free them.")),
+        ),
+        Linger::On => Vec::new(),
+        Linger::Unrecognized(other) => row(
+            DoctorCheckStatus::Warn,
+            format!("could not read the lingering state: {other:?}"),
             None,
         ),
-        Err(e) => row(
+        Linger::Failed(stderr) => row(
+            DoctorCheckStatus::Warn,
+            format!("loginctl could not answer: {stderr}"),
+            None,
+        ),
+        Linger::NotRun(e) => row(
             DoctorCheckStatus::Warn,
             format!("could not run loginctl: {e}"),
             None,
@@ -704,7 +687,7 @@ fn build_doctor_recommendation_view(
     let now = chrono::Local::now().naive_local();
     let window = crate::drift::default_window();
     let pools_grouped = pools::detect_source_pools(config);
-    let pools_by_uuid: HashMap<String, Vec<String>> = pools_grouped
+    let pools_by_uuid: HashMap<String, Vec<SubvolName>> = pools_grouped
         .iter()
         .map(|p| (p.uuid.clone(), p.subvolume_names.clone()))
         .collect();
@@ -774,14 +757,14 @@ fn build_doctor_recommendation_view_inner(
             continue;
         };
         for name in &pool.subvolume_names {
-            subvol_pool.insert(name.clone(), (mp.clone(), pool.uuid.clone()));
+            subvol_pool.insert(name.to_string(), (mp.clone(), pool.uuid.clone()));
         }
     }
 
     // Destination metadata: (drive label, metadata ratio) for each
     // available drive with a resolvable UUID. The External row's max-of
     // aggregation reads from here.
-    let destination_metadata: Vec<(String, f64)> = config
+    let destination_metadata: Vec<(DriveLabel, f64)> = config
         .drives
         .iter()
         .filter(|d| drives::drive_availability(d) == drives::DriveAvailability::Available)
@@ -797,7 +780,7 @@ fn build_doctor_recommendation_view_inner(
             .iter()
             .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
         {
-            Some((label, ratio)) => (Some(label.clone()), Some(*ratio)),
+            Some((label, ratio)) => (Some(label.to_string()), Some(*ratio)),
             None => (None, None),
         };
 
@@ -809,7 +792,7 @@ fn build_doctor_recommendation_view_inner(
         let churn = compute_churn_for(state_db, &sv.name, window, now);
 
         // Source-pool signals for this subvolume.
-        let source_signals = subvol_pool.get(&sv.name).map(|(mp, uuid)| {
+        let source_signals = subvol_pool.get(sv.name.as_str()).map(|(mp, uuid)| {
             let space = pool_space_by_mountpoint.get(mp).copied();
             let trend = pool_trend_by_uuid.get(uuid).copied().flatten();
             (space, trend)
@@ -930,7 +913,7 @@ fn build_doctor_recommendation_view_inner(
             .filter(|p| *p != ProtectionLevel::Custom);
 
         rows.push(DoctorRecommendationRow {
-            name: sv.name.clone(),
+            name: sv.name.to_string(),
             local,
             external,
             note,
@@ -962,7 +945,7 @@ fn recovery_bytes(row: &DoctorRecommendationRow) -> u64 {
 
 fn compute_churn_for(
     state_db: Option<&StateDb>,
-    name: &str,
+    name: &SubvolName,
     window: chrono::Duration,
     now: chrono::NaiveDateTime,
 ) -> crate::drift::ChurnEstimate {
@@ -989,8 +972,8 @@ fn build_doctor_churn_view_inner(
         .map(|sv| {
             let estimate = compute_churn_for(state_db, &sv.name, window, now);
             DoctorChurnRow {
-                name: sv.name.clone(),
-                state: crate::output::render_churn(&estimate),
+                name: sv.name.to_string(),
+                state: crate::drift::render_churn(&estimate),
             }
         })
         .collect();
@@ -1024,6 +1007,7 @@ fn unpack_advice(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::svname;
 
     // ── Retention-change advisory (ADR-110) ────────────────────────────
 
@@ -1048,7 +1032,7 @@ mod tests {
         };
         assert!(retention_change_checks(&[]).is_empty());
         let checks = retention_change_checks(&[RetentionChange {
-            subvolume: "docs".to_string(),
+            subvolume: svname("docs"),
             previous: previous.into(),
             current,
         }]);
@@ -1344,7 +1328,7 @@ source = "/data/gamma"
         let db = StateDb::open_memory().unwrap();
         let now = chrono::NaiveDateTime::parse_from_str(
             "2026-05-01T12:00:00",
-            "%Y-%m-%dT%H:%M:%S",
+            crate::types::TIMESTAMP_FORMAT,
         )
         .unwrap();
 
@@ -1385,16 +1369,11 @@ source = "/data/gamma"
     // ── #125 Retention: orphan-pin advisories ──────────────────────
 
     fn drive(label: &str) -> crate::config::DriveConfig {
-        crate::config::DriveConfig {
-            label: label.to_string(),
-            uuid: None,
-            mount_path: std::path::PathBuf::from(format!("/mnt/{label}")),
-            snapshot_root: ".snapshots".to_string(),
-            role: crate::types::DriveRole::Offsite,
-            max_usage_percent: None,
-            min_free_bytes: None,
-            rotation_interval: None,
-        }
+        crate::testkit::drive_config(
+            label,
+            &format!("/mnt/{label}"),
+            crate::types::DriveRole::Offsite,
+        )
     }
 
     #[test]
@@ -1565,7 +1544,7 @@ source = "/data/docs"
     }
 
     fn now_fixed() -> chrono::NaiveDateTime {
-        chrono::NaiveDateTime::parse_from_str("2026-05-01T12:00:00", "%Y-%m-%dT%H:%M:%S").unwrap()
+        chrono::NaiveDateTime::parse_from_str("2026-05-01T12:00:00", crate::types::TIMESTAMP_FORMAT).unwrap()
     }
 
     /// Helper that calls `build_doctor_recommendation_view_inner` with
@@ -1938,7 +1917,7 @@ source = "/data/cold"
         pools::SourcePool {
             uuid: "pool-uuid-test".to_string(),
             mountpoints: vec![std::path::PathBuf::from("/data")],
-            subvolume_names: names.iter().map(|s| (*s).to_string()).collect(),
+            subvolume_names: names.iter().map(|s| svname(s)).collect(),
         }
     }
 

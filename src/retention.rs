@@ -8,7 +8,7 @@ use crate::events::{Event, EventPayload, ProtectReason, PruneRule, UnstampedEven
 use crate::plan::{BackupPlan, PlanFilters, PlannedOperation};
 use crate::types::{
     Interval, LocalRetentionPolicy, MonthlyCount, ProtectionLevel, ResolvedGraduatedRetention,
-    SnapshotName,
+    SnapshotName, SubvolName,
 };
 
 /// Classifies a delete by what motivates it. Carried from `retention.rs` through
@@ -1099,7 +1099,7 @@ impl RetentionShape {
 /// applied.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetentionChange {
-    pub subvolume: String,
+    pub subvolume: SubvolName,
     pub previous: RecordedRetention,
     pub current: RetentionShape,
 }
@@ -1150,7 +1150,7 @@ pub struct RetentionGate {
     /// deletions were not withheld (unchanged, loosened, first seen, or
     /// tightened and confirmed), with only the halves this run applied
     /// taken from the current config (see [`RecordedRetention::merged`]).
-    pub record: Vec<(String, RecordedRetention)>,
+    pub record: Vec<(SubvolName, RecordedRetention)>,
 }
 
 /// Is `sv` bound by a named protection promise (the subvolumes the gate
@@ -1165,7 +1165,7 @@ fn is_promise_level(sv: &ResolvedSubvolume) -> bool {
 #[must_use]
 pub fn tightened_since_recorded(
     subvolumes: &[ResolvedSubvolume],
-    recorded: &HashMap<String, RecordedRetention>,
+    recorded: &HashMap<SubvolName, RecordedRetention>,
 ) -> Vec<RetentionChange> {
     subvolumes
         .iter()
@@ -1192,7 +1192,7 @@ pub fn tightened_since_recorded(
 #[must_use]
 pub fn pending_retention_changes(
     subvolumes: &[ResolvedSubvolume],
-    recorded: &HashMap<String, RecordedRetention>,
+    recorded: &HashMap<SubvolName, RecordedRetention>,
 ) -> Vec<RetentionChange> {
     tightened_since_recorded(subvolumes, recorded)
         .into_iter()
@@ -1215,7 +1215,7 @@ pub fn pending_retention_changes(
 #[must_use]
 pub fn decide_retention_gate(
     subvolumes: &[ResolvedSubvolume],
-    recorded: &HashMap<String, RecordedRetention>,
+    recorded: &HashMap<SubvolName, RecordedRetention>,
     confirmed: bool,
     scope: RecordScope<'_>,
 ) -> RetentionGate {
@@ -1282,7 +1282,7 @@ pub fn apply_retention_gate(plan: &mut BackupPlan, gate: &RetentionGate) -> Vec<
                 held_deletions,
             },
         );
-        event.fill_subvolume(Some(change.subvolume.clone()));
+        event.fill_subvolume(Some(change.subvolume.to_string()));
         plan.events.push(event);
         holds.push(RetentionHold {
             change: change.clone(),
@@ -1297,6 +1297,8 @@ pub fn apply_retention_gate(plan: &mut BackupPlan, gate: &RetentionGate) -> Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::svname;
+    use crate::testkit::fixed_now as now;
     use chrono::NaiveDate;
 
     fn make_snap(date_str: &str, time_str: &str, name: &str) -> SnapshotName {
@@ -1308,13 +1310,6 @@ mod tests {
         // Legacy format for convenience
         let s = format!("{date_str}-{name}");
         SnapshotName::parse(&s).unwrap()
-    }
-
-    fn now() -> NaiveDateTime {
-        NaiveDate::from_ymd_opt(2026, 3, 22)
-            .unwrap()
-            .and_hms_opt(15, 0, 0)
-            .unwrap()
     }
 
     fn default_config() -> ResolvedGraduatedRetention {
@@ -2782,7 +2777,7 @@ mod tests {
         shape: RetentionShape,
     ) -> ResolvedSubvolume {
         ResolvedSubvolume {
-            name: name.to_string(),
+            name: name.into(),
             short_name: name.to_string(),
             source: std::path::PathBuf::from(format!("/data/{name}")),
             priority: 1,
@@ -2817,7 +2812,7 @@ mod tests {
         PlannedOperation::DeleteSnapshot {
             path: std::path::PathBuf::from(format!("/snap/{subvol}/{snap}")),
             reason: "graduated: daily thinning".to_string(),
-            subvolume_name: subvol.to_string(),
+            subvolume_name: subvol.into(),
             kind: DeleteKind::Policy,
         }
     }
@@ -2841,7 +2836,7 @@ mod tests {
                 PlannedOperation::CreateSnapshot {
                     source: std::path::PathBuf::from("/data/home"),
                     dest: std::path::PathBuf::from("/snap/home/20260322-1200-home"),
-                    subvolume_name: "home".to_string(),
+                    subvolume_name: svname("home"),
                 },
                 delete_op("home", "20260301-1200-home"),
                 delete_op("home", "20260302-1200-home"),
@@ -2858,8 +2853,8 @@ mod tests {
         }
     }
 
-    fn recorded(entries: &[(&str, RetentionShape)]) -> HashMap<String, RecordedRetention> {
-        entries.iter().map(|(n, s)| ((*n).to_string(), (*s).into())).collect()
+    fn recorded(entries: &[(&str, RetentionShape)]) -> HashMap<SubvolName, RecordedRetention> {
+        entries.iter().map(|(n, s)| (svname(n), (*s).into())).collect()
     }
 
     static FULL_RUN: PlanFilters = PlanFilters {
@@ -2888,12 +2883,12 @@ mod tests {
             ("plain", base_shape()),
         ]);
         let filters = PlanFilters {
-            subvolume: Some("home".to_string()),
+            subvolume: Some(svname("home")),
             ..PlanFilters::default()
         };
         let gate = decide_retention_gate(&subvols, &prev, true, RecordScope { filters: &filters });
         assert!(gate.held.is_empty());
-        assert_eq!(gate.record, vec![("home".to_string(), tighter_shape().into())]);
+        assert_eq!(gate.record, vec![(svname("home"), tighter_shape().into())]);
     }
 
     #[test]
@@ -2905,7 +2900,7 @@ mod tests {
         let mut rows = recorded(&[("home", base_shape()), ("docs", base_shape())]);
         // `urd backup --subvolume home --confirm-retention-change`.
         let filters = PlanFilters {
-            subvolume: Some("home".to_string()),
+            subvolume: Some(svname("home")),
             ..PlanFilters::default()
         };
         let gate = decide_retention_gate(&subvols, &rows, true, RecordScope { filters: &filters });
@@ -2933,7 +2928,7 @@ mod tests {
         assert_eq!(
             gate.record,
             vec![(
-                "home".to_string(),
+                svname("home"),
                 RecordedRetention {
                     local: Some(current.local),
                     external: Some(base_shape().external),
@@ -2960,7 +2955,7 @@ mod tests {
         assert_eq!(
             gate.record,
             vec![(
-                "home".to_string(),
+                svname("home"),
                 RecordedRetention {
                     local: None,
                     external: Some(base_shape().external),
@@ -2984,7 +2979,7 @@ mod tests {
         assert_eq!(
             gate.record,
             vec![(
-                "nosend".to_string(),
+                svname("nosend"),
                 RecordedRetention {
                     local: Some(base_shape().local),
                     external: None,
@@ -3024,8 +3019,8 @@ mod tests {
         assert_eq!(
             gate.record,
             vec![
-                ("home".to_string(), tighter_shape().into()),
-                ("docs".to_string(), base_shape().into()),
+                (svname("home"), tighter_shape().into()),
+                (svname("docs"), base_shape().into()),
             ]
         );
     }
@@ -3048,7 +3043,7 @@ mod tests {
         assert_eq!(
             gate.held,
             vec![RetentionChange {
-                subvolume: "home".to_string(),
+                subvolume: svname("home"),
                 previous: base_shape().into(),
                 current: tighter_shape(),
             }]
@@ -3066,7 +3061,7 @@ mod tests {
         let prev = recorded(&[("home", base_shape())]);
         let gate = decide_retention_gate(&subvols, &prev, true, full_run());
         assert!(gate.held.is_empty());
-        assert_eq!(gate.record, vec![("home".to_string(), tighter_shape().into())]);
+        assert_eq!(gate.record, vec![(svname("home"), tighter_shape().into())]);
         // The recorded tighter shape is the next run's baseline: no longer tightened.
         let next = decide_retention_gate(
             &subvols,

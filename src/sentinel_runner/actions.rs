@@ -5,8 +5,6 @@
 
 use std::time::{Duration, Instant};
 
-use chrono::NaiveDateTime;
-
 use crate::advice;
 use crate::awareness;
 // gather + the ADR-119 `world::assess` door — the sanctioned prelude, see mod.rs.
@@ -16,6 +14,7 @@ use crate::heartbeat;
 use crate::notify;
 use crate::observation::{Observation, RealFileSystemState};
 use crate::sentinel;
+use crate::types::{DriveLabel, Timestamp};
 
 use super::{SentinelRunner, is_pid_alive};
 
@@ -165,7 +164,7 @@ impl SentinelRunner {
                         ),
                     },
                 );
-                event.fill_drive_label(Some(anomaly.drive_label.clone()));
+                event.fill_drive_label(Some(anomaly.drive_label.to_string()));
                 audit_events.push(event);
             }
             self.state.last_chain_health = current_chains;
@@ -214,7 +213,7 @@ impl SentinelRunner {
         Ok(())
     }
 
-    pub(super) fn execute_log_drive_change(&self, label: &str, mounted: bool) {
+    pub(super) fn execute_log_drive_change(&self, label: &DriveLabel, mounted: bool) {
         use crate::state::{DriveEventSource, DriveEventType};
 
         let event_type = if mounted {
@@ -242,9 +241,9 @@ impl SentinelRunner {
     /// Handle drive reconnection — check token state before dispatching.
     /// Sends a different notification depending on whether the drive's
     /// identity is verified or suspect (S1 fix from adversary review).
-    pub(super) fn execute_drive_reconnection_notification(&self, label: &str) {
+    pub(super) fn execute_drive_reconnection_notification(&self, label: &DriveLabel) {
         // Find drive config.
-        let Some(drive) = self.config.drives.iter().find(|d| d.label == label) else {
+        let Some(drive) = self.config.drives.iter().find(|d| d.label == *label) else {
             log::warn!("Drive reconnection notification for unknown label '{label}' — skipping");
             return;
         };
@@ -281,8 +280,7 @@ impl SentinelRunner {
             .ok()
             .flatten()
             .and_then(|ts| {
-                let parsed =
-                    NaiveDateTime::parse_from_str(&ts, "%Y-%m-%dT%H:%M:%S").ok()?;
+                let parsed = ts.parse::<Timestamp>().ok()?.as_naive();
                 let now = chrono::Local::now().naive_local();
                 Some(now.signed_duration_since(parsed).num_minutes())
             });
@@ -294,7 +292,7 @@ impl SentinelRunner {
         else {
             return;
         };
-        let duration_str = crate::plan::format_duration_short(m);
+        let duration_str = crate::voice::DurationStyle::Short.render(m.saturating_mul(60));
 
         let notification =
             notify::build_drive_reconnected_notification(label, Some(duration_str.as_str()));

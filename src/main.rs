@@ -25,6 +25,7 @@ mod output;
 mod plan;
 mod pools;
 mod preflight;
+mod probes;
 mod recommendation;
 mod recorder;
 mod retention;
@@ -37,6 +38,8 @@ mod storage_critical;
 mod strategy;
 mod sudoers;
 mod systemd_units;
+#[cfg(test)]
+mod testkit;
 mod types;
 mod voice;
 #[cfg(test)]

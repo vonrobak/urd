@@ -19,7 +19,7 @@ use crate::awareness::{
 };
 use crate::advice::{RedundancyAdvisory, RedundancyAdvisoryKind};
 use crate::guard::{self, PoolPressureSample};
-use crate::types::{DriveEvent, DriveEventKind};
+use crate::types::{DriveEvent, DriveEventKind, DriveLabel, SubvolName};
 
 // ── Events ──────────────────────────────────────────────────────────────
 
@@ -27,9 +27,9 @@ use crate::types::{DriveEvent, DriveEventKind};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SentinelEvent {
     /// A configured drive was mounted (label from drive config).
-    DriveMounted { label: String },
+    DriveMounted { label: DriveLabel },
     /// A configured drive was unmounted.
-    DriveUnmounted { label: String },
+    DriveUnmounted { label: DriveLabel },
     /// Adaptive tick fired — time to re-assess promise states.
     AssessmentTick,
     /// A backup run completed (detected via heartbeat change).
@@ -54,13 +54,13 @@ pub enum SentinelAction {
     /// Log a drive mount/unmount event. The runner logs it and records it in
     /// the `events` table (`kind='drive'`).
     LogDriveChange {
-        label: String,
+        label: DriveLabel,
         mounted: bool,
     },
     /// Notify the user that a drive reconnected (runner checks token state
     /// before dispatching — see sentinel_runner/actions.rs execute_drive_reconnection_notification).
     NotifyDriveReconnected {
-        label: String,
+        label: DriveLabel,
     },
     /// Clean exit.
     Exit,
@@ -73,7 +73,7 @@ pub enum SentinelAction {
 #[derive(Debug, Clone)]
 pub struct SentinelState {
     /// Currently mounted configured drives (by label).
-    pub mounted_drives: BTreeSet<String>,
+    pub mounted_drives: BTreeSet<DriveLabel>,
     /// Promise status per subvolume from the last assessment.
     /// Empty on startup — the first assessment populates without notifying.
     pub last_promise_states: Vec<PromiseSnapshot>,
@@ -443,7 +443,7 @@ pub struct RecordingWindow {
 
 /// Should this assess record promise-transition events? (UPI 063)
 ///
-/// Encodes the ownership rule backup.rs states ("Backup is canonical for
+/// Encodes the ownership rule `commands/backup/` states ("Backup is canonical for
 /// in-run promise transitions, trigger=Run") for the window the trigger
 /// suppression alone misses: a sentinel tick landing INSIDE a backup run
 /// would diff mid-run state against the sentinel's private baseline and
@@ -514,7 +514,7 @@ pub fn reconnection_worth_notifying(absent_minutes: i64) -> bool {
 }
 
 // ── Snapshot extractors ───────────────────────────────────────────────
-// (`snapshot_promises` moved to awareness.rs with `PromiseSnapshot`,
+// (`snapshot_promises` moved to awareness/transitions.rs with `PromiseSnapshot`,
 // UPI 088-a — the health twin below stays: `HealthSnapshot` is
 // sentinel-only state.)
 
@@ -522,7 +522,7 @@ pub fn reconnection_worth_notifying(absent_minutes: i64) -> bool {
 /// comparing health transitions to decide notifications.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HealthSnapshot {
-    pub name: String,
+    pub name: SubvolName,
     pub health: OperationalHealth,
     pub health_reasons: Vec<String>,
 }
@@ -615,8 +615,8 @@ pub fn compute_visual_state(assessments: &[SubvolAssessment]) -> VisualState {
 /// Built from `SubvolAssessment::chain_health` by `build_chain_snapshots()`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChainSnapshot {
-    pub subvolume: String,
-    pub drive_label: String,
+    pub subvolume: SubvolName,
+    pub drive_label: DriveLabel,
     /// true = incremental chain intact (pin exists, parent found on drive).
     pub chain_intact: bool,
 }
@@ -624,7 +624,7 @@ pub struct ChainSnapshot {
 /// A drive where multiple incremental chains broke simultaneously.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DriveAnomaly {
-    pub drive_label: String,
+    pub drive_label: DriveLabel,
     /// Total number of chains on this drive in the current state.
     pub total_chains: usize,
     /// Number of chains that broke between the two ticks.
@@ -640,7 +640,7 @@ pub struct DriveAnomaly {
 #[must_use]
 pub fn build_chain_snapshots(
     assessments: &[SubvolAssessment],
-    mounted_drives: &BTreeSet<String>,
+    mounted_drives: &BTreeSet<DriveLabel>,
 ) -> Vec<ChainSnapshot> {
     let mut snapshots = Vec::new();
     for assessment in assessments {
@@ -674,7 +674,7 @@ pub fn detect_simultaneous_chain_breaks(
     use std::collections::BTreeMap;
 
     // Count intact chains per drive in previous state
-    let mut prev_intact: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut prev_intact: BTreeMap<&DriveLabel, usize> = BTreeMap::new();
     for snap in previous {
         if snap.chain_intact {
             *prev_intact.entry(&snap.drive_label).or_insert(0) += 1;
@@ -682,7 +682,7 @@ pub fn detect_simultaneous_chain_breaks(
     }
 
     // Count intact and total chains per drive in current state
-    let mut curr: BTreeMap<&str, (usize, usize)> = BTreeMap::new(); // (intact, total)
+    let mut curr: BTreeMap<&DriveLabel, (usize, usize)> = BTreeMap::new(); // (intact, total)
     for snap in current {
         let entry = curr.entry(&snap.drive_label).or_insert((0, 0));
         entry.1 += 1;
@@ -700,7 +700,7 @@ pub fn detect_simultaneous_chain_breaks(
         // (disconnect removes chains from the current snapshot, leaving total == 0).
         if broken >= 2 && total > 0 {
             anomalies.push(DriveAnomaly {
-                drive_label: drive.to_string(),
+                drive_label: (*drive).clone(),
                 total_chains: total,
                 broken_count: broken,
             });
@@ -726,7 +726,7 @@ pub fn detect_simultaneous_chain_breaks(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RestoredMounts {
     /// Drives the previous instance last saw mounted, still in config.
-    pub drives: BTreeSet<String>,
+    pub drives: BTreeSet<DriveLabel>,
     /// When that set was last witnessed (the file's `last_assessment`).
     pub witnessed_at: NaiveDateTime,
 }
@@ -746,20 +746,23 @@ pub struct RestoredMounts {
 #[must_use]
 pub fn restorable_mounts(
     file: Option<&SentinelStateFile>,
-    config_labels: &BTreeSet<String>,
+    config_labels: &BTreeSet<DriveLabel>,
 ) -> Option<RestoredMounts> {
     let file = file?;
     if file.schema_version != SENTINEL_STATE_SCHEMA_VERSION {
         return None;
     }
-    let witnessed_at =
-        NaiveDateTime::parse_from_str(file.last_assessment.as_deref()?, "%Y-%m-%dT%H:%M:%S")
-            .ok()?;
+    let witnessed_at = file
+        .last_assessment
+        .as_deref()?
+        .parse::<crate::types::Timestamp>()
+        .ok()?
+        .as_naive();
     let drives = file
         .mounted_drives
         .iter()
-        .filter(|label| config_labels.contains(*label))
-        .cloned()
+        .filter(|label| config_labels.contains(label.as_str()))
+        .map(DriveLabel::from)
         .collect();
     Some(RestoredMounts {
         drives,
@@ -770,7 +773,7 @@ pub fn restorable_mounts(
 /// An unmount inferred at startup, stamped at last-witnessed presence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InferredUnmount {
-    pub label: String,
+    pub label: DriveLabel,
     pub at: NaiveDateTime,
 }
 
@@ -780,7 +783,7 @@ pub struct StartupReconciliation {
     /// Seed for `SentinelState::mounted_drives`: restored drives still
     /// present. A present drive outside this set still yields `DriveMounted`
     /// on the first scan, exactly as on a cold start.
-    pub mounted_drives: BTreeSet<String>,
+    pub mounted_drives: BTreeSet<DriveLabel>,
     /// Unmount events to record, one per restored drive now absent whose
     /// absence is not already witnessed in history.
     pub inferred_unmounts: Vec<InferredUnmount>,
@@ -816,9 +819,9 @@ pub struct StartupReconciliation {
 #[must_use]
 pub fn reconcile_restored_mounts(
     restored: &RestoredMounts,
-    present: &BTreeSet<String>,
-    latest_events: &BTreeMap<String, Option<DriveEvent>>,
-    last_sends: &BTreeMap<String, NaiveDateTime>,
+    present: &BTreeSet<DriveLabel>,
+    latest_events: &BTreeMap<DriveLabel, Option<DriveEvent>>,
+    last_sends: &BTreeMap<DriveLabel, NaiveDateTime>,
     now: NaiveDateTime,
 ) -> StartupReconciliation {
     let mounted_drives = restored.drives.intersection(present).cloned().collect();
@@ -1086,17 +1089,12 @@ fn eject_advance(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::{dlabel, svname};
     use crate::awareness::{DriveChainHealth, LocalAssessment, OperationalHealth};
+    use crate::testkit::subvol_assessment as make_assessment;
 
     fn fresh_state() -> SentinelState {
         SentinelState::new()
-    }
-
-    fn make_assessment(name: &str, status: PromiseStatus) -> SubvolAssessment {
-        SubvolAssessment {
-            local: LocalAssessment::fixture(status, 5, None),
-            ..SubvolAssessment::fixture(name, status)
-        }
     }
 
     // ── State machine transitions ───────────────────────────────────────
@@ -1105,7 +1103,7 @@ mod tests {
     fn transition_drive_mounted_adds_to_set() {
         let state = fresh_state();
         let event = SentinelEvent::DriveMounted {
-            label: "WD-18TB".to_string(),
+            label: dlabel("WD-18TB"),
         };
 
         let TransitionResult { state: new_state, actions, .. } = sentinel_transition(&state, &event);
@@ -1115,7 +1113,7 @@ mod tests {
         assert_eq!(
             actions[0],
             SentinelAction::LogDriveChange {
-                label: "WD-18TB".to_string(),
+                label: dlabel("WD-18TB"),
                 mounted: true,
             }
         );
@@ -1125,10 +1123,10 @@ mod tests {
     #[test]
     fn transition_drive_unmounted_removes_from_set() {
         let mut state = fresh_state();
-        state.mounted_drives.insert("WD-18TB".to_string());
+        state.mounted_drives.insert(dlabel("WD-18TB"));
 
         let event = SentinelEvent::DriveUnmounted {
-            label: "WD-18TB".to_string(),
+            label: dlabel("WD-18TB"),
         };
         let TransitionResult { state: new_state, actions, .. } = sentinel_transition(&state, &event);
 
@@ -1137,7 +1135,7 @@ mod tests {
         assert_eq!(
             actions[0],
             SentinelAction::LogDriveChange {
-                label: "WD-18TB".to_string(),
+                label: dlabel("WD-18TB"),
                 mounted: false,
             }
         );
@@ -1181,10 +1179,10 @@ mod tests {
     #[test]
     fn duplicate_mount_is_idempotent() {
         let mut state = fresh_state();
-        state.mounted_drives.insert("WD-18TB".to_string());
+        state.mounted_drives.insert(dlabel("WD-18TB"));
 
         let event = SentinelEvent::DriveMounted {
-            label: "WD-18TB".to_string(),
+            label: dlabel("WD-18TB"),
         };
         let TransitionResult { state: new_state, actions, .. } = sentinel_transition(&state, &event);
 
@@ -1196,7 +1194,7 @@ mod tests {
     fn unmount_unknown_drive_is_no_op() {
         let state = fresh_state();
         let event = SentinelEvent::DriveUnmounted {
-            label: "unknown".to_string(),
+            label: dlabel("unknown"),
         };
         let TransitionResult { actions, .. } = sentinel_transition(&state, &event);
 
@@ -1210,13 +1208,13 @@ mod tests {
         let TransitionResult { state, .. } = sentinel_transition(
             &state,
             &SentinelEvent::DriveMounted {
-                label: "WD-18TB".to_string(),
+                label: dlabel("WD-18TB"),
             },
         );
         let TransitionResult { state, .. } = sentinel_transition(
             &state,
             &SentinelEvent::DriveMounted {
-                label: "2TB-backup".to_string(),
+                label: dlabel("2TB-backup"),
             },
         );
 
@@ -1227,7 +1225,7 @@ mod tests {
         let TransitionResult { state, actions, .. } = sentinel_transition(
             &state,
             &SentinelEvent::DriveUnmounted {
-                label: "WD-18TB".to_string(),
+                label: dlabel("WD-18TB"),
             },
         );
 
@@ -1350,7 +1348,7 @@ mod tests {
     #[test]
     fn promise_change_detected() {
         let previous = vec![PromiseSnapshot {
-            name: "sv1".to_string(),
+            name: svname("sv1"),
             status: PromiseStatus::Protected,
         }];
         let current = vec![make_assessment("sv1", PromiseStatus::AtRisk)];
@@ -1361,7 +1359,7 @@ mod tests {
     #[test]
     fn no_change_when_status_same() {
         let previous = vec![PromiseSnapshot {
-            name: "sv1".to_string(),
+            name: svname("sv1"),
             status: PromiseStatus::Protected,
         }];
         let current = vec![make_assessment("sv1", PromiseStatus::Protected)];
@@ -1372,7 +1370,7 @@ mod tests {
     #[test]
     fn new_subvolume_is_a_change() {
         let previous = vec![PromiseSnapshot {
-            name: "sv1".to_string(),
+            name: svname("sv1"),
             status: PromiseStatus::Protected,
         }];
         let current = vec![
@@ -1387,11 +1385,11 @@ mod tests {
     fn removed_subvolume_is_a_change() {
         let previous = vec![
             PromiseSnapshot {
-                name: "sv1".to_string(),
+                name: svname("sv1"),
                 status: PromiseStatus::Protected,
             },
             PromiseSnapshot {
-                name: "sv2".to_string(),
+                name: svname("sv2"),
                 status: PromiseStatus::Protected,
             },
         ];
@@ -1409,7 +1407,7 @@ mod tests {
         let chain_health = chains
             .into_iter()
             .map(|(drive, intact)| DriveChainHealth {
-                drive_label: drive.to_string(),
+                drive_label: drive.into(),
                 status: if intact {
                     ChainStatus::Intact {
                         pin_parent: format!("20260329-1000-{name}"),
@@ -1423,7 +1421,7 @@ mod tests {
             })
             .collect();
         SubvolAssessment {
-            name: name.to_string(),
+            name: name.into(),
             short_name: name.to_string(),
             status: PromiseStatus::Protected,
             health: OperationalHealth::Healthy,
@@ -1447,7 +1445,7 @@ mod tests {
     #[test]
     fn build_chain_snapshots_filters_mounted_drives() {
         let mut mounted = BTreeSet::new();
-        mounted.insert("WD-18TB".to_string());
+        mounted.insert(dlabel("WD-18TB"));
         // WD-18TB1 is NOT mounted
 
         let assessments = vec![make_assessment_with_chains(
@@ -1464,7 +1462,7 @@ mod tests {
     #[test]
     fn build_chain_snapshots_intact_and_broken() {
         let mut mounted = BTreeSet::new();
-        mounted.insert("D1".to_string());
+        mounted.insert(dlabel("D1"));
 
         let assessments = vec![
             make_assessment_with_chains("sv1", vec![("D1", true)]),
@@ -1851,14 +1849,14 @@ mod tests {
         let TransitionResult { state: new_state, actions, .. } = sentinel_transition(
             &state,
             &SentinelEvent::DriveMounted {
-                label: "WD-18TB".to_string(),
+                label: dlabel("WD-18TB"),
             },
         );
 
         assert!(new_state.mounted_drives.contains("WD-18TB"));
         assert!(
             actions.contains(&SentinelAction::NotifyDriveReconnected {
-                label: "WD-18TB".to_string(),
+                label: dlabel("WD-18TB"),
             }),
             "should emit NotifyDriveReconnected after initial assessment: {actions:?}"
         );
@@ -1875,7 +1873,7 @@ mod tests {
         let TransitionResult { state: _new_state, actions, .. } = sentinel_transition(
             &state,
             &SentinelEvent::DriveMounted {
-                label: "WD-18TB".to_string(),
+                label: dlabel("WD-18TB"),
             },
         );
 
@@ -1892,12 +1890,12 @@ mod tests {
     fn duplicate_drive_mount_no_actions() {
         let mut state = fresh_state();
         state.has_initial_assessment = true;
-        state.mounted_drives.insert("WD-18TB".to_string());
+        state.mounted_drives.insert(dlabel("WD-18TB"));
 
         let TransitionResult { state: _new_state, actions, .. } = sentinel_transition(
             &state,
             &SentinelEvent::DriveMounted {
-                label: "WD-18TB".to_string(),
+                label: dlabel("WD-18TB"),
             },
         );
 
@@ -1911,13 +1909,13 @@ mod tests {
     fn unmount_then_remount_emits_reconnection() {
         let mut state = fresh_state();
         state.has_initial_assessment = true;
-        state.mounted_drives.insert("WD-18TB".to_string());
+        state.mounted_drives.insert(dlabel("WD-18TB"));
 
         // Unmount
         let TransitionResult { state: state_after_unmount, .. } = sentinel_transition(
             &state,
             &SentinelEvent::DriveUnmounted {
-                label: "WD-18TB".to_string(),
+                label: dlabel("WD-18TB"),
             },
         );
         assert!(!state_after_unmount.mounted_drives.contains("WD-18TB"));
@@ -1926,13 +1924,13 @@ mod tests {
         let TransitionResult { state: state_after_remount, actions, .. } = sentinel_transition(
             &state_after_unmount,
             &SentinelEvent::DriveMounted {
-                label: "WD-18TB".to_string(),
+                label: dlabel("WD-18TB"),
             },
         );
         assert!(state_after_remount.mounted_drives.contains("WD-18TB"));
         assert!(
             actions.contains(&SentinelAction::NotifyDriveReconnected {
-                label: "WD-18TB".to_string(),
+                label: dlabel("WD-18TB"),
             }),
             "remount should emit reconnection: {actions:?}"
         );
@@ -1948,7 +1946,7 @@ mod tests {
             mountpoint: std::path::PathBuf::from(format!("/mnt/{uuid}")),
             free_bytes: free,
             floor_bytes: floor,
-            subvol_names: vec![format!("{uuid}-sv")],
+            subvol_names: vec![svname(&format!("{uuid}-sv"))],
         }
     }
 
@@ -2371,12 +2369,10 @@ mod tests {
 
     // ── Startup mount reconciliation (#411) ─────────────────────────────
 
-    fn ts(s: &str) -> NaiveDateTime {
-        NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S").unwrap()
-    }
+    use crate::testkit::parse_dt as ts;
 
-    fn labels(names: &[&str]) -> BTreeSet<String> {
-        names.iter().map(|s| (*s).to_string()).collect()
+    fn labels(names: &[&str]) -> BTreeSet<DriveLabel> {
+        names.iter().map(|s| dlabel(s)).collect()
     }
 
     fn state_file(
@@ -2478,7 +2474,7 @@ mod tests {
         ];
         for (case, latest, expected) in cases {
             let mut latest_events = BTreeMap::new();
-            latest_events.insert("WD-18TB".to_string(), latest);
+            latest_events.insert(dlabel("WD-18TB"), latest);
             let v = reconcile_restored_mounts(
                 &restored(&["WD-18TB"]),
                 &labels(&[]),
@@ -2488,7 +2484,7 @@ mod tests {
             );
             let want: Vec<InferredUnmount> = expected
                 .map(|at| InferredUnmount {
-                    label: "WD-18TB".to_string(),
+                    label: dlabel("WD-18TB"),
                     at: ts(at),
                 })
                 .into_iter()
@@ -2553,9 +2549,9 @@ mod tests {
             ),
         ];
         for (case, latest, sent, expected) in cases {
-            let latest_events = BTreeMap::from([("WD-18TB".to_string(), latest)]);
-            let last_sends: BTreeMap<String, NaiveDateTime> = sent
-                .map(|at| ("WD-18TB".to_string(), ts(at)))
+            let latest_events = BTreeMap::from([(dlabel("WD-18TB"), latest)]);
+            let last_sends: BTreeMap<DriveLabel, NaiveDateTime> = sent
+                .map(|at| (dlabel("WD-18TB"), ts(at)))
                 .into_iter()
                 .collect();
             let v = reconcile_restored_mounts(
@@ -2567,7 +2563,7 @@ mod tests {
             );
             let want: Vec<InferredUnmount> = expected
                 .map(|at| InferredUnmount {
-                    label: "WD-18TB".to_string(),
+                    label: dlabel("WD-18TB"),
                     at: ts(at),
                 })
                 .into_iter()
@@ -2584,7 +2580,7 @@ mod tests {
             &restored(&["WD-18TB"]),
             &labels(&[]),
             &BTreeMap::new(),
-            &BTreeMap::from([("WD-18TB".to_string(), ts("2026-09-28T04:00:00"))]),
+            &BTreeMap::from([(dlabel("WD-18TB"), ts("2026-09-28T04:00:00"))]),
             ts(NOW),
         );
         assert!(v.inferred_unmounts.is_empty());
@@ -2596,7 +2592,7 @@ mod tests {
         let v = reconcile_restored_mounts(
             &restored(&["WD-18TB"]),
             &labels(&[]),
-            &BTreeMap::from([("WD-18TB".to_string(), None)]),
+            &BTreeMap::from([(dlabel("WD-18TB"), None)]),
             &BTreeMap::new(),
             ts(NOW),
         );
@@ -2643,7 +2639,7 @@ mod tests {
         let v = reconcile_restored_mounts(
             &r,
             &labels(&[]),
-            &BTreeMap::from([("WD-18TB".to_string(), None)]),
+            &BTreeMap::from([(dlabel("WD-18TB"), None)]),
             &BTreeMap::new(),
             ts(NOW),
         );

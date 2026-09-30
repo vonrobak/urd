@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use crate::config::DriveConfig;
 use crate::error::UrdError;
 use crate::state::StateDb;
+use crate::types::{DriveLabel, SubvolName};
 
 // ── Drive availability ─────────────────────────────────────────────────
 
@@ -85,8 +86,8 @@ pub fn get_filesystem_uuid(mount_path: &Path) -> crate::error::Result<Option<Str
 /// Suppresses suggestions when the detected UUID is already configured on
 /// another drive (cloned drive scenario — suggesting it would be contradictory).
 #[must_use]
-pub fn check_missing_uuids(drives: &[DriveConfig]) -> Vec<(String, String, String)> {
-    let detected: Vec<(String, String)> = drives
+pub fn check_missing_uuids(drives: &[DriveConfig]) -> Vec<(DriveLabel, String, String)> {
+    let detected: Vec<(DriveLabel, String)> = drives
         .iter()
         .filter(|d| d.uuid.is_none() && is_path_mounted(&d.mount_path))
         .filter_map(|d| {
@@ -104,8 +105,8 @@ pub fn check_missing_uuids(drives: &[DriveConfig]) -> Vec<(String, String, Strin
 #[must_use]
 pub(crate) fn filter_uuid_suggestions(
     drives: &[DriveConfig],
-    detected: Vec<(String, String)>,
-) -> Vec<(String, String, String)> {
+    detected: Vec<(DriveLabel, String)>,
+) -> Vec<(DriveLabel, String, String)> {
     let configured_uuids: std::collections::HashSet<&str> = drives
         .iter()
         .filter_map(|d| d.uuid.as_deref())
@@ -146,14 +147,14 @@ pub fn is_drive_mounted(drive: &DriveConfig) -> bool {
 /// `TempDir` fixture can never flip.
 #[must_use]
 pub fn fresh_away_map(
-    away_at_spawn: &std::collections::HashMap<String, Vec<String>>,
+    away_at_spawn: &std::collections::HashMap<SubvolName, Vec<DriveLabel>>,
     config: &crate::config::Config,
     probe: impl Fn(&DriveConfig) -> bool,
-) -> std::collections::HashMap<String, Vec<String>> {
+) -> std::collections::HashMap<SubvolName, Vec<DriveLabel>> {
     away_at_spawn
         .iter()
         .filter_map(|(subvol, labels)| {
-            let still_away: Vec<String> = labels
+            let still_away: Vec<DriveLabel> = labels
                 .iter()
                 .filter(|label| {
                     config
@@ -230,7 +231,7 @@ pub fn filesystem_free_bytes(path: &Path) -> crate::error::Result<u64> {
 /// Get the external snapshot directory for a subvolume on a drive.
 /// Returns `{mount_path}/{snapshot_root}/{subvol_name}`.
 #[must_use]
-pub fn external_snapshot_dir(drive: &DriveConfig, subvol_name: &str) -> PathBuf {
+pub fn external_snapshot_dir(drive: &DriveConfig, subvol_name: &SubvolName) -> PathBuf {
     drive
         .mount_path
         .join(&drive.snapshot_root)
@@ -300,7 +301,7 @@ pub fn read_drive_token(drive: &DriveConfig) -> crate::error::Result<Option<Stri
 pub fn write_drive_token(drive: &DriveConfig, token: &str) -> crate::error::Result<()> {
     let path = token_file_path(drive);
     let tmp_path = path.with_extension("tmp");
-    let now = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S");
+    let now = crate::types::Timestamp::from(chrono::Local::now().naive_local());
 
     let contents = format!(
         "# Urd drive session token — do not edit\n\
@@ -405,9 +406,7 @@ pub fn verify_drive_token(drive: &DriveConfig, state: &StateDb) -> DriveAvailabi
         Ok(Some(t)) => t,
         Ok(None) => {
             // Drive has a token but SQLite doesn't. Self-healing: store it.
-            let now = chrono::Local::now()
-                .format("%Y-%m-%dT%H:%M:%S")
-                .to_string();
+            let now = crate::types::Timestamp::from(chrono::Local::now().naive_local()).to_string();
             if let Err(e) = state.store_drive_token(&drive.label, &drive_token, &now) {
                 log::warn!(
                     "Self-heal: failed to store drive token for {}: {e}",
@@ -428,9 +427,7 @@ pub fn verify_drive_token(drive: &DriveConfig, state: &StateDb) -> DriveAvailabi
 
     if drive_token == stored_token {
         // Match — touch the last_verified timestamp.
-        let now = chrono::Local::now()
-            .format("%Y-%m-%dT%H:%M:%S")
-            .to_string();
+        let now = crate::types::Timestamp::from(chrono::Local::now().naive_local()).to_string();
         if let Err(e) = state.touch_drive_token(&drive.label, &now) {
             log::warn!(
                 "Failed to touch drive token timestamp for {}: {e}",
@@ -453,6 +450,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+    use crate::testkit::{dlabel, svname};
     use crate::config::Config;
     use crate::types::DriveRole;
 
@@ -489,7 +487,7 @@ mod tests {
 
     fn test_drive() -> DriveConfig {
         DriveConfig {
-            label: "WD-18TB".to_string(),
+            label: dlabel("WD-18TB"),
             uuid: None,
             mount_path: PathBuf::from("/run/media/user/WD-18TB"),
             snapshot_root: ".snapshots".to_string(),
@@ -546,7 +544,7 @@ source = "/data/alpha"
         std::fs::create_dir_all(&away_mount).unwrap();
         let config = test_config(vec![
             DriveConfig {
-                label: "HOME".to_string(),
+                label: dlabel("HOME"),
                 uuid: None,
                 mount_path: PathBuf::from("/"), // reconnected: a live mount point
                 snapshot_root: ".snapshots".to_string(),
@@ -556,7 +554,7 @@ source = "/data/alpha"
                 rotation_interval: None,
             },
             DriveConfig {
-                label: "AWAY".to_string(),
+                label: dlabel("AWAY"),
                 uuid: None,
                 mount_path: away_mount, // still away (not a mount point)
                 snapshot_root: ".snapshots".to_string(),
@@ -566,13 +564,13 @@ source = "/data/alpha"
                 rotation_interval: None,
             },
         ]);
-        let mut away_at_spawn: HashMap<String, Vec<String>> = HashMap::new();
-        away_at_spawn.insert("alpha".to_string(), vec!["HOME".to_string(), "AWAY".to_string()]);
+        let mut away_at_spawn: HashMap<SubvolName, Vec<DriveLabel>> = HashMap::new();
+        away_at_spawn.insert(svname("alpha"), vec![dlabel("HOME"), dlabel("AWAY")]);
 
         let fresh = fresh_away_map(&away_at_spawn, &config, is_drive_mounted);
         assert_eq!(
             fresh.get("alpha").map(Vec::as_slice),
-            Some(["AWAY".to_string()].as_slice()),
+            Some([dlabel("AWAY")].as_slice()),
             "a reconnected (mounted) drive is dropped from the cross-fs shed list",
         );
     }
@@ -585,7 +583,7 @@ source = "/data/alpha"
         // fixture would never mount; only the probe decides.
         let config = test_config(vec![
             DriveConfig {
-                label: "RECONNECTED".to_string(),
+                label: dlabel("RECONNECTED"),
                 uuid: None,
                 mount_path: PathBuf::from("/not/really/mounted/a"),
                 snapshot_root: ".snapshots".to_string(),
@@ -595,7 +593,7 @@ source = "/data/alpha"
                 rotation_interval: None,
             },
             DriveConfig {
-                label: "STILL-AWAY".to_string(),
+                label: dlabel("STILL-AWAY"),
                 uuid: None,
                 mount_path: PathBuf::from("/not/really/mounted/b"),
                 snapshot_root: ".snapshots".to_string(),
@@ -605,17 +603,17 @@ source = "/data/alpha"
                 rotation_interval: None,
             },
         ]);
-        let mut away_at_spawn: HashMap<String, Vec<String>> = HashMap::new();
+        let mut away_at_spawn: HashMap<SubvolName, Vec<DriveLabel>> = HashMap::new();
         away_at_spawn.insert(
-            "alpha".to_string(),
-            vec!["RECONNECTED".to_string(), "STILL-AWAY".to_string()],
+            svname("alpha"),
+            vec![dlabel("RECONNECTED"), dlabel("STILL-AWAY")],
         );
 
         let fresh =
             fresh_away_map(&away_at_spawn, &config, |d| d.label == "RECONNECTED");
         assert_eq!(
             fresh.get("alpha").map(Vec::as_slice),
-            Some(["STILL-AWAY".to_string()].as_slice()),
+            Some([dlabel("STILL-AWAY")].as_slice()),
             "the probe-reported-mounted drive is dropped; the other stays shed",
         );
     }
@@ -633,7 +631,7 @@ source = "/data/alpha"
     #[test]
     fn external_snapshot_dir_construction() {
         let drive = test_drive();
-        let dir = external_snapshot_dir(&drive, "htpc-home");
+        let dir = external_snapshot_dir(&drive, &svname("htpc-home"));
         assert_eq!(
             dir,
             PathBuf::from("/run/media/user/WD-18TB/.snapshots/htpc-home")
@@ -643,7 +641,7 @@ source = "/data/alpha"
     #[test]
     fn external_snapshot_dir_with_subvol_name() {
         let drive = test_drive();
-        let dir = external_snapshot_dir(&drive, "subvol3-opptak");
+        let dir = external_snapshot_dir(&drive, &svname("subvol3-opptak"));
         assert_eq!(
             dir,
             PathBuf::from("/run/media/user/WD-18TB/.snapshots/subvol3-opptak")
@@ -661,7 +659,7 @@ source = "/data/alpha"
     fn drive_availability_no_uuid_configured() {
         // Drive mounted at / (always mounted) with no UUID configured → Available
         let drive = DriveConfig {
-            label: "root".to_string(),
+            label: dlabel("root"),
             uuid: None,
             mount_path: PathBuf::from("/"),
             snapshot_root: ".snapshots".to_string(),
@@ -677,7 +675,7 @@ source = "/data/alpha"
     fn drive_availability_uuid_mismatch() {
         // Drive mounted at / but with a wrong UUID → UuidMismatch
         let drive = DriveConfig {
-            label: "root".to_string(),
+            label: dlabel("root"),
             uuid: Some("00000000-0000-0000-0000-000000000000".to_string()),
             mount_path: PathBuf::from("/"),
             snapshot_root: ".snapshots".to_string(),
@@ -701,7 +699,7 @@ source = "/data/alpha"
         let real_uuid = get_filesystem_uuid(Path::new("/"));
         if let Ok(Some(uuid)) = real_uuid {
             let drive = DriveConfig {
-                label: "root".to_string(),
+                label: dlabel("root"),
                 uuid: Some(uuid.clone()),
                 mount_path: PathBuf::from("/"),
                 snapshot_root: ".snapshots".to_string(),
@@ -720,7 +718,7 @@ source = "/data/alpha"
         let real_uuid = get_filesystem_uuid(Path::new("/"));
         if let Ok(Some(uuid)) = real_uuid {
             let drive = DriveConfig {
-                label: "root".to_string(),
+                label: dlabel("root"),
                 uuid: Some(uuid.to_uppercase()),
                 mount_path: PathBuf::from("/"),
                 snapshot_root: ".snapshots".to_string(),
@@ -740,7 +738,7 @@ source = "/data/alpha"
         let snap_root = "snapshots";
         std::fs::create_dir_all(dir.join(snap_root)).unwrap();
         DriveConfig {
-            label: "TEST-DRIVE".to_string(),
+            label: dlabel("TEST-DRIVE"),
             uuid: None,
             mount_path: dir.to_path_buf(),
             snapshot_root: snap_root.to_string(),
@@ -800,7 +798,7 @@ source = "/data/alpha"
     fn write_drive_token_creates_parent_dirs() {
         let tmp = tempfile::TempDir::new().unwrap();
         let drive = DriveConfig {
-            label: "D".to_string(),
+            label: dlabel("D"),
             uuid: None,
             mount_path: tmp.path().to_path_buf(),
             snapshot_root: "deep/nested/root".to_string(),
@@ -898,7 +896,7 @@ source = "/data/alpha"
     fn filter_uuid_suggestions_suppresses_duplicate() {
         let drives = vec![
             DriveConfig {
-                label: "WD-18TB".to_string(),
+                label: dlabel("WD-18TB"),
                 uuid: Some("aaaa-bbbb".to_string()),
                 mount_path: PathBuf::from("/mnt/wd"),
                 snapshot_root: ".snapshots".to_string(),
@@ -908,7 +906,7 @@ source = "/data/alpha"
                 rotation_interval: None,
             },
             DriveConfig {
-                label: "WD-18TB1".to_string(),
+                label: dlabel("WD-18TB1"),
                 uuid: None, // cloned, no UUID configured
                 mount_path: PathBuf::from("/mnt/wd1"),
                 snapshot_root: ".snapshots".to_string(),
@@ -921,7 +919,7 @@ source = "/data/alpha"
 
         // Detected: WD-18TB1 has the same UUID as WD-18TB
         let detected = vec![
-            ("WD-18TB1".to_string(), "aaaa-bbbb".to_string()),
+            (dlabel("WD-18TB1"), "aaaa-bbbb".to_string()),
         ];
 
         let results = filter_uuid_suggestions(&drives, detected);
@@ -932,7 +930,7 @@ source = "/data/alpha"
     fn filter_uuid_suggestions_allows_unique_uuid() {
         let drives = vec![
             DriveConfig {
-                label: "WD-18TB".to_string(),
+                label: dlabel("WD-18TB"),
                 uuid: Some("aaaa-bbbb".to_string()),
                 mount_path: PathBuf::from("/mnt/wd"),
                 snapshot_root: ".snapshots".to_string(),
@@ -942,7 +940,7 @@ source = "/data/alpha"
                 rotation_interval: None,
             },
             DriveConfig {
-                label: "2TB-backup".to_string(),
+                label: dlabel("2TB-backup"),
                 uuid: None,
                 mount_path: PathBuf::from("/mnt/2tb"),
                 snapshot_root: ".snapshots".to_string(),
@@ -955,7 +953,7 @@ source = "/data/alpha"
 
         // Detected: 2TB-backup has a different UUID
         let detected = vec![
-            ("2TB-backup".to_string(), "cccc-dddd".to_string()),
+            (dlabel("2TB-backup"), "cccc-dddd".to_string()),
         ];
 
         let results = filter_uuid_suggestions(&drives, detected);

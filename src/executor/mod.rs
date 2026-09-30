@@ -14,8 +14,9 @@ use std::time::Instant;
 
 use crate::btrfs::BtrfsOps;
 use crate::config::Config;
+use crate::plan::{BackupPlan, PlannedOperation};
 use crate::state::StateDb;
-use crate::types::{BackupPlan, FullSendReason, PlannedOperation, SendKind};
+use crate::types::{DriveLabel, FullSendReason, SendKind, SubvolName};
 
 mod coord;
 mod lifecycle;
@@ -34,7 +35,7 @@ pub use outcome::*;
 /// Constructed from config lookup + the armed tier in `execute()`.
 #[derive(Debug)]
 struct SubvolumeContext {
-    name: String,
+    name: SubvolName,
     is_transient: bool,
     /// Critical tier (UPI 031-b): after the gated cleanup, also delete the
     /// just-sent snapshot(s) and remove the pin, leaving zero local snapshots.
@@ -45,7 +46,7 @@ struct SubvolumeContext {
     /// first lets the planner's already-planned away-snapshot delete pass the
     /// presence-blind re-check and reclaim the same run. Empty when `clear_all`
     /// is true (no away pin) or below Critical.
-    shed_away_drives: Vec<String>,
+    shed_away_drives: Vec<DriveLabel>,
 }
 
 // ── Executor ────────────────────────────────────────────────────────────
@@ -141,7 +142,7 @@ impl<'a> Executor<'a> {
         for root in &self.config.local_snapshots.roots {
             roots.insert(root.path.clone());
         }
-        let mut subvol_to_root: HashMap<String, PathBuf> = HashMap::new();
+        let mut subvol_to_root: HashMap<SubvolName, PathBuf> = HashMap::new();
         for sv in self.config.resolved_subvolumes() {
             if let Some(p) = sv.snapshot_root.clone() {
                 subvol_to_root.insert(sv.name.clone(), p.clone());
@@ -271,7 +272,7 @@ impl<'a> Executor<'a> {
         run_id: Option<i64>,
         space_recovered: &mut HashMap<String, bool>,
         source_free: &HashMap<PathBuf, Option<u64>>,
-        subvol_to_root: &HashMap<String, PathBuf>,
+        subvol_to_root: &HashMap<SubvolName, PathBuf>,
     ) -> SubvolumeResult {
         let subvol_name = &context.name;
         let subvol_start = Instant::now();
@@ -282,13 +283,13 @@ impl<'a> Executor<'a> {
         let mut pin_failures: u32 = 0;
 
         // Transient cleanup tracking: old pin parents from incremental sends
-        let mut old_pin_parents: HashMap<String, std::path::PathBuf> = HashMap::new();
+        let mut old_pin_parents: HashMap<DriveLabel, std::path::PathBuf> = HashMap::new();
         // Clear-all tracking (UPI 031-b): the just-sent snapshot per drive,
         // deleted after the all-sends-succeeded gate for Critical subvolumes so
         // zero local snapshots survive between runs.
-        let mut sent_snapshots: HashMap<String, std::path::PathBuf> = HashMap::new();
-        let mut sends_succeeded: HashSet<String> = HashSet::new();
-        let mut planned_send_drives: HashSet<String> = HashSet::new();
+        let mut sent_snapshots: HashMap<DriveLabel, std::path::PathBuf> = HashMap::new();
+        let mut sends_succeeded: HashSet<DriveLabel> = HashSet::new();
+        let mut planned_send_drives: HashSet<DriveLabel> = HashSet::new();
 
         // UPI 030 drift telemetry: capture the prior successful send time per
         // drive BEFORE this run records any operation, so seconds_since_prev_send
@@ -296,10 +297,10 @@ impl<'a> Executor<'a> {
         // post-F1: one drift sample per (run_id, subvolume), derived from the first
         // successful send in plan-iteration order. Track that send's drive label so
         // we can compute the interval from the right chain after the loop.
-        let prior_send_time_by_drive: HashMap<String, chrono::NaiveDateTime> = self
+        let prior_send_time_by_drive: HashMap<DriveLabel, chrono::NaiveDateTime> = self
             .state
             .map(|s| {
-                let mut map: HashMap<String, chrono::NaiveDateTime> = HashMap::new();
+                let mut map: HashMap<DriveLabel, chrono::NaiveDateTime> = HashMap::new();
                 for op in ops {
                     let drive = match op {
                         PlannedOperation::SendIncremental { drive_label, .. }
@@ -317,7 +318,7 @@ impl<'a> Executor<'a> {
             })
             .unwrap_or_default();
         // Order in which sends are planned, used to find the FIRST successful send.
-        let mut send_plan_order: Vec<(String, SendKind)> = Vec::new();
+        let mut send_plan_order: Vec<(DriveLabel, SendKind)> = Vec::new();
         for op in ops {
             match op {
                 PlannedOperation::SendIncremental { drive_label, .. } => {
@@ -500,7 +501,7 @@ impl<'a> Executor<'a> {
         );
 
         SubvolumeResult {
-            name: subvol_name.to_string(),
+            name: subvol_name.clone(),
             success: subvol_success,
             operations,
             duration: subvol_start.elapsed(),
@@ -516,8 +517,8 @@ impl<'a> Executor<'a> {
 
 /// Group operations by subvolume name, preserving order within each group
 /// and order of first appearance across groups.
-fn group_by_subvolume(ops: &[PlannedOperation]) -> Vec<(String, Vec<&PlannedOperation>)> {
-    let mut groups: Vec<(String, Vec<&PlannedOperation>)> = Vec::new();
+fn group_by_subvolume(ops: &[PlannedOperation]) -> Vec<(SubvolName, Vec<&PlannedOperation>)> {
+    let mut groups: Vec<(SubvolName, Vec<&PlannedOperation>)> = Vec::new();
 
     for op in ops {
         let name = match op {
@@ -542,9 +543,11 @@ fn group_by_subvolume(ops: &[PlannedOperation]) -> Vec<(String, Vec<&PlannedOper
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::{dlabel, svname};
     use super::testkit::*;
     use crate::btrfs::{MockBtrfs, MockBtrfsCall};
-    use crate::types::{DeleteKind, SnapshotName};
+    use crate::plan::DeleteKind;
+    use crate::types::SnapshotName;
     use chrono::NaiveDate;
     use std::path::PathBuf;
 
@@ -594,12 +597,12 @@ mod tests {
                 PlannedOperation::CreateSnapshot {
                     source: PathBuf::from("/data/a"),
                     dest: PathBuf::from("/nonexistent-urd/snap/sv-a/20260322-1430-a"),
-                    subvolume_name: "sv-a".to_string(),
+                    subvolume_name: svname("sv-a"),
                 },
                 PlannedOperation::CreateSnapshot {
                     source: PathBuf::from("/data/b"),
                     dest: PathBuf::from("/nonexistent-urd/snap/sv-b/20260322-1430-b"),
-                    subvolume_name: "sv-b".to_string(),
+                    subvolume_name: svname("sv-b"),
                 },
             ],
             timestamp: ts,
@@ -632,7 +635,7 @@ mod tests {
             operations: vec![PlannedOperation::CreateSnapshot {
                 source: PathBuf::from("/data/a"),
                 dest,
-                subvolume_name: "sv-a".to_string(),
+                subvolume_name: svname("sv-a"),
             }],
             timestamp: NaiveDate::from_ymd_opt(2026, 3, 22)
                 .unwrap()
@@ -666,7 +669,7 @@ mod tests {
             operations: vec![PlannedOperation::CreateSnapshot {
                 source: PathBuf::from("/data/a"),
                 dest: dir.join("20260322-1430-a"),
-                subvolume_name: "sv-a".to_string(),
+                subvolume_name: svname("sv-a"),
             }],
             timestamp: NaiveDate::from_ymd_opt(2026, 3, 22)
                 .unwrap()
@@ -702,13 +705,13 @@ mod tests {
                 PlannedOperation::CreateSnapshot {
                     source: PathBuf::from("/data/a"),
                     dest: PathBuf::from("/nonexistent-urd/snap/sv-a/20260322-1430-a"),
-                    subvolume_name: "sv-a".to_string(),
+                    subvolume_name: svname("sv-a"),
                 },
                 PlannedOperation::SendFull {
                     snapshot: PathBuf::from("/nonexistent-urd/snap/sv-a/20260322-1430-a"),
                     dest_dir: PathBuf::from("/mnt/test/.snapshots/sv-a"),
-                    drive_label: "TEST-DRIVE".to_string(),
-                    subvolume_name: "sv-a".to_string(),
+                    drive_label: dlabel("TEST-DRIVE"),
+                    subvolume_name: svname("sv-a"),
                     pin_on_success: None,
                     reason: FullSendReason::FirstSend,
                     token_verified: false,
@@ -759,8 +762,8 @@ mod tests {
             operations: vec![PlannedOperation::SendFull {
                 snapshot: PathBuf::from("/nonexistent-urd/snap/sv-a/20260322-1430-a"),
                 dest_dir: PathBuf::from("/mnt/test/.snapshots/sv-a"),
-                drive_label: "TEST-DRIVE".to_string(),
-                subvolume_name: "sv-a".to_string(),
+                drive_label: dlabel("TEST-DRIVE"),
+                subvolume_name: svname("sv-a"),
                 pin_on_success: Some((pin_path.clone(), snap_name)),
                 reason: FullSendReason::FirstSend,
                 token_verified: false,
@@ -788,8 +791,8 @@ mod tests {
             operations: vec![PlannedOperation::SendFull {
                 snapshot: PathBuf::from("/nonexistent-urd/snap/sv-a/20260322-1430-a"),
                 dest_dir: PathBuf::from("/mnt/test/.snapshots/sv-a"),
-                drive_label: "TEST-DRIVE".to_string(),
-                subvolume_name: "sv-a".to_string(),
+                drive_label: dlabel("TEST-DRIVE"),
+                subvolume_name: svname("sv-a"),
                 pin_on_success: None,
                 reason: FullSendReason::FirstSend,
                 token_verified: false,
@@ -849,7 +852,7 @@ mod tests {
         assert!(coord.is_poisoned());
         executor.set_watchdog_coord(coord);
 
-        assert!(executor.pool_tripped("sv-a"), "a poisoned lock must not hide the trip");
+        assert!(executor.pool_tripped(&svname("sv-a")), "a poisoned lock must not hide the trip");
 
         executor.execute(&send_full_plan_for_sv_a(), "full");
         assert!(
@@ -918,12 +921,12 @@ mod tests {
                 PlannedOperation::CreateSnapshot {
                     source: PathBuf::from("/data/a"),
                     dest: PathBuf::from("/nonexistent-urd/snap/sv-a/20260322-1430-a"),
-                    subvolume_name: "sv-a".to_string(),
+                    subvolume_name: svname("sv-a"),
                 },
                 PlannedOperation::CreateSnapshot {
                     source: PathBuf::from("/data/b"),
                     dest: PathBuf::from("/nonexistent-urd/snap/sv-b/20260322-1430-b"),
-                    subvolume_name: "sv-b".to_string(),
+                    subvolume_name: svname("sv-b"),
                 },
             ],
             timestamp: ts,
@@ -978,19 +981,19 @@ mod tests {
                 PlannedOperation::DeleteSnapshot {
                     path: PathBuf::from("/mnt/test/.snapshots/sv-a/20260301-a"),
                     reason: "expired".to_string(),
-                    subvolume_name: "sv-a".to_string(),
+                    subvolume_name: svname("sv-a"),
                     kind: DeleteKind::SpacePressure,
                 },
                 PlannedOperation::DeleteSnapshot {
                     path: PathBuf::from("/mnt/test/.snapshots/sv-a/20260302-a"),
                     reason: "expired".to_string(),
-                    subvolume_name: "sv-a".to_string(),
+                    subvolume_name: svname("sv-a"),
                     kind: DeleteKind::SpacePressure,
                 },
                 PlannedOperation::DeleteSnapshot {
                     path: PathBuf::from("/mnt/test/.snapshots/sv-a/20260303-a"),
                     reason: "expired".to_string(),
-                    subvolume_name: "sv-a".to_string(),
+                    subvolume_name: svname("sv-a"),
                     kind: DeleteKind::SpacePressure,
                 },
             ],
@@ -1048,8 +1051,8 @@ mod tests {
             operations: vec![PlannedOperation::SendFull {
                 snapshot: PathBuf::from("/nonexistent-urd/snap/sv-a/20260322-1430-a"),
                 dest_dir: PathBuf::from("/mnt/test/.snapshots/sv-a"),
-                drive_label: "TEST-DRIVE".to_string(),
-                subvolume_name: "sv-a".to_string(),
+                drive_label: dlabel("TEST-DRIVE"),
+                subvolume_name: svname("sv-a"),
                 pin_on_success: None,
                 reason: FullSendReason::FirstSend,
                 token_verified: false,
@@ -1085,13 +1088,13 @@ mod tests {
                 PlannedOperation::DeleteSnapshot {
                     path: PathBuf::from("/mnt/test/.snapshots/sv-a/20260301-a"),
                     reason: "space pressure: expired".to_string(),
-                    subvolume_name: "sv-a".to_string(),
+                    subvolume_name: svname("sv-a"),
                     kind: DeleteKind::SpacePressure,
                 },
                 PlannedOperation::DeleteSnapshot {
                     path: PathBuf::from("/mnt/test/.snapshots/sv-b/20260301-b"),
                     reason: "space pressure: expired".to_string(),
-                    subvolume_name: "sv-b".to_string(),
+                    subvolume_name: svname("sv-b"),
                     kind: DeleteKind::SpacePressure,
                 },
             ],
@@ -1145,25 +1148,25 @@ mod tests {
                 PlannedOperation::DeleteSnapshot {
                     path: PathBuf::from("/mnt/test/.snapshots/sv-a/20260301-a"),
                     reason: "graduated: weekly thinning".to_string(),
-                    subvolume_name: "sv-a".to_string(),
+                    subvolume_name: svname("sv-a"),
                     kind: DeleteKind::Policy,
                 },
                 PlannedOperation::DeleteSnapshot {
                     path: PathBuf::from("/mnt/test/.snapshots/sv-a/20260302-a"),
                     reason: "graduated: weekly thinning".to_string(),
-                    subvolume_name: "sv-a".to_string(),
+                    subvolume_name: svname("sv-a"),
                     kind: DeleteKind::Policy,
                 },
                 PlannedOperation::DeleteSnapshot {
                     path: PathBuf::from("/mnt/test/.snapshots/sv-b/20260301-b"),
                     reason: "graduated: weekly thinning".to_string(),
-                    subvolume_name: "sv-b".to_string(),
+                    subvolume_name: svname("sv-b"),
                     kind: DeleteKind::Policy,
                 },
                 PlannedOperation::DeleteSnapshot {
                     path: PathBuf::from("/mnt/test/.snapshots/sv-b/20260302-b"),
                     reason: "graduated: weekly thinning".to_string(),
-                    subvolume_name: "sv-b".to_string(),
+                    subvolume_name: svname("sv-b"),
                     kind: DeleteKind::Policy,
                 },
             ],
@@ -1230,19 +1233,19 @@ mod tests {
                 PlannedOperation::DeleteSnapshot {
                     path: policy_a.clone(),
                     reason: "graduated: weekly thinning".to_string(),
-                    subvolume_name: "sv-a".to_string(),
+                    subvolume_name: svname("sv-a"),
                     kind: DeleteKind::Policy,
                 },
                 PlannedOperation::DeleteSnapshot {
                     path: policy_b.clone(),
                     reason: "graduated: weekly thinning".to_string(),
-                    subvolume_name: "sv-a".to_string(),
+                    subvolume_name: svname("sv-a"),
                     kind: DeleteKind::Policy,
                 },
                 PlannedOperation::DeleteSnapshot {
                     path: pressure_c.clone(),
                     reason: "space pressure: hourly thinning".to_string(),
-                    subvolume_name: "sv-a".to_string(),
+                    subvolume_name: svname("sv-a"),
                     kind: DeleteKind::SpacePressure,
                 },
             ],
@@ -1301,7 +1304,7 @@ mod tests {
             ops.push(PlannedOperation::DeleteSnapshot {
                 path: PathBuf::from(format!("/mnt/test/.snapshots/sv-a/202601{:02}-a", day)),
                 reason: "graduated: weekly thinning".to_string(),
-                subvolume_name: "sv-a".to_string(),
+                subvolume_name: svname("sv-a"),
                 kind: DeleteKind::Policy,
             });
         }
@@ -1397,19 +1400,19 @@ source = "/data/b"
                 PlannedOperation::DeleteSnapshot {
                     path: PathBuf::from("/nonexistent-urd/snap/sv-a/20260301-a"),
                     reason: "space pressure".to_string(),
-                    subvolume_name: "sv-a".to_string(),
+                    subvolume_name: svname("sv-a"),
                     kind: DeleteKind::SpacePressure,
                 },
                 PlannedOperation::DeleteSnapshot {
                     path: PathBuf::from("/nonexistent-urd/snap/sv-a/20260302-a"),
                     reason: "space pressure".to_string(),
-                    subvolume_name: "sv-a".to_string(),
+                    subvolume_name: svname("sv-a"),
                     kind: DeleteKind::SpacePressure,
                 },
                 PlannedOperation::DeleteSnapshot {
                     path: PathBuf::from("/nonexistent-urd/snap/sv-a/20260303-a"),
                     reason: "space pressure".to_string(),
-                    subvolume_name: "sv-a".to_string(),
+                    subvolume_name: svname("sv-a"),
                     kind: DeleteKind::SpacePressure,
                 },
             ],
@@ -1456,8 +1459,8 @@ source = "/data/b"
             operations: vec![PlannedOperation::SendFull {
                 snapshot: PathBuf::from("/nonexistent-urd/snap/sv-a/20260322-1430-a"),
                 dest_dir: PathBuf::from("/mnt/test/.snapshots/sv-a"),
-                drive_label: "TEST-DRIVE".to_string(),
-                subvolume_name: "sv-a".to_string(),
+                drive_label: dlabel("TEST-DRIVE"),
+                subvolume_name: svname("sv-a"),
                 pin_on_success: Some((pin_path, snap_name)),
                 reason: FullSendReason::FirstSend,
                 token_verified: false,
@@ -1481,17 +1484,17 @@ source = "/data/b"
             PlannedOperation::CreateSnapshot {
                 source: PathBuf::from("/a"),
                 dest: PathBuf::from("/nonexistent-urd/snap/a"),
-                subvolume_name: "sv-a".to_string(),
+                subvolume_name: svname("sv-a"),
             },
             PlannedOperation::CreateSnapshot {
                 source: PathBuf::from("/b"),
                 dest: PathBuf::from("/nonexistent-urd/snap/b"),
-                subvolume_name: "sv-b".to_string(),
+                subvolume_name: svname("sv-b"),
             },
             PlannedOperation::DeleteSnapshot {
                 path: PathBuf::from("/nonexistent-urd/snap/a/old"),
                 reason: "expired".to_string(),
-                subvolume_name: "sv-a".to_string(),
+                subvolume_name: svname("sv-a"),
                 kind: DeleteKind::Policy,
             },
         ];
@@ -1521,12 +1524,12 @@ source = "/data/b"
                 PlannedOperation::CreateSnapshot {
                     source: PathBuf::from("/data/a"),
                     dest: PathBuf::from("/nonexistent-urd/snap/sv-a/20260322-1430-a"),
-                    subvolume_name: "sv-a".to_string(),
+                    subvolume_name: svname("sv-a"),
                 },
                 PlannedOperation::CreateSnapshot {
                     source: PathBuf::from("/data/b"),
                     dest: PathBuf::from("/nonexistent-urd/snap/sv-b/20260322-1430-b"),
-                    subvolume_name: "sv-b".to_string(),
+                    subvolume_name: svname("sv-b"),
                 },
             ],
             timestamp: ts,
@@ -1559,12 +1562,12 @@ source = "/data/b"
                 PlannedOperation::CreateSnapshot {
                     source: PathBuf::from("/data/a"),
                     dest: PathBuf::from("/nonexistent-urd/snap/sv-a/20260322-1430-a"),
-                    subvolume_name: "sv-a".to_string(),
+                    subvolume_name: svname("sv-a"),
                 },
                 PlannedOperation::CreateSnapshot {
                     source: PathBuf::from("/data/b"),
                     dest: PathBuf::from("/nonexistent-urd/snap/sv-b/20260322-1430-b"),
-                    subvolume_name: "sv-b".to_string(),
+                    subvolume_name: svname("sv-b"),
                 },
             ],
             timestamp: ts,
@@ -1608,8 +1611,8 @@ source = "/data/b"
             operations: vec![PlannedOperation::SendFull {
                 snapshot: PathBuf::from("/nonexistent-urd/snap/sv-a/20260322-1430-a"),
                 dest_dir: PathBuf::from("/mnt/test/.snapshots/sv-a"),
-                drive_label: "TEST-DRIVE".to_string(),
-                subvolume_name: "sv-a".to_string(),
+                drive_label: dlabel("TEST-DRIVE"),
+                subvolume_name: svname("sv-a"),
                 pin_on_success: None,
                 reason: FullSendReason::FirstSend,
                 token_verified: false,
@@ -1650,8 +1653,8 @@ source = "/data/b"
             operations: vec![PlannedOperation::SendFull {
                 snapshot: PathBuf::from("/nonexistent-urd/snap/sv-a/20260322-1430-a"),
                 dest_dir: PathBuf::from("/mnt/test/.snapshots/sv-a"),
-                drive_label: "TEST-DRIVE".to_string(),
-                subvolume_name: "sv-a".to_string(),
+                drive_label: dlabel("TEST-DRIVE"),
+                subvolume_name: svname("sv-a"),
                 pin_on_success: None,
                 reason: FullSendReason::ChainBroken,
                 token_verified: false,
@@ -1747,8 +1750,8 @@ source = "/data/b"
             operations: vec![PlannedOperation::SendFull {
                 snapshot: PathBuf::from("/nonexistent-urd/snap/sv-a/20260322-1430-a"),
                 dest_dir: PathBuf::from("/mnt/test/.snapshots/sv-a"),
-                drive_label: "TEST-DRIVE".to_string(),
-                subvolume_name: "sv-a".to_string(),
+                drive_label: dlabel("TEST-DRIVE"),
+                subvolume_name: svname("sv-a"),
                 pin_on_success: None,
                 reason: FullSendReason::ChainBroken,
                 token_verified: true,
@@ -1854,8 +1857,8 @@ source = "/data/b"
                 PlannedOperation::SendFull {
                     snapshot: PathBuf::from("/nonexistent-urd/snap/sv-a/20260322-1430-a"),
                     dest_dir: PathBuf::from("/mnt/test/.snapshots/sv-a"),
-                    drive_label: "TEST-DRIVE".to_string(),
-                    subvolume_name: "sv-a".to_string(),
+                    drive_label: dlabel("TEST-DRIVE"),
+                    subvolume_name: svname("sv-a"),
                     pin_on_success: None,
                     reason: FullSendReason::ChainBroken,
                     token_verified: false,
@@ -1864,7 +1867,7 @@ source = "/data/b"
                 PlannedOperation::CreateSnapshot {
                     source: PathBuf::from("/data/b"),
                     dest: PathBuf::from("/nonexistent-urd/snap/sv-b/20260322-1430-b"),
-                    subvolume_name: "sv-b".to_string(),
+                    subvolume_name: svname("sv-b"),
                 },
             ],
             timestamp: ts,

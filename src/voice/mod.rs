@@ -22,6 +22,7 @@ mod chooser;
 mod doctor;
 mod drive_row;
 mod drives;
+mod duration;
 mod emergency;
 mod encounter;
 mod get;
@@ -63,6 +64,7 @@ pub use init::{
     render_incomplete_deletion_warning, render_init, render_init_first_time,
 };
 pub use plan::{render_empty_plan, render_nothing_to_do, render_plan};
+pub(crate) use duration::DurationStyle;
 pub(crate) use progress::{format_completion_line, format_progress_line};
 pub use retention::{
     render_retention_preview, retention_change_pending_line, retention_hold_warning,
@@ -134,22 +136,6 @@ pub fn approx_size(bytes: u64) -> String {
         bytes.saturating_add(step / 2) / step * step
     };
     crate::types::ByteSize(rounded).to_string()
-}
-
-/// Elapsed time as `m:ss`, or `h:mm:ss` from an hour up — the one duration
-/// convention for the streamed send line, the run header and the run tail.
-#[must_use]
-pub fn format_elapsed(d: std::time::Duration) -> String {
-    let total_secs = d.as_secs();
-    let hours = total_secs / 3600;
-    let mins = (total_secs % 3600) / 60;
-    let secs = total_secs % 60;
-
-    if hours > 0 {
-        format!("{hours}:{mins:02}:{secs:02}")
-    } else {
-        format!("{mins}:{secs:02}")
-    }
 }
 
 pub(super) fn exposure_label(status: PromiseStatus) -> &'static str {
@@ -229,21 +215,6 @@ pub(super) fn group_advisory_notes(
         .collect()
 }
 
-
-/// Humanize seconds into a compact duration string. Cross-renderer helper.
-pub(super) fn humanize_duration(secs: i64) -> String {
-    if secs <= 0 {
-        "<1s".to_string()
-    } else if secs < 60 {
-        format!("{secs}s")
-    } else if secs < 3600 {
-        format!("{}m", secs / 60)
-    } else if secs < 86400 {
-        format!("{}h", secs / 3600)
-    } else {
-        format!("{}d", secs / 86400)
-    }
-}
 
 // ── Table formatter ─────────────────────────────────────────────────────
 
@@ -400,7 +371,7 @@ pub(crate) fn truncate_str(s: &str, max_len: usize) -> String {
 // ── Next-Action Suggestions (4b) ──────────────────────────────────────
 
 /// Context for generating next-action suggestions after commands.
-/// Internal to voice.rs — constructed by render functions from their output data.
+/// Internal to voice/ — constructed by render functions from their output data.
 enum SuggestionContext {
     /// Bare `urd` (default command).
     Default { has_issues: bool },
@@ -797,19 +768,5 @@ mod tests {
         assert_eq!(approx_size(0), "0B");
         assert_eq!(approx_size(45), "45B");
         assert_eq!(approx_size(u64::MAX), "18000000TB");
-    }
-
-    #[test]
-    fn format_elapsed_is_minutes_seconds_then_hours() {
-        use std::time::Duration;
-        assert_eq!(format_elapsed(Duration::from_secs(35)), "0:35");
-        assert_eq!(format_elapsed(Duration::from_secs(274)), "4:34");
-        assert_eq!(format_elapsed(Duration::from_secs(3_725)), "1:02:05");
-    }
-
-    #[test]
-    fn humanize_duration_zero_returns_less_than_one() {
-        assert_eq!(humanize_duration(0), "<1s");
-        assert_eq!(humanize_duration(-1), "<1s");
     }
 }

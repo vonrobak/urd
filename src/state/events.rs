@@ -3,6 +3,7 @@ use crate::events::{Event, EventKind, EventPayload};
 use crate::output::EventRow;
 
 use super::{StateDb, db_err};
+use crate::types::Timestamp;
 
 impl StateDb {
     // ── Event log methods ───────────────────────────────────────────
@@ -39,7 +40,7 @@ impl StateDb {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 rusqlite::params![
                     ev.kind().as_str(),
-                    ev.occurred_at.format("%Y-%m-%dT%H:%M:%S").to_string(),
+                    Timestamp::from(ev.occurred_at).to_string(),
                     ev.run_id,
                     ev.subvolume,
                     ev.drive_label,
@@ -72,7 +73,7 @@ impl StateDb {
             )
             .map_err(db_err("query failed"))?;
 
-        let since = filter.since.as_ref().map(|dt| dt.format("%Y-%m-%dT%H:%M:%S").to_string());
+        let since = filter.since.map(|dt| Timestamp::from(dt).to_string());
         let kind_str = filter.kind.map(|k| k.as_str().to_string());
 
         let rows = stmt
@@ -240,10 +241,11 @@ mod tests {
         DeferScope, Event, EventKind, EventPayload, PruneRule, TransitionTrigger,
     };
     use chrono::NaiveDateTime;
+    use crate::types::TIMESTAMP_FORMAT;
 
     fn ev(payload: EventPayload, dt: &str) -> Event {
         Event {
-            occurred_at: NaiveDateTime::parse_from_str(dt, "%Y-%m-%dT%H:%M:%S").unwrap(),
+            occurred_at: NaiveDateTime::parse_from_str(dt, TIMESTAMP_FORMAT).unwrap(),
             run_id: None,
             subvolume: None,
             drive_label: None,
@@ -399,7 +401,7 @@ mod tests {
             ),
         ]);
         let cutoff =
-            NaiveDateTime::parse_from_str("2026-04-30T00:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
+            NaiveDateTime::parse_from_str("2026-04-30T00:00:00", TIMESTAMP_FORMAT).unwrap();
         let rows = db
             .query_events(&EventQueryFilter {
                 since: Some(cutoff),

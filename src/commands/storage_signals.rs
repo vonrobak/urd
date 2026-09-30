@@ -30,7 +30,7 @@ use crate::output::{AdaptationSummary, PoolPostureSummary};
 use crate::pools::{self, PoolSpace};
 use crate::state::StateDb;
 use crate::storage_critical::{self, ResolvedStorageSignal, StorageSignalMap, TightnessTier};
-use crate::types::PromiseStatus;
+use crate::types::{PromiseStatus, SubvolName};
 
 // The run's arming (`RunArming`, its `resolve`, and the per-pool rows it is
 // built from) is pure and lives in `crate::arming`; re-exported here so
@@ -53,7 +53,7 @@ pub struct StorageSignals {
 enum PoolKey {
     Uuid(String),
     Mount(PathBuf),
-    Subvol(String),
+    Subvol(SubvolName),
 }
 
 /// The host-survival floor for a pool, keyed on its **first send-enabled**
@@ -77,8 +77,8 @@ enum PoolKey {
 #[must_use]
 pub fn pool_floor_bytes(
     config: &Config,
-    pool_subvols: &[String],
-    send_enabled: &HashSet<String>,
+    pool_subvols: &[SubvolName],
+    send_enabled: &HashSet<SubvolName>,
     capacity_bytes: u64,
 ) -> Option<u64> {
     let first = pool_subvols.iter().find(|n| send_enabled.contains(*n))?;
@@ -130,7 +130,7 @@ fn gather_with(
     let mut by_key: HashMap<PoolKey, PoolSignal> = HashMap::new();
     // Subvol name → its pool key, in iteration order, so pass 2 needs no
     // re-resolve / no extra `findmnt`.
-    let mut subvol_order: Vec<(String, PoolKey)> = Vec::new();
+    let mut subvol_order: Vec<(SubvolName, PoolKey)> = Vec::new();
 
     // ── Pass 1: accumulate pools and record each subvol's pool key. ──
     for sv in &resolved {
@@ -164,7 +164,7 @@ fn gather_with(
                 .as_ref()
                 .map(|mp| mp.to_string_lossy().into_owned())
                 .or_else(|| uuid.clone())
-                .unwrap_or_else(|| sv.name.clone());
+                .unwrap_or_else(|| sv.name.to_string());
             by_key.insert(
                 key.clone(),
                 PoolSignal {
@@ -193,7 +193,7 @@ fn gather_with(
     // send-enabled subvol, identical to the watchdog/idle-eject
     // (`resolve_pool_targets` filters the same `sv.enabled && sv.send_enabled`),
     // via the one shared `pool_floor_bytes` so the floors cannot drift. ──
-    let send_enabled: HashSet<String> = resolved
+    let send_enabled: HashSet<SubvolName> = resolved
         .iter()
         .filter(|sv| sv.enabled && sv.send_enabled)
         .map(|sv| sv.name.clone())
@@ -243,7 +243,7 @@ fn gather_with(
 
 /// The write half of storage-signal handling (UPI 082-b, Branch E): the sole
 /// production caller is `backup`'s single post-execution writeback
-/// (`commands/backup.rs`), sanctioned via a clippy `disallowed-methods` allow
+/// (`commands/backup/mod.rs`), sanctioned via a clippy `disallowed-methods` allow
 /// — the same structural guard `world.rs` uses for `assess_view`. Read paths
 /// (`status`, bare `urd`, `doctor`, `urd plan`) never advance state (S1); this
 /// module is where that boundary is enforced, not just documented.
@@ -438,7 +438,7 @@ pub fn aggregate_adaptations(
             .iter()
             .find(|p| p.subvol_names.iter().any(|n| n == &a.name))
             .map(|p| p.label.clone())
-            .unwrap_or_else(|| a.name.clone());
+            .unwrap_or_else(|| a.name.to_string());
 
         // Normalize the cadence/external_only slots to None/false for a
         // local-only group so identical local-only lines share one key (S2).
@@ -469,7 +469,7 @@ pub fn aggregate_adaptations(
                 }
             })
             .subvolumes
-            .push(a.name.clone());
+            .push(a.name.to_string());
     }
 
     order
@@ -479,18 +479,18 @@ pub fn aggregate_adaptations(
 }
 
 // Module-under-test calls its own writeback::advance_and_writeback directly
-// (clippy disallowed-methods guard — backup.rs is the sanctioned production door).
+// (clippy disallowed-methods guard — commands/backup/mod.rs is the sanctioned
+// production door).
 #[allow(clippy::disallowed_methods)]
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::{dlabel, svname};
     use crate::arming::resolve_armed_tiers;
     use crate::events::EventPayload;
     use crate::storage_critical::{StoragePosture, TightnessTier};
 
-    fn dt(s: &str) -> NaiveDateTime {
-        NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S").unwrap()
-    }
+    use crate::testkit::parse_dt as dt;
 
     /// Two subvolumes `alpha` + `beta` sharing one pool (source `/data`), plus
     /// `root` on `/`. `root` is enabled, so `/` is entrusted.
@@ -885,7 +885,7 @@ source = "/"
     fn run_arming_resolve_composes_away_view() {
         // UPI 082, Branches C/D/G: RunArming::resolve = today's tiers fan-out
         // (resolve_armed_tiers) + arming::away_shed_map, composed pre-lock from
-        // ONE artifact. Same away-only-pin shape as plan.rs's
+        // ONE artifact. Same away-only-pin shape as plan/'s
         // upi058_planner_and_executor_agree_on_away_shed, proving the artifact
         // reaches the same away view the planner's own scopes derive.
         use crate::plan::MockFileSystemState;
@@ -953,7 +953,7 @@ local_retention = "transient"
 
         assert_eq!(
             arming.away_shed.get("sv1").map(Vec::as_slice),
-            Some(["D2".to_string()].as_slice()),
+            Some([dlabel("D2")].as_slice()),
             "RunArming::resolve must compose the away-shed view from arming::away_shed_map",
         );
         // Tiers-only fields behave exactly like resolve_armed_tiers on empty
@@ -1176,8 +1176,8 @@ source = "/"
         // first SEND-ENABLED subvol ("sent", min_free 20 GB), not "localonly"
         // (10 GB) — the F1 selection rule the watchdog/idle-eject share.
         let config = floor_cfg();
-        let pool_subvols = vec!["localonly".to_string(), "sent".to_string()];
-        let send_enabled: HashSet<String> = ["sent".to_string()].into_iter().collect();
+        let pool_subvols = vec![svname("localonly"), svname("sent")];
+        let send_enabled: HashSet<SubvolName> = [svname("sent")].into_iter().collect();
         let cap = 1000 * GB;
         let expected = crate::guard::source_floor_bytes(20 * GB, cap);
         assert_eq!(
@@ -1192,8 +1192,8 @@ source = "/"
     fn pool_floor_bytes_none_for_local_only_pool() {
         // No send-enabled subvol → no footprint to cap → None (gate inactive).
         let config = floor_cfg();
-        let pool_subvols = vec!["localonly".to_string()];
-        let send_enabled: HashSet<String> = HashSet::new();
+        let pool_subvols = vec![svname("localonly")];
+        let send_enabled: HashSet<SubvolName> = HashSet::new();
         assert_eq!(
             pool_floor_bytes(&config, &pool_subvols, &send_enabled, 1000 * GB),
             None,
@@ -1208,16 +1208,16 @@ source = "/"
         // "the reactive stack catches what the gate down-arms").
         let config = floor_cfg();
         let cap = 1000 * GB;
-        let send_enabled: HashSet<String> = ["sent".to_string()].into_iter().collect();
+        let send_enabled: HashSet<SubvolName> = [svname("sent")].into_iter().collect();
         let gather_floor = pool_floor_bytes(
             &config,
-            &["localonly".to_string(), "sent".to_string()], // gather: full set
+            &[svname("localonly"), svname("sent")], // gather: full set
             &send_enabled,
             cap,
         );
         let watchdog_floor = pool_floor_bytes(
             &config,
-            &["sent".to_string()], // watchdog: send_subvols only
+            &[svname("sent")], // watchdog: send_subvols only
             &send_enabled,
             cap,
         );
@@ -1324,7 +1324,7 @@ source = "/"
             pools: vec![PoolSignal {
                 uuid: None,
                 label: label.to_string(),
-                subvol_names: subvols.iter().map(|s| s.to_string()).collect(),
+                subvol_names: subvols.iter().map(|s| svname(s)).collect(),
                 free_ratio: None,
                 free_bytes: None,
                 capacity_bytes: None,
@@ -1348,7 +1348,7 @@ source = "/"
         use crate::types::{DriveRole, Interval};
         let external = if has_external {
             vec![DriveAssessment {
-                drive_label: "drive".to_string(),
+                drive_label: dlabel("drive"),
                 status: PromiseStatus::Protected,
                 mounted: true,
                 snapshot_count: Some(1),

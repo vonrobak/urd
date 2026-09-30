@@ -666,7 +666,7 @@ mod tests {
         let capture: SealFn<'_> = &|config, _| {
             sealed_labels
                 .borrow_mut()
-                .extend(config.drives.iter().map(|d| d.label.clone()));
+                .extend(config.drives.iter().map(|d| d.label.to_string()));
             Ok(SealOutcome::Sealed)
         };
         // The "editor" runs as `sh script`, never by exec'ing the script itself:

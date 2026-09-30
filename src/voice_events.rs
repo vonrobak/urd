@@ -625,7 +625,7 @@ mod tests {
         Event {
             occurred_at: NaiveDateTime::parse_from_str(
                 "2026-04-30T03:14:22",
-                "%Y-%m-%dT%H:%M:%S",
+                crate::types::TIMESTAMP_FORMAT,
             )
             .unwrap(),
             run_id: None,

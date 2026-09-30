@@ -144,10 +144,9 @@ pub(super) fn plan_external_send(i: &SendInputs) -> PlanFragment {
                 .and_then(|(_, measured_at)| {
                     // Age against the planner's `now`, never the wall clock
                     // (ADR-108): the same inputs word the same note.
-                    let age_days =
-                        chrono::NaiveDateTime::parse_from_str(&measured_at, "%Y-%m-%dT%H:%M:%S")
-                            .map(|ts| (now - ts).num_days())
-                            .unwrap_or(365); // corrupt timestamp → treat as stale, not fresh
+                    let age_days = measured_at
+                        .map(|ts| (now - ts.as_naive()).num_days())
+                        .unwrap_or(365); // corrupt timestamp → treat as stale, not fresh
                     (age_days > 30).then_some(age_days)
                 });
             SkipReason::CalibratedSizeExceedsSpace {
@@ -187,7 +186,7 @@ pub(super) fn plan_external_send(i: &SendInputs) -> PlanFragment {
         None
     } else {
         Some((
-            local_dir.join(format!(".last-external-parent-{}", drive.label)),
+            crate::chain::pin_path(local_dir, &drive.label),
             snap_to_send.clone(),
         ))
     };
@@ -218,7 +217,7 @@ pub(super) fn plan_external_send(i: &SendInputs) -> PlanFragment {
             subvolume_name: subvol.name.clone(),
             pin_on_success: pin_info,
             reason,
-            token_verified: false, // stamped by backup.rs; see ADR-100 amendment 2026-09-04
+            token_verified: false, // stamped by commands/backup/gating.rs; see ADR-100 amendment 2026-09-04
         });
         // PlannerSendChoice only on full sends — incrementals are routine
         // and covered by the operations log.
@@ -227,11 +226,11 @@ pub(super) fn plan_external_send(i: &SendInputs) -> PlanFragment {
             EventPayload::PlannerSendChoice {
                 send_kind: SendKind::Full,
                 reason,
-                drive_label: drive.label.clone(),
+                drive_label: drive.label.to_string(),
             },
         );
-        event.fill_subvolume(Some(subvol.name.clone()));
-        event.fill_drive_label(Some(drive.label.clone()));
+        event.fill_subvolume(Some(subvol.name.to_string()));
+        event.fill_drive_label(Some(drive.label.to_string()));
         f.push_event(event);
     }
 
@@ -242,8 +241,6 @@ pub(super) fn plan_external_send(i: &SendInputs) -> PlanFragment {
 mod tests {
     use std::path::PathBuf;
 
-    use chrono::{NaiveDate, NaiveDateTime};
-
     use crate::btrfs::MockBtrfs;
     use crate::config::{DriveConfig, ResolvedSubvolume};
     use crate::events::UnstampedEvent;
@@ -251,23 +248,14 @@ mod tests {
     use crate::output::SkipCategory;
     use crate::plan::testkit::MockFileSystemState;
     use crate::storage_critical::EffectivePolicy;
+    use crate::testkit::{drive_config, fixed_now as now, snap};
     use crate::plan::PlannedSkip;
     use crate::types::{
         DriveRole, Interval, LocalRetentionPolicy, MonthlyCount, ResolvedGraduatedRetention,
     };
 
     use super::*;
-
-    fn now() -> NaiveDateTime {
-        NaiveDate::from_ymd_opt(2026, 3, 22)
-            .unwrap()
-            .and_hms_opt(15, 0, 0)
-            .unwrap()
-    }
-
-    fn snap(s: &str) -> SnapshotName {
-        SnapshotName::parse(s).unwrap()
-    }
+    use crate::testkit::{dlabel, svname};
 
     fn local_dir() -> PathBuf {
         PathBuf::from("/snap/sv1")
@@ -275,7 +263,7 @@ mod tests {
 
     fn subvol() -> ResolvedSubvolume {
         ResolvedSubvolume {
-            name: "sv1".to_string(),
+            name: svname("sv1"),
             short_name: "one".to_string(),
             source: PathBuf::from("/data/sv1"),
             priority: 1,
@@ -318,16 +306,7 @@ mod tests {
     }
 
     fn drive() -> DriveConfig {
-        DriveConfig {
-            label: "D1".to_string(),
-            uuid: None,
-            mount_path: PathBuf::from("/mnt/d1"),
-            snapshot_root: ".snapshots".to_string(),
-            role: DriveRole::Primary,
-            max_usage_percent: None,
-            min_free_bytes: None,
-            rotation_interval: None,
-        }
+        drive_config("D1", "/mnt/d1", DriveRole::Primary)
     }
 
     /// Run `plan_external_send` and split its fragment into flat vecs.
@@ -751,7 +730,7 @@ mod tests {
         let pin_dir = tempfile::TempDir::new().unwrap();
         std::fs::write(pin_dir.path().join(".last-external-parent"), parent.as_str()).unwrap();
         let real = crate::observation::RealFileSystemState { state: None };
-        let pin = real.read_pin_file(pin_dir.path(), "D1").unwrap();
+        let pin = real.read_pin_file(pin_dir.path(), &dlabel("D1")).unwrap();
 
         let sv = subvol();
         let e = eff(true, false);
@@ -799,7 +778,7 @@ mod tests {
         let pin_dir = tempfile::TempDir::new().unwrap();
         std::fs::write(pin_dir.path().join(".last-external-parent-D1"), "").unwrap();
         let real = crate::observation::RealFileSystemState { state: None };
-        assert!(real.read_pin_file(pin_dir.path(), "D1").is_err(), "empty pin → Err");
+        assert!(real.read_pin_file(pin_dir.path(), &dlabel("D1")).is_err(), "empty pin → Err");
 
         let sv = subvol();
         let e = eff(true, false);

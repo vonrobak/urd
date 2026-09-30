@@ -7,7 +7,7 @@ use crate::config::Config;
 use crate::drives;
 use crate::output::{OutputMode, VerifyCheck, VerifyDrive, VerifyOutput, VerifySubvolume};
 use crate::observation::{FilesystemQuery, RealFileSystemState};
-use crate::types::SnapshotName;
+use crate::types::{DriveLabel, SnapshotName};
 use crate::voice;
 
 pub fn run(config: Config, args: VerifyArgs, mode: OutputMode) -> anyhow::Result<()> {
@@ -46,12 +46,10 @@ pub(crate) fn collect_verify_output(config: &Config, args: &VerifyArgs) -> Verif
             // Check for stale pin files — suggests send_enabled was previously true
             if let Some(root) = config.snapshot_root_for(&subvol.name) {
                 let local_dir = root.join(&subvol.name);
-                let drive_labels: Vec<String> =
-                    config.drives.iter().map(|d| d.label.clone()).collect();
-                let pinned = chain::find_pinned_snapshots(&local_dir, &drive_labels);
+                let pinned = chain::find_pinned_snapshots(&local_dir, &config.drive_labels());
                 if !pinned.is_empty() {
                     subvolumes.push(VerifySubvolume {
-                        name: subvol.name.clone(),
+                        name: subvol.name.to_string(),
                         drives: vec![VerifyDrive {
                             label: "(config)".to_string(),
                             checks: vec![VerifyCheck {
@@ -98,7 +96,7 @@ pub(crate) fn collect_verify_output(config: &Config, args: &VerifyArgs) -> Verif
                 });
                 total_warn += 1;
                 sv_drives.push(VerifyDrive {
-                    label: drive.label.clone(),
+                    label: drive.label.to_string(),
                     checks,
                 });
                 continue;
@@ -214,13 +212,13 @@ pub(crate) fn collect_verify_output(config: &Config, args: &VerifyArgs) -> Verif
             }
 
             sv_drives.push(VerifyDrive {
-                label: drive.label.clone(),
+                label: drive.label.to_string(),
                 checks,
             });
         }
 
         subvolumes.push(VerifySubvolume {
-            name: subvol.name.clone(),
+            name: subvol.name.to_string(),
             drives: sv_drives,
         });
     }
@@ -284,7 +282,7 @@ fn stale_pin_checks(
     let threshold_secs = stale_threshold_secs(send_interval);
     if age.as_secs() > threshold_secs as u64 {
         let days = age.as_secs() / 86400;
-        let threshold_str = format_threshold(threshold_secs);
+        let threshold_str = voice::DurationStyle::Threshold.render(threshold_secs);
         vec![VerifyCheck {
             name: "stale-pin".to_string(),
             status: "warn".to_string(),
@@ -307,9 +305,8 @@ fn stale_pin_checks(
 /// of the stale-pin check, kept separate from the pure decision in
 /// `stale_pin_checks`. Returns `None` when the pin is absent or its mtime can't
 /// be read (the check is then simply skipped, as before).
-fn pin_file_mtime(local_dir: &Path, drive_label: &str) -> Option<SystemTime> {
-    let pin_path = local_dir.join(format!(".last-external-parent-{drive_label}"));
-    std::fs::metadata(&pin_path).and_then(|m| m.modified()).ok()
+fn pin_file_mtime(local_dir: &Path, drive_label: &DriveLabel) -> Option<SystemTime> {
+    std::fs::metadata(chain::pin_path(local_dir, drive_label)).and_then(|m| m.modified()).ok()
 }
 
 /// Tally `ok` / `warn` statuses from a batch of checks, folding the running
@@ -329,22 +326,14 @@ fn stale_threshold_secs(send_interval: &crate::types::Interval) -> i64 {
     (send_interval.as_secs() * 2).max(86400)
 }
 
-/// Format a threshold in seconds as a human-readable string.
-fn format_threshold(secs: i64) -> String {
-    let days = secs / 86400;
-    if days > 0 {
-        format!("{days} day(s)")
-    } else {
-        format!("{}h", secs / 3600)
-    }
-}
 
 // ── Tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Interval, SnapshotName};
+    use crate::testkit::snap;
+    use crate::types::Interval;
 
     #[test]
     fn stale_threshold_minimum_one_day() {
@@ -358,23 +347,7 @@ mod tests {
         assert_eq!(stale_threshold_secs(&interval), 345600);
     }
 
-    #[test]
-    fn format_threshold_days() {
-        assert_eq!(format_threshold(86400), "1 day(s)");
-        assert_eq!(format_threshold(172800), "2 day(s)");
-    }
-
-    #[test]
-    fn format_threshold_hours() {
-        assert_eq!(format_threshold(7200), "2h");
-        assert_eq!(format_threshold(3600), "1h");
-    }
-
     // ── orphan_checks (pure) ───────────────────────────────────────────
-
-    fn snap(s: &str) -> SnapshotName {
-        SnapshotName::parse(s).unwrap()
-    }
 
     #[test]
     fn orphan_checks_none_when_pin_is_newest() {

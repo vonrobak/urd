@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use super::{CandidateDeletion, DeleteCandidate, Executor, OffsiteChainRelease, ReclaimOutcome};
 use crate::chain;
+use crate::types::{DriveLabel, SubvolName};
 
 impl Executor<'_> {
     /// Pool-scoped emergency reclaim after a mid-op watchdog abort (UPI 033,
@@ -73,8 +74,8 @@ impl Executor<'_> {
     #[must_use]
     pub fn emergency_reclaim_pool(
         &self,
-        subvol_names: &[String],
-        away_sheddable: &HashMap<String, Vec<String>>,
+        subvol_names: &[SubvolName],
+        away_sheddable: &HashMap<SubvolName, Vec<DriveLabel>>,
         floor_bytes: u64,
         measure_free: impl Fn() -> Option<u64>,
     ) -> ReclaimOutcome {
@@ -191,10 +192,10 @@ impl Executor<'_> {
     /// `pinned`, i.e. exactly the snapshot + pin we must shed.
     fn shed_and_delete_unpinned(
         &self,
-        name: &str,
+        name: &SubvolName,
         local_dir: &Path,
-        drive_labels: &[String],
-        pins_to_remove: &[String],
+        drive_labels: &[DriveLabel],
+        pins_to_remove: &[DriveLabel],
     ) -> (u32, Option<String>, Option<PathBuf>, Vec<OffsiteChainRelease>) {
         // (0) Never-the-only-copy gate — a subvol with NO pin has never had a
         // send confirmed offsite, so its local snapshots are its sole stored
@@ -240,7 +241,7 @@ impl Executor<'_> {
             }
             if let Some(parent) = drive_pin {
                 releases.push(OffsiteChainRelease {
-                    subvolume: name.to_string(),
+                    subvolume: name.clone(),
                     drive: label.clone(),
                     parent,
                 });
@@ -355,11 +356,13 @@ impl Executor<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::{dlabel, svname};
     use crate::btrfs::{MockBtrfs, MockBtrfsCall};
     use crate::config::Config;
     use crate::executor::OpResult;
     use crate::executor::testkit::*;
-    use crate::types::{BackupPlan, DeleteKind, PlannedOperation, SnapshotName};
+    use crate::plan::{BackupPlan, DeleteKind, PlannedOperation};
+    use crate::types::SnapshotName;
 
     fn sync_calls(mock: &MockBtrfs) -> Vec<PathBuf> {
         mock.calls()
@@ -376,7 +379,7 @@ mod tests {
     /// nothing) — the behavior these tests were written against, now expressed
     /// through the two-tier signature. The `away` + probe path is exercised by
     /// the dedicated UPI 058 tests below.
-    fn reclaim_blanket(executor: &Executor, subvols: &[String]) -> ReclaimOutcome {
+    fn reclaim_blanket(executor: &Executor, subvols: &[SubvolName]) -> ReclaimOutcome {
         executor.emergency_reclaim_pool(subvols, &HashMap::new(), 0, || None)
     }
 
@@ -396,8 +399,12 @@ mod tests {
         std::fs::create_dir(&parent).unwrap();
         let aborted = sv_dir.join("20260322-1430-t");
         std::fs::create_dir(&aborted).unwrap();
-        chain::write_pin_file(&sv_dir, "DRIVE-A", &SnapshotName::parse("20260321-t").unwrap())
-            .unwrap();
+        chain::write_pin_file(
+            &sv_dir,
+            &dlabel("DRIVE-A"),
+            &SnapshotName::parse("20260321-t").unwrap(),
+        )
+        .unwrap();
         let pin_path = sv_dir.join(".last-external-parent-DRIVE-A");
         assert!(pin_path.exists());
 
@@ -409,7 +416,7 @@ mod tests {
         let shutdown = no_shutdown();
         let executor = Executor::new(&mock, None, &config, &shutdown);
 
-        let outcome = reclaim_blanket(&executor, &["sv-t".to_string()]);
+        let outcome = reclaim_blanket(&executor, &[svname("sv-t")]);
 
         assert!(matches!(outcome, ReclaimOutcome::Reclaimed { .. }));
         assert_eq!(outcome.deleted(), 2);
@@ -448,7 +455,7 @@ mod tests {
         let shutdown = no_shutdown();
         let executor = Executor::new(&mock, None, &config, &shutdown);
 
-        let outcome = reclaim_blanket(&executor, &["sv-t".to_string()]);
+        let outcome = reclaim_blanket(&executor, &[svname("sv-t")]);
 
         assert_eq!(outcome, ReclaimOutcome::Nothing);
         assert!(delete_calls(&mock).is_empty(), "no deletions without a confirmed offsite copy");
@@ -480,7 +487,7 @@ mod tests {
             operations: vec![PlannedOperation::DeleteSnapshot {
                 path: target.clone(),
                 reason: "expired".to_string(),
-                subvolume_name: "sv-t".to_string(),
+                subvolume_name: svname("sv-t"),
                 kind: DeleteKind::Policy,
             }],
             timestamp: test_ts(),
@@ -517,7 +524,7 @@ mod tests {
         let shutdown = no_shutdown();
         let executor = Executor::new(&mock, None, &config, &shutdown);
 
-        let outcome = reclaim_blanket(&executor, &["sv-t".to_string()]);
+        let outcome = reclaim_blanket(&executor, &[svname("sv-t")]);
 
         assert_eq!(outcome, ReclaimOutcome::Nothing, "never-offsite subvol is preserved");
         assert!(delete_calls(&mock).is_empty(), "the only stored copy must not be deleted");
@@ -543,7 +550,7 @@ mod tests {
         std::fs::create_dir(&pinned_snap).unwrap();
         chain::write_pin_file(
             &pinned_dir,
-            "DRIVE-A",
+            &dlabel("DRIVE-A"),
             &SnapshotName::parse("20260322-1430-p").unwrap(),
         )
         .unwrap();
@@ -601,7 +608,7 @@ local_retention = "transient"
         let executor = Executor::new(&mock, None, &config, &shutdown);
 
         let outcome =
-            reclaim_blanket(&executor, &["pinned-sv".to_string(), "nopin-sv".to_string()]);
+            reclaim_blanket(&executor, &[svname("pinned-sv"), svname("nopin-sv")]);
 
         assert!(matches!(outcome, ReclaimOutcome::Reclaimed { .. }));
         assert_eq!(outcome.deleted(), 1);
@@ -625,7 +632,7 @@ local_retention = "transient"
         let shutdown = no_shutdown();
         let executor = Executor::new(&mock, None, &config, &shutdown);
 
-        let outcome = reclaim_blanket(&executor, &["sv-t".to_string()]);
+        let outcome = reclaim_blanket(&executor, &[svname("sv-t")]);
         assert_eq!(outcome, ReclaimOutcome::Nothing);
         assert!(delete_calls(&mock).is_empty());
     }
@@ -641,8 +648,12 @@ local_retention = "transient"
         let snap = sv_dir.join("20260322-1430-t");
         std::fs::create_dir(&snap).unwrap();
         // A pin → confirmed offsite copy, so the offsite gate lets the clear-all proceed.
-        chain::write_pin_file(&sv_dir, "DRIVE-A", &SnapshotName::parse("20260322-1430-t").unwrap())
-            .unwrap();
+        chain::write_pin_file(
+            &sv_dir,
+            &dlabel("DRIVE-A"),
+            &SnapshotName::parse("20260322-1430-t").unwrap(),
+        )
+        .unwrap();
 
         let config = transient_config_n_drives(
             snap_dir.path(),
@@ -652,7 +663,7 @@ local_retention = "transient"
         let shutdown = no_shutdown();
         let executor = Executor::new(&mock, None, &config, &shutdown);
 
-        let outcome = reclaim_blanket(&executor, &["sv-t".to_string()]);
+        let outcome = reclaim_blanket(&executor, &[svname("sv-t")]);
         assert!(matches!(outcome, ReclaimOutcome::Reclaimed { .. }));
         assert_eq!(outcome.deleted(), 1);
         let deletes = delete_calls(&mock);
@@ -688,10 +699,18 @@ local_retention = "transient"
         std::fs::create_dir(&connected).unwrap();
         let away = sv_dir.join("20260101-0900-t");
         std::fs::create_dir(&away).unwrap();
-        chain::write_pin_file(&sv_dir, "PRIMARY", &SnapshotName::parse("20260322-1430-t").unwrap())
-            .unwrap();
-        chain::write_pin_file(&sv_dir, "OFFSITE", &SnapshotName::parse("20260101-0900-t").unwrap())
-            .unwrap();
+        chain::write_pin_file(
+            &sv_dir,
+            &dlabel("PRIMARY"),
+            &SnapshotName::parse("20260322-1430-t").unwrap(),
+        )
+        .unwrap();
+        chain::write_pin_file(
+            &sv_dir,
+            &dlabel("OFFSITE"),
+            &SnapshotName::parse("20260101-0900-t").unwrap(),
+        )
+        .unwrap();
         let primary_pin = sv_dir.join(".last-external-parent-PRIMARY");
         let offsite_pin = sv_dir.join(".last-external-parent-OFFSITE");
         let config = transient_config_n_drives(
@@ -713,11 +732,11 @@ local_retention = "transient"
         )
     }
 
-    fn away_map(subvol: &str, labels: &[&str]) -> HashMap<String, Vec<String>> {
+    fn away_map(subvol: &str, labels: &[&str]) -> HashMap<SubvolName, Vec<DriveLabel>> {
         let mut m = HashMap::new();
         m.insert(
-            subvol.to_string(),
-            labels.iter().map(|s| s.to_string()).collect(),
+            svname(subvol),
+            labels.iter().map(|s| dlabel(s)).collect(),
         );
         m
     }
@@ -739,7 +758,7 @@ local_retention = "transient"
         // probe is read once by the gate, once by the post-Tier-1 sufficiency check.
         let probe_calls = std::cell::Cell::new(0u32);
         let outcome = executor.emergency_reclaim_pool(
-            &["sv-t".to_string()],
+            &[svname("sv-t")],
             &away_map("sv-t", &["OFFSITE"]),
             floor,
             || {
@@ -793,7 +812,7 @@ local_retention = "transient"
 
         let floor = 100;
         let outcome = executor.emergency_reclaim_pool(
-            &["sv-t".to_string()],
+            &[svname("sv-t")],
             &away_map("sv-t", &["OFFSITE"]),
             floor,
             || Some(floor - 1), // below floor throughout → Tier 1 then Tier 2
@@ -819,7 +838,7 @@ local_retention = "transient"
         let shutdown = no_shutdown();
         let executor = Executor::new(&mock, None, &config, &shutdown);
 
-        let outcome = reclaim_blanket(&executor, &["sv-t".to_string()]);
+        let outcome = reclaim_blanket(&executor, &[svname("sv-t")]);
 
         assert_eq!(outcome, ReclaimOutcome::Nothing);
         assert!(delete_calls(&mock).is_empty());
@@ -839,7 +858,7 @@ local_retention = "transient"
 
         let floor = 100;
         let outcome = executor.emergency_reclaim_pool(
-            &["sv-t".to_string()],
+            &[svname("sv-t")],
             &away_map("sv-t", &["OFFSITE"]),
             floor,
             || Some(floor - 1), // still below floor → escalate
@@ -868,7 +887,7 @@ local_retention = "transient"
         let executor = Executor::new(&mock, None, &config, &shutdown);
 
         let outcome = executor.emergency_reclaim_pool(
-            &["sv-t".to_string()],
+            &[svname("sv-t")],
             &away_map("sv-t", &["OFFSITE"]),
             100,
             || None, // probe unavailable → escalate
@@ -894,10 +913,18 @@ local_retention = "transient"
         std::fs::create_dir_all(&sv_dir).unwrap();
         let shared = sv_dir.join("20260322-1430-t");
         std::fs::create_dir(&shared).unwrap();
-        chain::write_pin_file(&sv_dir, "PRIMARY", &SnapshotName::parse("20260322-1430-t").unwrap())
-            .unwrap();
-        chain::write_pin_file(&sv_dir, "OFFSITE", &SnapshotName::parse("20260322-1430-t").unwrap())
-            .unwrap();
+        chain::write_pin_file(
+            &sv_dir,
+            &dlabel("PRIMARY"),
+            &SnapshotName::parse("20260322-1430-t").unwrap(),
+        )
+        .unwrap();
+        chain::write_pin_file(
+            &sv_dir,
+            &dlabel("OFFSITE"),
+            &SnapshotName::parse("20260322-1430-t").unwrap(),
+        )
+        .unwrap();
         let config = transient_config_n_drives(
             snap_dir.path(),
             &[
@@ -913,7 +940,7 @@ local_retention = "transient"
         // reclaim; shed_any_away is false (empty map) → Tier 1 no-op → straight to
         // Tier 2 blanket, the only path that frees a shared snapshot.
         let outcome = executor.emergency_reclaim_pool(
-            &["sv-t".to_string()],
+            &[svname("sv-t")],
             &HashMap::new(),
             100,
             || Some(99),
@@ -940,7 +967,7 @@ local_retention = "transient"
         let executor = Executor::new(&mock, None, &config, &shutdown);
 
         let outcome = executor.emergency_reclaim_pool(
-            &["sv-t".to_string()],
+            &[svname("sv-t")],
             &HashMap::new(),
             100,
             || Some(99), // below floor → entry gate admits; Tier 1 no-op → Tier 2
@@ -980,7 +1007,7 @@ local_retention = "transient"
 
         let floor = 100;
         let outcome = executor.emergency_reclaim_pool(
-            &["sv-t".to_string()],
+            &[svname("sv-t")],
             &away_map("sv-t", &["OFFSITE"]),
             floor,
             || Some(floor), // free == floor → not below → no genuine pressure
@@ -1009,7 +1036,7 @@ local_retention = "transient"
         for n in names {
             std::fs::create_dir(sv_dir.join(n)).unwrap();
         }
-        chain::write_pin_file(&sv_dir, "DRIVE-A", &SnapshotName::parse(names[0]).unwrap())
+        chain::write_pin_file(&sv_dir, &dlabel("DRIVE-A"), &SnapshotName::parse(names[0]).unwrap())
             .unwrap();
         let config = transient_config_n_drives(
             snap_dir.path(),
@@ -1027,10 +1054,11 @@ local_retention = "transient"
         let shutdown = no_shutdown();
         let executor = Executor::new(&mock, None, &config, &shutdown);
 
+        let subvolume = svname("sv-t");
         let candidates: Vec<DeleteCandidate<'_>> = [&pinned, &middle, &latest]
             .into_iter()
             .map(|p| DeleteCandidate {
-                subvolume: "sv-t",
+                subvolume: &subvolume,
                 path: p.clone(),
             })
             .collect();
@@ -1067,10 +1095,11 @@ local_retention = "transient"
         let shutdown = no_shutdown();
         let executor = Executor::new(&mock, None, &config, &shutdown);
 
+        let subvolume = svname("sv-t");
         let candidates: Vec<DeleteCandidate<'_>> = [middle, latest]
             .into_iter()
             .map(|path| DeleteCandidate {
-                subvolume: "sv-t",
+                subvolume: &subvolume,
                 path,
             })
             .collect();

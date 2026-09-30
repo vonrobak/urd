@@ -8,7 +8,7 @@ use crate::types::{
     opacity_violations,
 };
 
-// ── Version dispatch ───────────────────────────────────────────────────
+// ── Version extraction (dispatch: config/mod.rs) ────────────────────────
 
 /// Extract `config_version` from raw TOML without fully parsing the config
 /// schema.

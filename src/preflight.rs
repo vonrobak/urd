@@ -352,7 +352,10 @@ fn check_rotation_interval_on_offsite(config: &Config, checks: &mut Vec<Prefligh
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
-/// Format hours into a human-readable duration string.
+/// Format hours into a human-readable duration string ("1d 12h"). The
+/// duration-style inventory lives in `voice/duration.rs`; this style stays
+/// here because preflight messages are data (they reach `urd verify --json`),
+/// and a pure module below the voice layer does not import `voice/`.
 fn format_hours(hours: i64) -> String {
     if hours >= 24 && hours % 24 == 0 {
         let days = hours / 24;
@@ -371,6 +374,7 @@ fn format_hours(hours: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::{dlabel, svname};
     use crate::config::{
         Config, DefaultsConfig, DriveConfig, GeneralConfig, LocalSnapshotsConfig, SnapshotRoot,
         SubvolumeConfig,
@@ -428,7 +432,7 @@ mod tests {
 
     fn test_drive() -> DriveConfig {
         DriveConfig {
-            label: "test-drive".to_string(),
+            label: dlabel("test-drive"),
             uuid: None,
             mount_path: PathBuf::from("/mnt/test"),
             snapshot_root: "urd-snapshots".to_string(),
@@ -441,7 +445,7 @@ mod tests {
 
     fn test_subvolume(name: &str) -> SubvolumeConfig {
         SubvolumeConfig {
-            name: name.to_string(),
+            name: name.into(),
             short_name: name.to_string(),
             source: PathBuf::from(format!("/{name}")),
             priority: 1,
@@ -463,7 +467,7 @@ mod tests {
         send_interval: &str,
     ) -> SubvolumeConfig {
         SubvolumeConfig {
-            name: name.to_string(),
+            name: name.into(),
             short_name: name.to_string(),
             source: PathBuf::from(format!("/{name}")),
             priority: 1,
@@ -780,7 +784,7 @@ mod tests {
         ret: GraduatedRetention,
     ) -> SubvolumeConfig {
         SubvolumeConfig {
-            name: name.to_string(),
+            name: name.into(),
             short_name: name.to_string(),
             source: PathBuf::from(format!("/{name}")),
             priority: 1,
@@ -883,7 +887,7 @@ mod tests {
             yearly: Some(5),
         };
         let sv = SubvolumeConfig {
-            name: "sv1".to_string(),
+            name: svname("sv1"),
             short_name: "sv1".to_string(),
             source: PathBuf::from("/sv1"),
             priority: 1,
@@ -916,7 +920,7 @@ mod tests {
             yearly: Some(5),
         };
         let sv = SubvolumeConfig {
-            name: "sv1".to_string(),
+            name: svname("sv1"),
             short_name: "sv1".to_string(),
             source: PathBuf::from("/sv1"),
             priority: 1,
@@ -948,7 +952,7 @@ mod tests {
             yearly: Some(3),
         };
         let sv = SubvolumeConfig {
-            name: "sv1".to_string(),
+            name: svname("sv1"),
             short_name: "sv1".to_string(),
             source: PathBuf::from("/sv1"),
             priority: 1,
@@ -981,7 +985,7 @@ mod tests {
             yearly: Some(0),
         };
         let sv = SubvolumeConfig {
-            name: "sv1".to_string(),
+            name: svname("sv1"),
             short_name: "sv1".to_string(),
             source: PathBuf::from("/sv1"),
             priority: 1,
@@ -1069,7 +1073,7 @@ mod tests {
 
     fn offsite_drive() -> DriveConfig {
         DriveConfig {
-            label: "offsite-drive".to_string(),
+            label: dlabel("offsite-drive"),
             uuid: None,
             mount_path: PathBuf::from("/mnt/offsite"),
             snapshot_root: "urd-snapshots".to_string(),
@@ -1086,7 +1090,7 @@ mod tests {
         sv.protection_level = Some(crate::types::ProtectionLevel::Fortified);
         // Two primary drives — no offsite
         let mut drive2 = test_drive();
-        drive2.label = "drive-2".to_string();
+        drive2.label = dlabel("drive-2");
         let config = test_config(vec![sv], vec![test_drive(), drive2]);
         let results: Vec<_> = preflight_checks(&config)
             .into_iter()
@@ -1127,7 +1131,7 @@ mod tests {
     fn fortified_with_scoped_offsite_drive_passes() {
         let mut sv = test_subvolume("recordings");
         sv.protection_level = Some(crate::types::ProtectionLevel::Fortified);
-        sv.drives = Some(vec!["test-drive".to_string(), "offsite-drive".to_string()]);
+        sv.drives = Some(vec![dlabel("test-drive"), dlabel("offsite-drive")]);
         let config = test_config(vec![sv], vec![test_drive(), offsite_drive()]);
         let results: Vec<_> = preflight_checks(&config)
             .into_iter()
@@ -1165,5 +1169,16 @@ mod tests {
             .collect();
 
         assert!(results.is_empty());
+    }
+
+    /// The duration-style inventory table (see `voice/duration.rs`), on the
+    /// shared inputs converted to whole hours as the caller does.
+    #[test]
+    fn format_hours_inventory_table() {
+        let got: Vec<String> = [0i64, 59, 61, 3599, 3661, 90061, 129600, 2595661, -61]
+            .iter()
+            .map(|&s| format_hours(s / 3600))
+            .collect();
+        assert_eq!(got, ["0h", "0h", "0h", "0h", "1h", "1d 1h", "1d 12h", "30d 1h", "0h"]);
     }
 }

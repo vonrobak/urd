@@ -16,10 +16,11 @@ pub fn run_daemon(config: Config, config_override: Option<&Path>) -> anyhow::Res
 /// Show sentinel status.
 pub fn status(config: Config, output_mode: OutputMode) -> anyhow::Result<()> {
     let state_path = sentinel_state_path(&config);
+    let now = chrono::Local::now().naive_local();
 
     let status_output = match read_sentinel_state_file(&state_path) {
         Some(state) if is_pid_alive(state.pid) => {
-            let uptime = format_uptime(&state.started);
+            let uptime = format_uptime(&state.started, now);
             SentinelStatusOutput::Running { state: Box::new(state), uptime }
         }
         Some(state) => {
@@ -31,35 +32,22 @@ pub fn status(config: Config, output_mode: OutputMode) -> anyhow::Result<()> {
         None => SentinelStatusOutput::NotRunning { last_seen: None },
     };
 
-    let now = chrono::Local::now().naive_local();
     let rendered = voice::render_sentinel_status(&status_output, output_mode, now);
     print!("{rendered}");
 
     Ok(())
 }
 
-/// Format uptime from a started timestamp string to a human-readable duration.
-fn format_uptime(started: &str) -> String {
+/// Format uptime from a started timestamp string to a human-readable duration
+/// (the voice's `Uptime` style), measured against the caller's `now`. The
+/// string travels in `SentinelStatusOutput::Running.uptime`, so it is part of
+/// `urd sentinel status --json` as well as the interactive line.
+fn format_uptime(started: &str, now: chrono::NaiveDateTime) -> String {
     let Ok(started_dt) =
-        chrono::NaiveDateTime::parse_from_str(started, "%Y-%m-%dT%H:%M:%S")
+        chrono::NaiveDateTime::parse_from_str(started, crate::types::TIMESTAMP_FORMAT)
     else {
         return "unknown".to_string();
     };
 
-    let now = chrono::Local::now().naive_local();
-    let elapsed = now.signed_duration_since(started_dt);
-
-    let total_minutes = elapsed.num_minutes();
-    if total_minutes < 1 {
-        return "just started".to_string();
-    }
-
-    let hours = total_minutes / 60;
-    let minutes = total_minutes % 60;
-
-    if hours > 0 {
-        format!("{hours}h {minutes}m")
-    } else {
-        format!("{minutes}m")
-    }
+    voice::DurationStyle::Uptime.render(now.signed_duration_since(started_dt).num_seconds())
 }

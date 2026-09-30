@@ -8,7 +8,8 @@ use std::time::Duration;
 use crate::executor::SendType;
 use crate::types::ByteSize;
 
-use super::{approx_size, format_elapsed};
+use super::approx_size;
+use super::duration::clock;
 
 /// Format the live progress line shown during an active send.
 #[allow(clippy::too_many_arguments)]
@@ -22,7 +23,7 @@ pub(crate) fn format_progress_line(
     elapsed: Duration,
     estimated: Option<u64>,
 ) -> String {
-    let elapsed_str = format_elapsed(elapsed);
+    let elapsed_str = clock(elapsed);
     let prefix = format!("  [{index}/{total}] {name} → {drive}:");
 
     // ETA and denominator for full sends with estimates
@@ -47,7 +48,7 @@ pub(crate) fn format_progress_line(
                     approx_size(est),
                     ByteSize(rate as u64),
                     elapsed_str,
-                    format_elapsed(remaining),
+                    clock(remaining),
                 ),
                 None => format!(
                     " {} / ~{} @ {}/s  [{}]",
@@ -105,7 +106,7 @@ pub(crate) fn format_completion_line(
         name,
         drive,
         ByteSize(bytes),
-        format_elapsed(elapsed),
+        clock(elapsed),
         type_label,
     )
 }

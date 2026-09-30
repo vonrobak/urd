@@ -1,15 +1,16 @@
 //! Pool detection and per-pool sysfs/statvfs helpers (UPI 043).
 //!
-//! I/O module — sibling of `drives.rs`. Findmnt subprocess + sysfs/statvfs
-//! syscalls. Two pure helpers (`group_subvolumes_by_pool`,
+//! I/O module — sibling of `drives.rs`. The `findmnt --target` probe
+//! (`probes::findmnt_target`) + sysfs/statvfs syscalls. Two pure helpers (`group_subvolumes_by_pool`,
 //! `compute_pool_metrics_from`) are extracted for unit testability per
 //! ADR-108's spirit. No module spawns `btrfs` subprocesses.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use crate::config::{Config, DriveConfig};
 use crate::error::UrdError;
+use crate::probes;
+use crate::types::{DriveLabel, SubvolName};
 
 /// A detected source pool: one BTRFS filesystem hosting one or more configured
 /// subvolume sources.
@@ -21,7 +22,7 @@ pub struct SourcePool {
     pub mountpoints: Vec<PathBuf>,
     /// Subvolume `name`s on this pool — used only for in-run grouping; not
     /// written to the heartbeat (R4).
-    pub subvolume_names: Vec<String>,
+    pub subvolume_names: Vec<SubvolName>,
 }
 
 /// One row of input to `compute_pool_metrics_from`: a drive's configured
@@ -29,7 +30,7 @@ pub struct SourcePool {
 /// was found mounted.
 #[derive(Debug, Clone)]
 pub struct DriveResolution {
-    pub label: String,
+    pub label: DriveLabel,
     pub uuid: Option<String>,
     pub mounted: bool,
     pub mountpoint: Option<PathBuf>,
@@ -41,22 +42,10 @@ pub struct DriveResolution {
 // duplicate contract.
 use crate::metrics::PoolMetric;
 
-/// One resolved row from the concentrated `findmnt --target` probe: which
-/// filesystem (if any) holds an arbitrary path. All three fields are
-/// independent — a mount can resolve a `target` with an empty `uuid` (no
-/// superblock UUID), and `fstype` lets a caller gate on "must be btrfs"
-/// without a second probe (UPI 084; see `discover()`'s home-pool lookup).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct FindmntEntry {
-    pub target: Option<PathBuf>,
-    pub fstype: Option<String>,
-    pub uuid: Option<String>,
-}
-
 /// Resolve the BTRFS filesystem UUID hosting an arbitrary path.
 /// `Ok(None)` for missing paths or mounts without a UUID.
 pub fn pool_uuid_for_path(path: &Path) -> crate::error::Result<Option<String>> {
-    Ok(findmnt_probe_target(path)?.uuid)
+    Ok(probes::findmnt_target(path)?.uuid)
 }
 
 /// Resolve a source path's pool UUID **and** mountpoint in a **single**
@@ -69,73 +58,8 @@ pub fn pool_uuid_for_path(path: &Path) -> crate::error::Result<Option<String>> {
 pub fn resolve_source_pool(
     path: &Path,
 ) -> crate::error::Result<(Option<String>, Option<PathBuf>)> {
-    let entry = findmnt_probe_target(path)?;
+    let entry = probes::findmnt_target(path)?;
     Ok((entry.uuid, entry.target))
-}
-
-/// The concentrated `findmnt --target` probe (UPI 084): one subprocess spawn
-/// and one parser for "which filesystem holds this path?" queries, shared by
-/// `pool_uuid_for_path`, `resolve_source_pool`, `drives::get_filesystem_uuid`,
-/// and `discovery`'s home-pool lookup (which additionally gates on
-/// `fstype == "btrfs"` at its call site, since that filter is specific to
-/// discovery's zero-state inventory and not shared by the other consumers).
-///
-/// Uses `-J` (JSON) output — the most robust `findmnt` format to parse,
-/// tolerant of field reordering and locale quirks that broke the older `-P`
-/// key="value" parser. `Err` only on a findmnt I/O failure with stderr
-/// content; a missing/unmounted path → `Ok(FindmntEntry::default())`.
-pub fn findmnt_probe_target(path: &Path) -> crate::error::Result<FindmntEntry> {
-    let path_str = path.to_str().ok_or_else(|| UrdError::Io {
-        path: path.to_path_buf(),
-        source: std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "path is not valid UTF-8",
-        ),
-    })?;
-
-    let output = Command::new("findmnt")
-        .env("LC_ALL", "C")
-        .args(["-J", "-o", "TARGET,FSTYPE,UUID", "--target", path_str])
-        .output()
-        .map_err(|e| UrdError::Io {
-            path: PathBuf::from("findmnt"),
-            source: e,
-        })?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    if !output.status.success() {
-        if stdout.trim().is_empty() {
-            // findmnt complained about a missing path; treat as "unresolved".
-            return Ok(FindmntEntry::default());
-        }
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(UrdError::Io {
-            path: path.to_path_buf(),
-            source: std::io::Error::other(format!("findmnt failed: {}", stderr.trim())),
-        });
-    }
-
-    Ok(parse_findmnt_probe_target(&stdout))
-}
-
-/// Pure parse of `findmnt -J -o TARGET,FSTYPE,UUID --target <path>` output —
-/// a single-entry `filesystems` array. Empty/absent fields map to `None`.
-/// Extracted for unit testing (the subprocess wrapper above stays a thin I/O
-/// shim).
-#[must_use]
-fn parse_findmnt_probe_target(json: &str) -> FindmntEntry {
-    let Some(fs) = serde_json::from_str::<serde_json::Value>(json)
-        .ok()
-        .and_then(|root| root.get("filesystems")?.as_array()?.first().cloned())
-    else {
-        return FindmntEntry::default();
-    };
-    let non_empty = |v: Option<&str>| v.filter(|s| !s.is_empty()).map(str::to_string);
-    FindmntEntry {
-        target: non_empty(fs.get("target").and_then(serde_json::Value::as_str)).map(PathBuf::from),
-        fstype: non_empty(fs.get("fstype").and_then(serde_json::Value::as_str)),
-        uuid: non_empty(fs.get("uuid").and_then(serde_json::Value::as_str)),
-    }
 }
 
 /// Group configured subvolume sources by source-pool UUID. Subvolumes whose
@@ -144,7 +68,7 @@ fn parse_findmnt_probe_target(json: &str) -> FindmntEntry {
 /// see R4). I/O is read-only (findmnt + sysfs); no subprocess spawn beyond
 /// findmnt.
 pub fn detect_source_pools(config: &Config) -> Vec<SourcePool> {
-    let pairs: Vec<(String, Option<String>, Option<PathBuf>)> = config
+    let pairs: Vec<(SubvolName, Option<String>, Option<PathBuf>)> = config
         .subvolumes
         .iter()
         .map(|sv| {
@@ -162,7 +86,7 @@ pub fn detect_source_pools(config: &Config) -> Vec<SourcePool> {
 /// excluded; mountpoints are deduplicated and sorted per pool.
 #[must_use]
 pub fn group_subvolumes_by_pool(
-    pairs: &[(String, Option<String>, Option<PathBuf>)],
+    pairs: &[(SubvolName, Option<String>, Option<PathBuf>)],
 ) -> Vec<SourcePool> {
     let mut by_uuid: std::collections::BTreeMap<String, SourcePool> =
         std::collections::BTreeMap::new();
@@ -329,7 +253,7 @@ pub fn compute_pool_metrics_from(
         out.push(PoolMetric {
             uuid: uuid.clone(),
             role: "destination".to_string(),
-            label: drive.label.clone(),
+            label: drive.label.to_string(),
             free_bytes: space.map(|s| s.free_bytes),
             capacity_bytes: space.map(|s| s.capacity_bytes),
             metadata_utilization_ratio: meta,
@@ -353,7 +277,7 @@ pub fn canonical_mountpoint_label(mountpoints: &[PathBuf]) -> String {
 }
 
 /// Construct a `DriveResolution` from a config drive plus its observed mount
-/// state. Intended for callers in `commands/backup.rs` (slice 5); kept here
+/// state. Called from `commands/backup/observability.rs`; kept here
 /// so all pool-input bundling lives next to the pure helper that consumes it.
 #[must_use]
 pub fn resolve_drive(
@@ -376,6 +300,7 @@ pub fn resolve_drive(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::{dlabel, svname};
     use tempfile::TempDir;
 
     fn write_sysfs_fixture(root: &Path, uuid: &str, used: &str, total: &str) {
@@ -383,49 +308,6 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("bytes_used"), used).unwrap();
         std::fs::write(dir.join("total_bytes"), total).unwrap();
-    }
-
-    // ── UPI 084: concentrated findmnt --target probe ────────────────
-
-    #[test]
-    fn parse_findmnt_probe_target_both_present() {
-        let entry = parse_findmnt_probe_target(
-            r#"{"filesystems":[{"target":"/","fstype":"btrfs","uuid":"6c1a-1234"}]}"#,
-        );
-        assert_eq!(entry.uuid.as_deref(), Some("6c1a-1234"));
-        assert_eq!(entry.target, Some(PathBuf::from("/")));
-        assert_eq!(entry.fstype.as_deref(), Some("btrfs"));
-    }
-
-    #[test]
-    fn parse_findmnt_probe_target_empty_uuid_is_none() {
-        // Non-BTRFS mount: TARGET resolves, UUID is empty → mountpoint still
-        // surfaces so storage-signal gathering can read free-ratio (S5).
-        let entry = parse_findmnt_probe_target(
-            r#"{"filesystems":[{"target":"/boot","fstype":"vfat","uuid":""}]}"#,
-        );
-        assert_eq!(entry.uuid, None);
-        assert_eq!(entry.target, Some(PathBuf::from("/boot")));
-        assert_eq!(entry.fstype.as_deref(), Some("vfat"));
-    }
-
-    #[test]
-    fn parse_findmnt_probe_target_empty_output_is_default() {
-        assert_eq!(parse_findmnt_probe_target(""), FindmntEntry::default());
-        assert_eq!(parse_findmnt_probe_target("{}"), FindmntEntry::default());
-        assert_eq!(
-            parse_findmnt_probe_target(r#"{"filesystems":[]}"#),
-            FindmntEntry::default()
-        );
-    }
-
-    #[test]
-    fn parse_findmnt_probe_target_tolerates_target_with_space() {
-        let entry = parse_findmnt_probe_target(
-            r#"{"filesystems":[{"target":"/mnt/my drive","fstype":"btrfs","uuid":"abcd"}]}"#,
-        );
-        assert_eq!(entry.uuid.as_deref(), Some("abcd"));
-        assert_eq!(entry.target, Some(PathBuf::from("/mnt/my drive")));
     }
 
     /// A `space_resolver` that ignores the path and always reports the same
@@ -475,17 +357,17 @@ mod tests {
     fn group_subvolumes_by_pool_groups_by_uuid() {
         let pairs = vec![
             (
-                "home".to_string(),
+                svname("home"),
                 Some("uuid-a".to_string()),
                 Some(PathBuf::from("/home")),
             ),
             (
-                "etc".to_string(),
+                svname("etc"),
                 Some("uuid-a".to_string()),
                 Some(PathBuf::from("/")),
             ),
             (
-                "data".to_string(),
+                svname("data"),
                 Some("uuid-b".to_string()),
                 Some(PathBuf::from("/data")),
             ),
@@ -503,11 +385,11 @@ mod tests {
     fn group_subvolumes_by_pool_skips_unknown_uuid_subvolumes() {
         let pairs = vec![
             (
-                "home".to_string(),
+                svname("home"),
                 Some("uuid-a".to_string()),
                 Some(PathBuf::from("/home")),
             ),
-            ("orphan".to_string(), None, None),
+            (svname("orphan"), None, None),
         ];
         let pools = group_subvolumes_by_pool(&pairs);
         assert_eq!(pools.len(), 1);
@@ -518,12 +400,12 @@ mod tests {
     fn group_subvolumes_by_pool_dedups_mountpoints() {
         let pairs = vec![
             (
-                "home".to_string(),
+                svname("home"),
                 Some("uuid-a".to_string()),
                 Some(PathBuf::from("/home")),
             ),
             (
-                "var".to_string(),
+                svname("var"),
                 Some("uuid-a".to_string()),
                 Some(PathBuf::from("/home")),
             ),
@@ -559,10 +441,10 @@ mod tests {
         let pools = vec![SourcePool {
             uuid: "uuid-src".to_string(),
             mountpoints: vec![PathBuf::from("/home")],
-            subvolume_names: vec!["home".to_string()],
+            subvolume_names: vec![svname("home")],
         }];
         let drives = vec![DriveResolution {
-            label: "WD-18TB".to_string(),
+            label: dlabel("WD-18TB"),
             uuid: Some("uuid-dst".to_string()),
             mounted: true,
             mountpoint: Some(PathBuf::from("/mnt/wd")),
@@ -586,7 +468,7 @@ mod tests {
     #[test]
     fn compute_pool_metrics_from_skips_unmounted_drives() {
         let drives = vec![DriveResolution {
-            label: "WD-18TB".to_string(),
+            label: dlabel("WD-18TB"),
             uuid: Some("uuid-dst".to_string()),
             mounted: false,
             mountpoint: None,
@@ -644,7 +526,7 @@ mod tests {
     #[test]
     fn compute_pool_metrics_from_skips_drives_without_uuid() {
         let drives = vec![DriveResolution {
-            label: "WD-18TB".to_string(),
+            label: dlabel("WD-18TB"),
             uuid: None,
             mounted: true,
             mountpoint: Some(PathBuf::from("/mnt/wd")),
