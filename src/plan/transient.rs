@@ -2,6 +2,7 @@ use chrono::NaiveDateTime;
 
 use crate::config::DriveConfig;
 use crate::events::DeferScope;
+use crate::plan::SkipReason;
 
 use super::fragment::{
     ExternalRetentionInputs, LocalRetentionInputs, LocalSnapshotInputs, PlanFragment, SendInputs,
@@ -100,7 +101,7 @@ pub(super) fn plan_transient_lifecycle(i: &TransientInputs) -> PlanFragment {
             f.defer(
                 &subvol.name,
                 None,
-                "transient \u{2014} no drives available for send".to_string(),
+                SkipReason::TransientNoDrives,
                 None,
                 DeferScope::Subvolume,
                 now,
@@ -125,25 +126,15 @@ pub(super) fn plan_transient_lifecycle(i: &TransientInputs) -> PlanFragment {
                 Some((drive.label.clone(), next_in.num_minutes()))
             })
             .collect();
-        let skip_msg = next_dues
-            .iter()
-            .map(|(label, mins)| {
-                format!(
-                    "send to {} not due (next in ~{})",
-                    label,
-                    super::format_duration_short(*mins)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("; ");
-        if !skip_msg.is_empty() {
+        if !next_dues.is_empty() {
+            let next_due = next_dues.iter().map(|(_, m)| *m).min();
             // Subvolume-scope: applies to the whole subvolume across the
             // batch of sendable drives, not a single drive.
             f.defer(
                 &subvol.name,
                 None,
-                skip_msg,
-                next_dues.iter().map(|(_, m)| *m).min(),
+                SkipReason::SendsNotDue { drives: next_dues },
+                next_due,
                 DeferScope::Subvolume,
                 now,
             );
@@ -254,9 +245,9 @@ mod tests {
     use crate::plan::testkit::MockFileSystemState;
     use crate::plan::PlanFilters;
     use crate::storage_critical::EffectivePolicy;
+    use crate::plan::{PlannedOperation, PlannedSkip};
     use crate::types::{
-        Interval, LocalRetentionPolicy, MonthlyCount, PlannedOperation, PlannedSkip,
-        ResolvedGraduatedRetention, SnapshotName,
+        Interval, LocalRetentionPolicy, MonthlyCount, ResolvedGraduatedRetention, SnapshotName,
     };
 
     use super::*;
@@ -470,7 +461,7 @@ priority = 1
 
         assert_eq!(skipped.len(), 1);
         assert!(
-            skipped[0].reason.contains("host-survival floor"),
+            skipped[0].reason.to_string().contains("host-survival floor"),
             "{}",
             skipped[0].reason
         );
@@ -513,7 +504,7 @@ priority = 1
 
         assert_eq!(skipped.len(), 1);
         assert_eq!(
-            skipped[0].reason,
+            skipped[0].reason.to_string(),
             "transient \u{2014} no drives available for send"
         );
         assert_eq!(ops.len(), 1);
@@ -567,7 +558,7 @@ priority = 1
 
         // A's drive-scoped gate defer is the only skip.
         assert_eq!(skipped.len(), 1);
-        assert_eq!(skipped[0].reason, "drive D1 not mounted");
+        assert_eq!(skipped[0].reason.to_string(), "drive D1 not mounted");
         let stamped = events[0]
             .clone()
             .stamp(&crate::events::RunContext::outside_run());
@@ -613,7 +604,7 @@ priority = 1
 
         assert_eq!(skipped.len(), 1);
         assert_eq!(
-            skipped[0].reason,
+            skipped[0].reason.to_string(),
             "send to D1 not due (next in ~3h0m); send to D2 not due (next in ~2h0m)"
         );
         // next_due_minutes = min across drives.
@@ -756,7 +747,7 @@ priority = 1
         assert!(is_delete_of(&ops[2], "20260322-0900-one"));
         assert_eq!(ops.len(), 3, "{ops:?}");
         assert_eq!(skipped.len(), 1);
-        assert_eq!(skipped[0].reason, "send to D2 not due (next in ~3h0m)");
+        assert_eq!(skipped[0].reason.to_string(), "send to D2 not due (next in ~3h0m)");
         assert_eq!(skipped[0].next_due_minutes, Some(180));
         assert_invariant_clean(&ops, &skipped);
     }
@@ -814,7 +805,7 @@ priority = 1
 
         assert_eq!(skipped.len(), 1);
         assert!(
-            skipped[0].reason.contains("host-survival floor"),
+            skipped[0].reason.to_string().contains("host-survival floor"),
             "{}",
             skipped[0].reason
         );

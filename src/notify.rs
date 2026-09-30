@@ -7,15 +7,24 @@
 //
 // This is component 5a of the Sentinel design (see docs/95-ideas/
 // 2026-03-26-design-sentinel.md). It runs at the end of `urd backup`,
-// not as a daemon.
+// not as a daemon. The sentinel daemon's content builders
+// (`build_notifications`, `build_health_notifications`,
+// `check_backup_overdue`, `build_drive_anomaly_notification`) live here
+// too; the runner only decides when to call them and dispatches.
 
 use std::path::PathBuf;
 use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
-use crate::awareness::{PromiseChange, PromiseRollup, PromiseSnapshot, promise_changes};
+use chrono::NaiveDateTime;
+
+use crate::awareness::{
+    PromiseChange, PromiseRollup, PromiseSnapshot, SubvolAssessment, promise_changes,
+    snapshot_promises,
+};
 use crate::heartbeat::{Heartbeat, SubvolumeHeartbeat};
+use crate::sentinel::HealthSnapshot;
 use crate::storage_critical::{TightnessTier, Transition};
 
 // ── Event types ────────────────────────────────────────────────────────
@@ -162,7 +171,7 @@ impl std::fmt::Display for Urgency {
 pub struct Notification {
     /// Read only by this module's tests, which pattern-match the event a
     /// notification was built from; the dispatcher renders title/body.
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub event: NotificationEvent,
     pub urgency: Urgency,
     pub title: String,
@@ -322,7 +331,7 @@ pub fn compute_notifications(
 /// degraded/recovered/all-unprotected prose (UPI 088-a, arc R1).
 ///
 /// Both notification paths feed it: `compute_notifications` (heartbeat
-/// diff, backup path) and `sentinel_runner::build_notifications`
+/// diff, backup path) and `build_notifications`
 /// (assessment diff, daemon path). First-run suppression is deliberately
 /// the caller's: pass the changes you want spoken and the
 /// all-unprotected verdict you computed — the two callers suppress
@@ -661,6 +670,163 @@ pub fn build_emergency_retention_notification(
         urgency: Urgency::Warning,
         title: "Emergency retention ran".to_string(),
         body,
+    }
+}
+
+// ── Sentinel-path notifications (S2 fix, VFM-B, HSD-B) ────────────────
+// Content builders for the daemon path. The sentinel runner decides WHEN
+// (first-run suppression, debounce, change detection); these decide WHAT.
+
+/// Build notifications from Sentinel-observed promise state changes.
+///
+/// Pure function: previous promise snapshots + current assessments → notifications.
+///
+/// Contract:
+/// - Produces: PromiseDegraded, PromiseRecovered, AllUnprotected
+/// - Does NOT produce: BackupFailures, PinWriteFailures (backup-path-only events)
+/// - BackupOverdue is handled separately by `check_backup_overdue()` (S1 fix)
+/// - Urgency: degradation = Warning, recovery = Info, AllUnprotected = Critical
+///
+/// This is a separate path from `notify::compute_notifications()`, which operates
+/// on heartbeat data. The two paths converge at `notify::dispatch()`.
+pub fn build_notifications(
+    previous: &[PromiseSnapshot],
+    current: &[SubvolAssessment],
+) -> Vec<Notification> {
+    // Thin adapter over the shared prose core (UPI 088-a, arc R1):
+    // detect via awareness, speak via notify. First-run suppression is
+    // NOT here — the `has_initial_assessment && has_promise_changes`
+    // gate in execute_assess owns it (load-bearing: with an empty
+    // `previous`, all-unprotected below would still fire).
+    let changes = promise_changes(previous, &snapshot_promises(current));
+    let all_unprotected = PromiseRollup::from_assessments(current).all_unprotected();
+
+    build_promise_change_notifications(&changes, all_unprotected)
+}
+
+/// Check whether the heartbeat is stale and a BackupOverdue notification is needed.
+///
+/// Pure function (S2 fix): takes heartbeat data and current time, returns notification.
+/// Called independently from promise-change notifications so it fires even when
+/// promise states are stable (S1 fix). Debouncing is the caller's responsibility (M2).
+#[must_use]
+pub fn check_backup_overdue(
+    heartbeat: &Heartbeat,
+    now: NaiveDateTime,
+) -> Option<Notification> {
+    let stale_after =
+        NaiveDateTime::parse_from_str(&heartbeat.stale_after, "%Y-%m-%dT%H:%M:%S").ok()?;
+
+    if now <= stale_after {
+        return None;
+    }
+
+    let timestamp =
+        NaiveDateTime::parse_from_str(&heartbeat.timestamp, "%Y-%m-%dT%H:%M:%S").ok()?;
+
+    let age_hours = (now.signed_duration_since(timestamp).num_minutes() as u64 + 30) / 60;
+    let stale_hours =
+        (stale_after.signed_duration_since(timestamp).num_minutes() as u64 + 30) / 60;
+
+    Some(Notification {
+        event: NotificationEvent::BackupOverdue {
+            last_heartbeat_age_hours: age_hours,
+            stale_after_hours: stale_hours,
+        },
+        urgency: Urgency::Warning,
+        title: format!("Urd: no run in {age_hours}h"),
+        body: format!(
+            "The last run was {age_hours}h ago — expected within {stale_hours}h. \
+             The spindle sits idle: the timer has not run. Check that it is enabled."
+        ),
+    })
+}
+
+/// Build notifications from Sentinel-observed health state changes.
+///
+/// Pure function: previous health snapshots + current assessments → notifications.
+/// Parallel to `build_notifications()` for promise changes.
+///
+/// Urgency: Info (health is operational readiness, not data safety).
+pub fn build_health_notifications(
+    previous: &[HealthSnapshot],
+    current: &[SubvolAssessment],
+) -> Vec<Notification> {
+    let mut notifications = Vec::new();
+
+    for assess in current {
+        if let Some(prev) = previous.iter().find(|p| p.name == assess.name)
+            && assess.health != prev.health
+        {
+            let from = prev.health.to_string();
+            let to = assess.health.to_string();
+
+            if assess.health < prev.health {
+                let reasons = if assess.health_reasons.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " {} Run `urd status` for details.",
+                        assess.health_reasons.join("; ")
+                    )
+                };
+                notifications.push(Notification {
+                    event: NotificationEvent::HealthDegraded {
+                        subvolume: assess.name.clone(),
+                        from: from.clone(),
+                        to: to.clone(),
+                    },
+                    urgency: Urgency::Info,
+                    title: format!("Urd: {} health now {}", assess.name, to),
+                    body: format!(
+                        "The spindle for {} reports {} — was {}.{}",
+                        assess.name, to, from, reasons
+                    ),
+                });
+            } else {
+                notifications.push(Notification {
+                    event: NotificationEvent::HealthRecovered {
+                        subvolume: assess.name.clone(),
+                        from: from.clone(),
+                        to: to.clone(),
+                    },
+                    urgency: Urgency::Info,
+                    title: format!("Urd: {} health restored to {}", assess.name, to),
+                    body: format!(
+                        "The spindle for {} is running smoothly again — restored from {} to {}.",
+                        assess.name, from, to
+                    ),
+                });
+            }
+        }
+    }
+
+    notifications
+}
+
+/// Build the notification for a simultaneous chain-break anomaly on one drive
+/// (HSD-B). Detection and its structural debounce are
+/// `sentinel::detect_simultaneous_chain_breaks`; this is only the prose.
+#[must_use]
+pub fn build_drive_anomaly_notification(
+    drive_label: &str,
+    total_chains: usize,
+    broken_count: usize,
+) -> Notification {
+    Notification {
+        event: NotificationEvent::DriveAnomalyDetected {
+            drive_label: drive_label.to_string(),
+            total_chains,
+            broken_count,
+        },
+        urgency: Urgency::Warning,
+        title: format!("Drive anomaly on {}", drive_label),
+        body: format!(
+            "{} of {} incremental chains on {} broke simultaneously. \
+             The drive may have been swapped or cloned. \
+             Run `urd status` to inspect chain health.",
+            broken_count, total_chains, drive_label,
+        ),
     }
 }
 
@@ -1680,5 +1846,428 @@ mod tests {
             n.event,
             NotificationEvent::StoragePressureRising { host_root: true, .. }
         ));
+    }
+}
+
+// ── Sentinel-path builder tests ────────────────────────────────────────
+// A sibling module rather than more of `tests`: these fixtures
+// (`make_heartbeat`, `make_assessment`) are shaped differently from the
+// heartbeat-path fixtures above and keep their names.
+
+#[cfg(test)]
+mod sentinel_path_tests {
+    use super::*;
+    use crate::awareness::{LocalAssessment, OperationalHealth, PromiseStatus};
+    use crate::heartbeat;
+    use crate::sentinel;
+
+    fn make_assessment(name: &str, status: PromiseStatus) -> SubvolAssessment {
+        SubvolAssessment {
+            name: name.to_string(),
+            short_name: name.to_string(),
+            status,
+            health: OperationalHealth::Healthy,
+            health_reasons: vec![],
+            local: LocalAssessment {
+                status,
+                snapshot_count: 5,
+                newest_age: None,
+            },
+            external: vec![],
+            chain_health: vec![],
+            advisories: vec![],
+            redundancy_advisories: vec![],
+            errors: vec![],
+            storage_posture: None,
+            cadence_adapted: false,
+            effective_send_interval: None,
+        }
+    }
+
+    // ── build_notifications ─────────────────────────────────────────
+
+    #[test]
+    fn notifications_degradation_produces_warning() {
+        let previous = vec![PromiseSnapshot {
+            name: "home".to_string(),
+            status: PromiseStatus::Protected,
+        }];
+        let current = vec![make_assessment("home", PromiseStatus::AtRisk)];
+
+        let notifications = build_notifications(&previous, &current);
+
+        let degraded: Vec<_> = notifications
+            .iter()
+            .filter(|n| matches!(n.event, NotificationEvent::PromiseDegraded { .. }))
+            .collect();
+        assert_eq!(degraded.len(), 1);
+        assert_eq!(degraded[0].urgency, Urgency::Warning);
+        assert!(degraded[0].title.contains("AT RISK"));
+    }
+
+    #[test]
+    fn notifications_recovery_produces_info() {
+        let previous = vec![PromiseSnapshot {
+            name: "home".to_string(),
+            status: PromiseStatus::AtRisk,
+        }];
+        let current = vec![make_assessment("home", PromiseStatus::Protected)];
+
+        let notifications = build_notifications(&previous, &current);
+
+        let recovered: Vec<_> = notifications
+            .iter()
+            .filter(|n| matches!(n.event, NotificationEvent::PromiseRecovered { .. }))
+            .collect();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].urgency, Urgency::Info);
+    }
+
+    #[test]
+    fn notifications_all_unprotected_is_critical() {
+        let previous = vec![
+            PromiseSnapshot {
+                name: "home".to_string(),
+                status: PromiseStatus::Protected,
+            },
+            PromiseSnapshot {
+                name: "docs".to_string(),
+                status: PromiseStatus::Protected,
+            },
+        ];
+        let current = vec![
+            make_assessment("home", PromiseStatus::Unprotected),
+            make_assessment("docs", PromiseStatus::Unprotected),
+        ];
+
+        let notifications = build_notifications(&previous, &current);
+
+        let all_unprot: Vec<_> = notifications
+            .iter()
+            .filter(|n| matches!(n.event, NotificationEvent::AllUnprotected))
+            .collect();
+        assert_eq!(all_unprot.len(), 1);
+        assert_eq!(all_unprot[0].urgency, Urgency::Critical);
+    }
+
+    #[test]
+    fn notifications_never_produces_backup_only_events() {
+        let previous = vec![PromiseSnapshot {
+            name: "home".to_string(),
+            status: PromiseStatus::Protected,
+        }];
+        let current = vec![make_assessment("home", PromiseStatus::Unprotected)];
+
+        let notifications = build_notifications(&previous, &current);
+
+        for n in &notifications {
+            assert!(
+                !matches!(n.event, NotificationEvent::BackupFailures { .. }),
+                "Sentinel must not produce BackupFailures"
+            );
+            assert!(
+                !matches!(n.event, NotificationEvent::PinWriteFailures { .. }),
+                "Sentinel must not produce PinWriteFailures"
+            );
+        }
+    }
+
+    #[test]
+    fn notifications_no_change_produces_empty() {
+        let previous = vec![PromiseSnapshot {
+            name: "home".to_string(),
+            status: PromiseStatus::Protected,
+        }];
+        let current = vec![make_assessment("home", PromiseStatus::Protected)];
+
+        let notifications = build_notifications(&previous, &current);
+        assert!(notifications.is_empty());
+    }
+
+    // ── Golden prose (UPI 088-a, arc R8) ────────────────────────────
+    // Twin fixtures: byte-identical to notify.rs's golden section by
+    // design — the two builders emit the same sentences independently,
+    // and these goldens are the acceptance criterion for collapsing
+    // both onto one shared core. See notify.rs for the rationale.
+
+    #[test]
+    fn golden_twin_degraded_prose_exact() {
+        let previous = vec![PromiseSnapshot {
+            name: "home".to_string(),
+            status: PromiseStatus::Protected,
+        }];
+        let current = vec![make_assessment("home", PromiseStatus::AtRisk)];
+
+        let notifications = build_notifications(&previous, &current);
+
+        let degraded: Vec<_> = notifications
+            .iter()
+            .filter(|n| matches!(n.event, NotificationEvent::PromiseDegraded { .. }))
+            .collect();
+        assert_eq!(degraded.len(), 1);
+        assert_eq!(degraded[0].urgency, Urgency::Warning);
+        assert_eq!(degraded[0].title, "Urd: home is now AT RISK");
+        assert_eq!(
+            degraded[0].body,
+            "The thread of home has frayed — it was PROTECTED, now AT RISK. \
+             The well remembers, but the thread grows thin."
+        );
+    }
+
+    #[test]
+    fn golden_twin_recovered_prose_exact() {
+        let previous = vec![PromiseSnapshot {
+            name: "home".to_string(),
+            status: PromiseStatus::AtRisk,
+        }];
+        let current = vec![make_assessment("home", PromiseStatus::Protected)];
+
+        let notifications = build_notifications(&previous, &current);
+
+        let recovered: Vec<_> = notifications
+            .iter()
+            .filter(|n| matches!(n.event, NotificationEvent::PromiseRecovered { .. }))
+            .collect();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].urgency, Urgency::Info);
+        assert_eq!(recovered[0].title, "Urd: home restored to PROTECTED");
+        assert_eq!(
+            recovered[0].body,
+            "The thread of home is mended — restored from AT RISK to PROTECTED."
+        );
+    }
+
+    #[test]
+    fn golden_twin_all_unprotected_prose_exact() {
+        let previous = vec![
+            PromiseSnapshot {
+                name: "home".to_string(),
+                status: PromiseStatus::Protected,
+            },
+            PromiseSnapshot {
+                name: "docs".to_string(),
+                status: PromiseStatus::Protected,
+            },
+        ];
+        let current = vec![
+            make_assessment("home", PromiseStatus::Unprotected),
+            make_assessment("docs", PromiseStatus::Unprotected),
+        ];
+
+        let notifications = build_notifications(&previous, &current);
+
+        let all_unprot: Vec<_> = notifications
+            .iter()
+            .filter(|n| matches!(n.event, NotificationEvent::AllUnprotected))
+            .collect();
+        assert_eq!(all_unprot.len(), 1);
+        assert_eq!(all_unprot[0].urgency, Urgency::Critical);
+        assert_eq!(all_unprot[0].title, "Urd: all promises broken");
+        assert_eq!(
+            all_unprot[0].body,
+            "Every thread in the well has snapped. No subvolume is protected. \
+             Attend to this — your data stands exposed."
+        );
+    }
+
+    #[test]
+    fn golden_twin_empty_previous_all_unprotected_still_fires() {
+        // This function has NO internal first-run guard: with an empty
+        // `previous`, transitions cannot match but all-unprotected still
+        // fires. The runner's `has_initial_assessment &&
+        // has_promise_changes` gate in execute_assess is what suppresses
+        // first-run noise — that gate is load-bearing, and this test
+        // documents why.
+        let previous: Vec<PromiseSnapshot> = vec![];
+        let current = vec![make_assessment("home", PromiseStatus::Unprotected)];
+
+        let notifications = build_notifications(&previous, &current);
+
+        assert!(notifications.iter().all(|n| !matches!(
+            n.event,
+            NotificationEvent::PromiseDegraded { .. }
+                | NotificationEvent::PromiseRecovered { .. }
+        )));
+        let all_unprot: Vec<_> = notifications
+            .iter()
+            .filter(|n| matches!(n.event, NotificationEvent::AllUnprotected))
+            .collect();
+        assert_eq!(all_unprot.len(), 1);
+        assert_eq!(all_unprot[0].title, "Urd: all promises broken");
+    }
+
+    // ── check_backup_overdue (S2: pure function with tests) ─────────
+
+    fn dt(s: &str) -> NaiveDateTime {
+        NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S").unwrap()
+    }
+
+    fn make_heartbeat(timestamp: &str, stale_after: &str) -> heartbeat::Heartbeat {
+        heartbeat::Heartbeat {
+            schema_version: 2,
+            timestamp: timestamp.to_string(),
+            stale_after: stale_after.to_string(),
+            run_result: "success".to_string(),
+            run_id: Some(1),
+            notifications_dispatched: true,
+            subvolumes: vec![],
+            pools: vec![],
+            drives: vec![],
+        }
+    }
+
+    #[test]
+    fn overdue_not_stale_returns_none() {
+        // Heartbeat at 04:00, stale after 06:00, now is 05:00 → not stale.
+        let hb = make_heartbeat("2026-03-27T04:00:00", "2026-03-27T06:00:00");
+        let now = dt("2026-03-27T05:00:00");
+        assert!(check_backup_overdue(&hb, now).is_none());
+    }
+
+    #[test]
+    fn overdue_stale_returns_notification() {
+        // Heartbeat at 04:00, stale after 06:00, now is 10:00 → 6h overdue.
+        let hb = make_heartbeat("2026-03-27T04:00:00", "2026-03-27T06:00:00");
+        let now = dt("2026-03-27T10:00:00");
+        let notification = check_backup_overdue(&hb, now).expect("should fire");
+
+        assert_eq!(notification.urgency, Urgency::Warning);
+        match notification.event {
+            NotificationEvent::BackupOverdue {
+                last_heartbeat_age_hours,
+                stale_after_hours,
+            } => {
+                assert_eq!(last_heartbeat_age_hours, 6);
+                assert_eq!(stale_after_hours, 2);
+            }
+            _ => panic!("expected BackupOverdue event"),
+        }
+        // The check watches the run, not the data (#410): say so.
+        assert_eq!(notification.title, "Urd: no run in 6h");
+        assert_eq!(
+            notification.body,
+            "The last run was 6h ago — expected within 2h. \
+             The spindle sits idle: the timer has not run. Check that it is enabled."
+        );
+    }
+
+    #[test]
+    fn overdue_corrupt_timestamps_returns_none() {
+        let hb = make_heartbeat("not-a-timestamp", "also-not-a-timestamp");
+        let now = dt("2026-03-27T10:00:00");
+        assert!(check_backup_overdue(&hb, now).is_none());
+    }
+
+    #[test]
+    fn overdue_corrupt_stale_after_only_returns_none() {
+        let hb = make_heartbeat("2026-03-27T04:00:00", "corrupt");
+        let now = dt("2026-03-27T10:00:00");
+        assert!(check_backup_overdue(&hb, now).is_none());
+    }
+
+    #[test]
+    fn overdue_exactly_at_stale_boundary_returns_none() {
+        // now == stale_after → not overdue (need to be strictly past).
+        let hb = make_heartbeat("2026-03-27T04:00:00", "2026-03-27T06:00:00");
+        let now = dt("2026-03-27T06:00:00");
+        assert!(check_backup_overdue(&hb, now).is_none());
+    }
+
+    // ── Health notification tests (VFM-B) ──────────────────────────────
+
+    fn make_health_snapshot(name: &str, health: OperationalHealth) -> sentinel::HealthSnapshot {
+        sentinel::HealthSnapshot {
+            name: name.to_string(),
+            health,
+            health_reasons: vec![],
+        }
+    }
+
+    #[test]
+    fn health_degraded_produces_notification() {
+        let prev = vec![make_health_snapshot("sv1", OperationalHealth::Healthy)];
+        let mut a = make_assessment("sv1", PromiseStatus::Protected);
+        a.health = OperationalHealth::Degraded;
+        a.health_reasons = vec!["chain broken on WD-18TB".to_string()];
+
+        let notifs = build_health_notifications(&prev, &[a]);
+        assert_eq!(notifs.len(), 1);
+        assert!(matches!(
+            &notifs[0].event,
+            NotificationEvent::HealthDegraded { subvolume, from, to }
+            if subvolume == "sv1" && from == "healthy" && to == "degraded"
+        ));
+        assert_eq!(notifs[0].urgency, Urgency::Info);
+    }
+
+    #[test]
+    fn health_recovered_produces_notification() {
+        let prev = vec![make_health_snapshot("sv1", OperationalHealth::Degraded)];
+        let a = make_assessment("sv1", PromiseStatus::Protected);
+
+        let notifs = build_health_notifications(&prev, &[a]);
+        assert_eq!(notifs.len(), 1);
+        assert!(matches!(
+            &notifs[0].event,
+            NotificationEvent::HealthRecovered { subvolume, from, to }
+            if subvolume == "sv1" && from == "degraded" && to == "healthy"
+        ));
+    }
+
+    #[test]
+    fn health_blocked_produces_degraded_notification() {
+        let prev = vec![make_health_snapshot("sv1", OperationalHealth::Healthy)];
+        let mut a = make_assessment("sv1", PromiseStatus::Protected);
+        a.health = OperationalHealth::Blocked;
+
+        let notifs = build_health_notifications(&prev, &[a]);
+        assert_eq!(notifs.len(), 1);
+        assert!(matches!(
+            &notifs[0].event,
+            NotificationEvent::HealthDegraded { to, .. } if to == "blocked"
+        ));
+    }
+
+    #[test]
+    fn health_no_change_produces_nothing() {
+        let prev = vec![make_health_snapshot("sv1", OperationalHealth::Healthy)];
+        let a = make_assessment("sv1", PromiseStatus::Protected);
+        assert!(build_health_notifications(&prev, &[a]).is_empty());
+    }
+
+    #[test]
+    fn health_mixed_transitions() {
+        let prev = vec![
+            make_health_snapshot("sv1", OperationalHealth::Healthy),
+            make_health_snapshot("sv2", OperationalHealth::Degraded),
+        ];
+        let mut a1 = make_assessment("sv1", PromiseStatus::Protected);
+        a1.health = OperationalHealth::Degraded;
+        let a2 = make_assessment("sv2", PromiseStatus::Protected);
+
+        let notifs = build_health_notifications(&prev, &[a1, a2]);
+        assert_eq!(notifs.len(), 2);
+        assert!(matches!(&notifs[0].event, NotificationEvent::HealthDegraded { subvolume, .. } if subvolume == "sv1"));
+        assert!(matches!(&notifs[1].event, NotificationEvent::HealthRecovered { subvolume, .. } if subvolume == "sv2"));
+    }
+
+    // ── Drive anomaly (HSD-B) ──────────────────────────────────────
+
+    #[test]
+    fn drive_anomaly_prose_exact() {
+        let n = build_drive_anomaly_notification("WD-18TB", 4, 3);
+        assert!(matches!(
+            &n.event,
+            NotificationEvent::DriveAnomalyDetected { drive_label, total_chains: 4, broken_count: 3 }
+            if drive_label == "WD-18TB"
+        ));
+        assert_eq!(n.urgency, Urgency::Warning);
+        assert_eq!(n.title, "Drive anomaly on WD-18TB");
+        assert_eq!(
+            n.body,
+            "3 of 4 incremental chains on WD-18TB broke simultaneously. \
+             The drive may have been swapped or cloned. \
+             Run `urd status` to inspect chain health."
+        );
     }
 }

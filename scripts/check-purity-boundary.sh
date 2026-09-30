@@ -44,7 +44,8 @@ cd "$REPO_ROOT"
 # entry lints every .rs file under it.
 PURE=(
     src/plan
-    src/awareness.rs
+    src/observation/estimate.rs
+    src/awareness
     src/advice.rs
     src/retention.rs
     src/recommendation.rs

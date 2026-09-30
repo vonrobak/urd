@@ -199,8 +199,9 @@ pub struct BackupArgs {
     #[arg(long)]
     pub external_only: bool,
 
-    /// Confirm that retention deletions derived from protection promises are intended.
-    /// Without this flag, retention is skipped for promise-level subvolumes (fail-closed).
+    /// Confirm a retention change: apply the deletions of promise-level subvolumes whose
+    /// retention tightened since it was last applied. Without this flag those deletions are
+    /// held (backups still run) until one confirmed run.
     #[arg(long)]
     pub confirm_retention_change: bool,
 

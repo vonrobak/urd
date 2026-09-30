@@ -3,7 +3,7 @@ Description=Urd BTRFS backup
 
 [Service]
 Type=oneshot
-ExecStart=%h/.cargo/bin/urd backup --auto --confirm-retention-change
+ExecStart=%h/.cargo/bin/urd backup --auto
 Environment=RUST_LOG=info
 
 # Never time-limit a backup run. A first full multi-TB send can legitimately

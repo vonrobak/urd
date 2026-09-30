@@ -37,6 +37,7 @@ pub(crate) fn test_status_output() -> StatusOutput {
     StatusOutput {
         seal_gap: None,
         privilege_unclear: false,
+        retention_changes: vec![],
         assessments: vec![
             StatusAssessment {
                 name: "htpc-home".to_string(),
@@ -175,12 +176,14 @@ pub(crate) fn test_backup_summary() -> BackupSummary {
                 name: "htpc-home".to_string(),
                 reason: "drive 2TB-backup not mounted".to_string(),
                 category: SkipCategory::DriveNotMounted,
+                drive: Some("2TB-backup".to_string()),
             },
             SkippedSubvolume {
                 next_due_minutes: None,
                 name: "htpc-docs".to_string(),
                 reason: "drive 2TB-backup not mounted".to_string(),
                 category: SkipCategory::DriveNotMounted,
+                drive: Some("2TB-backup".to_string()),
             },
         ],
         assessments: vec![StatusAssessment {

@@ -74,6 +74,9 @@ pub(super) fn render_status_interactive(data: &StatusOutput) -> String {
     // ── Redundancy advisories ───────────────────────────────────────
     render_redundancy_advisories(data, &mut out);
 
+    // ── Retention changes awaiting confirmation (ADR-110) ──────────
+    render_retention_changes(data, &mut out);
+
     // ── Drive summary ───────────────────────────────────────────────
     writeln!(out).ok();
     render_drive_summary(data, &mut out);
@@ -597,6 +600,24 @@ fn stale_detail_days(detail: &str) -> i64 {
         }
     }
     digits.parse().unwrap_or(0)
+}
+
+/// One yellow line per promise-level subvolume whose retention tightened
+/// since it was last applied (ADR-110). Silent when there are none.
+pub(super) fn render_retention_changes(data: &StatusOutput, out: &mut String) {
+    if data.retention_changes.is_empty() {
+        return;
+    }
+    writeln!(out).ok();
+    writeln!(out, "{}", "RETENTION".dimmed()).ok();
+    for change in &data.retention_changes {
+        writeln!(
+            out,
+            "  {}",
+            super::retention::retention_change_pending_line(change).yellow()
+        )
+        .ok();
+    }
 }
 
 pub(super) fn render_redundancy_advisories(data: &StatusOutput, out: &mut String) {
@@ -1404,6 +1425,32 @@ mod tests {
         assert!(!out.contains("not yet spun"), "{out}");
     }
 
+    /// ADR-110: a pending retention change renders one RETENTION line naming
+    /// the subvolume and the confirming command; none renders nothing, and
+    /// JSON omits the empty list.
+    #[test]
+    fn retention_change_renders_when_pending_and_is_silent_otherwise() {
+        let _color = color_guard(false);
+        let mut data = crate::voice::test_fixtures::test_status_output();
+        let quiet = render_status(&data, OutputMode::Interactive);
+        assert!(!quiet.contains("RETENTION"), "{quiet}");
+        assert!(!render_status(&data, OutputMode::Daemon).contains("retention_changes"));
+
+        data.retention_changes = vec![crate::output::RetentionChangePending {
+            subvolume: "htpc-home".to_string(),
+            local_tightened: false,
+            external_tightened: true,
+            previous: "p".to_string(),
+            current: "c".to_string(),
+        }];
+        let out = render_status(&data, OutputMode::Interactive);
+        assert!(out.contains("RETENTION"), "{out}");
+        assert!(out.contains("htpc-home: external retention tightened"), "{out}");
+        assert!(out.contains("urd backup --confirm-retention-change"), "{out}");
+        let json = render_status(&data, OutputMode::Daemon);
+        assert!(json.contains("\"retention_changes\""), "{json}");
+    }
+
     /// UPI 081 B2: an Unclear probe renders the cannot-verify line, never
     /// the seal-gap banner (mutually exclusive by construction) and never
     /// silent.
@@ -1465,6 +1512,7 @@ mod tests {
         let data = StatusOutput {
             seal_gap: None,
             privilege_unclear: false,
+            retention_changes: vec![],
             assessments: vec![],
             chain_health: vec![],
             drives: vec![],
@@ -1543,6 +1591,7 @@ mod tests {
         let data = StatusOutput {
             seal_gap: None,
             privilege_unclear: false,
+            retention_changes: vec![],
             assessments: vec![],
             chain_health: vec![],
             drives: vec![],

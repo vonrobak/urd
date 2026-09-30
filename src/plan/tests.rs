@@ -7,7 +7,8 @@ use crate::observation::RealFileSystemState;
 use crate::storage_critical::{ArmedTierMap, TightnessTier};
 use crate::btrfs::MockBtrfs;
 use crate::events::{EventPayload, UnstampedEvent};
-use crate::types::{FullSendReason, NothingNew};
+use crate::plan::NothingNew;
+use crate::types::{FullSendReason, SendKind};
 use chrono::NaiveDate;
 
 fn test_config() -> Config {
@@ -191,7 +192,7 @@ fn drive_gate_truth_table_all_seven_availability_variants() {
                 let (ops, skipped, events) = f.into_parts();
                 assert!(ops.is_empty(), "{avail:?}");
                 assert_eq!(skipped.len(), 1, "{avail:?}");
-                assert_eq!(skipped[0].reason, expected_reason, "{avail:?}");
+                assert_eq!(skipped[0].reason.to_string(), expected_reason, "{avail:?}");
                 assert!(
                     !skipped[0].is_nothing_new(),
                     "a gate defer is never nothing-new: {avail:?}",
@@ -453,7 +454,7 @@ fn skips_snapshot_when_interval_not_elapsed() {
         result
             .skipped
             .iter()
-            .any(|s| s.name == "sv1" && s.reason.contains("interval"))
+            .any(|s| s.name == "sv1" && s.reason.to_string().contains("interval"))
     );
 }
 
@@ -722,7 +723,7 @@ fn skips_send_when_drive_not_mounted() {
         result
             .skipped
             .iter()
-            .any(|s| s.reason.contains("not mounted"))
+            .any(|s| s.reason.to_string().contains("not mounted"))
     );
     let sends: Vec<_> = result
         .operations
@@ -780,7 +781,7 @@ send_enabled = false
         result
             .skipped
             .iter()
-            .any(|s| s.reason.contains("local only"))
+            .any(|s| s.reason.to_string().contains("local only"))
     );
 }
 
@@ -1026,7 +1027,7 @@ fn send_skipped_insufficient_space() {
         result
             .skipped
             .iter()
-            .any(|s| s.name == "sv1" && s.reason.contains("estimated")),
+            .any(|s| s.name == "sv1" && s.reason.to_string().contains("estimated")),
         "Should report space estimation skip"
     );
 }
@@ -1170,7 +1171,7 @@ fn send_deferred_in_band_between_min_free_and_floor() {
             .skipped
             .iter()
             .any(|s| s.name == "sv1"
-                && s.reason.contains("host-survival floor")),
+                && s.reason.to_string().contains("host-survival floor")),
         "Defer reason should name the host-survival floor"
     );
 }
@@ -1308,7 +1309,7 @@ fn calibrated_size_skips_send_when_too_large() {
         result
             .skipped
             .iter()
-            .any(|s| s.name == "sv1" && s.reason.contains("calibrated size")),
+            .any(|s| s.name == "sv1" && s.reason.to_string().contains("calibrated size")),
         "Skip reason should mention calibrated size"
     );
 }
@@ -1332,8 +1333,8 @@ fn calibrated_skip_reason(measured_at: &str) -> String {
     result
         .skipped
         .iter()
-        .find(|s| s.name == "sv1" && s.reason.contains("calibrated size"))
-        .map(|s| s.reason.clone())
+        .find(|s| s.name == "sv1" && s.reason.to_string().contains("calibrated size"))
+        .map(|s| s.reason.to_string())
         .expect("calibrated-size skip must be recorded")
 }
 
@@ -1430,7 +1431,7 @@ fn last_failed_send_floor_skips_send_when_too_large() {
         result
             .skipped
             .iter()
-            .any(|s| s.name == "sv1" && s.reason.contains("skipped: estimated")),
+            .any(|s| s.name == "sv1" && s.reason.to_string().contains("skipped: estimated")),
         "Skip reason should use the generic estimated-size wording, not calibrated: {:?}",
         result.skipped
     );
@@ -1490,7 +1491,7 @@ fn cross_drive_fallback_space_check() {
         result
             .skipped
             .iter()
-            .any(|s| s.name == "sv1" && s.reason.contains("estimated")),
+            .any(|s| s.name == "sv1" && s.reason.to_string().contains("estimated")),
         "Skip reason should mention estimated size"
     );
 }
@@ -1520,7 +1521,7 @@ fn future_dated_snapshot_suppresses_creation() {
         result
             .skipped
             .iter()
-            .any(|s| s.name == "sv1" && s.reason.contains("interval")),
+            .any(|s| s.name == "sv1" && s.reason.to_string().contains("interval")),
         "Should report interval not elapsed for future-dated snapshot"
     );
 }
@@ -1546,7 +1547,7 @@ fn uuid_mismatch_skips_drive() {
         result
             .skipped
             .iter()
-            .any(|s| s.reason.contains("UUID mismatch")),
+            .any(|s| s.reason.to_string().contains("UUID mismatch")),
         "UUID mismatch should produce a skip reason: {:?}",
         result.skipped
     );
@@ -1583,7 +1584,7 @@ fn uuid_check_failed_skips_drive() {
         result
             .skipped
             .iter()
-            .any(|s| s.reason.contains("UUID check failed")),
+            .any(|s| s.reason.to_string().contains("UUID check failed")),
         "UUID check failure should produce a skip reason: {:?}",
         result.skipped
     );
@@ -1662,7 +1663,7 @@ fn token_mismatch_skips_send() {
         result
             .skipped
             .iter()
-            .any(|s| s.reason.contains("token mismatch")),
+            .any(|s| s.reason.to_string().contains("token mismatch")),
         "Token mismatch should produce a skip reason: {:?}",
         result.skipped
     );
@@ -1722,7 +1723,7 @@ fn token_expected_but_missing_skips_sends() {
         result
             .skipped
             .iter()
-            .any(|s| s.reason.contains("token expected but missing")),
+            .any(|s| s.reason.to_string().contains("token expected but missing")),
         "TokenExpectedButMissing should produce a skip reason: {:?}",
         result.skipped
     );
@@ -1791,7 +1792,7 @@ fn skips_snapshot_when_local_space_below_threshold() {
     let skip_reasons: Vec<_> = result
         .skipped
         .iter()
-        .filter(|s| s.name == "sv1" && s.reason.contains("low on space"))
+        .filter(|s| s.name == "sv1" && s.reason.to_string().contains("low on space"))
         .collect();
     assert_eq!(
         skip_reasons.len(),
@@ -2176,7 +2177,7 @@ fn transient_lifecycle_deferred_below_floor_retention_still_runs() {
             .skipped
             .iter()
             .any(|s| s.name == "sv1"
-                && s.reason.contains("host-survival floor")),
+                && s.reason.to_string().contains("host-survival floor")),
         "Defer reason should name the host-survival floor"
     );
     let deletes = result
@@ -2547,7 +2548,7 @@ fn transient_no_drives_skips_snapshot_creation() {
     let has_transient_skip = result
         .skipped
         .iter()
-        .any(|s| s.name == "sv1" && s.reason.contains("transient"));
+        .any(|s| s.name == "sv1" && s.reason.to_string().contains("transient"));
     assert!(
         has_transient_skip,
         "should have a transient skip reason, got: {:?}",
@@ -3156,7 +3157,7 @@ fn skip_intervals_still_respects_space_guard() {
         result
             .skipped
             .iter()
-            .any(|s| s.name == "sv1" && s.reason.contains("low on space")),
+            .any(|s| s.name == "sv1" && s.reason.to_string().contains("low on space")),
         "should report space guard skip"
     );
 }
@@ -3280,7 +3281,7 @@ fn transient_lifecycle_no_drives_no_create() {
     let has_transient_skip = result
         .skipped
         .iter()
-        .any(|s| s.name == "sv1" && s.reason.contains("transient"));
+        .any(|s| s.name == "sv1" && s.reason.to_string().contains("transient"));
     assert!(has_transient_skip, "should have transient skip reason");
 }
 
@@ -3359,7 +3360,7 @@ fn transient_lifecycle_send_interval_not_elapsed() {
     let interval_skip = result
         .skipped
         .iter()
-        .find(|s| s.name == "sv1" && s.reason.contains("not due"));
+        .find(|s| s.name == "sv1" && s.reason.to_string().contains("not due"));
     assert!(interval_skip.is_some(), "should have interval skip reason: {:?}", result.skipped);
     assert!(
         interval_skip.unwrap().next_due_minutes.is_some(),
@@ -3475,7 +3476,7 @@ local_retention = "transient"
     let has_space_skip = result
         .skipped
         .iter()
-        .any(|s| s.name == "sv1" && s.reason.contains("host-survival floor"));
+        .any(|s| s.name == "sv1" && s.reason.to_string().contains("host-survival floor"));
     assert!(has_space_skip, "should have space skip reason: {:?}", result.skipped);
 }
 
@@ -3505,7 +3506,7 @@ fn transient_lifecycle_multi_drive_one_mounted() {
     let d2_skip = result
         .skipped
         .iter()
-        .any(|s| s.name == "sv1" && s.reason.contains("D2") && s.reason.contains("not mounted"));
+        .any(|s| s.name == "sv1" && s.reason.to_string().contains("D2") && s.reason.to_string().contains("not mounted"));
     assert!(d2_skip, "should skip D2: {:?}", result.skipped);
 }
 
@@ -3590,7 +3591,7 @@ fn transient_lifecycle_multi_drive_only_one_needs_send() {
     let d2_skip = result
         .skipped
         .iter()
-        .any(|s| s.name == "sv1" && s.reason.contains("D2") && s.reason.contains("not due"));
+        .any(|s| s.name == "sv1" && s.reason.to_string().contains("D2") && s.reason.to_string().contains("not due"));
     assert!(d2_skip, "D2 should be skipped for interval: {:?}", result.skipped);
 }
 
@@ -3619,7 +3620,7 @@ fn skip_when_generation_equal() {
     let skip = result.skipped.iter().find(|s| s.name == "sv1");
     assert!(skip.is_some(), "sv1 should be in skipped list");
     assert!(
-        skip.unwrap().reason.starts_with("unchanged"),
+        skip.unwrap().reason.to_string().starts_with("unchanged"),
         "reason should start with 'unchanged', got: {}",
         skip.unwrap().reason
     );
@@ -3806,7 +3807,7 @@ fn skip_intervals_still_checks_generation() {
     assert_eq!(creates.len(), 0, "skip_intervals should not override generation check");
     let skip = result.skipped.iter().find(|s| s.name == "sv1");
     assert!(
-        skip.is_some() && skip.unwrap().reason.starts_with("unchanged"),
+        skip.is_some() && skip.unwrap().reason.to_string().starts_with("unchanged"),
         "should report unchanged reason"
     );
 }
@@ -4640,7 +4641,7 @@ fn assert_marker(result: &BackupPlan, name: &str, substr: &str, expected: bool) 
     let skip = result
         .skipped
         .iter()
-        .find(|s| s.name == name && s.reason.contains(substr))
+        .find(|s| s.name == name && s.reason.to_string().contains(substr))
         .unwrap_or_else(|| {
             panic!(
                 "no skip for {name} matching {substr:?}; skips: {:?}",
@@ -4970,8 +4971,8 @@ fn op_send(name: &str) -> PlannedOperation {
 
 /// A marker-false deferral (interval, drive-away, floor, space guard — the
 /// benign create-without-send inputs to arm 2).
-fn skip_deferred(name: &str, reason: &str) -> PlannedSkip {
-    PlannedSkip::deferred(name, reason.to_string(), None)
+fn skip_deferred(name: &str, reason: SkipReason) -> PlannedSkip {
+    PlannedSkip::deferred(name, reason, None)
 }
 
 /// A marker-true "already on <drive>" conclusion — the sanctioned nothing-new
@@ -5031,9 +5032,29 @@ fn orphan_invariant_arm2_marker_false_defers_clean() {
         &[judgment("sv1", false, true)],
         &[op_create("sv1")],
         &[
-            skip_deferred("sv1", "send to D1 not due (next in ~2h)"),
-            skip_deferred("sv1", "drive D2 not mounted"),
-            skip_deferred("sv1", "send to D3 skipped: estimated ~1 GB exceeds 0 B available"),
+            skip_deferred(
+                "sv1",
+                SkipReason::SendNotDue {
+                    drive: "D1".to_string(),
+                    next_in_minutes: 120,
+                },
+            ),
+            skip_deferred(
+                "sv1",
+                SkipReason::DriveNotMounted {
+                    drive: "D2".to_string(),
+                },
+            ),
+            skip_deferred(
+                "sv1",
+                SkipReason::EstimatedSizeExceedsSpace {
+                    drive: "D3".to_string(),
+                    estimated: crate::types::ByteSize(1_000_000_000),
+                    available: crate::types::ByteSize(0),
+                    free: crate::types::ByteSize(0),
+                    min_free: crate::types::ByteSize(0),
+                },
+            ),
         ],
     );
     assert!(violations.is_empty(), "{violations:?}");

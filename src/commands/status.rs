@@ -3,13 +3,14 @@ use chrono::NaiveDateTime;
 use crate::advice;
 use crate::awareness::{ChainBreakReason, ChainStatus, SubvolAssessment};
 use crate::chain;
+use crate::commands::seal::SealPosture;
 use crate::commands::storage_signals;
 use crate::commands::world::{World, WorldView};
 use crate::config::Config;
 use crate::drives;
 use crate::output::{
     AdaptationSummary, ChainHealth, ChainHealthEntry, DriveInfo, LastRunInfo, OutputMode,
-    PoolPostureSummary, StatusAssessment, StatusOutput,
+    PoolPostureSummary, RetentionChangePending, StatusAssessment, StatusOutput,
 };
 use crate::voice;
 
@@ -52,7 +53,7 @@ pub fn run(config: Config, output_mode: OutputMode) -> anyhow::Result<()> {
         .collect();
 
     // ── Last run ────────────────────────────────────────────────────
-    let last_run = world.db().and_then(|db| db.last_run_info());
+    let last_run = world.db().and_then(|db| db.last_run_info()).map(LastRunInfo::from);
 
     // ── Pin count ───────────────────────────────────────────────────
     let total_pins: usize = config
@@ -66,20 +67,31 @@ pub fn run(config: Config, output_mode: OutputMode) -> anyhow::Result<()> {
         })
         .sum();
 
+    // ── Retention changes the next backup will hold (ADR-110) ───────
+    let retention_changes: Vec<RetentionChangePending> =
+        crate::retention::pending_retention_changes(
+            &config.resolved_subvolumes(),
+            &crate::commands::plan_cmd::recorded_retention_shapes(world.db()).unwrap_or_default(),
+        )
+        .iter()
+        .map(RetentionChangePending::from)
+        .collect();
+
     // ── Assemble and render ─────────────────────────────────────────
-    let status_output = assemble_status_output(
+    let mut status_output = assemble_status_output(
         &assessments,
-        storage_postures,
-        storage_adaptations,
-        drive_infos,
-        last_run,
-        total_pins,
         &config,
         now,
-        posture.gap,
-        posture.earned,
-        posture.privilege_unclear,
+        StatusInputs {
+            storage_postures,
+            storage_adaptations,
+            drive_infos,
+            last_run,
+            total_pins,
+            seal: posture,
+        },
     );
+    status_output.retention_changes = retention_changes;
 
     let rendered = voice::render_status(&status_output, output_mode);
     print!("{rendered}");
@@ -87,25 +99,44 @@ pub fn run(config: Config, output_mode: OutputMode) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Assemble the renderable `StatusOutput` from the assessment view and the
-/// I/O-fetched facts. Pure function: `run()` gathers, this stitches —
-/// chain-health worst-selection, promise-level threading, advice filtering,
-/// redundancy advisories, and last-run age all live here.
-#[must_use]
-#[allow(clippy::too_many_arguments)]
-fn assemble_status_output(
-    assessments: &[SubvolAssessment],
+/// The I/O-fetched facts `run()` gathers for [`assemble_status_output`]; each
+/// passes through to `StatusOutput` (the seal posture's `earned` also gates
+/// advice).
+struct StatusInputs {
     storage_postures: Vec<PoolPostureSummary>,
     storage_adaptations: Vec<AdaptationSummary>,
     drive_infos: Vec<DriveInfo>,
     last_run: Option<LastRunInfo>,
     total_pins: usize,
+    /// The seal stage (UPI 071/075/081): gap, earned-privilege, and the
+    /// unclear-privilege flag, exactly as `seal::seal_posture` reported them.
+    seal: SealPosture,
+}
+
+/// Assemble the renderable `StatusOutput` from the assessment view and the
+/// I/O-fetched facts. Pure function: `run()` gathers, this stitches —
+/// chain-health worst-selection, promise-level threading, advice filtering,
+/// redundancy advisories, and last-run age all live here.
+#[must_use]
+fn assemble_status_output(
+    assessments: &[SubvolAssessment],
     config: &Config,
     now: NaiveDateTime,
-    seal_gap: Option<crate::output::SealGap>,
-    earned: bool,
-    privilege_unclear: bool,
+    inputs: StatusInputs,
 ) -> StatusOutput {
+    let StatusInputs {
+        storage_postures,
+        storage_adaptations,
+        drive_infos,
+        last_run,
+        total_pins,
+        seal:
+            SealPosture {
+                gap: seal_gap,
+                earned,
+                privilege_unclear,
+            },
+    } = inputs;
     // ── Chain health per subvolume (derived from awareness assessment) ──
     let chain_health_entries: Vec<ChainHealthEntry> = assessments
         .iter()
@@ -147,7 +178,14 @@ fn assemble_status_output(
         .iter()
         .filter_map(|a| {
             let sv = resolved.iter().find(|sv| sv.name == a.name)?;
-            advice::compute_advice(a, earned, sv.send_enabled, sv.local_retention.is_transient())
+            advice::compute_advice(
+                a,
+                advice::AdviceContext {
+                    earned,
+                    send_enabled: sv.send_enabled,
+                    external_only: sv.local_retention.is_transient(),
+                },
+            )
         })
         .collect();
 
@@ -164,6 +202,8 @@ fn assemble_status_output(
         storage_adaptations,
         seal_gap,
         privilege_unclear,
+        // Threaded in by `run()` from the state DB's recorded shapes.
+        retention_changes: Vec::new(),
     }
 }
 
@@ -240,7 +280,6 @@ local_retention = "transient"
                 status: PromiseStatus::Protected,
                 snapshot_count: 5,
                 newest_age: None,
-                configured_interval: Interval::hours(1),
             },
             external: vec![],
             chain_health: vec![],
@@ -269,20 +308,29 @@ local_retention = "transient"
         }
     }
 
+    /// Empty I/O facts with the given seal posture.
+    fn inputs(seal: SealPosture) -> StatusInputs {
+        StatusInputs {
+            storage_postures: vec![],
+            storage_adaptations: vec![],
+            drive_infos: vec![],
+            last_run: None,
+            total_pins: 0,
+            seal,
+        }
+    }
+
+    /// A fully sealed, privilege-earned posture — the common test default.
+    fn sealed() -> SealPosture {
+        SealPosture {
+            gap: None,
+            earned: true,
+            privilege_unclear: false,
+        }
+    }
+
     fn assemble(assessments: &[SubvolAssessment], config: &Config) -> StatusOutput {
-        assemble_status_output(
-            assessments,
-            vec![],
-            vec![],
-            vec![],
-            None,
-            0,
-            config,
-            dt(2026, 6, 10, 12, 0),
-            None,
-            true,
-            false,
-        )
+        assemble_status_output(assessments, config, dt(2026, 6, 10, 12, 0), inputs(sealed()))
     }
 
     #[test]
@@ -297,16 +345,12 @@ local_retention = "transient"
         ] {
             let out = assemble_status_output(
                 &[],
-                vec![],
-                vec![],
-                vec![],
-                None,
-                0,
                 &config,
                 dt(2026, 6, 10, 12, 0),
-                Some(gap),
-                true,
-                false,
+                inputs(SealPosture {
+                    gap: Some(gap),
+                    ..sealed()
+                }),
             );
             assert_eq!(out.seal_gap, Some(gap));
         }
@@ -320,16 +364,13 @@ local_retention = "transient"
         let config = test_config();
         let out = assemble_status_output(
             &[],
-            vec![],
-            vec![],
-            vec![],
-            None,
-            0,
             &config,
             dt(2026, 6, 10, 12, 0),
-            None,
-            false,
-            true,
+            inputs(SealPosture {
+                gap: None,
+                earned: false,
+                privilege_unclear: true,
+            }),
         );
         assert!(out.privilege_unclear);
         assert!(!assemble(&[], &config).privilege_unclear);
@@ -523,16 +564,12 @@ local_retention = "transient"
         };
         let out = assemble_status_output(
             &[],
-            vec![],
-            vec![],
-            vec![],
-            Some(last_run),
-            0,
             &test_config(),
             dt(2026, 6, 10, 12, 0),
-            None,
-            true,
-            false,
+            StatusInputs {
+                last_run: Some(last_run),
+                ..inputs(sealed())
+            },
         );
         assert_eq!(out.last_run_age_secs, Some(7200));
     }

@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- `--confirm-retention-change` now means what ADR-110 says. Urd records the
+  retention shape under which each subvolume's deletions were last applied and
+  holds a named-level subvolume's deletions only when its retention has
+  tightened since — snapshots and sends still run. Run `urd backup
+  --confirm-retention-change` once to apply the tighter retention; the hold is
+  named in the run summary, `urd plan`, `urd status`, `urd doctor` and an
+  `events` row. Previously every run without the flag held every promise-level
+  deletion, and the scheduled unit always passed the flag, so timer runs were
+  never gated and manual runs always were. The unit no longer passes the flag;
+  `urd doctor` reports the installed unit as drifted until `urd init` re-seals
+  it. The first run after upgrading records the current shapes and holds
+  nothing.
+
 ### Fixed
 - A destination snapshot that already carries the name about to be sent is no
   longer deleted on inference. It is kept when its pin names it (as before) or

@@ -28,7 +28,7 @@ use crate::commands::{init, verify};
 pub fn run(config: Config, args: DoctorArgs, output_mode: OutputMode) -> anyhow::Result<()> {
     // ── 1. Config checks (preflight — pure, instant) ──────────────
     let preflight_results = preflight::preflight_checks(&config);
-    let config_checks: Vec<DoctorCheck> = if preflight_results.is_empty() {
+    let mut config_checks: Vec<DoctorCheck> = if preflight_results.is_empty() {
         let subvol_count = config
             .subvolumes
             .iter()
@@ -191,6 +191,13 @@ pub fn run(config: Config, args: DoctorArgs, output_mode: OutputMode) -> anyhow:
     let assessments = world.view(&config, now).assessments;
 
     let resolved = config.resolved_subvolumes();
+
+    // Retention tightened since last applied (ADR-110): a config-section
+    // Warn per subvolume the next backup would hold. Read-only.
+    config_checks.extend(retention_change_checks(&crate::retention::pending_retention_changes(
+        &resolved,
+        &crate::commands::plan_cmd::recorded_retention_shapes(world.db()).unwrap_or_default(),
+    )));
     let data_safety: Vec<DoctorDataSafety> = assessments
         .iter()
         .map(|a| {
@@ -198,7 +205,14 @@ pub fn run(config: Config, args: DoctorArgs, output_mode: OutputMode) -> anyhow:
             let send_enabled = sv_config.is_none_or(|sv| sv.send_enabled);
             let external_only = sv_config.is_some_and(|sv| sv.local_retention.is_transient());
             let earned = sudo_probe.0 == crate::sudoers::GrantProbe::Granted;
-            let advice = advice::compute_advice(a, earned, send_enabled, external_only);
+            let advice = advice::compute_advice(
+                a,
+                advice::AdviceContext {
+                    earned,
+                    send_enabled,
+                    external_only,
+                },
+            );
 
             // Extract structured advice into doctor display fields.
             let (issue, suggestion, reason) = match a.status {
@@ -350,6 +364,23 @@ pub fn run(config: Config, args: DoctorArgs, output_mode: OutputMode) -> anyhow:
     print!("{}", voice::render_doctor(&output, output_mode));
 
     Ok(())
+}
+
+/// One config-section Warn per retention change the next backup would hold
+/// (ADR-110 transition safety). Pure over the pending list; the prose is
+/// the voice layer's.
+fn retention_change_checks(pending: &[crate::retention::RetentionChange]) -> Vec<DoctorCheck> {
+    pending
+        .iter()
+        .map(|change| DoctorCheck {
+            name: voice::retention_change_pending_line(
+                &crate::output::RetentionChangePending::from(change),
+            ),
+            status: DoctorCheckStatus::Warn,
+            detail: None,
+            suggestion: Some("Run `urd backup --confirm-retention-change` once.".to_string()),
+        })
+        .collect()
 }
 
 /// The honest-skip row for a drift check that cannot run: never a silent
@@ -703,7 +734,6 @@ fn build_doctor_recommendation_view(
 /// single bad sample.
 const MIN_SAMPLE_DAYS: u32 = 3;
 
-#[allow(clippy::too_many_arguments)]
 fn build_doctor_recommendation_view_inner(
     config: &Config,
     state_db: Option<&StateDb>,
@@ -994,6 +1024,42 @@ fn unpack_advice(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Retention-change advisory (ADR-110) ────────────────────────────
+
+    #[test]
+    fn retention_change_checks_warn_once_per_pending_change() {
+        use crate::retention::{RetentionChange, RetentionShape};
+        use crate::types::{LocalRetentionPolicy, MonthlyCount, ResolvedGraduatedRetention};
+        let g = ResolvedGraduatedRetention {
+            hourly: 24,
+            daily: 30,
+            weekly: 4,
+            monthly: MonthlyCount::Count(0),
+            yearly: 0,
+        };
+        let previous = RetentionShape {
+            local: LocalRetentionPolicy::Graduated(g),
+            external: g,
+        };
+        let current = RetentionShape {
+            local: LocalRetentionPolicy::Transient,
+            ..previous
+        };
+        assert!(retention_change_checks(&[]).is_empty());
+        let checks = retention_change_checks(&[RetentionChange {
+            subvolume: "docs".to_string(),
+            previous: previous.into(),
+            current,
+        }]);
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].status, DoctorCheckStatus::Warn);
+        assert!(checks[0].name.starts_with("docs: local retention tightened"), "{}", checks[0].name);
+        assert_eq!(
+            checks[0].suggestion.as_deref(),
+            Some("Run `urd backup --confirm-retention-change` once.")
+        );
+    }
 
     // ── Sudoers drift (UPI 071) ────────────────────────────────────────
 

@@ -23,7 +23,6 @@ use crate::awareness::{PromiseStatus, SubvolAssessment};
 use crate::config::Config;
 use crate::error::UrdError;
 use crate::executor::ExecutionResult;
-use crate::output::{ChurnHeartbeatFields, SubvolumeExtras};
 
 /// Current schema version. Bump when adding fields (never remove fields).
 const SCHEMA_VERSION: u32 = 4;
@@ -127,25 +126,62 @@ pub struct SubvolumeHeartbeat {
     pub estimated_local_pinned_delta_bytes: Option<u64>,
 }
 
+/// Heartbeat / metrics projection of a single subvolume's churn state.
+/// `commands/backup.rs` builds a `HashMap<String, ChurnHeartbeatFields>` and
+/// passes it to both `heartbeat::build` and
+/// `backup::write_metrics_per_spec` so both surfaces share the same
+/// policy: incremental → `churn_bytes_per_second`; full-only →
+/// `last_full_send_bytes`. Cold-start subvolumes have both `None`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ChurnHeartbeatFields {
+    pub churn_bytes_per_second: Option<f64>,
+    pub last_full_send_bytes: Option<u64>,
+    /// Arithmetic mean of `bytes_transferred` over in-window incrementals.
+    /// Used by UPI 043's pinned-delta computation in `gather_pool_observability`.
+    pub mean_incremental_bytes: Option<u64>,
+}
+
+/// Per-subvolume "extras" populated by `gather_pool_observability` and threaded
+/// to both `heartbeat::build` and `backup::write_metrics_per_spec`
+/// so both surfaces share the same `pool_uuid`, `local_snapshot_count`, and
+/// `estimated_local_pinned_delta_bytes` values for a given run (UPI 043).
+#[derive(Debug, Clone, Default)]
+pub struct SubvolumeExtras {
+    pub pool_uuid: Option<String>,
+    pub local_snapshot_count: Option<u32>,
+    pub estimated_local_pinned_delta_bytes: Option<u64>,
+}
+
 // ── Builder ─────────────────────────────────────────────────────────────
 
-/// Build a heartbeat with awareness assessments. `result` is the completed
-/// backup run, or `None` for an empty/skipped run (`run_result: "empty"`).
-///
-/// If a future addition pushes this past 8 args, refactor to a
-/// `HeartbeatInputs { ... }` struct instead of growing the positional list.
+/// Everything [`build`] projects into a heartbeat. Grow this struct, not a
+/// positional list, when the heartbeat gains a new input.
+pub struct HeartbeatInputs<'a> {
+    pub config: &'a Config,
+    pub now: NaiveDateTime,
+    /// The completed backup run, or `None` for an empty/skipped run
+    /// (`run_result: "empty"`).
+    pub result: Option<&'a ExecutionResult>,
+    pub assessments: &'a [SubvolAssessment],
+    pub churn_views: &'a HashMap<String, ChurnHeartbeatFields>,
+    pub pools: Vec<PoolHeartbeat>,
+    pub drives: Vec<DriveHeartbeat>,
+    pub subvol_extras: &'a HashMap<String, SubvolumeExtras>,
+}
+
+/// Build a heartbeat with awareness assessments (see [`HeartbeatInputs`]).
 #[must_use]
-#[allow(clippy::too_many_arguments)]
-pub fn build(
-    config: &Config,
-    now: NaiveDateTime,
-    result: Option<&ExecutionResult>,
-    assessments: &[SubvolAssessment],
-    churn_views: &HashMap<String, ChurnHeartbeatFields>,
-    pools: Vec<PoolHeartbeat>,
-    drives: Vec<DriveHeartbeat>,
-    subvol_extras: &HashMap<String, SubvolumeExtras>,
-) -> Heartbeat {
+pub fn build(inputs: HeartbeatInputs<'_>) -> Heartbeat {
+    let HeartbeatInputs {
+        config,
+        now,
+        result,
+        assessments,
+        churn_views,
+        pools,
+        drives,
+        subvol_extras,
+    } = inputs;
     let subvolumes = build_subvolume_entries(result, assessments, churn_views, subvol_extras);
 
     Heartbeat {
@@ -429,16 +465,16 @@ mod tests {
         let assessments = test_assessments();
         let result = test_execution_result();
 
-        let heartbeat = build(
-            &config,
+        let heartbeat = build(HeartbeatInputs {
+            config: &config,
             now,
-            Some(&result),
-            &assessments,
-            &HashMap::new(),
-            Vec::new(),
-            Vec::new(),
-            &HashMap::new(),
-        );
+            result: Some(&result),
+            assessments: &assessments,
+            churn_views: &HashMap::new(),
+            pools: Vec::new(),
+            drives: Vec::new(),
+            subvol_extras: &HashMap::new(),
+        });
         let json = serde_json::to_string_pretty(&heartbeat).unwrap();
         let parsed: Heartbeat = serde_json::from_str(&json).unwrap();
 
@@ -482,16 +518,16 @@ mod tests {
         });
         let result = test_execution_result();
 
-        let heartbeat = build(
-            &config,
+        let heartbeat = build(HeartbeatInputs {
+            config: &config,
             now,
-            Some(&result),
-            &assessments,
-            &HashMap::new(),
-            Vec::new(),
-            Vec::new(),
-            &HashMap::new(),
-        );
+            result: Some(&result),
+            assessments: &assessments,
+            churn_views: &HashMap::new(),
+            pools: Vec::new(),
+            drives: Vec::new(),
+            subvol_extras: &HashMap::new(),
+        });
         let json = serde_json::to_string(&heartbeat).unwrap();
         assert!(
             !json.contains("storage_posture") && !json.contains("posture"),
@@ -534,16 +570,16 @@ mod tests {
             NaiveDateTime::parse_from_str("2026-03-24T02:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
         let assessments = test_assessments();
 
-        let heartbeat = build(
-            &config,
+        let heartbeat = build(HeartbeatInputs {
+            config: &config,
             now,
-            None,
-            &assessments,
-            &HashMap::new(),
-            Vec::new(),
-            Vec::new(),
-            &HashMap::new(),
-        );
+            result: None,
+            assessments: &assessments,
+            churn_views: &HashMap::new(),
+            pools: Vec::new(),
+            drives: Vec::new(),
+            subvol_extras: &HashMap::new(),
+        });
 
         assert_eq!(heartbeat.run_result, "empty");
         assert_eq!(heartbeat.run_id, None);
@@ -568,16 +604,16 @@ mod tests {
             NaiveDateTime::parse_from_str("2026-03-24T02:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
         let assessments = test_assessments();
 
-        let heartbeat = build(
-            &config,
+        let heartbeat = build(HeartbeatInputs {
+            config: &config,
             now,
-            None,
-            &assessments,
-            &HashMap::new(),
-            Vec::new(),
-            Vec::new(),
-            &HashMap::new(),
-        );
+            result: None,
+            assessments: &assessments,
+            churn_views: &HashMap::new(),
+            pools: Vec::new(),
+            drives: Vec::new(),
+            subvol_extras: &HashMap::new(),
+        });
         write(&path, &heartbeat).unwrap();
 
         // Temp file cleaned up
@@ -596,16 +632,16 @@ mod tests {
         let config = test_config(&[("home", "1h")]);
         let now =
             NaiveDateTime::parse_from_str("2026-03-24T02:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
-        let heartbeat = build(
-            &config,
+        let heartbeat = build(HeartbeatInputs {
+            config: &config,
             now,
-            None,
-            &test_assessments(),
-            &HashMap::new(),
-            Vec::new(),
-            Vec::new(),
-            &HashMap::new(),
-        );
+            result: None,
+            assessments: &test_assessments(),
+            churn_views: &HashMap::new(),
+            pools: Vec::new(),
+            drives: Vec::new(),
+            subvol_extras: &HashMap::new(),
+        });
         write(&path, &heartbeat).unwrap();
 
         assert!(path.exists());
@@ -618,16 +654,16 @@ mod tests {
         let config = test_config(&[("home", "1h")]);
         let now =
             NaiveDateTime::parse_from_str("2026-04-30T03:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
-        let heartbeat = build(
-            &config,
+        let heartbeat = build(HeartbeatInputs {
+            config: &config,
             now,
-            None,
-            &test_assessments(),
-            &HashMap::new(),
-            Vec::new(),
-            Vec::new(),
-            &HashMap::new(),
-        );
+            result: None,
+            assessments: &test_assessments(),
+            churn_views: &HashMap::new(),
+            pools: Vec::new(),
+            drives: Vec::new(),
+            subvol_extras: &HashMap::new(),
+        });
         assert_eq!(heartbeat.schema_version, 4);
         let json = serde_json::to_string(&heartbeat).unwrap();
         assert!(json.contains("\"schema_version\":4"));
@@ -648,16 +684,16 @@ mod tests {
             },
         );
 
-        let hb = build(
-            &config,
+        let hb = build(HeartbeatInputs {
+            config: &config,
             now,
-            None,
-            &test_assessments(),
-            &churn,
-            Vec::new(),
-            Vec::new(),
-            &HashMap::new(),
-        );
+            result: None,
+            assessments: &test_assessments(),
+            churn_views: &churn,
+            pools: Vec::new(),
+            drives: Vec::new(),
+            subvol_extras: &HashMap::new(),
+        });
         let json = serde_json::to_string(&hb).unwrap();
         let parsed: Heartbeat = serde_json::from_str(&json).unwrap();
         let home = parsed.subvolumes.iter().find(|s| s.name == "home").unwrap();
@@ -680,16 +716,16 @@ mod tests {
             },
         );
 
-        let hb = build(
-            &config,
+        let hb = build(HeartbeatInputs {
+            config: &config,
             now,
-            None,
-            &test_assessments(),
-            &churn,
-            Vec::new(),
-            Vec::new(),
-            &HashMap::new(),
-        );
+            result: None,
+            assessments: &test_assessments(),
+            churn_views: &churn,
+            pools: Vec::new(),
+            drives: Vec::new(),
+            subvol_extras: &HashMap::new(),
+        });
         let json = serde_json::to_string(&hb).unwrap();
         let parsed: Heartbeat = serde_json::from_str(&json).unwrap();
         let home = parsed.subvolumes.iter().find(|s| s.name == "home").unwrap();
@@ -728,16 +764,16 @@ mod tests {
         let config = test_config(&[("home", "1h")]);
         let now =
             NaiveDateTime::parse_from_str("2026-04-30T03:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
-        let hb = build(
-            &config,
+        let hb = build(HeartbeatInputs {
+            config: &config,
             now,
-            None,
-            &test_assessments(),
-            &HashMap::new(),
-            Vec::new(),
-            Vec::new(),
-            &HashMap::new(),
-        );
+            result: None,
+            assessments: &test_assessments(),
+            churn_views: &HashMap::new(),
+            pools: Vec::new(),
+            drives: Vec::new(),
+            subvol_extras: &HashMap::new(),
+        });
         let json = serde_json::to_string(&hb).unwrap();
         assert!(
             !json.contains("churn_bytes_per_second"),
@@ -750,16 +786,16 @@ mod tests {
         let config = test_config(&[("home", "1h")]);
         let now =
             NaiveDateTime::parse_from_str("2026-04-30T03:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
-        let hb = build(
-            &config,
+        let hb = build(HeartbeatInputs {
+            config: &config,
             now,
-            None,
-            &test_assessments(),
-            &HashMap::new(),
-            Vec::new(),
-            Vec::new(),
-            &HashMap::new(),
-        );
+            result: None,
+            assessments: &test_assessments(),
+            churn_views: &HashMap::new(),
+            pools: Vec::new(),
+            drives: Vec::new(),
+            subvol_extras: &HashMap::new(),
+        });
         let json = serde_json::to_string(&hb).unwrap();
         assert!(
             !json.contains("last_full_send_bytes"),
@@ -844,16 +880,16 @@ mod tests {
             run_id: Some(1),
         };
 
-        let hb = build(
-            &config,
+        let hb = build(HeartbeatInputs {
+            config: &config,
             now,
-            Some(&result),
-            &assessments,
-            &HashMap::new(),
-            Vec::new(),
-            Vec::new(),
-            &HashMap::new(),
-        );
+            result: Some(&result),
+            assessments: &assessments,
+            churn_views: &HashMap::new(),
+            pools: Vec::new(),
+            drives: Vec::new(),
+            subvol_extras: &HashMap::new(),
+        });
         assert!(hb.subvolumes[0].send_completed);
     }
 
@@ -882,16 +918,16 @@ mod tests {
             run_id: Some(1),
         };
 
-        let hb = build(
-            &config,
+        let hb = build(HeartbeatInputs {
+            config: &config,
             now,
-            Some(&result),
-            &assessments,
-            &HashMap::new(),
-            Vec::new(),
-            Vec::new(),
-            &HashMap::new(),
-        );
+            result: Some(&result),
+            assessments: &assessments,
+            churn_views: &HashMap::new(),
+            pools: Vec::new(),
+            drives: Vec::new(),
+            subvol_extras: &HashMap::new(),
+        });
         assert!(!hb.subvolumes[0].send_completed);
     }
 
@@ -931,16 +967,16 @@ mod tests {
             run_id: Some(1),
         };
 
-        let hb = build(
-            &config,
+        let hb = build(HeartbeatInputs {
+            config: &config,
             now,
-            Some(&result),
-            &assessments,
-            &HashMap::new(),
-            Vec::new(),
-            Vec::new(),
-            &HashMap::new(),
-        );
+            result: Some(&result),
+            assessments: &assessments,
+            churn_views: &HashMap::new(),
+            pools: Vec::new(),
+            drives: Vec::new(),
+            subvol_extras: &HashMap::new(),
+        });
         assert!(hb.subvolumes[0].send_completed);
     }
 
@@ -969,16 +1005,16 @@ mod tests {
             run_id: Some(1),
         };
 
-        let hb = build(
-            &config,
+        let hb = build(HeartbeatInputs {
+            config: &config,
             now,
-            Some(&result),
-            &assessments,
-            &HashMap::new(),
-            Vec::new(),
-            Vec::new(),
-            &HashMap::new(),
-        );
+            result: Some(&result),
+            assessments: &assessments,
+            churn_views: &HashMap::new(),
+            pools: Vec::new(),
+            drives: Vec::new(),
+            subvol_extras: &HashMap::new(),
+        });
         assert!(!hb.subvolumes[0].send_completed);
     }
 
@@ -1066,16 +1102,16 @@ mod tests {
         let config = test_config(&[("home", "1h")]);
         let now =
             NaiveDateTime::parse_from_str("2026-05-15T03:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
-        let hb = build(
-            &config,
+        let hb = build(HeartbeatInputs {
+            config: &config,
             now,
-            None,
-            &test_assessments(),
-            &HashMap::new(),
-            Vec::new(),
-            Vec::new(),
-            &HashMap::new(),
-        );
+            result: None,
+            assessments: &test_assessments(),
+            churn_views: &HashMap::new(),
+            pools: Vec::new(),
+            drives: Vec::new(),
+            subvol_extras: &HashMap::new(),
+        });
         let json = serde_json::to_string(&hb).unwrap();
         assert!(!json.contains("\"pools\""), "pools should be omitted: {json}");
         assert!(
@@ -1095,16 +1131,16 @@ mod tests {
             free_bytes: Some(42),
             metadata_utilization_ratio: Some(0.5),
         }];
-        let hb = build(
-            &config,
+        let hb = build(HeartbeatInputs {
+            config: &config,
             now,
-            None,
-            &test_assessments(),
-            &HashMap::new(),
+            result: None,
+            assessments: &test_assessments(),
+            churn_views: &HashMap::new(),
             pools,
-            Vec::new(),
-            &HashMap::new(),
-        );
+            drives: Vec::new(),
+            subvol_extras: &HashMap::new(),
+        });
         let json = serde_json::to_string(&hb).unwrap();
         let parsed: Heartbeat = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.pools.len(), 1);
@@ -1120,16 +1156,16 @@ mod tests {
         let config = test_config(&[("home", "1h")]);
         let now =
             NaiveDateTime::parse_from_str("2026-05-15T03:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
-        let hb = build(
-            &config,
+        let hb = build(HeartbeatInputs {
+            config: &config,
             now,
-            None,
-            &test_assessments(),
-            &HashMap::new(),
-            Vec::new(),
-            Vec::new(),
-            &HashMap::new(),
-        );
+            result: None,
+            assessments: &test_assessments(),
+            churn_views: &HashMap::new(),
+            pools: Vec::new(),
+            drives: Vec::new(),
+            subvol_extras: &HashMap::new(),
+        });
         let json = serde_json::to_string(&hb).unwrap();
         assert!(!json.contains("pool_uuid"), "pool_uuid omitted: {json}");
     }
@@ -1148,16 +1184,16 @@ mod tests {
                 estimated_local_pinned_delta_bytes: Some(1_000_000),
             },
         );
-        let hb = build(
-            &config,
+        let hb = build(HeartbeatInputs {
+            config: &config,
             now,
-            None,
-            &test_assessments(),
-            &HashMap::new(),
-            Vec::new(),
-            Vec::new(),
-            &extras,
-        );
+            result: None,
+            assessments: &test_assessments(),
+            churn_views: &HashMap::new(),
+            pools: Vec::new(),
+            drives: Vec::new(),
+            subvol_extras: &extras,
+        });
         let json = serde_json::to_string(&hb).unwrap();
         let parsed: Heartbeat = serde_json::from_str(&json).unwrap();
         let home = parsed.subvolumes.iter().find(|s| s.name == "home").unwrap();
@@ -1178,16 +1214,16 @@ mod tests {
             mounted: true,
             pool_uuid: Some("uuid-x".to_string()),
         }];
-        let hb = build(
-            &config,
+        let hb = build(HeartbeatInputs {
+            config: &config,
             now,
-            None,
-            &test_assessments(),
-            &HashMap::new(),
-            Vec::new(),
+            result: None,
+            assessments: &test_assessments(),
+            churn_views: &HashMap::new(),
+            pools: Vec::new(),
             drives,
-            &HashMap::new(),
-        );
+            subvol_extras: &HashMap::new(),
+        });
         let json = serde_json::to_string(&hb).unwrap();
         // DriveRole::Primary renders as "primary" via Display.
         assert!(
@@ -1208,16 +1244,16 @@ mod tests {
         let config = test_config(&[("home", "1h")]);
         let now =
             NaiveDateTime::parse_from_str("2026-05-15T03:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
-        let hb = build(
-            &config,
+        let hb = build(HeartbeatInputs {
+            config: &config,
             now,
-            None,
-            &test_assessments(),
-            &HashMap::new(),
-            Vec::new(),
+            result: None,
+            assessments: &test_assessments(),
+            churn_views: &HashMap::new(),
+            pools: Vec::new(),
             drives,
-            &HashMap::new(),
-        );
+            subvol_extras: &HashMap::new(),
+        });
         let json = serde_json::to_string(&hb).unwrap();
         let parsed: Heartbeat = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.drives.len(), 1);

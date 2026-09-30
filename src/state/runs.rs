@@ -1,4 +1,5 @@
 use crate::error::UrdError;
+use crate::output::LastRunInfo;
 
 use super::{OperationRecord, OperationRow, RunRecord, StateDb, db_err};
 
@@ -99,12 +100,12 @@ impl StateDb {
     }
 
     /// Query last run, fail-open: a query error is logged and reads as "no
-    /// run". The presentation shape is composed by `output::LastRunInfo`'s
-    /// `From<RunRecord>`, not here.
+    /// run". Returns the raw row; callers compose the presentation shape
+    /// through `output::LastRunInfo`'s `From<RunRecord>`.
     #[must_use]
-    pub fn last_run_info(&self) -> Option<crate::output::LastRunInfo> {
+    pub fn last_run_info(&self) -> Option<RunRecord> {
         match self.last_run() {
-            Ok(Some(run)) => Some(run.into()),
+            Ok(Some(run)) => Some(run),
             Ok(None) => None,
             Err(e) => {
                 log::warn!("Failed to query last run: {e}");
@@ -353,6 +354,23 @@ impl StateDb {
             error_message: row.get(7)?,
             bytes_transferred: row.get(8)?,
         })
+    }
+}
+
+/// Compose the presentation summary from the raw `runs` row: `duration` is
+/// the humanized span when the run finished, `None` while it is running.
+impl From<RunRecord> for LastRunInfo {
+    fn from(run: RunRecord) -> Self {
+        let duration = run
+            .finished_at
+            .as_ref()
+            .and_then(|f| crate::types::format_run_duration(&run.started_at, f));
+        Self {
+            id: run.id,
+            started_at: run.started_at,
+            result: run.result,
+            duration,
+        }
     }
 }
 

@@ -8,15 +8,21 @@ use crate::config::{Config, DriveConfig, ResolvedSubvolume};
 use crate::drives::DriveAvailability;
 use crate::events::DeferScope;
 use crate::storage_critical;
-use crate::types::{
-    BackupPlan, Interval, PlannedLifecycle, PlannedOperation, PlannedSkip, SendKind, SnapshotName,
-};
+use crate::types::{Interval, SnapshotName};
 
 mod external;
 mod fragment;
 mod local;
 mod send;
 mod transient;
+mod types;
+
+// The planner's output vocabulary (`types.rs`); `crate::types` re-exports
+// these too, so both paths resolve.
+pub use types::{
+    BackupPlan, DeleteKind, NothingNew, PlannedLifecycle, PlannedOperation, PlannedSkip,
+    SkipReason,
+};
 
 #[cfg(test)]
 mod testkit;
@@ -56,17 +62,16 @@ fn send_floor_defer_reason(
     subvol: &ResolvedSubvolume,
     local_dir: &Path,
     obs: &Observation,
-) -> Option<String> {
+) -> Option<SkipReason> {
     let capacity = obs.fs.filesystem_capacity_bytes(local_dir).unwrap_or(0);
     let floor = crate::guard::source_floor_bytes(subvol.min_free_bytes.unwrap_or(0), capacity);
     let free = free_bytes_fail_open(obs, local_dir);
     if free < floor {
         use crate::types::ByteSize;
-        Some(format!(
-            "source pool below the host-survival floor ({} free, {} required) — deferring send",
-            ByteSize(free),
-            ByteSize(floor),
-        ))
+        Some(SkipReason::SourceBelowFloor {
+            free: ByteSize(free),
+            required: ByteSize(floor),
+        })
     } else {
         None
     }
@@ -86,78 +91,13 @@ pub(crate) use crate::observation::read_snapshot_dir;
 
 // ── Size estimation helper ──────────────────────────────────────────────
 
-/// Which cascade tier `estimated_send_size_with_source` resolved to — lets a
-/// caller reconstruct tier-specific display detail (the calibrated-staleness
-/// note) without re-running the cascade or duplicating it (#304).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SizeEstimateSource {
-    /// A successful send, same-drive or cross-drive.
-    History,
-    /// The full subvolume footprint from `urd calibrate`.
-    Calibrated,
-    /// A failed/aborted send's byte count, used as a last-resort floor (#210).
-    FailedFloor,
-}
-
-/// Best available estimate of the bytes a next send will transfer, plus
-/// which tier produced it. Strategy: same-drive history > cross-drive
-/// history > calibrated size (full sends only) > failed-send floor.
-/// Returns None when no data is available.
-///
-/// Note: calibrated size is the full subvolume footprint, so it is
-/// only a valid estimate when a full send is needed. For incremental
-/// sends, calibrated is skipped — callers must treat "unknown" as
-/// not-a-constraint rather than substituting calibrated.
-#[must_use]
-pub fn estimated_send_size_with_source(
-    history: &dyn HistoryQuery,
-    subvol_name: &str,
-    drive_label: &str,
-    needs_full: bool,
-) -> Option<(u64, SizeEstimateSource)> {
-    let send_kind = if needs_full {
-        SendKind::Full
-    } else {
-        SendKind::Incremental
-    };
-    // Preference order, strongest signal first (#210): a successful send to this
-    // drive, then a successful send to any drive, then the calibrated size (full
-    // only), and — only when no confident signal exists — a failed/aborted send's
-    // bytes as a last-resort floor. A failed partial must never outrank a real
-    // measurement, which is the bug this order fixes.
-    history
-        .last_send_size(subvol_name, drive_label, send_kind)
-        .or_else(|| history.last_send_size_any_drive(subvol_name, send_kind))
-        .map(|bytes| (bytes, SizeEstimateSource::History))
-        .or_else(|| {
-            if needs_full {
-                history
-                    .calibrated_size(subvol_name)
-                    .map(|(bytes, _)| (bytes, SizeEstimateSource::Calibrated))
-            } else {
-                None
-            }
-        })
-        .or_else(|| {
-            history
-                .last_failed_send_floor(subvol_name, drive_label, send_kind)
-                .map(|bytes| (bytes, SizeEstimateSource::FailedFloor))
-        })
-}
-
-/// Best available estimate of the bytes a next send will transfer. Thin
-/// wrapper over `estimated_send_size_with_source` for callers that only need
-/// the byte count, not which tier produced it.
-#[must_use]
-pub fn estimated_send_size(
-    history: &dyn HistoryQuery,
-    subvol_name: &str,
-    drive_label: &str,
-    needs_full: bool,
-) -> Option<u64> {
-    estimated_send_size_with_source(history, subvol_name, drive_label, needs_full)
-        .map(|(bytes, _)| bytes)
-}
+// The estimator is a pure function over `HistoryQuery`, shared with awareness's
+// space check; it lives with the query traits (`observation/estimate.rs`) so
+// the observer does not depend on the planner. Re-exported so
+// `crate::plan::{estimated_send_size, ..}` paths keep resolving.
+pub use crate::observation::estimate::{
+    SizeEstimateSource, estimated_send_size, estimated_send_size_with_source,
+};
 
 /// The size estimate to show a human for the next send. An incremental send's
 /// estimate is the size of the previous incremental send, so when the last
@@ -201,6 +141,17 @@ pub struct PlanFilters {
     pub force_snapshot: bool,
 }
 
+impl PlanFilters {
+    /// Does the `--priority` / `--subvolume` scoping admit `sv`? The planner
+    /// skips a subvolume these filters exclude, and the retention-change gate
+    /// (ADR-110) records no shape for it — one predicate, so the two agree.
+    #[must_use]
+    pub fn admits(&self, sv: &crate::config::ResolvedSubvolume) -> bool {
+        self.priority.is_none_or(|p| sv.priority == p)
+            && self.subvolume.as_ref().is_none_or(|s| s == &sv.name)
+    }
+}
+
 // ── Helpers ────────────────────────────────────────────────────────────
 
 /// The outcome of gating a drive for sends: ready to receive, or the defer
@@ -222,10 +173,11 @@ fn check_drive_availability(
     obs: &Observation,
     now: NaiveDateTime,
 ) -> DriveGate {
-    // Every defer arm is drive-scoped with no next-due — only the reason prose
+    // Every defer arm is drive-scoped with no next-due — only the reason
     // differs. One closure keeps the shape single-homed and the reasons the
     // only per-arm variation.
-    let deferred = |reason: String| {
+    let label = || drive.label.clone();
+    let deferred = |reason: SkipReason| {
         let mut f = fragment::PlanFragment::default();
         f.defer(
             subvol_name,
@@ -239,22 +191,30 @@ fn check_drive_availability(
     };
     match obs.fs.drive_availability(drive) {
         DriveAvailability::Available => DriveGate::Ready,
-        DriveAvailability::NotMounted => deferred(format!("drive {} not mounted", drive.label)),
-        DriveAvailability::UuidMismatch { expected, found } => deferred(format!(
-            "drive {} UUID mismatch (expected {}, found {})",
-            drive.label, expected, found
-        )),
-        DriveAvailability::UuidCheckFailed(reason) => {
-            deferred(format!("drive {} UUID check failed: {}", drive.label, reason))
+        DriveAvailability::NotMounted => deferred(SkipReason::DriveNotMounted { drive: label() }),
+        DriveAvailability::UuidMismatch { expected, found } => {
+            deferred(SkipReason::DriveUuidMismatch {
+                drive: label(),
+                expected,
+                found,
+            })
         }
-        DriveAvailability::TokenMismatch { expected, found } => deferred(format!(
-            "drive {} token mismatch (expected {}, found {}) — possible drive swap",
-            drive.label, expected, found
-        )),
-        DriveAvailability::TokenExpectedButMissing => deferred(format!(
-            "drive {} token expected but missing \u{2014} run `urd drives adopt {}`",
-            drive.label, drive.label
-        )),
+        DriveAvailability::UuidCheckFailed(error) => {
+            deferred(SkipReason::DriveUuidCheckFailed {
+                drive: label(),
+                error,
+            })
+        }
+        DriveAvailability::TokenMismatch { expected, found } => {
+            deferred(SkipReason::DriveTokenMismatch {
+                drive: label(),
+                expected,
+                found,
+            })
+        }
+        DriveAvailability::TokenExpectedButMissing => {
+            deferred(SkipReason::DriveTokenExpectedButMissing { drive: label() })
+        }
         // Benign: first use or pre-token drive. Proceed with send.
         DriveAvailability::TokenMissing => DriveGate::Ready,
     }
@@ -301,8 +261,8 @@ pub fn plan(
 ) -> crate::error::Result<BackupPlan> {
     // The run's single accumulator (UPI 089-c): every region fragment is
     // absorbed and every body defer recorded here, in emission order.
-    // Skip reason strings are classified by output::SkipCategory::from_reason().
-    // When adding new patterns, update output::tests::classify_all_18_patterns.
+    // Skip reasons are typed (`SkipReason`); a new variant must choose its
+    // prose (`Display`) and its `SkipCategory` in plan/types.rs.
     let mut f = fragment::PlanFragment::default();
     let mut judgments: Vec<SubvolJudgment> = Vec::new();
     let mut lifecycles: std::collections::HashMap<String, PlannedLifecycle> =
@@ -317,7 +277,7 @@ pub fn plan(
             f.defer(
                 &subvol.name,
                 None,
-                "disabled".to_string(),
+                SkipReason::Disabled,
                 None,
                 DeferScope::Subvolume,
                 now,
@@ -325,28 +285,23 @@ pub fn plan(
             continue;
         }
 
-        // Filter: priority
-        if let Some(p) = filters.priority
-            && subvol.priority != p
-        {
+        // Filter: priority, specific subvolume
+        if !filters.admits(subvol) {
             continue;
         }
 
-        // Filter: specific subvolume (overrides interval check)
+        // A specifically named subvolume overrides the interval check.
         let force = filters
             .subvolume
             .as_ref()
             .is_some_and(|s| s == &subvol.name);
-        if filters.subvolume.is_some() && !force {
-            continue;
-        }
 
         // Resolve local snapshot directory
         let Some(ref snapshot_root) = subvol.snapshot_root else {
             f.defer(
                 &subvol.name,
                 None,
-                "no snapshot root configured".to_string(),
+                SkipReason::NoSnapshotRoot,
                 None,
                 DeferScope::Subvolume,
                 now,
@@ -530,7 +485,7 @@ pub fn plan(
             f.defer(
                 &subvol.name,
                 None,
-                "local only".to_string(),
+                SkipReason::LocalOnly,
                 None,
                 DeferScope::Subvolume,
                 now,
@@ -636,7 +591,8 @@ fn orphan_invariant_violations(
             violations.push(format!(
                 "{} has CreateSnapshot alongside a nothing-new-to-send defer ({:?}) — \
                  the send planner did not see tonight's snapshot; it will be stranded",
-                j.name, skip.reason
+                j.name,
+                skip.reason.to_string()
             ));
         }
     }

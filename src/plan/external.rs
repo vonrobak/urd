@@ -1,5 +1,5 @@
 use crate::retention;
-use crate::types::PlannedOperation;
+use crate::plan::PlannedOperation;
 
 use super::fragment::{ExternalRetentionInputs, PlanFragment, SubvolInputs, stamp_context};
 

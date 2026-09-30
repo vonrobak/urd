@@ -42,7 +42,7 @@ does not set them.
 | `AT RISK` | At least one required copy is older than the level's freshness threshold. Data is still recoverable, but the safety margin has eroded. |
 | `UNPROTECTED` | A required copy is missing or unusably stale. The promise is broken; user attention is warranted. |
 
-Source: `awareness.rs`, ADR-110.
+Source: `awareness/` (judgment), `types.rs` (`PromiseStatus`), ADR-110.
 
 **In context (heartbeat JSON, machine-facing):**
 
@@ -75,12 +75,12 @@ a subvolume's copies, across subvolumes, and the aggregate summary line. The rul
 load-bearing and deliberately enforced — a second severity representation that could
 disagree with `status` is the bug UPI 053 shipped a deletion to remove (the hand-rolled
 `status_severity` helper), and the mistake `DriveRotation`/`rotation.rs` cite as the one
-not to repeat (no `RotationTier`/`Due` gravity — `awareness.rs:423`, `rotation.rs:107`).
+not to repeat (no `RotationTier`/`Due` gravity — `awareness/types.rs` `DriveRotation`, `rotation.rs` `RotationTier`).
 Orthogonal axes (operational health, storage posture, the rotation voice register) may
 *layer over* gravity, but never re-order it. A derived display classifier reads gravity;
 it never competes with it, and carries no `Ord` of its own.
 
-**operational health** (`OperationalHealth`, `awareness.rs`). A second, orthogonal axis
+**operational health** (`OperationalHealth`, `awareness/types.rs`). A second, orthogonal axis
 answering *"can the next backup succeed efficiently?"* — distinct from gravity's *"is my
 data safe?"*. Three values, ordered worst-to-best (`min()` yields the worst):
 
@@ -96,7 +96,7 @@ Mostly separate from `PromiseStatus`: a subvolume can be `PROTECTED` yet `degrad
 lowercase engine word renders directly (`healthy` dimmed, `degraded` yellow, `blocked`
 red), and `urd status` shows the HEALTH column only when some subvolume is non-`healthy`.
 
-**PromiseRollup** (`awareness.rs`, UPI 088-a). The three-way partition of subvolume
+**PromiseRollup** (`awareness/transitions.rs`, UPI 088-a). The three-way partition of subvolume
 names by promise state — the single home of the protected/at-risk/unprotected
 reduction. Every "how many are sealed?" / "is everything broken?" question reads this
 one projection (`from_assessments` / `from_pairs`); no surface re-derives the
@@ -105,7 +105,7 @@ deliberately asymmetric and load-bearing: `all_protected()` is **vacuously true*
 (zero subvolumes, zero broken promises — `urd doctor` renders "✓ 0 of 0 sealed"),
 `all_unprotected()` is **guarded false** (the alarm needs actual subvolumes).
 
-**promise change** (`PromiseChange`, `awareness.rs`, UPI 088-a). The *detection
+**promise change** (`PromiseChange`, `awareness/transitions.rs`, UPI 088-a). The *detection
 result* of diffing two promise-snapshot sets by name: `name` went `from` → `to`,
 computed only by `awareness::promise_changes` (the single transition detection).
 Distinct from `EventPayload::PromiseTransition`, the *persisted event* a change may
@@ -437,7 +437,7 @@ guards (the old UPI 032) were retired in the 2026-05-30 re-grill.
 
 | Term | Meaning |
 |------|---------|
-| `tightness tier` | Source-pool free-space tier: `TightnessTier { Roomy, Tight, Critical }` (`storage_critical.rs`). The ratio classifier (`recommendation::classify_free_ratio_value`: `< 0.25` → Tight, `< 0.15` → Critical) is the primary arming path, but since **UPI 064-a** (ADR-113 amendment) a one-way **absolute-headroom downgrade gate** runs ahead of it: a pool with free bytes above a small multiple of the host-survival floor (`guard::source_floor_bytes`) is forced **Roomy** regardless of ratio (so a 15 TB pool at 20 % free / 3 TB absolute stays Roomy, not permanently Tight — issue #202). The imperative-bundle axis the Do-No-Harm response climbs with. |
+| `tightness tier` | Source-pool free-space tier: `TightnessTier { Roomy, Tight, Critical }` (`storage_critical.rs`). The ratio classifier (`storage_critical::classify_free_ratio_value`: `< 0.25` → Tight, `< 0.15` → Critical) is the primary arming path, but since **UPI 064-a** (ADR-113 amendment) a one-way **absolute-headroom downgrade gate** runs ahead of it: a pool with free bytes above a small multiple of the host-survival floor (`guard::source_floor_bytes`) is forced **Roomy** regardless of ratio (so a 15 TB pool at 20 % free / 3 TB absolute stays Roomy, not permanently Tight — issue #202). The imperative-bundle axis the Do-No-Harm response climbs with. |
 | `tight` / `critical` | User-facing names for the `Tight` / `Critical` tiers (state vocabulary). `Roomy` is silent — Urd says nothing about a roomy pool. |
 | `host-root axis` | The structural escalation flag (`storage_critical::host_root`): the subvolume's source is on the pool hosting `/` (UUID match) **and** an *enabled* subvolume entrusts `/` itself (`source == "/"`). Orthogonal to the tier — pressure on the host-root pool risks the **machine itself**, not just retention. This is the relocated home of UPI 031's stakes-not-action advisory prose. |
 | `storage posture` | The per-subvolume `StoragePosture { tier, host_root }` carried on `SubvolAssessment` — `Some` only when `tier >= Tight`. A presentation axis distinct from the data-safety `PromiseStatus`: "Urd is watching a tight pool." **Mostly** separate (ADR-110 R4) — **but** UPI 031-b's AT-RISK cap is the one recorded coupling: at **Critical**, the deliberate clear-all cadence is an honest reduction in protection, so the promise is capped at AT RISK (ADR-110 amendment 2026-05-30, overturning R4 at Critical only). Tight/Roomy stay fully separate. |

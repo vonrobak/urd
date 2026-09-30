@@ -10,9 +10,9 @@
 //!
 //! - **Tightness tier** — `TightnessTier { Roomy, Tight, Critical }`, derived
 //!   from the source pool's free-ratio alone (via
-//!   `recommendation::classify_free_ratio_value`, the single source of truth
-//!   for the boundaries). Drives the response tier for *any* tight pool Urd
-//!   snapshots to.
+//!   `classify_free_ratio_value`, the single source of truth for the
+//!   boundaries, which `recommendation`'s composite classifier also reads).
+//!   Drives the response tier for *any* tight pool Urd snapshots to.
 //! - **Host-root flag** — `host_root()`: the source lives on the pool hosting
 //!   `/` *and* an enabled subvolume entrusts `/` itself to Urd. Escalates the
 //!   voice/stakes orthogonally (pressure here risks the host, not just
@@ -36,12 +36,59 @@
 
 use std::collections::HashMap;
 
+use chrono::NaiveDateTime;
 use serde::Serialize;
 
-use crate::recommendation::{
-    self, FREE_RATIO_CAUTION, FREE_RATIO_PRESSURE, HeadroomSeverity,
-};
 use crate::types::{Interval, LocalRetentionPolicy};
+
+// ── Free-ratio classification (UPI 044 thresholds, ADR-115 amendment 2026-05-16) ──
+// N=1-calibrated from the 2026-05-09 retention-tuning report. Soft —
+// post-UPI-044 30-day checkpoint revises (ADR amendment, not new ADR).
+// Boundaries are strict (`<`): exact-threshold values land in the lower
+// tier (e.g., free_ratio == 0.25 → Healthy). The tightness tier below and
+// `recommendation`'s composite headroom classifier both read these.
+
+pub const FREE_RATIO_CAUTION: f64 = 0.25;
+pub const FREE_RATIO_PRESSURE: f64 = 0.15;
+
+/// Per-(subvolume, role) headroom severity (UPI 044). Ordering is
+/// load-bearing: `.iter().max()` yields the dominant tier when multiple
+/// signals fire.
+///
+/// UPI 031 retired the doctor-side Critical *injection*; UPI 031-b's
+/// tier-graded ephemeral spine confirmed the behavioral bundle keys on
+/// `TightnessTier`, not this severity ladder, so the dormant `Critical`
+/// variant (and its dead voice/recommendation paths) were deleted (AB5).
+/// `classify_headroom_severity` emits only `Healthy | Caution | Pressure`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HeadroomSeverity {
+    Healthy,
+    Caution,
+    Pressure,
+}
+
+/// Classify a pre-computed free-ratio by free-ratio alone. Boundaries are
+/// strict (`<`): exact-threshold values land in the lower (roomier) tier
+/// (e.g. `0.25` → `Healthy`). Non-finite ratios fail toward `Healthy`.
+///
+/// Shared with `storage_critical::resolve_armed_tier` (UPI 031-a) so the
+/// tightness-tier boundaries have a single source of truth.
+#[must_use]
+pub fn classify_free_ratio_value(ratio: f64) -> HeadroomSeverity {
+    if !ratio.is_finite() {
+        return HeadroomSeverity::Healthy;
+    }
+    if ratio < FREE_RATIO_PRESSURE {
+        HeadroomSeverity::Pressure
+    } else if ratio < FREE_RATIO_CAUTION {
+        HeadroomSeverity::Caution
+    } else {
+        HeadroomSeverity::Healthy
+    }
+}
+
+// ── Tightness tier ─────────────────────────────────────────────────────
 
 /// Hysteresis level-band (UPI 031-a, D4). A pool de-escalates only once free
 /// recovers to its arm threshold **plus** this band, so a pool hovering at a
@@ -106,7 +153,7 @@ pub const CRITICAL_INTERVAL_FLOOR_DAYS: i64 = 7;
 pub type ArmedTierMap = HashMap<String, TightnessTier>;
 
 /// Source-pool tightness, free-ratio only (UPI 031-a). Distinct from
-/// `recommendation::HeadroomSeverity` (a *composite* of free-ratio + trend +
+/// `HeadroomSeverity` as `recommendation` composes it (free-ratio + trend +
 /// destination metadata): the tier is the imperative-bundle axis that drives
 /// Do-No-Harm response. Ordering is load-bearing (`Roomy < Tight < Critical`):
 /// hysteresis and aggregation compare and `.max()` tiers.
@@ -268,7 +315,7 @@ pub fn host_root(
 /// the floor lands, to stamp `PoolSignal::armed_tier` (UPI 082, Branch D).
 /// Never re-derived post-exec (AB1) and never re-resolved by any other
 /// consumer. The per-subvolume carrier
-/// [`ResolvedStorageSignal::resolved`](crate::awareness::ResolvedStorageSignal::resolved)
+/// [`ResolvedStorageSignal::resolved`]
 /// and `resolve_armed_tiers` both read `PoolSignal::armed_tier` back rather
 /// than re-deriving it, so the two consumers stay coherent by construction.
 /// `pub(crate)` keeps the resolver in-crate.
@@ -286,9 +333,7 @@ pub(crate) fn resolve_armed_tier(
     if let (Some(free), Some(floor)) = (free_bytes, floor_bytes)
         && floor > 0
     {
-        #[allow(clippy::cast_precision_loss)]
         let free_f = free as f64;
-        #[allow(clippy::cast_precision_loss)]
         let floor_f = floor as f64;
         let forces_roomy = match prior_armed {
             // Hold Roomy while above the arm multiple (>= so exactly-at-arm holds).
@@ -309,7 +354,7 @@ pub(crate) fn resolve_armed_tier(
     };
 
     let current = TightnessTier::from(
-        recommendation::classify_free_ratio_value(ratio),
+        classify_free_ratio_value(ratio),
     );
     if current > prior_armed {
         // Worse than armed → escalate immediately to the classified tier.
@@ -334,6 +379,91 @@ pub(crate) fn resolve_armed_tier(
     }
     armed
 }
+
+// ── Per-subvolume signal ───────────────────────────────────────────────
+
+/// Per-subvolume raw storage signal fed into `assess()` (UPI 031-a). Resolved
+/// by the command layer (`commands/storage_signals.rs`) from `pools::pool_space`
+/// (free-ratio), `findmnt /` (host-root), and the persisted prior armed tier;
+/// `assess()` consumes it purely (ADR-108) — it performs no I/O of its own.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ResolvedStorageSignal {
+    /// Source pool free / capacity ratio; `None` when unmeasurable (holds the
+    /// prior armed tier rather than silently disarming).
+    pub free_ratio: Option<f64>,
+    /// This subvolume's source is on the host-root pool and `/` is entrusted.
+    pub host_root: bool,
+    /// The hysteresis-stabilized armed tier read back from `pool_armed_tier`
+    /// (defaults to `Roomy` for an untracked / UUID-less pool).
+    pub prior_armed_tier: TightnessTier,
+    /// When the armed tier last changed (the "flagged since" timestamp).
+    pub prior_since: Option<NaiveDateTime>,
+    /// The hysteresis-resolved armed tier for this run, resolved ONCE at the
+    /// single site (`commands/storage_signals::gather_with`) and stamped here
+    /// by the constructor rather than re-derived. Private and read-only: every
+    /// consumer (planner via the map, executor, awareness) reads back the SAME
+    /// resolved value, so the promise can never desync from the plan. This
+    /// carries the ADR-113 single-gather invariant in the type rather than a
+    /// prose comment. Read via [`armed_tier`](ResolvedStorageSignal::armed_tier).
+    armed_tier: TightnessTier,
+}
+
+impl ResolvedStorageSignal {
+    /// Build a signal from an already-resolved `armed_tier` (UPI 082, Branch
+    /// D). Single resolution site is `commands/storage_signals::gather_with`;
+    /// this constructor stores what it's given rather than re-deriving —
+    /// awareness and the planner/executor `armed_tier_map` all read the SAME
+    /// stamped value, so the promise can never desync from the plan.
+    ///
+    /// `free_bytes`/`floor_bytes` (UPI 064-a) feed the absolute-headroom gate
+    /// but are **not** stored — kept here only to cross-check the invariant in
+    /// debug builds: a signal whose stamped `armed_tier` disagrees with its
+    /// inputs cannot exist.
+    #[must_use]
+    pub fn resolved(
+        free_ratio: Option<f64>,
+        free_bytes: Option<u64>,
+        floor_bytes: Option<u64>,
+        host_root: bool,
+        prior_armed_tier: TightnessTier,
+        prior_since: Option<NaiveDateTime>,
+        armed_tier: TightnessTier,
+    ) -> Self {
+        debug_assert_eq!(
+            armed_tier,
+            resolve_armed_tier(
+                prior_armed_tier,
+                free_ratio,
+                free_bytes,
+                floor_bytes,
+            ),
+            "ResolvedStorageSignal::resolved: given armed_tier disagrees with its inputs"
+        );
+        Self {
+            free_ratio,
+            host_root,
+            prior_armed_tier,
+            prior_since,
+            armed_tier,
+        }
+    }
+
+    /// The hysteresis-resolved armed tier for this run (read-only). The single
+    /// value the planner timed against and awareness judges staleness against.
+    #[must_use]
+    pub fn armed_tier(&self) -> TightnessTier {
+        self.armed_tier
+    }
+}
+
+/// Per-subvolume storage signals keyed by subvolume name (UPI 031-a). Built at
+/// the command boundary; threaded into `assess()` as a pure input so the query
+/// seams stay narrow (parallels the 032 churn-map decision, arc R8). Subvolumes
+/// absent from the map get no posture.
+pub type StorageSignalMap =
+    std::collections::HashMap<String, ResolvedStorageSignal>;
+
+// ── Transitions and posture ────────────────────────────────────────────
 
 /// The transition between a prior and new armed tier, if any (UPI 031-a).
 /// `None` when the tier is unchanged.
@@ -516,7 +646,6 @@ pub fn effective_send_interval(
 /// Scale an interval by a factor, rounding to whole seconds. The tuple field is
 /// private to `Interval`, so the scaled duration is built via `from_chrono`.
 fn scale_interval(interval: Interval, factor: f64) -> Interval {
-    #[allow(clippy::cast_possible_truncation)]
     let scaled_secs = (interval.as_secs() as f64 * factor) as i64;
     Interval::from_chrono(chrono::Duration::seconds(scaled_secs))
 }

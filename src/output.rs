@@ -5,9 +5,9 @@
 
 use std::io::IsTerminal;
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
-use crate::advice::{ActionableAdvice, AdviceIssue, RedundancyAdvisory, RedundancyAdvisoryKind};
+use crate::advice::{ActionableAdvice, AdviceIssue, RedundancyAdvisory};
 use crate::awareness::{DriveAssessment, PromiseStatus, SubvolAssessment};
 use crate::config::ResolvedSubvolume;
 use crate::rotation::WindowSource;
@@ -81,35 +81,16 @@ impl std::fmt::Display for ChainHealth {
     }
 }
 
-// ── Redundancy Advisory Summary ────────────────────────────────────────
+// ── Sentinel state file (ADR-105) ───────────────────────────────────
 
-/// Summary of redundancy advisories for the sentinel state file.
-/// `None` in the state file means "unknown, not zero" (backward compat with v2).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AdvisorySummary {
-    /// Count of non-informational advisories.
-    pub count: usize,
-    /// Worst advisory kind (for badge/icon decisions).
-    pub worst: Option<RedundancyAdvisoryKind>,
-}
-
-impl AdvisorySummary {
-    /// Build from a list of advisories. Returns `None` when the list is empty.
-    /// Informational advisories (`TransientNoLocalRecovery`) are excluded from `count`.
-    #[must_use]
-    pub fn from_advisories(advisories: &[RedundancyAdvisory]) -> Option<Self> {
-        if advisories.is_empty() {
-            return None;
-        }
-        // Exclude informational advisories from both count and worst.
-        // count == 0 && worst == None means "only informational advisories exist."
-        let is_actionable =
-            |a: &&RedundancyAdvisory| a.kind != RedundancyAdvisoryKind::TransientNoLocalRecovery;
-        let count = advisories.iter().filter(is_actionable).count();
-        let worst = advisories.iter().filter(is_actionable).map(|a| a.kind).min();
-        Some(Self { count, worst })
-    }
-}
+// The sentinel state-file schema (`SentinelStateFile`, its version, the
+// visual-state and advisory-summary blocks) and the `urd sentinel status`
+// output that wraps it live in `sentinel.rs`; re-exported so
+// `crate::output::X` paths resolve.
+pub use crate::sentinel::{
+    AdvisorySummary, SENTINEL_STATE_SCHEMA_VERSION, SentinelCircuitState, SentinelPromiseState,
+    SentinelStateFile, SentinelStatusOutput,
+};
 
 // ── PoolPostureSummary ──────────────────────────────────────────────────
 
@@ -213,6 +194,12 @@ pub struct StatusOutput {
     /// privilege itself is unconfirmed.
     #[serde(default, skip_serializing_if = "is_false")]
     pub privilege_unclear: bool,
+    /// Promise-level subvolumes whose retention tightened since their
+    /// deletions were last applied (ADR-110): the next backup holds those
+    /// deletions until `urd backup --confirm-retention-change`. Omitted from
+    /// JSON when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retention_changes: Vec<RetentionChangePending>,
 }
 
 /// The seal stage `urd status` names as incomplete, in seal order —
@@ -473,23 +460,6 @@ impl LastRunInfo {
     }
 }
 
-/// Compose the presentation summary from the raw `runs` row: `duration` is
-/// the humanized span when the run finished, `None` while it is running.
-impl From<crate::state::RunRecord> for LastRunInfo {
-    fn from(run: crate::state::RunRecord) -> Self {
-        let duration = run
-            .finished_at
-            .as_ref()
-            .and_then(|f| crate::types::format_run_duration(&run.started_at, f));
-        Self {
-            id: run.id,
-            started_at: run.started_at,
-            result: run.result,
-            duration,
-        }
-    }
-}
-
 // ── DefaultStatusOutput ────────────────────────────────────────────────
 
 /// Structured output for bare `urd` — one-sentence status.
@@ -545,73 +515,46 @@ impl DefaultStatusOutput {
     }
 }
 
+// ── Retention-change gate (ADR-110) ───────────────────────────────────
+
+/// A promise-level subvolume whose retention tightened since its deletions
+/// were last applied: the next `urd backup` without
+/// `--confirm-retention-change` holds its retention deletions (backups still
+/// run). Surfaced by `urd status` (JSON + advisory line), `urd doctor`, and —
+/// with a held count — the backup summary and plan preview.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RetentionChangePending {
+    pub subvolume: String,
+    pub local_tightened: bool,
+    pub external_tightened: bool,
+    /// `RetentionShape` canonical text of the last applied shape.
+    pub previous: String,
+    /// `RetentionShape` canonical text of the configured shape.
+    pub current: String,
+}
+
+impl From<&crate::retention::RetentionChange> for RetentionChangePending {
+    fn from(change: &crate::retention::RetentionChange) -> Self {
+        Self {
+            subvolume: change.subvolume.clone(),
+            local_tightened: change.local_tightened(),
+            external_tightened: change.external_tightened(),
+            previous: change.previous.to_canonical(),
+            current: change.current.to_canonical(),
+        }
+    }
+}
+
 // ── RetentionPreview ──────────────────────────────────────────────────
+
+// The per-subvolume preview types are computed by `retention.rs` and live
+// there; re-exported so `crate::output::{RetentionPreview, ..}` paths resolve.
+pub use crate::retention::{RecoveryWindow, RetentionPreview};
 
 /// Full output for the `urd retention-preview` command.
 #[derive(Debug, Clone, Serialize)]
 pub struct RetentionPreviewOutput {
     pub previews: Vec<RetentionPreview>,
-}
-
-/// Retention policy preview for a single subvolume.
-#[derive(Debug, Clone, Serialize)]
-pub struct RetentionPreview {
-    pub subvolume_name: String,
-    pub policy_description: String,
-    pub snapshot_interval: String,
-    pub recovery_windows: Vec<RecoveryWindow>,
-    /// Disk usage estimate (absent when no calibration data and no snapshots).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub estimated_disk_usage: Option<DiskEstimate>,
-    /// Comparison to the alternate retention mode (graduated vs transient).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub transient_comparison: Option<TransientComparison>,
-}
-
-/// A single recovery window in the cascading retention chain.
-#[derive(Debug, Clone, Serialize)]
-pub struct RecoveryWindow {
-    /// Granularity label: "hourly", "daily", "weekly", "monthly".
-    pub granularity: &'static str,
-    /// Number of snapshots kept in this bucket.
-    pub count: u32,
-    /// Cumulative days from now (for compact formatting).
-    pub cumulative_days: f64,
-    /// Cumulative description from now, e.g. "daily snapshots back 31 days".
-    pub cumulative_description: String,
-}
-
-/// Estimated disk usage for retained snapshots.
-#[derive(Debug, Clone, Serialize)]
-pub struct DiskEstimate {
-    pub method: EstimateMethod,
-    pub per_snapshot_bytes: u64,
-    pub total_bytes: u64,
-    pub total_count: u32,
-}
-
-/// How the disk estimate was derived.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EstimateMethod {
-    /// Measured from actual snapshot sizes on disk.
-    Calibrated,
-}
-
-/// Comparison between graduated and transient retention.
-#[derive(Debug, Clone, Serialize)]
-pub struct TransientComparison {
-    pub graduated_count: u32,
-    pub transient_count: u32,
-    /// Byte-based totals (only when calibrated data exists).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub graduated_total_bytes: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub transient_total_bytes: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub savings_bytes: Option<u64>,
-    /// What the user loses by switching to transient.
-    pub lost_window: String,
 }
 
 // ── EmergencyOutput ───────────────────────────────────────────────────
@@ -812,54 +755,11 @@ pub enum ChurnRender {
     FullSendOnlyFirst { bytes: u64 },
 }
 
-/// Pure mapping from raw aggregates (`drift::ChurnEstimate`) to the
-/// presentation enum (`ChurnRender`). No I/O.
-#[must_use]
-pub fn render_churn(estimate: &crate::drift::ChurnEstimate) -> ChurnRender {
-    use ChurnRender::*;
-    match (estimate.incremental_count, estimate.full_count) {
-        (0, 0) => NotMeasured,
-        (0, 1) => FullSendOnlyFirst {
-            bytes: estimate.latest_full_bytes.unwrap_or(0),
-        },
-        (0, _) => FullSendOnly {
-            bytes_per_send: estimate.median_full_bytes.unwrap_or(0),
-            seconds_between: estimate.latest_full_interval_secs.unwrap_or(0),
-        },
-        (1, _) => FirstMeasurement {
-            bytes_per_second: estimate.mean_bytes_per_second.unwrap_or(0.0),
-        },
-        (_, _) => Incremental {
-            bytes_per_second: estimate.mean_bytes_per_second.unwrap_or(0.0),
-        },
-    }
-}
-
-/// Heartbeat / metrics projection of a single subvolume's churn state.
-/// `commands/backup.rs` builds a `HashMap<String, ChurnHeartbeatFields>` and
-/// passes it to both `heartbeat::build` and
-/// `backup::write_metrics_per_spec` so both surfaces share the same
-/// policy: incremental → `churn_bytes_per_second`; full-only →
-/// `last_full_send_bytes`. Cold-start subvolumes have both `None`.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct ChurnHeartbeatFields {
-    pub churn_bytes_per_second: Option<f64>,
-    pub last_full_send_bytes: Option<u64>,
-    /// Arithmetic mean of `bytes_transferred` over in-window incrementals.
-    /// Used by UPI 043's pinned-delta computation in `gather_pool_observability`.
-    pub mean_incremental_bytes: Option<u64>,
-}
-
-/// Per-subvolume "extras" populated by `gather_pool_observability` and threaded
-/// to both `heartbeat::build` and `backup::write_metrics_per_spec`
-/// so both surfaces share the same `pool_uuid`, `local_snapshot_count`, and
-/// `estimated_local_pinned_delta_bytes` values for a given run (UPI 043).
-#[derive(Debug, Clone, Default)]
-pub struct SubvolumeExtras {
-    pub pool_uuid: Option<String>,
-    pub local_snapshot_count: Option<u32>,
-    pub estimated_local_pinned_delta_bytes: Option<u64>,
-}
+// `render_churn` (the `ChurnEstimate` → `ChurnRender` mapping) lives in
+// `drift.rs`; the heartbeat/metrics churn projection and per-subvolume extras
+// live in `heartbeat.rs`. Re-exported so `crate::output::X` paths resolve.
+pub use crate::drift::render_churn;
+pub use crate::heartbeat::{ChurnHeartbeatFields, SubvolumeExtras};
 
 /// A single diagnostic check result.
 #[derive(Debug, Clone, Serialize)]
@@ -1058,7 +958,8 @@ pub struct GetOutput {
 // ── EventsView ────────────────────────────────────────────────────────
 
 /// Presentation projection of one event log row, ready for rendering.
-/// Wraps `state::EventQueryRow` for serde + voice consumption.
+/// Built from `state::EventQueryRow` (the `From` impl lives in
+/// `state/events.rs`) for serde + voice consumption.
 #[derive(Debug, Clone, Serialize)]
 pub struct EventRow {
     pub id: i64,
@@ -1071,20 +972,6 @@ pub struct EventRow {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub drive_label: Option<String>,
     pub payload: crate::events::EventPayload,
-}
-
-impl From<crate::state::EventQueryRow> for EventRow {
-    fn from(row: crate::state::EventQueryRow) -> Self {
-        Self {
-            id: row.id,
-            kind: row.kind,
-            occurred_at: row.occurred_at,
-            run_id: row.run_id,
-            subvolume: row.subvolume,
-            drive_label: row.drive_label,
-            payload: row.payload,
-        }
-    }
 }
 
 /// Top-level output for `urd events`. Holds the rows plus an echo of
@@ -1211,8 +1098,8 @@ pub struct SendSummary {
 /// Classification of why a subvolume/send was skipped.
 ///
 /// Used for grouped rendering in plan output and structured JSON for daemon consumers.
-/// Classification happens at the output boundary via `from_reason()`, keeping plan.rs
-/// skip reasons as free-text strings.
+/// Classified from the planner's typed `SkipReason` by the total
+/// `impl From<&SkipReason> for SkipCategory` in plan/types.rs — no prose matching.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SkipCategory {
@@ -1232,43 +1119,6 @@ pub enum SkipCategory {
     Other,
 }
 
-impl SkipCategory {
-    /// Classify a skip reason string into a category.
-    ///
-    /// Matches against the 17 known patterns from plan.rs. Unknown patterns
-    /// fall to `Other`. A completeness test in the test module ensures all
-    /// known patterns classify correctly.
-    #[must_use]
-    pub fn from_reason(reason: &str) -> Self {
-        if reason == "disabled" {
-            Self::Disabled
-        } else if reason == "local only" {
-            Self::LocalOnly
-        } else if reason.starts_with("drive ")
-            && reason.ends_with(" not mounted")
-        {
-            Self::DriveNotMounted
-        } else if reason.starts_with("interval not elapsed")
-            || reason.contains("not due (next in")
-        {
-            Self::IntervalNotElapsed
-        } else if reason.starts_with("local filesystem low on space")
-            || reason.contains("skipped: estimated ~")
-            || reason.contains("skipped: calibrated size ~")
-        {
-            Self::SpaceExceeded
-        } else if reason == "no local snapshots to send" {
-            Self::NoSnapshotsAvailable
-        } else if reason.starts_with("external-only") {
-            Self::ExternalOnly
-        } else if reason.starts_with("unchanged") {
-            Self::Unchanged
-        } else {
-            Self::Other
-        }
-    }
-}
-
 /// A planner-skipped subvolume/send with reason.
 #[derive(Debug, Serialize)]
 pub struct SkippedSubvolume {
@@ -1280,6 +1130,12 @@ pub struct SkippedSubvolume {
     /// out of the prose reason.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_due_minutes: Option<i64>,
+    /// The one drive this skip is scoped to, when it is (`SkipReason::drive`)
+    /// — carried typed so renderers read the unmounted drive's label instead
+    /// of parsing `reason`. Not serialized: `urd plan --json` keeps its
+    /// `name`/`reason`/`category`/`next_due_minutes` shape (ADR-105).
+    #[serde(skip)]
+    pub drive: Option<String>,
 }
 
 // ── PlanOutput ─────────────────────────────────────────────────────────
@@ -1424,12 +1280,7 @@ pub fn build_pre_action_summary(
         .iter()
         .filter(|s| s.category == SkipCategory::DriveNotMounted)
         .filter_map(|s| {
-            // Extract drive label from reason: "drive {label} not mounted"
-            let label = s
-                .reason
-                .strip_prefix("drive ")?
-                .strip_suffix(" not mounted")?
-                .to_string();
+            let label = s.drive.clone()?;
             if !seen_labels.insert(label.clone()) {
                 return None;
             }
@@ -1671,131 +1522,6 @@ pub struct InitSnapshotCount {
     pub external_counts: Vec<(String, usize)>,
 }
 
-// ── Visual state types (VFM-B) ──────────────────────────────────────────
-
-/// Icon state for tray icon consumers. Four states, each maps to a static
-/// SVG icon file. The tray applet selects by name: `urd-icon-ok.svg`, etc.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum VisualIcon {
-    /// All safe, all healthy.
-    Ok,
-    /// Safety ok but health degraded, or safety aging.
-    Warning,
-    /// Data gap exists (any subvolume UNPROTECTED).
-    Critical,
-    /// Backup currently running (reserved, not yet produced).
-    Active,
-}
-
-/// Safety axis counts using tray-friendly vocabulary.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SafetyCounts {
-    pub ok: usize,
-    pub aging: usize,
-    pub gap: usize,
-}
-
-/// Health axis counts.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HealthCounts {
-    pub healthy: usize,
-    pub degraded: usize,
-    pub blocked: usize,
-}
-
-/// Structured visual state for tray icon and external consumers.
-/// No pre-computed text — consumers render their own tooltips/summaries
-/// from this structured data (design review S2).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VisualState {
-    pub icon: VisualIcon,
-    /// Worst promise status across subvolumes (serializes SCREAMING).
-    pub worst_safety: PromiseStatus,
-    /// Worst operational health across subvolumes. Stays `String`:
-    /// `OperationalHealth` has no SCREAMING serde form and is out of scope for
-    /// UPI 053 — the `worst_safety: PromiseStatus` / `worst_health: String`
-    /// asymmetry is deliberate, not an omission.
-    pub worst_health: String,
-    pub safety_counts: SafetyCounts,
-    pub health_counts: HealthCounts,
-}
-
-// ── SentinelStatusOutput ─────────────────────────────────────────────────
-
-/// The `SentinelStateFile` schema version the runner writes. A startup restore
-/// of mount tracking (#411) trusts only a file of this version.
-pub const SENTINEL_STATE_SCHEMA_VERSION: u32 = 3;
-
-/// Sentinel state file schema — written atomically by the runner, read by
-/// `urd sentinel status`. Also serves as a "running" indicator (PID check).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SentinelStateFile {
-    pub schema_version: u32,
-    pub pid: u32,
-    pub started: String,
-    pub last_assessment: Option<String>,
-    pub mounted_drives: Vec<String>,
-    pub tick_interval_secs: u64,
-    pub promise_states: Vec<SentinelPromiseState>,
-    pub circuit_breaker: SentinelCircuitState,
-    /// Visual state for tray icon and external consumers (VFM-B, schema v2+).
-    /// `None` when reading schema v1 files for backward compatibility.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub visual_state: Option<VisualState>,
-    /// Redundancy advisory summary (schema v3+). `None` means "unknown, not zero."
-    /// Absent in v2 files; consumers must treat `None` as "advisories not computed."
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub advisory_summary: Option<AdvisorySummary>,
-}
-
-/// Per-subvolume promise state in the sentinel state file.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SentinelPromiseState {
-    pub name: String,
-    /// Promise status (serializes SCREAMING: "PROTECTED" / "AT RISK" / "UNPROTECTED").
-    /// Deserialization accepts the closed `PromiseStatus` set plus legacy
-    /// `snake_case` aliases; an out-of-set value fails the whole state-file
-    /// parse, which the reader treats as absent (fail-open via `.ok()`).
-    pub status: PromiseStatus,
-    /// Operational health (VFM-B, schema v2+). Defaults to "healthy" for v1 files.
-    #[serde(default = "default_healthy")]
-    pub health: String,
-    /// Reasons for non-healthy status. Omitted from JSON when empty.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub health_reasons: Vec<String>,
-}
-
-fn default_healthy() -> String {
-    "healthy".to_string()
-}
-
-/// Circuit breaker summary in the sentinel state file.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SentinelCircuitState {
-    pub state: String,
-    pub failure_count: u32,
-}
-
-/// Structured output for `urd sentinel status`.
-#[derive(Debug, Serialize)]
-#[serde(tag = "status")]
-pub enum SentinelStatusOutput {
-    /// Sentinel is running (PID alive, state file present).
-    #[serde(rename = "running")]
-    Running {
-        state: Box<SentinelStateFile>,
-        /// Human-readable uptime (e.g., "3h 12m").
-        uptime: String,
-    },
-    /// Sentinel is not running (no state file, or stale file cleaned up).
-    #[serde(rename = "not_running")]
-    NotRunning {
-        /// If a stale state file was found, when the sentinel was last seen.
-        last_seen: Option<String>,
-    },
-}
-
 // ── DrivesListOutput ──────────────────────────────────────────────────
 
 /// Structured output for `urd drives`.
@@ -1909,6 +1635,7 @@ pub enum SealSendState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::advice::RedundancyAdvisoryKind;
 
     #[test]
     fn chain_health_ordering() {
@@ -2271,188 +1998,6 @@ mod tests {
         assert_eq!(kinds.into_iter().min(), Some(NoOffsiteProtection));
     }
 
-    // ── SkipCategory classification tests ──────────────────────────────
-
-    #[test]
-    fn classify_disabled() {
-        assert_eq!(SkipCategory::from_reason("disabled"), SkipCategory::Disabled);
-    }
-
-    #[test]
-    fn classify_local_only() {
-        assert_eq!(
-            SkipCategory::from_reason("local only"),
-            SkipCategory::LocalOnly
-        );
-    }
-
-    #[test]
-    fn classify_drive_not_mounted() {
-        assert_eq!(
-            SkipCategory::from_reason("drive WD-18TB not mounted"),
-            SkipCategory::DriveNotMounted
-        );
-        assert_eq!(
-            SkipCategory::from_reason("drive 2TB-backup not mounted"),
-            SkipCategory::DriveNotMounted
-        );
-    }
-
-    #[test]
-    fn classify_interval_not_elapsed() {
-        assert_eq!(
-            SkipCategory::from_reason("interval not elapsed (next in ~14h6m)"),
-            SkipCategory::IntervalNotElapsed
-        );
-        assert_eq!(
-            SkipCategory::from_reason("send to WD-18TB not due (next in ~2h30m)"),
-            SkipCategory::IntervalNotElapsed
-        );
-    }
-
-    #[test]
-    fn classify_space_exceeded() {
-        assert_eq!(
-            SkipCategory::from_reason(
-                "local filesystem low on space (1.2 GB free, 5.0 GB required)"
-            ),
-            SkipCategory::SpaceExceeded
-        );
-        assert_eq!(
-            SkipCategory::from_reason(
-                "send to WD-18TB skipped: estimated ~4.5 GB exceeds WD-18TB available (free: 2.1 GB, min_free: 50.0 GB)"
-            ),
-            SkipCategory::SpaceExceeded
-        );
-        assert_eq!(
-            SkipCategory::from_reason(
-                "send to WD-18TB skipped: calibrated size ~4.5 GB exceeds WD-18TB available"
-            ),
-            SkipCategory::SpaceExceeded
-        );
-    }
-
-    #[test]
-    fn classify_no_snapshots_available() {
-        assert_eq!(
-            SkipCategory::from_reason("no local snapshots to send"),
-            SkipCategory::NoSnapshotsAvailable
-        );
-    }
-
-    #[test]
-    fn classify_other() {
-        assert_eq!(
-            SkipCategory::from_reason(
-                "drive WD-18TB UUID mismatch (expected abc, found def)"
-            ),
-            SkipCategory::Other
-        );
-        assert_eq!(
-            SkipCategory::from_reason("drive WD-18TB UUID check failed: io error"),
-            SkipCategory::Other
-        );
-        assert_eq!(
-            SkipCategory::from_reason(
-                "drive WD-18TB token mismatch (expected abc, found def) — possible drive swap"
-            ),
-            SkipCategory::Other
-        );
-        assert_eq!(
-            SkipCategory::from_reason("snapshot already exists"),
-            SkipCategory::Other
-        );
-        assert_eq!(
-            SkipCategory::from_reason("no local snapshots to send"),
-            SkipCategory::NoSnapshotsAvailable
-        );
-        assert_eq!(
-            SkipCategory::from_reason("20260329-0404-htpc-home already on WD-18TB"),
-            SkipCategory::Other
-        );
-    }
-
-    #[test]
-    fn classify_unknown_falls_to_other() {
-        assert_eq!(
-            SkipCategory::from_reason("some completely unknown reason"),
-            SkipCategory::Other
-        );
-    }
-
-    /// Completeness test: all 18 known plan.rs skip patterns classify to their
-    /// expected category. Prevents silent regressions when new patterns are added.
-    #[test]
-    fn classify_all_18_patterns() {
-        let patterns = vec![
-            ("disabled", SkipCategory::Disabled),
-            ("local only", SkipCategory::LocalOnly),
-            ("drive WD-18TB not mounted", SkipCategory::DriveNotMounted),
-            (
-                "drive WD-18TB UUID mismatch (expected abc, found def)",
-                SkipCategory::Other,
-            ),
-            (
-                "drive WD-18TB UUID check failed: io error",
-                SkipCategory::Other,
-            ),
-            (
-                "drive WD-18TB token mismatch (expected abc, found def) \u{2014} possible drive swap",
-                SkipCategory::Other,
-            ),
-            (
-                "drive WD-18TB token expected but missing \u{2014} run `urd drives adopt WD-18TB`",
-                SkipCategory::Other,
-            ),
-            (
-                "local filesystem low on space (1.2 GB free, 5.0 GB required)",
-                SkipCategory::SpaceExceeded,
-            ),
-            ("snapshot already exists", SkipCategory::Other),
-            (
-                "interval not elapsed (next in ~14h6m)",
-                SkipCategory::IntervalNotElapsed,
-            ),
-            (
-                "send to WD-18TB not due (next in ~2h30m)",
-                SkipCategory::IntervalNotElapsed,
-            ),
-            ("no local snapshots to send", SkipCategory::NoSnapshotsAvailable),
-            (
-                "external-only \u{2014} sends on next backup",
-                SkipCategory::ExternalOnly,
-            ),
-            (
-                "20260329-0404-htpc-home already on WD-18TB",
-                SkipCategory::Other,
-            ),
-            (
-                "send to WD-18TB skipped: estimated ~4.5 GB exceeds WD-18TB available (free: 2.1 GB, min_free: 50.0 GB)",
-                SkipCategory::SpaceExceeded,
-            ),
-            (
-                "send to WD-18TB skipped: calibrated size ~4.5 GB exceeds WD-18TB available",
-                SkipCategory::SpaceExceeded,
-            ),
-            (
-                "unchanged \u{2014} no changes since last snapshot (21h ago)",
-                SkipCategory::Unchanged,
-            ),
-            (
-                "transient \u{2014} no drives available for send",
-                SkipCategory::Other,
-            ),
-        ];
-
-        for (reason, expected) in patterns {
-            assert_eq!(
-                SkipCategory::from_reason(reason),
-                expected,
-                "pattern: {reason}"
-            );
-        }
-    }
-
     #[test]
     fn build_pre_action_from_plan_output() {
         let plan_output = PlanOutput {
@@ -2492,12 +2037,14 @@ mod tests {
                     name: "sv1".to_string(),
                     reason: "drive D2 not mounted".to_string(),
                     category: SkipCategory::DriveNotMounted,
+                    drive: Some("D2".to_string()),
                 },
                 SkippedSubvolume {
                     next_due_minutes: None,
                     name: "sv2".to_string(),
                     reason: "drive D2 not mounted".to_string(),
                     category: SkipCategory::DriveNotMounted,
+                    drive: Some("D2".to_string()),
                 },
             ],
             summary: PlanSummaryOutput {
@@ -2646,112 +2193,7 @@ source = "/data/sv2"
         assert!(!json.contains("last_seen"));
     }
 
-    // ── UPI 030: render_churn mapping table + JSON omission ────────
-
-    fn drift_estimate(
-        incr: usize,
-        full: usize,
-        mean: Option<f64>,
-        median_full: Option<u64>,
-        latest_full: Option<u64>,
-        latest_full_secs: Option<i64>,
-    ) -> crate::drift::ChurnEstimate {
-        crate::drift::ChurnEstimate {
-            mean_bytes_per_second: mean,
-            mean_incremental_bytes: None,
-            incremental_count: incr,
-            full_count: full,
-            median_full_bytes: median_full,
-            latest_full_bytes: latest_full,
-            latest_full_interval_secs: latest_full_secs,
-        }
-    }
-
-    #[test]
-    fn render_churn_table() {
-        // Cold start: all zero.
-        assert_eq!(
-            render_churn(&drift_estimate(0, 0, None, None, None, None)),
-            ChurnRender::NotMeasured
-        );
-
-        // Single incremental: FirstMeasurement.
-        assert_eq!(
-            render_churn(&drift_estimate(1, 0, Some(100.0), None, None, None)),
-            ChurnRender::FirstMeasurement {
-                bytes_per_second: 100.0
-            }
-        );
-
-        // Two incrementals: Incremental.
-        assert_eq!(
-            render_churn(&drift_estimate(2, 0, Some(123.4), None, None, None)),
-            ChurnRender::Incremental {
-                bytes_per_second: 123.4
-            }
-        );
-
-        // Single full: FullSendOnlyFirst.
-        assert_eq!(
-            render_churn(&drift_estimate(
-                0,
-                1,
-                None,
-                Some(12_000_000_000),
-                Some(12_000_000_000),
-                Some(86_400),
-            )),
-            ChurnRender::FullSendOnlyFirst {
-                bytes: 12_000_000_000
-            }
-        );
-
-        // Two fulls: FullSendOnly with median + latest interval.
-        assert_eq!(
-            render_churn(&drift_estimate(
-                0,
-                2,
-                None,
-                Some(14_000_000_000),
-                Some(14_000_000_000),
-                Some(93_600),
-            )),
-            ChurnRender::FullSendOnly {
-                bytes_per_send: 14_000_000_000,
-                seconds_between: 93_600
-            }
-        );
-
-        // Mixed (1 incr, 1 full): incrementals win → FirstMeasurement.
-        assert_eq!(
-            render_churn(&drift_estimate(
-                1,
-                1,
-                Some(50.0),
-                Some(10_000_000_000),
-                Some(10_000_000_000),
-                Some(86_400),
-            )),
-            ChurnRender::FirstMeasurement {
-                bytes_per_second: 50.0
-            }
-        );
-
-        // Mixed (2 incr, 1 full): incrementals win → Incremental.
-        assert_eq!(
-            render_churn(&drift_estimate(
-                2,
-                1,
-                Some(75.0),
-                Some(10_000_000_000),
-                Some(10_000_000_000),
-                Some(86_400),
-            )),
-            ChurnRender::Incremental {
-                bytes_per_second: 75.0
-            }
-        );
-    }
+    // ── UPI 030: DoctorOutput churn JSON omission ───────────────────
 
     #[test]
     fn doctor_output_serializes_with_omitted_churn_when_none() {

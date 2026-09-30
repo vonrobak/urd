@@ -5,8 +5,8 @@
 // observability with no behavior change. The executor records a sample per
 // (run_id, subvolume) after a successful send; this module aggregates those
 // samples over a `Duration`-shaped window to answer "how much is this
-// subvolume churning?" The presentation layer (`output::render_churn`) maps
-// the raw aggregates here onto a `ChurnRender` enum.
+// subvolume churning?" `render_churn` (below) maps the raw
+// aggregates here onto the presentation enum `output::ChurnRender`.
 //
 // Design: ADR-108 (pure functions). Time-windowed (not sample-count-windowed)
 // so the same code holds when Urd moves beyond nightly cadence.
@@ -18,6 +18,7 @@
 
 use chrono::{Duration, NaiveDateTime};
 
+use crate::output::ChurnRender;
 use crate::types::SendKind;
 
 /// One persisted drift sample, projected from the `drift_samples` table for
@@ -41,7 +42,7 @@ pub struct DriftSample {
 }
 
 /// Raw aggregates over an in-window slice of drift samples.
-/// No presentation labels — `output::render_churn` maps this to `ChurnRender`.
+/// No presentation labels — `render_churn` maps this to `ChurnRender`.
 ///
 /// `Default` yields the safe-empty estimate (all-`None`, counts `0`) and is
 /// exactly `compute_rolling_churn(&[])`. The drift read path composes
@@ -127,7 +128,6 @@ pub fn compute_rolling_churn(
             .map(|s| s.seconds_since_prev_send.unwrap_or(0))
             .sum();
         let mean_bps = if total_seconds > 0 {
-            #[allow(clippy::cast_precision_loss)]
             let mean = total_bytes as f64 / total_seconds as f64;
             Some(mean)
         } else {
@@ -211,7 +211,6 @@ pub fn compute_pool_free_bytes_trend(
     }
 
     // Step 3: linear regression. x in seconds from window_start; y in bytes.
-    #[allow(clippy::cast_precision_loss)]
     let (xs, ys): (Vec<f64>, Vec<f64>) = in_window
         .iter()
         .map(|(s, fb)| {
@@ -222,7 +221,6 @@ pub fn compute_pool_free_bytes_trend(
         })
         .unzip();
 
-    #[allow(clippy::cast_precision_loss)]
     let n = xs.len() as f64;
     let x_mean = xs.iter().sum::<f64>() / n;
     let y_mean = ys.iter().sum::<f64>() / n;
@@ -246,9 +244,33 @@ pub fn compute_pool_free_bytes_trend(
         return None;
     }
 
-    #[allow(clippy::cast_possible_truncation)]
     let truncated = slope_per_day as i64;
     Some(truncated)
+}
+
+// ── Presentation mapping (UPI 030) ─────────────────────────────────────
+
+/// Pure mapping from raw aggregates (`drift::ChurnEstimate`) to the
+/// presentation enum (`ChurnRender`). No I/O.
+#[must_use]
+pub fn render_churn(estimate: &ChurnEstimate) -> ChurnRender {
+    use ChurnRender::*;
+    match (estimate.incremental_count, estimate.full_count) {
+        (0, 0) => NotMeasured,
+        (0, 1) => FullSendOnlyFirst {
+            bytes: estimate.latest_full_bytes.unwrap_or(0),
+        },
+        (0, _) => FullSendOnly {
+            bytes_per_send: estimate.median_full_bytes.unwrap_or(0),
+            seconds_between: estimate.latest_full_interval_secs.unwrap_or(0),
+        },
+        (1, _) => FirstMeasurement {
+            bytes_per_second: estimate.mean_bytes_per_second.unwrap_or(0.0),
+        },
+        (_, _) => Incremental {
+            bytes_per_second: estimate.mean_bytes_per_second.unwrap_or(0.0),
+        },
+    }
 }
 
 #[cfg(test)]
@@ -721,5 +743,112 @@ mod tests {
         ];
         let trend = compute_pool_free_bytes_trend(&samples, default_window(), now, 1);
         assert_eq!(trend, None);
+    }
+
+    // ── UPI 030: render_churn mapping table ─────────────────────────
+
+    fn drift_estimate(
+        incr: usize,
+        full: usize,
+        mean: Option<f64>,
+        median_full: Option<u64>,
+        latest_full: Option<u64>,
+        latest_full_secs: Option<i64>,
+    ) -> ChurnEstimate {
+        ChurnEstimate {
+            mean_bytes_per_second: mean,
+            mean_incremental_bytes: None,
+            incremental_count: incr,
+            full_count: full,
+            median_full_bytes: median_full,
+            latest_full_bytes: latest_full,
+            latest_full_interval_secs: latest_full_secs,
+        }
+    }
+
+    #[test]
+    fn render_churn_table() {
+        // Cold start: all zero.
+        assert_eq!(
+            render_churn(&drift_estimate(0, 0, None, None, None, None)),
+            ChurnRender::NotMeasured
+        );
+
+        // Single incremental: FirstMeasurement.
+        assert_eq!(
+            render_churn(&drift_estimate(1, 0, Some(100.0), None, None, None)),
+            ChurnRender::FirstMeasurement {
+                bytes_per_second: 100.0
+            }
+        );
+
+        // Two incrementals: Incremental.
+        assert_eq!(
+            render_churn(&drift_estimate(2, 0, Some(123.4), None, None, None)),
+            ChurnRender::Incremental {
+                bytes_per_second: 123.4
+            }
+        );
+
+        // Single full: FullSendOnlyFirst.
+        assert_eq!(
+            render_churn(&drift_estimate(
+                0,
+                1,
+                None,
+                Some(12_000_000_000),
+                Some(12_000_000_000),
+                Some(86_400),
+            )),
+            ChurnRender::FullSendOnlyFirst {
+                bytes: 12_000_000_000
+            }
+        );
+
+        // Two fulls: FullSendOnly with median + latest interval.
+        assert_eq!(
+            render_churn(&drift_estimate(
+                0,
+                2,
+                None,
+                Some(14_000_000_000),
+                Some(14_000_000_000),
+                Some(93_600),
+            )),
+            ChurnRender::FullSendOnly {
+                bytes_per_send: 14_000_000_000,
+                seconds_between: 93_600
+            }
+        );
+
+        // Mixed (1 incr, 1 full): incrementals win → FirstMeasurement.
+        assert_eq!(
+            render_churn(&drift_estimate(
+                1,
+                1,
+                Some(50.0),
+                Some(10_000_000_000),
+                Some(10_000_000_000),
+                Some(86_400),
+            )),
+            ChurnRender::FirstMeasurement {
+                bytes_per_second: 50.0
+            }
+        );
+
+        // Mixed (2 incr, 1 full): incrementals win → Incremental.
+        assert_eq!(
+            render_churn(&drift_estimate(
+                2,
+                1,
+                Some(75.0),
+                Some(10_000_000_000),
+                Some(10_000_000_000),
+                Some(86_400),
+            )),
+            ChurnRender::Incremental {
+                bytes_per_second: 75.0
+            }
+        );
     }
 }

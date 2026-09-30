@@ -1,7 +1,7 @@
 // Sentinel — pure state machine for the Urd backup awareness daemon.
 //
 // This module contains only types and pure functions. No I/O. The runner
-// (sentinel_runner.rs, Session 2) translates real-world events into
+// (sentinel_runner/, Session 2) translates real-world events into
 // SentinelEvents and executes the SentinelActions returned by transitions.
 //
 // Design: follows ADR-108 (pure-function module pattern), same as planner,
@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use crate::awareness::{
     ChainStatus, OperationalHealth, PromiseSnapshot, PromiseStatus, SubvolAssessment,
 };
+use crate::advice::{RedundancyAdvisory, RedundancyAdvisoryKind};
 use crate::guard::{self, PoolPressureSample};
 use crate::types::{DriveEvent, DriveEventKind};
 
@@ -57,7 +58,7 @@ pub enum SentinelAction {
         mounted: bool,
     },
     /// Notify the user that a drive reconnected (runner checks token state
-    /// before dispatching — see sentinel_runner.rs execute_drive_reconnection_notification).
+    /// before dispatching — see sentinel_runner/actions.rs execute_drive_reconnection_notification).
     NotifyDriveReconnected {
         label: String,
     },
@@ -112,30 +113,156 @@ impl Default for SentinelState {
     }
 }
 
-/// The circuit-breaker state carried on the `SentinelCircuitBreak` event
-/// (ADR-105 on-disk contract — old event rows must keep deserializing).
-///
-/// The decision machinery that used to populate this (auto-trigger
-/// evaluation, backoff, half-open trials) was deleted as dormant, dead
-/// code — see #385. This type, the event variant, and the
-/// `backup_circuit_breaker_trips_total` / `urd_circuit_breaker_trips_total`
-/// metrics remain as permanently-zero contract surfaces; a future
-/// active-mode design can repopulate them without a contract change.
+// ── Sentinel state file (ADR-105 contract) ─────────────────────────────
+
+// Visual state types (VFM-B).
+
+/// Icon state for tray icon consumers. Four states, each maps to a static
+/// SVG icon file. The tray applet selects by name: `urd-icon-ok.svg`, etc.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum CircuitState {
-    Closed,
-    Open,
-    HalfOpen,
+pub enum VisualIcon {
+    /// All safe, all healthy.
+    Ok,
+    /// Safety ok but health degraded, or safety aging.
+    Warning,
+    /// Data gap exists (any subvolume UNPROTECTED).
+    Critical,
+    /// Backup currently running (reserved, not yet produced).
+    Active,
 }
 
-impl std::fmt::Display for CircuitState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Closed => write!(f, "closed"),
-            Self::Open => write!(f, "open"),
-            Self::HalfOpen => write!(f, "half-open"),
+/// Safety axis counts using tray-friendly vocabulary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SafetyCounts {
+    pub ok: usize,
+    pub aging: usize,
+    pub gap: usize,
+}
+
+/// Health axis counts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HealthCounts {
+    pub healthy: usize,
+    pub degraded: usize,
+    pub blocked: usize,
+}
+
+/// Structured visual state for tray icon and external consumers.
+/// No pre-computed text — consumers render their own tooltips/summaries
+/// from this structured data (design review S2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VisualState {
+    pub icon: VisualIcon,
+    /// Worst promise status across subvolumes (serializes SCREAMING).
+    pub worst_safety: PromiseStatus,
+    /// Worst operational health across subvolumes. Stays `String`:
+    /// `OperationalHealth` has no SCREAMING serde form and is out of scope for
+    /// UPI 053 — the `worst_safety: PromiseStatus` / `worst_health: String`
+    /// asymmetry is deliberate, not an omission.
+    pub worst_health: String,
+    pub safety_counts: SafetyCounts,
+    pub health_counts: HealthCounts,
+}
+
+/// The `SentinelStateFile` schema version the runner writes. A startup restore
+/// of mount tracking (#411) trusts only a file of this version.
+pub const SENTINEL_STATE_SCHEMA_VERSION: u32 = 3;
+
+/// Sentinel state file schema — written atomically by the runner, read by
+/// `urd sentinel status`. Also serves as a "running" indicator (PID check).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SentinelStateFile {
+    pub schema_version: u32,
+    pub pid: u32,
+    pub started: String,
+    pub last_assessment: Option<String>,
+    pub mounted_drives: Vec<String>,
+    pub tick_interval_secs: u64,
+    pub promise_states: Vec<SentinelPromiseState>,
+    pub circuit_breaker: SentinelCircuitState,
+    /// Visual state for tray icon and external consumers (VFM-B, schema v2+).
+    /// `None` when reading schema v1 files for backward compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visual_state: Option<VisualState>,
+    /// Redundancy advisory summary (schema v3+). `None` means "unknown, not zero."
+    /// Absent in v2 files; consumers must treat `None` as "advisories not computed."
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advisory_summary: Option<AdvisorySummary>,
+}
+
+/// Per-subvolume promise state in the sentinel state file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SentinelPromiseState {
+    pub name: String,
+    /// Promise status (serializes SCREAMING: "PROTECTED" / "AT RISK" / "UNPROTECTED").
+    /// Deserialization accepts the closed `PromiseStatus` set plus legacy
+    /// `snake_case` aliases; an out-of-set value fails the whole state-file
+    /// parse, which the reader treats as absent (fail-open via `.ok()`).
+    pub status: PromiseStatus,
+    /// Operational health (VFM-B, schema v2+). Defaults to "healthy" for v1 files.
+    #[serde(default = "default_healthy")]
+    pub health: String,
+    /// Reasons for non-healthy status. Omitted from JSON when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub health_reasons: Vec<String>,
+}
+
+fn default_healthy() -> String {
+    "healthy".to_string()
+}
+
+/// Circuit breaker summary in the sentinel state file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SentinelCircuitState {
+    pub state: String,
+    pub failure_count: u32,
+}
+
+/// Structured output for `urd sentinel status`.
+#[derive(Debug, Serialize)]
+#[serde(tag = "status")]
+pub enum SentinelStatusOutput {
+    /// Sentinel is running (PID alive, state file present).
+    #[serde(rename = "running")]
+    Running {
+        state: Box<SentinelStateFile>,
+        /// Human-readable uptime (e.g., "3h 12m").
+        uptime: String,
+    },
+    /// Sentinel is not running (no state file, or stale file cleaned up).
+    #[serde(rename = "not_running")]
+    NotRunning {
+        /// If a stale state file was found, when the sentinel was last seen.
+        last_seen: Option<String>,
+    },
+}
+
+/// Summary of redundancy advisories for the sentinel state file.
+/// `None` in the state file means "unknown, not zero" (backward compat with v2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdvisorySummary {
+    /// Count of non-informational advisories.
+    pub count: usize,
+    /// Worst advisory kind (for badge/icon decisions).
+    pub worst: Option<RedundancyAdvisoryKind>,
+}
+
+impl AdvisorySummary {
+    /// Build from a list of advisories. Returns `None` when the list is empty.
+    /// Informational advisories (`TransientNoLocalRecovery`) are excluded from `count`.
+    #[must_use]
+    pub fn from_advisories(advisories: &[RedundancyAdvisory]) -> Option<Self> {
+        if advisories.is_empty() {
+            return None;
         }
+        // Exclude informational advisories from both count and worst.
+        // count == 0 && worst == None means "only informational advisories exist."
+        let is_actionable =
+            |a: &&RedundancyAdvisory| a.kind != RedundancyAdvisoryKind::TransientNoLocalRecovery;
+        let count = advisories.iter().filter(is_actionable).count();
+        let worst = advisories.iter().filter(is_actionable).map(|a| a.kind).min();
+        Some(Self { count, worst })
     }
 }
 
@@ -304,6 +431,16 @@ pub fn has_health_changes(
     has_changes(previous, current, |p| &p.name, |p, a| p.health != a.health)
 }
 
+/// The sentinel's state for [`should_record_transitions`]: whether it has a
+/// baseline to diff against, and whether a backup run holds the lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordingWindow {
+    /// The sentinel has taken its first assessment (a baseline exists).
+    pub has_initial_assessment: bool,
+    /// A backup run holds the lock right now.
+    pub backup_active: bool,
+}
+
 /// Should this assess record promise-transition events? (UPI 063)
 ///
 /// Encodes the ownership rule backup.rs states ("Backup is canonical for
@@ -316,11 +453,64 @@ pub fn has_health_changes(
 /// event), and the run's own pre/post diff is the honest attribution.
 #[must_use]
 pub fn should_record_transitions(
-    has_initial_assessment: bool,
     trigger: Option<crate::events::TransitionTrigger>,
-    backup_active: bool,
+    window: RecordingWindow,
 ) -> bool {
-    has_initial_assessment && trigger.is_some() && !backup_active
+    window.has_initial_assessment && trigger.is_some() && !window.backup_active
+}
+
+/// Pick the originating `TransitionTrigger` for promise-transition events
+/// emitted during this cycle. Returns `None` when `BackupCompleted` fired
+/// without an explicit trigger event — the backup itself emitted promise
+/// transitions with `trigger=Run` and the sentinel must not duplicate them.
+///
+/// `BackupCompleted` suppresses a coalesced routine Tick too (UPI 063): the
+/// run's pid is already dead when the completion is detected, so the
+/// backup-lock probe cannot see this window — a Tick landing in the same
+/// poll cycle would diff against the pre-run baseline and re-record the
+/// run's transitions. The baseline refresh absorbs the post-run state
+/// instead.
+///
+/// Precedence (when multiple events fire in the same cycle): an explicit
+/// trigger event (DriveMounted, ConfigChanged) wins over everything — a
+/// drive event coalesced with a completion is a real external change and
+/// keeps its trigger.
+#[must_use]
+pub fn pick_transition_trigger(
+    events: &[SentinelEvent],
+) -> Option<crate::events::TransitionTrigger> {
+    let mut saw_tick = false;
+    let mut saw_backup_completed = false;
+    for event in events {
+        match event {
+            SentinelEvent::DriveMounted { .. } => {
+                return Some(crate::events::TransitionTrigger::DriveMounted);
+            }
+            SentinelEvent::ConfigChanged => {
+                return Some(crate::events::TransitionTrigger::ConfigChanged);
+            }
+            SentinelEvent::AssessmentTick => saw_tick = true,
+            SentinelEvent::BackupCompleted => saw_backup_completed = true,
+            // DriveUnmounted, Shutdown — no diff trigger.
+            _ => {}
+        }
+    }
+    (saw_tick && !saw_backup_completed).then_some(crate::events::TransitionTrigger::Tick)
+}
+
+// ── Drive reconnection suppression ─────────────────────────────────────
+
+/// Absences shorter than this produce no reconnection notification — a
+/// brief unplug/replug is not news.
+pub const MIN_ABSENT_MINUTES: i64 = 60;
+
+/// Is an absence of `absent_minutes` long enough to announce the drive's
+/// reconnection? The runner computes the absence from the drive token's
+/// `last_verified` stamp; when that stamp is missing it has no absence to
+/// speak of and does not ask.
+#[must_use]
+pub fn reconnection_worth_notifying(absent_minutes: i64) -> bool {
+    absent_minutes >= MIN_ABSENT_MINUTES
 }
 
 // ── Snapshot extractors ───────────────────────────────────────────────
@@ -359,8 +549,7 @@ pub fn snapshot_health(assessments: &[SubvolAssessment]) -> Vec<HealthSnapshot> 
 /// any Degraded/Blocked) > Ok (all Protected and all Healthy).
 /// The `Active` state is reserved for backup-in-progress detection (future).
 #[must_use]
-pub fn compute_visual_state(assessments: &[SubvolAssessment]) -> crate::output::VisualState {
-    use crate::output::{HealthCounts, SafetyCounts, VisualIcon, VisualState};
+pub fn compute_visual_state(assessments: &[SubvolAssessment]) -> VisualState {
 
     let mut safety_counts = SafetyCounts {
         ok: 0,
@@ -556,11 +745,11 @@ pub struct RestoredMounts {
 /// over-stating by the previous instance's whole uptime.
 #[must_use]
 pub fn restorable_mounts(
-    file: Option<&crate::output::SentinelStateFile>,
+    file: Option<&SentinelStateFile>,
     config_labels: &BTreeSet<String>,
 ) -> Option<RestoredMounts> {
     let file = file?;
-    if file.schema_version != crate::output::SENTINEL_STATE_SCHEMA_VERSION {
+    if file.schema_version != SENTINEL_STATE_SCHEMA_VERSION {
         return None;
     }
     let witnessed_at =
@@ -898,7 +1087,6 @@ fn eject_advance(
 mod tests {
     use super::*;
     use crate::awareness::{DriveChainHealth, LocalAssessment, OperationalHealth};
-    use crate::types::Interval;
 
     fn fresh_state() -> SentinelState {
         SentinelState::new()
@@ -1088,9 +1276,11 @@ mod tests {
     fn records_on_tick_when_initialized_and_no_backup() {
         use crate::events::TransitionTrigger;
         assert!(should_record_transitions(
-            true,
             Some(TransitionTrigger::Tick),
-            false
+            RecordingWindow {
+                has_initial_assessment: true,
+                backup_active: false,
+            }
         ));
     }
 
@@ -1099,7 +1289,13 @@ mod tests {
         use crate::events::TransitionTrigger;
         for trigger in [None, Some(TransitionTrigger::Tick)] {
             for backup_active in [false, true] {
-                assert!(!should_record_transitions(false, trigger, backup_active));
+                assert!(!should_record_transitions(
+                    trigger,
+                    RecordingWindow {
+                        has_initial_assessment: false,
+                        backup_active,
+                    }
+                ));
             }
         }
     }
@@ -1109,7 +1305,13 @@ mod tests {
         // BackupCompleted-only cycles arrive as trigger=None — the backup
         // already recorded with trigger=Run.
         for backup_active in [false, true] {
-            assert!(!should_record_transitions(true, None, backup_active));
+            assert!(!should_record_transitions(
+                None,
+                RecordingWindow {
+                    has_initial_assessment: true,
+                    backup_active,
+                }
+            ));
         }
     }
 
@@ -1124,7 +1326,13 @@ mod tests {
             TransitionTrigger::DriveMounted,
             TransitionTrigger::ConfigChanged,
         ] {
-            assert!(!should_record_transitions(true, Some(trigger), true));
+            assert!(!should_record_transitions(
+                Some(trigger),
+                RecordingWindow {
+                    has_initial_assessment: true,
+                    backup_active: true,
+                }
+            ));
         }
     }
 
@@ -1224,7 +1432,6 @@ mod tests {
                 status: PromiseStatus::Protected,
                 snapshot_count: 5,
                 newest_age: None,
-                configured_interval: Interval::hours(1),
             },
             external: vec![],
             chain_health,
@@ -1548,7 +1755,7 @@ mod tests {
             make_assessment("sv2", PromiseStatus::Protected),
         ];
         let vs = compute_visual_state(&assessments);
-        assert_eq!(vs.icon, crate::output::VisualIcon::Ok);
+        assert_eq!(vs.icon, VisualIcon::Ok);
         assert_eq!(vs.safety_counts.ok, 2);
         assert_eq!(vs.health_counts.healthy, 2);
     }
@@ -1560,7 +1767,7 @@ mod tests {
             make_assessment("sv2", PromiseStatus::AtRisk),
         ];
         let vs = compute_visual_state(&assessments);
-        assert_eq!(vs.icon, crate::output::VisualIcon::Warning);
+        assert_eq!(vs.icon, VisualIcon::Warning);
         assert_eq!(vs.safety_counts.aging, 1);
         assert_eq!(vs.worst_safety, PromiseStatus::AtRisk);
     }
@@ -1572,7 +1779,7 @@ mod tests {
             make_assessment("sv2", PromiseStatus::Unprotected),
         ];
         let vs = compute_visual_state(&assessments);
-        assert_eq!(vs.icon, crate::output::VisualIcon::Critical);
+        assert_eq!(vs.icon, VisualIcon::Critical);
         assert_eq!(vs.safety_counts.gap, 1);
     }
 
@@ -1581,7 +1788,7 @@ mod tests {
         let mut a = make_assessment("sv1", PromiseStatus::Protected);
         a.health = OperationalHealth::Degraded;
         let vs = compute_visual_state(&[a]);
-        assert_eq!(vs.icon, crate::output::VisualIcon::Warning);
+        assert_eq!(vs.icon, VisualIcon::Warning);
         assert_eq!(vs.worst_health, "degraded");
         assert_eq!(vs.health_counts.degraded, 1);
     }
@@ -1591,7 +1798,7 @@ mod tests {
         let mut a = make_assessment("sv1", PromiseStatus::Protected);
         a.health = OperationalHealth::Blocked;
         let vs = compute_visual_state(&[a]);
-        assert_eq!(vs.icon, crate::output::VisualIcon::Critical);
+        assert_eq!(vs.icon, VisualIcon::Critical);
         assert_eq!(vs.health_counts.blocked, 1);
     }
 
@@ -1601,13 +1808,13 @@ mod tests {
         a1.health = OperationalHealth::Blocked;
         let a2 = make_assessment("sv2", PromiseStatus::Protected);
         let vs = compute_visual_state(&[a1, a2]);
-        assert_eq!(vs.icon, crate::output::VisualIcon::Warning);
+        assert_eq!(vs.icon, VisualIcon::Warning);
     }
 
     #[test]
     fn visual_state_empty_assessments_is_ok() {
         let vs = compute_visual_state(&[]);
-        assert_eq!(vs.icon, crate::output::VisualIcon::Ok);
+        assert_eq!(vs.icon, VisualIcon::Ok);
         assert_eq!(vs.safety_counts.ok, 0);
         assert_eq!(vs.health_counts.healthy, 0);
     }
@@ -1617,7 +1824,7 @@ mod tests {
         let mut a1 = make_assessment("sv1", PromiseStatus::Unprotected);
         a1.health = OperationalHealth::Degraded;
         let vs = compute_visual_state(&[a1]);
-        assert_eq!(vs.icon, crate::output::VisualIcon::Critical);
+        assert_eq!(vs.icon, VisualIcon::Critical);
     }
 
     #[test]
@@ -2176,8 +2383,8 @@ mod tests {
         schema_version: u32,
         last_assessment: Option<&str>,
         mounted: &[&str],
-    ) -> crate::output::SentinelStateFile {
-        crate::output::SentinelStateFile {
+    ) -> SentinelStateFile {
+        SentinelStateFile {
             schema_version,
             pid: 1,
             started: "2026-09-01T00:00:00".to_string(),
@@ -2185,7 +2392,7 @@ mod tests {
             mounted_drives: mounted.iter().map(|s| (*s).to_string()).collect(),
             tick_interval_secs: 900,
             promise_states: vec![],
-            circuit_breaker: crate::output::SentinelCircuitState {
+            circuit_breaker: SentinelCircuitState {
                 state: "closed".to_string(),
                 failure_count: 0,
             },
@@ -2211,7 +2418,7 @@ mod tests {
     #[test]
     fn restorable_mounts_intersects_with_config_and_reads_witness_time() {
         let file = state_file(
-            crate::output::SENTINEL_STATE_SCHEMA_VERSION,
+            SENTINEL_STATE_SCHEMA_VERSION,
             Some(FILE_AT),
             &["WD-18TB", "REMOVED"],
         );
@@ -2224,7 +2431,7 @@ mod tests {
     #[test]
     fn restorable_mounts_restores_nothing_without_a_trustworthy_file() {
         let cfg = labels(&["WD-18TB"]);
-        let current = crate::output::SENTINEL_STATE_SCHEMA_VERSION;
+        let current = SENTINEL_STATE_SCHEMA_VERSION;
         // No file.
         assert_eq!(restorable_mounts(None, &cfg), None);
         // Old schema.
@@ -2441,5 +2648,104 @@ mod tests {
             ts(NOW),
         );
         assert_eq!(v.inferred_unmounts[0].at, ts(NOW));
+    }
+
+    // ── pick_transition_trigger tests ──────────────────────────────
+
+    #[test]
+    fn trigger_drive_mounted_wins_over_tick() {
+        let events = vec![
+            SentinelEvent::AssessmentTick,
+            SentinelEvent::DriveMounted {
+                label: "WD-18TB".into(),
+            },
+        ];
+        assert_eq!(
+            pick_transition_trigger(&events),
+            Some(crate::events::TransitionTrigger::DriveMounted)
+        );
+    }
+
+    #[test]
+    fn trigger_config_changed_wins_over_tick() {
+        let events = vec![
+            SentinelEvent::AssessmentTick,
+            SentinelEvent::ConfigChanged,
+        ];
+        assert_eq!(
+            pick_transition_trigger(&events),
+            Some(crate::events::TransitionTrigger::ConfigChanged)
+        );
+    }
+
+    #[test]
+    fn trigger_tick_when_alone() {
+        let events = vec![SentinelEvent::AssessmentTick];
+        assert_eq!(
+            pick_transition_trigger(&events),
+            Some(crate::events::TransitionTrigger::Tick)
+        );
+    }
+
+    #[test]
+    fn trigger_none_for_backup_completed_only() {
+        // BackupCompleted by itself does not yield a trigger — the backup
+        // itself emitted the promise transitions with Run.
+        let events = vec![SentinelEvent::BackupCompleted];
+        assert_eq!(pick_transition_trigger(&events), None);
+    }
+
+    #[test]
+    fn trigger_none_for_drive_unmounted_alone() {
+        let events = vec![SentinelEvent::DriveUnmounted {
+            label: "WD-18TB".into(),
+        }];
+        assert_eq!(pick_transition_trigger(&events), None);
+    }
+
+    #[test]
+    fn trigger_backup_completed_suppresses_coalesced_tick() {
+        // UPI 063: a Tick in the same poll cycle as the completion would diff
+        // against the pre-run baseline and re-record the run's transitions —
+        // the run's pid is already dead, so the lock probe can't catch it.
+        // Order must not matter.
+        for events in [
+            vec![SentinelEvent::BackupCompleted, SentinelEvent::AssessmentTick],
+            vec![SentinelEvent::AssessmentTick, SentinelEvent::BackupCompleted],
+        ] {
+            assert_eq!(pick_transition_trigger(&events), None);
+        }
+    }
+
+    #[test]
+    fn trigger_explicit_events_survive_backup_completed() {
+        // A drive event coalesced with a completion is a real external change
+        // and keeps its trigger.
+        let events = vec![
+            SentinelEvent::BackupCompleted,
+            SentinelEvent::DriveMounted {
+                label: "WD-18TB".into(),
+            },
+        ];
+        assert_eq!(
+            pick_transition_trigger(&events),
+            Some(crate::events::TransitionTrigger::DriveMounted)
+        );
+
+        let events = vec![SentinelEvent::BackupCompleted, SentinelEvent::ConfigChanged];
+        assert_eq!(
+            pick_transition_trigger(&events),
+            Some(crate::events::TransitionTrigger::ConfigChanged)
+        );
+    }
+
+    // ── Drive reconnection suppression ─────────────────────────────
+
+    #[test]
+    fn reconnection_threshold_is_one_hour_inclusive() {
+        assert!(!reconnection_worth_notifying(0));
+        assert!(!reconnection_worth_notifying(MIN_ABSENT_MINUTES - 1));
+        assert!(reconnection_worth_notifying(MIN_ABSENT_MINUTES));
+        assert!(reconnection_worth_notifying(3 * 24 * 60));
     }
 }

@@ -1,13 +1,14 @@
 use std::collections::HashSet;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
 
 use crate::btrfs::{BtrfsOps, RealBtrfs, SystemBtrfs};
 use crate::chain;
 use crate::config::{Config, ResolvedSubvolume, SnapshotRoot};
 use crate::drives;
+use crate::executor::{CandidateDeletion, DeleteCandidate, Executor};
 use crate::guard;
 use crate::output::{
     EmergencyOutput, EmergencyResult, EmergencyRootAssessment, EmergencySubvolDetail, OutputMode,
@@ -300,6 +301,10 @@ pub fn run(config: Config, output_mode: OutputMode) -> anyhow::Result<()> {
         bytes_counter,
         sys.supports_compressed_data,
     );
+    // A maintenance executor: no state DB, and the deletion loop never
+    // consults shutdown (the confirmed set runs to completion).
+    let no_shutdown = AtomicBool::new(false);
+    let executor = Executor::new(&btrfs, None, &config, &no_shutdown);
 
     for root_assessment in &assessed {
         if !root_assessment.assessment.is_critical {
@@ -312,25 +317,33 @@ pub fn run(config: Config, output_mode: OutputMode) -> anyhow::Result<()> {
         let mut failed: usize = 0;
 
         // The plans the user just confirmed — deleting a freshly re-read set
-        // would delete snapshots that were never shown to them.
+        // would delete snapshots that were never shown to them. The executor
+        // owns the deletion loop, the ADR-106 layer-3 re-check included.
         for subvol in &root_assessment.plans {
-            for rd in &subvol.result.delete {
-                let snap_path = subvol.inputs.local_dir.join(rd.snapshot.as_str());
+            let candidates: Vec<DeleteCandidate<'_>> = subvol
+                .result
+                .delete
+                .iter()
+                .map(|rd| DeleteCandidate {
+                    subvolume: &subvol.inputs.name,
+                    path: subvol.inputs.local_dir.join(rd.snapshot.as_str()),
+                })
+                .collect();
+            let outcomes = executor.delete_candidates(&candidates);
 
-                // Defense-in-depth (ADR-106 layer 3): shared re-check
-                if chain::is_pinned_at_delete_time(&snap_path, &subvol.inputs.name, &config) {
-                    log::warn!(
-                        "Defense-in-depth: refusing to delete pinned snapshot {}",
-                        snap_path.display()
-                    );
-                    continue;
-                }
-
-                match btrfs.delete_subvolume(&snap_path) {
-                    Ok(()) => {
+            for (candidate, outcome) in candidates.iter().zip(outcomes) {
+                let snap_path = &candidate.path;
+                match outcome {
+                    CandidateDeletion::RefusedPinned => {
+                        log::warn!(
+                            "Defense-in-depth: refusing to delete pinned snapshot {}",
+                            snap_path.display()
+                        );
+                    }
+                    CandidateDeletion::Deleted => {
                         deleted += 1;
                     }
-                    Err(e) => {
+                    CandidateDeletion::Failed(e) => {
                         log::error!("Failed to delete {}: {e}", snap_path.display());
                         failed += 1;
                     }

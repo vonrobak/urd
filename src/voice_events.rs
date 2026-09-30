@@ -111,6 +111,12 @@ fn summary_for(payload: &EventPayload) -> String {
                 format!("stayed her hand on {count} snapshots, {oldest} … {newest}  ({phrase})")
             }
         }
+        EventPayload::RetentionChangeHeld { held_deletions, .. } => {
+            format!(
+                "held {held_deletions} deletion(s)  (retention tightened; \
+                 awaiting --confirm-retention-change)"
+            )
+        }
         EventPayload::PlannerSendChoice {
             send_kind: _,
             reason,
@@ -460,8 +466,8 @@ mod tests {
         let _color = setup();
         let row = make_row(
             EventPayload::SentinelCircuitBreak {
-                from: crate::sentinel::CircuitState::Closed,
-                to: crate::sentinel::CircuitState::Open,
+                from: crate::events::CircuitState::Closed,
+                to: crate::events::CircuitState::Open,
                 reason: "3 consecutive failures".into(),
                 backoff_secs: 900,
             },

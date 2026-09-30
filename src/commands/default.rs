@@ -6,7 +6,7 @@ use crate::awareness;
 use crate::commands::world::{World, WorldView};
 use crate::commands::{storage_signals, CliExit};
 use crate::config;
-use crate::output::{DefaultStatusOutput, OutputMode};
+use crate::output::{DefaultStatusOutput, LastRunInfo, OutputMode};
 use crate::voice;
 
 pub fn run(config_path: Option<&Path>, output_mode: OutputMode) -> anyhow::Result<CliExit> {
@@ -36,7 +36,7 @@ pub fn run(config_path: Option<&Path>, output_mode: OutputMode) -> anyhow::Resul
     let now = chrono::Local::now().naive_local();
     let WorldView { signals, assessments } = world.view(&config, now);
 
-    let last_run = world.db().and_then(|db| db.last_run_info());
+    let last_run = world.db().and_then(|db| db.last_run_info()).map(LastRunInfo::from);
 
     let last_run_age_secs = last_run.as_ref().and_then(|run| run.age_secs(now));
 
@@ -69,9 +69,11 @@ pub fn run(config_path: Option<&Path>, output_mode: OutputMode) -> anyhow::Resul
             let sv = resolved.iter().find(|sv| sv.name == a.name)?;
             advice::compute_advice(
                 a,
-                posture.earned,
-                sv.send_enabled,
-                sv.local_retention.is_transient(),
+                advice::AdviceContext {
+                    earned: posture.earned,
+                    send_enabled: sv.send_enabled,
+                    external_only: sv.local_retention.is_transient(),
+                },
             )
         })
         .collect();

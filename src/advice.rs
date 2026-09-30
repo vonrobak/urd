@@ -9,15 +9,20 @@
 //! module turns observations into prescriptions.
 
 use chrono::{Duration, NaiveDateTime};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::awareness::{
-    ChainStatus, DriveAssessment, DriveChainHealth, OperationalHealth, PromiseStatus,
-    StorageSignalMap, SubvolAssessment,
+    ChainStatus, DriveAssessment, DriveChainHealth, OperationalHealth, SubvolAssessment,
 };
 use crate::config::Config;
 use crate::observation::Observation;
-use crate::types::{DriveRole, ProtectionLevel};
+use crate::storage_critical::StorageSignalMap;
+use crate::types::{DriveRole, PromiseStatus, ProtectionLevel};
+
+// The redundancy advisory types live beside `SubvolAssessment`, which carries
+// them (`awareness/types.rs`); this module computes them. Re-exported so
+// `crate::advice::RedundancyAdvisory{,Kind}` paths keep resolving.
+pub use crate::awareness::{RedundancyAdvisory, RedundancyAdvisoryKind};
 
 // ── Actionable Advice ─────────────────────────────────────────────────
 
@@ -95,22 +100,36 @@ pub struct ActionableAdvice {
     pub reason: Option<String>,
 }
 
+/// The machine and subvolume facts [`compute_advice`] reads beside the
+/// assessment, named so each call site states what it is asserting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdviceContext {
+    /// Whether the machine's privileges are confirmed (UPI 081) — command-producing
+    /// advice suppresses when `false` (the seal-gap banner speaks once instead of a
+    /// `urd backup` that would just fail at `sudo btrfs`); config/physical advice
+    /// (branches 2/3/5/8) is valid regardless of earned state and stays unguarded.
+    pub earned: bool,
+    /// Whether external sends are configured for this subvolume.
+    pub send_enabled: bool,
+    /// True when local retention is transient (no local recovery).
+    pub external_only: bool,
+}
+
 /// Compute actionable advice for a subvolume based on its assessment.
 ///
 /// Returns `None` when the subvolume is protected and healthy (no action needed).
-/// `earned`: whether the machine's privileges are confirmed (UPI 081) — command-producing
-/// advice suppresses when `false` (the seal-gap banner speaks once instead of a `urd backup`
-/// that would just fail at `sudo btrfs`); config/physical advice (branches 2/3/5/8) is valid
-/// regardless of earned state and stays unguarded.
-/// `send_enabled`: whether external sends are configured for this subvolume.
-/// `external_only`: true when local retention is transient (no local recovery).
+/// See [`AdviceContext`] for how `earned`, `send_enabled`, and `external_only`
+/// steer the branches.
 #[must_use]
 pub fn compute_advice(
     assessment: &SubvolAssessment,
-    earned: bool,
-    send_enabled: bool,
-    external_only: bool,
+    ctx: AdviceContext,
 ) -> Option<ActionableAdvice> {
+    let AdviceContext {
+        earned,
+        send_enabled,
+        external_only,
+    } = ctx;
     let name = &assessment.name;
 
     // Branch 1: Protected + Healthy → no advice
@@ -364,34 +383,6 @@ fn stale_issue(assessment: &SubvolAssessment, external_only: bool) -> AdviceIssu
             age_secs: issue_age_secs(assessment, external_only),
         },
     )
-}
-
-// ── Redundancy advisories ──────────────────────────────────────────────
-
-/// Redundancy advisory kind, ordered worst-first so `min()` yields most severe.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RedundancyAdvisoryKind {
-    /// All drives are local for a resilient subvolume — no offsite protection.
-    NoOffsiteProtection,
-    /// Offsite drive not seen in > threshold days.
-    OffsiteDriveStale,
-    /// Single external drive for a protected/resilient subvolume.
-    SinglePointOfFailure,
-    /// Informational: transient subvolume with all drives unmounted.
-    TransientNoLocalRecovery,
-}
-
-/// A structured redundancy advisory produced by `compute_redundancy_advisories()`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct RedundancyAdvisory {
-    pub kind: RedundancyAdvisoryKind,
-    pub subvolume: String,
-    /// Affected drive label (for offsite-stale and single-point advisories).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub drive: Option<String>,
-    /// Human-readable detail for voice rendering.
-    pub detail: String,
 }
 
 // ── Assessment view ────────────────────────────────────────────────────
@@ -648,6 +639,14 @@ mod tests {
     use crate::plan::MockFileSystemState;
     use crate::types::Interval;
     use chrono::Duration;
+
+    /// The common advice context: an earned machine sending externally with
+    /// local recovery. Variations override one field via struct update.
+    const SENDING: AdviceContext = AdviceContext {
+        earned: true,
+        send_enabled: true,
+        external_only: false,
+    };
 
     // ── Offsite freshness overlay tests ─��───────────────────────────
 
@@ -1601,13 +1600,13 @@ local_retention = "transient"
     #[test]
     fn advice_protected_healthy_returns_none() {
         let a = test_assessment_for_advice("sv1", PromiseStatus::Protected, OperationalHealth::Healthy);
-        assert!(compute_advice(&a, true, true, false).is_none());
+        assert!(compute_advice(&a, SENDING).is_none());
     }
 
     #[test]
     fn advice_unprotected_no_drives() {
         let a = test_assessment_for_advice("sv1", PromiseStatus::Unprotected, OperationalHealth::Healthy);
-        let advice = compute_advice(&a, true, true, false).unwrap();
+        let advice = compute_advice(&a, SENDING).unwrap();
         assert_eq!(
             advice.issue,
             AdviceIssue::new(PromiseStatus::Unprotected, IssueDetail::NoExternalDrives)
@@ -1620,7 +1619,7 @@ local_retention = "transient"
     fn advice_unprotected_all_drives_absent() {
         let mut a = test_assessment_for_advice("sv1", PromiseStatus::Unprotected, OperationalHealth::Blocked);
         a.external = vec![drive_assessment("WD-18TB", false, None)];
-        let advice = compute_advice(&a, true, true, false).unwrap();
+        let advice = compute_advice(&a, SENDING).unwrap();
         assert_eq!(
             advice.issue,
             AdviceIssue::new(PromiseStatus::Unprotected, IssueDetail::AllDrivesDisconnected)
@@ -1645,7 +1644,7 @@ local_retention = "transient"
                 pin_parent: "20260731-1618-opptak".to_string(),
             },
         }];
-        let advice = compute_advice(&a, true, true, false).expect("recoverable exposure is advisable");
+        let advice = compute_advice(&a, SENDING).expect("recoverable exposure is advisable");
         assert_eq!(
             advice.command.as_deref(),
             Some("urd backup --subvolume sv1"),
@@ -1664,7 +1663,7 @@ local_retention = "transient"
             drive_assessment("WD-18TB", false, None),
             drive_assessment("WD-18TB1", true, Some(50 * 24)),
         ];
-        let advice = compute_advice(&a, true, true, false).expect("one present drive is enough to act");
+        let advice = compute_advice(&a, SENDING).expect("one present drive is enough to act");
         assert_eq!(advice.command.as_deref(), Some("urd backup --subvolume sv1"));
     }
 
@@ -1674,7 +1673,7 @@ local_retention = "transient"
         // same guard branch 6 carries for the At Risk twin.
         let mut a = test_assessment_for_advice("sv1", PromiseStatus::Unprotected, OperationalHealth::Healthy);
         a.external = vec![drive_assessment("WD-18TB1", true, Some(50 * 24))];
-        assert!(compute_advice(&a, false, true, false).is_none());
+        assert!(compute_advice(&a, AdviceContext { earned: false, ..SENDING }).is_none());
     }
 
     #[test]
@@ -1690,7 +1689,7 @@ local_retention = "transient"
                 pin_parent: None,
             },
         }];
-        let advice = compute_advice(&a, true, true, false).expect("broken chain is advisable");
+        let advice = compute_advice(&a, SENDING).expect("broken chain is advisable");
         assert!(advice.command.as_deref().unwrap().contains("--force-full"));
     }
 
@@ -1705,7 +1704,7 @@ local_retention = "transient"
                 pin_parent: None,
             },
         }];
-        let advice = compute_advice(&a, true, true, false).unwrap();
+        let advice = compute_advice(&a, SENDING).unwrap();
         assert!(advice.command.as_ref().unwrap().contains("--force-full"));
         assert!(advice.reason.as_ref().unwrap().contains("thread to WD-18TB broken"));
     }
@@ -1714,7 +1713,7 @@ local_retention = "transient"
     fn advice_at_risk_drive_absent() {
         let mut a = test_assessment_for_advice("sv1", PromiseStatus::AtRisk, OperationalHealth::Degraded);
         a.external = vec![drive_assessment("WD-18TB", false, Some(48))];
-        let advice = compute_advice(&a, true, true, false).unwrap();
+        let advice = compute_advice(&a, SENDING).unwrap();
         assert!(advice.command.is_none());
         assert!(advice.reason.as_ref().unwrap().contains("Connect WD-18TB"));
     }
@@ -1723,7 +1722,7 @@ local_retention = "transient"
     fn advice_at_risk_drive_mounted_no_break() {
         let mut a = test_assessment_for_advice("sv1", PromiseStatus::AtRisk, OperationalHealth::Healthy);
         a.external = vec![drive_assessment("WD-18TB", true, Some(48))];
-        let advice = compute_advice(&a, true, true, false).unwrap();
+        let advice = compute_advice(&a, SENDING).unwrap();
         assert!(advice.command.as_ref().unwrap().contains("urd backup --subvolume sv1"));
         assert!(!advice.command.as_ref().unwrap().contains("--force-full"));
         assert!(advice.reason.is_none());
@@ -1740,7 +1739,7 @@ local_retention = "transient"
                 pin_parent: None,
             },
         }];
-        let advice = compute_advice(&a, true, true, false).unwrap();
+        let advice = compute_advice(&a, SENDING).unwrap();
         assert_eq!(
             advice.issue,
             AdviceIssue::new(
@@ -1762,7 +1761,7 @@ local_retention = "transient"
             test_assessment_for_advice("sv1", PromiseStatus::Protected, OperationalHealth::Degraded);
         a.external = vec![drive_assessment("WD-18TB1", false, Some(48))];
         a.health_reasons = vec!["WD-18TB1 overdue for 45 days".to_string()];
-        let advice = compute_advice(&a, true, true, false).unwrap();
+        let advice = compute_advice(&a, SENDING).unwrap();
         assert_eq!(
             advice.issue,
             AdviceIssue::new(
@@ -1789,7 +1788,7 @@ local_retention = "transient"
         ];
         a.health_reasons = vec!["space tight on WD-18TB".to_string()];
         assert!(
-            compute_advice(&a, true, true, false).is_none(),
+            compute_advice(&a, SENDING).is_none(),
             "must not recommend connecting an offsite whose absence is not the cause"
         );
     }
@@ -1803,7 +1802,7 @@ local_retention = "transient"
         a.external = vec![drive_assessment("WD-18TB", false, Some(48))];
         a.health_reasons = vec!["WD-18TB1 overdue for 45 days".to_string()];
         assert!(
-            compute_advice(&a, true, true, false).is_none(),
+            compute_advice(&a, SENDING).is_none(),
             "a reason about WD-18TB1 must not flag WD-18TB as the cause"
         );
     }
@@ -1812,7 +1811,7 @@ local_retention = "transient"
     fn advice_send_disabled_ignores_external() {
         let mut a = test_assessment_for_advice("sv1", PromiseStatus::AtRisk, OperationalHealth::Degraded);
         a.external = vec![drive_assessment("WD-18TB", false, None)];
-        let advice = compute_advice(&a, true, false, false).unwrap();
+        let advice = compute_advice(&a, AdviceContext { send_enabled: false, ..SENDING }).unwrap();
         assert!(advice.command.as_ref().unwrap().contains("urd backup --subvolume sv1"));
         assert!(!advice.command.as_ref().unwrap().contains("--force-full"));
     }
@@ -1822,7 +1821,7 @@ local_retention = "transient"
         let mut a = test_assessment_for_advice("sv1", PromiseStatus::AtRisk, OperationalHealth::Healthy);
         // Local age is 2h (from test_assessment_for_advice), but external send was 48h ago
         a.external = vec![drive_assessment("WD-18TB", true, Some(48))];
-        let advice = compute_advice(&a, true, true, true).unwrap();
+        let advice = compute_advice(&a, AdviceContext { external_only: true, ..SENDING }).unwrap();
         assert_eq!(
             advice.issue,
             AdviceIssue::new(
@@ -1842,7 +1841,7 @@ local_retention = "transient"
     fn advice_unearned_send_disabled_at_risk_returns_none() {
         let mut a = test_assessment_for_advice("sv1", PromiseStatus::AtRisk, OperationalHealth::Degraded);
         a.external = vec![drive_assessment("WD-18TB", false, None)];
-        assert!(compute_advice(&a, false, false, false).is_none());
+        assert!(compute_advice(&a, AdviceContext { earned: false, send_enabled: false, ..SENDING }).is_none());
     }
 
     #[test]
@@ -1856,14 +1855,14 @@ local_retention = "transient"
                 pin_parent: None,
             },
         }];
-        assert!(compute_advice(&a, false, true, false).is_none());
+        assert!(compute_advice(&a, AdviceContext { earned: false, ..SENDING }).is_none());
     }
 
     #[test]
     fn advice_unearned_at_risk_drive_mounted_returns_none() {
         let mut a = test_assessment_for_advice("sv1", PromiseStatus::AtRisk, OperationalHealth::Healthy);
         a.external = vec![drive_assessment("WD-18TB", true, Some(48))];
-        assert!(compute_advice(&a, false, true, false).is_none());
+        assert!(compute_advice(&a, AdviceContext { earned: false, ..SENDING }).is_none());
     }
 
     #[test]
@@ -1877,7 +1876,7 @@ local_retention = "transient"
                 pin_parent: None,
             },
         }];
-        assert!(compute_advice(&a, false, true, false).is_none());
+        assert!(compute_advice(&a, AdviceContext { earned: false, ..SENDING }).is_none());
     }
 
     /// M2 regression: the branch-7 guard sits inside branch 7's own `Some`,
@@ -1891,7 +1890,7 @@ local_retention = "transient"
             test_assessment_for_advice("sv1", PromiseStatus::Protected, OperationalHealth::Degraded);
         a.external = vec![drive_assessment("WD-18TB1", false, Some(48))];
         a.health_reasons = vec!["WD-18TB1 overdue for 45 days".to_string()];
-        let advice = compute_advice(&a, false, true, false).unwrap();
+        let advice = compute_advice(&a, AdviceContext { earned: false, ..SENDING }).unwrap();
         assert_eq!(
             advice.issue,
             AdviceIssue::new(
@@ -1922,14 +1921,14 @@ local_retention = "transient"
         let mut a = test_assessment_for_advice("sv1", PromiseStatus::AtRisk, OperationalHealth::Degraded);
         a.external = vec![drive_assessment("WD-18TB", false, None)];
         assert_eq!(
-            compute_advice(&a, true, false, true).unwrap().issue,
+            compute_advice(&a, AdviceContext { send_enabled: false, external_only: true, ..SENDING }).unwrap().issue,
             AdviceIssue::new(PromiseStatus::AtRisk, stale(false, Some(2 * 3600)))
         );
 
         // Branch 2: no drives configured at all.
         let a = test_assessment_for_advice("sv1", PromiseStatus::Unprotected, OperationalHealth::Healthy);
         assert_eq!(
-            compute_advice(&a, true, true, false).unwrap().issue,
+            compute_advice(&a, SENDING).unwrap().issue,
             AdviceIssue::new(PromiseStatus::Unprotected, IssueDetail::NoExternalDrives)
         );
 
@@ -1937,7 +1936,7 @@ local_retention = "transient"
         let mut a = test_assessment_for_advice("sv1", PromiseStatus::Unprotected, OperationalHealth::Blocked);
         a.external = vec![drive_assessment("WD-18TB", false, None)];
         assert_eq!(
-            compute_advice(&a, true, true, false).unwrap().issue,
+            compute_advice(&a, SENDING).unwrap().issue,
             AdviceIssue::new(PromiseStatus::Unprotected, IssueDetail::AllDrivesDisconnected)
         );
 
@@ -1954,16 +1953,16 @@ local_retention = "transient"
             },
         }];
         assert_eq!(
-            compute_advice(&a, true, true, false).unwrap().issue,
+            compute_advice(&a, SENDING).unwrap().issue,
             AdviceIssue::new(PromiseStatus::AtRisk, stale(false, Some(2 * 3600)))
         );
         assert_eq!(
-            compute_advice(&a, true, true, true).unwrap().issue,
+            compute_advice(&a, AdviceContext { external_only: true, ..SENDING }).unwrap().issue,
             AdviceIssue::new(PromiseStatus::AtRisk, stale(true, Some(48 * 3600)))
         );
         a.status = PromiseStatus::Unprotected;
         assert_eq!(
-            compute_advice(&a, true, true, false).unwrap().issue,
+            compute_advice(&a, SENDING).unwrap().issue,
             AdviceIssue::new(PromiseStatus::Unprotected, stale(false, Some(2 * 3600)))
         );
 
@@ -1971,7 +1970,7 @@ local_retention = "transient"
         let mut a = test_assessment_for_advice("sv1", PromiseStatus::AtRisk, OperationalHealth::Degraded);
         a.external = vec![drive_assessment("WD-18TB", false, Some(48))];
         assert_eq!(
-            compute_advice(&a, true, true, false).unwrap().issue,
+            compute_advice(&a, SENDING).unwrap().issue,
             AdviceIssue::new(PromiseStatus::AtRisk, stale(false, Some(2 * 3600)))
         );
 
@@ -1980,12 +1979,12 @@ local_retention = "transient"
         let mut a = test_assessment_for_advice("sv1", PromiseStatus::AtRisk, OperationalHealth::Healthy);
         a.external = vec![drive_assessment("WD-18TB", true, Some(48))];
         assert_eq!(
-            compute_advice(&a, true, true, false).unwrap().issue,
+            compute_advice(&a, SENDING).unwrap().issue,
             AdviceIssue::new(PromiseStatus::AtRisk, stale(false, Some(2 * 3600)))
         );
         a.local.newest_age = None;
         assert_eq!(
-            compute_advice(&a, true, true, false).unwrap().issue,
+            compute_advice(&a, SENDING).unwrap().issue,
             AdviceIssue::new(PromiseStatus::AtRisk, stale(false, None))
         );
 
@@ -2000,7 +1999,7 @@ local_retention = "transient"
             },
         }];
         assert_eq!(
-            compute_advice(&a, true, true, false).unwrap().issue,
+            compute_advice(&a, SENDING).unwrap().issue,
             AdviceIssue::new(
                 PromiseStatus::Protected,
                 IssueDetail::ChainBroken {
@@ -2014,7 +2013,7 @@ local_retention = "transient"
         a.external = vec![drive_assessment("WD-18TB1", false, Some(48))];
         a.health_reasons = vec!["WD-18TB1 overdue for 45 days".to_string()];
         assert_eq!(
-            compute_advice(&a, true, true, false).unwrap().issue,
+            compute_advice(&a, SENDING).unwrap().issue,
             AdviceIssue::new(
                 PromiseStatus::Protected,
                 IssueDetail::DriveAway {

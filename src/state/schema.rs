@@ -75,6 +75,12 @@ impl StateDb {
                     pool_uuid  TEXT PRIMARY KEY,
                     armed_tier TEXT NOT NULL,
                     since      TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS retention_shapes (
+                    subvolume   TEXT PRIMARY KEY,
+                    shape       TEXT NOT NULL,
+                    recorded_at TEXT NOT NULL
                 );",
             )
             .map_err(db_err("failed to create schema"))?;

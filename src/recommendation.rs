@@ -24,14 +24,18 @@ use serde::Serialize;
 use crate::drift::ChurnEstimate;
 use crate::types::ResolvedGraduatedRetention;
 
+// The free-ratio primitives belong to storage state (`storage_critical.rs`);
+// this module consumes them. Re-exported so `crate::recommendation::
+// HeadroomSeverity` / `classify_free_ratio_value` paths keep resolving.
+pub use crate::storage_critical::{HeadroomSeverity, classify_free_ratio_value};
+
 // ── UPI 044 thresholds (ADR-115 amendment 2026-05-16) ─────────────────
 // N=1-calibrated from the 2026-05-09 retention-tuning report. Soft —
 // post-UPI-044 30-day checkpoint revises (ADR amendment, not new ADR).
 // Boundaries are strict (`<` / `>`): exact-threshold values land in the
-// lower tier (e.g., free_ratio == 0.25 → Healthy).
+// lower tier (e.g., free_ratio == 0.25 → Healthy). The free-ratio pair
+// (`FREE_RATIO_CAUTION` / `FREE_RATIO_PRESSURE`) lives in `storage_critical.rs`.
 
-pub const FREE_RATIO_CAUTION: f64 = 0.25;
-pub const FREE_RATIO_PRESSURE: f64 = 0.15;
 const TIME_TO_EMPTY_CAUTION_DAYS: f64 = 90.0;
 const TIME_TO_EMPTY_PRESSURE_DAYS: f64 = 30.0;
 const METADATA_CAUTION: f64 = 0.85;
@@ -51,23 +55,6 @@ pub struct HeadroomContext {
     pub source_pool_capacity_bytes: Option<u64>,
     pub source_pool_trend_bytes_per_day: Option<i64>,
     pub destination_metadata_ratio: Option<f64>,
-}
-
-/// Per-(subvolume, role) headroom severity (UPI 044). Ordering is
-/// load-bearing: `.iter().max()` yields the dominant tier when multiple
-/// signals fire.
-///
-/// UPI 031 retired the doctor-side Critical *injection*; UPI 031-b's
-/// tier-graded ephemeral spine confirmed the behavioral bundle keys on
-/// `TightnessTier`, not this severity ladder, so the dormant `Critical`
-/// variant (and its dead voice/recommendation paths) were deleted (AB5).
-/// `classify_headroom_severity` emits only `Healthy | Caution | Pressure`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum HeadroomSeverity {
-    Healthy,
-    Caution,
-    Pressure,
 }
 
 /// Compute the headroom severity from a `HeadroomContext`. Returns
@@ -106,29 +93,8 @@ pub fn classify_free_ratio(free: Option<u64>, capacity: Option<u64>) -> Headroom
     if capacity == 0 {
         return HeadroomSeverity::Healthy;
     }
-    #[allow(clippy::cast_precision_loss)]
     let ratio = free as f64 / capacity as f64;
     classify_free_ratio_value(ratio)
-}
-
-/// Classify a pre-computed free-ratio by free-ratio alone. Boundaries are
-/// strict (`<`): exact-threshold values land in the lower (roomier) tier
-/// (e.g. `0.25` → `Healthy`). Non-finite ratios fail toward `Healthy`.
-///
-/// Shared with `storage_critical::resolve_armed_tier` (UPI 031-a) so the
-/// tightness-tier boundaries have a single source of truth.
-#[must_use]
-pub fn classify_free_ratio_value(ratio: f64) -> HeadroomSeverity {
-    if !ratio.is_finite() {
-        return HeadroomSeverity::Healthy;
-    }
-    if ratio < FREE_RATIO_PRESSURE {
-        HeadroomSeverity::Pressure
-    } else if ratio < FREE_RATIO_CAUTION {
-        HeadroomSeverity::Caution
-    } else {
-        HeadroomSeverity::Healthy
-    }
 }
 
 fn classify_time_to_empty(free: Option<u64>, trend: Option<i64>) -> HeadroomSeverity {
@@ -139,7 +105,6 @@ fn classify_time_to_empty(free: Option<u64>, trend: Option<i64>) -> HeadroomSeve
         // Growing or static pool — no time-to-empty.
         return HeadroomSeverity::Healthy;
     }
-    #[allow(clippy::cast_precision_loss)]
     let days = free as f64 / (-trend) as f64;
     if !days.is_finite() {
         return HeadroomSeverity::Healthy;
@@ -341,15 +306,12 @@ pub fn project_cost(
         None => 0,
         Some(mean) => {
             let span = chain_span_seconds(shape);
-            #[allow(clippy::cast_precision_loss)]
             let bytes_f = mean * span as f64;
             // Saturating cast to u64 (Rust 1.45+ semantics): NaN → 0,
             // negative → 0, overflow → u64::MAX. Defensive against any
             // odd ChurnEstimate input even though drift.rs guarantees a
             // positive finite mean.
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let bytes = bytes_f as u64;
-            bytes
+            bytes_f as u64
         }
     };
 
@@ -362,11 +324,11 @@ pub fn project_cost(
 /// Recommend a retention shape for the given role under observed `churn`.
 /// Thin wrapper around `recommend_shape_with_headroom` with an empty
 /// `HeadroomContext` — when no headroom signals are available, the result
-/// is the UPI-041 churn-fit recommendation unchanged. Retained for tests
-/// that pre-date UPI 044 and for external callers that don't need the
-/// headroom decoration.
+/// is the UPI-041 churn-fit recommendation unchanged. Retained for the tests
+/// that pre-date UPI 044; production callers go through the headroom-aware
+/// entry point.
+#[cfg(test)]
 #[must_use]
-#[allow(dead_code)]
 pub fn recommend_shape(
     current: &ResolvedGraduatedRetention,
     churn: &ChurnEstimate,
@@ -440,7 +402,6 @@ fn tighten(
     let slots_in = [shape.hourly, shape.daily, shape.weekly, monthly_count];
     let mut slots_out = [0_u32; 4];
     for idx in 0..4 {
-        #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let scaled = (f64::from(slots_in[idx]) * HEADROOM_TIGHTEN_MULTIPLIER).floor() as u32;
         let clamped = scaled.clamp(p.clamp_min[idx], p.clamp_max[idx]);
         slots_out[idx] = clamped;
@@ -525,7 +486,6 @@ pub fn pick_reason(
         ctx.source_pool_capacity_bytes,
     ) && capacity > 0
     {
-        #[allow(clippy::cast_precision_loss)]
         let ratio = free as f64 / capacity as f64;
         if classify_free_ratio(Some(free), Some(capacity)) != HeadroomSeverity::Healthy {
             return Some(AdjustmentReason::SourcePoolLow { free_ratio: ratio });
@@ -538,7 +498,6 @@ pub fn pick_reason(
         ctx.source_pool_trend_bytes_per_day,
     ) && trend < 0
     {
-        #[allow(clippy::cast_precision_loss)]
         let days = free as f64 / (-trend) as f64;
         if classify_time_to_empty(Some(free), Some(trend)) != HeadroomSeverity::Healthy {
             return Some(AdjustmentReason::SourcePoolShrinking {
@@ -582,7 +541,6 @@ fn recommend_shape_inner(
 
     let mut slots = [0_u32; 4];
     for idx in 0..4 {
-        #[allow(clippy::cast_precision_loss)]
         let budget_w = p.data_budget_bytes as f64 * p.slot_share[idx];
         let total_seconds_target = budget_w / r;
         let outer_edge = total_seconds_target / w_step_seconds[idx];
@@ -595,11 +553,8 @@ fn recommend_shape_inner(
             // contract. Defensive: route to clamp_max.
             p.clamp_max[idx]
         } else {
-            #[allow(clippy::cast_precision_loss)]
             let clamped = outer_edge.clamp(0.0, f64::from(p.clamp_max[idx]));
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let v = clamped as u32;
-            v
+            clamped as u32
         };
         slots[idx] = bounded.max(p.clamp_min[idx]);
     }

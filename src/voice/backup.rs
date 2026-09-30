@@ -328,11 +328,8 @@ fn render_skipped_block(skipped: &[crate::output::SkippedSubvolume], out: &mut S
     let mut actionable_skips: Vec<&crate::output::SkippedSubvolume> = Vec::new();
 
     for skip in skipped {
-        if let Some(label) = skip
-            .reason
-            .strip_prefix("drive ")
-            .and_then(|r| r.strip_suffix(" not mounted"))
-        {
+        if skip.category == SkipCategory::DriveNotMounted {
+            let label = skip.drive.as_deref().unwrap_or("unknown");
             if !not_mounted_drives.contains(&label.to_string()) {
                 not_mounted_drives.push(label.to_string());
             }
@@ -798,12 +795,14 @@ mod tests {
                 name: "sv1".to_string(),
                 reason: "drive WD-18TB not mounted".to_string(),
                 category: SkipCategory::DriveNotMounted,
+                drive: Some("WD-18TB".to_string()),
             },
             SkippedSubvolume {
                 next_due_minutes: None,
                 name: "sv2".to_string(),
                 reason: "estimated send exceeds free space".to_string(),
                 category: SkipCategory::SpaceExceeded,
+                drive: None,
             },
         ];
         let mut out = String::new();
@@ -831,6 +830,7 @@ mod tests {
             name: "sv1".to_string(),
             reason: "drive WD-18TB not mounted".to_string(),
             category: SkipCategory::DriveNotMounted,
+            drive: Some("WD-18TB".to_string()),
         }];
         let mut out = String::new();
         render_skipped_block(&skipped, &mut out);
@@ -847,6 +847,7 @@ mod tests {
             name: "sv1".to_string(),
             reason: "unchanged \u{2014} no changes since last snapshot (21h ago)".to_string(),
             category: SkipCategory::Unchanged,
+            drive: None,
         }];
         let mut out = String::new();
         render_skipped_block(&skipped, &mut out);
@@ -957,12 +958,14 @@ mod tests {
                 name: "htpc-home".to_string(),
                 reason: "drive WD-18TB not mounted".to_string(),
                 category: SkipCategory::DriveNotMounted,
+                drive: Some("WD-18TB".to_string()),
             },
             SkippedSubvolume {
                 next_due_minutes: None,
                 name: "htpc-home".to_string(),
                 reason: "drive 2TB-backup UUID mismatch (expected abc, found def)".to_string(),
                 category: SkipCategory::Other,
+                drive: None,
             },
         ];
         let output = render_backup_summary(&data, OutputMode::Interactive);
@@ -1220,24 +1223,28 @@ mod tests {
                     name: "htpc-home".to_string(),
                     reason: "drive WD-18TB not mounted".to_string(),
                     category: SkipCategory::DriveNotMounted,
+                    drive: Some("WD-18TB".to_string()),
                 },
                 SkippedSubvolume {
                     next_due_minutes: None,
                     name: "htpc-docs".to_string(),
                     reason: "drive WD-18TB not mounted".to_string(),
                     category: SkipCategory::DriveNotMounted,
+                    drive: Some("WD-18TB".to_string()),
                 },
                 SkippedSubvolume {
                     next_due_minutes: None,
                     name: "htpc-home".to_string(),
                     reason: "drive 2TB-backup not mounted".to_string(),
                     category: SkipCategory::DriveNotMounted,
+                    drive: Some("2TB-backup".to_string()),
                 },
                 SkippedSubvolume {
                     next_due_minutes: None,
                     name: "htpc-docs".to_string(),
                     reason: "drive 2TB-backup not mounted".to_string(),
                     category: SkipCategory::DriveNotMounted,
+                    drive: Some("2TB-backup".to_string()),
                 },
             ],
             assessments: vec![],
@@ -1270,6 +1277,7 @@ mod tests {
             name: "htpc-root".to_string(),
             reason: "external-only \u{2014} sends on next backup".to_string(),
             category: SkipCategory::ExternalOnly,
+            drive: None,
         }];
         let output = render_backup_summary(&data, OutputMode::Interactive);
         assert!(
@@ -1298,12 +1306,14 @@ mod tests {
                     name: "subvol4-multimedia".to_string(),
                     reason: "local only".to_string(),
                     category: SkipCategory::LocalOnly,
+                    drive: None,
                 },
                 SkippedSubvolume {
                     next_due_minutes: None,
                     name: "htpc-home".to_string(),
                     reason: "drive WD-18TB not mounted".to_string(),
                     category: SkipCategory::DriveNotMounted,
+                    drive: Some("WD-18TB".to_string()),
                 },
             ],
             assessments: vec![],

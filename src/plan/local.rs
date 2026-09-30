@@ -2,7 +2,8 @@ use std::collections::HashSet;
 
 use crate::events::DeferScope;
 use crate::retention;
-use crate::types::{DeleteKind, LocalRetentionPolicy, PlannedOperation, SnapshotName};
+use crate::plan::{DeleteKind, PlannedOperation, SkipReason};
+use crate::types::{LocalRetentionPolicy, SnapshotName};
 
 use super::fragment::{self, LocalRetentionInputs, LocalSnapshotInputs, PlanFragment, SnapshotOutcome};
 
@@ -29,11 +30,10 @@ pub(super) fn plan_local_snapshot(i: &LocalSnapshotInputs) -> SnapshotOutcome {
             f.defer(
                 &subvol.name,
                 None,
-                format!(
-                    "local filesystem low on space ({} free, {} required)",
-                    ByteSize(free),
-                    ByteSize(min_free),
-                ),
+                SkipReason::LocalLowOnSpace {
+                    free: ByteSize(free),
+                    required: ByteSize(min_free),
+                },
                 None,
                 DeferScope::Subvolume,
                 now,
@@ -83,10 +83,9 @@ pub(super) fn plan_local_snapshot(i: &LocalSnapshotInputs) -> SnapshotOutcome {
         f.defer(
             &subvol.name,
             None,
-            format!(
-                "interval not elapsed (next in ~{})",
-                super::format_duration_short(mins)
-            ),
+            SkipReason::IntervalNotElapsed {
+                next_in_minutes: mins,
+            },
             Some(mins),
             DeferScope::Subvolume,
             now,
@@ -114,10 +113,9 @@ pub(super) fn plan_local_snapshot(i: &LocalSnapshotInputs) -> SnapshotOutcome {
                 f.defer(
                     &subvol.name,
                     None,
-                    format!(
-                        "unchanged \u{2014} no changes since last snapshot ({} ago)",
-                        super::format_duration_short(mins)
-                    ),
+                    SkipReason::Unchanged {
+                        since_minutes: mins,
+                    },
                     None,
                     DeferScope::Subvolume,
                     now,
@@ -153,7 +151,7 @@ pub(super) fn plan_local_snapshot(i: &LocalSnapshotInputs) -> SnapshotOutcome {
         f.defer(
             &subvol.name,
             None,
-            "snapshot already exists".to_string(),
+            SkipReason::SnapshotAlreadyExists,
             None,
             DeferScope::Subvolume,
             now,
@@ -389,7 +387,7 @@ mod tests {
         let (ops, skipped, _events) = out.fragment.into_parts();
         assert!(ops.is_empty());
         assert_eq!(skipped.len(), 1);
-        assert!(skipped[0].reason.contains("low on space"), "{}", skipped[0].reason);
+        assert!(skipped[0].reason.to_string().contains("low on space"), "{}", skipped[0].reason);
     }
 
     #[test]
@@ -546,7 +544,7 @@ mod tests {
         assert!(out.planned.is_none());
         let (_ops, skipped, _events) = out.fragment.into_parts();
         assert_eq!(skipped.len(), 1);
-        assert!(skipped[0].reason.contains("unchanged"), "{}", skipped[0].reason);
+        assert!(skipped[0].reason.to_string().contains("unchanged"), "{}", skipped[0].reason);
     }
 
     #[test]
@@ -718,7 +716,7 @@ mod tests {
         let (ops, skipped, _events) = out.fragment.into_parts();
         assert!(ops.is_empty());
         assert_eq!(skipped.len(), 1);
-        assert!(skipped[0].reason.contains("already exists"), "{}", skipped[0].reason);
+        assert!(skipped[0].reason.to_string().contains("already exists"), "{}", skipped[0].reason);
     }
 
     #[test]
@@ -819,7 +817,7 @@ mod tests {
         assert!(out.planned.is_none(), "clock skew defers rather than creating");
         let (_ops, skipped, _events) = out.fragment.into_parts();
         assert_eq!(skipped.len(), 1);
-        assert!(skipped[0].reason.contains("interval not elapsed"), "{}", skipped[0].reason);
+        assert!(skipped[0].reason.to_string().contains("interval not elapsed"), "{}", skipped[0].reason);
     }
 
     // ── plan_local_retention ─────────────────────────────────────────
