@@ -10,9 +10,11 @@ use crate::output::{
     OutputMode, PlanOperationEntry, PlanOutput, PlanSummaryOutput, SkipCategory,
     SkippedSubvolume,
 };
-use crate::plan::{self, HistoryQuery, NothingNew, PlanFilters, SkipReason};
+use crate::plan::{
+    self, HistoryQuery, NothingNew, PlanFilters, PlannedOperation, PlannedSkip, SkipReason,
+};
 use crate::state::StateDb;
-use crate::types::{DISPLAY_MINUTE_FORMAT, PlannedOperation, PlannedSkip};
+use crate::types::DISPLAY_MINUTE_FORMAT;
 use crate::voice;
 
 pub fn run(config: Config, args: PlanArgs, mode: OutputMode) -> anyhow::Result<()> {
@@ -56,7 +58,7 @@ pub fn run(config: Config, args: PlanArgs, mode: OutputMode) -> anyhow::Result<(
 /// pure decision `urd backup` makes (ADR-100 preview parity), read-only: a
 /// preview never records a shape. Returns the holds for the warning lines.
 pub(crate) fn gate_preview(
-    backup_plan: &mut crate::types::BackupPlan,
+    backup_plan: &mut crate::plan::BackupPlan,
     config: &Config,
     recorded: &HashMap<String, crate::retention::RecordedRetention>,
     filters: &PlanFilters,
@@ -120,7 +122,7 @@ pub(crate) fn retention_hold_warnings(holds: &[crate::retention::RetentionHold])
 /// Build PlanOutput from a BackupPlan. Shared by `urd plan` and `urd backup --dry-run`.
 #[must_use]
 pub fn build_plan_output(
-    backup_plan: &crate::types::BackupPlan,
+    backup_plan: &crate::plan::BackupPlan,
     fs_state: &dyn HistoryQuery,
     config: &Config,
 ) -> PlanOutput {
@@ -369,9 +371,9 @@ fn build_operation_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plan::{MockFileSystemState, NothingNew};
+    use crate::plan::{BackupPlan, MockFileSystemState, NothingNew};
     use crate::testkit::ConfigBuilder;
-    use crate::types::{BackupPlan, SendKind, SnapshotName};
+    use crate::types::{SendKind, SnapshotName};
     use std::path::PathBuf;
 
     fn dummy_snap(subvol: &str) -> SnapshotName {
@@ -561,7 +563,7 @@ mod tests {
             ("htpc-docs".into(), "WD-18TB".into(), SendKind::Full),
             1_200_000_000,
         );
-        let plan = crate::types::BackupPlan {
+        let plan = crate::plan::BackupPlan {
             lifecycles: HashMap::new(),
             timestamp: chrono::NaiveDateTime::default(),
             operations: vec![
@@ -582,7 +584,7 @@ mod tests {
             ("htpc-home".into(), "WD-18TB".into(), SendKind::Full),
             53_000_000_000,
         );
-        let plan = crate::types::BackupPlan {
+        let plan = crate::plan::BackupPlan {
             lifecycles: HashMap::new(),
             timestamp: chrono::NaiveDateTime::default(),
             operations: vec![
@@ -599,7 +601,7 @@ mod tests {
     #[test]
     fn summary_no_estimates_is_none() {
         let fs = MockFileSystemState::new();
-        let plan = crate::types::BackupPlan {
+        let plan = crate::plan::BackupPlan {
             lifecycles: HashMap::new(),
             timestamp: chrono::NaiveDateTime::default(),
             operations: vec![mock_send_full("htpc-home", "WD-18TB")],
@@ -745,7 +747,7 @@ mod tests {
             path: PathBuf::from("/mnt/wd/htpc-home/20260322-1430-htpc-home"),
             reason: "beyond retention window".to_string(),
             subvolume_name: "htpc-home".to_string(),
-            kind: crate::types::DeleteKind::Policy,
+            kind: crate::plan::DeleteKind::Policy,
         };
         let entry = build_operation_entry(&op, &fs, &config.drives, test_now(), &[]);
         assert_eq!(entry.drive_label.as_deref(), Some("WD-18TB"));
@@ -759,7 +761,7 @@ mod tests {
             path: PathBuf::from("/snap/htpc-home/20260322-1430-htpc-home"),
             reason: "graduated: daily thinning".to_string(),
             subvolume_name: "htpc-home".to_string(),
-            kind: crate::types::DeleteKind::Policy,
+            kind: crate::plan::DeleteKind::Policy,
         };
         let entry = build_operation_entry(&op, &fs, &config.drives, test_now(), &[]);
         assert_eq!(entry.drive_label, None, "local delete carries no drive label");
@@ -772,7 +774,7 @@ mod tests {
         // byte-identical Display output and byte-identical PlanOperationEntry.
         // This guards the on-disk / monitoring contract (ADR-105) against
         // accidental kind-leaks via Display, plan_cmd, or downstream renderers.
-        use crate::types::DeleteKind;
+        use crate::plan::DeleteKind;
 
         let make_plan = |kind: DeleteKind| BackupPlan {
             lifecycles: HashMap::new(),
@@ -859,7 +861,7 @@ mod tests {
             path: PathBuf::from(format!("/snap/{subvol}/20260301-0404-{subvol}")),
             reason: "graduated: daily thinning".to_string(),
             subvolume_name: subvol.to_string(),
-            kind: crate::types::DeleteKind::Policy,
+            kind: crate::plan::DeleteKind::Policy,
         };
         let make_plan = || BackupPlan {
             lifecycles: HashMap::new(),

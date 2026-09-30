@@ -8,7 +8,7 @@ use chrono::NaiveDate;
 
 use crate::btrfs::{MockBtrfs, MockBtrfsCall};
 use crate::config::Config;
-use crate::types::{BackupPlan, DeleteKind, PlannedOperation};
+use crate::plan::{BackupPlan, DeleteKind, PlannedOperation};
 
 /// Shutdown flag that never triggers — used for all tests that don't test signal handling.
 pub(super) fn no_shutdown() -> AtomicBool {

@@ -14,8 +14,9 @@ use std::time::Instant;
 
 use crate::btrfs::BtrfsOps;
 use crate::config::Config;
+use crate::plan::{BackupPlan, PlannedOperation};
 use crate::state::StateDb;
-use crate::types::{BackupPlan, FullSendReason, PlannedOperation, SendKind};
+use crate::types::{FullSendReason, SendKind};
 
 mod coord;
 mod lifecycle;
@@ -544,7 +545,8 @@ mod tests {
     use super::*;
     use super::testkit::*;
     use crate::btrfs::{MockBtrfs, MockBtrfsCall};
-    use crate::types::{DeleteKind, SnapshotName};
+    use crate::plan::DeleteKind;
+    use crate::types::SnapshotName;
     use chrono::NaiveDate;
     use std::path::PathBuf;
 

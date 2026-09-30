@@ -9,7 +9,7 @@ use crate::commands::storage_signals;
 use crate::config::Config;
 use crate::executor::{OpResult, OperationOutcome, SendType, SubvolumeResult, TransientCleanupOutcome};
 use crate::storage_critical::TightnessTier;
-use crate::types::BackupPlan;
+use crate::plan::BackupPlan;
 
 pub(super) fn wd_config() -> Config {
     let toml_str = r#"

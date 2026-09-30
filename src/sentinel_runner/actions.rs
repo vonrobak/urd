@@ -292,7 +292,7 @@ impl SentinelRunner {
         else {
             return;
         };
-        let duration_str = crate::plan::format_duration_short(m);
+        let duration_str = crate::voice::DurationStyle::Short.render(m.saturating_mul(60));
 
         let notification =
             notify::build_drive_reconnected_notification(label, Some(duration_str.as_str()));

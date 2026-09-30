@@ -9,7 +9,7 @@ use std::time::Instant;
 use super::{Executor, OpResult, OperationOutcome, outcome_failure, outcome_success};
 use crate::chain;
 use crate::error::UrdError;
-use crate::types::DeleteKind;
+use crate::plan::DeleteKind;
 
 impl Executor<'_> {
     pub(super) fn execute_create<'b>(
@@ -223,7 +223,7 @@ mod tests {
     use super::*;
     use crate::btrfs::{MockBtrfs, MockBtrfsCall};
     use crate::executor::testkit::*;
-    use crate::types::{BackupPlan, PlannedOperation};
+    use crate::plan::{BackupPlan, PlannedOperation};
     use chrono::NaiveDate;
     use std::path::PathBuf;
 

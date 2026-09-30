@@ -572,7 +572,8 @@ mod tests {
     use crate::config::Config;
     use crate::executor::RunResult;
     use crate::executor::testkit::*;
-    use crate::types::{BackupPlan, FullSendReason, PlannedOperation};
+    use crate::plan::{BackupPlan, PlannedOperation};
+    use crate::types::FullSendReason;
     use chrono::NaiveDate;
     use std::collections::HashMap;
 

@@ -973,7 +973,7 @@ fn build_doctor_churn_view_inner(
             let estimate = compute_churn_for(state_db, &sv.name, window, now);
             DoctorChurnRow {
                 name: sv.name.clone(),
-                state: crate::output::render_churn(&estimate),
+                state: crate::drift::render_churn(&estimate),
             }
         })
         .collect();

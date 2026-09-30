@@ -10,9 +10,9 @@ use crate::output::{
     BackupSummary, DeferredInfo, EmptyPlanExplanation, SendSummary, SkipCategory,
     SkippedSubvolume, StatusAssessment, StructuredError, SubvolumeSummary, TransitionEvent,
 };
-use crate::plan::PlanFilters;
+use crate::plan::{BackupPlan, PlanFilters};
 use crate::preflight;
-use crate::types::{BackupPlan, SendKind};
+use crate::types::SendKind;
 
 use super::preflight::EmergencyRootReclaim;
 
@@ -223,7 +223,7 @@ pub(super) fn build_backup_summary(
 }
 
 pub(super) fn build_empty_plan_explanation(
-    plan: &crate::types::BackupPlan,
+    plan: &crate::plan::BackupPlan,
     filters: &PlanFilters,
 ) -> EmptyPlanExplanation {
     // Single pass to classify all skip reasons
@@ -310,8 +310,8 @@ mod tests {
     use std::path::PathBuf;
     use crate::awareness::{PromiseStatus, SubvolAssessment};
     use crate::executor::{RunResult, SendType};
-    use crate::plan::{NothingNew, SkipReason};
-    use crate::types::{DeleteKind, Interval, PlannedOperation, ProtectionLevel};
+    use crate::plan::{DeleteKind, NothingNew, PlannedOperation, SkipReason};
+    use crate::types::{Interval, ProtectionLevel};
     use crate::commands::backup::test_fixtures::*;
 
     #[test]
@@ -785,14 +785,14 @@ mod tests {
             operations: vec![],
             timestamp: chrono::NaiveDateTime::default(),
             skipped: vec![
-                crate::types::PlannedSkip::deferred(
+                crate::plan::PlannedSkip::deferred(
                     "htpc-home",
                     SkipReason::DriveNotMounted {
                         drive: "WD-18TB".to_string(),
                     },
                     None,
                 ),
-                crate::types::PlannedSkip::deferred("htpc-docs", SkipReason::Disabled, None),
+                crate::plan::PlannedSkip::deferred("htpc-docs", SkipReason::Disabled, None),
             ],
             events: Vec::new(),
         };
@@ -915,8 +915,8 @@ mod tests {
                 .into_iter()
                 .map(|(n, r)| match r {
                     // A nothing-new conclusion has its own constructor.
-                    SkipReason::NothingNew(why) => crate::types::PlannedSkip::nothing_new(n, &why),
-                    r => crate::types::PlannedSkip::deferred(n, r, None),
+                    SkipReason::NothingNew(why) => crate::plan::PlannedSkip::nothing_new(n, &why),
+                    r => crate::plan::PlannedSkip::deferred(n, r, None),
                 })
                 .collect(),
             events: Vec::new(),

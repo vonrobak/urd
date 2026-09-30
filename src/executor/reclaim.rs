@@ -359,7 +359,8 @@ mod tests {
     use crate::config::Config;
     use crate::executor::OpResult;
     use crate::executor::testkit::*;
-    use crate::types::{BackupPlan, DeleteKind, PlannedOperation, SnapshotName};
+    use crate::plan::{BackupPlan, DeleteKind, PlannedOperation};
+    use crate::types::SnapshotName;
 
     fn sync_calls(mock: &MockBtrfs) -> Vec<PathBuf> {
         mock.calls()

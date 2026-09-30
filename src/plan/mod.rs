@@ -82,12 +82,6 @@ fn send_floor_defer_reason(
 // so existing `crate::plan::{FilesystemQuery, HistoryQuery, ..}` import paths
 // keep resolving (UPI 052).
 pub use crate::observation::{FilesystemQuery, HistoryQuery, Observation};
-// The production adapter lives with the traits it implements
-// (`observation/real.rs`); re-exported so `crate::plan::{RealFileSystemState,
-// read_snapshot_dir}` keep resolving for the command handlers that still
-// import them from here. Neither is used by the planner itself.
-pub use crate::observation::RealFileSystemState;
-pub(crate) use crate::observation::read_snapshot_dir;
 
 // ── Size estimation helper ──────────────────────────────────────────────
 

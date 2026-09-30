@@ -7,11 +7,6 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::error::UrdError;
 
-// The planner-output types live in `plan/types.rs`; re-exported so existing
-// `crate::types::{BackupPlan, PlannedOperation, ..}` paths keep resolving.
-// A path alias only — nothing in this module names them.
-pub use crate::plan::{BackupPlan, DeleteKind, PlannedOperation, PlannedSkip};
-
 // ── Interval ────────────────────────────────────────────────────────────
 
 /// A duration parsed from human-readable strings like "15m", "1h", "1d", "1w".

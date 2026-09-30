@@ -233,8 +233,8 @@ mod tests {
     use crate::btrfs::{MockBtrfs, MockBtrfsCall};
     use crate::config::Config;
     use crate::executor::testkit::*;
-    use crate::plan::PlannedLifecycle;
-    use crate::types::{BackupPlan, DeleteKind, FullSendReason, PlannedOperation, SnapshotName};
+    use crate::plan::{BackupPlan, DeleteKind, PlannedLifecycle, PlannedOperation};
+    use crate::types::{FullSendReason, SnapshotName};
     use std::path::PathBuf;
 
     // ── Transient immediate cleanup tests ──────────────────────────────

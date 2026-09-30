@@ -1,3 +1,4 @@
+use crate::commands::world;
 use crate::config::Config;
 use crate::drives::{
     DriveAvailability, drive_availability, filesystem_free_bytes, generate_drive_token,
@@ -13,13 +14,7 @@ use crate::voice;
 
 /// List all configured drives with status and token state.
 pub fn run_drives_list(config: &Config, output_mode: OutputMode) -> anyhow::Result<()> {
-    let state = match StateDb::open(&config.general.state_db) {
-        Ok(db) => Some(db),
-        Err(e) => {
-            log::warn!("Failed to open state DB for drives list: {e}");
-            None
-        }
-    };
+    let state = world::open_state_best_effort(&config.general.state_db, "drives list");
     let mut entries = Vec::new();
 
     for drive in &config.drives {

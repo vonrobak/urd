@@ -6,8 +6,8 @@ use chrono::{NaiveDate, NaiveDateTime};
 
 use crate::cli::GetArgs;
 use crate::config::{Config, SubvolumeConfig, expand_tilde};
+use crate::observation::read_snapshot_dir;
 use crate::output::{GetOutput, OutputMode};
-use crate::plan::read_snapshot_dir;
 use crate::types::{DISPLAY_MINUTE_FORMAT, SnapshotName};
 use crate::voice;
 

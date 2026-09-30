@@ -5,8 +5,8 @@
 
 use crate::config::Config;
 use crate::drives;
+use crate::plan::{BackupPlan, PlannedOperation};
 use crate::state::StateDb;
-use crate::types::{BackupPlan, PlannedOperation};
 
 /// Probe every mounted drive's identity token — the I/O half of token gating
 /// (UPI 059-b): whether its token file is readable, and its availability
@@ -150,8 +150,8 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::path::PathBuf;
-    use crate::plan::PlanFilters;
-    use crate::types::{DeleteKind, FullSendReason};
+    use crate::plan::{DeleteKind, PlanFilters};
+    use crate::types::FullSendReason;
 
     // ── Retention-change gate recording (ADR-110) ──────────────────────
 

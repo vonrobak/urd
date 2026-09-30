@@ -134,7 +134,8 @@ mod tests {
     use crate::btrfs::MockBtrfs;
     use crate::executor::testkit::*;
     use crate::executor::{OffsiteChainRelease, RunResult};
-    use crate::types::{BackupPlan, PlannedOperation, SnapshotName};
+    use crate::plan::{BackupPlan, PlannedOperation};
+    use crate::types::SnapshotName;
     use chrono::NaiveDate;
 
     // ── BackupPlan.events persistence ──────────────────────────────

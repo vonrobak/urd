@@ -48,7 +48,7 @@ pub(super) fn write_metrics_per_spec(
     config: &Config,
     state_db: Option<&StateDb>,
     spec: &MetricsSpec<'_>,
-    plan: &crate::types::BackupPlan,
+    plan: &crate::plan::BackupPlan,
     now: chrono::NaiveDateTime,
     fs_state: &dyn FilesystemQuery,
     churn_views: &HashMap<String, ChurnHeartbeatFields>,
@@ -97,7 +97,7 @@ pub(super) fn write_metrics_per_spec(
 fn subvolume_metric_rows(
     config: &Config,
     result: Option<&crate::executor::ExecutionResult>,
-    plan: &crate::types::BackupPlan,
+    plan: &crate::plan::BackupPlan,
     now_ts: i64,
     fs_state: &dyn FilesystemQuery,
     churn_views: &HashMap<String, ChurnHeartbeatFields>,
@@ -234,7 +234,7 @@ pub(super) fn build_churn_views(
         let samples = fs.drift_samples(&sv.name, now - window);
         let estimate = crate::drift::compute_rolling_churn(&samples, window, now);
         let mean_incremental_bytes = estimate.mean_incremental_bytes;
-        let fields = match crate::output::render_churn(&estimate) {
+        let fields = match crate::drift::render_churn(&estimate) {
             ChurnRender::NotMeasured => ChurnHeartbeatFields {
                 mean_incremental_bytes,
                 ..Default::default()
@@ -495,8 +495,8 @@ mod tests {
     use std::collections::BTreeSet;
     use crate::awareness::{DriveAssessment, PromiseStatus};
     use crate::executor::{ExecutionResult, OpResult, OperationOutcome, RunResult, SendType, SubvolumeResult};
-    use crate::plan::SkipReason;
-    use crate::types::{BackupPlan, ByteSize, Interval, SendKind};
+    use crate::plan::{BackupPlan, SkipReason};
+    use crate::types::{ByteSize, Interval, SendKind};
     use crate::commands::backup::test_fixtures::*;
 
     // ── assessment_lookup (backup_pin_failures / backup_promise_state,
@@ -673,7 +673,7 @@ enabled = false
         BackupPlan {
             skipped: names
                 .iter()
-                .map(|(n, r)| crate::types::PlannedSkip::deferred(*n, r.clone(), None))
+                .map(|(n, r)| crate::plan::PlannedSkip::deferred(*n, r.clone(), None))
                 .collect(),
             ..empty_plan()
         }

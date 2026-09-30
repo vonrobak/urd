@@ -265,7 +265,7 @@ fn first_snapshot(config: &Config, config_path: &Path) -> bool {
 
 /// True while any enabled subvolume that PLANS local snapshots (adversary
 /// F5 — a mapping-less subvolume must not pend forever) has none on disk.
-/// Filesystem of truth via `plan::read_snapshot_dir` (absent dir = none).
+/// Filesystem of truth via `observation::read_snapshot_dir` (absent dir = none).
 fn first_thread_pending(config: &Config) -> bool {
     config
         .resolved_subvolumes()
@@ -273,7 +273,7 @@ fn first_thread_pending(config: &Config) -> bool {
         .filter(|sv| sv.enabled)
         .any(|sv| match config.local_snapshot_dir(&sv.name) {
             None => false,
-            Some(dir) => crate::plan::read_snapshot_dir(&dir)
+            Some(dir) => crate::observation::read_snapshot_dir(&dir)
                 .map(|snaps| snaps.is_empty())
                 .unwrap_or(false),
         })
@@ -422,7 +422,7 @@ fn already_sent(
             .filter(|sv| sv.enabled && sv.send_enabled && sv.accepts_drive(&drive.label))
             .any(|sv| {
                 let dir = crate::drives::external_snapshot_dir(drive, &sv.name);
-                crate::plan::read_snapshot_dir(&dir)
+                crate::observation::read_snapshot_dir(&dir)
                     .map(|snaps| !snaps.is_empty())
                     .unwrap_or(false)
             })

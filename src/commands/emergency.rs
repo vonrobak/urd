@@ -10,10 +10,10 @@ use crate::config::{Config, ResolvedSubvolume, SnapshotRoot};
 use crate::drives;
 use crate::executor::{CandidateDeletion, DeleteCandidate, Executor};
 use crate::guard;
+use crate::observation;
 use crate::output::{
     EmergencyOutput, EmergencyResult, EmergencyRootAssessment, EmergencySubvolDetail, OutputMode,
 };
-use crate::plan;
 use crate::retention::{self, RetentionResult};
 use crate::types::SnapshotName;
 use crate::voice;
@@ -109,7 +109,7 @@ fn gather_emergency_inputs(
         }
 
         let local_dir = root.path.join(subvol_name);
-        let snapshots = match plan::read_snapshot_dir(&local_dir) {
+        let snapshots = match observation::read_snapshot_dir(&local_dir) {
             Ok(s) => s,
             Err(e) => {
                 log::warn!(
@@ -368,7 +368,7 @@ pub fn run(config: Config, output_mode: OutputMode) -> anyhow::Result<()> {
             .plans
             .iter()
             .map(|subvol| {
-                plan::read_snapshot_dir(&subvol.inputs.local_dir)
+                observation::read_snapshot_dir(&subvol.inputs.local_dir)
                     .map(|s| s.len())
                     .unwrap_or(0)
             })

@@ -757,7 +757,6 @@ pub enum ChurnRender {
 // `render_churn` (the `ChurnEstimate` → `ChurnRender` mapping) lives in
 // `drift.rs`; the heartbeat/metrics churn projection and per-subvolume extras
 // live in `heartbeat.rs`. Re-exported so `crate::output::X` paths resolve.
-pub use crate::drift::render_churn;
 pub use crate::heartbeat::{ChurnHeartbeatFields, SubvolumeExtras};
 
 /// A single diagnostic check result.

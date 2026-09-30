@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use crate::config::Config;
 use crate::executor::{CompletionReport, ProgressContext, SizeEstimates};
 use crate::observation::HistoryQuery;
-use crate::types::{BackupPlan, PlannedOperation};
+use crate::plan::{BackupPlan, PlannedOperation};
 use crate::voice::{format_completion_line, format_progress_line};
 
 // ── Progress display ──────────────────────────────────────────────────
