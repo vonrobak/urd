@@ -308,8 +308,7 @@ fn stale_pin_checks(
 /// `stale_pin_checks`. Returns `None` when the pin is absent or its mtime can't
 /// be read (the check is then simply skipped, as before).
 fn pin_file_mtime(local_dir: &Path, drive_label: &str) -> Option<SystemTime> {
-    let pin_path = local_dir.join(format!(".last-external-parent-{drive_label}"));
-    std::fs::metadata(&pin_path).and_then(|m| m.modified()).ok()
+    std::fs::metadata(chain::pin_path(local_dir, drive_label)).and_then(|m| m.modified()).ok()
 }
 
 /// Tally `ok` / `warn` statuses from a batch of checks, folding the running

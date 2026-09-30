@@ -187,7 +187,7 @@ pub(super) fn plan_external_send(i: &SendInputs) -> PlanFragment {
         None
     } else {
         Some((
-            local_dir.join(format!(".last-external-parent-{}", drive.label)),
+            crate::chain::pin_path(local_dir, &drive.label),
             snap_to_send.clone(),
         ))
     };

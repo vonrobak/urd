@@ -5,6 +5,16 @@ use crate::config::Config;
 use crate::error::UrdError;
 use crate::types::SnapshotName;
 
+/// The pin file for a specific drive in a local snapshot directory:
+/// `.last-external-parent-{LABEL}`. The one place that filename is built —
+/// the reader, writer and remover here, the planner's pin intent, and
+/// verify's stale-pin check all take it from this function. Pure path
+/// arithmetic; touches nothing on disk.
+#[must_use]
+pub fn pin_path(local_snapshot_dir: &Path, drive_label: &str) -> PathBuf {
+    local_snapshot_dir.join(format!("{PIN_PREFIX}{drive_label}"))
+}
+
 /// Read the pin file for a specific drive from a local snapshot directory:
 /// `.last-external-parent-{LABEL}`, the only pin form Urd reads (ADR-105,
 /// amendment 2026-09-29).
@@ -14,7 +24,7 @@ pub fn read_pin_file(
     local_snapshot_dir: &Path,
     drive_label: &str,
 ) -> crate::error::Result<Option<SnapshotName>> {
-    try_read_pin(&local_snapshot_dir.join(format!("{PIN_PREFIX}{drive_label}")))
+    try_read_pin(&pin_path(local_snapshot_dir, drive_label))
 }
 
 /// Collect all pinned snapshot names across all drives.
@@ -202,8 +212,8 @@ pub fn write_pin_file(
 ) -> crate::error::Result<()> {
     use std::io::Write;
 
-    let final_path = local_snapshot_dir.join(format!(".last-external-parent-{drive_label}"));
-    let tmp_path = local_snapshot_dir.join(format!(".last-external-parent-{drive_label}.tmp"));
+    let final_path = pin_path(local_snapshot_dir, drive_label);
+    let tmp_path = local_snapshot_dir.join(format!("{PIN_PREFIX}{drive_label}.tmp"));
 
     std::fs::File::create(&tmp_path)
         .and_then(|mut file| {
@@ -234,13 +244,13 @@ pub fn write_pin_file(
 /// success (`NotFound` → `Ok`). Used by the executor's clear-all cleanup
 /// (UPI 031-b): the pin is dropped *before* the fail-closed re-read so the
 /// just-sent snapshot (and any surviving Tight-era parent) can then be deleted,
-/// leaving zero local snapshots between runs. Owns the same
-/// `.last-external-parent-{label}` filename format as `write_pin_file`.
+/// leaving zero local snapshots between runs. Names the pin through
+/// [`pin_path`], like `write_pin_file`.
 pub fn remove_pin_file(
     local_snapshot_dir: &Path,
     drive_label: &str,
 ) -> crate::error::Result<()> {
-    let path = local_snapshot_dir.join(format!(".last-external-parent-{drive_label}"));
+    let path = pin_path(local_snapshot_dir, drive_label);
     match std::fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -278,6 +288,14 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn pin_path_names_the_drive_specific_pin() {
+        assert_eq!(
+            pin_path(Path::new("/snap/home"), "WD-18TB"),
+            PathBuf::from("/snap/home/.last-external-parent-WD-18TB")
+        );
+    }
 
     #[test]
     fn read_drive_specific_pin() {
