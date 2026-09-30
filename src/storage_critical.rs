@@ -97,7 +97,7 @@ pub const TIGHT_INTERVAL_FACTOR: f64 = 1.5;
 pub const CRITICAL_INTERVAL_FLOOR_DAYS: i64 = 7;
 
 /// Planner/executor-facing map: subvolume name → armed tier (UPI 031-b).
-/// Resolved once pre-plan (`commands/storage_signals::resolve_armed_tiers`) and
+/// Resolved once pre-plan (`arming::resolve_armed_tiers`) and
 /// threaded into `plan::plan` and the executor. Awareness does not read this
 /// map — it reads the per-subvolume `ResolvedStorageSignal::armed_tier`, derived
 /// from the same gathered inputs. An absent key defaults to `Roomy`

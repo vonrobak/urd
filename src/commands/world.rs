@@ -7,6 +7,8 @@
 //! `backup`) that need the `Observation` itself. Does NOT compute or decide —
 //! it assembles the read-only world others judge.
 
+use std::path::Path;
+
 use chrono::NaiveDateTime;
 
 use crate::advice;
@@ -14,8 +16,21 @@ use crate::awareness::{StorageSignalMap, SubvolAssessment};
 use crate::btrfs::RealBtrfs;
 use crate::commands::storage_signals::{self, StorageSignals};
 use crate::config::Config;
-use crate::plan::{Observation, RealFileSystemState};
+use crate::observation::{Observation, RealFileSystemState};
 use crate::state::StateDb;
+
+/// Open the state DB best-effort (ADR-102: a SQLite failure never blocks the
+/// operation). A failure is logged at `warn!` naming `purpose` — ADR-107's
+/// "silent fail-open is indistinguishable from a bug" — and reads as `None`, so
+/// the caller proceeds without history. The one door for every caller that
+/// degrades rather than fails; callers that must fail (`urd events`, `urd
+/// calibrate`) still use `StateDb::open` with `?`.
+#[must_use]
+pub(crate) fn open_state_best_effort(path: &Path, purpose: &str) -> Option<StateDb> {
+    StateDb::open(path)
+        .inspect_err(|e| log::warn!("Failed to open state DB for {purpose}: {e}"))
+        .ok()
+}
 
 /// The long-lived adapters every command prelude assembles: a best-effort
 /// state DB handle and a read-only btrfs generation-counter seam.
@@ -36,13 +51,7 @@ impl World {
     /// exactly `backup.rs`'s existing semantics) and a read-only btrfs handle.
     #[must_use]
     pub fn open(config: &Config) -> Self {
-        let state_db = match StateDb::open(&config.general.state_db) {
-            Ok(db) => Some(db),
-            Err(e) => {
-                log::warn!("Failed to open state DB, continuing without history: {e}");
-                None
-            }
-        };
+        let state_db = open_state_best_effort(&config.general.state_db, "history");
         let btrfs = RealBtrfs::for_reads(&config.general.btrfs_path);
         Self { state_db, btrfs }
     }
@@ -152,6 +161,17 @@ monthly = 0
         let config = test_config(&unwritable);
         let world = World::open(&config);
         assert!(world.db().is_none());
+    }
+
+    #[test]
+    fn open_state_best_effort_returns_none_on_open_failure() {
+        // A path under a regular file cannot be created even as root (ENOTDIR),
+        // unlike the unwritable-directory case above.
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let file = dir.path().join("not-a-dir");
+        std::fs::write(&file, b"").expect("write file");
+        assert!(open_state_best_effort(&file.join("urd.db"), "test").is_none());
+        assert!(open_state_best_effort(&dir.path().join("urd.db"), "test").is_some());
     }
 
     #[test]

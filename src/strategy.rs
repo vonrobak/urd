@@ -697,7 +697,7 @@ fn snapshot_root_for(candidate: &CandidateSubvol, inventory: &SystemInventory) -
 fn granularity_intention(granularity: GranularityAnswer, today: NaiveDate) -> Intention {
     let phrase = match granularity {
         GranularityAnswer::YesterdayIsFine => "daily — yesterday is fine",
-        GranularityAnswer::LastHour => "sub-hourly — the last hour matters",
+        GranularityAnswer::LastHour => "nightly, the sentinel watching — the last hour matters",
     };
     Intention {
         anchor: IntentionAnchor::Header,
@@ -1655,7 +1655,7 @@ mod tests {
     }
 
     #[test]
-    fn last_hour_derives_sentinel_with_hourly_sheltered_policy() {
+    fn last_hour_derives_sentinel_with_sheltered_policy() {
         let inv = fedora_with_external();
         let mut answers = with_importance(base_answers(), "/home", Importance::Irreplaceable);
         answers.granularity = GranularityAnswer::LastHour;

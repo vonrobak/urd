@@ -310,8 +310,23 @@ pub enum UrdError {
     #[error("btrfs send|receive failed: {context}")]
     BtrfsSendReceive { context: SendReceiveErrorContext },
 
+    /// A SQLite call failed. `context` names the operation; the
+    /// `rusqlite::Error` stays reachable through `source()` and downcasts
+    /// directly (a `Box` would shave 8 bytes off the enum but make the source
+    /// a `Box<rusqlite::Error>`, which a `downcast_ref::<rusqlite::Error>()`
+    /// misses). Display keeps the pre-typed "context: message" shape.
+    #[error("State database error: {context}: {source}")]
+    State {
+        context: String,
+        #[source]
+        source: rusqlite::Error,
+    },
+
+    /// A state-database failure with no SQLite error underneath: a stored
+    /// value that does not decode, a payload that does not serialize, or a
+    /// wrapped inner failure.
     #[error("State database error: {0}")]
-    State(String),
+    StateData(String),
 }
 
 impl UrdError {

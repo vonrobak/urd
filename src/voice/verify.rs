@@ -14,7 +14,7 @@ use crate::output::{FailuresOutput, OutputMode, VerifyOutput};
 
 use super::{
     SuggestionContext, append_suggestion, classify_verify_checks, format_history_table, pluralize,
-    truncate_str,
+    render_json, truncate_str,
 };
 
 /// Render failures output.
@@ -22,9 +22,7 @@ use super::{
 pub fn render_failures(data: &FailuresOutput, mode: OutputMode) -> String {
     match mode {
         OutputMode::Interactive => render_failures_interactive(data),
-        OutputMode::Daemon => {
-            serde_json::to_string_pretty(data).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
-        }
+        OutputMode::Daemon => render_json(data),
     }
 }
 
@@ -74,9 +72,7 @@ fn render_failures_interactive(data: &FailuresOutput) -> String {
 pub fn render_verify(data: &VerifyOutput, mode: OutputMode, detail: bool) -> String {
     match mode {
         OutputMode::Interactive => render_verify_interactive(data, detail),
-        OutputMode::Daemon => {
-            serde_json::to_string_pretty(data).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
-        }
+        OutputMode::Daemon => render_json(data),
     }
 }
 
@@ -202,4 +198,229 @@ fn render_verify_tail(data: &VerifyOutput, out: &mut String) {
         &SuggestionContext::Verify { has_broken: data.fail_count > 0 },
         out,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::output::{VerifyCheck, VerifyDrive, VerifySubvolume};
+    use crate::voice::test_fixtures::*;
+
+    // ── Verify tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn verify_detail_shows_all_checks() {
+        let data = VerifyOutput {
+            subvolumes: vec![VerifySubvolume {
+                name: "htpc-home".to_string(),
+                drives: vec![VerifyDrive {
+                    label: "WD-18TB".to_string(),
+                    checks: vec![
+                        VerifyCheck {
+                            name: "pin-file".to_string(),
+                            status: "ok".to_string(),
+                            detail: Some("Pin: 20260325-0400-home".to_string()),
+                            suggestion: None,
+                        },
+                        VerifyCheck {
+                            name: "pin-exists-local".to_string(),
+                            status: "fail".to_string(),
+                            detail: Some("Pinned snapshot missing locally".to_string()),
+                            suggestion: None,
+                        },
+                    ],
+                }],
+            }],
+            preflight_warnings: vec![],
+            ok_count: 1,
+            warn_count: 0,
+            fail_count: 1,
+        };
+        let output = render_verify(&data, OutputMode::Interactive, true);
+        assert!(output.contains("htpc-home"), "missing subvolume");
+        assert!(output.contains("OK"), "missing ok check");
+        assert!(output.contains("FAIL"), "missing fail check");
+    }
+
+    #[test]
+    fn verify_daemon_produces_valid_json() {
+        let data = VerifyOutput {
+            subvolumes: vec![],
+            preflight_warnings: vec![],
+            ok_count: 0,
+            warn_count: 0,
+            fail_count: 0,
+        };
+        let output = render_verify(&data, OutputMode::Daemon, false);
+        let _: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
+    }
+
+    #[test]
+    fn verify_findings_first_all_clean() {
+        let _color = color_guard(false);
+        let data = VerifyOutput {
+            subvolumes: vec![VerifySubvolume {
+                name: "htpc-home".to_string(),
+                drives: vec![VerifyDrive {
+                    label: "WD-18TB".to_string(),
+                    checks: vec![VerifyCheck {
+                        name: "pin-file".to_string(),
+                        status: "ok".to_string(),
+                        detail: Some("Pin: 20260325-0400-home".to_string()),
+                        suggestion: None,
+                    }],
+                }],
+            }],
+            preflight_warnings: vec![],
+            ok_count: 1,
+            warn_count: 0,
+            fail_count: 0,
+        };
+        let output = render_verify(&data, OutputMode::Interactive, false);
+        assert!(
+            output.contains("All threads intact"),
+            "missing all-clean message: {output}"
+        );
+    }
+
+    #[test]
+    fn verify_findings_first_one_failure() {
+        let _color = color_guard(false);
+        let data = VerifyOutput {
+            subvolumes: vec![VerifySubvolume {
+                name: "htpc-home".to_string(),
+                drives: vec![VerifyDrive {
+                    label: "WD-18TB".to_string(),
+                    checks: vec![
+                        VerifyCheck {
+                            name: "pin-file".to_string(),
+                            status: "ok".to_string(),
+                            detail: Some("Pin: 20260325-0400-home".to_string()),
+                            suggestion: None,
+                        },
+                        VerifyCheck {
+                            name: "pin-exists-local".to_string(),
+                            status: "fail".to_string(),
+                            detail: Some("Pinned snapshot missing locally".to_string()),
+                            suggestion: Some("Run `urd backup` when drive is connected.".to_string()),
+                        },
+                    ],
+                }],
+            }],
+            preflight_warnings: vec![],
+            ok_count: 1,
+            warn_count: 0,
+            fail_count: 1,
+        };
+        let output = render_verify(&data, OutputMode::Interactive, false);
+        assert!(
+            output.contains("htpc-home/WD-18TB"),
+            "missing subvol/drive grouping: {output}"
+        );
+        assert!(
+            output.contains("FAIL"),
+            "missing failure indicator: {output}"
+        );
+        assert!(
+            output.contains("1 check OK"),
+            "missing OK summary: {output}"
+        );
+        assert!(
+            !output.contains("All threads intact"),
+            "should not show all-clean: {output}"
+        );
+    }
+
+    #[test]
+    fn verify_findings_first_absent_drives_collapsed() {
+        let _color = color_guard(false);
+        let data = VerifyOutput {
+            subvolumes: vec![VerifySubvolume {
+                name: "htpc-home".to_string(),
+                drives: vec![
+                    VerifyDrive {
+                        label: "WD-18TB1".to_string(),
+                        checks: vec![VerifyCheck {
+                            name: "drive-mounted".to_string(),
+                            status: "warn".to_string(),
+                            detail: Some("Drive not mounted".to_string()),
+                            suggestion: None,
+                        }],
+                    },
+                    VerifyDrive {
+                        label: "2TB-backup".to_string(),
+                        checks: vec![VerifyCheck {
+                            name: "drive-mounted".to_string(),
+                            status: "warn".to_string(),
+                            detail: Some("Drive not mounted".to_string()),
+                            suggestion: None,
+                        }],
+                    },
+                ],
+            }],
+            preflight_warnings: vec![],
+            ok_count: 0,
+            warn_count: 2,
+            fail_count: 0,
+        };
+        let output = render_verify(&data, OutputMode::Interactive, false);
+        assert!(
+            output.contains("2 drives not mounted"),
+            "missing absent drives summary: {output}"
+        );
+        assert!(
+            output.contains("WD-18TB1"),
+            "missing drive label: {output}"
+        );
+        assert!(
+            output.contains("2TB-backup"),
+            "missing drive label: {output}"
+        );
+        assert!(
+            !output.contains("WARN"),
+            "should not show individual warnings: {output}"
+        );
+    }
+
+    #[test]
+    fn verify_findings_first_suggestion_rendered() {
+        let _color = color_guard(false);
+        let data = VerifyOutput {
+            subvolumes: vec![VerifySubvolume {
+                name: "htpc-root".to_string(),
+                drives: vec![VerifyDrive {
+                    label: "WD-18TB".to_string(),
+                    checks: vec![VerifyCheck {
+                        name: "pin-exists-local".to_string(),
+                        status: "fail".to_string(),
+                        detail: Some("Chain broken".to_string()),
+                        suggestion: Some("Run `urd backup` when drive is connected.".to_string()),
+                    }],
+                }],
+            }],
+            preflight_warnings: vec![],
+            ok_count: 0,
+            warn_count: 0,
+            fail_count: 1,
+        };
+        let output = render_verify(&data, OutputMode::Interactive, false);
+        assert!(
+            output.contains("\u{2192} Run `urd backup`"),
+            "missing suggestion: {output}"
+        );
+    }
+
+    #[test]
+    fn verify_daemon_ignores_detail() {
+        let data = VerifyOutput {
+            subvolumes: vec![],
+            preflight_warnings: vec![],
+            ok_count: 0,
+            warn_count: 0,
+            fail_count: 0,
+        };
+        let output_false = render_verify(&data, OutputMode::Daemon, false);
+        let output_true = render_verify(&data, OutputMode::Daemon, true);
+        assert_eq!(output_false, output_true, "daemon mode should ignore detail flag");
+    }
 }

@@ -20,8 +20,8 @@ use crate::types::{ByteSize, DriveRole};
 
 use super::drive_row::{aggregate_drive_info, offsite_drive_label, unmounted_drive_label};
 use super::{
-    SuggestionContext, append_suggestion, color_result, exposure_cell, format_table, health_cell,
-    humanize_cadence, humanize_duration, pluralize,
+    SuggestionContext, append_suggestion, color_result, exposure_cell, format_table,
+    humanize_duration, pluralize, render_json,
 };
 
 // ── Status ──────────────────────────────────────────────────────────────
@@ -36,7 +36,7 @@ pub fn render_status(data: &StatusOutput, mode: OutputMode) -> String {
 }
 
 pub(super) fn render_status_daemon(data: &StatusOutput) -> String {
-    serde_json::to_string_pretty(data).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
+    render_json(data)
 }
 
 pub(super) fn render_status_interactive(data: &StatusOutput) -> String {
@@ -239,6 +239,27 @@ pub(super) fn render_summary_line(data: &StatusOutput, out: &mut String) {
     writeln!(out, "{safety_part}{health_part}").ok();
 }
 
+/// Humanize a *cadence* without `humanize_duration`'s lossy day-flooring. The
+/// tight-tier stretch multiplies the declared interval (e.g. daily × 1.5 = 36h);
+/// flooring that to "1d" makes the slowed cadence read identically to the
+/// declared one, hiding the very adaptation the voice is trying to narrate
+/// (#195). Whole numbers of days stay "Nd"; a sub-two-day cadence that isn't a
+/// whole day shows hours ("36h"); anything else with a fractional day shows one
+/// decimal ("2.5d"). Sub-day cadences fall back to `humanize_duration`.
+fn humanize_cadence(secs: i64) -> String {
+    // Sub-day (incl. zero/negative) → the plain humanizer handles it.
+    if secs < 86400 {
+        return humanize_duration(secs);
+    }
+    if secs % 86400 == 0 {
+        return format!("{}d", secs / 86400);
+    }
+    if secs < 2 * 86400 && secs % 3600 == 0 {
+        return format!("{}h", secs / 3600);
+    }
+    format!("{:.1}d", secs as f64 / 86400.0)
+}
+
 /// Render storage-adaptation prose (UPI 031-b AB3.1; grouped per UPI 079-a §2).
 /// When a tight pool has slowed Urd's cadence, explain it told-not-silent so the
 /// slowdown reads as deliberate care, not failure. Reads the pre-aggregated
@@ -364,6 +385,24 @@ fn assessment_health_cell(a: &StatusAssessment) -> String {
             debug_assert!(false, "unrecognized health label: {:?}", a.health);
             a.health.clone()
         }
+    }
+}
+
+/// Render an operational health as its colored HEALTH cell, in one step.
+///
+/// Mirrors `exposure_cell` (#305): the color match is exhaustive on
+/// `OperationalHealth` — compiler-enforced against new variants — replacing
+/// the former re-match on the health label (`"healthy"` / `"degraded"` /
+/// `"blocked"`) that silently rendered any unmatched label uncolored (#361).
+/// `StatusAssessment.health` itself stays a `String` (see
+/// `OperationalHealth::from_label`'s doc for why); callers that only hold
+/// the label recover the enum via `voice::status::assessment_health_cell`
+/// before calling this.
+fn health_cell(health: OperationalHealth) -> String {
+    match health {
+        OperationalHealth::Healthy => "healthy".dimmed().to_string(),
+        OperationalHealth::Degraded => "degraded".yellow().to_string(),
+        OperationalHealth::Blocked => "blocked".red().to_string(),
     }
 }
 
@@ -735,7 +774,7 @@ pub fn render_default_status(data: &DefaultStatusOutput, mode: OutputMode) -> St
 }
 
 fn render_default_status_daemon(data: &DefaultStatusOutput) -> String {
-    serde_json::to_string_pretty(data).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
+    render_json(data)
 }
 
 fn render_default_status_interactive(data: &DefaultStatusOutput) -> String {
@@ -863,6 +902,7 @@ mod tests {
     use super::*;
     use crate::advice::{ActionableAdvice, AdviceIssue, IssueDetail};
     use crate::output::{AdaptationSummary, DriveInfo, StatusDriveAssessment};
+    use crate::voice::status;
     use crate::voice::test_fixtures::*;
 
     /// An AT RISK staleness issue with `age_secs` since the last local backup.
@@ -2356,4 +2396,94 @@ mod tests {
         );
     }
 
+    /// Pins the colored `health_cell` output for every `OperationalHealth`
+    /// variant (#361). The old string-relay design (`color_health_str`
+    /// re-matching the label) let a future label change silently ship
+    /// uncolored output because the fall-through arm passed any unmatched
+    /// string through unchanged. Now the color decision matches on the enum
+    /// directly and exhaustively — a new `OperationalHealth` variant fails
+    /// to compile here rather than rendering uncolored at runtime.
+    #[test]
+    fn health_cell_colors_every_operational_health() {
+        let _color = color_guard(true);
+        assert_eq!(
+            health_cell(OperationalHealth::Healthy),
+            "healthy".dimmed().to_string()
+        );
+        assert_eq!(
+            health_cell(OperationalHealth::Degraded),
+            "degraded".yellow().to_string()
+        );
+        assert_eq!(
+            health_cell(OperationalHealth::Blocked),
+            "blocked".red().to_string()
+        );
+    }
+
+    /// `OperationalHealth::from_label` must round-trip every variant's
+    /// `Display` string exactly (#361) — the two mappings are hand-written
+    /// in different spots (`awareness.rs`) and only this test would catch
+    /// them drifting apart.
+    #[test]
+    fn operational_health_from_label_round_trips_display() {
+        for health in [
+            OperationalHealth::Healthy,
+            OperationalHealth::Degraded,
+            OperationalHealth::Blocked,
+        ] {
+            assert_eq!(
+                OperationalHealth::from_label(&health.to_string()),
+                Some(health),
+                "from_label must recover {health} from its own Display output"
+            );
+        }
+        assert_eq!(OperationalHealth::from_label("bogus"), None);
+    }
+
+    /// End-to-end pass-through pin: a pre-colored HEALTH cell (built by
+    /// `health_cell`) must survive `format_table` byte-identical when the
+    /// caller passes `|_, _| None` (the status table's actual usage) — no
+    /// column is colored there at all (#361), mirroring EXPOSURE's
+    /// pass-through (#305).
+    #[test]
+    fn format_table_passes_through_precolored_health_cell_unchanged() {
+        let _color = color_guard(true);
+        let headers = vec!["HEALTH".to_string(), "SUBVOLUME".to_string()];
+        let precolored = health_cell(OperationalHealth::Degraded);
+        let rows = vec![vec![precolored.clone(), "htpc-home".to_string()]];
+        let mut out = String::new();
+        format_table(&headers, &rows, |_, _| None, &mut out);
+        assert!(
+            out.contains(&precolored),
+            "pre-colored HEALTH cell must pass through byte-identical: {out:?}"
+        );
+    }
+
+    #[test]
+    fn render_thread_status_maps_all_variants() {
+        assert_eq!(status::render_thread_status(&ChainHealth::NoDriveData), "\u{2014}");
+        assert_eq!(
+            status::render_thread_status(&ChainHealth::Incremental("pin".to_string())),
+            "unbroken"
+        );
+        assert_eq!(
+            status::render_thread_status(&ChainHealth::Full("no pin".to_string())),
+            "broken \u{2014} full send (no pin)"
+        );
+    }
+
+    #[test]
+    fn humanize_cadence_does_not_floor_sub_two_day_stretch() {
+        // #195: the lossy floor that hid the tight-stretch.
+        assert_eq!(humanize_cadence(129600), "36h"); // daily × 1.5
+        assert_eq!(humanize_duration(129600), "1d"); // the old, misleading form
+        // Whole days stay clean.
+        assert_eq!(humanize_cadence(86400), "1d");
+        assert_eq!(humanize_cadence(7 * 86400), "7d");
+        // Beyond two days, a non-whole cadence shows one decimal.
+        assert_eq!(humanize_cadence(216000), "2.5d");
+        // Sub-day falls back to the plain humanizer.
+        assert_eq!(humanize_cadence(3600), "1h");
+        assert_eq!(humanize_cadence(0), "<1s");
+    }
 }

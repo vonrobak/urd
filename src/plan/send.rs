@@ -142,10 +142,11 @@ pub(super) fn plan_external_send(i: &SendInputs) -> PlanFragment {
                 .history
                 .calibrated_size(&subvol.name)
                 .map(|(_, measured_at)| {
-                    let now_ts = chrono::Local::now().naive_local();
+                    // Age against the planner's `now`, never the wall clock
+                    // (ADR-108): the same inputs word the same note.
                     let age_days =
                         chrono::NaiveDateTime::parse_from_str(&measured_at, "%Y-%m-%dT%H:%M:%S")
-                            .map(|ts| (now_ts - ts).num_days())
+                            .map(|ts| (now - ts).num_days())
                             .unwrap_or(365); // corrupt timestamp → treat as stale, not fresh
                     if age_days > 30 {
                         format!(
@@ -759,7 +760,7 @@ mod tests {
         let parent = snap("20260320-0400-one");
         let pin_dir = tempfile::TempDir::new().unwrap();
         std::fs::write(pin_dir.path().join(".last-external-parent"), parent.as_str()).unwrap();
-        let real = crate::plan::RealFileSystemState { state: None };
+        let real = crate::observation::RealFileSystemState { state: None };
         let pin = real.read_pin_file(pin_dir.path(), "D1").unwrap();
 
         let sv = subvol();
@@ -807,7 +808,7 @@ mod tests {
         // empty pin file now is (#420) — plans the same full send as no pin.
         let pin_dir = tempfile::TempDir::new().unwrap();
         std::fs::write(pin_dir.path().join(".last-external-parent-D1"), "").unwrap();
-        let real = crate::plan::RealFileSystemState { state: None };
+        let real = crate::observation::RealFileSystemState { state: None };
         assert!(real.read_pin_file(pin_dir.path(), "D1").is_err(), "empty pin → Err");
 
         let sv = subvol();

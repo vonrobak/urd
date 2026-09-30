@@ -1,3 +1,5 @@
+use anyhow::Context;
+
 use crate::cli::HistoryArgs;
 use crate::config::Config;
 use crate::output::{
@@ -10,14 +12,15 @@ use crate::voice;
 pub fn run(config: Config, args: HistoryArgs, mode: OutputMode) -> anyhow::Result<()> {
     crate::cli_validation::require_known_subvolume(&config, args.subvolume.as_deref())?;
 
-    let db = match StateDb::open(&config.general.state_db) {
-        Ok(db) => db,
-        Err(_) => {
-            let output = HistoryOutput { runs: vec![] };
-            print!("{}", voice::render_history(&output, mode));
-            return Ok(());
-        }
-    };
+    // An open failure is an error, not an empty history: a corrupt or unreadable
+    // DB must not read as "no runs". (`StateDb::open` creates a missing DB, so a
+    // fresh install still renders an empty history.) Same posture as `urd events`.
+    let db = StateDb::open(&config.general.state_db).with_context(|| {
+        format!(
+            "failed to open state DB at {}",
+            config.general.state_db.display()
+        )
+    })?;
 
     if args.failures {
         show_failures(&db, args.last, mode)?;
@@ -98,17 +101,68 @@ fn show_failures(db: &StateDb, limit: usize, mode: OutputMode) -> anyhow::Result
 
 #[cfg(test)]
 mod tests {
-    fn truncate_str(s: &str, max_len: usize) -> String {
-        if s.len() <= max_len {
-            return s.to_string();
+    use super::*;
+    use crate::voice::truncate_str;
+
+    fn history_config(state_db: &std::path::Path) -> Config {
+        let toml_str = format!(
+            r#"
+drives = []
+subvolumes = []
+
+[general]
+state_db = "{}"
+metrics_file = "/tmp/urd-history-test.prom"
+log_dir = "/tmp"
+
+[local_snapshots]
+roots = []
+
+[defaults]
+snapshot_interval = "1h"
+send_interval = "1d"
+send_enabled = true
+enabled = true
+[defaults.local_retention]
+hourly = 24
+daily = 30
+weekly = 26
+monthly = 12
+[defaults.external_retention]
+daily = 30
+weekly = 26
+monthly = 0
+"#,
+            state_db.display()
+        );
+        toml::from_str(&toml_str).expect("test config should parse")
+    }
+
+    fn history_args() -> HistoryArgs {
+        HistoryArgs {
+            last: 10,
+            subvolume: None,
+            failures: false,
         }
-        let end = s
-            .char_indices()
-            .take_while(|(i, _)| *i < max_len.saturating_sub(3))
-            .last()
-            .map(|(i, c)| i + c.len_utf8())
-            .unwrap_or(0);
-        format!("{}...", &s[..end])
+    }
+
+    #[test]
+    fn unopenable_state_db_is_an_error_not_an_empty_history() {
+        // A path under a regular file cannot be opened even as root (ENOTDIR).
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let file = dir.path().join("not-a-dir");
+        std::fs::write(&file, b"").expect("write file");
+        let config = history_config(&file.join("urd.db"));
+        let err = run(config, history_args(), OutputMode::Daemon)
+            .expect_err("an unopenable DB must not render as \"no runs\"");
+        assert!(err.to_string().contains("failed to open state DB"), "{err}");
+    }
+
+    #[test]
+    fn missing_state_db_still_renders_empty_history() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let config = history_config(&dir.path().join("urd.db"));
+        run(config, history_args(), OutputMode::Daemon).expect("fresh DB is an empty history");
     }
 
     #[test]

@@ -4,16 +4,16 @@
 //! (away / last-backup / disconnected) and the offsite rotation voice
 //! (hibernating / due home / absent). Pure presentation — takes pre-computed
 //! ages and forecasts, renders mythic-voice strings. The shared duration
-//! primitives (`humanize_duration`, and `humanize_away_age` for the
-//! away/last-backup ages, which rounds days rather than flooring) stay in the
-//! parent (`super`); only drive-row vocabulary lives here.
+//! primitive (`humanize_duration`) stays in the parent (`super`); its
+//! drive-row variant `humanize_away_age` (away/last-backup ages, rounding days
+//! rather than flooring) lives here with the only rows that speak it.
 
 use colored::Colorize;
 
 use crate::awareness::PromiseStatus;
 use crate::output::StatusAssessment;
 
-use super::{humanize_away_age, humanize_duration};
+use super::humanize_duration;
 
 /// Single-pass aggregation of per-drive presentation fields. The drive-level
 /// fields (`absent_duration_secs`, `last_activity_age_secs`) co-travel across
@@ -242,6 +242,21 @@ fn offsite_absent_label(
         age.yellow().to_string()
     };
     format!("{} absent {age} — {suffix}", drive_label.bold())
+}
+
+/// Humanize how long a drive has been away (or since its last backup) —
+/// `humanize_duration`, except that once past a day it rounds to the nearest
+/// day instead of flooring (#411). Flooring understates on exactly the wrong
+/// side: a drive gone 2d21h read "away 2d", the most optimistic age consistent
+/// with the truth. Below a day it defers to `humanize_duration` unchanged, so
+/// the hour→day switch stays at 24h and nothing under a day reads "1d":
+/// 23h → "23h", 36h → "2d", 2d11h → "2d", 2d12h → "3d", 2d21h → "3d".
+/// Presentation only — the stored age and every threshold stay untouched.
+fn humanize_away_age(secs: i64) -> String {
+    if secs < 86400 {
+        return humanize_duration(secs);
+    }
+    format!("{}d", secs.saturating_add(43_200) / 86400)
 }
 
 #[cfg(test)]
@@ -532,5 +547,30 @@ mod tests {
             None,
         );
         assert!(unprot.contains("absent") && unprot.contains("worn thin"), "Unprotected: {unprot}");
+    }
+
+    // ── humanize_away_age tests ────────────────────────────────────────
+
+    #[test]
+    fn humanize_away_age_rounds_days_and_keeps_the_hour_boundary() {
+        // #411: day-granular ages round to nearest instead of flooring.
+        let h = 3600;
+        let d = 86400;
+        // Below a day: unchanged hour rendering, never rounded up to "1d".
+        assert_eq!(humanize_away_age(0), "<1s");
+        assert_eq!(humanize_away_age(15 * 60), "15m");
+        assert_eq!(humanize_away_age(23 * h), "23h");
+        assert_eq!(humanize_away_age(d - 1), "23h");
+        // At and past a day: nearest whole day, halves round up.
+        assert_eq!(humanize_away_age(d), "1d");
+        assert_eq!(humanize_away_age(36 * h - 1), "1d");
+        assert_eq!(humanize_away_age(36 * h), "2d");
+        assert_eq!(humanize_away_age(2 * d + 11 * h), "2d");
+        assert_eq!(humanize_away_age(2 * d + 12 * h), "3d");
+        assert_eq!(humanize_away_age(2 * d + 21 * h), "3d"); // the incident: was "2d"
+        assert_eq!(humanize_away_age(30 * d), "30d");
+        assert_eq!(humanize_away_age(i64::MAX), format!("{}d", i64::MAX / d));
+        // The shared humanizer keeps flooring for its other surfaces.
+        assert_eq!(humanize_duration(2 * d + 21 * h), "2d");
     }
 }

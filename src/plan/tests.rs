@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use super::*;
+use crate::arming::away_shed_map;
+use crate::observation::RealFileSystemState;
 use crate::storage_critical::{ArmedTierMap, TightnessTier};
 use crate::btrfs::MockBtrfs;
 use crate::events::{EventPayload, UnstampedEvent};
@@ -1308,6 +1310,54 @@ fn calibrated_size_skips_send_when_too_large() {
             .iter()
             .any(|s| s.name == "sv1" && s.reason.contains("calibrated size")),
         "Skip reason should mention calibrated size"
+    );
+}
+
+/// The calibrated-size skip reason for `sv1` when the calibration was taken
+/// at `measured_at` and the planner runs at `now()`.
+fn calibrated_skip_reason(measured_at: &str) -> String {
+    let config = test_config();
+    let mut fs = MockFileSystemState::new();
+    fs.local_snapshots
+        .insert("sv1".to_string(), vec![snap("20260322-1300-one")]);
+    fs.mounted_drives.insert("D1".to_string());
+    fs.calibrated_sizes.insert(
+        "sv1".to_string(),
+        (1_000_000_000_000, measured_at.to_string()),
+    );
+    fs.free_bytes
+        .insert(PathBuf::from("/mnt/d1"), 500_000_000_000);
+
+    let result = plan(&config, now(), &PlanFilters::default(), &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &RunArming::default()).unwrap();
+    result
+        .skipped
+        .iter()
+        .find(|s| s.name == "sv1" && s.reason.contains("calibrated size"))
+        .map(|s| s.reason.clone())
+        .expect("calibrated-size skip must be recorded")
+}
+
+#[test]
+fn calibrated_skip_staleness_is_aged_against_planner_now() {
+    // The staleness note ages the calibration against the planner's `now`,
+    // not the wall clock (ADR-108), so the wording is deterministic.
+    // now() = 2026-03-22T15:00:00. Fresh (30 days, the boundary) → no note.
+    let fresh = calibrated_skip_reason("2026-02-20T15:00:00");
+    assert!(
+        !fresh.contains("days ago"),
+        "a 30-day-old calibration is not stale: {fresh:?}"
+    );
+    // 31 days → the refresh note, with the age computed from `now`.
+    let stale = calibrated_skip_reason("2026-02-19T15:00:00");
+    assert!(
+        stale.ends_with(" (calibrated 31 days ago — run `urd calibrate` to refresh)"),
+        "stale calibration must carry the refresh note: {stale:?}"
+    );
+    // Corrupt timestamp → treated as stale (365 days), never as fresh.
+    let corrupt = calibrated_skip_reason("not-a-timestamp");
+    assert!(
+        corrupt.contains("calibrated 365 days ago"),
+        "corrupt timestamp must read as stale: {corrupt:?}"
     );
 }
 
@@ -3761,59 +3811,6 @@ fn skip_intervals_still_checks_generation() {
     );
 }
 
-#[test]
-fn real_file_system_state_round_trips_drive_events() {
-    use crate::state::{DriveEventSource, DriveEventType, StateDb};
-    use tempfile::TempDir;
-
-    let dir = TempDir::new().unwrap();
-    let db = StateDb::open(&dir.path().join("urd.db")).unwrap();
-    db.record_drive_event("D1", DriveEventType::Mounted, DriveEventSource::Sentinel)
-        .unwrap();
-    db.record_drive_event("D1", DriveEventType::Unmounted, DriveEventSource::Sentinel)
-        .unwrap();
-
-    let fs = RealFileSystemState { state: Some(&db) };
-    let event = fs
-        .last_drive_event("D1")
-        .expect("round-trip must yield an event — guards schema/parser drift");
-    assert!(matches!(event.kind, DriveEventKind::Unmount));
-}
-
-#[test]
-fn real_file_system_state_drive_mount_history_full_ordered_round_trip() {
-    // UPI 055: the rotation view consumes the full ordered stream. This
-    // round-trips real sentinel-written rows (whose timestamps the parser
-    // must accept) through `drive_mount_history`, oldest-first.
-    use crate::state::{DriveEventSource, DriveEventType, StateDb};
-    use tempfile::TempDir;
-
-    let dir = TempDir::new().unwrap();
-    let db = StateDb::open(&dir.path().join("urd.db")).unwrap();
-    db.record_drive_event("D1", DriveEventType::Mounted, DriveEventSource::Sentinel)
-        .unwrap();
-    db.record_drive_event("D1", DriveEventType::Unmounted, DriveEventSource::Sentinel)
-        .unwrap();
-    db.record_drive_event("D1", DriveEventType::Mounted, DriveEventSource::Sentinel)
-        .unwrap();
-
-    let fs = RealFileSystemState { state: Some(&db) };
-    let history = fs.drive_mount_history("D1");
-    let kinds: Vec<DriveEventKind> = history.iter().map(|e| e.kind).collect();
-    assert_eq!(
-        kinds,
-        vec![
-            DriveEventKind::Mount,
-            DriveEventKind::Unmount,
-            DriveEventKind::Mount,
-        ],
-        "history must be oldest-first (ORDER BY id ASC) and complete"
-    );
-
-    // Unknown drive → empty (never blocks).
-    assert!(fs.drive_mount_history("nope").is_empty());
-}
-
 // ── Send-size estimation: failed partials never outrank a real signal ──
 
 /// Seed an operation row for the estimate tests.
@@ -3900,49 +3897,6 @@ fn last_send_size_excludes_failed_sends() {
         fs.last_failed_send_floor("multimedia", "WD-18TB1", SendKind::Full),
         Some(2_672_831_974_169)
     );
-}
-
-fn drift_at(s: &str) -> NaiveDateTime {
-    NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S").unwrap()
-}
-
-#[test]
-fn drift_samples_fail_open_when_db_absent() {
-    // ADR-102: no state DB → empty samples, never an error. This locks the
-    // command-site fallback — `compute_rolling_churn(&[])` is
-    // `ChurnEstimate::default()` and `compute_pool_free_bytes_trend(&[], …)`
-    // is `None`, so empty here reproduces the prior explicit fallbacks.
-    let fs = RealFileSystemState { state: None };
-    let since = drift_at("2026-05-01T00:00:00");
-    assert!(fs.drift_samples("home", since).is_empty());
-    assert!(fs.drift_samples_multi(&["home".to_string()], since).is_empty());
-}
-
-#[test]
-fn drift_samples_round_trips_through_the_adapter() {
-    use crate::state::{DriftSampleRow, StateDb};
-    use tempfile::TempDir;
-
-    let dir = TempDir::new().unwrap();
-    let db = StateDb::open(&dir.path().join("urd.db")).unwrap();
-    db.record_drift_sample_best_effort(&DriftSampleRow {
-        run_id: None,
-        subvolume: "home".to_string(),
-        sampled_at: drift_at("2026-05-02T04:00:00"),
-        seconds_since_prev_send: Some(86_400),
-        bytes_transferred: 4_096,
-        source_free_bytes: None,
-        send_kind: SendKind::Incremental,
-    });
-
-    let fs = RealFileSystemState { state: Some(&db) };
-    let since = drift_at("2026-05-01T00:00:00");
-    let one = fs.drift_samples("home", since);
-    assert_eq!(one.len(), 1);
-    assert_eq!(one[0].bytes_transferred, 4_096);
-    // Batched variant sees the same row; unrelated names stay empty.
-    assert_eq!(fs.drift_samples_multi(&["home".to_string()], since).len(), 1);
-    assert!(fs.drift_samples("photos", since).is_empty());
 }
 
 // ── Planner event-emission tests ───────────────────────────────────

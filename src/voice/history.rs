@@ -12,7 +12,7 @@ use colored::Colorize;
 
 use crate::output::{HistoryOutput, OutputMode, SubvolumeHistoryOutput};
 
-use super::{format_history_table, truncate_str};
+use super::{format_history_table, render_json, truncate_str};
 
 /// Render the `urd events` view. Delegates to `voice_events` for the
 /// per-variant columnar / NDJSON formatting.
@@ -29,9 +29,7 @@ pub fn render_events(view: &crate::output::EventsView, mode: OutputMode) -> Stri
 pub fn render_history(data: &HistoryOutput, mode: OutputMode) -> String {
     match mode {
         OutputMode::Interactive => render_history_interactive(data),
-        OutputMode::Daemon => {
-            serde_json::to_string_pretty(data).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
-        }
+        OutputMode::Daemon => render_json(data),
     }
 }
 
@@ -73,9 +71,7 @@ fn render_history_interactive(data: &HistoryOutput) -> String {
 pub fn render_subvolume_history(data: &SubvolumeHistoryOutput, mode: OutputMode) -> String {
     match mode {
         OutputMode::Interactive => render_subvolume_history_interactive(data),
-        OutputMode::Daemon => {
-            serde_json::to_string_pretty(data).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
-        }
+        OutputMode::Daemon => render_json(data),
     }
 }
 
@@ -122,4 +118,35 @@ fn render_subvolume_history_interactive(data: &SubvolumeHistoryOutput) -> String
     format_history_table(&headers, &rows, &mut out);
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::output::HistoryRun;
+
+    // ── History tests ───────────────────────────────────────────────────
+
+    #[test]
+    fn history_interactive_contains_runs() {
+        let data = HistoryOutput {
+            runs: vec![HistoryRun {
+                id: 42,
+                started_at: "2026-03-26T04:00:03".to_string(),
+                mode: "full".to_string(),
+                result: "success".to_string(),
+                duration: Some("2m 30s".to_string()),
+            }],
+        };
+        let output = render_history(&data, OutputMode::Interactive);
+        assert!(output.contains("42"), "missing run id");
+        assert!(output.contains("2m 30s"), "missing duration");
+    }
+
+    #[test]
+    fn history_daemon_produces_valid_json() {
+        let data = HistoryOutput { runs: vec![] };
+        let output = render_history(&data, OutputMode::Daemon);
+        let _: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
+    }
 }

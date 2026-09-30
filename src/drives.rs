@@ -139,7 +139,7 @@ pub fn is_drive_mounted(drive: &DriveConfig) -> bool {
 /// config is kept (it was classified away at spawn and we cannot prove it
 /// reconnected — the conservative direction is to not invent a connected
 /// chain). Subvolumes left with no away labels are dropped, matching
-/// `plan::away_shed_map`'s "absent key = no presence-aware shed."
+/// `arming::away_shed_map`'s "absent key = no presence-aware shed."
 ///
 /// `probe` is injectable so tests can drive the re-confirmation directly —
 /// the real probe (`is_drive_mounted`) is a `/proc/mounts` scan that a
@@ -172,19 +172,53 @@ pub fn fresh_away_map(
 /// Check if a path appears as a mount point in /proc/mounts.
 #[must_use]
 pub fn is_path_mounted(mount_path: &Path) -> bool {
-    let Some(mount_str) = mount_path.to_str() else {
-        return false;
-    };
     let Ok(mounts) = std::fs::read_to_string("/proc/mounts") else {
         return false;
     };
-    for line in mounts.lines() {
-        let parts: Vec<&str> = line.splitn(3, ' ').collect();
-        if parts.len() >= 2 && parts[1] == mount_str {
-            return true;
+    mounts_contain(&mounts, mount_path)
+}
+
+/// True if any line of `/proc/mounts` content has `mount_path` as its mount point
+/// (the second field). The field is unescaped first — the kernel writes a space
+/// in a mount point as `\040` — and compared as a `Path`, which ignores a
+/// trailing slash on either side.
+fn mounts_contain(mounts: &str, mount_path: &Path) -> bool {
+    mounts
+        .lines()
+        .filter_map(|line| line.split(' ').nth(1))
+        .any(|field| Path::new(unescape_proc_mounts_field(field).as_ref()) == mount_path)
+}
+
+/// Undo the kernel's octal escaping of a `/proc/mounts` field: `\040` (space),
+/// `\011` (tab), `\012` (newline) and `\134` (backslash) — the characters that
+/// would otherwise break the space-separated format. Any `\ooo` escape of an ASCII
+/// value is decoded; anything else is left as written.
+fn unescape_proc_mounts_field(field: &str) -> std::borrow::Cow<'_, str> {
+    if !field.contains('\\') {
+        return std::borrow::Cow::Borrowed(field);
+    }
+    let mut out = String::with_capacity(field.len());
+    let mut rest = field;
+    while let Some(pos) = rest.find('\\') {
+        out.push_str(&rest[..pos]);
+        let escape = rest.get(pos + 1..pos + 4);
+        match escape
+            .filter(|e| e.bytes().all(|b| (b'0'..=b'7').contains(&b)))
+            .and_then(|e| u8::from_str_radix(e, 8).ok())
+            .filter(u8::is_ascii)
+        {
+            Some(byte) => {
+                out.push(char::from(byte));
+                rest = &rest[pos + 4..];
+            }
+            None => {
+                out.push('\\');
+                rest = &rest[pos + 1..];
+            }
         }
     }
-    false
+    out.push_str(rest);
+    std::borrow::Cow::Owned(out)
 }
 
 /// Get free bytes on the filesystem containing the given path. Delegates to
@@ -421,6 +455,37 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::types::DriveRole;
+
+    // ── /proc/mounts parsing ────────────────────────────────────────────
+
+    #[test]
+    fn unescape_proc_mounts_field_decodes_kernel_escapes() {
+        assert_eq!(unescape_proc_mounts_field("/mnt/plain"), "/mnt/plain");
+        assert_eq!(unescape_proc_mounts_field("/mnt/My\\040Drive"), "/mnt/My Drive");
+        assert_eq!(unescape_proc_mounts_field("/a\\011b\\012c\\134d"), "/a\tb\nc\\d");
+        // Not a 3-digit octal escape: left as written, never panics.
+        assert_eq!(unescape_proc_mounts_field("/a\\9x"), "/a\\9x");
+        assert_eq!(unescape_proc_mounts_field("/a\\04"), "/a\\04");
+        assert_eq!(unescape_proc_mounts_field("/a\\"), "/a\\");
+        assert_eq!(unescape_proc_mounts_field("/a\\04é"), "/a\\04é");
+    }
+
+    #[test]
+    fn mounts_contain_matches_mount_point_with_space() {
+        let mounts = "/dev/sda1 / btrfs rw 0 0\n\
+                      /dev/sdb1 /run/media/user/My\\040Drive btrfs rw 0 0\n";
+        assert!(mounts_contain(mounts, Path::new("/run/media/user/My Drive")));
+        assert!(!mounts_contain(mounts, Path::new("/run/media/user/My\\040Drive")));
+        assert!(!mounts_contain(mounts, Path::new("/run/media/user/My")));
+    }
+
+    #[test]
+    fn mounts_contain_ignores_trailing_slash() {
+        let mounts = "/dev/sdb1 /run/media/user/WD-18TB btrfs rw 0 0\n";
+        assert!(mounts_contain(mounts, Path::new("/run/media/user/WD-18TB/")));
+        assert!(mounts_contain(mounts, Path::new("/run/media/user/WD-18TB")));
+        assert!(!mounts_contain(mounts, Path::new("/run/media/user")));
+    }
 
     fn test_drive() -> DriveConfig {
         DriveConfig {

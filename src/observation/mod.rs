@@ -6,6 +6,12 @@
 //! is the SQLite-history surface (send sizes, calibration, send/drive
 //! timestamps). Each command-layer caller depends on exactly the half it
 //! uses (UPI 052).
+//!
+//! The traits are the pure side of the boundary: planner, awareness, and
+//! advice depend on them and nothing else. The production adapter that
+//! implements them — [`RealFileSystemState`], plus the snapshot-directory
+//! reader [`read_snapshot_dir`] — lives in the `real` submodule and is the
+//! only I/O in this module.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -15,6 +21,11 @@ use chrono::NaiveDateTime;
 use crate::config::DriveConfig;
 use crate::drives::DriveAvailability;
 use crate::types::{DriveEvent, SendKind, SnapshotName};
+
+mod real;
+
+pub use real::RealFileSystemState;
+pub(crate) use real::{drive_record_to_event, read_snapshot_dir};
 
 // ── FilesystemQuery (filesystem is truth) ─────────────────────────────────
 

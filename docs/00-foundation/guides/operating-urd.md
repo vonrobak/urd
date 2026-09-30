@@ -333,7 +333,10 @@ can legitimately run longer than a day). The sentinel restarts on failure with a
 
 The sentinel is the integration layer — drive plug/unplug detection, sub-hourly
 promise-state updates, and notification dispatch all live there. Without it,
-Urd is a nightly cron job; with it, Urd is a continuous protection layer.
+Urd is a nightly cron job; with it, Urd is a continuous protection layer. The
+sentinel watches but does not trigger backups: the nightly timer is the only
+trigger in either mode, so a named protection level in sentinel mode derives
+the timer's daily snapshot and send intervals.
 
 ### Install / update units
 

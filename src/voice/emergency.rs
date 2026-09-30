@@ -206,3 +206,126 @@ fn render_emergency_result_interactive(data: &EmergencyResult) -> String {
 
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::output::{EmergencyRootAssessment, EmergencySubvolDetail};
+
+    // (backup_summary_suppresses_unchanged moved with render_skipped_block
+    //  into voice/backup.rs's #[cfg(test)] mod tests.)
+
+    // ── Emergency rendering tests ──────────────────────────────────────
+
+    #[test]
+    fn render_emergency_no_crisis() {
+        let data = EmergencyOutput {
+            roots: vec![
+                EmergencyRootAssessment {
+                    root: std::path::PathBuf::from("/snap/home"),
+                    free_bytes: 12_000_000_000,
+                    min_free_bytes: Some(10_000_000_000),
+                    is_critical: false,
+                    subvolumes: vec![],
+                    unsent_count: 0,
+                    drives_needing_full_send: vec![],
+                },
+                EmergencyRootAssessment {
+                    root: std::path::PathBuf::from("/mnt/data"),
+                    free_bytes: 3_000_000_000,
+                    min_free_bytes: None,
+                    is_critical: false,
+                    subvolumes: vec![],
+                    unsent_count: 0,
+                    drives_needing_full_send: vec![],
+                },
+            ],
+        };
+        let output = render_emergency(&data, OutputMode::Interactive);
+        assert!(output.contains("No crisis detected"), "should show no crisis: {output}");
+        assert!(output.contains("OK"), "should show OK for configured root: {output}");
+        assert!(
+            output.contains("no threshold configured"),
+            "should show unconfigured root: {output}"
+        );
+    }
+
+    #[test]
+    fn render_emergency_crisis() {
+        let data = EmergencyOutput {
+            roots: vec![EmergencyRootAssessment {
+                root: std::path::PathBuf::from("/snap/home"),
+                free_bytes: 1_800_000_000,
+                min_free_bytes: Some(10_000_000_000),
+                is_critical: true,
+                subvolumes: vec![
+                    EmergencySubvolDetail {
+                        name: "home".to_string(),
+                        snapshot_count: 40,
+                        keep_count: 5,
+                        delete_count: 35,
+                        latest: "20260403-1200-home".to_string(),
+                        pinned_count: 2,
+                    },
+                    EmergencySubvolDetail {
+                        name: "root".to_string(),
+                        snapshot_count: 7,
+                        keep_count: 4,
+                        delete_count: 3,
+                        latest: "20260403-1200-root".to_string(),
+                        pinned_count: 1,
+                    },
+                ],
+                unsent_count: 5,
+                drives_needing_full_send: vec!["WD-18TB".to_string()],
+            }],
+        };
+        let output = render_emergency(&data, OutputMode::Interactive);
+        assert!(output.contains("crisis"), "should show crisis: {output}");
+        assert!(output.contains("delete 35"), "should show delete count: {output}");
+        assert!(
+            output.contains("5 unsent snapshots"),
+            "should show unsent advisory: {output}"
+        );
+        assert!(
+            output.contains("WD-18TB"),
+            "should show drives needing full send: {output}"
+        );
+    }
+
+    #[test]
+    fn render_emergency_result_success() {
+        let data = EmergencyResult {
+            root: std::path::PathBuf::from("/snap/home"),
+            deleted: 35,
+            failed: 0,
+            freed_bytes: 8_200_000_000,
+            remaining_snapshots: 5,
+            remaining_free: 10_000_000_000,
+            still_critical: false,
+        };
+        let output = render_emergency_result(&data, OutputMode::Interactive);
+        assert!(output.contains("Freed"), "should show freed: {output}");
+        assert!(output.contains("5 snapshots remain"), "should show remaining: {output}");
+        assert!(!output.contains("Still below"), "should not show still critical: {output}");
+    }
+
+    #[test]
+    fn render_emergency_result_still_critical() {
+        let data = EmergencyResult {
+            root: std::path::PathBuf::from("/snap/home"),
+            deleted: 10,
+            failed: 2,
+            freed_bytes: 2_000_000_000,
+            remaining_snapshots: 3,
+            remaining_free: 3_000_000_000,
+            still_critical: true,
+        };
+        let output = render_emergency_result(&data, OutputMode::Interactive);
+        assert!(output.contains("2 failed"), "should show failures: {output}");
+        assert!(
+            output.contains("Still below threshold"),
+            "should show still critical: {output}"
+        );
+    }
+}

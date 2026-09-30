@@ -148,7 +148,7 @@ pub fn emergency_automatic_threshold(min_free: u64) -> u64 {
 /// mismatch, token-blocked. The `pin` is the drive's last external parent.
 ///
 /// The I/O (reading availability + pin files) stays in the caller — the shared
-/// `plan::drive_scopes` helper builds these so the planner and the executor's
+/// `arming::drive_scopes` helper builds these so the planner and the executor's
 /// away-shed compute the presence predicate from the *same* source (ADR-108,
 /// UPI 058 R1).
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -1,9 +1,12 @@
+#[cfg(test)]
 use std::cell::RefCell;
+#[cfg(test)]
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
 use std::io::Read as _;
 use std::os::fd::AsFd as _;
 use std::path::{Path, PathBuf};
-use std::process::{ChildStdin, Command, Stdio};
+use std::process::{ChildStdin, Command, Output, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
@@ -159,6 +162,70 @@ impl RealBtrfs {
     pub fn for_maintenance(btrfs_path: &str) -> Self {
         Self::new(btrfs_path, Arc::new(AtomicU64::new(0)), false)
     }
+
+    /// Run `LC_ALL=C sudo -n <btrfs_path> <args…>` to completion through the
+    /// configured binary; non-zero exit is an `Err` tagged with `op`.
+    fn run_btrfs(&self, op: BtrfsOperation, args: &[&OsStr]) -> crate::error::Result<Output> {
+        run_btrfs(btrfs_command(&self.btrfs_path, args), op)
+    }
+}
+
+// ── The one-shot sudo btrfs invocation ──────────────────────────────────
+
+/// `LC_ALL=C sudo -n <btrfs_path> <args…>`, built apart from running it.
+/// Every run-to-completion btrfs call goes through here (the send/receive
+/// pipeline spawns its own two piped children). `LC_ALL=C` pins the stderr
+/// language that `error::translate_btrfs_error` pattern-matches; `-n` never
+/// prompts — an ungranted sudoers line fails fast instead of hanging on a
+/// password (#274).
+fn btrfs_command(btrfs_path: &str, args: &[&OsStr]) -> Command {
+    let mut cmd = Command::new("sudo");
+    cmd.env("LC_ALL", "C").arg("-n").arg(btrfs_path).args(args);
+    cmd
+}
+
+/// Run a built btrfs command to completion: a spawn failure and a non-zero
+/// exit both become `UrdError::Btrfs` tagged with `op`; success returns the
+/// captured output. Blocking — see `delete_subvolume` for the accepted
+/// residual against a wedged device.
+fn run_btrfs(mut cmd: Command, op: BtrfsOperation) -> crate::error::Result<Output> {
+    let output = cmd
+        .output()
+        .map_err(|e| UrdError::btrfs_spawn(op, spawn_message(op, &e)))?;
+
+    if !output.status.success() {
+        return Err(UrdError::btrfs_exit(
+            op,
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr),
+        ));
+    }
+    Ok(output)
+}
+
+/// The spawn-failure text per operation. The mutating verbs have always said
+/// "failed to spawn btrfs: …"; the read verbs report the bare I/O error.
+/// Kept distinct so the messages callers log and tests match stay stable.
+fn spawn_message(op: BtrfsOperation, e: &std::io::Error) -> String {
+    match op {
+        BtrfsOperation::Show | BtrfsOperation::List => e.to_string(),
+        BtrfsOperation::Snapshot
+        | BtrfsOperation::Delete
+        | BtrfsOperation::Sync
+        | BtrfsOperation::Send
+        | BtrfsOperation::Receive => format!("failed to spawn btrfs: {e}"),
+    }
+}
+
+/// Whether a failed `btrfs subvolume show` stderr is the clean answer "there
+/// is no subvolume here" (path absent, or present but not a subvolume) —
+/// as opposed to sudo refusing, a spawn failure, or anything unrecognized.
+/// Matches the `LC_ALL=C` wording of btrfs-progs.
+fn show_failure_means_absent(stderr: &str) -> bool {
+    let lower = stderr.to_lowercase();
+    lower.contains("no such file or directory")
+        || lower.contains("not a subvolume")
+        || lower.contains("not a btrfs subvolume")
 }
 
 impl BtrfsOps for RealBtrfs {
@@ -169,28 +236,16 @@ impl BtrfsOps for RealBtrfs {
             source.display(),
             dest.display()
         );
-        let output = Command::new("sudo")
-            .env("LC_ALL", "C")
-            .arg("-n")
-            .arg(&self.btrfs_path)
-            .args(["subvolume", "snapshot", "-r"])
-            .arg(source)
-            .arg(dest)
-            .output()
-            .map_err(|e| {
-                UrdError::btrfs_spawn(
-                    BtrfsOperation::Snapshot,
-                    format!("failed to spawn btrfs: {e}"),
-                )
-            })?;
-
-        if !output.status.success() {
-            return Err(UrdError::btrfs_exit(
-                BtrfsOperation::Snapshot,
-                output.status.code(),
-                String::from_utf8_lossy(&output.stderr),
-            ));
-        }
+        self.run_btrfs(
+            BtrfsOperation::Snapshot,
+            &[
+                OsStr::new("subvolume"),
+                OsStr::new("snapshot"),
+                OsStr::new("-r"),
+                source.as_os_str(),
+                dest.as_os_str(),
+            ],
+        )?;
         Ok(())
     }
 
@@ -427,27 +482,10 @@ impl BtrfsOps for RealBtrfs {
             self.btrfs_path,
             path.display()
         );
-        let output = Command::new("sudo")
-            .env("LC_ALL", "C")
-            .arg("-n")
-            .arg(&self.btrfs_path)
-            .args(["subvolume", "delete"])
-            .arg(path)
-            .output()
-            .map_err(|e| {
-                UrdError::btrfs_spawn(
-                    BtrfsOperation::Delete,
-                    format!("failed to spawn btrfs: {e}"),
-                )
-            })?;
-
-        if !output.status.success() {
-            return Err(UrdError::btrfs_exit(
-                BtrfsOperation::Delete,
-                output.status.code(),
-                String::from_utf8_lossy(&output.stderr),
-            ));
-        }
+        self.run_btrfs(
+            BtrfsOperation::Delete,
+            &[OsStr::new("subvolume"), OsStr::new("delete"), path.as_os_str()],
+        )?;
         Ok(())
     }
 
@@ -456,16 +494,36 @@ impl BtrfsOps for RealBtrfs {
         // the path is actually a btrfs subvolume, not a regular directory.
         // This prevents the crash recovery path from treating a non-subvolume
         // directory as an already-sent snapshot.
-        Command::new("sudo")
-            .env("LC_ALL", "C")
-            .arg("-n")
-            .arg(&self.btrfs_path)
-            .args(["subvolume", "show"])
-            .arg(path)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success())
+        //
+        // The `bool` cannot say "don't know": a sudo refusal or spawn failure
+        // reads as "not a subvolume" just like a clean absence. Until the
+        // signature carries that (a `Result`), at least make the ambiguous
+        // case visible in the log.
+        // Inspected here rather than via `run_btrfs`: a spawn error's text
+        // ("No such file or directory" for a missing sudo) must not pass as
+        // a clean absence.
+        match show_command(&self.btrfs_path, path).output() {
+            Ok(output) if output.status.success() => true,
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if !show_failure_means_absent(&stderr) {
+                    log::warn!(
+                        "could not determine whether {} is a subvolume (exit {}: {}), treating it as absent",
+                        path.display(),
+                        output.status.code().unwrap_or(-1),
+                        stderr.trim()
+                    );
+                }
+                false
+            }
+            Err(e) => {
+                log::warn!(
+                    "could not determine whether {} is a subvolume (failed to spawn btrfs: {e}), treating it as absent",
+                    path.display()
+                );
+                false
+            }
+        }
     }
 
     fn filesystem_free_bytes(&self, path: &Path) -> crate::error::Result<u64> {
@@ -478,27 +536,10 @@ impl BtrfsOps for RealBtrfs {
             self.btrfs_path,
             path.display()
         );
-        let output = Command::new("sudo")
-            .env("LC_ALL", "C")
-            .arg("-n")
-            .arg(&self.btrfs_path)
-            .args(["subvolume", "sync"])
-            .arg(path)
-            .output()
-            .map_err(|e| {
-                UrdError::btrfs_spawn(
-                    BtrfsOperation::Sync,
-                    format!("failed to spawn btrfs: {e}"),
-                )
-            })?;
-
-        if !output.status.success() {
-            return Err(UrdError::btrfs_exit(
-                BtrfsOperation::Sync,
-                output.status.code(),
-                String::from_utf8_lossy(&output.stderr),
-            ));
-        }
+        self.run_btrfs(
+            BtrfsOperation::Sync,
+            &[OsStr::new("subvolume"), OsStr::new("sync"), path.as_os_str()],
+        )?;
         Ok(())
     }
 }
@@ -576,32 +617,18 @@ pub fn parse_subvolume_list(output: &str) -> crate::error::Result<Vec<PathBuf>> 
 /// fail-open call (field visit 2026-07-06, #274). Callers already treat an
 /// Err here as "no generation info" and proceed without the optimization.
 fn show_command(btrfs_path: &str, path: &Path) -> Command {
-    let mut cmd = Command::new("sudo");
-    cmd.env("LC_ALL", "C")
-        .arg("-n")
-        .arg(btrfs_path)
-        .args(["subvolume", "show"])
-        .arg(path);
-    cmd
+    btrfs_command(
+        btrfs_path,
+        &[OsStr::new("subvolume"), OsStr::new("show"), path.as_os_str()],
+    )
 }
 
 /// Run `sudo btrfs subvolume show` and return its stdout. Shared by the
 /// `BtrfsRead` field readers (`subvolume_generation`, `received_uuid`) — one
 /// invocation, one sudoers surface.
 fn subvolume_show(btrfs_path: &str, path: &Path) -> crate::error::Result<String> {
-    let output = show_command(btrfs_path, path)
-        .output()
-        .map_err(|e| UrdError::btrfs_spawn(BtrfsOperation::Show, e.to_string()))?;
-
-    if !output.status.success() {
-        return Err(UrdError::btrfs_exit(
-            BtrfsOperation::Show,
-            output.status.code(),
-            String::from_utf8_lossy(&output.stderr),
-        ));
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    let output = run_btrfs(show_command(btrfs_path, path), BtrfsOperation::Show)?;
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 impl BtrfsRead for RealBtrfs {
@@ -630,22 +657,10 @@ impl BtrfsRead for RealBtrfs {
         // re-render, live-found 2026-07-05) would scare where silence is
         // the contract. An ungranted line fails fast; the caller renders
         // the failure as no note at all.
-        let output = Command::new("sudo")
-            .env("LC_ALL", "C")
-            .arg("-n")
-            .arg(&self.btrfs_path)
-            .args(["subvolume", "list"])
-            .arg(path)
-            .output()
-            .map_err(|e| UrdError::btrfs_spawn(BtrfsOperation::List, e.to_string()))?;
-
-        if !output.status.success() {
-            return Err(UrdError::btrfs_exit(
-                BtrfsOperation::List,
-                output.status.code(),
-                String::from_utf8_lossy(&output.stderr),
-            ));
-        }
+        let output = self.run_btrfs(
+            BtrfsOperation::List,
+            &[OsStr::new("subvolume"), OsStr::new("list"), path.as_os_str()],
+        )?;
 
         parse_subvolume_list(&String::from_utf8_lossy(&output.stdout))
     }
@@ -863,8 +878,10 @@ fn wait_child_cancellable(
 
 // ── MockBtrfs ───────────────────────────────────────────────────────────
 
+// Every item below is `#[cfg(test)]`: the mock never ships in the binary.
+
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum MockBtrfsCall {
     CreateSnapshot {
         source: PathBuf,
@@ -885,7 +902,7 @@ pub enum MockBtrfsCall {
 
 /// Mock implementation of `BtrfsOps` for testing.
 /// Records all calls and can inject failures for specific paths.
-#[allow(dead_code)]
+#[cfg(test)]
 pub struct MockBtrfs {
     pub calls: RefCell<Vec<MockBtrfsCall>>,
     pub fail_creates: RefCell<HashSet<PathBuf>>,
@@ -914,7 +931,7 @@ pub struct MockBtrfs {
     pub fail_subvolume_lists: RefCell<HashSet<PathBuf>>,
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 impl MockBtrfs {
     #[must_use]
     pub fn new() -> Self {
@@ -943,12 +960,14 @@ impl MockBtrfs {
     }
 }
 
+#[cfg(test)]
 impl Default for MockBtrfs {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(test)]
 impl BtrfsRead for MockBtrfs {
     fn subvolume_generation(&self, path: &Path) -> crate::error::Result<u64> {
         if self.fail_generations.borrow().contains(path) {
@@ -1011,6 +1030,7 @@ impl BtrfsRead for MockBtrfs {
     }
 }
 
+#[cfg(test)]
 impl BtrfsOps for MockBtrfs {
     fn create_readonly_snapshot(&self, source: &Path, dest: &Path) -> crate::error::Result<()> {
         self.calls.borrow_mut().push(MockBtrfsCall::CreateSnapshot {
@@ -1155,6 +1175,63 @@ mod tests {
                 "/data/sv1"
             ]
         );
+    }
+
+    #[test]
+    fn btrfs_command_pins_locale_never_prompts_and_keeps_arg_order() {
+        let cmd = btrfs_command(
+            "/usr/sbin/btrfs",
+            &[
+                OsStr::new("subvolume"),
+                OsStr::new("snapshot"),
+                OsStr::new("-r"),
+                OsStr::new("/data/sv1"),
+                OsStr::new("/snap/20260930-1200-sv1"),
+            ],
+        );
+        assert_eq!(cmd.get_program(), "sudo");
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "-n",
+                "/usr/sbin/btrfs",
+                "subvolume",
+                "snapshot",
+                "-r",
+                "/data/sv1",
+                "/snap/20260930-1200-sv1"
+            ]
+        );
+        let envs: Vec<_> = cmd.get_envs().collect();
+        assert_eq!(envs, [(OsStr::new("LC_ALL"), Some(OsStr::new("C")))]);
+    }
+
+    #[test]
+    fn spawn_message_keeps_the_per_verb_wording() {
+        let e = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert_eq!(
+            spawn_message(BtrfsOperation::Delete, &e),
+            format!("failed to spawn btrfs: {e}")
+        );
+        assert_eq!(spawn_message(BtrfsOperation::List, &e), e.to_string());
+        assert_eq!(spawn_message(BtrfsOperation::Show, &e), e.to_string());
+    }
+
+    #[test]
+    fn show_failure_absence_versus_unknown() {
+        // Clean "no subvolume here" answers from btrfs-progs.
+        assert!(show_failure_means_absent(
+            "ERROR: cannot find real path for '/mnt/x/snap': No such file or directory\n"
+        ));
+        assert!(show_failure_means_absent("ERROR: Not a Btrfs subvolume: Invalid argument\n"));
+        assert!(show_failure_means_absent("ERROR: not a subvolume: /mnt/x/dir\n"));
+        // sudo refusing is NOT an answer about the path.
+        assert!(!show_failure_means_absent("sudo: a password is required\n"));
+        assert!(!show_failure_means_absent(""));
     }
 
     #[test]

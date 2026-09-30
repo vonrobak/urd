@@ -3,15 +3,13 @@ use std::path::Path;
 
 use chrono::NaiveDateTime;
 
-use crate::commands::storage_signals::RunArming;
+use crate::arming::{RunArming, drive_scopes};
 use crate::config::{Config, DriveConfig, ResolvedSubvolume};
 use crate::drives::DriveAvailability;
-use crate::error::UrdError;
 use crate::events::DeferScope;
 use crate::storage_critical;
 use crate::types::{
-    BackupPlan, DriveEvent, DriveEventKind, Interval, PlannedLifecycle, PlannedOperation,
-    PlannedSkip, SendKind, SnapshotName,
+    BackupPlan, Interval, PlannedLifecycle, PlannedOperation, PlannedSkip, SendKind, SnapshotName,
 };
 
 mod external;
@@ -79,6 +77,12 @@ fn send_floor_defer_reason(
 // so existing `crate::plan::{FilesystemQuery, HistoryQuery, ..}` import paths
 // keep resolving (UPI 052).
 pub use crate::observation::{FilesystemQuery, HistoryQuery, Observation};
+// The production adapter lives with the traits it implements
+// (`observation/real.rs`); re-exported so `crate::plan::{RealFileSystemState,
+// read_snapshot_dir}` keep resolving for the command handlers that still
+// import them from here. Neither is used by the planner itself.
+pub use crate::observation::RealFileSystemState;
+pub(crate) use crate::observation::read_snapshot_dir;
 
 // ── Size estimation helper ──────────────────────────────────────────────
 
@@ -639,82 +643,6 @@ fn orphan_invariant_violations(
     violations
 }
 
-/// Compute the per-drive [`crate::guard::DriveScope`]s for a subvolume from the
-/// in-run filesystem state (UPI 058 F5). The **single source** of the presence
-/// predicate: a drive is in scope iff the subvolume `accepts_drive` it, and
-/// `mounted` iff it is usable for a send now (`drive_availability ∈ {Available,
-/// TokenMissing}` — the same `usable_drives` filter the planner scopes transient
-/// retention against). The pin is read for **every** in-scope drive (mounted and
-/// away) so away-only pins can be detected by [`crate::guard::away_sheddable_pins`].
-///
-/// Called by the planner (to derive `mounted_pins`) **and** by [`away_shed_map`]
-/// (which `commands/backup.rs` and the sentinel use to build the executor's
-/// away-shed map), so the executor's `has_away_pin` cannot diverge from the
-/// planner's `clear_all` decision — coherence by construction, not discipline
-/// (R1). A pin-read error is logged and treated as "no pin" (the same fail-soft
-/// the inline `mounted_pins` derivation used pre-058).
-fn drive_scopes(
-    subvol: &ResolvedSubvolume,
-    drives: &[DriveConfig],
-    local_dir: &Path,
-    fs: &dyn FilesystemQuery,
-) -> Vec<crate::guard::DriveScope> {
-    drives
-        .iter()
-        .filter(|d| subvol.accepts_drive(&d.label))
-        .map(|d| {
-            let mounted = matches!(
-                fs.drive_availability(d),
-                DriveAvailability::Available | DriveAvailability::TokenMissing
-            );
-            let pin = match fs.read_pin_file(local_dir, &d.label) {
-                Ok(pin) => pin,
-                Err(e) => {
-                    log::warn!(
-                        "Failed to read pin file for drive {:?} in {}: {e}",
-                        d.label,
-                        local_dir.display()
-                    );
-                    None
-                }
-            };
-            crate::guard::DriveScope {
-                label: d.label.clone(),
-                mounted,
-                pin,
-            }
-        })
-        .collect()
-}
-
-/// Build the per-subvolume away-sheddable pin map (UPI 058): subvol name → the
-/// away drive labels whose pin is **away-only** ([`crate::guard::away_sheddable_pins`]).
-/// Computed from the SAME [`drive_scopes`] source the planner derives
-/// `mounted_pins` from, so the executor's `has_away_pin` and away-shed cannot
-/// diverge from the planner's `clear_all` decision (R1). Only subvolumes with at
-/// least one away-only pin appear — an absent key means "no presence-aware shed."
-///
-/// Threaded to the executor (`set_away_shed_pins`) and passed to
-/// `emergency_reclaim_pool` so both read one in-run computation rather than each
-/// recomputing presence.
-#[must_use]
-pub(crate) fn away_shed_map(
-    config: &Config,
-    fs: &dyn FilesystemQuery,
-) -> std::collections::HashMap<String, Vec<String>> {
-    let mut map = std::collections::HashMap::new();
-    for sv in config.resolved_subvolumes() {
-        let Some(local_dir) = config.local_snapshot_dir(&sv.name) else {
-            continue;
-        };
-        let scopes = drive_scopes(&sv, &config.drives, &local_dir, fs);
-        let away = crate::guard::away_sheddable_pins(&scopes);
-        if !away.is_empty() {
-            map.insert(sv.name.clone(), away);
-        }
-    }
-    map
-}
 /// Format a duration in minutes to a short human-readable string.
 ///
 /// Used by the planner for skip reasons and by voice.rs for grouped rendering.
@@ -752,263 +680,3 @@ fn exceeds_available_space(
         None
     }
 }
-
-// ── RealFileSystemState ─────────────────────────────────────────────────
-
-/// Real filesystem state — reads actual directories, pin files, and mounts.
-/// Optionally carries a StateDb reference for historical send size estimation.
-pub struct RealFileSystemState<'a> {
-    pub state: Option<&'a crate::state::StateDb>,
-}
-
-impl FilesystemQuery for RealFileSystemState<'_> {
-    fn local_snapshots(
-        &self,
-        root: &Path,
-        subvol_name: &str,
-    ) -> crate::error::Result<Vec<SnapshotName>> {
-        read_snapshot_dir(&root.join(subvol_name))
-    }
-
-    fn external_snapshots(
-        &self,
-        drive: &DriveConfig,
-        subvol_name: &str,
-    ) -> crate::error::Result<Vec<SnapshotName>> {
-        let dir = crate::drives::external_snapshot_dir(drive, subvol_name);
-        read_snapshot_dir(&dir)
-    }
-
-    fn drive_availability(&self, drive: &DriveConfig) -> DriveAvailability {
-        crate::drives::drive_availability(drive)
-    }
-
-    fn filesystem_free_bytes(&self, path: &Path) -> crate::error::Result<u64> {
-        crate::drives::filesystem_free_bytes(path)
-    }
-
-    fn filesystem_capacity_bytes(&self, path: &Path) -> crate::error::Result<u64> {
-        crate::pools::pool_space(path).map(|s| s.capacity_bytes)
-    }
-
-    fn read_pin_file(
-        &self,
-        local_dir: &Path,
-        drive_label: &str,
-    ) -> crate::error::Result<Option<SnapshotName>> {
-        crate::chain::read_pin_file(local_dir, drive_label)
-    }
-
-    fn pinned_snapshots(&self, local_dir: &Path, drive_labels: &[String]) -> HashSet<SnapshotName> {
-        crate::chain::find_pinned_snapshots(local_dir, drive_labels)
-    }
-}
-
-impl HistoryQuery for RealFileSystemState<'_> {
-    fn last_send_size(
-        &self,
-        subvol_name: &str,
-        drive_label: &str,
-        send_kind: SendKind,
-    ) -> Option<u64> {
-        // Successful sends only. A failed/aborted send's bytes are an under-count
-        // and must never stand in for a real measurement — they are consulted
-        // separately as a last-resort floor (#210).
-        self.state.and_then(|db| {
-            db.last_successful_send_size(subvol_name, drive_label, send_kind.as_db_str())
-                .ok()
-                .flatten()
-        })
-    }
-
-    fn last_send_size_any_drive(&self, subvol_name: &str, send_kind: SendKind) -> Option<u64> {
-        self.state.and_then(|db| {
-            db.last_successful_send_size_any_drive(subvol_name, send_kind.as_db_str())
-                .ok()
-                .flatten()
-        })
-    }
-
-    fn last_failed_send_floor(
-        &self,
-        subvol_name: &str,
-        drive_label: &str,
-        send_kind: SendKind,
-    ) -> Option<u64> {
-        self.state.and_then(|db| {
-            let send_type = send_kind.as_db_str();
-            db.last_failed_send_size(subvol_name, drive_label, send_type)
-                .ok()
-                .flatten()
-                .or_else(|| {
-                    db.last_failed_send_size_any_drive(subvol_name, send_type)
-                        .ok()
-                        .flatten()
-                })
-        })
-    }
-
-    fn calibrated_size(&self, subvol_name: &str) -> Option<(u64, String)> {
-        self.state
-            .and_then(|db| db.calibrated_size(subvol_name).ok().flatten())
-    }
-
-    fn last_successful_send_time(
-        &self,
-        subvol_name: &str,
-        drive_label: &str,
-    ) -> Option<NaiveDateTime> {
-        self.state.and_then(|db| {
-            db.last_successful_send_time(subvol_name, drive_label)
-                .ok()
-                .flatten()
-        })
-    }
-
-    fn last_drive_event(&self, drive_label: &str) -> Option<DriveEvent> {
-        let record = self
-            .state
-            .and_then(|db| db.last_drive_connection(drive_label).ok().flatten())?;
-        drive_record_to_event(&record)
-    }
-
-    fn drive_mount_history(&self, drive_label: &str) -> Vec<DriveEvent> {
-        // No state DB (e.g. SQLite open failed) → empty history, never blocks
-        // (ADR-102). Unparseable rows are dropped by `drive_record_to_event`.
-        let Some(db) = self.state else {
-            return Vec::new();
-        };
-        match db.drive_connection_history(drive_label) {
-            Ok(records) => records.iter().filter_map(drive_record_to_event).collect(),
-            Err(e) => {
-                log::warn!("drive_connection_history failed for {drive_label}: {e}");
-                Vec::new()
-            }
-        }
-    }
-
-    fn last_successful_operation_at(&self, drive_label: &str) -> Option<NaiveDateTime> {
-        self.state.and_then(|db| {
-            db.last_successful_operation_at(drive_label)
-                .ok()
-                .flatten()
-        })
-    }
-}
-
-/// Drift-history composition — the single home for the "fetch rows → map to
-/// `DriftSample` → fail-open (ADR-102)" sequence that command callers used to
-/// re-assemble inline. Mirrors `drive_mount_history`/`drive_record_to_event`:
-/// granular `state.rs` wrappers, with the domain shape localized once at the
-/// adapter. Inherent (not on `HistoryQuery`) because every drift consumer is a
-/// command-layer path holding `Option<&StateDb>`; no pure function reaches drift
-/// through `Observation`. Empty results feed the pure aggregators unchanged —
-/// `drift::compute_rolling_churn(&[])` is `ChurnEstimate::default()` and
-/// `compute_pool_free_bytes_trend(&[], …)` is `None`.
-impl RealFileSystemState<'_> {
-    /// Drift samples for one subvolume since `since`, newest-first. DB absent
-    /// or query error → empty, never an error that could block a backup
-    /// (ADR-102). Feeds `drift::compute_rolling_churn`.
-    #[must_use]
-    pub fn drift_samples(&self, subvol_name: &str, since: NaiveDateTime) -> Vec<crate::drift::DriftSample> {
-        let Some(db) = self.state else {
-            return Vec::new();
-        };
-        match db.drift_samples_for_subvolume(subvol_name, since) {
-            Ok(rows) => rows
-                .into_iter()
-                .map(crate::state::StateDb::drift_row_to_sample)
-                .collect(),
-            Err(e) => {
-                log::warn!("drift_samples_for_subvolume failed for {subvol_name}: {e}");
-                Vec::new()
-            }
-        }
-    }
-
-    /// Batched variant across a set of subvolumes (the pool-trend path, UPI
-    /// 044). Same fail-open contract as `drift_samples`. Feeds
-    /// `drift::compute_pool_free_bytes_trend`.
-    #[must_use]
-    pub fn drift_samples_multi(
-        &self,
-        subvol_names: &[String],
-        since: NaiveDateTime,
-    ) -> Vec<crate::drift::DriftSample> {
-        let Some(db) = self.state else {
-            return Vec::new();
-        };
-        match db.drift_samples_for_subvolumes(subvol_names, since) {
-            Ok(rows) => rows
-                .into_iter()
-                .map(crate::state::StateDb::drift_row_to_sample)
-                .collect(),
-            Err(e) => {
-                log::warn!("drift_samples_for_subvolumes failed: {e}");
-                Vec::new()
-            }
-        }
-    }
-}
-
-/// Map a persisted `DriveConnectionRecord` to a `DriveEvent`, or `None` for an
-/// unknown event type / unparseable timestamp (logged). Shared by
-/// `last_drive_event` (one row) and `drive_mount_history` (all rows). The parse
-/// format matches the sentinel's write format (`%Y-%m-%dT%H:%M:%S`).
-///
-/// This is the read-side composition pattern: granular `state.rs` wrappers, with
-/// the domain shaping localized once at the adapter (see also `drift_samples`).
-/// Keep `state.rs` itself one-method-per-query — composition lives here.
-pub(crate) fn drive_record_to_event(
-    record: &crate::state::DriveConnectionRecord,
-) -> Option<DriveEvent> {
-    let kind = match record.event_type.as_str() {
-        "mounted" => DriveEventKind::Mount,
-        "unmounted" => DriveEventKind::Unmount,
-        other => {
-            log::warn!("unknown drive event_type {other:?} — ignoring");
-            return None;
-        }
-    };
-    let at = chrono::NaiveDateTime::parse_from_str(&record.timestamp, "%Y-%m-%dT%H:%M:%S")
-        .inspect_err(|e| {
-            log::warn!(
-                "failed to parse drive event timestamp {:?}: {e}",
-                record.timestamp
-            );
-        })
-        .ok()?;
-    Some(DriveEvent { kind, at })
-}
-
-pub(crate) fn read_snapshot_dir(dir: &Path) -> crate::error::Result<Vec<SnapshotName>> {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => {
-            return Err(UrdError::Io {
-                path: dir.to_path_buf(),
-                source: e,
-            });
-        }
-    };
-
-    let mut snapshots = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|e| UrdError::Io {
-            path: dir.to_path_buf(),
-            source: e,
-        })?;
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        // Skip hidden files (pin files, etc.)
-        if name_str.starts_with('.') {
-            continue;
-        }
-        if let Ok(snap) = SnapshotName::parse(&name_str) {
-            snapshots.push(snap);
-        }
-    }
-    Ok(snapshots)
-}
-

@@ -11,6 +11,8 @@ use colored::Colorize;
 use crate::output::{InitOutput, InitStatus, OutputMode};
 use crate::types::{ByteSize, DriveRole};
 
+use super::render_json;
+
 /// First-run pointer when `urd init` finds no config and cannot offer
 /// the Encounter (no terminal on stdin or stdout). A missing config is
 /// the expected starting state — greet and point, never error.
@@ -39,7 +41,7 @@ pub fn render_init(data: &InitOutput, mode: OutputMode) -> String {
 }
 
 fn render_init_daemon(data: &InitOutput) -> String {
-    serde_json::to_string_pretty(data).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
+    render_json(data)
 }
 
 fn render_init_interactive(data: &InitOutput) -> String {
@@ -249,6 +251,7 @@ pub fn render_incomplete_deletion_result(path: &str, result: Result<(), &str>) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::output::{InitCheck, InitDriveStatus, InitPinFile, InitSnapshotCount};
     use crate::voice::test_fixtures::color_guard;
 
     #[test]
@@ -285,5 +288,106 @@ mod tests {
             render_incomplete_deletion_result("/mnt/snap/home", Err("permission denied")),
             "  ERROR Failed to delete /mnt/snap/home: permission denied"
         );
+    }
+
+    // ── Init tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn init_interactive_renders_all_sections() {
+        let data = InitOutput {
+            infrastructure: vec![InitCheck {
+                name: "State database".to_string(),
+                status: InitStatus::Ok,
+                detail: None,
+            }],
+            subvolume_sources: vec![InitCheck {
+                name: "htpc-home".to_string(),
+                status: InitStatus::Ok,
+                detail: Some("/home".to_string()),
+            }],
+            snapshot_roots: vec![InitCheck {
+                name: "/snapshots".to_string(),
+                status: InitStatus::Ok,
+                detail: None,
+            }],
+            drives: vec![InitDriveStatus {
+                label: "WD-18TB".to_string(),
+                role: DriveRole::Primary,
+                mount_path: "/mnt/wd".to_string(),
+                mounted: true,
+                free_bytes: Some(500_000_000_000),
+            }],
+            pin_files: vec![InitPinFile {
+                subvolume: "htpc-home".to_string(),
+                drive: "WD-18TB".to_string(),
+                status: InitStatus::Ok,
+                snapshot_name: Some("20260327-0400-htpc-home".to_string()),
+                error: None,
+            }],
+            incomplete_snapshots: vec![],
+            snapshot_counts: vec![InitSnapshotCount {
+                subvolume: "htpc-home".to_string(),
+                local_count: 24,
+                external_counts: vec![("WD-18TB".to_string(), 10)],
+            }],
+            preflight_warnings: vec![],
+        };
+
+        let output = render_init(&data, OutputMode::Interactive);
+        assert!(output.contains("Urd initialization"), "missing header");
+        assert!(output.contains("State database"), "missing infrastructure");
+        assert!(output.contains("htpc-home"), "missing subvolume");
+        assert!(output.contains("WD-18TB"), "missing drive");
+        assert!(output.contains("Snapshot counts"), "missing counts section");
+        assert!(
+            output.contains("Initialization complete"),
+            "missing footer"
+        );
+    }
+
+    #[test]
+    fn init_daemon_produces_valid_json() {
+        let data = InitOutput {
+            infrastructure: vec![],
+            subvolume_sources: vec![],
+            snapshot_roots: vec![],
+            drives: vec![],
+            pin_files: vec![],
+            incomplete_snapshots: vec![],
+            snapshot_counts: vec![],
+            preflight_warnings: vec![],
+        };
+        let output = render_init(&data, OutputMode::Daemon);
+        let _: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
+    }
+
+    #[test]
+    fn init_first_time_interactive_guides_without_erroring() {
+        let path = std::path::Path::new("/home/user/.config/urd/urd.toml");
+        let output = render_init_first_time(path, OutputMode::Interactive);
+        assert!(
+            output.contains("/home/user/.config/urd/urd.toml"),
+            "must name the path where the config belongs"
+        );
+        assert!(
+            output.contains("propose"),
+            "must say the Encounter proposes protection"
+        );
+        assert!(
+            output.contains("`urd init`"),
+            "must close the loop back to init"
+        );
+        assert!(
+            !output.to_lowercase().contains("error"),
+            "a missing config is a starting state, not an error"
+        );
+    }
+
+    #[test]
+    fn init_first_time_daemon_reports_not_configured() {
+        let path = std::path::Path::new("/home/user/.config/urd/urd.toml");
+        let output = render_init_first_time(path, OutputMode::Daemon);
+        let parsed: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
+        assert_eq!(parsed["status"], "not_configured");
     }
 }

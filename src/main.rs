@@ -1,4 +1,5 @@
 mod advice;
+mod arming;
 mod awareness;
 mod btrfs;
 mod chain;

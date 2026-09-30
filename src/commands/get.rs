@@ -19,11 +19,7 @@ pub fn run(config: Config, args: GetArgs, output_mode: OutputMode) -> anyhow::Re
 
     // 2. Find the subvolume
     let subvol = match &args.subvolume {
-        Some(name) => config
-            .subvolumes
-            .iter()
-            .find(|sv| sv.name == *name)
-            .expect("validated by require_known_subvolume"),
+        Some(name) => subvolume_named(&config.subvolumes, name)?,
         None => find_subvolume_for_path(&path, &config.subvolumes).ok_or_else(|| {
             let sources: Vec<_> = config
                 .subvolumes
@@ -209,6 +205,24 @@ fn find_subvolume_for_path<'a>(
         .max_by_key(|sv| sv.source.components().count())
 }
 
+/// Look up an explicit `--subvolume` by name. `require_known_subvolume` has
+/// already vetted it (with a did-you-mean listing), so the error here is a
+/// backstop that keeps the lookup panic-free, not the user-facing message.
+fn subvolume_named<'a>(
+    subvolumes: &'a [SubvolumeConfig],
+    name: &str,
+) -> anyhow::Result<&'a SubvolumeConfig> {
+    subvolumes
+        .iter()
+        .find(|sv| sv.name == name)
+        .ok_or_else(|| anyhow!("no subvolume named {name:?} in config"))
+}
+
+/// The last second of `date`: a bare date reference means "as of end of day".
+fn end_of_day(date: NaiveDate) -> anyhow::Result<NaiveDateTime> {
+    date.and_hms_opt(23, 59, 59).context("23:59:59 is a valid time of day")
+}
+
 /// Parse a date reference string into a NaiveDateTime.
 fn parse_date_reference(s: &str, now: NaiveDateTime) -> anyhow::Result<NaiveDateTime> {
     let s = s.trim();
@@ -216,7 +230,7 @@ fn parse_date_reference(s: &str, now: NaiveDateTime) -> anyhow::Result<NaiveDate
         "today" => Ok(now),
         "yesterday" => {
             let yesterday = now.date() - chrono::Duration::days(1);
-            Ok(yesterday.and_hms_opt(23, 59, 59).expect("valid HMS"))
+            end_of_day(yesterday)
         }
         _ => {
             // Try YYYY-MM-DD HH:MM
@@ -225,11 +239,11 @@ fn parse_date_reference(s: &str, now: NaiveDateTime) -> anyhow::Result<NaiveDate
             }
             // Try YYYY-MM-DD
             if let Ok(d) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
-                return Ok(d.and_hms_opt(23, 59, 59).expect("valid HMS"));
+                return end_of_day(d);
             }
             // Try YYYYMMDD (snapshot name prefix format)
             if let Ok(d) = NaiveDate::parse_from_str(s, "%Y%m%d") {
-                return Ok(d.and_hms_opt(23, 59, 59).expect("valid HMS"));
+                return end_of_day(d);
             }
             Err(anyhow!(
                 "unrecognized date format: {s:?}. \
@@ -379,6 +393,21 @@ mod tests {
                 drives: None,
             },
         ]
+    }
+
+    #[test]
+    fn subvolume_named_finds_by_name_and_errors_instead_of_panicking() {
+        let svs = make_subvolumes();
+        assert_eq!(subvolume_named(&svs, "htpc-home").unwrap().name, "htpc-home");
+        // Matches `name`, not `short_name` — the same key require_known_subvolume uses.
+        let err = subvolume_named(&svs, "opptak").unwrap_err();
+        assert!(err.to_string().contains("no subvolume named"), "{err}");
+    }
+
+    #[test]
+    fn end_of_day_is_last_second() {
+        let d = NaiveDate::from_ymd_opt(2026, 3, 24).unwrap();
+        assert_eq!(end_of_day(d).unwrap(), d.and_hms_opt(23, 59, 59).unwrap());
     }
 
     #[test]
