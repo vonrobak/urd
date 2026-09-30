@@ -27,6 +27,7 @@ use anyhow::{anyhow, bail, Context};
 
 use crate::config::Config;
 use crate::output::OutputMode;
+use crate::probes::{self, PoolLocus};
 use crate::sudoers::{self, Coverage, GrantProbe, RenderContext};
 use crate::voice;
 
@@ -121,7 +122,7 @@ fn second_look(config: &Config, btrfs: &dyn crate::btrfs::BtrfsRead) -> Option<u
     let mut pools: std::collections::BTreeMap<String, PoolView> =
         std::collections::BTreeMap::new();
     for sv in config.resolved_subvolumes().iter().filter(|sv| sv.enabled) {
-        let locus = pool_locus(&sv.source)?;
+        let locus = probes::findmnt_locus(&sv.source)?;
         let snapshot_dir = config.local_snapshot_dir(&sv.name);
         fold_source(&mut pools, &locus, &sv.source, snapshot_dir.as_deref())?;
     }
@@ -165,14 +166,6 @@ fn fold_source(
     Some(())
 }
 
-/// Where a promised source lives: the mount holding it, that mount's
-/// FSROOT, and the filesystem's UUID (the pool identity).
-struct PoolLocus {
-    mount: PathBuf,
-    fsroot: PathBuf,
-    uuid: String,
-}
-
 /// One promised pool as the classifier sees it: everything in the pool's
 /// own subvol-path coordinates, plus one mount to list it through.
 struct PoolView {
@@ -210,43 +203,6 @@ fn fs_relative(path: &Path, mount: &Path, fsroot: &Path) -> Option<PathBuf> {
     let below = path.strip_prefix(mount).ok()?;
     let root = fsroot.strip_prefix("/").unwrap_or(fsroot);
     Some(root.join(below))
-}
-
-/// One findmnt call: the mountpoint holding `path`, that mount's FSROOT,
-/// and the filesystem UUID.
-fn pool_locus(path: &Path) -> Option<PoolLocus> {
-    let out = Command::new("findmnt")
-        .env("LC_ALL", "C")
-        .args(["-n", "-P", "-o", "TARGET,FSROOT,UUID", "--target"])
-        .arg(path)
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    parse_findmnt_locus(&String::from_utf8_lossy(&out.stdout))
-}
-
-/// Pure parse of `findmnt -P -o TARGET,FSROOT,UUID`:
-/// `TARGET="/" FSROOT="/root" UUID="abcd-..."`. An empty UUID is a parse
-/// failure — without a pool identity the second look stays silent rather
-/// than guessing.
-fn parse_findmnt_locus(stdout: &str) -> Option<PoolLocus> {
-    let extract = |key: &str| -> Option<String> {
-        let needle = format!("{key}=\"");
-        let start = stdout.find(&needle)? + needle.len();
-        let rest = &stdout[start..];
-        Some(rest[..rest.find('"')?].to_string())
-    };
-    let uuid = extract("UUID")?;
-    if uuid.is_empty() {
-        return None;
-    }
-    Some(PoolLocus {
-        mount: PathBuf::from(extract("TARGET")?),
-        fsroot: PathBuf::from(extract("FSROOT")?),
-        uuid,
-    })
 }
 
 /// Whether a configured snapshot root needs the earning's privileged
@@ -751,13 +707,7 @@ fn systemctl_user(args: &[&str]) -> Result<(), String> {
 /// not scare, and doctor carries the standing check.
 fn linger_loose() -> Option<String> {
     let user = invoking_username().ok()?;
-    let out = Command::new("loginctl")
-        .env("LC_ALL", "C")
-        .args(["show-user", &user, "--property=Linger"])
-        .output()
-        .ok()?;
-    (out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "Linger=no")
-        .then_some(user)
+    matches!(probes::loginctl_linger(&user), probes::Linger::Off).then_some(user)
 }
 
 /// Print the linger sentence at the units stage when the thread is loose.
@@ -1297,15 +1247,10 @@ pub(crate) fn check_coverage(config: &Config) -> Result<(), String> {
 /// obtained, or parsed.
 fn effective_coverage(config: &Config) -> Result<Coverage, String> {
     let expected = sudoers::expected_grant_lines(config).map_err(|r| r.to_string())?;
-    let out = Command::new("sudo")
-        .env("LC_ALL", "C")
-        .args(["-n", "-l"])
-        .output()
-        .map_err(|e| format!("could not run sudo -n -l: {e}"))?;
-    if !out.status.success() {
-        return Err("the privilege listing needs a password (sudo -n -l)".to_string());
-    }
-    coverage_from_listing(&expected, &String::from_utf8_lossy(&out.stdout))
+    let listing = probes::sudo_privilege_listing()
+        .map_err(|e| format!("could not run sudo -n -l: {e}"))?
+        .ok_or_else(|| "the privilege listing needs a password (sudo -n -l)".to_string())?;
+    coverage_from_listing(&expected, &listing)
 }
 
 /// Parse a raw `sudo -n -l` listing and diff it against `expected`. Pure —
@@ -1708,19 +1653,6 @@ role = "primary"
     }
 
     // ── The second look's pure classification (adversary F2) ───────────
-
-    #[test]
-    fn parse_findmnt_locus_reads_all_three_fields() {
-        let locus =
-            parse_findmnt_locus("TARGET=\"/\" FSROOT=\"/root\" UUID=\"ab12\"\n").unwrap();
-        assert_eq!(locus.mount, PathBuf::from("/"));
-        assert_eq!(locus.fsroot, PathBuf::from("/root"));
-        assert_eq!(locus.uuid, "ab12");
-        // No pool identity → no locus: the second look must stay silent
-        // rather than key pools on a guess.
-        assert!(parse_findmnt_locus("TARGET=\"/\" FSROOT=\"/root\" UUID=\"\"\n").is_none());
-        assert!(parse_findmnt_locus("garbage").is_none());
-    }
 
     /// The live-found double count (2026-07-05): one filesystem mounted at
     /// both `/` (subvol `root`) and `/home` (subvol `home`) — Fedora's

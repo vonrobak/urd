@@ -25,6 +25,7 @@ mod output;
 mod plan;
 mod pools;
 mod preflight;
+mod probes;
 mod recommendation;
 mod recorder;
 mod retention;

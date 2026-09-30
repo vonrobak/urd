@@ -109,13 +109,7 @@ pub fn run(config: Config, args: DoctorArgs, output_mode: OutputMode) -> anyhow:
             sudo_probe.1
         ))],
         crate::sudoers::GrantProbe::Granted => {
-            let listing = std::process::Command::new("sudo")
-                .env("LC_ALL", "C")
-                .args(["-n", "-l"])
-                .output()
-                .ok()
-                .filter(|o| o.status.success())
-                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+            let listing = crate::probes::sudo_privilege_listing().ok().flatten();
             build_sudoers_drift_checks(&config, listing.as_deref())
         }
     };
@@ -565,6 +559,8 @@ fn build_units_drift_checks(
 /// an unanswerable loginctl → an honest skip; `Linger=yes` → silence (a
 /// real pass needs no row).
 fn linger_check() -> Vec<DoctorCheck> {
+    use crate::probes::Linger;
+
     let row = |status, detail: String, suggestion: Option<String>| {
         vec![DoctorCheck {
             name: "session lingering".to_string(),
@@ -580,37 +576,26 @@ fn linger_check() -> Vec<DoctorCheck> {
             None,
         );
     };
-    match std::process::Command::new("loginctl")
-        .env("LC_ALL", "C")
-        .args(["show-user", &user, "--property=Linger"])
-        .output()
-    {
-        Ok(out) if out.status.success() => {
-            match String::from_utf8_lossy(&out.stdout).trim() {
-                "Linger=no" => row(
-                    DoctorCheckStatus::Warn,
-                    "lingering is off: backups run only while you are logged in \
-                     (missed nights catch up at next login)"
-                        .to_string(),
-                    Some(format!("Run `loginctl enable-linger {user}` to free them.")),
-                ),
-                "Linger=yes" => Vec::new(),
-                other => row(
-                    DoctorCheckStatus::Warn,
-                    format!("could not read the lingering state: {other:?}"),
-                    None,
-                ),
-            }
-        }
-        Ok(out) => row(
+    match crate::probes::loginctl_linger(&user) {
+        Linger::Off => row(
             DoctorCheckStatus::Warn,
-            format!(
-                "loginctl could not answer: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            ),
+            "lingering is off: backups run only while you are logged in \
+             (missed nights catch up at next login)"
+                .to_string(),
+            Some(format!("Run `loginctl enable-linger {user}` to free them.")),
+        ),
+        Linger::On => Vec::new(),
+        Linger::Unrecognized(other) => row(
+            DoctorCheckStatus::Warn,
+            format!("could not read the lingering state: {other:?}"),
             None,
         ),
-        Err(e) => row(
+        Linger::Failed(stderr) => row(
+            DoctorCheckStatus::Warn,
+            format!("loginctl could not answer: {stderr}"),
+            None,
+        ),
+        Linger::NotRun(e) => row(
             DoctorCheckStatus::Warn,
             format!("could not run loginctl: {e}"),
             None,

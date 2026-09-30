@@ -1,15 +1,15 @@
 //! Pool detection and per-pool sysfs/statvfs helpers (UPI 043).
 //!
-//! I/O module — sibling of `drives.rs`. Findmnt subprocess + sysfs/statvfs
-//! syscalls. Two pure helpers (`group_subvolumes_by_pool`,
+//! I/O module — sibling of `drives.rs`. The `findmnt --target` probe
+//! (`probes::findmnt_target`) + sysfs/statvfs syscalls. Two pure helpers (`group_subvolumes_by_pool`,
 //! `compute_pool_metrics_from`) are extracted for unit testability per
 //! ADR-108's spirit. No module spawns `btrfs` subprocesses.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use crate::config::{Config, DriveConfig};
 use crate::error::UrdError;
+use crate::probes;
 
 /// A detected source pool: one BTRFS filesystem hosting one or more configured
 /// subvolume sources.
@@ -41,22 +41,10 @@ pub struct DriveResolution {
 // duplicate contract.
 use crate::metrics::PoolMetric;
 
-/// One resolved row from the concentrated `findmnt --target` probe: which
-/// filesystem (if any) holds an arbitrary path. All three fields are
-/// independent — a mount can resolve a `target` with an empty `uuid` (no
-/// superblock UUID), and `fstype` lets a caller gate on "must be btrfs"
-/// without a second probe (UPI 084; see `discover()`'s home-pool lookup).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct FindmntEntry {
-    pub target: Option<PathBuf>,
-    pub fstype: Option<String>,
-    pub uuid: Option<String>,
-}
-
 /// Resolve the BTRFS filesystem UUID hosting an arbitrary path.
 /// `Ok(None)` for missing paths or mounts without a UUID.
 pub fn pool_uuid_for_path(path: &Path) -> crate::error::Result<Option<String>> {
-    Ok(findmnt_probe_target(path)?.uuid)
+    Ok(probes::findmnt_target(path)?.uuid)
 }
 
 /// Resolve a source path's pool UUID **and** mountpoint in a **single**
@@ -69,73 +57,8 @@ pub fn pool_uuid_for_path(path: &Path) -> crate::error::Result<Option<String>> {
 pub fn resolve_source_pool(
     path: &Path,
 ) -> crate::error::Result<(Option<String>, Option<PathBuf>)> {
-    let entry = findmnt_probe_target(path)?;
+    let entry = probes::findmnt_target(path)?;
     Ok((entry.uuid, entry.target))
-}
-
-/// The concentrated `findmnt --target` probe (UPI 084): one subprocess spawn
-/// and one parser for "which filesystem holds this path?" queries, shared by
-/// `pool_uuid_for_path`, `resolve_source_pool`, `drives::get_filesystem_uuid`,
-/// and `discovery`'s home-pool lookup (which additionally gates on
-/// `fstype == "btrfs"` at its call site, since that filter is specific to
-/// discovery's zero-state inventory and not shared by the other consumers).
-///
-/// Uses `-J` (JSON) output — the most robust `findmnt` format to parse,
-/// tolerant of field reordering and locale quirks that broke the older `-P`
-/// key="value" parser. `Err` only on a findmnt I/O failure with stderr
-/// content; a missing/unmounted path → `Ok(FindmntEntry::default())`.
-pub fn findmnt_probe_target(path: &Path) -> crate::error::Result<FindmntEntry> {
-    let path_str = path.to_str().ok_or_else(|| UrdError::Io {
-        path: path.to_path_buf(),
-        source: std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "path is not valid UTF-8",
-        ),
-    })?;
-
-    let output = Command::new("findmnt")
-        .env("LC_ALL", "C")
-        .args(["-J", "-o", "TARGET,FSTYPE,UUID", "--target", path_str])
-        .output()
-        .map_err(|e| UrdError::Io {
-            path: PathBuf::from("findmnt"),
-            source: e,
-        })?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    if !output.status.success() {
-        if stdout.trim().is_empty() {
-            // findmnt complained about a missing path; treat as "unresolved".
-            return Ok(FindmntEntry::default());
-        }
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(UrdError::Io {
-            path: path.to_path_buf(),
-            source: std::io::Error::other(format!("findmnt failed: {}", stderr.trim())),
-        });
-    }
-
-    Ok(parse_findmnt_probe_target(&stdout))
-}
-
-/// Pure parse of `findmnt -J -o TARGET,FSTYPE,UUID --target <path>` output —
-/// a single-entry `filesystems` array. Empty/absent fields map to `None`.
-/// Extracted for unit testing (the subprocess wrapper above stays a thin I/O
-/// shim).
-#[must_use]
-fn parse_findmnt_probe_target(json: &str) -> FindmntEntry {
-    let Some(fs) = serde_json::from_str::<serde_json::Value>(json)
-        .ok()
-        .and_then(|root| root.get("filesystems")?.as_array()?.first().cloned())
-    else {
-        return FindmntEntry::default();
-    };
-    let non_empty = |v: Option<&str>| v.filter(|s| !s.is_empty()).map(str::to_string);
-    FindmntEntry {
-        target: non_empty(fs.get("target").and_then(serde_json::Value::as_str)).map(PathBuf::from),
-        fstype: non_empty(fs.get("fstype").and_then(serde_json::Value::as_str)),
-        uuid: non_empty(fs.get("uuid").and_then(serde_json::Value::as_str)),
-    }
 }
 
 /// Group configured subvolume sources by source-pool UUID. Subvolumes whose
@@ -383,49 +306,6 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("bytes_used"), used).unwrap();
         std::fs::write(dir.join("total_bytes"), total).unwrap();
-    }
-
-    // ── UPI 084: concentrated findmnt --target probe ────────────────
-
-    #[test]
-    fn parse_findmnt_probe_target_both_present() {
-        let entry = parse_findmnt_probe_target(
-            r#"{"filesystems":[{"target":"/","fstype":"btrfs","uuid":"6c1a-1234"}]}"#,
-        );
-        assert_eq!(entry.uuid.as_deref(), Some("6c1a-1234"));
-        assert_eq!(entry.target, Some(PathBuf::from("/")));
-        assert_eq!(entry.fstype.as_deref(), Some("btrfs"));
-    }
-
-    #[test]
-    fn parse_findmnt_probe_target_empty_uuid_is_none() {
-        // Non-BTRFS mount: TARGET resolves, UUID is empty → mountpoint still
-        // surfaces so storage-signal gathering can read free-ratio (S5).
-        let entry = parse_findmnt_probe_target(
-            r#"{"filesystems":[{"target":"/boot","fstype":"vfat","uuid":""}]}"#,
-        );
-        assert_eq!(entry.uuid, None);
-        assert_eq!(entry.target, Some(PathBuf::from("/boot")));
-        assert_eq!(entry.fstype.as_deref(), Some("vfat"));
-    }
-
-    #[test]
-    fn parse_findmnt_probe_target_empty_output_is_default() {
-        assert_eq!(parse_findmnt_probe_target(""), FindmntEntry::default());
-        assert_eq!(parse_findmnt_probe_target("{}"), FindmntEntry::default());
-        assert_eq!(
-            parse_findmnt_probe_target(r#"{"filesystems":[]}"#),
-            FindmntEntry::default()
-        );
-    }
-
-    #[test]
-    fn parse_findmnt_probe_target_tolerates_target_with_space() {
-        let entry = parse_findmnt_probe_target(
-            r#"{"filesystems":[{"target":"/mnt/my drive","fstype":"btrfs","uuid":"abcd"}]}"#,
-        );
-        assert_eq!(entry.uuid.as_deref(), Some("abcd"));
-        assert_eq!(entry.target, Some(PathBuf::from("/mnt/my drive")));
     }
 
     /// A `space_resolver` that ignores the path and always reports the same
