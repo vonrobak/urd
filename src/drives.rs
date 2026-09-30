@@ -139,7 +139,7 @@ pub fn is_drive_mounted(drive: &DriveConfig) -> bool {
 /// config is kept (it was classified away at spawn and we cannot prove it
 /// reconnected — the conservative direction is to not invent a connected
 /// chain). Subvolumes left with no away labels are dropped, matching
-/// `plan::away_shed_map`'s "absent key = no presence-aware shed."
+/// `arming::away_shed_map`'s "absent key = no presence-aware shed."
 ///
 /// `probe` is injectable so tests can drive the re-confirmation directly —
 /// the real probe (`is_drive_mounted`) is a `/proc/mounts` scan that a

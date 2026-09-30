@@ -1647,7 +1647,7 @@ impl<'a> Executor<'a> {
     ///
     /// **Tier 1 (graceful, away-first):** shed only the `away_sheddable` pins —
     /// away drives whose pinned snapshot is away-*only* (computed by the caller
-    /// from the shared `plan::drive_scopes`, so a snapshot shared with a
+    /// from the shared `arming::drive_scopes`, so a snapshot shared with a
     /// connected drive is NOT shed here). Delete the now-unpinned away snapshots,
     /// sync once, then `measure_free()`. If free has reached `floor_bytes`, stop
     /// — the connected incremental chains survive. A single below-floor reading,
@@ -1877,7 +1877,7 @@ impl<'a> Executor<'a> {
         // (3) Delete every on-disk snapshot not in the pinned set. Names that do
         // not parse are skipped by `read_snapshot_dir` (fail-closed). The
         // SnapshotName preserves its raw on-disk name, so the join is exact.
-        let snapshots = match crate::plan::read_snapshot_dir(local_dir) {
+        let snapshots = match crate::observation::read_snapshot_dir(local_dir) {
             Ok(s) => s,
             Err(e) => {
                 log::warn!(

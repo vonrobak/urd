@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use crate::arming::RunArming;
 use crate::cli::PlanArgs;
 use crate::commands::storage_signals;
 use crate::commands::world::World;
@@ -36,7 +37,7 @@ pub fn run(config: Config, args: PlanArgs, mode: OutputMode) -> anyhow::Result<(
     // rather than declared policy. Degrades gracefully — an unmounted/unmeasurable
     // pool yields free_ratio None → Roomy → declared behavior.
     let signals = storage_signals::gather(&config, world.db());
-    let arming = storage_signals::RunArming::resolve(&signals, &config, &fs_state);
+    let arming = RunArming::resolve(&signals.pools, &config, &fs_state);
     let backup_plan = plan::plan(&config, now, &filters, &observation, &arming)?;
 
     let mut output = build_plan_output(&backup_plan, &fs_state, &config);

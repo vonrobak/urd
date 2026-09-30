@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::arming::RunArming;
 use crate::awareness::SubvolAssessment;
 use crate::btrfs::{BtrfsOps, RealBtrfs};
 use crate::cli::BackupArgs;
@@ -29,7 +30,8 @@ use crate::output::{
     SubvolumeExtras, SubvolumeSummary, TransitionEvent,
 };
 use crate::notify;
-use crate::plan::{self, FilesystemQuery, HistoryQuery, PlanFilters, RealFileSystemState};
+use crate::observation::{FilesystemQuery, HistoryQuery, RealFileSystemState};
+use crate::plan::{self, PlanFilters};
 use crate::pools::{self, PoolSpace};
 use crate::storage_critical::TightnessTier;
 use crate::preflight;
@@ -88,10 +90,10 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     // a higher free-ratio and falsely de-escalate Critical→Tight — desyncing
     // the effective send interval the planner timed against from the one
     // awareness judges staleness against, surfacing a correctly-adapting
-    // subvolume as false AT RISK. See [`storage_signals::RunArming`] for the
+    // subvolume as false AT RISK. See [`RunArming`] for the
     // full single-resolution-site invariant this artifact carries.
     let signals = storage_signals::gather(&config, world.db());
-    let arming = storage_signals::RunArming::resolve(&signals, &config, &fs_state);
+    let arming = RunArming::resolve(&signals.pools, &config, &fs_state);
 
     let mut backup_plan = plan::plan(&config, now, &filters, &observation, &arming)?;
 

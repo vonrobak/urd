@@ -14,7 +14,7 @@ use crate::awareness::{StorageSignalMap, SubvolAssessment};
 use crate::btrfs::RealBtrfs;
 use crate::commands::storage_signals::{self, StorageSignals};
 use crate::config::Config;
-use crate::plan::{Observation, RealFileSystemState};
+use crate::observation::{Observation, RealFileSystemState};
 use crate::state::StateDb;
 
 /// The long-lived adapters every command prelude assembles: a best-effort

@@ -24,7 +24,7 @@ use crate::drives::{self, DriveAvailability};
 use crate::heartbeat;
 use crate::notify::{self, Notification, NotificationEvent, Urgency};
 use crate::output::{SentinelCircuitState, SentinelPromiseState, SentinelStateFile};
-use crate::plan::{Observation, RealFileSystemState};
+use crate::observation::{Observation, RealFileSystemState};
 use crate::sentinel::{
     self, EjectAction, EjectEvent, EjectPhase, EjectState, EjectTransition, SentinelAction,
     SentinelEvent, SentinelState, TransitionResult,
@@ -303,7 +303,7 @@ impl SentinelRunner {
                         latest_events.insert((*label).clone(), None);
                     }
                     Ok(Some(record)) => {
-                        if let Some(event) = crate::plan::drive_record_to_event(&record) {
+                        if let Some(event) = crate::observation::drive_record_to_event(&record) {
                             latest_events.insert((*label).clone(), Some(event));
                         }
                     }
@@ -921,7 +921,7 @@ impl SentinelRunner {
                 // presence read fails, the subvol simply has no away entry →
                 // Tier-1 no-op → Tier-2 blanket (safe degradation, R3).
                 let fs = RealFileSystemState { state: None };
-                let away = crate::plan::away_shed_map(&self.config, &fs);
+                let away = crate::arming::away_shed_map(&self.config, &fs);
 
                 *ctx = Some(EjectContext {
                     _guard: guard,

@@ -12,7 +12,7 @@ use crate::output::{
     InitCheck, InitDriveStatus, InitIncomplete, InitOutput, InitPinFile, InitSnapshotCount,
     InitStatus, OutputMode,
 };
-use crate::plan::{FilesystemQuery, RealFileSystemState};
+use crate::observation::{FilesystemQuery, RealFileSystemState};
 use crate::state::StateDb;
 
 /// CLI entry for the make-whole verb (arc grill Q5): no config → offer

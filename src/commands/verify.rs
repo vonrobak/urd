@@ -6,7 +6,7 @@ use crate::cli::VerifyArgs;
 use crate::config::Config;
 use crate::drives;
 use crate::output::{OutputMode, VerifyCheck, VerifyDrive, VerifyOutput, VerifySubvolume};
-use crate::plan::{FilesystemQuery, RealFileSystemState};
+use crate::observation::{FilesystemQuery, RealFileSystemState};
 use crate::types::SnapshotName;
 use crate::voice;
 

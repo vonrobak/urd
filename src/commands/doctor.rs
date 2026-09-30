@@ -12,7 +12,7 @@ use crate::output::{
     DoctorRecommendationView, DoctorSentinelStatus, DoctorVerdict, InitStatus, OutputMode,
     SchemaStatus,
 };
-use crate::plan::RealFileSystemState;
+use crate::observation::RealFileSystemState;
 use crate::recommendation::{
     self, AdjustmentReason, HeadroomContext, HeadroomSeverity, ShapeRole,
 };
