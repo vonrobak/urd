@@ -393,6 +393,7 @@ pub fn run(config: Config, output_mode: OutputMode) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::snap;
 
     /// A config with one snapshot root under `root`, one subvolume `alpha`,
     /// one drive `D1`, and a 1 GB `min_free_bytes` — so the interactive crisis
@@ -448,10 +449,6 @@ source = "/data/alpha"
         "20260102-1200-alpha",
         "20260103-1200-alpha",
     ];
-
-    fn snap(name: &str) -> SnapshotName {
-        SnapshotName::parse(name).unwrap()
-    }
 
     fn subvol_inputs(name: &str, snapshots: &[&str], pins: &[&str]) -> EmergencySubvolInputs {
         EmergencySubvolInputs {

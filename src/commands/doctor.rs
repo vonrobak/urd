@@ -1368,16 +1368,11 @@ source = "/data/gamma"
     // ── #125 Retention: orphan-pin advisories ──────────────────────
 
     fn drive(label: &str) -> crate::config::DriveConfig {
-        crate::config::DriveConfig {
-            label: label.to_string(),
-            uuid: None,
-            mount_path: std::path::PathBuf::from(format!("/mnt/{label}")),
-            snapshot_root: ".snapshots".to_string(),
-            role: crate::types::DriveRole::Offsite,
-            max_usage_percent: None,
-            min_free_bytes: None,
-            rotation_interval: None,
-        }
+        crate::testkit::drive_config(
+            label,
+            &format!("/mnt/{label}"),
+            crate::types::DriveRole::Offsite,
+        )
     }
 
     #[test]

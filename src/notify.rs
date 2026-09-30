@@ -1857,32 +1857,10 @@ mod tests {
 #[cfg(test)]
 mod sentinel_path_tests {
     use super::*;
-    use crate::awareness::{LocalAssessment, OperationalHealth, PromiseStatus};
+    use crate::awareness::{OperationalHealth, PromiseStatus};
     use crate::heartbeat;
     use crate::sentinel;
-
-    fn make_assessment(name: &str, status: PromiseStatus) -> SubvolAssessment {
-        SubvolAssessment {
-            name: name.to_string(),
-            short_name: name.to_string(),
-            status,
-            health: OperationalHealth::Healthy,
-            health_reasons: vec![],
-            local: LocalAssessment {
-                status,
-                snapshot_count: 5,
-                newest_age: None,
-            },
-            external: vec![],
-            chain_health: vec![],
-            advisories: vec![],
-            redundancy_advisories: vec![],
-            errors: vec![],
-            storage_posture: None,
-            cadence_adapted: false,
-            effective_send_interval: None,
-        }
-    }
+    use crate::testkit::subvol_assessment as make_assessment;
 
     // ── build_notifications ─────────────────────────────────────────
 
@@ -2098,9 +2076,7 @@ mod sentinel_path_tests {
 
     // ── check_backup_overdue (S2: pure function with tests) ─────────
 
-    fn dt(s: &str) -> NaiveDateTime {
-        NaiveDateTime::parse_from_str(s, crate::types::TIMESTAMP_FORMAT).unwrap()
-    }
+    use crate::testkit::parse_dt as dt;
 
     fn make_heartbeat(timestamp: &str, stale_after: &str) -> heartbeat::Heartbeat {
         heartbeat::Heartbeat {

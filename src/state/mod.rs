@@ -152,9 +152,7 @@ impl StateDb {
 
 #[cfg(test)]
 mod testkit {
-    pub(super) fn drift_dt(s: &str) -> chrono::NaiveDateTime {
-        chrono::NaiveDateTime::parse_from_str(s, crate::types::TIMESTAMP_FORMAT).unwrap()
-    }
+    pub(super) use crate::testkit::parse_dt as drift_dt;
 }
 
 #[cfg(test)]

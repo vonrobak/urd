@@ -36,6 +36,12 @@ pub(crate) fn fixed_now() -> NaiveDateTime {
     dt(2026, 3, 22, 15, 0)
 }
 
+/// Parse a timestamp in its persisted form (`2026-03-22T15:00:00`,
+/// [`crate::types::TIMESTAMP_FORMAT`]), panicking on a malformed one.
+pub(crate) fn parse_dt(s: &str) -> NaiveDateTime {
+    NaiveDateTime::parse_from_str(s, crate::types::TIMESTAMP_FORMAT).unwrap()
+}
+
 /// Parse a snapshot name (`20260322-1400-sv1`), panicking on a malformed one.
 pub(crate) fn snap(s: &str) -> SnapshotName {
     SnapshotName::parse(s).unwrap()

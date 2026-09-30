@@ -276,14 +276,7 @@ pub fn render_churn(estimate: &ChurnEstimate) -> ChurnRender {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::NaiveDate;
-
-    fn dt(y: i32, m: u32, d: u32, h: u32, min: u32) -> NaiveDateTime {
-        NaiveDate::from_ymd_opt(y, m, d)
-            .unwrap()
-            .and_hms_opt(h, min, 0)
-            .unwrap()
-    }
+    use crate::testkit::dt;
 
     fn sample(
         sampled_at: NaiveDateTime,

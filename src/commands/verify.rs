@@ -334,7 +334,8 @@ fn stale_threshold_secs(send_interval: &crate::types::Interval) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Interval, SnapshotName};
+    use crate::testkit::snap;
+    use crate::types::Interval;
 
     #[test]
     fn stale_threshold_minimum_one_day() {
@@ -349,10 +350,6 @@ mod tests {
     }
 
     // ── orphan_checks (pure) ───────────────────────────────────────────
-
-    fn snap(s: &str) -> SnapshotName {
-        SnapshotName::parse(s).unwrap()
-    }
 
     #[test]
     fn orphan_checks_none_when_pin_is_newest() {

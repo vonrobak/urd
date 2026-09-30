@@ -2368,9 +2368,7 @@ mod tests {
 
     // ── Startup mount reconciliation (#411) ─────────────────────────────
 
-    fn ts(s: &str) -> NaiveDateTime {
-        NaiveDateTime::parse_from_str(s, crate::types::TIMESTAMP_FORMAT).unwrap()
-    }
+    use crate::testkit::parse_dt as ts;
 
     fn labels(names: &[&str]) -> BTreeSet<String> {
         names.iter().map(|s| (*s).to_string()).collect()

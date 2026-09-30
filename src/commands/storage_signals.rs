@@ -489,9 +489,7 @@ mod tests {
     use crate::events::EventPayload;
     use crate::storage_critical::{StoragePosture, TightnessTier};
 
-    fn dt(s: &str) -> NaiveDateTime {
-        NaiveDateTime::parse_from_str(s, crate::types::TIMESTAMP_FORMAT).unwrap()
-    }
+    use crate::testkit::parse_dt as dt;
 
     /// Two subvolumes `alpha` + `beta` sharing one pool (source `/data`), plus
     /// `root` on `/`. `root` is enabled, so `/` is entrusted.
