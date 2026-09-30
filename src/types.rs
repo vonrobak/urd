@@ -850,7 +850,6 @@ impl<'de> Deserialize<'de> for MonthlyCount {
                         "monthly value {value} cannot be negative"
                     )));
                 }
-                #[allow(clippy::cast_sign_loss)]
                 self.visit_u64(value as u64)
             }
 
@@ -908,7 +907,6 @@ where
                     "monthly value {value} cannot be negative"
                 )));
             }
-            #[allow(clippy::cast_sign_loss)]
             self.visit_u64(value as u64)
         }
 
@@ -1155,7 +1153,6 @@ impl FromStr for ByteSize {
             "TIB" => 1_099_511_627_776,
             _ => return Err(UrdError::Parse(format!("unknown byte size unit: {unit:?}"))),
         };
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         Ok(Self((num * multiplier as f64) as u64))
     }
 }

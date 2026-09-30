@@ -93,7 +93,6 @@ pub fn classify_free_ratio(free: Option<u64>, capacity: Option<u64>) -> Headroom
     if capacity == 0 {
         return HeadroomSeverity::Healthy;
     }
-    #[allow(clippy::cast_precision_loss)]
     let ratio = free as f64 / capacity as f64;
     classify_free_ratio_value(ratio)
 }
@@ -106,7 +105,6 @@ fn classify_time_to_empty(free: Option<u64>, trend: Option<i64>) -> HeadroomSeve
         // Growing or static pool — no time-to-empty.
         return HeadroomSeverity::Healthy;
     }
-    #[allow(clippy::cast_precision_loss)]
     let days = free as f64 / (-trend) as f64;
     if !days.is_finite() {
         return HeadroomSeverity::Healthy;
@@ -308,15 +306,12 @@ pub fn project_cost(
         None => 0,
         Some(mean) => {
             let span = chain_span_seconds(shape);
-            #[allow(clippy::cast_precision_loss)]
             let bytes_f = mean * span as f64;
             // Saturating cast to u64 (Rust 1.45+ semantics): NaN → 0,
             // negative → 0, overflow → u64::MAX. Defensive against any
             // odd ChurnEstimate input even though drift.rs guarantees a
             // positive finite mean.
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let bytes = bytes_f as u64;
-            bytes
+            bytes_f as u64
         }
     };
 
@@ -407,7 +402,6 @@ fn tighten(
     let slots_in = [shape.hourly, shape.daily, shape.weekly, monthly_count];
     let mut slots_out = [0_u32; 4];
     for idx in 0..4 {
-        #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let scaled = (f64::from(slots_in[idx]) * HEADROOM_TIGHTEN_MULTIPLIER).floor() as u32;
         let clamped = scaled.clamp(p.clamp_min[idx], p.clamp_max[idx]);
         slots_out[idx] = clamped;
@@ -492,7 +486,6 @@ pub fn pick_reason(
         ctx.source_pool_capacity_bytes,
     ) && capacity > 0
     {
-        #[allow(clippy::cast_precision_loss)]
         let ratio = free as f64 / capacity as f64;
         if classify_free_ratio(Some(free), Some(capacity)) != HeadroomSeverity::Healthy {
             return Some(AdjustmentReason::SourcePoolLow { free_ratio: ratio });
@@ -505,7 +498,6 @@ pub fn pick_reason(
         ctx.source_pool_trend_bytes_per_day,
     ) && trend < 0
     {
-        #[allow(clippy::cast_precision_loss)]
         let days = free as f64 / (-trend) as f64;
         if classify_time_to_empty(Some(free), Some(trend)) != HeadroomSeverity::Healthy {
             return Some(AdjustmentReason::SourcePoolShrinking {
@@ -549,7 +541,6 @@ fn recommend_shape_inner(
 
     let mut slots = [0_u32; 4];
     for idx in 0..4 {
-        #[allow(clippy::cast_precision_loss)]
         let budget_w = p.data_budget_bytes as f64 * p.slot_share[idx];
         let total_seconds_target = budget_w / r;
         let outer_edge = total_seconds_target / w_step_seconds[idx];
@@ -562,11 +553,8 @@ fn recommend_shape_inner(
             // contract. Defensive: route to clamp_max.
             p.clamp_max[idx]
         } else {
-            #[allow(clippy::cast_precision_loss)]
             let clamped = outer_edge.clamp(0.0, f64::from(p.clamp_max[idx]));
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let v = clamped as u32;
-            v
+            clamped as u32
         };
         slots[idx] = bounded.max(p.clamp_min[idx]);
     }

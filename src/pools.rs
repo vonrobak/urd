@@ -211,7 +211,6 @@ impl PoolSpace {
         if self.capacity_bytes == 0 {
             return None;
         }
-        #[allow(clippy::cast_precision_loss)]
         let ratio = self.free_bytes as f64 / self.capacity_bytes as f64;
         ratio.is_finite().then_some(ratio)
     }
@@ -274,7 +273,6 @@ pub(crate) fn metadata_utilization_ratio_from(sysfs_root: &Path, uuid: &str) -> 
     if total == 0 {
         return None;
     }
-    #[allow(clippy::cast_precision_loss)]
     let ratio = used as f64 / total as f64;
     Some(ratio)
 }

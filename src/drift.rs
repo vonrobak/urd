@@ -128,7 +128,6 @@ pub fn compute_rolling_churn(
             .map(|s| s.seconds_since_prev_send.unwrap_or(0))
             .sum();
         let mean_bps = if total_seconds > 0 {
-            #[allow(clippy::cast_precision_loss)]
             let mean = total_bytes as f64 / total_seconds as f64;
             Some(mean)
         } else {
@@ -212,7 +211,6 @@ pub fn compute_pool_free_bytes_trend(
     }
 
     // Step 3: linear regression. x in seconds from window_start; y in bytes.
-    #[allow(clippy::cast_precision_loss)]
     let (xs, ys): (Vec<f64>, Vec<f64>) = in_window
         .iter()
         .map(|(s, fb)| {
@@ -223,7 +221,6 @@ pub fn compute_pool_free_bytes_trend(
         })
         .unzip();
 
-    #[allow(clippy::cast_precision_loss)]
     let n = xs.len() as f64;
     let x_mean = xs.iter().sum::<f64>() / n;
     let y_mean = ys.iter().sum::<f64>() / n;
@@ -247,7 +244,6 @@ pub fn compute_pool_free_bytes_trend(
         return None;
     }
 
-    #[allow(clippy::cast_possible_truncation)]
     let truncated = slope_per_day as i64;
     Some(truncated)
 }

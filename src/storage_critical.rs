@@ -333,9 +333,7 @@ pub(crate) fn resolve_armed_tier(
     if let (Some(free), Some(floor)) = (free_bytes, floor_bytes)
         && floor > 0
     {
-        #[allow(clippy::cast_precision_loss)]
         let free_f = free as f64;
-        #[allow(clippy::cast_precision_loss)]
         let floor_f = floor as f64;
         let forces_roomy = match prior_armed {
             // Hold Roomy while above the arm multiple (>= so exactly-at-arm holds).
@@ -648,7 +646,6 @@ pub fn effective_send_interval(
 /// Scale an interval by a factor, rounding to whole seconds. The tuple field is
 /// private to `Interval`, so the scaled duration is built via `from_chrono`.
 fn scale_interval(interval: Interval, factor: f64) -> Interval {
-    #[allow(clippy::cast_possible_truncation)]
     let scaled_secs = (interval.as_secs() as f64 * factor) as i64;
     Interval::from_chrono(chrono::Duration::seconds(scaled_secs))
 }

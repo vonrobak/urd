@@ -123,11 +123,6 @@ pub fn trip_is_same_filesystem(in_flight: Option<&Path>, pool_roots: &HashSet<Pa
 /// two actors.
 #[must_use]
 pub fn source_floor_bytes(min_free: u64, capacity_bytes: u64) -> u64 {
-    #[allow(
-        clippy::cast_precision_loss,
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss
-    )]
     let budget = (capacity_bytes as f64 * CLEANUP_BUDGET_CAPACITY_FRACTION) as u64;
     min_free + budget
 }
@@ -368,7 +363,6 @@ mod tests {
         // min_free 2 GB → 2 GB + 1.5% of 100 GB capacity (the budget is always
         // derived since UPI 068).
         let cap = 100 * GB;
-        #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let expected_budget = (cap as f64 * CLEANUP_BUDGET_CAPACITY_FRACTION) as u64;
         assert_eq!(source_floor_bytes(2 * GB, cap), 2 * GB + expected_budget);
     }
