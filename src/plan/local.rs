@@ -1,5 +1,3 @@
-use std::collections::HashSet;
-
 use crate::events::DeferScope;
 use crate::retention;
 use crate::plan::{DeleteKind, PlannedOperation, SkipReason};
@@ -202,44 +200,24 @@ pub(super) fn plan_local_retention(i: &LocalRetentionInputs) -> PlanFragment {
     //     would keep all ~30 dailies; anchoring on the connected 0613 keeps only
     //     the 3-set while still holding 0514 as a discrete parent). Graduated
     //     anchors on the oldest of its protected set (unchanged).
-    let protected = if subvol.send_enabled {
-        let (discrete, unsent_anchor): (HashSet<SnapshotName>, Option<&SnapshotName>) =
-            if eff.local_retention.is_transient() {
-                let discrete = if eff.protect_away_pins {
-                    pinned.clone()
-                } else {
-                    mounted_pins.clone()
-                };
-                (discrete, mounted_pins.iter().min())
-            } else {
-                (pinned.clone(), pinned.iter().min())
-            };
-        let mut expanded = discrete;
-        match unsent_anchor {
-            Some(oldest) => {
-                for snap in local_snaps {
-                    if snap > oldest {
-                        expanded.insert(snap.clone());
-                    }
-                }
-            }
-            None if eff.local_retention.is_transient() => {
-                // Transient + no mounted pin = no unsent expansion. At
-                // retain-parents the discrete away pins are ALREADY in the
-                // protected set even when no drive is mounted (the held-offsite
-                // fix); the None anchor merely means "no unsent expansion."
-            }
-            None => {
-                // Non-transient: no pins at all — nothing has ever been sent.
-                // Protect all local snapshots until the first send succeeds.
-                for snap in local_snaps {
-                    expanded.insert(snap.clone());
-                }
-            }
+    let protected = if subvol.send_enabled && eff.local_retention.is_transient() {
+        let mut expanded = if eff.protect_away_pins {
+            pinned.clone()
+        } else {
+            mounted_pins.clone()
+        };
+        // Transient + no mounted pin = no unsent expansion. At retain-parents
+        // the discrete away pins are ALREADY in the protected set even when no
+        // drive is mounted (the held-offsite fix); a missing anchor merely
+        // means "no unsent expansion."
+        if let Some(oldest) = mounted_pins.iter().min() {
+            expanded.extend(local_snaps.iter().filter(|s| *s > oldest).cloned());
         }
         expanded
     } else {
-        pinned.clone()
+        // Graduated (or local-only): pins, plus everything unsent — shared
+        // with the retention gate's previous-shape keep test.
+        retention::graduated_protected(local_snaps, pinned, subvol.send_enabled)
     };
 
     match &eff.local_retention {
@@ -290,6 +268,7 @@ pub(super) fn plan_local_retention(i: &LocalRetentionInputs) -> PlanFragment {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::path::PathBuf;
 
     use crate::btrfs::MockBtrfs;

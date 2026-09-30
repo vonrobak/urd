@@ -100,41 +100,46 @@ pub(crate) fn apply_gate(
     crate::retention::apply_retention_gate(backup_plan, gate, &views)
 }
 
-/// Each held subvolume's snapshot listings and tier adaptation — the I/O
-/// half of the retention gate's keep test ([`crate::retention::HeldSubvolumeView`]).
-/// Lists where the planner looks: the local snapshot directory and every
-/// drive the subvolume accepts. A failed listing is left out, so the gate
-/// withholds that location's policy deletes (fail closed).
+/// Each held subvolume's snapshot listings, protected sets and tier
+/// adaptation — the I/O half of the retention gate's keep test
+/// ([`crate::retention::HeldSubvolumeView`]). Reads what the planner reads:
+/// the local snapshot directory and its pins, and every drive the subvolume
+/// accepts. A failed listing is carried as `None`, so the gate withholds that
+/// location's policy deletes (fail closed).
 fn held_subvolume_views(
     config: &Config,
     gate: &crate::retention::RetentionGate,
     fs: &dyn FilesystemQuery,
     arming: &RunArming,
 ) -> HashMap<SubvolName, crate::retention::HeldSubvolumeView> {
-    use crate::retention::{HeldLocation, HeldSubvolumeView};
+    use crate::retention::{HeldLocation, HeldSubvolumeView, graduated_protected};
     let resolved = config.resolved_subvolumes();
+    let drive_labels = config.drive_labels();
     gate.held
         .iter()
         .filter_map(|change| {
             let sv = resolved.iter().find(|sv| sv.name == change.subvolume)?;
-            let mut locations = Vec::new();
-            if let Some(root) = &sv.snapshot_root
-                && let Ok(snapshots) = fs.local_snapshots(root, &sv.name)
-            {
-                locations.push(HeldLocation {
-                    dir: root.join(&sv.name),
-                    drive: None,
-                    snapshots,
-                });
-            }
+            // Without a snapshot root the planner plans nothing for it.
+            let root = sv.snapshot_root.as_ref()?;
+            let local_dir = root.join(&sv.name);
+            let pinned = fs.pinned_snapshots(&local_dir, &drive_labels);
+            let local = fs.local_snapshots(root, &sv.name).ok();
+            let mut locations = vec![HeldLocation {
+                protected: local
+                    .as_deref()
+                    .map(|snaps| graduated_protected(snaps, &pinned, sv.send_enabled))
+                    .unwrap_or_default(),
+                dir: local_dir,
+                drive: None,
+                snapshots: local,
+            }];
             for drive in config.drives.iter().filter(|d| sv.accepts_drive(&d.label)) {
-                if let Ok(snapshots) = fs.external_snapshots(drive, &sv.name) {
-                    locations.push(HeldLocation {
-                        dir: drives::external_snapshot_dir(drive, &sv.name),
-                        drive: Some(drive.label.clone()),
-                        snapshots,
-                    });
-                }
+                locations.push(HeldLocation {
+                    dir: drives::external_snapshot_dir(drive, &sv.name),
+                    drive: Some(drive.label.clone()),
+                    snapshots: fs.external_snapshots(drive, &sv.name).ok(),
+                    protected: pinned.clone(),
+                });
             }
             let tier = arming.armed_tier_map.get(&sv.name).copied().unwrap_or_default();
             let view = HeldSubvolumeView {
@@ -926,6 +931,90 @@ mod tests {
             policy_out.summary.deletions,
             pressure_out.summary.deletions,
         );
+    }
+
+    // ── Retention-change gate, end to end (ADR-110) ─────────────────────
+
+    #[test]
+    fn gate_end_to_end_withholds_only_what_the_previous_shape_keeps() {
+        use crate::observation::Observation;
+        use crate::retention::{RecordedRetention, RetentionShape, decide_retention_gate};
+        use crate::types::{LocalRetentionPolicy, ResolvedGraduatedRetention};
+
+        let config = crate::testkit::ConfigBuilder::new()
+            .subvolumes(&["home"])
+            .subvolume_line("home", "protection_level = \"sheltered\"")
+            .drives(&[("D1", "/mnt/d1", "primary")])
+            .build();
+        let sv = &config.resolved_subvolumes()[0];
+        // The previous shape kept 90 more dailies on both halves: the
+        // current one is a tightening.
+        let looser = |g: ResolvedGraduatedRetention| ResolvedGraduatedRetention {
+            daily: g.daily + 90,
+            ..g
+        };
+        let LocalRetentionPolicy::Graduated(local) = sv.local_retention else {
+            panic!("sheltered derives graduated local retention");
+        };
+        let previous = RecordedRetention::from(RetentionShape {
+            local: LocalRetentionPolicy::Graduated(looser(local)),
+            external: looser(sv.external_retention),
+        });
+        let recorded = HashMap::from([(svname("home"), previous)]);
+
+        // A daily snapshot for every day since December, two beyond every
+        // window, the newest pinned (sent) — on both the source and D1.
+        let mut names: Vec<String> = vec!["20200101-0400-home".into(), "20200102-0400-home".into()];
+        let mut day = chrono::NaiveDate::from_ymd_opt(2025, 12, 1).unwrap();
+        while day < test_now().date() {
+            names.push(format!("{}-0400-home", day.format("%Y%m%d")));
+            day = day.succ_opt().unwrap();
+        }
+        let snaps: Vec<SnapshotName> = names.iter().map(|n| SnapshotName::parse(n).unwrap()).collect();
+        let newest = snaps.iter().max().unwrap().clone();
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots.insert("home".to_string(), snaps.clone());
+        fs.external_snapshots.insert(("D1".to_string(), "home".to_string()), snaps);
+        fs.mounted_drives.insert("D1".to_string());
+        fs.pin_files.insert((PathBuf::from("/snap/home"), "D1".to_string()), newest);
+
+        let btrfs = crate::btrfs::MockBtrfs::new();
+        let obs = Observation { fs: &fs, history: &fs, btrfs: &btrfs };
+        let arming = RunArming::default();
+        let filters = PlanFilters::default();
+        let mut backup_plan = plan::plan(&config, test_now(), &filters, &obs, &arming).unwrap();
+        let deletes = |p: &crate::plan::BackupPlan| -> Vec<String> {
+            p.operations
+                .iter()
+                .filter_map(|op| match op {
+                    PlannedOperation::DeleteSnapshot { path, .. } => Some(path.display().to_string()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let before = deletes(&backup_plan);
+        let old_local = "/snap/home/20200101-0400-home".to_string();
+        let old_external = format!(
+            "{}/20200101-0400-home",
+            drives::external_snapshot_dir(&config.drives[0], &svname("home")).display()
+        );
+        assert!(before.contains(&old_local) && before.contains(&old_external), "{before:?}");
+
+        let gate = decide_retention_gate(
+            &config.resolved_subvolumes(),
+            &recorded,
+            false,
+            crate::retention::RecordScope { filters: &filters },
+        );
+        assert_eq!(gate.held.len(), 1);
+        let holds = apply_gate(&mut backup_plan, &config, &gate, &fs, &arming);
+        let after = deletes(&backup_plan);
+
+        // Deletes both shapes make go through on both halves — the gate found
+        // each location — and the tightening's extra deletes wait.
+        assert!(after.contains(&old_local) && after.contains(&old_external), "{after:?}");
+        assert!(!holds.is_empty() && holds[0].held_deletions > 0);
+        assert_eq!(after.len() + holds[0].held_deletions as usize, before.len());
     }
 
     // ── Retention-change gate preview parity (ADR-100 / ADR-110) ──────

@@ -1260,6 +1260,27 @@ pub struct RetentionHold {
     pub held_deletions: u32,
 }
 
+/// The local snapshots a graduated retention run protects: every pinned
+/// snapshot, plus — for a subvolume that sends — every snapshot newer than
+/// the oldest pin (not yet on every drive), or all of them when there is no
+/// pin (nothing has been sent). The planner's graduated branch and the
+/// retention gate's previous-shape keep test share it.
+#[must_use]
+pub fn graduated_protected(
+    local_snaps: &[SnapshotName],
+    pinned: &HashSet<SnapshotName>,
+    send_enabled: bool,
+) -> HashSet<SnapshotName> {
+    let mut protected = pinned.clone();
+    if send_enabled {
+        match pinned.iter().min() {
+            Some(oldest) => protected.extend(local_snaps.iter().filter(|s| *s > oldest).cloned()),
+            None => protected.extend(local_snaps.iter().cloned()),
+        }
+    }
+    protected
+}
+
 /// One place a held subvolume's snapshots live, listed for the gate's
 /// previous-policy keep test: the local snapshot directory (`drive: None`)
 /// or one drive's snapshot directory.
@@ -1267,7 +1288,14 @@ pub struct RetentionHold {
 pub struct HeldLocation {
     pub dir: PathBuf,
     pub drive: Option<DriveLabel>,
-    pub snapshots: Vec<SnapshotName>,
+    /// The location's snapshots; `None` when listing them failed, and the
+    /// gate then withholds the location's policy deletes (fail closed).
+    pub snapshots: Option<Vec<SnapshotName>>,
+    /// What the previous shape's retention run would protect here: for the
+    /// local directory, the graduated protected set ([`graduated_protected`]
+    /// — pins and everything not yet sent), because a transient current shape
+    /// protects less; for a drive, the pins the planner protects there.
+    pub protected: HashSet<SnapshotName>,
 }
 
 /// What [`apply_retention_gate`] needs to know about one held subvolume
@@ -1276,14 +1304,14 @@ pub struct HeldLocation {
 /// observation and arming the planner read.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HeldSubvolumeView {
-    /// Every location whose listing succeeded. A delete whose directory is
-    /// not listed here is withheld (fail closed: no listing, no keep test).
+    /// Every location the planner could delete in. A delete whose directory
+    /// is not here, or whose listing failed, is withheld (fail closed).
     pub locations: Vec<HeldLocation>,
     /// The source pool is armed Tight or Critical and the subvolume sends,
     /// so its local retention is transient whatever the declared shape
-    /// (`storage_critical::derive_effective_policy`). The previous shape
-    /// would have been transient too, so the tier's local deletions are not
-    /// the tightening's and are never held.
+    /// (`storage_critical::derive_effective_policy`). Those deletions answer
+    /// the pool's state, not the tightening, so they are never held — the
+    /// host wins (ADR-113), as for space-pressure deletes.
     pub local_tier_adapted: bool,
 }
 
@@ -1315,6 +1343,9 @@ fn withholds(
     let Some(location) = view.locations.iter().find(|l| l.dir == dir) else {
         return true;
     };
+    let Some(snapshots) = &location.snapshots else {
+        return true;
+    };
     let previous = match &location.drive {
         None if !change.local_tightened() || view.local_tier_adapted => return false,
         None => change.previous.local.as_ref().map(local_tiers),
@@ -1327,7 +1358,7 @@ fn withholds(
         return true;
     };
     let keep = kept_by_previous.entry(location.dir.clone()).or_insert_with(|| {
-        graduated_retention(&location.snapshots, now, &previous, &HashSet::new(), false)
+        graduated_retention(snapshots, now, &previous, &location.protected, false)
             .keep
             .into_iter()
             .collect()
@@ -2992,10 +3023,11 @@ mod tests {
                 locations: vec![HeldLocation {
                     dir: std::path::PathBuf::from("/snap/home"),
                     drive: None,
-                    snapshots: vec![
+                    snapshots: Some(vec![
                         snap("20260301-1200-home"),
                         snap("20260302-1200-home"),
-                    ],
+                    ]),
+                    protected: HashSet::new(),
                 }],
                 local_tier_adapted: false,
             },
@@ -3322,12 +3354,14 @@ mod tests {
                     HeldLocation {
                         dir: std::path::PathBuf::from("/snap/home"),
                         drive: None,
-                        snapshots: snaps.clone(),
+                        snapshots: Some(snaps.clone()),
+                        protected: HashSet::new(),
                     },
                     HeldLocation {
                         dir: std::path::PathBuf::from(EXT_DIR),
                         drive: Some(dlabel("D1")),
-                        snapshots: snaps,
+                        snapshots: Some(snaps),
+                        protected: HashSet::new(),
                     },
                 ],
                 local_tier_adapted,
@@ -3461,9 +3495,9 @@ mod tests {
         let holds = apply_retention_gate(&mut plan, &held_gate(tighter_shape()), &HashMap::new());
         assert!(deleted_paths(&plan).is_empty());
         assert_eq!(holds[0].held_deletions, 1);
-        // A view whose listing of this directory failed (left out).
+        // A view whose listing of this directory failed.
         let mut views = view_both(&names, false);
-        views.get_mut("home").unwrap().locations.retain(|l| l.drive.is_some());
+        views.get_mut("home").unwrap().locations[0].snapshots = None;
         let mut plan = plan_of(ops(), vec![]);
         apply_retention_gate(&mut plan, &held_gate(tighter_shape()), &views);
         assert!(deleted_paths(&plan).is_empty());
@@ -3525,5 +3559,76 @@ mod tests {
                 "{path}: deleted iff the previous shape would delete it too",
             );
         }
+    }
+
+    #[test]
+    fn gate_keeps_what_the_previous_shape_protected_as_unsent() {
+        // The local half moves from graduated to transient while the only
+        // drive is away. The planner's transient branch protects the away pin
+        // A but expands the unsent set only from a *mounted* pin, so it plans
+        // to delete everything newer than A. The previous graduated shape
+        // protected all of it as unsent: the gate must withhold every one,
+        // not just the snapshots its tiers would keep.
+        let away_pin = "20260310-1200-home";
+        // Two a day: the previous tiers keep one per day, so only its unsent
+        // protection keeps the other.
+        let recent: Vec<String> = (11..=20)
+            .flat_map(|d| [format!("202603{d:02}-0000-home"), format!("202603{d:02}-1200-home")])
+            .collect();
+        let mut names = vec!["20200101-1200-home", away_pin];
+        names.extend(recent.iter().map(String::as_str));
+        let snaps: Vec<SnapshotName> = names.iter().map(|n| snap(n)).collect();
+        let pinned = HashSet::from([snap(away_pin)]);
+
+        let current = RetentionShape {
+            local: LocalRetentionPolicy::Transient,
+            ..base_shape()
+        };
+        let mut view = view_both(&names, false);
+        view.get_mut("home").unwrap().locations[0].protected =
+            graduated_protected(&snaps, &pinned, true);
+        let mut plan = plan_of(
+            names
+                .iter()
+                .filter(|n| **n != away_pin)
+                .map(|n| delete_in("/snap/home", n, DeleteKind::Policy))
+                .collect(),
+            vec![],
+        );
+        let holds = apply_retention_gate(&mut plan, &held_gate(current), &view);
+        // Only the snapshot older than the pin, which the previous shape
+        // would also delete, goes.
+        assert_eq!(deleted_paths(&plan), vec!["/snap/home/20200101-1200-home"]);
+        assert_eq!(holds[0].held_deletions, 20);
+    }
+
+    #[test]
+    fn graduated_protected_table() {
+        let snaps = vec![
+            snap("20260301-1200-home"),
+            snap("20260302-1200-home"),
+            snap("20260303-1200-home"),
+        ];
+        let pin = HashSet::from([snap("20260302-1200-home")]);
+        let names = |set: HashSet<SnapshotName>| {
+            let mut v: Vec<String> = set.into_iter().map(|s| s.to_string()).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(
+            names(graduated_protected(&snaps, &pin, true)),
+            vec!["20260302-1200-home", "20260303-1200-home"],
+            "the pin and everything newer (unsent)",
+        );
+        assert_eq!(
+            names(graduated_protected(&snaps, &HashSet::new(), true)).len(),
+            3,
+            "nothing sent yet"
+        );
+        assert_eq!(
+            names(graduated_protected(&snaps, &pin, false)),
+            vec!["20260302-1200-home"],
+            "local-only: pins"
+        );
     }
 }
