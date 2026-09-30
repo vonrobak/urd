@@ -6,7 +6,7 @@ project: ['[[urd]]']
 sensitivity: public
 status: active
 created: '2026-03-24'
-timestamp: '2026-07-11T09:19:17+02:00'
+timestamp: '2026-09-30T12:00:00+02:00'
 ---
 # ADR-106: Defense-in-Depth for Data Integrity
 
@@ -16,7 +16,7 @@ timestamp: '2026-07-11T09:19:17+02:00'
 > guard). Each layer is independently testable and independently sufficient.
 
 **Date:** 2026-03-22 (identified in Phase 1 hardening; formalized 2026-03-24)
-**Status:** Accepted
+**Status:** Accepted (amended 2026-09-30 — see [Amendment 2026-09-30](#amendment-2026-09-30-the-shared-layer-3-and-the-sanctioned-pin-sheds))
 **Supersedes:** None (crystallized across Phase 1–5 adversary reviews)
 
 ## Context
@@ -99,3 +99,49 @@ Silent data loss requires all three layers to fail simultaneously on the same sn
   unsent snapshot protection introduced
 - Phase 3.5 adversary review (`docs/99-reports/2026-03-22-arch-adversary-phase35.md`) —
   "three layers of protection" articulated
+
+## Amendment 2026-09-30: the shared Layer 3, and the sanctioned pin sheds
+
+The three layers are unchanged for retention. This ADR says "a snapshot that is any
+drive's current pin parent is never proposed for deletion" and does not mention the
+paths that remove a pin on purpose. Those paths were added under other ADRs. This
+amendment names them, and names the one implementation of Layer 3 they share.
+
+### Layer 3 is one function
+
+`chain::is_pinned_at_delete_time` (`src/chain.rs`) is the only pin re-check, and only the
+executor calls it:
+
+- planned `DeleteSnapshot` operations (`executor/ops.rs`);
+- the lifecycle deletions of the tier-graded footprint cap (`executor/lifecycle.rs`),
+  read after any pin removal the lifecycle made;
+- `Executor::delete_candidates` (`executor/reclaim.rs`), the single deletion loop behind
+  `urd emergency` and the backup's emergency pre-flight. Both of those surfaces choose
+  candidates from a pin read made at planning time, and the loop re-checks each one
+  immediately before its delete.
+
+It fails closed. An unparseable snapshot name, an unresolvable local directory, or any
+configured drive's pin file that exists but cannot be read keeps the snapshot. An absent
+pin file is not a failure; it means that drive pins nothing. This satisfies the
+Constraint that new deletion paths implement Layer 3: `urd emergency` is such a path, and
+it gets Layer 3 by deleting through the executor.
+
+### Where a pinned snapshot may still be deleted
+
+Three paths remove a pin *first* and then delete the snapshot that is no longer pinned.
+None of them bypasses Layer 3. Each changes what is pinned, under a rule stated in the ADR
+that authorizes it, and then deletes only what the fail-closed re-read shows is
+unpinned:
+
+| Path | Authorized by | What it sheds |
+|---|---|---|
+| Tier-graded clear-all at Critical, and the in-run away-pin shed (`executor/lifecycle.rs`) | ADR-113 Layer 1; ADR-116 Consequence 1 | Away-only pins first; at Critical, the run's own pins after the send |
+| `Executor::emergency_reclaim_pool` after a watchdog abort or an idle eject (`executor/reclaim.rs`) | ADR-113 Layers 2 and 3 (the "ADR-106-scoped exception" in its Implementation section); ADR-116 | Tier 1 away-only pins, then Tier 2 every pin, until the pool is above the floor |
+
+The rule that ties them together: **a pin is shed only to keep the host alive, and never
+from a subvolume that has no pin at all.** A subvolume with no confirmed offsite copy
+keeps every local snapshot, even at the catastrophic floor. Shedding a pin costs a full
+send next time. It never costs the only copy.
+
+Read the Decision's "never proposed for deletion" as applying to retention, which is what
+this ADR set out to protect, and not to these host-survival paths.

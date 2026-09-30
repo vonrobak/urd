@@ -6,7 +6,7 @@ project: ['[[urd]]']
 sensitivity: public
 status: active
 created: '2026-03-24'
-timestamp: '2026-07-11T09:19:17+02:00'
+timestamp: '2026-09-30T12:00:00+02:00'
 ---
 # ADR-109: Config-Boundary Validation
 
@@ -16,7 +16,7 @@ timestamp: '2026-07-11T09:19:17+02:00'
 > the codebase.
 
 **Date:** 2026-03-22 (added during Phase 1 hardening; formalized 2026-03-24)
-**Status:** Accepted
+**Status:** Accepted (amended 2026-09-30 — see [Amendment 2026-09-30](#amendment-2026-09-30-the-validation-points-beyond-configvalidate))
 **Supersedes:** None (crystallized across Phase 1 hardening and Phase 3.5 reviews)
 
 ## Context
@@ -117,3 +117,39 @@ are separate from config validation because they come from a different trust bou
   path validation introduced
 - Phase 3.5 adversary review (`docs/99-reports/2026-03-22-arch-adversary-phase35.md`) —
   "Every path that reaches `sudo btrfs` has been validated"
+
+## Amendment 2026-09-30: the validation points beyond `Config::validate`
+
+The rule stands: user-provided values are validated once, at a boundary, and trusted
+afterward. The claim under Positive that "the sudo attack surface is auditable in one
+function (`Config::validate()`)" is false. There are four boundaries. Each validates for
+the medium the value is about to enter, and a value can pass one and be refused by the
+next.
+
+| Boundary | Where | Validates for | On a bad value |
+|---|---|---|---|
+| Config load | `Config::validate` (`src/config/validate.rs`), called from `Config::load` after `parse_versioned` | Filesystem paths and path components: the checks in the table above, plus `"` and newline refused in names (`validate_name_safe`) | Refuses the config; Urd does not start |
+| Sudoers render | `sudoers::render_sudoers` / `expected_grant_lines` (`src/sudoers.rs`) | A sudoers line: control characters, `#`, and non-UTF-8 refused in every value; a snapshot scope with fewer than two path components refused (`scope_deep_enough`); the username checked against sudoers' User_List syntax and the reserved word `ALL` | Renders nothing (`SudoersRefusal`); the seal installs nothing |
+| Unit render | `systemd_units::checked_exe` (`src/systemd_units.rs`) | A systemd `ExecStart=` line: the resolved binary path must be UTF-8, absolute, and free of whitespace and control characters | Renders nothing (`UnitsRefusal`); the seal's units stage reports it |
+| CLI arguments | `cli_validation::require_known_subvolume` (`src/cli_validation.rs`); `urd get`'s own traversal check (`commands/get.rs`) | A `--subvolume NAME` must name a configured subvolume; a `urd get` path must not traverse out of its snapshot | Refuses the command with the configured names and a nearest-match suggestion |
+
+The sudoers and unit boundaries **refuse rather than escape** (ADR-120). A config value
+that is a perfectly good path can still change the meaning of a sudoers line. An escaped
+newline there is a line continuation, so no escaping discipline makes such a value safe.
+Refusal is total: one bad value means nothing is rendered, and the message names the
+value. Those two boundaries sit in pure modules so that the check and the artifact
+cannot disagree. The same render is what the seal installs and what `urd doctor` diffs
+against.
+
+`cli_validation.rs` exists because the planner trusts `filters.subvolume` to name a real
+subvolume. An unknown name used to match the empty set and report "Nothing to do." That
+trust is established at the CLI boundary, before the planner runs, as this ADR's rule
+requires.
+
+The corrected Positive consequence: **every value that reaches a privileged command or a
+privileged file is checked at exactly one boundary for that medium, in a pure function
+that renders nothing on refusal.** Auditing the sudo surface means reading
+`Config::validate` for the paths `btrfs.rs` receives, and `sudoers.rs` for the grant
+that authorizes them. The Constraint "new config fields that become path components or
+command arguments must be added to `Config::validate()`" still holds. A field that also
+reaches the sudoers grant or a unit file must also pass that module's checks.

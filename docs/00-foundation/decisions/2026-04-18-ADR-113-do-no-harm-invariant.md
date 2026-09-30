@@ -6,7 +6,7 @@ project: ['[[urd]]']
 sensitivity: public
 status: active
 created: '2026-04-21'
-timestamp: '2026-06-26T12:00:41+02:00'
+timestamp: '2026-09-30T12:00:00+02:00'
 ---
 # ADR-113: The Do-No-Harm Invariant
 
@@ -20,7 +20,7 @@ timestamp: '2026-06-26T12:00:41+02:00'
 > it prefers host survival over backup-chain continuity.
 
 **Date:** 2026-04-18
-**Status:** Accepted (amended 2026-05-30, UPI 031-b; 2026-06-14, UPI 064-a; 2026-06-17, UPI 065-b; 2026-06-24, UPI 066; 2026-06-26, UPI 067)
+**Status:** Accepted (amended 2026-05-30, UPI 031-b; 2026-06-14, UPI 064-a; 2026-06-17, UPI 065-b; 2026-06-24, UPI 066; 2026-06-26, UPI 067; 2026-09-30, consolidating — see [Amendment 2026-09-30](#amendment-2026-09-30-the-defense-stack-as-it-stands))
 **Supersedes:** UPI 011 (hard-cap of 1 local snapshot for transient subvolumes)
 
 > **Amendment — 2026-05-30 (UPI 031-b, the tier-graded ephemeral spine).**
@@ -426,3 +426,71 @@ Arc sequence beyond this UPI: **031-b → 033 → 034**.
 
 Each increment is independently testable and independently deployable. `/design` is
 run per UPI. Adversary review and post-review apply to each.
+
+## Amendment 2026-09-30: the defense stack as it stands
+
+The invariant, the probabilistic contract, and "defer, never refuse" are unchanged. Five
+amendment blocks at the head of this ADR each changed part of the stack, and the
+Decision's table and the Implementation list were written before most of them. This
+amendment states the whole stack once, as the code has it, and corrects the names that
+have gone stale. Where it disagrees with an earlier block, it is the later statement.
+
+### The defenses
+
+Four mechanisms stand between an Urd operation and a full source pool. The code and the
+events cite three of them as numbered layers, and the numbering is kept.
+
+| Defense | What it does | Pure decision | Where it acts |
+|---|---|---|---|
+| **Layer 1 — tier-graded footprint cap** | Per-pool armed `TightnessTier` (Roomy / Tight / Critical) with hysteresis and the absolute-headroom downgrade gate; Tight → retain-one and a stretched interval, Critical → clear-all and a weekly interval floor, the promise capped at AT RISK | `storage_critical::resolve_armed_tier`; fanned out by `RunArming::resolve` (`src/arming.rs`) | The planner, through `derive_effective_policy`; the executor's gated clear-all (`executor/lifecycle.rs`) |
+| **The reactive floor** (unnumbered) | The planner's send-floor guard defers every send from a source pool below `source_floor_bytes` (`SkipReason::SourceBelowFloor`); the backup's emergency pre-flight deletes unpinned snapshots on a root below half `min_free_bytes` (`guard::emergency_automatic_threshold`) before planning again | `plan::send_floor_defer_reason`; the `min_free_bytes` ladder in `src/guard.rs` | `plan/`; `commands/backup/preflight.rs` through `Executor::delete_candidates` |
+| **Layer 2 — mid-op watchdog** | Polls source-pool free every 250 ms during a send; below the floor, aborts a send on the same filesystem or reclaims a different one concurrently | `guard::evaluate`, `guard::watchdog_step` (a pool that started below the floor degrades to bare `min_free`), `guard::trip_is_same_filesystem` | The watchdog thread (`commands/backup/watchdog.rs`), the executor's per-send gate, and `Executor::emergency_reclaim_pool` |
+| **Layer 3 — idle emergency eject** | The sentinel samples armed pools outside any send; below the floor, it takes the run lock and reclaims | `guard::evaluate_idle_eject`; the eject protocol `sentinel::eject_transition` | `sentinel_runner/eject.rs` through `Executor::emergency_reclaim_pool` |
+
+All three floor-based deciders share one number, `guard::source_floor_bytes(min_free,
+capacity)`: `min_free` plus a working room of 1.5 % of pool capacity
+(`CLEANUP_BUDGET_CAPACITY_FRACTION`). The pre-flight rung is deliberately lower. It
+deletes with no human present, so it waits until the root is unambiguously in trouble.
+
+### Names that have moved or gone
+
+- **`cleanup_budget` is not a config field.** Implementation item 5 says UPI 033
+  "introduces the `cleanup_budget` config field (`floor = min_free + cleanup_budget`,
+  default 1.5 % of capacity)". The field was retired (ADR-111's 2026-07-02 amendment).
+  The budget is always the derived 1.5 %, resolved in `guard.rs` because it needs the pool
+  capacity. The 2026-06-14 block's `min_free + cleanup_budget` should be read the same way.
+- **The reserve file is gone.** `.urd-emergency-reserve` and its fast bridge were deleted
+  with the cliff (the 2026-06-26 block). The only code that still names the file is the
+  sweep that removes leftovers, recorded as an exception in ADR-105's amendment of this
+  date.
+- **`classify_free_ratio_value`** and the `FREE_RATIO_*` constants are defined in
+  `storage_critical.rs`, not `recommendation.rs` (ADR-115's amendment of this date).
+- **The watchdog's wiring** is `commands/backup/watchdog.rs`, not `commands/backup.rs`:
+  the thread loop, `arm_watchdog_pools`, and the trip handler, all taking one
+  `WatchdogCtx` (the cancel flag, the coordination cell, the shutdown flag, the firing
+  list, and an owned `Config`). The coordination cell itself, `WatchdogCoord` (the
+  in-flight root and the tripped-pool set), is `src/executor/coord.rs`, because the
+  executor reads it before every send. The teardown's same-filesystem vs
+  cross-filesystem reclaim decision is `run_tail::decide_reclaim` (ADR-121).
+- **Awareness** is the directory `src/awareness/`, not `awareness.rs` (Implementation
+  item 1).
+
+### A poisoned coordination lock fails closed
+
+`WatchdogCoord` sits behind a `Mutex` that the watchdog thread and the executor both take.
+A panic on either thread while holding it poisons the lock. Every site now recovers the
+poisoned guard (`PoisonError::into_inner`) and reads the trip set as it stands. None of
+them reads a poisoned lock as "not tripped". The cell is a plain set and an option, and an
+`insert` either completed or did not, so the recovered value is consistent. Treating the
+poison as "no information" would have let the executor keep sending to a pool the
+watchdog had tripped. That would be Layer 2 failing open, which this ADR does not
+permit.
+
+### The one destructive fail-open
+
+`emergency_reclaim_pool` re-measures free space before shedding and treats an unreadable
+level as *not* at or above the floor, so it proceeds. That is the "Probe-unavailable biases to
+proceed" of the 2026-06-24 block. It is the one place where a deletion proceeds on missing
+information, and it is recorded as the sanctioned exception to "deletion operations fail
+closed" in ADR-107's amendment of this date. Which snapshots it may delete is still decided
+fail-closed: strict pin reads, and never the only copy.
