@@ -553,6 +553,14 @@ impl UnstampedEvent {
         self.event.subvolume.as_deref()
     }
 
+    /// Read-only access to the semantic-origin drive label, for the same
+    /// emit-side matching as [`subvolume`](Self::subvolume): a local prune
+    /// row has none, an external one names its drive.
+    #[must_use]
+    pub fn drive_label(&self) -> Option<&str> {
+        self.event.drive_label.as_deref()
+    }
+
     /// Set the semantic-origin subvolume if not already set. `None` is a
     /// no-op; an already-set value is never clobbered (preserves the
     /// planner's `stamp_context` fill-if-unset guard).

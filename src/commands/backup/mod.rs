@@ -109,10 +109,11 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
 
     // ── Retention-change gate (ADR-110 transition safety) ──
     // A promise-level subvolume whose retention tightened since its deletions
-    // were last applied keeps its snapshots until the operator confirms once
-    // with --confirm-retention-change. Backups proceed regardless (ADR-107
-    // fail-open); only the destructive half — that subvolume's retention
-    // deletions — is held. Decided once here from the recorded shapes (pure,
+    // were last applied is pruned under the more generous of its old and new
+    // retention until the operator confirms once with
+    // --confirm-retention-change: only the extra deletions the tightening
+    // causes wait. Backups, space-pressure deletes and tier-adapted local
+    // deletes proceed regardless (`retention::apply_retention_gate`). Decided once here from the recorded shapes (pure,
     // `retention::decide_retention_gate`); `urd plan` applies the same
     // decision read-only. At run end (`record_retention_shapes`, never on a
     // dry run) each subvolume that is NOT held and was inside this run's
@@ -127,8 +128,13 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
         args.confirm_retention_change,
         crate::retention::RecordScope { filters: &filters },
     );
-    let mut retention_holds =
-        crate::retention::apply_retention_gate(&mut backup_plan, &retention_gate);
+    let mut retention_holds = crate::commands::plan_cmd::apply_gate(
+        &mut backup_plan,
+        &config,
+        &retention_gate,
+        &fs_state,
+        &arming,
+    );
 
     // Run pre-flight config consistency checks
     let preflight_warnings = crate::preflight::preflight_checks(&config);
@@ -173,9 +179,15 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     // mid-run, even though emergency just freed space).
     if emergency.any_deleted {
         backup_plan = plan::plan(&config, now, &filters, &observation, &arming)?;
-        // Same gate decision, re-applied to the fresh plan.
-        retention_holds =
-            crate::retention::apply_retention_gate(&mut backup_plan, &retention_gate);
+        // Same gate decision, re-applied to the fresh plan over fresh
+        // listings (the emergency pass just deleted snapshots).
+        retention_holds = crate::commands::plan_cmd::apply_gate(
+            &mut backup_plan,
+            &config,
+            &retention_gate,
+            &fs_state,
+            &arming,
+        );
     }
     // Info, not warn: the summary's WARNING line already tells a TTY user.
     for hold in &retention_holds {

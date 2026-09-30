@@ -6,6 +6,7 @@ use crate::commands::storage_signals;
 use crate::commands::world::World;
 use crate::config::{Config, DriveConfig, ResolvedSubvolume};
 use crate::drives;
+use crate::observation::FilesystemQuery;
 use crate::output::{
     OutputMode, PlanOperationEntry, PlanOutput, PlanSummaryOutput, SkipCategory,
     SkippedSubvolume,
@@ -14,7 +15,7 @@ use crate::plan::{
     self, HistoryQuery, NothingNew, PlanFilters, PlannedOperation, PlannedSkip, SkipReason,
 };
 use crate::state::StateDb;
-use crate::types::{DISPLAY_MINUTE_FORMAT, SubvolName};
+use crate::types::{DISPLAY_MINUTE_FORMAT, SubvolName, TightnessTier};
 use crate::voice;
 
 pub fn run(config: Config, args: PlanArgs, mode: OutputMode) -> anyhow::Result<()> {
@@ -44,7 +45,15 @@ pub fn run(config: Config, args: PlanArgs, mode: OutputMode) -> anyhow::Result<(
     // `urd plan` has no confirmation flag: it previews what `urd backup`
     // without --confirm-retention-change would do.
     let recorded = retention_baseline_or_warn(world.db()).shapes;
-    let holds = gate_preview(&mut backup_plan, &config, &recorded, &filters, false);
+    let holds = gate_preview(
+        &mut backup_plan,
+        &config,
+        &recorded,
+        &filters,
+        false,
+        &fs_state,
+        &arming,
+    );
 
     let mut output = build_plan_output(&backup_plan, &fs_state, &config);
     populate_token_warnings(&mut output, world.db(), &config);
@@ -63,6 +72,8 @@ pub(crate) fn gate_preview(
     recorded: &HashMap<SubvolName, crate::retention::RecordedRetention>,
     filters: &PlanFilters,
     confirmed: bool,
+    fs: &dyn FilesystemQuery,
+    arming: &RunArming,
 ) -> Vec<crate::retention::RetentionHold> {
     let gate = crate::retention::decide_retention_gate(
         &config.resolved_subvolumes(),
@@ -70,7 +81,69 @@ pub(crate) fn gate_preview(
         confirmed,
         crate::retention::RecordScope { filters },
     );
-    crate::retention::apply_retention_gate(backup_plan, &gate)
+    apply_gate(backup_plan, config, &gate, fs, arming)
+}
+
+/// Apply a decided retention gate to `backup_plan`: list each held
+/// subvolume's snapshots ([`held_subvolume_views`]) and withhold only the
+/// deletions its previous shape would keep. Shared by `urd plan`,
+/// `backup --dry-run` and `urd backup` (and its emergency re-plan) so all
+/// withhold the same set.
+pub(crate) fn apply_gate(
+    backup_plan: &mut crate::plan::BackupPlan,
+    config: &Config,
+    gate: &crate::retention::RetentionGate,
+    fs: &dyn FilesystemQuery,
+    arming: &RunArming,
+) -> Vec<crate::retention::RetentionHold> {
+    let views = held_subvolume_views(config, gate, fs, arming);
+    crate::retention::apply_retention_gate(backup_plan, gate, &views)
+}
+
+/// Each held subvolume's snapshot listings and tier adaptation — the I/O
+/// half of the retention gate's keep test ([`crate::retention::HeldSubvolumeView`]).
+/// Lists where the planner looks: the local snapshot directory and every
+/// drive the subvolume accepts. A failed listing is left out, so the gate
+/// withholds that location's policy deletes (fail closed).
+fn held_subvolume_views(
+    config: &Config,
+    gate: &crate::retention::RetentionGate,
+    fs: &dyn FilesystemQuery,
+    arming: &RunArming,
+) -> HashMap<SubvolName, crate::retention::HeldSubvolumeView> {
+    use crate::retention::{HeldLocation, HeldSubvolumeView};
+    let resolved = config.resolved_subvolumes();
+    gate.held
+        .iter()
+        .filter_map(|change| {
+            let sv = resolved.iter().find(|sv| sv.name == change.subvolume)?;
+            let mut locations = Vec::new();
+            if let Some(root) = &sv.snapshot_root
+                && let Ok(snapshots) = fs.local_snapshots(root, &sv.name)
+            {
+                locations.push(HeldLocation {
+                    dir: root.join(&sv.name),
+                    drive: None,
+                    snapshots,
+                });
+            }
+            for drive in config.drives.iter().filter(|d| sv.accepts_drive(&d.label)) {
+                if let Ok(snapshots) = fs.external_snapshots(drive, &sv.name) {
+                    locations.push(HeldLocation {
+                        dir: drives::external_snapshot_dir(drive, &sv.name),
+                        drive: Some(drive.label.clone()),
+                        snapshots,
+                    });
+                }
+            }
+            let tier = arming.armed_tier_map.get(&sv.name).copied().unwrap_or_default();
+            let view = HeldSubvolumeView {
+                locations,
+                local_tier_adapted: sv.send_enabled && tier != TightnessTier::Roomy,
+            };
+            Some((sv.name.clone(), view))
+        })
+        .collect()
 }
 
 /// The retention shapes last applied per subvolume (ADR-110), read from the
@@ -859,7 +932,7 @@ mod tests {
 
     #[test]
     fn plan_preview_withholds_what_backup_withholds() {
-        use crate::retention::{RetentionShape, apply_retention_gate, decide_retention_gate};
+        use crate::retention::{RetentionShape, decide_retention_gate};
         // htpc-home moves to a named level; its previous (recorded) retention
         // kept far more. htpc-docs stays on explicit retention.
         let mut config = test_config();
@@ -901,15 +974,23 @@ mod tests {
             skipped: vec![],
             events: Vec::new(),
         };
-        let fs = MockFileSystemState::new();
+        // The recorded roomy shape would keep htpc-home's snapshot, so an
+        // unconfirmed run withholds its deletion.
+        let mut fs = MockFileSystemState::new();
+        fs.local_snapshots.insert(
+            "htpc-home".to_string(),
+            vec![SnapshotName::parse("20260301-0404-htpc-home").unwrap()],
+        );
         let filters = PlanFilters::default();
+        let arming = RunArming::default();
 
         for confirmed in [false, true] {
             // The preview path (`urd plan` passes false; `backup --dry-run`
             // passes its flag) …
             let mut preview = make_plan();
             let recorded = retention_baseline_or_warn(Some(&db)).shapes;
-            let holds = gate_preview(&mut preview, &config, &recorded, &filters, confirmed);
+            let holds =
+                gate_preview(&mut preview, &config, &recorded, &filters, confirmed, &fs, &arming);
             let mut output = build_plan_output(&preview, &fs, &config);
             output.warnings.extend(retention_hold_warnings(&holds));
             // … and backup's own decision over the same recorded shapes.
@@ -920,7 +1001,7 @@ mod tests {
                 confirmed,
                 crate::retention::RecordScope { filters: &filters },
             );
-            apply_retention_gate(&mut executed, &gate);
+            apply_gate(&mut executed, &config, &gate, &fs, &arming);
 
             let ops = |p: &BackupPlan| p.operations.iter().map(ToString::to_string).collect::<Vec<_>>();
             assert_eq!(ops(&preview), ops(&executed), "confirmed={confirmed}");

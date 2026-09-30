@@ -162,8 +162,8 @@ pub fn retention_hold_warning(change: &RetentionChangePending, held_deletions: u
 #[must_use]
 pub fn retention_change_pending_line(change: &RetentionChangePending) -> String {
     format!(
-        "{}: {} retention tightened since it was last applied — backups continue, \
-         but its deletions wait for `urd backup --confirm-retention-change` (run once).",
+        "{}: {} retention tightened since it was last applied — backups continue under \
+         the old retention until `urd backup --confirm-retention-change` (run once).",
         change.subvolume,
         tightened_halves(change),
     )
