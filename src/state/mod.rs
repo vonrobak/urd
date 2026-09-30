@@ -12,6 +12,7 @@ mod drift;
 mod drives;
 mod events;
 mod posture;
+mod retention;
 mod runs;
 mod schema;
 

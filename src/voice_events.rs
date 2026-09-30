@@ -111,6 +111,12 @@ fn summary_for(payload: &EventPayload) -> String {
                 format!("stayed her hand on {count} snapshots, {oldest} … {newest}  ({phrase})")
             }
         }
+        EventPayload::RetentionChangeHeld { held_deletions, .. } => {
+            format!(
+                "held {held_deletions} deletion(s)  (retention tightened; \
+                 awaiting --confirm-retention-change)"
+            )
+        }
         EventPayload::PlannerSendChoice {
             send_kind: _,
             reason,

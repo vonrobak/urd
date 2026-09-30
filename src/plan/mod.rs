@@ -136,6 +136,17 @@ pub struct PlanFilters {
     pub force_snapshot: bool,
 }
 
+impl PlanFilters {
+    /// Does the `--priority` / `--subvolume` scoping admit `sv`? The planner
+    /// skips a subvolume these filters exclude, and the retention-change gate
+    /// (ADR-110) records no shape for it — one predicate, so the two agree.
+    #[must_use]
+    pub fn admits(&self, sv: &crate::config::ResolvedSubvolume) -> bool {
+        self.priority.is_none_or(|p| sv.priority == p)
+            && self.subvolume.as_ref().is_none_or(|s| s == &sv.name)
+    }
+}
+
 // ── Helpers ────────────────────────────────────────────────────────────
 
 /// The outcome of gating a drive for sends: ready to receive, or the defer
@@ -260,21 +271,16 @@ pub fn plan(
             continue;
         }
 
-        // Filter: priority
-        if let Some(p) = filters.priority
-            && subvol.priority != p
-        {
+        // Filter: priority, specific subvolume
+        if !filters.admits(subvol) {
             continue;
         }
 
-        // Filter: specific subvolume (overrides interval check)
+        // A specifically named subvolume overrides the interval check.
         let force = filters
             .subvolume
             .as_ref()
             .is_some_and(|s| s == &subvol.name);
-        if filters.subvolume.is_some() && !force {
-            continue;
-        }
 
         // Resolve local snapshot directory
         let Some(ref snapshot_root) = subvol.snapshot_root else {

@@ -9,7 +9,7 @@ use crate::config::Config;
 use crate::drives;
 use crate::output::{
     AdaptationSummary, ChainHealth, ChainHealthEntry, DriveInfo, LastRunInfo, OutputMode,
-    PoolPostureSummary, StatusAssessment, StatusOutput,
+    PoolPostureSummary, RetentionChangePending, StatusAssessment, StatusOutput,
 };
 use crate::voice;
 
@@ -66,8 +66,18 @@ pub fn run(config: Config, output_mode: OutputMode) -> anyhow::Result<()> {
         })
         .sum();
 
+    // ── Retention changes the next backup will hold (ADR-110) ───────
+    let retention_changes: Vec<RetentionChangePending> =
+        crate::retention::pending_retention_changes(
+            &config.resolved_subvolumes(),
+            &crate::commands::plan_cmd::recorded_retention_shapes(world.db()).unwrap_or_default(),
+        )
+        .iter()
+        .map(RetentionChangePending::from)
+        .collect();
+
     // ── Assemble and render ─────────────────────────────────────────
-    let status_output = assemble_status_output(
+    let mut status_output = assemble_status_output(
         &assessments,
         storage_postures,
         storage_adaptations,
@@ -80,6 +90,7 @@ pub fn run(config: Config, output_mode: OutputMode) -> anyhow::Result<()> {
         posture.earned,
         posture.privilege_unclear,
     );
+    status_output.retention_changes = retention_changes;
 
     let rendered = voice::render_status(&status_output, output_mode);
     print!("{rendered}");
@@ -164,6 +175,8 @@ fn assemble_status_output(
         storage_adaptations,
         seal_gap,
         privilege_unclear,
+        // Threaded in by `run()` from the state DB's recorded shapes.
+        retention_changes: Vec::new(),
     }
 }
 

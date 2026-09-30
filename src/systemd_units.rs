@@ -227,6 +227,22 @@ mod tests {
         assert_eq!(units[1].content, BACKUP_TIMER);
     }
 
+    /// The nightly run must never pre-confirm a retention change (ADR-110):
+    /// the retention-change gate only means something if a tightened policy
+    /// waits for the operator. The whole ExecStart line is pinned.
+    #[test]
+    fn backup_service_does_not_confirm_retention_changes() {
+        let units = expected_units(&timer_mode(), &exe()).unwrap();
+        let service = &units[0].content;
+        assert!(
+            service
+                .lines()
+                .any(|l| l == "ExecStart=/home/alice/.cargo/bin/urd backup --auto"),
+            "backup ExecStart must be exactly `urd backup --auto`:\n{service}"
+        );
+        assert!(!service.contains("--confirm-retention-change"), "{service}");
+    }
+
     /// Sends are never time-limited (project invariant): the rendered
     /// backup service must always carry the infinite start timeout. This
     /// test fails loudly if the embedded unit file is ever edited

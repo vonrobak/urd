@@ -38,13 +38,83 @@ pub fn run(config: Config, args: PlanArgs, mode: OutputMode) -> anyhow::Result<(
     // pool yields free_ratio None → Roomy → declared behavior.
     let signals = storage_signals::gather(&config, world.db());
     let arming = RunArming::resolve(&signals.pools, &config, &fs_state);
-    let backup_plan = plan::plan(&config, now, &filters, &observation, &arming)?;
+    let mut backup_plan = plan::plan(&config, now, &filters, &observation, &arming)?;
+    // `urd plan` has no confirmation flag: it previews what `urd backup`
+    // without --confirm-retention-change would do.
+    let recorded = retention_baseline_or_warn(world.db());
+    let holds = gate_preview(&mut backup_plan, &config, &recorded, &filters, false);
 
     let mut output = build_plan_output(&backup_plan, &fs_state, &config);
     populate_token_warnings(&mut output, world.db(), &config);
+    output.warnings.extend(retention_hold_warnings(&holds));
     print!("{}", voice::render_plan(&output, mode, args.verbose));
 
     Ok(())
+}
+
+/// Apply the retention-change gate (ADR-110) to a preview plan — the same
+/// pure decision `urd backup` makes (ADR-100 preview parity), read-only: a
+/// preview never records a shape. Returns the holds for the warning lines.
+pub(crate) fn gate_preview(
+    backup_plan: &mut crate::types::BackupPlan,
+    config: &Config,
+    recorded: &HashMap<String, crate::retention::RecordedRetention>,
+    filters: &PlanFilters,
+    confirmed: bool,
+) -> Vec<crate::retention::RetentionHold> {
+    let gate = crate::retention::decide_retention_gate(
+        &config.resolved_subvolumes(),
+        recorded,
+        confirmed,
+        crate::retention::RecordScope { filters },
+    );
+    crate::retention::apply_retention_gate(backup_plan, &gate)
+}
+
+/// The retention shapes last applied per subvolume (ADR-110), read from the
+/// state DB. `None` when the DB is absent or the read fails — the baseline
+/// is unknown (ADR-102: history is best-effort, a SQLite failure never
+/// blocks a backup). Shared by `urd backup`, `urd plan`, `urd status` and
+/// `urd doctor` so all four judge the same baseline.
+#[must_use]
+pub(crate) fn recorded_retention_shapes(
+    db: Option<&StateDb>,
+) -> Option<HashMap<String, crate::retention::RecordedRetention>> {
+    db?.all_retention_shapes().ok()
+}
+
+/// [`recorded_retention_shapes`] for the paths that gate (`urd backup`,
+/// `urd plan`): an unknown baseline gates nothing, which is the fail-open
+/// reading for deletions — so say so, once per run, rather than silently.
+#[must_use]
+pub(crate) fn retention_baseline_or_warn(
+    db: Option<&StateDb>,
+) -> HashMap<String, crate::retention::RecordedRetention> {
+    let cause = match db.map(StateDb::all_retention_shapes) {
+        Some(Ok(shapes)) => return shapes,
+        Some(Err(e)) => e.to_string(),
+        None => "the state DB is unavailable".to_string(),
+    };
+    log::warn!(
+        "Retention baseline could not be read ({cause}) — no retention-tightening \
+         gate (ADR-110) applies this run"
+    );
+    HashMap::new()
+}
+
+/// One warning line per subvolume whose deletions the retention gate held —
+/// the backup summary's, the empty-plan exit's, and the plan preview's.
+#[must_use]
+pub(crate) fn retention_hold_warnings(holds: &[crate::retention::RetentionHold]) -> Vec<String> {
+    holds
+        .iter()
+        .map(|h| {
+            voice::retention_hold_warning(
+                &crate::output::RetentionChangePending::from(&h.change),
+                h.held_deletions,
+            )
+        })
+        .collect()
 }
 
 /// Build PlanOutput from a BackupPlan. Shared by `urd plan` and `urd backup --dry-run`.
@@ -791,5 +861,91 @@ source = "/data/htpc-docs"
             policy_out.summary.deletions,
             pressure_out.summary.deletions,
         );
+    }
+
+    // ── Retention-change gate preview parity (ADR-100 / ADR-110) ──────
+
+    #[test]
+    fn plan_preview_withholds_what_backup_withholds() {
+        use crate::retention::{RetentionShape, apply_retention_gate, decide_retention_gate};
+        // htpc-home moves to a named level; its previous (recorded) retention
+        // kept far more. htpc-docs stays on explicit retention.
+        let mut config = test_config();
+        config.subvolumes[0].protection_level = Some(crate::types::ProtectionLevel::Recorded);
+        let resolved = config.resolved_subvolumes();
+        let roomy = crate::types::ResolvedGraduatedRetention {
+            hourly: 1000,
+            daily: 1000,
+            weekly: 1000,
+            monthly: crate::types::MonthlyCount::Unlimited,
+            yearly: 1000,
+        };
+        let roomy = crate::retention::RecordedRetention::from(RetentionShape {
+            local: crate::types::LocalRetentionPolicy::Graduated(roomy),
+            external: roomy,
+        });
+        let db = StateDb::open_memory().unwrap();
+        db.upsert_retention_shape_best_effort("htpc-home", &roomy, test_now());
+        db.upsert_retention_shape_best_effort(
+            "htpc-docs",
+            &RetentionShape::of(&resolved[1]).into(),
+            test_now(),
+        );
+
+        let delete = |subvol: &str| PlannedOperation::DeleteSnapshot {
+            path: PathBuf::from(format!("/snap/{subvol}/20260301-0404-{subvol}")),
+            reason: "graduated: daily thinning".to_string(),
+            subvolume_name: subvol.to_string(),
+            kind: crate::types::DeleteKind::Policy,
+        };
+        let make_plan = || BackupPlan {
+            lifecycles: HashMap::new(),
+            operations: vec![
+                mock_send_incremental("htpc-home", "WD-18TB"),
+                delete("htpc-home"),
+                delete("htpc-docs"),
+            ],
+            timestamp: test_now(),
+            skipped: vec![],
+            events: Vec::new(),
+        };
+        let fs = MockFileSystemState::new();
+        let filters = PlanFilters::default();
+
+        for confirmed in [false, true] {
+            // The preview path (`urd plan` passes false; `backup --dry-run`
+            // passes its flag) …
+            let mut preview = make_plan();
+            let recorded = retention_baseline_or_warn(Some(&db));
+            let holds = gate_preview(&mut preview, &config, &recorded, &filters, confirmed);
+            let mut output = build_plan_output(&preview, &fs, &config);
+            output.warnings.extend(retention_hold_warnings(&holds));
+            // … and backup's own decision over the same recorded shapes.
+            let mut executed = make_plan();
+            let gate = decide_retention_gate(
+                &resolved,
+                &recorded,
+                confirmed,
+                crate::retention::RecordScope { filters: &filters },
+            );
+            apply_retention_gate(&mut executed, &gate);
+
+            let ops = |p: &BackupPlan| p.operations.iter().map(ToString::to_string).collect::<Vec<_>>();
+            assert_eq!(ops(&preview), ops(&executed), "confirmed={confirmed}");
+            if confirmed {
+                assert_eq!(output.summary.deletions, 2);
+                assert!(output.warnings.is_empty());
+            } else {
+                // The send survives; only htpc-home's deletion is held.
+                assert_eq!(output.summary.sends, 1);
+                assert_eq!(output.summary.deletions, 1);
+                assert_eq!(output.operations.len(), 2);
+                assert_eq!(output.warnings.len(), 1);
+                assert!(output.warnings[0].starts_with("htpc-home: "), "{}", output.warnings[0]);
+                assert!(output.warnings[0].contains("1 deletion(s) held"), "{}", output.warnings[0]);
+            }
+        }
+        // Read-only: the preview recorded nothing.
+        assert_eq!(db.all_retention_shapes().unwrap()["htpc-home"], roomy);
     }
 }

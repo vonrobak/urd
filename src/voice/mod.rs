@@ -62,7 +62,9 @@ pub use init::{
     render_incomplete_deletion_warning, render_init, render_init_first_time,
 };
 pub use plan::{render_empty_plan, render_nothing_to_do, render_plan};
-pub use retention::render_retention_preview;
+pub use retention::{
+    render_retention_preview, retention_change_pending_line, retention_hold_warning,
+};
 pub use sentinel::render_sentinel_status;
 pub use status::{render_default_status, render_first_time, render_status};
 pub use verify::{render_failures, render_verify};

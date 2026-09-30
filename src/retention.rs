@@ -1,13 +1,16 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use chrono::{Datelike, Months, NaiveDateTime, Timelike};
 
+use crate::config::ResolvedSubvolume;
 use crate::events::{Event, EventPayload, ProtectReason, PruneRule, UnstampedEvent};
+use crate::plan::PlanFilters;
 use crate::output::{
     DiskEstimate, EstimateMethod, RecoveryWindow, RetentionPreview, TransientComparison,
 };
 use crate::types::{
-    Interval, LocalRetentionPolicy, MonthlyCount, ResolvedGraduatedRetention, SnapshotName,
+    BackupPlan, Interval, LocalRetentionPolicy, MonthlyCount, PlannedOperation, ProtectionLevel,
+    ResolvedGraduatedRetention, SnapshotName,
 };
 
 /// Classifies a delete by what motivates it. Carried from `retention.rs` through
@@ -780,6 +783,454 @@ fn compact_window(w: &RecoveryWindow) -> String {
             format!("{}y", (months as f64 / 12.0).round() as i64)
         }
     }
+}
+
+// ── Retention shape (ADR-110 transition safety) ────────────────────────
+
+/// The effective retention a subvolume's policy resolves to — the local and
+/// external graduated counts exactly as the planner sees them on
+/// `ResolvedSubvolume`. Persisted per subvolume after a run whose retention
+/// deletions were applied (the state DB's `retention_shapes` table), so the
+/// next run can tell whether the policy has since been tightened (ADR-110
+/// "Transition safety").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetentionShape {
+    pub local: LocalRetentionPolicy,
+    pub external: ResolvedGraduatedRetention,
+}
+
+/// Canonical-form version prefixes. `v1` spells both halves; `v2` adds the
+/// `absent` token for a half that has never been applied (a `--local-only` /
+/// `--external-only` run records only the half that ran). A row with both
+/// halves is still written as `v1`, so the common row stays readable by a
+/// v1-only binary; the reader accepts both. Bump only with a parser that
+/// still reads every earlier version — a row that fails to parse is treated
+/// as "no record" (never gates), the safe-for-backups but unguarded reading.
+const SHAPE_V1: &str = "v1";
+const SHAPE_V2: &str = "v2";
+const ABSENT_HALF: &str = "absent";
+
+impl RetentionShape {
+    /// The canonical text form carried by the `RetentionChangeHeld` event and
+    /// stored in the state DB for a fully recorded row: a version prefix,
+    /// then every tier in a fixed order, e.g.
+    /// `v1;local:hourly=24,daily=30,weekly=26,monthly=12,yearly=0;external:hourly=0,daily=30,weekly=26,monthly=unlimited,yearly=0`
+    /// (`local:transient` for a transient local policy). Stable by
+    /// construction — hand-rendered, no map iteration order involved.
+    #[must_use]
+    pub fn to_canonical(self) -> String {
+        RecordedRetention::from(self).to_canonical()
+    }
+}
+
+/// The retention a subvolume's deletions were last applied under, per half.
+/// A half is `None` when no run has applied it yet — it reads as "no record"
+/// for that half, so the detector never gates on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordedRetention {
+    pub local: Option<LocalRetentionPolicy>,
+    pub external: Option<ResolvedGraduatedRetention>,
+}
+
+impl From<RetentionShape> for RecordedRetention {
+    fn from(shape: RetentionShape) -> Self {
+        Self {
+            local: Some(shape.local),
+            external: Some(shape.external),
+        }
+    }
+}
+
+impl RecordedRetention {
+    /// Canonical text: `v1` when both halves are present (identical to
+    /// [`RetentionShape::to_canonical`]), `v2` with `absent` for a missing
+    /// half, e.g. `v2;local:transient;external:absent`.
+    #[must_use]
+    pub fn to_canonical(self) -> String {
+        let version = if self.local.is_some() && self.external.is_some() {
+            SHAPE_V1
+        } else {
+            SHAPE_V2
+        };
+        let local = match &self.local {
+            None => ABSENT_HALF.to_string(),
+            Some(LocalRetentionPolicy::Transient) => "transient".to_string(),
+            Some(LocalRetentionPolicy::Graduated(g)) => canonical_tiers(g),
+        };
+        let external = self
+            .external
+            .as_ref()
+            .map_or_else(|| ABSENT_HALF.to_string(), canonical_tiers);
+        format!("{version};local:{local};external:{external}")
+    }
+
+    /// Parse [`to_canonical`](Self::to_canonical)'s output, v1 or v2.
+    /// `None` for any other text — unknown version, missing tier, stray
+    /// field, or `absent` in a v1 row.
+    #[must_use]
+    pub fn parse_canonical(s: &str) -> Option<Self> {
+        let mut parts = s.split(';');
+        let absent_allowed = match parts.next()? {
+            SHAPE_V1 => false,
+            SHAPE_V2 => true,
+            _ => return None,
+        };
+        let local = match parts.next()?.strip_prefix("local:")? {
+            ABSENT_HALF if absent_allowed => None,
+            "transient" => Some(LocalRetentionPolicy::Transient),
+            tiers => Some(LocalRetentionPolicy::Graduated(parse_tiers(tiers)?)),
+        };
+        let external = match parts.next()?.strip_prefix("external:")? {
+            ABSENT_HALF if absent_allowed => None,
+            tiers => Some(parse_tiers(tiers)?),
+        };
+        if parts.next().is_some() {
+            return None;
+        }
+        Some(Self { local, external })
+    }
+
+    /// The row to record after a run that applied only some halves: each
+    /// half that ran takes `current`'s value, each half that did not keeps
+    /// this (previously recorded) row's value — absent if it never had one.
+    #[must_use]
+    pub fn merged(
+        previous: Option<Self>,
+        current: RetentionShape,
+        local_ran: bool,
+        external_ran: bool,
+    ) -> Self {
+        let previous = previous.unwrap_or(Self {
+            local: None,
+            external: None,
+        });
+        Self {
+            local: if local_ran { Some(current.local) } else { previous.local },
+            external: if external_ran {
+                Some(current.external)
+            } else {
+                previous.external
+            },
+        }
+    }
+}
+
+fn canonical_tiers(g: &ResolvedGraduatedRetention) -> String {
+    let monthly = match g.monthly {
+        MonthlyCount::Count(n) => n.to_string(),
+        MonthlyCount::Unlimited => "unlimited".to_string(),
+    };
+    format!(
+        "hourly={},daily={},weekly={},monthly={monthly},yearly={}",
+        g.hourly, g.daily, g.weekly, g.yearly
+    )
+}
+
+fn parse_tiers(s: &str) -> Option<ResolvedGraduatedRetention> {
+    let mut fields = s.split(',');
+    let mut next = |key: &str| fields.next()?.strip_prefix(key)?.strip_prefix('=');
+    let hourly = next("hourly")?.parse().ok()?;
+    let daily = next("daily")?.parse().ok()?;
+    let weekly = next("weekly")?.parse().ok()?;
+    let monthly = match next("monthly")? {
+        "unlimited" => MonthlyCount::Unlimited,
+        n => MonthlyCount::Count(n.parse().ok()?),
+    };
+    let yearly = next("yearly")?.parse().ok()?;
+    if fields.next().is_some() {
+        return None;
+    }
+    Some(ResolvedGraduatedRetention {
+        hourly,
+        daily,
+        weekly,
+        monthly,
+        yearly,
+    })
+}
+
+/// A local policy's tier counts. Transient keeps no history, so it reads as
+/// every tier at zero: graduated → transient tightens whichever tiers kept
+/// snapshots; transient → graduated only loosens.
+fn local_tiers(policy: &LocalRetentionPolicy) -> ResolvedGraduatedRetention {
+    match policy {
+        LocalRetentionPolicy::Graduated(g) => *g,
+        LocalRetentionPolicy::Transient => ResolvedGraduatedRetention {
+            hourly: 0,
+            daily: 0,
+            weekly: 0,
+            monthly: MonthlyCount::Count(0),
+            yearly: 0,
+        },
+    }
+}
+
+/// True when any tier of `current` keeps fewer than `previous` did. A tier
+/// that kept snapshots and now keeps none is the limiting case of the same
+/// rule; bounded monthly after `unlimited` is a decrease.
+fn tiers_tightened(
+    previous: &ResolvedGraduatedRetention,
+    current: &ResolvedGraduatedRetention,
+) -> bool {
+    current.hourly < previous.hourly
+        || current.daily < previous.daily
+        || current.weekly < previous.weekly
+        || current.monthly.is_weaker_than(previous.monthly)
+        || current.yearly < previous.yearly
+}
+
+/// Has the local half of the retention shape tightened? An absent recorded
+/// half is "no record" and never has.
+#[must_use]
+pub fn local_retention_tightened(previous: &RecordedRetention, current: &RetentionShape) -> bool {
+    previous
+        .local
+        .is_some_and(|p| tiers_tightened(&local_tiers(&p), &local_tiers(&current.local)))
+}
+
+/// Has the external half of the retention shape tightened? An absent
+/// recorded half is "no record" and never has.
+#[must_use]
+pub fn external_retention_tightened(
+    previous: &RecordedRetention,
+    current: &RetentionShape,
+) -> bool {
+    previous
+        .external
+        .is_some_and(|p| tiers_tightened(&p, &current.external))
+}
+
+/// The ADR-110 tightening detector: any local or external tier count
+/// decreased (including a tier that kept snapshots and now keeps none).
+/// Loosening, or no change, is `false`. The caller treats "no previous
+/// record" as not tightened — a first run records and never gates, so an
+/// existing install is not held by the upgrade that introduced the record;
+/// an absent half of a recorded row is judged the same way.
+#[must_use]
+pub fn retention_tightened(previous: &RecordedRetention, current: &RetentionShape) -> bool {
+    local_retention_tightened(previous, current) || external_retention_tightened(previous, current)
+}
+
+// ── Retention-change gate (ADR-110 transition safety) ──────────────────
+//
+// Changing a subvolume's protection level (or its retention) can make the
+// derived policy tighter than the one its snapshots were kept under, and the
+// next run would retroactively delete the difference. The gate holds those
+// deletions until the operator confirms once with `--confirm-retention-change`.
+// Backups proceed either way (ADR-107 fail-open); only the destructive half —
+// retention deletions — is held, and only for the subvolume that tightened.
+//
+// Pure: the command reads the recorded shapes, calls `decide_retention_gate`,
+// applies it with `apply_retention_gate`, and writes `RetentionGate::record`
+// back at run end. `urd plan` / `backup --dry-run` apply the same decision
+// read-only (ADR-100 preview parity).
+
+impl RetentionShape {
+    /// The shape `sv`'s policy resolves to, as the planner sees it.
+    #[must_use]
+    pub fn of(sv: &ResolvedSubvolume) -> Self {
+        Self {
+            local: sv.local_retention,
+            external: sv.external_retention,
+        }
+    }
+}
+
+/// A subvolume whose retention tightened since its deletions were last
+/// applied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetentionChange {
+    pub subvolume: String,
+    pub previous: RecordedRetention,
+    pub current: RetentionShape,
+}
+
+impl RetentionChange {
+    /// Did the local half tighten? An absent recorded half never has.
+    #[must_use]
+    pub fn local_tightened(&self) -> bool {
+        local_retention_tightened(&self.previous, &self.current)
+    }
+
+    /// Did the external half tighten? An absent recorded half never has.
+    #[must_use]
+    pub fn external_tightened(&self) -> bool {
+        external_retention_tightened(&self.previous, &self.current)
+    }
+}
+
+/// Which part of a subvolume's retention one run was eligible to apply —
+/// the run's plan filters, restated for the recorder. A subvolume outside
+/// the scope records nothing; inside it, only the halves that ran record.
+#[derive(Debug, Clone, Copy)]
+pub struct RecordScope<'a> {
+    pub filters: &'a PlanFilters,
+}
+
+impl RecordScope<'_> {
+    /// `(local_ran, external_ran)` for `sv`, or `None` when the run did not
+    /// plan it at all (disabled, or outside `--priority` / `--subvolume`).
+    /// External retention runs only for a send-enabled subvolume outside
+    /// `--local-only`; local retention runs outside `--external-only`.
+    fn halves(&self, sv: &ResolvedSubvolume) -> Option<(bool, bool)> {
+        if !sv.enabled || !self.filters.admits(sv) {
+            return None;
+        }
+        let local_ran = !self.filters.external_only;
+        let external_ran = !self.filters.local_only && sv.send_enabled;
+        (local_ran || external_ran).then_some((local_ran, external_ran))
+    }
+}
+
+/// The gate's decision for one run.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RetentionGate {
+    /// Promise-level subvolumes whose retention deletions this run withholds.
+    pub held: Vec<RetentionChange>,
+    /// The rows to record once the run ends: every in-scope subvolume whose
+    /// deletions were not withheld (unchanged, loosened, first seen, or
+    /// tightened and confirmed), with only the halves this run applied
+    /// taken from the current config (see [`RecordedRetention::merged`]).
+    pub record: Vec<(String, RecordedRetention)>,
+}
+
+/// Is `sv` bound by a named protection promise (the subvolumes the gate
+/// guards)? `Custom` and unset levels spell their retention out explicitly.
+fn is_promise_level(sv: &ResolvedSubvolume) -> bool {
+    matches!(sv.protection_level, Some(level) if level != ProtectionLevel::Custom)
+}
+
+/// Every configured subvolume whose retention tightened since its recorded
+/// shape — promise-level or not. `urd status` / `doctor` narrow this to what
+/// the gate would hold. No record → not tightened.
+#[must_use]
+pub fn tightened_since_recorded(
+    subvolumes: &[ResolvedSubvolume],
+    recorded: &HashMap<String, RecordedRetention>,
+) -> Vec<RetentionChange> {
+    subvolumes
+        .iter()
+        .filter_map(|sv| {
+            let mut previous = *recorded.get(&sv.name)?;
+            // External retention never runs for a send-disabled subvolume, so
+            // no run could ever confirm an external tightening there — judging
+            // it would hold the local deletions for good. Judge local only.
+            if !sv.send_enabled {
+                previous.external = None;
+            }
+            let current = RetentionShape::of(sv);
+            retention_tightened(&previous, &current).then(|| RetentionChange {
+                subvolume: sv.name.clone(),
+                previous,
+                current,
+            })
+        })
+        .collect()
+}
+
+/// The retention changes a run without `--confirm-retention-change` would
+/// hold: promise-level subvolumes whose retention tightened since recorded.
+#[must_use]
+pub fn pending_retention_changes(
+    subvolumes: &[ResolvedSubvolume],
+    recorded: &HashMap<String, RecordedRetention>,
+) -> Vec<RetentionChange> {
+    tightened_since_recorded(subvolumes, recorded)
+        .into_iter()
+        .filter(|change| {
+            subvolumes
+                .iter()
+                .any(|sv| sv.name == change.subvolume && is_promise_level(sv))
+        })
+        .collect()
+}
+
+/// Decide the gate. A promise-level subvolume is held when its retention
+/// tightened since its recorded shape and `confirmed` is false — whatever
+/// the run's scope (an out-of-scope subvolume has no deletions to hold, and
+/// is not recorded either, so it stays pending). Every other subvolume
+/// inside `scope` is recorded, halves merged per [`RecordScope`] — including
+/// non-promise ones, so a later switch from custom retention to a tighter
+/// named level is caught against the custom shape it replaced. No recorded
+/// shape (or half) → never held on it: the first run records.
+#[must_use]
+pub fn decide_retention_gate(
+    subvolumes: &[ResolvedSubvolume],
+    recorded: &HashMap<String, RecordedRetention>,
+    confirmed: bool,
+    scope: RecordScope<'_>,
+) -> RetentionGate {
+    let tightened = tightened_since_recorded(subvolumes, recorded);
+    let mut gate = RetentionGate::default();
+    for sv in subvolumes {
+        let change = tightened.iter().find(|c| c.subvolume == sv.name);
+        if let Some(change) = change
+            && !confirmed
+            && is_promise_level(sv)
+        {
+            gate.held.push(change.clone());
+            continue;
+        }
+        if let Some((local_ran, external_ran)) = scope.halves(sv) {
+            let row = RecordedRetention::merged(
+                recorded.get(&sv.name).copied(),
+                RetentionShape::of(sv),
+                local_ran,
+                external_ran,
+            );
+            gate.record.push((sv.name.clone(), row));
+        }
+    }
+    gate
+}
+
+/// What the gate withheld from one plan for one subvolume.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetentionHold {
+    pub change: RetentionChange,
+    pub held_deletions: u32,
+}
+
+/// Apply the gate to a plan: drop every `DeleteSnapshot` of each held
+/// subvolume (and the `RetentionPrune` rows that explained them — a prune
+/// that will not happen is not history), then emit one
+/// `RetentionChangeHeld` event per subvolume that actually lost deletions.
+/// Returns those holds for the run summary. Strictly shrinks the plan
+/// (ADR-100): sends and snapshots are untouched.
+pub fn apply_retention_gate(plan: &mut BackupPlan, gate: &RetentionGate) -> Vec<RetentionHold> {
+    let mut holds = Vec::new();
+    for change in &gate.held {
+        let name = change.subvolume.as_str();
+        let before = plan.operations.len();
+        plan.operations.retain(|op| {
+            !matches!(op, PlannedOperation::DeleteSnapshot { subvolume_name, .. }
+                if subvolume_name == name)
+        });
+        let removed = before - plan.operations.len();
+        if removed == 0 {
+            continue;
+        }
+        plan.events.retain(|e| {
+            !(e.subvolume() == Some(name)
+                && matches!(e.payload(), EventPayload::RetentionPrune { .. }))
+        });
+        let held_deletions = u32::try_from(removed).unwrap_or(u32::MAX);
+        let mut event = Event::pure(
+            plan.timestamp,
+            EventPayload::RetentionChangeHeld {
+                previous: change.previous.to_canonical(),
+                current: change.current.to_canonical(),
+                held_deletions,
+            },
+        );
+        event.fill_subvolume(Some(change.subvolume.clone()));
+        plan.events.push(event);
+        holds.push(RetentionHold {
+            change: change.clone(),
+            held_deletions,
+        });
+    }
+    holds
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
@@ -2060,5 +2511,565 @@ mod tests {
             ));
         }
         assert_eq!(result.events.len(), result.delete.len());
+    }
+
+    // ── Retention shape + tightening detector (ADR-110) ────────────────
+
+    fn tiers(h: u32, d: u32, w: u32, m: MonthlyCount, y: u32) -> ResolvedGraduatedRetention {
+        ResolvedGraduatedRetention {
+            hourly: h,
+            daily: d,
+            weekly: w,
+            monthly: m,
+            yearly: y,
+        }
+    }
+
+    fn base_shape() -> RetentionShape {
+        RetentionShape {
+            local: LocalRetentionPolicy::Graduated(tiers(24, 30, 26, MonthlyCount::Count(12), 2)),
+            external: tiers(0, 30, 26, MonthlyCount::Unlimited, 5),
+        }
+    }
+
+    #[test]
+    fn retention_shape_canonical_round_trips() {
+        let transient = RetentionShape {
+            local: LocalRetentionPolicy::Transient,
+            ..base_shape()
+        };
+        for shape in [base_shape(), transient] {
+            let text = shape.to_canonical();
+            assert_eq!(RecordedRetention::parse_canonical(&text), Some(shape.into()), "{text}");
+        }
+    }
+
+    #[test]
+    fn recorded_retention_with_an_absent_half_round_trips_as_v2() {
+        let full = RecordedRetention::from(base_shape());
+        for row in [
+            RecordedRetention { local: None, ..full },
+            RecordedRetention { external: None, ..full },
+            RecordedRetention { local: None, external: None },
+        ] {
+            let text = row.to_canonical();
+            assert!(text.starts_with("v2;"), "{text}");
+            assert_eq!(RecordedRetention::parse_canonical(&text), Some(row), "{text}");
+        }
+        assert_eq!(
+            RecordedRetention { external: None, ..full }.to_canonical(),
+            "v2;local:hourly=24,daily=30,weekly=26,monthly=12,yearly=2;external:absent"
+        );
+        // A full row stays v1, readable by a v1-only reader; v1 has no `absent`.
+        assert!(full.to_canonical().starts_with("v1;"));
+        assert_eq!(
+            RecordedRetention::parse_canonical("v1;local:absent;external:absent"),
+            None
+        );
+    }
+
+    #[test]
+    fn merged_takes_only_the_halves_that_ran() {
+        let previous = RecordedRetention::from(looser_shape());
+        let current = tighter_shape();
+        let local_only = RecordedRetention::merged(Some(previous), current, true, false);
+        assert_eq!(local_only.local, Some(current.local));
+        assert_eq!(local_only.external, previous.external, "external kept from the old row");
+        let external_only = RecordedRetention::merged(None, current, false, true);
+        assert_eq!(external_only.local, None, "no previous row: the local half stays absent");
+        assert_eq!(external_only.external, Some(current.external));
+        assert_eq!(
+            RecordedRetention::merged(Some(previous), current, true, true),
+            RecordedRetention::from(current)
+        );
+    }
+
+    #[test]
+    fn an_absent_recorded_half_never_counts_as_tightened() {
+        let row = RecordedRetention { local: None, ..RecordedRetention::from(base_shape()) };
+        let transient = RetentionShape {
+            local: LocalRetentionPolicy::Transient,
+            ..base_shape()
+        };
+        assert!(!retention_tightened(&row, &transient), "local was never applied");
+        let external_down = RetentionShape {
+            external: tiers(0, 1, 26, MonthlyCount::Unlimited, 5),
+            ..transient
+        };
+        assert!(retention_tightened(&row, &external_down));
+    }
+
+    #[test]
+    fn retention_shape_canonical_form_is_pinned() {
+        // The stored text is a wire format: a change here strands every row
+        // already on disk (they would read as "no record" and stop gating).
+        assert_eq!(
+            base_shape().to_canonical(),
+            "v1;local:hourly=24,daily=30,weekly=26,monthly=12,yearly=2;\
+             external:hourly=0,daily=30,weekly=26,monthly=unlimited,yearly=5"
+        );
+    }
+
+    #[test]
+    fn retention_shape_parse_rejects_malformed_text() {
+        let good = base_shape().to_canonical();
+        for bad in [
+            String::new(),
+            good.replacen("v1", "v3", 1),
+            good.replacen("daily=30", "daily=x", 1),
+            good.replacen(",yearly=2", "", 1),
+            format!("{good};extra"),
+            format!("{good},stray=1"),
+            good.replacen("local:", "locale:", 1),
+        ] {
+            assert_eq!(RecordedRetention::parse_canonical(&bad), None, "accepted {bad:?}");
+        }
+    }
+
+    #[test]
+    fn retention_tightened_table() {
+        let base = base_shape();
+        let with_local = |g: ResolvedGraduatedRetention| RetentionShape {
+            local: LocalRetentionPolicy::Graduated(g),
+            ..base
+        };
+        let with_external = |g: ResolvedGraduatedRetention| RetentionShape {
+            external: g,
+            ..base
+        };
+        let cases: Vec<(&str, RetentionShape, bool)> = vec![
+            ("equal", base, false),
+            ("local hourly down", with_local(tiers(12, 30, 26, MonthlyCount::Count(12), 2)), true),
+            ("local daily down", with_local(tiers(24, 7, 26, MonthlyCount::Count(12), 2)), true),
+            ("local weekly down", with_local(tiers(24, 30, 4, MonthlyCount::Count(12), 2)), true),
+            ("local monthly down", with_local(tiers(24, 30, 26, MonthlyCount::Count(6), 2)), true),
+            ("local yearly to none", with_local(tiers(24, 30, 26, MonthlyCount::Count(12), 0)), true),
+            (
+                "local graduated to transient",
+                RetentionShape {
+                    local: LocalRetentionPolicy::Transient,
+                    ..base
+                },
+                true,
+            ),
+            ("external daily down", with_external(tiers(0, 14, 26, MonthlyCount::Unlimited, 5)), true),
+            ("external weekly down", with_external(tiers(0, 30, 25, MonthlyCount::Unlimited, 5)), true),
+            (
+                "external monthly unlimited to bounded",
+                with_external(tiers(0, 30, 26, MonthlyCount::Count(120), 5)),
+                true,
+            ),
+            ("external yearly down", with_external(tiers(0, 30, 26, MonthlyCount::Unlimited, 1)), true),
+            (
+                "local loosened",
+                with_local(tiers(48, 60, 52, MonthlyCount::Unlimited, 10)),
+                false,
+            ),
+            (
+                "external loosened (hourly tier gains a count)",
+                with_external(tiers(24, 30, 26, MonthlyCount::Unlimited, 5)),
+                false,
+            ),
+            (
+                "one tier up, another down",
+                with_local(tiers(48, 29, 26, MonthlyCount::Count(12), 2)),
+                true,
+            ),
+        ];
+        for (name, current, expected) in cases {
+            assert_eq!(retention_tightened(&base.into(), &current), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn retention_tightened_splits_by_half() {
+        let base = base_shape();
+        let local_down = RetentionShape {
+            local: LocalRetentionPolicy::Transient,
+            ..base
+        };
+        assert!(local_retention_tightened(&base.into(), &local_down));
+        assert!(!external_retention_tightened(&base.into(), &local_down));
+        let external_down = RetentionShape {
+            external: tiers(0, 1, 26, MonthlyCount::Unlimited, 5),
+            ..base
+        };
+        assert!(!local_retention_tightened(&base.into(), &external_down));
+        assert!(external_retention_tightened(&base.into(), &external_down));
+    }
+
+    #[test]
+    fn transient_local_transitions() {
+        let transient = RetentionShape {
+            local: LocalRetentionPolicy::Transient,
+            ..base_shape()
+        };
+        // transient → graduated loosens; transient → transient is equal.
+        assert!(!retention_tightened(&transient.into(), &base_shape()));
+        assert!(!retention_tightened(&transient.into(), &transient));
+        // A graduated policy that kept nothing locally loses nothing to transient.
+        let empty_local = RetentionShape {
+            local: LocalRetentionPolicy::Graduated(tiers(0, 0, 0, MonthlyCount::Count(0), 0)),
+            ..base_shape()
+        };
+        assert!(!retention_tightened(&empty_local.into(), &transient));
+    }
+
+    // ── Retention-change gate (ADR-110) ────────────────────────────────
+
+    fn resolved(
+        name: &str,
+        level: Option<ProtectionLevel>,
+        shape: RetentionShape,
+    ) -> ResolvedSubvolume {
+        ResolvedSubvolume {
+            name: name.to_string(),
+            short_name: name.to_string(),
+            source: std::path::PathBuf::from(format!("/data/{name}")),
+            priority: 1,
+            enabled: true,
+            snapshot_interval: Interval::hours(1),
+            send_interval: Interval::days(1),
+            send_enabled: true,
+            local_retention: shape.local,
+            external_retention: shape.external,
+            protection_level: level,
+            drives: None,
+            snapshot_root: None,
+            min_free_bytes: None,
+        }
+    }
+
+    fn tighter_shape() -> RetentionShape {
+        RetentionShape {
+            local: LocalRetentionPolicy::Graduated(tiers(24, 7, 4, MonthlyCount::Count(0), 0)),
+            ..base_shape()
+        }
+    }
+
+    fn looser_shape() -> RetentionShape {
+        RetentionShape {
+            external: tiers(0, 60, 52, MonthlyCount::Unlimited, 10),
+            ..base_shape()
+        }
+    }
+
+    fn delete_op(subvol: &str, snap: &str) -> PlannedOperation {
+        PlannedOperation::DeleteSnapshot {
+            path: std::path::PathBuf::from(format!("/snap/{subvol}/{snap}")),
+            reason: "graduated: daily thinning".to_string(),
+            subvolume_name: subvol.to_string(),
+            kind: DeleteKind::Policy,
+        }
+    }
+
+    fn prune_event(subvol: &str, snap: &str) -> UnstampedEvent {
+        let mut e = Event::pure(
+            now(),
+            EventPayload::RetentionPrune {
+                snapshot: snap.to_string(),
+                rule: PruneRule::GraduatedDaily,
+                tier: None,
+            },
+        );
+        e.fill_subvolume(Some(subvol.to_string()));
+        e
+    }
+
+    fn gate_plan() -> BackupPlan {
+        BackupPlan {
+            operations: vec![
+                PlannedOperation::CreateSnapshot {
+                    source: std::path::PathBuf::from("/data/home"),
+                    dest: std::path::PathBuf::from("/snap/home/20260322-1200-home"),
+                    subvolume_name: "home".to_string(),
+                },
+                delete_op("home", "20260301-1200-home"),
+                delete_op("home", "20260302-1200-home"),
+                delete_op("docs", "20260301-1200-docs"),
+            ],
+            timestamp: now(),
+            skipped: vec![],
+            events: vec![
+                prune_event("home", "20260301-1200-home"),
+                prune_event("home", "20260302-1200-home"),
+                prune_event("docs", "20260301-1200-docs"),
+            ],
+            lifecycles: std::collections::HashMap::new(),
+        }
+    }
+
+    fn recorded(entries: &[(&str, RetentionShape)]) -> HashMap<String, RecordedRetention> {
+        entries.iter().map(|(n, s)| ((*n).to_string(), (*s).into())).collect()
+    }
+
+    static FULL_RUN: PlanFilters = PlanFilters {
+        priority: None,
+        subvolume: None,
+        local_only: false,
+        external_only: false,
+        skip_intervals: true,
+        force_snapshot: false,
+    };
+
+    fn full_run() -> RecordScope<'static> {
+        RecordScope { filters: &FULL_RUN }
+    }
+
+    #[test]
+    fn confirmed_run_scoped_to_one_subvolume_records_only_it() {
+        let subvols = vec![
+            resolved("home", Some(ProtectionLevel::Sheltered), tighter_shape()),
+            resolved("docs", Some(ProtectionLevel::Sheltered), tighter_shape()),
+            resolved("plain", None, looser_shape()),
+        ];
+        let prev = recorded(&[
+            ("home", base_shape()),
+            ("docs", base_shape()),
+            ("plain", base_shape()),
+        ]);
+        let filters = PlanFilters {
+            subvolume: Some("home".to_string()),
+            ..PlanFilters::default()
+        };
+        let gate = decide_retention_gate(&subvols, &prev, true, RecordScope { filters: &filters });
+        assert!(gate.held.is_empty());
+        assert_eq!(gate.record, vec![("home".to_string(), tighter_shape().into())]);
+    }
+
+    #[test]
+    fn tightened_out_of_scope_subvolume_is_held_on_the_next_full_run() {
+        let subvols = vec![
+            resolved("home", Some(ProtectionLevel::Sheltered), tighter_shape()),
+            resolved("docs", Some(ProtectionLevel::Sheltered), tighter_shape()),
+        ];
+        let mut rows = recorded(&[("home", base_shape()), ("docs", base_shape())]);
+        // `urd backup --subvolume home --confirm-retention-change`.
+        let filters = PlanFilters {
+            subvolume: Some("home".to_string()),
+            ..PlanFilters::default()
+        };
+        let gate = decide_retention_gate(&subvols, &rows, true, RecordScope { filters: &filters });
+        rows.extend(gate.record);
+        // The next unconfirmed full run: home is settled, docs still holds.
+        let next = decide_retention_gate(&subvols, &rows, false, full_run());
+        let held: Vec<&str> = next.held.iter().map(|c| c.subvolume.as_str()).collect();
+        assert_eq!(held, vec!["docs"]);
+    }
+
+    #[test]
+    fn confirmed_local_only_run_records_the_local_half_and_keeps_the_external_row() {
+        // Both halves tightened; only local retention ran this time.
+        let current = RetentionShape {
+            external: tiers(0, 1, 1, MonthlyCount::Count(0), 0),
+            ..tighter_shape()
+        };
+        let subvols = vec![resolved("home", Some(ProtectionLevel::Sheltered), current)];
+        let mut rows = recorded(&[("home", base_shape())]);
+        let filters = PlanFilters {
+            local_only: true,
+            ..PlanFilters::default()
+        };
+        let gate = decide_retention_gate(&subvols, &rows, true, RecordScope { filters: &filters });
+        assert_eq!(
+            gate.record,
+            vec![(
+                "home".to_string(),
+                RecordedRetention {
+                    local: Some(current.local),
+                    external: Some(base_shape().external),
+                },
+            )]
+        );
+        // The external tightening was never confirmed by a run that applied it.
+        rows.extend(gate.record);
+        let next = decide_retention_gate(&subvols, &rows, false, full_run());
+        assert_eq!(next.held.len(), 1);
+        assert!(!next.held[0].local_tightened());
+        assert!(next.held[0].external_tightened());
+    }
+
+    #[test]
+    fn external_only_run_with_no_previous_row_leaves_the_local_half_absent() {
+        let subvols = vec![resolved("home", Some(ProtectionLevel::Sheltered), base_shape())];
+        let filters = PlanFilters {
+            external_only: true,
+            ..PlanFilters::default()
+        };
+        let scope = RecordScope { filters: &filters };
+        let gate = decide_retention_gate(&subvols, &HashMap::new(), false, scope);
+        assert_eq!(
+            gate.record,
+            vec![(
+                "home".to_string(),
+                RecordedRetention {
+                    local: None,
+                    external: Some(base_shape().external),
+                },
+            )]
+        );
+    }
+
+    #[test]
+    fn disabled_and_send_disabled_subvolumes_record_only_what_ran() {
+        let mut disabled = resolved("off", None, base_shape());
+        disabled.enabled = false;
+        let mut local_only_sv = resolved("nosend", None, base_shape());
+        local_only_sv.send_enabled = false;
+        let gate = decide_retention_gate(
+            &[disabled, local_only_sv],
+            &HashMap::new(),
+            false,
+            full_run(),
+        );
+        assert_eq!(
+            gate.record,
+            vec![(
+                "nosend".to_string(),
+                RecordedRetention {
+                    local: Some(base_shape().local),
+                    external: None,
+                },
+            )]
+        );
+    }
+
+    #[test]
+    fn external_tightening_is_not_judged_for_a_send_disabled_subvolume() {
+        // A row recorded while sends were on keeps a roomy external half; the
+        // external half can never be applied again, so it must not hold.
+        let mut sv = resolved(
+            "home",
+            Some(ProtectionLevel::Sheltered),
+            RetentionShape {
+                external: tiers(0, 1, 0, MonthlyCount::Count(0), 0),
+                ..base_shape()
+            },
+        );
+        sv.send_enabled = false;
+        let prev = recorded(&[("home", looser_shape())]);
+        assert!(decide_retention_gate(&[sv.clone()], &prev, false, full_run()).held.is_empty());
+        // A local tightening still holds.
+        sv.local_retention = LocalRetentionPolicy::Transient;
+        assert_eq!(decide_retention_gate(&[sv], &prev, false, full_run()).held.len(), 1);
+    }
+
+    #[test]
+    fn gate_first_run_records_every_subvolume_without_holding() {
+        let subvols = vec![
+            resolved("home", Some(ProtectionLevel::Sheltered), tighter_shape()),
+            resolved("docs", None, base_shape()),
+        ];
+        let gate = decide_retention_gate(&subvols, &HashMap::new(), false, full_run());
+        assert!(gate.held.is_empty(), "no record → never held (upgrade must not gate)");
+        assert_eq!(
+            gate.record,
+            vec![
+                ("home".to_string(), tighter_shape().into()),
+                ("docs".to_string(), base_shape().into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn gate_holds_only_the_tightened_promise_subvolume() {
+        let subvols = vec![
+            resolved("home", Some(ProtectionLevel::Sheltered), tighter_shape()),
+            resolved("docs", Some(ProtectionLevel::Sheltered), looser_shape()),
+            resolved("custom", Some(ProtectionLevel::Custom), tighter_shape()),
+            resolved("plain", None, tighter_shape()),
+        ];
+        let prev = recorded(&[
+            ("home", base_shape()),
+            ("docs", base_shape()),
+            ("custom", base_shape()),
+            ("plain", base_shape()),
+        ]);
+        let gate = decide_retention_gate(&subvols, &prev, false, full_run());
+        assert_eq!(
+            gate.held,
+            vec![RetentionChange {
+                subvolume: "home".to_string(),
+                previous: base_shape().into(),
+                current: tighter_shape(),
+            }]
+        );
+        // Loosened and non-promise subvolumes record their current shape; the
+        // held one keeps its old record (so the next run holds again).
+        let names: Vec<&str> = gate.record.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["docs", "custom", "plain"]);
+        assert_eq!(pending_retention_changes(&subvols, &prev), gate.held);
+    }
+
+    #[test]
+    fn gate_confirmed_holds_nothing_and_records_the_new_shape() {
+        let subvols = vec![resolved("home", Some(ProtectionLevel::Sheltered), tighter_shape())];
+        let prev = recorded(&[("home", base_shape())]);
+        let gate = decide_retention_gate(&subvols, &prev, true, full_run());
+        assert!(gate.held.is_empty());
+        assert_eq!(gate.record, vec![("home".to_string(), tighter_shape().into())]);
+        // The recorded tighter shape is the next run's baseline: no longer tightened.
+        let next = decide_retention_gate(
+            &subvols,
+            &recorded(&[("home", tighter_shape())]),
+            false,
+            full_run(),
+        );
+        assert!(next.held.is_empty());
+    }
+
+    #[test]
+    fn apply_gate_withholds_only_the_held_subvolume_and_emits_its_event() {
+        let subvols = vec![
+            resolved("home", Some(ProtectionLevel::Sheltered), tighter_shape()),
+            resolved("docs", Some(ProtectionLevel::Sheltered), base_shape()),
+        ];
+        let prev = recorded(&[("home", base_shape()), ("docs", base_shape())]);
+        let gate = decide_retention_gate(&subvols, &prev, false, full_run());
+        let mut plan = gate_plan();
+        let holds = apply_retention_gate(&mut plan, &gate);
+
+        assert_eq!(holds.len(), 1);
+        assert_eq!(holds[0].change.subvolume, "home");
+        assert_eq!(holds[0].held_deletions, 2);
+        // The snapshot and docs' delete survive; home's deletes are gone.
+        assert_eq!(plan.operations.len(), 2);
+        assert!(matches!(plan.operations[0], PlannedOperation::CreateSnapshot { .. }));
+        assert!(matches!(
+            &plan.operations[1],
+            PlannedOperation::DeleteSnapshot { subvolume_name, .. } if subvolume_name == "docs"
+        ));
+        // home's prune rows are dropped (they will not happen); docs' stays;
+        // one RetentionChangeHeld row for home carries both shapes.
+        let stamped: Vec<Event> = plan
+            .events
+            .into_iter()
+            .map(|e| e.stamp(&crate::events::RunContext::for_run(Some(1))))
+            .collect();
+        assert_eq!(stamped.len(), 2);
+        assert_eq!(stamped[0].subvolume.as_deref(), Some("docs"));
+        assert!(matches!(stamped[0].payload, EventPayload::RetentionPrune { .. }));
+        assert_eq!(stamped[1].subvolume.as_deref(), Some("home"));
+        assert_eq!(
+            stamped[1].payload,
+            EventPayload::RetentionChangeHeld {
+                previous: base_shape().to_canonical(),
+                current: tighter_shape().to_canonical(),
+                held_deletions: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn apply_gate_is_silent_when_the_held_subvolume_had_no_deletions() {
+        let subvols = vec![resolved("other", Some(ProtectionLevel::Sheltered), tighter_shape())];
+        let prev = recorded(&[("other", base_shape())]);
+        let gate = decide_retention_gate(&subvols, &prev, false, full_run());
+        assert_eq!(gate.held.len(), 1, "still pending — status/doctor keep saying so");
+        let mut plan = gate_plan();
+        let holds = apply_retention_gate(&mut plan, &gate);
+        assert!(holds.is_empty());
+        assert_eq!(plan.operations.len(), 4);
+        assert_eq!(plan.events.len(), 3);
     }
 }

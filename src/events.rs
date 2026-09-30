@@ -199,6 +199,17 @@ pub enum EventPayload {
         oldest: String,
         newest: String,
     },
+    /// Retention deletions withheld for a promise-level subvolume whose
+    /// retention tightened since its deletions were last applied, on a run
+    /// without `--confirm-retention-change` (ADR-110 transition safety).
+    /// Backups proceeded; only the deletions wait for the operator's
+    /// confirmation. `previous`/`current` are `RetentionShape` canonical
+    /// strings; the subvolume rides the event's `subvolume` column.
+    RetentionChangeHeld {
+        previous: String,
+        current: String,
+        held_deletions: u32,
+    },
     PlannerSendChoice {
         send_kind: SendKind,
         reason: FullSendReason,
@@ -311,7 +322,8 @@ impl EventPayload {
         match self {
             Self::RetentionPrune { .. }
             | Self::RetentionProtect { .. }
-            | Self::RetentionProtectSummary { .. } => EventKind::Retention,
+            | Self::RetentionProtectSummary { .. }
+            | Self::RetentionChangeHeld { .. } => EventKind::Retention,
             Self::PlannerSendChoice { .. } | Self::PlannerDefer { .. } => EventKind::Planner,
             Self::PromiseTransition { .. } => EventKind::Promise,
             Self::SentinelCircuitBreak { .. } | Self::SentinelAnomaly { .. } => EventKind::Sentinel,
@@ -337,6 +349,8 @@ impl EventPayload {
             Self::RetentionProtect { .. } | Self::RetentionProtectSummary { .. } => {
                 Severity::Notice
             }
+            // Held deletions wait on the operator — worth noticing, not alarming.
+            Self::RetentionChangeHeld { .. } => Severity::Notice,
             Self::PlannerSendChoice { reason, .. } => match reason {
                 FullSendReason::ChainBroken => Severity::Notice,
                 FullSendReason::FirstSend | FullSendReason::NoPinFile => Severity::Info,
@@ -483,6 +497,15 @@ impl UnstampedEvent {
         &self.event.payload
     }
 
+    /// Read-only access to the semantic-origin subvolume, for emit-side
+    /// matching (e.g. dropping the prune rows of deletions the retention
+    /// gate withheld). A `&str`, not `&Event` — same bypass rule as
+    /// [`payload`](Self::payload).
+    #[must_use]
+    pub fn subvolume(&self) -> Option<&str> {
+        self.event.subvolume.as_deref()
+    }
+
     /// Set the semantic-origin subvolume if not already set. `None` is a
     /// no-op; an already-set value is never clobbered (preserves the
     /// planner's `stamp_context` fill-if-unset guard).
@@ -547,6 +570,14 @@ mod tests {
                     count: 2,
                     oldest: "a".into(),
                     newest: "b".into(),
+                },
+                EventKind::Retention,
+            ),
+            (
+                EventPayload::RetentionChangeHeld {
+                    previous: "p".into(),
+                    current: "c".into(),
+                    held_deletions: 3,
                 },
                 EventKind::Retention,
             ),
@@ -781,6 +812,13 @@ mod tests {
             count: 34,
             oldest: "20260801-0400-home".into(),
             newest: "20260928-0400-home".into(),
+        });
+        roundtrip(&EventPayload::RetentionChangeHeld {
+            previous: "v1;local:transient;external:hourly=0,daily=30,weekly=26,monthly=0,yearly=0"
+                .into(),
+            current: "v1;local:transient;external:hourly=0,daily=7,weekly=4,monthly=0,yearly=0"
+                .into(),
+            held_deletions: 12,
         });
         roundtrip(&EventPayload::PlannerSendChoice {
             send_kind: SendKind::Full,
@@ -1022,6 +1060,15 @@ mod tests {
                 },
             ),
             (
+                "RetentionChangeHeld",
+                r#"{"type":"RetentionChangeHeld","previous":"v1;local:transient;external:hourly=0,daily=30,weekly=26,monthly=0,yearly=0","current":"v1;local:transient;external:hourly=0,daily=7,weekly=4,monthly=0,yearly=0","held_deletions":12}"#,
+                EventPayload::RetentionChangeHeld {
+                    previous: "v1;local:transient;external:hourly=0,daily=30,weekly=26,monthly=0,yearly=0".into(),
+                    current: "v1;local:transient;external:hourly=0,daily=7,weekly=4,monthly=0,yearly=0".into(),
+                    held_deletions: 12,
+                },
+            ),
+            (
                 "PlannerSendChoice",
                 r#"{"type":"PlannerSendChoice","send_kind":"full","reason":"chain_broken","drive_label":"WD-18TB"}"#,
                 EventPayload::PlannerSendChoice {
@@ -1192,6 +1239,7 @@ mod tests {
             EventPayload::RetentionPrune { .. }
             | EventPayload::RetentionProtect { .. }
             | EventPayload::RetentionProtectSummary { .. }
+            | EventPayload::RetentionChangeHeld { .. }
             | EventPayload::PlannerSendChoice { .. }
             | EventPayload::PlannerDefer { .. }
             | EventPayload::PromiseTransition { .. }

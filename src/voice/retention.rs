@@ -6,7 +6,9 @@ use std::fmt::Write;
 
 use colored::Colorize;
 
-use crate::output::{OutputMode, RecoveryWindow, RetentionPreviewOutput};
+use crate::output::{
+    OutputMode, RecoveryWindow, RetentionChangePending, RetentionPreviewOutput,
+};
 use crate::types::ByteSize;
 
 use super::render_json;
@@ -132,11 +134,75 @@ fn format_snapshot_breakdown(windows: &[RecoveryWindow]) -> String {
         .join(" + ")
 }
 
+// ── Retention-change gate (ADR-110 transition safety) ──────────────────
+
+/// Which half of the retention tightened, as a parenthetical.
+fn tightened_halves(change: &RetentionChangePending) -> &'static str {
+    match (change.local_tightened, change.external_tightened) {
+        (true, true) => "local and external",
+        (true, false) => "local",
+        (false, _) => "external",
+    }
+}
+
+/// The run-summary / plan-preview warning for deletions the gate withheld
+/// this run. Backups proceeded; only the deletions wait.
+#[must_use]
+pub fn retention_hold_warning(change: &RetentionChangePending, held_deletions: u32) -> String {
+    format!(
+        "{}: {} retention tightened since it was last applied — {held_deletions} \
+         deletion(s) held. Run `urd backup --confirm-retention-change` once to apply it.",
+        change.subvolume,
+        tightened_halves(change),
+    )
+}
+
+/// The `urd status` / `urd doctor` advisory for a tightening the next
+/// backup will hold. Says what happens, and the one command that settles it.
+#[must_use]
+pub fn retention_change_pending_line(change: &RetentionChangePending) -> String {
+    format!(
+        "{}: {} retention tightened since it was last applied — backups continue, \
+         but its deletions wait for `urd backup --confirm-retention-change` (run once).",
+        change.subvolume,
+        tightened_halves(change),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::output::{DiskEstimate, EstimateMethod, RetentionPreview, TransientComparison};
     use crate::voice::test_fixtures::color_guard;
+
+    // ── Retention-change gate prose (ADR-110) ────────────────────────
+
+    fn pending(local: bool, external: bool) -> RetentionChangePending {
+        RetentionChangePending {
+            subvolume: "htpc-home".to_string(),
+            local_tightened: local,
+            external_tightened: external,
+            previous: "p".to_string(),
+            current: "c".to_string(),
+        }
+    }
+
+    #[test]
+    fn retention_hold_warning_names_count_halves_and_command() {
+        let line = retention_hold_warning(&pending(true, true), 12);
+        assert!(line.starts_with("htpc-home: local and external retention tightened"), "{line}");
+        assert!(line.contains("12 deletion(s) held"), "{line}");
+        assert!(line.contains("`urd backup --confirm-retention-change`"), "{line}");
+    }
+
+    #[test]
+    fn retention_change_pending_line_names_the_half() {
+        let local = retention_change_pending_line(&pending(true, false));
+        assert!(local.contains(": local retention tightened"), "{local}");
+        let external = retention_change_pending_line(&pending(false, true));
+        assert!(external.contains(": external retention tightened"), "{external}");
+        assert!(external.contains("backups continue"), "{external}");
+    }
 
     // ── Retention preview tests ──────────────────────────────────────
 

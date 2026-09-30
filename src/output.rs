@@ -213,6 +213,12 @@ pub struct StatusOutput {
     /// privilege itself is unconfirmed.
     #[serde(default, skip_serializing_if = "is_false")]
     pub privilege_unclear: bool,
+    /// Promise-level subvolumes whose retention tightened since their
+    /// deletions were last applied (ADR-110): the next backup holds those
+    /// deletions until `urd backup --confirm-retention-change`. Omitted from
+    /// JSON when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retention_changes: Vec<RetentionChangePending>,
 }
 
 /// The seal stage `urd status` names as incomplete, in seal order —
@@ -542,6 +548,36 @@ impl DefaultStatusOutput {
     #[must_use]
     pub fn sealed_count(&self) -> usize {
         self.total - self.waning_names.len() - self.exposed_names.len()
+    }
+}
+
+// ── Retention-change gate (ADR-110) ───────────────────────────────────
+
+/// A promise-level subvolume whose retention tightened since its deletions
+/// were last applied: the next `urd backup` without
+/// `--confirm-retention-change` holds its retention deletions (backups still
+/// run). Surfaced by `urd status` (JSON + advisory line), `urd doctor`, and —
+/// with a held count — the backup summary and plan preview.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RetentionChangePending {
+    pub subvolume: String,
+    pub local_tightened: bool,
+    pub external_tightened: bool,
+    /// `RetentionShape` canonical text of the last applied shape.
+    pub previous: String,
+    /// `RetentionShape` canonical text of the configured shape.
+    pub current: String,
+}
+
+impl From<&crate::retention::RetentionChange> for RetentionChangePending {
+    fn from(change: &crate::retention::RetentionChange) -> Self {
+        Self {
+            subvolume: change.subvolume.clone(),
+            local_tightened: change.local_tightened(),
+            external_tightened: change.external_tightened(),
+            previous: change.previous.to_canonical(),
+            current: change.current.to_canonical(),
+        }
     }
 }
 

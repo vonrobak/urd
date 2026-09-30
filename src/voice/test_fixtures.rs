@@ -37,6 +37,7 @@ pub(crate) fn test_status_output() -> StatusOutput {
     StatusOutput {
         seal_gap: None,
         privilege_unclear: false,
+        retention_changes: vec![],
         assessments: vec![
             StatusAssessment {
                 name: "htpc-home".to_string(),

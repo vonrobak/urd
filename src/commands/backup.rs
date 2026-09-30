@@ -36,7 +36,7 @@ use crate::pools::{self, PoolSpace};
 use crate::storage_critical::TightnessTier;
 use crate::preflight;
 use crate::state::StateDb;
-use crate::types::{BackupPlan, ByteSize, PlannedOperation, ProtectionLevel, SendKind};
+use crate::types::{BackupPlan, ByteSize, PlannedOperation, SendKind};
 use crate::voice::{approx_size, format_elapsed};
 use crate::recorder::{DispatchPolicy, Recorder, Recording};
 use crate::run_tail::{
@@ -97,12 +97,26 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
 
     let mut backup_plan = plan::plan(&config, now, &filters, &observation, &arming)?;
 
-    // ADR-107: fail-closed for retention on promise-level subvolumes.
-    // If a subvolume has a protection_level, skip retention deletions unless
-    // --confirm-retention-change is explicitly set.
-    if !args.confirm_retention_change {
-        filter_promise_retention(&config, &mut backup_plan);
-    }
+    // ── Retention-change gate (ADR-110 transition safety) ──
+    // A promise-level subvolume whose retention tightened since its deletions
+    // were last applied keeps its snapshots until the operator confirms once
+    // with --confirm-retention-change. Backups proceed regardless (ADR-107
+    // fail-open); only the destructive half — that subvolume's retention
+    // deletions — is held. Decided once here from the recorded shapes (pure,
+    // `retention::decide_retention_gate`); `urd plan` applies the same
+    // decision read-only. At run end (`record_retention_shapes`, never on a
+    // dry run) each subvolume that is NOT held and was inside this run's
+    // filter scope records the halves of its shape this run applied. An
+    // unreadable baseline gates nothing and is warned about once, here.
+    let recorded_shapes = crate::commands::plan_cmd::retention_baseline_or_warn(world.db());
+    let retention_gate = crate::retention::decide_retention_gate(
+        &config.resolved_subvolumes(),
+        &recorded_shapes,
+        args.confirm_retention_change,
+        crate::retention::RecordScope { filters: &filters },
+    );
+    let mut retention_holds =
+        crate::retention::apply_retention_gate(&mut backup_plan, &retention_gate);
 
     // Run pre-flight config consistency checks
     let preflight_warnings = preflight::preflight_checks(&config);
@@ -116,6 +130,9 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
             world.db(),
             &config,
         );
+        plan_output
+            .warnings
+            .extend(crate::commands::plan_cmd::retention_hold_warnings(&retention_holds));
         let mode = crate::output::OutputMode::detect();
         // Summary-first like `urd plan` (028-R5); the pointer line in the
         // rendered output redirects detail-seekers to `urd plan --verbose`.
@@ -144,9 +161,18 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     // mid-run, even though emergency just freed space).
     if emergency.any_deleted {
         backup_plan = plan::plan(&config, now, &filters, &observation, &arming)?;
-        if !args.confirm_retention_change {
-            filter_promise_retention(&config, &mut backup_plan);
-        }
+        // Same gate decision, re-applied to the fresh plan.
+        retention_holds =
+            crate::retention::apply_retention_gate(&mut backup_plan, &retention_gate);
+    }
+    // Info, not warn: the summary's WARNING line already tells a TTY user.
+    for hold in &retention_holds {
+        log::info!(
+            "Held {} retention deletion(s) for {}: retention tightened since it was last \
+             applied (run `urd backup --confirm-retention-change` once to apply)",
+            hold.held_deletions,
+            hold.change.subvolume,
+        );
     }
 
     if backup_plan.is_empty() {
@@ -165,6 +191,32 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
             print!("{}", crate::voice::render_warning_lines(&warnings));
             println!();
         }
+        // Retention held by the gate (ADR-110) can be the very reason the plan
+        // is empty. The executor never runs here, so it never persists the
+        // plan's events — record the hold events directly (no run id: no run
+        // began), and tell a TTY user inline, as the executed summary would.
+        let held_events: Vec<_> = backup_plan
+            .events
+            .iter()
+            .filter(|e| {
+                matches!(e.payload(), crate::events::EventPayload::RetentionChangeHeld { .. })
+            })
+            .cloned()
+            .collect();
+        recorder.record(
+            &RunContext::outside_run(),
+            Recording {
+                events: held_events,
+                notifications: vec![],
+                dispatch: DispatchPolicy::Immediate,
+            },
+        );
+        if !args.auto && !retention_holds.is_empty() {
+            let warnings = crate::commands::plan_cmd::retention_hold_warnings(&retention_holds);
+            print!("{}", crate::voice::render_warning_lines(&warnings));
+            println!();
+        }
+        record_retention_shapes(world.db(), &retention_gate, now);
         // Empty plan: no operations to execute. This includes plans where all subvolumes
         // were skipped (drives disconnected, space guard, etc.). Previously this case fell
         // through to the executor which ran zero operations and reported run_result "success".
@@ -678,6 +730,13 @@ pub fn run(config: Config, args: BackupArgs) -> anyhow::Result<()> {
     if let Some(message) = &watchdog_panic {
         summary.warnings.push(notify::watchdog_panic_prose(message));
     }
+    // Retention the gate held (ADR-110): the one command that applies it.
+    summary
+        .warnings
+        .extend(crate::commands::plan_cmd::retention_hold_warnings(&retention_holds));
+    // Record the shapes whose deletions this run did not withhold, before
+    // the failure exit below can skip it.
+    record_retention_shapes(world.db(), &retention_gate, now);
     let output_mode = OutputMode::detect();
     let rendered = crate::voice::render_backup_summary(&summary, output_mode);
     println!("{rendered}");
@@ -2555,40 +2614,20 @@ fn apply_token_gating(plan: &mut BackupPlan, gating: &TokenGating) {
     }
 }
 
-/// Remove retention delete operations for subvolumes that have a protection promise.
-///
-/// ADR-107 fail-closed: when a protection level derives retention parameters, those
-/// deletions are skipped unless the user explicitly confirms with `--confirm-retention-change`.
-/// Backups proceed normally — only deletions are held back.
-fn filter_promise_retention(config: &Config, plan: &mut BackupPlan) {
-    let resolved = config.resolved_subvolumes();
-    let promise_subvols: std::collections::HashSet<&str> = resolved
-        .iter()
-        .filter(|sv| {
-            matches!(
-                sv.protection_level,
-                Some(level) if level != ProtectionLevel::Custom
-            )
-        })
-        .map(|sv| sv.name.as_str())
-        .collect();
-
-    if promise_subvols.is_empty() {
+/// Record, at run end, the retention shape of every subvolume whose
+/// deletions this run did not withhold (ADR-110 transition safety): the
+/// baseline the next run's gate compares against. Best-effort (ADR-102) —
+/// with no state DB nothing is recorded, and the next run gates nothing.
+fn record_retention_shapes(
+    db: Option<&StateDb>,
+    gate: &crate::retention::RetentionGate,
+    recorded_at: chrono::NaiveDateTime,
+) {
+    let Some(db) = db else {
         return;
-    }
-
-    let before = plan.operations.len();
-    plan.operations.retain(|op| {
-        !matches!(op, PlannedOperation::DeleteSnapshot { subvolume_name, .. }
-            if promise_subvols.contains(subvolume_name.as_str()))
-    });
-    let removed = before - plan.operations.len();
-
-    if removed > 0 {
-        log::info!(
-            "Skipped {removed} retention deletion(s) for promise-level subvolumes \
-             (use --confirm-retention-change to apply)"
-        );
+    };
+    for (subvolume, shape) in &gate.record {
+        db.upsert_retention_shape_best_effort(subvolume, shape, recorded_at);
     }
 }
 
@@ -2604,9 +2643,186 @@ mod tests {
         TransientCleanupOutcome,
     };
     use crate::types::Interval;
-    use crate::types::{DeleteKind, FullSendReason, PlannedOperation};
+    use crate::types::{DeleteKind, FullSendReason, PlannedOperation, ProtectionLevel};
     use std::collections::BTreeSet;
     use std::path::PathBuf;
+
+    // ── Retention-change gate recording (ADR-110) ──────────────────────
+
+    /// `alpha` carries a named level (derived retention); `beta` is custom.
+    fn gate_config() -> Config {
+        let toml_str = r#"
+drives = []
+
+[general]
+state_db = "/tmp/urd-gate/urd.db"
+metrics_file = "/tmp/urd-gate/m.prom"
+log_dir = "/tmp/urd-gate"
+
+[local_snapshots]
+roots = [
+  { path = "/snap", subvolumes = ["alpha", "beta"] }
+]
+
+[defaults]
+snapshot_interval = "1h"
+send_interval = "4h"
+[defaults.local_retention]
+hourly = 24
+[defaults.external_retention]
+daily = 30
+
+[[subvolumes]]
+name = "alpha"
+short_name = "alpha"
+source = "/data/alpha"
+protection_level = "recorded"
+
+[[subvolumes]]
+name = "beta"
+short_name = "beta"
+source = "/data/beta"
+"#;
+        toml::from_str(toml_str).unwrap()
+    }
+
+    /// A shape strictly looser than anything the config derives: what the
+    /// subvolume "used to keep" before its level changed.
+    fn roomy_shape() -> crate::retention::RecordedRetention {
+        let g = crate::types::ResolvedGraduatedRetention {
+            hourly: 1000,
+            daily: 1000,
+            weekly: 1000,
+            monthly: crate::types::MonthlyCount::Unlimited,
+            yearly: 1000,
+        };
+        crate::retention::RecordedRetention {
+            local: Some(crate::types::LocalRetentionPolicy::Graduated(g)),
+            external: Some(g),
+        }
+    }
+
+    fn gate_t() -> chrono::NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(2026, 9, 30)
+            .unwrap()
+            .and_hms_opt(4, 0, 0)
+            .unwrap()
+    }
+
+    /// `decide_retention_gate` over the DB's rows for a run with `filters`.
+    fn gate_for(
+        resolved: &[crate::config::ResolvedSubvolume],
+        db: &StateDb,
+        confirmed: bool,
+        filters: &PlanFilters,
+    ) -> crate::retention::RetentionGate {
+        crate::retention::decide_retention_gate(
+            resolved,
+            &db.all_retention_shapes().unwrap(),
+            confirmed,
+            crate::retention::RecordScope { filters },
+        )
+    }
+
+    #[test]
+    fn retention_gate_first_run_records_then_tightening_holds_until_confirmed() {
+        use crate::retention::{RecordedRetention, RetentionShape};
+        let config = gate_config();
+        let resolved = config.resolved_subvolumes();
+        // `recorded` sends nothing, so only alpha's local half ever runs; its
+        // external half stays absent ("no record").
+        assert!(!resolved[0].send_enabled);
+        let alpha_now = RecordedRetention {
+            local: Some(RetentionShape::of(&resolved[0]).local),
+            external: None,
+        };
+        let db = StateDb::open_memory().unwrap();
+        let full = PlanFilters::default();
+
+        // First run on an upgraded install: no record → nothing held, all recorded.
+        let gate = gate_for(&resolved, &db, false, &full);
+        assert!(gate.held.is_empty());
+        record_retention_shapes(Some(&db), &gate, gate_t());
+        assert_eq!(db.all_retention_shapes().unwrap()["alpha"], alpha_now);
+
+        // The level changed since: alpha used to keep far more.
+        db.upsert_retention_shape_best_effort("alpha", &roomy_shape(), gate_t());
+        let gate = gate_for(&resolved, &db, false, &full);
+        assert_eq!(gate.held.len(), 1);
+        assert_eq!(gate.held[0].subvolume, "alpha");
+        record_retention_shapes(Some(&db), &gate, gate_t());
+        assert_eq!(
+            db.all_retention_shapes().unwrap()["alpha"],
+            roomy_shape(),
+            "a held subvolume keeps its old record, so the next run holds again"
+        );
+
+        // One confirmed run applies and records the new local half; the
+        // external half (no sends ran) keeps the old row's value. Only the
+        // local half had tightened, so the next unconfirmed run holds nothing.
+        let gate = gate_for(&resolved, &db, true, &full);
+        assert!(gate.held.is_empty());
+        record_retention_shapes(Some(&db), &gate, gate_t());
+        assert_eq!(
+            db.all_retention_shapes().unwrap()["alpha"],
+            RecordedRetention {
+                external: roomy_shape().external,
+                ..alpha_now
+            }
+        );
+        assert!(gate_for(&resolved, &db, false, &full).held.is_empty());
+    }
+
+    #[test]
+    fn confirmed_subvolume_scoped_run_records_that_subvolume_only() {
+        // `urd backup --subvolume beta --confirm-retention-change` while alpha
+        // (named level) has tightened: beta records, alpha keeps its old row
+        // and is still held by the next full run.
+        let config = gate_config();
+        let resolved = config.resolved_subvolumes();
+        let db = StateDb::open_memory().unwrap();
+        db.upsert_retention_shape_best_effort("alpha", &roomy_shape(), gate_t());
+        let scoped = PlanFilters {
+            subvolume: Some("beta".to_string()),
+            ..PlanFilters::default()
+        };
+        let gate = gate_for(&resolved, &db, true, &scoped);
+        let recorded: Vec<&str> = gate.record.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(recorded, vec!["beta"]);
+        record_retention_shapes(Some(&db), &gate, gate_t());
+        assert_eq!(db.all_retention_shapes().unwrap()["alpha"], roomy_shape());
+
+        let next = gate_for(&resolved, &db, false, &PlanFilters::default());
+        assert_eq!(next.held.len(), 1);
+        assert_eq!(next.held[0].subvolume, "alpha");
+    }
+
+    #[test]
+    fn retention_gate_never_holds_a_custom_subvolume() {
+        let config = gate_config();
+        let resolved = config.resolved_subvolumes();
+        let db = StateDb::open_memory().unwrap();
+        db.upsert_retention_shape_best_effort("beta", &roomy_shape(), gate_t());
+        let gate = gate_for(&resolved, &db, false, &PlanFilters::default());
+        assert!(gate.held.is_empty(), "beta tightened but is custom: {:?}", gate.held);
+    }
+
+    #[test]
+    fn record_retention_shapes_without_a_db_is_a_no_op() {
+        let gate = crate::retention::RetentionGate {
+            held: vec![],
+            record: vec![("alpha".to_string(), roomy_shape())],
+        };
+        record_retention_shapes(None, &gate, chrono::NaiveDateTime::default());
+    }
+
+    #[test]
+    fn unreadable_retention_baseline_gates_nothing() {
+        // No DB: the baseline is unknown, so nothing is held (ADR-102) — the
+        // helper warns once; the empty map is what the gate sees.
+        assert!(crate::commands::plan_cmd::retention_baseline_or_warn(None).is_empty());
+        assert!(crate::commands::plan_cmd::recorded_retention_shapes(None).is_none());
+    }
 
     // ── Mid-op watchdog arming + reserve-create (UPI 033) ──────────────
 
