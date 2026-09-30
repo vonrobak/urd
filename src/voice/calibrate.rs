@@ -76,3 +76,49 @@ fn render_calibrate_interactive(data: &CalibrateOutput) -> String {
 
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::output::CalibrateEntry;
+
+    // ── Calibrate tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn calibrate_interactive_shows_entries() {
+        let data = CalibrateOutput {
+            entries: vec![
+                CalibrateEntry {
+                    name: "htpc-home".to_string(),
+                    result: CalibrateResult::Ok {
+                        snapshot: "20260326-0400-home".to_string(),
+                        bytes: 1_073_741_824,
+                    },
+                },
+                CalibrateEntry {
+                    name: "htpc-tmp".to_string(),
+                    result: CalibrateResult::Skipped {
+                        reason: "disabled".to_string(),
+                    },
+                },
+            ],
+            calibrated: 1,
+            skipped: 1,
+        };
+        let output = render_calibrate(&data, OutputMode::Interactive);
+        assert!(output.contains("htpc-home"), "missing subvolume name");
+        assert!(output.contains("SKIP"), "missing skip indicator");
+        assert!(output.contains("Calibrated 1"), "missing summary");
+    }
+
+    #[test]
+    fn calibrate_daemon_produces_valid_json() {
+        let data = CalibrateOutput {
+            entries: vec![],
+            calibrated: 0,
+            skipped: 0,
+        };
+        let output = render_calibrate(&data, OutputMode::Daemon);
+        let _: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
+    }
+}

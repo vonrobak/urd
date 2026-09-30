@@ -123,3 +123,34 @@ fn render_subvolume_history_interactive(data: &SubvolumeHistoryOutput) -> String
 
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::output::HistoryRun;
+
+    // ── History tests ───────────────────────────────────────────────────
+
+    #[test]
+    fn history_interactive_contains_runs() {
+        let data = HistoryOutput {
+            runs: vec![HistoryRun {
+                id: 42,
+                started_at: "2026-03-26T04:00:03".to_string(),
+                mode: "full".to_string(),
+                result: "success".to_string(),
+                duration: Some("2m 30s".to_string()),
+            }],
+        };
+        let output = render_history(&data, OutputMode::Interactive);
+        assert!(output.contains("42"), "missing run id");
+        assert!(output.contains("2m 30s"), "missing duration");
+    }
+
+    #[test]
+    fn history_daemon_produces_valid_json() {
+        let data = HistoryOutput { runs: vec![] };
+        let output = render_history(&data, OutputMode::Daemon);
+        let _: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
+    }
+}

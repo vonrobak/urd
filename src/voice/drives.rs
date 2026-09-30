@@ -188,3 +188,193 @@ fn render_drives_adopt_interactive(data: &DriveAdoptOutput) -> String {
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{ByteSize, DriveRole};
+    use crate::voice::test_fixtures::*;
+
+    /// Fixed "now" for the drives list tests (5 days after
+    /// `test_drives_list`'s absent drive's `last_seen`).
+    fn drives_now() -> chrono::NaiveDateTime {
+        fixed_now("2026-03-29T10:00:00")
+    }
+
+    // ── Drives rendering ──────────────────────────────────────────────
+
+    fn test_drives_list() -> DrivesListOutput {
+        use crate::output::{DriveListEntry, DriveStatus, TokenState};
+
+        DrivesListOutput {
+            drives: vec![
+                DriveListEntry {
+                    label: "WD-18TB".to_string(),
+                    status: DriveStatus::Connected,
+                    token_state: TokenState::Verified,
+                    free_space: Some(ByteSize(4_200_000_000_000)),
+                    role: DriveRole::Primary,
+                },
+                DriveListEntry {
+                    label: "WD-18TB1".to_string(),
+                    status: DriveStatus::Absent {
+                        last_seen: Some("2026-03-24T10:00:00".to_string()),
+                    },
+                    token_state: TokenState::Recorded,
+                    free_space: None,
+                    role: DriveRole::Offsite,
+                },
+                DriveListEntry {
+                    label: "2TB-backup".to_string(),
+                    status: DriveStatus::Connected,
+                    token_state: TokenState::New,
+                    free_space: Some(ByteSize(1_100_000_000_000)),
+                    role: DriveRole::Primary,
+                },
+                DriveListEntry {
+                    label: "BAD-UUID".to_string(),
+                    status: DriveStatus::UuidMismatch,
+                    token_state: TokenState::Unknown,
+                    free_space: Some(ByteSize(500_000_000_000)),
+                    role: DriveRole::Primary,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn drives_list_interactive_columns() {
+        let _color = color_guard(false);
+        let output = render_drives_list(
+            &test_drives_list(),
+            OutputMode::Interactive,
+            drives_now(),
+        );
+        assert!(output.contains("DRIVE"), "should have header: {output}");
+        assert!(output.contains("STATUS"), "should have header: {output}");
+        assert!(output.contains("TOKEN"), "should have header: {output}");
+        assert!(
+            output.contains("WD-18TB"),
+            "should list drives: {output}"
+        );
+        assert!(
+            output.contains("connected"),
+            "should show connected: {output}"
+        );
+        assert!(output.contains("absent"), "should show absent: {output}");
+        assert!(output.contains("new"), "should show new token: {output}");
+    }
+
+    #[test]
+    fn drives_list_absent_shows_duration() {
+        let _color = color_guard(false);
+        let output = render_drives_list(
+            &test_drives_list(),
+            OutputMode::Interactive,
+            drives_now(),
+        );
+        // The absent drive's last_seen is 2026-03-24, so "absent Nd" should appear
+        assert!(
+            output.contains("absent") && output.contains("d"),
+            "absent drive should show duration: {output}"
+        );
+    }
+
+    #[test]
+    fn drives_list_uuid_mismatch_shows_status() {
+        let _color = color_guard(false);
+        let output = render_drives_list(
+            &test_drives_list(),
+            OutputMode::Interactive,
+            drives_now(),
+        );
+        assert!(
+            output.contains("uuid mismatch"),
+            "uuid mismatch drive should show status: {output}"
+        );
+    }
+
+    #[test]
+    fn drives_list_token_column_uses_ascii() {
+        let _color = color_guard(false);
+        let output = render_drives_list(
+            &test_drives_list(),
+            OutputMode::Interactive,
+            drives_now(),
+        );
+        assert!(output.contains("ok"), "Verified token should show 'ok': {output}");
+        // Token column should not contain Unicode check/cross marks
+        assert!(
+            !output.contains('\u{2713}') && !output.contains('\u{2717}'),
+            "token column should not contain Unicode check/cross marks: {output}"
+        );
+    }
+
+    /// Golden test (issue #384 part 3): `render_drives_list` used to call
+    /// `chrono::Local::now()` internally to compute the "absent NNd" age,
+    /// which made this line untestable without racing the real clock. With
+    /// `now` threaded through as a parameter, a fixed instant in produces a
+    /// fixed line out.
+    #[test]
+    fn drives_list_absent_duration_golden_line() {
+        let _color = color_guard(false);
+        let now = drives_now();
+        let output = render_drives_list(&test_drives_list(), OutputMode::Interactive, now);
+        assert_eq!(
+            output,
+            "DRIVE        STATUS          TOKEN            FREE   ROLE\n\
+             WD-18TB      connected       ok              4.2TB   primary\n\
+             WD-18TB1     absent 5d       recorded            —   offsite\n\
+             2TB-backup   connected       new             1.1TB   primary\n\
+             BAD-UUID     uuid mismatch   -               500GB   primary\n"
+        );
+    }
+
+    #[test]
+    fn drives_list_daemon_valid_json() {
+        let output = render_drives_list(&test_drives_list(), OutputMode::Daemon, drives_now());
+        let parsed: serde_json::Value =
+            serde_json::from_str(&output).expect("should be valid JSON");
+        assert!(parsed["drives"].is_array());
+        assert_eq!(parsed["drives"].as_array().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn drives_adopt_messages() {
+        let _color = color_guard(false);
+
+        let adopted = DriveAdoptOutput {
+            label: "WD-18TB".to_string(),
+            action: AdoptAction::AdoptedExisting {
+                token: "tok".to_string(),
+            },
+        };
+        let output = render_drives_adopt(&adopted, OutputMode::Interactive);
+        assert!(
+            output.contains("Adopted") && output.contains("existing token"),
+            "adopted existing: {output}"
+        );
+
+        let generated = DriveAdoptOutput {
+            label: "WD-18TB".to_string(),
+            action: AdoptAction::GeneratedNew {
+                token: "tok".to_string(),
+            },
+        };
+        let output = render_drives_adopt(&generated, OutputMode::Interactive);
+        assert!(
+            output.contains("Adopted") && output.contains("new token"),
+            "generated new: {output}"
+        );
+
+        let current = DriveAdoptOutput {
+            label: "WD-18TB".to_string(),
+            action: AdoptAction::AlreadyCurrent,
+        };
+        let output = render_drives_adopt(&current, OutputMode::Interactive);
+        assert!(
+            output.contains("already adopted"),
+            "already current: {output}"
+        );
+    }
+}

@@ -130,3 +130,151 @@ fn format_snapshot_breakdown(windows: &[RecoveryWindow]) -> String {
         .collect::<Vec<_>>()
         .join(" + ")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::output::{DiskEstimate, EstimateMethod, RetentionPreview, TransientComparison};
+    use crate::voice::test_fixtures::color_guard;
+
+    // ── Retention preview tests ──────────────────────────────────────
+
+    fn test_graduated_preview() -> RetentionPreviewOutput {
+        RetentionPreviewOutput {
+            previews: vec![RetentionPreview {
+                subvolume_name: "htpc-root".to_string(),
+                policy_description: "graduated (hourly = 24, daily = 30, weekly = 26)".to_string(),
+                snapshot_interval: "4h".to_string(),
+                recovery_windows: vec![
+                    RecoveryWindow {
+                        granularity: "hourly",
+                        count: 24,
+                        cumulative_days: 1.0,
+                        cumulative_description:
+                            "point-in-time recovery for the last 24 hours".to_string(),
+                    },
+                    RecoveryWindow {
+                        granularity: "daily",
+                        count: 30,
+                        cumulative_days: 31.0,
+                        cumulative_description: "daily snapshots back 31 days".to_string(),
+                    },
+                    RecoveryWindow {
+                        granularity: "weekly",
+                        count: 26,
+                        cumulative_days: 213.0,
+                        cumulative_description: "weekly snapshots back 7 months".to_string(),
+                    },
+                ],
+                estimated_disk_usage: Some(DiskEstimate {
+                    method: EstimateMethod::Calibrated,
+                    per_snapshot_bytes: 1_500_000_000,
+                    total_bytes: 120_000_000_000,
+                    total_count: 80,
+                }),
+                transient_comparison: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn retention_preview_interactive() {
+        let _color = color_guard(false);
+        let output = render_retention_preview(&test_graduated_preview(), OutputMode::Interactive);
+        assert!(
+            output.contains("htpc-root"),
+            "missing subvolume name: {output}"
+        );
+        assert!(output.contains("graduated"), "missing policy: {output}");
+        assert!(
+            output.contains("24 hours"),
+            "missing hourly window: {output}"
+        );
+        assert!(
+            output.contains("31 days"),
+            "missing daily window: {output}"
+        );
+        assert!(
+            output.contains("7 months"),
+            "missing weekly window: {output}"
+        );
+        assert!(
+            output.contains("120GB"),
+            "missing disk estimate: {output}"
+        );
+        assert!(
+            output.contains("Upper bound"),
+            "missing caveat: {output}"
+        );
+    }
+
+    #[test]
+    fn retention_preview_daemon_json() {
+        let output = render_retention_preview(&test_graduated_preview(), OutputMode::Daemon);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&output).expect("daemon output should be valid JSON");
+        assert!(parsed["previews"][0]["subvolume_name"]
+            .as_str()
+            .unwrap()
+            .contains("htpc-root"));
+        assert_eq!(parsed["previews"][0]["recovery_windows"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn retention_preview_transient() {
+        let _color = color_guard(false);
+        let output = render_retention_preview(
+            &RetentionPreviewOutput {
+                previews: vec![RetentionPreview {
+                    subvolume_name: "htpc-root".to_string(),
+                    policy_description: "transient".to_string(),
+                    snapshot_interval: "1d".to_string(),
+                    recovery_windows: Vec::new(),
+                    estimated_disk_usage: None,
+                    transient_comparison: None,
+                }],
+            },
+            OutputMode::Interactive,
+        );
+        assert!(output.contains("none"), "missing 'none' for empty windows: {output}");
+        assert!(
+            output.contains("No local recovery"),
+            "missing transient description: {output}"
+        );
+    }
+
+    #[test]
+    fn retention_preview_with_comparison() {
+        let _color = color_guard(false);
+        let output = render_retention_preview(
+            &RetentionPreviewOutput {
+                previews: vec![RetentionPreview {
+                    subvolume_name: "test".to_string(),
+                    policy_description: "graduated (daily = 30)".to_string(),
+                    snapshot_interval: "1d".to_string(),
+                    recovery_windows: vec![RecoveryWindow {
+                        granularity: "daily",
+                        count: 30,
+                        cumulative_days: 30.0,
+                        cumulative_description: "daily snapshots back 30 days".to_string(),
+                    }],
+                    estimated_disk_usage: None,
+                    transient_comparison: Some(TransientComparison {
+                        graduated_count: 30,
+                        transient_count: 1,
+                        graduated_total_bytes: None,
+                        transient_total_bytes: None,
+                        savings_bytes: None,
+                        lost_window: "daily snapshots back 30 days".to_string(),
+                    }),
+                }],
+            },
+            OutputMode::Interactive,
+        );
+        assert!(
+            output.contains("saves 29 snapshots"),
+            "missing savings count: {output}"
+        );
+        assert!(output.contains("Loses:"), "missing loses: {output}");
+    }
+}
