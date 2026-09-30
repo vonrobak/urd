@@ -52,7 +52,7 @@ use freshness::{
     EXTERNAL_AT_RISK_MULTIPLIER, assess_external_status, assess_local, clamp_age,
     compute_overall_status, external_source_unchanged, local_source_unchanged,
 };
-use health::{compute_health, drive_absence_signal, space_is_tight};
+use health::{HealthInputs, compute_health, drive_absence_signal, space_is_tight};
 use types::OffsiteContext;
 
 // ── Core function ──────────────────────────────────────────────────────
@@ -412,15 +412,17 @@ pub fn assess(
             });
 
         let (health, health_reasons) = compute_health(
-            subvol.send_enabled,
-            &chain_health_entries,
-            &drive_assessments,
-            &config.drives,
+            &HealthInputs {
+                subvol_name: &subvol.name,
+                send_enabled: subvol.send_enabled,
+                local_space_tight: local_space_tight.is_some(),
+                is_transient: subvol.local_retention.is_transient(),
+                chain_health: &chain_health_entries,
+                drive_assessments: &drive_assessments,
+                drives_config: &config.drives,
+                offsite_ctx: &offsite_ctx,
+            },
             obs,
-            &subvol.name,
-            local_space_tight.is_some(),
-            subvol.local_retention.is_transient(),
-            &offsite_ctx,
         );
 
         // ── Storage posture (UPI 031-a) ──────────────────────────────

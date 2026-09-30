@@ -88,22 +88,43 @@ pub(super) fn drive_absence_signal(
 
 // ── Health ─────────────────────────────────────────────────────────────
 
+/// The per-subvolume facts [`compute_health`] judges, named so the call site
+/// reads as prose rather than a row of positional bools.
+pub(super) struct HealthInputs<'a> {
+    pub(super) subvol_name: &'a str,
+    /// Only send-enabled subvolumes are judged on drive/chain health; a
+    /// local-only one stops after the local-space check.
+    pub(super) send_enabled: bool,
+    /// Local snapshot root is within the tight margin of its `min_free`
+    /// (pre-computed by the caller, which holds the config access).
+    pub(super) local_space_tight: bool,
+    /// Transient local retention: some chain breaks are expected, not a
+    /// degradation (`is_expected_chain_break`).
+    pub(super) is_transient: bool,
+    pub(super) chain_health: &'a [DriveChainHealth],
+    pub(super) drive_assessments: &'a [DriveAssessment],
+    pub(super) drives_config: &'a [DriveConfig],
+    pub(super) offsite_ctx: &'a std::collections::HashMap<String, OffsiteContext>,
+}
+
 /// Compute operational health for a subvolume.
 ///
 /// Pure function: chain health + drive state + space info in, health out.
 /// Checks (in priority order): blocked conditions, then degraded conditions.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn compute_health(
-    send_enabled: bool,
-    chain_health: &[DriveChainHealth],
-    drive_assessments: &[DriveAssessment],
-    drives_config: &[DriveConfig],
+    inputs: &HealthInputs<'_>,
     obs: &Observation,
-    subvol_name: &str,
-    local_space_tight: bool,
-    is_transient: bool,
-    offsite_ctx: &std::collections::HashMap<String, OffsiteContext>,
 ) -> (OperationalHealth, Vec<String>) {
+    let HealthInputs {
+        subvol_name,
+        send_enabled,
+        local_space_tight,
+        is_transient,
+        chain_health,
+        drive_assessments,
+        drives_config,
+        offsite_ctx,
+    } = *inputs;
     let mut reasons: Vec<String> = Vec::new();
     let mut worst = OperationalHealth::Healthy;
 
