@@ -11,7 +11,7 @@ use colored::Colorize;
 
 use crate::events::{EventPayload, Severity};
 use crate::output::{EventRow, EventsView};
-use crate::types::ByteSize;
+use crate::types::{ByteSize, TightnessTier};
 use crate::voice::truncate_str;
 
 /// Render the events view as a columnar listing for interactive use.
@@ -219,7 +219,7 @@ fn summary_for(payload: &EventPayload) -> String {
             host_root,
         } => {
             // Escalation tightens; de-escalation eases (direction by tier order).
-            let verb = if crate::storage_critical::TightnessTier::escalated_from_db_str(from, to) {
+            let verb = if TightnessTier::escalated_from_db_str(from, to) {
                 "tightened"
             } else {
                 "eased"

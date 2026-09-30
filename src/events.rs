@@ -15,7 +15,7 @@ use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
 
 use crate::types::PromiseStatus;
-use crate::types::{FullSendReason, SendKind};
+use crate::types::{FullSendReason, SendKind, TightnessTier};
 
 // ── Top-level kind ─────────────────────────────────────────────────────
 
@@ -425,7 +425,7 @@ impl EventPayload {
             // Tier transitions: Notice on escalation (worsening), Info on
             // de-escalation (mirrors PromiseTransition's direction logic).
             Self::StorageTierTransition { from, to, .. } => {
-                if crate::storage_critical::TightnessTier::escalated_from_db_str(from, to) {
+                if TightnessTier::escalated_from_db_str(from, to) {
                     Severity::Notice
                 } else {
                     Severity::Info
