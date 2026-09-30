@@ -23,11 +23,11 @@ use super::duration::DurationStyle;
 pub fn render_empty_plan(explanation: &crate::output::EmptyPlanExplanation) -> String {
     let mut out = String::new();
     let reasons = explanation.reasons.join("; ");
-    let _ = write!(out, "Nothing to back up — {reasons}.");
+    write!(out, "Nothing to back up — {reasons}.").ok();
     if let Some(ref suggestion) = explanation.suggestion {
-        let _ = write!(out, "\n  {suggestion}");
+        write!(out, "\n  {suggestion}").ok();
     }
-    let _ = writeln!(out);
+    writeln!(out).ok();
     out
 }
 

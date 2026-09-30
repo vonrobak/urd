@@ -515,47 +515,52 @@ pub fn render_pre_action(summary: &PreActionSummary) -> String {
 
     // Main line depends on filters
     if summary.filters.local_only {
-        let _ = writeln!(
+        writeln!(
             out,
             "Snapshotting {} subvolume{}.",
             summary.snapshot_count,
             if summary.snapshot_count == 1 { "" } else { "s" }
-        );
+        )
+        .ok();
     } else if summary.filters.external_only {
         let total_sends: usize = summary.send_plan.iter().map(|d| d.subvolume_count).sum();
-        let _ = writeln!(
+        writeln!(
             out,
             "Sending to {drive_list}.\n  {total_sends} subvolume{}{size_str}",
             if total_sends == 1 { "" } else { "s" },
-        );
+        )
+        .ok();
     } else if let Some(ref name) = summary.filters.subvolume {
-        let _ = writeln!(
+        writeln!(
             out,
             "Backing up {name} to {drive_list}.\n  1 snapshot{size_str}",
-        );
+        )
+        .ok();
     } else {
         let total_sends: usize = summary.send_plan.iter().map(|d| d.subvolume_count).sum();
-        let _ = writeln!(
+        writeln!(
             out,
             "Backing up everything to {drive_list}.\n  {} snapshot{}, {total_sends} send{}{size_str}",
             summary.snapshot_count,
             if summary.snapshot_count == 1 { "" } else { "s" },
             if total_sends == 1 { "" } else { "s" },
-        );
+        )
+        .ok();
     }
 
     // Disconnected drives
     for d in &summary.disconnected_drives {
         match d.role {
             DriveRole::Offsite => {
-                let _ = writeln!(
+                writeln!(
                     out,
                     "  {} is away — copies will update when it returns.",
                     d.label
-                );
+                )
+                .ok();
             }
             _ => {
-                let _ = writeln!(out, "  {} not connected.", d.label);
+                writeln!(out, "  {} not connected.", d.label).ok();
             }
         }
     }
