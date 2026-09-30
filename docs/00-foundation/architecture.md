@@ -29,7 +29,7 @@ flowchart LR
     %% Sources
     cfg["config/<br/>parse + validate TOML"]
     obs["observation/<br/>FilesystemQuery + HistoryQuery<br/>(bundled as Observation)<br/>+ RealFileSystemState adapter"]
-    db[("state.rs<br/>SQLite history")]
+    db[("state/<br/>SQLite history")]
 
     %% Pure core
     subgraph pure["Pure functions (no I/O)"]
@@ -143,7 +143,7 @@ ADR in parentheses is the canonical statement (full list of invariants in
 
 3. **Filesystem is truth, SQLite is history (ADR-102).** Pin files and snapshot
    directories are authoritative for "what exists." The state DB records what
-   happened, but a SQLite failure never blocks a backup. This is why `state.rs`
+   happened, but a SQLite failure never blocks a backup. This is why `state/`
    appears as both an input and an output of the pipeline: callers persist
    best-effort records, and readers (awareness, drift, sentinel) consult them
    knowing the data may be incomplete. The read-side split lives in
@@ -187,7 +187,7 @@ the documentation convention in `contributing-internal.md`).
 | `arming.rs` | Pure: the run's storage arming (ADR-113 Layer 1) — `RunArming` (per-subvolume armed tier map, per-pool `ResolvedPoolTier` rows for the writeback, the away-sheddable pin view) resolved once per run, pre-lock, by `RunArming::resolve` from the gathered `PoolSignal`s, `Config`, and a `FilesystemQuery`; owns `drive_scopes`, the presence predicate the planner and the away-shed view share | Perform I/O (`commands/storage_signals.rs` gathers the signals); re-resolve mid-run; derive tiers (`storage_critical.rs` does) |
 | `guard.rs` | Pure do-no-harm decision cores: the mid-op watchdog (ADR-113 Layer 2) `evaluate(free_bytes, floor_bytes) -> WatchdogAction` (floor-only), and the idle emergency-eject (Layer 3) `evaluate_idle_eject(samples) -> pools below the floor`, over the shared `source_floor_bytes` floor both layers compute | Perform I/O; poll (the watchdog thread in `commands/backup.rs` and the sentinel runner sample and act) |
 | `chain.rs` | Track incremental chain parents (pin files) | Send snapshots |
-| `state.rs` | Record history in SQLite — granular SQL wrappers (one method per query) | Influence backup decisions; compose domain-shaped answers (callers compose primitives) |
+| `state/` | Record history in SQLite — granular SQL wrappers (one method per query), one `impl StateDb` file per table family (`schema`, `runs`, `calibration`, `drives`, `drift`, `posture`, `events`); a SQLite failure is `UrdError::State` with the `rusqlite::Error` as its source | Influence backup decisions; compose domain-shaped answers (callers compose primitives) |
 | `preflight.rs` | Validate config achievability (pure, advisory) | Block backups |
 | `heartbeat.rs` | Write JSON health signal after each run | Block backups on failure |
 | `metrics.rs` | Write Prometheus `.prom` files | Read metrics |

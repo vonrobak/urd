@@ -473,6 +473,23 @@ impl LastRunInfo {
     }
 }
 
+/// Compose the presentation summary from the raw `runs` row: `duration` is
+/// the humanized span when the run finished, `None` while it is running.
+impl From<crate::state::RunRecord> for LastRunInfo {
+    fn from(run: crate::state::RunRecord) -> Self {
+        let duration = run
+            .finished_at
+            .as_ref()
+            .and_then(|f| crate::types::format_run_duration(&run.started_at, f));
+        Self {
+            id: run.id,
+            started_at: run.started_at,
+            result: run.result,
+            duration,
+        }
+    }
+}
+
 // ── DefaultStatusOutput ────────────────────────────────────────────────
 
 /// Structured output for bare `urd` — one-sentence status.

@@ -216,7 +216,7 @@ impl RealFileSystemState<'_> {
         match db.drift_samples_for_subvolume(subvol_name, since) {
             Ok(rows) => rows
                 .into_iter()
-                .map(crate::state::StateDb::drift_row_to_sample)
+                .map(crate::drift::DriftSample::from)
                 .collect(),
             Err(e) => {
                 log::warn!("drift_samples_for_subvolume failed for {subvol_name}: {e}");
@@ -240,7 +240,7 @@ impl RealFileSystemState<'_> {
         match db.drift_samples_for_subvolumes(subvol_names, since) {
             Ok(rows) => rows
                 .into_iter()
-                .map(crate::state::StateDb::drift_row_to_sample)
+                .map(crate::drift::DriftSample::from)
                 .collect(),
             Err(e) => {
                 log::warn!("drift_samples_for_subvolumes failed: {e}");
