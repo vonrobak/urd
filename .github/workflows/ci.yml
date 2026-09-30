@@ -44,3 +44,4 @@ jobs:
       - run: bash scripts/check-docs.sh
       - run: bash scripts/check-present-not-journey.sh
       - run: bash scripts/check-voice-boundary.sh
+      - run: bash scripts/check-purity-boundary.sh
