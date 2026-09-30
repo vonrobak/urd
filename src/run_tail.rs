@@ -160,16 +160,16 @@ pub fn decide_tail<'a>(i: &TailInputs<'a>) -> TailPlan<'a> {
         ),
     };
 
-    let heartbeat = heartbeat::build(
-        i.config,
-        i.heartbeat_now,
+    let heartbeat = heartbeat::build(heartbeat::HeartbeatInputs {
+        config: i.config,
+        now: i.heartbeat_now,
         result,
-        i.assessments,
-        i.churn_views,
-        i.observability.pools_heartbeat.clone(),
-        i.observability.drives_heartbeat.clone(),
-        &i.observability.subvol_extras,
-    );
+        assessments: i.assessments,
+        churn_views: i.churn_views,
+        pools: i.observability.pools_heartbeat.clone(),
+        drives: i.observability.drives_heartbeat.clone(),
+        subvol_extras: &i.observability.subvol_extras,
+    });
 
     // The one gate site: computed here, pure — the recorder's GateOnSentinel
     // owns the probe/mark/retry mechanics.

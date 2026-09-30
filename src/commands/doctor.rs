@@ -727,7 +727,6 @@ fn build_doctor_recommendation_view(
 /// single bad sample.
 const MIN_SAMPLE_DAYS: u32 = 3;
 
-#[allow(clippy::too_many_arguments)]
 fn build_doctor_recommendation_view_inner(
     config: &Config,
     state_db: Option<&StateDb>,
