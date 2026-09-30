@@ -911,6 +911,9 @@ pub struct MockBtrfs {
     pub fail_syncs: RefCell<HashSet<PathBuf>>,
     pub existing_subvolumes: RefCell<HashSet<PathBuf>>,
     pub free_bytes: RefCell<u64>,
+    /// Paths for which filesystem_free_bytes() should return an error (a
+    /// failed statvfs). Unlisted paths report `free_bytes`.
+    pub fail_free_bytes: RefCell<HashSet<PathBuf>>,
     pub mock_bytes_transferred: RefCell<Option<u64>>,
     /// Partial bytes to report when a send fails (simulates partial transfer)
     pub mock_fail_send_bytes: RefCell<Option<u64>>,
@@ -943,6 +946,7 @@ impl MockBtrfs {
             fail_syncs: RefCell::new(HashSet::new()),
             existing_subvolumes: RefCell::new(HashSet::new()),
             free_bytes: RefCell::new(1_000_000_000_000), // 1TB default
+            fail_free_bytes: RefCell::new(HashSet::new()),
             mock_bytes_transferred: RefCell::new(None),
             mock_fail_send_bytes: RefCell::new(None),
             generations: RefCell::new(HashMap::new()),
@@ -1094,7 +1098,13 @@ impl BtrfsOps for MockBtrfs {
         self.existing_subvolumes.borrow().contains(path)
     }
 
-    fn filesystem_free_bytes(&self, _path: &Path) -> crate::error::Result<u64> {
+    fn filesystem_free_bytes(&self, path: &Path) -> crate::error::Result<u64> {
+        if self.fail_free_bytes.borrow().contains(path) {
+            return Err(UrdError::Io {
+                path: path.to_path_buf(),
+                source: std::io::Error::other("mock: statvfs failed"),
+            });
+        }
         Ok(*self.free_bytes.borrow())
     }
 

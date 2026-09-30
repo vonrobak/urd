@@ -3,10 +3,13 @@
 //! (the unattended rung of the `guard` ladder), through the same walk
 //! `urd emergency` renders.
 
+use std::sync::atomic::AtomicBool;
+
 use crate::btrfs::{BtrfsOps, RealBtrfs};
 use crate::commands::emergency;
 use crate::config::Config;
 use crate::events::RunContext;
+use crate::executor::{CandidateDeletion, DeleteCandidate, Executor};
 use crate::guard;
 use crate::notify;
 use crate::recorder::{DispatchPolicy, Recorder, Recording};
@@ -98,8 +101,9 @@ pub(super) struct EmergencyRootReclaim {
 /// btrfs handle are injected and the clock is passed in, so the ADR-107
 /// deletion path is unit-testable without a live filesystem. Selects candidates
 /// through `emergency::emergency_walk` — the same walk `urd emergency` renders
-/// — and issues the deletes via `btrfs`, returning the prune events (the
-/// wrapper records them best-effort).
+/// — and issues the deletes through `Executor::delete_candidates` over
+/// `btrfs` (the layer-3 re-check lives there), returning the prune events
+/// (the wrapper records them best-effort).
 ///
 /// `now` is read once per pass — not per subvolume as the inline version did —
 /// so every prune event in one pass shares an `occurred_at`. Benign: the events
@@ -113,6 +117,10 @@ fn run_emergency_preflight_with(
 ) -> anyhow::Result<EmergencyPreflightOutcome> {
     let resolved = config.resolved_subvolumes();
     let drive_labels = config.drive_labels();
+    // A maintenance executor: no state DB, and the loop never consults
+    // shutdown (as before, the pass runs to completion under the lock).
+    let no_shutdown = AtomicBool::new(false);
+    let executor = Executor::new(btrfs, None, config, &no_shutdown);
     let mut any_deleted = false;
     let mut emitted_events: Vec<crate::events::UnstampedEvent> = Vec::new();
     let mut root_summaries: Vec<EmergencyRootReclaim> = Vec::new();
@@ -151,27 +159,32 @@ fn run_emergency_preflight_with(
             let subvol_name = &inputs.name;
             let local_dir = &inputs.local_dir;
 
+            // The executor owns the deletion loop, the ADR-106 layer-3
+            // re-check included; one outcome per candidate, in order.
+            let candidates: Vec<DeleteCandidate<'_>> = result
+                .delete
+                .iter()
+                .map(|rd| DeleteCandidate {
+                    subvolume: subvol_name,
+                    path: local_dir.join(rd.snapshot.as_str()),
+                })
+                .collect();
+            let outcomes = executor.delete_candidates(&candidates);
+
             // Map snap → its emitted event (by snapshot name) so we can
             // persist only events whose underlying delete succeeded.
-            for rd in &result.delete {
+            for ((rd, candidate), outcome) in result.delete.iter().zip(&candidates).zip(outcomes) {
                 let snap = &rd.snapshot;
-                let snap_path = local_dir.join(snap.as_str());
+                let snap_path = &candidate.path;
 
-                // Defense-in-depth (ADR-106 layer 3)
-                if crate::chain::is_pinned_at_delete_time(
-                    &snap_path,
-                    subvol_name,
-                    config,
-                ) {
-                    log::warn!(
-                        "Emergency: defense-in-depth refused delete of {}",
-                        snap_path.display()
-                    );
-                    continue;
-                }
-
-                match btrfs.delete_subvolume(&snap_path) {
-                    Ok(()) => {
+                match outcome {
+                    CandidateDeletion::RefusedPinned => {
+                        log::warn!(
+                            "Emergency: defense-in-depth refused delete of {}",
+                            snap_path.display()
+                        );
+                    }
+                    CandidateDeletion::Deleted => {
                         any_deleted = true;
                         root_deleted += 1;
                         log::info!("Emergency: deleted {}", snap_path.display());
@@ -191,7 +204,7 @@ fn run_emergency_preflight_with(
                             emitted_events.push(ev);
                         }
                     }
-                    Err(e) => {
+                    CandidateDeletion::Failed(e) => {
                         log::error!(
                             "Emergency: failed to delete {}: {e}",
                             snap_path.display()
