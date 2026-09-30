@@ -27,7 +27,7 @@ before reading specific modules or ADRs.
 ```mermaid
 flowchart LR
     %% Sources
-    cfg["config.rs<br/>parse + validate TOML"]
+    cfg["config/<br/>parse + validate TOML"]
     obs["observation.rs<br/>FilesystemQuery + HistoryQuery<br/>(bundled as Observation)"]
     db[("state.rs<br/>SQLite history")]
 
@@ -162,7 +162,7 @@ the documentation convention in `contributing-internal.md`).
 
 | Module | Does | Does NOT |
 |--------|------|----------|
-| `config.rs` | Parse TOML, validate, expand paths, resolve subvolumes | Touch filesystem beyond path checks |
+| `config/` | Parse TOML (legacy/v1/v2 parsers behind one version dispatch), validate, expand paths, resolve subvolumes | Touch filesystem beyond path checks |
 | `cli.rs` | Define the `clap` command surface (argument parsing) | Contain command logic (`commands/` does that) |
 | `cli_validation.rs` | CLI-boundary guards: resolve a user string to a known config name before the planner, or refuse with help | Run core logic; let unvalidated input reach the planner |
 | `types.rs` | Domain types, parsing, `Display`, `derive_policy()`, `validate_protection_contract()` (the ADR-110 opacity contract) | Contain business logic |
@@ -188,7 +188,7 @@ the documentation convention in `contributing-internal.md`).
 | `pools.rs` | Detect BTRFS pools, group subvolumes by pool UUID, read sysfs/statvfs utilization | Know about retention, plans, drive lifecycle, or notification policy |
 | `discovery.rs` | Build the zero-state `SystemInventory` (pools, mounted subvolumes, candidate drives with internal/external class + LUKS state, typed notes) from unprivileged probes — `lsblk -J`/`findmnt -J` parsing, per-disk signal aggregation; observational only | Use sudo or `BtrfsOps`; read config or state DB; vouch for device identity to privileged consumers (they re-verify at action time) |
 | `strategy.rs` | Pure: derive a `ProposedStrategy` from `SystemInventory` + `FateAnswers` — promises on the named levels, drive roles, `derive_policy()` retention shapes, typed `Gap`s and intention strings; owns the shared candidate/destination rules the Encounter's question list is built from (positive-evidence pool residency, ask-don't-guess) | Produce `Config` or TOML (config generation owns conversion); ask questions or render (conversation/voice own those); derive `fortified` or `custom`; perform I/O |
-| `config_render.rs` | Pure: convert an approved `ProposedStrategy` into the internal `Config` normal form and hand-render it as fully explicit, commented v2 TOML (`generate_config`, the single entry) — anchored intention comments, typed exclusion block, gap commentary, tool-agnostic header | Perform I/O or write files (`commands/encounter.rs` owns the self-check + atomic no-clobber publish); parse configs (`config.rs` owns the tri-parser); derive strategies; render conversation or mythic voice |
+| `config_render.rs` | Pure: convert an approved `ProposedStrategy` into the internal `Config` normal form and hand-render it as fully explicit, commented v2 TOML (`generate_config`, the single entry) — anchored intention comments, typed exclusion block, gap commentary, tool-agnostic header | Perform I/O or write files (`commands/encounter.rs` owns the self-check + atomic no-clobber publish); parse configs (`config/` owns the tri-parser); derive strategies; render conversation or mythic voice |
 | `encounter.rs` | Pure state machine for the Fate Conversation (`begin`/`advance` → typed `Effect`s: prompt, look, carve, farewell — discovery is *requested* via `Effect::Look`, never performed here) — question queues derived from `strategy.rs`'s candidate/destination rules (question economy by construction), input parsing against the live prompt's choice vector, and the composed views (`LookingView`, `RunestoneView`, `EmptyView`) the renderer consumes | Perform I/O (`commands/encounter.rs` owns stdin, discovery, clock, carve, the editor loop); render text (`voice/encounter.rs`); derive strategies or generate configs (it calls, never reimplements) |
 | `sudoers.rs` | Pure: render the scoped `/etc/sudoers.d/urd` grant from `Config` (`render_sudoers`, the single oracle) — creation/deletion lines per source/snapshot-root pair, broad send/receive, read-only diagnostics; refuses hostile config values (control chars, `#`, non-UTF-8, a scope floor that blocks shallow paths) rather than escaping them; also the drift oracle's granted side — parses `sudo -n -l` output (`parse_privilege_listing`), three-state `coverage`, and `classify_probe` | Perform I/O; install or write the sudoers file (`commands/seal.rs` does that); prompt for consent |
 | `systemd_units.rs` | Pure: the units oracle — render the expected systemd user units from the embedded repo `systemd/` files (`expected_units`: cadence-selected set, ExecStart substituted with the resolved binary path, hostile paths refused rather than escaped) and diff installed contents against them (`diff_units`); serves the seal's install and doctor's drift advisory from one render | Perform I/O; write or enable units (`commands/seal.rs` does that); talk to systemctl |
