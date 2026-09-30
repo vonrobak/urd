@@ -8,7 +8,7 @@ use chrono::{Duration, NaiveDateTime};
 
 use super::types::{DriveAssessment, LocalAssessment};
 use crate::observation::Observation;
-use crate::types::{Interval, LocalRetentionPolicy, PromiseStatus, SnapshotName};
+use crate::types::{DriveLabel, Interval, LocalRetentionPolicy, PromiseStatus, SnapshotName};
 
 // ── Thresholds ─────────────────────────────────────────────────────────
 
@@ -144,7 +144,7 @@ pub(super) fn external_source_unchanged(
     obs: &Observation,
     source_gen: Option<u64>,
     local_dir: &std::path::Path,
-    drive_label: &str,
+    drive_label: &DriveLabel,
     ext_snaps: Option<&[SnapshotName]>,
 ) -> bool {
     let Some(source_gen) = source_gen else {

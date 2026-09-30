@@ -5,7 +5,7 @@ use chrono::{Duration, NaiveDateTime};
 use serde::{Deserialize, Serialize};
 
 use super::chain::DriveChainHealth;
-use crate::types::{DriveRole, Interval, PromiseStatus};
+use crate::types::{DriveLabel, DriveRole, Interval, PromiseStatus, SubvolName};
 
 // ── Types ──────────────────────────────────────────────────────────────
 
@@ -56,7 +56,7 @@ impl OperationalHealth {
 /// Complete assessment for a single subvolume.
 #[derive(Debug)]
 pub struct SubvolAssessment {
-    pub name: String,
+    pub name: SubvolName,
     /// The user-facing short name (UPI 079-a §8a) — rendered in the SUBVOLUME
     /// display cell. `name` stays the join key for chain health, advisories, and
     /// errors; only the display cell uses this.
@@ -114,7 +114,7 @@ impl SubvolAssessment {
     /// fields out; a seventeenth field now lands here once (#387).
     pub(crate) fn fixture(name: &str, status: PromiseStatus) -> Self {
         Self {
-            name: name.to_string(),
+            name: name.into(),
             short_name: name.to_string(),
             status,
             health: OperationalHealth::Healthy,
@@ -228,7 +228,7 @@ pub(super) struct OffsiteContext {
 /// External drive send freshness assessment.
 #[derive(Debug)]
 pub struct DriveAssessment {
-    pub drive_label: String,
+    pub drive_label: DriveLabel,
     pub status: PromiseStatus,
     pub mounted: bool,
     pub snapshot_count: Option<usize>,
@@ -268,7 +268,7 @@ impl DriveAssessment {
     /// syntax, as with [`SubvolAssessment::fixture`].
     pub(crate) fn fixture(label: &str) -> Self {
         Self {
-            drive_label: label.to_string(),
+            drive_label: label.into(),
             status: PromiseStatus::Unprotected,
             mounted: true,
             snapshot_count: None,

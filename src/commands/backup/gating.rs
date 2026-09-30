@@ -7,6 +7,7 @@ use crate::config::Config;
 use crate::drives;
 use crate::plan::{BackupPlan, PlannedOperation};
 use crate::state::StateDb;
+use crate::types::DriveLabel;
 
 /// Probe every mounted drive's identity token — the I/O half of token gating
 /// (UPI 059-b): whether its token file is readable, and its availability
@@ -16,7 +17,7 @@ use crate::state::StateDb;
 pub(super) fn probe_drive_tokens(
     config: &Config,
     db: &StateDb,
-) -> Vec<(String, drives::DriveAvailability, bool)> {
+) -> Vec<(DriveLabel, drives::DriveAvailability, bool)> {
     config
         .drives
         .iter()
@@ -59,8 +60,8 @@ pub(super) fn probe_drive_tokens(
 /// gate may proceed for these drives.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(super) struct TokenGating {
-    blocked: std::collections::BTreeSet<String>,
-    verified: std::collections::BTreeSet<String>,
+    blocked: std::collections::BTreeSet<DriveLabel>,
+    verified: std::collections::BTreeSet<DriveLabel>,
 }
 
 /// Classify drive token probes into blocked and verified labels (pure).
@@ -73,7 +74,7 @@ pub(super) struct TokenGating {
 /// [`probe_drive_tokens`] at the I/O boundary — this function does no logging.
 #[must_use]
 pub(super) fn resolve_token_gating(
-    probes: &[(String, drives::DriveAvailability, bool)],
+    probes: &[(DriveLabel, drives::DriveAvailability, bool)],
 ) -> TokenGating {
     let mut gating = TokenGating::default();
     for (label, avail, has_readable_token) in probes {
@@ -148,6 +149,8 @@ pub(super) fn record_retention_shapes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::dlabel;
+    use crate::testkit::svname;
     use std::collections::HashMap;
     use std::path::PathBuf;
     use crate::plan::{DeleteKind, PlanFilters};
@@ -252,7 +255,7 @@ source = "/data/beta"
         assert_eq!(db.all_retention_shapes().unwrap()["alpha"], alpha_now);
 
         // The level changed since: alpha used to keep far more.
-        db.upsert_retention_shape_best_effort("alpha", &roomy_shape(), gate_t());
+        db.upsert_retention_shape_best_effort(&svname("alpha"), &roomy_shape(), gate_t());
         let gate = gate_for(&resolved, &db, false, &full);
         assert_eq!(gate.held.len(), 1);
         assert_eq!(gate.held[0].subvolume, "alpha");
@@ -287,9 +290,9 @@ source = "/data/beta"
         let config = gate_config();
         let resolved = config.resolved_subvolumes();
         let db = StateDb::open_memory().unwrap();
-        db.upsert_retention_shape_best_effort("alpha", &roomy_shape(), gate_t());
+        db.upsert_retention_shape_best_effort(&svname("alpha"), &roomy_shape(), gate_t());
         let scoped = PlanFilters {
-            subvolume: Some("beta".to_string()),
+            subvolume: Some(svname("beta")),
             ..PlanFilters::default()
         };
         let gate = gate_for(&resolved, &db, true, &scoped);
@@ -308,7 +311,7 @@ source = "/data/beta"
         let config = gate_config();
         let resolved = config.resolved_subvolumes();
         let db = StateDb::open_memory().unwrap();
-        db.upsert_retention_shape_best_effort("beta", &roomy_shape(), gate_t());
+        db.upsert_retention_shape_best_effort(&svname("beta"), &roomy_shape(), gate_t());
         let gate = gate_for(&resolved, &db, false, &PlanFilters::default());
         assert!(gate.held.is_empty(), "beta tightened but is custom: {:?}", gate.held);
     }
@@ -317,7 +320,7 @@ source = "/data/beta"
     fn record_retention_shapes_without_a_db_is_a_no_op() {
         let gate = crate::retention::RetentionGate {
             held: vec![],
-            record: vec![("alpha".to_string(), roomy_shape())],
+            record: vec![(svname("alpha"), roomy_shape())],
         };
         record_retention_shapes(None, &gate, chrono::NaiveDateTime::default());
     }
@@ -336,8 +339,8 @@ source = "/data/beta"
         PlannedOperation::SendFull {
             snapshot: PathBuf::from(format!("/snaps/sv/{drive}-snap")),
             dest_dir: PathBuf::from(format!("/mnt/{drive}/sv")),
-            drive_label: drive.to_string(),
-            subvolume_name: "sv".to_string(),
+            drive_label: drive.into(),
+            subvolume_name: svname("sv"),
             pin_on_success: None,
             reason: FullSendReason::FirstSend,
             token_verified,
@@ -349,8 +352,8 @@ source = "/data/beta"
             parent: PathBuf::from("/snaps/sv/parent"),
             snapshot: PathBuf::from("/snaps/sv/snap"),
             dest_dir: PathBuf::from(format!("/mnt/{drive}/sv")),
-            drive_label: drive.to_string(),
-            subvolume_name: "sv".to_string(),
+            drive_label: drive.into(),
+            subvolume_name: svname("sv"),
             pin_on_success: None,
         }
     }
@@ -359,7 +362,7 @@ source = "/data/beta"
         PlannedOperation::DeleteSnapshot {
             path: PathBuf::from(format!("/snaps/{subvol}/old")),
             reason: "retention".to_string(),
-            subvolume_name: subvol.to_string(),
+            subvolume_name: subvol.into(),
             kind: DeleteKind::Policy,
         }
     }
@@ -378,7 +381,7 @@ source = "/data/beta"
     fn resolve_token_gating_mismatch_blocks() {
         // A readable-but-mismatched token blocks (readable=true must not verify it).
         let probes = vec![(
-            "WD-18TB".to_string(),
+            dlabel("WD-18TB"),
             drives::DriveAvailability::TokenMismatch {
                 expected: "aaa".to_string(),
                 found: "bbb".to_string(),
@@ -393,7 +396,7 @@ source = "/data/beta"
     #[test]
     fn resolve_token_gating_expected_but_missing_blocks() {
         let probes = vec![(
-            "WD-18TB".to_string(),
+            dlabel("WD-18TB"),
             drives::DriveAvailability::TokenExpectedButMissing,
             false,
         )];
@@ -405,7 +408,7 @@ source = "/data/beta"
     #[test]
     fn resolve_token_gating_available_and_readable_verifies() {
         let probes = vec![(
-            "WD-18TB".to_string(),
+            dlabel("WD-18TB"),
             drives::DriveAvailability::Available,
             true,
         )];
@@ -419,7 +422,7 @@ source = "/data/beta"
         // Fail-open: drive is available but its token file can't be read.
         // Must NOT be treated as verified (excludes fail-open from verified).
         let probes = vec![(
-            "WD-18TB".to_string(),
+            dlabel("WD-18TB"),
             drives::DriveAvailability::Available,
             false,
         )];
@@ -434,15 +437,15 @@ source = "/data/beta"
         // unavailability all fall through to neither — even when the token
         // file happens to be readable (TokenMissing with readable=true).
         let probes = vec![
-            ("a".to_string(), drives::DriveAvailability::TokenMissing, true),
-            ("b".to_string(), drives::DriveAvailability::NotMounted, false),
+            (dlabel("a"), drives::DriveAvailability::TokenMissing, true),
+            (dlabel("b"), drives::DriveAvailability::NotMounted, false),
             (
-                "c".to_string(),
+                dlabel("c"),
                 drives::DriveAvailability::UuidCheckFailed("findmnt not found".to_string()),
                 true,
             ),
             (
-                "d".to_string(),
+                dlabel("d"),
                 drives::DriveAvailability::UuidMismatch {
                     expected: "x".to_string(),
                     found: "y".to_string(),
@@ -465,7 +468,7 @@ source = "/data/beta"
             delete_snapshot("sv"),
         ]);
         let gating = TokenGating {
-            blocked: ["WD-18TB".to_string()].into_iter().collect(),
+            blocked: [dlabel("WD-18TB")].into_iter().collect(),
             verified: Default::default(),
         };
         apply_token_gating(&mut plan, &gating);
@@ -486,7 +489,7 @@ source = "/data/beta"
         ]);
         let gating = TokenGating {
             blocked: Default::default(),
-            verified: ["WD-18TB".to_string()].into_iter().collect(),
+            verified: [dlabel("WD-18TB")].into_iter().collect(),
         };
         apply_token_gating(&mut plan, &gating);
         // Nothing dropped (no blocked labels).

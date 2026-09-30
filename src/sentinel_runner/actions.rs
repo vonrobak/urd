@@ -14,7 +14,7 @@ use crate::heartbeat;
 use crate::notify;
 use crate::observation::{Observation, RealFileSystemState};
 use crate::sentinel;
-use crate::types::Timestamp;
+use crate::types::{DriveLabel, Timestamp};
 
 use super::{SentinelRunner, is_pid_alive};
 
@@ -164,7 +164,7 @@ impl SentinelRunner {
                         ),
                     },
                 );
-                event.fill_drive_label(Some(anomaly.drive_label.clone()));
+                event.fill_drive_label(Some(anomaly.drive_label.to_string()));
                 audit_events.push(event);
             }
             self.state.last_chain_health = current_chains;
@@ -213,7 +213,7 @@ impl SentinelRunner {
         Ok(())
     }
 
-    pub(super) fn execute_log_drive_change(&self, label: &str, mounted: bool) {
+    pub(super) fn execute_log_drive_change(&self, label: &DriveLabel, mounted: bool) {
         use crate::state::{DriveEventSource, DriveEventType};
 
         let event_type = if mounted {
@@ -241,9 +241,9 @@ impl SentinelRunner {
     /// Handle drive reconnection — check token state before dispatching.
     /// Sends a different notification depending on whether the drive's
     /// identity is verified or suspect (S1 fix from adversary review).
-    pub(super) fn execute_drive_reconnection_notification(&self, label: &str) {
+    pub(super) fn execute_drive_reconnection_notification(&self, label: &DriveLabel) {
         // Find drive config.
-        let Some(drive) = self.config.drives.iter().find(|d| d.label == label) else {
+        let Some(drive) = self.config.drives.iter().find(|d| d.label == *label) else {
             log::warn!("Drive reconnection notification for unknown label '{label}' — skipping");
             return;
         };

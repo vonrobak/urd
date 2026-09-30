@@ -93,7 +93,7 @@ pub fn resume_seal(config: &Config, config_path: &Path) -> anyhow::Result<SealOu
             .iter()
             .filter(|sv| sv.enabled)
             .map(|sv| crate::output::SealThread {
-                name: sv.name.clone(),
+                name: sv.name.to_string(),
                 level: sv.protection_level.map(|l| l.to_string()),
             })
             .collect(),
@@ -1281,6 +1281,7 @@ fn coverage_missing(config: &Config) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::dlabel;
 
     /// UPI 081 A3 (#277): sets `Off` for the closure's duration and always
     /// restores the prior level after — on the success path, and on the
@@ -1750,7 +1751,7 @@ role = "primary"
 
         let tmp = tempfile::TempDir::new().unwrap();
         let drive = crate::config::DriveConfig {
-            label: "backup-1".to_string(),
+            label: dlabel("backup-1"),
             uuid: None,
             mount_path: tmp.path().to_path_buf(),
             snapshot_root: ".snapshots".to_string(),
@@ -1780,7 +1781,7 @@ role = "primary"
 
         let tmp = tempfile::TempDir::new().unwrap();
         let drive = crate::config::DriveConfig {
-            label: "backup-1".to_string(),
+            label: dlabel("backup-1"),
             uuid: None,
             mount_path: tmp.path().to_path_buf(),
             snapshot_root: ".snapshots".to_string(),

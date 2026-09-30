@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use super::*;
+use crate::testkit::{dlabel, svname};
 use crate::arming::away_shed_map;
 use crate::observation::RealFileSystemState;
 use crate::storage_critical::{ArmedTierMap, TightnessTier};
@@ -135,7 +136,7 @@ fn drive_gate_truth_table_all_seven_availability_variants() {
         };
         assert!(
             matches!(
-                check_drive_availability("sv1", drive, &obs, now()),
+                check_drive_availability(&svname("sv1"), drive, &obs, now()),
                 DriveGate::Ready
             ),
             "{avail:?} should be Ready",
@@ -177,7 +178,7 @@ fn drive_gate_truth_table_all_seven_availability_variants() {
             history: &fs,
             btrfs: &btrfs,
         };
-        match check_drive_availability("sv1", drive, &obs, now()) {
+        match check_drive_availability(&svname("sv1"), drive, &obs, now()) {
             DriveGate::Deferred(f) => {
                 let (ops, skipped, events) = f.into_parts();
                 assert!(ops.is_empty(), "{avail:?}");
@@ -199,7 +200,7 @@ fn drive_scopes_classifies_presence_and_reads_all_pins() {
     let config = two_drive_config(None);
     let resolved = config.resolved_subvolumes();
     let sv = resolved.iter().find(|s| s.name == "sv1").unwrap();
-    let local_dir = config.local_snapshot_dir("sv1").unwrap();
+    let local_dir = config.local_snapshot_dir(&svname("sv1")).unwrap();
 
     let mut fs = MockFileSystemState::new();
     fs.drive_availability_overrides
@@ -233,7 +234,7 @@ fn drive_scopes_token_missing_counts_as_mounted() {
     let config = two_drive_config(None);
     let resolved = config.resolved_subvolumes();
     let sv = resolved.iter().find(|s| s.name == "sv1").unwrap();
-    let local_dir = config.local_snapshot_dir("sv1").unwrap();
+    let local_dir = config.local_snapshot_dir(&svname("sv1")).unwrap();
     let mut fs = MockFileSystemState::new();
     fs.drive_availability_overrides
         .insert("PRIMARY".into(), DriveAvailability::TokenMissing);
@@ -252,7 +253,7 @@ fn drive_scopes_respects_accepts_drive_filter() {
     let config = two_drive_config(Some("PRIMARY"));
     let resolved = config.resolved_subvolumes();
     let sv = resolved.iter().find(|s| s.name == "sv1").unwrap();
-    let local_dir = config.local_snapshot_dir("sv1").unwrap();
+    let local_dir = config.local_snapshot_dir(&svname("sv1")).unwrap();
     let fs = MockFileSystemState::new();
     let scopes = drive_scopes(sv, &config.drives, &local_dir, &fs);
     assert_eq!(scopes.len(), 1);
@@ -266,7 +267,7 @@ fn drive_scopes_pin_read_error_is_no_pin() {
     let config = two_drive_config(None);
     let resolved = config.resolved_subvolumes();
     let sv = resolved.iter().find(|s| s.name == "sv1").unwrap();
-    let local_dir = config.local_snapshot_dir("sv1").unwrap();
+    let local_dir = config.local_snapshot_dir(&svname("sv1")).unwrap();
     let mut fs = MockFileSystemState::new();
     fs.drive_availability_overrides
         .insert("PRIMARY".into(), DriveAvailability::Available);
@@ -288,7 +289,7 @@ fn est_full_needed_uses_same_drive_history_first() {
         .insert(("sv1".into(), "OTHER".into(), SendKind::Full), 10_000_000_000);
     fs.calibrated_sizes
         .insert("sv1".into(), (999_999_999_999, None));
-    assert_eq!(estimated_send_size(&fs, "sv1", "D1", true), Some(50_000_000_000));
+    assert_eq!(estimated_send_size(&fs, &svname("sv1"), &dlabel("D1"), true), Some(50_000_000_000));
 }
 
 #[test]
@@ -296,7 +297,7 @@ fn est_full_needed_falls_back_cross_drive() {
     let mut fs = MockFileSystemState::new();
     fs.send_sizes
         .insert(("sv1".into(), "OTHER".into(), SendKind::Full), 10_000_000_000);
-    assert_eq!(estimated_send_size(&fs, "sv1", "D1", true), Some(10_000_000_000));
+    assert_eq!(estimated_send_size(&fs, &svname("sv1"), &dlabel("D1"), true), Some(10_000_000_000));
 }
 
 #[test]
@@ -310,7 +311,7 @@ fn est_any_drive_prefers_recency_over_value() {
         .insert(("sv1".into(), "D1".into(), SendKind::Full), 90_000_000_000);
     fs.send_sizes
         .insert(("sv1".into(), "D2".into(), SendKind::Full), 10_000_000_000);
-    assert_eq!(estimated_send_size(&fs, "sv1", "D3", true), Some(10_000_000_000));
+    assert_eq!(estimated_send_size(&fs, &svname("sv1"), &dlabel("D3"), true), Some(10_000_000_000));
 }
 
 #[test]
@@ -318,7 +319,7 @@ fn est_full_needed_falls_back_calibrated_when_no_history() {
     let mut fs = MockFileSystemState::new();
     fs.calibrated_sizes
         .insert("sv1".into(), (42_000_000_000, None));
-    assert_eq!(estimated_send_size(&fs, "sv1", "D1", true), Some(42_000_000_000));
+    assert_eq!(estimated_send_size(&fs, &svname("sv1"), &dlabel("D1"), true), Some(42_000_000_000));
 }
 
 #[test]
@@ -328,7 +329,7 @@ fn est_incremental_uses_same_drive_history() {
         ("sv1".into(), "D1".into(), SendKind::Incremental),
         5_000_000,
     );
-    assert_eq!(estimated_send_size(&fs, "sv1", "D1", false), Some(5_000_000));
+    assert_eq!(estimated_send_size(&fs, &svname("sv1"), &dlabel("D1"), false), Some(5_000_000));
 }
 
 #[test]
@@ -338,7 +339,7 @@ fn est_incremental_falls_back_cross_drive() {
         ("sv1".into(), "OTHER".into(), SendKind::Incremental),
         3_000_000,
     );
-    assert_eq!(estimated_send_size(&fs, "sv1", "D1", false), Some(3_000_000));
+    assert_eq!(estimated_send_size(&fs, &svname("sv1"), &dlabel("D1"), false), Some(3_000_000));
 }
 
 #[test]
@@ -346,7 +347,7 @@ fn est_incremental_never_uses_calibrated() {
     let mut fs = MockFileSystemState::new();
     fs.calibrated_sizes
         .insert("sv1".into(), (999_999_999_999, None));
-    assert_eq!(estimated_send_size(&fs, "sv1", "D1", false), None);
+    assert_eq!(estimated_send_size(&fs, &svname("sv1"), &dlabel("D1"), false), None);
 }
 
 fn displayed_estimate_fs(last_send_days_ago: Option<i64>) -> (MockFileSystemState, NaiveDateTime) {
@@ -369,43 +370,78 @@ fn displayed_estimate_fs(last_send_days_ago: Option<i64>) -> (MockFileSystemStat
 #[test]
 fn displayed_estimate_incremental_fresh_is_shown() {
     let (fs, now) = displayed_estimate_fs(Some(1));
-    let shown = displayed_send_estimate(&fs, "sv1", "D1", false, now, Some(Interval::days(1)));
+    let shown = displayed_send_estimate(
+        &fs,
+        &svname("sv1"),
+        &dlabel("D1"),
+        false,
+        now,
+        Some(Interval::days(1)),
+    );
     assert_eq!(shown, Some(194_600_000_000));
 }
 
 #[test]
 fn displayed_estimate_incremental_older_than_twice_interval_is_withheld() {
     let (fs, now) = displayed_estimate_fs(Some(3));
-    let shown = displayed_send_estimate(&fs, "sv1", "D1", false, now, Some(Interval::days(1)));
+    let shown = displayed_send_estimate(
+        &fs,
+        &svname("sv1"),
+        &dlabel("D1"),
+        false,
+        now,
+        Some(Interval::days(1)),
+    );
     assert_eq!(shown, None);
 }
 
 #[test]
 fn displayed_estimate_incremental_exactly_twice_interval_is_shown() {
     let (fs, now) = displayed_estimate_fs(Some(2));
-    let shown = displayed_send_estimate(&fs, "sv1", "D1", false, now, Some(Interval::days(1)));
+    let shown = displayed_send_estimate(
+        &fs,
+        &svname("sv1"),
+        &dlabel("D1"),
+        false,
+        now,
+        Some(Interval::days(1)),
+    );
     assert_eq!(shown, Some(194_600_000_000));
 }
 
 #[test]
 fn displayed_estimate_full_send_ignores_staleness() {
     let (fs, now) = displayed_estimate_fs(Some(50));
-    let shown = displayed_send_estimate(&fs, "sv1", "D1", true, now, Some(Interval::days(1)));
+    let shown = displayed_send_estimate(
+        &fs,
+        &svname("sv1"),
+        &dlabel("D1"),
+        true,
+        now,
+        Some(Interval::days(1)),
+    );
     assert_eq!(shown, Some(194_600_000_000));
 }
 
 #[test]
 fn displayed_estimate_without_last_send_time_is_unchanged() {
     let (fs, now) = displayed_estimate_fs(None);
-    let shown = displayed_send_estimate(&fs, "sv1", "D1", false, now, Some(Interval::days(1)));
+    let shown = displayed_send_estimate(
+        &fs,
+        &svname("sv1"),
+        &dlabel("D1"),
+        false,
+        now,
+        Some(Interval::days(1)),
+    );
     assert_eq!(shown, Some(194_600_000_000));
 }
 
 #[test]
 fn est_returns_none_when_no_data() {
     let fs = MockFileSystemState::new();
-    assert_eq!(estimated_send_size(&fs, "sv1", "D1", true), None);
-    assert_eq!(estimated_send_size(&fs, "sv1", "D1", false), None);
+    assert_eq!(estimated_send_size(&fs, &svname("sv1"), &dlabel("D1"), true), None);
+    assert_eq!(estimated_send_size(&fs, &svname("sv1"), &dlabel("D1"), false), None);
 }
 
 #[test]
@@ -541,7 +577,7 @@ fn subvolume_filter_overrides_interval() {
         .insert("sv1".to_string(), vec![snap("20260322-1458-one")]);
 
     let filters = PlanFilters {
-        subvolume: Some("sv1".to_string()),
+        subvolume: Some(svname("sv1")),
         ..PlanFilters::default()
     };
     let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &RunArming::default()).unwrap();
@@ -591,7 +627,7 @@ fn incremental_send_with_valid_pin() {
     );
 
     let filters = PlanFilters {
-        subvolume: Some("sv1".to_string()),
+        subvolume: Some(svname("sv1")),
         ..PlanFilters::default()
     };
     let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &RunArming::default()).unwrap();
@@ -612,7 +648,7 @@ fn full_send_when_no_pin() {
     fs.mounted_drives.insert("D1".to_string());
 
     let filters = PlanFilters {
-        subvolume: Some("sv1".to_string()),
+        subvolume: Some(svname("sv1")),
         ..PlanFilters::default()
     };
     let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &RunArming::default()).unwrap();
@@ -645,7 +681,7 @@ fn full_send_when_parent_missing_on_external() {
         .insert((PathBuf::from("/snap/sv1"), "D1".to_string()), parent);
 
     let filters = PlanFilters {
-        subvolume: Some("sv1".to_string()),
+        subvolume: Some(svname("sv1")),
         ..PlanFilters::default()
     };
     let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &RunArming::default()).unwrap();
@@ -678,7 +714,7 @@ fn chain_broken_plan_defaults_token_verified_false() {
         .insert((PathBuf::from("/snap/sv1"), "D1".to_string()), parent);
 
     let filters = PlanFilters {
-        subvolume: Some("sv1".to_string()),
+        subvolume: Some(svname("sv1")),
         ..PlanFilters::default()
     };
     let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &RunArming::default()).unwrap();
@@ -826,7 +862,7 @@ fn send_includes_pin_info() {
     fs.mounted_drives.insert("D1".to_string());
 
     let filters = PlanFilters {
-        subvolume: Some("sv1".to_string()),
+        subvolume: Some(svname("sv1")),
         ..PlanFilters::default()
     };
     let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &RunArming::default()).unwrap();
@@ -871,7 +907,7 @@ fn unsent_snapshots_protected_from_retention() {
         .insert((PathBuf::from("/snap/sv1"), "D1".to_string()), pin_snap);
 
     let filters = PlanFilters {
-        subvolume: Some("sv1".to_string()),
+        subvolume: Some(svname("sv1")),
         local_only: true,
         ..PlanFilters::default()
     };
@@ -908,7 +944,7 @@ fn all_snapshots_protected_when_no_pin() {
     );
 
     let filters = PlanFilters {
-        subvolume: Some("sv1".to_string()),
+        subvolume: Some(svname("sv1")),
         local_only: true,
         ..PlanFilters::default()
     };
@@ -1827,7 +1863,7 @@ fn space_guard_not_overridden_by_force() {
 
     // Force sv1 — should still be blocked by space guard
     let filters = PlanFilters {
-        subvolume: Some("sv1".to_string()),
+        subvolume: Some(svname("sv1")),
         ..PlanFilters::default()
     };
     let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &MockBtrfs::new() }, &RunArming::default()).unwrap();
@@ -2599,7 +2635,7 @@ fn transient_absent_drive_pin_held_at_tight_retain_parents() {
     );
 
     let mut armed = ArmedTierMap::new();
-    armed.insert("sv1".to_string(), TightnessTier::Tight);
+    armed.insert(svname("sv1"), TightnessTier::Tight);
     let deletes = sv1_delete_names(&plan(
         &config,
         now(),
@@ -2651,7 +2687,7 @@ fn transient_absent_drive_pin_shed_at_critical() {
     );
 
     let mut armed = ArmedTierMap::new();
-    armed.insert("sv1".to_string(), TightnessTier::Critical);
+    armed.insert(svname("sv1"), TightnessTier::Critical);
     let deletes = sv1_delete_names(&plan(
         &config,
         now(),
@@ -2690,7 +2726,7 @@ fn transient_no_mounted_drive_holds_away_pin_at_tight() {
     // D1 NOT mounted (away).
 
     let mut armed = ArmedTierMap::new();
-    armed.insert("sv1".to_string(), TightnessTier::Tight);
+    armed.insert(svname("sv1"), TightnessTier::Tight);
     let deletes = sv1_delete_names(&plan(
         &config,
         now(),
@@ -2744,7 +2780,7 @@ fn transient_retain_parents_field_scenario_bounds_footprint() {
     );
 
     let mut armed = ArmedTierMap::new();
-    armed.insert("sv1".to_string(), TightnessTier::Tight);
+    armed.insert(svname("sv1"), TightnessTier::Tight);
     let deletes = sv1_delete_names(&plan(
         &config,
         now(),
@@ -2809,7 +2845,7 @@ fn transient_retain_parents_holds_every_away_drive_pin() {
     );
 
     let mut armed = ArmedTierMap::new();
-    armed.insert("sv1".to_string(), TightnessTier::Tight);
+    armed.insert(svname("sv1"), TightnessTier::Tight);
     let deletes = sv1_delete_names(&plan(
         &config,
         now(),
@@ -3760,7 +3796,7 @@ fn force_subvolume_overrides_generation() {
         .insert(PathBuf::from("/snap/sv1/20260322-1440-one"), 500);
 
     let filters = PlanFilters {
-        subvolume: Some("sv1".to_string()),
+        subvolume: Some(svname("sv1")),
         ..PlanFilters::default()
     };
     let result = plan(&config, now(), &filters, &Observation { fs: &fs, history: &fs, btrfs: &mb }, &RunArming::default()).unwrap();
@@ -3847,7 +3883,7 @@ fn estimated_send_size_prefers_successful_any_drive_over_failed_partial() {
 
     let fs = RealFileSystemState { state: Some(&db) };
     assert_eq!(
-        estimated_send_size(&fs, "multimedia", "WD-18TB1", true),
+        estimated_send_size(&fs, &svname("multimedia"), &dlabel("WD-18TB1"), true),
         Some(7_577_674_879_444),
         "a failed partial must not outrank a successful any-drive send"
     );
@@ -3865,7 +3901,7 @@ fn estimated_send_size_uses_failed_partial_only_as_last_resort_floor() {
 
     let fs = RealFileSystemState { state: Some(&db) };
     assert_eq!(
-        estimated_send_size(&fs, "multimedia", "WD-18TB1", true),
+        estimated_send_size(&fs, &svname("multimedia"), &dlabel("WD-18TB1"), true),
         Some(2_672_831_974_169),
         "with no better signal, the failed partial is the floor"
     );
@@ -3882,11 +3918,11 @@ fn last_send_size_excludes_failed_sends() {
     seed_op(&db, "multimedia", "WD-18TB1", SendKind::Full, "failure", 2_672_831_974_169);
 
     let fs = RealFileSystemState { state: Some(&db) };
-    assert_eq!(fs.last_send_size("multimedia", "WD-18TB1", SendKind::Full), None);
-    assert_eq!(fs.last_send_size_any_drive("multimedia", SendKind::Full), None);
+    assert_eq!(fs.last_send_size(&svname("multimedia"), &dlabel("WD-18TB1"), SendKind::Full), None);
+    assert_eq!(fs.last_send_size_any_drive(&svname("multimedia"), SendKind::Full), None);
     // But the floor method still surfaces it.
     assert_eq!(
-        fs.last_failed_send_floor("multimedia", "WD-18TB1", SendKind::Full),
+        fs.last_failed_send_floor(&svname("multimedia"), &dlabel("WD-18TB1"), SendKind::Full),
         Some(2_672_831_974_169)
     );
 }
@@ -4094,7 +4130,7 @@ priority = 1
 
 fn armed_map(name: &str, tier: crate::storage_critical::TightnessTier) -> ArmedTierMap {
     let mut m = ArmedTierMap::new();
-    m.insert(name.to_string(), tier);
+    m.insert(name.into(), tier);
     m
 }
 
@@ -4301,7 +4337,7 @@ fn upi058_planner_and_executor_agree_on_away_shed() {
     };
     assert_eq!(
         arming.away_shed.get("sv1").map(Vec::as_slice),
-        Some(["D2".to_string()].as_slice()),
+        Some([dlabel("D2")].as_slice()),
         "away_shed_map names the away drive the planner's has_away_pin reads",
     );
     let planned = plan(
@@ -4522,7 +4558,7 @@ fn lifecycle_critical_away_only_pin_sheds_instead_of_clear_all() {
         Some(&PlannedLifecycle {
             is_transient: true,
             clear_all: false,
-            shed_away_drives: vec!["D2".to_string()],
+            shed_away_drives: vec![dlabel("D2")],
         }),
     );
 }
@@ -4935,7 +4971,7 @@ fn marker_false_transient_defers() {
 
 fn judgment(name: &str, effective_transient: bool, send_enabled: bool) -> SubvolJudgment {
     SubvolJudgment {
-        name: name.to_string(),
+        name: name.into(),
         effective_transient,
         send_enabled,
     }
@@ -4945,7 +4981,7 @@ fn op_create(name: &str) -> PlannedOperation {
     PlannedOperation::CreateSnapshot {
         source: PathBuf::from(format!("/data/{name}")),
         dest: PathBuf::from(format!("/snap/{name}/20260322-1500-x")),
-        subvolume_name: name.to_string(),
+        subvolume_name: name.into(),
     }
 }
 
@@ -4954,8 +4990,8 @@ fn op_send(name: &str) -> PlannedOperation {
         parent: PathBuf::from(format!("/snap/{name}/20260321-1500-x")),
         snapshot: PathBuf::from(format!("/snap/{name}/20260322-1500-x")),
         dest_dir: PathBuf::from("/mnt/d1/.snapshots"),
-        drive_label: "D1".to_string(),
-        subvolume_name: name.to_string(),
+        drive_label: dlabel("D1"),
+        subvolume_name: name.into(),
         pin_on_success: None,
     }
 }
@@ -4974,7 +5010,7 @@ fn skip_already_on(name: &str, snapshot: &str, drive: &str) -> PlannedSkip {
         name,
         &NothingNew::AlreadyOn {
             snapshot: snap(snapshot),
-            drive: drive.to_string(),
+            drive: drive.into(),
         },
     )
 }
@@ -5026,20 +5062,20 @@ fn orphan_invariant_arm2_marker_false_defers_clean() {
             skip_deferred(
                 "sv1",
                 SkipReason::SendNotDue {
-                    drive: "D1".to_string(),
+                    drive: dlabel("D1"),
                     next_in_minutes: 120,
                 },
             ),
             skip_deferred(
                 "sv1",
                 SkipReason::DriveNotMounted {
-                    drive: "D2".to_string(),
+                    drive: dlabel("D2"),
                 },
             ),
             skip_deferred(
                 "sv1",
                 SkipReason::EstimatedSizeExceedsSpace {
-                    drive: "D3".to_string(),
+                    drive: dlabel("D3"),
                     estimated: crate::types::ByteSize(1_000_000_000),
                     available: crate::types::ByteSize(0),
                     free: crate::types::ByteSize(0),

@@ -26,6 +26,7 @@ use crate::awareness::{
 use crate::heartbeat::{Heartbeat, SubvolumeHeartbeat};
 use crate::sentinel::HealthSnapshot;
 use crate::storage_critical::{TightnessTier, Transition};
+use crate::types::SubvolName;
 
 // ── Event types ────────────────────────────────────────────────────────
 
@@ -249,7 +250,7 @@ pub fn compute_notifications(
         subvolumes
             .iter()
             .map(|sv| PromiseSnapshot {
-                name: sv.name.clone(),
+                name: SubvolName::from(&sv.name),
                 status: sv.promise_status,
             })
             .collect()
@@ -265,7 +266,7 @@ pub fn compute_notifications(
         None => Vec::new(),
     };
     let all_unprotected =
-        PromiseRollup::from_pairs(current_snaps.iter().map(|s| (s.name.clone(), s.status)))
+        PromiseRollup::from_pairs(current_snaps.iter().map(|s| (s.name.to_string(), s.status)))
             .all_unprotected();
 
     let mut notifications = build_promise_change_notifications(&changes, all_unprotected);
@@ -347,7 +348,7 @@ pub fn build_promise_change_notifications(
         if change.to.worsened_from(change.from) {
             notifications.push(Notification {
                 event: NotificationEvent::PromiseDegraded {
-                    subvolume: change.name.clone(),
+                    subvolume: change.name.to_string(),
                     from: change.from.to_string(),
                     to: change.to.to_string(),
                 },
@@ -362,7 +363,7 @@ pub fn build_promise_change_notifications(
         } else {
             notifications.push(Notification {
                 event: NotificationEvent::PromiseRecovered {
-                    subvolume: change.name.clone(),
+                    subvolume: change.name.to_string(),
                     from: change.from.to_string(),
                     to: change.to.to_string(),
                 },
@@ -772,7 +773,7 @@ pub fn build_health_notifications(
                 };
                 notifications.push(Notification {
                     event: NotificationEvent::HealthDegraded {
-                        subvolume: assess.name.clone(),
+                        subvolume: assess.name.to_string(),
                         from: from.clone(),
                         to: to.clone(),
                     },
@@ -786,7 +787,7 @@ pub fn build_health_notifications(
             } else {
                 notifications.push(Notification {
                     event: NotificationEvent::HealthRecovered {
-                        subvolume: assess.name.clone(),
+                        subvolume: assess.name.to_string(),
                         from: from.clone(),
                         to: to.clone(),
                     },
@@ -1861,13 +1862,14 @@ mod sentinel_path_tests {
     use crate::heartbeat;
     use crate::sentinel;
     use crate::testkit::subvol_assessment as make_assessment;
+    use crate::testkit::svname;
 
     // ── build_notifications ─────────────────────────────────────────
 
     #[test]
     fn notifications_degradation_produces_warning() {
         let previous = vec![PromiseSnapshot {
-            name: "home".to_string(),
+            name: svname("home"),
             status: PromiseStatus::Protected,
         }];
         let current = vec![make_assessment("home", PromiseStatus::AtRisk)];
@@ -1886,7 +1888,7 @@ mod sentinel_path_tests {
     #[test]
     fn notifications_recovery_produces_info() {
         let previous = vec![PromiseSnapshot {
-            name: "home".to_string(),
+            name: svname("home"),
             status: PromiseStatus::AtRisk,
         }];
         let current = vec![make_assessment("home", PromiseStatus::Protected)];
@@ -1905,11 +1907,11 @@ mod sentinel_path_tests {
     fn notifications_all_unprotected_is_critical() {
         let previous = vec![
             PromiseSnapshot {
-                name: "home".to_string(),
+                name: svname("home"),
                 status: PromiseStatus::Protected,
             },
             PromiseSnapshot {
-                name: "docs".to_string(),
+                name: svname("docs"),
                 status: PromiseStatus::Protected,
             },
         ];
@@ -1931,7 +1933,7 @@ mod sentinel_path_tests {
     #[test]
     fn notifications_never_produces_backup_only_events() {
         let previous = vec![PromiseSnapshot {
-            name: "home".to_string(),
+            name: svname("home"),
             status: PromiseStatus::Protected,
         }];
         let current = vec![make_assessment("home", PromiseStatus::Unprotected)];
@@ -1953,7 +1955,7 @@ mod sentinel_path_tests {
     #[test]
     fn notifications_no_change_produces_empty() {
         let previous = vec![PromiseSnapshot {
-            name: "home".to_string(),
+            name: svname("home"),
             status: PromiseStatus::Protected,
         }];
         let current = vec![make_assessment("home", PromiseStatus::Protected)];
@@ -1971,7 +1973,7 @@ mod sentinel_path_tests {
     #[test]
     fn golden_twin_degraded_prose_exact() {
         let previous = vec![PromiseSnapshot {
-            name: "home".to_string(),
+            name: svname("home"),
             status: PromiseStatus::Protected,
         }];
         let current = vec![make_assessment("home", PromiseStatus::AtRisk)];
@@ -1995,7 +1997,7 @@ mod sentinel_path_tests {
     #[test]
     fn golden_twin_recovered_prose_exact() {
         let previous = vec![PromiseSnapshot {
-            name: "home".to_string(),
+            name: svname("home"),
             status: PromiseStatus::AtRisk,
         }];
         let current = vec![make_assessment("home", PromiseStatus::Protected)];
@@ -2019,11 +2021,11 @@ mod sentinel_path_tests {
     fn golden_twin_all_unprotected_prose_exact() {
         let previous = vec![
             PromiseSnapshot {
-                name: "home".to_string(),
+                name: svname("home"),
                 status: PromiseStatus::Protected,
             },
             PromiseSnapshot {
-                name: "docs".to_string(),
+                name: svname("docs"),
                 status: PromiseStatus::Protected,
             },
         ];
@@ -2153,7 +2155,7 @@ mod sentinel_path_tests {
 
     fn make_health_snapshot(name: &str, health: OperationalHealth) -> sentinel::HealthSnapshot {
         sentinel::HealthSnapshot {
-            name: name.to_string(),
+            name: name.into(),
             health,
             health_reasons: vec![],
         }

@@ -123,7 +123,7 @@ pub fn run(config: Config, args: GetArgs, output_mode: OutputMode) -> anyhow::Re
         .with_context(|| format!("failed to read metadata: {}", snapshot_file.display()))?;
 
     let get_output = GetOutput {
-        subvolume: subvol.name.clone(),
+        subvolume: subvol.name.to_string(),
         snapshot: snapshot.as_str().to_string(),
         snapshot_date: snapshot.datetime().format(DISPLAY_MINUTE_FORMAT).to_string(),
         file_path: relative_path.display().to_string(),
@@ -276,6 +276,7 @@ fn validate_no_traversal(path: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::svname;
     use chrono::NaiveDate;
 
     // ── Date parsing ────────────────────────────────────────────────
@@ -351,7 +352,7 @@ mod tests {
     fn make_subvolumes() -> Vec<SubvolumeConfig> {
         vec![
             SubvolumeConfig {
-                name: "htpc-root".to_string(),
+                name: svname("htpc-root"),
                 short_name: "htpc-root".to_string(),
                 source: PathBuf::from("/"),
                 priority: 3,
@@ -365,7 +366,7 @@ mod tests {
                 drives: None,
             },
             SubvolumeConfig {
-                name: "htpc-home".to_string(),
+                name: svname("htpc-home"),
                 short_name: "htpc-home".to_string(),
                 source: PathBuf::from("/home"),
                 priority: 1,
@@ -379,7 +380,7 @@ mod tests {
                 drives: None,
             },
             SubvolumeConfig {
-                name: "subvol3-opptak".to_string(),
+                name: svname("subvol3-opptak"),
                 short_name: "opptak".to_string(),
                 source: PathBuf::from("/mnt/btrfs-pool/subvol3-opptak"),
                 priority: 1,
@@ -438,7 +439,7 @@ mod tests {
     fn subvolume_no_match_without_root() {
         // Without a root subvolume, unmatched paths return None
         let svs = vec![SubvolumeConfig {
-            name: "htpc-home".to_string(),
+            name: svname("htpc-home"),
             short_name: "htpc-home".to_string(),
             source: PathBuf::from("/home"),
             priority: 1,

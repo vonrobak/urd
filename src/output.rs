@@ -318,7 +318,7 @@ impl StatusAssessment {
     /// Reached in production only through `rows()`'s impossible-miss arm.
     fn incomplete_from_assessment(a: &SubvolAssessment) -> Self {
         Self {
-            name: a.name.clone(),
+            name: a.name.to_string(),
             short_name: a.short_name.clone(),
             status: a.status,
             health: a.health.to_string(),
@@ -410,7 +410,7 @@ impl StatusDriveAssessment {
     #[must_use]
     pub fn from_assessment(a: &DriveAssessment) -> Self {
         Self {
-            drive_label: a.drive_label.clone(),
+            drive_label: a.drive_label.to_string(),
             status: a.status,
             mounted: a.mounted,
             snapshot_count: a.snapshot_count,
@@ -535,7 +535,7 @@ pub struct RetentionChangePending {
 impl From<&crate::retention::RetentionChange> for RetentionChangePending {
     fn from(change: &crate::retention::RetentionChange) -> Self {
         Self {
-            subvolume: change.subvolume.clone(),
+            subvolume: change.subvolume.to_string(),
             local_tightened: change.local_tightened(),
             external_tightened: change.external_tightened(),
             previous: change.previous.to_canonical(),
@@ -1634,6 +1634,7 @@ pub enum SealSendState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::dlabel;
     use crate::advice::RedundancyAdvisoryKind;
 
     #[test]
@@ -1917,7 +1918,7 @@ mod tests {
     ) -> DriveAssessment {
         use crate::types::Interval;
         DriveAssessment {
-            drive_label: "Offsite-4TB".to_string(),
+            drive_label: dlabel("Offsite-4TB"),
             status: PromiseStatus::Protected,
             mounted: false,
             snapshot_count: Some(3),

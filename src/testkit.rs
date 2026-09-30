@@ -17,7 +17,7 @@ use chrono::{NaiveDate, NaiveDateTime};
 
 use crate::awareness::{LocalAssessment, PromiseStatus, SubvolAssessment};
 use crate::config::{Config, DriveConfig};
-use crate::types::{DriveRole, SnapshotName};
+use crate::types::{DriveLabel, DriveRole, SnapshotName, SubvolName};
 
 // ── Clock and names ─────────────────────────────────────────────────────
 
@@ -45,6 +45,17 @@ pub(crate) fn parse_dt(s: &str) -> NaiveDateTime {
 /// Parse a snapshot name (`20260322-1400-sv1`), panicking on a malformed one.
 pub(crate) fn snap(s: &str) -> SnapshotName {
     SnapshotName::parse(s).unwrap()
+}
+
+/// A drive label literal (`dlabel("WD-18TB")`). Names the type at the call
+/// site so a fixture reads as which name it is, not just a string.
+pub(crate) fn dlabel(s: &str) -> DriveLabel {
+    DriveLabel::from(s)
+}
+
+/// A subvolume name literal (`svname("sv1")`).
+pub(crate) fn svname(s: &str) -> SubvolName {
+    SubvolName::from(s)
 }
 
 // ── Config ──────────────────────────────────────────────────────────────
@@ -249,7 +260,7 @@ monthly = 0
 /// snapshots under `.snapshots`. Tests vary other fields via struct update.
 pub(crate) fn drive_config(label: &str, mount_path: &str, role: DriveRole) -> DriveConfig {
     DriveConfig {
-        label: label.to_string(),
+        label: dlabel(label),
         uuid: None,
         mount_path: PathBuf::from(mount_path),
         snapshot_root: ".snapshots".to_string(),

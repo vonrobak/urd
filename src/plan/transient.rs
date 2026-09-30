@@ -8,6 +8,7 @@ use super::fragment::{
     ExternalRetentionInputs, LocalRetentionInputs, LocalSnapshotInputs, PlanFragment, SendInputs,
     SubvolInputs, TransientInputs,
 };
+use crate::types::DriveLabel;
 
 /// Atomic lifecycle planning for transient subvolumes.
 ///
@@ -117,7 +118,7 @@ pub(super) fn plan_transient_lifecycle(i: &TransientInputs) -> PlanFragment {
     }
 
     if !any_send_due {
-        let next_dues: Vec<(String, i64)> = sendable_drives
+        let next_dues: Vec<(DriveLabel, i64)> = sendable_drives
             .iter()
             .filter_map(|(drive, newest_ext)| {
                 let newest_dt = (*newest_ext)?;
@@ -250,6 +251,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::testkit::svname;
 
     fn local_dir() -> PathBuf {
         PathBuf::from("/snap/sv1")
@@ -257,7 +259,7 @@ mod tests {
 
     fn subvol(min_free_bytes: Option<u64>) -> ResolvedSubvolume {
         ResolvedSubvolume {
-            name: "sv1".to_string(),
+            name: svname("sv1"),
             short_name: "one".to_string(),
             source: PathBuf::from("/data/sv1"),
             priority: 1,
@@ -394,7 +396,7 @@ priority = 1
     /// hand-roll arm 1.
     fn assert_invariant_clean(operations: &[PlannedOperation], skipped: &[PlannedSkip]) {
         let judgments = [super::super::SubvolJudgment {
-            name: "sv1".to_string(),
+            name: svname("sv1"),
             effective_transient: true,
             send_enabled: true,
         }];

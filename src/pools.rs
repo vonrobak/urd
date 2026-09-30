@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use crate::config::{Config, DriveConfig};
 use crate::error::UrdError;
 use crate::probes;
+use crate::types::{DriveLabel, SubvolName};
 
 /// A detected source pool: one BTRFS filesystem hosting one or more configured
 /// subvolume sources.
@@ -21,7 +22,7 @@ pub struct SourcePool {
     pub mountpoints: Vec<PathBuf>,
     /// Subvolume `name`s on this pool — used only for in-run grouping; not
     /// written to the heartbeat (R4).
-    pub subvolume_names: Vec<String>,
+    pub subvolume_names: Vec<SubvolName>,
 }
 
 /// One row of input to `compute_pool_metrics_from`: a drive's configured
@@ -29,7 +30,7 @@ pub struct SourcePool {
 /// was found mounted.
 #[derive(Debug, Clone)]
 pub struct DriveResolution {
-    pub label: String,
+    pub label: DriveLabel,
     pub uuid: Option<String>,
     pub mounted: bool,
     pub mountpoint: Option<PathBuf>,
@@ -67,7 +68,7 @@ pub fn resolve_source_pool(
 /// see R4). I/O is read-only (findmnt + sysfs); no subprocess spawn beyond
 /// findmnt.
 pub fn detect_source_pools(config: &Config) -> Vec<SourcePool> {
-    let pairs: Vec<(String, Option<String>, Option<PathBuf>)> = config
+    let pairs: Vec<(SubvolName, Option<String>, Option<PathBuf>)> = config
         .subvolumes
         .iter()
         .map(|sv| {
@@ -85,7 +86,7 @@ pub fn detect_source_pools(config: &Config) -> Vec<SourcePool> {
 /// excluded; mountpoints are deduplicated and sorted per pool.
 #[must_use]
 pub fn group_subvolumes_by_pool(
-    pairs: &[(String, Option<String>, Option<PathBuf>)],
+    pairs: &[(SubvolName, Option<String>, Option<PathBuf>)],
 ) -> Vec<SourcePool> {
     let mut by_uuid: std::collections::BTreeMap<String, SourcePool> =
         std::collections::BTreeMap::new();
@@ -252,7 +253,7 @@ pub fn compute_pool_metrics_from(
         out.push(PoolMetric {
             uuid: uuid.clone(),
             role: "destination".to_string(),
-            label: drive.label.clone(),
+            label: drive.label.to_string(),
             free_bytes: space.map(|s| s.free_bytes),
             capacity_bytes: space.map(|s| s.capacity_bytes),
             metadata_utilization_ratio: meta,
@@ -299,6 +300,7 @@ pub fn resolve_drive(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::{dlabel, svname};
     use tempfile::TempDir;
 
     fn write_sysfs_fixture(root: &Path, uuid: &str, used: &str, total: &str) {
@@ -355,17 +357,17 @@ mod tests {
     fn group_subvolumes_by_pool_groups_by_uuid() {
         let pairs = vec![
             (
-                "home".to_string(),
+                svname("home"),
                 Some("uuid-a".to_string()),
                 Some(PathBuf::from("/home")),
             ),
             (
-                "etc".to_string(),
+                svname("etc"),
                 Some("uuid-a".to_string()),
                 Some(PathBuf::from("/")),
             ),
             (
-                "data".to_string(),
+                svname("data"),
                 Some("uuid-b".to_string()),
                 Some(PathBuf::from("/data")),
             ),
@@ -383,11 +385,11 @@ mod tests {
     fn group_subvolumes_by_pool_skips_unknown_uuid_subvolumes() {
         let pairs = vec![
             (
-                "home".to_string(),
+                svname("home"),
                 Some("uuid-a".to_string()),
                 Some(PathBuf::from("/home")),
             ),
-            ("orphan".to_string(), None, None),
+            (svname("orphan"), None, None),
         ];
         let pools = group_subvolumes_by_pool(&pairs);
         assert_eq!(pools.len(), 1);
@@ -398,12 +400,12 @@ mod tests {
     fn group_subvolumes_by_pool_dedups_mountpoints() {
         let pairs = vec![
             (
-                "home".to_string(),
+                svname("home"),
                 Some("uuid-a".to_string()),
                 Some(PathBuf::from("/home")),
             ),
             (
-                "var".to_string(),
+                svname("var"),
                 Some("uuid-a".to_string()),
                 Some(PathBuf::from("/home")),
             ),
@@ -439,10 +441,10 @@ mod tests {
         let pools = vec![SourcePool {
             uuid: "uuid-src".to_string(),
             mountpoints: vec![PathBuf::from("/home")],
-            subvolume_names: vec!["home".to_string()],
+            subvolume_names: vec![svname("home")],
         }];
         let drives = vec![DriveResolution {
-            label: "WD-18TB".to_string(),
+            label: dlabel("WD-18TB"),
             uuid: Some("uuid-dst".to_string()),
             mounted: true,
             mountpoint: Some(PathBuf::from("/mnt/wd")),
@@ -466,7 +468,7 @@ mod tests {
     #[test]
     fn compute_pool_metrics_from_skips_unmounted_drives() {
         let drives = vec![DriveResolution {
-            label: "WD-18TB".to_string(),
+            label: dlabel("WD-18TB"),
             uuid: Some("uuid-dst".to_string()),
             mounted: false,
             mountpoint: None,
@@ -524,7 +526,7 @@ mod tests {
     #[test]
     fn compute_pool_metrics_from_skips_drives_without_uuid() {
         let drives = vec![DriveResolution {
-            label: "WD-18TB".to_string(),
+            label: dlabel("WD-18TB"),
             uuid: None,
             mounted: true,
             mountpoint: Some(PathBuf::from("/mnt/wd")),

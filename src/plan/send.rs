@@ -226,11 +226,11 @@ pub(super) fn plan_external_send(i: &SendInputs) -> PlanFragment {
             EventPayload::PlannerSendChoice {
                 send_kind: SendKind::Full,
                 reason,
-                drive_label: drive.label.clone(),
+                drive_label: drive.label.to_string(),
             },
         );
-        event.fill_subvolume(Some(subvol.name.clone()));
-        event.fill_drive_label(Some(drive.label.clone()));
+        event.fill_subvolume(Some(subvol.name.to_string()));
+        event.fill_drive_label(Some(drive.label.to_string()));
         f.push_event(event);
     }
 
@@ -255,6 +255,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::testkit::{dlabel, svname};
 
     fn local_dir() -> PathBuf {
         PathBuf::from("/snap/sv1")
@@ -262,7 +263,7 @@ mod tests {
 
     fn subvol() -> ResolvedSubvolume {
         ResolvedSubvolume {
-            name: "sv1".to_string(),
+            name: svname("sv1"),
             short_name: "one".to_string(),
             source: PathBuf::from("/data/sv1"),
             priority: 1,
@@ -729,7 +730,7 @@ mod tests {
         let pin_dir = tempfile::TempDir::new().unwrap();
         std::fs::write(pin_dir.path().join(".last-external-parent"), parent.as_str()).unwrap();
         let real = crate::observation::RealFileSystemState { state: None };
-        let pin = real.read_pin_file(pin_dir.path(), "D1").unwrap();
+        let pin = real.read_pin_file(pin_dir.path(), &dlabel("D1")).unwrap();
 
         let sv = subvol();
         let e = eff(true, false);
@@ -777,7 +778,7 @@ mod tests {
         let pin_dir = tempfile::TempDir::new().unwrap();
         std::fs::write(pin_dir.path().join(".last-external-parent-D1"), "").unwrap();
         let real = crate::observation::RealFileSystemState { state: None };
-        assert!(real.read_pin_file(pin_dir.path(), "D1").is_err(), "empty pin → Err");
+        assert!(real.read_pin_file(pin_dir.path(), &dlabel("D1")).is_err(), "empty pin → Err");
 
         let sv = subvol();
         let e = eff(true, false);

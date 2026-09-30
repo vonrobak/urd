@@ -4,7 +4,7 @@
 use chrono::NaiveDateTime;
 
 use super::types::SubvolAssessment;
-use crate::types::PromiseStatus;
+use crate::types::{PromiseStatus, SubvolName};
 
 // ── Promise snapshots and transition detection (UPI 088-a) ─────────────
 
@@ -16,7 +16,7 @@ use crate::types::PromiseStatus;
 /// that detection now; the daemon imports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PromiseSnapshot {
-    pub name: String,
+    pub name: SubvolName,
     pub status: PromiseStatus,
 }
 
@@ -38,7 +38,7 @@ pub fn snapshot_promises(assessments: &[SubvolAssessment]) -> Vec<PromiseSnapsho
 /// `EventPayload::PromiseTransition` it may become downstream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PromiseChange {
-    pub name: String,
+    pub name: SubvolName,
     pub from: PromiseStatus,
     pub to: PromiseStatus,
 }
@@ -89,7 +89,7 @@ impl PromiseRollup {
     /// Partition assessments by promise state.
     #[must_use]
     pub fn from_assessments(assessments: &[SubvolAssessment]) -> Self {
-        Self::from_pairs(assessments.iter().map(|a| (a.name.clone(), a.status)))
+        Self::from_pairs(assessments.iter().map(|a| (a.name.to_string(), a.status)))
     }
 
     /// Partition `(name, status)` pairs — the entry point for the other
@@ -166,7 +166,7 @@ pub fn diff_promise_states(
                     trigger,
                 },
             );
-            event.fill_subvolume(Some(change.name));
+            event.fill_subvolume(Some(change.name.into_string()));
             event
         })
         .collect()
@@ -177,6 +177,7 @@ pub fn diff_promise_states(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::svname;
     use chrono::NaiveDate;
 
     // ── diff_promise_states tests ──────────────────────────────────
@@ -187,7 +188,7 @@ mod tests {
 
     fn make_promise_snapshot(name: &str, status: PromiseStatus) -> PromiseSnapshot {
         PromiseSnapshot {
-            name: name.to_string(),
+            name: name.into(),
             status,
         }
     }
@@ -230,7 +231,7 @@ mod tests {
         assert_eq!(
             changes,
             vec![PromiseChange {
-                name: "sv1".to_string(),
+                name: svname("sv1"),
                 from: PromiseStatus::Protected,
                 to: PromiseStatus::AtRisk,
             }]
@@ -343,7 +344,7 @@ mod tests {
             make_assess("b", PromiseStatus::Unprotected),
         ];
         let via_pairs = PromiseRollup::from_pairs(
-            assessments.iter().map(|a| (a.name.clone(), a.status)),
+            assessments.iter().map(|a| (a.name.to_string(), a.status)),
         );
         assert_eq!(via_pairs, PromiseRollup::from_assessments(&assessments));
     }

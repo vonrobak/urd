@@ -21,7 +21,7 @@ use chrono::NaiveDateTime;
 
 use crate::config::DriveConfig;
 use crate::drives::DriveAvailability;
-use crate::types::{DriveEvent, SendKind, SnapshotName, Timestamp};
+use crate::types::{DriveEvent, DriveLabel, SendKind, SnapshotName, SubvolName, Timestamp};
 
 pub mod estimate;
 mod real;
@@ -38,14 +38,14 @@ pub trait FilesystemQuery {
     fn local_snapshots(
         &self,
         root: &Path,
-        subvol_name: &str,
+        subvol_name: &SubvolName,
     ) -> crate::error::Result<Vec<SnapshotName>>;
 
     /// List snapshot names on an external drive for a subvolume.
     fn external_snapshots(
         &self,
         drive: &DriveConfig,
-        subvol_name: &str,
+        subvol_name: &SubvolName,
     ) -> crate::error::Result<Vec<SnapshotName>>;
 
     /// Check if a drive is currently mounted.
@@ -69,11 +69,15 @@ pub trait FilesystemQuery {
     fn read_pin_file(
         &self,
         local_dir: &Path,
-        drive_label: &str,
+        drive_label: &DriveLabel,
     ) -> crate::error::Result<Option<SnapshotName>>;
 
     /// Collect all pinned snapshot names for a subvolume across all drives.
-    fn pinned_snapshots(&self, local_dir: &Path, drive_labels: &[String]) -> HashSet<SnapshotName>;
+    fn pinned_snapshots(
+        &self,
+        local_dir: &Path,
+        drive_labels: &[DriveLabel],
+    ) -> HashSet<SnapshotName>;
 }
 
 // ── HistoryQuery (SQLite is history) ──────────────────────────────────────
@@ -85,14 +89,18 @@ pub trait HistoryQuery {
     /// Returns None if no history exists (e.g., first-ever send).
     fn last_send_size(
         &self,
-        subvol_name: &str,
-        drive_label: &str,
+        subvol_name: &SubvolName,
+        drive_label: &DriveLabel,
         send_kind: SendKind,
     ) -> Option<u64>;
 
     /// Get the bytes_transferred from the most recent successful send of a given kind
     /// across **all** drives. Cross-drive fallback for drive swap scenarios.
-    fn last_send_size_any_drive(&self, subvol_name: &str, send_kind: SendKind) -> Option<u64>;
+    fn last_send_size_any_drive(
+        &self,
+        subvol_name: &SubvolName,
+        send_kind: SendKind,
+    ) -> Option<u64>;
 
     /// A last-resort *floor* from a failed/aborted send (this drive preferred,
     /// then any drive). A failed send's `bytes_transferred` is an under-count —
@@ -101,38 +109,38 @@ pub trait HistoryQuery {
     /// a confident estimate (#210). Returns None when no failed send is on record.
     fn last_failed_send_floor(
         &self,
-        subvol_name: &str,
-        drive_label: &str,
+        subvol_name: &SubvolName,
+        drive_label: &DriveLabel,
         send_kind: SendKind,
     ) -> Option<u64>;
 
     /// Get a calibrated size estimate for a subvolume (from `urd calibrate`).
     /// Returns `(estimated_bytes, measured_at)` or None if not calibrated;
     /// `measured_at` is None when the stored timestamp does not parse.
-    fn calibrated_size(&self, subvol_name: &str) -> Option<(u64, Option<Timestamp>)>;
+    fn calibrated_size(&self, subvol_name: &SubvolName) -> Option<(u64, Option<Timestamp>)>;
 
     /// Get the timestamp of the most recent successful send (full or incremental)
     /// for a subvolume to a specific drive. Returns None if no send history exists.
     fn last_successful_send_time(
         &self,
-        subvol_name: &str,
-        drive_label: &str,
+        subvol_name: &SubvolName,
+        drive_label: &DriveLabel,
     ) -> Option<NaiveDateTime>;
 
     /// Most recent mount/unmount event for a drive, from the `events` table
     /// (`kind='drive'`).
     /// None if no event recorded (drive never seen by sentinel).
-    fn last_drive_event(&self, drive_label: &str) -> Option<DriveEvent>;
+    fn last_drive_event(&self, drive_label: &DriveLabel) -> Option<DriveEvent>;
 
     /// Full ordered (oldest-first) mount/unmount history for a drive, from the
     /// `events` table (`kind='drive'`). The rotation view (UPI 055) derives the
     /// observed cadence from this stream. Empty when no events exist or the
     /// query fails — never blocks assessment (ADR-102).
-    fn drive_mount_history(&self, drive_label: &str) -> Vec<DriveEvent>;
+    fn drive_mount_history(&self, drive_label: &DriveLabel) -> Vec<DriveEvent>;
 
     /// Most recent successful send timestamp for this drive (any subvolume).
     /// None when no successful send has ever completed for this drive.
-    fn last_successful_operation_at(&self, drive_label: &str) -> Option<NaiveDateTime>;
+    fn last_successful_operation_at(&self, drive_label: &DriveLabel) -> Option<NaiveDateTime>;
 }
 
 // ── Observation ───────────────────────────────────────────────────────────

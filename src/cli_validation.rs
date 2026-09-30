@@ -105,7 +105,7 @@ mod tests {
 
     fn mk_subvol(name: &str) -> SubvolumeConfig {
         SubvolumeConfig {
-            name: name.to_string(),
+            name: name.into(),
             short_name: name.to_string(),
             source: PathBuf::from(format!("/{name}")),
             priority: 1,

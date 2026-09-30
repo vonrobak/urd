@@ -200,7 +200,7 @@ fn run_emergency_preflight_with(
                             })
                         {
                             let mut ev = result.events.remove(idx);
-                            ev.fill_subvolume(Some(subvol_name.clone()));
+                            ev.fill_subvolume(Some(subvol_name.to_string()));
                             emitted_events.push(ev);
                         }
                     }
@@ -250,6 +250,7 @@ fn run_emergency_preflight_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::{dlabel, svname};
     use std::collections::BTreeSet;
     use std::path::PathBuf;
     use crate::commands::backup::test_fixtures::*;
@@ -261,7 +262,7 @@ mod tests {
     fn emergency_config(root: &std::path::Path) -> Config {
         let mut config = wd_config();
         config.local_snapshots.roots[0].path = root.to_path_buf();
-        config.local_snapshots.roots[0].subvolumes = vec!["alpha".to_string()];
+        config.local_snapshots.roots[0].subvolumes = vec![svname("alpha")];
         config.local_snapshots.roots[0].min_free_bytes =
             Some(crate::types::ByteSize(1_000_000_000));
         config
@@ -352,7 +353,7 @@ mod tests {
         // construction (F3) through the canonical drive-scoped path — the legacy
         // unlabeled pin no longer anchors retention on its own (#133).
         config.drives.push(crate::config::DriveConfig {
-            label: "D1".to_string(),
+            label: dlabel("D1"),
             uuid: None,
             mount_path: std::path::PathBuf::from("/mnt/d1"),
             snapshot_root: ".snapshots".to_string(),
@@ -371,7 +372,7 @@ mod tests {
         // defence-in-depth dir (`config.local_snapshot_dir`) must agree, else the
         // two pin layers would read different files.
         assert_eq!(
-            config.local_snapshot_dir("alpha").unwrap(),
+            config.local_snapshot_dir(&svname("alpha")).unwrap(),
             alpha,
             "both pin-read layers must resolve the same dir"
         );
@@ -397,7 +398,7 @@ mod tests {
         make_snap_dirs(&alpha, &THREE_SNAPS);
         let mut config = emergency_config(dir.path());
         config.drives.push(crate::config::DriveConfig {
-            label: "D1".to_string(),
+            label: dlabel("D1"),
             uuid: None,
             mount_path: std::path::PathBuf::from("/mnt/d1"),
             snapshot_root: ".snapshots".to_string(),
@@ -557,7 +558,7 @@ mod tests {
         make_snap_dirs(&alpha, &THREE_SNAPS);
         let mut config = emergency_config(dir.path());
         config.drives.push(crate::config::DriveConfig {
-            label: "D1".to_string(),
+            label: dlabel("D1"),
             uuid: None,
             mount_path: std::path::PathBuf::from("/mnt/d1"),
             snapshot_root: ".snapshots".to_string(),

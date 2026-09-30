@@ -8,6 +8,7 @@ use crate::output::{
 };
 use crate::state::StateDb;
 use crate::voice;
+use crate::types::SubvolName;
 
 pub fn run(config: Config, args: HistoryArgs, mode: OutputMode) -> anyhow::Result<()> {
     crate::cli_validation::require_known_subvolume(&config, args.subvolume.as_deref())?;
@@ -25,7 +26,7 @@ pub fn run(config: Config, args: HistoryArgs, mode: OutputMode) -> anyhow::Resul
     if args.failures {
         show_failures(&db, args.last, mode)?;
     } else if let Some(ref subvol) = args.subvolume {
-        show_subvolume_history(&db, subvol, args.last, mode)?;
+        show_subvolume_history(&db, &SubvolName::from(subvol), args.last, mode)?;
     } else {
         show_recent_runs(&db, args.last, mode)?;
     }
@@ -56,7 +57,7 @@ fn show_recent_runs(db: &StateDb, limit: usize, mode: OutputMode) -> anyhow::Res
 
 fn show_subvolume_history(
     db: &StateDb,
-    name: &str,
+    name: &SubvolName,
     limit: usize,
     mode: OutputMode,
 ) -> anyhow::Result<()> {

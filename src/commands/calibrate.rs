@@ -29,7 +29,7 @@ pub fn run(config: Config, args: CalibrateArgs, mode: OutputMode) -> anyhow::Res
 
         if !subvol.enabled {
             entries.push(CalibrateEntry {
-                name: subvol.name.clone(),
+                name: subvol.name.to_string(),
                 result: CalibrateResult::Skipped {
                     reason: "disabled".to_string(),
                 },
@@ -40,7 +40,7 @@ pub fn run(config: Config, args: CalibrateArgs, mode: OutputMode) -> anyhow::Res
 
         let Some(snapshot_root) = config.snapshot_root_for(&subvol.name) else {
             entries.push(CalibrateEntry {
-                name: subvol.name.clone(),
+                name: subvol.name.to_string(),
                 result: CalibrateResult::Skipped {
                     reason: "no snapshot root configured".to_string(),
                 },
@@ -55,7 +55,7 @@ pub fn run(config: Config, args: CalibrateArgs, mode: OutputMode) -> anyhow::Res
 
         let Some(newest) = local_snaps.iter().max() else {
             entries.push(CalibrateEntry {
-                name: subvol.name.clone(),
+                name: subvol.name.to_string(),
                 result: CalibrateResult::Skipped {
                     reason: "no local snapshots".to_string(),
                 },
@@ -72,7 +72,7 @@ pub fn run(config: Config, args: CalibrateArgs, mode: OutputMode) -> anyhow::Res
             DuSize::Bytes(bytes) => {
                 state_db.upsert_subvolume_size(&subvol.name, bytes, "du -sb")?;
                 entries.push(CalibrateEntry {
-                    name: subvol.name.clone(),
+                    name: subvol.name.to_string(),
                     result: CalibrateResult::Ok {
                         snapshot: snapshot_name,
                         bytes,
@@ -82,7 +82,7 @@ pub fn run(config: Config, args: CalibrateArgs, mode: OutputMode) -> anyhow::Res
             }
             DuSize::Unusable(stdout) => {
                 entries.push(CalibrateEntry {
-                    name: subvol.name.clone(),
+                    name: subvol.name.to_string(),
                     result: CalibrateResult::Failed {
                         snapshot: snapshot_name,
                         error: format!("du -sb returned no usable size (output: {stdout:?})"),
@@ -92,7 +92,7 @@ pub fn run(config: Config, args: CalibrateArgs, mode: OutputMode) -> anyhow::Res
             }
             DuSize::Failed(stderr) => {
                 entries.push(CalibrateEntry {
-                    name: subvol.name.clone(),
+                    name: subvol.name.to_string(),
                     result: CalibrateResult::Failed {
                         snapshot: snapshot_name,
                         error: format!("du failed: {stderr}"),
@@ -102,7 +102,7 @@ pub fn run(config: Config, args: CalibrateArgs, mode: OutputMode) -> anyhow::Res
             }
             DuSize::NotRun(e) => {
                 entries.push(CalibrateEntry {
-                    name: subvol.name.clone(),
+                    name: subvol.name.to_string(),
                     result: CalibrateResult::Failed {
                         snapshot: snapshot_name,
                         error: format!("du error: {e}"),

@@ -7,7 +7,7 @@ use crate::config::{DriveConfig, ResolvedSubvolume};
 use crate::events::{DeferScope, Event, EventPayload, UnstampedEvent};
 use crate::storage_critical::EffectivePolicy;
 use crate::plan::{NothingNew, PlannedOperation, PlannedSkip, SkipReason};
-use crate::types::SnapshotName;
+use crate::types::{DriveLabel, SnapshotName, SubvolName};
 
 use super::{Observation, PlanFilters};
 
@@ -40,8 +40,8 @@ impl PlanFragment {
     /// marker-true path is [`Self::defer_nothing_new`].
     pub(crate) fn defer(
         &mut self,
-        subvol: &str,
-        drive: Option<&str>,
+        subvol: &SubvolName,
+        drive: Option<&DriveLabel>,
         reason: SkipReason,
         next_due: Option<i64>,
         scope: DeferScope,
@@ -61,9 +61,14 @@ impl PlanFragment {
     /// `plan/` rather than forcing a `types.rs → events.rs` dependency. The
     /// event is built through the shared [`defer_event`], the same seam
     /// `defer_parts` uses (UPI 089-b).
-    pub(crate) fn defer_nothing_new(&mut self, subvol: &str, why: NothingNew, now: NaiveDateTime) {
+    pub(crate) fn defer_nothing_new(
+        &mut self,
+        subvol: &SubvolName,
+        why: NothingNew,
+        now: NaiveDateTime,
+    ) {
         let (drive_label, scope) = match &why {
-            NothingNew::AlreadyOn { drive, .. } => (Some(drive.as_str()), DeferScope::Drive),
+            NothingNew::AlreadyOn { drive, .. } => (Some(drive), DeferScope::Drive),
             NothingNew::NoLocalSnapshots { .. } => (None, DeferScope::Subvolume),
         };
         // `nothing_new` derives the reason once; the event reuses its prose.
@@ -104,8 +109,8 @@ impl PlanFragment {
 /// paths cannot build the `PlannerDefer` event differently (UPI 089-b,
 /// adversary F1).
 pub(super) fn defer_parts(
-    subvol_name: &str,
-    drive_label: Option<&str>,
+    subvol_name: &SubvolName,
+    drive_label: Option<&DriveLabel>,
     reason: SkipReason,
     next_due_minutes: Option<i64>,
     scope: DeferScope,
@@ -124,8 +129,8 @@ pub(super) fn defer_parts(
 /// to how the event is built — a new field, a changed fill — can't diverge
 /// between the two paths (UPI 089-b, adversary F1).
 pub(super) fn defer_event(
-    subvol_name: &str,
-    drive_label: Option<&str>,
+    subvol_name: &SubvolName,
+    drive_label: Option<&DriveLabel>,
     reason: &str,
     scope: DeferScope,
     now: NaiveDateTime,
@@ -138,7 +143,7 @@ pub(super) fn defer_event(
         },
     );
     event.fill_subvolume(Some(subvol_name.to_string()));
-    event.fill_drive_label(drive_label.map(str::to_string));
+    event.fill_drive_label(drive_label.map(ToString::to_string));
     event
 }
 
@@ -148,12 +153,12 @@ pub(super) fn defer_event(
 /// the recorder stamps and persists it.
 pub(super) fn stamp_context(
     events: &mut [UnstampedEvent],
-    subvolume: Option<&str>,
-    drive_label: Option<&str>,
+    subvolume: Option<&SubvolName>,
+    drive_label: Option<&DriveLabel>,
 ) {
     for ev in events.iter_mut() {
-        ev.fill_subvolume(subvolume.map(str::to_string));
-        ev.fill_drive_label(drive_label.map(str::to_string));
+        ev.fill_subvolume(subvolume.map(ToString::to_string));
+        ev.fill_drive_label(drive_label.map(ToString::to_string));
     }
 }
 
@@ -224,6 +229,7 @@ pub(crate) struct SnapshotOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::{dlabel, svname};
 
     fn now() -> NaiveDateTime {
         "2026-01-01T04:00:00"
@@ -237,7 +243,7 @@ mod tests {
         accumulator.push_operation(PlannedOperation::DeleteSnapshot {
             path: "/pre-existing".into(),
             reason: "prefix".to_string(),
-            subvolume_name: "pre".to_string(),
+            subvolume_name: svname("pre"),
             kind: crate::plan::DeleteKind::Policy,
         });
         accumulator
@@ -248,11 +254,11 @@ mod tests {
         fragment.push_operation(PlannedOperation::DeleteSnapshot {
             path: "/new".into(),
             reason: "new".to_string(),
-            subvolume_name: "sv1".to_string(),
+            subvolume_name: svname("sv1"),
             kind: crate::plan::DeleteKind::Policy,
         });
         fragment.defer(
-            "sv1",
+            &svname("sv1"),
             None,
             SkipReason::LocalOnly,
             None,
@@ -275,10 +281,10 @@ mod tests {
     fn defer_produces_matching_skip_and_event() {
         let mut fragment = PlanFragment::default();
         fragment.defer(
-            "sv1",
-            Some("D1"),
+            &svname("sv1"),
+            Some(&dlabel("D1")),
             SkipReason::SendNotDue {
-                drive: "D1".to_string(),
+                drive: dlabel("D1"),
                 next_in_minutes: 42,
             },
             Some(42),
@@ -311,7 +317,7 @@ mod tests {
     fn defer_never_sets_nothing_new_marker() {
         let mut fragment = PlanFragment::default();
         fragment.defer(
-            "sv1",
+            &svname("sv1"),
             None,
             SkipReason::SnapshotAlreadyExists,
             None,
@@ -328,10 +334,10 @@ mod tests {
     fn defer_nothing_new_derives_marker_prose_scope_and_drive() {
         let why = NothingNew::AlreadyOn {
             snapshot: SnapshotName::parse("20260322-1330-one").expect("valid"),
-            drive: "D1".to_string(),
+            drive: dlabel("D1"),
         };
         let mut fragment = PlanFragment::default();
-        fragment.defer_nothing_new("sv1", why, now());
+        fragment.defer_nothing_new(&svname("sv1"), why, now());
 
         let (_operations, skipped, events) = fragment.into_parts();
 
@@ -359,19 +365,19 @@ mod tests {
     fn both_defer_paths_build_identical_events() {
         let why = NothingNew::AlreadyOn {
             snapshot: SnapshotName::parse("20260322-1330-one").expect("valid"),
-            drive: "D1".to_string(),
+            drive: dlabel("D1"),
         };
 
         let mut fragment = PlanFragment::default();
-        fragment.defer_nothing_new("sv1", why.clone(), now());
+        fragment.defer_nothing_new(&svname("sv1"), why.clone(), now());
         let (_operations, _skipped, events) = fragment.into_parts();
 
         // Same coordinates through the ordinary-defer path.
         // (Test-only: production never passes a `NothingNew` reason through
         // `defer_parts` — this pins that both paths build the same event.)
         let (_, direct) = defer_parts(
-            "sv1",
-            Some("D1"),
+            &svname("sv1"),
+            Some(&dlabel("D1")),
             SkipReason::NothingNew(why),
             None,
             DeferScope::Drive,

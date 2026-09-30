@@ -18,6 +18,7 @@ use crate::metrics::PoolMetric;
 use crate::notify::{self, Notification};
 use crate::output::{ChurnHeartbeatFields, SubvolumeExtras, TransitionEvent};
 use crate::recorder::{DispatchPolicy, Recording};
+use crate::types::{DriveLabel, SubvolName};
 
 /// UPI 043: bundled outputs from a single pool-observability pass. Threaded
 /// into both metrics emission (`write_metrics_per_spec`) and heartbeat
@@ -254,7 +255,7 @@ pub fn decide_tail<'a>(i: &TailInputs<'a>) -> TailPlan<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WatchdogFiring {
     pub pool_label: String,
-    pub subvol_names: Vec<String>,
+    pub subvol_names: Vec<SubvolName>,
     /// Source-pool mountpoint for the two-tier abort-reclaim's free-probe
     /// (UPI 058 — the watchdog thread already holds it as `ArmedPool.poll_path`).
     pub mountpoint: PathBuf,
@@ -284,7 +285,7 @@ pub enum ReclaimDecision<'a> {
     /// Same-filesystem abort: cancelling the send freed no source space — the
     /// teardown must run the two-tier reclaim now, over exactly these inputs.
     ReclaimHere {
-        subvol_names: &'a [String],
+        subvol_names: &'a [SubvolName],
         mountpoint: &'a Path,
         floor_bytes: u64,
     },
@@ -414,16 +415,16 @@ pub fn offsite_recordings(
 fn was_first_send_to_drive(
     pre_a: &SubvolAssessment,
     post_a: &SubvolAssessment,
-    drive_label: &str,
+    drive_label: &DriveLabel,
 ) -> bool {
     let now_has_snapshots = post_a
         .external
         .iter()
-        .any(|e| e.drive_label == drive_label && e.snapshot_count.unwrap_or(0) > 0);
+        .any(|e| e.drive_label == *drive_label && e.snapshot_count.unwrap_or(0) > 0);
     let was_mounted_empty = pre_a
         .external
         .iter()
-        .any(|e| e.drive_label == drive_label && e.snapshot_count == Some(0));
+        .any(|e| e.drive_label == *drive_label && e.snapshot_count == Some(0));
     now_has_snapshots && was_mounted_empty
 }
 
@@ -457,8 +458,8 @@ fn detect_transitions(
             });
             if was_broken && !was_first_send_to_drive(pre_a, post_a, &post_ch.drive_label) {
                 transitions.push(TransitionEvent::ThreadRestored {
-                    subvolume: post_a.name.clone(),
-                    drive: post_ch.drive_label.clone(),
+                    subvolume: post_a.name.to_string(),
+                    drive: post_ch.drive_label.to_string(),
                 });
             }
         }
@@ -470,8 +471,8 @@ fn detect_transitions(
         for post_ext in &post_a.external {
             if was_first_send_to_drive(pre_a, post_a, &post_ext.drive_label) {
                 transitions.push(TransitionEvent::FirstSendToDrive {
-                    subvolume: post_a.name.clone(),
-                    drive: post_ext.drive_label.clone(),
+                    subvolume: post_a.name.to_string(),
+                    drive: post_ext.drive_label.to_string(),
                 });
             }
         }
@@ -479,7 +480,7 @@ fn detect_transitions(
         // Promise recovered: status improved
         if post_a.status > pre_a.status {
             transitions.push(TransitionEvent::PromiseRecovered {
-                subvolume: post_a.name.clone(),
+                subvolume: post_a.name.to_string(),
                 from: pre_a.status,
                 to: post_a.status,
             });
@@ -502,6 +503,7 @@ fn detect_transitions(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::dlabel;
     use crate::awareness::{
         ChainBreakReason, ChainStatus, DriveAssessment, DriveChainHealth, LocalAssessment,
         PromiseStatus, SubvolAssessment,
@@ -1078,7 +1080,7 @@ source = "/data/alpha"
 
     fn make_drive_assessment(label: &str, count: Option<usize>) -> DriveAssessment {
         DriveAssessment {
-            drive_label: label.to_string(),
+            drive_label: label.into(),
             status: PromiseStatus::Protected,
             mounted: true,
             snapshot_count: count,
@@ -1098,7 +1100,7 @@ source = "/data/alpha"
             "htpc-home",
             PromiseStatus::Protected,
             vec![DriveChainHealth {
-                drive_label: "WD-18TB".to_string(),
+                drive_label: dlabel("WD-18TB"),
                 status: ChainStatus::Broken {
                     reason: ChainBreakReason::PinMissingOnDrive,
                     pin_parent: Some("20260401-0400-htpc-home".to_string()),
@@ -1110,7 +1112,7 @@ source = "/data/alpha"
             "htpc-home",
             PromiseStatus::Protected,
             vec![DriveChainHealth {
-                drive_label: "WD-18TB".to_string(),
+                drive_label: dlabel("WD-18TB"),
                 status: ChainStatus::Intact {
                     pin_parent: "20260401-1200-htpc-home".to_string(),
                 },
@@ -1210,7 +1212,7 @@ source = "/data/alpha"
                 "a",
                 PromiseStatus::Unprotected,
                 vec![DriveChainHealth {
-                    drive_label: "WD-18TB".to_string(),
+                    drive_label: dlabel("WD-18TB"),
                     status: ChainStatus::Broken {
                         reason: ChainBreakReason::NoPinFile,
                         pin_parent: None,
@@ -1225,7 +1227,7 @@ source = "/data/alpha"
                 "a",
                 PromiseStatus::Protected,
                 vec![DriveChainHealth {
-                    drive_label: "WD-18TB".to_string(),
+                    drive_label: dlabel("WD-18TB"),
                     status: ChainStatus::Intact {
                         pin_parent: "20260401-1200-a".to_string(),
                     },
@@ -1264,7 +1266,7 @@ source = "/data/alpha"
             "subvol4-multimedia",
             PromiseStatus::Unprotected,
             vec![DriveChainHealth {
-                drive_label: "WD-18TB1".to_string(),
+                drive_label: dlabel("WD-18TB1"),
                 status: ChainStatus::Broken {
                     reason: ChainBreakReason::NoPinFile,
                     pin_parent: None,
@@ -1276,7 +1278,7 @@ source = "/data/alpha"
             "subvol4-multimedia",
             PromiseStatus::Protected,
             vec![DriveChainHealth {
-                drive_label: "WD-18TB1".to_string(),
+                drive_label: dlabel("WD-18TB1"),
                 status: ChainStatus::Intact {
                     pin_parent: "20260618-0402-multimedia".to_string(),
                 },

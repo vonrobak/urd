@@ -23,8 +23,8 @@ use serde::{Deserialize, Serialize};
 use crate::error::UrdError;
 use crate::notify::NotificationConfig;
 use crate::types::{
-    ByteSize, DriveRole, GraduatedRetention, Interval, LocalRetentionConfig, MonthlyCount,
-    ProtectionLevel, RunFrequency,
+    ByteSize, DriveLabel, DriveRole, GraduatedRetention, Interval, LocalRetentionConfig,
+    MonthlyCount, ProtectionLevel, RunFrequency, SubvolName,
 };
 
 pub(crate) use legacy::extract_config_version;
@@ -91,7 +91,7 @@ pub struct LocalSnapshotsConfig {
 #[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct SnapshotRoot {
     pub path: PathBuf,
-    pub subvolumes: Vec<String>,
+    pub subvolumes: Vec<SubvolName>,
     #[serde(default)]
     pub min_free_bytes: Option<ByteSize>,
 }
@@ -101,7 +101,7 @@ pub struct SnapshotRoot {
 /// declared it)`. The threshold slot is filled by the first subvolume under
 /// the root that declares one; a later disagreement is refused rather than
 /// resolved, so the value that survives is the only one declared for the root.
-type RootGrouping<'a> = (Vec<String>, Option<(ByteSize, &'a str)>);
+type RootGrouping<'a> = (Vec<SubvolName>, Option<(ByteSize, &'a str)>);
 
 /// Group v1/v2 subvolumes into the `[local_snapshots]` roots the internal
 /// `Config` carries, refusing a config in which two subvolumes share a
@@ -132,7 +132,7 @@ fn group_subvolumes_by_snapshot_root<'a>(
         let entry = root_map
             .entry(snapshot_root)
             .or_insert_with(|| (Vec::new(), None));
-        entry.0.push(name.to_string());
+        entry.0.push(SubvolName::from(name));
         match (entry.1, min_free_bytes) {
             (Some((declared, declared_by)), Some(new)) if declared != new => {
                 return Err(format!(
@@ -160,7 +160,7 @@ fn group_subvolumes_by_snapshot_root<'a>(
 
 #[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct DriveConfig {
-    pub label: String,
+    pub label: DriveLabel,
     #[serde(default)]
     pub uuid: Option<String>,
     pub mount_path: PathBuf,
@@ -198,7 +198,7 @@ fn default_true() -> bool {
 
 #[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct SubvolumeConfig {
-    pub name: String,
+    pub name: SubvolName,
     pub short_name: String,
     pub source: PathBuf,
     #[serde(default = "default_priority")]
@@ -212,7 +212,7 @@ pub struct SubvolumeConfig {
     #[serde(default)]
     pub protection_level: Option<ProtectionLevel>,
     #[serde(default)]
-    pub drives: Option<Vec<String>>,
+    pub drives: Option<Vec<DriveLabel>>,
 }
 
 pub(crate) fn default_priority() -> u8 {
@@ -319,7 +319,7 @@ impl Config {
 
     /// Find the snapshot root path for a given subvolume name.
     #[must_use]
-    pub fn snapshot_root_for(&self, subvol_name: &str) -> Option<PathBuf> {
+    pub fn snapshot_root_for(&self, subvol_name: &SubvolName) -> Option<PathBuf> {
         for root in &self.local_snapshots.roots {
             if root.subvolumes.iter().any(|s| s == subvol_name) {
                 return Some(root.path.clone());
@@ -330,20 +330,20 @@ impl Config {
 
     /// Collect all configured drive labels.
     #[must_use]
-    pub fn drive_labels(&self) -> Vec<String> {
+    pub fn drive_labels(&self) -> Vec<DriveLabel> {
         self.drives.iter().map(|d| d.label.clone()).collect()
     }
 
     /// Get the local snapshot directory for a subvolume: `{root}/{subvol_name}/`
     #[must_use]
-    pub fn local_snapshot_dir(&self, subvol_name: &str) -> Option<PathBuf> {
+    pub fn local_snapshot_dir(&self, subvol_name: &SubvolName) -> Option<PathBuf> {
         self.snapshot_root_for(subvol_name)
             .map(|root| root.join(subvol_name))
     }
 
     /// Get the min_free_bytes for the root containing this subvolume.
     #[must_use]
-    pub fn root_min_free_bytes(&self, subvol_name: &str) -> Option<u64> {
+    pub fn root_min_free_bytes(&self, subvol_name: &SubvolName) -> Option<u64> {
         for root in &self.local_snapshots.roots {
             if root.subvolumes.iter().any(|s| s == subvol_name) {
                 return root.min_free_bytes.map(|b| b.bytes());
@@ -378,7 +378,7 @@ impl Config {
     /// scope. One accessor so the predicate cannot drift between the backup's
     /// arming walk and the sentinel's eject sampling.
     #[must_use]
-    pub(crate) fn send_enabled_names(&self) -> HashSet<String> {
+    pub(crate) fn send_enabled_names(&self) -> HashSet<SubvolName> {
         self.resolved_subvolumes()
             .into_iter()
             .filter(|sv| sv.enabled && sv.send_enabled)
@@ -438,6 +438,7 @@ pub(crate) fn default_config_path() -> crate::error::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::svname;
     use super::v2::tests::v2_minimal_config_str;
 
     #[test]
@@ -587,14 +588,14 @@ source = "/b"
 "#;
         let config: Config = toml::from_str(config_str).unwrap();
         assert_eq!(
-            config.snapshot_root_for("a"),
+            config.snapshot_root_for(&svname("a")),
             Some(PathBuf::from("/snap-a"))
         );
         assert_eq!(
-            config.snapshot_root_for("b"),
+            config.snapshot_root_for(&svname("b")),
             Some(PathBuf::from("/snap-b"))
         );
-        assert_eq!(config.snapshot_root_for("c"), None);
+        assert_eq!(config.snapshot_root_for(&svname("c")), None);
     }
 
     #[test]

@@ -13,7 +13,7 @@ use chrono::{Duration, NaiveDateTime};
 
 use crate::config::{Config, DriveConfig};
 use crate::observation::Observation;
-use crate::types::DriveRole;
+use crate::types::{DriveLabel, DriveRole};
 
 mod chain;
 mod freshness;
@@ -73,7 +73,7 @@ pub fn assess(
 
     // Per-drive cascade lookup computed once (identical for all subvols).
     // Avoids N*M SQLite round-trips on every render.
-    let drive_absence: std::collections::HashMap<String, (Option<i64>, Option<i64>)> = config
+    let drive_absence: std::collections::HashMap<DriveLabel, (Option<i64>, Option<i64>)> = config
         .drives
         .iter()
         .map(|d| {
@@ -99,7 +99,7 @@ pub fn assess(
     // `now`, so the homecoming forecast is pre-computed here (the
     // `last_run_age_secs` precedent). This is the only new `obs.history` call in
     // `assess()`; the function stays pure (ADR-108).
-    let offsite_ctx: std::collections::HashMap<String, OffsiteContext> = config
+    let offsite_ctx: std::collections::HashMap<DriveLabel, OffsiteContext> = config
         .drives
         .iter()
         .filter(|d| d.role == DriveRole::Offsite)
@@ -461,6 +461,7 @@ pub fn assess(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::svname;
     use super::test_support::{dt, offsite_test_config, snap, test_config};
     use crate::btrfs::MockBtrfs;
     use crate::plan::MockFileSystemState;
@@ -623,7 +624,7 @@ source = "/data/sv1"
         let (config, now, fs) = posture_fixture();
         let mut signals = crate::awareness::StorageSignalMap::new();
         signals.insert(
-            "sv1".to_string(),
+            svname("sv1"),
             ResolvedStorageSignal::resolved(
                 Some(0.20), // < 0.25 → Tight
                 None,
@@ -652,7 +653,7 @@ source = "/data/sv1"
         let (config, now, fs) = posture_fixture();
         let mut signals = crate::awareness::StorageSignalMap::new();
         signals.insert(
-            "sv1".to_string(),
+            svname("sv1"),
             ResolvedStorageSignal::resolved(
                 Some(0.05), // < 0.15 → Critical
                 None,
@@ -681,7 +682,7 @@ source = "/data/sv1"
         let (config, now, fs) = posture_fixture();
         let mut signals = crate::awareness::StorageSignalMap::new();
         signals.insert(
-            "sv1".to_string(),
+            svname("sv1"),
             ResolvedStorageSignal::resolved(
                 Some(0.50), // roomy
                 None,
@@ -724,7 +725,7 @@ source = "/data/sv1"
         let mut signals = crate::awareness::StorageSignalMap::new();
         // Only sv1 has a signal; sv2 must stay posture-free.
         signals.insert(
-            "sv1".to_string(),
+            svname("sv1"),
             ResolvedStorageSignal::resolved(
                 Some(0.10),
                 None,
@@ -756,7 +757,7 @@ source = "/data/sv1"
         let (config, now, fs) = posture_fixture();
         let mut signals = crate::awareness::StorageSignalMap::new();
         signals.insert(
-            "sv1".to_string(),
+            svname("sv1"),
             ResolvedStorageSignal::resolved(
                 Some(0.18), // classifies Tight; prior was Roomy
                 None,
@@ -791,7 +792,7 @@ source = "/data/sv1"
         let (config, now, fs) = posture_fixture();
         let mut signals = crate::awareness::StorageSignalMap::new();
         signals.insert(
-            "sv1".to_string(),
+            svname("sv1"),
             ResolvedStorageSignal::resolved(
                 Some(0.28),
                 None,
@@ -838,7 +839,7 @@ source = "/data/sv1"
         );
         let mut signals = StorageSignalMap::new();
         signals.insert(
-            "sv1".to_string(),
+            svname("sv1"),
             ResolvedStorageSignal::resolved(
                 Some(free_ratio),
                 None,

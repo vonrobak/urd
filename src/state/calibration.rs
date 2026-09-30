@@ -1,5 +1,5 @@
 use super::{StateDb, db_err};
-use crate::types::Timestamp;
+use crate::types::{SubvolName, Timestamp};
 
 impl StateDb {
     // ── Calibration methods ─────────────────────────────────────────
@@ -7,7 +7,7 @@ impl StateDb {
     /// Store (or update) a calibrated size for a subvolume.
     pub fn upsert_subvolume_size(
         &self,
-        subvolume: &str,
+        subvolume: &SubvolName,
         estimated_bytes: u64,
         method: &str,
     ) -> crate::error::Result<()> {
@@ -18,7 +18,7 @@ impl StateDb {
                  VALUES (?1, ?2, ?3, ?4)
                  ON CONFLICT(subvolume) DO UPDATE SET
                    estimated_bytes = ?2, measured_at = ?3, method = ?4",
-                rusqlite::params![subvolume, estimated_bytes as i64, now, method],
+                rusqlite::params![subvolume.as_str(), estimated_bytes as i64, now, method],
             )
             .map_err(db_err("failed to upsert subvolume size"))?;
         Ok(())
@@ -31,7 +31,7 @@ impl StateDb {
     /// words an unknown age as stale.
     pub fn calibrated_size(
         &self,
-        subvolume: &str,
+        subvolume: &SubvolName,
     ) -> crate::error::Result<Option<(u64, Option<Timestamp>)>> {
         let mut stmt = self
             .conn
@@ -41,7 +41,7 @@ impl StateDb {
             .map_err(db_err("query failed"))?;
 
         let mut rows = stmt
-            .query_map(rusqlite::params![subvolume], |row| {
+            .query_map(rusqlite::params![subvolume.as_str()], |row| {
                 let bytes: i64 = row.get(0)?;
                 let measured_at: String = row.get(1)?;
                 Ok((bytes as u64, measured_at.parse::<Timestamp>().ok()))
@@ -59,6 +59,7 @@ impl StateDb {
 #[cfg(test)]
 mod tests {
     use crate::state::*;
+    use crate::testkit::svname;
 
     // ── calibration tests ─────────────────────────────────────────────
 
@@ -66,9 +67,9 @@ mod tests {
     fn upsert_and_query_calibrated_size() {
         let db = StateDb::open_memory().unwrap();
 
-        db.upsert_subvolume_size("htpc-home", 77_640_000_000, "du -sb")
+        db.upsert_subvolume_size(&svname("htpc-home"), 77_640_000_000, "du -sb")
             .unwrap();
-        let result = db.calibrated_size("htpc-home").unwrap();
+        let result = db.calibrated_size(&svname("htpc-home")).unwrap();
         assert!(result.is_some());
         let (bytes, measured_at) = result.unwrap();
         assert_eq!(bytes, 77_640_000_000);
@@ -79,10 +80,10 @@ mod tests {
     fn upsert_overwrites_calibrated_size() {
         let db = StateDb::open_memory().unwrap();
 
-        db.upsert_subvolume_size("sv1", 100, "du -sb").unwrap();
-        db.upsert_subvolume_size("sv1", 200, "du -sb").unwrap();
+        db.upsert_subvolume_size(&svname("sv1"), 100, "du -sb").unwrap();
+        db.upsert_subvolume_size(&svname("sv1"), 200, "du -sb").unwrap();
 
-        let (bytes, _) = db.calibrated_size("sv1").unwrap().unwrap();
+        let (bytes, _) = db.calibrated_size(&svname("sv1")).unwrap().unwrap();
         assert_eq!(bytes, 200);
     }
 
@@ -99,7 +100,7 @@ mod tests {
                 [],
             )
             .unwrap();
-        let (bytes, measured_at) = db.calibrated_size("sv1").unwrap().unwrap();
+        let (bytes, measured_at) = db.calibrated_size(&svname("sv1")).unwrap().unwrap();
         assert_eq!(bytes, 4096);
         assert_eq!(measured_at.unwrap().to_string(), "2026-03-24T02:05:00");
     }
@@ -114,26 +115,26 @@ mod tests {
                 [],
             )
             .unwrap();
-        assert_eq!(db.calibrated_size("sv1").unwrap(), Some((4096, None)));
+        assert_eq!(db.calibrated_size(&svname("sv1")).unwrap(), Some((4096, None)));
     }
 
     #[test]
     fn calibrated_size_written_now_round_trips() {
         let db = StateDb::open_memory().unwrap();
-        db.upsert_subvolume_size("sv1", 1, "du -sb").unwrap();
+        db.upsert_subvolume_size(&svname("sv1"), 1, "du -sb").unwrap();
         let stored: String = db
             .conn
             .query_row("SELECT measured_at FROM subvolume_sizes WHERE subvolume = 'sv1'", [], |r| {
                 r.get(0)
             })
             .unwrap();
-        let (_, measured_at) = db.calibrated_size("sv1").unwrap().unwrap();
+        let (_, measured_at) = db.calibrated_size(&svname("sv1")).unwrap().unwrap();
         assert_eq!(measured_at.unwrap().to_string(), stored);
     }
 
     #[test]
     fn calibrated_size_returns_none_for_unknown() {
         let db = StateDb::open_memory().unwrap();
-        assert_eq!(db.calibrated_size("nonexistent").unwrap(), None);
+        assert_eq!(db.calibrated_size(&svname("nonexistent")).unwrap(), None);
     }
 }

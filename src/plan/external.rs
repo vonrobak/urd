@@ -68,6 +68,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::testkit::svname;
 
     fn drive() -> DriveConfig {
         drive_config("D1", "/mnt/d1", DriveRole::Primary)
@@ -78,7 +79,7 @@ mod tests {
     /// function for the region's delete-emission path).
     fn subvol_keep_nothing() -> ResolvedSubvolume {
         ResolvedSubvolume {
-            name: "sv1".to_string(),
+            name: svname("sv1"),
             short_name: "one".to_string(),
             source: PathBuf::from("/data/sv1"),
             priority: 1,

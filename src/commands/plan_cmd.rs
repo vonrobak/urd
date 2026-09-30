@@ -14,7 +14,7 @@ use crate::plan::{
     self, HistoryQuery, NothingNew, PlanFilters, PlannedOperation, PlannedSkip, SkipReason,
 };
 use crate::state::StateDb;
-use crate::types::DISPLAY_MINUTE_FORMAT;
+use crate::types::{DISPLAY_MINUTE_FORMAT, SubvolName};
 use crate::voice;
 
 pub fn run(config: Config, args: PlanArgs, mode: OutputMode) -> anyhow::Result<()> {
@@ -23,7 +23,7 @@ pub fn run(config: Config, args: PlanArgs, mode: OutputMode) -> anyhow::Result<(
     let now = chrono::Local::now().naive_local();
     let filters = PlanFilters {
         priority: args.priority,
-        subvolume: args.subvolume,
+        subvolume: args.subvolume.map(SubvolName::from),
         local_only: args.local_only,
         external_only: args.external_only,
         skip_intervals: !args.auto,
@@ -60,7 +60,7 @@ pub fn run(config: Config, args: PlanArgs, mode: OutputMode) -> anyhow::Result<(
 pub(crate) fn gate_preview(
     backup_plan: &mut crate::plan::BackupPlan,
     config: &Config,
-    recorded: &HashMap<String, crate::retention::RecordedRetention>,
+    recorded: &HashMap<SubvolName, crate::retention::RecordedRetention>,
     filters: &PlanFilters,
     confirmed: bool,
 ) -> Vec<crate::retention::RetentionHold> {
@@ -81,7 +81,7 @@ pub(crate) fn gate_preview(
 #[must_use]
 pub(crate) fn recorded_retention_shapes(
     db: Option<&StateDb>,
-) -> Option<HashMap<String, crate::retention::RecordedRetention>> {
+) -> Option<HashMap<SubvolName, crate::retention::RecordedRetention>> {
     db?.all_retention_shapes().ok()
 }
 
@@ -91,7 +91,7 @@ pub(crate) fn recorded_retention_shapes(
 #[must_use]
 pub(crate) fn retention_baseline_or_warn(
     db: Option<&StateDb>,
-) -> HashMap<String, crate::retention::RecordedRetention> {
+) -> HashMap<SubvolName, crate::retention::RecordedRetention> {
     let cause = match db.map(StateDb::all_retention_shapes) {
         Some(Ok(shapes)) => return shapes,
         Some(Err(e)) => e.to_string(),
@@ -206,11 +206,11 @@ pub(crate) fn collapse_skipped(skipped: &[PlannedSkip]) -> Vec<SkippedSubvolume>
             continue;
         }
         out.push(SkippedSubvolume {
-            name: skip.name.clone(),
+            name: skip.name.to_string(),
             category,
             reason: skip.reason.to_string(),
             next_due_minutes: skip.next_due_minutes,
-            drive: skip.reason.drive().map(str::to_string),
+            drive: skip.reason.drive().map(ToString::to_string),
         });
     }
     out
@@ -253,14 +253,14 @@ fn build_operation_entry(
     resolved: &[ResolvedSubvolume],
 ) -> PlanOperationEntry {
     let send_interval =
-        |name: &str| resolved.iter().find(|r| r.name == name).map(|r| r.send_interval);
+        |name: &SubvolName| resolved.iter().find(|r| r.name == *name).map(|r| r.send_interval);
     match op {
         PlannedOperation::CreateSnapshot {
             source,
             dest,
             subvolume_name,
         } => PlanOperationEntry {
-            subvolume: subvolume_name.clone(),
+            subvolume: subvolume_name.to_string(),
             operation: "create".to_string(),
             detail: format!("{} -> {}", source.display(), dest.display()),
             drive_label: None,
@@ -294,12 +294,12 @@ fn build_operation_entry(
             );
 
             PlanOperationEntry {
-                subvolume: subvolume_name.clone(),
+                subvolume: subvolume_name.to_string(),
                 operation: "send".to_string(),
                 detail: format!(
                     "{snap_name} -> {drive_label} (incremental, parent: {parent_name}){pin_suffix}"
                 ),
-                drive_label: Some(drive_label.clone()),
+                drive_label: Some(drive_label.to_string()),
                 estimated_bytes,
                 is_full_send: Some(false),
                 full_send_reason: None,
@@ -330,12 +330,12 @@ fn build_operation_entry(
             );
 
             PlanOperationEntry {
-                subvolume: subvolume_name.clone(),
+                subvolume: subvolume_name.to_string(),
                 operation: "send".to_string(),
                 detail: format!(
                     "{snap_name} -> {drive_label} (full \u{2014} {reason}){pin_suffix}"
                 ),
-                drive_label: Some(drive_label.clone()),
+                drive_label: Some(drive_label.to_string()),
                 estimated_bytes,
                 is_full_send: Some(true),
                 full_send_reason: Some(reason.to_string()),
@@ -354,9 +354,9 @@ fn build_operation_entry(
             let drive_label = drives
                 .iter()
                 .find(|d| path.starts_with(&d.mount_path))
-                .map(|d| d.label.clone());
+                .map(|d| d.label.to_string());
             PlanOperationEntry {
-                subvolume: subvolume_name.clone(),
+                subvolume: subvolume_name.to_string(),
                 operation: "delete".to_string(),
                 detail: format!("{snap_name} ({reason})"),
                 drive_label,
@@ -372,6 +372,7 @@ fn build_operation_entry(
 mod tests {
     use super::*;
     use crate::plan::{BackupPlan, MockFileSystemState, NothingNew};
+    use crate::testkit::{dlabel, svname};
     use crate::testkit::ConfigBuilder;
     use crate::types::{SendKind, SnapshotName};
     use std::path::PathBuf;
@@ -390,12 +391,12 @@ mod tests {
         PlannedOperation::SendFull {
             snapshot: PathBuf::from(format!("/snapshots/{subvol}/20260329-0404-{subvol}")),
             dest_dir: PathBuf::from(format!("/mnt/{drive}/{subvol}")),
-            drive_label: drive.to_string(),
+            drive_label: drive.into(),
             pin_on_success: Some((
                 PathBuf::from(format!("/snapshots/{subvol}/.last-external-parent-{drive}")),
                 dummy_snap(subvol),
             )),
-            subvolume_name: subvol.to_string(),
+            subvolume_name: subvol.into(),
             reason: crate::types::FullSendReason::FirstSend,
             token_verified: false,
         }
@@ -417,12 +418,12 @@ mod tests {
             snapshot: PathBuf::from(format!("/snapshots/{subvol}/20260329-0404-{subvol}")),
             parent: PathBuf::from(format!("/snapshots/{subvol}/20260328-0404-{subvol}")),
             dest_dir: PathBuf::from(format!("/mnt/{drive}/{subvol}")),
-            drive_label: drive.to_string(),
+            drive_label: drive.into(),
             pin_on_success: Some((
                 PathBuf::from(format!("/snapshots/{subvol}/.last-external-parent-{drive}")),
                 dummy_snap(subvol),
             )),
-            subvolume_name: subvol.to_string(),
+            subvolume_name: subvol.into(),
         }
     }
 
@@ -624,7 +625,7 @@ mod tests {
             name,
             &NothingNew::AlreadyOn {
                 snapshot: SnapshotName::parse(&format!("20260329-0404-{name}")).expect("valid"),
-                drive: drive.to_string(),
+                drive: drive.into(),
             },
         )
     }
@@ -704,7 +705,7 @@ mod tests {
             PlannedSkip::deferred(
                 "htpc-home",
                 SkipReason::SendNotDue {
-                    drive: "WD-18TB1".to_string(),
+                    drive: dlabel("WD-18TB1"),
                     next_in_minutes: 240,
                 },
                 Some(240),
@@ -746,7 +747,7 @@ mod tests {
         let op = PlannedOperation::DeleteSnapshot {
             path: PathBuf::from("/mnt/wd/htpc-home/20260322-1430-htpc-home"),
             reason: "beyond retention window".to_string(),
-            subvolume_name: "htpc-home".to_string(),
+            subvolume_name: svname("htpc-home"),
             kind: crate::plan::DeleteKind::Policy,
         };
         let entry = build_operation_entry(&op, &fs, &config.drives, test_now(), &[]);
@@ -760,7 +761,7 @@ mod tests {
         let op = PlannedOperation::DeleteSnapshot {
             path: PathBuf::from("/snap/htpc-home/20260322-1430-htpc-home"),
             reason: "graduated: daily thinning".to_string(),
-            subvolume_name: "htpc-home".to_string(),
+            subvolume_name: svname("htpc-home"),
             kind: crate::plan::DeleteKind::Policy,
         };
         let entry = build_operation_entry(&op, &fs, &config.drives, test_now(), &[]);
@@ -781,7 +782,7 @@ mod tests {
             operations: vec![PlannedOperation::DeleteSnapshot {
                 path: PathBuf::from("/snap/htpc-home/20260329-0404-htpc-home"),
                 reason: "graduated: weekly thinning".to_string(),
-                subvolume_name: "htpc-home".to_string(),
+                subvolume_name: svname("htpc-home"),
                 kind,
             }],
             timestamp: chrono::NaiveDate::from_ymd_opt(2026, 3, 22)
@@ -850,9 +851,9 @@ mod tests {
             external: roomy,
         });
         let db = StateDb::open_memory().unwrap();
-        db.upsert_retention_shape_best_effort("htpc-home", &roomy, test_now());
+        db.upsert_retention_shape_best_effort(&svname("htpc-home"), &roomy, test_now());
         db.upsert_retention_shape_best_effort(
-            "htpc-docs",
+            &svname("htpc-docs"),
             &RetentionShape::of(&resolved[1]).into(),
             test_now(),
         );
@@ -860,7 +861,7 @@ mod tests {
         let delete = |subvol: &str| PlannedOperation::DeleteSnapshot {
             path: PathBuf::from(format!("/snap/{subvol}/20260301-0404-{subvol}")),
             reason: "graduated: daily thinning".to_string(),
-            subvolume_name: subvol.to_string(),
+            subvolume_name: subvol.into(),
             kind: crate::plan::DeleteKind::Policy,
         };
         let make_plan = || BackupPlan {

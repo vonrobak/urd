@@ -20,7 +20,7 @@ use crate::pools::{self, PoolSpace};
 use crate::preflight;
 use crate::sentinel_runner;
 use crate::state::StateDb;
-use crate::types::{LocalRetentionPolicy, ProtectionLevel};
+use crate::types::{DriveLabel, LocalRetentionPolicy, ProtectionLevel, SubvolName};
 use crate::voice;
 
 use crate::commands::{init, verify};
@@ -234,7 +234,7 @@ pub fn run(config: Config, args: DoctorArgs, output_mode: OutputMode) -> anyhow:
                 }
             };
             DoctorDataSafety {
-                name: a.name.clone(),
+                name: a.name.to_string(),
                 status: a.status,
                 health: a.health.to_string(),
                 issue,
@@ -687,7 +687,7 @@ fn build_doctor_recommendation_view(
     let now = chrono::Local::now().naive_local();
     let window = crate::drift::default_window();
     let pools_grouped = pools::detect_source_pools(config);
-    let pools_by_uuid: HashMap<String, Vec<String>> = pools_grouped
+    let pools_by_uuid: HashMap<String, Vec<SubvolName>> = pools_grouped
         .iter()
         .map(|p| (p.uuid.clone(), p.subvolume_names.clone()))
         .collect();
@@ -757,14 +757,14 @@ fn build_doctor_recommendation_view_inner(
             continue;
         };
         for name in &pool.subvolume_names {
-            subvol_pool.insert(name.clone(), (mp.clone(), pool.uuid.clone()));
+            subvol_pool.insert(name.to_string(), (mp.clone(), pool.uuid.clone()));
         }
     }
 
     // Destination metadata: (drive label, metadata ratio) for each
     // available drive with a resolvable UUID. The External row's max-of
     // aggregation reads from here.
-    let destination_metadata: Vec<(String, f64)> = config
+    let destination_metadata: Vec<(DriveLabel, f64)> = config
         .drives
         .iter()
         .filter(|d| drives::drive_availability(d) == drives::DriveAvailability::Available)
@@ -780,7 +780,7 @@ fn build_doctor_recommendation_view_inner(
             .iter()
             .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
         {
-            Some((label, ratio)) => (Some(label.clone()), Some(*ratio)),
+            Some((label, ratio)) => (Some(label.to_string()), Some(*ratio)),
             None => (None, None),
         };
 
@@ -792,7 +792,7 @@ fn build_doctor_recommendation_view_inner(
         let churn = compute_churn_for(state_db, &sv.name, window, now);
 
         // Source-pool signals for this subvolume.
-        let source_signals = subvol_pool.get(&sv.name).map(|(mp, uuid)| {
+        let source_signals = subvol_pool.get(sv.name.as_str()).map(|(mp, uuid)| {
             let space = pool_space_by_mountpoint.get(mp).copied();
             let trend = pool_trend_by_uuid.get(uuid).copied().flatten();
             (space, trend)
@@ -913,7 +913,7 @@ fn build_doctor_recommendation_view_inner(
             .filter(|p| *p != ProtectionLevel::Custom);
 
         rows.push(DoctorRecommendationRow {
-            name: sv.name.clone(),
+            name: sv.name.to_string(),
             local,
             external,
             note,
@@ -945,7 +945,7 @@ fn recovery_bytes(row: &DoctorRecommendationRow) -> u64 {
 
 fn compute_churn_for(
     state_db: Option<&StateDb>,
-    name: &str,
+    name: &SubvolName,
     window: chrono::Duration,
     now: chrono::NaiveDateTime,
 ) -> crate::drift::ChurnEstimate {
@@ -972,7 +972,7 @@ fn build_doctor_churn_view_inner(
         .map(|sv| {
             let estimate = compute_churn_for(state_db, &sv.name, window, now);
             DoctorChurnRow {
-                name: sv.name.clone(),
+                name: sv.name.to_string(),
                 state: crate::drift::render_churn(&estimate),
             }
         })
@@ -1007,6 +1007,7 @@ fn unpack_advice(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::svname;
 
     // ── Retention-change advisory (ADR-110) ────────────────────────────
 
@@ -1031,7 +1032,7 @@ mod tests {
         };
         assert!(retention_change_checks(&[]).is_empty());
         let checks = retention_change_checks(&[RetentionChange {
-            subvolume: "docs".to_string(),
+            subvolume: svname("docs"),
             previous: previous.into(),
             current,
         }]);
@@ -1916,7 +1917,7 @@ source = "/data/cold"
         pools::SourcePool {
             uuid: "pool-uuid-test".to_string(),
             mountpoints: vec![std::path::PathBuf::from("/data")],
-            subvolume_names: names.iter().map(|s| (*s).to_string()).collect(),
+            subvolume_names: names.iter().map(|s| svname(s)).collect(),
         }
     }
 

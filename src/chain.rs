@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use crate::config::Config;
 use crate::error::UrdError;
-use crate::types::SnapshotName;
+use crate::types::{DriveLabel, SnapshotName, SubvolName};
 
 /// The pin file for a specific drive in a local snapshot directory:
 /// `.last-external-parent-{LABEL}`. The one place that filename is built —
@@ -11,7 +11,7 @@ use crate::types::SnapshotName;
 /// verify's stale-pin check all take it from this function. Pure path
 /// arithmetic; touches nothing on disk.
 #[must_use]
-pub fn pin_path(local_snapshot_dir: &Path, drive_label: &str) -> PathBuf {
+pub fn pin_path(local_snapshot_dir: &Path, drive_label: &DriveLabel) -> PathBuf {
     local_snapshot_dir.join(format!("{PIN_PREFIX}{drive_label}"))
 }
 
@@ -22,7 +22,7 @@ pub fn pin_path(local_snapshot_dir: &Path, drive_label: &str) -> PathBuf {
 /// empty, unreadable, or malformed is an `Err` (#402, #420).
 pub fn read_pin_file(
     local_snapshot_dir: &Path,
-    drive_label: &str,
+    drive_label: &DriveLabel,
 ) -> crate::error::Result<Option<SnapshotName>> {
     try_read_pin(&pin_path(local_snapshot_dir, drive_label))
 }
@@ -36,7 +36,7 @@ pub fn read_pin_file(
 #[must_use]
 pub fn find_pinned_snapshots(
     local_snapshot_dir: &Path,
-    drive_labels: &[String],
+    drive_labels: &[DriveLabel],
 ) -> HashSet<SnapshotName> {
     let mut pinned = HashSet::new();
 
@@ -64,7 +64,7 @@ pub fn find_pinned_snapshots(
 /// closed on an unreadable pin (ADR-107), i.e. [`is_pinned_at_delete_time`].
 pub fn find_pinned_snapshots_strict(
     local_snapshot_dir: &Path,
-    drive_labels: &[String],
+    drive_labels: &[DriveLabel],
 ) -> crate::error::Result<HashSet<SnapshotName>> {
     pin_reads(local_snapshot_dir, drive_labels)
         .filter_map(|(_, read)| read.transpose())
@@ -74,8 +74,8 @@ pub fn find_pinned_snapshots_strict(
 /// Per-drive pin reads shared by the lenient and strict collectors.
 fn pin_reads<'a>(
     local_snapshot_dir: &'a Path,
-    drive_labels: &'a [String],
-) -> impl Iterator<Item = (&'a String, crate::error::Result<Option<SnapshotName>>)> + 'a {
+    drive_labels: &'a [DriveLabel],
+) -> impl Iterator<Item = (&'a DriveLabel, crate::error::Result<Option<SnapshotName>>)> + 'a {
     drive_labels
         .iter()
         .map(move |label| (label, read_pin_file(local_snapshot_dir, label)))
@@ -85,7 +85,7 @@ fn pin_reads<'a>(
 /// its `.last-external-parent-{LABEL}` filename and the snapshot it names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscoveredPin {
-    pub label: String,
+    pub label: DriveLabel,
     pub snapshot: SnapshotName,
     /// Full path to the pin file — supplied by the scan so callers never
     /// reconstruct the `.last-external-parent-{LABEL}` filename themselves.
@@ -123,7 +123,7 @@ pub fn discover_pin_files(local_snapshot_dir: &Path) -> Vec<DiscoveredPin> {
         let path = entry.path();
         if let Ok(Some(snapshot)) = try_read_pin(&path) {
             pins.push(DiscoveredPin {
-                label: label.to_string(),
+                label: DriveLabel::from(label),
                 snapshot,
                 path,
             });
@@ -149,7 +149,10 @@ pub fn unlabeled_pin_file(local_snapshot_dir: &Path) -> Option<PathBuf> {
 /// the configured shape is silently overridden (#125). Comparison is
 /// case-sensitive, matching the exact pin-file label form.
 #[must_use]
-pub fn orphan_pins(discovered: &[DiscoveredPin], configured_labels: &[String]) -> Vec<DiscoveredPin> {
+pub fn orphan_pins(
+    discovered: &[DiscoveredPin],
+    configured_labels: &[DriveLabel],
+) -> Vec<DiscoveredPin> {
     discovered
         .iter()
         .filter(|p| !configured_labels.iter().any(|l| l == &p.label))
@@ -172,7 +175,7 @@ pub fn orphan_pins(discovered: &[DiscoveredPin], configured_labels: &[String]) -
 #[must_use]
 pub fn is_pinned_at_delete_time(
     snapshot_path: &Path,
-    subvolume_name: &str,
+    subvolume_name: &SubvolName,
     config: &Config,
 ) -> bool {
     let Some(snap_name_osstr) = snapshot_path.file_name() else {
@@ -208,7 +211,7 @@ pub fn is_pinned_at_delete_time(
 /// survives a crash; that failing only warns, since the pin is already written.
 pub fn write_pin_file(
     local_snapshot_dir: &Path,
-    drive_label: &str,
+    drive_label: &DriveLabel,
     snapshot_name: &SnapshotName,
 ) -> crate::error::Result<()> {
     use std::io::Write;
@@ -249,7 +252,7 @@ pub fn write_pin_file(
 /// [`pin_path`], like `write_pin_file`.
 pub fn remove_pin_file(
     local_snapshot_dir: &Path,
-    drive_label: &str,
+    drive_label: &DriveLabel,
 ) -> crate::error::Result<()> {
     let path = pin_path(local_snapshot_dir, drive_label);
     match std::fs::remove_file(&path) {
@@ -287,13 +290,14 @@ fn try_read_pin(path: &Path) -> crate::error::Result<Option<SnapshotName>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::{dlabel, svname};
     use std::fs;
     use tempfile::TempDir;
 
     #[test]
     fn pin_path_names_the_drive_specific_pin() {
         assert_eq!(
-            pin_path(Path::new("/snap/home"), "WD-18TB"),
+            pin_path(Path::new("/snap/home"), &dlabel("WD-18TB")),
             PathBuf::from("/snap/home/.last-external-parent-WD-18TB")
         );
     }
@@ -307,7 +311,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = read_pin_file(dir.path(), "WD-18TB").unwrap().unwrap();
+        let result = read_pin_file(dir.path(), &dlabel("WD-18TB")).unwrap().unwrap();
         assert_eq!(result.as_str(), "20260322-opptak");
     }
 
@@ -339,7 +343,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         for_each_unlabeled_pin(dir.path(), |shape| {
             assert!(
-                read_pin_file(dir.path(), "WD-18TB").unwrap().is_none(),
+                read_pin_file(dir.path(), &dlabel("WD-18TB")).unwrap().is_none(),
                 "{shape} unlabeled pin must read as no pin"
             );
         });
@@ -354,7 +358,7 @@ mod tests {
         )
         .unwrap();
         for_each_unlabeled_pin(dir.path(), |shape| {
-            let result = read_pin_file(dir.path(), "WD-18TB").unwrap().unwrap();
+            let result = read_pin_file(dir.path(), &dlabel("WD-18TB")).unwrap().unwrap();
             assert_eq!(result.as_str(), "20260322-1400-opptak", "{shape}");
         });
     }
@@ -362,7 +366,7 @@ mod tests {
     #[test]
     fn no_pin_files() {
         let dir = TempDir::new().unwrap();
-        let result = read_pin_file(dir.path(), "WD-18TB").unwrap();
+        let result = read_pin_file(dir.path(), &dlabel("WD-18TB")).unwrap();
         assert!(result.is_none());
     }
 
@@ -375,7 +379,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = read_pin_file(dir.path(), "WD-18TB");
+        let result = read_pin_file(dir.path(), &dlabel("WD-18TB"));
         assert!(result.is_err());
     }
 
@@ -385,10 +389,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let pin = dir.path().join(".last-external-parent-WD-18TB");
         fs::write(&pin, "  \n  ").unwrap();
-        assert!(read_pin_file(dir.path(), "WD-18TB").is_err(), "whitespace-only");
+        assert!(read_pin_file(dir.path(), &dlabel("WD-18TB")).is_err(), "whitespace-only");
 
         fs::write(&pin, "").unwrap();
-        assert!(read_pin_file(dir.path(), "WD-18TB").is_err(), "zero-length");
+        assert!(read_pin_file(dir.path(), &dlabel("WD-18TB")).is_err(), "zero-length");
     }
 
     #[test]
@@ -398,7 +402,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join(".last-external-parent-WD-18TB"), "").unwrap();
         fs::write(dir.path().join(".last-external-parent"), "20260321-opptak").unwrap();
-        assert!(read_pin_file(dir.path(), "WD-18TB").is_err());
+        assert!(read_pin_file(dir.path(), &dlabel("WD-18TB")).is_err());
     }
 
     #[test]
@@ -415,7 +419,7 @@ mod tests {
         )
         .unwrap();
 
-        let labels = vec!["WD-18TB".to_string(), "WD-18TB1".to_string()];
+        let labels = vec![dlabel("WD-18TB"), dlabel("WD-18TB1")];
         let pinned = find_pinned_snapshots(dir.path(), &labels);
         assert_eq!(pinned.len(), 2);
         assert!(pinned.iter().any(|s| s.as_str() == "20260322-opptak"));
@@ -468,17 +472,17 @@ mod tests {
     fn orphan_pins_flags_unconfigured_labels() {
         let discovered = vec![
             DiscoveredPin {
-                label: "WD-18TB".to_string(),
+                label: dlabel("WD-18TB"),
                 snapshot: SnapshotName::parse("20260516-0401-containers").unwrap(),
                 path: PathBuf::from(".last-external-parent-WD-18TB"),
             },
             DiscoveredPin {
-                label: "2TB-backup".to_string(),
+                label: dlabel("2TB-backup"),
                 snapshot: SnapshotName::parse("20260402-1925-containers").unwrap(),
                 path: PathBuf::from(".last-external-parent-2TB-backup"),
             },
         ];
-        let configured = vec!["WD-18TB".to_string(), "WD-18TB1".to_string()];
+        let configured = vec![dlabel("WD-18TB"), dlabel("WD-18TB1")];
 
         let orphans = orphan_pins(&discovered, &configured);
         assert_eq!(orphans.len(), 1);
@@ -488,11 +492,11 @@ mod tests {
     #[test]
     fn orphan_pins_empty_when_all_configured() {
         let discovered = vec![DiscoveredPin {
-            label: "WD-18TB".to_string(),
+            label: dlabel("WD-18TB"),
             snapshot: SnapshotName::parse("20260516-0401-containers").unwrap(),
             path: PathBuf::from(".last-external-parent-WD-18TB"),
         }];
-        let configured = vec!["WD-18TB".to_string()];
+        let configured = vec![dlabel("WD-18TB")];
         assert!(orphan_pins(&discovered, &configured).is_empty());
     }
 
@@ -527,7 +531,7 @@ mod tests {
         )
         .unwrap();
 
-        let labels = vec!["WD-18TB".to_string(), "WD-18TB1".to_string()];
+        let labels = vec![dlabel("WD-18TB"), dlabel("WD-18TB1")];
         for_each_unlabeled_pin(dir.path(), |shape| {
             let lenient = find_pinned_snapshots(dir.path(), &labels);
             let strict = find_pinned_snapshots_strict(dir.path(), &labels).unwrap();
@@ -543,9 +547,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let name = SnapshotName::parse("20260322-1430-opptak").unwrap();
 
-        write_pin_file(dir.path(), "WD-18TB", &name).unwrap();
+        write_pin_file(dir.path(), &dlabel("WD-18TB"), &name).unwrap();
 
-        let result = read_pin_file(dir.path(), "WD-18TB").unwrap().unwrap();
+        let result = read_pin_file(dir.path(), &dlabel("WD-18TB")).unwrap().unwrap();
         assert_eq!(result.as_str(), "20260322-1430-opptak");
     }
 
@@ -555,10 +559,10 @@ mod tests {
         let old = SnapshotName::parse("20260321-opptak").unwrap();
         let new = SnapshotName::parse("20260322-1430-opptak").unwrap();
 
-        write_pin_file(dir.path(), "WD-18TB", &old).unwrap();
-        write_pin_file(dir.path(), "WD-18TB", &new).unwrap();
+        write_pin_file(dir.path(), &dlabel("WD-18TB"), &old).unwrap();
+        write_pin_file(dir.path(), &dlabel("WD-18TB"), &new).unwrap();
 
-        let result = read_pin_file(dir.path(), "WD-18TB").unwrap().unwrap();
+        let result = read_pin_file(dir.path(), &dlabel("WD-18TB")).unwrap().unwrap();
         assert_eq!(result.as_str(), "20260322-1430-opptak");
     }
 
@@ -567,7 +571,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let name = SnapshotName::parse("20260322-1430-opptak").unwrap();
 
-        write_pin_file(dir.path(), "WD-18TB", &name).unwrap();
+        write_pin_file(dir.path(), &dlabel("WD-18TB"), &name).unwrap();
 
         let tmp = dir.path().join(".last-external-parent-WD-18TB.tmp");
         assert!(!tmp.exists());
@@ -582,7 +586,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = read_pin_file(dir.path(), "WD-18TB").unwrap().unwrap();
+        let result = read_pin_file(dir.path(), &dlabel("WD-18TB")).unwrap().unwrap();
         assert_eq!(result.as_str(), "20260322-opptak");
     }
 
@@ -648,7 +652,7 @@ source = "/data/a"
 
         let config = pin_recheck_config(dir.path());
         let snap_path = local_dir.join("20260322-1200-a");
-        assert!(is_pinned_at_delete_time(&snap_path, "sv-a", &config));
+        assert!(is_pinned_at_delete_time(&snap_path, &svname("sv-a"), &config));
     }
 
     #[test]
@@ -665,7 +669,7 @@ source = "/data/a"
         let config = pin_recheck_config(dir.path());
         // Different snapshot — not pinned
         let snap_path = local_dir.join("20260321-1200-a");
-        assert!(!is_pinned_at_delete_time(&snap_path, "sv-a", &config));
+        assert!(!is_pinned_at_delete_time(&snap_path, &svname("sv-a"), &config));
     }
 
     #[test]
@@ -674,7 +678,7 @@ source = "/data/a"
         let config = pin_recheck_config(dir.path());
         // Subvolume "unknown" has no local dir → fail-closed (true = keep)
         let snap_path = dir.path().join("unknown/20260322-1200-a");
-        assert!(is_pinned_at_delete_time(&snap_path, "unknown", &config));
+        assert!(is_pinned_at_delete_time(&snap_path, &svname("unknown"), &config));
     }
 
     // ── Unreadable pins fail closed at delete time (#402) ──────────────
@@ -688,7 +692,7 @@ source = "/data/a"
         let config = pin_recheck_config(dir.path());
         let snap_path = local_dir.join("20260322-1200-a");
         assert!(
-            !is_pinned_at_delete_time(&snap_path, "sv-a", &config),
+            !is_pinned_at_delete_time(&snap_path, &svname("sv-a"), &config),
             "an absent pin file is not a read failure — the delete may proceed"
         );
     }
@@ -704,7 +708,7 @@ source = "/data/a"
         let config = pin_recheck_config(dir.path());
         let snap_path = local_dir.join("20260322-1200-a");
         assert!(
-            is_pinned_at_delete_time(&snap_path, "sv-a", &config),
+            is_pinned_at_delete_time(&snap_path, &svname("sv-a"), &config),
             "an unreadable pin must keep the snapshot (fail closed)"
         );
     }
@@ -725,7 +729,7 @@ source = "/data/a"
 
         let config = pin_recheck_config_drives(dir.path(), &["D1", "D2"]);
         let snap_path = local_dir.join("20260322-1200-a");
-        assert!(is_pinned_at_delete_time(&snap_path, "sv-a", &config));
+        assert!(is_pinned_at_delete_time(&snap_path, &svname("sv-a"), &config));
     }
 
     #[test]
@@ -739,7 +743,7 @@ source = "/data/a"
         let config = pin_recheck_config(dir.path());
         let snap_path = local_dir.join("20260322-1200-a");
         for_each_unlabeled_pin(&local_dir, |shape| {
-            assert!(!is_pinned_at_delete_time(&snap_path, "sv-a", &config), "{shape}");
+            assert!(!is_pinned_at_delete_time(&snap_path, &svname("sv-a"), &config), "{shape}");
         });
     }
 
@@ -754,7 +758,7 @@ source = "/data/a"
 
         let config = pin_recheck_config(dir.path());
         let snap_path = local_dir.join("20260322-1200-a");
-        assert!(is_pinned_at_delete_time(&snap_path, "sv-a", &config));
+        assert!(is_pinned_at_delete_time(&snap_path, &svname("sv-a"), &config));
     }
 
     #[test]
@@ -766,7 +770,7 @@ source = "/data/a"
 
         let config = pin_recheck_config(dir.path());
         let snap_path = local_dir.join("20260322-1200-a");
-        assert!(is_pinned_at_delete_time(&snap_path, "sv-a", &config));
+        assert!(is_pinned_at_delete_time(&snap_path, &svname("sv-a"), &config));
     }
 
     #[test]
@@ -779,7 +783,7 @@ source = "/data/a"
 
         let config = pin_recheck_config(dir.path());
         let snap_path = local_dir.join("20260322-1200-a");
-        assert!(is_pinned_at_delete_time(&snap_path, "sv-a", &config));
+        assert!(is_pinned_at_delete_time(&snap_path, &svname("sv-a"), &config));
     }
 
     #[test]
@@ -791,13 +795,13 @@ source = "/data/a"
 
         let config = pin_recheck_config(dir.path());
         let snap_path = local_dir.join("20260322-1200-a");
-        assert!(is_pinned_at_delete_time(&snap_path, "sv-a", &config));
+        assert!(is_pinned_at_delete_time(&snap_path, &svname("sv-a"), &config));
     }
 
     #[test]
     fn strict_find_distinguishes_absent_from_unreadable() {
         let dir = TempDir::new().unwrap();
-        let labels = vec!["D1".to_string(), "D2".to_string()];
+        let labels = vec![dlabel("D1"), dlabel("D2")];
 
         // Nothing on disk → Ok, empty.
         assert!(find_pinned_snapshots_strict(dir.path(), &labels).unwrap().is_empty());
@@ -821,7 +825,7 @@ source = "/data/a"
         fs::write(dir.path().join(".last-external-parent-D1"), "20260322-1200-a").unwrap();
         fs::create_dir(dir.path().join(".last-external-parent-D2")).unwrap();
 
-        let labels = vec!["D1".to_string(), "D2".to_string()];
+        let labels = vec![dlabel("D1"), dlabel("D2")];
         let pinned = find_pinned_snapshots(dir.path(), &labels);
         assert_eq!(pinned.len(), 1);
         assert!(pinned.iter().any(|s| s.as_str() == "20260322-1200-a"));

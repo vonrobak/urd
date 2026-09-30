@@ -10,6 +10,7 @@ use crate::config::Config;
 use crate::executor::{OpResult, OperationOutcome, SendType, SubvolumeResult, TransientCleanupOutcome};
 use crate::storage_critical::TightnessTier;
 use crate::plan::BackupPlan;
+use crate::testkit::{dlabel, svname};
 
 pub(super) fn wd_config() -> Config {
     let toml_str = r#"
@@ -53,7 +54,7 @@ pub(super) fn wd_signals(subvols: &[&str]) -> storage_signals::StorageSignals {
         pools: vec![storage_signals::PoolSignal {
             uuid: Some("pool-uuid".to_string()),
             label: "/data".to_string(),
-            subvol_names: subvols.iter().map(|s| s.to_string()).collect(),
+            subvol_names: subvols.iter().map(|s| svname(s)).collect(),
             free_ratio: None,
             // The watchdog computes its own floor from config + the space
             // closure's capacity (`pool_floor_bytes`), so these raw fields are
@@ -89,7 +90,7 @@ pub(super) fn make_outcome(
 ) -> OperationOutcome {
     OperationOutcome {
         operation: operation.to_string(),
-        drive_label: drive.map(str::to_string),
+        drive_label: drive.map(dlabel),
         result,
         duration: Duration::from_millis(100),
         error: error.map(str::to_string),
@@ -107,7 +108,7 @@ pub(super) fn make_subvol_result(
     pin_failures: u32,
 ) -> SubvolumeResult {
     SubvolumeResult {
-        name: name.to_string(),
+        name: name.into(),
         success,
         operations,
         duration: Duration::from_secs(2),
@@ -124,7 +125,7 @@ pub(super) fn empty_assessments() -> Vec<SubvolAssessment> {
 
 pub(super) fn sample_assessments() -> Vec<SubvolAssessment> {
     vec![SubvolAssessment {
-        name: "htpc-home".to_string(),
+        name: svname("htpc-home"),
         short_name: "htpc-home".to_string(),
         status: PromiseStatus::Protected,
         health: OperationalHealth::Healthy,

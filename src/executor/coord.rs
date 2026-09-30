@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use super::SendType;
+use crate::types::{DriveLabel, SubvolName};
 
 // ── Watchdog coordination (UPI 065-b) ──────────────────────────────────
 
@@ -51,8 +52,8 @@ pub(crate) struct WatchdogCoord {
 ///   4. Update context fields (executor only)
 ///   5. Release lock
 pub(crate) struct ProgressContext {
-    pub subvolume_name: String,
-    pub drive_label: String,
+    pub subvolume_name: SubvolName,
+    pub drive_label: DriveLabel,
     pub send_type: SendType,
     pub send_index: u32,
     pub total_sends: u32,
@@ -60,7 +61,7 @@ pub(crate) struct ProgressContext {
 }
 
 /// Pre-computed size estimates keyed by (subvolume_name, drive_label).
-pub(crate) type SizeEstimates = HashMap<(String, String), Option<u64>>;
+pub(crate) type SizeEstimates = HashMap<(SubvolName, DriveLabel), Option<u64>>;
 
 /// One finished send, as the executor reports it to the command's completion
 /// sink. The executor decides *that* a send completed (and that it ran long
@@ -68,8 +69,8 @@ pub(crate) type SizeEstimates = HashMap<(String, String), Option<u64>>;
 /// shows.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CompletionReport<'a> {
-    pub subvolume_name: &'a str,
-    pub drive_label: &'a str,
+    pub subvolume_name: &'a SubvolName,
+    pub drive_label: &'a DriveLabel,
     pub bytes_transferred: u64,
     pub elapsed: Duration,
     pub send_type: SendType,

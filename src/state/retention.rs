@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use super::{StateDb, db_err};
 use crate::retention::RecordedRetention;
-use crate::types::Timestamp;
+use crate::types::{SubvolName, Timestamp};
 
 impl StateDb {
     // ── Applied retention shapes (ADR-110 transition safety) ────────
@@ -19,7 +19,7 @@ impl StateDb {
     /// they read as "no record" rather than failing the caller.
     pub fn all_retention_shapes(
         &self,
-    ) -> crate::error::Result<HashMap<String, RecordedRetention>> {
+    ) -> crate::error::Result<HashMap<SubvolName, RecordedRetention>> {
         let mut stmt = self
             .conn
             .prepare("SELECT subvolume, shape FROM retention_shapes")
@@ -38,7 +38,7 @@ impl StateDb {
             let (subvolume, text) = row.map_err(db_err("read retention-shape row"))?;
             match RecordedRetention::parse_canonical(&text) {
                 Some(shape) => {
-                    out.insert(subvolume, shape);
+                    out.insert(SubvolName::from(subvolume), shape);
                 }
                 None => log::warn!(
                     "skipping retention-shape row for {subvolume} with unparseable shape {text:?}"
@@ -52,7 +52,7 @@ impl StateDb {
     /// Best-effort per ADR-102: failures are logged and swallowed.
     pub fn upsert_retention_shape_best_effort(
         &self,
-        subvolume: &str,
+        subvolume: &SubvolName,
         shape: &RecordedRetention,
         recorded_at: chrono::NaiveDateTime,
     ) {
@@ -63,7 +63,7 @@ impl StateDb {
 
     fn upsert_retention_shape_inner(
         &self,
-        subvolume: &str,
+        subvolume: &SubvolName,
         shape: &RecordedRetention,
         recorded_at: chrono::NaiveDateTime,
     ) -> crate::error::Result<()> {
@@ -75,7 +75,7 @@ impl StateDb {
                      shape = excluded.shape,
                      recorded_at = excluded.recorded_at",
                 rusqlite::params![
-                    subvolume,
+                    subvolume.as_str(),
                     shape.to_canonical(),
                     Timestamp::from(recorded_at).to_string(),
                 ],
@@ -91,6 +91,7 @@ mod tests {
     use crate::state::testkit::drift_dt;
     use crate::state::*;
     use crate::types::{LocalRetentionPolicy, MonthlyCount, ResolvedGraduatedRetention};
+    use crate::testkit::svname;
 
     fn shape(daily: u32) -> RecordedRetention {
         let g = ResolvedGraduatedRetention {
@@ -111,9 +112,13 @@ mod tests {
         let db = StateDb::open_memory().unwrap();
         assert!(db.all_retention_shapes().unwrap().is_empty());
 
-        db.upsert_retention_shape_best_effort("home", &shape(30), drift_dt("2026-09-01T04:00:00"));
         db.upsert_retention_shape_best_effort(
-            "docs",
+            &svname("home"),
+            &shape(30),
+            drift_dt("2026-09-01T04:00:00"),
+        );
+        db.upsert_retention_shape_best_effort(
+            &svname("docs"),
             &RecordedRetention {
                 local: None,
                 ..shape(7)
@@ -131,8 +136,16 @@ mod tests {
     #[test]
     fn retention_shape_upsert_replaces_the_row() {
         let db = StateDb::open_memory().unwrap();
-        db.upsert_retention_shape_best_effort("home", &shape(30), drift_dt("2026-09-01T04:00:00"));
-        db.upsert_retention_shape_best_effort("home", &shape(7), drift_dt("2026-09-02T04:00:00"));
+        db.upsert_retention_shape_best_effort(
+            &svname("home"),
+            &shape(30),
+            drift_dt("2026-09-01T04:00:00"),
+        );
+        db.upsert_retention_shape_best_effort(
+            &svname("home"),
+            &shape(7),
+            drift_dt("2026-09-02T04:00:00"),
+        );
 
         let all = db.all_retention_shapes().unwrap();
         assert_eq!(all.len(), 1);
@@ -151,7 +164,11 @@ mod tests {
     #[test]
     fn unparseable_retention_shape_row_reads_as_no_record() {
         let db = StateDb::open_memory().unwrap();
-        db.upsert_retention_shape_best_effort("home", &shape(30), drift_dt("2026-09-01T04:00:00"));
+        db.upsert_retention_shape_best_effort(
+            &svname("home"),
+            &shape(30),
+            drift_dt("2026-09-01T04:00:00"),
+        );
         db.conn
             .execute(
                 "INSERT INTO retention_shapes (subvolume, shape, recorded_at)

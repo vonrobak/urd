@@ -14,7 +14,7 @@ use super::{
 };
 use crate::chain;
 use crate::drives;
-use crate::types::{SendKind, SnapshotName};
+use crate::types::{DriveLabel, SendKind, SnapshotName, SubvolName};
 
 impl Executor<'_> {
     /// Pre-send sweep of abandoned partial snapshots at the destination
@@ -46,7 +46,7 @@ impl Executor<'_> {
         &self,
         snapshot: &Path,
         dest_dir: &Path,
-        drive_label: &str,
+        drive_label: &DriveLabel,
         pin_on_success: Option<&(PathBuf, SnapshotName)>,
     ) {
         // The same-name path belongs to the crash-recovery check, not the sweep.
@@ -138,7 +138,7 @@ impl Executor<'_> {
     /// recovered, not read as "not tripped": the trip set is a plain `HashSet` an
     /// `insert` either completed or did not, and a trip is an ADR-113 safety signal
     /// that must survive a panic on the watchdog thread (fail closed).
-    pub(super) fn pool_tripped(&self, subvol_name: &str) -> bool {
+    pub(super) fn pool_tripped(&self, subvol_name: &SubvolName) -> bool {
         let Some(coord) = &self.watchdog_coord else {
             return false;
         };
@@ -157,7 +157,7 @@ impl Executor<'_> {
     /// Shared by a fresh send and crash recovery's completed-but-unpinned case.
     fn write_pin_on_success(
         pin_on_success: Option<&(PathBuf, SnapshotName)>,
-        drive_label: &str,
+        drive_label: &DriveLabel,
     ) -> bool {
         if let Some((pin_path, pin_name)) = pin_on_success
             && let Some(pin_dir) = pin_path.parent()
@@ -177,10 +177,10 @@ impl Executor<'_> {
         snapshot: &Path,
         parent: Option<&Path>,
         dest_dir: &Path,
-        drive_label: &str,
+        drive_label: &DriveLabel,
         pin_on_success: Option<&(std::path::PathBuf, crate::types::SnapshotName)>,
         failed_creates: &HashSet<&Path>,
-        subvol_name: &str,
+        subvol_name: &SubvolName,
     ) -> (OperationOutcome, bool) {
         let start = Instant::now();
         let send_kind = if parent.is_some() {
@@ -199,7 +199,7 @@ impl Executor<'_> {
             return (
                 OperationOutcome {
                     operation: op_name.to_string(),
-                    drive_label: Some(drive_label.to_string()),
+                    drive_label: Some(drive_label.clone()),
                     result: OpResult::Skipped,
                     duration: start.elapsed(),
                     error: Some("snapshot creation failed".to_string()),
@@ -223,7 +223,7 @@ impl Executor<'_> {
                 return (
                     OperationOutcome {
                         operation: op_name.to_string(),
-                        drive_label: Some(drive_label.to_string()),
+                        drive_label: Some(drive_label.clone()),
                         result: OpResult::Failure,
                         duration: start.elapsed(),
                         error: Some(format!(
@@ -262,7 +262,7 @@ impl Executor<'_> {
                             return (
                                 outcome_success(
                                     op_name,
-                                    Some(drive_label.to_string()),
+                                    Some(drive_label.clone()),
                                     None,
                                     start.elapsed(),
                                 ),
@@ -279,7 +279,7 @@ impl Executor<'_> {
                             return (
                                 OperationOutcome {
                                     operation: op_name.to_string(),
-                                    drive_label: Some(drive_label.to_string()),
+                                    drive_label: Some(drive_label.clone()),
                                     result: OpResult::Failure,
                                     duration: start.elapsed(),
                                     error: Some(format!(
@@ -317,7 +317,7 @@ impl Executor<'_> {
                         return (
                             outcome_success(
                                 op_name,
-                                Some(drive_label.to_string()),
+                                Some(drive_label.clone()),
                                 None,
                                 start.elapsed(),
                             ),
@@ -334,7 +334,7 @@ impl Executor<'_> {
                         return (
                             OperationOutcome {
                                 operation: op_name.to_string(),
-                                drive_label: Some(drive_label.to_string()),
+                                drive_label: Some(drive_label.clone()),
                                 result: OpResult::Failure,
                                 duration: start.elapsed(),
                                 error: Some(format!(
@@ -363,7 +363,7 @@ impl Executor<'_> {
                     return (
                         OperationOutcome {
                             operation: op_name.to_string(),
-                            drive_label: Some(drive_label.to_string()),
+                            drive_label: Some(drive_label.clone()),
                             result: OpResult::Failure,
                             duration: start.elapsed(),
                             error: Some(format!(
@@ -403,15 +403,15 @@ impl Executor<'_> {
                 .size_estimates
                 .as_ref()
                 .and_then(|m| {
-                    m.get(&(subvol_name.to_string(), drive_label.to_string()))
+                    m.get(&(subvol_name.clone(), drive_label.clone()))
                 })
                 .copied()
                 .flatten();
             // A poisoned lock is recovered, as at the watchdog sites: the
             // context is plain display data every writer leaves consistent.
             let mut progress = ctx.lock().unwrap_or_else(PoisonError::into_inner);
-            progress.subvolume_name = subvol_name.to_string();
-            progress.drive_label = drive_label.to_string();
+            progress.subvolume_name = subvol_name.clone();
+            progress.drive_label = drive_label.clone();
             progress.send_type = send_type;
             progress.send_index += 1;
             progress.estimated_bytes = estimated;
@@ -442,7 +442,7 @@ impl Executor<'_> {
                 return (
                     OperationOutcome {
                         operation: op_name.to_string(),
-                        drive_label: Some(drive_label.to_string()),
+                        drive_label: Some(drive_label.clone()),
                         result: OpResult::Skipped,
                         duration: start.elapsed(),
                         error: Some("source pool under watchdog pressure".to_string()),
@@ -502,7 +502,7 @@ impl Executor<'_> {
                 (
                     outcome_success(
                         op_name,
-                        Some(drive_label.to_string()),
+                        Some(drive_label.clone()),
                         result.bytes_transferred,
                         elapsed,
                     ),
@@ -517,7 +517,7 @@ impl Executor<'_> {
                 }
                 // Send is the one failure arm that records a partial transfer.
                 let mut outcome =
-                    outcome_failure(op_name, Some(drive_label.to_string()), &e, start.elapsed());
+                    outcome_failure(op_name, Some(drive_label.clone()), &e, start.elapsed());
                 outcome.bytes_transferred = partial_bytes;
                 (outcome, false)
             }
@@ -526,8 +526,8 @@ impl Executor<'_> {
 
     /// Write a drive session token if one does not already exist on the drive.
     /// Called after a successful send. Failures are logged but not fatal.
-    fn maybe_write_drive_token(&self, drive_label: &str) {
-        let Some(drive) = self.config.drives.iter().find(|d| d.label == drive_label) else {
+    fn maybe_write_drive_token(&self, drive_label: &DriveLabel) {
+        let Some(drive) = self.config.drives.iter().find(|d| d.label == *drive_label) else {
             return;
         };
 
@@ -568,6 +568,7 @@ impl Executor<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::{dlabel, svname};
     use crate::btrfs::{MockBtrfs, MockBtrfsCall};
     use crate::config::Config;
     use crate::executor::RunResult;
@@ -598,8 +599,12 @@ mod tests {
         let local_dir = tmp.path().join("local/sv-a");
         std::fs::create_dir_all(&local_dir).unwrap();
         if let Some(pin) = pin {
-            chain::write_pin_file(&local_dir, "TEST-DRIVE", &SnapshotName::parse(pin).unwrap())
-                .unwrap();
+            chain::write_pin_file(
+                &local_dir,
+                &dlabel("TEST-DRIVE"),
+                &SnapshotName::parse(pin).unwrap(),
+            )
+            .unwrap();
         }
 
         let ts = NaiveDate::from_ymd_opt(2026, 6, 11)
@@ -611,8 +616,8 @@ mod tests {
             operations: vec![PlannedOperation::SendFull {
                 snapshot: local_dir.join("20260611-1430-sv-a"),
                 dest_dir: dest_dir.clone(),
-                drive_label: "TEST-DRIVE".to_string(),
-                subvolume_name: "sv-a".to_string(),
+                drive_label: dlabel("TEST-DRIVE"),
+                subvolume_name: svname("sv-a"),
                 pin_on_success: Some((
                     local_dir.join(".last-external-parent-TEST-DRIVE"),
                     SnapshotName::parse("20260611-1430-sv-a").unwrap(),
@@ -878,7 +883,7 @@ mod tests {
         assert!(mock.calls().is_empty(), "no delete, no send: {:?}", mock.calls());
         let drive_token = drives::read_drive_token(&config.drives[0]).unwrap();
         assert!(drive_token.is_some(), "token written to the drive");
-        assert_eq!(db.get_drive_token("TEST-DRIVE").unwrap(), drive_token);
+        assert_eq!(db.get_drive_token(&dlabel("TEST-DRIVE")).unwrap(), drive_token);
     }
 
     #[test]
@@ -959,13 +964,13 @@ mod tests {
                 PlannedOperation::CreateSnapshot {
                     source: PathBuf::from("/data/a"),
                     dest: PathBuf::from("/nonexistent-urd/snap/sv-a/20260322-1430-a"),
-                    subvolume_name: "sv-a".to_string(),
+                    subvolume_name: svname("sv-a"),
                 },
                 PlannedOperation::SendFull {
                     snapshot: PathBuf::from("/nonexistent-urd/snap/sv-a/20260322-1430-a"),
                     dest_dir: dest_dir.clone(),
-                    drive_label: "TEST-DRIVE".to_string(),
-                    subvolume_name: "sv-a".to_string(),
+                    drive_label: dlabel("TEST-DRIVE"),
+                    subvolume_name: svname("sv-a"),
                     pin_on_success: None,
                     reason: FullSendReason::FirstSend,
                     token_verified: false,
@@ -1009,13 +1014,13 @@ mod tests {
                 PlannedOperation::CreateSnapshot {
                     source: PathBuf::from("/data/a"),
                     dest: PathBuf::from("/nonexistent-urd/snap/sv-a/20260322-1430-a"),
-                    subvolume_name: "sv-a".to_string(),
+                    subvolume_name: svname("sv-a"),
                 },
                 PlannedOperation::SendFull {
                     snapshot: PathBuf::from("/nonexistent-urd/snap/sv-a/20260322-1430-a"),
                     dest_dir,
-                    drive_label: "TEST-DRIVE".to_string(),
-                    subvolume_name: "sv-a".to_string(),
+                    drive_label: dlabel("TEST-DRIVE"),
+                    subvolume_name: svname("sv-a"),
                     pin_on_success: None,
                     reason: FullSendReason::FirstSend,
                     token_verified: false,
@@ -1089,13 +1094,13 @@ source = "/data/sv1"
         let drive = &config.drives[0];
         assert!(drives::read_drive_token(drive).unwrap().is_none());
 
-        executor.maybe_write_drive_token("TEMP-DRIVE");
+        executor.maybe_write_drive_token(&dlabel("TEMP-DRIVE"));
 
         // Token should now exist on drive and in SQLite
         let drive_token = drives::read_drive_token(drive).unwrap();
         assert!(drive_token.is_some(), "token should be written to drive");
 
-        let stored_token = db.get_drive_token("TEMP-DRIVE").unwrap();
+        let stored_token = db.get_drive_token(&dlabel("TEMP-DRIVE")).unwrap();
         assert_eq!(stored_token, drive_token, "SQLite should match drive token");
     }
 
@@ -1112,13 +1117,13 @@ source = "/data/sv1"
         let drive = &config.drives[0];
         drives::write_drive_token(drive, "existing-token").unwrap();
 
-        executor.maybe_write_drive_token("TEMP-DRIVE");
+        executor.maybe_write_drive_token(&dlabel("TEMP-DRIVE"));
 
         // Token should still be the original one
         let token = drives::read_drive_token(drive).unwrap().unwrap();
         assert_eq!(token, "existing-token", "should not overwrite existing token");
         // SQLite should NOT have the token (since we didn't store it)
-        assert!(db.get_drive_token("TEMP-DRIVE").unwrap().is_none());
+        assert!(db.get_drive_token(&dlabel("TEMP-DRIVE")).unwrap().is_none());
     }
 
     #[test]
@@ -1131,6 +1136,6 @@ source = "/data/sv1"
         let executor = Executor::new(&mock_btrfs, Some(&db), &config, &shutdown);
 
         // Should not panic for unknown drive label
-        executor.maybe_write_drive_token("NONEXISTENT-DRIVE");
+        executor.maybe_write_drive_token(&dlabel("NONEXISTENT-DRIVE"));
     }
 }

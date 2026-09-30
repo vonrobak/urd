@@ -11,6 +11,7 @@ use crate::config::Config;
 use crate::executor::{CompletionReport, ProgressContext, SizeEstimates};
 use crate::observation::HistoryQuery;
 use crate::plan::{BackupPlan, PlannedOperation};
+use crate::types::SubvolName;
 use crate::voice::{format_completion_line, format_progress_line};
 
 // ── Progress display ──────────────────────────────────────────────────
@@ -25,7 +26,7 @@ pub(super) fn build_size_estimates(
 ) -> SizeEstimates {
     let resolved = config.resolved_subvolumes();
     let send_interval =
-        |name: &str| resolved.iter().find(|r| r.name == name).map(|r| r.send_interval);
+        |name: &SubvolName| resolved.iter().find(|r| r.name == *name).map(|r| r.send_interval);
     let mut estimates = HashMap::new();
     for op in &plan.operations {
         match op {
@@ -185,8 +186,8 @@ pub(super) fn progress_display_loop(
             let ctx = context.lock().unwrap_or_else(|e| e.into_inner());
             ProgressSnapshot {
                 send_index: ctx.send_index,
-                subvolume_name: ctx.subvolume_name.clone(),
-                drive_label: ctx.drive_label.clone(),
+                subvolume_name: ctx.subvolume_name.to_string(),
+                drive_label: ctx.drive_label.to_string(),
                 total_sends: ctx.total_sends,
                 estimated_bytes: ctx.estimated_bytes,
             }
@@ -223,6 +224,7 @@ pub(super) fn print_completion_line(report: &CompletionReport<'_>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::{dlabel, svname};
     use std::path::PathBuf;
     use crate::types::{FullSendReason, SendKind};
 
@@ -376,8 +378,8 @@ mod tests {
                 PlannedOperation::SendFull {
                     snapshot: PathBuf::from("/snaps/sv1/20260329-0400-sv1"),
                     dest_dir: PathBuf::from("/mnt/wd/sv1"),
-                    drive_label: "WD-18TB".to_string(),
-                    subvolume_name: "sv1".to_string(),
+                    drive_label: dlabel("WD-18TB"),
+                    subvolume_name: svname("sv1"),
                     pin_on_success: None,
                     reason: FullSendReason::FirstSend,
                     token_verified: false,
@@ -386,14 +388,14 @@ mod tests {
                     parent: PathBuf::from("/snaps/sv2/20260328-0400-sv2"),
                     snapshot: PathBuf::from("/snaps/sv2/20260329-0400-sv2"),
                     dest_dir: PathBuf::from("/mnt/wd/sv2"),
-                    drive_label: "WD-18TB".to_string(),
-                    subvolume_name: "sv2".to_string(),
+                    drive_label: dlabel("WD-18TB"),
+                    subvolume_name: svname("sv2"),
                     pin_on_success: None,
                 },
                 PlannedOperation::CreateSnapshot {
                     source: PathBuf::from("/data/sv1"),
                     dest: PathBuf::from("/snaps/sv1/20260329-0400-sv1"),
-                    subvolume_name: "sv1".to_string(),
+                    subvolume_name: svname("sv1"),
                 },
             ],
             timestamp: chrono::NaiveDateTime::default(),
@@ -415,12 +417,12 @@ mod tests {
 
         // Full send should have estimate
         assert_eq!(
-            estimates[&("sv1".to_string(), "WD-18TB".to_string())],
+            estimates[&(svname("sv1"), dlabel("WD-18TB"))],
             Some(53_000_000_000),
         );
         // Incremental should have estimate
         assert_eq!(
-            estimates[&("sv2".to_string(), "WD-18TB".to_string())],
+            estimates[&(svname("sv2"), dlabel("WD-18TB"))],
             Some(5_500_000),
         );
         // CreateSnapshot should not be in map
@@ -436,8 +438,8 @@ mod tests {
             operations: vec![PlannedOperation::SendFull {
                 snapshot: PathBuf::from("/snaps/sv1/snap"),
                 dest_dir: PathBuf::from("/mnt/d/sv1"),
-                drive_label: "new-drive".to_string(),
-                subvolume_name: "sv1".to_string(),
+                drive_label: dlabel("new-drive"),
+                subvolume_name: svname("sv1"),
                 pin_on_success: None,
                 reason: FullSendReason::FirstSend,
                 token_verified: false,
@@ -451,7 +453,7 @@ mod tests {
         let estimates = build_size_estimates(&plan, &fs, &no_subvol_config());
 
         assert_eq!(
-            estimates[&("sv1".to_string(), "new-drive".to_string())],
+            estimates[&(svname("sv1"), dlabel("new-drive"))],
             None,
         );
     }
@@ -465,8 +467,8 @@ mod tests {
             operations: vec![PlannedOperation::SendFull {
                 snapshot: PathBuf::from("/snaps/sv1/snap"),
                 dest_dir: PathBuf::from("/mnt/new/sv1"),
-                drive_label: "new-drive".to_string(),
-                subvolume_name: "sv1".to_string(),
+                drive_label: dlabel("new-drive"),
+                subvolume_name: svname("sv1"),
                 pin_on_success: None,
                 reason: FullSendReason::FirstSend,
                 token_verified: false,
@@ -486,7 +488,7 @@ mod tests {
 
         let estimates = build_size_estimates(&plan, &fs, &no_subvol_config());
         assert_eq!(
-            estimates[&("sv1".to_string(), "new-drive".to_string())],
+            estimates[&(svname("sv1"), dlabel("new-drive"))],
             Some(50_000_000_000),
         );
     }
@@ -504,8 +506,8 @@ mod tests {
             operations: vec![PlannedOperation::SendFull {
                 snapshot: PathBuf::from("/snaps/sv1/snap"),
                 dest_dir: PathBuf::from("/mnt/d/sv1"),
-                drive_label: "d1".to_string(),
-                subvolume_name: "sv1".to_string(),
+                drive_label: dlabel("d1"),
+                subvolume_name: svname("sv1"),
                 pin_on_success: None,
                 reason: FullSendReason::FirstSend,
                 token_verified: false,
@@ -515,7 +517,7 @@ mod tests {
             events: Vec::new(),
         };
         let est_full = build_size_estimates(&plan_full, &fs, &no_subvol_config());
-        assert_eq!(est_full[&("sv1".to_string(), "d1".to_string())], Some(45_000_000_000));
+        assert_eq!(est_full[&(svname("sv1"), dlabel("d1"))], Some(45_000_000_000));
 
         // Incremental send: should NOT use calibrated (two-tier only)
         let plan_inc = BackupPlan {
@@ -524,8 +526,8 @@ mod tests {
                 parent: PathBuf::from("/snaps/sv1/old"),
                 snapshot: PathBuf::from("/snaps/sv1/new"),
                 dest_dir: PathBuf::from("/mnt/d/sv1"),
-                drive_label: "d1".to_string(),
-                subvolume_name: "sv1".to_string(),
+                drive_label: dlabel("d1"),
+                subvolume_name: svname("sv1"),
                 pin_on_success: None,
             }],
             timestamp: chrono::NaiveDateTime::default(),
@@ -533,7 +535,7 @@ mod tests {
             events: Vec::new(),
         };
         let est_inc = build_size_estimates(&plan_inc, &fs, &no_subvol_config());
-        assert_eq!(est_inc[&("sv1".to_string(), "d1".to_string())], None);
+        assert_eq!(est_inc[&(svname("sv1"), dlabel("d1"))], None);
     }
 
     fn no_subvol_config() -> Config {
@@ -583,8 +585,8 @@ source = "/data/sv1"
                 parent: PathBuf::from("/snaps/sv1/old"),
                 snapshot: PathBuf::from("/snaps/sv1/new"),
                 dest_dir: PathBuf::from("/mnt/d/sv1"),
-                drive_label: "d1".to_string(),
-                subvolume_name: "sv1".to_string(),
+                drive_label: dlabel("d1"),
+                subvolume_name: svname("sv1"),
                 pin_on_success: None,
             }],
             timestamp: now,
@@ -596,17 +598,17 @@ source = "/data/sv1"
             ("sv1".to_string(), "d1".to_string(), SendKind::Incremental),
             194_600_000_000,
         );
-        let key = ("sv1".to_string(), "d1".to_string());
+        let key = (svname("sv1"), dlabel("d1"));
 
         fs.send_times
-            .insert(key.clone(), now - chrono::Duration::days(1));
+            .insert((key.0.to_string(), key.1.to_string()), now - chrono::Duration::days(1));
         assert_eq!(
             build_size_estimates(&plan, &fs, &config)[&key],
             Some(194_600_000_000),
         );
 
         fs.send_times
-            .insert(key.clone(), now - chrono::Duration::days(3));
+            .insert((key.0.to_string(), key.1.to_string()), now - chrono::Duration::days(3));
         assert_eq!(build_size_estimates(&plan, &fs, &config)[&key], None);
     }
 

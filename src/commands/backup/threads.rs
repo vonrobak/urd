@@ -51,6 +51,7 @@ pub(super) fn take_firings(slot: &Mutex<Vec<WatchdogFiring>>) -> Vec<WatchdogFir
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::svname;
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -121,7 +122,7 @@ mod tests {
     fn poisoning_firing() -> WatchdogFiring {
         WatchdogFiring {
             pool_label: "/data".to_string(),
-            subvol_names: vec!["home".to_string()],
+            subvol_names: vec![svname("home")],
             mountpoint: PathBuf::from("/data"),
             floor_bytes: 4_000_000_000,
             send_aborted: false,

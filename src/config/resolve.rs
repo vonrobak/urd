@@ -7,8 +7,8 @@ use serde::Serialize;
 
 use super::{DefaultsConfig, SubvolumeConfig};
 use crate::types::{
-    GraduatedRetention, Interval, LocalRetentionConfig, LocalRetentionPolicy, ProtectionLevel,
-    ResolvedGraduatedRetention, RunFrequency,
+    DriveLabel, GraduatedRetention, Interval, LocalRetentionConfig, LocalRetentionPolicy,
+    ProtectionLevel, ResolvedGraduatedRetention, RunFrequency, SubvolName,
 };
 
 // ── Resolved subvolume (all defaults filled in) ─────────────────────────
@@ -16,7 +16,7 @@ use crate::types::{
 /// A subvolume config with all optional fields resolved against defaults.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ResolvedSubvolume {
-    pub name: String,
+    pub name: SubvolName,
     pub short_name: String,
     pub source: PathBuf,
     pub priority: u8,
@@ -27,7 +27,7 @@ pub struct ResolvedSubvolume {
     pub local_retention: LocalRetentionPolicy,
     pub external_retention: ResolvedGraduatedRetention,
     pub protection_level: Option<ProtectionLevel>,
-    pub drives: Option<Vec<String>>,
+    pub drives: Option<Vec<DriveLabel>>,
     /// The snapshot root path for this subvolume. Populated by `resolved_subvolumes()`.
     pub snapshot_root: Option<PathBuf>,
     /// Minimum free bytes threshold for the snapshot root. Populated by `resolved_subvolumes()`.
@@ -40,7 +40,7 @@ impl ResolvedSubvolume {
     /// restricts to the listed labels. Shared by the planner's send gate and
     /// the `backup_external_expected` metric so the two cannot drift.
     #[must_use]
-    pub fn accepts_drive(&self, drive_label: &str) -> bool {
+    pub fn accepts_drive(&self, drive_label: &DriveLabel) -> bool {
         self.drives
             .as_ref()
             .is_none_or(|allowed| allowed.iter().any(|a| a == drive_label))
@@ -161,6 +161,7 @@ impl SubvolumeConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::dlabel;
     use crate::config::Config;
     use crate::config::v1::parse_v1;
     use crate::types::{DriveRole, MonthlyCount};
@@ -607,7 +608,7 @@ drives = ["D1"]
         let config: Config = toml::from_str(config_str).unwrap();
         let resolved =
             config.subvolumes[0].resolved(&config.defaults, config.general.run_frequency);
-        assert_eq!(resolved.drives, Some(vec!["D1".to_string()]));
+        assert_eq!(resolved.drives, Some(vec![dlabel("D1")]));
     }
 
     #[test]

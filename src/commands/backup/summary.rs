@@ -57,7 +57,7 @@ pub(super) fn build_backup_summary(
                     OpResult::Success => {
                         if let Some(send_type) = send_kind_display(&op.operation) {
                             sends.push(SendSummary {
-                                drive: op.drive_label.clone().unwrap_or_default(),
+                                drive: op.drive_label.as_deref().unwrap_or_default().to_string(),
                                 send_type: send_type.to_string(),
                                 bytes_transferred: op.bytes_transferred,
                             });
@@ -80,7 +80,7 @@ pub(super) fn build_backup_summary(
                                 summary: detail.summary,
                                 cause: detail.cause,
                                 remediation: detail.remediation,
-                                drive: op.drive_label.clone(),
+                                drive: op.drive_label.as_ref().map(ToString::to_string),
                                 bytes_transferred: op.bytes_transferred,
                             });
                         }
@@ -97,7 +97,7 @@ pub(super) fn build_backup_summary(
             }
 
             SubvolumeSummary {
-                name: sv.name.clone(),
+                name: sv.name.to_string(),
                 success: sv.success,
                 duration_secs: sv.duration.as_secs_f64(),
                 sends,
@@ -306,6 +306,7 @@ pub(super) fn emergency_reclaim_warnings(root_summaries: &[EmergencyRootReclaim]
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::{dlabel, svname};
     use std::collections::HashMap;
     use std::path::PathBuf;
     use crate::awareness::{PromiseStatus, SubvolAssessment};
@@ -641,13 +642,13 @@ mod tests {
                 PlannedOperation::DeleteSnapshot {
                     path: PathBuf::from("/snaps/sv1/20260320-0400-sv1"),
                     reason: "retention".to_string(),
-                    subvolume_name: "sv1".to_string(),
+                    subvolume_name: svname("sv1"),
                     kind: DeleteKind::Policy,
                 },
                 PlannedOperation::DeleteSnapshot {
                     path: PathBuf::from("/snaps/sv1/20260319-0400-sv1"),
                     reason: "retention".to_string(),
-                    subvolume_name: "sv1".to_string(),
+                    subvolume_name: svname("sv1"),
                     kind: DeleteKind::Policy,
                 },
             ],
@@ -788,7 +789,7 @@ mod tests {
                 crate::plan::PlannedSkip::deferred(
                     "htpc-home",
                     SkipReason::DriveNotMounted {
-                        drive: "WD-18TB".to_string(),
+                        drive: dlabel("WD-18TB"),
                     },
                     None,
                 ),
@@ -938,7 +939,7 @@ mod tests {
             operations: vec![PlannedOperation::CreateSnapshot {
                 source: PathBuf::from("/data"),
                 dest: PathBuf::from("/snap/htpc-root/20260324-0400-root"),
-                subvolume_name: "htpc-root".to_string(),
+                subvolume_name: svname("htpc-root"),
             }],
             ..plan
         };
@@ -1015,7 +1016,7 @@ mod tests {
             (
                 "sv",
                 SkipReason::SendNotDue {
-                    drive: "WD-18TB".to_string(),
+                    drive: dlabel("WD-18TB"),
                     next_in_minutes: 150,
                 },
             ),
@@ -1040,7 +1041,7 @@ mod tests {
             (
                 "sv",
                 SkipReason::DriveNotMounted {
-                    drive: "WD-18TB".to_string(),
+                    drive: dlabel("WD-18TB"),
                 },
             ),
         ]);

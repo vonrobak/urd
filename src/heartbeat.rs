@@ -216,11 +216,11 @@ fn build_subvolume_entries(
             // so a gated send after a successful one would read `Deferred`.
             let send_completed = sv_result.is_some_and(|sv| sv.send_succeeded());
 
-            let churn = churn_views.get(&a.name).copied().unwrap_or_default();
-            let extras = subvol_extras.get(&a.name).cloned().unwrap_or_default();
+            let churn = churn_views.get(a.name.as_str()).copied().unwrap_or_default();
+            let extras = subvol_extras.get(a.name.as_str()).cloned().unwrap_or_default();
 
             SubvolumeHeartbeat {
-                name: a.name.clone(),
+                name: a.name.to_string(),
                 backup_success: sv_result.map(|sv| sv.success),
                 promise_status: a.status,
                 pin_failures: sv_result.map(|sv| sv.pin_failures).unwrap_or(0),
@@ -312,6 +312,7 @@ pub fn mark_dispatched(path: &Path) -> crate::error::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::{dlabel, svname};
     use crate::awareness::{DriveAssessment, LocalAssessment, PromiseStatus};
     use crate::config::{
         Config, DefaultsConfig, GeneralConfig, LocalSnapshotsConfig, SnapshotRoot, SubvolumeConfig,
@@ -329,7 +330,7 @@ mod tests {
         let subvolumes: Vec<SubvolumeConfig> = intervals
             .iter()
             .map(|(name, interval)| SubvolumeConfig {
-                name: name.to_string(),
+                name: svname(name),
                 short_name: name.to_string(),
                 source: PathBuf::from("/test"),
                 priority: 2,
@@ -359,7 +360,7 @@ mod tests {
             local_snapshots: LocalSnapshotsConfig {
                 roots: vec![SnapshotRoot {
                     path: PathBuf::from("/tmp/snapshots"),
-                    subvolumes: intervals.iter().map(|(n, _)| n.to_string()).collect(),
+                    subvolumes: intervals.iter().map(|(n, _)| svname(n)).collect(),
                     min_free_bytes: None,
                 }],
             },
@@ -398,7 +399,7 @@ mod tests {
                     Some(chrono::Duration::minutes(30)),
                 ),
                 external: vec![DriveAssessment {
-                    drive_label: "WD-18TB".to_string(),
+                    drive_label: dlabel("WD-18TB"),
                     status: PromiseStatus::Protected,
                     mounted: true,
                     snapshot_count: Some(10),
@@ -428,7 +429,7 @@ mod tests {
             overall: RunResult::Partial,
             subvolume_results: vec![
                 SubvolumeResult {
-                    name: "home".to_string(),
+                    name: svname("home"),
                     success: true,
                     operations: vec![make_operation(
                         SendKind::Incremental.as_db_str(),
@@ -441,7 +442,7 @@ mod tests {
                     offsite_releases: Vec::new(),
                 },
                 SubvolumeResult {
-                    name: "docs".to_string(),
+                    name: svname("docs"),
                     success: false,
                     operations: vec![],
                     duration: std::time::Duration::from_secs(1),
@@ -845,7 +846,7 @@ mod tests {
     fn make_operation(name: &str, result: crate::executor::OpResult) -> crate::executor::OperationOutcome {
         crate::executor::OperationOutcome {
             operation: name.to_string(),
-            drive_label: Some("TEST".to_string()),
+            drive_label: Some(dlabel("TEST")),
             result,
             duration: std::time::Duration::ZERO,
             error: None,
@@ -865,7 +866,7 @@ mod tests {
         let result = ExecutionResult {
             overall: RunResult::Success,
             subvolume_results: vec![SubvolumeResult {
-                name: "home".to_string(),
+                name: svname("home"),
                 success: true,
                 operations: vec![make_operation(
                     SendKind::Incremental.as_db_str(),
@@ -903,7 +904,7 @@ mod tests {
         let result = ExecutionResult {
             overall: RunResult::Success,
             subvolume_results: vec![SubvolumeResult {
-                name: "home".to_string(),
+                name: svname("home"),
                 success: true,
                 operations: vec![make_operation(
                     SendKind::Full.as_db_str(),
@@ -944,12 +945,12 @@ mod tests {
             SendKind::Full.as_db_str(),
             crate::executor::OpResult::Deferred,
         );
-        gated.drive_label = Some("OFFSITE".to_string());
+        gated.drive_label = Some(dlabel("OFFSITE"));
 
         let result = ExecutionResult {
             overall: RunResult::Success,
             subvolume_results: vec![SubvolumeResult {
-                name: "home".to_string(),
+                name: svname("home"),
                 success: true,
                 operations: vec![
                     make_operation(
@@ -990,7 +991,7 @@ mod tests {
         let result = ExecutionResult {
             overall: RunResult::Success,
             subvolume_results: vec![SubvolumeResult {
-                name: "home".to_string(),
+                name: svname("home"),
                 success: true,
                 operations: vec![make_operation(
                     "snapshot",

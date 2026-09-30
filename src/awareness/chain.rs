@@ -5,7 +5,7 @@
 
 use crate::config::DriveConfig;
 use crate::observation::Observation;
-use crate::types::SnapshotName;
+use crate::types::{DriveLabel, SnapshotName};
 
 // ── Types ──────────────────────────────────────────────────────────────
 
@@ -15,7 +15,7 @@ use crate::types::SnapshotName;
 /// for simultaneous chain-break detection (HSD Session B).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DriveChainHealth {
-    pub drive_label: String,
+    pub drive_label: DriveLabel,
     pub status: ChainStatus,
 }
 

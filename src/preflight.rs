@@ -374,6 +374,7 @@ fn format_hours(hours: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::{dlabel, svname};
     use crate::config::{
         Config, DefaultsConfig, DriveConfig, GeneralConfig, LocalSnapshotsConfig, SnapshotRoot,
         SubvolumeConfig,
@@ -431,7 +432,7 @@ mod tests {
 
     fn test_drive() -> DriveConfig {
         DriveConfig {
-            label: "test-drive".to_string(),
+            label: dlabel("test-drive"),
             uuid: None,
             mount_path: PathBuf::from("/mnt/test"),
             snapshot_root: "urd-snapshots".to_string(),
@@ -444,7 +445,7 @@ mod tests {
 
     fn test_subvolume(name: &str) -> SubvolumeConfig {
         SubvolumeConfig {
-            name: name.to_string(),
+            name: name.into(),
             short_name: name.to_string(),
             source: PathBuf::from(format!("/{name}")),
             priority: 1,
@@ -466,7 +467,7 @@ mod tests {
         send_interval: &str,
     ) -> SubvolumeConfig {
         SubvolumeConfig {
-            name: name.to_string(),
+            name: name.into(),
             short_name: name.to_string(),
             source: PathBuf::from(format!("/{name}")),
             priority: 1,
@@ -783,7 +784,7 @@ mod tests {
         ret: GraduatedRetention,
     ) -> SubvolumeConfig {
         SubvolumeConfig {
-            name: name.to_string(),
+            name: name.into(),
             short_name: name.to_string(),
             source: PathBuf::from(format!("/{name}")),
             priority: 1,
@@ -886,7 +887,7 @@ mod tests {
             yearly: Some(5),
         };
         let sv = SubvolumeConfig {
-            name: "sv1".to_string(),
+            name: svname("sv1"),
             short_name: "sv1".to_string(),
             source: PathBuf::from("/sv1"),
             priority: 1,
@@ -919,7 +920,7 @@ mod tests {
             yearly: Some(5),
         };
         let sv = SubvolumeConfig {
-            name: "sv1".to_string(),
+            name: svname("sv1"),
             short_name: "sv1".to_string(),
             source: PathBuf::from("/sv1"),
             priority: 1,
@@ -951,7 +952,7 @@ mod tests {
             yearly: Some(3),
         };
         let sv = SubvolumeConfig {
-            name: "sv1".to_string(),
+            name: svname("sv1"),
             short_name: "sv1".to_string(),
             source: PathBuf::from("/sv1"),
             priority: 1,
@@ -984,7 +985,7 @@ mod tests {
             yearly: Some(0),
         };
         let sv = SubvolumeConfig {
-            name: "sv1".to_string(),
+            name: svname("sv1"),
             short_name: "sv1".to_string(),
             source: PathBuf::from("/sv1"),
             priority: 1,
@@ -1072,7 +1073,7 @@ mod tests {
 
     fn offsite_drive() -> DriveConfig {
         DriveConfig {
-            label: "offsite-drive".to_string(),
+            label: dlabel("offsite-drive"),
             uuid: None,
             mount_path: PathBuf::from("/mnt/offsite"),
             snapshot_root: "urd-snapshots".to_string(),
@@ -1089,7 +1090,7 @@ mod tests {
         sv.protection_level = Some(crate::types::ProtectionLevel::Fortified);
         // Two primary drives — no offsite
         let mut drive2 = test_drive();
-        drive2.label = "drive-2".to_string();
+        drive2.label = dlabel("drive-2");
         let config = test_config(vec![sv], vec![test_drive(), drive2]);
         let results: Vec<_> = preflight_checks(&config)
             .into_iter()
@@ -1130,7 +1131,7 @@ mod tests {
     fn fortified_with_scoped_offsite_drive_passes() {
         let mut sv = test_subvolume("recordings");
         sv.protection_level = Some(crate::types::ProtectionLevel::Fortified);
-        sv.drives = Some(vec!["test-drive".to_string(), "offsite-drive".to_string()]);
+        sv.drives = Some(vec![dlabel("test-drive"), dlabel("offsite-drive")]);
         let config = test_config(vec![sv], vec![test_drive(), offsite_drive()]);
         let results: Vec<_> = preflight_checks(&config)
             .into_iter()

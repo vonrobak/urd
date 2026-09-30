@@ -29,7 +29,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use crate::types::SnapshotName;
+use crate::types::{DriveLabel, SnapshotName, SubvolName};
 
 /// Watchdog poll cadence, mirroring `progress_display_loop`'s 250 ms (UPI 033).
 pub const WATCHDOG_POLL_MS: u64 = 250;
@@ -187,7 +187,7 @@ pub fn emergency_automatic_threshold(min_free: u64) -> u64 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DriveScope {
     /// Drive label (the `.last-external-parent-{label}` key).
-    pub label: String,
+    pub label: DriveLabel,
     /// True iff usable for a send now (the planner's `usable_drives` predicate).
     /// `false` == "away" for shedding purposes.
     pub mounted: bool,
@@ -212,7 +212,7 @@ pub struct DriveScope {
 /// executor removes before the (already-planned) delete of that snapshot. An
 /// empty result means no presence-aware shed applies (`has_away_pin = false`).
 #[must_use]
-pub fn away_sheddable_pins(scopes: &[DriveScope]) -> Vec<String> {
+pub fn away_sheddable_pins(scopes: &[DriveScope]) -> Vec<DriveLabel> {
     // Snapshots pinned by any mounted drive — never sheddable (shared-parent).
     let mounted_pins: HashSet<&SnapshotName> = scopes
         .iter()
@@ -242,7 +242,7 @@ pub struct PoolPressureSample {
     pub mountpoint: PathBuf,
     pub free_bytes: u64,
     pub floor_bytes: u64,
-    pub subvol_names: Vec<String>,
+    pub subvol_names: Vec<SubvolName>,
 }
 
 /// Which idle pools have crossed the host-survival floor (UPI 034). Pure
@@ -262,6 +262,7 @@ pub fn evaluate_idle_eject(samples: &[PoolPressureSample]) -> Vec<PoolPressureSa
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::svname;
 
     const GB: u64 = 1024 * 1024 * 1024;
 
@@ -385,7 +386,7 @@ mod tests {
             mountpoint: PathBuf::from(format!("/mnt/{uuid}")),
             free_bytes: free,
             floor_bytes: floor,
-            subvol_names: vec![format!("{uuid}-sv")],
+            subvol_names: vec![svname(&format!("{uuid}-sv"))],
         }
     }
 
@@ -440,7 +441,7 @@ mod tests {
 
     fn scope(label: &str, mounted: bool, pin: Option<&str>) -> DriveScope {
         DriveScope {
-            label: label.to_string(),
+            label: label.into(),
             mounted,
             pin: pin.map(|p| SnapshotName::parse(p).unwrap()),
         }

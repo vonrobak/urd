@@ -268,6 +268,9 @@ impl SentinelRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::svname;
+    use crate::types::SubvolName;
+    use crate::testkit::dlabel;
     use super::actions::backup_run_active_at;
     use super::eject::pressure_samples_from;
     use crate::observation::{Observation, RealFileSystemState};
@@ -788,7 +791,7 @@ protection = "recorded"
                 subvolume_names: vec!["scratch-sv".into()],
             },
         ];
-        let send_enabled: HashSet<String> = ["sent".to_string()].into_iter().collect();
+        let send_enabled: HashSet<SubvolName> = [svname("sent")].into_iter().collect();
 
         let samples = pressure_samples_from(
             pools,
@@ -819,7 +822,7 @@ protection = "recorded"
             mountpoints: vec![PathBuf::from("/data")],
             subvolume_names: vec!["sent".into()],
         }];
-        let send_enabled: HashSet<String> = ["sent".to_string()].into_iter().collect();
+        let send_enabled: HashSet<SubvolName> = [svname("sent")].into_iter().collect();
 
         let samples =
             pressure_samples_from(pools, &send_enabled, |_mp| None, |_first, _cap| 5_000);
@@ -957,7 +960,7 @@ drives = ["D1"]
     fn drive_rows(runner: &SentinelRunner, label: &str) -> Vec<crate::state::DriveConnectionRecord> {
         StateDb::open(&runner.config.general.state_db)
             .unwrap()
-            .drive_connection_history(label)
+            .drive_connection_history(&dlabel(label))
             .unwrap()
     }
 
@@ -978,7 +981,7 @@ drives = ["D1"]
 
         // P1 (restored, present) stays tracked; D1 (absent) and REMOVED
         // (not in config) do not.
-        assert_eq!(runner.state.mounted_drives, BTreeSet::from(["P1".to_string()]));
+        assert_eq!(runner.state.mounted_drives, BTreeSet::from([dlabel("P1")]));
         // …so the first scan emits nothing: no spurious DriveMounted for P1,
         // and D1's unmount was already accounted for.
         assert!(runner.detect_drive_events().is_empty());
@@ -1033,7 +1036,7 @@ drives = ["D1"]
                 bytes_transferred: Some(100),
             })
             .unwrap();
-            db.last_successful_operation_at("D1").unwrap().unwrap()
+            db.last_successful_operation_at(&dlabel("D1")).unwrap().unwrap()
         };
 
         runner.restore_mount_tracking();
@@ -1061,7 +1064,7 @@ drives = ["D1"]
         StateDb::open(&runner.config.general.state_db)
             .unwrap()
             .record_drive_event_at(
-                "D1",
+                &dlabel("D1"),
                 crate::state::DriveEventType::Unmounted,
                 crate::state::DriveEventSource::Sentinel,
                 unmounted_at,

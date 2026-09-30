@@ -302,6 +302,7 @@ mod tests {
     use crate::types::{Interval, MonthlyCount, ResolvedGraduatedRetention};
 
     use super::*;
+    use crate::testkit::svname;
 
     fn local_dir() -> PathBuf {
         PathBuf::from("/snap/sv1")
@@ -309,7 +310,7 @@ mod tests {
 
     fn subvol(local_retention: LocalRetentionPolicy) -> ResolvedSubvolume {
         ResolvedSubvolume {
-            name: "sv1".to_string(),
+            name: svname("sv1"),
             short_name: "one".to_string(),
             source: PathBuf::from("/data/sv1"),
             priority: 1,

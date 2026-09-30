@@ -8,7 +8,7 @@ use crate::config::{Config, DriveConfig, ResolvedSubvolume};
 use crate::drives::DriveAvailability;
 use crate::events::DeferScope;
 use crate::storage_critical;
-use crate::types::{Interval, SnapshotName};
+use crate::types::{DriveLabel, Interval, SnapshotName, SubvolName};
 
 mod external;
 mod fragment;
@@ -102,8 +102,8 @@ pub use crate::observation::estimate::{
 #[must_use]
 pub fn displayed_send_estimate(
     history: &dyn HistoryQuery,
-    subvol_name: &str,
-    drive_label: &str,
+    subvol_name: &SubvolName,
+    drive_label: &DriveLabel,
     needs_full: bool,
     now: NaiveDateTime,
     send_interval: Option<Interval>,
@@ -125,7 +125,7 @@ pub fn displayed_send_estimate(
 #[derive(Debug, Default)]
 pub struct PlanFilters {
     pub priority: Option<u8>,
-    pub subvolume: Option<String>,
+    pub subvolume: Option<SubvolName>,
     pub local_only: bool,
     pub external_only: bool,
     /// When true, bypass interval gating for snapshots and sends.
@@ -162,7 +162,7 @@ enum DriveGate {
 /// `DriveAvailability` variants: `Available` and `TokenMissing` (benign: first
 /// use or pre-token drive) are ready; the other five defer, drive-scoped.
 fn check_drive_availability(
-    subvol_name: &str,
+    subvol_name: &SubvolName,
     drive: &DriveConfig,
     obs: &Observation,
     now: NaiveDateTime,
@@ -259,11 +259,11 @@ pub fn plan(
     // prose (`Display`) and its `SkipCategory` in plan/types.rs.
     let mut f = fragment::PlanFragment::default();
     let mut judgments: Vec<SubvolJudgment> = Vec::new();
-    let mut lifecycles: std::collections::HashMap<String, PlannedLifecycle> =
+    let mut lifecycles: std::collections::HashMap<SubvolName, PlannedLifecycle> =
         std::collections::HashMap::new();
 
     let resolved = config.resolved_subvolumes();
-    let drive_labels: Vec<String> = config.drives.iter().map(|d| d.label.clone()).collect();
+    let drive_labels = config.drive_labels();
 
     for subvol in &resolved {
         // Filter: enabled
@@ -515,7 +515,7 @@ pub fn plan(
 /// never diverge.
 #[derive(Debug)]
 struct SubvolJudgment {
-    name: String,
+    name: SubvolName,
     effective_transient: bool,
     send_enabled: bool,
 }

@@ -28,7 +28,7 @@ impl SentinelRunner {
             pid: std::process::id(),
             started: Timestamp::from(self.started).to_string(),
             last_assessment: Some(Timestamp::from(now).to_string()),
-            mounted_drives: self.state.mounted_drives.iter().cloned().collect(),
+            mounted_drives: self.state.mounted_drives.iter().map(ToString::to_string).collect(),
             tick_interval_secs: self.tick_interval.as_secs(),
             promise_states: self
                 .state
@@ -41,7 +41,7 @@ impl SentinelRunner {
                         .iter()
                         .find(|h| h.name == p.name);
                     SentinelPromiseState {
-                        name: p.name.clone(),
+                        name: p.name.to_string(),
                         status: p.status,
                         health: health_snap
                             .map(|h| h.health.to_string())

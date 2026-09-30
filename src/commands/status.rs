@@ -16,7 +16,7 @@ use crate::voice;
 
 pub fn run(config: Config, output_mode: OutputMode) -> anyhow::Result<()> {
     let world = World::open(&config);
-    let drive_labels: Vec<String> = config.drives.iter().map(|d| d.label.clone()).collect();
+    let drive_labels = config.drive_labels();
 
     // ── The seal (UPI 071/075/081) ──────────────────────────────────
     // An incomplete seal stage is a named state, not a degraded render.
@@ -40,7 +40,7 @@ pub fn run(config: Config, output_mode: OutputMode) -> anyhow::Result<()> {
         .map(|d| {
             let mounted = drives::is_drive_mounted(d);
             DriveInfo {
-                label: d.label.clone(),
+                label: d.label.to_string(),
                 mounted,
                 free_bytes: if mounted {
                     drives::filesystem_free_bytes(&d.mount_path).ok()
@@ -156,7 +156,7 @@ fn assemble_status_output(
                 })
                 .min();
             worst.map(|health| ChainHealthEntry {
-                subvolume: a.name.clone(),
+                subvolume: a.name.to_string(),
                 health,
             })
         })
@@ -212,6 +212,7 @@ fn assemble_status_output(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::dlabel;
     use crate::awareness::test_support::dt;
     use crate::awareness::{DriveAssessment, DriveChainHealth, PromiseStatus};
     use crate::testkit::{ConfigBuilder, subvol_assessment};
@@ -233,7 +234,7 @@ mod tests {
 
     fn mounted_drive(label: &str) -> DriveAssessment {
         DriveAssessment {
-            drive_label: label.to_string(),
+            drive_label: label.into(),
             status: PromiseStatus::Protected,
             mounted: true,
             snapshot_count: Some(3),
@@ -321,7 +322,7 @@ mod tests {
     fn chain_health_intact_only_pins_incremental() {
         let mut a = assessment("sv1");
         a.chain_health = vec![DriveChainHealth {
-            drive_label: "ext-drive".to_string(),
+            drive_label: dlabel("ext-drive"),
             status: ChainStatus::Intact {
                 pin_parent: "20260610-0400-sv1".to_string(),
             },
@@ -339,7 +340,7 @@ mod tests {
     fn chain_health_no_drive_data_maps_to_no_drive_data() {
         let mut a = assessment("sv1");
         a.chain_health = vec![DriveChainHealth {
-            drive_label: "ext-drive".to_string(),
+            drive_label: dlabel("ext-drive"),
             status: ChainStatus::Broken {
                 reason: ChainBreakReason::NoDriveData,
                 pin_parent: None,
@@ -356,13 +357,13 @@ mod tests {
         let mut a = assessment("sv1");
         a.chain_health = vec![
             DriveChainHealth {
-                drive_label: "drive-a".to_string(),
+                drive_label: dlabel("drive-a"),
                 status: ChainStatus::Intact {
                     pin_parent: "20260610-0400-sv1".to_string(),
                 },
             },
             DriveChainHealth {
-                drive_label: "drive-b".to_string(),
+                drive_label: dlabel("drive-b"),
                 status: ChainStatus::Broken {
                     reason: ChainBreakReason::NoPinFile,
                     pin_parent: None,
@@ -379,14 +380,14 @@ mod tests {
         let mut b = assessment("sv2");
         b.chain_health = vec![
             DriveChainHealth {
-                drive_label: "drive-a".to_string(),
+                drive_label: dlabel("drive-a"),
                 status: ChainStatus::Broken {
                     reason: ChainBreakReason::NoPinFile,
                     pin_parent: None,
                 },
             },
             DriveChainHealth {
-                drive_label: "drive-b".to_string(),
+                drive_label: dlabel("drive-b"),
                 status: ChainStatus::Broken {
                     reason: ChainBreakReason::NoDriveData,
                     pin_parent: None,

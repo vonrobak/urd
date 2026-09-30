@@ -5,7 +5,7 @@
 use std::path::PathBuf;
 
 use crate::error::{BtrfsOperation, UrdError};
-use crate::types::{SendKind, SnapshotName};
+use crate::types::{DriveLabel, SendKind, SnapshotName, SubvolName};
 
 // ── Types ───────────────────────────────────────────────────────────────
 
@@ -71,7 +71,7 @@ pub enum FullSendPolicy {
 #[derive(Debug)]
 pub struct OperationOutcome {
     pub operation: String,
-    pub drive_label: Option<String>,
+    pub drive_label: Option<DriveLabel>,
     pub result: OpResult,
     pub duration: std::time::Duration,
     /// Contextual message for non-Success results: error details for Failure,
@@ -90,7 +90,7 @@ pub struct OperationOutcome {
 /// fields construct the literal directly (#180).
 pub(super) fn outcome_success(
     operation: &str,
-    drive_label: Option<String>,
+    drive_label: Option<DriveLabel>,
     bytes_transferred: Option<u64>,
     duration: std::time::Duration,
 ) -> OperationOutcome {
@@ -112,7 +112,7 @@ pub(super) fn outcome_success(
 /// which records a partial transfer, sets it on the returned value.
 pub(super) fn outcome_failure(
     operation: &str,
-    drive_label: Option<String>,
+    drive_label: Option<DriveLabel>,
     error: &UrdError,
     duration: std::time::Duration,
 ) -> OperationOutcome {
@@ -130,7 +130,7 @@ pub(super) fn outcome_failure(
 
 #[derive(Debug)]
 pub struct SubvolumeResult {
-    pub name: String,
+    pub name: SubvolName,
     pub success: bool,
     pub operations: Vec<OperationOutcome>,
     pub duration: std::time::Duration,
@@ -166,8 +166,8 @@ impl SubvolumeResult {
 /// drive-specific* pin actually removed — never a phantom (F3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OffsiteChainRelease {
-    pub subvolume: String,
-    pub drive: String,
+    pub subvolume: SubvolName,
+    pub drive: DriveLabel,
     pub parent: SnapshotName,
 }
 
@@ -183,13 +183,13 @@ impl OffsiteChainRelease {
         let mut ev = crate::events::Event::pure(
             occurred_at,
             crate::events::EventPayload::OffsiteChainReleased {
-                subvolume: self.subvolume.clone(),
-                drive: self.drive.clone(),
+                subvolume: self.subvolume.to_string(),
+                drive: self.drive.to_string(),
                 parent: self.parent.to_string(),
             },
         );
-        ev.fill_subvolume(Some(self.subvolume.clone()));
-        ev.fill_drive_label(Some(self.drive.clone()));
+        ev.fill_subvolume(Some(self.subvolume.to_string()));
+        ev.fill_drive_label(Some(self.drive.to_string()));
         ev
     }
 }
@@ -267,7 +267,7 @@ impl ReclaimOutcome {
 /// path, and the subvolume whose pins the Layer-3 re-check reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeleteCandidate<'a> {
-    pub subvolume: &'a str,
+    pub subvolume: &'a SubvolName,
     pub path: PathBuf,
 }
 

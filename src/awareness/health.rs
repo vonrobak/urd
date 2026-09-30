@@ -11,7 +11,7 @@ use super::types::{DriveAssessment, OffsiteContext, OperationalHealth};
 use crate::config::DriveConfig;
 use crate::observation::Observation;
 use crate::observation::estimate::estimated_send_size;
-use crate::types::{DriveEvent, DriveEventKind, DriveRole};
+use crate::types::{DriveEvent, DriveEventKind, DriveLabel, DriveRole, SubvolName};
 
 // ── Thresholds ─────────────────────────────────────────────────────────
 
@@ -91,7 +91,7 @@ pub(super) fn drive_absence_signal(
 /// The per-subvolume facts [`compute_health`] judges, named so the call site
 /// reads as prose rather than a row of positional bools.
 pub(super) struct HealthInputs<'a> {
-    pub(super) subvol_name: &'a str,
+    pub(super) subvol_name: &'a SubvolName,
     /// Only send-enabled subvolumes are judged on drive/chain health; a
     /// local-only one stops after the local-space check.
     pub(super) send_enabled: bool,
@@ -104,7 +104,7 @@ pub(super) struct HealthInputs<'a> {
     pub(super) chain_health: &'a [DriveChainHealth],
     pub(super) drive_assessments: &'a [DriveAssessment],
     pub(super) drives_config: &'a [DriveConfig],
-    pub(super) offsite_ctx: &'a std::collections::HashMap<String, OffsiteContext>,
+    pub(super) offsite_ctx: &'a std::collections::HashMap<DriveLabel, OffsiteContext>,
 }
 
 /// Compute operational health for a subvolume.

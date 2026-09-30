@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use super::{Executor, OpResult, OperationOutcome};
 use crate::state::{DriftSampleRow, OperationRecord};
-use crate::types::SendKind;
+use crate::types::{DriveLabel, SendKind, SubvolName};
 
 impl Executor<'_> {
     /// Build and persist a drift sample for the subvolume's run, if at least
@@ -17,12 +17,12 @@ impl Executor<'_> {
     pub(super) fn maybe_record_drift_sample(
         &self,
         run_id: Option<i64>,
-        subvol_name: &str,
+        subvol_name: &SubvolName,
         operations: &[OperationOutcome],
-        send_plan_order: &[(String, SendKind)],
-        prior_send_time_by_drive: &HashMap<String, chrono::NaiveDateTime>,
+        send_plan_order: &[(DriveLabel, SendKind)],
+        prior_send_time_by_drive: &HashMap<DriveLabel, chrono::NaiveDateTime>,
         source_free: &HashMap<PathBuf, Option<u64>>,
-        subvol_to_root: &HashMap<String, PathBuf>,
+        subvol_to_root: &HashMap<SubvolName, PathBuf>,
     ) {
         let Some(state) = self.state else { return };
 
@@ -102,7 +102,12 @@ impl Executor<'_> {
         }
     }
 
-    pub(super) fn record_operation(&self, run_id: i64, subvol_name: &str, outcome: &OperationOutcome) {
+    pub(super) fn record_operation(
+        &self,
+        run_id: i64,
+        subvol_name: &SubvolName,
+        outcome: &OperationOutcome,
+    ) {
         if let Some(state) = self.state {
             let result_str = match outcome.result {
                 OpResult::Success => "success",
@@ -114,7 +119,7 @@ impl Executor<'_> {
                 run_id,
                 subvolume: subvol_name.to_string(),
                 operation: outcome.operation.clone(),
-                drive_label: outcome.drive_label.clone(),
+                drive_label: outcome.drive_label.as_ref().map(ToString::to_string),
                 duration_secs: Some(outcome.duration.as_secs_f64()),
                 result: result_str.to_string(),
                 error_message: outcome.error.clone(),
@@ -131,6 +136,7 @@ impl Executor<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::{dlabel, svname};
     use crate::btrfs::MockBtrfs;
     use crate::executor::testkit::*;
     use crate::executor::{OffsiteChainRelease, RunResult};
@@ -414,22 +420,22 @@ mod tests {
                 PlannedOperation::CreateSnapshot {
                     source: PathBuf::from("/data/a"),
                     dest: PathBuf::from("/nonexistent-urd/snap/sv-a/20260322-1430-a"),
-                    subvolume_name: "sv-a".to_string(),
+                    subvolume_name: svname("sv-a"),
                 },
                 PlannedOperation::SendIncremental {
                     parent: PathBuf::from("/nonexistent-urd/snap/sv-a/20260321-a"),
                     snapshot: PathBuf::from("/nonexistent-urd/snap/sv-a/20260322-1430-a"),
                     dest_dir: PathBuf::from("/mnt/drive-a/.snapshots/sv-a"),
-                    drive_label: "DRIVE-A".to_string(),
-                    subvolume_name: "sv-a".to_string(),
+                    drive_label: dlabel("DRIVE-A"),
+                    subvolume_name: svname("sv-a"),
                     pin_on_success: None,
                 },
                 PlannedOperation::SendIncremental {
                     parent: PathBuf::from("/nonexistent-urd/snap/sv-a/20260321-a"),
                     snapshot: PathBuf::from("/nonexistent-urd/snap/sv-a/20260322-1430-a"),
                     dest_dir: PathBuf::from("/mnt/drive-b/.snapshots/sv-a"),
-                    drive_label: "DRIVE-B".to_string(),
-                    subvolume_name: "sv-a".to_string(),
+                    drive_label: dlabel("DRIVE-B"),
+                    subvolume_name: svname("sv-a"),
                     pin_on_success: None,
                 },
             ],
@@ -495,22 +501,22 @@ mod tests {
                 PlannedOperation::CreateSnapshot {
                     source: PathBuf::from("/data/a"),
                     dest: snap_a.clone(),
-                    subvolume_name: "sv-a".to_string(),
+                    subvolume_name: svname("sv-a"),
                 },
                 PlannedOperation::SendIncremental {
                     parent: PathBuf::from("/nonexistent-urd/snap/sv-a/20260321-a"),
                     snapshot: snap_a.clone(),
                     dest_dir: PathBuf::from("/mnt/drive-a/.snapshots/sv-a"),
-                    drive_label: "DRIVE-A".to_string(),
-                    subvolume_name: "sv-a".to_string(),
+                    drive_label: dlabel("DRIVE-A"),
+                    subvolume_name: svname("sv-a"),
                     pin_on_success: None,
                 },
                 PlannedOperation::SendIncremental {
                     parent: PathBuf::from("/nonexistent-urd/snap/sv-a/20260321-a"),
                     snapshot: snap_b_for_sv_a.clone(),
                     dest_dir: PathBuf::from("/mnt/drive-b/.snapshots/sv-a"),
-                    drive_label: "DRIVE-B".to_string(),
-                    subvolume_name: "sv-a".to_string(),
+                    drive_label: dlabel("DRIVE-B"),
+                    subvolume_name: svname("sv-a"),
                     pin_on_success: None,
                 },
             ],

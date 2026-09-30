@@ -17,7 +17,7 @@ use crate::awareness::{
 use crate::config::Config;
 use crate::observation::Observation;
 use crate::storage_critical::StorageSignalMap;
-use crate::types::{DriveRole, PromiseStatus, ProtectionLevel};
+use crate::types::{DriveLabel, DriveRole, PromiseStatus, ProtectionLevel};
 
 // The redundancy advisory types live beside `SubvolAssessment`, which carries
 // them (`awareness/types.rs`); this module computes them. Re-exported so
@@ -146,7 +146,7 @@ pub fn compute_advice(
                 return None;
             }
             return Some(ActionableAdvice {
-                subvolume: name.clone(),
+                subvolume: name.to_string(),
                 // `external_only` is moot here: with sends off, the local
                 // snapshot is the only copy there is to age.
                 issue: stale_issue(assessment, false),
@@ -161,7 +161,7 @@ pub fn compute_advice(
     // Branch 2: Unprotected + no external drives configured
     if assessment.status == PromiseStatus::Unprotected && assessment.external.is_empty() {
         return Some(ActionableAdvice {
-            subvolume: name.clone(),
+            subvolume: name.to_string(),
             issue: AdviceIssue::new(assessment.status, IssueDetail::NoExternalDrives),
             command: None,
             reason: Some(
@@ -177,7 +177,7 @@ pub fn compute_advice(
     {
         let first_label = &assessment.external[0].drive_label;
         return Some(ActionableAdvice {
-            subvolume: name.clone(),
+            subvolume: name.to_string(),
             issue: AdviceIssue::new(assessment.status, IssueDetail::AllDrivesDisconnected),
             command: None,
             reason: Some(format!("Connect {first_label} to restore protection")),
@@ -193,7 +193,7 @@ pub fn compute_advice(
             return None;
         }
         return Some(ActionableAdvice {
-            subvolume: name.clone(),
+            subvolume: name.to_string(),
             issue: stale_issue(assessment, external_only),
             command: Some(format!("urd backup --force-full --subvolume {name}")),
             reason: Some(chain_break_reason_text(broken)),
@@ -205,7 +205,7 @@ pub fn compute_advice(
         && let Some(absent) = assessment.external.iter().find(|d| !d.mounted)
     {
         return Some(ActionableAdvice {
-            subvolume: name.clone(),
+            subvolume: name.to_string(),
             issue: stale_issue(assessment, external_only),
             command: None,
             reason: Some(format!(
@@ -221,7 +221,7 @@ pub fn compute_advice(
             return None;
         }
         return Some(ActionableAdvice {
-            subvolume: name.clone(),
+            subvolume: name.to_string(),
             issue: stale_issue(assessment, external_only),
             command: Some(format!("urd backup --subvolume {name}")),
             reason: None,
@@ -241,7 +241,7 @@ pub fn compute_advice(
             return None;
         }
         return Some(ActionableAdvice {
-            subvolume: name.clone(),
+            subvolume: name.to_string(),
             issue: stale_issue(assessment, external_only),
             command: Some(format!("urd backup --subvolume {name}")),
             reason: None,
@@ -261,11 +261,11 @@ pub fn compute_advice(
                 return None;
             }
             return Some(ActionableAdvice {
-                subvolume: name.clone(),
+                subvolume: name.to_string(),
                 issue: AdviceIssue::new(
                     assessment.status,
                     IssueDetail::ChainBroken {
-                        drive: broken.drive_label.clone(),
+                        drive: broken.drive_label.to_string(),
                     },
                 ),
                 command: Some(format!("urd backup --force-full --subvolume {name}")),
@@ -285,11 +285,11 @@ pub fn compute_advice(
             !d.mounted && drive_absence_is_health_cause(&d.drive_label, &assessment.health_reasons)
         }) {
             return Some(ActionableAdvice {
-                subvolume: name.clone(),
+                subvolume: name.to_string(),
                 issue: AdviceIssue::new(
                     assessment.status,
                     IssueDetail::DriveAway {
-                        drive: absent.drive_label.clone(),
+                        drive: absent.drive_label.to_string(),
                     },
                 ),
                 command: None,
@@ -331,7 +331,7 @@ pub fn count_distinct_causes(advice: &[ActionableAdvice]) -> usize {
 /// days"). The leading-token (`"{label} "`) match is deliberate: it excludes the
 /// "space tight on {label}" reason (label not leading) and never confuses a
 /// label that is a prefix of another (`WD-18TB` vs `WD-18TB1`). See #120.
-fn drive_absence_is_health_cause(drive_label: &str, health_reasons: &[String]) -> bool {
+fn drive_absence_is_health_cause(drive_label: &DriveLabel, health_reasons: &[String]) -> bool {
     let prefix = format!("{drive_label} ");
     health_reasons.iter().any(|r| r.starts_with(&prefix))
 }
@@ -509,7 +509,7 @@ pub fn compute_redundancy_advisories(
             if !has_offsite {
                 advisories.push(RedundancyAdvisory {
                     kind: RedundancyAdvisoryKind::NoOffsiteProtection,
-                    subvolume: assessment.name.clone(),
+                    subvolume: assessment.name.to_string(),
                     drive: None,
                     detail: format!(
                         "{} seeks resilience, but all drives share the same fate",
@@ -567,8 +567,8 @@ pub fn compute_redundancy_advisories(
                     };
                     advisories.push(RedundancyAdvisory {
                         kind: RedundancyAdvisoryKind::OffsiteDriveStale,
-                        subvolume: assessment.name.clone(),
-                        drive: Some(da.drive_label.clone()),
+                        subvolume: assessment.name.to_string(),
+                        drive: Some(da.drive_label.to_string()),
                         detail,
                     });
                 }
@@ -590,8 +590,8 @@ pub fn compute_redundancy_advisories(
             {
                 advisories.push(RedundancyAdvisory {
                     kind: RedundancyAdvisoryKind::SinglePointOfFailure,
-                    subvolume: assessment.name.clone(),
-                    drive: Some(only.drive_label.clone()),
+                    subvolume: assessment.name.to_string(),
+                    drive: Some(only.drive_label.to_string()),
                     detail: format!(
                         "{} rests on a single external drive",
                         assessment.name,
@@ -608,7 +608,7 @@ pub fn compute_redundancy_advisories(
             if all_unmounted {
                 advisories.push(RedundancyAdvisory {
                     kind: RedundancyAdvisoryKind::TransientNoLocalRecovery,
-                    subvolume: assessment.name.clone(),
+                    subvolume: assessment.name.to_string(),
                     drive: None,
                     detail: format!(
                         "{} lives only on external drives \u{2014} local snapshots are disabled",
@@ -632,6 +632,7 @@ pub fn compute_redundancy_advisories(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::dlabel;
     use crate::awareness::{ChainBreakReason, DriveChainHealth, LocalAssessment};
     use crate::awareness::test_support::{dt, offsite_test_config, snap, test_config};
     use crate::btrfs::MockBtrfs;
@@ -686,7 +687,7 @@ mod tests {
 
     fn offsite_drive_assessment(status: PromiseStatus, mounted: bool) -> DriveAssessment {
         DriveAssessment {
-            drive_label: "offsite-drive".to_string(),
+            drive_label: dlabel("offsite-drive"),
             status,
             mounted,
             snapshot_count: if mounted { Some(5) } else { None },
@@ -704,7 +705,7 @@ mod tests {
 
     fn primary_drive_assessment() -> DriveAssessment {
         DriveAssessment {
-            drive_label: "primary-drive".to_string(),
+            drive_label: dlabel("primary-drive"),
             status: PromiseStatus::Protected,
             mounted: true,
             snapshot_count: Some(100),
@@ -851,7 +852,7 @@ mod tests {
         // alongside a Protected copy leaves the headline Protected.
         let config = fortified_config();
         let stale_offsite = DriveAssessment {
-            drive_label: "offsite-old".to_string(),
+            drive_label: dlabel("offsite-old"),
             status: PromiseStatus::Unprotected,
             mounted: false,
             snapshot_count: None,
@@ -1403,7 +1404,7 @@ protection_level = "guarded"
 
     fn drive_assessment(label: &str, mounted: bool, send_age_hours: Option<i64>) -> DriveAssessment {
         DriveAssessment {
-            drive_label: label.to_string(),
+            drive_label: label.into(),
             status: PromiseStatus::Protected,
             mounted,
             snapshot_count: Some(5),
@@ -1459,7 +1460,7 @@ protection_level = "guarded"
         let mut a = test_assessment_for_advice("sv1", PromiseStatus::Unprotected, OperationalHealth::Healthy);
         a.external = vec![drive_assessment("WD-18TB1", true, Some(50 * 24))];
         a.chain_health = vec![DriveChainHealth {
-            drive_label: "WD-18TB1".to_string(),
+            drive_label: dlabel("WD-18TB1"),
             status: ChainStatus::Intact {
                 pin_parent: "20260731-1618-opptak".to_string(),
             },
@@ -1503,7 +1504,7 @@ protection_level = "guarded"
         let mut a = test_assessment_for_advice("sv1", PromiseStatus::Unprotected, OperationalHealth::Degraded);
         a.external = vec![drive_assessment("WD-18TB1", true, Some(50 * 24))];
         a.chain_health = vec![DriveChainHealth {
-            drive_label: "WD-18TB1".to_string(),
+            drive_label: dlabel("WD-18TB1"),
             status: ChainStatus::Broken {
                 reason: ChainBreakReason::PinMissingLocally,
                 pin_parent: None,
@@ -1518,7 +1519,7 @@ protection_level = "guarded"
         let mut a = test_assessment_for_advice("sv1", PromiseStatus::AtRisk, OperationalHealth::Degraded);
         a.external = vec![drive_assessment("WD-18TB", true, Some(48))];
         a.chain_health = vec![DriveChainHealth {
-            drive_label: "WD-18TB".to_string(),
+            drive_label: dlabel("WD-18TB"),
             status: ChainStatus::Broken {
                 reason: ChainBreakReason::PinMissingLocally,
                 pin_parent: None,
@@ -1553,7 +1554,7 @@ protection_level = "guarded"
         let mut a = test_assessment_for_advice("sv1", PromiseStatus::Protected, OperationalHealth::Degraded);
         a.external = vec![drive_assessment("WD-18TB", true, Some(6))];
         a.chain_health = vec![DriveChainHealth {
-            drive_label: "WD-18TB".to_string(),
+            drive_label: dlabel("WD-18TB"),
             status: ChainStatus::Broken {
                 reason: ChainBreakReason::NoPinFile,
                 pin_parent: None,
@@ -1669,7 +1670,7 @@ protection_level = "guarded"
         let mut a = test_assessment_for_advice("sv1", PromiseStatus::AtRisk, OperationalHealth::Degraded);
         a.external = vec![drive_assessment("WD-18TB", true, Some(48))];
         a.chain_health = vec![DriveChainHealth {
-            drive_label: "WD-18TB".to_string(),
+            drive_label: dlabel("WD-18TB"),
             status: ChainStatus::Broken {
                 reason: ChainBreakReason::PinMissingLocally,
                 pin_parent: None,
@@ -1690,7 +1691,7 @@ protection_level = "guarded"
         let mut a = test_assessment_for_advice("sv1", PromiseStatus::Protected, OperationalHealth::Degraded);
         a.external = vec![drive_assessment("WD-18TB", true, Some(6))];
         a.chain_health = vec![DriveChainHealth {
-            drive_label: "WD-18TB".to_string(),
+            drive_label: dlabel("WD-18TB"),
             status: ChainStatus::Broken {
                 reason: ChainBreakReason::NoPinFile,
                 pin_parent: None,
@@ -1766,7 +1767,7 @@ protection_level = "guarded"
         let mut a = test_assessment_for_advice("sv1", PromiseStatus::AtRisk, OperationalHealth::Degraded);
         a.external = vec![drive_assessment("WD-18TB", true, Some(48))];
         a.chain_health = vec![DriveChainHealth {
-            drive_label: "WD-18TB".to_string(),
+            drive_label: dlabel("WD-18TB"),
             status: ChainStatus::Broken {
                 reason: ChainBreakReason::PinMissingLocally,
                 pin_parent: None,
@@ -1812,7 +1813,7 @@ protection_level = "guarded"
         let mut a = test_assessment_for_advice("sv1", PromiseStatus::Protected, OperationalHealth::Degraded);
         a.external = vec![drive_assessment("WD-18TB", true, Some(6))];
         a.chain_health = vec![DriveChainHealth {
-            drive_label: "WD-18TB".to_string(),
+            drive_label: dlabel("WD-18TB"),
             status: ChainStatus::Broken {
                 reason: ChainBreakReason::NoPinFile,
                 pin_parent: None,

@@ -10,12 +10,13 @@ use crate::drives::{self, DriveAvailability};
 use crate::sentinel::{self, SentinelEvent};
 
 use super::{SentinelRunner, read_sentinel_state_file, sentinel_state_path};
+use crate::types::DriveLabel;
 
 impl SentinelRunner {
     // ── Event detection ─────────────────────────────────────────────────
 
     /// Labels of configured drives that are mounted and verified right now.
-    fn present_drives(&self) -> BTreeSet<String> {
+    fn present_drives(&self) -> BTreeSet<DriveLabel> {
         self.config
             .drives
             .iter()
@@ -34,14 +35,13 @@ impl SentinelRunner {
     /// records nothing (ADR-102) — the restored set is still reconciled
     /// against what is present, so the first scan stays correct.
     pub(super) fn restore_mount_tracking(&mut self) {
-        let config_labels: BTreeSet<String> =
-            self.config.drives.iter().map(|d| d.label.clone()).collect();
+        let config_labels: BTreeSet<DriveLabel> = self.config.drive_labels().into_iter().collect();
         let file = read_sentinel_state_file(&self.state_file_path);
         let Some(restored) = sentinel::restorable_mounts(file.as_ref(), &config_labels) else {
             return;
         };
         let present = self.present_drives();
-        let absent: Vec<&String> = restored.drives.difference(&present).collect();
+        let absent: Vec<&DriveLabel> = restored.drives.difference(&present).collect();
 
         let db = if absent.is_empty() {
             None

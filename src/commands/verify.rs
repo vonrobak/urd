@@ -7,7 +7,7 @@ use crate::config::Config;
 use crate::drives;
 use crate::output::{OutputMode, VerifyCheck, VerifyDrive, VerifyOutput, VerifySubvolume};
 use crate::observation::{FilesystemQuery, RealFileSystemState};
-use crate::types::SnapshotName;
+use crate::types::{DriveLabel, SnapshotName};
 use crate::voice;
 
 pub fn run(config: Config, args: VerifyArgs, mode: OutputMode) -> anyhow::Result<()> {
@@ -46,12 +46,10 @@ pub(crate) fn collect_verify_output(config: &Config, args: &VerifyArgs) -> Verif
             // Check for stale pin files — suggests send_enabled was previously true
             if let Some(root) = config.snapshot_root_for(&subvol.name) {
                 let local_dir = root.join(&subvol.name);
-                let drive_labels: Vec<String> =
-                    config.drives.iter().map(|d| d.label.clone()).collect();
-                let pinned = chain::find_pinned_snapshots(&local_dir, &drive_labels);
+                let pinned = chain::find_pinned_snapshots(&local_dir, &config.drive_labels());
                 if !pinned.is_empty() {
                     subvolumes.push(VerifySubvolume {
-                        name: subvol.name.clone(),
+                        name: subvol.name.to_string(),
                         drives: vec![VerifyDrive {
                             label: "(config)".to_string(),
                             checks: vec![VerifyCheck {
@@ -98,7 +96,7 @@ pub(crate) fn collect_verify_output(config: &Config, args: &VerifyArgs) -> Verif
                 });
                 total_warn += 1;
                 sv_drives.push(VerifyDrive {
-                    label: drive.label.clone(),
+                    label: drive.label.to_string(),
                     checks,
                 });
                 continue;
@@ -214,13 +212,13 @@ pub(crate) fn collect_verify_output(config: &Config, args: &VerifyArgs) -> Verif
             }
 
             sv_drives.push(VerifyDrive {
-                label: drive.label.clone(),
+                label: drive.label.to_string(),
                 checks,
             });
         }
 
         subvolumes.push(VerifySubvolume {
-            name: subvol.name.clone(),
+            name: subvol.name.to_string(),
             drives: sv_drives,
         });
     }
@@ -307,7 +305,7 @@ fn stale_pin_checks(
 /// of the stale-pin check, kept separate from the pure decision in
 /// `stale_pin_checks`. Returns `None` when the pin is absent or its mtime can't
 /// be read (the check is then simply skipped, as before).
-fn pin_file_mtime(local_dir: &Path, drive_label: &str) -> Option<SystemTime> {
+fn pin_file_mtime(local_dir: &Path, drive_label: &DriveLabel) -> Option<SystemTime> {
     std::fs::metadata(chain::pin_path(local_dir, drive_label)).and_then(|m| m.modified()).ok()
 }
 

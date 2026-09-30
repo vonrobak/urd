@@ -13,8 +13,8 @@ use super::{
 };
 use crate::notify::NotificationConfig;
 use crate::types::{
-    ByteSize, GraduatedRetention, Interval, LocalRetentionConfig, LocalRetentionKind,
-    MonthlyCount, ProtectionContractView, ProtectionLevel, RunFrequency,
+    ByteSize, DriveLabel, GraduatedRetention, Interval, LocalRetentionConfig, LocalRetentionKind,
+    MonthlyCount, ProtectionContractView, ProtectionLevel, RunFrequency, SubvolName,
     validate_protection_contract,
 };
 
@@ -218,7 +218,7 @@ impl V2Config {
                 };
                 SubvolumeConfig {
                     short_name: sv.short_name.unwrap_or_else(|| sv.name.clone()),
-                    name: sv.name,
+                    name: SubvolName::from(sv.name),
                     source: sv.source,
                     priority: sv.priority,
                     enabled: sv.enabled,
@@ -230,7 +230,7 @@ impl V2Config {
                         .external_retention
                         .map(V2GraduatedRetention::into_graduated),
                     protection_level: sv.protection,
-                    drives: sv.drives,
+                    drives: sv.drives.map(|d| d.into_iter().map(DriveLabel::from).collect()),
                 }
             })
             .collect();
@@ -298,6 +298,7 @@ pub(super) fn parse_v2(raw: &str) -> Result<Config, String> {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+    use crate::testkit::svname;
     use crate::config::v1::parse_v1;
 
     // ── V2 (UPI 042) tests ─────────────────────────────────────────────
@@ -724,7 +725,7 @@ source = "/docs"
 snapshot_root = "/snap"
 min_free_bytes = "10GB"
 "#).unwrap();
-        assert_eq!(config.root_min_free_bytes("docs"), Some(10_000_000_000));
+        assert_eq!(config.root_min_free_bytes(&svname("docs")), Some(10_000_000_000));
     }
 
     #[test]
@@ -745,8 +746,8 @@ source = "/docs"
 snapshot_root = "/snap"
 "#).unwrap();
         // The one declared threshold governs the whole root.
-        assert_eq!(config.root_min_free_bytes("home"), Some(10_000_000_000));
-        assert_eq!(config.root_min_free_bytes("docs"), Some(10_000_000_000));
+        assert_eq!(config.root_min_free_bytes(&svname("home")), Some(10_000_000_000));
+        assert_eq!(config.root_min_free_bytes(&svname("docs")), Some(10_000_000_000));
     }
 
     #[test]

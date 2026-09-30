@@ -10,6 +10,7 @@ use super::{Executor, OpResult, OperationOutcome, outcome_failure, outcome_succe
 use crate::chain;
 use crate::error::UrdError;
 use crate::plan::DeleteKind;
+use crate::types::{DriveLabel, SubvolName};
 
 impl Executor<'_> {
     pub(super) fn execute_create<'b>(
@@ -60,8 +61,10 @@ impl Executor<'_> {
     pub(super) fn execute_delete(
         &self,
         path: &Path,
-        subvolume_name: &str,
+        subvolume_name: &SubvolName,
         kind: DeleteKind,
+        // Keyed by recovery location: a drive label for external paths, the
+        // snapshot-root path for local ones (`space_recovery_key`).
         space_recovered: &mut HashMap<String, bool>,
     ) -> OperationOutcome {
         let start = Instant::now();
@@ -187,9 +190,9 @@ impl Executor<'_> {
     /// Return a key for space recovery tracking. External paths use the drive
     /// label; local paths use the snapshot root path string. Returns None if
     /// the path doesn't match any known location.
-    fn space_recovery_key(&self, path: &Path, subvolume_name: &str) -> Option<String> {
+    fn space_recovery_key(&self, path: &Path, subvolume_name: &SubvolName) -> Option<String> {
         if let Some(label) = self.drive_label_for_path(path) {
-            Some(label)
+            Some(label.into_string())
         } else {
             self.config
                 .snapshot_root_for(subvolume_name)
@@ -211,7 +214,7 @@ impl Executor<'_> {
             .find(|d| path.starts_with(&d.mount_path))
     }
 
-    fn drive_label_for_path(&self, path: &Path) -> Option<String> {
+    fn drive_label_for_path(&self, path: &Path) -> Option<DriveLabel> {
         self.drive_for_path(path).map(|d| d.label.clone())
     }
 }
@@ -221,6 +224,7 @@ impl Executor<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::svname;
     use crate::btrfs::{MockBtrfs, MockBtrfsCall};
     use crate::executor::testkit::*;
     use crate::plan::{BackupPlan, PlannedOperation};
@@ -246,13 +250,13 @@ mod tests {
                 PlannedOperation::DeleteSnapshot {
                     path: PathBuf::from("/nonexistent-urd/snap/sv-a/20260301-a"),
                     reason: "space pressure: expired".to_string(),
-                    subvolume_name: "sv-a".to_string(),
+                    subvolume_name: svname("sv-a"),
                     kind: DeleteKind::SpacePressure,
                 },
                 PlannedOperation::DeleteSnapshot {
                     path: PathBuf::from("/nonexistent-urd/snap/sv-a/20260302-a"),
                     reason: "space pressure: expired".to_string(),
-                    subvolume_name: "sv-a".to_string(),
+                    subvolume_name: svname("sv-a"),
                     kind: DeleteKind::SpacePressure,
                 },
             ],
@@ -316,13 +320,13 @@ mod tests {
                 PlannedOperation::DeleteSnapshot {
                     path: PathBuf::from("/nonexistent-urd/snap/sv-a/20260301-a"),
                     reason: "space pressure: expired".to_string(),
-                    subvolume_name: "sv-a".to_string(),
+                    subvolume_name: svname("sv-a"),
                     kind: DeleteKind::SpacePressure,
                 },
                 PlannedOperation::CreateSnapshot {
                     source: PathBuf::from("/data/a"),
                     dest: PathBuf::from("/nonexistent-urd/snap/sv-a/20260322-1430-a"),
-                    subvolume_name: "sv-a".to_string(),
+                    subvolume_name: svname("sv-a"),
                 },
             ],
             timestamp: ts,
@@ -357,7 +361,7 @@ mod tests {
             operations: vec![PlannedOperation::DeleteSnapshot {
                 path: PathBuf::from("/mnt/test/.snapshots/sv-a/20260301-a"),
                 reason: "space pressure: expired".to_string(),
-                subvolume_name: "sv-a".to_string(),
+                subvolume_name: svname("sv-a"),
                 kind: DeleteKind::SpacePressure,
             }],
             timestamp: ts,

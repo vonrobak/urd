@@ -19,6 +19,7 @@ use crate::guard::{self, WatchdogAction, WATCHDOG_POLL_MS};
 use crate::pools::{self, PoolSpace};
 use crate::run_tail::WatchdogFiring;
 use crate::storage_critical::TightnessTier;
+use crate::types::{DriveLabel, SubvolName};
 
 /// A source pool the watchdog guards during this run. Built pre-execution from
 /// the single pre-plan storage gather; only Tight/Critical pools with a
@@ -51,7 +52,7 @@ pub(super) struct ArmedPool {
     /// User-facing pool label for the abort event/notification.
     label: String,
     /// Send-enabled subvolumes on this pool, for the Step-5b abort-reclaim.
-    subvol_names: Vec<String>,
+    subvol_names: Vec<SubvolName>,
 }
 
 /// The shared cells the watchdog thread reads and writes, bundled so the loop
@@ -89,7 +90,7 @@ pub(super) fn arm_watchdog_pools(
 /// reserve-creation need *after* the tier filter. (The tier itself is consumed
 /// by the `tier_ok` predicate in `resolve_pool_targets`, so it is not carried.)
 struct PoolTarget {
-    send_subvols: Vec<String>,
+    send_subvols: Vec<SubvolName>,
     root: PathBuf,
     space: PoolSpace,
     label: String,
@@ -121,7 +122,7 @@ fn resolve_pool_targets(
         if !tier_ok(tier) {
             continue;
         }
-        let send_subvols: Vec<String> = pool
+        let send_subvols: Vec<SubvolName> = pool
             .subvol_names
             .iter()
             .filter(|n| send_enabled.contains(*n))
@@ -228,7 +229,7 @@ pub(super) fn watchdog_loop(
     // away map is the spawn-time snapshot, re-filtered to still-unmounted drives at
     // reclaim time (S3).
     maint_btrfs: &dyn BtrfsOps,
-    away_at_spawn: &HashMap<String, Vec<String>>,
+    away_at_spawn: &HashMap<SubvolName, Vec<DriveLabel>>,
 ) {
     let mut started_below: HashMap<PathBuf, bool> = HashMap::new();
     // Each pool fires at most once per run (UPI 065-b): after a same-fs abort or a
@@ -299,7 +300,7 @@ fn handle_watchdog_trip(
     pool: &ArmedPool,
     ctx: &WatchdogCtx,
     maint_btrfs: &dyn BtrfsOps,
-    away_at_spawn: &HashMap<String, Vec<String>>,
+    away_at_spawn: &HashMap<SubvolName, Vec<DriveLabel>>,
 ) -> WatchdogFiring {
     let config: &Config = &ctx.config;
     let in_flight = {
@@ -361,6 +362,7 @@ fn handle_watchdog_trip(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::svname;
     use crate::btrfs::RealBtrfs;
     use std::sync::Arc;
     use crate::commands::backup::test_fixtures::*;
@@ -370,7 +372,7 @@ mod tests {
     fn tier_map(pairs: &[(&str, TightnessTier)]) -> crate::storage_critical::ArmedTierMap {
         let mut m = crate::storage_critical::ArmedTierMap::new();
         for (n, t) in pairs {
-            m.insert((*n).to_string(), *t);
+            m.insert((*n).into(), *t);
         }
         m
     }
@@ -480,7 +482,7 @@ mod tests {
         poll: PathBuf,
         roots: Vec<PathBuf>,
         floor_bytes: u64,
-        subvol_names: Vec<String>,
+        subvol_names: Vec<SubvolName>,
     ) -> ArmedPool {
         ArmedPool {
             poll_path: poll,
@@ -501,7 +503,7 @@ mod tests {
         let thread_ctx = ctx.clone();
         let handle = std::thread::spawn(move || {
             let maint = RealBtrfs::for_maintenance("/usr/sbin/btrfs");
-            let away: HashMap<String, Vec<String>> = HashMap::new();
+            let away: HashMap<SubvolName, Vec<DriveLabel>> = HashMap::new();
             watchdog_loop(&[pool], &thread_ctx, &maint, &away);
         });
         std::thread::sleep(Duration::from_millis(50)); // ≥1 poll
@@ -533,7 +535,7 @@ mod tests {
             dir.path().to_path_buf(),
             vec![dir.path().to_path_buf()],
             u64::MAX,
-            vec!["alpha".to_string()],
+            vec![svname("alpha")],
         );
         let (aborted, firings) = run_loop_briefly(pool);
         assert!(!aborted, "started-below floor must not abort");
@@ -549,7 +551,7 @@ mod tests {
             dir.path().to_path_buf(),
             vec![dir.path().to_path_buf()],
             0, // free is always >= 0, never below → no floor trip
-            vec!["alpha".to_string()],
+            vec![svname("alpha")],
         );
         let (aborted, firings) = run_loop_briefly(pool);
         assert!(!aborted);
@@ -575,7 +577,7 @@ mod tests {
             poll.clone(),
             vec![poll.clone(), other_root.clone()], // one UUID-pool, two roots
             u64::MAX,
-            vec!["alpha".to_string()],
+            vec![svname("alpha")],
         );
         let ctx = test_ctx(WatchdogCoord {
             in_flight: Some(other_root.clone()), // ≠ poll_path, but IS a pool root
@@ -601,7 +603,7 @@ mod tests {
         // No send in flight → same-fs (nothing to cross-pool-harm): abort path.
         let dir = tempfile::TempDir::new().unwrap();
         let poll = dir.path().to_path_buf();
-        let pool = test_armed_pool(poll.clone(), vec![poll], u64::MAX, vec!["alpha".to_string()]);
+        let pool = test_armed_pool(poll.clone(), vec![poll], u64::MAX, vec![svname("alpha")]);
         let ctx = test_ctx(WatchdogCoord::default()); // in_flight = None
         let mock = crate::btrfs::MockBtrfs::new();
         let away = HashMap::new();
@@ -622,7 +624,7 @@ mod tests {
             poll.clone(),
             vec![poll.clone()],
             u64::MAX,
-            vec!["alpha".to_string()],
+            vec![svname("alpha")],
         );
         let ctx = test_ctx(WatchdogCoord {
             in_flight: Some(foreign.clone()),
@@ -649,7 +651,12 @@ mod tests {
         // left the pool out of `tripped`, so the executor kept sending to it.
         let dir = tempfile::TempDir::new().unwrap();
         let poll = dir.path().to_path_buf();
-        let pool = test_armed_pool(poll.clone(), vec![poll.clone()], u64::MAX, vec!["alpha".to_string()]);
+        let pool = test_armed_pool(
+            poll.clone(),
+            vec![poll.clone()],
+            u64::MAX,
+            vec![svname("alpha")],
+        );
         let ctx = test_ctx(WatchdogCoord::default());
         let coord = &ctx.coord;
         std::thread::scope(|s| {
