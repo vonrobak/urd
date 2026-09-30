@@ -1,8 +1,8 @@
 use crate::cli::RetentionPreviewArgs;
+use crate::commands::world;
 use crate::config::Config;
 use crate::output::{OutputMode, RetentionPreviewOutput};
 use crate::retention;
-use crate::state::StateDb;
 use crate::types::LocalRetentionPolicy;
 use crate::voice;
 
@@ -37,7 +37,7 @@ pub fn run(config: Config, args: RetentionPreviewArgs, mode: OutputMode) -> anyh
 
     // Optionally load calibrated sizes from state DB
     let state_db = if config.general.state_db.exists() {
-        StateDb::open(&config.general.state_db).ok()
+        world::open_state_best_effort(&config.general.state_db, "calibrated sizes")
     } else {
         None
     };

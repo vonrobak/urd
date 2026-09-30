@@ -29,7 +29,6 @@ use crate::sentinel::{
     self, EjectAction, EjectEvent, EjectPhase, EjectState, EjectTransition, SentinelAction,
     SentinelEvent, SentinelState, TransitionResult,
 };
-use crate::state::StateDb;
 
 /// Poll interval: how often the runner checks for events.
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -203,7 +202,10 @@ impl SentinelRunner {
         // is outside any backup run — the stamp is an explicit outside_run.
         // The empty guard keeps quiet rounds from opening the DB at all.
         if !all_audit_events.is_empty() {
-            let db = StateDb::open(&self.config.general.state_db).ok();
+            let db = world::open_state_best_effort(
+                &self.config.general.state_db,
+                "sentinel audit events",
+            );
             let recorder = crate::recorder::Recorder::new(db.as_ref(), &self.config);
             recorder.record(
                 &crate::events::RunContext::outside_run(),
@@ -286,11 +288,10 @@ impl SentinelRunner {
         let db = if absent.is_empty() {
             None
         } else {
-            StateDb::open(&self.config.general.state_db)
-                .inspect_err(|e| {
-                    log::warn!("Failed to open state DB for startup drive reconciliation: {e}");
-                })
-                .ok()
+            world::open_state_best_effort(
+                &self.config.general.state_db,
+                "startup drive reconciliation",
+            )
         };
 
         // Newest history event per absent label; a label left out of the map
@@ -501,7 +502,7 @@ impl SentinelRunner {
     ) -> anyhow::Result<()> {
         let now = chrono::Local::now().naive_local();
         let state_db = if self.config.general.state_db.exists() {
-            StateDb::open(&self.config.general.state_db).ok()
+            world::open_state_best_effort(&self.config.general.state_db, "sentinel assessment")
         } else {
             None
         };
@@ -697,17 +698,11 @@ impl SentinelRunner {
         log::info!("Drive {verb}: {label}");
 
         // Record in SQLite. ADR-102: failure never prevents operation.
-        match StateDb::open(&self.config.general.state_db) {
-            Ok(db) => {
-                if let Err(e) =
-                    db.record_drive_event(label, event_type, DriveEventSource::Sentinel)
-                {
-                    log::warn!("Failed to record drive event: {e}");
-                }
-            }
-            Err(e) => {
-                log::warn!("Failed to open state DB for drive event: {e}");
-            }
+        if let Some(db) =
+            world::open_state_best_effort(&self.config.general.state_db, "drive event")
+            && let Err(e) = db.record_drive_event(label, event_type, DriveEventSource::Sentinel)
+        {
+            log::warn!("Failed to record drive event: {e}");
         }
     }
 
@@ -727,13 +722,12 @@ impl SentinelRunner {
         };
 
         // Open state DB for token check and duration lookup.
-        let state_db = match StateDb::open(&self.config.general.state_db) {
-            Ok(db) => db,
-            Err(e) => {
-                // Fail-open: if DB unavailable, proceed with normal reconnection.
-                log::warn!("Failed to open state DB for reconnection notification: {e}");
-                return;
-            }
+        // Fail-open: if DB unavailable, proceed with normal reconnection.
+        let Some(state_db) = world::open_state_best_effort(
+            &self.config.general.state_db,
+            "reconnection notification",
+        ) else {
+            return;
         };
 
         // Check token state before dispatching (S1 fix).
@@ -825,7 +819,10 @@ impl SentinelRunner {
             let db = if ctx.audit_events.is_empty() {
                 None
             } else {
-                StateDb::open(&self.config.general.state_db).ok()
+                world::open_state_best_effort(
+                    &self.config.general.state_db,
+                    "sentinel audit events",
+                )
             };
             let recorder = crate::recorder::Recorder::new(db.as_ref(), &self.config);
             recorder.record(
@@ -1383,6 +1380,7 @@ fn backup_run_active_at(lock_path: &std::path::Path) -> bool {
 mod tests {
     use super::*;
     use crate::awareness::{LocalAssessment, OperationalHealth, PromiseStatus};
+    use crate::state::StateDb;
     use crate::types::Interval;
 
     fn make_assessment(name: &str, status: PromiseStatus) -> SubvolAssessment {

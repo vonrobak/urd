@@ -1866,8 +1866,7 @@ fn write_global_metrics(
 
     // Aggregate counter families from the events table.
     // Best-effort: a missing or unreadable DB yields zeros, never an error.
-    let event_counters = StateDb::open(&config.general.state_db)
-        .ok()
+    let event_counters = world::open_state_best_effort(&config.general.state_db, "metrics counters")
         .map(|db| crate::metrics::EventCounters {
             circuit_breaker_trips: db.count_circuit_breaker_trips().unwrap_or(0),
             full_sends_by_reason: db.count_full_sends_by_reason().unwrap_or_default(),
