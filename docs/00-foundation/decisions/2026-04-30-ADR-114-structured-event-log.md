@@ -450,6 +450,10 @@ the heartbeat file, not through the events table or a socket:
   (`sentinel_runner/detect.rs`) and treats a newer heartbeat as `BackupCompleted`, which
   triggers a fresh assessment. The backup has already recorded its transition events with
   `trigger = Run`, so the sentinel refreshes its baseline without recording them again.
+- **The previous heartbeat is the backup's baseline.** The run tail reads the heartbeat
+  before overwriting it, and `notify::compute_notifications(previous, current)` diffs the
+  promise states of the two. The backup's promise-change notifications are therefore
+  relative to the last heartbeat any run wrote, not to the events table.
 - **`DispatchPolicy::GateOnSentinel`** (`src/recorder.rs`) is the backup's one gated
   dispatch site, the promise-transition notifications computed by `run_tail::decide_tail`.
   If a sentinel is running (`sentinel_runner::sentinel_is_running`), the backup marks the
