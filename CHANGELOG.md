@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `AGENTS.md`: the public instructions for AI coding agents, covering the
+  architectural invariants, area rules, conventions and contracts. Agents
+  without access to the maintainer's private notes, such as cloud sessions and
+  contributors' tools, now start from the same rules. CI warns on any pull
+  request that changes it (ADR-118 amendment).
+
 ## [0.39.0] - 2026-10-01
 
 ### Changed

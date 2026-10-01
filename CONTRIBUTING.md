@@ -37,8 +37,9 @@ in environments where those are absent.
 ## Internal docs
 
 Internal docs (ideas, plans, journals, reports, project-supervisor state, the archive) and
-`CLAUDE.md` itself live in a private vault, reached from this repo only through gitignored
-symlinks — no paths or titles are referenced here (ADR-118).
+the maintainer's private `CLAUDE.md` live in a private vault, reached from this repo only
+through gitignored symlinks — no paths or titles are referenced here (ADR-118). The public
+agent instructions are tracked in `AGENTS.md`.
 
 ## Testing
 
@@ -58,8 +59,7 @@ All three must pass before submitting a PR.
 - No `unsafe`, no `unwrap()`/`expect()` in library code
 - Unit tests live in `#[cfg(test)] mod tests` in the same file
 
-`CLAUDE.md` (not in this repo — see "Internal docs" above) has the full coding conventions
-and architectural invariants.
+`AGENTS.md` has the full coding conventions and architectural invariants.
 
 ## Architecture
 

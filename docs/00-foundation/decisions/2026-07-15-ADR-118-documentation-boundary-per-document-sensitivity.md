@@ -164,6 +164,48 @@ The move is a pure local relocation, not a two-PR untrack-then-symlink sequence.
   into a private vault — there is nothing to scrub for the migration itself. Classification
   (assigning `sensitivity:`) is the work, not scrubbing.
 
+## Amendment 2026-10-01: AGENTS.md carries the public half of the instructions
+
+Delta 7 removed the instruction-injection surface, and with it every instruction a session
+without the vault could read. That cost turned out larger than the Consequences section
+weighed. A cloud session that ran a four-PR refactor had no architectural invariants, no
+conventions and no ADR bar to work from. Its new ADRs contradicted rulings it could not see.
+
+**Decision.** The instructions are split in two:
+
+- **`AGENTS.md` (tracked, public).** The vision and north-star tests, the architectural
+  invariants, error handling, area rules, coding conventions, testing, config and
+  on-disk contracts, BTRFS, build commands and the ADR bar. Everything in it is already
+  true of the public code and its public ADRs.
+- **`CLAUDE.md` (vault, untracked, as before).** It imports `AGENTS.md` and adds the
+  private half: pointers into the vault, the maintainer's development workflow and skills,
+  and the vault mechanics.
+
+Claude Code reads `AGENTS.md` on its own only when no `CLAUDE.md` exists in the working
+directory or above it. Sessions on the maintainer's machine are therefore unchanged and
+read one copy through the import. Cloud sessions, CI and contributors' agents, which have
+no `CLAUDE.md`, now load `AGENTS.md`.
+
+**What happens to the surface delta 7 closed.** It reopens, scoped to `AGENTS.md` and to
+sessions without the vault. It is held in three ways:
+
+- `AGENTS.md` is public-safe by construction, so a session reading it learns nothing
+  private.
+- Every change reaches `master` through the maintainer's reviewed squash-merge.
+- The CI `docs` job emits a warning on any pull request that touches `AGENTS.md`, so an
+  instruction change is never a quiet line in a larger diff.
+
+`CLAUDE.md` itself stays exactly as delta 7 left it.
+
+**Alternatives considered.**
+
+- Paste the rules into each cloud brief by hand: this depends on remembering, and it had
+  already failed once.
+- Restrict cloud sessions to bounded, pre-briefed work: this gives up the
+  ambitious-refactor use.
+- Path-scoped `.claude/rules/`: `.claude/` is private and untracked, so cloud sessions
+  would never see the rules.
+
 ## Related
 
 - **containers ADR-043** — the adopted model (github.com/vonrobak/containers,
