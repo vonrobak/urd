@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # check-present-not-journey.sh — Enforce the "present, not journey" doc convention.
 #
-# CLAUDE.md and docs/00-foundation/architecture.md are always-loaded / authoritative
+# AGENTS.md, CLAUDE.md and docs/00-foundation/architecture.md are always-loaded / authoritative
 # reference docs. They must describe the PRESENT system, never the journey to it: no UPI
 # history, no amendment narration ("amended", "now complete", "as of …"), and no bare dates
 # in prose. That kind of detail belongs in journals, the registry, and the ADRs.
@@ -29,6 +29,7 @@ cd "$REPO_ROOT"
 
 # Docs governed by the convention. Add a file here to bring it under the lint.
 targets=(
+    "AGENTS.md"
     "CLAUDE.md"
     "docs/00-foundation/architecture.md"
 )

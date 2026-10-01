@@ -45,3 +45,15 @@ jobs:
       - run: bash scripts/check-present-not-journey.sh
       - run: bash scripts/check-voice-boundary.sh
       - run: bash scripts/check-purity-boundary.sh
+      # AGENTS.md steers every AI-agent session that reads it (ADR-118). Never blocks;
+      # makes the change visible at review. On pull_request, HEAD is the merge commit, so
+      # a diff against the base tip is exactly the PR's change.
+      - name: Flag instruction-surface changes
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          git fetch --no-tags --depth=1 origin "$BASE_REF"
+          if git diff --name-only FETCH_HEAD HEAD -- AGENTS.md | grep -q .; then
+            echo "::warning file=AGENTS.md::Instruction surface changed: AGENTS.md steers AI-agent sessions. Review it as code (ADR-118)."
+          fi
