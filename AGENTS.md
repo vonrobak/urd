@@ -110,6 +110,9 @@ Rules that bind when you touch a specific part of the code:
 - Test retention logic exhaustively — it protects against data loss.
 - Vertical slicing: one test, implement to pass, repeat. Never all tests then all impl.
 - A regression test must fail without its fix: revert the fix locally once and watch it fail.
+- TTY-gated flows (the Encounter, any `is_terminal()` prompt) take the non-interactive path
+  under plain pipes. Drive them through a pty:
+  `printf '1\n' | python3 -c "import pty; pty.spawn(['target/debug/urd', ...])"`.
 - **Symmetric fixes need symmetric reviews.** When a bug is rooted in a shared planning or
   rendering pattern, grep for the pattern in adjacent code paths before closing the fix.
 - `scripts/check.sh` is the full gate (clippy, tests, release build, doc lints).
@@ -124,6 +127,10 @@ Rules that bind when you touch a specific part of the code:
   datetime), snapshot dirs (`{snapshot_root}/{name}/{YYYYMMDD-HHMM-short_name}/`), pin files
   (`.last-external-parent-{DRIVE_LABEL}`), and Prometheus metric names/labels/semantics.
   Field-level detail: `docs/20-reference/` (cli, metrics, heartbeat-schema).
+- **A new schema ships with its retirement plan.** When a data format gains a successor,
+  the design states the retirement criterion, what clears the legacy artifact, and when the
+  code drops legacy handling. Preservation without retirement lets dead history keep acting:
+  a legacy pin file once anchored two months of snapshots against retention.
 - **Observability stays monitoring-agnostic:** standard Prometheus textfile to a
   user-configured path, no assumptions about any stack.
 - **Versioning (ADR-112):** SemVer; single source of truth is `Cargo.toml`. Pre-1.0: MINOR

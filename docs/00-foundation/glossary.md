@@ -30,6 +30,18 @@ on-disk artifacts. Skim by cluster heading; use the examples when a definition
 alone is too abstract. Terms still in transition are collected at the bottom
 under "Flagged Ambiguities."
 
+**What earns an entry.** A term that recurs across code, designs and docs and needs
+consistent use, whether or not a user ever sees it ("protection-level contract" is
+internal and still belongs here).
+
+**Engine words and voice words.** Machine surfaces (types, config, heartbeat,
+Prometheus, SQLite) use established backup terms where they exist: *rotation*,
+*offsite*, *overdue*, *stale*. The mythic rendering lives only in `voice/`. One word
+serves both only where Urd coined the concept and a single word is clearest. Example:
+the engine's `RotationTier` is `on_schedule / overdue / stale`; the offsite thread
+speaks *holds / fraying / worn thin*, and *hibernating* and *due home* exist only in
+`voice/`.
+
 ## Cluster: Promise states (semantic)
 
 The awareness model assigns each subvolume one of three promise states. They answer
