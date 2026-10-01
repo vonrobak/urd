@@ -56,3 +56,4 @@ scripts/*
 !scripts/release-preflight.sh
 !scripts/release-bump.sh
 !scripts/collect-diagnostics.sh
+!scripts/agent-worktree.sh

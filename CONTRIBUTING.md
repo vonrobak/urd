@@ -41,6 +41,20 @@ the maintainer's private `CLAUDE.md` live in a private vault, reached from this 
 through gitignored symlinks — no paths or titles are referenced here (ADR-118). The public
 agent instructions are tracked in `AGENTS.md`.
 
+## Agent worktrees
+
+When several coding agents work in parallel, give each its own worktree:
+
+```bash
+scripts/agent-worktree.sh create NAME [--base REF] [--branch BRANCH | --detach]
+scripts/agent-worktree.sh list
+scripts/agent-worktree.sh remove NAME   # deletes its target/ first
+```
+
+`create` mirrors the main checkout's gitignored symlinks into the worktree, which
+git does not do. Each worktree builds into its own `target/`; remove worktrees once
+their PRs merge, because abandoned build dirs add up fast.
+
 ## Testing
 
 ```bash
