@@ -24,7 +24,7 @@ offsite or swapping in a sibling).
 ## Mental model
 
 A configured drive lives in one of two states (see
-[glossary](../../00-foundation/glossary.md#drive-states)):
+[glossary](../../../glossary.md#drive-states)):
 
 - **`connected`** — mounted, Urd can read and write it now.
 - **`away`** — not currently mounted. Urd defers operations targeting it.

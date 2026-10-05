@@ -26,13 +26,13 @@ the presentation layer (`voice/`), never in config or data structures. Urd think
 *promises*, not operations: the user declares what matters; Urd derives the operations.
 Promise states (PROTECTED / AT RISK / UNPROTECTED) are the universal language. Brevity is
 part of the promise: Urd says only what is necessary for fate to be sealed. Every word
-carries consequential weight. Taxonomy and full vocabulary: `docs/00-foundation/glossary.md`.
+carries consequential weight. Taxonomy and full vocabulary: `glossary.md` (repo root).
 
 ## Orient yourself
 
 - `docs/00-foundation/architecture.md` — the flow diagram and the authoritative
   module-responsibility table (`Does` / `Does NOT`).
-- `docs/00-foundation/glossary.md` — controlled vocabulary.
+- `glossary.md` (repo root) — controlled vocabulary.
 - `docs/00-foundation/decisions/` — the ADR index; filenames carry number and title.
 - `docs/20-reference/` — CLI, metrics and heartbeat-schema contracts.
 
