@@ -265,6 +265,6 @@ rows are never rewritten, so every payload form ever written must still decode.
 
 - **Architectural invariants:** `decisions/` — each ADR opens with a TL;DR that
   states the load-bearing rule it holds the code to.
-- **Glossary:** `glossary.md` (this directory) — promise states, voice labels,
+- **Glossary:** `glossary.md` (repo root) — promise states, voice labels,
   protection levels, retention tiers, identifiers.
 - **ADRs:** `decisions/` — the why behind every box and edge.
