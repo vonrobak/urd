@@ -101,7 +101,7 @@ impl PlanFragment {
 }
 
 /// The ONE home for the ordinary-deferral skip+event construction — the
-/// anti-twin seam CLAUDE.md's symmetric-fix rule warns about.
+/// anti-twin seam AGENTS.md's symmetric-fix rule warns about.
 /// Always produces a marker-false skip (via
 /// [`PlannedSkip::deferred`]); the only marker-true path is
 /// [`PlanFragment::defer_nothing_new`]. The event half goes through the shared

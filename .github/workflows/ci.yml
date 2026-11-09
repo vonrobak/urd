@@ -5,7 +5,7 @@
 # The tag in the trailing comment is informational only; bump by editing the SHA.
 #
 # No `cargo fmt --check`: HEAD is formatted with an older rustfmt and the current
-# version mass-reformats many files (see CLAUDE.md, Project State).
+# version mass-reformats many files (see AGENTS.md, Coding conventions).
 
 name: CI
 

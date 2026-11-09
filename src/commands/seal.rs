@@ -1744,7 +1744,7 @@ role = "primary"
     /// The adoption action over a real (temp) filesystem: the token write
     /// creates the snapshot home, and a re-run without a DB record adopts
     /// the existing identity instead of minting a new one (mocks are blind
-    /// to filesystem preconditions — CLAUDE.md testing rule).
+    /// to filesystem preconditions — AGENTS.md testing rule).
     #[test]
     fn adopt_one_creates_snapshot_home_and_keeps_identity_on_rerun() {
         use crate::output::AdoptAction;

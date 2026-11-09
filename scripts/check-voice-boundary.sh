@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # check-voice-boundary.sh — Keep the mythic voice inside src/voice/.
 #
-# CLAUDE.md: "The mythic voice (the character of the norn) belongs entirely in the
+# AGENTS.md: "The mythic voice (the character of the norn) belongs entirely in the
 # presentation layer (`voice/`), never in config or data structures." The glossary says
 # the same from the other side: the promise states travel as semantic names
 # (PROTECTED / AT RISK / UNPROTECTED) on every machine surface, and only the interactive
