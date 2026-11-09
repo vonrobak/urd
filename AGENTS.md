@@ -115,7 +115,8 @@ Rules that bind when you touch a specific part of the code:
   `printf '1\n' | python3 -c "import pty; pty.spawn(['target/debug/urd', ...])"`.
 - **Symmetric fixes need symmetric reviews.** When a bug is rooted in a shared planning or
   rendering pattern, grep for the pattern in adjacent code paths before closing the fix.
-- `scripts/check.sh` is the full gate (clippy, tests, release build, doc lints).
+- `scripts/check.sh` is the full gate (clippy, tests, release-mode tests, and the doc,
+  voice-boundary and purity-boundary lints).
 
 ## Config and backward compatibility
 
@@ -145,7 +146,7 @@ bytes, sync. The send|receive pipeline captures both sides' stderr, checks both 
 and cleans up partial snapshots on failure. Paths pass as `&Path` to `Command::arg()`, never
 stringified — prevents shell injection and preserves non-UTF-8 paths. API patterns:
 `docs/00-foundation/source-documentation/btrfs-reference.md`; the other dependency
-references there (rusqlite, toml, nix, colored, Rust 2024) serve `state.rs`, `config.rs`
+references there (rusqlite, toml, nix, colored, Rust 2024) serve `state/`, `config/`
 and `lock.rs` work.
 
 ## Build and run
