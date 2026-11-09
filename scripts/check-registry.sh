@@ -68,17 +68,20 @@ echo
 # --- Check 2: Reverse — every design file has a registry row --------------
 echo "--- Reverse: design files have registry rows ---"
 
-# Extract UPI numbers (with optional letter suffix) listed in registry table.
-# Table rows look like: | 026 | Title | ... or | 010-a | ... — capture col 1.
+# Extract the UPI number of every registry table row. Rows look like
+# | 026 | Title | ... or | 010-a | ... — capture the digits of col 1. A sliced
+# arc has rows 088-a, 088-b, 088-c and no bare 088 row, while its design files
+# are named design-088-a-…, and an arc-level design-059-… covers rows 059-a and
+# 059-b. A filename cannot tell a slice letter from a title that starts with
+# "a", so the match is on the number: the check asks whether the UPI is
+# registered at all.
 mapfile -t registered_upis < <(
-    grep -oP '^\|\s*\K[0-9]+[a-z]?(?:-[a-z])?(?=\s*\|)' "$REGISTRY" | sort -u
+    grep -oP '^\|\s*\K[0-9]+(?=[a-z]?(?:-[a-z])?\s*\|)' "$REGISTRY" | sort -u
 )
 
 declare -A registered_set=()
 for upi in "${registered_upis[@]}"; do
-    # Normalize "010-a" → "010a" for matching against filenames.
-    normalized="${upi/-/}"
-    registered_set["$normalized"]=1
+    registered_set["$upi"]=1
 done
 
 missing=0
@@ -86,9 +89,9 @@ designs_checked=0
 for design in "${IDEAS_DIR}"/*-design-[0-9]*-*.md; do
     [[ -f "$design" ]] || continue
     base="$(basename "$design")"
-    # Pull the UPI from filenames like 2026-04-30-design-036-foo.md
-    # or 2026-04-03-design-010a-foo.md
-    if [[ "$base" =~ -design-([0-9]+[a-z]?)- ]]; then
+    # Pull the UPI number from filenames like 2026-04-30-design-036-foo.md,
+    # 2026-04-03-design-010a-foo.md or 2026-07-11-design-088-a-foo.md
+    if [[ "$base" =~ -design-([0-9]+)[a-z]?- ]]; then
         upi="${BASH_REMATCH[1]}"
         designs_checked=$((designs_checked + 1))
         if [[ -z "${registered_set[$upi]:-}" ]]; then
