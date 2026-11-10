@@ -211,6 +211,7 @@ fn render_emergency_result_interactive(data: &EmergencyResult) -> String {
 mod tests {
     use super::*;
     use crate::output::{EmergencyRootAssessment, EmergencySubvolDetail};
+    use crate::voice::test_fixtures::color_guard;
 
     // (backup_summary_suppresses_unchanged moved with render_skipped_block
     //  into voice/backup.rs's #[cfg(test)] mod tests.)
@@ -219,6 +220,7 @@ mod tests {
 
     #[test]
     fn render_emergency_no_crisis() {
+        let _color = color_guard(false);
         let data = EmergencyOutput {
             roots: vec![
                 EmergencyRootAssessment {
@@ -252,6 +254,7 @@ mod tests {
 
     #[test]
     fn render_emergency_crisis() {
+        let _color = color_guard(false);
         let data = EmergencyOutput {
             roots: vec![EmergencyRootAssessment {
                 root: std::path::PathBuf::from("/snap/home"),
@@ -295,6 +298,7 @@ mod tests {
 
     #[test]
     fn render_emergency_result_success() {
+        let _color = color_guard(false);
         let data = EmergencyResult {
             root: std::path::PathBuf::from("/snap/home"),
             deleted: 35,
@@ -312,6 +316,7 @@ mod tests {
 
     #[test]
     fn render_emergency_result_still_critical() {
+        let _color = color_guard(false);
         let data = EmergencyResult {
             root: std::path::PathBuf::from("/snap/home"),
             deleted: 10,
